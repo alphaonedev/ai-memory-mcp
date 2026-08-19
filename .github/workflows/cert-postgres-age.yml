@@ -120,11 +120,65 @@ jobs:
         with:
           components: clippy
 
-      - name: Install mold linker + postgresql-client
+      - name: Install mold linker + postgresql-client (#1148, pinned+bounded #3090)
+        timeout-minutes: 8
+        env:
+          MOLD_VERSION: "2.4.1"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y mold postgresql-client
+          set -euo pipefail
+          # ------------------------------------------------------------------
+          # #3090 — bounded, pinned, fail-loud install (see ci.yml for the full
+          # rationale). The old bare `apt-get install -y mold postgresql-client`
+          # could hang on a stalled apt mirror until the job timeout fired. mold
+          # comes from a pinned first-party release tarball (apt bounded
+          # fallback); postgresql-client stays on bounded apt. No external
+          # Action added.
+          # ------------------------------------------------------------------
+          install_from_tarball() {
+            local arch tgz url dir ok attempt
+            arch="$(uname -m)"
+            tgz="mold-${MOLD_VERSION}-${arch}-linux.tar.gz"
+            url="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${tgz}"
+            dir="$(mktemp -d)"; ok=0
+            for attempt in 1 2; do
+              if timeout 120 curl -fsSL --retry 2 --retry-delay 3 -o "${dir}/${tgz}" "${url}"; then
+                ok=1; break
+              fi
+              echo "mold tarball fetch attempt ${attempt} failed; retrying" >&2; sleep 3
+            done
+            [ "${ok}" = 1 ] || return 1
+            tar -xzf "${dir}/${tgz}" -C "${dir}"
+            sudo install -m0755 "${dir}/mold-${MOLD_VERSION}-${arch}-linux/bin/mold" /usr/local/bin/mold
+            sudo ln -sf /usr/local/bin/mold /usr/local/bin/ld.mold
+          }
+          install_from_apt() {
+            local ok attempt; ok=0
+            for attempt in 1 2; do
+              if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y mold; then
+                ok=1; break
+              fi
+              echo "apt mold install attempt ${attempt} failed; retrying" >&2; sleep 5
+            done
+            [ "${ok}" = 1 ]
+          }
+          if ! { command -v mold >/dev/null 2>&1 && mold --version | grep -q "${MOLD_VERSION}"; }; then
+            if ! install_from_tarball; then
+              echo "::warning::pinned mold tarball unavailable — falling back to apt"
+              install_from_apt || { echo "::error::mold install failed (tarball + apt both failed)"; exit 1; }
+            fi
+          fi
+          command -v mold >/dev/null 2>&1 || { echo "::error::mold not on PATH after install"; exit 1; }
           mold --version
+          # postgresql-client — bounded apt, one retry, fail loud.
+          pg_ok=0
+          for attempt in 1 2; do
+            if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y postgresql-client; then
+              pg_ok=1; break
+            fi
+            echo "apt postgresql-client attempt ${attempt} failed; retrying" >&2; sleep 5
+          done
+          [ "${pg_ok}" = 1 ] || { echo "::error::postgresql-client install failed"; exit 1; }
+          psql --version
 
       - uses: Swatinem/rust-cache@v2
 

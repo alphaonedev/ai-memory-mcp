@@ -72,15 +72,78 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Reclaim runner disk (#2960, first-party, no external action)
+        if: runner.os == 'Linux'
+        run: |
+          # #2960 — this heavy pg+AGE parity job builds sal-postgres and runs
+          # #[ignore]-gated live-PG tests on a stock ubuntu-latest runner
+          # (~14 GiB free). Prune the large preinstalled toolchains this build
+          # never touches BEFORE the compile, guarded so a shifting runner
+          # image can never fail the job. Pure first-party shell — no external
+          # 'free-disk-space' action (repo no-external-code-injection rule).
+          # NOTE: `docker image prune` (not `system prune --volumes`) so the
+          # running `services:` postgres container + its volume are untouched.
+          echo "::group::disk before reclaim"; df -h /; echo "::endgroup::"
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+                      /usr/share/swift /usr/lib/jvm || true
+          sudo docker image prune -af || true
+          sudo apt-get clean || true
+          echo "::group::disk after reclaim"; df -h /; echo "::endgroup::"
+
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
-      - name: Install mold linker (#1148)
+      - name: Install mold linker (#1148, pinned+bounded #3090)
+        timeout-minutes: 6
+        env:
+          MOLD_VERSION: "2.4.1"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y mold
+          set -euo pipefail
+          # ------------------------------------------------------------------
+          # #3090 — bounded, pinned, fail-loud mold install (see ci.yml for the
+          # full rationale). The old bare `apt-get install -y mold` could hang
+          # on a stalled apt mirror until the job timeout fired. Primary path is
+          # a pinned first-party mold release tarball; apt is the bounded
+          # fallback. No external Action added.
+          # ------------------------------------------------------------------
+          if command -v mold >/dev/null 2>&1 && mold --version | grep -q "${MOLD_VERSION}"; then
+            echo "mold ${MOLD_VERSION} already present: $(mold --version)"; exit 0
+          fi
+          install_from_tarball() {
+            local arch tgz url dir ok attempt
+            arch="$(uname -m)"
+            tgz="mold-${MOLD_VERSION}-${arch}-linux.tar.gz"
+            url="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${tgz}"
+            dir="$(mktemp -d)"; ok=0
+            for attempt in 1 2; do
+              if timeout 120 curl -fsSL --retry 2 --retry-delay 3 -o "${dir}/${tgz}" "${url}"; then
+                ok=1; break
+              fi
+              echo "mold tarball fetch attempt ${attempt} failed; retrying" >&2; sleep 3
+            done
+            [ "${ok}" = 1 ] || return 1
+            tar -xzf "${dir}/${tgz}" -C "${dir}"
+            sudo install -m0755 "${dir}/mold-${MOLD_VERSION}-${arch}-linux/bin/mold" /usr/local/bin/mold
+            sudo ln -sf /usr/local/bin/mold /usr/local/bin/ld.mold
+          }
+          install_from_apt() {
+            local ok attempt; ok=0
+            for attempt in 1 2; do
+              if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y mold; then
+                ok=1; break
+              fi
+              echo "apt mold install attempt ${attempt} failed; retrying" >&2; sleep 5
+            done
+            [ "${ok}" = 1 ]
+          }
+          if ! install_from_tarball; then
+            echo "::warning::pinned mold tarball unavailable — falling back to apt"
+            install_from_apt || { echo "::error::mold install failed (tarball + apt both failed)"; exit 1; }
+          fi
+          command -v mold >/dev/null 2>&1 || { echo "::error::mold not on PATH after install"; exit 1; }
           mold --version
 
       - uses: Swatinem/rust-cache@v2
