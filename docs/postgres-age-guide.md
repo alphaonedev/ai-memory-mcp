@@ -48,13 +48,13 @@ works on postgres.
 
 | Component | Version | Notes |
 |---|---|---|
-| PostgreSQL | **18.4** (canonical) | The recommended Enterprise Federated substrate. SSOT: `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.4`). PG 16.x + AGE 1.6.0 remains a tested alternate matrix (`infra/lan-parity-test/`). |
-| Apache AGE | **1.7.0** (canonical) | Targets PG 18. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` (`apache/age:release_PG18_1.7.0`) or build from source (see below). |
+| PostgreSQL | **18.6** (canonical) | The recommended Enterprise Federated substrate. SSOT: `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.6`). PG 16.x + AGE 1.6.0 remains a tested alternate matrix (`infra/lan-parity-test/`). |
+| Apache AGE | **1.8.0** (canonical extversion) | Targets PG 18. Installed via the pinned pgdg apt package (`postgresql-18-age=1.8.0~rc0-2.pgdg13+1`, SSOT `EXPECTED_AGE_VERSION=1.8.0`) overlaid on the `apache/age:release_PG18_1.7.0` base — `CREATE EXTENSION age` reports extversion 1.8.0. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` or the pgdg apt package (see below). |
 | pgvector | **0.8.6** (canonical) | Faster HNSW; 0.8.3 fixed HNSW-vacuuming index corruption. SSOT: `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
 | ai-memory | v0.9.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
 
 > **CI evidence (#2548 / #2512).** The **one true certified triple** —
-> PostgreSQL **18.4** + Apache AGE **1.7.0** + pgvector **0.8.6** — is
+> PostgreSQL **18.6** + Apache AGE **1.8.0** + pgvector **0.8.6** — is
 > exercised **in-PR on `release/**`** by
 > `.github/workflows/cert-postgres-age.yml`, which BUILDS the bundled
 > [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
@@ -62,10 +62,11 @@ works on postgres.
 > declaration source — no literal is re-typed in the workflow), runs the
 > `#[ignore]`-gated postgres cells AND the AGE-backed cells against that built
 > image, and **hard-fails on ANY drift from the exact pinned minors** —
-> PostgreSQL 18.4, Apache AGE 1.7.0, pgvector 0.8.6, not merely "PG 18" or
-> "AGE 1.7.x" — so the certified tier is proven by execution, never merely
+> PostgreSQL 18.6, Apache AGE 1.8.0, pgvector 0.8.6, not merely "PG 18" or
+> "AGE 1.8.x" — so the certified tier is proven by execution, never merely
 > claimed (2026-08-01 cutline ruling §5.4(3): "you cannot certify a tier CI
-> does not run"). The `infra/lan-parity-test/` alternate matrix (PG 16 + AGE
+> does not run"; standardized to PG 18.6 / AGE 1.8.0 by operator directive
+> 2026-08-18). The `infra/lan-parity-test/` alternate matrix (PG 16 + AGE
 > 1.6.0) is what the `coverage.yml` line-coverage measurement runs; that is a
 > coverage measurement, not cert evidence.
 
@@ -78,7 +79,8 @@ maps Rust vectors to Postgres `vector` columns), the repo ships a
 ready-made stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
 (#1065). It layers pgvector `0.8.6` (precompiled .deb from the pgdg apt
-repo) onto the `apache/age:release_PG18_1.7.0` base — no source build
+repo) onto the `apache/age:release_PG18_1.7.0` base AND upgrades AGE to
+`1.8.0` via the pinned pgdg `postgresql-18-age` package — no source build
 needed. Use this image for any deployment that backs ai-memory onto
 Postgres+AGE. (The `infra/lan-parity-test/` image — PG 16 + AGE 1.6.0 +
 pgvector 0.8.2 — remains as a tested alternate matrix.)
@@ -89,7 +91,7 @@ pgvector 0.8.2 — remains as a tested alternate matrix.)
 > if you write your own SQL probes, prefer the SQL-function form. (A
 > historical AGE 1.5.0 + PG 16 quirk could emit "could not find
 > parameter $N" for some bind shapes against the raw `prepare`-path;
-> the SQL-function form sidesteps it entirely and AGE 1.7.0 on PG 18 is
+> the SQL-function form sidesteps it entirely and AGE 1.8.0 on PG 18 is
 > unaffected. Wave 1 Stream C fixed our equivalence test harness to use
 > the safe form; production code never needed the fix.)
 
@@ -114,11 +116,12 @@ cd pgvector
 sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config install
 cd ..
 
-# 3. Apache AGE 1.7.0 from source against PG 18.
-git clone --depth 1 --branch PG18/v1.7.0 https://github.com/apache/age.git
-cd age
-sudo make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config install
-cd ..
+# 3. Apache AGE 1.8.0 from the PGDG apt repo (the certified install path —
+#    1.8.0 is the newest RELEASED AGE for PG18 and is published as a pinned
+#    pgdg .deb; `CREATE EXTENSION age` reports extversion 1.8.0). The pgdg
+#    package is the same mechanism the do-1461 native lane + bundled
+#    Dockerfile use; there is no stable 1.8.0 source tag (only v1.8.0-rc0).
+sudo apt install -y postgresql-18-age=1.8.0~rc0-2.pgdg13+1
 
 # 4. Restart postgres to pick up the shared libraries.
 sudo systemctl restart postgresql@18-main
@@ -163,7 +166,7 @@ services:
 ```
 
 Plan C operators running on K8s / ECS / Cloud Run build this image
-once, tag it (`pg-age-vector:PG18.4-1.7.0-pgvector0.8.6`), and reference
+once, tag it (`pg-age-vector:PG18.6-1.8.0-pgvector0.8.6`), and reference
 the tag from their workload manifests instead of the bare upstream
 image.
 
@@ -742,7 +745,7 @@ recommendation; the v0.7.0 release does not yet expose these as
 The four KG operations dispatch on the `KgBackend` tag the postgres
 adapter probes at connect time:
 
-| Op | AGE 1.7.0 (Cypher) | CTE fallback | Speedup at depth=5 |
+| Op | AGE 1.8.0 (Cypher) | CTE fallback | Speedup at depth=5 |
 |---|---|---|---|
 | `kg_query` | `MATCH (a)-[*1..d]->(b) WHERE a.id = $1` | recursive `WITH` join | ≥30% (S76 gate) |
 | `kg_timeline` | `MATCH ... WHERE valid_from < $1 AND (valid_until IS NULL OR valid_until > $1)` | recursive temporal join | ≥30% |
@@ -821,7 +824,7 @@ migration guide.)
 ### "could not find parameter $N" against a Cypher query
 
 This is the historical AGE 1.5.0 + PG 16 binding quirk mentioned above
-(AGE 1.7.0 on PG 18 is unaffected). ai-memory's production code never
+(AGE 1.8.0 on PG 18 is unaffected). ai-memory's production code never
 hits it — if you see it, you're running a custom psql probe. Use the
 AGE-recommended SQL-function shape:
 
@@ -878,7 +881,7 @@ parity test is the gate that prevents it.
 
 ## References
 
-- Apache AGE 1.7.0 docs: https://age.apache.org/
+- Apache AGE 1.8.0 docs: https://age.apache.org/
 - pgvector 0.8.6 docs: https://github.com/pgvector/pgvector
 - ai-memory v0.7.0 release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html)
 - A2A campaign Pages: https://alphaonedev.github.io/ai-memory-a2a-v0.7.0/

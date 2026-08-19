@@ -545,14 +545,14 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
         <tr><th>Component</th><th>Canonical version</th><th>SSOT pin</th></tr>
       </thead>
       <tbody>
-        <tr><td>PostgreSQL</td><td><strong>18.4</strong></td><td><code>PG_APT_VERSION=18.4-1.pgdg13+1</code> · <code>EXPECTED_PG_VERSION=18.4</code></td></tr>
-        <tr><td>Apache AGE</td><td><strong>1.7.0</strong></td><td><code>AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0</code> · <code>EXPECTED_AGE_VERSION=1.7.0</code></td></tr>
-        <tr><td>pgvector (server extension)</td><td><strong>0.8.2</strong></td><td><code>PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1</code></td></tr>
+        <tr><td>PostgreSQL</td><td><strong>18.6</strong></td><td><code>PG_APT_VERSION=18.6-1.pgdg13+2</code> · <code>EXPECTED_PG_VERSION=18.6</code></td></tr>
+        <tr><td>Apache AGE</td><td><strong>1.8.0</strong></td><td><code>AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1</code> · <code>EXPECTED_AGE_VERSION=1.8.0</code> (extversion 1.8.0, overlaid via pinned pgdg apt on the <code>release_PG18_1.7.0</code> base image)</td></tr>
+        <tr><td>pgvector (server extension)</td><td><strong>0.8.6</strong></td><td><code>PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1</code></td></tr>
         <tr><td>pgvector (Rust binding crate)</td><td><strong>0.4</strong></td><td><code>Cargo.toml</code> → <code>pgvector = "0.4"</code></td></tr>
         <tr><td>ai-memory postgres schema</td><td><strong>v89</strong></td><td>schema parity with SQLite at v89 (<code>CURRENT_SCHEMA_VERSION = 89</code> in both adapters; the v58–v70 arms are the v0.8.0 coordination + visibility + encryption-prep + archive-edge additive DDL, v71 adds the signed <code>forget_tombstones</code> table per #1821 / G30, the v72–v78 arms are the v0.9.0 append-only revision spine, audit cause-binding, BLAKE3 content-id, lineage-DAG, identity-lineage succession, recall-purity fold state, and model-attestation additive DDL, and the v79–v89 arms are the v1.0.0 crypto-core / claim-bitemporal valid-time / lineage-custody + M-of-N key-recovery / per-agent-api-key / embedding-space provenance / archive-column-parity additive DDL)</td></tr>
       </tbody>
     </table>
-    <p>The bundled stacked image at <code>deploy/docker-1461/Dockerfile.pg-age-vector</code> (<code>ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0</code>, <code>ARG PG_MAJOR=18</code>) layers pgvector 0.8.2 onto the AGE base so K8s / ECS / Cloud Run operators don't build AGE from source. <strong>Alternate tested matrix:</strong> <code>infra/lan-parity-test/</code> legitimately runs PG 16 + AGE 1.6.0 + pgvector 0.8.2 as a second tested combination; the <em>recommended</em> install targets the PG 18.4 / AGE 1.7.0 matrix above.</p>
+    <p>The bundled stacked image at <code>deploy/docker-1461/Dockerfile.pg-age-vector</code> (<code>ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0</code>, <code>ARG PG_MAJOR=18</code>) overlays Apache AGE 1.8.0 and pgvector 0.8.6 via pinned pgdg apt onto the AGE base so K8s / ECS / Cloud Run operators don't build AGE from source. <strong>Alternate tested matrix:</strong> <code>infra/lan-parity-test/</code> legitimately runs PG 16 + AGE 1.6.0 + pgvector 0.8.2 as a second tested combination; the <em>recommended</em> install targets the PG 18.6 / AGE 1.8.0 matrix above.</p>
   </div>
 </section>
 
