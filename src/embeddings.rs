@@ -873,6 +873,24 @@ pub trait Embed: Send + Sync {
         false
     }
 
+    /// #3063 — canonical model id of the CONSTRUCTED embedder for the
+    /// capabilities surface, or `None` when the impl carries none (test
+    /// doubles / abstract impls). Exposed on `dyn Embed` because the
+    /// `memory_capabilities` dispatch holds the embedder as `&dyn Embed`. The
+    /// production [`Embedder`] overrides this (and [`Embed::embedding_dim`])
+    /// with its real values so `/capabilities` reports what actually loaded,
+    /// not the resolved-config default. Default `None` → capabilities leaves
+    /// the config-resolved value unchanged.
+    fn embedding_model_id(&self) -> Option<String> {
+        None
+    }
+
+    /// #3063 — vector dimensionality of the CONSTRUCTED embedder, or `None`
+    /// for impls that report none. See [`Embed::embedding_model_id`].
+    fn embedding_dim(&self) -> Option<usize> {
+        None
+    }
+
     /// #2167 — the [`embedding_space_fingerprint`] of the vectors this embedder
     /// produces, exposed on the `dyn Embed` interface so the trait-generic
     /// backfill sweep ([`crate::store::run_embedding_backfill_on_store`],
@@ -1212,6 +1230,28 @@ impl Embedder {
             Self::Ollama {
                 model_name, dim, ..
             } => format!("{model_name} ({dim}-dim, remote)"),
+        }
+    }
+
+    /// #3063 — canonical model identifier for the capabilities surface.
+    ///
+    /// Reports the model the process ACTUALLY constructed, NOT the
+    /// resolved-config default. The two diverge under the operator-
+    /// documented "embedding-guard-gap" fallback: config resolves the
+    /// nomic-768 tier preset while boot falls back to the local
+    /// MiniLM-384 embedder (e.g. `AI_MEMORY_NO_CONFIG=1`, or a configured
+    /// model the daemon cannot construct — see
+    /// [`crate::daemon_runtime::resolve_embedder_model`]). The local
+    /// variant is ALWAYS `MiniLM` (the sole in-process model), so it
+    /// reports the [`crate::config::EmbeddingModel::MiniLmL6V2`] HF id;
+    /// the remote variant reports its operator-picked model id verbatim.
+    #[must_use]
+    pub fn capability_model_id(&self) -> String {
+        match self {
+            Self::Local { .. } => crate::config::EmbeddingModel::MiniLmL6V2
+                .hf_model_id()
+                .to_string(),
+            Self::Ollama { model_name, .. } => model_name.clone(),
         }
     }
 
@@ -1838,6 +1878,16 @@ impl Embed for Embedder {
         Self::is_degraded(self)
     }
 
+    fn embedding_model_id(&self) -> Option<String> {
+        // #3063 — the constructed embedder's real model id.
+        Some(Self::capability_model_id(self))
+    }
+
+    fn embedding_dim(&self) -> Option<usize> {
+        // #3063 — the constructed embedder's real vector dim.
+        Some(Self::dim(self))
+    }
+
     fn space_fingerprint(&self) -> String {
         // Delegate to the inherent #2168 method (returns the SSOT fingerprint).
         Embedder::space_fingerprint(self)
@@ -1849,6 +1899,126 @@ impl Embed for Embedder {
         // produce the same vectors. Safe to cache across instances.
         Some(Embedder::space_fingerprint(self))
     }
+}
+
+// ---------------------------------------------------------------------------
+// #3063 — capabilities must report the CONSTRUCTED embedder, not the config
+// default. The `memory_capabilities` / `GET /api/v1/capabilities` `models.*`
+// block is built from the resolver-derived `ResolvedModels`, but under the
+// embedding-guard-gap the embedder the process actually loaded can differ
+// (config resolves nomic-768; boot falls back to MiniLM-384). Left unfixed,
+// an operator reading `/capabilities` believes recall is nomic-768 quality
+// when it is MiniLM-384 — a truthfulness defect, not a data-integrity one,
+// but the capabilities surface is the operator's window into the live wiring.
+// ---------------------------------------------------------------------------
+
+/// #3063 — true when the LOADED embedder's `(model, dim)` disagrees with the
+/// config-resolved embedding identity. Pure (no side effects); drives the
+/// one-shot capabilities WARN in [`reconcile_capability_models`].
+///
+/// The dimension is the load-bearing, unambiguous signal (768 vs 384 → a
+/// different vector space); the model id is compared canonically so a matching
+/// deployment (resolved `nomic-embed-text-v1.5`, loaded remote `nomic-embed-
+/// text-v1.5`, equal dims) does not spuriously warn.
+#[must_use]
+pub fn embedder_capability_mismatch(
+    resolved: &crate::config::ResolvedEmbeddings,
+    loaded_model: &str,
+    loaded_dim: usize,
+) -> bool {
+    let dim_mismatch = resolved
+        .embedding_dim
+        .and_then(|d| usize::try_from(d).ok())
+        .is_some_and(|d| d != loaded_dim);
+    let model_mismatch = !embedding_model_ids_equivalent(&resolved.model, loaded_model);
+    dim_mismatch || model_mismatch
+}
+
+/// Canonical equivalence of two embedding-model id strings. When BOTH resolve
+/// to a known [`crate::config::EmbeddingModel`] they must be the same variant;
+/// otherwise fall back to a trimmed case-insensitive string compare (so an
+/// operator-picked API model id matches itself).
+fn embedding_model_ids_equivalent(a: &str, b: &str) -> bool {
+    use crate::config::EmbeddingModel;
+    match (
+        EmbeddingModel::from_canonical_id(a),
+        EmbeddingModel::from_canonical_id(b),
+    ) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    }
+}
+
+/// #3063 — return the [`crate::config::ResolvedModels`] the capabilities
+/// surface should report, with `embeddings.{model, embedding_dim}` overridden
+/// to the embedder the process ACTUALLY constructed. When no embedder is loaded
+/// (keyword tier / load failure) the config-resolved value stands unchanged.
+///
+/// When the loaded embedder disagrees with what config resolved, a one-shot
+/// (`Once`-gated) WARN is emitted so an operator is not silently misled about
+/// recall quality. Both runtime emit sites — the MCP `memory_capabilities`
+/// dispatch and the HTTP `GET /api/v1/capabilities` handler — thread their live
+/// `Option<&dyn Embed>` through here.
+#[must_use]
+pub fn reconcile_capability_models(
+    resolved: &crate::config::ResolvedModels,
+    embedder: Option<&dyn Embed>,
+) -> crate::config::ResolvedModels {
+    // Held as `&dyn Embed` because the MCP `memory_capabilities` dispatch
+    // carries the live embedder that way. `embedding_model_id` /
+    // `embedding_dim` default to `None` on impls that don't carry a real
+    // model (test doubles); the production `Embedder` overrides both.
+    let (Some(loaded_model), Some(loaded_dim)) = (
+        embedder.and_then(Embed::embedding_model_id),
+        embedder.and_then(Embed::embedding_dim),
+    ) else {
+        return resolved.clone();
+    };
+    warn_on_embedder_capability_mismatch(resolved, &loaded_model, loaded_dim);
+    override_embedding_identity(resolved, &loaded_model, loaded_dim)
+}
+
+/// #3063 — clone `resolved` with the embedding model id + dim overwritten to
+/// the constructed embedder's real values. Split out from
+/// [`reconcile_capability_models`] so the override is unit-testable via
+/// primitives without constructing a live [`Embedder`].
+#[must_use]
+pub fn override_embedding_identity(
+    resolved: &crate::config::ResolvedModels,
+    loaded_model: &str,
+    loaded_dim: usize,
+) -> crate::config::ResolvedModels {
+    let mut out = resolved.clone();
+    out.embeddings.model = loaded_model.to_string();
+    out.embeddings.embedding_dim = u32::try_from(loaded_dim).ok();
+    out
+}
+
+/// One-shot WARN when the loaded embedder differs from the resolved config
+/// (the #3063 embedding-guard-gap). `Once`-gated so a busy daemon does not
+/// spam the log on every capabilities call.
+fn warn_on_embedder_capability_mismatch(
+    resolved: &crate::config::ResolvedModels,
+    loaded_model: &str,
+    loaded_dim: usize,
+) {
+    if !embedder_capability_mismatch(&resolved.embeddings, loaded_model, loaded_dim) {
+        return;
+    }
+    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+    WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            target: "embeddings.capability_drift",
+            configured_model = %resolved.embeddings.model,
+            configured_dim = resolved.embeddings.embedding_dim.unwrap_or(0),
+            loaded_model = %loaded_model,
+            loaded_dim,
+            "capabilities: LOADED embedder differs from resolved config \
+             (embedding-guard-gap #3063) — /capabilities now reports the \
+             CONSTRUCTED embedder (model+dim); recall quality is the LOADED \
+             model, NOT the configured default"
+        );
+    });
 }
 
 /// Constant for backward compatibility — dimension of the default (`MiniLM`) embedding.
@@ -2152,6 +2322,41 @@ mod tests {
             "google/gemini-embedding-2 (3072-dim, remote)"
         );
         assert!(!embedder.is_degraded());
+    }
+
+    #[test]
+    fn capability_model_id_reports_constructed_remote_model_3063() {
+        let embedder = Embedder::new_remote(
+            offline_openai_compatible_client(),
+            "google/gemini-embedding-2".to_string(),
+            3072,
+        );
+        assert_eq!(embedder.capability_model_id(), "google/gemini-embedding-2");
+        assert_eq!(embedder.dim(), 3072);
+    }
+
+    #[test]
+    fn reconcile_overrides_config_with_constructed_embedder_3063() {
+        // Resolved config claims the nomic-768 tier preset, but the process
+        // actually constructed a 384-dim embedder (the embedding-guard-gap).
+        // Capabilities must report the CONSTRUCTED 384, not the config 768.
+        let mut resolved = crate::config::ResolvedModels::default();
+        resolved.embeddings.model = "nomic-embed-text-v1.5".to_string();
+        resolved.embeddings.embedding_dim = Some(768);
+
+        let loaded = Embedder::new_remote(
+            offline_openai_compatible_client(),
+            "all-MiniLM-L6-v2".to_string(),
+            384,
+        );
+        let out = reconcile_capability_models(&resolved, Some(&loaded as &dyn Embed));
+        assert_eq!(out.embeddings.model, "all-MiniLM-L6-v2");
+        assert_eq!(out.embeddings.embedding_dim, Some(384));
+
+        // None embedder → config-resolved value stands unchanged.
+        let passthrough = reconcile_capability_models(&resolved, None);
+        assert_eq!(passthrough.embeddings.model, "nomic-embed-text-v1.5");
+        assert_eq!(passthrough.embeddings.embedding_dim, Some(768));
     }
 
     #[test]

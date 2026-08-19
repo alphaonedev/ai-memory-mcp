@@ -2403,10 +2403,16 @@ fn dispatch_memory_capabilities(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
     // auth rejection) is degraded and must report `false` so
     // `recall_mode_active` follows truthfully.
     let embedder_live = ctx.embedder.is_some_and(|e| !e.is_degraded());
+    // #3063 — report the CONSTRUCTED embedder's model + dim in
+    // `models.*`, not the resolved-config default (they diverge under
+    // the embedding-guard-gap: config resolves nomic-768 while boot
+    // fell back to MiniLM-384). A loud one-shot WARN fires on mismatch.
+    let reconciled_models =
+        crate::embeddings::reconcile_capability_models(ctx.resolved_models, ctx.embedder);
     let result = match accept {
         CapabilitiesAccept::V3 => handle_capabilities_with_conn_v3(
             ctx.tier_config,
-            ctx.resolved_models,
+            &reconciled_models,
             ctx.reranker,
             embedder_live,
             Some(ctx.conn),
@@ -2417,7 +2423,7 @@ fn dispatch_memory_capabilities(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
         ),
         _ => handle_capabilities_with_conn(
             ctx.tier_config,
-            ctx.resolved_models,
+            &reconciled_models,
             ctx.reranker,
             embedder_live,
             Some(ctx.conn),
