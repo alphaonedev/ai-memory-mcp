@@ -1,0 +1,344 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+
+  ai-memory v1.0.0 — Enterprise-Federation Audit Reproduction + the 3x7 audit scheme.
+
+  The single, GitHub-Pages-sourceable procedure for standing up the EXACT
+  environment the v1.0.0 enterprise-federation audit used (Docker PostgreSQL
+  18.6 + Apache AGE 1.8.0 + pgvector 0.8.6, TLS 1.3 hostssl-only + mTLS to the
+  store, ai-memory served on the client<->daemon mTLS API under the certified
+  posture) and re-running the 3x7 audit scheme.
+
+  Committed kit: deploy/enterprise-federation-repro/ (repro.sh + verify.sh +
+  gen-certs.sh + initdb + seed-corpus.sh). Version pins are SOURCED from
+  deploy/docker-1461/provision/lib.sh (the one provisioning SSOT).
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-memory — Enterprise-Federation Reproduction</title>
+<meta name="description" content="The 100%-reproducible enterprise-federation audit environment: Docker PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6 over TLS 1.3 hostssl-only + mTLS, ai-memory served on the client-to-daemon mTLS API under the certified posture, plus the 3x7 audit scheme (7 feature domains x 3 adversarial lenses).">
+<meta name="theme-color" content="#0d1117">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/compliance/enterprise-federation-repro.html">
+<style>
+:root {
+  --bg:#000; --bg-raised:#0a0a0a; --bg-card:#111; --bg-elev:#161616; --bg-code:#1a1a1a;
+  --border:#262626; --border-hl:#3d3d3d;
+  --text:#fff; --text-muted:#999; --text-dim:#666;
+  --good:#6ee7ff; --warn:#ffb86b; --bad:#ff6b9d; --p3:#c8a2ff;
+  --font-mono:'SF Mono','Cascadia Code','Fira Code','JetBrains Mono',Consolas,monospace;
+  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  --max-w:1200px;
+}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.65;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--good);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--font-mono);font-size:.84rem;background:var(--bg-code);padding:.12em .35em;border-radius:4px;word-break:break-word}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1{font-weight:800;letter-spacing:-0.03em;font-size:2.5rem;line-height:1.1;margin-bottom:.75rem}
+h2{font-weight:700;letter-spacing:-0.02em;font-size:1.8rem;line-height:1.2;margin-bottom:.75rem}
+h3{font-weight:700;font-size:1.15rem;margin:1.25rem 0 .5rem;color:var(--text)}
+p{color:var(--text-muted);margin-bottom:.85rem}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.9);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}
+.topnav a:hover,.topnav a.active{color:var(--text);text-decoration:none}
+.topnav .home-link{color:var(--text);font-weight:600}
+.topnav .right{display:flex;gap:1.25rem;align-items:center}
+@media(max-width:800px){.topnav .right{display:none}}
+.hero{padding:4rem 0 2.75rem;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;padding:.3rem .8rem;border-radius:999px;background:rgba(110,231,255,0.1);color:var(--good);font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:1rem;border:1px solid rgba(110,231,255,0.25)}
+.hero .tagline{font-size:1.05rem;color:var(--text-muted);max-width:74ch}
+.hero-pills{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1.4rem}
+.hero-pill{padding:.4rem .85rem;border-radius:999px;background:var(--bg-elev);color:var(--text);font-size:.8rem;font-weight:600;border:1px solid var(--border-hl)}
+.hero-pill.good{background:rgba(110,231,255,0.08);color:var(--good);border-color:rgba(110,231,255,0.3)}
+section{padding:2.75rem 0;border-bottom:1px solid var(--border)}
+section:last-child{border-bottom:none}
+.section-eyebrow{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--good);margin-bottom:.85rem}
+.lede{font-size:1.02rem;color:var(--text);max-width:78ch;margin-bottom:1.25rem}
+.scroll-x{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.85rem;margin:1rem 0}
+thead th{text-align:left;padding:.65rem .75rem;background:var(--bg-elev);color:var(--text);font-weight:700;border-bottom:2px solid var(--border-hl);font-size:.74rem;letter-spacing:.05em;text-transform:uppercase}
+tbody td{padding:.65rem .75rem;border-bottom:1px solid var(--border);vertical-align:top;color:var(--text-muted)}
+tbody td.col-name{color:var(--text);font-weight:600}
+tbody tr:hover{background:rgba(255,255,255,0.02)}
+pre.codeblock{background:var(--bg-code);border:1px solid var(--border);border-radius:6px;padding:.85rem 1rem;overflow-x:auto;font-family:var(--font-mono);font-size:.78rem;line-height:1.6;color:var(--text-muted);margin:.85rem 0}
+pre.codeblock .cm{color:var(--text-dim)}
+.warn-box{background:var(--bg-card);border-left:3px solid var(--warn);padding:1rem 1.25rem;border-radius:6px;margin:1.25rem 0;color:var(--text-muted);font-size:.92rem}
+.warn-box strong{color:var(--warn);display:block;margin-bottom:.35rem}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1.25rem;margin:1.25rem 0}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.25rem}
+.card .lbl{font-size:.7rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--good);margin-bottom:.5rem}
+.card p{font-size:.9rem;margin-bottom:0}
+.stat-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:1rem;margin:1.25rem 0}
+.stat{background:var(--bg-elev);border:1px solid var(--border-hl);border-radius:10px;padding:1rem;text-align:center}
+.stat .n{font-size:1.8rem;font-weight:800;color:var(--good);letter-spacing:-0.02em;line-height:1.1}
+.stat .l{color:var(--text-muted);font-size:.78rem;margin-top:.3rem}
+footer{padding:3rem 0 4rem;border-top:1px solid var(--border);background:var(--bg-raised);color:var(--text-dim);font-size:.85rem}
+footer a{color:var(--text-muted)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <div class="left">
+      <a class="home-link" href="../index.html">ai-memory</a>
+      <a href="../reproducible-baselines.html">Baselines</a>
+      <a href="../reference-architecture/">Reference architecture</a>
+      <a class="active" href="index.html">Compliance</a>
+    </div>
+    <div class="right">
+      <a href="ENTERPRISE-FEDERATION-CERTIFICATION.md">Certification</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="container">
+    <span class="eyebrow">Enterprise-Federation · Audit Reproduction</span>
+    <h1>Reproduce the audit environment. Re-run the audit.</h1>
+    <p class="tagline">An audit you cannot reproduce is an anecdote. This page is the single, GitHub-Pages-sourceable procedure for standing up the <strong>exact</strong> substrate the v1.0.0 enterprise-federation audit ran on — a Docker PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6 data tier over TLS 1.3 (hostssl-only, cleartext refused) with mutual-TLS to the store, and <code>ai-memory</code> wired into ONLY that tier, served on the client&harr;daemon mTLS API under the certified posture — and re-running the <strong>3&times;7 audit scheme</strong>. Any AI NHI (or human peer reviewer) can operate the substrate exactly as this audit did.</p>
+    <div class="hero-pills">
+      <span class="hero-pill good">PostgreSQL 18.6</span>
+      <span class="hero-pill good">Apache AGE 1.8.0</span>
+      <span class="hero-pill good">pgvector 0.8.6</span>
+      <span class="hero-pill">TLS 1.3 · hostssl-only</span>
+      <span class="hero-pill">mTLS store + API</span>
+      <span class="hero-pill">Ed25519 audit chain</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============================================================ OVERVIEW -->
+<section id="overview">
+  <div class="container">
+    <span class="section-eyebrow">What this reproduces</span>
+    <h2>One command up, one command proven</h2>
+    <p class="lede">The committed kit lives at <code>deploy/enterprise-federation-repro/</code>. It EXTENDS the canonical <code>deploy/docker-1461/</code> provisioning lane rather than forking it: the PostgreSQL / AGE / pgvector version pins are <strong>sourced</strong> from <code>deploy/docker-1461/provision/lib.sh</code> (the one provisioning source of truth), the image is built from <code>deploy/docker-1461/Dockerfile.pg-age-vector</code>, and the fail-closed hostssl proof reuses <code>deploy/docker-1461/pg-hostssl-healthcheck.sh</code>. The kit adds only the audit-shaped pieces: the single-daemon standup, the two encrypted legs' certificate sets, the deterministic seed-corpus generator, and the 3&times;7 verify harness.</p>
+    <div class="cards">
+      <div class="card"><div class="lbl">repro.sh</div><p>Idempotent one-command standup: <em>stack &rarr; certs &rarr; keys &rarr; schema-init &rarr; seed &rarr; migrate &rarr; certified daemon</em>. Every scratch artifact lands under <code>.local-runs/ef-repro/</code> (gitignored; never <code>/tmp</code>).</p></div>
+      <div class="card"><div class="lbl">verify.sh</div><p>Proves every invariant with real output and fails loud on any deviation: server version, extension versions, TLS on, cleartext refused, TLS 1.3 negotiated, the certified posture readout, the signed audit trail, semantic recall, and the fail-closed write gate.</p></div>
+      <div class="card"><div class="lbl">gen-certs.sh</div><p>Mints — into the gitignored run dir, never committed — the CA plus both encrypted legs: the PG server + client (store mTLS) and the daemon server + an allowed API client with a SHA-256 fingerprint allowlist.</p></div>
+    </div>
+    <pre class="codeblock"><span class="cm"># Prereqs: docker (or podman), openssl, curl, cargo (only if no prebuilt binary).</span>
+deploy/enterprise-federation-repro/repro.sh      <span class="cm"># stand it up</span>
+deploy/enterprise-federation-repro/verify.sh     <span class="cm"># prove the invariants</span></pre>
+  </div>
+</section>
+
+<!-- ======================================================== PROVISIONING -->
+<section id="provisioning">
+  <div class="container">
+    <span class="section-eyebrow">1 · Provisioning the data tier</span>
+    <h2>PostgreSQL 18.6 + AGE 1.8.0 + pgvector 0.8.6</h2>
+    <p class="lede">The tier image is built from the canonical in-repo Dockerfile. Apache AGE 1.8.0 installs from a <strong>pinned pgdg apt package</strong> (<code>postgresql-18-age=1.8.0~rc0-2.pgdg13+1</code>) overlaid on the <code>apache/age:release_PG18_1.7.0</code> base — NOT a source build; <code>CREATE EXTENSION age</code> then reports extversion 1.8.0. Every version literal lives once, in <code>deploy/docker-1461/provision/lib.sh</code>, and arrives at the build as a <code>--build-arg</code>. <code>repro.sh</code> reads those same pins.</p>
+
+    <h3>Image build</h3>
+    <pre class="codeblock"><span class="cm"># repro.sh builds this automatically; pins come from provision/lib.sh.</span>
+docker build \
+  --build-arg AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0 \
+  --build-arg PG_MAJOR=18 \
+  --build-arg PG_APT_VERSION=18.6-1.pgdg13+2 \
+  --build-arg AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1 \
+  --build-arg PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1 \
+  -f deploy/docker-1461/Dockerfile.pg-age-vector \
+  -t ai-memory-cert-pg:pg18.6-age1.8.0-pgv0.8.6 \
+  deploy/docker-1461</pre>
+
+    <h3>initdb — extensions only</h3>
+    <p>The first-boot hook creates only the two extension binaries the <code>sal-postgres</code> adapter needs. The AGE graph itself (<code>create_graph('memory_graph')</code>) is created later by <code>ai-memory schema-init</code>, so this stays purely about the binaries.</p>
+    <pre class="codeblock"><span class="cm"># initdb/01-extensions.sql</span>
+CREATE EXTENSION IF NOT EXISTS age;
+CREATE EXTENSION IF NOT EXISTS vector;</pre>
+    <div class="warn-box"><strong>Schema-placement reality (audit finding #3055)</strong>
+      An <em>unqualified</em> <code>CREATE TABLE</code> lands in whichever schema the connection's <code>search_path</code> resolves first. If <code>ag_catalog</code> precedes the app schema, <code>ai-memory</code>'s own tables would be created <em>inside</em> <code>ag_catalog</code>. The store DSN this kit builds pins <code>public,ag_catalog</code> (<code>public</code> first), so app tables live in <code>public</code> and AGE's catalog stays reachable. This is the honest, load-bearing ordering — stated, not hidden.</div>
+
+    <h3>pg_hba.conf — hostssl-only, client-cert mTLS enforced</h3>
+    <p>There are NO plain <code>host</code> lines. A plaintext (<code>sslmode=disable</code>) TCP connection is refused PRE-AUTH with <em>"no pg_hba.conf entry … no encryption"</em>; <code>clientcert=verify-full</code> additionally demands a client certificate whose CN matches the connecting role. The local unix socket stays <code>trust</code> so the container's own bootstrap + the hostssl healthcheck work without a password.</p>
+    <pre class="codeblock"><span class="cm"># initdb/pg_hba.conf</span>
+<span class="cm"># TYPE   DATABASE  USER  ADDRESS      METHOD</span>
+local    all       all                trust
+hostssl  all       all   0.0.0.0/0    scram-sha-256  clientcert=verify-full
+hostssl  all       all   ::/0         scram-sha-256  clientcert=verify-full</pre>
+
+    <h3>Container run — the TLS GUCs</h3>
+    <pre class="codeblock">postgres \
+  -c shared_preload_libraries=age \
+  -c ssl=on \
+  -c ssl_cert_file=/etc/postgresql/tls/server.pem \
+  -c ssl_key_file=/etc/postgresql/tls/server.key \
+  -c ssl_ca_file=/certs/ca.pem \
+  -c ssl_min_protocol_version=TLSv1.2 \
+  -c hba_file=/etc/postgresql/pg_hba.conf</pre>
+    <p>A bind-mounted host key keeps its host uid and PostgreSQL refuses an <code>ssl_key_file</code> it does not own, so the entrypoint wrapper <em>installs</em> the server cert/key to a postgres-owned <code>0600</code> path before handing off. Readiness is gated on the fail-closed <code>pg-hostssl-healthcheck.sh</code> — "healthy" means hostssl is PROVABLY armed, not merely that the postmaster is up.</p>
+  </div>
+</section>
+
+<!-- ======================================================== CERTIFICATES -->
+<section id="certificates">
+  <div class="container">
+    <span class="section-eyebrow">2 · Certificates — both encrypted legs</span>
+    <h2>gen-certs.sh mints everything; nothing is committed</h2>
+    <p class="lede">Generation is part of the reproduction. <code>gen-certs.sh</code> mints all material into the gitignored run dir, idempotently (existing material is reused so the trust topology is stable across re-runs). Two legs, one CA.</p>
+    <div class="scroll-x"><table>
+      <thead><tr><th>Leg</th><th>Material</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td class="col-name">Store (daemon &rarr; PG)</td><td><code>ca.crt</code> · <code>pg-server.{crt,key}</code> (SAN <code>IP:127.0.0.1,DNS:localhost</code>) · <code>pg-client.{crt,key}</code> (CN = the pg role <code>ai_memory</code>)</td><td>The daemon dials the store under <code>sslmode=verify-full</code> — chain + hostname validated — and presents its client cert for mTLS.</td></tr>
+        <tr><td class="col-name">API (AI NHI &rarr; daemon)</td><td><code>daemon-server.{crt,key}</code> (SAN <code>IP:127.0.0.1,DNS:localhost</code>) · <code>client-good.{crt,key}</code> · <code>allowlist.txt</code> (SHA-256(DER) fingerprint pin)</td><td>The client&harr;daemon mTLS API on <code>:9077</code>: the daemon demands a client cert whose fingerprint is on the allowlist.</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<!-- ============================================================== CORPUS -->
+<section id="corpus">
+  <div class="container">
+    <span class="section-eyebrow">3 · The corpus</span>
+    <h2>A deterministic seed, loaded via <code>migrate</code></h2>
+    <p class="lede">The audit ran over a 7,855-row Atlas corpus (embedder = local all-MiniLM-L6-v2, 384-d, under loopback-only egress). That corpus is proprietary; a portable reproduction ships a <strong>generator</strong>, not the data. <code>seed-corpus.sh</code> writes a small, byte-deterministic corpus into a local sqlite DB — every run produces identical rows — then <code>repro.sh</code> migrates it into the pg tier verbatim (memories + links + embeddings; #3054/#3060).</p>
+    <pre class="codeblock">ai-memory schema-init --store-url "postgres://…?sslmode=verify-full&amp;sslrootcert=ca.crt&amp;sslcert=pg-client.crt&amp;sslkey=pg-client.key&amp;options=-csearch_path%3Dpublic%2Cag_catalog"
+ai-memory migrate --from "sqlite:///…/seed.db" --to "&lt;same TLS DSN&gt;" --batch 1000</pre>
+    <p><strong>Embeddings are derived, not durable.</strong> The seed rows carry only their durable TEXT — the source of truth. The certified daemon RE-DERIVES the embedding vectors from that text at serve-boot (its backfill sweep, under the local MiniLM embedder / loopback-only egress). Embedding vectors are disposable, regenerable artifacts; the memory text is never at risk. Semantic recall over the seed exercises the result.</p>
+  </div>
+</section>
+
+<!-- ============================================================== CONFIG -->
+<section id="config">
+  <div class="container">
+    <span class="section-eyebrow">4 · The certified posture</span>
+    <h2>18 machine-checked controls; a boot the daemon refuses if any fails</h2>
+    <p class="lede">The posture is not a prose checklist — it is the checked-in profile <code>docs/deploy/enterprise-federation.env</code>, validated by <code>src/enterprise_federation_posture.rs</code> (the single source of truth both the boot gate and <code>ai-memory doctor --posture enterprise-federation</code> share). <code>repro.sh</code> renders the effective posture by EXTENDING that template (its <code>KEY=VALUE</code> lines) with the per-deployment values, then arms the boot-refusing gate — the daemon boots ONLY when every one of the 18 controls passes.</p>
+    <div class="scroll-x"><table>
+      <thead><tr><th>Control group</th><th>What the posture pins</th></tr></thead>
+      <tbody>
+        <tr><td class="col-name">Hardened base</td><td><code>AI_MEMORY_SECURITY_PROFILE=asi-hard</code> engages the no-disable posture (its pinned knobs at their hard floor, including <code>AI_MEMORY_DB_SYNCHRONOUS=FULL</code>).</td></tr>
+        <tr><td class="col-name">Federation receive</td><td>Peer enrollment required, per-message Ed25519 signatures + nonce freshness, inbound-write namespace confinement, stale-policy refusal; the two trust-bypass knobs must stay UNSET.</td></tr>
+        <tr><td class="col-name">Governance</td><td><code>AI_MEMORY_PERMISSIONS_MODE=enforce</code>, governance fail-CLOSED on rule-consultation error.</td></tr>
+        <tr><td class="col-name">Trust material</td><td>A set trust domain, a readable peer server-cert pin file, valid peer-attestation JSON with no bare <code>**</code> allow-all glob.</td></tr>
+        <tr><td class="col-name">Transport + at-rest</td><td>https-only peers (plaintext-peer refusal in force); at-rest encryption on a sqlcipher build.</td></tr>
+        <tr><td class="col-name">Self-attestation</td><td>The boot-refusing gate itself armed, so later posture drift cannot silently boot.</td></tr>
+      </tbody>
+    </table></div>
+    <pre class="codeblock"><span class="cm"># repro.sh sources the posture env, then:</span>
+ai-memory doctor --posture enterprise-federation   <span class="cm"># ALL PASS, or repro refuses to serve</span>
+
+ai-memory serve \
+  --host 127.0.0.1 --port 9077 \
+  --tls-cert daemon-server.crt --tls-key daemon-server.key \
+  --mtls-allowlist allowlist.txt
+<span class="cm"># the daemon signs as AI_MEMORY_AGENT_ID=ai:cert-fed-proxy and reads the</span>
+<span class="cm"># postgres DSN from AI_MEMORY_STORE_URL_FILE (0600, non-argv secure channel).</span></pre>
+    <div class="warn-box"><strong>doctor --posture is NOT verify-audit-trail — an honest distinction</strong>
+      <code>doctor --posture</code> machine-checks the 18 boot-time controls. It does NOT check the four audit-custody require-modes (witness / role-separation / cause-binding / rollback), which are consumed by the SEPARATE <code>ai-memory verify-audit-trail</code>. A node can boot clean and pass <code>doctor --posture</code> while <code>verify-audit-trail</code> still reports a lane needing key enrollment. This kit runs BOTH.</div>
+  </div>
+</section>
+
+<!-- ============================================================== WIRING -->
+<section id="wiring">
+  <div class="container">
+    <span class="section-eyebrow">5 · Wiring the AI NHI</span>
+    <h2>Operate the substrate exactly as the audit did</h2>
+    <p class="lede">The AI NHI connects through the client&harr;daemon mTLS API — presenting the allowed client cert + the CA + its <code>X-Agent-Id</code> principal — the same way the audit operated the substrate.</p>
+    <pre class="codeblock">RUN=.local-runs/ef-repro
+
+<span class="cm"># stats / recall / a signed store, all over mTLS</span>
+curl --cacert "$RUN/tls/ca.crt" --cert "$RUN/tls/client-good.crt" --key "$RUN/tls/client-good.key" \
+     -H 'X-Agent-Id: ai:cert-fed-proxy' \
+     https://127.0.0.1:9077/api/v1/stats
+
+curl --cacert "$RUN/tls/ca.crt" --cert "$RUN/tls/client-good.crt" --key "$RUN/tls/client-good.key" \
+     -H 'X-Agent-Id: ai:cert-fed-proxy' -H 'Content-Type: application/json' \
+     -X POST --data '{"context":"append-only signed audit chain","namespace":"ef-repro/audit","limit":5}' \
+     https://127.0.0.1:9077/api/v1/recall</pre>
+    <p>An MCP-over-mTLS shim points the same client-cert material at the HTTP API, so an MCP host drives <code>memory_store</code> / <code>memory_recall</code> against the certified daemon.</p>
+  </div>
+</section>
+
+<!-- =========================================================== VERIFY -->
+<section id="verify">
+  <div class="container">
+    <span class="section-eyebrow">6 · Prove the invariants</span>
+    <h2><code>verify.sh</code> — real output, fail-loud on deviation</h2>
+    <p class="lede">Each check prints what it observed AND what it required, so a reviewer reads the evidence directly rather than trusting a green tick.</p>
+    <div class="scroll-x"><table>
+      <thead><tr><th>#</th><th>Invariant</th><th>How it is proven</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td class="col-name"><code>SELECT version()</code> = PostgreSQL 18.6</td><td><code>psql</code> over the container's local trust socket.</td></tr>
+        <tr><td>2</td><td class="col-name">age / vector extversion = 1.8.0 / 0.8.6</td><td><code>SELECT extversion FROM pg_extension</code>.</td></tr>
+        <tr><td>3</td><td class="col-name"><code>SHOW ssl</code> = on</td><td>direct GUC read.</td></tr>
+        <tr><td>4</td><td class="col-name">cleartext refused</td><td>a <code>sslmode=disable</code> TCP connection is rejected pre-auth (hostssl healthcheck + host-side probe).</td></tr>
+        <tr><td>5</td><td class="col-name">TLS 1.3 negotiated</td><td><code>openssl s_client -starttls postgres</code> reports <code>Protocol: TLSv1.3</code>.</td></tr>
+        <tr><td>6</td><td class="col-name">certified posture</td><td><code>ai-memory doctor --posture enterprise-federation</code> exits 0 (all controls PASS).</td></tr>
+        <tr><td>7</td><td class="col-name">signed audit trail</td><td><code>ai-memory verify-audit-trail --store-url &lt;DSN&gt;</code> — the append-only <code>signed_events</code> hash chain + witness + role-separation lanes.</td></tr>
+        <tr><td>8</td><td class="col-name">semantic recall</td><td>a recall over the seed returns rows over the mTLS API (keyword is an honest DEGRADE when the local embedder is not pre-staged).</td></tr>
+        <tr><td>9</td><td class="col-name">write governance</td><td>an unsigned <code>POST /api/v1/memories</code> is refused <code>403</code> (agent-attestation enforced on the HTTP-direct surface).</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<!-- ============================================================ 3x7 SCHEME -->
+<section id="scheme">
+  <div class="container">
+    <span class="section-eyebrow">7 · The 3&times;7 audit scheme</span>
+    <h2>Seven feature domains &times; three adversarial lenses</h2>
+    <p class="lede">The audit method is a matrix: each of seven feature domains is examined through three adversarial lenses. The lenses are deliberately independent so they do not converge by groupthink — one asks whether the feature <em>works on this postgres tier at all</em>, one whether its <em>control is actually enforced</em> (not merely present), and one whether the <em>published claim matches the code</em>. A domain passes a cell only when its probe returns the evidence the lens demands.</p>
+    <div class="scroll-x"><table>
+      <thead><tr><th>Feature domain</th><th>L1 · works-on-pg</th><th>L2 · control-enforced</th><th>L3 · claims-match-code</th></tr></thead>
+      <tbody>
+        <tr><td class="col-name">Recall / search</td><td>a recall over the mTLS API returns seed rows; the reported mode is honest (semantic or degraded keyword).</td><td>recall is PURE — it mutates no <code>memories</code> row; the query-embed budget degrades loudly rather than hanging.</td><td>the recall pipeline in <code>src/handlers/recall.rs</code> matches the documented blend + fail-closed degrade.</td></tr>
+        <tr><td class="col-name">Store / write-governance</td><td>a signed write lands and reads back over the pg store.</td><td>an unsigned HTTP-direct write is refused <code>403</code>; secret-screen refuses credential-shaped content.</td><td><code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION</code> surface scoping in <code>src/identity/attest.rs</code> matches the documented tri-state.</td></tr>
+        <tr><td class="col-name">Federation</td><td><code>/api/v1/sync/*</code> answers over mTLS.</td><td>an unenrolled peer / out-of-scope namespace push is refused; the two trust-bypass knobs are UNSET.</td><td>the receive gates in <code>src/federation/receive_auth.rs</code> match the documented fail-closed defaults.</td></tr>
+        <tr><td class="col-name">Audit chain</td><td><code>verify-audit-trail</code> walks the chain over postgres.</td><td>a tail-truncation / mid-suffix rewrite is DETECTED; witness + role-separation lanes verify.</td><td>the tamper-evidence scope in <code>src/signed_events.rs</code> matches what the docs claim is detectable.</td></tr>
+        <tr><td class="col-name">Identity / capability / governance</td><td>agent identity + capability tokens resolve over mTLS.</td><td>governance <code>enforce</code> mode denies a policy-violating action; capability caveats are non-escalating.</td><td>the macaroon caveat chain in <code>src/governance/capability.rs</code> matches the attenuation-only claim.</td></tr>
+        <tr><td class="col-name">Knowledge-graph (AGE)</td><td><code>create_graph('memory_graph')</code> exists; a Cypher traversal returns.</td><td>the relational recursive-CTE path stays read-your-own-write correct under deferred projection.</td><td>the AGE + recursive-CTE dual path in <code>src/kg/</code> matches the documented traversal semantics.</td></tr>
+        <tr><td class="col-name">Postgres coverage</td><td>every advertised operation the tier supports answers.</td><td>an operation with no postgres trait coverage returns an HONEST <code>501</code> (never a silent success).</td><td>the postgres-gate surface in <code>src/handlers/postgres_gate.rs</code> matches the documented supported set.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Probe recipes</h3>
+    <div class="cards">
+      <div class="card"><div class="lbl">mTLS curl</div><p>Drive any API surface with the allowed client cert + CA + <code>X-Agent-Id</code> (see §5). Negative tests point the cert at a rogue / absent identity and assert the refusal.</p></div>
+      <div class="card"><div class="lbl">pg SQL</div><p><code>psql</code> over the local trust socket for substrate facts (<code>pg_extension</code>, <code>pg_stat_ssl</code>, <code>SHOW ssl</code>); a verify-full TLS connection for the mTLS + TLS-1.3 proof.</p></div>
+      <div class="card"><div class="lbl">codegraph</div><p>For the L3 claims-match-code lens: query the codegraph knowledge graph (or read the cited <code>src/…</code> symbol) to confirm the enforcing code matches the published claim, following real call edges rather than text matches.</p></div>
+    </div>
+
+    <h3>Verdict rubric</h3>
+    <p>A cell is <strong>PASS</strong> only when its probe returns the evidence the lens demands with real output; <strong>DEGRADE</strong> when the substrate correctly returns fewer / weaker results without producing a wrong one (e.g. keyword recall when the local embedder is absent) — a pass under the data-integrity North Star; <strong>FAIL</strong> on any wrong result, silent success where a refusal was required, or a claim the code does not support. A domain is certified only when all three lenses are PASS or a documented DEGRADE; a single FAIL blocks the domain and is filed, tracked, and fixed.</p>
+  </div>
+</section>
+
+<!-- ============================================================ CAVEATS -->
+<section id="caveats">
+  <div class="container">
+    <span class="section-eyebrow">8 · Honest caveats</span>
+    <h2>What the reproduction does — and does not — claim</h2>
+    <div class="warn-box"><strong>Local embedder (loopback-only)</strong>
+      The audit used the local all-MiniLM-L6-v2 (384-d) embedder under loopback-only egress. The seed carries only durable text; the daemon re-derives embeddings at serve-boot. On a machine with no pre-staged model, semantic recall degrades LOUDLY to keyword — a DEGRADE (fewer, FTS-ranked results), never a wrong result. Pre-stage the model to exercise true semantic recall.</div>
+    <div class="warn-box"><strong>Schema placement in ag_catalog (#3055)</strong>
+      An unqualified <code>CREATE TABLE</code> lands in <code>ag_catalog</code> if it precedes the app schema on the search path. The store DSN pins <code>public</code> first; this is stated, not hidden.</div>
+    <div class="warn-box"><strong>Postgres coverage surface (501)</strong>
+      Some operations have no postgres trait coverage yet and return an HONEST <code>501</code> (<code>unsupported_on_postgres</code>) — never a silent success. The 3&times;7 postgres-coverage domain probes exactly this boundary.</div>
+    <div class="warn-box"><strong>At-rest encryption is the pg tier's job (#3061)</strong>
+      The certified posture's at-rest control is satisfied by a sqlcipher build + <code>AI_MEMORY_ENCRYPT_AT_REST=1</code> (which governs local sqlite). Encrypting the durable memory ROWS in the postgres tier is the PG tier's responsibility — disk / tablespace / pgcrypto encryption — tracked as #3061.</div>
+    <div class="warn-box"><strong>verify-audit-trail enrollment</strong>
+      The append-only chain + witness + role-separation lanes verify with the keys <code>repro.sh</code> enrolls. Under the certified asi-hard posture the identity-lineage require-mode additionally needs a genesis succession record enrolled; that enrollment is a tracked follow-up, and <code>verify.sh</code> reports the exact lane honestly rather than claiming a false clean.</div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p style="margin-bottom:.5rem"><strong>ai-memory v1.0.0</strong> &middot; Enterprise-Federation Audit Reproduction &middot; public-facing &middot; maintained by AlphaOne LLC under Apache 2.0.</p>
+    <p>Kit: <code>deploy/enterprise-federation-repro/</code> &middot; Companions: <a href="ENTERPRISE-FEDERATION-CERTIFICATION.md">enterprise-federation certification</a> &middot; <a href="../reproducible-baselines.html">reproducible baselines</a> &middot; <a href="../reference-architecture/">reference architecture</a> &middot; <a href="index.html">compliance &amp; procurement</a>. Part of the audit remediation epic (#3076; issue #3078).</p>
+  </div>
+</footer>
+
+</body>
+</html>
