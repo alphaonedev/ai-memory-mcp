@@ -1103,24 +1103,62 @@ pub fn last_audit_watermark(db_id: Option<&str>) -> Option<(i64, String)> {
     // (unauthenticated) anchor. The L7 exonerating lanes gate on
     // [`audit_watermark_exoneration_authenticated`] instead.
     //
-    // v1.0.0 #2955 — `db_id` scopes the SHARED on-host forensic sink PER
-    // DATABASE (mirrors [`read_head_anchor_high_water`]): a watermark carrying a
-    // DIFFERENT db_id anchors a sibling DB on this mount and is skipped, so a
-    // restored / rotated / co-located DB's head can never be read as THIS db's
-    // high-water. `db_id = None` (an opener with no genesis / empty chain) reads
-    // every watermark — the conservative pre-#2955 posture.
+    // v1.0.0 #2955 / #3068 — `db_id` scopes the SHARED on-host forensic sink
+    // PER DATABASE: a watermark carrying a DIFFERENT db_id anchors a sibling DB
+    // on this mount and is skipped, so a restored / rotated / co-located DB's
+    // head can never be read as THIS db's high-water. An IDENTITY-LESS reader
+    // (`db_id = None`, no genesis / empty chain) counts only db_id-LESS (legacy)
+    // watermarks and SKIPS every IDENTIFIED one — it cannot own a watermark
+    // stamped for an identified database (see [`scan_file_last_watermark`]).
+    // #3068: the pre-fix "None reads every watermark" posture let a freshly-
+    // migrated empty chain be convicted of truncation on a live sibling's
+    // climbing watermark. Wipe-to-empty of a formerly-identified chain is owned
+    // by the SIGNED head-anchor-log lane ([`read_head_anchor_high_water`] /
+    // `RollbackCheck`), NOT this raw unsigned lane.
+    let mut skipped_identified = false;
     for file in files.iter().rev().take(2) {
-        if let Some((seq, hash, _signed)) = scan_file_last_watermark(file, db_id) {
+        let scan = scan_file_last_watermark(file, db_id);
+        if let Some((seq, hash, _signed)) = scan.last {
             return Some((seq, hash));
         }
+        skipped_identified |= scan.skipped_identified_for_idless;
+    }
+    if skipped_identified {
+        // #3068 — the degrade is OBSERVABLE, never a silent withhold: an
+        // operator relying on the raw forensic-watermark lane (no audit-witness
+        // enrolled) is told WHY it withheld and where the attestable control is.
+        tracing::warn!(
+            target: AUDIT_TRACE_TARGET,
+            "verify-audit-trail: this database has no genesis / empty audit chain \
+             (db_head = 0), and the SHARED on-host forensic watermark sink carries \
+             only watermarks stamped for OTHER (identified) databases — none can \
+             be attributed to this opener, so the forensic-watermark truncation \
+             lane WITHHOLDS (#3068 cross-store bleed fix). Wipe-to-empty detection \
+             for a formerly-identified chain is owned by the SIGNED head-anchor-log \
+             lane; enrol an audit-witness key (AI_MEMORY_WITNESS_KEY_DIR / \
+             AI_MEMORY_WITNESS_PUBKEY) for that attestable control."
+        );
     }
     None
 }
 
-/// The most-recent watermark row in a single forensic file:
-/// `(head_sequence, head_canonical_hash, signed)` where `signed` is `true`
-/// iff that row carried a non-empty Ed25519 `sig`. `None` if the file carries
-/// no watermark. Malformed / wrong-version rows are skipped.
+/// Outcome of one forensic-file watermark scan.
+struct WatermarkScan {
+    /// The most-recent eligible watermark row for the resolving database:
+    /// `(head_sequence, head_canonical_hash, signed)` where `signed` is `true`
+    /// iff that row carried a non-empty Ed25519 `sig`. `None` if the file
+    /// carried no watermark eligible for this opener.
+    last: Option<(i64, String, bool)>,
+    /// v1.0.0 #3068 — set when an IDENTITY-LESS opener (`db_id = None`, an
+    /// empty / no-genesis chain) SKIPPED at least one IDENTIFIED (db_id-bearing)
+    /// watermark on this shared sink. Surfaces the cross-store deferral to the
+    /// caller so the degrade is OBSERVABLE ([`last_audit_watermark`] WARNs)
+    /// rather than a silent withhold.
+    skipped_identified_for_idless: bool,
+}
+
+/// The most-recent watermark row in a single forensic file (see
+/// [`WatermarkScan`]). Malformed / wrong-version rows are skipped.
 ///
 /// The `signed` bit is what the L7
 /// [`audit_watermark_exoneration_authenticated`] gate consumes: `verify_since`
@@ -1128,9 +1166,15 @@ pub fn last_audit_watermark(db_id: Option<&str>) -> Option<(i64, String)> {
 /// lanes must additionally confirm the exact watermark they trust is itself
 /// signed. [`last_audit_watermark`] ignores the bit (the CONVICTING lanes read
 /// the raw unauthenticated anchor).
-fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> Option<(i64, String, bool)> {
-    let f = File::open(path).ok()?;
+fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> WatermarkScan {
+    let Ok(f) = File::open(path) else {
+        return WatermarkScan {
+            last: None,
+            skipped_identified_for_idless: false,
+        };
+    };
     let mut found: Option<(i64, String, bool)> = None;
+    let mut skipped_identified_for_idless = false;
     for line in BufReader::new(f).lines() {
         let Ok(line) = line else { continue };
         if line.trim().is_empty() {
@@ -1147,18 +1191,42 @@ fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> Option<(i64, St
         {
             continue;
         }
-        // v1.0.0 #2955 — per-database scoping (mirrors `scan_head_anchor_log`'s
-        // #2370 match): a watermark carrying a DIFFERENT db_id anchors a sibling
-        // DB sharing this on-host sink and must NEVER become this opener's
-        // high-water. A db_id-less (legacy) watermark is counted conservatively
-        // for every opener; `db_id = None` (no genesis / empty chain) counts
-        // every watermark. Only the cross-DB (foreign-id) row is skipped.
-        if let (Some(line_id), Some(mine)) = (
+        // v1.0.0 #2955 / #3068 — per-database scoping of the SHARED on-host
+        // forensic sink. A watermark declares the database it anchors via its
+        // payload `db_id` (the genesis-derived [`crate::signed_events::db_id_from_genesis_parts`]).
+        match (
             row.payload.get("db_id").and_then(serde_json::Value::as_str),
             db_id,
-        ) && line_id != mine
-        {
-            continue;
+        ) {
+            // #2955 — a watermark for a DIFFERENT identified DB anchors a
+            // sibling sharing this mount and must NEVER become this (identified)
+            // opener's high-water.
+            (Some(row_db_id), Some(mine)) if row_db_id != mine => continue,
+            // #3068 — an IDENTITY-LESS opener (no genesis / empty chain) cannot
+            // OWN an IDENTIFIED watermark: a row that declares a db_id belongs
+            // to some identified database, and an opener that has neither
+            // genesis nor chain is provably not it. Reading it as this opener's
+            // high-water is the cross-store bleed #3068 reported (a freshly-
+            // migrated DB co-located with a live sibling was convicted of
+            // truncation on the sibling's climbing watermark). Skip it, and
+            // record the skip so the caller can surface the deferral. An empty
+            // chain (`db_head = 0`, no genesis) has NOTHING to truncate FROM, so
+            // withholding here suppresses no legitimate same-db truncation; the
+            // ONLY case deferred is a wipe-to-empty of a FORMERLY-identified
+            // chain, which is owned by the SIGNED, K1-pinned head-anchor-log
+            // lane (`scan_head_anchor_log` / `RollbackCheck`) — that lane
+            // DELIBERATELY still over-counts for a None reader because its pin
+            // gate makes the over-count an ATTESTABLE wipe detector, whereas
+            // THIS lane reads the raw UNSIGNED anchor and must not over-convict.
+            (Some(_), None) => {
+                skipped_identified_for_idless = true;
+                continue;
+            }
+            // (Some, Some) matching own db_id, or (None, _) a db_id-LESS legacy
+            // (pre-#2955) watermark counted CONSERVATIVELY for every opener
+            // (over-detect toward Evidence on the one-release compat window,
+            // never suppression): counted below.
+            _ => {}
         }
         let seq = row
             .payload
@@ -1172,7 +1240,10 @@ fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> Option<(i64, St
             found = Some((seq, hash.to_string(), !row.sig.is_empty()));
         }
     }
-    found
+    WatermarkScan {
+        last: found,
+        skipped_identified_for_idless,
+    }
 }
 
 /// L7 (PR-4, forensic-audit-trail wave) — earliest `--since` sentinel the
@@ -1248,7 +1319,7 @@ pub fn audit_watermark_exoneration_authenticated(
         return false;
     };
     for file in files.iter().rev().take(2) {
-        if let Some((_, _, signed)) = scan_file_last_watermark(file, db_id) {
+        if let Some((_, _, signed)) = scan_file_last_watermark(file, db_id).last {
             return signed;
         }
     }

@@ -121,15 +121,18 @@ MAP=(
   "consolidate_confidence_floor_2935|subst|min_confidence = min_confidence.min(mem.confidence);>>>min_confidence = min_confidence.min(1.0); // CERT-REMOVAL-PROOF-MUTATION|src/storage/mod.rs|trust_propagation_1958_1959|consolidate_floors_confidence_and_stamps_claim_2935"
   "consolidate_derived_kind_2935|subst|memory_kind: crate::models::MemoryKind::Claim,>>>memory_kind: crate::models::MemoryKind::Observation, // CERT-REMOVAL-PROOF-MUTATION|src/storage/mod.rs|trust_propagation_1958_1959|consolidate_floors_confidence_and_stamps_claim_2935"
   # #2955 — forensic watermark PER-DATABASE scoping. The control is a SINGLE
-  # branch in `scan_file_last_watermark` (not a guard fn), so it uses `subst`:
-  # neutralizing `if line_id != mine {` to `if false {` stops the cross-DB skip,
-  # so a SIBLING database's watermark (a different genesis `db_id`) is honored as
-  # THIS db's high-water — the exact cross-DB watermark bleed #2955 closes. The
-  # lane test asserts a foreign-`db_id` watermark is NOT returned to a scoped
-  # reader; the mutation makes it returned => RED. Both backends read through
-  # this ONE shared reader (`last_audit_watermark`), so the pg twin is
-  # composite-covered by the same proof.
-  "scan_file_last_watermark_db_id_scope_2955|subst|) && line_id != mine>>>) && false // CERT-REMOVAL-PROOF-MUTATION|src/governance/audit.rs|audit_watermark_db_id_scope_2955|foreign_db_watermark_not_honored_as_this_db_high_water"
+  # match arm in `scan_file_last_watermark` (not a guard fn), so it uses `subst`:
+  # neutralizing the `(Some(line_id), Some(mine)) if line_id != mine => continue`
+  # arm's guard to `if false` stops the cross-DB skip, so a SIBLING database's
+  # watermark (a different genesis `db_id`) is honored as THIS db's high-water —
+  # the exact cross-DB watermark bleed #2955 closes. The lane test asserts a
+  # foreign-`db_id` watermark is NOT returned to a scoped reader; the mutation
+  # makes it returned => RED. Both backends read through this ONE shared reader
+  # (`last_audit_watermark`), so the pg twin is composite-covered by the same
+  # proof. (v1.0.0 #3068 rewrote this branch from an `if let` guard to a `match`;
+  # the IDENTITY-LESS-reader arm `(Some(_), None)` added there is a SEPARATE
+  # control proven by `empty_migrated_store_not_convicted_on_sibling_watermark`.)
+  "scan_file_last_watermark_db_id_scope_2955|subst|(Some(row_db_id), Some(mine)) if row_db_id != mine => continue,>>>(Some(row_db_id), Some(mine)) if false => continue, // CERT-REMOVAL-PROOF-MUTATION|src/governance/audit.rs|audit_watermark_db_id_scope_2955|foreign_db_watermark_not_honored_as_this_db_high_water"
 )
 
 # Apply MUTATION to function CTL in TARGET, per SHAPE.

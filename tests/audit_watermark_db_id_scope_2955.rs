@@ -20,7 +20,11 @@
 //!   the foreign row honored → this test RED);
 //! - THIS db's own watermark IS still honored (the fix does not over-block);
 //! - a legacy id-less watermark is counted CONSERVATIVELY for every opener;
-//! - `db_id = None` (empty chain) reads every watermark (pre-#2955 posture);
+//! - v1.0.0 #3068 — an IDENTITY-LESS opener (`db_id = None`, no genesis / empty
+//!   chain) counts only db_id-LESS legacy watermarks and SKIPS every IDENTIFIED
+//!   one, so two stores sharing one host never bleed a sibling's head (the
+//!   pre-#3068 "None reads every watermark" posture convicted a freshly-migrated
+//!   empty chain of truncation on a live sibling's climbing watermark);
 //! - END-TO-END: a foreign watermark can no longer forge a `Detected`
 //!   truncation verdict against a chain that was never truncated.
 //!
@@ -114,12 +118,17 @@ fn foreign_db_watermark_not_honored_as_this_db_high_water() {
         "own-db watermark must still be honored"
     );
 
-    // `db_id = None` (an opener with no genesis / empty chain) reads every
-    // watermark — the conservative pre-#2955 posture.
+    // v1.0.0 #3068 — an IDENTITY-LESS opener (`db_id = None`, no genesis /
+    // empty chain) can NOT own an IDENTIFIED (db_id-bearing) watermark: the
+    // `db-alpha` row is skipped, so a freshly-migrated empty chain co-located
+    // with a live sibling is never convicted of truncation on the sibling's
+    // watermark. (Pre-#3068 this returned `Some((100, ...))` — the cross-store
+    // bleed.) Wipe-to-empty of a formerly-identified chain is owned by the
+    // SIGNED head-anchor-log lane, not this raw unsigned lane.
     assert_eq!(
         forensic::last_audit_watermark(None),
-        Some((100, "sibling-head-hash".to_string())),
-        "None (no genesis) must read every watermark (conservative posture)"
+        None,
+        "None (no genesis) must NOT read an identified sibling's watermark (#3068)"
     );
 }
 
@@ -232,5 +241,85 @@ fn own_db_watermark_still_detects_truncation() {
             db_head: 3,
         },
         "own-db watermark must still convict a real tail truncation; report={report:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3068 — TWO STORES, ONE HOST: an IDENTITY-LESS (empty-chain / no-
+// genesis) opener sharing the on-host forensic sink with an IDENTIFIED sibling
+// must NOT read the sibling's watermark as its own high-water, but a LEGACY
+// id-less watermark is still counted (conservative compat window preserved).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn idless_opener_skips_identified_sibling_but_counts_legacy() {
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fdir = fresh_dir("e-forensic");
+    forensic::init(fdir.path(), None).expect("forensic init");
+
+    // A live IDENTIFIED sibling (its own genesis-derived db_id) stamped a high
+    // head=78_000 into the SHARED sink.
+    forensic::record_audit_watermark(78_000, "sibling-head", Some("sibling-db-id"));
+    forensic::flush_blocking();
+
+    // An IDENTITY-LESS opener (None = no genesis / empty chain) must NOT read
+    // the identified sibling's watermark — cross-store bleed closed (#3068).
+    assert_eq!(
+        forensic::last_audit_watermark(None),
+        None,
+        "an identity-less opener must not read an identified sibling's watermark (#3068)"
+    );
+
+    // But a LEGACY id-less watermark on the same sink IS still counted for the
+    // identity-less opener (over-detect toward Evidence, never suppression).
+    forensic::record_audit_watermark(42, "legacy-head", None);
+    forensic::flush_blocking();
+    assert_eq!(
+        forensic::last_audit_watermark(None),
+        Some((42, "legacy-head".to_string())),
+        "a legacy id-less watermark must still be counted for an identity-less opener"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3068 — a freshly-migrated store (memories migrated, but the
+// signed_events audit chain is genuinely EMPTY: 0 rows, no genesis) must NOT be
+// convicted of truncation on a co-located live sibling's climbing watermark.
+// This is the exact shape #3068 reported against the pg-186 hive store.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_migrated_store_not_convicted_on_sibling_watermark() {
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fdir = fresh_dir("f-forensic");
+    let ddir = fresh_dir("f-db");
+    forensic::init(fdir.path(), None).expect("forensic init");
+
+    // Fresh store: no signed_events rows appended → genesis_db_id == None.
+    let conn = open_db(ddir.path());
+    assert_eq!(
+        genesis_db_id(&conn).expect("genesis db_id read"),
+        None,
+        "a fresh store has no signed_events genesis"
+    );
+
+    // A live sibling on the SHARED sink is at head=78_000 and climbing.
+    forensic::record_audit_watermark(78_000, "sibling-head", Some("sibling-db-id"));
+    forensic::flush_blocking();
+
+    // #3068 — pre-fix this forged `Detected { anchored_head: 78_000, db_head: 0 }`.
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
+    assert_eq!(
+        report.head_sequence, 0,
+        "empty chain head is 0; report={report:?}"
+    );
+    assert_eq!(
+        report.truncation,
+        TruncationCheck::Unknown,
+        "an empty migrated store must not be convicted on a sibling's watermark (#3068); report={report:?}"
     );
 }
