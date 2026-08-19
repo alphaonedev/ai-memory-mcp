@@ -532,7 +532,7 @@ ai-memory namespace set-standard --namespace agents/secops --id &lt;standard-mem
         <tr><td>Concurrent writers</td><td>~10–20 before mutex contention shows up</td><td>Bulk imports starve real-time agents</td></tr>
         <tr><td>Total memories</td><td>~10⁶ before HNSW RAM cost is noticeable</td><td>Vector index lives in-process</td></tr>
         <tr><td>Write throughput</td><td>~500-2000 writes/sec (single SQLite writer)</td><td>Bulk operations should chunk</td></tr>
-        <tr><td>Recall p95</td><td>sub-10ms at 10⁵ memories with HNSW</td><td>Scales to 10⁶ with care</td></tr>
+        <tr><td>Recall p95</td><td>~361 ms measured at 10⁵ rows (SQLite, #1579 P1 audit — see <a href="performance.html" style="color:var(--p1)">performance.html</a>); the ≤50 ms budget holds only at small-corpus/default scale</td><td>Default ≤50 ms budget stops holding past ~100k rows</td></tr>
         <tr><td>Network exposure</td><td>loopback by default, mTLS available</td><td>Set up TLS before binding non-loopback</td></tr>
         <tr><td>Cross-machine sharing</td><td>none</td><td>Walk to <a href="architectures-t3.html" style="color:var(--p1)">Tier 3</a></td></tr>
       </tbody>
