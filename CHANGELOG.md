@@ -104,6 +104,23 @@ federation requests while advertising that no security knob can be loosened.
   in `src/security_profile.rs`, the `17`→`21` narrative in
   `src/enterprise_federation_posture.rs`, and the certification doc
   (`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`).
+### Security (cross-agent private-row confidentiality; #2990)
+
+- **#2990 (GA Wave-1 blocker, #3089) — the shell-to-CLI recall path leaked
+  other agents' `scope=private` rows.** The MCP and HTTP recall paths apply a
+  per-row ownership post-filter (`crate::visibility::is_visible_to_caller`)
+  after the `db::recall*` SQL scan, but the CLI path (`cli::recall::
+  run_with_embedder`) did not. The SQL `visibility_clause` only gates private
+  rows by owner when `--as-agent` is supplied (it binds the private prefix
+  placeholder from the namespace); with `--as-agent` absent — the common CLI
+  invocation — that placeholder is NULL and the whole gate short-circuits to
+  "all visible", so a CLI recall could surface another agent's `scope=private`
+  rows even with `AI_MEMORY_AGENT_ID` set. The CLI path now applies the SAME
+  `is_visible_to_caller` post-filter the MCP/HTTP paths use, keyed on the
+  read-visibility caller (`identity::resolve_read_visibility_caller`,
+  `AI_MEMORY_AGENT_ID`). Fail-closed: the filter can only HIDE rows, never
+  widen the returned set; `None` caller (no stable env identity) preserves the
+  single-tenant trust-all read posture. Collective and caller-owned rows pass.
 
 ### Fixed (enterprise-federation Postgres-adapter audit; #3070 #3073 #3074)
 

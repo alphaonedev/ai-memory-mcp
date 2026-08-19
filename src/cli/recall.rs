@@ -541,6 +541,29 @@ pub(crate) fn run_with_embedder(
             .collect(),
     };
 
+    // v0.7.0 #1468 / v1.0.0 #2990 — per-row ownership visibility post-filter,
+    // mirroring the MCP/HTTP recall paths (`crate::mcp::tools::recall::
+    // handle_recall_dto`'s `apply_visibility_filter`). The `db::recall*` SQL
+    // gate applies the #151 namespace-scope (`--as-agent`) gate but NOT the
+    // per-row `scope=private` ownership predicate UNLESS `--as-agent` was
+    // passed: with `as_agent=None` (the common CLI case) the
+    // `visibility_clause` private prefix (`?8`) binds NULL, short-circuiting
+    // the whole gate to "all visible" so a cross-agent `scope=private` row
+    // would otherwise reach the CLI wire. When `vis_caller` is `Some`, drop
+    // every row the caller does not own via the canonical
+    // `crate::visibility::is_visible_to_caller` predicate (owner OR
+    // inbox-target for private; collective + subtree-matched team/unit/org
+    // pass). `None` (no stable `AI_MEMORY_AGENT_ID`) keeps the single-tenant
+    // trust-all read posture. Fail-closed: this can only HIDE rows, never
+    // widen the returned set.
+    let results: Vec<(crate::models::Memory, f64)> = match vis_caller.as_deref() {
+        None => results,
+        Some(c) => results
+            .into_iter()
+            .filter(|(m, _)| crate::visibility::is_visible_to_caller(m, c))
+            .collect(),
+    };
+
     // v0.9.0 P0-1 (#1869, T8) — CLI ledger append: with recall pure by
     // default, a recall that writes no `recall_observations` row
     // vanishes from the access signal (its counts freeze). Record the
@@ -856,6 +879,145 @@ mod tests {
         // No assertion error; JSON shape comes through.
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert!(v["memories"].is_array());
+    }
+
+    /// v1.0.0 #2990 — seed a memory with an explicit `scope` + owner
+    /// `agent_id` (the two `metadata` keys the visibility predicate reads),
+    /// so the cross-agent private-visibility regression can assert on real
+    /// scoped rows. Mirrors `seed_memory` field-for-field except for the two
+    /// injected keys.
+    fn seed_scoped(
+        db_path: &Path,
+        namespace: &str,
+        title: &str,
+        content: &str,
+        scope: &str,
+        owner: &str,
+    ) -> String {
+        use crate::models::{self, ConfidenceSource};
+        let conn = db::open(db_path).expect("db::open");
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut metadata = models::default_metadata();
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert(
+                crate::META_KEY_AGENT_ID.to_string(),
+                serde_json::Value::String(owner.to_string()),
+            );
+            obj.insert(
+                crate::META_KEY_SCOPE.to_string(),
+                serde_json::Value::String(scope.to_string()),
+            );
+        }
+        let mem = models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: models::Tier::Mid,
+            namespace: namespace.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            priority: 5,
+            confidence: 1.0,
+            source: "import".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata,
+            memory_kind: models::MemoryKind::Observation,
+            confidence_source: ConfidenceSource::CallerProvided,
+            version: 1,
+            lifecycle_state: models::LifecycleState::Open,
+            ..Default::default()
+        };
+        db::insert(&conn, &mem).expect("db::insert")
+    }
+
+    #[test]
+    fn recall_cli_drops_cross_agent_private_row_2990() {
+        // v1.0.0 #2990 (GA Wave-1) — the shell-to-CLI recall path MUST apply
+        // the same per-row ownership post-filter the MCP/HTTP recall paths
+        // apply. Without `--as-agent`, the `db::recall*` SQL visibility gate
+        // short-circuits to "all visible" (`?8`/private-prefix binds NULL),
+        // so a cross-agent `scope=private` row would reach the CLI wire. The
+        // `is_visible_to_caller` post-filter keyed on `AI_MEMORY_AGENT_ID`
+        // closes the leak: agent A must NOT see agent B's private row, owner
+        // B must, and a `collective` row is visible to both.
+        //
+        // Serialize on the crate-wide agent-id env lock (#1772) since this
+        // test mutates `AI_MEMORY_AGENT_ID` process-wide.
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let prev = std::env::var_os("AI_MEMORY_AGENT_ID");
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Agent B's private row and a world-readable collective row, both
+        // keyword-matching "needle". No `--as-agent` on the recall (the
+        // common CLI shape that leaves the SQL gate inert).
+        seed_scoped(
+            &db,
+            "test",
+            "needle private",
+            "bob secret",
+            "private",
+            "ai:bob",
+        );
+        seed_scoped(
+            &db,
+            "test",
+            "needle collective",
+            "shared body",
+            "collective",
+            "ai:bob",
+        );
+
+        let titles_for = |agent: &str, env: &mut TestEnv, db: &Path| -> Vec<String> {
+            // SAFETY: process-global env mutation serialized on the
+            // crate-wide agent-id test lock held for this test's body.
+            unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", agent) };
+            let args = default_args();
+            let cfg = AppConfig::default();
+            {
+                let mut out = env.output();
+                run(db, &args, true, &cfg, &mut out).unwrap();
+            }
+            let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+            let titles = v["memories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["title"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            env.stdout.clear();
+            env.stderr.clear();
+            titles
+        };
+
+        // Agent A (ai:alice) — private row owned by ai:bob is HIDDEN; the
+        // collective row is visible.
+        let alice = titles_for("ai:alice", &mut env, &db);
+        assert!(
+            !alice.iter().any(|t| t == "needle private"),
+            "CONFIDENTIALITY LEAK: agent A saw agent B's private row: {alice:?}"
+        );
+        assert!(
+            alice.iter().any(|t| t == "needle collective"),
+            "collective row must be visible to agent A: {alice:?}"
+        );
+
+        // Owner B (ai:bob) — sees its own private row AND the collective row.
+        let bob = titles_for("ai:bob", &mut env, &db);
+        assert!(
+            bob.iter().any(|t| t == "needle private"),
+            "owner B must see its own private row: {bob:?}"
+        );
+        assert!(
+            bob.iter().any(|t| t == "needle collective"),
+            "collective row must be visible to owner B: {bob:?}"
+        );
+
+        // Restore the pre-test env (still holding the lock).
+        // SAFETY: serialized on the crate-wide agent-id test lock.
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") },
+        }
     }
 
     #[test]
