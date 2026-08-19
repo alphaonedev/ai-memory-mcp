@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (CI reliability — mold-install hang + runner-disk reclaim; #3090 #2960)
+
+Two GitHub-Actions infra flakes were throttling the `release/v1.0.0` merge
+cascade (each remediation PR lost ~1h15m to reruns). CI-only change; no product
+code, no job renames, no required-context set change.
+
+- **#3090 — the `Install mold linker` step could hang for the full job timeout.**
+  All four mold-install steps (`ci.yml` Postgres feature gate, `coverage.yml`
+  Per-Module Coverage Thresholds, `postgres-parity-nightly.yml`,
+  `cert-postgres-age.yml`) were a bare `apt-get update && apt-get install -y
+  mold` with no step timeout, no retry, and no pin. A stalled Azure apt mirror
+  blocked the step until the *job* `timeout-minutes` fired (75 min on coverage).
+  Each step is now idempotent, installs a **pinned** first-party mold release
+  tarball (`rui314/mold` v2.4.1) into `/usr/local/bin` off the happy path,
+  falls back to a bounded `apt` install, is time-bounded (step `timeout-minutes`
+  + per-command GNU `timeout`), retried once, and **fails loud** (exit 1)
+  instead of hanging. No external Action added.
+
+- **#2960 — added a first-party disk-reclaim step to `postgres-parity-nightly`,**
+  the one heavy mold-using job still lacking one (the required Check matrix,
+  coverage, and Postgres feature gate jobs already carry `#2960` reclaim). Prunes
+  the large unused preinstalled toolchains before the sal-postgres build, guarded
+  with `|| true`; uses `docker image prune` (not `system prune --volumes`) so the
+  running `services:` postgres container is untouched. Pure shell — no external
+  `free-disk-space` action.
+
 ### Fixed (enterprise-federation Postgres-adapter audit; #3070 #3073 #3074)
 
 Three LOW-severity Postgres-adapter findings from the enterprise-federation
