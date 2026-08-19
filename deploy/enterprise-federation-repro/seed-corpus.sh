@@ -33,6 +33,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(resolve_ai_memory_bin)" || die "seed: no ai-memory binary — run repro.sh (it builds one) or set AI_MEMORY_BIN"
 
 mkdir -p "$SEED_DIR"
+# A sqlcipher-built binary (the kit default) refuses EVERY sqlite open without
+# a passphrase, so the local seed DB is opened with --db-passphrase-file.
+ensure_db_passphrase
 
 # A fixed, ordered topic vocabulary. The (i mod N) pick makes each row's
 # content a pure function of its index — deterministic across machines.
@@ -58,10 +61,17 @@ _seed_row() {
   topic="${TOPICS[$t]}"
   title="$(printf 'audit-fact-%04d' "$i")"
   content="Reproducible audit fact ${i}: the enterprise-federation substrate records ${topic}. This row is synthetic, deterministic, and regenerable from its durable text."
+  # --scope collective so the migrated corpus is visible to EVERY recall
+  # caller over the mTLS API (verify.sh check 8), not just the storing
+  # agent — the default scope is `private`, which the read-path ownership
+  # filter would hide from a different X-Agent-Id. The synthetic seed is
+  # public audit data, so collective visibility is correct.
   AI_MEMORY_NO_CONFIG=1 "$BIN" store \
     --db "$SEED_DB" \
+    --db-passphrase-file "$DB_PASSPHRASE_FILE" \
     --namespace "$SEED_NAMESPACE" \
     --tier mid \
+    --scope collective \
     --title "$title" \
     --content "$content" \
     --tags "ef-repro,audit,seed" \

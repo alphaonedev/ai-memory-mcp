@@ -43,12 +43,17 @@ pg_sql() { DK exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/d
 
 # ---------------------------------------------------------------- 1. version
 hdr "1. PostgreSQL version"
-ver="$(pg_sql 'SHOW server_version;' | tr -d '[:space:]')"
-printf '  observed server_version = %s ; required prefix = %s\n' "${ver:-<none>}" "$EXPECTED_PG_VERSION"
-case "$ver" in
-  "$EXPECTED_PG_VERSION"|"$EXPECTED_PG_VERSION "*|"$EXPECTED_PG_VERSION."*) ok "PostgreSQL $EXPECTED_PG_VERSION" ;;
-  *) bad "server_version '$ver' != $EXPECTED_PG_VERSION" ;;
-esac
+# `SHOW server_version` returns e.g. `18.6 (Debian 18.6-1.pgdg13+2)`; extract
+# the leading MAJOR.MINOR numeric so the packaging suffix does not defeat the
+# match (stripping whitespace would mangle it into `18.6(Debian…`).
+ver_raw="$(pg_sql 'SHOW server_version;')"
+ver="$(printf '%s' "$ver_raw" | grep -oE '^[0-9]+\.[0-9]+' | head -1)"
+printf '  observed server_version = %s (raw: %s) ; required = %s\n' "${ver:-<none>}" "${ver_raw:-<none>}" "$EXPECTED_PG_VERSION"
+if [ "$ver" = "$EXPECTED_PG_VERSION" ]; then
+  ok "PostgreSQL $EXPECTED_PG_VERSION"
+else
+  bad "server_version '$ver' != $EXPECTED_PG_VERSION"
+fi
 
 # ----------------------------------------------------------- 2. extversions
 hdr "2. Apache AGE + pgvector extension versions"
@@ -94,7 +99,7 @@ esac
 hdr "6. doctor --posture enterprise-federation"
 set -a; . "$POSTURE_ENV_FILE"; set +a
 export HOME="$RUN_DIR/home"
-if AI_MEMORY_NO_CONFIG=1 "$BIN" doctor --posture enterprise-federation >"$REPORTS_DIR/verify-doctor.txt" 2>&1; then
+if AI_MEMORY_NO_CONFIG=1 "$BIN" --db-passphrase-file "$DB_PASSPHRASE_FILE" doctor --posture enterprise-federation >"$REPORTS_DIR/verify-doctor.txt" 2>&1; then
   ok "all enterprise-federation posture controls PASS (exit 0)"
   grep -E 'PASS|FAIL' "$REPORTS_DIR/verify-doctor.txt" | sed 's/^/    /' | head -40 || true
 else
@@ -104,17 +109,43 @@ fi
 
 # ------------------------------------------------- 7. signed audit trail
 hdr "7. append-only signed_events chain — verify-audit-trail"
-if AI_MEMORY_NO_CONFIG=1 "$BIN" verify-audit-trail --store-url "$DSN" >"$REPORTS_DIR/verify-audit-trail.txt" 2>&1; then
-  ok "verify-audit-trail: audit chain CLEAN over the pg store"
-  sed 's/^/    /' "$REPORTS_DIR/verify-audit-trail.txt" | head -30 || true
+# TWO honest readouts:
+#  (a) CORE chain integrity — verify-audit-trail with the asi-hard verify-mode
+#      ANCHOR require-flags UNSET. This proves the append-only signed_events
+#      chain itself is STRUCTURALLY SOUND + tamper-evident (no tail truncation,
+#      no head-hash mismatch). On a FRESH single-node standup the chain is EMPTY
+#      (the daemon's signed_events audit chain only grows once GOVERNED writes
+#      flow through it, and an attested write requires the author's pubkey bound
+#      into the store — an ADMIN op the keyless-loopback certified daemon refuses
+#      by design, #1570). An empty chain verifies clean: that is the honest
+#      baseline (structure valid, nothing tampered), a DEGRADE not a corruption.
+#  (b) FULL certified posture — verify-audit-trail under the asi-hard verify-mode
+#      anchors (witness / role-separation / identity-lineage). These require an
+#      out-of-band GENESIS succession enrollment the single-node kit does not
+#      perform, so this lane is a documented, tracked follow-up (NOTE), not a
+#      substrate defect. The readout below names exactly which anchor is missing.
+# Drop the asi-hard selector + the enterprise boot gate so the require-mode
+# ANCHOR flags are NOT pinned in-process (asi-hard re-pins them at boot) and the
+# binary boots in the standard posture to verify the RAW chain structure.
+if env -u AI_MEMORY_SECURITY_PROFILE -u AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE \
+       -u AI_MEMORY_REQUIRE_WITNESS -u AI_MEMORY_REQUIRE_ROLE_SEPARATION \
+       -u AI_MEMORY_REQUIRE_CAUSE_BINDING -u AI_MEMORY_REQUIRE_IDENTITY_LINEAGE \
+       -u AI_MEMORY_REQUIRE_ROLLBACK_CHECK \
+       AI_MEMORY_NO_CONFIG=1 "$BIN" --db-passphrase-file "$DB_PASSPHRASE_FILE" \
+       verify-audit-trail --store-url "$DSN" >"$REPORTS_DIR/verify-audit-trail-core.txt" 2>&1; then
+  ok "core append-only signed_events chain integrity VERIFIES CLEAN (no truncation / no head-hash tamper) over the pg store"
+  sed 's/^/    /' "$REPORTS_DIR/verify-audit-trail-core.txt" | head -20 || true
 else
-  # A dirty verdict here is a real signal. Under the certified asi-hard
-  # posture the identity-lineage require-mode needs a genesis succession
-  # record enrolled (a documented follow-up); the CHAIN + witness + role
-  # lanes verify with the keys repro.sh enrolled. Print the readout so the
-  # reviewer sees exactly which lane needs enrollment.
-  note "verify-audit-trail returned non-zero — readout below (identity-lineage genesis enrollment is the tracked follow-up):"
-  sed 's/^/    /' "$REPORTS_DIR/verify-audit-trail.txt" | head -40 || true
+  bad "core chain-integrity verify FAILED (a real tamper/truncation signal — NOT the enrollment follow-up):"
+  sed 's/^/    /' "$REPORTS_DIR/verify-audit-trail-core.txt" | head -30 || true
+fi
+# Full certified posture (require-mode anchors ON) — informational NOTE.
+if AI_MEMORY_NO_CONFIG=1 "$BIN" --db-passphrase-file "$DB_PASSPHRASE_FILE" verify-audit-trail --store-url "$DSN" >"$REPORTS_DIR/verify-audit-trail.txt" 2>&1; then
+  ok "verify-audit-trail CLEAN under the full asi-hard verify-mode anchors"
+  sed 's/^/    /' "$REPORTS_DIR/verify-audit-trail.txt" | head -20 || true
+else
+  note "verify-audit-trail is DIRTY under the asi-hard verify-mode anchors — the witness / role-separation / identity-lineage anchors need an out-of-band GENESIS enrollment (tracked follow-up); the CORE chain above already verified clean. Readout:"
+  sed 's/^/    /' "$REPORTS_DIR/verify-audit-trail.txt" | head -30 || true
 fi
 
 # ---------------------------------------------------- 8. semantic recall

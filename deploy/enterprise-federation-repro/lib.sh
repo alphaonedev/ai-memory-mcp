@@ -97,6 +97,13 @@ PG_PASSWORD_FILE="${RUN_DIR}/pg_password"          # 0600
 STORE_URL_FILE="${RUN_DIR}/store-url"              # 0600 — AI_MEMORY_STORE_URL_FILE
 POSTURE_ENV_FILE="${RUN_DIR}/posture.env"          # rendered certified posture env
 SEED_DB="${SEED_DIR}/seed.db"                       # sqlite:/// migrate source
+# Local-sqlite at-rest passphrase (0400). The kit's default binary is built
+# --features sqlcipher (posture control #15), and a sqlcipher build refuses
+# EVERY sqlite open without a passphrase (`apply_sqlcipher_key`,
+# src/storage/connection.rs). So the seed corpus DB + the `migrate --from
+# sqlite://…` source (and `serve`, belt-and-suspenders) MUST be opened with
+# `--db-passphrase-file "$DB_PASSPHRASE_FILE"`. Minted once here, reused.
+DB_PASSPHRASE_FILE="${RUN_DIR}/db.passphrase"
 DAEMON_PID_FILE="${RUN_DIR}/daemon.pid"
 DAEMON_LOG="${LOG_DIR}/daemon.log"
 
@@ -198,12 +205,40 @@ CERT_DAYS="${EF_REPRO_CERT_DAYS:-825}"
 CONTAINER_RUNTIME="${EF_REPRO_CONTAINER_RUNTIME:-docker}"
 
 # --------------------------------------------------------------------------
+# PG-tier container network mode:
+#   auto   (default) — publish the port with `-p 127.0.0.1:$PG_PORT:5432`;
+#                      if that fails because the host's docker `DOCKER` nat
+#                      chain is broken (the well-known `iptables: No
+#                      chain/target/match by that name` / "Unable to enable
+#                      DNAT rule" bug), automatically FALL BACK to
+#                      `--network host` with postgres bound loopback-only on
+#                      $PG_PORT — so the kit stands up on a clean machine AND
+#                      on a `-p`-broken host without operator intervention.
+#   bridge — force `-p` publishing (fail loud if the host `-p` bug is present).
+#   host   — force `--network host` (postgres listens on 127.0.0.1:$PG_PORT
+#            directly; the healthcheck reads PGPORT). Loopback-bound either way.
+# In `host`/fallback mode the daemon still dials 127.0.0.1:$PG_PORT and the
+# hostssl+mTLS enforcement is identical — only the docker port plumbing differs.
+# --------------------------------------------------------------------------
+EF_REPRO_PG_NETWORK_MODE="${EF_REPRO_PG_NETWORK_MODE:-auto}"
+
+# --------------------------------------------------------------------------
 # The certified store DSN (postgres over verify-full TLS + client cert mTLS).
 # Password read from the 0600 secret file at call time — never echoed, never
 # placed on a command line. search_path pins public first (ag_catalog second)
 # per the #3055 schema-placement note.
 # --------------------------------------------------------------------------
 pg_password() { cat "$PG_PASSWORD_FILE"; }
+
+# Mint the local-sqlite at-rest passphrase (0400) if absent — idempotent.
+# Both repro.sh and seed-corpus.sh call this before any sqlite open so a
+# sqlcipher-built binary always has AI_MEMORY_DB_PASSPHRASE available.
+ensure_db_passphrase() {
+  [ -s "$DB_PASSPHRASE_FILE" ] && return 0
+  mkdir -p "$(dirname "$DB_PASSPHRASE_FILE")"
+  ( umask 077; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 48 >"$DB_PASSPHRASE_FILE" || true )
+  chmod 0400 "$DB_PASSPHRASE_FILE"
+}
 
 # URL-encode the search_path comma so it survives the DSN query string.
 store_dsn() {

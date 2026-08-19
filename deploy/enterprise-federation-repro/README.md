@@ -54,6 +54,18 @@ Point at a prebuilt binary (must be built `--features sal,sal-postgres,sqlcipher
 with `AI_MEMORY_BIN=/path/to/ai-memory`. Every knob is env-overridable
 (`EF_REPRO_*`); see `lib.sh`.
 
+**Host networking (`-p` DNAT bug).** `repro.sh` publishes the PG tier with
+`-p 127.0.0.1:$PG_PORT:5432` by default. Some hosts have a broken docker
+`DOCKER` iptables nat chain where port publishing fails (`iptables: No
+chain/target/match by that name` / "Unable to enable DNAT rule"). On that
+failure the kit AUTO-FALLS-BACK to `--network host` (postgres bound
+loopback-only on `$PG_PORT`; the hostssl + client-cert mTLS enforcement and the
+daemon's `sslmode=verify-full` dial to `127.0.0.1:$PG_PORT` are byte-identical).
+Force either mode with `EF_REPRO_PG_NETWORK_MODE=host|bridge|auto` (default
+`auto`). A sqlcipher-built binary (the required feature set) also needs a local
+passphrase for the seed/migrate/serve sqlite opens — the kit mints and threads
+it (`--db-passphrase-file`) automatically.
+
 ## Wiring an AI NHI
 
 The certified daemon speaks the mTLS HTTP API on `:9077`:
