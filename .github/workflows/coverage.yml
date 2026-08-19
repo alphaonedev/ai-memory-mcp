@@ -44,6 +44,13 @@ on:
     branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam"]
   push:
     branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**"]
+  # Merge Queue (#3089) — `Per-Module Coverage Thresholds` (+ the sibling
+  # doc/claims gates) are REQUIRED contexts, so this workflow MUST report on
+  # the `merge_group` ref or the queue wedges. The `Coverage classify` decider
+  # defaults to `docs_only=false` on `merge_group` (explicit arm below): the
+  # full llvm-cov sweep runs, never a docs-only short-circuit. See ci.yml.
+  merge_group:
+    types: [checks_requested]
 
 # v0.7.x (#1148) — cancel stale runs on a PR when a new push lands.
 # Fork-PR-safe concurrency key: coalesces push + same-branch internal
@@ -93,6 +100,15 @@ jobs:
           # said docs_only=false (12-file backend change) while ci.yml's
           # incremental one said true (CLAUDE.md-only last commit) — the
           # in-repo A/B that proved the defect. ci.yml now matches this.
+          # Merge Queue (#3089) — a merge_group event has no PR diff; a merge
+          # group MUST run the full llvm-cov sweep (never a docs-only skip).
+          # Pin docs_only=false explicitly (the fail-closed `else`/empty-base
+          # arm below would also yield it, but the queue depends on it).
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::merge_group event — running the full coverage sweep (not docs-only)"
+            exit 0
+          fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
           elif [ "${{ github.event_name }}" = "push" ]; then
@@ -300,6 +316,12 @@ jobs:
           mold --version
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # CI-speed (#3089) — save the cache only on trunk `push` events;
+          # PR + merge_group runs restore-only. See ci.yml's `check` job for
+          # the full rationale (no poison from a failed compile; no LRU
+          # eviction of the warm trunk cache). No new Action introduced.
+          save-if: ${{ github.event_name == 'push' }}
 
       # #2019 — the reranker (cross-encoder/ms-marco-MiniLM-L-6-v2) + embedder
       # (sentence-transformers/all-MiniLM-L6-v2) tests download their weights via
@@ -383,12 +405,29 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Install jq + postgresql-client
+      - name: Install jq + postgresql-client (bounded+retry #3090/#2960)
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq postgresql-client
+          set -euo pipefail
+          # #3090/#2960 — bounded, retried, fail-LOUD apt install, mirroring the
+          # postgresql-client hardening #3091 landed in cert-postgres-age.yml.
+          # The old bare `apt-get update && apt-get install` had NO step timeout,
+          # NO retry: a stalled apt mirror blocked until the JOB timeout fired.
+          # Now: step-level timeout-minutes + per-command GNU `timeout`, one
+          # retry, `::error::` + exit 1 on failure. No external Action added.
+          apt_ok=0
+          for attempt in 1 2; do
+            if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y jq postgresql-client; then
+              apt_ok=1; break
+            fi
+            echo "apt jq+postgresql-client attempt ${attempt} failed; retrying" >&2; sleep 5
+          done
+          [ "${apt_ok}" = 1 ] || { echo "::error::jq + postgresql-client install failed"; exit 1; }
+          jq --version
+          psql --version
 
       - name: Install pgvector + provision AGE/vector extensions
+        timeout-minutes: 6
         env:
           PGPASSWORD: ai_memory_test
         run: |
@@ -398,8 +437,20 @@ jobs:
           # (apache/age inherits debian-bookworm via postgres:16).
           PG_CONTAINER=$(docker ps --filter "ancestor=apache/age:release_PG16_1.6.0" --format '{{.ID}}' | head -1)
           echo "pg container: $PG_CONTAINER"
-          docker exec "$PG_CONTAINER" apt-get update
-          docker exec "$PG_CONTAINER" apt-get install -y postgresql-16-pgvector
+          # #3090/#2960 — bounded, retried, fail-LOUD apt install INSIDE the pg
+          # container (the pgdg/debian mirror is the flaky bit). GNU `timeout`
+          # bounds each docker exec; one retry; `::error::` + exit 1 on failure
+          # so a stalled mirror fails loud instead of hanging to the step/job
+          # timeout. No external Action added.
+          pgv_ok=0
+          for attempt in 1 2; do
+            if timeout 180 docker exec "$PG_CONTAINER" apt-get update \
+               && timeout 180 docker exec "$PG_CONTAINER" apt-get install -y postgresql-16-pgvector; then
+              pgv_ok=1; break
+            fi
+            echo "pgvector apt install attempt ${attempt} failed; retrying" >&2; sleep 5
+          done
+          [ "${pgv_ok}" = 1 ] || { echo "::error::postgresql-16-pgvector install failed"; exit 1; }
           # Provision extensions + the memory_graph AGE graph the SAL
           # postgres adapter expects. Mirrors infra/lan-parity-test/init-age.sql.
           psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_test -c "CREATE EXTENSION IF NOT EXISTS vector;"

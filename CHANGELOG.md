@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (CI cycle speedup: apt hardening + build-cache scoping + Merge Queue prereq; #3089 #2960 #3090)
+
+Follow-on to #3091 (which hardened only the `mold` install). CI-only change; no
+product code, no job `name:` changed, no required-context set changed, still
+`runs-on: ubuntu-latest`.
+
+- **Hardened every remaining flaky `apt-get install` (the #2960/#3090 class).**
+  #3091 fixed `mold` + one `postgresql-client`, but other bare
+  `apt-get update && install` steps could still hang on a stalled apt mirror
+  until the job timeout fired (it cost #3094 a full rerun). Swept all workflows
+  and applied #3091's exact shape — step-level `timeout-minutes`, per-command
+  GNU `timeout`, one bounded retry, `::error::` + `exit 1` fail-loud — to:
+  `coverage.yml` **Install jq + postgresql-client** and the in-container
+  **pgvector** install (`docker exec … apt-get`), `batman-mode-acceptance.yml`
+  **sqlite3 + jq**, and `release.yml` **pipx** (copr-cli) + **rpm**. No external
+  Action added (the apt mirror stays the source; only the hang is bounded).
+- **Scoped the Rust build cache save to trunk pushes on the three heavy compile
+  jobs** (`check` matrix, `Postgres feature gate`, `Per-Module Coverage
+  Thresholds`). Those jobs already use the repo's house action
+  `Swatinem/rust-cache@v2`; adding a second `actions/cache` target-dir layer
+  would only bloat/stale it. Instead each now sets
+  `save-if: ${{ github.event_name == 'push' }}` so `pull_request` + `merge_group`
+  runs **restore** the warm trunk cache but never **save** — a failed/partial PR
+  compile can no longer poison the shared cache, and per-PR caches no longer
+  evict the trunk cache under GitHub's 10 GB/repo LRU limit. Worst case degrades
+  to a colder cache (slower, never wrong).
+- **Added the `merge_group` trigger to every workflow carrying a REQUIRED status
+  check** (`ci.yml`, `c8-precheck.yml`, `coverage.yml`) — the prerequisite for
+  enabling GitHub Merge Queue. Without it a queued PR's required checks never run
+  on the merge-group ref and the queue wedges the branch. Both docs-only
+  classifiers (`Classify changes`, `Coverage classify`) now pin
+  `docs_only=false` on `merge_group` so a merge group exercises the FULL gate
+  (never a docs-only short-circuit); the two event-scoped `c8-precheck` gates
+  (cert-expiry, commit-signing-posture) N/A-skip to exit 0 on the non-PR event.
+  No job `name:` changed — the same required contexts report on `merge_group` as
+  on `pull_request`. `cert-postgres-age.yml` was intentionally left off: it
+  carries no required context (verified against live branch protection), and it
+  is a heavy Postgres+AGE job that would slow the queue for no gating benefit.
+  New `test-ci-workflow-invariants.sh` scenario s9 pins the merge_group
+  full-pipeline invariant.
+
 ### Fixed (CI reliability — mold-install hang + runner-disk reclaim; #3090 #2960)
 
 Two GitHub-Actions infra flakes were throttling the `release/v1.0.0` merge

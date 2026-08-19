@@ -150,8 +150,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: batman-mode-acceptance
-      - name: Install sqlite3 + jq
-        run: sudo apt-get update && sudo apt-get install -y sqlite3 jq
+      - name: Install sqlite3 + jq (bounded+retry #3090/#2960)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          # #3090/#2960 — bounded, retried, fail-LOUD apt install (mirrors the
+          # postgresql-client hardening #3091). The old bare
+          # `apt-get update && apt-get install` could hang on a stalled apt
+          # mirror until the job timeout fired. No external Action added.
+          apt_ok=0
+          for attempt in 1 2; do
+            if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y sqlite3 jq; then
+              apt_ok=1; break
+            fi
+            echo "apt sqlite3+jq attempt ${attempt} failed; retrying" >&2; sleep 5
+          done
+          [ "${apt_ok}" = 1 ] || { echo "::error::sqlite3 + jq install failed"; exit 1; }
+          sqlite3 --version
+          jq --version
       - name: Build release binary + install to PATH
         run: |
           cargo build --release --bin ai-memory

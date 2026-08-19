@@ -266,6 +266,19 @@ OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=schedule PR_ACTION="" PR_BASE_SHA="" PR_
     && ok "s8 unknown event fails closed" \
     || bad "s8 unknown event" "got docs_only=$(getout "$OUT" docs_only)"
 
+# --- Scenario 9 (#3089, Merge Queue): a `merge_group` event MUST run the full
+# pipeline — docs_only=false + __ALL__ — regardless of what the diff would be,
+# so a queued PR's required contexts all report on the merge_group ref. Even a
+# docs-shaped fixture must NOT short-circuit here.
+F="$SCRATCH/s9"; build_fixture "$F" docs docs
+OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=merge_group PR_ACTION="" PR_BASE_SHA="" PR_BEFORE="")"
+[ "$(getout "$OUT" docs_only)" = "false" ] \
+    && [ "$(getout "$OUT" test_impact)" = "__ALL__" ] \
+    && [ "$(getout "$OUT" test_impact_reason)" = "merge_group-full-pipeline" ] \
+    && ok "s9 merge_group runs the full pipeline (docs_only=false, __ALL__) — no docs-only short-circuit" \
+    || bad "s9 merge_group must run everything" \
+           "docs_only=$(getout "$OUT" docs_only) impact=$(getout "$OUT" test_impact) reason=$(getout "$OUT" test_impact_reason)"
+
 # --- Regression leg: the PRE-FIX block MUST mis-classify scenario 1. --------
 # Fail-closed: a missing or repaired fixture is a FAILURE, never a SKIP. A
 # regression leg that can quietly opt out is not evidence of anything.
