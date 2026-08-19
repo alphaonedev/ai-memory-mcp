@@ -131,11 +131,21 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
    coordination checkpoint for any namespace outside its declared scope. This
    is enforced at the runtime `/sync/push` guards, not merely documented — and
    each guard is proven load-bearing (§5.4.5, see §4).
-2. **Peer identity is attested.** Peer enrollment is required
+2. **Peer identity is attested, and the outer transport gates are
+   no-disable under `asi-hard`.** Peer enrollment is required
    (`AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT`), per-message Ed25519 signatures +
-   nonce freshness are required (`AI_MEMORY_FED_REQUIRE_SIG`/`_NONCE`), and
-   outbound peer server certs are verified (`AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`,
-   pinned by `asi-hard`).
+   nonce freshness are required (`AI_MEMORY_FED_REQUIRE_SIG`/`_NONCE`),
+   inbound writes are namespace-confined
+   (`AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE`), and outbound peer server
+   certs are verified (`AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`). **All five are
+   pinned by `asi-hard`** — the four outer federation-transport gates were
+   added to the `asi-hard` `KNOBS` SSOT in #3033 (they default fail-closed at
+   v1.0.0 and now additionally cannot be DISABLED under the hardened posture:
+   an `asi-hard` daemon with any of them set falsy REFUSES to boot). Before
+   #3033 these four were secure-by-default but NOT covered by the
+   `asi-hard` "no-disable" contract, so this clause over-stated the
+   guarantee for the raw `asi-hard` posture (the enterprise-federation
+   posture gate already checked them via `evaluate` checks #3-#6).
 3. **Authority-granting federated writes are per-actor attested** — transitions
    (`_REQUIRE_TRANSITION_SIG`), checkpoint resolutions (`_REQUIRE_CHECKPOINT_SIG`),
    relayed content (`_REQUIRE_WRITE_SIG`) and signals (`_REQUIRE_SIGNAL_SIG`) all
@@ -197,8 +207,16 @@ code.)
 1. `AI_MEMORY_SECURITY_PROFILE` (unset → `standard`)
 2. `asi-hard pinned knobs` — post-#2927 this row **FAILs honestly under
    a `standard` profile** (`profile=standard — asi-hard pins not in
-   force; the 17-knob hard floor was not evaluated`) instead of the pre-#2927 vacuous
-   `17/17 at floor` PASS (#2923)
+   force; the N-knob hard floor was not evaluated`, where N is
+   `pinned_knobs().len()` — **21** post-#3033, 17 in the captured
+   evidence below) instead of the pre-#2927 vacuous
+   `N/N at floor` PASS (#2923). **Evidence note (#3033):** the
+   `cert-54/` `.out` captures in §2 predate #3033 and render the
+   `17`-knob text; the count rose to 21 when the four outer
+   federation-transport gates were pinned, and the doctor render is
+   `pinned_knobs().len()`-driven, so re-capture on the post-#3033
+   release binary shows `21/21`. The PASS/FAIL verdict per leg is
+   unchanged (the row is one check regardless of the knob count).
 3. `AI_MEMORY_FED_TRUST_DOMAIN` (unset)
 4. `AI_MEMORY_FED_PEER_FINGERPRINTS` (unset)
 5. `AI_MEMORY_FED_PEER_ATTESTATION` (unset)

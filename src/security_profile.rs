@@ -43,6 +43,10 @@
 //! | `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` | `1` | unsigned direct writes refused on EVERY surface |
 //! | `AI_MEMORY_FED_REQUIRE_WRITE_SIG` | `1` | inbound relayed memories must carry a verified per-write signature |
 //! | `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` | `1` | inbound relayed signals must verify against the enrolled author key |
+//! | `AI_MEMORY_FED_REQUIRE_SIG` | `1` | inbound federation requests must carry a verified per-message Ed25519 signature (#3033 outer-transport gate) |
+//! | `AI_MEMORY_FED_REQUIRE_NONCE` | `1` | inbound federation requests must carry a fresh per-message nonce (#3033 outer-transport gate) |
+//! | `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` | `1` | an inbound peer's `X-Peer-Id` must resolve to an enrolled Ed25519 key (#3033 outer-transport gate) |
+//! | `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` | `1` | inbound `/sync/push` writes are confined to the peer's declared `allowed_namespaces` (#3033 outer-transport gate) |
 //! | `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` | `1` | provenance-less inbound writes are quarantined, not accepted-visible |
 //! | `AI_MEMORY_CID_ENFORCE` | `1` | content-id mismatch is WARN-enforced, not detect-only |
 //! | `AI_MEMORY_REQUIRE_ROLLBACK_CHECK` | `1` | open-time rollback-evidence check fail-closed |
@@ -62,6 +66,19 @@
 //! (`AI_MEMORY_FED_REQUIRE_TRANSITION_SIG`, `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`)
 //! already default fail-closed (`1`); `asi-hard` still refuses a loosening
 //! override on them so the posture is complete.
+//!
+//! The four OUTER federation-transport gates (`AI_MEMORY_FED_REQUIRE_SIG`,
+//! `AI_MEMORY_FED_REQUIRE_NONCE`, `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT`,
+//! `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE`) likewise default ON;
+//! `asi-hard` pins them so the "no-disable" contract covers the outermost
+//! network access-control gates, not only the inner per-object attestation
+//! (#3033). Because these gates use the DEFAULT-ON grammar (enabled unless an
+//! explicit falsy token), their `meets_floor` predicates delegate to the same
+//! value-level readers the runtime resolves through
+//! ([`crate::federation::receive_auth::flag_value_default_on`] /
+//! [`crate::handlers::federation_signing_check::peer_enrollment_value_enabled`]),
+//! never a re-derived truthy grammar that would false-refuse a boot the live
+//! gate treats as compliant.
 //!
 //! ## Call site (#2386 — pre-runtime ONLY)
 //!
@@ -250,6 +267,47 @@ const KNOBS: &[KnobSpec] = &[
         hard_value: "1",
         meets_floor: is_truthy,
     },
+    // #3033 — the FOUR OUTER federation-TRANSPORT gates. The sig-lane rows
+    // above pin the INNER per-object attestation (write/signal/transition/
+    // checkpoint); these pin the gates the receive path applies to the
+    // request ITSELF before any object is inspected: per-message Ed25519
+    // signature + nonce freshness, enrolled-peer identity, and inbound-write
+    // namespace confinement. All FOUR already default fail-closed (ON) at
+    // v1.0.0, so pinning them is a NO-OP for a compliant deployment — it only
+    // removes the ability to DISABLE them under `asi-hard`, closing the
+    // #3033 defect where the "no-disable" contract silently excluded the
+    // outermost network access-control gates.
+    //
+    // Each `meets_floor` delegates to the SAME value-level grammar helper the
+    // live runtime reader uses (NOT `is_truthy`, which would false-RED a value
+    // the live default-ON gate treats as enabled — the NB1 lesson): the three
+    // `env_flag_default_on` gates share
+    // `receive_auth::flag_value_default_on` (case-sensitive), and the
+    // peer-enrollment gate shares
+    // `federation_signing_check::peer_enrollment_value_enabled`
+    // (case-insensitive) — the identical predicate
+    // `require_sig`/`require_nonce`/`require_push_namespace_scope_enabled`/
+    // `require_peer_enrollment_enabled` resolve through.
+    KnobSpec {
+        env: crate::federation::signing::REQUIRE_SIG_ENV,
+        hard_value: "1",
+        meets_floor: crate::federation::receive_auth::flag_value_default_on,
+    },
+    KnobSpec {
+        env: crate::federation::signing::REQUIRE_NONCE_ENV,
+        hard_value: "1",
+        meets_floor: crate::federation::receive_auth::flag_value_default_on,
+    },
+    KnobSpec {
+        env: crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
+        hard_value: "1",
+        meets_floor: crate::handlers::federation_signing_check::peer_enrollment_value_enabled,
+    },
+    KnobSpec {
+        env: crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+        hard_value: "1",
+        meets_floor: crate::federation::receive_auth::flag_value_default_on,
+    },
     KnobSpec {
         env: "AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED",
         hard_value: "1",
@@ -340,7 +398,7 @@ pub fn pinned_knobs() -> Vec<(&'static str, &'static str)> {
 /// [`enforce_at_boot`], which may only run in the synchronous
 /// pre-runtime phase of `fn main()` (#2386), this is safe to call from
 /// any live process (e.g. `ai-memory doctor --posture
-/// enterprise-federation`, which reuses this as ONE SSOT for the 17
+/// enterprise-federation`, which reuses this as ONE SSOT for the 21
 /// `asi-hard` pinned knobs rather than re-deriving the KNOBS table).
 ///
 /// Returns `(env, current_value, hard_value)` triples.
@@ -725,7 +783,7 @@ mod tests {
         // The pinned set must match the documented count so the module
         // docs table and the KNOBS SSOT cannot silently drift.
         let pins = pinned_knobs();
-        assert_eq!(pins.len(), 17, "documented asi-hard knob count");
+        assert_eq!(pins.len(), 21, "documented asi-hard knob count");
         // Every pin's env name is non-empty and the durability pin is FULL.
         assert!(pins.iter().all(|(e, _)| !e.is_empty()));
         assert!(
@@ -754,6 +812,78 @@ mod tests {
                 .any(|(e, v)| *e == crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV && v.is_empty()),
             "asi-hard must pin the plaintext-peer hatch OFF (#2477)"
         );
+        // #3033 — the FOUR OUTER federation-transport gates are pinned ON, so
+        // the "no-disable" contract covers the outermost network
+        // access-control gates (per-message sig + nonce, enrolled-peer
+        // identity, inbound-write namespace confinement), not only the inner
+        // per-object attestation. Before #3033 an `asi-hard` deployment could
+        // still set e.g. `AI_MEMORY_FED_REQUIRE_SIG=0` and accept UNSIGNED
+        // inbound federation requests while advertising the no-disable posture.
+        for env in [
+            crate::federation::signing::REQUIRE_SIG_ENV,
+            crate::federation::signing::REQUIRE_NONCE_ENV,
+            crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
+            crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+        ] {
+            assert!(
+                pins.iter().any(|(e, v)| *e == env && *v == "1"),
+                "asi-hard must pin the outer-transport gate {env} ON (#3033)"
+            );
+        }
+    }
+
+    /// #3033 — `asi-hard` REFUSES to boot when an operator tries to DISABLE
+    /// any of the four outer federation-transport gates. Exercises the
+    /// default-ON grammar delegation directly: a case-sensitive falsy token
+    /// (`0`) loosens the `env_flag_default_on` gates, and a case-INSENSITIVE
+    /// falsy token (`FALSE`) loosens the peer-enrollment gate — each must be
+    /// caught as a below-floor override and refuse boot.
+    #[test]
+    fn asi_hard_refuses_disabling_outer_transport_gates() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_refuses_disabling_outer_transport_gates",
+        ) {
+            return;
+        }
+        // Each case: (env var, a value that DISABLES the live gate).
+        let cases = [
+            (crate::federation::signing::REQUIRE_SIG_ENV, "0"),
+            (crate::federation::signing::REQUIRE_NONCE_ENV, "off"),
+            (
+                crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                "false",
+            ),
+            // Case-INSENSITIVE for the peer-enrollment gate: `FALSE` disables
+            // the live reader, so it must refuse boot (a case-sensitive
+            // `flag_value_default_on` would MISS this — the grammars differ).
+            (
+                crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
+                "FALSE",
+            ),
+        ];
+        for (env, disabling_value) in cases {
+            let _g = env_lock();
+            unsafe {
+                clear_all();
+            }
+            let _cleanup = KnobsGuard;
+            unsafe {
+                std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+                std::env::set_var(env, disabling_value);
+            }
+            let err = enforce_at_boot().unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("asi-hard") && msg.contains(env),
+                "refusal must name the posture + the loosened gate {env}: {msg}"
+            );
+            // And the read-only accessor reports the same violation.
+            let below = asi_hard_below_floor();
+            assert!(
+                below.iter().any(|(e, _, _)| *e == env),
+                "asi_hard_below_floor must report the loosened gate {env}"
+            );
+        }
     }
 
     #[test]
@@ -764,7 +894,7 @@ mod tests {
             return;
         }
         // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
-        // reuses this accessor as the SSOT for the 17-knob asi-hard set
+        // reuses this accessor as the SSOT for the 21-knob asi-hard set
         // rather than re-deriving KNOBS; pin its own read-only contract
         // directly (in addition to the exhaustive coverage the
         // `enterprise_federation_posture::tests` module gives it
