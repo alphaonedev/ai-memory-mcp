@@ -1111,6 +1111,8 @@ pub async fn load_family_handler(
             until: None,
             valid_at: None,
             limit,
+            // #1876 — load_family listing serves the first window.
+            offset: 0,
             // #2167 — load_family listing never runs the recall space gate.
             active_embedding_space: None,
             // #2580 — GIN-served pushdown of the family predicate.

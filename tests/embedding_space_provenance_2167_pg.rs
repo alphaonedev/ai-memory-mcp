@@ -131,6 +131,7 @@ async fn pg_recall_never_scores_foreign_space_2167() {
         since: None,
         until: None,
         limit: 50,
+        offset: 0,
         active_embedding_space: Some(active.clone()),
         valid_at: None,
         // #2580 — metadata-equality pushdown axis unused on this path.

@@ -158,6 +158,10 @@ pub async fn list_memories(
             // validated at the entry guard above).
             valid_at: p.valid_at.clone(),
             limit,
+            // #1876 — list DTO paging: this surface serves the first window
+            // (no offset param wired yet); the migrate paginator is the
+            // OFFSET consumer.
+            offset: 0,
             // #2167 — list/search never runs the recall space gate.
             active_embedding_space: None,
             // #2580 — metadata-equality pushdown axis unused on this path.
@@ -357,6 +361,8 @@ pub async fn search_memories(
             // surface does not expose it, so no as-of filter applies here.
             valid_at: None,
             limit,
+            // #1876 — keyword-search surface serves the first window only.
+            offset: 0,
             // #2167 — list/search never runs the recall space gate.
             active_embedding_space: None,
             // #2580 — metadata-equality pushdown axis unused on this path.
