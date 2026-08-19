@@ -36,6 +36,17 @@
 //! - emission binds the genesis `db_id` on BOTH backends (sqlite here; the
 //!   `#[ignore]` live-postgres twin below).
 //!
+//! v1.0.0 #2942 (5-agent vote, #3089 Vote A) — asi-hard COLD-BOOT read-time
+//! carve-out:
+//!
+//! - a brand-new asi-hard node whose witness pin is NOT YET enrolled
+//!   (`AnchorScan::Unpinnable`) and that has NO surviving off-table head anchor
+//!   BOOTS CLEAN under require-mode (so it can run its own witness-enrollment
+//!   ceremony — the cold-boot chicken-and-egg), while a wiped node (head-0 /
+//!   genesis-less, pin stripped) with a SURVIVING off-table anchor stays
+//!   fail-closed (`Missing`) and refuses the open. No genesis row is minted on
+//!   first open (the witness-mount write-authority invariant is preserved).
+//!
 //! The witness / operator env vars are process-global, so every test that
 //! sets them serialises via a module-local lock and clears the env on exit.
 
@@ -646,6 +657,68 @@ fn sqlite_witness_emission_binds_v3_genesis_db_id() {
     assert!(
         res.contains(&format!("\"db_id\":\"{db_id}\"")),
         "emission binds THIS database's genesis db-id: {res}"
+    );
+
+    clear_env();
+}
+
+// ── (11b) #2942 — asi-hard cold-boot: fresh node boots, wiped node refuses ──
+
+#[test]
+fn asi_hard_cold_node_boots_fresh_but_refuses_wiped_with_surviving_anchor() {
+    let _g = lock();
+    unsafe {
+        std::env::set_var(witness::REQUIRE_ROLLBACK_CHECK_ENV, "1");
+    }
+
+    // (a) NET-NEW #2942 — a brand-new asi-hard node whose witness pin is NOT yet
+    // enrolled (`Unpinnable`) and that has NO off-table head anchor on the mount
+    // is a genuinely fresh DB: it BOOTS CLEAN under require-mode so the operator
+    // can then run the witness-enrollment ceremony (the cold-boot chicken-and-
+    // egg). Point the witness key dir at an EMPTY dir: no pubkey → Unpinnable,
+    // no anchor log → nothing to roll back FROM.
+    let fresh_kdir = fresh_dir("cold-fresh-keys");
+    unsafe {
+        std::env::set_var(witness::WITNESS_KEY_DIR_ENV, fresh_kdir.path());
+        std::env::remove_var(witness::WITNESS_PUBKEY_ENV);
+    }
+    assert_eq!(
+        witness::compute_rollback_verdict_for_report(0, None),
+        RollbackCheck::NotApplicable,
+        "#2942 cold-boot carve-out: unenrolled pin + head-0 + no surviving anchor is NotApplicable"
+    );
+    let fresh_db = fresh_dir("cold-fresh-db");
+    let fresh_path = fresh_db.path().join("audit.db");
+    drop(
+        ai_memory::db::open(&fresh_path)
+            .expect("#2942 — a fresh asi-hard node must boot under require-mode to self-enrol"),
+    );
+
+    // (b) REGRESSION — a wiped node: head-0 / genesis-less, its witness pin ALSO
+    // stripped (`Unpinnable`), but a SURVIVING off-table head anchor remains on
+    // the mount from a prior require-mode run. The discriminator
+    // (`off_table_head_anchor_present`) keeps it FAIL-CLOSED (`Missing`) → the
+    // open REFUSES under require-mode. (A truly fresh node has no such line.)
+    let wiped_kdir = fresh_dir("cold-wiped-keys");
+    std::fs::write(
+        wiped_kdir.path().join(witness::HEAD_ANCHOR_LOG_FILENAME),
+        "{\"surviving\":\"anchor-line-from-a-prior-require-mode-run\"}\n",
+    )
+    .expect("write surviving off-table anchor");
+    unsafe {
+        std::env::set_var(witness::WITNESS_KEY_DIR_ENV, wiped_kdir.path());
+        std::env::remove_var(witness::WITNESS_PUBKEY_ENV);
+    }
+    assert_eq!(
+        witness::compute_rollback_verdict_for_report(0, None),
+        RollbackCheck::Missing,
+        "#2942 — a surviving off-table anchor keeps a wiped node fail-closed (not carved out)"
+    );
+    let wiped_db = fresh_dir("cold-wiped-db");
+    let wiped_path = wiped_db.path().join("audit.db");
+    assert!(
+        ai_memory::db::open(&wiped_path).is_err(),
+        "#2942 — a wiped node with a surviving off-table anchor must refuse under require-mode"
     );
 
     clear_env();

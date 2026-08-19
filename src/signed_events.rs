@@ -2418,9 +2418,17 @@ pub fn verify_audit_trail(
     // v1.0.0 #2955 — this database's genesis-derived identity scopes the SHARED
     // on-host forensic watermark reads below (both the truncation lane and the
     // #1873 head-hash lane), so a sibling DB sharing this sink can never bleed
-    // its head into THIS db's verdict. `None` on an empty chain / read fault =
-    // the conservative count-every-watermark posture.
-    let watermark_db_id = genesis_db_id(conn).ok().flatten();
+    // its head into THIS db's verdict. `Ok(None)` on an empty chain = the #3068
+    // WITHHOLD posture (an identity-less opener cannot own an identified
+    // sibling's watermark). v1.0.0 #3006/#3068 — PROPAGATE a genuine read fault
+    // instead of the pre-fix silent `Err → None` degrade: `None` now WITHHOLDS
+    // the truncation verdict, so swallowing a read fault to `None` would
+    // silently blind the lane rather than surface the fault. The chain head read
+    // above already `?`-propagates the same-table read, so this is consistent
+    // (mirrors the rollback/emission lanes' propagation, and the pg twin's
+    // `.map_err(…)?` on the identical genesis fetch — K3 parity).
+    let watermark_db_id = genesis_db_id(conn)
+        .context("verify_audit_trail: read genesis db-id for per-database watermark scoping")?;
     let exonerate_ok = crate::governance::audit::audit_watermark_exoneration_authenticated(
         audit_pubkey,
         watermark_db_id.as_deref(),

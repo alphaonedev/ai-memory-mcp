@@ -121,6 +121,47 @@ federation requests while advertising that no security knob can be loosened.
   `AI_MEMORY_AGENT_ID`). Fail-closed: the filter can only HIDE rows, never
   widen the returned set; `None` caller (no stable env identity) preserves the
   single-tenant trust-all read posture. Collective and caller-owned rows pass.
+### Fixed (CERT-KEYSTONE audit-spine read-time fixes; #3006 #3068 #2942)
+
+Per the 2026-08-19 5-agent vote (#3089 Vote A). Two read-time integrity fixes
+sharing `src/governance/audit.rs`; NO on-disk audit artifact is written from the
+daemon at boot (the witness-mount write-authority invariant is preserved).
+
+- **#3006 / #3068 — `verify-audit-trail` false-convicted every fresh /
+  DR-restored / co-located database (forensic WATERMARK lane).** The shared
+  on-host forensic watermark sink is process/host-global, and an identity-less
+  reader (`db_id = None`: a fresh, DR-restored, or store-only-migrated store
+  with an empty audit chain) MATCHED EVERY watermark — so a live sibling's
+  climbing head was read as this store's high-water and forged a `Detected`
+  truncation verdict against a chain that was never truncated. `scan_file_last_watermark`
+  now returns a typed `WatermarkScan` enum MIRRORING the shipped `AnchorScan`
+  (rollback lane): an identity-less / empty-chain / foreign-only opener WITHHOLDS
+  (never match-all `Detected`), counting only db_id-less legacy watermarks and
+  skipping every IDENTIFIED one; the degrade is OBSERVABLE (the same legacy-id-less
+  WARN the rollback lane emits). The withhold is scoped to the FORENSIC WATERMARK
+  lane ONLY — the SIGNED off-table head-anchor ROLLBACK lane deliberately keeps
+  its match-all so a wipe-to-empty of a formerly-identified chain stays convicted
+  (its K1 pin makes the over-count an attestable wipe detector; this raw unsigned
+  lane must not over-convict). The silent `genesis_db_id` `Err → None` degrade in
+  `verify_audit_trail` (`src/signed_events.rs`) is stopped — a genuine read fault
+  now PROPAGATES rather than blinding the lane. The pg twin (`src/store/postgres.rs`
+  `verify_audit_trail`) reads through the SAME shared db_id-scoped reader, so it
+  inherits the fix at K3 parity.
+- **#2942 — an asi-hard cold node could not boot (rollback ROLLBACK lane).**
+  Under `AI_MEMORY_REQUIRE_ROLLBACK_CHECK=1` (pinned by `AI_MEMORY_SECURITY_PROFILE=asi-hard`)
+  a brand-new node whose witness pin is not yet enrolled (`AnchorScan::Unpinnable`)
+  was refused the open (`RollbackCheck::Missing`) — the cold-boot chicken-and-egg
+  (it must boot to RUN its own witness-enrollment ceremony). The shipped #2370-C2
+  bootstrap carve-out is extended to the `Unpinnable` require path: a genesis-less,
+  head-0 opener with NO surviving off-table head anchor boots clean. The
+  fresh-vs-wiped discriminator is the SURVIVING off-table head anchor, not
+  chain-emptiness — a DB that ran under require-mode and was later wiped left
+  anchor lines behind and stays fail-closed. No genesis row is minted on first
+  open (genesis-emit deferred to a narrow follow-up vote).
+
+Regression coverage: `tests/audit_watermark_db_id_scope_2955.rs` (two-DBs-on-one-host
+non-interference, sqlite + live-pg twin), `tests/rollback_evidence_1946.rs`
+(asi-hard cold-boot: fresh node boots, wiped node with surviving anchor refuses).
 
 ### Fixed (enterprise-federation Postgres-adapter audit; #3070 #3073 #3074)
 
