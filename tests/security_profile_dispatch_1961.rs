@@ -88,22 +88,54 @@ fn standard_posture_is_a_noop_and_command_proceeds() {
 
 /// `asi-hard` ENGAGED: the `posture == AsiHard` pin-logging branch runs and
 /// PINS the fail-closed knob set ON — including `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`
-/// (#124), which then refuses to open a fresh DB that has no off-table witness
-/// head anchor. The refusal at the db-open seam is the observable PROOF that
-/// the asi-hard branch executed and its pins took effect (the pin loop runs
-/// BEFORE the db is opened). Exercises the net-new #1961 `AsiHard` arm.
+/// (#124), which refuses to open a WIPED database at the db-open seam.
+///
+/// v1.0.0 #2942 (5-agent vote, #3089 Vote A) narrowed the open-time rollback
+/// control with a cold-boot carve-out: a genuinely FRESH asi-hard node (no
+/// surviving off-table head anchor) now BOOTS so the operator can run the
+/// witness-enrollment ceremony (covered by
+/// [`asi_hard_cold_boot_fresh_db_boots_clean_2942`]). The refuse-open PROOF that
+/// the asi-hard branch executed and its pins took effect therefore moves to a
+/// WIPED node: a `signed_events` head of 0 (genesis-less) BUT a SURVIVING
+/// off-table head anchor from a prior require-mode run whose witness pin is no
+/// longer resolvable (`Unpinnable`). The surviving-anchor discriminator
+/// (`off_table_head_anchor_present`) keeps the verdict `Missing`, so the open is
+/// refused — and ONLY under the asi-hard-pinned require-mode (under `standard`
+/// the same wiped node would open, exactly as
+/// [`standard_posture_is_a_noop_and_command_proceeds`] shows for a clean node).
+/// The wiped state is seeded DETERMINISTICALLY via an explicit
+/// `AI_MEMORY_WITNESS_KEY_DIR` (asi-hard does not pin that operator-owned dir),
+/// so the refusal never depends on ambient default-custody-dir state. Exercises
+/// the net-new #1961 `AsiHard` arm.
 #[test]
-fn asi_hard_engaged_pins_rollback_check_and_refuses_open_on_fresh_db() {
-    let (_dir, db) = fresh_db("asi-hard-engaged");
+fn asi_hard_engaged_pins_rollback_check_and_refuses_open_on_wiped_db() {
+    let (_dir, db) = fresh_db("asi-hard-engaged-wiped");
+    // Seed the wiped-vs-fresh discriminator (#2942): a SURVIVING off-table head
+    // anchor line but NO enrolled pubkey in the witness key dir → the pin is
+    // `Unpinnable` AND an anchor survives, so the cold-boot carve-out does NOT
+    // apply and the rollback verdict stays `Missing` (refuse) under require-mode.
+    let kdir = tempfile::Builder::new()
+        .prefix("asi-hard-wiped-keys-")
+        .tempdir()
+        .expect("tempdir for witness key dir");
+    std::fs::write(
+        kdir.path().join("head-anchor.log"),
+        "{\"surviving\":\"anchor-line-from-a-prior-require-mode-run\"}\n",
+    )
+    .expect("write surviving off-table anchor");
+    let kdir_s = kdir.path().to_str().expect("utf-8 witness key dir path");
     let out = run_ai_memory(
         &db,
         &["stats", "--json"],
-        &[("AI_MEMORY_SECURITY_PROFILE", "asi-hard")],
+        &[
+            ("AI_MEMORY_SECURITY_PROFILE", "asi-hard"),
+            ("AI_MEMORY_WITNESS_KEY_DIR", kdir_s),
+        ],
     );
     assert!(
         !out.status.success(),
-        "asi-hard pins require_rollback_check=1 → fresh-db open must be refused; \
-         exit={:?} stdout={}",
+        "asi-hard pins require_rollback_check=1 → a WIPED db (surviving off-table \
+         anchor, unresolvable pin) open must be refused; exit={:?} stdout={}",
         out.status.code(),
         String::from_utf8_lossy(&out.stdout)
     );
@@ -113,6 +145,47 @@ fn asi_hard_engaged_pins_rollback_check_and_refuses_open_on_fresh_db() {
             || stderr.contains("AI_MEMORY_REQUIRE_ROLLBACK_CHECK"),
         "expected the asi-hard-pinned rollback-check refusal; stderr={stderr}"
     );
+}
+
+/// v1.0.0 #2942 (5-agent vote, #3089 Vote A) — the asi-hard COLD-BOOT carve-out
+/// at the subprocess dispatch seam (the companion of
+/// [`asi_hard_engaged_pins_rollback_check_and_refuses_open_on_wiped_db`]). A
+/// genuinely fresh asi-hard node — genesis-less, `signed_events` head 0, witness
+/// pin NOT yet enrolled, and NO surviving off-table head anchor on the mount —
+/// must BOOT CLEAN under the asi-hard-pinned require-mode, so the operator can
+/// run the witness-enrollment ceremony (the cold-boot chicken-and-egg). Same
+/// asi-hard pins as the wiped case; only the surviving-anchor discriminator
+/// differs, flipping the verdict from `Missing` (refuse) to `NotApplicable`
+/// (proceed). The witness key dir is pointed at an EMPTY dir so the custody
+/// state is deterministic: no pubkey (unenrolled pin) and no `head-anchor.log`
+/// (nothing to roll back FROM).
+#[test]
+fn asi_hard_cold_boot_fresh_db_boots_clean_2942() {
+    let (_dir, db) = fresh_db("asi-hard-cold-fresh");
+    let kdir = tempfile::Builder::new()
+        .prefix("asi-hard-fresh-keys-")
+        .tempdir()
+        .expect("tempdir for empty witness key dir");
+    let kdir_s = kdir.path().to_str().expect("utf-8 witness key dir path");
+    let out = run_ai_memory(
+        &db,
+        &["stats", "--json"],
+        &[
+            ("AI_MEMORY_SECURITY_PROFILE", "asi-hard"),
+            ("AI_MEMORY_WITNESS_KEY_DIR", kdir_s),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "asi-hard #2942 cold-boot carve-out: a genuinely fresh db (unenrolled \
+         pin + head-0 + no surviving off-table anchor) must BOOT CLEAN under \
+         require-mode; exit={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("stats --json parses on a cold-boot asi-hard fresh db");
+    assert_eq!(v["total"], 0, "fresh cold-boot db has zero memories; got: {v}");
 }
 
 /// `asi-hard` + an operator LOOSENING override below the hard floor: boot is
