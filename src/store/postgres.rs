@@ -173,6 +173,43 @@ const SQL_CLEAR_LOCK_TIMEOUT: &str = "SET lock_timeout = 0";
 /// 3,000,000 rows / 1,520 MB built in 5.24 s plain, 5.57 s CONCURRENTLY.
 const INDEX_BUILD_TIMEOUT_MS: u64 = 900_000;
 
+/// v1.0.0 #3074 — CLOSE (never return to the pool) a connection whose
+/// per-session `statement_timeout` / `lock_timeout` GUCs were RELAXED for a
+/// one-shot bootstrap, migrate, or `CREATE INDEX CONCURRENTLY` build.
+///
+/// Those relaxations are plain `SET`s ([`SQL_CLEAR_STATEMENT_TIMEOUT`] /
+/// [`SQL_CLEAR_LOCK_TIMEOUT`] / [`INDEX_BUILD_TIMEOUT_MS`]) rather than
+/// `SET LOCAL`, because `SET LOCAL` is transaction-scoped and cannot span the
+/// NON-transactional `pg_advisory_lock` session or a `CREATE INDEX
+/// CONCURRENTLY` (which is rejected inside a transaction). sqlx does NOT reset
+/// GUC state when a pooled connection is returned (acknowledged at the AGE
+/// `ensure_memory_graph` call site), so simply dropping the connection re-enters
+/// it into the pool PERMANENTLY OUTSIDE the `after_connect` safety envelope —
+/// the audit-observed `statement_timeout = 0` (bootstrap / migrate lock
+/// connections) and the index-build connection's `lock_timeout = 0` /
+/// 900 s statement bound. A subsequent normal query that happens to check that
+/// connection out then runs UNBOUNDED at the DB layer, defeating the M4/M7
+/// runaway-query guard.
+///
+/// Detaching + closing the connection instead lets the pool SELF-HEAL: it opens
+/// a fresh connection on the next demand and `after_connect` re-applies the
+/// bounded envelope. The one-time reconnect cost is paid only at boot / migrate
+/// / first-index-build, never on the request hot path. The graceful close is
+/// best-effort — the physical connection is closed regardless (the advisory
+/// lock, when held, is already released explicitly by the caller and would drop
+/// on close anyway).
+async fn close_timeout_relaxed_conn(conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
+    use sqlx::Connection as _;
+    if let Err(e) = conn.detach().close().await {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            err = %e,
+            "#3074: graceful close of a timeout-relaxed pool connection failed; \
+             it is dropped (physically closed) regardless"
+        );
+    }
+}
+
 /// v1.0.0 #2578 — one v88 composite ordering index. `create_sql` and
 /// `drop_sql` are single statements by construction: `CREATE INDEX
 /// CONCURRENTLY` is rejected inside a transaction block, and sqlx's simple
@@ -1588,7 +1625,10 @@ impl PostgresStore {
         let _ = sqlx::query("SELECT pg_advisory_unlock_all()")
             .execute(&mut *bootstrap_lock_conn)
             .await;
-        drop(bootstrap_lock_conn);
+        // v1.0.0 #3074 — this connection had its `statement_timeout` /
+        // `lock_timeout` cleared to 0 above; CLOSE it rather than dropping it
+        // back into the pool UNBOUNDED (see `close_timeout_relaxed_conn`).
+        close_timeout_relaxed_conn(bootstrap_lock_conn).await;
 
         bootstrap_result
     }
@@ -2027,7 +2067,10 @@ impl PostgresStore {
         let _ = sqlx::query("SELECT pg_advisory_unlock_all()")
             .execute(&mut *lock_conn)
             .await;
-        drop(lock_conn);
+        // v1.0.0 #3074 — CLOSE the timeout-relaxed lock connection instead of
+        // returning it to the pool with `statement_timeout = 0` (see
+        // `close_timeout_relaxed_conn`).
+        close_timeout_relaxed_conn(lock_conn).await;
 
         result
     }
@@ -5204,6 +5247,10 @@ impl PostgresStore {
                     "#2578: could not relax timeouts on the index-build connection; \
                      skipping the build (reads fall back to the pre-v88 plan)"
                 );
+                // v1.0.0 #3074 — the first `SET` may already have relaxed a
+                // timeout on this connection; CLOSE it rather than returning it
+                // to the pool half-relaxed (see `close_timeout_relaxed_conn`).
+                close_timeout_relaxed_conn(conn).await;
                 return status;
             }
         }
@@ -5259,6 +5306,11 @@ impl PostgresStore {
                 }
             }
         }
+        // v1.0.0 #3074 — this connection carries `lock_timeout = 0` +
+        // a 900 s `statement_timeout`; CLOSE it so it does not re-enter the
+        // pool outside the `after_connect` safety envelope (see
+        // `close_timeout_relaxed_conn`).
+        close_timeout_relaxed_conn(conn).await;
         status
     }
 
@@ -19957,6 +20009,17 @@ impl MemoryStore for PostgresStore {
                        $9::text IS NULL
                        OR COALESCE(metadata->>'scope', 'private') <> 'private'
                        OR metadata->>'agent_id' = $9
+                       -- v1.0.0 #3070 — inbox carve-out PARITY with the FTS
+                       -- pool (see the matching clause on the FTS query
+                       -- above) + sqlite `db::recall_hybrid`. Without this a
+                       -- scope=private row targeted at the caller
+                       -- (`metadata.target_agent_id == caller`) surfaced via
+                       -- the FTS pool but was silently dropped from the
+                       -- SEMANTIC pool, so it never received a cosine score
+                       -- and could be crowded out of the blended top-k.
+                       -- Fail-closed + completeness-only: it can only ADD a
+                       -- row the caller is already entitled to see.
+                       OR metadata->>'target_agent_id' = $9
                    )
                    -- v1.0.0 #2167 §3.4 — the embedding-space gate as a SQL
                    -- predicate: a stored vector is scored ONLY when its

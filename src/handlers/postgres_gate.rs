@@ -51,14 +51,22 @@ use super::{AppState, StorageBackend};
 #[cfg(feature = "sal")]
 #[must_use]
 pub fn postgres_not_implemented(endpoint: &'static str) -> Response {
-    // #934 (Track C, 2026-05-20) — for `/api/v1/find_paths` callers
-    // who hit this fallback on a pre-alias binary, point at the
-    // canonical `/api/v1/kg/find_paths` so the remediation hint is
-    // actually actionable. The alias landed in `src/lib.rs` so
-    // /find_paths no longer reaches this gate at runtime on a
-    // current binary — this branch survives so historic clients on
-    // older binaries still get a useful pointer instead of a
-    // confusing "feature missing" message.
+    // #934 (Track C, 2026-05-20; comment corrected #3070/#3073, v1.0.0) —
+    // for `/api/v1/find_paths` callers who hit this fallback, point at the
+    // canonical `/api/v1/kg/find_paths` so the remediation hint is actually
+    // actionable. NOTE: on a POSTGRES-backed daemon the bare `/find_paths`
+    // path DOES still reach this gate and returns 501. The router alias in
+    // `src/lib.rs` registers the bare path (so it works on sqlite and is a
+    // known production route — see `path_is_registered_route`), but the
+    // postgres surface gate (`postgres_endpoint_supported`) allow-lists only
+    // `KG_FIND_PATHS`, NOT the bare `FIND_PATHS`, so `postgres_route_gate`
+    // shields the bare path with this 501 on postgres. The earlier claim that
+    // "/find_paths no longer reaches this gate on a current binary" was true
+    // only for the sqlite router path; it was never true on postgres. This
+    // branch is therefore load-bearing (not merely a courtesy for historic
+    // clients): it hands every bare-`/find_paths` caller on a postgres daemon
+    // the canonical `/api/v1/kg/find_paths` path instead of a bare
+    // "feature missing" message.
     let remediation = if endpoint == super::routes::FIND_PATHS {
         "POST /api/v1/kg/find_paths instead (same handler; the bare /find_paths path is now an alias on v0.7.0+ binaries). Accepts both `source_id`/`target_id` and `from_id`/`to_id` body fields."
     } else {

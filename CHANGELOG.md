@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (enterprise-federation Postgres-adapter audit; #3070 #3073 #3074)
+
+Three LOW-severity Postgres-adapter findings from the enterprise-federation
+audit (epic #3076), fixed in one cohesive change.
+
+- **#3070 — the pg SEMANTIC recall pool dropped inbox-targeted private rows.**
+  The FTS pool's `scope=private` visibility clause carries a
+  `metadata.target_agent_id == caller` inbox carve-out (matching sqlite
+  `db::recall_hybrid`), but the semantic (pgvector cosine) pool's clause
+  omitted it — so a `scope=private` row targeted at the caller surfaced via
+  FTS yet never received a cosine score, and could be crowded out of the
+  blended top-k. The carve-out is added to the semantic clause
+  (`src/store/postgres.rs`). Completeness-only and fail-closed: it can only
+  ADD a row the caller is already entitled to see.
+- **#3074 — bootstrap/migrate/index-build connections returned to the pool
+  UNBOUNDED.** The `after_connect` hook bounds every pooled connection with a
+  30 s `statement_timeout`, but the bootstrap + migrate advisory-lock
+  connections cleared it to `0` (and the `CREATE INDEX CONCURRENTLY`
+  connection relaxed it to 900 s + `lock_timeout = 0`) via a plain `SET`.
+  sqlx does not reset GUC state when a connection returns to the pool, so a
+  later normal query checking out that connection ran with no server-side
+  bound (the audit-observed `statement_timeout = 0`). Those connections are
+  now CLOSED (`close_timeout_relaxed_conn`) instead of returned, so the pool
+  self-heals through `after_connect`. Data-integrity: bounds a runaway
+  AGE/pgvector query at the DB layer.
+- **#3073 — stale comment in `postgres_not_implemented`.** The comment
+  claimed the bare `/api/v1/find_paths` alias "no longer reaches this gate
+  at runtime on a current binary"; on a Postgres-backed daemon it still does
+  (the router registers the alias, but `postgres_endpoint_supported`
+  allow-lists only `kg/find_paths`), so the bare path is correctly 501-gated
+  and the remediation hint pointing to `/api/v1/kg/find_paths` is
+  load-bearing. Comment corrected (`src/handlers/postgres_gate.rs`).
+
+Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
+
 ### Fixed (Batman auto-atomisation was structurally inert product-wide; #2983 #2984 #2985 #2986 #2987)
 
 Implements the ratified 5-agent adversarial verdict (protocol `4d3ea1c5`,
