@@ -155,68 +155,100 @@ pub async fn migrate(
         ..MigrationReport::default()
     };
 
-    // Migration strategy (blocker #298 fix).
+    // Migration strategy — real OFFSET pagination (#1876 fix; restores the
+    // documented "streams in pages" contract).
     //
-    // The earlier pagination used `created_at` as the cursor, but
-    // adapter `list` returns rows ordered by `priority DESC, updated_at
-    // DESC`. Low-priority memories newer than page-1's `min(created_at)`
-    // were permanently skipped — the priority-ordered page didn't
-    // include them, and the created_at cursor then filtered them out on
-    // the next call. That's data loss, silently.
+    // History (blocker #298): an earlier attempt paged on a `created_at`
+    // cursor, but `list` orders by `priority DESC, updated_at DESC`, so
+    // low-priority rows newer than page-1's `min(created_at)` were skipped
+    // — silent data loss. The interim "fix" was a SINGLE `list` call with
+    // `limit = MAX_ROWS`; but both adapters clamp `list` to
+    // `LIST_MAX_LIMIT` (= 1000) and, until #1876, ignored any offset, so the
+    // single call structurally returned only the first <=1000 rows AND the
+    // `>= MAX_ROWS` saturation guard never fired (1000 < 1_000_000) — every
+    // corpus past 1000 memories was silently truncated while the report
+    // said `errors: 0`. That is exactly the loss the #298 comment swore to
+    // prevent.
     //
-    // For v0.6.0 we migrate in a single `list` call capped at MAX_ROWS.
-    // The caller's `batch_size` parameter is kept for API compatibility
-    // but is NOT used to cap total rows — it's a hint for the future
-    // streaming migrate tool (tracked in v0.7 as
-    // `MemoryStore::list_all`).
-    //
-    // Correctness > throughput: a correct single-call migrate is
-    // strictly preferable to a paginated migrate that silently drops
-    // rows. If the source exceeds MAX_ROWS the migration refuses
-    // loudly rather than truncating.
+    // The correct design: page over the SAME stable total order both
+    // adapters already emit — `ORDER BY priority DESC, updated_at DESC,
+    // id ASC` — whose UNIQUE `id` final tiebreak makes OFFSET paging over a
+    // static source skip/dup-free. `batch_size` is the documented page-size
+    // hint; a single page is <= `LIST_MAX_LIMIT` by design, so clamp the
+    // hint into `1..=LIST_MAX_LIMIT` (the default 1000 == the clamp cap).
+    // A TOTAL cap of `MAX_ROWS` still refuses loudly rather than migrating
+    // an unbounded corpus.
     const MAX_ROWS: usize = 1_000_000;
-    let _ = batch_size; // Retained for API compatibility; see comment above.
-
-    let filter = Filter {
-        namespace: namespace_filter.clone(),
-        until: None,
-        limit: MAX_ROWS,
-        ..Filter::default()
-    };
-    let page = match from.list(&ctx, &filter).await {
-        Ok(p) => p,
-        Err(e) => {
-            report.errors.push(format!("source list failed: {e}"));
-            return report;
-        }
-    };
-
-    // Detect cap saturation. If the source returned exactly MAX_ROWS
-    // memories, refuse rather than risk silent truncation. Operators
-    // with >1M memories need the streaming migrate (v0.7).
-    if page.len() >= MAX_ROWS {
-        report.errors.push(format!(
-            "source has >= {} memories; single-call migrate cap reached. \
-             Use the streaming migrate tool (v0.7+) instead of \
-             silently dropping rows.",
-            MAX_ROWS
-        ));
-        return report;
-    }
+    let page_size = batch_size.clamp(1, crate::storage::LIST_MAX_LIMIT);
 
     let mut seen: HashSet<String> = HashSet::new();
-    report.batches = 1;
-    for mem in &page {
-        if !seen.insert(mem.id.clone()) {
-            continue;
-        }
-        report.memories_read += 1;
-        if !dry_run {
-            match to.store(&ctx, mem).await {
-                Ok(_) => report.memories_written += 1,
-                Err(e) => report.errors.push(format!("write {} failed: {e}", mem.id)),
+    let mut offset: usize = 0;
+    loop {
+        let filter = Filter {
+            namespace: namespace_filter.clone(),
+            limit: page_size,
+            offset,
+            ..Filter::default()
+        };
+        let page = match from.list(&ctx, &filter).await {
+            Ok(p) => p,
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("source list failed at offset {offset}: {e}"));
+                return report;
+            }
+        };
+        let page_len = page.len();
+        report.batches += 1;
+        for mem in &page {
+            // `seen` is belt-and-suspenders over the stable-ordered offset
+            // walk (a static source yields no duplicates); it also guards a
+            // source mutated mid-migrate from double-writing a row.
+            if !seen.insert(mem.id.clone()) {
+                continue;
+            }
+            // Total-rows cap: refuse LOUDLY before crossing MAX_ROWS rather
+            // than silently truncating (the documented streaming contract).
+            if report.memories_read >= MAX_ROWS {
+                report.errors.push(format!(
+                    "source exceeds the {MAX_ROWS}-memory migrate cap; \
+                     refusing to continue rather than risk silent truncation"
+                ));
+                return report;
+            }
+            report.memories_read += 1;
+            if !dry_run {
+                match to.store(&ctx, mem).await {
+                    Ok(_) => report.memories_written += 1,
+                    Err(e) => report.errors.push(format!("write {} failed: {e}", mem.id)),
+                }
             }
         }
+        // A short page means the stable-ordered offset walk has reached the
+        // end of the source. `page_size >= 1`, so this always terminates.
+        if page_len < page_size {
+            break;
+        }
+        offset += page_len;
+    }
+
+    // Completeness safety — never let an INCOMPLETE migrate report success.
+    // The paginator reads the source to exhaustion, so `memories_read` is
+    // the authoritative count of migratable rows (the SAME expiry +
+    // lifecycle filter `list` applies on both backends; a separate raw
+    // COUNT(*) would over-count legitimately-excluded expired/tombstoned
+    // rows, which is why no independent count is taken here). Every read
+    // either writes-ok or records an error, so `written < read` with an
+    // empty error set is structurally impossible today — assert it so any
+    // future regression that silently drops a write FAILS LOUDLY instead of
+    // minting a false success.
+    if !dry_run && report.errors.is_empty() && report.memories_written != report.memories_read {
+        report.errors.push(format!(
+            "incomplete migrate: read {} memories but wrote {} with no \
+             recorded error — refusing to report success",
+            report.memories_read, report.memories_written
+        ));
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -248,6 +280,13 @@ pub async fn migrate(
     //
     // Dry-run mode skips every write but still tallies `links_read`
     // so operators can size the migration before committing.
+    // #1876 — unlike `list`, `list_links` is NOT subject to the
+    // `LIST_MAX_LIMIT` clamp on EITHER adapter: both `SqliteStore::list_links`
+    // and `PostgresStore::list_links` issue a single unbounded
+    // `SELECT ... ORDER BY (source_id, target_id, relation)` with no `LIMIT`,
+    // so this call returns the full edge set in one pass. There is no second
+    // silent-truncation path here to paginate; the deterministic key ordering
+    // is documented on both impls as resume-safe should that ever change.
     let link_filter = namespace_filter.as_deref();
     let links = match from.list_links(link_filter).await {
         Ok(rows) => rows,
@@ -414,9 +453,10 @@ mod tests {
         let report = migrate(&src, &dst, 2, None, false).await;
         assert_eq!(report.memories_read, 5);
         assert_eq!(report.memories_written, 5);
-        // v0.6.0 migrate is single-call (blocker #298 fix); batch_size
-        // parameter retained for API compat but doesn't force pagination.
-        assert_eq!(report.batches, 1);
+        // #1876 — migrate genuinely PAGES again: 5 rows at page_size 2 =
+        // pages of 2, 2, 1 (the last short page terminates the walk).
+        assert_eq!(report.batches, 3);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
         // Verify destination has them all.
         for i in 0..5 {
             let got = dst.get(&ctx, &format!("m{i}")).await.expect("get dst");
@@ -481,6 +521,71 @@ mod tests {
         assert!(dst.get(&ctx, "ns-m1").await.is_ok());
         assert!(dst.get(&ctx, "ns-m2").await.is_ok());
         assert!(dst.get(&ctx, "ns-m3").await.is_err());
+    }
+
+    /// Count every row in `ns` via the SAME stable-ordered OFFSET paging the
+    /// migrator uses — the only way to tally a corpus larger than
+    /// `LIST_MAX_LIMIT` (a single `list` clamps to <=1000).
+    async fn count_ns(store: &dyn MemoryStore, ctx: &CallerContext, ns: &str) -> usize {
+        let mut offset = 0usize;
+        let mut total = 0usize;
+        loop {
+            let f = Filter {
+                namespace: Some(ns.to_string()),
+                limit: crate::storage::LIST_MAX_LIMIT,
+                offset,
+                ..Filter::default()
+            };
+            let page = store.list(ctx, &f).await.expect("list page");
+            let n = page.len();
+            total += n;
+            if n < crate::storage::LIST_MAX_LIMIT {
+                break;
+            }
+            offset += n;
+        }
+        total
+    }
+
+    /// #1876 regression — a corpus LARGER than `LIST_MAX_LIMIT` (1000) must
+    /// migrate COMPLETELY. Before the fix `migrate` did a single clamped
+    /// `list` call (offset hardcoded to 0), so it read exactly the first
+    /// 1000 rows and reported `errors: 0` — silent data loss on every
+    /// corpus past 1000 memories. This pins the OFFSET paginator: all 2500
+    /// rows land, across multiple batches, with zero errors.
+    #[tokio::test]
+    async fn migrate_paginates_past_list_max_limit() {
+        const N: usize = 2500;
+        assert!(
+            N > crate::storage::LIST_MAX_LIMIT,
+            "test must exceed the per-page clamp to be meaningful"
+        );
+        let src_tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src = SqliteStore::open(src_tmp.path()).unwrap();
+        let dst = SqliteStore::open(dst_tmp.path()).unwrap();
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_MIGRATE);
+
+        for i in 0..N {
+            let mem = sample_memory(
+                &format!("mem-{i:05}"),
+                "pagination-test",
+                &format!("row {i}"),
+            );
+            src.store(&ctx, &mem).await.unwrap();
+        }
+
+        let report = migrate(&src, &dst, 1000, Some("pagination-test".to_string()), false).await;
+
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert_eq!(report.memories_read, N, "must READ every source row");
+        assert_eq!(report.memories_written, N, "must WRITE every source row");
+        // 2500 rows at page_size 1000 = pages of 1000, 1000, 500.
+        assert_eq!(report.batches, 3, "must page, not single-call truncate");
+
+        // Independent completeness proof: the destination holds all N rows.
+        let dst_count = count_ns(&dst, &ctx, "pagination-test").await;
+        assert_eq!(dst_count, N, "destination must hold every migrated row");
     }
 
     // ----------------------------------------------------------------

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (`ai-memory migrate` silently dropped every row past the first 1000; #1876)
+
+- **Data-loss: cross-backend `migrate` truncated to the first `LIST_MAX_LIMIT`
+  (1000) memories and reported `errors: 0`.** `migrate::migrate` issued a
+  SINGLE `from.list()` call with `filter.limit = MAX_ROWS` (1_000_000), but
+  both SAL adapters clamp `list` to `LIST_MAX_LIMIT` (1000) and — until this
+  fix — ignored any offset (`SqliteStore::list` passed a hardcoded `0`;
+  `PostgresStore::list` bound no `OFFSET`), so a `migrate` of a corpus larger
+  than 1000 rows persisted only the first 1000 and the `>= MAX_ROWS`
+  saturation guard never fired (1000 < 1_000_000). A 7,888-row hive migrated
+  as `memories_read: 1000, batches: 1` with a clean report. `migrate` now
+  PAGES over the stable total order both adapters already emit
+  (`priority DESC, updated_at DESC, id ASC` — a UNIQUE `id` tiebreak makes
+  OFFSET paging over a static source skip/dup-free), honoring `--batch` as the
+  documented page-size hint, keeping the `MAX_ROWS` total-rows refusal, and
+  adding a completeness guard that pushes a LOUD error rather than reporting
+  success on an incomplete read. Restores the module's own documented
+  "streams in pages" contract. Mechanism: a new `Filter.offset` field
+  (`Default` 0, so every existing call site is byte-identical) threaded into
+  each adapter's `LIMIT ... OFFSET`. `list_links` is unbounded on both
+  adapters and needs no pagination. Pinned by
+  `migrate::tests::migrate_paginates_past_list_max_limit` (sqlite→sqlite,
+  2500 rows). This is a single-correct-answer bug fix restoring the
+  documented contract via the pagination the SQL layer already implements
+  (crossroads-protocol exempt).
+
 ### Fixed (Batman auto-atomisation was structurally inert product-wide; #2983 #2984 #2985 #2986 #2987)
 
 Implements the ratified 5-agent adversarial verdict (protocol `4d3ea1c5`,

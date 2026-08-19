@@ -750,6 +750,17 @@ pub struct Filter {
     /// valid-time filter.
     pub valid_at: Option<String>,
     pub limit: usize,
+    /// v1.0.0 #1876 — OFFSET for paged listing over a STABLE-ordered source.
+    /// Both adapters order by `priority DESC, updated_at DESC, id ASC` (a
+    /// UNIQUE `id` final tiebreak — `build_list_query` on sqlite, the
+    /// `COLLATE "C"` clause on postgres), so a static source paged by
+    /// incrementing `offset` by the prior page length walks the full result
+    /// set with NO skips or duplicates. Threaded into each backend's
+    /// `LIMIT ... OFFSET` bind. Defaults to `0` (`#[derive(Default)]`), so
+    /// every existing `..Filter::default()` / `..Default::default()` call
+    /// site is byte-identical. Set by the migrate paginator
+    /// (`crate::migrate`); the recall path leaves it at 0.
+    pub offset: usize,
     /// v1.0.0 #2167 §3 — the live embedder's space fingerprint for a
     /// semantic `recall_hybrid`. `Some(fp)` gates every stored vector
     /// against `fp` so recall never scores a vector from a different
