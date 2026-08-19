@@ -186,6 +186,31 @@ daemon at boot (the witness-mount write-authority invariant is preserved).
 Regression coverage: `tests/audit_watermark_db_id_scope_2955.rs` (two-DBs-on-one-host
 non-interference, sqlite + live-pg twin), `tests/rollback_evidence_1946.rs`
 (asi-hard cold-boot: fresh node boots, wiped node with surviving anchor refuses).
+### Fixed (re-store silently shortened a TTL — LOCAL write funnels now FLOOR expiry; #2515)
+
+- **Data-loss: a re-store / upsert could SILENTLY SHORTEN a live memory's TTL
+  (#2515, GA Wave-1 data-integrity blocker).** Every LOCAL create/upsert
+  funnel merges an incoming `(title, namespace)` row onto the existing one.
+  The `expires_at` arm was the lattice-BLIND
+  `ELSE COALESCE(excluded.expires_at, memories.expires_at)`, which adopts the
+  INCOMING expiry verbatim — so re-storing the same `(title, namespace)` with
+  an EARLIER expiry rolled a live row's TTL BACKWARDS, a #1596
+  never-move-expiry-earlier violation and unintentional data loss (premature
+  GC reap → permanent link-edge loss under the v70 auto-eviction posture).
+  Every such arm now applies the shipped #2335 tier-aware lattice FLOOR
+  (`MAX` on sqlite `storage::insert_inner`, `GREATEST` on the five postgres
+  funnels `store` / `store_batch` / `capture_turn_idempotent` /
+  `recover_turn_idempotent` / `store_with_embedding_inner`, over the
+  COALESCE'd pair): a mid/short-tier re-store converges on the LATER expiry
+  regardless of store order, and a long-tier row pins to NULL (#1626). The
+  EXPLICIT-shortening `memory_update` / `db::update` path is deliberately
+  UNCHANGED — it stays the only sanctioned TTL-shortener. Per 5-agent vote
+  ([#3089](https://github.com/alphaonedev/ai-memory-mcp/issues/3089) Vote C).
+  Regression coverage: `tests/expiry_floor_restore_2515.rs` (sqlite +
+  live-pg-gated). New static guard
+  `tests/qual_expiry_floor_local_write_funnel_2515.rs` forbids a bare
+  `COALESCE(excluded.expires_at, memories.expires_at)` on any LOCAL write
+  funnel (source-scan, executable-SQL-only).
 
 ### Fixed (enterprise-federation Postgres-adapter audit; #3070 #3073 #3074)
 
