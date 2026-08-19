@@ -1285,6 +1285,8 @@ pub async fn session_start(
             until: None,
             valid_at: None,
             limit,
+            // #1876 — subscription-mirror listing serves the first window.
+            offset: 0,
             active_embedding_space: None,
             // #2580 — metadata-equality pushdown axis unused on this path.
             metadata_eq: None,

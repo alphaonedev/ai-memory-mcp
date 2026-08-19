@@ -43,6 +43,7 @@ async fn sqlite_list_clamps_limit_to_list_max_limit_1877() {
         until: None,
         valid_at: None,
         limit: 5000, // > LIST_MAX_LIMIT
+        offset: 0,   // #1876 — clamp behavior is unchanged at offset 0
         active_embedding_space: None,
         // #2580 — metadata-equality pushdown axis unused on this path.
         metadata_eq: None,

@@ -401,13 +401,19 @@ impl MemoryStore for SqliteStore {
             // #1877 — clamp to `LIST_MAX_LIMIT` for SAL parity with
             // `PostgresStore::list` (which clamps to the same cap). Without this
             // a caller with `limit > 1000` read a different window per backend.
-            // Paging past the first window rides #1876 (a `Filter` offset).
+            // A single page is <= LIST_MAX_LIMIT by design; #1876 (below) pages
+            // PAST the first window via `filter.offset`.
             if filter.limit == 0 {
                 100
             } else {
                 filter.limit.min(crate::storage::LIST_MAX_LIMIT)
             },
-            0,
+            // #1876 — thread the `Filter` OFFSET (was a hardcoded `0`, which
+            // structurally capped `list` at the first <=1000-row window and
+            // silently truncated every paged consumer — the migrate data-loss
+            // class). `build_list_query`'s stable `id ASC` tiebreak makes
+            // offset paging skip/dup-free over a static source.
+            filter.offset,
             None,
             since.as_deref(),
             until.as_deref(),

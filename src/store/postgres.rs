@@ -18189,11 +18189,21 @@ impl MemoryStore for PostgresStore {
         // so `{"family": 123}` / `null` / `["core"]` / a NESTED
         // `{"a":{"family":"core"}}` all correctly fail to match, identically
         // to `metadata.get(k).and_then(Value::as_str) == Some(v)`.
+        // #1876 — `$9` is the always-present OFFSET bind (below), so the
+        // conditional metadata-equality axis shifts to `$10`/`$11`.
         let metadata_eq_predicate = if filter.metadata_eq.is_some() {
-            "AND metadata @> jsonb_build_object($9::text, $10::text)"
+            "AND metadata @> jsonb_build_object($10::text, $11::text)"
         } else {
             ""
         };
+        // #1876 — thread the `Filter` OFFSET so the postgres adapter pages
+        // identically to sqlite (SAL parity — both clamp LIMIT to
+        // LIST_MAX_LIMIT and page PAST the first window via OFFSET). The
+        // `ORDER BY ... id COLLATE "C" ASC` tiebreak (#2602) makes offset
+        // paging skip/dup-free over a static source. Always bound as `$9`
+        // (never conditional) so the placeholder number is stable regardless
+        // of the metadata-equality axis.
+        let offset: i64 = i64::try_from(filter.offset).unwrap_or(i64::MAX);
         // v1.0.0 #2602 — `id ASC` is the FINAL total-order tiebreak, IDENTICAL
         // to the sqlite twin (`storage::build_list_query`) + the
         // `memory_load_family` loader: `(priority, updated_at)` ties are common,
@@ -18230,7 +18240,7 @@ impl MemoryStore for PostgresStore {
                {metadata_eq_predicate}
                {lifecycle_vis}
              ORDER BY priority DESC, updated_at DESC, id COLLATE \"C\" ASC
-             LIMIT $5",
+             LIMIT $5 OFFSET $9",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list. Also
             // covers the export egress: `export_memories` delegates to `list`.
             // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS).
@@ -18257,7 +18267,10 @@ impl MemoryStore for PostgresStore {
             // comparison is exactly instant comparison.
             .bind(crate::validate::canonical_valid_time_opt(
                 filter.valid_at.as_deref(),
-            ));
+            ))
+            // #1876 — OFFSET ($9), always bound so the placeholder number is
+            // fixed; the conditional metadata-equality binds follow as $10/$11.
+            .bind(offset);
         let rows = match metadata_eq_binds {
             Some((k, v)) => rows.bind(k).bind(v),
             None => rows,

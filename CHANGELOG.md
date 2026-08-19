@@ -41,6 +41,49 @@ audit (epic #3076), fixed in one cohesive change.
   load-bearing. Comment corrected (`src/handlers/postgres_gate.rs`).
 
 Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
+### Fixed (`ai-memory migrate` dropped rows past 1000 AND never copied embeddings; #1876 #3060)
+
+- **Data-loss: cross-backend `migrate` copied memory TEXT but NOT the
+  embedding VECTORS (#3060 / F4).** `store()` carries the durable `Memory`
+  struct, but a memory's embedding lives in a separate column (sqlite
+  side-table / postgres pgvector) that the struct does not carry, so a
+  migrated corpus landed with `embedding IS NOT NULL = 0`. Under a certified
+  `AI_MEMORY_INFERENCE_EGRESS=loopback-only`/`deny` posture the destination's
+  external embedder cannot re-derive them, and re-embedding under a different
+  model would change the #2167 `embedding_space` fingerprint. `migrate` now
+  has a Phase 3 that copies each migrated row's stored `(vector, space)`
+  verbatim via `get_embedding_with_space` → `set_embeddings_batch` (bucketed
+  by space, paged) — NEVER re-embedding, NEVER synthesizing a space — records
+  `embeddings_copied` in the `MigrationReport`, and pushes a LOUD error if the
+  copied count falls short of the source's embedded-row count. Reuses existing
+  SAL methods only (no new trait surface). Pinned by
+  `migrate::tests::migrate_copies_embeddings_and_preserves_space`.
+
+### Fixed (`ai-memory migrate` silently dropped every row past the first 1000; #1876)
+
+- **Data-loss: cross-backend `migrate` truncated to the first `LIST_MAX_LIMIT`
+  (1000) memories and reported `errors: 0`.** `migrate::migrate` issued a
+  SINGLE `from.list()` call with `filter.limit = MAX_ROWS` (1_000_000), but
+  both SAL adapters clamp `list` to `LIST_MAX_LIMIT` (1000) and — until this
+  fix — ignored any offset (`SqliteStore::list` passed a hardcoded `0`;
+  `PostgresStore::list` bound no `OFFSET`), so a `migrate` of a corpus larger
+  than 1000 rows persisted only the first 1000 and the `>= MAX_ROWS`
+  saturation guard never fired (1000 < 1_000_000). A 7,888-row hive migrated
+  as `memories_read: 1000, batches: 1` with a clean report. `migrate` now
+  PAGES over the stable total order both adapters already emit
+  (`priority DESC, updated_at DESC, id ASC` — a UNIQUE `id` tiebreak makes
+  OFFSET paging over a static source skip/dup-free), honoring `--batch` as the
+  documented page-size hint, keeping the `MAX_ROWS` total-rows refusal, and
+  adding a completeness guard that pushes a LOUD error rather than reporting
+  success on an incomplete read. Restores the module's own documented
+  "streams in pages" contract. Mechanism: a new `Filter.offset` field
+  (`Default` 0, so every existing call site is byte-identical) threaded into
+  each adapter's `LIMIT ... OFFSET`. `list_links` is unbounded on both
+  adapters and needs no pagination. Pinned by
+  `migrate::tests::migrate_paginates_past_list_max_limit` (sqlite→sqlite,
+  2500 rows). This is a single-correct-answer bug fix restoring the
+  documented contract via the pagination the SQL layer already implements
+  (crossroads-protocol exempt).
 
 ### Fixed (Batman auto-atomisation was structurally inert product-wide; #2983 #2984 #2985 #2986 #2987)
 
