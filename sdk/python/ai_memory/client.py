@@ -301,7 +301,7 @@ class AiMemoryClient:
         agent_id: str | None = None,
         as_agent: str | None = None,
     ) -> list[Memory]:
-        """``GET /api/v1/search`` — FTS keyword AND search."""
+        """``GET /api/v1/search`` — FTS keyword OR search (matches any token)."""
         raw = self._request(
             "GET",
             "/api/v1/search",

@@ -422,7 +422,7 @@ export class AiMemoryClient {
     });
   }
 
-  /** `GET /api/v1/search` — AND keyword search (read-only). */
+  /** `GET /api/v1/search` — keyword OR search (matches any token, read-only). */
   async search(
     query: SearchQuery,
     opts?: RequestOptions,
