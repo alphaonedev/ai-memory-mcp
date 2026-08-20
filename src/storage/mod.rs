@@ -1832,8 +1832,22 @@ fn insert_inner(
                             WHEN excluded.tier = 'mid' THEN 'mid'
                             ELSE memories.tier END,
                 updated_at = excluded.updated_at,
+                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
+                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
+                -- COALESCE(excluded.expires_at, memories.expires_at) adopted the
+                -- incoming row's expiry verbatim, so re-storing the same
+                -- (title, namespace) with an EARLIER expiry silently rolled a
+                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
+                -- violation (premature GC reap / permanent link-edge loss under
+                -- the v70 auto-eviction posture). Mirrors EXACTLY the shipped
+                -- #2335 federation extension-FLOOR lattice join (scalar MAX over
+                -- the COALESCE'd pair, both operands funnel-canonical per #2332):
+                -- the merge converges on the LATER expiry regardless of store
+                -- order. Long⇒NULL keeps the #1626 immortality coupling. EXPLICIT
+                -- shortening stays ONLY on the memory_update / db::update path.
                 expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                                  ELSE COALESCE(excluded.expires_at, memories.expires_at) END,
+                                  ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
+                                           COALESCE(memories.expires_at, excluded.expires_at)) END,
                 -- #1784 — preserve immutable provenance keys (agent_id + the
                 -- consolidation derived_from / consolidated_from_agents arrays)
                 -- across upsert. json_patch overlays the existing row's

@@ -16021,9 +16021,23 @@ impl MemoryStore for PostgresStore {
                 -- #1629 — sqlite parity: long-tier rows pin expiry to NULL;
                 -- otherwise an incoming row that omits expiry keeps the
                 -- stored one rather than blanking it out.
+                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
+                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
+                -- COALESCE(EXCLUDED.expires_at, memories.expires_at) adopted the
+                -- incoming row's expiry verbatim, so re-storing the same
+                -- (title, namespace) with an EARLIER expiry silently rolled a
+                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
+                -- violation (premature GC reap / permanent link-edge loss). This
+                -- mirrors EXACTLY the shipped #2335 federation extension-FLOOR
+                -- lattice join (GREATEST over the COALESCE'd pair, both operands
+                -- funnel-canonical per #2332): the merge converges on the LATER
+                -- expiry regardless of store order. Long⇒NULL keeps the #1626
+                -- coupling. EXPLICIT shortening stays ONLY on the memory_update /
+                -- db::update path, never on this re-store funnel.
                 expires_at = CASE
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
-                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                    ELSE GREATEST(COALESCE(EXCLUDED.expires_at, memories.expires_at),
+                                  COALESCE(memories.expires_at, EXCLUDED.expires_at))
                 END,
                 metadata = (EXCLUDED.metadata || (
                     -- #1784 — preserve immutable provenance keys (agent_id +
@@ -16507,9 +16521,23 @@ impl MemoryStore for PostgresStore {
                 confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
                 source = EXCLUDED.source,
                 updated_at = EXCLUDED.updated_at,
+                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
+                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
+                -- COALESCE(EXCLUDED.expires_at, memories.expires_at) adopted the
+                -- incoming row's expiry verbatim, so re-storing the same
+                -- (title, namespace) with an EARLIER expiry silently rolled a
+                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
+                -- violation (premature GC reap / permanent link-edge loss). This
+                -- mirrors EXACTLY the shipped #2335 federation extension-FLOOR
+                -- lattice join (GREATEST over the COALESCE'd pair, both operands
+                -- funnel-canonical per #2332): the merge converges on the LATER
+                -- expiry regardless of store order. Long⇒NULL keeps the #1626
+                -- coupling. EXPLICIT shortening stays ONLY on the memory_update /
+                -- db::update path, never on this re-store funnel.
                 expires_at = CASE
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
-                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                    ELSE GREATEST(COALESCE(EXCLUDED.expires_at, memories.expires_at),
+                                  COALESCE(memories.expires_at, EXCLUDED.expires_at))
                 END,
                 metadata = (EXCLUDED.metadata || (
                     -- #1784 — preserve immutable provenance keys (agent_id +
@@ -16875,9 +16903,23 @@ impl MemoryStore for PostgresStore {
                 confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
                 source = EXCLUDED.source,
                 updated_at = EXCLUDED.updated_at,
+                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
+                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
+                -- COALESCE(EXCLUDED.expires_at, memories.expires_at) adopted the
+                -- incoming row's expiry verbatim, so re-storing the same
+                -- (title, namespace) with an EARLIER expiry silently rolled a
+                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
+                -- violation (premature GC reap / permanent link-edge loss). This
+                -- mirrors EXACTLY the shipped #2335 federation extension-FLOOR
+                -- lattice join (GREATEST over the COALESCE'd pair, both operands
+                -- funnel-canonical per #2332): the merge converges on the LATER
+                -- expiry regardless of store order. Long⇒NULL keeps the #1626
+                -- coupling. EXPLICIT shortening stays ONLY on the memory_update /
+                -- db::update path, never on this re-store funnel.
                 expires_at = CASE
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
-                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                    ELSE GREATEST(COALESCE(EXCLUDED.expires_at, memories.expires_at),
+                                  COALESCE(memories.expires_at, EXCLUDED.expires_at))
                 END,
                 metadata = (EXCLUDED.metadata || (
                     -- #1784 — preserve immutable provenance keys (agent_id +
@@ -17191,9 +17233,23 @@ impl MemoryStore for PostgresStore {
                 confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
                 source = EXCLUDED.source,
                 updated_at = EXCLUDED.updated_at,
+                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
+                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
+                -- COALESCE(EXCLUDED.expires_at, memories.expires_at) adopted the
+                -- incoming row's expiry verbatim, so re-storing the same
+                -- (title, namespace) with an EARLIER expiry silently rolled a
+                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
+                -- violation (premature GC reap / permanent link-edge loss). This
+                -- mirrors EXACTLY the shipped #2335 federation extension-FLOOR
+                -- lattice join (GREATEST over the COALESCE'd pair, both operands
+                -- funnel-canonical per #2332): the merge converges on the LATER
+                -- expiry regardless of store order. Long⇒NULL keeps the #1626
+                -- coupling. EXPLICIT shortening stays ONLY on the memory_update /
+                -- db::update path, never on this re-store funnel.
                 expires_at = CASE
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
-                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                    ELSE GREATEST(COALESCE(EXCLUDED.expires_at, memories.expires_at),
+                                  COALESCE(memories.expires_at, EXCLUDED.expires_at))
                 END,
                 metadata = (EXCLUDED.metadata || (
                     -- #1784 — preserve immutable provenance keys (agent_id +
@@ -27648,9 +27704,23 @@ impl PostgresStore {
                 confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
                 source = EXCLUDED.source,
                 updated_at = EXCLUDED.updated_at,
+                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
+                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
+                -- COALESCE(EXCLUDED.expires_at, memories.expires_at) adopted the
+                -- incoming row's expiry verbatim, so re-storing the same
+                -- (title, namespace) with an EARLIER expiry silently rolled a
+                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
+                -- violation (premature GC reap / permanent link-edge loss). This
+                -- mirrors EXACTLY the shipped #2335 federation extension-FLOOR
+                -- lattice join (GREATEST over the COALESCE'd pair, both operands
+                -- funnel-canonical per #2332): the merge converges on the LATER
+                -- expiry regardless of store order. Long⇒NULL keeps the #1626
+                -- coupling. EXPLICIT shortening stays ONLY on the memory_update /
+                -- db::update path, never on this re-store funnel.
                 expires_at = CASE
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
-                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                    ELSE GREATEST(COALESCE(EXCLUDED.expires_at, memories.expires_at),
+                                  COALESCE(memories.expires_at, EXCLUDED.expires_at))
                 END,
                 metadata = (EXCLUDED.metadata || (
                     -- #1784 — preserve immutable provenance keys (agent_id +
