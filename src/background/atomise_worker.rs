@@ -212,6 +212,22 @@ pub fn resolve_queue_capacity() -> usize {
 /// queue-full honestly) rather than aborting boot.
 #[must_use]
 pub fn spawn(provider: AtomiserProvider) -> Option<AtomiseQueue> {
+    spawn_joinable(provider).map(|(queue, _handle)| queue)
+}
+
+/// Like [`spawn`] but also hands back the consumer thread's [`JoinHandle`].
+///
+/// The consumer exits when every [`AtomiseQueue`] sender is dropped: closing
+/// the channel makes `rx.recv()` return `Err` only AFTER every buffered job has
+/// been drained, so `handle.join()` is a DETERMINISTIC "await full drain" —
+/// no wall-clock deadline. Production uses the handle-less [`spawn`] (the
+/// daemon-lifetime thread is never joined); tests use this to observe that the
+/// deferred atoms have landed without racing a timer (#2986: the old 15s poll
+/// flaked under llvm-cov instrumentation, which slows the worker past the
+/// deadline even though it always completes).
+pub fn spawn_joinable(
+    provider: AtomiserProvider,
+) -> Option<(AtomiseQueue, std::thread::JoinHandle<()>)> {
     let capacity = resolve_queue_capacity();
     let (tx, rx) = std::sync::mpsc::sync_channel::<AtomiseJob>(capacity);
     let spawned = std::thread::Builder::new()
@@ -227,7 +243,7 @@ pub fn spawn(provider: AtomiserProvider) -> Option<AtomiseQueue> {
             tracing::info!(target: TRACE_TARGET, "atomise worker stopped");
         });
     match spawned {
-        Ok(_handle) => Some(AtomiseQueue { tx }),
+        Ok(handle) => Some((AtomiseQueue { tx }, handle)),
         Err(e) => {
             tracing::error!(
                 target: TRACE_TARGET,
