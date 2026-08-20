@@ -99,6 +99,38 @@ the app tables with it (silent data loss), and placement was non-deterministic.
   extension). Unit test `demote_ag_catalog_tests` covers the pure
   search_path rewrite (leading-`ag_catalog` demoted; caller-pinned/non-leading
   paths untouched).
+### Security (Wave-2 Cluster B — epoch-resolve authz #3007 + header-trust identity boot-gate #3065)
+
+Two cert-core, fail-closed hardening changes for the enterprise-federation trust
+boundary. Both default-engage only under the certified / `asi-hard` posture, so
+standard single-node dev is byte-for-byte unaffected.
+
+- **#3007 — local MCP `epoch_advance` resolve authz.** The local
+  `memory_checkpoint_resolve` lane no longer auto-signs an `epoch_advance`
+  freeze anchor with the daemon key — a daemon-signed anchor is caller-mintable
+  authority (the daemon key is available to whatever local process drives the
+  handler). Under the certified / `asi-hard` posture the resolution is signed
+  (`verify:true`) ONLY when `resolved_by` presents a detached Ed25519 signature
+  that verifies against `resolved_by`'s locally-**enrolled** key over the SAME
+  `resolution_signable` bytes the federation receive path uses
+  (`authorize_remote_checkpoint_resolution`, #1936/#1947, reused verbatim).
+  Absent / not-enrolled / forged → the state still resolves but stays
+  `Unsigned` (`verify:false`) — degrade, never daemon-sign. Accepted resolutions
+  are attested under the OPERATOR's enrolled key (separation of duties), not the
+  daemon's. Advisory (daemon signs as before) under standard posture.
+- **#3065 — `AI_MEMORY_ADMIN_HEADER_TRUST` identity boot-gate.** Header-asserted
+  identity (`AI_MEMORY_ADMIN_HEADER_TRUST=1` + `X-Agent-Id`) is certified only
+  behind a single-fingerprint mTLS proxy. Under the certified / `asi-hard`
+  posture the daemon now REFUSES to boot when header-trust is on AND the inbound
+  mTLS allowlist (`--mtls-allowlist`) admits more than one fingerprint AND
+  per-agent binding is inactive (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` is
+  not `enforce` AND zero enrolled `agent_api_keys`). Decided ONCE at boot (never
+  a per-request cardinality flip). The by-the-book single-proxy-cert runbook
+  (≤ 1 fingerprint) is unaffected. The load-bearing decision is the pure
+  `admin_header_trust_boot_refusal`, added to
+  `scripts/check-cert-removal-proof.sh`. The full per-agent cert → `X-Agent-Id`
+  enrollment lane (#2044) is deferred. `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`
+  now states the single-fingerprint-topology scope conspicuously.
 
 ### Tests (serialize `AI_MEMORY_AGENT_ID`-dependent recall tests; fix #3092 isolation flake)
 

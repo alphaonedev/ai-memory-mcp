@@ -61,6 +61,36 @@ pub fn sign_resolution_into(cp: &mut Checkpoint, keypair: &AgentKeypair) -> anyh
     Ok(())
 }
 
+/// #3007 (Wave-2 Cluster B) — persist an EXTERNALLY-produced resolution
+/// attestation (a detached operator Ed25519 signature + the resolver's ENROLLED
+/// public key) onto an already-resolved checkpoint row.
+///
+/// The local MCP `epoch_advance` freeze-anchor gate
+/// ([`crate::mcp::tools::checkpoint::handle_checkpoint_resolve`]) resolves the
+/// anchor WITHOUT the daemon key — the daemon must never auto-sign a
+/// caller-mintable freeze anchor — and, once the operator's signature has
+/// verified against `resolved_by`'s enrolled key via
+/// [`crate::federation::receive_auth::authorize_remote_checkpoint_resolution`],
+/// stores it verbatim here so [`verify`] attests the resolution to the OPERATOR
+/// who authorized it (separation of duties), not to the daemon. Mirrors the
+/// attestation-column UPDATE inside [`resolve`] — the ONE site that owns the
+/// `checkpoints.signature` / `resolver_pubkey` write.
+///
+/// # Errors
+/// Propagates the `rusqlite` update error.
+pub fn store_resolution_attestation(
+    conn: &Connection,
+    id: &str,
+    signature: &[u8],
+    resolver_pubkey: &[u8],
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE checkpoints SET signature = ?1, resolver_pubkey = ?2 WHERE id = ?3",
+        params![signature, resolver_pubkey, id],
+    )?;
+    Ok(())
+}
+
 /// Verify a checkpoint's Ed25519 attested-resolution signature against its
 /// embedded `resolver_pubkey`.
 ///

@@ -13,6 +13,11 @@
 
 use crate::identity::keypair::AgentKeypair;
 use crate::mcp::param_names;
+// #3007 — the local `epoch_advance` gate decodes the operator's detached
+// signature from URL-safe base64, the MCP Ed25519-signature convention (see
+// `crate::mcp::server_identity`).
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
 /// JSON response field carrying the serialized checkpoint object (SSOT for the
@@ -210,6 +215,98 @@ pub fn handle_checkpoint_resolve(
         .and_then(Value::as_str);
     let now = chrono::Utc::now().timestamp();
 
+    // #3007 (authz half, Wave-2 Cluster B) — the local MCP resolve lane must NOT
+    // auto-sign an `epoch_advance` freeze anchor with the DAEMON key. The daemon
+    // keypair is available to whatever local process drives this handler, so a
+    // daemon-signed epoch anchor is caller-mintable AUTHORITY (the freeze anchor
+    // the #1878 epoch-apply consumer trusts). Under the certified / asi-hard
+    // posture we ENGAGE a gate that MIRRORS the shipped federation receive authz
+    // (`authorize_remote_checkpoint_resolution`, #1936/#1947) and REUSES its
+    // exact `resolution_signable` byte format: the resolution is signed
+    // (verify:true) ONLY when `resolved_by` presents a detached Ed25519
+    // signature that verifies against `resolved_by`'s LOCALLY-ENROLLED key over
+    // the canonical resolution. Absent / not-enrolled / forged → the state still
+    // resolves but stays Unsigned (verify:false) — DEGRADE, never daemon-sign a
+    // caller-mintable freeze anchor. ADVISORY (no gate; the daemon signs as
+    // before) under standard posture so single-node dev is unaffected.
+    let stored = crate::checkpoints::get(conn, id).map_err(|e| e.to_string())?;
+    let is_epoch_anchor = stored
+        .as_ref()
+        .is_some_and(|c| c.condition_type == crate::models::ConditionType::EpochAdvance);
+    let posture_engaged = crate::security_profile::is_asi_hard()
+        || crate::enterprise_federation_posture::enterprise_federation_posture_required();
+
+    // Choose the attestation lane BEFORE the resolve:
+    //   - `resolve_keypair`       — the key `resolve()` signs with (None on the
+    //                               epoch lane; the daemon key on the legacy lane).
+    //   - `resolve_at`            — the `resolved_at` persisted (the operator-
+    //                               signed instant on an epoch Accept; else `now`).
+    //   - `external_attestation`  — Some((sig, enrolled_pubkey)) to store AFTER
+    //                               the resolve on an epoch Accept; None otherwise.
+    let (resolve_keypair, resolve_at, external_attestation): (
+        Option<&AgentKeypair>,
+        i64,
+        Option<(Vec<u8>, Vec<u8>)>,
+    ) = if is_epoch_anchor && posture_engaged {
+        let stored = stored
+            .as_ref()
+            .expect("is_epoch_anchor implies a stored row");
+        // The operator's detached Ed25519 signature over the canonical
+        // resolution (URL-safe base64). Absent / malformed → empty bytes, which
+        // `authorize_remote_checkpoint_resolution` treats as RejectUnsigned
+        // under the engaged `require_sig = true`.
+        let presented_sig = params
+            .get(param_names::SIGNATURE)
+            .and_then(Value::as_str)
+            .and_then(|s| URL_SAFE_NO_PAD.decode(s.trim()).ok())
+            .unwrap_or_default();
+        // The operator signs over a SPECIFIC `resolved_at` (inside the signed
+        // surface), so the caller supplies it and the resolved row persists THAT
+        // value — otherwise the re-derived bytes could never verify. An absent
+        // value can only yield an Unsigned outcome, so `now` is a safe default.
+        let signed_at = params
+            .get(param_names::RESOLVED_AT)
+            .and_then(Value::as_i64)
+            .unwrap_or(now);
+        // Re-derive the would-be-resolved signable via the SHIPPED
+        // `resolution_signable` (verbatim byte format) over a synthetic view of
+        // the post-resolve row.
+        let synthetic = crate::models::Checkpoint {
+            state,
+            resolved_by: Some(resolved_by.to_string()),
+            resolution: resolution.map(str::to_string),
+            resolved_at: Some(signed_at),
+            ..stored.clone()
+        };
+        let signable = crate::checkpoints::resolution_signable(&synthetic);
+        let enrolled = crate::identity::verify::lookup_peer_public_key(resolved_by);
+        // Reuse the federation receive verdict fn VERBATIM. `require_sig = true`:
+        // the gate is engaged, so an absent signature fails closed to Unsigned.
+        match crate::federation::receive_auth::authorize_remote_checkpoint_resolution(
+            &signable,
+            &presented_sig,
+            enrolled.as_ref(),
+            true,
+        ) {
+            crate::federation::receive_auth::CheckpointResolutionAuthz::Accept => {
+                // Accept ⇒ `enrolled` verified the signature, so it is Some.
+                let pubkey = enrolled
+                    .expect("Accept implies an enrolled verifying key")
+                    .to_bytes()
+                    .to_vec();
+                (None, signed_at, Some((presented_sig, pubkey)))
+            }
+            // RejectUnsigned / RejectNotEnrolled / RejectForged: withhold the
+            // daemon key so the anchor resolves Unsigned (verify:false).
+            _ => (None, now, None),
+        }
+    } else {
+        // Legacy lane — non-epoch kinds, or standard posture (advisory): the
+        // daemon keypair signs as before (byte-identical to pre-#3007).
+        (keypair, now, None)
+    };
+    let operator_attested = external_attestation.is_some();
+
     let resolved = crate::checkpoints::resolve(
         conn,
         id,
@@ -217,8 +314,8 @@ pub fn handle_checkpoint_resolve(
         resolved_by,
         resolution,
         resolution_note,
-        now,
-        keypair,
+        resolve_at,
+        resolve_keypair,
     )
     .map_err(|e| e.to_string())?;
     match resolved {
@@ -231,7 +328,18 @@ pub fn handle_checkpoint_resolve(
             existing.resolved_by.as_deref().unwrap_or(""),
             existing.state.as_str()
         )),
-        crate::checkpoints::ResolveOutcome::Resolved(cp) => {
+        crate::checkpoints::ResolveOutcome::Resolved(mut cp) => {
+            // #3007 — on the epoch Accept path `resolve()` withheld the daemon
+            // key, so the row is currently Unsigned. Persist the operator's
+            // externally-verified attestation now (signature + enrolled pubkey)
+            // so `verify()` attests the resolution to the OPERATOR, not the
+            // daemon (separation of duties). No-op on every other lane.
+            if let Some((sig, pubkey)) = external_attestation {
+                crate::checkpoints::store_resolution_attestation(conn, id, &sig, &pubkey)
+                    .map_err(|e| e.to_string())?;
+                cp.signature = sig;
+                cp.resolver_pubkey = pubkey;
+            }
             // #1722 — coordination observability: best-effort audit row for the
             // resolution, attributed to the resolving agent (`resolved_by`).
             // Identity = checkpoint id / resolver / target state.
@@ -243,6 +351,9 @@ pub fn handle_checkpoint_resolve(
             );
             let attest_level = if cp.signature.is_empty() {
                 crate::models::AttestLevel::Unsigned.as_str()
+            } else if operator_attested {
+                // Signed against `resolved_by`'s ENROLLED key (not self-signed).
+                crate::models::AttestLevel::PeerAttested.as_str()
             } else {
                 crate::models::AttestLevel::SelfSigned.as_str()
             };
@@ -804,5 +915,171 @@ mod handler_tests {
                 .expect("created_at")
                 > 0
         );
+    }
+
+    // ---- #3007 (Wave-2 Cluster B) — local epoch_advance resolve authz -----
+    //
+    // These two tests run in an ISOLATED CHILD process (#2905) because they set
+    // process-global env (`AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` to
+    // engage the gate, `AI_MEMORY_KEY_DIR` to a tempdir so the operator key
+    // enrolls without touching the real keystore). Both create a
+    // caller-mintable `epoch_advance` freeze anchor and resolve it.
+
+    /// Create + resolve helper: mint an `epoch_advance` checkpoint and return
+    /// `(conn, id, namespace)`.
+    fn fresh_epoch_anchor() -> (rusqlite::Connection, String, String) {
+        let conn = fresh();
+        let ns = "_epoch".to_string();
+        let created = handle_checkpoint_create(
+            &conn,
+            &json!({ "namespace": ns, "title": "freeze", "condition_type": "epoch_advance",
+                     "created_by": "attacker" }),
+        )
+        .expect("epoch_advance create ok (caller-mintable)");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+        (conn, id, ns)
+    }
+
+    /// Attacker resolves a caller-mintable `epoch_advance` anchor with the
+    /// daemon key but NO enrolled-operator signature → the anchor still resolves
+    /// but stays Unsigned + verify:false (the daemon key is withheld). Proves
+    /// the gate DEGRADES, never daemon-signs a caller-mintable freeze anchor.
+    #[test]
+    fn epoch_advance_resolve_without_enrolled_sig_stays_unsigned_3007() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "mcp::checkpoint::handler_tests::epoch_advance_resolve_without_enrolled_sig_stays_unsigned_3007",
+        ) {
+            return;
+        }
+        let _g = crate::config::test_env_lock();
+        let key_dir = tempfile::tempdir().expect("key dir");
+        // SAFETY: single-threaded isolated child; guarded by test_env_lock.
+        unsafe {
+            std::env::set_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+                "1",
+            );
+            std::env::set_var(crate::identity::keypair::KEY_DIR_ENV, key_dir.path());
+        }
+
+        let (conn, id, _ns) = fresh_epoch_anchor();
+        // The daemon HAS a signing key available — the pre-#3007 lane would
+        // daemon-sign. The gate must withhold it.
+        let daemon_kp = crate::identity::keypair::generate("daemon").expect("daemon key");
+        let out = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "attacker",
+                     "resolution": "approved" }),
+            Some(&daemon_kp),
+        )
+        .expect("resolve applies (Unsigned) — the state flip is not blocked");
+        assert_eq!(
+            out["attest_level"].as_str(),
+            Some(crate::models::AttestLevel::Unsigned.as_str()),
+            "an epoch_advance resolved without an enrolled-operator sig must be Unsigned"
+        );
+        // And the persisted row does NOT verify (no daemon-minted attestation).
+        let stored = crate::checkpoints::get(&conn, &id)
+            .expect("get")
+            .expect("row");
+        assert!(stored.signature.is_empty(), "no signature persisted");
+        assert!(
+            !crate::checkpoints::verify(&stored),
+            "a caller-mintable freeze anchor must not verify"
+        );
+
+        unsafe {
+            std::env::remove_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+            );
+            std::env::remove_var(crate::identity::keypair::KEY_DIR_ENV);
+        }
+    }
+
+    /// The SAME anchor resolved WITH a valid Ed25519 signature by
+    /// `resolved_by`'s enrolled operator key is accepted + signed (verify:true),
+    /// attested to the operator (PeerAttested), never the daemon.
+    #[test]
+    fn epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "mcp::checkpoint::handler_tests::epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007",
+        ) {
+            return;
+        }
+        let _g = crate::config::test_env_lock();
+        let key_dir = tempfile::tempdir().expect("key dir");
+        // SAFETY: single-threaded isolated child; guarded by test_env_lock.
+        unsafe {
+            std::env::set_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+                "1",
+            );
+            std::env::set_var(crate::identity::keypair::KEY_DIR_ENV, key_dir.path());
+        }
+
+        let (conn, id, ns) = fresh_epoch_anchor();
+
+        // Enroll the operator key (full keypair) so `lookup_peer_public_key`
+        // finds its public half in the key dir; keep the in-memory handle to
+        // sign with.
+        let operator = crate::identity::keypair::generate("operator-x").expect("op key");
+        crate::identity::keypair::save(&operator, key_dir.path()).expect("enroll operator key");
+
+        // Sign the EXACT canonical resolution bytes the handler will re-derive:
+        // reuse `SignableCheckpointResolution` + `sign_checkpoint_resolution`.
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let signed_at: i64 = 1_800_000_000;
+        let signable = crate::identity::sign::SignableCheckpointResolution {
+            checkpoint_id: &id,
+            namespace: &ns,
+            state: "resolved",
+            resolved_by: "operator-x",
+            resolution: Some("approved"),
+            resolved_at: signed_at,
+        };
+        let sig = crate::identity::sign::sign_checkpoint_resolution(&operator, &signable)
+            .expect("operator signs");
+        let sig_b64 = URL_SAFE_NO_PAD.encode(&sig);
+
+        // A daemon key is ALSO available — the gate must sign with the OPERATOR
+        // attestation, not the daemon key.
+        let daemon_kp = crate::identity::keypair::generate("daemon").expect("daemon key");
+        let out = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "operator-x",
+                     "resolution": "approved", "resolved_at": signed_at,
+                     "signature": sig_b64 }),
+            Some(&daemon_kp),
+        )
+        .expect("resolve ok");
+        assert_eq!(
+            out["attest_level"].as_str(),
+            Some(crate::models::AttestLevel::PeerAttested.as_str()),
+            "an enrolled-operator-signed epoch_advance resolution is operator-attested"
+        );
+        let stored = crate::checkpoints::get(&conn, &id)
+            .expect("get")
+            .expect("row");
+        assert!(!stored.signature.is_empty(), "operator signature persisted");
+        assert_eq!(
+            stored.resolver_pubkey,
+            operator.public.to_bytes().to_vec(),
+            "attested under the OPERATOR's enrolled key, never the daemon key"
+        );
+        assert!(
+            crate::checkpoints::verify(&stored),
+            "the operator-attested freeze anchor must verify"
+        );
+
+        unsafe {
+            std::env::remove_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+            );
+            std::env::remove_var(crate::identity::keypair::KEY_DIR_ENV);
+        }
     }
 }
