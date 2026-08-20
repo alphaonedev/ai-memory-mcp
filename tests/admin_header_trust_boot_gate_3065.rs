@@ -63,16 +63,33 @@ fn header_trust_off_permits() {
 
 #[test]
 fn single_fingerprint_proxy_is_byte_for_byte_unchanged() {
-    // The certified runbook: exactly one client-cert fingerprint (the proxy).
+    // The certified runbook: EXACTLY one client-cert fingerprint (the proxy).
     let mut i = dangerous_inputs();
     i.mtls_allowlist_len = 1;
     assert!(
         admin_header_trust_boot_refusal(i).is_none(),
         "a single-fingerprint proxy stand-up must NEVER self-brick"
     );
-    // And zero (no --mtls-allowlist) is out of the >1 scope too.
+}
+
+#[test]
+fn zero_fingerprints_no_proxy_refuses_boot() {
+    // BLOCKER 2 (adversarial review): len == 0 (NO --mtls-allowlist at all)
+    // means header-trust with no client-cert layer — strictly MORE exposed than
+    // the multi-cert case, and it BOOTS CLEANLY through the 18 posture checks +
+    // asi-hard KNOBS (none require an allowlist). It MUST refuse, not permit.
+    let mut i = dangerous_inputs();
     i.mtls_allowlist_len = 0;
-    assert!(admin_header_trust_boot_refusal(i).is_none());
+    let refusal = admin_header_trust_boot_refusal(i);
+    assert!(
+        refusal.is_some(),
+        "header-trust with ZERO inbound mTLS fingerprints and no per-agent backstop under \
+         the certified posture MUST refuse boot (no proxy = no client-cert layer)"
+    );
+    assert!(
+        refusal.unwrap().contains("UNSET"),
+        "the len==0 refusal must name the unset allowlist"
+    );
 }
 
 #[test]

@@ -112,15 +112,19 @@ pub struct AdminHeaderTrustBootInputs {
 /// flip (which would split-brain a rollout).
 ///
 /// Returns `Some(reason)` to REFUSE boot, `None` to permit. Refuses IFF ALL of:
-/// the certified/asi-hard posture is engaged, header-trust is on, the inbound
-/// mTLS allowlist admits MORE THAN ONE fingerprint, AND per-agent binding is
-/// inactive (attested-identity is not `enforce` AND zero enrolled agent keys).
+/// the certified/asi-hard posture is engaged, header-trust is on, per-agent
+/// binding is inactive (attested-identity is not `enforce` AND zero enrolled
+/// agent keys), AND the inbound mTLS allowlist does NOT admit EXACTLY ONE
+/// fingerprint — i.e. `len > 1` (multiple certs each free to assert any
+/// identity) OR `len == 0` (no `--mtls-allowlist` at all: header-trust with no
+/// client-cert layer, strictly MORE exposed than the multi-cert case, since
+/// nothing in the 18 posture checks / asi-hard KNOBS requires an allowlist or
+/// pins `HTTP_REQUIRE_ATTESTED_IDENTITY`).
 ///
-/// The by-the-book single-proxy-cert runbook (`mtls_allowlist_len <= 1`) is
-/// BYTE-FOR-BYTE unaffected — it never reaches the refusal. `0` (no
-/// `--mtls-allowlist`) is likewise out of this gate's `> 1` scope (a separate
-/// concern; the certified runbook mandates the single proxy cert). Mirrors the
-/// `security_profile` / `enterprise_federation_posture` boot-refusal shape.
+/// The by-the-book single-proxy-cert runbook (`mtls_allowlist_len == 1`) is
+/// BYTE-FOR-BYTE unaffected — it is the sole permitted topology under
+/// header-trust with no per-agent backstop. Mirrors the `security_profile` /
+/// `enterprise_federation_posture` boot-refusal shape.
 ///
 /// Removal-proof: `scripts/check-cert-removal-proof.sh` neutralizes this fn's
 /// body to `None` and `tests/admin_header_trust_boot_gate_3065.rs` proves the
@@ -136,25 +140,39 @@ pub fn admin_header_trust_boot_refusal(i: AdminHeaderTrustBootInputs) -> Option<
     if !i.header_trust_enabled {
         return None;
     }
-    // Safe topology: at most one client-cert fingerprint (the single mTLS
-    // proxy). Two distinct certs are what makes `X-Agent-Id` spoofable.
-    if i.mtls_allowlist_len <= 1 {
-        return None;
-    }
-    // Per-agent binding present ⇒ each key-derived principal is bound, so
-    // header-trust is backstopped. Active iff attested-identity is ENFORCE or
-    // at least one agent api-key is enrolled.
+    // Per-agent binding present ⇒ each key-derived principal is already bound,
+    // so header-trust is backstopped REGARDLESS of the allowlist size. Active
+    // iff attested-identity is ENFORCE or at least one agent api-key is
+    // enrolled. Checked BEFORE the fingerprint count so a backstopped
+    // deployment permits at any `mtls_allowlist_len`.
     if i.attested_identity_enforced || i.agent_api_key_count > 0 {
         return None;
     }
+    // Certified topology: header-trust is sound ONLY behind EXACTLY ONE
+    // client-cert fingerprint (the single mTLS proxy). Permit len == 1 only.
+    // REFUSE both len > 1 (two distinct certs each assert any identity) AND
+    // len == 0 (NO inbound mTLS allowlist at all — zero fingerprints = no
+    // proxy = header-trust with no client-cert layer, strictly MORE exposed
+    // than the multi-cert case). The cert doc says "certified ONLY behind a
+    // SINGLE-fingerprint mTLS proxy"; anything but exactly one fails closed.
+    if i.mtls_allowlist_len == 1 {
+        return None;
+    }
+    let allowlist_desc = if i.mtls_allowlist_len == 0 {
+        "the inbound mTLS allowlist is UNSET (0 fingerprints — no client-cert layer at all)"
+            .to_string()
+    } else {
+        format!(
+            "the inbound mTLS allowlist admits {} fingerprints",
+            i.mtls_allowlist_len
+        )
+    };
     Some(format!(
         "{ENV_ADMIN_HEADER_TRUST}=1 (header-asserted X-Agent-Id) is certified ONLY behind a \
-         SINGLE-fingerprint mTLS proxy, but the inbound mTLS allowlist admits {} fingerprints AND \
-         per-agent binding is inactive ({}!=enforce AND 0 enrolled agent_api_keys) — any of those \
-         client certs could assert ANY agent identity. Fix ONE of: reduce --mtls-allowlist to the \
-         single proxy fingerprint; set {}=enforce (or enroll per-agent api keys); or unset \
-         {ENV_ADMIN_HEADER_TRUST}.",
-        i.mtls_allowlist_len,
+         SINGLE-fingerprint mTLS proxy, but {allowlist_desc} AND per-agent binding is inactive \
+         ({}!=enforce AND 0 enrolled agent_api_keys) — a caller could assert ANY agent identity. \
+         Fix ONE of: set --mtls-allowlist to EXACTLY the single proxy fingerprint; set {}=enforce \
+         (or enroll per-agent api keys); or unset {ENV_ADMIN_HEADER_TRUST}.",
         crate::config::ENV_HTTP_ATTESTED_IDENTITY,
         crate::config::ENV_HTTP_ATTESTED_IDENTITY,
     ))

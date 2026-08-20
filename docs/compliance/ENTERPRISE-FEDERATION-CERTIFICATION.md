@@ -185,13 +185,16 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 > multi-fingerprint allowlist under header-trust is a fleet-wide impersonation
 > lever. This is the ratified cert scope (500–1000 agents behind ONE proxy cert,
 > ≤ 50 peers). Under the certified / `asi-hard` posture the daemon **refuses to
-> boot** when `AI_MEMORY_ADMIN_HEADER_TRUST=1` AND the inbound mTLS allowlist
-> admits more than one fingerprint AND per-agent binding is inactive
+> boot** when `AI_MEMORY_ADMIN_HEADER_TRUST=1` AND per-agent binding is inactive
 > (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` is not `enforce` AND zero
-> `agent_api_keys` enrolled) — decided **once at boot**, never a per-request
-> flip (`admin_header_trust_boot_refusal`,
+> `agent_api_keys` enrolled) AND the inbound mTLS allowlist does **not** admit
+> **exactly one** fingerprint — refusing both `> 1` (multiple certs each free to
+> assert any identity) **and** `0` (no `--mtls-allowlist` at all: header-trust
+> with no client-cert layer, which nothing in the posture checks / `asi-hard`
+> KNOBS otherwise requires — strictly more exposed, not less). Decided **once at
+> boot**, never a per-request flip (`admin_header_trust_boot_refusal`,
 > `scripts/check-cert-removal-proof.sh`). The by-the-book single-proxy-cert
-> stand-up (≤ 1 fingerprint) is unaffected. The full per-agent cert →
+> stand-up (**exactly one** fingerprint) is unaffected. The full per-agent cert →
 > `X-Agent-Id` enrollment lane (the `agent_api_keys` per-agent binding) is
 > deferred — see [#2044](https://github.com/alphaonedev/ai-memory-mcp/issues/2044).
 

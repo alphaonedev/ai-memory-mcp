@@ -230,11 +230,15 @@ pub fn handle_checkpoint_resolve(
     // caller-mintable freeze anchor. ADVISORY (no gate; the daemon signs as
     // before) under standard posture so single-node dev is unaffected.
     let stored = crate::checkpoints::get(conn, id).map_err(|e| e.to_string())?;
-    let is_epoch_anchor = stored
+    // Engage the operator-attestation lane exactly when the SHARED
+    // `withhold_daemon_signature` predicate (epoch_advance under the certified /
+    // asi-hard posture) would refuse to daemon-sign this resolution — SINGLE-
+    // SOURCED so this MCP accept-path gate and the `checkpoints::resolve` /
+    // postgres withhold gates can never drift. `is_epoch_anchor` therefore comes
+    // from the STORED row's condition_type, not caller params.
+    let epoch_gate = stored
         .as_ref()
-        .is_some_and(|c| c.condition_type == crate::models::ConditionType::EpochAdvance);
-    let posture_engaged = crate::security_profile::is_asi_hard()
-        || crate::enterprise_federation_posture::enterprise_federation_posture_required();
+        .is_some_and(crate::checkpoints::withhold_daemon_signature);
 
     // Choose the attestation lane BEFORE the resolve:
     //   - `resolve_keypair`       — the key `resolve()` signs with (None on the
@@ -247,10 +251,8 @@ pub fn handle_checkpoint_resolve(
         Option<&AgentKeypair>,
         i64,
         Option<(Vec<u8>, Vec<u8>)>,
-    ) = if is_epoch_anchor && posture_engaged {
-        let stored = stored
-            .as_ref()
-            .expect("is_epoch_anchor implies a stored row");
+    ) = if epoch_gate {
+        let stored = stored.as_ref().expect("epoch_gate implies a stored row");
         // The operator's detached Ed25519 signature over the canonical
         // resolution (URL-safe base64). Absent / malformed → empty bytes, which
         // `authorize_remote_checkpoint_resolution` treats as RejectUnsigned
