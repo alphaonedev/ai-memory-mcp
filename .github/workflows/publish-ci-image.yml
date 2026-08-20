@@ -1,0 +1,185 @@
+# Publish the prebuilt ai-memory CI container image to GHCR (build lever #3,
+# refs #2960 / #3089).
+#
+# WHAT THIS PUBLISHES. `.github/Dockerfile.ci` — one image that bakes the
+# CERTIFIED data tier (PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6,
+# the ONE TRUE triple from deploy/docker-1461/provision/lib.sh) PLUS the Rust
+# CI build deps the postgres-backed jobs `apt-get install` at job start (mold,
+# build-essential, jq, sqlite3, postgresql-client). Publishing it once and
+# having jobs PULL it moves the apt-mirror flake + the per-run `docker build`
+# of the data tier off the per-PR hot path (see the Dockerfile header).
+#
+# WHY THIS IS NOT A REQUIRED CONTEXT. It triggers on `push` to `release/**`
+# and `workflow_dispatch` ONLY — never `pull_request` — so it creates no
+# required-status-check context, cannot wedge a PR (rules (c)/(f) of
+# scripts/check-required-contexts.sh do not reach it), and is not in that
+# gate's COVERED_WORKFLOWS. Consumers that pull the image tolerate its
+# absence: cert-postgres-age.yml falls back to building the data tier locally
+# when the pull fails (fork PRs, a not-yet-published tag, a GHCR outage), so
+# a missing/stale published image DEGRADES a consumer to today's behaviour
+# rather than reddening it.
+#
+# PATHS. Rebuilds only when the image's inputs change: `.github/Dockerfile.ci`
+# OR the SSOT that pins its versions (deploy/docker-1461/provision/lib.sh) OR
+# this workflow. A version-pin bump in the SSOT therefore auto-republishes the
+# image under a new triple-encoded tag, and consumers that resolve the same
+# tag from the same SSOT pick it up with zero drift by construction.
+#
+# FAIL-CLOSED. The image's certified triple is ASSERTED against the SSOT from
+# the locally-loaded build BEFORE the push step runs (identical assertion to
+# cert-postgres-age.yml). A base-image or apt-snapshot drift that silently
+# moved a version off its SSOT pin reds here and NO image is pushed — a bad
+# image can never reach the registry for a consumer to pull.
+name: "Publish CI image (pg18.6/AGE1.8.0/pgvector0.8.6)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["release/**"]
+    paths:
+      - ".github/Dockerfile.ci"
+      - ".github/workflows/publish-ci-image.yml"
+      - "deploy/docker-1461/provision/lib.sh"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # push-only + workflow_dispatch: no push/PR event collision to guard against,
+  # but still serialise per-ref so two rapid pushes don't race the registry.
+  group: publish-ci-image-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/ai-memory-ci
+
+jobs:
+  publish-ci-image:
+    name: "Build + push prebuilt CI image"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve certified stack pins + image tag from deploy SSOT
+        run: |
+          set -euo pipefail
+          # ONE declaration source: every version literal comes from
+          # deploy/docker-1461/provision/lib.sh — the SAME file the docker-1461
+          # mesh + cert-postgres-age.yml consume. Nothing is re-typed here.
+          source deploy/docker-1461/provision/lib.sh
+          # Triple-encoded tag: a pin bump yields a new tag, so consumers that
+          # resolve the same tag from the same SSOT never pull a stale image
+          # under a moving tag. pgvector's tag segment uses the bare semver
+          # (strip the pgdg package suffix), matching pg_extension.extversion.
+          img_tag="pg${EXPECTED_PG_VERSION}-age${EXPECTED_AGE_VERSION}-pgvector${PGVECTOR_APT_VERSION%%-*}"
+          {
+            echo "CI_AGE_BASE_IMAGE=${AGE_BASE_IMAGE}"
+            echo "CI_PG_MAJOR=${PG_MAJOR}"
+            echo "CI_PG_APT_VERSION=${PG_APT_VERSION}"
+            echo "CI_AGE_APT_VERSION=${AGE_APT_VERSION}"
+            echo "CI_PGVECTOR_APT_VERSION=${PGVECTOR_APT_VERSION}"
+            echo "CI_EXPECTED_PG_VERSION=${EXPECTED_PG_VERSION}"
+            echo "CI_EXPECTED_AGE_VERSION=${EXPECTED_AGE_VERSION}"
+            echo "CI_EXPECTED_PGVECTOR_VERSION=${PGVECTOR_APT_VERSION%%-*}"
+            echo "CI_IMAGE_TAG=${img_tag}"
+          } >> "$GITHUB_ENV"
+          echo "::notice::CI image tag resolved from SSOT: ${IMAGE_REPO}:${img_tag}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build CI image (load locally for pre-push assertion)
+        uses: docker/build-push-action@v6
+        with:
+          context: .github
+          file: .github/Dockerfile.ci
+          load: true
+          tags: ai-memory-ci:verify
+          build-args: |
+            AGE_BASE_IMAGE=${{ env.CI_AGE_BASE_IMAGE }}
+            PG_MAJOR=${{ env.CI_PG_MAJOR }}
+            PG_APT_VERSION=${{ env.CI_PG_APT_VERSION }}
+            AGE_APT_VERSION=${{ env.CI_AGE_APT_VERSION }}
+            PGVECTOR_APT_VERSION=${{ env.CI_PGVECTOR_APT_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Assert certified triple in the built image (fail-closed, pre-push)
+        run: |
+          set -euo pipefail
+          # Same assertion cert-postgres-age.yml runs — proving the image
+          # before it is pushed. Uses `docker exec` (no host port) so it is
+          # robust regardless of runner networking. A drift off ANY SSOT pin
+          # reds here and the push step never runs.
+          docker run -d --name ci-image-verify \
+            -e POSTGRES_USER=ai_memory \
+            -e POSTGRES_PASSWORD=ci_verify \
+            -e POSTGRES_DB=ci_verify \
+            ai-memory-ci:verify
+          for i in $(seq 1 60); do
+            if docker exec ci-image-verify pg_isready -U ai_memory -d ci_verify >/dev/null 2>&1; then
+              echo "::notice::postgres up after $((i*2))s"; break
+            fi
+            sleep 2
+            if [ "$i" = 60 ]; then echo "::error::postgres did not become ready"; docker logs ci-image-verify || true; exit 1; fi
+          done
+          PSQL() { docker exec -e PGPASSWORD=ci_verify ci-image-verify psql -U ai_memory -d ci_verify -tAX "$@"; }
+          PSQL -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
+          PSQL -c "CREATE EXTENSION IF NOT EXISTS age;" >/dev/null
+          pg_ver=$(PSQL -c "SELECT split_part(current_setting('server_version'), ' ', 1);" | tr -d '[:space:]')
+          age_ver=$(PSQL -c "SELECT extversion FROM pg_extension WHERE extname='age';" | tr -d '[:space:]')
+          vec_ver=$(PSQL -c "SELECT extversion FROM pg_extension WHERE extname='vector';" | tr -d '[:space:]')
+          echo "::notice::built CI image — PostgreSQL=$pg_ver Apache AGE=$age_ver pgvector=$vec_ver"
+          {
+            echo "### Prebuilt CI image — certified data tier"
+            echo ""
+            echo "| component | built | certified (SSOT) |"
+            echo "| --- | --- | --- |"
+            echo "| PostgreSQL | $pg_ver | ${CI_EXPECTED_PG_VERSION} |"
+            echo "| Apache AGE | $age_ver | ${CI_EXPECTED_AGE_VERSION} |"
+            echo "| pgvector | $vec_ver | ${CI_EXPECTED_PGVECTOR_VERSION} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          case "$pg_ver" in
+            "$CI_EXPECTED_PG_VERSION") : ;;
+            *) echo "::error::PostgreSQL $pg_ver != certified $CI_EXPECTED_PG_VERSION (SSOT) — refusing to publish"; exit 1 ;;
+          esac
+          case "$age_ver" in
+            "$CI_EXPECTED_AGE_VERSION") : ;;
+            *) echo "::error::Apache AGE $age_ver != certified $CI_EXPECTED_AGE_VERSION (SSOT) — refusing to publish"; exit 1 ;;
+          esac
+          case "$vec_ver" in
+            ${CI_EXPECTED_PGVECTOR_VERSION}*) : ;;
+            *) echo "::error::pgvector $vec_ver != certified ${CI_EXPECTED_PGVECTOR_VERSION} (SSOT) — refusing to publish"; exit 1 ;;
+          esac
+          docker rm -f ci-image-verify >/dev/null 2>&1 || true
+          echo "certified triple asserted — safe to push"
+
+      - name: Push CI image (cache hit from the verified build)
+        uses: docker/build-push-action@v6
+        with:
+          context: .github
+          file: .github/Dockerfile.ci
+          push: true
+          tags: |
+            ${{ env.IMAGE_REPO }}:${{ env.CI_IMAGE_TAG }}
+            ${{ env.IMAGE_REPO }}:latest
+          build-args: |
+            AGE_BASE_IMAGE=${{ env.CI_AGE_BASE_IMAGE }}
+            PG_MAJOR=${{ env.CI_PG_MAJOR }}
+            PG_APT_VERSION=${{ env.CI_PG_APT_VERSION }}
+            AGE_APT_VERSION=${{ env.CI_AGE_APT_VERSION }}
+            PGVECTOR_APT_VERSION=${{ env.CI_PGVECTOR_APT_VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

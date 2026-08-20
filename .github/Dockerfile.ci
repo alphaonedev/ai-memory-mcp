@@ -1,0 +1,119 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# ai-memory prebuilt CI container image (build lever #3, refs #2960/#3089).
+#
+# WHY THIS IMAGE EXISTS. Every postgres-backed CI job today does two flaky,
+# slow things at job start:
+#
+#   1. It `apt-get install`s the Rust build deps (mold, postgresql-client,
+#      jq, sqlite3, build-essential) from the runner's apt mirror — the
+#      exact hang-until-timeout failure #3090 bounded but could not
+#      eliminate (a stalled mirror still costs the retry budget + minutes).
+#   2. The certified pg+AGE+pgvector job additionally `docker build`s the
+#      certified data tier from apache/age + pgdg apt on EVERY run — pulling
+#      the base image and re-running the same apt layers each time.
+#
+# Baking BOTH into one prebuilt image, published once to GHCR and pulled by
+# the jobs, moves those apt/build steps off the hot path: the mirror flake
+# now only exists at the rare image-rebuild moment (a Dockerfile.ci or SSOT
+# pin change), never on the per-PR path. When it is used, a job pulls a
+# ready image instead of re-deriving it.
+#
+# ------------------------------------------------------------------------
+# LAYER 1 — CERTIFIED DATA TIER (byte-identical to the shipped deploy image)
+# ------------------------------------------------------------------------
+# This layer is the SAME recipe as deploy/docker-1461/Dockerfile.pg-age-vector
+# (the image the docker-1461 mesh ships and cert-postgres-age.yml builds):
+# the SAME apache/age base, the SAME pgdg `apt --only-upgrade` to the exact
+# server minor, the SAME pinned AGE + pgvector .debs. "Extend prior art, do
+# not fork it" (CLAUDE.md): no version literal is typed here — every pin
+# arrives as a --build-arg resolved from the ONE SSOT,
+# deploy/docker-1461/provision/lib.sh (PG_APT_VERSION / AGE_APT_VERSION /
+# PGVECTOR_APT_VERSION / AGE_BASE_IMAGE), exactly as cert-postgres-age.yml
+# and the docker-1461 validate harness resolve them. The published image's
+# tag encodes the resolved triple (see .github/workflows/publish-ci-image.yml),
+# so a future pin bump produces a new tag and consumers self-heal (a missing
+# tag falls back to a local build — see cert-postgres-age.yml). The base
+# image's ENTRYPOINT/CMD (the postgres docker-entrypoint + AGE's
+# /docker-entrypoint-initdb.d auto-`CREATE EXTENSION age`) is preserved, so
+# `docker run` starts postgres exactly as the deploy image does. The pgdg
+# AGE/pgvector overlay encodes the fixes recorded in the deploy Dockerfile's
+# header (#1842/#2293 lineage) — this image inherits them, it does not
+# re-derive them.
+ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0
+FROM ${AGE_BASE_IMAGE}
+
+# Re-declare post-FROM so the build args are in scope for the RUN layer.
+ARG PG_MAJOR=18
+ARG PG_APT_VERSION
+ARG AGE_APT_VERSION
+ARG PGVECTOR_APT_VERSION
+
+USER root
+
+# Pinned, reproducible data tier: exact minor for server + client, exact AGE,
+# exact pgvector — all from pgdg apt. Identical command to
+# deploy/docker-1461/Dockerfile.pg-age-vector (kept in lockstep via the shared
+# SSOT build-args); no plaintext-refusing hostssl HEALTHCHECK is layered on
+# here — CI reaches this container over loopback and gates readiness with its
+# own `pg_isready`, so the deploy image's mTLS-posture healthcheck (which
+# assumes provisioned TLS material) is deliberately omitted from the CI image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends --only-upgrade \
+      "postgresql-${PG_MAJOR}=${PG_APT_VERSION}" \
+      "postgresql-client-${PG_MAJOR}=${PG_APT_VERSION}" \
+ && apt-get install -y --no-install-recommends \
+      "postgresql-${PG_MAJOR}-age=${AGE_APT_VERSION}" \
+      "postgresql-${PG_MAJOR}-pgvector=${PGVECTOR_APT_VERSION}" \
+ && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------------
+# LAYER 2 — RUST CI BUILD DEPS (the apt set the pg-CI jobs install today)
+# ------------------------------------------------------------------------
+# The exact packages the postgres-backed jobs `apt-get install` at job start
+# (grep of .github/workflows: mold, postgresql-client, jq, sqlite3,
+# build-essential; `curl`/`ca-certificates` are the mold-tarball fetch
+# prereqs). Baking them here is what removes the per-job apt-mirror flake for
+# any job that runs INSIDE this image. `postgresql-client` is already provided
+# by the postgresql-client-${PG_MAJOR} bumped in layer 1 (psql 18 on PATH); it
+# is not re-installed. Kept as a distinct layer so the data tier above stays a
+# verbatim copy of the deploy recipe.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      jq \
+      sqlite3 \
+      curl \
+      ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# mold — pinned to the SAME first-party release tarball the workflows fetch
+# (MOLD_VERSION default matches the `MOLD_VERSION: "2.4.1"` pin in
+# cert-postgres-age.yml / postgres-parity-nightly.yml / coverage.yml / ci.yml).
+# Fetching it at IMAGE-BUILD time (a rare event) rather than per-job is the
+# whole point: the tarball-fetch flake moves off the per-PR hot path. Pinned
+# by version + verified on PATH; the build fails loudly if the pinned tarball
+# is unavailable (no silent unpinned fallback in the image — the workflows'
+# apt fallback exists only because they run per-PR).
+ARG MOLD_VERSION=2.4.1
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    tgz="mold-${MOLD_VERSION}-${arch}-linux.tar.gz"; \
+    url="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${tgz}"; \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL --retry 3 --retry-delay 3 -o "${tmp}/${tgz}" "${url}"; \
+    tar -xzf "${tmp}/${tgz}" -C "${tmp}"; \
+    install -m0755 "${tmp}/mold-${MOLD_VERSION}-${arch}-linux/bin/mold" /usr/local/bin/mold; \
+    ln -sf /usr/local/bin/mold /usr/local/bin/ld.mold; \
+    rm -rf "${tmp}"; \
+    mold --version | grep -q "${MOLD_VERSION}"
+
+# Provenance labels (mirrors the release.yml GHCR image convention).
+LABEL org.opencontainers.image.source="https://github.com/alphaonedev/ai-memory-mcp"
+LABEL org.opencontainers.image.description="ai-memory CI image: certified PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6 data tier plus the Rust CI build deps (mold, build-essential, jq, sqlite3, postgresql-client)."
+
+# The base image's postgres ENTRYPOINT/CMD + USER state are intentionally
+# left untouched: `docker run` starts postgres (AGE auto-inits) exactly as the
+# deploy image, and a job may equally use this image as a `container:` for its
+# baked build deps. No CMD/ENTRYPOINT override.
