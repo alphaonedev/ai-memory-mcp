@@ -220,6 +220,33 @@ Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
   2500 rows). This is a single-correct-answer bug fix restoring the
   documented contract via the pagination the SQL layer already implements
   (crossroads-protocol exempt).
+### Fixed (capabilities advertised the CONFIGURED embedder, not the CONSTRUCTED one; [#3063](https://github.com/alphaonedev/ai-memory-mcp/issues/3063))
+
+- **#3063 — `memory_capabilities` / `GET /api/v1/capabilities` reported the
+  resolved-config embedding model + dim, not the embedder the process actually
+  loaded.** The `models.embedding` / `models.embedding_dim` fields were built
+  from the resolver-derived `ResolvedModels` (the CONFIGURED default), so under
+  the operator-documented "embedding-guard-gap" — config resolves the nomic-768
+  tier preset while boot falls back to the local `all-MiniLM-L6-v2` (384-dim)
+  embedder (e.g. `AI_MEMORY_NO_CONFIG=1`, or a configured model the daemon
+  cannot construct) — capabilities advertised `nomic-embed-text-v1.5` / `768`
+  while recall was actually MiniLM / `384`. An operator reading `/capabilities`
+  believed recall was nomic-768 quality when it was MiniLM-384. Both runtime
+  emit sites (MCP `memory_capabilities` dispatch, HTTP `get_capabilities`) now
+  reconcile the resolved-config `ResolvedModels` against the LIVE `Embedder` at
+  emit time (`embeddings::reconcile_capability_models`), so `models.*` reports
+  the CONSTRUCTED embedder's real model id + dim; when the loaded embedder
+  disagrees with what config resolved a loud one-shot WARN
+  (`target: embeddings.capability_drift`) fires so an operator is not silently
+  misled. New `Embedder::capability_model_id()` reports the loaded model id
+  (local → the `MiniLM` HF id; remote → the operator-picked model verbatim).
+  The capabilities wire SHAPE is unchanged (same fields, corrected values), so
+  no schema / token-budget contract moves. Regression:
+  `tests/capabilities_embedder_truth_3063.rs` (drives the real
+  `build_capability_models` with a constructed embedder that differs from
+  config, including the fallback-mismatch case) +
+  `embeddings::tests::{capability_model_id_reports_constructed_remote_model_3063,
+  reconcile_overrides_config_with_constructed_embedder_3063}`.
 
 ### Fixed (Batman auto-atomisation was structurally inert product-wide; #2983 #2984 #2985 #2986 #2987)
 

@@ -68,6 +68,18 @@ pub async fn get_capabilities(
         .as_ref()
         .as_ref()
         .is_some_and(|e| !e.is_degraded());
+    // #3063 — the `models.*` block must report the CONSTRUCTED embedder's
+    // model + dim, not the resolved-config default (they diverge under the
+    // embedding-guard-gap: config resolves nomic-768 while boot fell back to
+    // the local MiniLM-384 embedder). Reconcile against the live embedder;
+    // a loud one-shot WARN fires when they disagree.
+    let reconciled_models = crate::embeddings::reconcile_capability_models(
+        app.resolved_models.current().as_ref(),
+        app.embedder
+            .as_ref()
+            .as_ref()
+            .map(|e| e as &dyn crate::embeddings::Embed),
+    );
     let lock = app.db.lock().await;
     let conn = &lock.0;
     let result = match accept {
@@ -76,8 +88,9 @@ pub async fn get_capabilities(
             // v0.7.x (issue #1168) — the operator-resolved models
             // triple drives the `models.*` block so it matches the
             // boot banner + the live LLM client wiring, not the
-            // compiled tier preset.
-            app.resolved_models.current().as_ref(),
+            // compiled tier preset. #3063 — reconciled to the
+            // constructed embedder above.
+            &reconciled_models,
             None,
             embedder_loaded,
             Some(conn),
@@ -92,7 +105,7 @@ pub async fn get_capabilities(
         ),
         _ => crate::mcp::handle_capabilities_with_conn(
             app.tier_config.as_ref(),
-            app.resolved_models.current().as_ref(),
+            &reconciled_models,
             None,
             embedder_loaded,
             Some(conn),
