@@ -73,6 +73,37 @@ code, no job renames, no required-context set change.
   with `|| true`; uses `docker image prune` (not `system prune --volumes`) so the
   running `services:` postgres container is untouched. Pure shell — no external
   `free-disk-space` action.
+### Fixed (asi-hard "no-disable" outer federation-transport gates; #3033)
+
+Per the 5-agent Vote B (#3089), the `asi-hard` hardened posture's
+"no-disable" contract silently EXCLUDED the outermost federation-transport
+access controls, so the guarantee was over-stated: an `asi-hard` daemon could
+still set e.g. `AI_MEMORY_FED_REQUIRE_SIG=0` and accept UNSIGNED inbound
+federation requests while advertising that no security knob can be loosened.
+
+- **Four outer-transport gates added to the `asi-hard` `KNOBS` SSOT**
+  (`src/security_profile.rs`), raising the pinned set 17 → 21:
+  `AI_MEMORY_FED_REQUIRE_SIG` (per-message Ed25519 signature),
+  `AI_MEMORY_FED_REQUIRE_NONCE` (per-message nonce freshness),
+  `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` (enrolled-peer identity), and
+  `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` (inbound-write namespace
+  confinement). All four already default fail-closed at v1.0.0, so the pin is
+  a NO-OP for a compliant deployment — it only makes them impossible to
+  DISABLE under `asi-hard` (an override below the floor REFUSES boot).
+- **`meets_floor` delegates to the live default-ON reader grammar**, never a
+  re-derived truthy grammar (the NB1 false-red lesson): the three
+  `env_flag_default_on` gates share the new value-level
+  `receive_auth::flag_value_default_on` (case-sensitive) that
+  `require_sig`/`require_nonce`/`require_push_namespace_scope_enabled` resolve
+  through, and the peer-enrollment gate shares the new value-level
+  `federation_signing_check::peer_enrollment_value_enabled` (case-insensitive)
+  that `require_peer_enrollment_enabled` resolves through — so the boot-refusal
+  floor can never disagree with the running process's actual gate state.
+- Reconciled every count/enumeration SSOT: `docs/deploy/asi-hard.env`,
+  `CLAUDE.md` env-row #130 (17 → 21), the module doc table + count assertion
+  in `src/security_profile.rs`, the `17`→`21` narrative in
+  `src/enterprise_federation_posture.rs`, and the certification doc
+  (`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`).
 
 ### Fixed (enterprise-federation Postgres-adapter audit; #3070 #3073 #3074)
 

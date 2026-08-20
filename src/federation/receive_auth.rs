@@ -356,7 +356,27 @@ pub fn require_checkpoint_sig_enabled() -> bool {
 pub fn env_flag_default_on(name: &str) -> bool {
     std::env::var(name)
         .ok()
-        .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
+        .is_none_or(|v| flag_value_default_on(&v))
+}
+
+/// Value-level half of the [`env_flag_default_on`] grammar: given an
+/// already-resolved value, is a default-ON federation knob still ENABLED?
+/// A trimmed value is DISABLED only by an explicit falsy token
+/// (`0`/`false`/`no`/`off`, case- and whitespace-SENSITIVE per #1914); every
+/// other value — empty string or unknown word — keeps it enabled.
+///
+/// Split out of [`env_flag_default_on`] (#3033) as the ONE grammar SSOT both
+/// the live receive gate AND the `asi-hard` KNOBS `meets_floor` predicate
+/// share: the boot-refusal floor for `AI_MEMORY_FED_REQUIRE_SIG` /
+/// `_NONCE` / `_PUSH_NAMESPACE_SCOPE` must answer "does this value keep the
+/// gate enabled?" using the EXACT same parse the runtime uses, never a
+/// re-derived truthy grammar — the NB1 false-red class
+/// (`src/enterprise_federation_posture.rs` check #4 docs) that treats e.g.
+/// `FED_REQUIRE_SIG=FALSE` (case-mismatched, so the live gate stays ON) as a
+/// loosening and bricks a compliant boot.
+#[must_use]
+pub fn flag_value_default_on(v: &str) -> bool {
+    !matches!(v.trim(), "0" | "false" | "no" | "off")
 }
 
 /// **Secure default for the federation per-write CONTENT-signature lane**

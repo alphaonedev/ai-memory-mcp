@@ -1674,19 +1674,31 @@ pub(crate) const REQUIRE_PEER_ENROLLMENT_ENV: &str = "AI_MEMORY_FED_REQUIRE_PEER
 /// instead of re-deriving the truthy/falsy grammar a second time.
 pub(crate) fn require_peer_enrollment_enabled() -> bool {
     match std::env::var(REQUIRE_PEER_ENROLLMENT_ENV) {
-        Ok(v) => {
-            let t = v.trim();
-            // Explicit falsy values revert to v0.7.x permissive; everything
-            // else (including the truthy `1`/`true`/`yes`/`on` and any other
-            // non-empty string) keeps the v0.8 secure default ON.
-            !(t.eq_ignore_ascii_case("0")
-                || t.eq_ignore_ascii_case("false")
-                || t.eq_ignore_ascii_case("no")
-                || t.eq_ignore_ascii_case("off"))
-        }
+        Ok(v) => peer_enrollment_value_enabled(&v),
         // UNSET → secure default ON (#1789).
         Err(_) => true,
     }
+}
+
+/// Value-level half of [`require_peer_enrollment_enabled`]'s grammar: given
+/// an already-resolved value, is peer-enrollment still REQUIRED? Explicit
+/// falsy values (`0`/`false`/`no`/`off`, case-INSENSITIVE, trimmed) revert to
+/// the v0.7.x permissive posture; everything else — the truthy set and any
+/// other non-empty string — keeps the v0.8 secure default ON.
+///
+/// Split out of [`require_peer_enrollment_enabled`] (#3033) as the ONE
+/// grammar SSOT both the live receive gate AND the `asi-hard` KNOBS
+/// `meets_floor` predicate for `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` share,
+/// so the boot-refusal floor is decided by the EXACT parse the runtime uses
+/// (case-insensitive here — deliberately unlike the case-sensitive
+/// [`crate::federation::receive_auth::flag_value_default_on`] siblings) rather
+/// than a re-derived grammar (the NB1 false-red class).
+pub(crate) fn peer_enrollment_value_enabled(v: &str) -> bool {
+    let t = v.trim();
+    !(t.eq_ignore_ascii_case("0")
+        || t.eq_ignore_ascii_case("false")
+        || t.eq_ignore_ascii_case("no")
+        || t.eq_ignore_ascii_case("off"))
 }
 
 /// Env var gating the unenrolled-peer rollout escape hatch. Hoisted to a
