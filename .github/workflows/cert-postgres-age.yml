@@ -71,6 +71,13 @@ on:
 
 permissions:
   contents: read
+  # #3089/#2960 — read-only pull of the prebuilt CI image from GHCR (build
+  # lever #3). The "Prepare certified pg image" step below prefers the
+  # published ghcr.io/<owner>/ai-memory-ci image and falls back to building
+  # the data tier locally when the pull is unavailable (fork PRs get no
+  # packages token; a not-yet-published tag; a GHCR outage) — so this grant
+  # only ever speeds the job, never gates it.
+  packages: read
 
 concurrency:
   # Event-distinct key (includes github.event_name) so a same-sha push +
@@ -203,24 +210,53 @@ jobs:
             # (e.g. "0.8.6"), never the pgdg package suffix — strip it here
             # once so the assert step below has no literal of its own.
             echo "CERT_EXPECTED_PGVECTOR_VERSION=${PGVECTOR_APT_VERSION%%-*}"
+            # Prebuilt CI image reference (build lever #3, #3089/#2960). The
+            # tag is the SAME triple-encoded tag publish-ci-image.yml resolves
+            # from THIS SSOT, so both sides agree by construction: a pin bump
+            # yields a new tag on both, and a not-yet-republished tag simply
+            # misses the pull and falls back to the local build below.
+            echo "CERT_CI_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER}/ai-memory-ci:pg${EXPECTED_PG_VERSION}-age${EXPECTED_AGE_VERSION}-pgvector${PGVECTOR_APT_VERSION%%-*}"
           } >> "$GITHUB_ENV"
           echo "::notice::certified pins resolved from deploy/docker-1461/provision/lib.sh — PG ${PG_APT_VERSION} (server ${EXPECTED_PG_VERSION}), AGE base ${AGE_BASE_IMAGE} (server ${EXPECTED_AGE_VERSION}), pgvector ${PGVECTOR_APT_VERSION}"
 
-      - name: Build certified pg+AGE+pgvector image (deploy/docker-1461/Dockerfile.pg-age-vector)
+      - name: Prepare certified pg image (prefer prebuilt GHCR image, else build)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Builds the SAME artifact the docker-1461 mesh ships — extending
-          # prior art rather than forking a second recipe. Every ARG comes
-          # from the previous step's resolved SSOT env, never a literal here.
-          docker build \
-            --build-arg AGE_BASE_IMAGE="${CERT_AGE_BASE_IMAGE}" \
-            --build-arg PG_MAJOR="${CERT_PG_MAJOR}" \
-            --build-arg PG_APT_VERSION="${CERT_PG_APT_VERSION}" \
-            --build-arg AGE_APT_VERSION="${CERT_AGE_APT_VERSION}" \
-            --build-arg PGVECTOR_APT_VERSION="${CERT_PGVECTOR_APT_VERSION}" \
-            -t cert-pg-age-vector:ci \
-            -f deploy/docker-1461/Dockerfile.pg-age-vector \
-            deploy/docker-1461
+          # Build lever #3 (#3089/#2960): prefer the prebuilt CI image whose
+          # certified data tier is byte-identical to the local build below —
+          # SAME apache/age base, SAME pgdg apt pins from the SAME SSOT
+          # (publish-ci-image.yml asserts the exact triple BEFORE it pushes).
+          # Pulling it skips the per-run `docker build` of the data tier.
+          #
+          # FAIL-CLOSED / DEGRADE-NEVER-BREAK: the pull is best-effort. Any
+          # failure — login denied on a fork PR (no packages token), a
+          # not-yet-published or SSOT-bumped tag, a GHCR outage — falls back
+          # to building the SAME artifact the docker-1461 mesh ships, exactly
+          # as before this lever existed. Either way the "Assert certified
+          # stack versions" step below re-verifies the running container
+          # against the SSOT and hard-fails on ANY drift, so a stale pulled
+          # image cannot silently certify the wrong versions.
+          echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin >/dev/null 2>&1 || true
+          if docker pull "${CERT_CI_IMAGE}" >/dev/null 2>&1; then
+            docker tag "${CERT_CI_IMAGE}" cert-pg-age-vector:ci
+            echo "::notice::using prebuilt CI image ${CERT_CI_IMAGE}"
+          else
+            echo "::notice::prebuilt CI image ${CERT_CI_IMAGE} unavailable — building data tier locally (unchanged fallback)"
+            # Builds the SAME artifact the docker-1461 mesh ships — extending
+            # prior art rather than forking a second recipe. Every ARG comes
+            # from the resolved SSOT env, never a literal here.
+            docker build \
+              --build-arg AGE_BASE_IMAGE="${CERT_AGE_BASE_IMAGE}" \
+              --build-arg PG_MAJOR="${CERT_PG_MAJOR}" \
+              --build-arg PG_APT_VERSION="${CERT_PG_APT_VERSION}" \
+              --build-arg AGE_APT_VERSION="${CERT_AGE_APT_VERSION}" \
+              --build-arg PGVECTOR_APT_VERSION="${CERT_PGVECTOR_APT_VERSION}" \
+              -t cert-pg-age-vector:ci \
+              -f deploy/docker-1461/Dockerfile.pg-age-vector \
+              deploy/docker-1461
+          fi
 
       - name: Run certified pg+AGE+pgvector container
         run: |

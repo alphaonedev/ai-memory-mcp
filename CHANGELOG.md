@@ -30,6 +30,42 @@ post-filter is correct and untouched.
   vacuous-on-empty tests and the pure `apply_form4_recall_filters` unit tests are
   unaffected and left untouched. Proven with 70 stress iterations
   (50× `--test-threads=8`, 20× `--test-threads=16`), all green.
+### Added (CI throughput lever #3: prebuilt pg18.6/AGE1.8.0/pgvector0.8.6 container image; #3089 #2960)
+
+CI-only change; no product code, no job `name:` changed, no required-context set
+changed.
+
+- **New `.github/Dockerfile.ci` — one prebuilt image baking the certified data
+  tier + the Rust CI build deps.** The data-tier layer is byte-identical to the
+  shipped `deploy/docker-1461/Dockerfile.pg-age-vector` (SAME apache/age base,
+  SAME pgdg `apt` pins resolved from the ONE SSOT
+  `deploy/docker-1461/provision/lib.sh` — PostgreSQL 18.6 + Apache AGE 1.8.0 +
+  pgvector 0.8.6); a second layer bakes the apt set the postgres-backed jobs
+  install at job start (mold 2.4.1 pinned tarball, build-essential, jq, sqlite3,
+  postgresql-client). Baking both moves the apt-mirror flake (#2960/#3090) and
+  the per-run `docker build` of the data tier off the per-PR hot path.
+- **New `.github/workflows/publish-ci-image.yml`** — builds `Dockerfile.ci` and
+  pushes `ghcr.io/<owner>/ai-memory-ci:pg<pg>-age<age>-pgvector<vec>` (+ `latest`)
+  on `workflow_dispatch` and on `push` to `release/**` when the Dockerfile, the
+  SSOT `lib.sh`, or this workflow changes. Triple-encoded tag resolved from the
+  SSOT (a pin bump auto-republishes under a new tag). `GITHUB_TOKEN` +
+  `packages: write`; actions pinned to the repo's house tags
+  (`docker/{setup-buildx,login,build-push}-action`). Fail-closed: the certified
+  triple is asserted against the SSOT from a locally-loaded build **before** the
+  push step runs, so a base-image/apt-snapshot drift reds and no image is pushed.
+  Push-only + `workflow_dispatch` (never `pull_request`) so it creates no
+  required-status-check context.
+- **Wired `cert-postgres-age.yml` (a NON-required context) to prefer the prebuilt
+  image, with an unchanged local-build fallback.** The former "Build certified
+  pg+AGE+pgvector image" step now pulls the prebuilt image when available and
+  falls back to building the SAME `Dockerfile.pg-age-vector` locally on any pull
+  failure (fork PRs with no packages token, a not-yet-published/SSOT-bumped tag,
+  a GHCR outage). The existing "Assert certified stack versions" step still
+  hard-fails on any drift of the running container, so a stale pulled image can
+  never silently certify the wrong versions (degrade-never-corrupt). The required
+  gates (`Postgres feature gate`, `Per-Module Coverage`) are deliberately left on
+  today's apt path — flagged as a follow-up pending a byte-parity proof for a
+  required job.
 
 ### Changed (CI cycle speedup: apt hardening + build-cache scoping + Merge Queue prereq; #3089 #2960 #3090)
 
