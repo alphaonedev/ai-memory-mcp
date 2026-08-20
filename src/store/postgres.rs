@@ -12983,6 +12983,40 @@ async fn pg_emit_revision_leaf_if_enabled(
 /// in-place content overwrite). `None` when the spine is OFF (default → no probe,
 /// byte-identical) or when no prior row exists (a fresh INSERT). MUST run in the
 /// SAME tx as the upsert (caller-held) so the probe cannot race the write.
+/// v1.0.0 #2954 — acquire an xact-scoped advisory lock keyed on
+/// `(hashtext(title), hashtext(namespace))` so concurrent same-`(title,
+/// namespace)` upserts SERIALIZE within their transactions. This closes the
+/// FRESH-INSERT TOCTOU on BOTH postgres COW-supersede probes (#2948 create funnel
+/// + #2954 federation funnel): the version/pre-image `SELECT` only sees a
+/// COMMITTED row, so under READ COMMITTED two peers/callers racing on a key with
+/// NO row yet could BOTH probe `None`, then the `ON CONFLICT` loser overwrites the
+/// winner's content in place with no pre-image → a MISSED supersede leaf (the
+/// audit hole). The lock (auto-released at tx end) blocks the second caller until
+/// the first COMMITs, so its probe reliably sees the row and emits its leaf.
+///
+/// The two-arg int4 form keys on two `hashtext` ints — deliberately NOT the
+/// one-arg `hashtext(title || sep || namespace)`, because a NUL separator is an
+/// illegal byte in a postgres `text` value and any other separator re-introduces
+/// the `'a'||'bc'` == `'ab'||'c'` collision this form avoids. Callers that take
+/// MULTIPLE keys in one tx (`store_batch`) MUST acquire them in a consistent
+/// order (see its sorted probe loop) so two batches cannot deadlock; single-key
+/// callers are trivially deadlock-free.
+///
+/// # Errors
+/// Propagates the lock query error.
+async fn pg_advisory_lock_title_namespace(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    title: &str,
+    namespace: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+        .bind(title)
+        .bind(namespace)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+}
+
 async fn pg_probe_upsert_prior_version(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     title: &str,
@@ -12991,6 +13025,9 @@ async fn pg_probe_upsert_prior_version(
     if !crate::config::append_only_enabled() {
         return Ok(None);
     }
+    // #2954 — serialize concurrent same-key create-funnel upserts so a
+    // fresh-insert race cannot make the loser overwrite content with no leaf.
+    pg_advisory_lock_title_namespace(tx, title, namespace).await?;
     sqlx::query_scalar::<_, i64>("SELECT version FROM memories WHERE title = $1 AND namespace = $2")
         .bind(title)
         .bind(namespace)
@@ -13034,6 +13071,17 @@ async fn pg_probe_federation_merge_preimage(
     if !crate::config::append_only_enabled() {
         return Ok(None);
     }
+    // #2954 — serialize concurrent same-`(title, namespace)` applies WITHIN the
+    // caller's tx so a FRESH-INSERT race cannot silently drop a leaf. The
+    // `FOR UPDATE` below only locks an EXISTING row; when NO row holds the key
+    // yet, two peers pushing the same key under READ COMMITTED could BOTH probe
+    // `None`, then the ON CONFLICT loser overwrites the winner's content in
+    // place with NO pre-image → no supersede leaf (the sqlite path is immune —
+    // its `BEGIN IMMEDIATE` RESERVED lock already spans probe→upsert). Exactly
+    // ONE key is locked per apply (a single memory), so there is no
+    // lock-ordering deadlock. Only taken on the armed path (this fn already
+    // returned above when the spine is off), so the default apply is unchanged.
+    pg_advisory_lock_title_namespace(tx, title, namespace).await?;
     let row = sqlx::query(
         "SELECT updated_at, id, version, content, encrypted_envelope \
          FROM memories WHERE title = $1 AND namespace = $2 FOR UPDATE",
@@ -16377,7 +16425,21 @@ impl MemoryStore for PostgresStore {
         let mut batch_prior_versions: std::collections::HashMap<(String, String), i64> =
             std::collections::HashMap::new();
         if crate::config::append_only_enabled() {
-            for idx in keep.iter().copied() {
+            // #2954 — `pg_probe_upsert_prior_version` now takes a per-key
+            // advisory lock (the fresh-insert TOCTOU fix). This loop acquires
+            // MULTIPLE locks in ONE tx, so it MUST visit the distinct keys in a
+            // globally-consistent order — else two concurrent batches sharing
+            // two keys could acquire them in opposite order and deadlock. Probe
+            // in `(title, namespace)` sorted order (a stable total order across
+            // batches); `batch_prior_versions` is a key-map, so the probe order
+            // does not affect its contents, and `keep` (which drives the INSERT
+            // row order + return-Vec alignment) is left UNTOUCHED.
+            let mut probe_order: Vec<usize> = keep.clone();
+            probe_order.sort_by(|&a, &b| {
+                (memories[a].title.as_str(), memories[a].namespace.as_str())
+                    .cmp(&(memories[b].title.as_str(), memories[b].namespace.as_str()))
+            });
+            for idx in probe_order {
                 let memory = &memories[idx];
                 if let Some(v) =
                     pg_probe_upsert_prior_version(&mut tx, &memory.title, &memory.namespace)
@@ -19550,8 +19612,21 @@ impl MemoryStore for PostgresStore {
         // the superseded pre-merge content lives only in the row it replaced,
         // never in the leaf.
         if let Some(pre) = merge_preimage.as_ref() {
-            let inbound_won = updated_at > pre.updated_at
-                || (updated_at == pre.updated_at && memory.id.as_str() > pre.id.as_str());
+            // #2954 (FIX 4) — the SQL `CASE` compares `EXCLUDED.updated_at` and
+            // `memories.updated_at` as `timestamptz`, whose resolution is
+            // MICROSECONDS; sqlx binds the inbound `DateTime<Utc>` (up to
+            // nanoseconds) as that same µs `timestamptz`, and `pre.updated_at`
+            // was decoded from a µs column. Truncating the Rust-side operand to
+            // µs makes this predicate BYTE-IDENTICAL to the live `CASE` — a
+            // sub-µs tie where the id-tiebreak favours the LOCAL row can no
+            // longer emit a spurious leaf. `duration_trunc` cannot fail for a
+            // 1µs unit; the fallback is defensive only.
+            use chrono::DurationRound;
+            let inbound_us = updated_at
+                .duration_trunc(chrono::Duration::microseconds(1))
+                .unwrap_or(updated_at);
+            let inbound_won = inbound_us > pre.updated_at
+                || (inbound_us == pre.updated_at && memory.id.as_str() > pre.id.as_str());
             let content_changed = remote_content != pre.content.as_str()
                 || remote_envelope.map(Vec::as_slice) != pre.encrypted_envelope.as_deref();
             if inbound_won && content_changed {

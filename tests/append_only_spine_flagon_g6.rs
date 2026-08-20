@@ -681,6 +681,62 @@ fn federation_newer_wins_but_content_unchanged_emits_no_leaf() {
 }
 
 #[test]
+fn federation_fresh_insert_if_newer_then_newer_overwrite_emits_one_leaf() {
+    // #2954 — the SERIALIZED-ordering proof the pg advisory lock guarantees under
+    // a race: a FRESH `insert_if_newer` (no prior row) writes NO leaf, and a
+    // SECOND `insert_if_newer` on the SAME (title, namespace) with a DIFFERENT id
+    // + newer updated_at must see the first's committed row and emit EXACTLY ONE
+    // supersede leaf (never zero — the "missed leaf on the raced second apply"
+    // regression class). sqlite is structurally immune to the fresh-insert race
+    // (BEGIN IMMEDIATE spans probe→upsert); this pins the emit path end-to-end.
+    let _g = flag_guard();
+    ensure_audit_key();
+    ai_memory::config::set_append_only(true);
+
+    let conn = open_mem_db();
+    let mut first = make_memory(
+        "00000000-0000-0000-0000-00000000c301",
+        "fed-seq-title",
+        "ns-fed-seq",
+        "fed-seq-v1",
+    );
+    first.created_at = "2020-01-01T00:00:00Z".to_string();
+    first.updated_at = "2020-01-01T00:00:00Z".to_string();
+    db::insert_if_newer(&conn, &first).expect("fresh insert_if_newer");
+    assert_eq!(
+        leaf_count(&conn),
+        0,
+        "a fresh insert_if_newer (no prior row) writes no leaf"
+    );
+
+    let mut second = make_memory(
+        "ffffffff-ffff-ffff-ffff-fffffffffff1",
+        "fed-seq-title",
+        "ns-fed-seq",
+        "fed-seq-v2",
+    );
+    second.updated_at = chrono::Utc::now().to_rfc3339();
+    second.created_at.clone_from(&second.updated_at);
+    db::insert_if_newer(&conn, &second).expect("newer insert_if_newer overwrite");
+
+    let leaves = read_leaves(&conn);
+    assert_eq!(
+        leaves.len(),
+        1,
+        "the second (newer) insert_if_newer sees the committed fresh row and emits ONE leaf"
+    );
+    assert_eq!(leaves[0].kind, "SUPERSEDE");
+    let (_id, content): (String, String) = conn
+        .query_row(
+            "SELECT id, content FROM memories WHERE title = ?1 AND namespace = ?2",
+            rusqlite::params!["fed-seq-title", "ns-fed-seq"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("read surviving head");
+    assert_eq!(content, "fed-seq-v2", "the newer content won");
+}
+
+#[test]
 fn federation_fresh_insert_emits_no_leaf() {
     let _g = flag_guard();
     ensure_audit_key();
@@ -1075,6 +1131,146 @@ mod postgres_twins {
             count_leaves(&pg, &local.id, "SUPERSEDE").await - before_loss,
             0,
             "an inbound-LOSS federation overwrite emits no leaf"
+        );
+    }
+
+    /// #2954 (FIX 1) — the SEQUENTIAL-ordering proof the advisory lock guarantees
+    /// under a fresh-insert race: a FRESH `apply_remote_memory` (no prior row)
+    /// writes NO leaf, and a SECOND `apply_remote_memory` on the SAME (title,
+    /// namespace) with a DIFFERENT id + newer updated_at must see the first's
+    /// committed row (its `FOR UPDATE` probe now reliably does, because the
+    /// advisory lock serialized them) and emit EXACTLY ONE supersede leaf —
+    /// never zero (the missed-leaf regression class the advisory lock closes).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
+    async fn pg_apply_remote_memory_fresh_then_newer_emits_one_leaf() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        ai_memory::config::set_append_only(true);
+        let ctx = CallerContext::for_agent("ai:g6-flagon");
+        let ns = "ns-pg-fed-seq";
+        let title = format!("pg-fed-seq-{}", uuid::Uuid::new_v4());
+
+        // FRESH apply (no prior row) — a plain insert, no leaf.
+        let mut first = sample(&uuid::Uuid::new_v4().to_string(), ns, "pg-seq-v1");
+        first.title = title.clone();
+        first.created_at = "2020-01-01T00:00:00Z".to_string();
+        first.updated_at = "2020-01-01T00:00:00Z".to_string();
+        let first_id = MemoryStore::apply_remote_memory(&pg, &ctx, &first)
+            .await
+            .expect("fresh apply_remote_memory");
+
+        // SECOND apply — same (title, ns), different id, newer ts, changed content.
+        let before = count_leaves(&pg, &first_id, "SUPERSEDE").await;
+        let mut second = sample(&uuid::Uuid::new_v4().to_string(), ns, "pg-seq-v2");
+        second.title = title.clone();
+        second.updated_at = chrono::Utc::now().to_rfc3339();
+        second.created_at.clone_from(&second.updated_at);
+        let applied = MemoryStore::apply_remote_memory(&pg, &ctx, &second)
+            .await
+            .expect("newer apply_remote_memory overwrite");
+        assert_eq!(applied, first_id, "the upsert keeps the first row's id");
+        assert_eq!(
+            count_leaves(&pg, &first_id, "SUPERSEDE").await - before,
+            1,
+            "the second (newer) apply sees the committed fresh row and emits ONE leaf (#2954 FIX 1)"
+        );
+    }
+
+    /// #2948 (inherited residual, FIX 1) — the pg CREATE funnel had the SAME
+    /// fresh-insert TOCTOU (`pg_probe_upsert_prior_version` had no FOR UPDATE and
+    /// no lock). A FRESH `store` writes no leaf; a SECOND `store` on the SAME
+    /// (title, namespace) overwrites content in place and, now that the probe
+    /// takes the advisory lock, reliably sees the committed row and emits ONE
+    /// supersede leaf.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
+    async fn pg_store_fresh_then_re_store_overwrite_emits_one_leaf() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        ai_memory::config::set_append_only(true);
+        let ctx = CallerContext::for_agent("ai:g6-flagon");
+        let ns = "ns-pg-create-seq";
+        let title = format!("pg-create-seq-{}", uuid::Uuid::new_v4());
+
+        let mut first = sample(&uuid::Uuid::new_v4().to_string(), ns, "create-v1");
+        first.title = title.clone();
+        let first_id = MemoryStore::store(&pg, &ctx, &first)
+            .await
+            .expect("fresh store");
+        let before = count_leaves(&pg, &first_id, "SUPERSEDE").await;
+
+        // A re-store of the SAME (title, namespace) — the create funnel's
+        // unconditional ON CONFLICT overwrite of `content`.
+        let mut second = sample(&uuid::Uuid::new_v4().to_string(), ns, "create-v2");
+        second.title = title.clone();
+        MemoryStore::store(&pg, &ctx, &second)
+            .await
+            .expect("re-store overwrite");
+        assert_eq!(
+            count_leaves(&pg, &first_id, "SUPERSEDE").await - before,
+            1,
+            "the re-store overwrite emits ONE supersede leaf (#2948 pg residual closed by FIX 1)"
+        );
+    }
+
+    /// #2954 (FIX 1) — CONCURRENCY: two concurrent fresh applies to the SAME
+    /// (title, namespace) with NO prior row (the exact race the advisory lock
+    /// closes — `FOR UPDATE` alone cannot lock a not-yet-inserted row). Proves
+    /// the advisory lock serialization is deadlock-free and leaves the store
+    /// CONSISTENT: exactly one surviving row, the newer content wins, both calls
+    /// return `Ok`, and at most one supersede leaf is written (the exact leaf
+    /// COUNT is order-dependent — 1 iff the older applier committed first — so it
+    /// is not asserted; the deterministic missed-leaf proof is the sequential
+    /// test above, which the advisory lock reduces every race to).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
+    async fn pg_concurrent_same_key_fresh_applies_no_deadlock_consistent() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        ai_memory::config::set_append_only(true);
+        let ctx = CallerContext::for_agent("ai:g6-flagon");
+        let ns = "ns-pg-fed-race";
+        let title = format!("pg-fed-race-{}", uuid::Uuid::new_v4());
+
+        let mut older = sample(&uuid::Uuid::new_v4().to_string(), ns, "race-older");
+        older.title = title.clone();
+        older.updated_at = "2020-01-01T00:00:00Z".to_string();
+        older.created_at.clone_from(&older.updated_at);
+        let mut newer = sample(&uuid::Uuid::new_v4().to_string(), ns, "race-newer");
+        newer.title = title.clone();
+        newer.updated_at = chrono::Utc::now().to_rfc3339();
+        newer.created_at.clone_from(&newer.updated_at);
+
+        // Race them. The advisory lock serializes the two same-key applies; a
+        // deadlock would surface as an Err here.
+        let (ra, rb) = tokio::join!(
+            MemoryStore::apply_remote_memory(&pg, &ctx, &older),
+            MemoryStore::apply_remote_memory(&pg, &ctx, &newer),
+        );
+        let ida = ra.expect("older apply must succeed (no deadlock)");
+        let idb = rb.expect("newer apply must succeed (no deadlock)");
+        assert_eq!(ida, idb, "both applies converge on the SAME surviving id");
+
+        // Exactly one row survives, carrying the NEWER content.
+        let (content, leaves): (String, i64) = sqlx::query_as(
+            "SELECT m.content, \
+                    (SELECT COUNT(*) FROM memory_revisions r \
+                     WHERE r.memory_id = m.id AND r.kind = 'SUPERSEDE') \
+             FROM memories m WHERE m.title = $1 AND m.namespace = $2",
+        )
+        .bind(&title)
+        .bind(ns)
+        .fetch_one(pg.pool())
+        .await
+        .expect("exactly one surviving row");
+        assert_eq!(content, "race-newer", "the newer content wins the merge");
+        assert!(
+            (0..=1).contains(&leaves),
+            "at most one supersede leaf (order-dependent), never a crash/duplicate: {leaves}"
         );
     }
 }

@@ -100,6 +100,19 @@ MAP=(
   # SUPERSEDE leaf => the lane test's `leaves.len() == 1` assertion goes RED,
   # proving the #2948 wiring (not the shared emitter) is load-bearing.
   "emit_upsert_supersede_leaf_if_enabled|body|Ok(())|src/storage/mod.rs|append_only_upsert_supersede_2948|armed_upsert_merge_emits_one_identity_only_supersede_leaf"
+  # #2954 (GA Wave-2) — the sqlite fn that routes the FEDERATION newer-wins LWW
+  # overwrite (`db::insert_if_newer`, `content = CASE WHEN excluded.updated_at >
+  # memories.updated_at … THEN excluded.content …`) through the signed
+  # `memory_revisions` ledger. This is a DISTINCT control from the #2948 create
+  # funnel above (a conditional inbound-WIN overwrite, not the unconditional
+  # `= excluded.content`). Neutralized to the no-op `Ok(())` body (body shape —
+  # the whole emission is the control) so an armed inbound-WIN overwrite stops
+  # appending its SUPERSEDE leaf => the lane test's `leaves.len() == 1` assertion
+  # goes RED, proving the #2954 wiring (not the shared emitter, not merely the
+  # static `APPEND-ONLY-SANCTIONED` marker) is load-bearing. The pg twin
+  # (`apply_remote_memory`) is END-TO-END pinned against a live PG by
+  # append_only_spine_flagon_g6::postgres_twins::pg_apply_remote_memory_newer_wins_writes_one_supersede_leaf.
+  "emit_federation_newer_wins_supersede_leaf_if_enabled|body|Ok(())|src/storage/mod.rs|append_only_spine_flagon_g6|federation_newer_wins_emits_one_identity_only_supersede_leaf"
   # L7 (PR-4, forensic-audit-trail wave) — the EXONERATION-authenticity gate.
   # `return true` (the always-allow disposition) lets an UNAUTHENTICATED forensic
   # watermark exonerate, defeating the L7 asymmetry. GUARD FIXTURE is the
