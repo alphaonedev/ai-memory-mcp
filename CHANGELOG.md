@@ -139,6 +139,27 @@ audit (epic #3076), fixed in one cohesive change.
   load-bearing. Comment corrected (`src/handlers/postgres_gate.rs`).
 
 Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
+### Docs (recall write-coupling drift corrected; #3086)
+
+- **SDK docstrings + operator docs still described `memory_recall` as
+  synchronously write-coupled** (bumping `access_count` and sliding TTLs on
+  every recall) — a claim that has been false since recall became a PURE read
+  at v1.0.0 (#1869 P0-1 + #1953 removed the `AI_MEMORY_RECALL_TOUCH_SYNC`
+  knob). Recall now writes **zero** rows to `memories`; it appends one row per
+  returned memory to the append-only `recall_observations` ledger, and the
+  access ladders (access-count, TTL floor-extend, mid→long promotion at 5
+  accesses, priority every 10, opt-in confidence decay) are applied out of
+  band by the periodic fold job (`db::fold_recall_accesses`), never inline on
+  the recall path. The SQLite 3x7 audit (#3086) flagged the stale sites; this
+  corrects them to the pure-recall / ledger-fold framing already used in
+  `sdk/typescript/README.md` and `docs/architectures-t1.html`. Docs/comments
+  only — zero behavior change. Files: `sdk/python/ai_memory/client.py`,
+  `sdk/typescript/src/client.ts`, `docs/DEVELOPER_GUIDE.md`,
+  `docs/GLOSSARY.md`, `docs/recall.md`, `docs/CLI_REFERENCE.md`,
+  `docs/USER_GUIDE.md`, `docs/ADMIN_GUIDE.md`, `docs/postgres-age-guide.md`,
+  `docs/essays/brass-tacks-2-how.html`, `docs/spec/v1.md`,
+  `docs/spec/TRACT-L1-CLAIM-CONTRACT.md`, `docs/confidence-calibration.md`.
+
 ### Fixed (`ai-memory migrate` dropped rows past 1000 AND never copied embeddings; #1876 #3060)
 
 - **Data-loss: cross-backend `migrate` copied memory TEXT but NOT the

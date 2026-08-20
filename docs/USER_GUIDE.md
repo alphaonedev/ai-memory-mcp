@@ -1609,7 +1609,7 @@ Update an existing memory by ID. Only the fields you provide are changed.
 
 ### recall
 
-Recall memories relevant to a context. Fuzzy OR search with ranked results; auto-touches recalled memories.
+Recall memories relevant to a context. Fuzzy OR search with ranked results. Recall is a PURE read (#1953): it writes zero rows to `memories`; the access ladders (access-count, TTL extension, promotion) are folded from the append-only `recall_observations` ledger out of band by the periodic fold job.
 
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
@@ -1912,7 +1912,9 @@ Show archive statistics (count, size, oldest/newest).
 
 ### Automatic Behaviors
 
-- **TTL extension**: Every time a memory is recalled, its expiry extends (1 hour for short, 1 day for mid)
+Recall itself is a **pure read** — it writes zero rows to `memories` and records each access in the append-only `recall_observations` ledger instead (#1953). The behaviors below are applied out of band by the periodic **fold job** (`db::fold_recall_accesses`) from that ledger, not inline on the recall path:
+
+- **TTL extension**: A recalled memory's expiry is floor-extended (1 hour for short, 1 day for mid; an access never moves an expiry earlier)
 - **Auto-promotion**: A mid-tier memory recalled 5+ times automatically becomes long-term (expiry cleared)
 - **Priority reinforcement**: Every 10 accesses, a memory's priority increases by 1 (max 10)
 - **Garbage collection**: Expired memories are cleaned up every 30 minutes (optionally archived instead of deleted when `archive_on_gc = true` in `config.toml`)

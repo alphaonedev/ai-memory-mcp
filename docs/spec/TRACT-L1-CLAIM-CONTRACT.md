@@ -359,9 +359,9 @@ eviction; they are unbundled and serve different purposes:
 | # | Surface | What it is | Symbol |
 |---|---|---|---|
 | 1 | **Recall ranking** | recency + capped access-count + tier bonus tilt *ordering* toward fresh/hot rows | the FTS score `+ MIN(access_count,50)*0.1 + … + recency_factor + tier_bonus` (`storage::mod`) |
-| 2 | **TTL floor-extend on access** | an access raises `expires_at` by a per-tier floor — frequently-recalled rows live longer | `SHORT_TTL_EXTEND_SECS` / `MID_TTL_EXTEND_SECS` (`models::mod`), #1596 |
-| 3 | **Confidence decay on touch** | a memory's `confidence` decays with age on recall touch | `crate::confidence::decay`, `ConfidenceSource::Decayed` |
-| 4 | **Access-count promotion** | mid→long auto-promotion at 5 accesses; priority increments every 10 | recall-pipeline touch ops |
+| 2 | **TTL floor-extend on access** | an access raises `expires_at` by a per-tier floor — frequently-recalled rows live longer; recall is pure (#1953), so this is applied by the fold job from the ledger, not inline | `SHORT_TTL_EXTEND_SECS` / `MID_TTL_EXTEND_SECS` (`models::mod`), #1596 |
+| 3 | **Confidence decay on access** | a memory's `confidence` decays with age when the fold job applies the recall-access ladders (recall itself writes nothing) | `crate::confidence::decay`, `ConfidenceSource::Decayed` |
+| 4 | **Access-count promotion** | mid→long auto-promotion at 5 accesses; priority increments every 10 — folded from the `recall_observations` ledger, not on the recall path | fold-job ladders (`fold_recall_accesses`) |
 
 ### 10.2 The true gap (localized)
 

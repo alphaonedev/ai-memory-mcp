@@ -409,7 +409,7 @@ export class AiMemoryClient {
   // Recall / search / forget
   // ========================================================================
 
-  /** `POST /api/v1/recall` — fuzzy hybrid recall (mutates access_count + TTL). */
+  /** `POST /api/v1/recall` — fuzzy hybrid recall; PURE (writes zero rows to `memories`; access ladders folded from the ledger out of band, #1953). */
   async recall(
     body: RecallRequest,
     opts?: RequestOptions,
