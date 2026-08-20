@@ -185,7 +185,10 @@ fn asi_hard_cold_boot_fresh_db_boots_clean_2942() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)
         .expect("stats --json parses on a cold-boot asi-hard fresh db");
-    assert_eq!(v["total"], 0, "fresh cold-boot db has zero memories; got: {v}");
+    assert_eq!(
+        v["total"], 0,
+        "fresh cold-boot db has zero memories; got: {v}"
+    );
 }
 
 /// `asi-hard` + an operator LOOSENING override below the hard floor: boot is
