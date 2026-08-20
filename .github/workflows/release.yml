@@ -1085,9 +1085,21 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
 
       - name: Install copr-cli
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pipx
+          set -euo pipefail
+          # #3090/#2960 — bounded, retried, fail-LOUD apt install (mirrors the
+          # postgresql-client hardening #3091). The old bare
+          # `apt-get update && apt-get install -y pipx` could hang on a stalled
+          # apt mirror until the job timeout fired. No external Action added.
+          apt_ok=0
+          for attempt in 1 2; do
+            if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y pipx; then
+              apt_ok=1; break
+            fi
+            echo "apt pipx attempt ${attempt} failed; retrying" >&2; sleep 5
+          done
+          [ "${apt_ok}" = 1 ] || { echo "::error::pipx install failed"; exit 1; }
           pipx ensurepath
           pipx install copr-cli
           pipx inject copr-cli rich
@@ -1099,7 +1111,20 @@ jobs:
           echo "${{ secrets.COPR_CONFIG }}" > ~/.config/copr
 
       - name: Install RPM build tools
-        run: sudo apt-get update && sudo apt-get install -y rpm
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          # #3090/#2960 — bounded, retried, fail-LOUD apt install (mirrors the
+          # postgresql-client hardening #3091). No external Action added.
+          apt_ok=0
+          for attempt in 1 2; do
+            if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y rpm; then
+              apt_ok=1; break
+            fi
+            echo "apt rpm attempt ${attempt} failed; retrying" >&2; sleep 5
+          done
+          [ "${apt_ok}" = 1 ] || { echo "::error::rpm install failed"; exit 1; }
+          rpm --version
 
       - name: Build source RPM
         run: |

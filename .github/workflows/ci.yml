@@ -26,6 +26,15 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main, develop, "release/**"]
+  # Merge Queue (#3089) — GitHub runs a queued PR's REQUIRED checks against the
+  # ephemeral `merge_group` ref, NOT the PR ref. A required workflow that does
+  # not trigger on `merge_group` never reports on that ref, so its context stays
+  # pending forever and the queue wedges the branch. Adding the trigger keeps
+  # the SAME required-context names (no `name:` changed). The `classify` decider
+  # defaults to `docs_only=false` on `merge_group` (explicit arm below): a merge
+  # group must exercise the FULL gate, never short-circuit to a docs-only skip.
+  merge_group:
+    types: [checks_requested]
 
 # Concurrency: coalesces `push` + same-branch internal `pull_request`
 # events while keeping fork PRs isolated.
@@ -155,6 +164,22 @@ jobs:
           #     do not gate merges — required contexts are matched on
           #     the PR head commit.
           ZERO=0000000000000000000000000000000000000000
+          # Merge Queue (#3089) — a `merge_group` event has no PR diff to
+          # classify, and a merge group MUST run the whole pipeline (never a
+          # docs-only short-circuit). Pin it here to `docs_only=false` +
+          # `__ALL__`. The generic fail-closed `else` arm below would also
+          # yield this (empty base → run everything), but the merge queue's
+          # correctness depends on it, so it is explicit and not left implicit
+          # to a future refactor of the base-resolution block.
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
+            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_reason=merge_group-full-pipeline" >> "$GITHUB_OUTPUT"
+            echo "::notice::merge_group event — running the full pipeline (not docs-only)"
+            exit 0
+          fi
           if [ "$EVENT_NAME" = "pull_request" ]; then
             cls_base="$PR_BASE_SHA"
             if [ -n "$PR_BEFORE" ] && [ "$PR_BEFORE" != "$ZERO" ] && [ "$PR_ACTION" = "synchronize" ]; then
@@ -616,6 +641,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         if: needs.classify.outputs.docs_only != 'true'
+        with:
+          # CI-speed (#3089) — SAVE the cache only on trunk `push` events
+          # (push.branches = main/develop/release/**). `pull_request` and
+          # `merge_group` runs RESTORE the warm trunk cache but never SAVE, so
+          # (a) a failed/partial PR compile cannot poison the shared cache
+          # (the "save-always: false" property) and (b) per-PR caches do not
+          # evict the trunk cache under GitHub's 10 GB/repo LRU limit, keeping
+          # the hit-rate high across PRs. Worst case degrades to a colder
+          # cache (slower, never wrong). rust-cache@v2 is the repo's existing
+          # house action — no new/unpinned Action is introduced.
+          save-if: ${{ github.event_name == 'push' }}
 
       # v0.9.0 pre-GA (#1853) — e1 macOS anti-flake. The
       # tests/e1_orchestration_dry_run.rs harness historically ran a NESTED
@@ -976,6 +1012,12 @@ jobs:
           mold --version
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # CI-speed (#3089) — save the cache only on trunk `push` events;
+          # PR + merge_group runs restore-only. See the `check` job above for
+          # the full rationale (no cache poison from a failed PR compile; no
+          # LRU eviction of the warm trunk cache). No new Action introduced.
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Wait for postgres readiness
         run: |

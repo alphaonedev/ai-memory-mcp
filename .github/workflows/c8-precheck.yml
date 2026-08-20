@@ -59,6 +59,14 @@ on:
     branches: [main, develop, "release/**"]
   pull_request:
     branches: [main, develop, "release/**"]
+  # Merge Queue (#3089) — this workflow carries several REQUIRED gate contexts,
+  # so it MUST report on the `merge_group` ref or the queue wedges. Its jobs
+  # have no docs-only/event `if:` gating (the two event-scoped gates —
+  # cert-expiry and commit-signing-posture — N/A-skip to exit 0 on a non-PR
+  # event, staying green), so every context reports on merge_group unchanged.
+  # No `name:` changed. See ci.yml for the full merge-queue rationale.
+  merge_group:
+    types: [checks_requested]
 
 # Fork-PR-safe concurrency key: coalesces push + same-branch internal
 # PR events; isolates fork PRs by PR number. See ci.yml for full
