@@ -743,6 +743,10 @@ mod tests {
     fn test_recall_keyword_tier_no_embedder() {
         // Keyword tier => no embedder; the keyword branch must run
         // happily and find the seeded title.
+        // #3092 isolation — pin AI_MEMORY_AGENT_ID UNSET (trust-all read)
+        // so a concurrent `recall_cli_drops_cross_agent_private_row_2990`
+        // set-var window can't hide the owner-keyed seeded row.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "haystack content");
@@ -1041,6 +1045,10 @@ mod tests {
 
     #[test]
     fn test_recall_json_output_includes_score_mode_tokens() {
+        // #3092 isolation — see note on `test_recall_keyword_tier_no_embedder`:
+        // this test asserts the seeded row is PRESENT, so it must run with
+        // AI_MEMORY_AGENT_ID unset (serialized against the #2990 mutator).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "haystack content");
@@ -1062,6 +1070,9 @@ mod tests {
 
     #[test]
     fn test_recall_text_output_formats_correctly() {
+        // #3092 isolation — asserts the seeded row is PRESENT in stdout;
+        // pin AI_MEMORY_AGENT_ID unset (serialized against the #2990 mutator).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test-ns", "needle title", "haystack content");
@@ -1144,6 +1155,10 @@ mod tests {
     /// confidence row directly via `db::insert`.
     #[test]
     fn test_recall_text_output_shows_confidence_below_full() {
+        // #3092 isolation — asserts the inserted row renders `conf=50%`, i.e.
+        // it must be PRESENT; pin AI_MEMORY_AGENT_ID unset (serialized against
+        // the #2990 mutator). The row's owner ("") never equals a leaked agent.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         {
@@ -1205,6 +1220,10 @@ mod tests {
     /// build a no-op so the test stays model-free and offline.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_recall_inside_runtime_uses_block_in_place_bridge() {
+        // #3092 isolation — asserts `count >= 1` (seeded row PRESENT); pin
+        // AI_MEMORY_AGENT_ID unset (serialized against the #2990 mutator).
+        // The guard is !Send but is held across no await in this body.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "haystack content");
@@ -1424,6 +1443,9 @@ limit = 25
         // Below CLI_HNSW_BUILD_MIN_ENTRIES the vector_index is None and
         // the recall pipeline's linear-scan fallback serves the
         // semantic phase — results must still come back in hybrid mode.
+        // #3092 isolation — asserts the seeded row is PRESENT; pin
+        // AI_MEMORY_AGENT_ID unset (serialized against the #2990 mutator).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "needle content body");
@@ -1600,6 +1622,10 @@ limit = 25
         // Drives the `confidence < 1.0` branch in the text output loop
         // (line 350) which formats " conf=XX%". Use a custom inserted
         // memory with confidence below 1.0.
+        // #3092 isolation — asserts the inserted row renders `conf=42%`
+        // (PRESENT); pin AI_MEMORY_AGENT_ID unset (serialized against the
+        // #2990 mutator). The row's owner "t" never equals a leaked agent.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         // Insert a low-confidence memory directly.
@@ -1692,6 +1718,11 @@ limit = 25
     fn recall_session_default_off_does_not_splice_scope() {
         // session_default=false short-circuits the scope branch to None
         // (line 92), so the configured scope is invisible.
+        // #3092 isolation — asserts both seeded namespaces are PRESENT
+        // (`nses.len() >= 2 || contains("other-ns")`); pin AI_MEMORY_AGENT_ID
+        // unset (serialized against the #2990 mutator). This is the exact
+        // assertion observed flaking in CI.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "scope-ns", "needle title", "content");
@@ -1846,6 +1877,9 @@ limit = 25
     #[test]
     fn recall_with_kind_filter_all_keyword_is_noop() {
         // --kind=all parses to None → no filter applied.
+        // #3092 isolation — asserts `count >= 1` (seeded row PRESENT); pin
+        // AI_MEMORY_AGENT_ID unset (serialized against the #2990 mutator).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "haystack content");
