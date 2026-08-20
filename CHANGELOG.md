@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests (serialize `AI_MEMORY_AGENT_ID`-dependent recall tests; fix #3092 isolation flake)
+
+Test-only. No product code changed — the #3092 `is_visible_to_caller` recall
+post-filter is correct and untouched.
+
+- **Root cause.** #3092 added an owner-keyed visibility post-filter to the CLI
+  recall path (`run_with_embedder`), keyed on the process-global
+  `AI_MEMORY_AGENT_ID` env var: when set + shape-valid, recall drops every row
+  the caller does not own. One sibling test
+  (`recall_cli_drops_cross_agent_private_row_2990`) SETS that var process-wide;
+  Rust runs the module's tests on parallel threads, so any recall test that
+  seeds owner-keyed rows and asserts they are PRESENT could intermittently see
+  an empty result set when it overlapped the set-var window (observed CI failure:
+  `recall_session_default_off_does_not_splice_scope`).
+- **Fix.** Each of the 9 presence-asserting recall tests now takes
+  `crate::identity::agent_id_env_unset_guard()` as its first statement — the
+  panic-safe RAII fixture that acquires the crate-wide agent-id test lock,
+  removes `AI_MEMORY_AGENT_ID` for the test's lifetime, and restores it on drop.
+  This both serializes each reader against the #2990 mutator and pins the
+  trust-all read posture, making the outcome deterministic. Absence-asserting /
+  vacuous-on-empty tests and the pure `apply_form4_recall_filters` unit tests are
+  unaffected and left untouched. Proven with 70 stress iterations
+  (50× `--test-threads=8`, 20× `--test-threads=16`), all green.
+
 ### Changed (CI cycle speedup: apt hardening + build-cache scoping + Merge Queue prereq; #3089 #2960 #3090)
 
 Follow-on to #3091 (which hardened only the `mold` install). CI-only change; no
