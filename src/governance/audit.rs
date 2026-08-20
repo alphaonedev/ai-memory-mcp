@@ -1107,30 +1107,90 @@ pub fn last_audit_watermark(db_id: Option<&str>) -> Option<(i64, String)> {
     // DATABASE (mirrors [`read_head_anchor_high_water`]): a watermark carrying a
     // DIFFERENT db_id anchors a sibling DB on this mount and is skipped, so a
     // restored / rotated / co-located DB's head can never be read as THIS db's
-    // high-water. `db_id = None` (an opener with no genesis / empty chain) reads
-    // every watermark — the conservative pre-#2955 posture.
+    // high-water.
+    //
+    // v1.0.0 #3006 / #3068 — an IDENTITY-LESS opener (`db_id = None`, no genesis
+    // / empty chain) WITHHOLDS instead of matching every watermark: it counts
+    // only db_id-LESS (legacy) rows and SKIPS every IDENTIFIED one — it provably
+    // cannot OWN a watermark stamped for an identified database, and the pre-fix
+    // "None reads every watermark" posture let a freshly-migrated / co-located
+    // empty chain be FALSE-CONVICTED of truncation on a live sibling's climbing
+    // watermark. This mirrors [`scan_head_anchor_log`]'s `ForeignOnly` withhold
+    // ([`WatermarkScan`]). Wipe-to-empty of a formerly-IDENTIFIED chain is owned
+    // by the SIGNED head-anchor-log rollback lane ([`read_head_anchor_high_water`]
+    // / `RollbackCheck`), which DELIBERATELY still over-counts for a `None`
+    // reader — its K1 pin makes the over-count an ATTESTABLE wipe detector,
+    // whereas THIS lane reads the raw UNSIGNED anchor and must not over-convict.
+    let mut withheld = false;
     for file in files.iter().rev().take(2) {
-        if let Some((seq, hash, _signed)) = scan_file_last_watermark(file, db_id) {
-            return Some((seq, hash));
+        match scan_file_last_watermark(file, db_id) {
+            WatermarkScan::Found(seq, hash, _signed) => return Some((seq, hash)),
+            WatermarkScan::Withheld => withheld = true,
+            WatermarkScan::NoEligibleRow => {}
         }
+    }
+    if withheld {
+        // #3068 — the degrade is OBSERVABLE, never a silent withhold: an
+        // operator relying on the raw forensic-watermark lane (no audit-witness
+        // enrolled) is told WHY it withheld and where the attestable control is.
+        // Mirrors the legacy-id-less WARN [`scan_head_anchor_log`] emits.
+        tracing::warn!(
+            target: AUDIT_TRACE_TARGET,
+            "verify-audit-trail: this database has no genesis / empty audit chain \
+             (db_head = 0), and the SHARED on-host forensic watermark sink carries \
+             only watermarks stamped for OTHER (identified) databases — none can be \
+             attributed to this opener, so the forensic-watermark truncation lane \
+             WITHHOLDS (#3068 cross-store bleed fix). Wipe-to-empty detection for a \
+             formerly-identified chain is owned by the SIGNED head-anchor-log lane; \
+             enrol an audit-witness key (AI_MEMORY_WITNESS_KEY_DIR / \
+             AI_MEMORY_WITNESS_PUBKEY) for that attestable control."
+        );
     }
     None
 }
 
-/// The most-recent watermark row in a single forensic file:
-/// `(head_sequence, head_canonical_hash, signed)` where `signed` is `true`
-/// iff that row carried a non-empty Ed25519 `sig`. `None` if the file carries
-/// no watermark. Malformed / wrong-version rows are skipped.
+/// v1.0.0 #3006 / #3068 — typed outcome of one forensic-file watermark scan,
+/// MIRRORING [`AnchorScan`] for the raw (unsigned) forensic-watermark lane so an
+/// identity-less / empty-chain / foreign-only opener WITHHOLDS (never match-all
+/// `Detected`). The raw lane carries no K1 pin authority, so there is no
+/// `Unpinnable` analog; the two "no high-water for this opener" states are
+/// [`WatermarkScan::NoEligibleRow`] (mirrors [`AnchorScan::NoPinnedLines`]) and
+/// [`WatermarkScan::Withheld`] (mirrors [`AnchorScan::ForeignOnly`]).
+enum WatermarkScan {
+    /// No watermark row in this file eligible for this opener (mirrors
+    /// [`AnchorScan::NoPinnedLines`]): file absent/empty, or every row was
+    /// malformed / wrong-version / a foreign identified row an identity-less
+    /// opener could not own with NONE it could.
+    NoEligibleRow,
+    /// An IDENTITY-LESS opener (`db_id = None`, no genesis / empty chain)
+    /// SKIPPED at least one IDENTIFIED (db_id-bearing) watermark on this shared
+    /// sink and found NONE it can own (mirrors [`AnchorScan::ForeignOnly`]).
+    /// WITHHOLD — never match-all `Detected`; the caller surfaces the deferral.
+    Withheld,
+    /// The most-recent eligible watermark for this opener (mirrors
+    /// [`AnchorScan::High`]): `(head_sequence, head_canonical_hash, signed)`
+    /// where `signed` is `true` iff that row carried a non-empty Ed25519 `sig`.
+    Found(i64, String, bool),
+}
+
+/// The most-recent watermark row in a single forensic file eligible for this
+/// opener (see [`WatermarkScan`]). Malformed / wrong-version rows are skipped.
 ///
-/// The `signed` bit is what the L7
+/// The `signed` bit ([`WatermarkScan::Found`]) is what the L7
 /// [`audit_watermark_exoneration_authenticated`] gate consumes: `verify_since`
 /// tolerates an unsigned row (counts it, never fails on it), so the exonerating
 /// lanes must additionally confirm the exact watermark they trust is itself
 /// signed. [`last_audit_watermark`] ignores the bit (the CONVICTING lanes read
 /// the raw unauthenticated anchor).
-fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> Option<(i64, String, bool)> {
-    let f = File::open(path).ok()?;
+fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> WatermarkScan {
+    let Ok(f) = File::open(path) else {
+        return WatermarkScan::NoEligibleRow;
+    };
     let mut found: Option<(i64, String, bool)> = None;
+    // #3068 — set when an identity-less opener skipped ≥1 IDENTIFIED watermark
+    // (mirrors `scan_head_anchor_log`'s `any_pinned`): decides NoEligibleRow vs
+    // Withheld when `found` is empty.
+    let mut skipped_identified = false;
     for line in BufReader::new(f).lines() {
         let Ok(line) = line else { continue };
         if line.trim().is_empty() {
@@ -1147,18 +1207,30 @@ fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> Option<(i64, St
         {
             continue;
         }
-        // v1.0.0 #2955 — per-database scoping (mirrors `scan_head_anchor_log`'s
-        // #2370 match): a watermark carrying a DIFFERENT db_id anchors a sibling
-        // DB sharing this on-host sink and must NEVER become this opener's
-        // high-water. A db_id-less (legacy) watermark is counted conservatively
-        // for every opener; `db_id = None` (no genesis / empty chain) counts
-        // every watermark. Only the cross-DB (foreign-id) row is skipped.
-        if let (Some(line_id), Some(mine)) = (
+        // v1.0.0 #2955 / #3068 — per-database scoping of the SHARED on-host
+        // forensic sink (mirrors `scan_head_anchor_log`'s #2370 match). A
+        // watermark declares the database it anchors via its payload `db_id`.
+        match (
             row.payload.get("db_id").and_then(serde_json::Value::as_str),
             db_id,
-        ) && line_id != mine
-        {
-            continue;
+        ) {
+            // #2955 — a watermark for a DIFFERENT identified DB anchors a sibling
+            // sharing this mount and must NEVER become this (identified) opener's
+            // high-water.
+            (Some(row_db_id), Some(mine)) if row_db_id != mine => continue,
+            // #3068 — an IDENTITY-LESS opener (no genesis / empty chain) cannot
+            // OWN an IDENTIFIED watermark: a row that declares a db_id belongs to
+            // some identified database, and an opener with neither genesis nor
+            // chain is provably not it. Skip it and record the skip so an empty
+            // scan resolves to WITHHOLD (`Withheld`), not `NoEligibleRow`.
+            (Some(_), None) => {
+                skipped_identified = true;
+                continue;
+            }
+            // (Some, Some) matching own db_id, or a db_id-LESS legacy (pre-#2955)
+            // watermark counted CONSERVATIVELY for every opener (over-detect
+            // toward Evidence on the one-release compat window, never suppress).
+            _ => {}
         }
         let seq = row
             .payload
@@ -1172,7 +1244,11 @@ fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> Option<(i64, St
             found = Some((seq, hash.to_string(), !row.sig.is_empty()));
         }
     }
-    found
+    match found {
+        Some((seq, hash, signed)) => WatermarkScan::Found(seq, hash, signed),
+        None if skipped_identified => WatermarkScan::Withheld,
+        None => WatermarkScan::NoEligibleRow,
+    }
 }
 
 /// L7 (PR-4, forensic-audit-trail wave) — earliest `--since` sentinel the
@@ -1248,7 +1324,7 @@ pub fn audit_watermark_exoneration_authenticated(
         return false;
     };
     for file in files.iter().rev().take(2) {
-        if let Some((_, _, signed)) = scan_file_last_watermark(file, db_id) {
+        if let WatermarkScan::Found(_, _, signed) = scan_file_last_watermark(file, db_id) {
             return signed;
         }
     }
@@ -2672,6 +2748,35 @@ fn sync_anchor_directory(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// v1.0.0 #2942 — is there ANY surviving line in the OFF-TABLE head-anchor log,
+/// regardless of whether it K1-pins? The cold-boot carve-out
+/// ([`compute_rollback_verdict_for_report`]) uses this as the fresh-vs-wiped
+/// discriminator when the witness pin is NOT YET enrolled ([`AnchorScan::Unpinnable`]):
+/// a genuinely FRESH node has no anchor log at all, whereas a DB that ran under
+/// require-mode and was later wiped (its `signed_events` emptied AND its witness
+/// key stripped, so the pin is now unresolvable) left anchor lines behind on the
+/// mount — those must keep it fail-closed.
+///
+/// Reads the RAW file only — no pin / signature authority (that is
+/// [`scan_head_anchor_log`]'s job). An unresolvable custody dir or a `NotFound`
+/// log is "no surviving anchor" (nothing to convict FROM: an empty-chain opener
+/// has no same-db truncation this could hide; the destroy-the-whole-mount case
+/// is the documented off-host-witness residual, not this lane). A log that
+/// EXISTS but is unreadable fails CLOSED (treated as a surviving anchor).
+fn off_table_head_anchor_present() -> bool {
+    let Ok(dir) = witness_key_dir() else {
+        return false;
+    };
+    let path = dir.join(HEAD_ANCHOR_LOG_FILENAME);
+    match File::open(&path) {
+        Ok(f) => BufReader::new(f)
+            .lines()
+            .any(|l| l.is_ok_and(|s| !s.trim().is_empty())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
 /// v1.0.0 #1946 B — read the highest witness-signed head anchored in the
 /// OFF-TABLE head-anchor log, K1-pinned against the enrolled witness pubkey.
 ///
@@ -2992,6 +3097,23 @@ pub fn compute_rollback_verdict_for_report(
         // a rollback (clean under require-mode too). Any other no-anchor case
         // keeps the #1946 withhold / fail-closed posture.
         AnchorScan::NoPinnedLines if db_head == 0 && db_id.is_none() => {
+            RollbackCheck::NotApplicable
+        }
+        // v1.0.0 #2942 — cold-boot carve-out for the asi-hard require path: a
+        // genesis-less, head-0 opener whose witness pin is NOT YET enrolled
+        // (`Unpinnable`) is a genuinely fresh asi-hard node ONLY when NO
+        // off-table head anchor survives on the mount. The discriminator is the
+        // SURVIVING off-table anchor, NOT chain-emptiness: a DB that ran under
+        // require-mode and was later wiped (its `signed_events` emptied AND its
+        // witness key stripped, so the pin is now unresolvable) left anchor
+        // lines behind → NOT carved out → stays fail-closed (`Missing`) below.
+        // No genesis row is minted on first open, so the witness-mount
+        // write-authority invariant is preserved (genesis-emit is deferred to
+        // the narrow T4 vote). Without this a brand-new asi-hard node cannot
+        // boot to RUN its own witness-enrollment ceremony (the chicken-and-egg).
+        AnchorScan::Unpinnable
+            if db_head == 0 && db_id.is_none() && !off_table_head_anchor_present() =>
+        {
             RollbackCheck::NotApplicable
         }
         AnchorScan::NoPinnedLines | AnchorScan::Unpinnable => {
