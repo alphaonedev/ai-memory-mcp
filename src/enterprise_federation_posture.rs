@@ -39,14 +39,17 @@
 //!    push-namespace-scope / governance permissions mode / governance
 //!    fail-open / trust domain / peer fingerprints / peer attestation
 //!    JSON+glob shape / the two "must be UNSET" federation trust
-//!    bypasses / at-rest encryption). TWO are BEYOND-RULING additions
-//!    from #2911 items 1-2, not from the ruling: the
+//!    bypasses / at-rest encryption). THREE are BEYOND-RULING additions,
+//!    not from the ruling: from #2911 items 1-2, the
 //!    stale-governance-policy refusal (FED-RQ-03, check #18) and the
 //!    boot-refusal env itself (check #17 — so `doctor --posture` cannot
 //!    PASS a deployment whose daemon would not refuse boot on later
-//!    drift). Every env-var-name literal below is a named `ENV_*` const
-//!    imported from its ONE existing declaration site — none are
-//!    redeclared here.
+//!    drift); and from #2954, the append-only-audit-spine-armed pairing
+//!    (check #19 — append-only spine ON *and* the daemon audit signing
+//!    key armed, so a federation newer-wins supersede leaf is SIGNED, not
+//!    unsigned theater). Every env-var-name literal below is a named
+//!    `ENV_*` const imported from its ONE existing declaration site —
+//!    none are redeclared here.
 //!
 //! ## Ruling-vs-code reconciliation (quoted, so the drift is auditable)
 //!
@@ -105,8 +108,10 @@ pub const ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE: &str =
 
 /// Number of [`PostureCheck`]s [`evaluate`] returns. Pinned so a
 /// dropped or added check is a loud test failure rather than a silent
-/// `doctor --posture` shape change (#2911).
-pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 18;
+/// `doctor --posture` shape change (#2911). #2954 raised it 18 → 19 (the
+/// append-only-audit-spine-armed pairing, check #19) — a DELIBERATE, ratified
+/// re-cert, not a silent drift.
+pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 19;
 
 /// `tracing` target for the §5.3 boot-banner rows
 /// (`daemon_runtime::run`, the B2 fix — see module docs). Hoisted to a
@@ -554,6 +559,46 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
         "unset AI_MEMORY_FED_REQUIRE_POLICY_CURRENT or set it to 1",
     ));
 
+    // ---- 19. append-only audit spine armed (#2954) -----------------
+    // The federation newer-wins overwrite (`insert_if_newer` /
+    // `apply_remote_memory`) appends an identity-only SUPERSEDE leaf ONLY when
+    // the append-only spine is ON, and that leaf is tamper-EVIDENT only when the
+    // daemon audit signing key is installed to SIGN it. The certified posture
+    // therefore requires BOTH — an unsigned leaf is theater (the #2954 reviewer
+    // killer objection). Both halves are CONFIG/DISK-resolvable, which is
+    // load-bearing: this module's boot gate runs in `fn main()` BEFORE
+    // `set_append_only` and `audit::init` (src/main.rs), so it reads the RESOLVED
+    // storage flag (env > `[storage]` > compiled, the same value boot will seed)
+    // and probes the daemon signing key the same way `init_forensic_audit` will
+    // (an already-installed process key OR a loadable key file). A doctor run
+    // (post-init) also PASSes via the installed-key arm.
+    let append_only_resolved = app_config.resolve_storage().append_only;
+    let audit_signer_armed = crate::governance::audit::audit_key_is_installed() || {
+        let agent_id = crate::identity::resolve_agent_id(None, None)
+            .unwrap_or_else(|_| "ai-memory".to_string());
+        crate::governance::audit::load_daemon_signing_key(&agent_id)
+            .ok()
+            .flatten()
+            .is_some()
+    };
+    out.push(check(
+        "append-only audit spine",
+        "append-only spine ON (AI_MEMORY_APPEND_ONLY / [storage].append_only) AND the daemon \
+         audit signing key armed (federation supersede leaves are SIGNED, not unsigned)",
+        format!(
+            "append_only={append_only_resolved}; audit_signing_key={}",
+            if audit_signer_armed {
+                "armed"
+            } else {
+                "absent"
+            }
+        ),
+        append_only_resolved && audit_signer_armed,
+        "set AI_MEMORY_APPEND_ONLY=1 (or [storage].append_only = true) AND provision the daemon \
+         audit signing key (see `governance::audit::load_daemon_signing_key`) so the append-only \
+         federation supersede leaves are signed",
+    ));
+
     debug_assert_eq!(
         out.len(),
         ENTERPRISE_FEDERATION_CHECK_COUNT,
@@ -651,7 +696,15 @@ mod tests {
         crate::encryption::ENV_ENCRYPT_AT_REST,
         crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
         ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+        // #2954 — check #19 append-only spine flag.
+        crate::config::ENV_APPEND_ONLY,
     ];
+
+    /// #2954 — keeps the installed daemon-audit-key temp dir alive for the
+    /// whole (env-isolated child) process so check #19's signing-key half stays
+    /// armed. First-install-wins (`OnceLock`), mirroring the flag-on suite's
+    /// `AUDIT_DIR`.
+    static POSTURE_AUDIT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::config::test_env_lock()
@@ -724,7 +777,26 @@ mod tests {
             // a FAIL (doctor must not PASS a process whose daemon would
             // not refuse boot on later drift).
             std::env::set_var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, "1");
+            // #2954 check #19 — the append-only audit spine must be armed for
+            // the certified posture (else a federation supersede leaf is
+            // unsigned theater). The signing-key half is armed just below.
+            std::env::set_var(crate::config::ENV_APPEND_ONLY, "1");
         }
+        // #2954 check #19 — install a process-wide daemon audit signing key so
+        // the append-only leaves would be SIGNED. Process-global `OnceLock`
+        // install, isolated per env-isolated child
+        // (`run_env_isolated_child_or_spawn`), kept alive for the test in a
+        // module-static tempdir (first-install-wins, like the flag-on suite).
+        POSTURE_AUDIT_DIR.get_or_init(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("ef-posture-audit-")
+                .tempdir()
+                .expect("audit tempdir");
+            let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+            crate::governance::audit::init(dir.path(), Some(signing))
+                .expect("install daemon audit key");
+            dir
+        });
         // AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT / _SIG / _NONCE /
         // _PUSH_NAMESPACE_SCOPE / _POLICY_CURRENT /
         // AI_MEMORY_PERMISSIONS_MODE /
@@ -1404,6 +1476,90 @@ mod tests {
         let https_row = find(&checks, crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV);
         assert!(!https_row.pass);
         assert!(https_row.control.contains("https-only peers"));
+    }
+
+    // ------------------------------------------------------------------
+    // #2954 check #19 — append-only audit spine (append-only ON AND the
+    // daemon audit signing key armed) — else a federation supersede leaf is
+    // unsigned theater.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn append_only_disarmed_fails_check_19() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::append_only_disarmed_fails_check_19",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        // Fully hardened (which arms BOTH halves), then strip the append-only
+        // flag: the spine is off, so no leaf is written at all — check #19 FAILs
+        // even though the signing key is armed.
+        let _fp_file = set_fully_hardened_env();
+        unsafe {
+            std::env::remove_var(crate::config::ENV_APPEND_ONLY);
+        }
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, "append-only audit spine");
+        assert!(
+            !c.pass,
+            "check #19 must FAIL when the append-only spine is disarmed: {c:?}"
+        );
+        assert!(
+            c.actual.contains("append_only=false"),
+            "actual must name the disarmed spine: {:?}",
+            c.actual
+        );
+        assert!(c.remediation.contains(crate::config::ENV_APPEND_ONLY));
+        assert!(!all_pass(&checks));
+    }
+
+    #[test]
+    fn audit_signing_disarmed_fails_check_19() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::audit_signing_disarmed_fails_check_19",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        // Arm the append-only spine but deliberately DO NOT install a daemon
+        // audit key (never call set_fully_hardened_env, which would), and point
+        // the key dir at an EMPTY temp dir so `load_daemon_signing_key` finds no
+        // key on disk either — the leaf would store UNSIGNED, so check #19 FAILs.
+        let empty_key_dir = tempfile::tempdir().expect("empty key dir");
+        unsafe {
+            std::env::set_var(crate::config::ENV_APPEND_ONLY, "1");
+            std::env::set_var(crate::identity::keypair::KEY_DIR_ENV, empty_key_dir.path());
+        }
+        assert!(
+            !crate::governance::audit::audit_key_is_installed(),
+            "precondition: no process audit key installed in this child"
+        );
+
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, "append-only audit spine");
+        assert!(
+            !c.pass,
+            "check #19 must FAIL when the audit signing key is disarmed: {c:?}"
+        );
+        assert!(
+            c.actual.contains("append_only=true") && c.actual.contains("audit_signing_key=absent"),
+            "actual must show the spine armed but the signer absent: {:?}",
+            c.actual
+        );
+        assert!(!all_pass(&checks));
+
+        unsafe {
+            std::env::remove_var(crate::identity::keypair::KEY_DIR_ENV);
+        }
     }
 
     // ------------------------------------------------------------------

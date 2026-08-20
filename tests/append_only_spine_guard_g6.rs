@@ -19,15 +19,21 @@
 //!     the conflicting row before re-inserting, annihilating the prior
 //!     version's content OUTSIDE the ledger; a bypass P1 + P2 do not catch.
 //!   * P4 — `INSERT … ON CONFLICT(title, namespace) DO UPDATE SET
-//!     (content|title) = …` (PR-3 #2948) — the primary CREATE funnel's
-//!     upsert-merge (`db::insert` / `PostgresStore::store*`) rewrites an
-//!     existing memory's durable authored TEXT in place on a `(title,
-//!     namespace)` collision. P2 misses it because the assignment sits behind
+//!     (content|title) = excluded.…` (PR-3 #2948, extended #2954) — an upsert
+//!     that rewrites an existing memory's durable authored TEXT in place on a
+//!     `(title, namespace)` collision, taking the new value from the
+//!     `excluded` conflict row. P2 misses it because the assignment sits behind
 //!     `DO UPDATE SET`, not `UPDATE memories SET`. Scoped to the memories-only
 //!     `(title, namespace)` conflict target so upserts on other tables are not
-//!     flagged. This was the DOCUMENTED RESIDUAL below until #2948 closed it
-//!     (5-agent vote `4d3ea1c5`, PR-3, UNANIMOUS A1 — route the overwrite
-//!     through the ledger).
+//!     flagged. TWO content-destroying shapes qualify under the SAME invariant:
+//!     the UNCONDITIONAL create-funnel overwrite (`content = excluded.content`
+//!     — `db::insert` / `PostgresStore::store*`, #2948) AND the federation
+//!     newer-wins LWW merge (`content = CASE WHEN excluded.updated_at >
+//!     memories.updated_at … THEN excluded.content …` — `insert_if_newer` /
+//!     `apply_remote_memory`, #2954). #2948 first closed the unconditional
+//!     residual (5-agent vote `4d3ea1c5`); #2954 folded the newer-wins merge in
+//!     so the source-static guard mechanically forbids a federation overwrite
+//!     that skips the ledger too.
 //!
 //! DELIBERATELY OUT OF SCOPE (the North-Star content-vs-derived-artifact line):
 //! a bare new-row `INSERT INTO memories` destroys nothing, and an in-place
@@ -266,52 +272,46 @@ fn stmt_rewrites_durable_text(stmt: &str) -> bool {
     stmt_assigns_column(stmt, "content") || stmt_assigns_column(stmt, "title")
 }
 
-/// Within a statement body, is a durable-TEXT column (`content` / `title`)
-/// assigned DIRECTLY from the `excluded` / `EXCLUDED` conflict row —
-/// i.e. `content = excluded.content` — the UNCONDITIONAL create-funnel
-/// overwrite? This deliberately does NOT match the federation newer-wins merge
-/// form `content = CASE WHEN excluded.updated_at > memories.updated_at …`
-/// (a conditional LWW convergence overwrite whose ledger story is a SEPARATE
-/// class, tracked in #2954 apart from #2948), nor `= memories.content` (a
-/// self-preserving arm).
-fn stmt_unconditionally_overwrites_durable_text(stmt: &str) -> bool {
-    assigns_column_from_excluded(stmt, "content") || assigns_column_from_excluded(stmt, "title")
+/// Case-insensitive substring search (the `regex`/`memmem` crates are not
+/// dependencies). Empty needle never matches.
+fn contains_ignore_ascii_case(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    hay.to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
 }
 
-/// `column = excluded.…` / `column = EXCLUDED.…` with word boundaries around
-/// `column` and an `excluded.` right-hand side (case-insensitive on the
-/// keyword). The RHS check is what separates the unconditional create-funnel
-/// overwrite from the `CASE WHEN …` federation merge and the self-preserving
-/// `memories.<col>` arms.
-fn assigns_column_from_excluded(stmt: &str, column: &str) -> bool {
-    let bytes = stmt.as_bytes();
-    let mut from = 0;
-    while let Some(rel) = stmt[from..].find(column) {
-        let idx = from + rel;
-        from = idx + column.len();
-        let before_ok = idx == 0 || {
-            let b = bytes[idx - 1];
-            !(b.is_ascii_alphanumeric() || b == b'_')
-        };
-        let after = &stmt[idx + column.len()..];
-        let boundary_ok = after
-            .chars()
-            .next()
-            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-        if before_ok && boundary_ok {
-            let rhs = after.trim_start();
-            if let Some(expr) = rhs.strip_prefix('=') {
-                let expr = expr.trim_start();
-                // Case-insensitive `excluded.` prefix (sqlite `excluded`,
-                // postgres `EXCLUDED`).
-                let head: String = expr.chars().take("excluded.".len()).collect();
-                if head.eq_ignore_ascii_case("excluded.") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+/// PR-3 (#2948) + PR (#2954) — within a statement body, is a durable-TEXT
+/// column (`content` / `title`) overwritten with a value TAKEN FROM the
+/// `excluded` / `EXCLUDED` conflict row? Two content-destroying shapes both
+/// qualify:
+///
+///  * `content = excluded.content` — the UNCONDITIONAL create-funnel overwrite
+///    (`db::insert` / `PostgresStore::store*`, #2948); AND
+///  * `content = CASE WHEN excluded.updated_at > memories.updated_at …
+///    THEN excluded.content …` — the federation newer-wins LWW merge
+///    (`insert_if_newer` / `apply_remote_memory`, #2954). The winning arm
+///    replaces the prior version's durable text in place exactly as the
+///    unconditional form does, so its ledger coverage is the SAME invariant,
+///    not a separate class.
+///
+/// A purely self-preserving arm (`content = memories.content`, with NO
+/// `excluded.<col>` anywhere in the assignment) is NOT flagged — it destroys
+/// nothing.
+fn stmt_overwrites_durable_text_from_excluded(stmt: &str) -> bool {
+    column_takes_excluded_value(stmt, "content") || column_takes_excluded_value(stmt, "title")
+}
+
+/// A durable-TEXT `column` is assigned (`column = …`) AND the statement takes
+/// that column's value from `excluded.<column>` somewhere in the assignment —
+/// either DIRECTLY (`= excluded.content`) or inside a `CASE … THEN
+/// excluded.content …` newer-wins arm. Case-insensitive on the `excluded`
+/// keyword (sqlite `excluded`, postgres `EXCLUDED`). The self-preserving
+/// `= memories.<col>` arm carries no `excluded.<col>` and so is not flagged.
+fn column_takes_excluded_value(stmt: &str, column: &str) -> bool {
+    stmt_assigns_column(stmt, column)
+        && contains_ignore_ascii_case(stmt, &format!("excluded.{column}"))
 }
 
 /// PR-3 (#2948) — the P4 pattern
@@ -331,12 +331,13 @@ fn assigns_column_from_excluded(stmt: &str, column: &str) -> bool {
 ///    index (whitespace-tolerant) — no other table upserts on that target
 ///    (`peer_state` → `(agent_id, peer_id)`, `namespace_meta` → `(namespace)`,
 ///    `actions`/`pending` → `(id)`); AND
-///  * the durable-TEXT column is assigned DIRECTLY from `excluded.…` (the
-///    UNCONDITIONAL create overwrite), NOT via the `CASE WHEN
-///    excluded.updated_at > memories.updated_at …` federation newer-wins merge.
-///    The federation LWW merge (`insert_if_newer` / `apply_remote_memory`) is a
-///    DISTINCT content-overwrite class whose ledger coverage is tracked in
-///    #2954, not #2948.
+///  * the durable-TEXT column is assigned from `excluded.…` — either the
+///    UNCONDITIONAL create overwrite (`= excluded.content`, #2948) OR the
+///    federation newer-wins merge (`content = CASE WHEN excluded.updated_at >
+///    memories.updated_at … THEN excluded.content …`, #2954). Both replace the
+///    prior version's durable text on the winning arm, so #2954 folded the
+///    federation LWW merge (`insert_if_newer` / `apply_remote_memory`) into
+///    this SAME P4 invariant — it is no longer a carved-out separate class.
 ///
 /// Returns the byte offsets of each matching `ON CONFLICT`.
 fn p4_on_conflict_do_update_durable_text(stripped: &str) -> Vec<usize> {
@@ -365,7 +366,7 @@ fn p4_on_conflict_do_update_durable_text(stripped: &str) -> Vec<usize> {
         // string literal — SQL upsert bodies carry no `;`), is a durable-TEXT
         // column UNCONDITIONALLY overwritten from `excluded.…`?
         let stmt_end = rest.find(';').unwrap_or(rest.len());
-        if stmt_unconditionally_overwrites_durable_text(&rest[..stmt_end]) {
+        if stmt_overwrites_durable_text_from_excluded(&rest[..stmt_end]) {
             hits.push(start);
         }
     }
@@ -628,26 +629,42 @@ fn p4_ignores_do_nothing_and_non_durable_and_other_tables() {
 }
 
 #[test]
-fn p4_ignores_federation_newer_wins_case_merge() {
-    // The federation LWW merge (`insert_if_newer` / `apply_remote_memory`)
+fn p4_flags_federation_newer_wins_case_merge() {
+    // #2954 — the federation LWW merge (`insert_if_newer` / `apply_remote_memory`)
     // overwrites content CONDITIONALLY via `CASE WHEN excluded.updated_at >
-    // memories.updated_at …` — a DISTINCT content-overwrite class whose ledger
-    // coverage is tracked in #2954, NOT #2948. P4 must NOT flag it, so
-    // the create-funnel guard does not force a federation-merge rewrite.
+    // memories.updated_at … THEN excluded.content …`. This IS a durable-text
+    // destruction on the winning arm, so #2954 folded it into the P4 invariant:
+    // the source-static guard now flags it, forcing a ledger route (the leaf
+    // emission + `APPEND-ONLY-SANCTIONED` marker the two funnels now carry).
     let fed = "ON CONFLICT(title, namespace) DO UPDATE SET \
                content = CASE WHEN excluded.updated_at > memories.updated_at \
                THEN excluded.content ELSE memories.content END, \
                version = memories.version + 1;";
-    assert!(
-        p4_on_conflict_do_update_durable_text(fed).is_empty(),
-        "P4 is scoped to the UNCONDITIONAL create overwrite; the federation \
-         newer-wins CASE merge is a separate class"
+    assert_eq!(
+        p4_on_conflict_do_update_durable_text(fed).len(),
+        1,
+        "P4 must flag the federation newer-wins CASE merge that takes \
+         excluded.content on the winning arm (#2954)"
     );
 
-    // The self-preserving arm (`content = memories.content`) is likewise not
-    // an overwrite of durable text and must not be flagged.
+    // The self-preserving arm (`content = memories.content`) carries no
+    // `excluded.content` and must NOT be flagged — it destroys nothing.
     let keep = "ON CONFLICT(title, namespace) DO UPDATE SET content = memories.content;";
-    assert!(p4_on_conflict_do_update_durable_text(keep).is_empty());
+    assert!(
+        p4_on_conflict_do_update_durable_text(keep).is_empty(),
+        "the self-preserving `= memories.content` arm is not a durable-text overwrite"
+    );
+
+    // A derived-only newer-wins CASE (e.g. lifecycle_state) that never touches
+    // `content`/`title` must NOT be flagged — only durable AUTHORED-TEXT is
+    // in scope.
+    let derived = "ON CONFLICT(title, namespace) DO UPDATE SET \
+                   lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at \
+                   THEN excluded.lifecycle_state ELSE memories.lifecycle_state END;";
+    assert!(
+        p4_on_conflict_do_update_durable_text(derived).is_empty(),
+        "a newer-wins CASE on a derived column is out of the durable-text scope"
+    );
 }
 
 #[test]
@@ -665,8 +682,10 @@ fn p4_matches_the_real_insert_inner_and_pg_store_are_sanctioned() {
         p4_total += p4_on_conflict_do_update_durable_text(&stripped).len();
     });
     assert!(
-        p4_total >= 2,
-        "the P4 detector must see the real create-funnel upserts in src/ \
-         (sqlite insert_inner + at least one PostgresStore upsert); found {p4_total}"
+        p4_total >= 4,
+        "the P4 detector must see the real durable-text upserts in src/: the \
+         UNCONDITIONAL create funnel (sqlite `insert_inner` + a PostgresStore \
+         upsert, #2948) AND the federation newer-wins CASE merge (sqlite \
+         `insert_if_newer` + pg `apply_remote_memory`, #2954); found {p4_total}"
     );
 }

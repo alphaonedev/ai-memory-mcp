@@ -181,13 +181,28 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 `ai-memory doctor --posture enterprise-federation` renders PASS/FAIL per
 requirement and **exits non-zero on any deviation of the running process**
 (the ruling's "a non-zero exit is falsifiable" bar). `run_posture`
-(`src/cli/doctor.rs:561`) returns **0 iff all 18 checks pass, else 2**
+(`src/cli/doctor.rs:561`) returns **0 iff all 19 checks pass, else 2**
 (the posture grew 16 → 18 when #2918/#2911 landed checks #17
-boot-refusal-env self-attest and #18 FED-RQ-03). Re-captured 2026-08-13
-on the release-built binary at the post-remediation tree (the merged
-cert wave: #2915-#2920, #2925-#2927, #2929); raw output in
-`docs/compliance/evidence/cert-54/` (see that directory's
-`SANITIZATION.md` + `MANIFEST.sha256`):
+boot-refusal-env self-attest and #18 FED-RQ-03, then **18 → 19 when #2954
+landed check #19 append-only-audit-spine-armed** — append-only spine ON
+AND the daemon audit signing key armed, so a federation newer-wins
+supersede leaf is SIGNED, not unsigned theater). The four-leg capture
+below was taken 2026-08-13 on the release-built binary at the
+post-remediation tree (the merged cert wave: #2915-#2920, #2925-#2927,
+#2929); raw output in `docs/compliance/evidence/cert-54/` (see that
+directory's `SANITIZATION.md` + `MANIFEST.sha256`):
+
+> **Evidence note (#2954, 2026-08-20):** the `cert-54/` §2 captures below
+> PREDATE #2954 and reflect the **18**-check posture. #2954 added check
+> #19, so a re-capture on the post-#2954 release binary shows **19**
+> checks: the **bare leg** gains one FAIL (append-only spine off + no
+> audit key) → **9 FAIL of 19**; the **certified pass leg** stays
+> `overall: PASS` because the checked-in `enterprise-federation.env`
+> profile now sets `AI_MEMORY_APPEND_ONLY=1` and a certified deployment
+> provisions the daemon audit signing key (→ **19 `[PASS]`, 0 `[FAIL]`**).
+> The PASS/FAIL *verdict per leg* is unchanged for the certified config;
+> only the check count and the bare-leg FAIL tally grew. (Same handling
+> precedent as the #3033 knob-count note below.)
 
 | Environment | Exit | Result |
 |---|---|---|
@@ -676,7 +691,7 @@ posture); an explicit downgrade now requires a two-key turn
 inventory load), and unmanaged-permissive drift surfaces as a non-action
 `ReconcileAdvisory`. It adds **NO new `AI_MEMORY_FED_*` identifier**
 (the existing env #29 mapping is unchanged) and REMOVES **no** certified
-control (the removal-proof set is unchanged; the cert gate's 18 checks
+control (the removal-proof set is unchanged; the cert gate's checks
 reference none of the changed symbols). Ratified by a 5-agent T3
 adversarial vote (4–1, recorded on #2975). **This PR does NOT re-mint
 the certification:** re-running §5.4(2)–(5) at the new SHA and
@@ -709,7 +724,8 @@ amended through the merged 2026-08-13 remediation wave — #2915-#2920,
 #2925-#2927, #2929 — with evidence re-captured at that tree):** the
 seven §5.4 falsifiability requirements are met as follows — §5.4(1)
 canonical doc = this document; §5.4(2) machine-checked posture = CLOSED
-(four-leg localhost proof at 18 checks: bare→exit 2 / **8 FAIL**,
+(four-leg localhost proof at 18 checks — PRE-#2954; see the §2 #2954
+evidence note, the post-#2954 count is **19**: bare→exit 2 / **8 FAIL**,
 hardened-non-sqlcipher→exit 2 / 2 FAIL, hardened-with-boot-gate-armed→
 **boot refusal** demonstrated, hardened-sqlcipher-armed→exit 0 /
 18 PASS); §5.4(3) executed pg+AGE+pgvector = green on the cert SHA at

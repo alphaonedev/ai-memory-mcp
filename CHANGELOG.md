@@ -19,6 +19,40 @@ consumer thread's `JoinHandle`; the test now `drop`s the queue (closing the
 channel) and `join`s the worker, so `rx.recv()` drains every buffered job before
 the assertion — a deterministic await with no timer. `spawn` delegates to it and
 drops the handle, so the daemon-lifetime production path is unchanged.
+### Fixed (cert: federation newer-wins Supersede leaf on LWW overwrite; #2954)
+
+Closes an append-only audit-spine hole on the federation funnel. Byte-identical
+legacy behaviour when the append-only spine is OFF (the default).
+
+- **The defect.** On a federation newer-wins (LWW-WIN) `(title, namespace)`
+  overwrite — sqlite `db::insert_if_newer` and the postgres
+  `PostgresStore::apply_remote_memory` twin — when an inbound row WON the
+  timestamp tiebreak and replaced the local row's durable `content` in place, NO
+  append-only `SUPERSEDE` leaf was emitted. The non-federation create funnel
+  already emitted leaves (#2948) and the same-id field-merge path already did
+  (`overwrite_full_row_by_id` / pg `merge_inbound`); this newer-wins upsert class
+  was the funnel-class miss, so a federation overwrite silently replaced content
+  with no ledger record.
+- **The fix (mirrors #2948).** Both funnels now append EXACTLY ONE identity-only
+  `SUPERSEDE` leaf in the SAME transaction as the overwrite, gated on
+  `append_only_enabled()`, IFF the inbound row won the tiebreak AND the stored
+  content actually changed (a no-op merge emits nothing). The won-and-changed
+  predicate is computed against a write-lock-held pre-image so it cannot diverge
+  from the live SQL `CASE`: sqlite extends the `BEGIN IMMEDIATE` guard to the
+  append-only path and probes under it; postgres holds a `SELECT … FOR UPDATE`
+  across the probe and the upsert (single tx, atomic under READ COMMITTED). The
+  leaf is identity-only (`prior_version` = the pre-merge version; the superseded
+  content is never carried into the ledger).
+- **Guard hardened.** The source-static G6 spine guard's P4 detector now also
+  flags the federation newer-wins `content = CASE WHEN excluded.updated_at > … `
+  merge (previously a documented carve-out), so a future federation overwrite
+  that skips the ledger re-reds CI mechanically.
+- **Posture pairing.** The certified enterprise-federation posture gains check
+  #19 (`ENTERPRISE_FEDERATION_CHECK_COUNT` 18 → 19): the daemon refuses to boot
+  the certified profile unless the append-only spine AND the daemon audit signing
+  key are BOTH armed — an unsigned leaf is tamper-evident in name only. The
+  checked-in `docs/deploy/enterprise-federation.env` now sets
+  `AI_MEMORY_APPEND_ONLY=1`.
 
 ### Tests (serialize `AI_MEMORY_AGENT_ID`-dependent recall tests; fix #3092 isolation flake)
 

@@ -12998,6 +12998,62 @@ async fn pg_probe_upsert_prior_version(
         .await
 }
 
+/// v1.0.0 #2954 — the pre-merge image of the `(title, namespace)` row the
+/// postgres federation newer-wins upsert ([`PostgresStore::apply_remote_memory`])
+/// may overwrite. The postgres twin of the sqlite [`crate::storage::FederationMergePreimage`].
+struct PgFederationMergePreimage {
+    /// The surviving local row's `updated_at` (the primary LWW key the
+    /// `CASE WHEN EXCLUDED.updated_at > memories.updated_at` arm compares).
+    updated_at: DateTime<Utc>,
+    /// The surviving local row's `id` (the `EXCLUDED.id > memories.id`
+    /// equal-timestamp tiebreak operand).
+    id: String,
+    /// The pre-supersede `version` recorded as the leaf's `prior_version`.
+    version: i64,
+    /// The stored `content` column (plaintext when encryption is off, the
+    /// placeholder when on).
+    content: String,
+    /// The stored at-rest ciphertext envelope (NULL when encryption is off).
+    encrypted_envelope: Option<Vec<u8>>,
+}
+
+/// v1.0.0 #2954 — probe the `(title, namespace)` row
+/// [`PostgresStore::apply_remote_memory`]'s newer-wins upsert may overwrite,
+/// `SELECT … FOR UPDATE` inside the caller's transaction so the probe and the
+/// upsert are ONE atomic unit under READ COMMITTED (the row lock blocks a
+/// concurrent writer from slipping between the probe and the upsert, so the
+/// Rust-side won-and-changed predicate cannot diverge from the SQL `CASE`).
+/// `None` when the append-only spine is OFF (default → no probe, byte-identical)
+/// or when no prior row exists (a fresh INSERT destroys nothing). MUST run in
+/// the SAME tx as the upsert (caller-held).
+async fn pg_probe_federation_merge_preimage(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    title: &str,
+    namespace: &str,
+) -> Result<Option<PgFederationMergePreimage>, sqlx::Error> {
+    if !crate::config::append_only_enabled() {
+        return Ok(None);
+    }
+    let row = sqlx::query(
+        "SELECT updated_at, id, version, content, encrypted_envelope \
+         FROM memories WHERE title = $1 AND namespace = $2 FOR UPDATE",
+    )
+    .bind(title)
+    .bind(namespace)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(PgFederationMergePreimage {
+        updated_at: row.try_get(field_names::UPDATED_AT)?,
+        id: row.try_get("id")?,
+        version: row.try_get("version")?,
+        content: row.try_get("content")?,
+        encrypted_envelope: row.try_get(field_names::ENCRYPTED_ENVELOPE)?,
+    }))
+}
+
 /// v0.9.0 G13-mem (#1859, COND 1) — the postgres half of the SINGLE
 /// consolidate-leaf emission site. Appends EXACTLY ONE signed
 /// `CONSOLIDATE` leaf for one merged-away source in the caller's open
@@ -19202,6 +19258,16 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin apply_remote_memory tx", e))?;
+        // #2954 — armed-only pre-image of the `(title, namespace)` row this
+        // upsert may overwrite, `SELECT … FOR UPDATE` inside this tx so the
+        // probe and the newer-wins upsert are atomic under READ COMMITTED (the
+        // row lock is load-bearing: it stops a concurrent writer from changing
+        // the row between the probe and the upsert whose verdict it mirrors).
+        // `None` when the spine is OFF (byte-identical) or no prior row exists.
+        let merge_preimage =
+            pg_probe_federation_merge_preimage(&mut tx, &memory.title, &memory.namespace)
+                .await
+                .map_err(|e| to_store_err("apply_remote_memory merge pre-image probe", e))?;
         // Sealed to the identity the SURVIVING row RETAINS: the newer-wins arm
         // takes the INBOUND envelope while the metadata overlay keeps the LOCAL
         // row's `agent_id` (#1784), so a peer-keyed seal left a row nothing
@@ -19474,6 +19540,34 @@ impl MemoryStore for PostgresStore {
         // `encrypted_envelope` MUST open under the row's persisted
         // `metadata.agent_id`.
         reconcile_envelope_owner(&mut *tx, &applied_id, &memory.content, &remote_seal).await?;
+        // APPEND-ONLY-SANCTIONED (#1823 G6 / #2954) — COW SUPERSEDE: the
+        // federation newer-wins upsert above rewrote an existing `(title,
+        // namespace)` row's durable `content` in place ONLY when the inbound
+        // row won the LWW tiebreak. Append ONE identity-only SUPERSEDE leaf in
+        // this same tx, gated on that same won-and-changed predicate — computed
+        // against the `FOR UPDATE` pre-image so it cannot diverge from the live
+        // `CASE`. Postgres twin of the sqlite `insert_if_newer` #2954 wiring;
+        // the superseded pre-merge content lives only in the row it replaced,
+        // never in the leaf.
+        if let Some(pre) = merge_preimage.as_ref() {
+            let inbound_won = updated_at > pre.updated_at
+                || (updated_at == pre.updated_at && memory.id.as_str() > pre.id.as_str());
+            let content_changed = remote_content != pre.content.as_str()
+                || remote_envelope.map(Vec::as_slice) != pre.encrypted_envelope.as_deref();
+            if inbound_won && content_changed {
+                pg_emit_revision_leaf_if_enabled(
+                    &mut tx,
+                    &applied_id,
+                    crate::revisions::RecordKind::Supersede,
+                    Some(pre.version),
+                    &memory.namespace,
+                    memory.metadata.get("agent_id").and_then(|v| v.as_str()),
+                    &chrono::Utc::now().to_rfc3339(),
+                )
+                .await
+                .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
+            }
+        }
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit apply_remote_memory tx", e))?;

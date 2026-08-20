@@ -121,6 +121,19 @@ fn enterprise_federation_env_selects_asi_hard_and_requires_the_posture_gate() {
         "POLICY_CURRENT must ship truthy in the certified template: {policy_current:?}"
     );
 
+    // #2954 check #19 — the append-only audit spine must ship ARMED in the
+    // certified template (else a federation newer-wins supersede leaf is never
+    // written / is unsigned). The signing-key half is deployment-provisioned
+    // (a key file, not an env value), documented in the template's audit-custody
+    // section — it cannot be pinned here.
+    let append_only = env
+        .get(ai_memory::config::ENV_APPEND_ONLY)
+        .expect("enterprise-federation.env must set AI_MEMORY_APPEND_ONLY (#2954 check #19)");
+    assert!(
+        matches!(append_only.as_str(), "1" | "true" | "TRUE" | "yes" | "on"),
+        "AI_MEMORY_APPEND_ONLY must ship truthy in the certified template: {append_only:?}"
+    );
+
     // Never ships the plaintext-peer hatch open, never ships either
     // must-be-UNSET federation trust bypass truthy.
     for env_name in [
