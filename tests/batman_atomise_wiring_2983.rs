@@ -328,10 +328,11 @@ fn deferred_mode_lands_atoms_through_the_bounded_worker_2986() {
     let calls = Arc::new(Mutex::new(0usize));
     let atomiser = mock_atomiser(&calls);
     let provider_atomiser = Arc::clone(&atomiser);
-    let queue: AtomiseQueue = ai_memory::background::atomise_worker::spawn(Arc::new(move || {
-        Some(Arc::clone(&provider_atomiser))
-    }))
-    .expect("worker spawns");
+    let (queue, worker): (AtomiseQueue, std::thread::JoinHandle<()>) =
+        ai_memory::background::atomise_worker::spawn_joinable(Arc::new(move || {
+            Some(Arc::clone(&provider_atomiser))
+        }))
+        .expect("worker spawns");
 
     let resp = store_through_mcp(
         &conn,
@@ -356,25 +357,28 @@ fn deferred_mode_lands_atoms_through_the_bounded_worker_2986() {
         "deferred mode must not archive the parent inline"
     );
 
-    // …and the single consumer drains it out-of-band.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let mut atoms = 0i64;
-    while std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let c = db::open(&path).expect("reopen");
-        atoms = c
-            .query_row(
-                "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
-                [&source_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if atoms >= 2 {
-            break;
-        }
-    }
-    assert_eq!(atoms, 2, "the bounded worker must land the two mock atoms");
+    // …and the single consumer drains it out-of-band. Close the queue (the
+    // sole sender) and DETERMINISTICALLY await the worker draining the buffered
+    // job by joining its thread — no wall-clock deadline. The prior 15s poll
+    // flaked under llvm-cov instrumentation (#2986): the worker always lands the
+    // atoms but the instrumented build can exceed a fixed timer, and the 50ms
+    // reopen-and-COUNT poll contended with the worker's writes. join() returns
+    // only after `rx.recv()` has drained every buffered job and the consumer
+    // has exited, so the atoms are guaranteed committed here.
     drop(queue);
+    worker
+        .join()
+        .expect("atomise worker thread joins after draining");
+
+    let verify = db::open(&path).expect("reopen");
+    let atoms: i64 = verify
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
+            [&source_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(atoms, 2, "the bounded worker must land the two mock atoms");
 }
 
 // ===========================================================================

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests (deterministic atomise-worker drain; fix #2986 coverage-instrumentation flake)
+
+Test-support only; production behaviour byte-identical. The deferred auto-atomise
+test (`deferred_mode_lands_atoms_through_the_bounded_worker_2986`) waited on the
+bounded worker with a fixed 15s wall-clock poll (reopening + `COUNT`-ing every
+50ms), which flaked under `llvm-cov` instrumentation — the instrumented worker
+always lands the atoms but can exceed a fixed timer, and the poll contended with
+the worker's writes. Added `atomise_worker::spawn_joinable`, which returns the
+consumer thread's `JoinHandle`; the test now `drop`s the queue (closing the
+channel) and `join`s the worker, so `rx.recv()` drains every buffered job before
+the assertion — a deterministic await with no timer. `spawn` delegates to it and
+drops the handle, so the daemon-lifetime production path is unchanged.
+
 ### Tests (serialize `AI_MEMORY_AGENT_ID`-dependent recall tests; fix #3092 isolation flake)
 
 Test-only. No product code changed — the #3092 `is_visible_to_caller` recall
