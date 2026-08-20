@@ -175,6 +175,28 @@ fn unit_vec(dim: usize) -> Vec<f32> {
     v
 }
 
+/// #3069 — resolve the ACTUAL declared dimension of the pgvector `embedding`
+/// column (`atttypmod == N` for `vector(N)`), so seeded vectors match the
+/// column regardless of how the fixture DB was provisioned (e.g. a fresh 384-d
+/// `MiniLM` schema vs. a 768-d nomic corpus). `pg_dim` reads the *established*
+/// dim from existing rows and defaults to 384 on an EMPTY corpus, which would
+/// mint a 384-d vector against a 768-d column; the column typmod is the ground
+/// truth. Falls back to `pg_dim` for an unbounded `vector` column (typmod -1).
+async fn pg_vector_dim(store: &PostgresStore) -> usize {
+    let typmod: Option<i32> = sqlx::query_scalar(
+        "SELECT atttypmod FROM pg_attribute \
+         WHERE attrelid = 'memories'::regclass AND attname = 'embedding'",
+    )
+    .fetch_optional(store.pool())
+    .await
+    .ok()
+    .flatten();
+    match typmod {
+        Some(n) if n > 0 => usize::try_from(n).unwrap_or(384),
+        _ => pg_dim(store).await,
+    }
+}
+
 /// #2178 — `store_with_embedding` stamps `embedding_space` atomically with
 /// the vector on BOTH the fresh INSERT and the ON-CONFLICT upsert-merge arm,
 /// so a same-dim model swap-back can never leave a stamp attesting a foreign
@@ -801,4 +823,118 @@ async fn pg_get_embedding_with_space_returns_real_space_2181() {
         null_emb.is_none(),
         "a NULL-embedding row must collapse the outer Option to None (matching get_embedding)"
     );
+}
+
+/// #3069 — the serve-boot embedding backfill must be a STRUCTURAL NO-OP on a
+/// migrated corpus. #3060 (f43c9777) makes `migrate` copy each source vector
+/// VERBATIM with its `embedding_space` fingerprint via `set_embeddings_batch`;
+/// this pins the OTHER half of that guarantee — that
+/// `PostgresStore::list_unembedded` (the scan
+/// `run_embedding_backfill_on_store` consumes) EXCLUDES those rows, so the
+/// boot backfill can never re-derive them. Without this the migrated corpus
+/// would be re-embedded on every boot (wasteful, a transient recall-degradation
+/// window, and — under `AI_MEMORY_INFERENCE_EGRESS=loopback-only` with an
+/// EXTERNAL embedder — unrecoverable). Seeding is done exactly as `migrate`
+/// lands the vectors (`set_embeddings_batch`, active space). A genuinely
+/// unembedded control row MUST still be returned (the scan is not vacuously
+/// empty). The scan is global, so assertions key on the fixture ids, not a
+/// whole-DB count.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // intentional: serialise the active-space global
+async fn pg_backfill_noop_on_migrated_same_space_rows_3069() {
+    let Some(store) = live_pg().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _lock = PG_HEAL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let owner = "ai:3069-pg";
+    let ctx = CallerContext::for_agent(owner);
+    let admin = CallerContext::for_admin(owner);
+    let ns = format!("space3069-{}", uuid::Uuid::new_v4());
+    let active = embedding_space_fingerprint("nomic-embed-text");
+    let dim = pg_vector_dim(&store).await;
+    let vec = unit_vec(dim);
+
+    // Three rows carrying an ACTIVE-space embedding (the migrated corpus,
+    // seeded EXACTLY the way #3060's migrate copy lands them: verbatim via
+    // `set_embeddings_batch`), plus one genuinely-unembedded control
+    // (`embedding IS NULL`).
+    let mut migrated: Vec<String> = Vec::new();
+    let mut entries: Vec<(String, Vec<f32>)> = Vec::new();
+    for i in 0..3 {
+        let id = uuid::Uuid::new_v4().to_string();
+        // Distinct titles: `store()` upserts on the (title, namespace) UNIQUE
+        // key, so a shared title would collapse all three into one row.
+        store
+            .store(
+                &ctx,
+                &mem(&id, &ns, &format!("migrated same-space {i}"), owner),
+            )
+            .await
+            .expect("store migrated");
+        entries.push((id.clone(), vec.clone()));
+        migrated.push(id);
+    }
+    let control_id = uuid::Uuid::new_v4().to_string();
+    store
+        .store(&ctx, &mem(&control_id, &ns, "genuinely unembedded", owner))
+        .await
+        .expect("store control");
+
+    let written = store
+        .set_embeddings_batch(&admin, &entries, &active)
+        .await
+        .expect("seed migrated embeddings");
+    assert_eq!(written, migrated.len(), "all migrated vectors landed");
+
+    // Knob OFF (default always-on predicate) + a seeded active fingerprint.
+    // SAFETY: edition-2024 env mutation serialised by PG_HEAL_ENV_LOCK.
+    unsafe { std::env::remove_var(ENV_PG_HEAL) };
+    ai_memory::embeddings::set_active_embedding_space(Some(active.clone()));
+
+    // The serve-boot backfill scan: what `run_embedding_backfill_on_store`
+    // would (re-)embed. The migrated ACTIVE-space rows must be ABSENT; the
+    // genuinely-unembedded control must be PRESENT.
+    let scan = unembedded_ids(&store, &admin).await;
+
+    // Also confirm the migrated vectors + spaces survive verbatim in the store,
+    // so the "excluded from the scan" fact is about REAL preserved vectors.
+    let mut preserved = Vec::with_capacity(migrated.len());
+    for id in &migrated {
+        preserved.push(
+            store
+                .get_embedding_with_space(&admin, id)
+                .await
+                .expect("read migrated embedding"),
+        );
+    }
+
+    // Restore the process-global + clean up BEFORE asserting so a failed assert
+    // can't leak either into a sibling test.
+    ai_memory::embeddings::set_active_embedding_space(None);
+    let _ = store.forget(&ctx, Some(&ns), None, None, true).await;
+
+    for id in &migrated {
+        assert!(
+            !scan.contains(id),
+            "#3069: a migrated ACTIVE-space embedded row ({id}) must NOT be returned by \
+             list_unembedded — the boot backfill must never re-derive it"
+        );
+    }
+    assert!(
+        scan.contains(&control_id),
+        "the genuinely-unembedded control MUST be swept (the scan is not vacuously empty)"
+    );
+    for got in preserved {
+        let (gvec, gspace) = got.expect("migrated row still carries its vector");
+        assert_eq!(gvec, vec, "the migrated vector is preserved verbatim");
+        assert_eq!(
+            gspace.as_deref(),
+            Some(active.as_str()),
+            "the migrated ACTIVE-space provenance is preserved"
+        );
+    }
 }

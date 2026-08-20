@@ -266,6 +266,27 @@ Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
   `docs/USER_GUIDE.md`, `docs/ADMIN_GUIDE.md`, `docs/postgres-age-guide.md`,
   `docs/essays/brass-tacks-2-how.html`, `docs/spec/v1.md`,
   `docs/spec/TRACT-L1-CLAIM-CONTRACT.md`, `docs/confidence-calibration.md`.
+### Fixed (serve-boot backfill no longer re-embeds a migrated corpus; #3069)
+
+- **The serve-boot embedding backfill re-derived the whole migrated corpus on
+  every boot.** Before #3060 landed the migrate embedding-copy, a migrated
+  postgres corpus had `embedding IS NULL` on every row, so
+  `run_embedding_backfill_on_store` re-embedded all of it — wasteful, a
+  transient recall-degradation window each boot, and UNRECOVERABLE under
+  `AI_MEMORY_INFERENCE_EGRESS=loopback-only` with an EXTERNAL embedder. #3060
+  now copies the vectors + `embedding_space` verbatim, and
+  `PostgresStore::list_unembedded` already EXCLUDES any row carrying a vector +
+  a non-NULL space (it keys on `embedding_space`, never the `embedding_dim`
+  scalar, which postgres intentionally leaves NULL — the dim gate reads
+  `vector_dims(embedding)`), so the boot backfill is now a STRUCTURAL NO-OP on
+  a migrated corpus. This adds the regression guard that keeps it a no-op:
+  `pg_backfill_noop_on_migrated_same_space_rows_3069` seeds a corpus exactly
+  as `migrate` lands it (`set_embeddings_batch`, active space) and asserts
+  `list_unembedded` returns none of those rows while a genuinely-unembedded
+  control IS returned. No production change was needed — the backfill also
+  already degrades loudly (WARN + stop) and never NULLs an existing vector on
+  embed failure, so loopback-only + external embedder preserves the migrated
+  vectors.
 
 ### Fixed (`ai-memory migrate` dropped rows past 1000 AND never copied embeddings; #1876 #3060)
 
