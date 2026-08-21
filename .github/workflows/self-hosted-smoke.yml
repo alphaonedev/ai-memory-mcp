@@ -6,6 +6,9 @@ name: Self-hosted node smoke
 
 on:
   workflow_dispatch:
+  push:
+    branches: [chore/ci-self-hosted-2x2]
+    paths: ['.github/workflows/self-hosted-smoke.yml']
 
 permissions:
   contents: read
