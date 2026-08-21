@@ -139,6 +139,13 @@ pub const RELATION: &str = "relation";
 pub const REMEMBER: &str = "remember";
 pub const RESOLUTION: &str = "resolution";
 pub const RESOLUTION_NOTE: &str = "resolution_note";
+// #3007 (Wave-2 Cluster B) — the epoch seconds the resolver signed over on the
+// `memory_checkpoint_resolve` surface. Consulted ONLY by the local
+// `epoch_advance` freeze-anchor authz gate: the operator's detached signature
+// commits to a specific `resolved_at` (part of the reused
+// `resolution_signable` bytes), so the caller supplies it and the resolved row
+// persists THAT value verbatim. Ordinary resolutions ignore it and stamp `now`.
+pub const RESOLVED_AT: &str = "resolved_at";
 pub const RESOLVED_BY: &str = "resolved_by";
 pub const RESOURCE_PATH: &str = "resource_path";
 pub const ROUTINE_ID: &str = "routine_id";
@@ -294,6 +301,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     REMEMBER,
     RESOLUTION,
     RESOLUTION_NOTE,
+    RESOLVED_AT,
     RESOLVED_BY,
     RESOURCE_PATH,
     ROUTINE_ID,
@@ -367,9 +375,12 @@ mod tests {
         // v1.0.0 #2258 (2026-07-19) — 131 -> 132: VALID_FROM (claim-bitemporal
         //   valid_from on the memory_store write surface; VALID_UNTIL already
         //   present for memory_kg_invalidate / memory_update).
+        // v1.0.0 #3007 (2026-08-16) — 132 -> 133: RESOLVED_AT (the resolver-
+        //   signed epoch seconds consumed by the local epoch_advance
+        //   freeze-anchor authz gate on memory_checkpoint_resolve).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            132,
+            133,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

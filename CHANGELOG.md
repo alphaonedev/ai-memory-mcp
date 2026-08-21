@@ -99,6 +99,47 @@ the app tables with it (silent data loss), and placement was non-deterministic.
   extension). Unit test `demote_ag_catalog_tests` covers the pure
   search_path rewrite (leading-`ag_catalog` demoted; caller-pinned/non-leading
   paths untouched).
+### Security (Wave-2 Cluster B — epoch-resolve authz #3007 + header-trust identity boot-gate #3065)
+
+Two cert-core, fail-closed hardening changes for the enterprise-federation trust
+boundary. Both default-engage only under the certified / `asi-hard` posture, so
+standard single-node dev is byte-for-byte unaffected.
+
+- **#3007 — `epoch_advance` resolve authz, across EVERY funnel + both backends.**
+  No resolve funnel auto-signs an `epoch_advance` freeze anchor with the
+  daemon/node key any longer (a daemon-signed anchor is caller-mintable authority
+  that peers would accept under `FED_REQUIRE_CHECKPOINT_SIG`). A single shared
+  predicate `checkpoints::withhold_daemon_signature` (epoch_advance under the
+  certified / `asi-hard` posture, keyed on the STORED row's condition_type) is
+  consulted by the sqlite free-fn `checkpoints::resolve` (the MCP handler, the
+  HTTP `resolve_checkpoint` sqlite lane, and the SAL sqlite twin all flow through
+  it) AND the postgres SAL twin `PostgresStore::checkpoint_resolve` — #1552-class
+  parity so the control cannot be bypassed on any surface or backend. A withheld
+  resolution still applies but stays `Unsigned` (`verify:false`); peers reject it
+  (`authorize_remote_checkpoint_resolution`, #1936/#1947), so it is never
+  broadcast-accepted. The local MCP handler additionally accepts an
+  operator-signed resolution: when `resolved_by` presents a detached Ed25519
+  signature that verifies against its locally-**enrolled** key over the SAME
+  `resolution_signable` bytes, the resolution is stored attested under the
+  OPERATOR's key (separation of duties). The operator epoch-apply ceremony
+  (`cli::epoch_apply`, which signs directly) is intentionally unaffected.
+  Advisory (daemon signs as before) under standard posture.
+- **#3065 — `AI_MEMORY_ADMIN_HEADER_TRUST` identity boot-gate.** Header-asserted
+  identity (`AI_MEMORY_ADMIN_HEADER_TRUST=1` + `X-Agent-Id`) is certified ONLY
+  behind a single-fingerprint mTLS proxy. Under the certified / `asi-hard`
+  posture the daemon now REFUSES to boot when header-trust is on AND per-agent
+  binding is inactive (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` is not
+  `enforce` AND zero enrolled `agent_api_keys`) AND the inbound mTLS allowlist
+  (`--mtls-allowlist`) does NOT admit EXACTLY ONE fingerprint — i.e. it refuses
+  both `> 1` (multiple certs each free to assert any identity) AND `0` (no
+  allowlist at all: header-trust with no client-cert layer, which nothing in the
+  18 posture checks / asi-hard KNOBS otherwise requires). Decided ONCE at boot
+  (never a per-request cardinality flip). The by-the-book single-proxy-cert
+  runbook (exactly 1 fingerprint) is unaffected. The load-bearing decision is the
+  pure `admin_header_trust_boot_refusal`, added to
+  `scripts/check-cert-removal-proof.sh`. The full per-agent cert → `X-Agent-Id`
+  enrollment lane (#2044) is deferred. `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`
+  now states the single-fingerprint-topology scope conspicuously.
 
 ### Tests (serialize `AI_MEMORY_AGENT_ID`-dependent recall tests; fix #3092 isolation flake)
 

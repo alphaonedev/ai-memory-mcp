@@ -61,6 +61,64 @@ pub fn sign_resolution_into(cp: &mut Checkpoint, keypair: &AgentKeypair) -> anyh
     Ok(())
 }
 
+/// #3007 (Wave-2 Cluster B) — persist an EXTERNALLY-produced resolution
+/// attestation (a detached operator Ed25519 signature + the resolver's ENROLLED
+/// public key) onto an already-resolved checkpoint row.
+///
+/// The local MCP `epoch_advance` freeze-anchor gate
+/// ([`crate::mcp::tools::checkpoint::handle_checkpoint_resolve`]) resolves the
+/// anchor WITHOUT the daemon key — the daemon must never auto-sign a
+/// caller-mintable freeze anchor — and, once the operator's signature has
+/// verified against `resolved_by`'s enrolled key via
+/// [`crate::federation::receive_auth::authorize_remote_checkpoint_resolution`],
+/// stores it verbatim here so [`verify`] attests the resolution to the OPERATOR
+/// who authorized it (separation of duties), not to the daemon. Mirrors the
+/// attestation-column UPDATE inside [`resolve`] — the ONE site that owns the
+/// `checkpoints.signature` / `resolver_pubkey` write.
+///
+/// # Errors
+/// Propagates the `rusqlite` update error.
+pub fn store_resolution_attestation(
+    conn: &Connection,
+    id: &str,
+    signature: &[u8],
+    resolver_pubkey: &[u8],
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE checkpoints SET signature = ?1, resolver_pubkey = ?2 WHERE id = ?3",
+        params![signature, resolver_pubkey, id],
+    )?;
+    Ok(())
+}
+
+/// #3007 (Wave-2 Cluster B) — whether the auto-supplied signing key must be
+/// WITHHELD from signing this checkpoint's resolution.
+///
+/// True for an `epoch_advance` freeze anchor under the certified / `asi-hard`
+/// posture. Every reachable auto-signing resolve funnel that would otherwise
+/// apply the daemon/node key — the local MCP handler, the HTTP
+/// `resolve_checkpoint` sqlite lane (via [`resolve`]), and the postgres SAL
+/// twin ([`crate::store::MemoryStore::checkpoint_resolve`]) — consults this ONE
+/// predicate, so the control cannot be bypassed on any surface or backend
+/// (#1552-class parity). A withheld resolution still applies but stays
+/// `Unsigned` / `verify() == false`: peers under
+/// `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` REJECT it
+/// ([`crate::federation::receive_auth::authorize_remote_checkpoint_resolution`]),
+/// so a caller-mintable epoch anchor can never be broadcast-accepted.
+///
+/// This targets the AUTO-SUPPLIED key ONLY: the operator epoch-apply ceremony
+/// (`crate::cli::epoch_apply`) signs via [`sign_resolution_into`] DIRECTLY (it
+/// never routes through [`resolve`]), and the local MCP handler stores an
+/// operator's externally-verified attestation via
+/// [`store_resolution_attestation`] — both intentionally UNAFFECTED. Outside
+/// the certified posture the daemon signs as before (advisory single-node dev).
+#[must_use]
+pub fn withhold_daemon_signature(cp: &Checkpoint) -> bool {
+    cp.condition_type == ConditionType::EpochAdvance
+        && (crate::security_profile::is_asi_hard()
+            || crate::enterprise_federation_posture::enterprise_federation_posture_required())
+}
+
 /// Verify a checkpoint's Ed25519 attested-resolution signature against its
 /// embedded `resolver_pubkey`.
 ///
@@ -359,8 +417,14 @@ pub fn resolve(
     // keypair is supplied — done after the resolution-field UPDATE so the
     // signable view reads the final resolved state/resolved_by/resolution/
     // resolved_at.
+    // #3007 (Wave-2 Cluster B) — WITHHOLD the auto-supplied key from an
+    // `epoch_advance` freeze anchor under the certified posture
+    // ([`withhold_daemon_signature`]): a daemon/node-signed epoch anchor is
+    // caller-mintable authority, so it degrades to Unsigned here (verify:false)
+    // on every funnel that reaches this free-fn (MCP, HTTP sqlite lane, SAL
+    // sqlite twin) rather than being auto-signed and fanned to the mesh.
     if let Some(kp) = keypair {
-        if kp.can_sign() {
+        if kp.can_sign() && !withhold_daemon_signature(&row) {
             sign_resolution_into(&mut row, kp).map_err(|e| {
                 rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
                     "checkpoint resolution sign failed: {e:#}"
@@ -869,6 +933,111 @@ mod tests {
         assert!(resolved.signature.is_empty());
         assert!(resolved.resolver_pubkey.is_empty());
         assert!(!verify(&resolved), "an unsigned resolution must not verify");
+    }
+
+    /// #3007 (Wave-2 Cluster B) — the SHARED `resolve` funnel (through which the
+    /// HTTP `resolve_checkpoint` sqlite lane and the SAL sqlite twin both flow)
+    /// must WITHHOLD the auto-supplied key from an `epoch_advance` freeze anchor
+    /// under the certified posture, so a caller-mintable anchor cannot be
+    /// daemon-signed and fanned to the mesh. Runs in an ISOLATED CHILD (#2905)
+    /// because it sets the process-global posture env.
+    #[test]
+    fn resolve_withholds_daemon_signature_for_epoch_anchor_under_posture_3007() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "checkpoints::tests::resolve_withholds_daemon_signature_for_epoch_anchor_under_posture_3007",
+        ) {
+            return;
+        }
+        let _g = crate::config::test_env_lock();
+        let kp = crate::identity::keypair::generate("node-daemon").expect("keypair");
+        let mut epoch = sample("epoch-1");
+        epoch.condition_type = ConditionType::EpochAdvance;
+        epoch.namespace = "_epoch".to_string();
+
+        // Posture ENGAGED: an epoch_advance resolve with a signing key stays
+        // Unsigned (the daemon key is withheld). A NON-epoch checkpoint still
+        // signs (the gate is epoch-specific, not a blanket refusal).
+        // SAFETY: single-threaded isolated child, guarded by test_env_lock.
+        unsafe {
+            std::env::set_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+                "1",
+            );
+        }
+        {
+            let conn = fresh();
+            insert(&conn, &epoch).unwrap();
+            let resolved = resolve(
+                &conn,
+                "epoch-1",
+                CheckpointState::Resolved,
+                "node-daemon",
+                Some("deadbeef"),
+                None,
+                1_700_000_500,
+                Some(&kp),
+            )
+            .unwrap()
+            .expect_resolved();
+            assert!(
+                resolved.signature.is_empty() && resolved.resolver_pubkey.is_empty(),
+                "epoch_advance under certified posture must NOT be daemon-signed"
+            );
+            assert!(
+                !verify(&resolved),
+                "a withheld epoch anchor must not verify"
+            );
+
+            insert(&conn, &sample("appr-1")).unwrap();
+            let appr = resolve(
+                &conn,
+                "appr-1",
+                CheckpointState::Resolved,
+                "node-daemon",
+                Some("approved"),
+                None,
+                1_700_000_500,
+                Some(&kp),
+            )
+            .unwrap()
+            .expect_resolved();
+            assert!(
+                !appr.signature.is_empty() && verify(&appr),
+                "a NON-epoch checkpoint still signs under the certified posture"
+            );
+        }
+
+        // Posture NOT engaged (standard): the SAME epoch resolve signs — advisory
+        // single-node dev is byte-for-byte unaffected.
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+            );
+        }
+        {
+            let conn = fresh();
+            let mut epoch2 = sample("epoch-2");
+            epoch2.condition_type = ConditionType::EpochAdvance;
+            epoch2.namespace = "_epoch".to_string();
+            insert(&conn, &epoch2).unwrap();
+            let resolved = resolve(
+                &conn,
+                "epoch-2",
+                CheckpointState::Resolved,
+                "node-daemon",
+                Some("deadbeef"),
+                None,
+                1_700_000_500,
+                Some(&kp),
+            )
+            .unwrap()
+            .expect_resolved();
+            assert!(
+                !resolved.signature.is_empty() && verify(&resolved),
+                "under STANDARD posture the daemon signs epoch anchors as before (advisory)"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

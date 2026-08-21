@@ -147,6 +147,16 @@ MAP=(
   # `(Some(_), None)` added there is a SEPARATE control proven by
   # `empty_migrated_store_not_convicted_on_sibling_watermark`.)
   "scan_file_last_watermark_db_id_scope_2955|subst|(Some(row_db_id), Some(mine)) if row_db_id != mine => continue,>>>(Some(row_db_id), Some(mine)) if false => continue, // CERT-REMOVAL-PROOF-MUTATION|src/governance/audit.rs|audit_watermark_db_id_scope_2955|foreign_db_watermark_not_honored_as_this_db_high_water"
+  # #3065 (Wave-2 Cluster B) — the ADMIN_HEADER_TRUST identity boot-gate verdict.
+  # `return` shape (a first-statement `return None;` — the always-permit
+  # disposition): the body carries a `format!` refusal string whose `{...}`
+  # captures would confuse the `body`-shape brace matcher, and a first-statement
+  # early-return neutralizes every branch just the same. Neutralized => the
+  # daemon stops refusing boot on the dangerous multi-fingerprint header-trust
+  # topology => the lane test's `.is_some()` refusal assertion goes RED. Pure fn
+  # (no I/O); the boot caller in daemon_runtime::run only gathers its live
+  # inputs, so this ONE fn is the load-bearing decision on both backends.
+  "admin_header_trust_boot_refusal|return|return None;|src/handlers/admin_role.rs|admin_header_trust_boot_gate_3065|dangerous_combo_refuses_boot"
 )
 
 # Apply MUTATION to function CTL in TARGET, per SHAPE.

@@ -174,6 +174,30 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
    hash chain + off-table watermark + witness anchor), with the honest residual
    bounds stated in `SECURITY.md`/`signed_events.rs`.
 
+> **`AI_MEMORY_ADMIN_HEADER_TRUST=1` is certified ONLY for the
+> single-fingerprint mTLS-proxy topology.** (#3065) Header-asserted identity —
+> trusting a bare `X-Agent-Id` request header to name the caller — is sound
+> **only** when the daemon sits behind **exactly one** mTLS proxy whose client
+> cert is the sole fingerprint in the inbound `--mtls-allowlist`, and **custody
+> of that proxy cert stays operator-held**. One client cert ⇒ one asserted
+> identity. It does **NOT** defend a **stolen or over-broad** proxy cert: anyone
+> holding an allowlisted client cert can assert **any** agent id, so a
+> multi-fingerprint allowlist under header-trust is a fleet-wide impersonation
+> lever. This is the ratified cert scope (500–1000 agents behind ONE proxy cert,
+> ≤ 50 peers). Under the certified / `asi-hard` posture the daemon **refuses to
+> boot** when `AI_MEMORY_ADMIN_HEADER_TRUST=1` AND per-agent binding is inactive
+> (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` is not `enforce` AND zero
+> `agent_api_keys` enrolled) AND the inbound mTLS allowlist does **not** admit
+> **exactly one** fingerprint — refusing both `> 1` (multiple certs each free to
+> assert any identity) **and** `0` (no `--mtls-allowlist` at all: header-trust
+> with no client-cert layer, which nothing in the posture checks / `asi-hard`
+> KNOBS otherwise requires — strictly more exposed, not less). Decided **once at
+> boot**, never a per-request flip (`admin_header_trust_boot_refusal`,
+> `scripts/check-cert-removal-proof.sh`). The by-the-book single-proxy-cert
+> stand-up (**exactly one** fingerprint) is unaffected. The full per-agent cert →
+> `X-Agent-Id` enrollment lane (the `agent_api_keys` per-agent binding) is
+> deferred — see [#2044](https://github.com/alphaonedev/ai-memory-mcp/issues/2044).
+
 ---
 
 ## 2. §5.4(2) — machine-checked posture (LOCALHOST-VERIFIED)
@@ -555,6 +579,15 @@ following should **not** treat v1.0.0 as sufficient:
 - **No distributed consensus coordinator;** no cross-tier consistent snapshot.
 - **Multi-hop propagation** of third-party content requires the **origin
   author's key enrolled at each hop** (TOFU key distribution deferred to v1.x).
+- **Header-asserted identity is NOT a per-agent binding.**
+  `AI_MEMORY_ADMIN_HEADER_TRUST=1` is certified ONLY behind a **single**-
+  fingerprint mTLS proxy with operator-held cert custody (§1 callout); it does
+  **not** defend a stolen/over-broad proxy cert, and the full per-agent cert →
+  `X-Agent-Id` enrollment lane (`agent_api_keys`) is **deferred**
+  ([#2044](https://github.com/alphaonedev/ai-memory-mcp/issues/2044)). A
+  multi-fingerprint allowlist that needs distinct per-agent identities must use
+  `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` with enrolled agent keys,
+  not header-trust.
 - **Hive/T8 is a pilot**, not a certified production topology.
 - **Reproducible builds are not claimed.**
 

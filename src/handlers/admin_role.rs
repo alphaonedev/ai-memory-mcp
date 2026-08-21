@@ -77,6 +77,107 @@ pub fn admin_header_trust_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// #3065 (Wave-2 Cluster B, cert-core) — resolved inputs to the certified-
+/// posture `ADMIN_HEADER_TRUST` identity boot-gate.
+///
+/// Header-asserted identity (`AI_MEMORY_ADMIN_HEADER_TRUST=1` + `X-Agent-Id`)
+/// is sound ONLY behind a SINGLE-fingerprint mTLS proxy: one client cert ⇒ one
+/// asserted identity, custody of that proxy cert held by the operator. When the
+/// inbound mTLS allowlist admits MORE THAN ONE fingerprint and there is no
+/// per-agent binding to fall back on, ANY of those client certs can assert ANY
+/// agent id — header-trust becomes a fleet-wide impersonation lever.
+#[derive(Debug, Clone, Copy)]
+pub struct AdminHeaderTrustBootInputs {
+    /// The certified / asi-hard posture is engaged (the gate only bites there;
+    /// standard single-node dev is unaffected).
+    pub posture_engaged: bool,
+    /// `AI_MEMORY_ADMIN_HEADER_TRUST` is truthy (the `X-Agent-Id` header is
+    /// trusted to assert identity).
+    pub header_trust_enabled: bool,
+    /// Number of distinct client-cert fingerprints in the inbound mTLS
+    /// allowlist (`--mtls-allowlist`). `0` when no allowlist is configured.
+    pub mtls_allowlist_len: usize,
+    /// `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY == enforce` — per-agent key
+    /// binding is HARD-required, so a client cert cannot free-assert identity.
+    pub attested_identity_enforced: bool,
+    /// Number of enrolled per-agent api-keys (`agent_api_keys` rows). `> 0`
+    /// means per-agent binding is active even under advisory mode.
+    pub agent_api_key_count: usize,
+}
+
+/// #3065 (Wave-2 Cluster B) — the LOAD-BEARING boot-refusal decision for the
+/// `ADMIN_HEADER_TRUST` identity gate. Pure (no I/O): the boot caller resolves
+/// the live [`AdminHeaderTrustBootInputs`] and this renders the verdict, so the
+/// decision is made ONCE at process start — never a per-request cardinality
+/// flip (which would split-brain a rollout).
+///
+/// Returns `Some(reason)` to REFUSE boot, `None` to permit. Refuses IFF ALL of:
+/// the certified/asi-hard posture is engaged, header-trust is on, per-agent
+/// binding is inactive (attested-identity is not `enforce` AND zero enrolled
+/// agent keys), AND the inbound mTLS allowlist does NOT admit EXACTLY ONE
+/// fingerprint — i.e. `len > 1` (multiple certs each free to assert any
+/// identity) OR `len == 0` (no `--mtls-allowlist` at all: header-trust with no
+/// client-cert layer, strictly MORE exposed than the multi-cert case, since
+/// nothing in the 18 posture checks / asi-hard KNOBS requires an allowlist or
+/// pins `HTTP_REQUIRE_ATTESTED_IDENTITY`).
+///
+/// The by-the-book single-proxy-cert runbook (`mtls_allowlist_len == 1`) is
+/// BYTE-FOR-BYTE unaffected — it is the sole permitted topology under
+/// header-trust with no per-agent backstop. Mirrors the `security_profile` /
+/// `enterprise_federation_posture` boot-refusal shape.
+///
+/// Removal-proof: `scripts/check-cert-removal-proof.sh` neutralizes this fn's
+/// body to `None` and `tests/admin_header_trust_boot_gate_3065.rs` proves the
+/// refusal turns RED — the control is load-bearing.
+#[must_use]
+pub fn admin_header_trust_boot_refusal(i: AdminHeaderTrustBootInputs) -> Option<String> {
+    // Advisory outside the certified/asi-hard posture (single-node dev is
+    // never bricked by this gate).
+    if !i.posture_engaged {
+        return None;
+    }
+    // Header-asserted identity is only in play when the operator turned it on.
+    if !i.header_trust_enabled {
+        return None;
+    }
+    // Per-agent binding present ⇒ each key-derived principal is already bound,
+    // so header-trust is backstopped REGARDLESS of the allowlist size. Active
+    // iff attested-identity is ENFORCE or at least one agent api-key is
+    // enrolled. Checked BEFORE the fingerprint count so a backstopped
+    // deployment permits at any `mtls_allowlist_len`.
+    if i.attested_identity_enforced || i.agent_api_key_count > 0 {
+        return None;
+    }
+    // Certified topology: header-trust is sound ONLY behind EXACTLY ONE
+    // client-cert fingerprint (the single mTLS proxy). Permit len == 1 only.
+    // REFUSE both len > 1 (two distinct certs each assert any identity) AND
+    // len == 0 (NO inbound mTLS allowlist at all — zero fingerprints = no
+    // proxy = header-trust with no client-cert layer, strictly MORE exposed
+    // than the multi-cert case). The cert doc says "certified ONLY behind a
+    // SINGLE-fingerprint mTLS proxy"; anything but exactly one fails closed.
+    if i.mtls_allowlist_len == 1 {
+        return None;
+    }
+    let allowlist_desc = if i.mtls_allowlist_len == 0 {
+        "the inbound mTLS allowlist is UNSET (0 fingerprints — no client-cert layer at all)"
+            .to_string()
+    } else {
+        format!(
+            "the inbound mTLS allowlist admits {} fingerprints",
+            i.mtls_allowlist_len
+        )
+    };
+    Some(format!(
+        "{ENV_ADMIN_HEADER_TRUST}=1 (header-asserted X-Agent-Id) is certified ONLY behind a \
+         SINGLE-fingerprint mTLS proxy, but {allowlist_desc} AND per-agent binding is inactive \
+         ({}!=enforce AND 0 enrolled agent_api_keys) — a caller could assert ANY agent identity. \
+         Fix ONE of: set --mtls-allowlist to EXACTLY the single proxy fingerprint; set {}=enforce \
+         (or enroll per-agent api keys); or unset {ENV_ADMIN_HEADER_TRUST}.",
+        crate::config::ENV_HTTP_ATTESTED_IDENTITY,
+        crate::config::ENV_HTTP_ATTESTED_IDENTITY,
+    ))
+}
+
 /// #1570 — process-wide marker: `true` when the running daemon has
 /// request authentication configured (an `api_key`, enforced by the
 /// `api_key_auth` middleware on every non-exempt route). Set once by

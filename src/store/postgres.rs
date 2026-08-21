@@ -23967,8 +23967,15 @@ impl MemoryStore for PostgresStore {
         // attestation columns when a signing keypair is supplied — mirroring
         // the sqlite free-fn (`crate::checkpoints::resolve`) and the
         // `signal_send` signed path.
+        //
+        // #3007 (Wave-2 Cluster B) — WITHHOLD the auto-supplied key from an
+        // `epoch_advance` freeze anchor under the certified posture
+        // (`crate::checkpoints::withhold_daemon_signature`), the postgres twin
+        // of the sqlite `resolve` gate: a daemon/node-signed epoch anchor is
+        // caller-mintable authority, so it degrades to Unsigned (verify:false)
+        // here too rather than being auto-signed and quorum-broadcast.
         if let Some(kp) = keypair {
-            if kp.can_sign() {
+            if kp.can_sign() && !crate::checkpoints::withhold_daemon_signature(&cp) {
                 crate::checkpoints::sign_resolution_into(&mut cp, kp).map_err(|e| {
                     StoreError::IntegrityFailed {
                         detail: format!("checkpoint resolution sign failed: {e:#}"),
