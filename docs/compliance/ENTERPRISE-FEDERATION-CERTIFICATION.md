@@ -163,6 +163,41 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
      envelope (`src/encryption/mod.rs`, `ENV_ENCRYPT_AT_REST` at
      `:567`). This is **not** the same control as SQLCipher, and it is
      **not** end-to-end across federation (see §6).
+
+   > **Control #15 is BACKEND-AWARE (#3061) — and the two backends carry
+   > two DIFFERENT strengths of assurance. Read this before trusting a pg
+   > PASS.** Posture check #15 resolves the backend from the store URL the
+   > process will open (`store_url::resolve_store_url` /
+   > `is_postgres_url`, the same detector as the #2679 wrong-store
+   > refusal):
+   >
+   > - **sqlite / sqlcipher → STRUCTURAL, machine-proven.** The exact
+   >   pre-#3061 predicate is unchanged (byte-identical): a
+   >   `--features sqlcipher` build with `AI_MEMORY_ENCRYPT_AT_REST=1`.
+   >   The control is a machine-checked property of the running binary.
+   > - **postgres → OPERATOR-VOUCHED, a COMPENSATING control (NOT
+   >   machine-proven encryption).** sqlcipher is a SQLite build feature
+   >   and cannot encrypt a postgres volume, so #15 was previously
+   >   *unsatisfiable* on pg — `all_pass` could never be true and the #17
+   >   boot gate could never arm a certified pg node. On a `postgres://`
+   >   DSN #15 now passes iff **both**: (a) the DSN pins TLS
+   >   `sslmode=verify-full` — **machine-checked** from the DSN, full
+   >   server-cert-chain + hostname verification of the key material in
+   >   flight — **and** (b) `AI_MEMORY_PG_AT_REST_ATTESTED=1` — an
+   >   **operator vouch**, recorded verbatim in the posture output, that
+   >   the postgres data volume/tablespace is encrypted at rest
+   >   (LUKS/dm-crypt, cloud-provider volume encryption, or postgres TDE).
+   >   **The daemon cannot prove its underlying block device is
+   >   encrypted**, so the attestation half is honor-system: CI can prove
+   >   the gate ROUTES and #17 ARMS, but it **cannot** prove the pg volume
+   >   is actually encrypted. Treat a pg #15 PASS as *"TLS is verify-full
+   >   AND the operator has attested at-rest encryption"*, never as
+   >   *"at-rest encryption is machine-proven"*. **pg-native TDE as a
+   >   machine-checked control is deliberately NOT claimed for GA.** An
+   >   operator who sets the attestation without encrypting the volume has
+   >   mis-certified their own node — the posture output names exactly what
+   >   was machine-checked vs vouched so an auditor can see the seam.
+
    `ai-memory doctor --posture` **never opens the database**; a doctor
    PASS does not prove the passphrase is present or that a row would
    decrypt. Boot-gate self-attestation and the FED-RQ-03 posture pin
@@ -173,6 +208,30 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 5. **The audit spine is tamper-evident** (append-only `signed_events` cross-row
    hash chain + off-table watermark + witness anchor), with the honest residual
    bounds stated in `SECURITY.md`/`signed_events.rs`.
+
+   > **A bare store-only migration is NON-certifiable / born DIRTY, and a
+   > SINGLE idempotent command brings it up (#3016/#3067).** A node whose
+   > data was copied without its `signed_events` spine (e.g. 7,889
+   > memories, `signed_events = 0`) has NO tamper-evident history: under
+   > the certified (`asi-hard`) audit require-modes
+   > (`AI_MEMORY_REQUIRE_WITNESS` / `_ROLE_SEPARATION` /
+   > `_IDENTITY_LINEAGE`, all pinned to `1`), an empty spine convicts on
+   > the witness + identity-lineage verdicts, so `ai-memory
+   > verify-audit-trail` exits **1**. The migration path deliberately does
+   > **NOT** copy or re-sign `signed_events` across backends (a
+   > chain-identity / `db_id` fork is irreversible-if-wrong). Bring the
+   > node up with the ONE idempotent command **`ai-memory audit
+   > bootstrap-node`**, which runs the existing operator-ceremony
+   > enrollment (identity-lineage GENESIS + audit-head witness anchor) and
+   > **REFUSES to report the node certified until `verify-audit-trail`
+   > exits 0**, printing the exact remaining ceremony on a refusal. It is
+   > a *command*, never a runbook checklist, so a provisioning system runs
+   > it unattended and a node that fails its own verify never claims cert.
+   > Distinct-custody trust (witness / recorder / judge / stopper keys)
+   > stays operator custody — bring-up VERIFIES it and NAMES anything
+   > missing, it never mints it. The postgres spine-WRITE twin is deferred
+   > (like the pg re-anchor twin #2217); the born-dirty verify GATE has a
+   > shipped pg twin (`verify_audit_trail_postgres`).
 
 > **`AI_MEMORY_ADMIN_HEADER_TRUST=1` is certified ONLY for the
 > single-fingerprint mTLS-proxy topology.** (#3065) Header-asserted identity —

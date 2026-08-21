@@ -371,4 +371,20 @@ jobs:
             --test pillar4_4c_deferred_age_cold_path_1735 \
             --test pillar4_4d_age_unprojection_on_delete_1783 \
             --test age_deferred_projection_cluster_2375_2376_2377 \
+            --test bootstrap_node_cert_gate_3016 \
             -- --include-ignored --test-threads=1
+
+      - name: Cluster-A cert-posture armability gate (#3061 #3016 #3067)
+        run: |
+          set -euo pipefail
+          # Load-bearing end-to-end proof (sibling to
+          # scripts/check-cert-removal-proof.sh): LEG A proves #3061 makes
+          # posture control #15 ARMABLE on a postgres store (doctor --posture
+          # exit 0 in the certified pg config, with negative controls for the
+          # attestation + verify-full halves — env-only, no live pg needed);
+          # LEG B proves the #3016/#3067 born-dirty -> bootstrap-node -> clean
+          # gate on a fresh sqlite node. Reuse the sal-postgres build cache for
+          # the `ai-memory` binary so no second toolchain build is needed.
+          cargo build --features sal-postgres --bin ai-memory
+          AI_MEMORY_BIN="$(pwd)/target/debug/ai-memory" \
+            bash scripts/check-bootstrap-cert-gate.sh

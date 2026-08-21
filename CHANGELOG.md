@@ -71,6 +71,44 @@ identically.
   the ownership re-check is provenance-independent. Its only remaining effect
   would be to also drop a SAME-OWNER `-`-inferred link from governance; keeping it
   is safe (same tenant; an ancestor can only ADD a restriction).
+### Added (cert: backend-aware at-rest posture #15 + mechanical node bring-up gate; #3061 #3016 #3067)
+
+Cluster-A (cert-posture armability). Makes the enterprise-federation certified
+posture ARMABLE on postgres and gives a store-only-migrated node a single
+idempotent path from born-dirty to certified. No change to the certified check
+COUNT (still 19); the sqlite/sqlcipher legs are byte-identical.
+
+- **#3061 — posture control #15 is now BACKEND-AWARE.** The at-rest-encryption
+  control resolves the backend from the store URL the process will open
+  (`store_url::resolve_store_url` / `is_postgres_url`, the same detector as the
+  #2679 wrong-store refusal), not an env hint. On sqlite it keeps the EXACT
+  sqlcipher predicate (byte-identical, STRUCTURAL / machine-proven). On a
+  `postgres://` DSN — where sqlcipher (a SQLite build feature) cannot encrypt the
+  volume, so #15 was previously UNSATISFIABLE and `all_pass` / the #17 boot gate
+  could never arm — it swaps to a COMPENSATING control that passes iff BOTH the
+  DSN pins TLS `sslmode=verify-full` (machine-checked) AND
+  `AI_MEMORY_PG_AT_REST_ATTESTED=1` (operator-vouched volume/tablespace
+  encryption). The cert doc labels this CONSPICUOUSLY: sqlite = machine-proven,
+  pg = operator-vouched (the attestation half is honor-system; pg-native TDE as a
+  machine-checked control is deliberately NOT claimed for GA). `PostureCheck.pass`
+  stays a bool.
+- **#3016/#3067 — `ai-memory audit bootstrap-node`, the single idempotent node
+  bring-up ceremony.** A bare store-only migration (data copied, `signed_events`
+  spine empty) is NON-certifiable / born DIRTY: under the certified `asi-hard`
+  audit require-modes an empty spine convicts on the witness + identity-lineage
+  verdicts, so `verify-audit-trail` exits 1. The new command runs the EXISTING
+  operator-ceremony enrollment (identity-lineage GENESIS + audit-head witness
+  anchor) over the local sqlite store and REFUSES to report the node certified
+  until `verify-audit-trail` exits 0, printing the exact remaining ceremony on a
+  refusal. Idempotent (re-running a brought-up node re-emits no genesis and simply
+  re-verifies); it NEVER copies or re-signs `signed_events` across a migration (a
+  chain-identity / `db_id` fork is irreversible-if-wrong) and mints NO
+  distinct-custody trust — witness / recorder / judge / stopper keys stay operator
+  custody; bring-up VERIFIES them and names any that are missing. The postgres
+  spine-WRITE twin is deferred (like the pg re-anchor twin #2217); the born-dirty
+  verify GATE has a shipped pg twin (`verify_audit_trail_postgres`), exercised on
+  the live pg tier. The deferred genesis-emit-on-first-open (a daemon-side on-disk
+  write) remains out of scope, gated by a separate narrow vote.
 
 ### Tests (deterministic atomise-worker drain; fix #2986 coverage-instrumentation flake)
 
