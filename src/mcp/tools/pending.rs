@@ -270,19 +270,9 @@ fn parse_remember_param(params: &Value) -> crate::approvals::Remember {
 /// missing / malformed entries are dropped (the quorum verifier then reports
 /// the honest shortfall). Empty when no signatures were presented.
 fn parse_signed_approvals(params: &Value) -> Vec<crate::approvals::signed::SignedApproval> {
-    let Some(arr) = params["approvals"].as_array() else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|entry| {
-            let pubkey = entry["pubkey"].as_str()?;
-            let signature = entry["signature"].as_str()?;
-            Some(crate::approvals::signed::SignedApproval {
-                signer_pubkey_b64: pubkey.to_string(),
-                signature_b64: signature.to_string(),
-            })
-        })
-        .collect()
+    // #2355 — one shared wire contract for presented approver signatures across
+    // MCP + the HTTP branches.
+    crate::approvals::signed::parse_presented_approvals(&params["approvals"])
 }
 
 /// v0.7 K10 — record a synthetic rule + publish on the approval bus
@@ -385,45 +375,66 @@ pub fn handle_pending_approve(
     // enrolled operator/approver keys MUST be met before the underlying approve
     // proceeds. Back-compat: an ordinary (non-escalated) pending with no
     // signatures skips this gate entirely.
+    // #2355 — route this funnel through the ONE pure chokepoint
+    // (`evaluate_signed_approval_gate`) so MCP + the four HTTP branches enforce
+    // the R40 gate identically. The verdict sits strictly ABOVE the
+    // `approve_with_approver_type` + `execute_pending_action` finalizer below.
     let signed_snapshot = db::get_pending_action(conn, id).map_err(|e| e.to_string())?;
-    let requires_signed = signed_snapshot
-        .as_ref()
-        .is_some_and(|p| crate::approvals::signed::pending_requires_signed_approval(&p.payload));
     let presented = parse_signed_approvals(params);
-    if requires_signed || !presented.is_empty() {
-        match crate::approvals::signed::verify_quorum_from_env(
-            id,
-            crate::approvals::Decision::Approve,
-            &presented,
-        ) {
-            Ok(quorum) => {
-                crate::approvals::signed::record_quorum_event(
-                    id,
-                    crate::approvals::Decision::Approve,
-                    &quorum,
-                );
-                // Quorum met — fall through to the existing approve + execute path.
-            }
-            Err(crate::approvals::signed::QuorumError::ThresholdNotMet {
-                distinct,
-                threshold,
-            }) => {
-                // #2634 — signatures accepted so far, awaiting quorum.
-                audit_pending_verdict(&agent_id, id, "allow");
-                return Ok(json!({
-                    "approved": false,
-                    "status": "pending",
-                    "id": id,
-                    "signed_votes": distinct,
-                    "signed_quorum": threshold,
-                    "reason": "signed approval quorum not yet met",
-                }));
-            }
-            Err(e) => {
-                // #2634 / #2643 — a rejected signature quorum is a refusal.
-                audit_pending_verdict(&agent_id, id, "refuse");
-                return Err(format!("signed approval rejected: {e}"));
-            }
+    // Term (2) of the requirement predicate — re-derive from the live rule
+    // engine (server-side; PURE, no audit emit) so a payload whose escalation
+    // flag was stripped is still gated.
+    let namespace_requires = signed_snapshot.as_ref().is_some_and(|pa| {
+        crate::approvals::signed::namespace_requires_signed_approval(
+            conn,
+            &pa.requested_by,
+            &pa.namespace,
+        )
+    });
+    let gate_payload = signed_snapshot
+        .as_ref()
+        .map_or(serde_json::Value::Null, |pa| pa.payload.clone());
+    // Single-use execution exemption — armed only when a signed quorum is MET,
+    // held across `execute_pending_action` so the already-approved write is not
+    // re-escalated by the L1-6 producer. Bound to this pending's content CID.
+    let mut _exemption_guard = None;
+    match crate::approvals::signed::evaluate_signed_approval_gate(
+        &gate_payload,
+        id,
+        crate::approvals::Decision::Approve,
+        &presented,
+        namespace_requires,
+    ) {
+        crate::approvals::signed::GateVerdict::NotRequired => {}
+        crate::approvals::signed::GateVerdict::Approved(quorum) => {
+            crate::approvals::signed::record_quorum_event(
+                id,
+                crate::approvals::Decision::Approve,
+                &quorum,
+            );
+            _exemption_guard =
+                crate::approvals::signed::exemption_guard_for_pending(id, &gate_payload);
+            // Quorum met — fall through to the existing approve + execute path.
+        }
+        crate::approvals::signed::GateVerdict::Pending {
+            distinct,
+            threshold,
+        } => {
+            // #2634 — signatures accepted so far, awaiting quorum.
+            audit_pending_verdict(&agent_id, id, "allow");
+            return Ok(json!({
+                "approved": false,
+                "status": "pending",
+                "id": id,
+                "signed_votes": distinct,
+                "signed_quorum": threshold,
+                "reason": "signed approval quorum not yet met",
+            }));
+        }
+        crate::approvals::signed::GateVerdict::Refused(e) => {
+            // #2634 / #2643 — a rejected signature quorum is a refusal.
+            audit_pending_verdict(&agent_id, id, "refuse");
+            return Err(format!("signed approval rejected: {e}"));
         }
     }
 

@@ -206,7 +206,14 @@ const QUAL_6_CEILING: usize = 120;
 // `handle_checkpoint_create` / `handle_routine_create`) via `?` (each enclosing
 // handler is `Result<Value, String>`). No new error contract — the same String
 // shape the coordination handlers already use. Measured 40.
-const QUAL_7_CEILING: usize = 40;
+// 2026-08-20 (#2991 GA Wave-2 approval chokepoint) — raised 40 → 41 for the L1-6
+// escalate PRODUCER helper `daemon_runtime::route_or_block_escalated_write`,
+// factored out of the pre-write hook closure so its escalate decision is
+// unit-testable. It MUST return `Result<(), String>` to match the
+// `crate::storage::GOVERNANCE_PRE_WRITE` hook contract (`Fn(&Memory) -> Result<(), String>`)
+// — no new error type, the exact String-error shape the hook already speaks.
+// Measured 41.
+const QUAL_7_CEILING: usize = 41;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {

@@ -55,6 +55,12 @@ pub struct ApprovalRequestBody {
     /// `"once"` (default), `"session"`, or `"forever"`.
     #[serde(default = "default_remember")]
     pub remember: crate::approvals::Remember,
+    /// #2355 — R40 approver signatures presented on the HTTP wire:
+    /// `[{"pubkey":"<b64>","signature":"<b64>"}, …]`. Absent (the default
+    /// `Null`) for an ordinary, non-escalated approve. Consulted by the shared
+    /// [`crate::approvals::signed::evaluate_signed_approval_gate`] chokepoint.
+    #[serde(default)]
+    pub approvals: serde_json::Value,
 }
 
 fn default_remember() -> crate::approvals::Remember {
@@ -238,6 +244,81 @@ fn audit_decide_verdict(
     );
 }
 
+/// #2355 — run the ONE R40 signed-approval chokepoint on an HTTP approve
+/// funnel, strictly ABOVE the backend finalizer. Shared by all four HTTP
+/// branches (`approval_decide` sqlite + pg, `approve_pending` sqlite + pg) so
+/// the gate is enforced identically on every wire surface.
+///
+/// Returns:
+/// - `Ok(guard)` — the gate did not block. `guard` is `Some` only when a signed
+///   quorum was MET; the funnel MUST hold it across `execute_pending_action` so
+///   the already-approved write is exempt from L1-6 re-escalation exactly once.
+/// - `Err(resp)` — a TERMINAL response the funnel returns verbatim: `403`
+///   fail-closed when signed approval is required-but-missing / forged /
+///   unenrolled, or `202` pending when the quorum is not yet met.
+///
+/// `namespace_requires` is term (2) of the requirement predicate: sqlite
+/// funnels re-derive it from the live rule engine
+/// ([`crate::approvals::signed::namespace_requires_signed_approval`]); pg
+/// funnels pass `false` and rely on the server-side stored escalation flag
+/// (term 1), which fully gates the escalated pending on both backends.
+/// `record_quorum_event` chains on the met path here, on EVERY surface —
+/// closing the §5.4 audit-spine HTTP hole.
+pub(crate) fn run_http_signed_gate<F: Fn(&str)>(
+    stored_payload: &serde_json::Value,
+    pending_id: &str,
+    presented_json: &serde_json::Value,
+    namespace_requires: bool,
+    audit_verdict: F,
+) -> Result<Option<crate::approvals::signed::ExemptionGuard>, axum::response::Response> {
+    use crate::approvals::signed::{self, GateVerdict};
+    let presented = signed::parse_presented_approvals(presented_json);
+    match signed::evaluate_signed_approval_gate(
+        stored_payload,
+        pending_id,
+        crate::approvals::Decision::Approve,
+        &presented,
+        namespace_requires,
+    ) {
+        GateVerdict::NotRequired => Ok(None),
+        GateVerdict::Approved(quorum) => {
+            signed::record_quorum_event(pending_id, crate::approvals::Decision::Approve, &quorum);
+            Ok(signed::exemption_guard_for_pending(
+                pending_id,
+                stored_payload,
+            ))
+        }
+        GateVerdict::Pending {
+            distinct,
+            threshold,
+        } => {
+            // #2634 — signatures accepted so far, awaiting quorum.
+            audit_verdict("allow");
+            Err((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "approved": false,
+                    "status": "pending",
+                    "id": pending_id,
+                    "signed_votes": distinct,
+                    "signed_quorum": threshold,
+                    "reason": "signed approval quorum not yet met",
+                })),
+            )
+                .into_response())
+        }
+        GateVerdict::Refused(e) => {
+            // #2634 / #2643 — a rejected signature quorum is a fail-closed refusal.
+            audit_verdict("refuse");
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": format!("signed approval rejected: {e}") })),
+            )
+                .into_response())
+        }
+    }
+}
+
 /// `POST /api/v1/approvals/{pending_id}` — K10's HMAC-gated approval
 /// endpoint. See module-level comment above for the full contract.
 #[allow(clippy::too_many_lines)]
@@ -320,6 +401,29 @@ pub async fn approval_decide(
     let pending_snapshot = db::get_pending_action(&lock.0, &id).ok().flatten();
     let outcome = match body.decision {
         crate::approvals::Decision::Approve => {
+            // #2355 — R40 signed-approval chokepoint, strictly ABOVE the
+            // approver-type finalizer. Term (2) re-derives from the live rule
+            // engine on this sqlite conn.
+            let stored_payload = pending_snapshot
+                .as_ref()
+                .map_or(serde_json::Value::Null, |pa| pa.payload.clone());
+            let namespace_requires = pending_snapshot.as_ref().is_some_and(|pa| {
+                crate::approvals::signed::namespace_requires_signed_approval(
+                    &lock.0,
+                    &pa.requested_by,
+                    &pa.namespace,
+                )
+            });
+            let _exemption_guard = match run_http_signed_gate(
+                &stored_payload,
+                &id,
+                &body.approvals,
+                namespace_requires,
+                |v| audit_decide_verdict(&agent_id, &id, body.decision, v),
+            ) {
+                Ok(g) => g,
+                Err(resp) => return resp,
+            };
             // #1796 (5-agent vote 4d3ea1c5) — HTTP approve surface enforces the
             // Human-arm self-approval gate UNCONDITIONALLY regardless of backend
             // (multi-tenant; no process AI_MEMORY_AGENT_ID to key the opt-in on).
@@ -447,6 +551,21 @@ async fn approval_decide_postgres(
     let remember_label = format!("{:?}", body.remember).to_lowercase();
     let outcome = match body.decision {
         crate::approvals::Decision::Approve => {
+            // #2355 — R40 signed-approval chokepoint, strictly ABOVE the pg
+            // consensus finalizer. Term (2) passes `false` — the pg funnel has
+            // no rusqlite rules conn; the server-side stored escalation flag
+            // (term 1, read from `get_pending`) fully gates the escalated
+            // pending on both backends.
+            let stored_payload = pending_snapshot
+                .as_ref()
+                .map_or(serde_json::Value::Null, |pa| pa.payload.clone());
+            let _exemption_guard =
+                match run_http_signed_gate(&stored_payload, id, &body.approvals, false, |v| {
+                    audit_decide_verdict(agent_id, id, body.decision, v)
+                }) {
+                    Ok(g) => g,
+                    Err(resp) => return resp,
+                };
             match app
                 .store
                 .governance_approve_with_consensus(&ctx, id, agent_id)

@@ -239,6 +239,16 @@ pub async fn approve_pending(
         }
     };
 
+    // #2355 — presented R40 approver signatures ride the request body as
+    // `{"approvals":[{"pubkey","signature"}, …]}`. Best-effort: an empty /
+    // non-JSON body (the ordinary non-escalated approve) yields `Null`, which
+    // the chokepoint treats as "no signatures presented".
+    let approvals_json: serde_json::Value =
+        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .and_then(|v| v.get("approvals").cloned())
+            .unwrap_or(serde_json::Value::Null);
+
     // #913 + #2634 / CB-24 — admin governance audit. Pre-fix a
     // `record_decision("allow")` fired UNCONDITIONALLY here, BEFORE the
     // `approve_with_approver_type` / consensus gate ran — so a REFUSED
@@ -269,6 +279,24 @@ pub async fn approve_pending(
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         use crate::store::ApproveOutcome as SalOutcome;
         let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
+        // #2355 — R40 signed-approval chokepoint, strictly ABOVE the pg
+        // consensus finalizer. Term (2) is `false` (no rusqlite rules conn on
+        // pg); the server-side stored escalation flag (term 1) gates the
+        // escalated pending. The exemption guard is held across execute.
+        let pending_snapshot = app.store.get_pending(&ctx, &id).await.ok().flatten();
+        let stored_payload = pending_snapshot
+            .as_ref()
+            .map_or(serde_json::Value::Null, |pa| pa.payload.clone());
+        let _exemption_guard = match super::approvals::run_http_signed_gate(
+            &stored_payload,
+            &id,
+            &approvals_json,
+            false,
+            |v| audit_pending_verdict(&agent_id, &id, v),
+        ) {
+            Ok(g) => g,
+            Err(resp) => return resp,
+        };
         return match app
             .store
             .governance_approve_with_consensus(&ctx, &id, &agent_id)
@@ -344,6 +372,30 @@ pub async fn approve_pending(
     }
 
     let lock = state.lock().await;
+    // #2355 — R40 signed-approval chokepoint, strictly ABOVE the approver-type
+    // finalizer. Term (2) re-derives from the live rule engine on this sqlite
+    // conn; the exemption guard is held across execute below.
+    let pending_snapshot = db::get_pending_action(&lock.0, &id).ok().flatten();
+    let stored_payload = pending_snapshot
+        .as_ref()
+        .map_or(serde_json::Value::Null, |pa| pa.payload.clone());
+    let namespace_requires = pending_snapshot.as_ref().is_some_and(|pa| {
+        crate::approvals::signed::namespace_requires_signed_approval(
+            &lock.0,
+            &pa.requested_by,
+            &pa.namespace,
+        )
+    });
+    let _exemption_guard = match super::approvals::run_http_signed_gate(
+        &stored_payload,
+        &id,
+        &approvals_json,
+        namespace_requires,
+        |v| audit_pending_verdict(&agent_id, &id, v),
+    ) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
     // #1796 (5-agent vote 4d3ea1c5) — the HTTP surface enforces the Human-arm
     // self-approval reject + registered-approver requirement UNCONDITIONALLY
     // (it is multi-tenant via per-request X-Agent-Id and sets no process

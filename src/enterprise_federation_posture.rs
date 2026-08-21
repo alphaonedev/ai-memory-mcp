@@ -110,8 +110,10 @@ pub const ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE: &str =
 /// dropped or added check is a loud test failure rather than a silent
 /// `doctor --posture` shape change (#2911). #2954 raised it 18 → 19 (the
 /// append-only-audit-spine-armed pairing, check #19) — a DELIBERATE, ratified
-/// re-cert, not a silent drift.
-pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 19;
+/// re-cert, not a silent drift. #2991 raised it 19 → 20 (check #20: the R40
+/// escalate producer is armable — approver keys enrolled — so the wired L1-6
+/// producer routes to a SATISFIABLE signed-approval gate).
+pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 20;
 
 /// `tracing` target for the §5.3 boot-banner rows
 /// (`daemon_runtime::run`, the B2 fix — see module docs). Hoisted to a
@@ -599,6 +601,33 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
          federation supersede leaves are signed",
     ));
 
+    // ---- 20. R40 escalate producer armable (#2991) -----------------
+    // The L1-6 pre-write `Decision::Escalate` producer
+    // (`daemon_runtime::install_governance_pre_write_hook`) routes an escalated
+    // write to the signed-approval gate as a `requires_signed_approval`
+    // pending — BUT with a keyless FAIL-CLOSED guardrail: when no approver keys
+    // are enrolled it keeps hard-blocking rather than parking a forever-un-
+    // approvable pending (the availability trap). The certified posture
+    // therefore requires enrolled approver keys so the wired producer routes to
+    // a SATISFIABLE gate: an escalated write can actually be approved (m-of-n
+    // signed quorum) instead of being permanently blocked. This is the
+    // positive counterpart of the guardrail and the doctor-visible assertion
+    // that the producer is wired to a live gate. Reuses the SAME resolver the
+    // producer + every approve funnel consult (`enrolled_approver_keys` —
+    // AI_MEMORY_OPERATOR_PUBKEY / on-disk operator key + AI_MEMORY_APPROVER_PUBKEYS),
+    // so a green row proves the exact keys the runtime gate will verify against.
+    let enrolled_key_count = crate::approvals::signed::enrolled_approver_keys().len();
+    out.push(check(
+        "R40 escalate producer",
+        "approver keys enrolled so the wired L1-6 escalate producer routes to a SATISFIABLE \
+         signed-approval gate (AI_MEMORY_OPERATOR_PUBKEY / AI_MEMORY_APPROVER_PUBKEYS)",
+        format!("{enrolled_key_count} approver key(s) enrolled"),
+        enrolled_key_count > 0,
+        "enroll at least one approver key (set AI_MEMORY_OPERATOR_PUBKEY or provision the \
+         on-disk operator.key.pub, and/or AI_MEMORY_APPROVER_PUBKEYS) so an escalated write \
+         can be approved rather than blocked by the keyless fail-closed guardrail",
+    ));
+
     debug_assert_eq!(
         out.len(),
         ENTERPRISE_FEDERATION_CHECK_COUNT,
@@ -721,6 +750,9 @@ mod tests {
             for env in FED_ENV_VARS {
                 std::env::remove_var(env);
             }
+            // #2991 check #20 — the escalate-producer approver-key enrollment.
+            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
+            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
         }
     }
 
@@ -750,6 +782,15 @@ mod tests {
     ///
     /// Returns the peer-fingerprints tempfile so it stays alive for the
     /// duration of the caller's assertions (dropped = file removed).
+    /// #2991 — a deterministic, valid base64 Ed25519 approver pubkey for the
+    /// escalate-producer posture check (#20). Derived from a fixed seed so the
+    /// value is stable and never depends on an RNG.
+    fn approver_pubkey_b64_for_test() -> String {
+        use base64::Engine as _;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
+    }
+
     fn set_fully_hardened_env() -> tempfile::NamedTempFile {
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard");
@@ -781,6 +822,13 @@ mod tests {
             // the certified posture (else a federation supersede leaf is
             // unsigned theater). The signing-key half is armed just below.
             std::env::set_var(crate::config::ENV_APPEND_ONLY, "1");
+            // #2991 check #20 — enroll an approver key so the wired L1-6
+            // escalate producer routes to a SATISFIABLE signed-approval gate
+            // (a keyless fleet would fail the check by design).
+            std::env::set_var(
+                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
+                approver_pubkey_b64_for_test(),
+            );
         }
         // #2954 check #19 — install a process-wide daemon audit signing key so
         // the append-only leaves would be SIGNED. Process-global `OnceLock`
@@ -1483,6 +1531,48 @@ mod tests {
     // daemon audit signing key armed) — else a federation supersede leaf is
     // unsigned theater.
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // #2991 check #20 — the R40 escalate producer must route to a SATISFIABLE
+    // gate: approver keys enrolled. A keyless fleet fails (the wired producer's
+    // keyless fail-closed guardrail would permanently block escalated writes).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn keyless_fleet_fails_escalate_producer_check_20() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::keyless_fleet_fails_escalate_producer_check_20",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        // Fully hardened (which enrolls an approver key), then strip the
+        // enrollment: no approver key resolvable → check #20 FAILs. Also
+        // neutralise any on-disk operator key so a dev host's staged
+        // operator.key.pub cannot make the fleet look keyed.
+        let _fp_file = set_fully_hardened_env();
+        let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        unsafe {
+            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
+            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
+        }
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, "R40 escalate producer");
+        assert!(
+            !c.pass,
+            "check #20 must FAIL when no approver key is enrolled: {c:?}"
+        );
+        assert!(
+            c.actual.contains("0 approver key"),
+            "actual must name the keyless state: {:?}",
+            c.actual
+        );
+        assert!(!all_pass(&checks));
+    }
 
     #[test]
     fn append_only_disarmed_fails_check_19() {

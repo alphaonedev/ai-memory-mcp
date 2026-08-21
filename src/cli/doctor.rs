@@ -4166,6 +4166,9 @@ enabled = true
                 crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
                 // #2954 check #19 — append-only spine flag.
                 crate::config::ENV_APPEND_ONLY,
+                // #2991 check #20 — R40 approver-key enrollment.
+                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
+                "AI_MEMORY_OPERATOR_PUBKEY",
             ] {
                 std::env::remove_var(env);
             }
@@ -4289,6 +4292,12 @@ enabled = true
 
         let fp_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(fp_file.path(), "example.org abc123\n").unwrap();
+        // #2991 check #20 — a deterministic, valid base64 Ed25519 approver pubkey.
+        let approver_pubkey_b64 = {
+            use base64::Engine as _;
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
+        };
         unsafe {
             std::env::set_var(
                 crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
@@ -4309,6 +4318,12 @@ enabled = true
             );
             // #2954 check #19 — arm the append-only audit spine flag.
             std::env::set_var(crate::config::ENV_APPEND_ONLY, "1");
+            // #2991 check #20 — enroll a deterministic approver key so the R40
+            // escalate producer routes to a SATISFIABLE signed-approval gate.
+            std::env::set_var(
+                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
+                &approver_pubkey_b64,
+            );
         }
         // #2954 check #19 — install a process-wide daemon audit signing key so
         // the append-only leaves would be SIGNED (the other half of the

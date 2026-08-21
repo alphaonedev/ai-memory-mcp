@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (cert: route ALL approve funnels through one signed-approval quorum gate + wire the escalate producer; #2991 #2355)
+
+The R40 m-of-n signed-approval gate was enforced on the MCP approve funnel ONLY —
+both HTTP approve funnels (`approval_decide` and `approve_pending`, on each of the
+sqlite + postgres backends) AND the CLI `pending approve` funnel bypassed it — and
+the daemon `Decision::Escalate` producer was never wired to it, so a signed-approval
+requirement was unenforced on the wire + CLI surfaces and never fired in production
+(a CWE-306 class gap on the certified enterprise-federation posture).
+
+- **One pure chokepoint.** New `approvals::signed::evaluate_signed_approval_gate`
+  returns a side-effect-free verdict (approved / pending / refused) strictly ABOVE
+  every finalizer. All SIX approve-and-execute funnels consult the SAME helper:
+  MCP `handle_pending_approve` (refactored onto it, byte-equal responses), HTTP
+  `approval_decide` (sqlite + pg), HTTP `approve_pending` (sqlite + pg), and CLI
+  `pending approve` (new `--approval <pubkey_b64>:<sig_b64>` flag). The requirement
+  predicate is the server-side OR of the stored escalation flag (from the DB
+  snapshot, never a caller field) and the pending namespace's live rule-engine
+  escalation — never the strippable `unwrap_or(false)` alone. Missing-when-required
+  / forged / unenrolled → fail-closed 403 (MCP/CLI: refuse + nonzero exit);
+  quorum-not-met → `{approved:false,status:"pending"}`. `record_quorum_event` now
+  chains on EVERY surface, closing the §5.4 audit-spine HTTP/CLI hole. (The
+  federation `sync_push` convergence-apply is BACKSTOPPED, not gated: it is not an
+  operator approve funnel — the m-of-n quorum is verified on the ORIGINATING peer,
+  and a flagged replay landing on a receiver is re-escalated by that receiver's
+  execute-time `GOVERNANCE_PRE_WRITE` hook, consistent with the federation trust
+  model.)
+- **Producer wired (#2991).** The L1-6 pre-write `Decision::Escalate` arm now routes
+  the escalated write through `route_escalation_to_approval_gate` as a
+  `requires_signed_approval` `store` pending (payload byte-shape-identical to the
+  `execute_pending_action` replay), with two non-negotiable guardrails: a KEYLESS
+  fail-closed guardrail (no enrolled approver keys → keep hard-blocking rather than
+  parking a forever-un-approvable pending) and a single-use, `(pending_id, payload-CID)`-bound
+  post-quorum execution EXEMPTION (never namespace-scoped / "any store") so an
+  approved write replays exactly once. `wire_check`'s Escalate arm stays fail-closed.
+  The CLI one-shot process does not install `GOVERNANCE_PRE_WRITE` (operator-as-actor),
+  so on the CLI the funnel gate is the SOLE enforcer — which is exactly why routing
+  the CLI funnel (not merely installing the backstop) is load-bearing.
+- **Three CI merge gates.** A surface-parity table test (all funnels enforce
+  identically), an exemption removal-proof in `scripts/check-cert-removal-proof.sh`
+  (neutralizing `consume_execution_exemption` reds the negative-control test), and a
+  new `doctor --posture` check #20 asserting the escalate producer routes to a
+  SATISFIABLE gate (approver keys enrolled). `ENTERPRISE_FEDERATION_CHECK_COUNT`
+  19 → 20.
+
 ### Tests (deterministic atomise-worker drain; fix #2986 coverage-instrumentation flake)
 
 Test-support only; production behaviour byte-identical. The deferred auto-atomise

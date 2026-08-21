@@ -205,12 +205,15 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 `ai-memory doctor --posture enterprise-federation` renders PASS/FAIL per
 requirement and **exits non-zero on any deviation of the running process**
 (the ruling's "a non-zero exit is falsifiable" bar). `run_posture`
-(`src/cli/doctor.rs:561`) returns **0 iff all 19 checks pass, else 2**
+(`src/cli/doctor.rs:561`) returns **0 iff all 20 checks pass, else 2**
 (the posture grew 16 → 18 when #2918/#2911 landed checks #17
 boot-refusal-env self-attest and #18 FED-RQ-03, then **18 → 19 when #2954
 landed check #19 append-only-audit-spine-armed** — append-only spine ON
 AND the daemon audit signing key armed, so a federation newer-wins
-supersede leaf is SIGNED, not unsigned theater). The four-leg capture
+supersede leaf is SIGNED, not unsigned theater — then **19 → 20 when #2991
+landed check #20 R40-escalate-producer-armable** — approver keys enrolled so
+the wired L1-6 escalate producer routes to a SATISFIABLE signed-approval gate
+rather than parking a forever-un-approvable pending). The four-leg capture
 below was taken 2026-08-13 on the release-built binary at the
 post-remediation tree (the merged cert wave: #2915-#2920, #2925-#2927,
 #2929); raw output in `docs/compliance/evidence/cert-54/` (see that
