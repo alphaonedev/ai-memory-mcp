@@ -524,10 +524,239 @@ fn same_id_supersede_converges_identically_flag_on_vs_off() {
         "the higher-id concurrent head wins the updated_at tie"
     );
 
-    // The ONLY divergence between the two runs is the audit leaf: ON emits a
-    // supersede leaf, OFF emits nothing.
-    assert_eq!(on.2, 1, "flag ON emits the supersede leaf");
+    // The ONLY divergence between the two runs is the audit leaves: ON emits
+    // TWO supersede leaves (one from the same-id in-place `update_*` supersede,
+    // one from the federation newer-wins `insert_if_newer` overwrite that the
+    // higher-id inbound head won — the #2954 fix), OFF emits nothing.
+    assert_eq!(
+        on.2, 2,
+        "flag ON emits both the in-place supersede leaf and the #2954 \
+         federation newer-wins supersede leaf"
+    );
     assert_eq!(off.2, 0, "flag OFF stays byte-identical at the leaf layer");
+}
+
+// ---------------------------------------------------------------------------
+// 5b. #2954 — federation newer-wins `insert_if_newer` (title, namespace) LWW
+//     overwrite emits exactly one identity-only SUPERSEDE leaf IFF the inbound
+//     row WON the tiebreak AND the content bytes actually changed.
+// ---------------------------------------------------------------------------
+
+/// Seed a local head at an OLD timestamp, then merge a same-(title, namespace)
+/// inbound row (DIFFERENT id) at `inbound_updated_at` carrying `inbound_content`.
+/// Returns `(surviving_id, surviving_content, leaf_count)`.
+fn run_insert_if_newer_case(
+    local_content: &str,
+    inbound_content: &str,
+    inbound_updated_at: &str,
+) -> (String, String, i64) {
+    let conn = open_mem_db();
+    let mut local = make_memory(
+        "00000000-0000-0000-0000-00000000c001",
+        "fed-lww-title",
+        "ns-fed-lww",
+        local_content,
+    );
+    local.created_at = "2020-01-01T00:00:00Z".to_string();
+    local.updated_at = "2020-01-01T00:00:00Z".to_string();
+    let local_id = db::insert(&conn, &local).expect("insert local head");
+    assert_eq!(
+        leaf_count(&conn),
+        0,
+        "a plain insert is not a revision leaf"
+    );
+
+    let mut inbound = make_memory(
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "fed-lww-title",
+        "ns-fed-lww",
+        inbound_content,
+    );
+    inbound.updated_at = inbound_updated_at.to_string();
+    inbound.created_at = inbound_updated_at.to_string();
+    db::insert_if_newer(&conn, &inbound).expect("federation merge");
+
+    let (id, content): (String, String) = conn
+        .query_row(
+            "SELECT id, content FROM memories WHERE title = ?1 AND namespace = ?2",
+            rusqlite::params!["fed-lww-title", "ns-fed-lww"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("read surviving head");
+    // The (title, namespace) upsert keeps the LOCAL row's id on conflict.
+    assert_eq!(id, local_id, "surviving row keeps the local id");
+    (id, content, leaf_count(&conn))
+}
+
+#[test]
+fn federation_newer_wins_emits_one_identity_only_supersede_leaf() {
+    let _g = flag_guard();
+    ensure_audit_key();
+    ai_memory::config::set_append_only(true);
+
+    const LOCAL_SECRET: &str = "FED-PRIOR-CONTENT-v1-do-not-leak";
+    let now = chrono::Utc::now().to_rfc3339();
+    let conn = open_mem_db();
+    // Re-seed by hand so we can inspect the leaf (run_* helper opens its own db).
+    let mut local = make_memory(
+        "00000000-0000-0000-0000-00000000c101",
+        "fed-win-title",
+        "ns-fed-win",
+        LOCAL_SECRET,
+    );
+    local.created_at = "2020-01-01T00:00:00Z".to_string();
+    local.updated_at = "2020-01-01T00:00:00Z".to_string();
+    let local_id = db::insert(&conn, &local).expect("insert local head");
+
+    let mut inbound = make_memory(
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "fed-win-title",
+        "ns-fed-win",
+        "fed-new-body-v2",
+    );
+    inbound.updated_at.clone_from(&now);
+    inbound.created_at = now;
+    db::insert_if_newer(&conn, &inbound).expect("federation newer-wins merge");
+
+    let leaves = read_leaves(&conn);
+    assert_eq!(
+        leaves.len(),
+        1,
+        "an inbound-WIN content overwrite writes EXACTLY ONE federation supersede leaf"
+    );
+    let leaf = &leaves[0];
+    assert_eq!(leaf.kind, "SUPERSEDE");
+    assert_eq!(
+        leaf.memory_id, local_id,
+        "the leaf is for the SURVIVING (local) memory id"
+    );
+    assert_eq!(leaf.namespace, "ns-fed-win");
+    assert_eq!(
+        leaf.prior_version,
+        Some(1),
+        "the leaf records the pre-merge version"
+    );
+    // IDENTITY-ONLY: the superseded prior content must be absent from the leaf.
+    assert!(
+        !leaf_bytes_contain(leaf, LOCAL_SECRET),
+        "the federation supersede leaf must NEVER carry the superseded content"
+    );
+    verify_leaf_signature(leaf);
+
+    let head = db::get(&conn, &local_id)
+        .expect("get")
+        .expect("head present");
+    assert_eq!(head.content, "fed-new-body-v2", "inbound content won");
+}
+
+#[test]
+fn federation_loss_emits_no_leaf() {
+    let _g = flag_guard();
+    ensure_audit_key();
+    ai_memory::config::set_append_only(true);
+
+    // The local head is at "now" (newer); the inbound row is stamped in the
+    // past, so it LOSES the tiebreak — content is not overwritten, no leaf.
+    let (_id, content, leaves) =
+        run_insert_if_newer_case("local-keeps", "inbound-stale", "2019-01-01T00:00:00Z");
+    assert_eq!(content, "local-keeps", "the stale inbound row must lose");
+    assert_eq!(leaves, 0, "an inbound-LOSS overwrite emits no leaf");
+}
+
+#[test]
+fn federation_newer_wins_but_content_unchanged_emits_no_leaf() {
+    let _g = flag_guard();
+    ensure_audit_key();
+    ai_memory::config::set_append_only(true);
+
+    // The inbound row WINS the tiebreak (newer updated_at) but carries the
+    // SAME content — a no-op content merge must emit NOTHING (#2954 point 4).
+    let now = chrono::Utc::now().to_rfc3339();
+    let (_id, content, leaves) = run_insert_if_newer_case("same-body", "same-body", &now);
+    assert_eq!(content, "same-body");
+    assert_eq!(
+        leaves, 0,
+        "an inbound-WIN with byte-identical content is a no-op merge — no leaf"
+    );
+}
+
+#[test]
+fn federation_fresh_insert_if_newer_then_newer_overwrite_emits_one_leaf() {
+    // #2954 — the SERIALIZED-ordering proof the pg advisory lock guarantees under
+    // a race: a FRESH `insert_if_newer` (no prior row) writes NO leaf, and a
+    // SECOND `insert_if_newer` on the SAME (title, namespace) with a DIFFERENT id
+    // + newer updated_at must see the first's committed row and emit EXACTLY ONE
+    // supersede leaf (never zero — the "missed leaf on the raced second apply"
+    // regression class). sqlite is structurally immune to the fresh-insert race
+    // (BEGIN IMMEDIATE spans probe→upsert); this pins the emit path end-to-end.
+    let _g = flag_guard();
+    ensure_audit_key();
+    ai_memory::config::set_append_only(true);
+
+    let conn = open_mem_db();
+    let mut first = make_memory(
+        "00000000-0000-0000-0000-00000000c301",
+        "fed-seq-title",
+        "ns-fed-seq",
+        "fed-seq-v1",
+    );
+    first.created_at = "2020-01-01T00:00:00Z".to_string();
+    first.updated_at = "2020-01-01T00:00:00Z".to_string();
+    db::insert_if_newer(&conn, &first).expect("fresh insert_if_newer");
+    assert_eq!(
+        leaf_count(&conn),
+        0,
+        "a fresh insert_if_newer (no prior row) writes no leaf"
+    );
+
+    let mut second = make_memory(
+        "ffffffff-ffff-ffff-ffff-fffffffffff1",
+        "fed-seq-title",
+        "ns-fed-seq",
+        "fed-seq-v2",
+    );
+    second.updated_at = chrono::Utc::now().to_rfc3339();
+    second.created_at.clone_from(&second.updated_at);
+    db::insert_if_newer(&conn, &second).expect("newer insert_if_newer overwrite");
+
+    let leaves = read_leaves(&conn);
+    assert_eq!(
+        leaves.len(),
+        1,
+        "the second (newer) insert_if_newer sees the committed fresh row and emits ONE leaf"
+    );
+    assert_eq!(leaves[0].kind, "SUPERSEDE");
+    let (_id, content): (String, String) = conn
+        .query_row(
+            "SELECT id, content FROM memories WHERE title = ?1 AND namespace = ?2",
+            rusqlite::params!["fed-seq-title", "ns-fed-seq"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("read surviving head");
+    assert_eq!(content, "fed-seq-v2", "the newer content won");
+}
+
+#[test]
+fn federation_fresh_insert_emits_no_leaf() {
+    let _g = flag_guard();
+    ensure_audit_key();
+    ai_memory::config::set_append_only(true);
+
+    // A brand-new (title, namespace) is a fresh INSERT — it destroys nothing,
+    // so the pre-image probe finds no prior row and no leaf is written.
+    let conn = open_mem_db();
+    let mem = make_memory(
+        "00000000-0000-0000-0000-00000000c201",
+        "fed-fresh-title",
+        "ns-fed-fresh",
+        "fresh-body",
+    );
+    db::insert_if_newer(&conn, &mem).expect("fresh federation insert");
+    assert_eq!(
+        leaf_count(&conn),
+        0,
+        "a fresh federation INSERT destroys nothing and writes no leaf"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -690,6 +919,27 @@ fn flag_off_writes_no_revision_leaves() {
     db::insert(&conn, &evi).expect("insert");
     db::size_gc(&conn, "ns-off-evi", 1, false).expect("size_gc");
 
+    // #2954 — a federation newer-wins overwrite (the exact path this issue
+    // fixes) must ALSO write nothing when the flag is off (byte-identical).
+    let mut fed_local = make_memory(
+        "00000000-0000-0000-0000-0000000000b7",
+        "off-fed",
+        "ns-off-fed",
+        "off-fed-v1",
+    );
+    fed_local.created_at = "2020-01-01T00:00:00Z".to_string();
+    fed_local.updated_at = "2020-01-01T00:00:00Z".to_string();
+    db::insert(&conn, &fed_local).expect("insert");
+    let mut fed_inbound = make_memory(
+        "ffffffff-ffff-ffff-ffff-fffffffffff0",
+        "off-fed",
+        "ns-off-fed",
+        "off-fed-v2",
+    );
+    fed_inbound.updated_at = chrono::Utc::now().to_rfc3339();
+    fed_inbound.created_at.clone_from(&fed_inbound.updated_at);
+    db::insert_if_newer(&conn, &fed_inbound).expect("federation merge");
+
     assert_eq!(
         leaf_count(&conn),
         0,
@@ -823,5 +1073,204 @@ mod postgres_twins {
             .expect("head present after supersede");
         assert_eq!(head.id, id, "supersede is SAME-id in-place (path-a)");
         assert_eq!(head.content, "pg-v2");
+    }
+
+    /// #2954 twin — the postgres federation newer-wins upsert
+    /// (`apply_remote_memory`, the pg `insert_if_newer`) appends exactly ONE
+    /// identity-only SUPERSEDE leaf when an inbound row WINS the `(title,
+    /// namespace)` LWW tiebreak and changes content, and ZERO when it loses.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
+    async fn pg_apply_remote_memory_newer_wins_writes_one_supersede_leaf() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        ai_memory::config::set_append_only(true);
+        let ctx = CallerContext::for_agent("ai:g6-flagon");
+        let ns = "ns-pg-fed-lww";
+        let title = format!("pg-fed-lww-{}", uuid::Uuid::new_v4());
+
+        // Seed a local head at an OLD timestamp under a shared (title, ns).
+        let mut local = sample(&uuid::Uuid::new_v4().to_string(), ns, "pg-fed-v1");
+        local.title = title.clone();
+        local.created_at = "2020-01-01T00:00:00Z".to_string();
+        local.updated_at = "2020-01-01T00:00:00Z".to_string();
+        MemoryStore::store(&pg, &ctx, &local)
+            .await
+            .expect("seed local head");
+
+        // Inbound: same (title, ns), DIFFERENT id, NEWER updated_at, changed content.
+        let before = count_leaves(&pg, &local.id, "SUPERSEDE").await;
+        let mut inbound = sample(&uuid::Uuid::new_v4().to_string(), ns, "pg-fed-v2");
+        inbound.title = title.clone();
+        inbound.updated_at = chrono::Utc::now().to_rfc3339();
+        inbound.created_at.clone_from(&inbound.updated_at);
+        let applied = MemoryStore::apply_remote_memory(&pg, &ctx, &inbound)
+            .await
+            .expect("apply_remote_memory newer-wins");
+        assert_eq!(
+            applied, local.id,
+            "the (title, namespace) upsert keeps the local id"
+        );
+        assert_eq!(
+            count_leaves(&pg, &local.id, "SUPERSEDE").await - before,
+            1,
+            "an inbound-WIN federation overwrite appends exactly one SUPERSEDE leaf (#2954)"
+        );
+
+        // A losing inbound (older timestamp) writes NO new leaf.
+        let before_loss = count_leaves(&pg, &local.id, "SUPERSEDE").await;
+        let mut stale = sample(&uuid::Uuid::new_v4().to_string(), ns, "pg-fed-stale");
+        stale.title = title.clone();
+        stale.updated_at = "2019-01-01T00:00:00Z".to_string();
+        stale.created_at.clone_from(&stale.updated_at);
+        MemoryStore::apply_remote_memory(&pg, &ctx, &stale)
+            .await
+            .expect("apply stale");
+        assert_eq!(
+            count_leaves(&pg, &local.id, "SUPERSEDE").await - before_loss,
+            0,
+            "an inbound-LOSS federation overwrite emits no leaf"
+        );
+    }
+
+    /// #2954 (FIX 1) — the SEQUENTIAL-ordering proof the advisory lock guarantees
+    /// under a fresh-insert race: a FRESH `apply_remote_memory` (no prior row)
+    /// writes NO leaf, and a SECOND `apply_remote_memory` on the SAME (title,
+    /// namespace) with a DIFFERENT id + newer updated_at must see the first's
+    /// committed row (its `FOR UPDATE` probe now reliably does, because the
+    /// advisory lock serialized them) and emit EXACTLY ONE supersede leaf —
+    /// never zero (the missed-leaf regression class the advisory lock closes).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
+    async fn pg_apply_remote_memory_fresh_then_newer_emits_one_leaf() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        ai_memory::config::set_append_only(true);
+        let ctx = CallerContext::for_agent("ai:g6-flagon");
+        let ns = "ns-pg-fed-seq";
+        let title = format!("pg-fed-seq-{}", uuid::Uuid::new_v4());
+
+        // FRESH apply (no prior row) — a plain insert, no leaf.
+        let mut first = sample(&uuid::Uuid::new_v4().to_string(), ns, "pg-seq-v1");
+        first.title = title.clone();
+        first.created_at = "2020-01-01T00:00:00Z".to_string();
+        first.updated_at = "2020-01-01T00:00:00Z".to_string();
+        let first_id = MemoryStore::apply_remote_memory(&pg, &ctx, &first)
+            .await
+            .expect("fresh apply_remote_memory");
+
+        // SECOND apply — same (title, ns), different id, newer ts, changed content.
+        let before = count_leaves(&pg, &first_id, "SUPERSEDE").await;
+        let mut second = sample(&uuid::Uuid::new_v4().to_string(), ns, "pg-seq-v2");
+        second.title = title.clone();
+        second.updated_at = chrono::Utc::now().to_rfc3339();
+        second.created_at.clone_from(&second.updated_at);
+        let applied = MemoryStore::apply_remote_memory(&pg, &ctx, &second)
+            .await
+            .expect("newer apply_remote_memory overwrite");
+        assert_eq!(applied, first_id, "the upsert keeps the first row's id");
+        assert_eq!(
+            count_leaves(&pg, &first_id, "SUPERSEDE").await - before,
+            1,
+            "the second (newer) apply sees the committed fresh row and emits ONE leaf (#2954 FIX 1)"
+        );
+    }
+
+    /// #2948 (inherited residual, FIX 1) — the pg CREATE funnel had the SAME
+    /// fresh-insert TOCTOU (`pg_probe_upsert_prior_version` had no FOR UPDATE and
+    /// no lock). A FRESH `store` writes no leaf; a SECOND `store` on the SAME
+    /// (title, namespace) overwrites content in place and, now that the probe
+    /// takes the advisory lock, reliably sees the committed row and emits ONE
+    /// supersede leaf.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
+    async fn pg_store_fresh_then_re_store_overwrite_emits_one_leaf() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        ai_memory::config::set_append_only(true);
+        let ctx = CallerContext::for_agent("ai:g6-flagon");
+        let ns = "ns-pg-create-seq";
+        let title = format!("pg-create-seq-{}", uuid::Uuid::new_v4());
+
+        let mut first = sample(&uuid::Uuid::new_v4().to_string(), ns, "create-v1");
+        first.title = title.clone();
+        let first_id = MemoryStore::store(&pg, &ctx, &first)
+            .await
+            .expect("fresh store");
+        let before = count_leaves(&pg, &first_id, "SUPERSEDE").await;
+
+        // A re-store of the SAME (title, namespace) — the create funnel's
+        // unconditional ON CONFLICT overwrite of `content`.
+        let mut second = sample(&uuid::Uuid::new_v4().to_string(), ns, "create-v2");
+        second.title = title.clone();
+        MemoryStore::store(&pg, &ctx, &second)
+            .await
+            .expect("re-store overwrite");
+        assert_eq!(
+            count_leaves(&pg, &first_id, "SUPERSEDE").await - before,
+            1,
+            "the re-store overwrite emits ONE supersede leaf (#2948 pg residual closed by FIX 1)"
+        );
+    }
+
+    /// #2954 (FIX 1) — CONCURRENCY: two concurrent fresh applies to the SAME
+    /// (title, namespace) with NO prior row (the exact race the advisory lock
+    /// closes — `FOR UPDATE` alone cannot lock a not-yet-inserted row). Proves
+    /// the advisory lock serialization is deadlock-free and leaves the store
+    /// CONSISTENT: exactly one surviving row, the newer content wins, both calls
+    /// return `Ok`, and at most one supersede leaf is written (the exact leaf
+    /// COUNT is order-dependent — 1 iff the older applier committed first — so it
+    /// is not asserted; the deterministic missed-leaf proof is the sequential
+    /// test above, which the advisory lock reduces every race to).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
+    async fn pg_concurrent_same_key_fresh_applies_no_deadlock_consistent() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        ai_memory::config::set_append_only(true);
+        let ctx = CallerContext::for_agent("ai:g6-flagon");
+        let ns = "ns-pg-fed-race";
+        let title = format!("pg-fed-race-{}", uuid::Uuid::new_v4());
+
+        let mut older = sample(&uuid::Uuid::new_v4().to_string(), ns, "race-older");
+        older.title = title.clone();
+        older.updated_at = "2020-01-01T00:00:00Z".to_string();
+        older.created_at.clone_from(&older.updated_at);
+        let mut newer = sample(&uuid::Uuid::new_v4().to_string(), ns, "race-newer");
+        newer.title = title.clone();
+        newer.updated_at = chrono::Utc::now().to_rfc3339();
+        newer.created_at.clone_from(&newer.updated_at);
+
+        // Race them. The advisory lock serializes the two same-key applies; a
+        // deadlock would surface as an Err here.
+        let (ra, rb) = tokio::join!(
+            MemoryStore::apply_remote_memory(&pg, &ctx, &older),
+            MemoryStore::apply_remote_memory(&pg, &ctx, &newer),
+        );
+        let ida = ra.expect("older apply must succeed (no deadlock)");
+        let idb = rb.expect("newer apply must succeed (no deadlock)");
+        assert_eq!(ida, idb, "both applies converge on the SAME surviving id");
+
+        // Exactly one row survives, carrying the NEWER content.
+        let (content, leaves): (String, i64) = sqlx::query_as(
+            "SELECT m.content, \
+                    (SELECT COUNT(*) FROM memory_revisions r \
+                     WHERE r.memory_id = m.id AND r.kind = 'SUPERSEDE') \
+             FROM memories m WHERE m.title = $1 AND m.namespace = $2",
+        )
+        .bind(&title)
+        .bind(ns)
+        .fetch_one(pg.pool())
+        .await
+        .expect("exactly one surviving row");
+        assert_eq!(content, "race-newer", "the newer content wins the merge");
+        assert!(
+            (0..=1).contains(&leaves),
+            "at most one supersede leaf (order-dependent), never a crash/duplicate: {leaves}"
+        );
     }
 }

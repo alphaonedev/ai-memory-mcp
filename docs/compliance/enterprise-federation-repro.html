@@ -213,8 +213,8 @@ ai-memory migrate --from "sqlite:///…/seed.db" --to "&lt;same TLS DSN&gt;" --b
 <section id="config">
   <div class="container">
     <span class="section-eyebrow">4 · The certified posture</span>
-    <h2>18 machine-checked controls; a boot the daemon refuses if any fails</h2>
-    <p class="lede">The posture is not a prose checklist — it is the checked-in profile <code>docs/deploy/enterprise-federation.env</code>, validated by <code>src/enterprise_federation_posture.rs</code> (the single source of truth both the boot gate and <code>ai-memory doctor --posture enterprise-federation</code> share). <code>repro.sh</code> renders the effective posture by EXTENDING that template (its <code>KEY=VALUE</code> lines) with the per-deployment values, then arms the boot-refusing gate — the daemon boots ONLY when every one of the 18 controls passes.</p>
+    <h2>19 machine-checked controls; a boot the daemon refuses if any fails</h2>
+    <p class="lede">The posture is not a prose checklist — it is the checked-in profile <code>docs/deploy/enterprise-federation.env</code>, validated by <code>src/enterprise_federation_posture.rs</code> (the single source of truth both the boot gate and <code>ai-memory doctor --posture enterprise-federation</code> share). <code>repro.sh</code> renders the effective posture by EXTENDING that template (its <code>KEY=VALUE</code> lines) with the per-deployment values, then arms the boot-refusing gate — the daemon boots ONLY when every one of the 19 controls passes (#2954 added check #19, the append-only-audit-spine-armed pairing).</p>
     <div class="scroll-x"><table>
       <thead><tr><th>Control group</th><th>What the posture pins</th></tr></thead>
       <tbody>

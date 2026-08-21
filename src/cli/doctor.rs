@@ -1843,10 +1843,11 @@ fn section_reflection_health(conn: &rusqlite::Connection) -> ReportSection {
 /// substitute is the unintentional-data-loss class. Visibility is the
 /// remedy, not a fallback.
 ///
-/// Deliberately NOT a check in `src/enterprise_federation_posture.rs`:
-/// `ENTERPRISE_FEDERATION_CHECK_COUNT = 18` is pinned, and a FAIL-capable
-/// addition there would flip certified deployments to exit 2 — an
-/// unintended re-cert event.
+/// Deliberately NOT a check in `src/enterprise_federation_posture.rs`: a
+/// FAIL-capable addition there flips certified deployments to exit 2, so it is
+/// reserved for DELIBERATE, ratified re-certs only (e.g. #2954 raised
+/// `ENTERPRISE_FEDERATION_CHECK_COUNT` 18 → 19 for the append-only-audit-spine
+/// pairing) — this atomisation-curator report is NOT such a case.
 fn section_atomisation_curator_2985(conn: &rusqlite::Connection) -> ReportSection {
     let mut facts = Vec::new();
     let mut severity = Severity::Info;
@@ -4163,6 +4164,8 @@ enabled = true
                 crate::encryption::ENV_ENCRYPT_AT_REST,
                 crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
                 crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+                // #2954 check #19 — append-only spine flag.
+                crate::config::ENV_APPEND_ONLY,
             ] {
                 std::env::remove_var(env);
             }
@@ -4304,7 +4307,16 @@ enabled = true
                 crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
                 "1",
             );
+            // #2954 check #19 — arm the append-only audit spine flag.
+            std::env::set_var(crate::config::ENV_APPEND_ONLY, "1");
         }
+        // #2954 check #19 — install a process-wide daemon audit signing key so
+        // the append-only leaves would be SIGNED (the other half of the
+        // pairing). Isolated per env-isolated child; the OnceLock persists for
+        // the child's lifetime independent of the tempdir.
+        let _audit_dir = tempfile::tempdir().expect("audit dir");
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let _ = crate::governance::audit::init(_audit_dir.path(), Some(signing));
 
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();

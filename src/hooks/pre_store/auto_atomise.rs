@@ -540,10 +540,12 @@ pub fn run_deferred_atomise(
 /// with a non-empty result is the misconfiguration #2985 filed: the knob
 /// is set and structurally dead.
 ///
-/// Deliberately NOT a check in `src/enterprise_federation_posture.rs` —
-/// `ENTERPRISE_FEDERATION_CHECK_COUNT = 18` is pinned and a FAIL-capable
-/// addition would flip certified deployments to exit 2, an unintended
-/// re-cert event (the cert-mechanics half of the Q3 verdict).
+/// Deliberately NOT a check in `src/enterprise_federation_posture.rs` — a
+/// FAIL-capable addition there flips certified deployments to exit 2, so it is
+/// reserved for DELIBERATE, ratified re-certs only (e.g. #2954 raised
+/// `ENTERPRISE_FEDERATION_CHECK_COUNT` 18 → 19 for the append-only-audit-spine
+/// pairing). This auto-atomise misconfiguration is NOT such a case (the
+/// cert-mechanics half of the Q3 verdict).
 #[must_use]
 pub fn namespaces_requesting_auto_atomise(conn: &rusqlite::Connection) -> Vec<String> {
     /// Bound the scan so a huge corpus cannot turn a boot WARN into a

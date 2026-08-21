@@ -1606,6 +1606,134 @@ fn emit_upsert_supersede_leaf_if_enabled(
     Ok(())
 }
 
+/// v1.0.0 #2954 — the pre-merge image of the `(title, namespace)` row a
+/// federation newer-wins upsert ([`insert_if_newer`]) is about to overwrite.
+/// Read under the SAME `BEGIN IMMEDIATE` write lock as the upsert (so the probe
+/// cannot race it), ONLY when the append-only spine is armed. Identity/version
+/// plus the two durable-content columns needed to decide whether the leaf fires
+/// — the plaintext/placeholder `content` and its at-rest `encrypted_envelope`.
+struct FederationMergePreimage {
+    /// The surviving local row's `updated_at` (the primary LWW key the
+    /// `CASE WHEN excluded.updated_at > memories.updated_at` arm compares).
+    updated_at: String,
+    /// The surviving local row's `id` (the `excluded.id > memories.id`
+    /// equal-timestamp tiebreak operand).
+    id: String,
+    /// The pre-supersede `version` recorded as the leaf's `prior_version`.
+    version: i64,
+    /// The stored `content` column (plaintext when encryption is off, the
+    /// placeholder when on) — compared against the value about to be stored to
+    /// decide whether the overwrite actually CHANGED durable content.
+    content: String,
+    /// The stored at-rest ciphertext envelope (NULL when encryption is off).
+    encrypted_envelope: Option<Vec<u8>>,
+}
+
+/// v1.0.0 #2954 — probe the `(title, namespace)` row [`insert_if_newer`]'s
+/// newer-wins upsert may overwrite, under the caller's open `BEGIN IMMEDIATE`
+/// write lock. Returns `None` when the append-only spine is OFF (default → no
+/// extra read → byte-identical) or when no row currently holds
+/// `(title, namespace)` (a fresh INSERT, which destroys nothing). The write
+/// lock is what makes the probe atomic with the upsert that follows.
+///
+/// # Errors
+///
+/// Propagates the lookup error; the caller rolls back its transaction.
+fn probe_federation_merge_preimage(
+    conn: &Connection,
+    title: &str,
+    namespace: &str,
+) -> Result<Option<FederationMergePreimage>> {
+    use rusqlite::OptionalExtension;
+    if !crate::config::append_only_enabled() {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT updated_at, id, version, content, encrypted_envelope \
+         FROM memories WHERE title = ?1 AND namespace = ?2",
+        params![title, namespace],
+        |r| {
+            Ok(FederationMergePreimage {
+                updated_at: r.get(0)?,
+                id: r.get(1)?,
+                version: r.get(2)?,
+                content: r.get(3)?,
+                encrypted_envelope: r.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// v1.0.0 #2954 — append ONE identity-only SUPERSEDE leaf for a federation
+/// newer-wins ([`insert_if_newer`]) overwrite, in the caller's open
+/// transaction, mirroring the create-funnel #2948 helper
+/// [`emit_upsert_supersede_leaf_if_enabled`]. Unlike that funnel (whose
+/// `(title, namespace)` upsert overwrites content UNCONDITIONALLY), the
+/// federation merge overwrites content only when the inbound row WINS the LWW
+/// tiebreak, so the leaf is gated on the SAME predicate the SQL `CASE`
+/// evaluates — computed here in Rust against the write-lock-held pre-image so
+/// it cannot diverge from the live overwrite:
+///
+///  * `pre` is `Some` ONLY when the spine is armed AND a prior `(title,
+///    namespace)` row existed (otherwise a fresh INSERT destroyed nothing);
+///  * the inbound row must WIN the tiebreak (`excluded.updated_at >
+///    memories.updated_at` OR the equal-timestamp `excluded.id >
+///    memories.id`), else the surviving content is the LOCAL row's and nothing
+///    was superseded; AND
+///  * the stored content must actually CHANGE — the `content` column OR its
+///    at-rest `encrypted_envelope` differs from what is about to be written
+///    (a no-op merge that re-pushes byte-identical content with a newer
+///    timestamp emits NOTHING). Under encryption the placeholder `content` is
+///    constant, so the freshly-sealed envelope drives the decision — a safe
+///    over-approximation (an extra identity-only leaf, never a MISSED
+///    supersede — the audit-integrity direction).
+///
+/// The leaf is IDENTITY-ONLY (never carries the superseded content) with
+/// `prior_version` = the pre-merge `version`. Extracted to a named fn so the
+/// §5.4(5) cert removal-proof harness can neutralize EXACTLY this #2954 wiring.
+///
+/// # Errors
+///
+/// Propagates the revision-leaf chain-read / INSERT error; the caller rolls
+/// back its transaction.
+fn emit_federation_newer_wins_supersede_leaf_if_enabled(
+    conn: &Connection,
+    pre: Option<&FederationMergePreimage>,
+    actual_id: &str,
+    mem: &Memory,
+    content_to_store: &str,
+    envelope_to_store: Option<&[u8]>,
+) -> Result<()> {
+    let Some(pre) = pre else {
+        return Ok(());
+    };
+    // The inbound row wins the LWW tiebreak — byte-for-byte the same total
+    // order the `ON CONFLICT … CASE` arm applies (updated_at, then id).
+    let inbound_won = mem.updated_at.as_str() > pre.updated_at.as_str()
+        || (mem.updated_at == pre.updated_at && mem.id.as_str() > pre.id.as_str());
+    if !inbound_won {
+        return Ok(());
+    }
+    // The overwrite actually changed durable content (content column or its
+    // at-rest ciphertext envelope) — a no-op merge emits nothing.
+    let content_changed = content_to_store.as_bytes() != pre.content.as_bytes()
+        || envelope_to_store != pre.encrypted_envelope.as_deref();
+    if !content_changed {
+        return Ok(());
+    }
+    crate::revisions::emit_revision_leaf_if_enabled(
+        conn,
+        actual_id,
+        crate::revisions::RecordKind::Supersede,
+        Some(pre.version),
+        &mem.namespace,
+        Some(memory_agent_id(mem)).filter(|s| !s.is_empty()),
+        &mem.updated_at,
+    )
+}
+
 fn insert_inner(
     conn: &Connection,
     mem: &Memory,
@@ -14116,11 +14244,26 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // `insert_inner`: only taken under at-rest encryption, and only when this
     // call owns the transaction (the federation receive loop wraps batches in
     // its own tx). Encryption off ⇒ byte-identical to pre-#2383.
-    let owns_seal_tx = crate::encryption::encryption_enabled(None) && conn.is_autocommit();
-    if owns_seal_tx {
+    // v1.0.0 #2383 (N1) seal/upsert/reconcile atomicity AND #2954 append-only
+    // COW-SUPERSEDE probe/upsert/leaf atomicity share ONE `BEGIN IMMEDIATE`: the
+    // write lock is taken up front so BOTH the encryption reconcile and the
+    // newer-wins pre-image probe cannot race the upsert they bracket. Only taken
+    // when this call owns the connection (autocommit) and at least one of the
+    // two concerns is live (the federation receive loop wraps batches in its own
+    // tx, whose lock already covers both). Neither concern live ⇒ byte-identical
+    // legacy path.
+    let owns_tx = (crate::encryption::encryption_enabled(None)
+        || crate::config::append_only_enabled())
+        && conn.is_autocommit();
+    if owns_tx {
         conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     }
     let sealed_merge = (|| -> Result<String> {
+        // #2954 — armed-only pre-image of the `(title, namespace)` row this
+        // upsert may overwrite. `None` when the spine is OFF (byte-identical) or
+        // no prior row exists. Read under the `BEGIN IMMEDIATE` write lock above
+        // so it cannot race the upsert whose newer-wins verdict it mirrors.
+        let merge_preimage = probe_federation_merge_preimage(conn, &mem.title, &mem.namespace)?;
         let seal = seal_content_for_upsert(conn, mem)?;
         let content_to_store = seal.content_to_store.as_str();
         let encrypted_envelope: Option<&[u8]> = seal.envelope_bytes();
@@ -14336,9 +14479,25 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // #2383 (N1) — invariant backstop; a no-op when the inbound row lost
         // the newer-wins tiebreak (our envelope is not the one on the row).
         reconcile_envelope_owner(conn, &actual_id, &mem.content, &seal)?;
+        // APPEND-ONLY-SANCTIONED (#1823 G6 / #2954) — COW SUPERSEDE: the
+        // federation newer-wins upsert above rewrote an existing `(title,
+        // namespace)` row's durable `content` in place ONLY when the inbound
+        // row won the LWW tiebreak. Append ONE identity-only SUPERSEDE leaf in
+        // this same tx, gated on that same won-and-changed predicate (evaluated
+        // against the write-lock-held pre-image so it cannot diverge from the
+        // live `CASE`). Mirrors the create-funnel #2948 wiring; the superseded
+        // pre-merge content lives only in the row it replaced, never in the leaf.
+        emit_federation_newer_wins_supersede_leaf_if_enabled(
+            conn,
+            merge_preimage.as_ref(),
+            &actual_id,
+            mem,
+            content_to_store,
+            encrypted_envelope,
+        )?;
         Ok(actual_id)
     })();
-    if owns_seal_tx {
+    if owns_tx {
         match &sealed_merge {
             Ok(_) => conn.execute_batch(connection::SQL_COMMIT)?,
             Err(_) => {
