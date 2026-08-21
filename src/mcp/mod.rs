@@ -603,6 +603,10 @@ pub use kg_query::handle_kg_query;
 pub use load_family::{handle_load_family, handle_smart_load};
 pub(crate) use namespace::AUDIT_KIND_NAMESPACE_CLEAR_STANDARD;
 pub(crate) use namespace::authorize_namespace_standard_bind;
+// #2542 — consumed only by the SAL/postgres HTTP funnel (the sqlite HTTP path
+// delegates parent authorization to `handle_namespace_set_standard`).
+#[cfg(feature = "sal")]
+pub(crate) use namespace::authorize_namespace_standard_parent;
 // v0.7.0 G-PHASE-E-2 (#707) — promoted to `pub` so the integration
 // regression at `tests/g_phase_e_2_namespace_set_standard_governance_passthrough.rs`
 // can exercise the merge path directly. The handler is still routed

@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
+
+Closes a tenant-isolation + approval-bypass primitive on the namespace-standard
+governance chain. Two independent routes let a namespace splice a namespace it
+does not own into the chain that `resolve_governance_policy` layers
+governance/approver policy over. Both backends (sqlite + postgres) enforce
+identically.
+
+- **Route 1 — declared-parent entitlement (the bind).** `set_namespace_standard`
+  read the caller-supplied `parent` and stored it as a governance ancestor with
+  NO check on the parent — the #929 ownership gate only checked the bound
+  standard memory. So Mallory could bind a standard on her own namespace with
+  `parent: victim-ns` and the victim namespace became a governance ancestor of
+  hers. The pure gate `mcp::authorize_namespace_standard_bind` now ALSO
+  authorizes the declared parent: the bind is refused unless the parent namespace
+  is UNOWNED (no standard bound) or its standard is owned by the SAME principal as
+  the caller. Wired through every local `set_standard` funnel (MCP, HTTP sqlite —
+  which delegates to the MCP funnel — and the HTTP postgres arm, which resolves
+  the parent standard under the same bypass-visibility probe ctx the bound-memory
+  gate uses, the #2709 fold-avoiding precedent). Brings the local funnels to
+  parity with the federation edge (`inbound_namespace_meta_authorized`), which
+  already authorizes the declared parent via peer scope. Refuses loudly and
+  fail-closed; the forensic audit chain records the true `refuse` verdict. A DB
+  read fault resolving the parent's owner also refuses (fail-closed) rather than
+  treating an unverifiable owner as unowned — sqlite now matches the postgres
+  twin (review Finding 3).
+- **Route 2 — CROSS-TENANT parent links excluded from governance layering.** A
+  governance view of the chain (`build_namespace_governance_chain`, and its
+  postgres twin `pg_namespace_chain(.., governance = true)`) follows each
+  `child → parent` `parent_namespace` link ONLY when it is ENTITLED, checked
+  PER-HOP: the parent is UNOWNED, or its bound standard is owned by the SAME
+  principal as `child` — the namespace that DECLARED the link (NOT the leaf being
+  resolved; a `/`-child inherits its `/`-parent's entitled links structurally). A
+  cross-tenant parent (and everything reached only through it) is dropped and a
+  loud WARN (`ai_memory::governance::chain_graft`) is emitted. This is the exact
+  Route-1 bind ownership rule re-checked at RESOLUTION; checking it per-hop KEEPS
+  a federation-pushed in-scope parent whose declaring namespace shares its owner
+  (the #2479 control — same-principal at the hop) while closing the cases the bind
+  gate cannot: a `-`-`auto_detect_parent`-inferred cross-tenant parent, a parent
+  that was UNOWNED at bind time and later bound by another tenant (a TOCTOU
+  window), and any pre-#2542 graft already persisted — all WITHOUT the deferred
+  provenance-persistence. Applied to every chain-walking layerer
+  (`resolve_governance_policy`, `resolve_require_approval_above_depth`,
+  `resolve_skill_promotion_min_depth`, `namespace_owner`) and both postgres
+  governance chain builders. The `-`-prefix inference and every stored parent are
+  KEPT for lookup/display (`build_namespace_chain` — the trait method is the full
+  lookup chain on BOTH backends); the `/`-derived hierarchy (the documented G1
+  inheritance) and the global `*` default are structural, never a graft vector,
+  and are always kept.
+  - TRUTHFUL DIRECTION: dropping a cross-tenant parent's layer REMOVES a
+    governance restriction the child never legitimately inherited — a deliberate,
+    WARN-observable de-restriction, not a silent "fail-closed"; it can only make a
+    child LESS governed (an ancestor is consulted only when the leaf has no policy
+    of its own) and never touches an entitled (same-owner / unowned) parent, so a
+    real approval gate is never bypassed. A legitimately-declared same-owner
+    parent — including a flat `-` hierarchy such as `acme-corp` →
+    `acme-corp-frontend` — KEEPS its Approve/approver/require-approval layer
+    intact (the exact regression the adversarial review caught).
+- **Deferred (separate narrow vote), no residual hole.** On-disk provenance
+  PERSISTENCE (recording explicit-vs-inferred origin of a `parent_namespace`
+  link) is a T4 sub-piece not shipped here. It is NOT needed to close the hazard:
+  the ownership re-check is provenance-independent. Its only remaining effect
+  would be to also drop a SAME-OWNER `-`-inferred link from governance; keeping it
+  is safe (same tenant; an ancestor can only ADD a restriction).
+
 ### Tests (deterministic atomise-worker drain; fix #2986 coverage-instrumentation flake)
 
 Test-support only; production behaviour byte-identical. The deferred auto-atomise

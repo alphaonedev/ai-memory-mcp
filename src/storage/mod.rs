@@ -17979,6 +17979,130 @@ pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bo
 /// leaf-first walk (most-specific wins).
 #[must_use]
 pub fn build_namespace_chain(conn: &Connection, namespace: &str) -> Vec<String> {
+    build_namespace_chain_view(conn, namespace, ChainView::Lookup)
+}
+
+/// #2542 — which VIEW of the namespace chain to build.
+///
+/// `namespace_meta.parent_namespace` is a graft vector. It is populated BOTH by
+/// an operator-declared `parent` AND by `-`-prefix [`auto_detect_parent`] when no
+/// parent was given (e.g. `acme-corp-attacker` silently adopting `acme-corp` by
+/// naming coincidence), and the namespace it points at may belong to a DIFFERENT
+/// tenant. `resolve_governance_policy` layers governance/approver policy along
+/// that column, so an UNENTITLED parent link installs a foreign tenant's policy
+/// over this namespace's writes — the #2542 chain-graft (tenant-isolation +
+/// approval hazard).
+///
+/// - [`ChainView::Lookup`] follows every `parent_namespace` link — the walk is a
+///   display / resolution convenience (the documented `ai-memory-tests` →
+///   `ai-memory` → `ai` walk), and any disclosure consequence is separately
+///   gated by the #2540 visibility filter.
+/// - [`ChainView::Governance`] follows each `child → parent` `parent_namespace`
+///   link ONLY when it is ENTITLED, checked PER-HOP: the parent is UNOWNED, or its
+///   bound standard is owned by the SAME principal as `child` — the namespace that
+///   DECLARED the link (NOT the leaf being resolved; a `/`-child inherits its
+///   `/`-parent's entitled links structurally). A cross-tenant parent (and
+///   everything reached only through it) is DROPPED and a loud WARN is emitted.
+///   This is the exact ownership rule the bind gate
+///   [`crate::mcp::authorize_namespace_standard_bind`] applies at write time
+///   (Route 1); re-applying it per-hop at resolution KEEPS a federation-pushed
+///   in-scope parent whose declaring namespace shares its owner (the #2479
+///   control — same-principal at the hop) while closing the residual cases the
+///   bind gate cannot — a parent that was UNOWNED at bind time and bound by
+///   another tenant LATER (a TOCTOU window), a `-`-auto-detected cross-tenant
+///   parent, and any pre-#2542 graft already persisted — WITHOUT needing the
+///   deferred provenance-persistence. The `/`-derived hierarchy
+///   (`namespace_ancestors`) and the global `*` default are structural, never a
+///   graft vector, and are always kept.
+///
+/// TRUTHFUL DIRECTION NOTE: dropping a cross-tenant parent's layer REMOVES a
+/// governance restriction the child never legitimately inherited — a deliberate,
+/// WARN-observable de-restriction, NOT a silent "fail-closed". It can only ever
+/// make the child LESS governed (an ancestor layer is only consulted when the
+/// leaf has no policy of its own), and it never touches a parent the operator
+/// legitimately owns (or an unowned parent), so a real, entitled approval gate is
+/// never bypassed. (Contrast the pre-review Route 2, which stripped EVERY
+/// `-`-coincident parent including a legitimately-declared same-owner one — that
+/// WAS an approval bypass and is what this ownership gate fixes.)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChainView {
+    /// Full chain including every `parent_namespace` link — lookup / display.
+    Lookup,
+    /// Entitled-parents-only chain — governance / approver / owner layering (#2542).
+    Governance,
+}
+
+/// #2542 — the concrete owner (`metadata.agent_id`) of `namespace`'s bound
+/// standard, or `None` when the namespace has no standard bound, the pointer is
+/// severed / dangling, or the standard is UNOWNED (empty / exact `system` /
+/// [`crate::identity::sentinels::SYSTEM_PRINCIPAL`]). The unowned-set mirrors the
+/// bind gate [`crate::mcp::authorize_namespace_standard_bind`] exactly.
+fn namespace_standard_owner(conn: &Connection, namespace: &str) -> Option<String> {
+    let owner = get_namespace_standard(conn, namespace)
+        .ok()
+        .flatten()
+        .and_then(|sid| get(conn, &sid).ok().flatten())
+        .and_then(|mem| {
+            mem.metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })?;
+    if owner.is_empty()
+        || owner == "system"
+        || owner == crate::identity::sentinels::SYSTEM_PRINCIPAL
+    {
+        None
+    } else {
+        Some(owner)
+    }
+}
+
+/// #2542 — whether a single `child → parent` `parent_namespace` link may layer
+/// GOVERNANCE. Entitled iff the parent is UNOWNED, or owned by the same principal
+/// as `declarer_owner` — the owner of `child`, the namespace whose
+/// `namespace_meta` row DECLARED this parent link (NOT the leaf being resolved).
+///
+/// Comparing per-hop against the DECLARER is exactly the Route-1 bind rule
+/// re-checked at resolution: a `child` may only splice a `parent` it is entitled
+/// to (unowned or same-principal), which is precisely what
+/// [`crate::mcp::authorize_namespace_standard_bind`] authorized at bind time for a
+/// local write and what [`crate::federation::receive_auth::inbound_namespace_meta_authorized`]
+/// authorized for a federated one. It closes the residual cases the bind gate
+/// cannot — a parent UNOWNED at bind and bound by another tenant LATER (TOCTOU),
+/// a `-`-auto-detected cross-tenant parent, and any pre-#2542 graft — while
+/// KEEPING a federation-pushed in-scope parent whose declaring namespace shares
+/// its owner (the #2479 control), because it is same-principal at the hop.
+fn parent_link_governance_entitled(
+    conn: &Connection,
+    declarer_owner: Option<&str>,
+    parent: &str,
+) -> bool {
+    match namespace_standard_owner(conn, parent) {
+        None => true, // unowned parent — no cross-tenant authority to graft
+        Some(parent_owner) => declarer_owner == Some(parent_owner.as_str()),
+    }
+}
+
+/// #2542 — one structured WARN per governance resolution that dropped a
+/// cross-tenant `parent_namespace` graft, so an operator can see that a
+/// namespace named a parent it is not entitled to and the parent's policy was
+/// deliberately NOT applied.
+fn warn_governance_graft_excluded(resolving_for: &str, child: &str, parent: &str) {
+    tracing::warn!(
+        target: "ai_memory::governance::chain_graft",
+        resolving_for = %resolving_for,
+        child = %child,
+        parent = %parent,
+        "#2542: dropped a cross-tenant `parent_namespace` link from the governance \
+         chain — the parent namespace's standard is owned by a DIFFERENT principal \
+         than the child namespace that declared the link, so its governance/approver \
+         policy was NOT layered. Declare an explicit same-principal parent (or \
+         re-bind) to establish legitimate inheritance."
+    );
+}
+
+fn build_namespace_chain_view(conn: &Connection, namespace: &str, view: ChainView) -> Vec<String> {
     const MAX_EXPLICIT_DEPTH: usize = 8;
     let mut chain: Vec<String> = Vec::new();
 
@@ -18000,21 +18124,35 @@ pub fn build_namespace_chain(conn: &Connection, namespace: &str) -> Vec<String> 
     // 2. If the ROOTmost of the /-chain has an explicit `namespace_meta` parent,
     //    prepend that chain (bounded by MAX_EXPLICIT_DEPTH + cycle-safe).
     //    Supports legacy flat namespaces (e.g. `ai-memory` → `ai-memory-mcp`).
+    //
+    //    #2542 — the GOVERNANCE view STOPS at the first UNENTITLED (cross-tenant)
+    //    parent link: it and everything above it are reached only through a graft
+    //    that the DECLARING namespace (`current`) is not entitled to, so they must
+    //    not layer governance/approver/owner authority. Each hop is checked
+    //    PER-HOP against `current`'s own owner (the namespace that declared the
+    //    link), NOT the leaf — a `/`-child inherits its `/`-parent's entitled
+    //    links structurally, so a federated in-scope parent whose declarer shares
+    //    its owner (the #2479 control) is kept even when the leaf is unowned. The
+    //    LOOKUP view follows every link.
     if let Some(root) = hierarchy_chain.first().cloned() {
         let mut explicit_above: Vec<String> = Vec::new();
         let mut current = root;
         for _ in 0..MAX_EXPLICIT_DEPTH {
-            match get_namespace_parent(conn, &current) {
-                Some(p)
-                    if p != "*"
-                        && !explicit_above.contains(&p)
-                        && !hierarchy_chain.contains(&p) =>
-                {
-                    explicit_above.push(p.clone());
-                    current = p;
-                }
-                _ => break,
+            let Some(p) = get_namespace_parent(conn, &current) else {
+                break;
+            };
+            if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
+                break;
             }
+            if view == ChainView::Governance {
+                let declarer_owner = namespace_standard_owner(conn, &current);
+                if !parent_link_governance_entitled(conn, declarer_owner.as_deref(), &p) {
+                    warn_governance_graft_excluded(namespace, &current, &p);
+                    break;
+                }
+            }
+            explicit_above.push(p.clone());
+            current = p;
         }
         // `explicit_above` is [immediate-explicit-parent, grandparent, ...];
         // reverse to prepend in top-down order.
@@ -18031,6 +18169,19 @@ pub fn build_namespace_chain(conn: &Connection, namespace: &str) -> Vec<String> 
     }
 
     chain
+}
+
+/// #2542 — the GOVERNANCE view of [`build_namespace_chain`]: identical, except a
+/// `parent_namespace` link is followed ONLY when ENTITLED (parent unowned or
+/// same-principal as the resolving namespace's standard owner); a cross-tenant
+/// parent link (and everything above it) is dropped with a WARN, so it cannot
+/// graft its governance/approver/owner layer. Every function that LAYERS
+/// governance along the chain ([`resolve_governance_policy`],
+/// [`resolve_require_approval_above_depth`], [`resolve_skill_promotion_min_depth`],
+/// [`namespace_owner`]) walks THIS chain; LOOKUP / display paths keep using
+/// [`build_namespace_chain`].
+fn build_namespace_governance_chain(conn: &Connection, namespace: &str) -> Vec<String> {
+    build_namespace_chain_view(conn, namespace, ChainView::Governance)
 }
 
 /// #2503 — what ONE level of the namespace chain contributes to governance
@@ -18217,7 +18368,11 @@ pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<G
     // build_namespace_chain returns top-down (`["*", root, ..., leaf]`).
     // Governance resolution wants leaf-first (most specific first), so
     // we reverse before walking.
-    let chain = build_namespace_chain(conn, namespace);
+    //
+    // #2542 — the GOVERNANCE chain excludes `-`-inferred parent links so an
+    // inferred ancestor (a naming coincidence, possibly a different tenant's
+    // namespace) cannot layer its governance/approver policy onto this write.
+    let chain = build_namespace_governance_chain(conn, namespace);
     let mut severed_level: Option<String> = None;
     for level in chain.into_iter().rev() {
         match read_namespace_level(conn, &level) {
@@ -18300,7 +18455,9 @@ fn warn_severed_floor_applied(severed_namespace: &str, resolving_for: &str) {
 /// Callers in `memory_reflect` compare `proposed_depth > threshold` and
 /// queue a `pending_actions` row when the condition is true.
 pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) -> Option<u32> {
-    let chain = build_namespace_chain(conn, namespace);
+    // #2542 — governance/approver LAYERING follows only explicitly-declared
+    // parents; a `-`-inferred ancestor must not inject an approval threshold.
+    let chain = build_namespace_governance_chain(conn, namespace);
     for level in chain.into_iter().rev() {
         let standard_id = match get_namespace_standard(conn, &level) {
             Ok(Some(id)) => id,
@@ -18369,7 +18526,9 @@ pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) 
 /// must have at least one level of synthesised insight (depth ≥ 1)
 /// before it can be promoted to a reusable skill.
 pub fn resolve_skill_promotion_min_depth(conn: &Connection, namespace: &str) -> Option<u32> {
-    let chain = build_namespace_chain(conn, namespace);
+    // #2542 — governance LAYERING follows only explicitly-declared parents; a
+    // `-`-inferred ancestor must not inject a promotion threshold.
+    let chain = build_namespace_governance_chain(conn, namespace);
     for level in chain.into_iter().rev() {
         let standard_id = match get_namespace_standard(conn, &level) {
             Ok(Some(id)) => id,
@@ -18519,7 +18678,11 @@ fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
     // build_namespace_chain returns top-down (`["*", root, ..., leaf]`).
     // We want leaf-first so the most-specific owner wins, matching how
     // resolve_governance_policy picks up the most-specific policy.
-    let chain = build_namespace_chain(conn, namespace);
+    //
+    // #2542 — resolve the Owner authority over the GOVERNANCE chain so a
+    // `-`-inferred ancestor cannot become the effective owner (an Owner-level
+    // policy check would otherwise resolve to a foreign tenant's standard owner).
+    let chain = build_namespace_governance_chain(conn, namespace);
     for level in chain.into_iter().rev() {
         let Some(standard_id) = get_namespace_standard(conn, &level).ok().flatten() else {
             continue;
