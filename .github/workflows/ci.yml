@@ -518,23 +518,26 @@ jobs:
         if: needs.classify.outputs.docs_only == 'true'
         run: echo "::notice::docs-only PR — ${{ matrix.leg }} matrix leg is a no-op"
 
-      # #2452 — tests/conformance_readers.rs is now FAIL-CLOSED: an absent
-      # python3/node is a test FAILURE, not a silent pass. Provision both
-      # explicitly rather than relying on what each runner image happens to
-      # ship. A controlled proof must
-      # not depend on an image accident: without these steps the fix would
-      # trade a silent pass for an environmental red, which is the pressure
-      # that gets a test deleted. The dedicated, self-tested proof lives in
-      # c8-precheck.yml (`Non-Rust conformance-reader proof gate (#2452)`).
-      - uses: actions/setup-python@v5
+      # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
+      # python3/node is a test FAILURE, not a silent pass. On the self-hosted
+      # fleet we do NOT use actions/setup-python / actions/setup-node: those
+      # actions try to populate the GitHub-hosted RUNNER_TOOL_CACHE default
+      # (/Users/runner/hostedtoolcache), which the `fate`/`fate_two` runner user
+      # cannot create (`mkdir: /Users/runner: Permission denied`), and
+      # RUNNER_TOOL_CACHE is runner-managed so .env cannot override it. The
+      # runners ship python3 + node pre-installed on PATH (f2 /usr/bin/python3
+      # 3.12 + /usr/bin/node v22; f1 /opt/homebrew/bin python3 3.14 + node v26),
+      # so ASSERT their presence instead of downloading — same fail-closed
+      # guarantee (an absent tool reds the step), no tool-cache write. The
+      # dedicated self-tested proof lives in c8-precheck.yml
+      # (`Non-Rust conformance-reader proof gate (#2452)`).
+      - name: Ensure python3 + node present (self-hosted; #2452 fail-closed)
         if: needs.classify.outputs.docs_only != 'true'
-        with:
-          python-version: '3.12'
-
-      - uses: actions/setup-node@v4
-        if: needs.classify.outputs.docs_only != 'true'
-        with:
-          node-version: '22'
+        shell: bash
+        run: |
+          command -v python3 >/dev/null || { echo "::error::python3 not on PATH on $RUNNER_NAME"; exit 1; }
+          command -v node    >/dev/null || { echo "::error::node not on PATH on $RUNNER_NAME"; exit 1; }
+          echo "python3=$(python3 --version) node=$(node --version)"
 
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         if: needs.classify.outputs.docs_only != 'true'

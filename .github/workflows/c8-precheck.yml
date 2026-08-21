@@ -481,15 +481,21 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      # The interpreters are PROVISIONED, not assumed. The gate fails closed
-      # when they are missing, so relying on whatever the runner image
-      # happens to ship would make a controlled proof depend on an accident.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+      # On the self-hosted fleet we ASSERT the pre-installed interpreters
+      # instead of actions/setup-python / actions/setup-node: those actions
+      # write the GitHub-hosted RUNNER_TOOL_CACHE default
+      # (/Users/runner/hostedtoolcache), which the `fate`/`fate_two` runner
+      # user cannot create, and RUNNER_TOOL_CACHE is runner-managed (.env
+      # cannot override it). The runners ship python3 + node on PATH. The gate
+      # still fails closed when they are missing — this assertion reds the job
+      # BEFORE the gate runs, so the controlled proof never depends on an
+      # accident, and it downloads nothing.
+      - name: Ensure python3 + node present (self-hosted; #2452 fail-closed)
+        shell: bash
+        run: |
+          command -v python3 >/dev/null || { echo "::error::python3 not on PATH on $RUNNER_NAME"; exit 1; }
+          command -v node    >/dev/null || { echo "::error::node not on PATH on $RUNNER_NAME"; exit 1; }
+          echo "python3=$(python3 --version) node=$(node --version)"
       # Needed only by the gate's R-203 / before-after evidence, which
       # compiles tests/conformance_readers.rs standalone with `rustc --test`
       # (the harness is deliberately crate-dependency-free — no cargo build).
