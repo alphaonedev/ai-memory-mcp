@@ -53,6 +53,52 @@ legacy behaviour when the append-only spine is OFF (the default).
   key are BOTH armed — an unsigned leaf is tamper-evident in name only. The
   checked-in `docs/deploy/enterprise-federation.env` now sets
   `AI_MEMORY_APPEND_ONLY=1`.
+### Fixed (Postgres+AGE: land app tables in `public`, not `ag_catalog`; safe in-place migration — #3055)
+
+Postgres+AGE only. Apache AGE's recommended setup pins the DATABASE default
+`search_path` to `ag_catalog, "$user", public`, so an unqualified `CREATE TABLE
+memories ...` landed the ai-memory application tables in `ag_catalog` (the first
+search_path entry is the create target) — entangling durable application data
+with the AGE extension catalog. A `DROP EXTENSION age CASCADE` could then take
+the app tables with it (silent data loss), and placement was non-deterministic.
+
+- **Deterministic placement via search_path normalization (`after_connect`).**
+  The adapter reorders the session `search_path` (`normalize_app_search_path`)
+  so the first REAL app schema wins the unqualified-CREATE target: it drops
+  BOTH AGE's `ag_catalog` AND Postgres's `"$user"` from the front, keeping the
+  remaining real schemas in order, and re-appends a single `ag_catalog` at the
+  END (kept for AGE type resolution). So `ag_catalog, "$user", public` →
+  `public, ag_catalog`, landing app tables in `public` — WITHOUT hard-coding
+  `public`. Demoting `"$user"` too is load-bearing: on a CVE-2018-1058-hardened
+  per-role-schema deploy, leaving `"$user"` in front of `public` would bootstrap
+  all 37 app tables into the role's schema (split-brain vs a different-role
+  reader). A caller-pinned path (e.g. the #1381 per-test isolation harness's
+  `-c search_path=<test_schema>,public`, carrying no `"$user"`/`ag_catalog`) is
+  returned unchanged, so test isolation holds. AGE ops still `SET LOCAL
+  search_path = ag_catalog, ...` per transaction. Verified on AGE 1.8.0 that
+  `LOAD 'age'` does not re-prepend `ag_catalog`, so the normalization sticks.
+- **In-place relocation (repairs the installed base).** A pre-bootstrap,
+  advisory-locked, idempotent self-heal (`relocate_app_tables_to_public`) moves
+  the 37 ai-memory app tables (+ 6 owned `BIGSERIAL` sequences) that a pre-fix
+  binary already created in `ag_catalog` back to `public` via `ALTER TABLE ...
+  SET SCHEMA public` over an EXPLICIT HARD-CODED allowlist — never a schema
+  wildcard, never an AGE-owned object (`ag_graph`, `ag_label`, `agtype`,
+  `_ag_label_*`). Each move is guarded by `to_regclass('ag_catalog.<t>') IS NOT
+  NULL AND to_regclass('public.<t>') IS NULL` (the crash-resume mechanism), runs
+  in ONE transaction, is reversible, and emits a loud operator WARN naming a
+  `pg_dump` capture command before moving anything. Placement is not a
+  schema-shape change, so `CURRENT_SCHEMA_VERSION` is unchanged and both
+  backends stay in lockstep.
+- **Proof.** `tests/pg_age_schema_placement_3055.rs` (sal-postgres, Postgres
+  CI cell): a fresh connect lands `memories`/`schema_version` in `public`; the
+  `after_connect` demotion makes an unqualified create land in `public` (with a
+  forced-`ag_catalog`-first negative control that still shadows); ZERO app
+  tables remain in `ag_catalog` after connect; a seeded `ag_catalog` table
+  relocates with data intact and a second run is a no-op; and a `DROP EXTENSION
+  age CASCADE` SPARES `public.memories` (which has no dependency on the `age`
+  extension). Unit test `demote_ag_catalog_tests` covers the pure
+  search_path rewrite (leading-`ag_catalog` demoted; caller-pinned/non-leading
+  paths untouched).
 
 ### Tests (serialize `AI_MEMORY_AGENT_ID`-dependent recall tests; fix #3092 isolation flake)
 

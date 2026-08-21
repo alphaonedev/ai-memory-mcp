@@ -426,6 +426,40 @@ fn agent_not_registered_for_bind(agent_id: &str) -> StoreError {
 /// Bootstrap schema run at adapter init — idempotent via IF NOT EXISTS.
 const INIT_SCHEMA: &str = include_str!("postgres_schema.sql");
 
+/// v1.0.0 #3055 — EXPLICIT, HARD-CODED allowlist relocation of the 37
+/// ai-memory application tables (plus their 6 column-owned `BIGSERIAL`
+/// sequences) out of the Apache AGE `ag_catalog` schema and back into
+/// `public`. See [`relocate_app_tables_to_public`] for the full rationale.
+///
+/// The tables are enumerated BY NAME — never a `SELECT relname FROM pg_class
+/// WHERE nspname = 'ag_catalog'` wildcard — so an AGE-owned catalog object
+/// (`ag_graph`, `ag_label`, `agtype`, `_ag_label_vertex`, `_ag_label_edge`,
+/// or any per-graph label table) can never be swept up and moved. Every move
+/// is guarded by `to_regclass('ag_catalog.<t>') IS NOT NULL AND
+/// to_regclass('public.<t>') IS NULL`, which IS the crash-resume /
+/// idempotency mechanism.
+const RELOCATE_APP_TABLES_SQL: &str = include_str!("postgres_relocate_ag_catalog_3055.sql");
+
+/// v1.0.0 #3055 — count how many of the 37 allowlisted app tables currently
+/// sit in `ag_catalog` (the AGE-first-search_path defect). A `0` result
+/// short-circuits [`relocate_app_tables_to_public`] (fresh or already-healed
+/// install). The `relname = ANY(ARRAY[...])` filter uses the SAME hard-coded
+/// allowlist, so the probe can never count an AGE-owned object.
+const RELOCATE_PROBE_SQL: &str = "SELECT count(*)::bigint FROM pg_class c \
+     JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = 'ag_catalog' AND c.relkind = 'r' \
+     AND c.relname = ANY(ARRAY[\
+     'memories','memory_links','archived_memories','archived_memory_links',\
+     'memory_revisions','memory_transcripts','memory_transcript_links',\
+     'transcript_line_dedup','entity_aliases','forget_tombstones',\
+     'namespace_meta','pending_actions','sync_state','subscriptions',\
+     'subscription_events','subscription_dlq','audit_log','signed_events',\
+     'signed_events_dlq','federation_push_dlq','kg_projection_outbox',\
+     'agent_lineage','agent_subkey_certs','agent_api_keys','agent_quotas',\
+     'model_attestations','confidence_shadow_observations','recall_observations',\
+     'offloaded_blobs','actions','action_edges','leases','signals',\
+     'checkpoints','routines','routine_runs','schema_version'])";
+
 /// v1.0.0 #2445 — presence probe for the `schema_version` relation. `NULL`
 /// means a genuinely FRESH database; the sqlite twin is
 /// `crate::storage::connection::probe_schema_stamp`.
@@ -1302,6 +1336,29 @@ impl PostgresStore {
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
                     use sqlx::Executor;
+                    // v1.0.0 #3055 — reorder the session search_path so the first
+                    // REAL app schema wins the unqualified-CREATE target,
+                    // demoting BOTH AGE's `ag_catalog` and Postgres's `"$user"`
+                    // out of the way (see `normalize_app_search_path`). This
+                    // lands app tables in `public` on the AGE default AND on a
+                    // CVE-2018-1058-hardened per-role-schema deploy, while a
+                    // caller-pinned path (e.g. the #1381 harness's
+                    // `-c search_path=<test_schema>,public`) is returned
+                    // unchanged so test isolation holds. Runs BEFORE the timeout
+                    // early-return so it applies even when the timeout envelope
+                    // is disabled. `ag_catalog` is kept on the path (at the end)
+                    // for type resolution; AGE ops still `SET LOCAL search_path =
+                    // ag_catalog, ...` per transaction.
+                    let current: String =
+                        sqlx::query_scalar("SELECT current_setting('search_path')")
+                            .fetch_one(&mut *conn)
+                            .await?;
+                    if let Some(normalized) = normalize_app_search_path(&current) {
+                        sqlx::query("SELECT set_config('search_path', $1, false)")
+                            .bind(&normalized)
+                            .execute(&mut *conn)
+                            .await?;
+                    }
                     if stmt_secs == 0 {
                         return Ok(());
                     }
@@ -1420,6 +1477,19 @@ impl PostgresStore {
                 // guard exists to close, so a hatch that re-opened it would be
                 // worse than no guard at all.
                 schema_ahead = observed > i64::from(CURRENT_SCHEMA_VERSION);
+            }
+
+            // v1.0.0 #3055 — repair the AGE schema-placement defect on an
+            // ALREADY-affected installed base BEFORE the bootstrap runs. The
+            // `after_connect` search_path demotion above stops NEW creates from
+            // landing in `ag_catalog`, but tables PHYSICALLY created there by a
+            // pre-fix binary must be moved with `ALTER TABLE ... SET SCHEMA`.
+            // Skipped under the operator hatch (`schema_ahead`): a DB this
+            // binary does not understand is handed back exactly as found.
+            // Idempotent self-heal (see `relocate_app_tables_to_public`); runs
+            // under the bootstrap advisory lock held at the outer scope.
+            if !schema_ahead {
+                relocate_app_tables_to_public(&pool).await?;
             }
 
             // Bootstrap schema — idempotent. The bundled template uses
@@ -14976,6 +15046,209 @@ fn age_params_jsonb(pairs: &[(&str, &str)]) -> String {
 /// when the resolved [`KgBackend`] is [`KgBackend::Age`] so every
 /// link write that follows can `MERGE` directly into the projection
 /// without racing a separate bootstrap step.
+/// v1.0.0 #3055 — reorder a session `search_path` so the first REAL app schema
+/// deterministically wins the unqualified-CREATE target, independent of AGE's
+/// `ag_catalog` and Postgres's `"$user"` conventions. Returns the rewritten
+/// path, or `None` when it is already in order.
+///
+/// This is the pure core of the `after_connect` fix. AGE's recommended setup
+/// pins the database default `search_path` to `ag_catalog, "$user", public`, so
+/// an UNQUALIFIED `CREATE TABLE memories ...` lands in `ag_catalog` (the first
+/// entry is the create target) — entangling app data with the AGE extension
+/// catalog. Merely demoting a LEADING `ag_catalog` is NOT enough: that leaves
+/// `"$user"` in front of `public`, and on a CVE-2018-1058-hardened deployment
+/// (per-role schemas — the very reason `"$user"` is in the default) a schema
+/// named after the connecting role captures every unqualified CREATE, so the
+/// 37 app tables bootstrap into `$user` instead of `public` → split-brain vs a
+/// different-role reader. A non-leading `ag_catalog` that still precedes
+/// `public` (`"$user", ag_catalog, public`) is the same hazard.
+///
+/// The rule (closes both): drop EVERY `"$user"` and `ag_catalog` entry, keep
+/// the remaining real schemas in their original order (so the first real schema
+/// wins), then re-append a single `ag_catalog` at the END iff one was present
+/// (kept for AGE type resolution — cypher/graph paths still `SET LOCAL
+/// search_path = ag_catalog, ...` per transaction). It NEVER hard-codes
+/// `public`: a caller who pinned its own schema first — e.g. the #1381
+/// per-test-schema isolation harness's `-c search_path=<test_schema>,public`
+/// (no `"$user"`, no `ag_catalog`) — is returned unchanged, so test isolation
+/// is preserved. When no real schema remains (a degenerate all-special path),
+/// `public` is used as the target.
+///
+/// Examples: `ag_catalog, "$user", public` → `public, ag_catalog`;
+/// `"$user", ag_catalog, public` → `public, ag_catalog`;
+/// `<test>, public` → unchanged; `public, ag_catalog` → unchanged.
+fn normalize_app_search_path(search_path: &str) -> Option<String> {
+    let entries: Vec<&str> = search_path
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if entries.is_empty() {
+        return None; // truly-empty / unset path — nothing to normalize
+    }
+    let is_ag = |s: &str| s == "ag_catalog" || s == "\"ag_catalog\"";
+    let is_user = |s: &str| s == "\"$user\"" || s == "$user";
+    let had_ag = entries.iter().any(|s| is_ag(s));
+
+    let mut app: Vec<&str> = entries
+        .iter()
+        .copied()
+        .filter(|s| !is_ag(s) && !is_user(s))
+        .collect();
+    if app.is_empty() {
+        app.push("public");
+    }
+    if had_ag {
+        app.push("ag_catalog");
+    }
+    let result = app.join(", ");
+
+    // `None` when already in order (compare against the whitespace-normalized
+    // original so cosmetic spacing never forces a redundant SET).
+    if result == entries.join(", ") {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+#[cfg(test)]
+mod normalize_app_search_path_tests {
+    use super::normalize_app_search_path;
+
+    #[test]
+    fn public_beats_user_and_ag_catalog_on_the_age_default() {
+        // The AGE-recommended database default: ag_catalog first + "$user"
+        // ahead of public. Both are demoted so `public` wins the create target
+        // (the CVE-2018-1058 `$user`-precedence split-brain fix); ag_catalog is
+        // kept LAST for type resolution.
+        assert_eq!(
+            normalize_app_search_path("ag_catalog, \"$user\", public").as_deref(),
+            Some("public, ag_catalog")
+        );
+        // The minor gap: a NON-leading ag_catalog that still precedes public.
+        assert_eq!(
+            normalize_app_search_path("\"$user\", ag_catalog, public").as_deref(),
+            Some("public, ag_catalog")
+        );
+        // `$user` ahead of public even without AGE -> still forced to public.
+        assert_eq!(
+            normalize_app_search_path("\"$user\", public").as_deref(),
+            Some("public")
+        );
+    }
+
+    #[test]
+    fn caller_pinned_and_already_ordered_paths_are_unchanged() {
+        // The #1381 per-test-schema harness pins its own path (no "$user", no
+        // ag_catalog): MUST be left alone so unqualified CREATE lands in the
+        // test schema.
+        assert_eq!(normalize_app_search_path("test_x_ab12, public"), None);
+        // An explicit non-$user app schema first is honoured (like the harness).
+        assert_eq!(normalize_app_search_path("myapp, public"), None);
+        // Already in order.
+        assert_eq!(normalize_app_search_path("public, ag_catalog"), None);
+        assert_eq!(normalize_app_search_path("public"), None);
+        assert_eq!(normalize_app_search_path(""), None);
+    }
+
+    #[test]
+    fn dedupes_extra_ag_catalog_and_handles_degenerate_paths() {
+        assert_eq!(
+            normalize_app_search_path("ag_catalog, public, ag_catalog").as_deref(),
+            Some("public, ag_catalog")
+        );
+        // All-special path -> fall back to public as the target.
+        assert_eq!(
+            normalize_app_search_path("\"$user\", ag_catalog").as_deref(),
+            Some("public, ag_catalog")
+        );
+    }
+}
+
+/// v1.0.0 #3055 — relocate ai-memory app tables out of the AGE `ag_catalog`
+/// schema and into `public`, PRE-BOOTSTRAP.
+///
+/// The `after_connect` [`normalize_app_search_path`] hook prevents NEW creates
+/// from landing in `ag_catalog`; this repairs an ALREADY-affected installed
+/// base whose tables were physically created in `ag_catalog` before the fix.
+///
+/// ## Why the probe is `ag_catalog`-only (not `"$user"`)
+///
+/// The probe/relocation deliberately scan only `ag_catalog`, not the per-role
+/// `"$user"` schema. A `"$user"`-mislanded installed base cannot exist: every
+/// binary that ever shipped resolves the AGE-default `ag_catalog, "$user",
+/// public` with `ag_catalog` FIRST, so its unqualified creates land in
+/// `ag_catalog` (covered here) — never `"$user"`. `"$user"` landing was only
+/// reachable through an intermediate demotion revision that left `"$user"`
+/// leading; that revision never shipped, and [`normalize_app_search_path`] now
+/// STRUCTURALLY prevents any future `"$user"` landing by demoting `"$user"`
+/// ahead of the create target on every connection. There is therefore no
+/// `"$user"` installed base to heal.
+///
+/// ## Why PRE-bootstrap
+///
+/// The bootstrap (`INIT_SCHEMA`) runs BEFORE `migrate_locked`. Running the
+/// relocation first means the bootstrap's `CREATE TABLE IF NOT EXISTS memories`
+/// finds the (now-in-`public`) table and no-ops, rather than the ladder racing
+/// a half-relocated schema. It runs under the bootstrap
+/// `MIGRATION_ADVISORY_LOCK_KEY` (held by the caller across the whole
+/// bootstrap), as an idempotent self-heal on every connect. Placement is not a
+/// schema SHAPE change, so `CURRENT_SCHEMA_VERSION` is deliberately NOT bumped
+/// and both backends stay in lockstep.
+///
+/// ## Safety
+///
+/// - HARD-CODED 37-table + 6-sequence allowlist ([`RELOCATE_APP_TABLES_SQL`]);
+///   never a schema wildcard, never an AGE-owned object.
+/// - Every move guarded by `to_regclass('ag_catalog.<t>') IS NOT NULL AND
+///   to_regclass('public.<t>') IS NULL` — the crash-resume / idempotency
+///   mechanism (a re-run skips already-moved tables).
+/// - The whole allowlist moves in ONE transaction: a crash mid-relocation
+///   rolls back cleanly (no split-schema), and the move is reversible
+///   (`ALTER TABLE public.<t> SET SCHEMA ag_catalog`).
+/// - Before taking the transaction, a loud operator WARN names the exact
+///   `pg_dump` capture command (the north-star zero-silent-loss backstop).
+///
+/// Fresh and already-healed installs short-circuit at the probe (nothing in
+/// `ag_catalog`), so the common path costs exactly one catalog count per boot.
+async fn relocate_app_tables_to_public(pool: &PgPool) -> StoreResult<()> {
+    let misplaced: i64 = sqlx::query_scalar(RELOCATE_PROBE_SQL)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| to_store_err("probe ag_catalog for misplaced app tables (#3055)", e))?;
+    if misplaced == 0 {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: TRACE_TARGET,
+        misplaced_tables = misplaced,
+        "#3055: {misplaced} ai-memory app table(s) are in the AGE `ag_catalog` \
+         schema; relocating them to `public` in ONE transaction so a future \
+         `DROP EXTENSION age CASCADE` cannot take application data with it. \
+         STRONGLY RECOMMENDED before upgrading a production node: capture a \
+         backup first — `pg_dump --format=custom --file=ai-memory-pre-3055.dump \
+         <STORE_URL>`. The relocation is transactional (a crash rolls back \
+         cleanly) and reversible (`ALTER TABLE public.<t> SET SCHEMA ag_catalog`)."
+    );
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| to_store_err("begin #3055 relocation tx", e))?;
+    sqlx::raw_sql(RELOCATE_APP_TABLES_SQL)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("relocate app tables ag_catalog -> public (#3055)", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| to_store_err("commit #3055 relocation tx", e))?;
+    tracing::info!(
+        target: TRACE_TARGET,
+        "#3055: app-table relocation ag_catalog -> public complete"
+    );
+    Ok(())
+}
+
 async fn ensure_memory_graph(pool: &PgPool) -> StoreResult<()> {
     // Run inside a transaction so `SET LOCAL search_path` auto-resets
     // on commit. A bare `SET search_path` mutates session GUC state
