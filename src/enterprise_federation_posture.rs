@@ -106,6 +106,19 @@ pub const POSTURE_ENTERPRISE_FEDERATION: &str = "enterprise-federation";
 pub const ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE: &str =
     "AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE";
 
+/// #3061 — operator attestation that the postgres data volume / tablespace
+/// is encrypted at rest. This is the OPERATOR-VOUCHED half of the
+/// backend-aware at-rest control (check #15) on a `postgres://` backend: the
+/// TLS `sslmode=verify-full` half is machine-checked from the DSN; THIS half
+/// cannot be mechanically verified (a daemon cannot prove its underlying block
+/// device is LUKS/dm-crypt/cloud-volume/TDE-encrypted), so it is recorded
+/// verbatim in the posture output as an operator vouch, NOT as machine-proven
+/// encryption. See the cert doc's control #15 labeling
+/// (`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`). Reuses the
+/// house truthy grammar ([`is_truthy`]). sqlite/sqlcipher keeps its
+/// byte-identical structural predicate (this const is unread on that leg).
+pub const ENV_PG_AT_REST_ATTESTED: &str = "AI_MEMORY_PG_AT_REST_ATTESTED";
+
 /// Number of [`PostureCheck`]s [`evaluate`] returns. Pinned so a
 /// dropped or added check is a loud test failure rather than a silent
 /// `doctor --posture` shape change (#2911). #2954 raised it 18 → 19 (the
@@ -170,6 +183,35 @@ fn is_truthy(v: &str) -> bool {
         v.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+/// #3061 — best-effort machine check that a `postgres://` DSN pins libpq's
+/// strictest TLS mode, `sslmode=verify-full` (full server-cert chain AND
+/// hostname verification). This is the MACHINE-CHECKED half of the
+/// compensating pg at-rest control (check #15 on a postgres backend); the
+/// at-rest confidentiality half is operator-vouched (see
+/// [`ENV_PG_AT_REST_ATTESTED`]).
+///
+/// Only the URL-form DSN reaches here ([`crate::store_url::is_postgres_url`]
+/// gates on the `postgres://`/`postgresql://` scheme), so the parameters live
+/// in the URL query string. libpq resolves a repeated key to its LAST
+/// occurrence, so this mirrors that precedence and fails closed on a
+/// malformed / absent query (returns `false`), never opening the control.
+fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
+    let Some((_, query)) = dsn.split_once('?') else {
+        return false;
+    };
+    // libpq uses the LAST occurrence of a repeated key — take it, so a
+    // trailing `&sslmode=require` cannot be masked by an earlier verify-full.
+    let mut last_sslmode: Option<&str> = None;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("sslmode") {
+                last_sslmode = Some(v.trim());
+            }
+        }
+    }
+    last_sslmode.is_some_and(|v| v.eq_ignore_ascii_case("verify-full"))
 }
 
 /// The RESOLVED security-posture token, for the #2923 pins-row `actual`.
@@ -481,26 +523,85 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
         "unset AI_MEMORY_FED_TRUST_BODY_AGENT_ID",
     ));
 
-    // ---- 15. AI_MEMORY_ENCRYPT_AT_REST=1 (sqlcipher build) ---------
-    let sqlcipher_build = crate::build_features::has_feature("sqlcipher");
-    let encrypt_env_truthy = crate::encryption::encryption_enabled(None);
-    out.push(check(
-        crate::encryption::ENV_ENCRYPT_AT_REST,
-        "1, on a binary built with --features sqlcipher",
-        format!(
-            "env={} sqlcipher_build={sqlcipher_build}",
-            std::env::var(crate::encryption::ENV_ENCRYPT_AT_REST)
-                .unwrap_or_else(|_| "(unset)".to_string())
-        ),
-        sqlcipher_build && encrypt_env_truthy,
-        // NB3 fix (Fable review, 2026-08-11): the parenthetical
-        // "(or [encryption].at_rest = true)" was dropped — `evaluate`
-        // (matching EVERY production call site of `encryption_enabled`,
-        // not merely this one) passes `config_flag: None`, so setting
-        // `[encryption].at_rest = true` in config.toml would NOT clear
-        // this FAIL; only the env var is a live remediation here.
-        "rebuild with --features sqlcipher AND set AI_MEMORY_ENCRYPT_AT_REST=1",
-    ));
+    // ---- 15. at-rest encryption — BACKEND-AWARE (#3061) ------------
+    // Resolve the backend from the store URL via `resolve_store_url(None)`
+    // — the `AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` ENV/FILE
+    // channels (and the #2679 wrong-store detector), NOT a bespoke
+    // `AI_MEMORY_BACKEND` hint.
+    //
+    // F3 CAVEAT (review, 2026-08-20): `evaluate` is a PURE fn with no argv,
+    // so it sees the ENV/FILE channels ONLY — it does NOT see `serve`'s
+    // `--store-url` ARGV flag. A pg node started via
+    // `ai-memory serve --store-url postgres://…` with NO store env would be
+    // read here as sqlite, evaluating the sqlcipher branch. Therefore
+    // `doctor --posture` (and the boot gate) MUST run in the IDENTICAL store
+    // ENV as `serve` (under systemd, the daemon's exact `EnvironmentFile`);
+    // a deployment that passes the pg DSN only on `serve`'s argv must ALSO
+    // export `AI_MEMORY_STORE_URL` so this control resolves the real backend.
+    // This mirrors the existing "doctor attests its own process, not a
+    // running daemon" caveat already documented in the cert doc.
+    //   - sqlite / no store URL: the EXACT sqlcipher predicate, byte-
+    //     identical to pre-#3061 — a STRUCTURAL, machine-proven control.
+    //   - postgres:// DSN: a COMPENSATING pg-at-rest control. sqlcipher is
+    //     a SQLite build feature and cannot encrypt a postgres volume, so
+    //     the sqlcipher predicate is UNSATISFIABLE on pg — pre-#3061 that
+    //     left #15 permanently FAIL, so `all_pass` could never be true and
+    //     the #17 boot gate could never arm a certified pg node. The
+    //     compensating control PASSES iff BOTH (a) the DSN pins
+    //     `sslmode=verify-full` (machine-checked) AND (b)
+    //     AI_MEMORY_PG_AT_REST_ATTESTED is truthy (operator-vouched
+    //     volume/tablespace encryption). The attestation half is recorded
+    //     verbatim in the posture output but CANNOT be mechanically
+    //     verified — it is labelled OPERATOR-VOUCHED (not machine-proven
+    //     encryption) in the cert doc control #15. `PostureCheck.pass`
+    //     stays a bool: the compensating control genuinely PASSES on pg
+    //     (no tri-state).
+    let resolved_store_url = crate::store_url::resolve_store_url(None).ok().flatten();
+    let backend_is_postgres = resolved_store_url
+        .as_deref()
+        .is_some_and(crate::store_url::is_postgres_url);
+    if backend_is_postgres {
+        let dsn = resolved_store_url.as_deref().unwrap_or_default();
+        let tls_verify_full = dsn_pins_sslmode_verify_full(dsn);
+        let attested_raw =
+            std::env::var(ENV_PG_AT_REST_ATTESTED).unwrap_or_else(|_| "(unset)".to_string());
+        let attested = is_truthy(&attested_raw);
+        out.push(check(
+            &format!("{ENV_PG_AT_REST_ATTESTED} (postgres at-rest, COMPENSATING control)"),
+            "postgres backend: store DSN pins TLS sslmode=verify-full (machine-checked) AND \
+             AI_MEMORY_PG_AT_REST_ATTESTED truthy (operator-vouched volume/tablespace encryption \
+             — NOT machine-proven at-rest encryption)",
+            format!(
+                "sslmode=verify-full={tls_verify_full}; {ENV_PG_AT_REST_ATTESTED}={attested_raw}"
+            ),
+            tls_verify_full && attested,
+            "add `?sslmode=verify-full` to the store DSN AND, after confirming the postgres data \
+             volume/tablespace is encrypted at rest (LUKS/dm-crypt, cloud-provider volume \
+             encryption, or postgres TDE), set AI_MEMORY_PG_AT_REST_ATTESTED=1. This is a \
+             COMPENSATING control — the attestation is operator-vouched, not machine-proven \
+             encryption; see docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md control #15",
+        ));
+    } else {
+        let sqlcipher_build = crate::build_features::has_feature("sqlcipher");
+        let encrypt_env_truthy = crate::encryption::encryption_enabled(None);
+        out.push(check(
+            crate::encryption::ENV_ENCRYPT_AT_REST,
+            "1, on a binary built with --features sqlcipher",
+            format!(
+                "env={} sqlcipher_build={sqlcipher_build}",
+                std::env::var(crate::encryption::ENV_ENCRYPT_AT_REST)
+                    .unwrap_or_else(|_| "(unset)".to_string())
+            ),
+            sqlcipher_build && encrypt_env_truthy,
+            // NB3 fix (Fable review, 2026-08-11): the parenthetical
+            // "(or [encryption].at_rest = true)" was dropped — `evaluate`
+            // (matching EVERY production call site of `encryption_enabled`,
+            // not merely this one) passes `config_flag: None`, so setting
+            // `[encryption].at_rest = true` in config.toml would NOT clear
+            // this FAIL; only the env var is a live remediation here.
+            "rebuild with --features sqlcipher AND set AI_MEMORY_ENCRYPT_AT_REST=1",
+        ));
+    }
 
     // ---- 16. peer URLs https-only ------------------------------------
     // Same underlying knob as one of the 21 asi-hard pins (#154) —
@@ -698,6 +799,14 @@ mod tests {
         ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
         // #2954 — check #19 append-only spine flag.
         crate::config::ENV_APPEND_ONLY,
+        // #3061 — check #15 is now backend-aware: it resolves the store URL
+        // via `store_url::resolve_store_url(None)` (these two channels) and,
+        // on a postgres:// DSN, reads the pg at-rest attestation. Cleared so
+        // the sqlite/sqlcipher leg every existing test asserts is
+        // deterministic regardless of a stray ambient store URL.
+        crate::store_url::STORE_URL_ENV,
+        crate::store_url::STORE_URL_FILE_ENV,
+        ENV_PG_AT_REST_ATTESTED,
     ];
 
     /// #2954 — keeps the installed daemon-audit-key temp dir alive for the
@@ -1707,6 +1816,159 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("refuses to boot"));
         assert!(msg.contains("AI_MEMORY_SECURITY_PROFILE"));
+    }
+
+    // ------------------------------------------------------------------
+    // #3061 — backend-aware at-rest control (check #15). On a postgres://
+    // backend the sqlcipher predicate (a SQLite build feature) is
+    // UNSATISFIABLE, so #15 is a COMPENSATING control: DSN sslmode=verify-full
+    // (machine-checked) AND AI_MEMORY_PG_AT_REST_ATTESTED (operator-vouched).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dsn_pins_sslmode_verify_full_parser_3061() {
+        // No env — pure DSN string parsing.
+        assert!(dsn_pins_sslmode_verify_full(
+            "postgres://u@db.internal/mem?sslmode=verify-full"
+        ));
+        assert!(dsn_pins_sslmode_verify_full(
+            "postgres://u@h/db?application_name=x&sslmode=verify-full"
+        ));
+        // Case-insensitive value; libpq accepts the mode regardless of case.
+        assert!(dsn_pins_sslmode_verify_full(
+            "postgres://u@h/db?sslmode=Verify-Full"
+        ));
+        // Weaker / absent modes fail CLOSED (control does not open).
+        assert!(!dsn_pins_sslmode_verify_full(
+            "postgres://u@h/db?sslmode=require"
+        ));
+        assert!(!dsn_pins_sslmode_verify_full("postgres://u@h/db"));
+        assert!(!dsn_pins_sslmode_verify_full("postgres://u@h/db?sslmode="));
+        // libpq LAST-wins: a trailing weaker mode masks an earlier strong one.
+        assert!(!dsn_pins_sslmode_verify_full(
+            "postgres://u@h/db?sslmode=verify-full&sslmode=require"
+        ));
+        // …and the inverse: a trailing verify-full wins.
+        assert!(dsn_pins_sslmode_verify_full(
+            "postgres://u@h/db?sslmode=require&sslmode=verify-full"
+        ));
+    }
+
+    /// Sets the fully-hardened federation env AND points the resolved store
+    /// at a postgres:// DSN, so check #15 evaluates the COMPENSATING pg
+    /// at-rest control instead of the sqlcipher predicate. Returns the
+    /// fingerprints tempfile (kept alive by the caller).
+    fn set_postgres_backend(dsn: &str) -> tempfile::NamedTempFile {
+        let fp = set_fully_hardened_env();
+        unsafe {
+            std::env::set_var(crate::store_url::STORE_URL_ENV, dsn);
+        }
+        fp
+    }
+
+    #[test]
+    fn postgres_backend_compensating_control_passes_and_lets_gate_arm_3061() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::postgres_backend_compensating_control_passes_and_lets_gate_arm_3061",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        let _fp = set_postgres_backend("postgres://u@db.internal:5432/mem?sslmode=verify-full");
+        unsafe {
+            std::env::set_var(ENV_PG_AT_REST_ATTESTED, "1");
+        }
+
+        let checks = evaluate(&AppConfig::default());
+        assert_eq!(
+            checks.len(),
+            ENTERPRISE_FEDERATION_CHECK_COUNT,
+            "backend-aware #15 must not change the check COUNT (#3061)"
+        );
+        // The at-rest control is the compensating pg control, NOT sqlcipher.
+        let c = find(&checks, ENV_PG_AT_REST_ATTESTED);
+        assert!(
+            c.pass,
+            "compensating pg at-rest control must PASS with verify-full + attestation: {c:?}"
+        );
+        assert!(
+            c.control.contains("COMPENSATING"),
+            "control label must conspicuously say COMPENSATING (operator-vouched): {:?}",
+            c.control
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.control != crate::encryption::ENV_ENCRYPT_AT_REST),
+            "the sqlcipher predicate must NOT appear on a postgres backend"
+        );
+        // The whole point: with #15 satisfiable on pg, `all_pass` is true even
+        // on a NON-sqlcipher binary, so the #17 boot gate can arm a certified
+        // pg node (pre-#3061 #15 was permanently FAIL on pg).
+        assert!(
+            all_pass(&checks),
+            "a fully-hardened pg node with the compensating control satisfied must pass overall \
+             so #17 can arm (this is unsatisfiable pre-#3061)"
+        );
+    }
+
+    #[test]
+    fn postgres_backend_fails_without_attestation_3061() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::postgres_backend_fails_without_attestation_3061",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        // verify-full pinned, but the operator attestation is UNSET.
+        let _fp = set_postgres_backend("postgres://u@db.internal/mem?sslmode=verify-full");
+
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, ENV_PG_AT_REST_ATTESTED);
+        assert!(
+            !c.pass,
+            "the machine-checked TLS half alone must NOT pass the control — the operator vouch \
+             is required: {c:?}"
+        );
+        assert!(c.actual.contains("sslmode=verify-full=true"));
+        assert!(!all_pass(&checks));
+    }
+
+    #[test]
+    fn postgres_backend_fails_without_verify_full_3061() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::postgres_backend_fails_without_verify_full_3061",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        // Attested, but the DSN pins a WEAKER TLS mode than verify-full.
+        let _fp = set_postgres_backend("postgres://u@db.internal/mem?sslmode=require");
+        unsafe {
+            std::env::set_var(ENV_PG_AT_REST_ATTESTED, "1");
+        }
+
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, ENV_PG_AT_REST_ATTESTED);
+        assert!(
+            !c.pass,
+            "the operator vouch alone must NOT pass the control — sslmode=verify-full is \
+             required so a MITM cannot read the at-rest ciphertext key material in flight: {c:?}"
+        );
+        assert!(c.actual.contains("sslmode=verify-full=false"));
+        assert!(!all_pass(&checks));
     }
 
     #[test]

@@ -66,6 +66,28 @@ pub enum AuditAction {
     /// pre-break record stays attributable. Signed by the DISTINCT off-daemon
     /// audit-witness custody key (opt-in — a no-op when none is enrolled).
     ReAnchor(ReAnchorArgs),
+    /// v1.0.0 #3016/#3067 — the SINGLE IDEMPOTENT node BRING-UP ceremony.
+    ///
+    /// A bare store-only migration (memories/links copied, the
+    /// `signed_events` audit spine left EMPTY) is NON-certifiable / born
+    /// DIRTY: under the certified (`asi-hard`) require-modes an empty spine
+    /// convicts on the audit-head WITNESS and identity-LINEAGE verdicts, so
+    /// `verify-audit-trail` exits 1. This command runs the EXISTING
+    /// operator-ceremony enrollment (identity-lineage GENESIS + audit-head
+    /// witness anchor) over the LOCAL sqlite store, then REFUSES to report
+    /// the node certified until `verify-audit-trail` exits 0 — printing the
+    /// exact remaining ceremony on a refusal.
+    ///
+    /// Idempotent: re-running a brought-up node re-emits no genesis (it
+    /// already exists), the witness force-emit is a no-op at a re-emitted
+    /// head, and it simply re-verifies. It NEVER copies or re-signs
+    /// `signed_events` across a migration (a chain-identity/`db_id` fork is
+    /// irreversible-if-wrong, #3067), and it mints NO distinct-custody trust
+    /// — witness / recorder / judge / stopper keys stay operator custody;
+    /// bring-up VERIFIES them and names any that are missing, it never forges
+    /// them. The POSTGRES spine-write twin is deferred (like the pg
+    /// re-anchor twin #2217); its verify GATE already has a pg twin.
+    BootstrapNode(BootstrapNodeArgs),
 }
 
 #[derive(Args)]
@@ -160,6 +182,39 @@ pub struct ReAnchorArgs {
     pub json: bool,
 }
 
+/// v1.0.0 #3016/#3067 — arguments for `ai-memory audit bootstrap-node`.
+#[derive(Args)]
+pub struct BootstrapNodeArgs {
+    /// Agent identifier whose identity-lineage genesis anchors this node.
+    /// Defaults to the resolved NHI daemon id (same precedence as the rest
+    /// of the CLI).
+    #[arg(long)]
+    pub agent_id: Option<String>,
+    /// Key storage directory holding the agent's Ed25519 keypair (the key
+    /// that self-signs the lineage genesis). Defaults to `AI_MEMORY_KEY_DIR`
+    /// → the platform key dir. Run `ai-memory identity generate` first.
+    #[arg(long, value_name = "PATH")]
+    pub key_dir: Option<std::path::PathBuf>,
+    /// Base64 Ed25519 RECOVERY public key committed into the lineage genesis
+    /// (#1949 — REQUIRED to enroll a NEW lineage so a stolen-and-lost key is
+    /// recoverable). Not needed on an idempotent re-run of an
+    /// already-enrolled node.
+    #[arg(long, value_name = "PUBKEY_B64")]
+    pub recovery_pubkey: Option<String>,
+    /// v1.0.0 #3061 F3 — the store this node runs on, mirroring `serve`'s
+    /// `--store-url`. Bring-up MUST target the SAME store `serve` opens, so
+    /// this honours the identical resolution ladder
+    /// (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > this argv). A
+    /// `postgres://` DSN here (or from those env channels) FAIL-CLOSES: the pg
+    /// spine-write bring-up twin is deferred (#2217-class). Omit on a local
+    /// sqlite node.
+    #[arg(long, value_name = "URL")]
+    pub store_url: Option<String>,
+    /// Emit a JSON summary instead of the human-readable lines.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// `ai-memory audit` entry point. Returns the desired process exit
 /// code so the caller can surface a non-zero status from the top-level
 /// dispatch without panicking.
@@ -172,6 +227,458 @@ pub fn run(args: AuditArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> 
         AuditAction::Show(s) => run_show(&s, app_config, out),
         AuditAction::RestoreAttest(r) => run_restore_attest(&r, app_config, out),
         AuditAction::ReAnchor(r) => run_re_anchor(&r, app_config, out),
+        AuditAction::BootstrapNode(b) => run_bootstrap_node(&b, app_config, out),
+    }
+}
+
+/// v1.0.0 #3016/#3067 — `ai-memory audit bootstrap-node`. See
+/// [`AuditAction::BootstrapNode`] for the full contract. Returns the desired
+/// process exit code: `0` once the node's audit spine verifies CLEAN
+/// (certified-ready), `1` when the node is still born-dirty (the remaining
+/// operator ceremony is printed). A hard error (DB open, keypair load, an
+/// enrollment failure) propagates as `Err`.
+fn run_bootstrap_node(
+    args: &BootstrapNodeArgs,
+    app_config: &AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    use anyhow::Context;
+
+    // #3067 — bring-up WRITES the LOCAL sqlite `signed_events` spine only.
+    // A postgres-backed node's spine-write twin is deferred (the pg
+    // signed_events GENESIS/witness ceremony, tracked like the pg re-anchor
+    // twin #2217). Its verify GATE already has a pg twin
+    // (`verify_audit_trail_postgres`), so a pg node here FAIL-CLOSES.
+    //
+    // #3061 F2/F3 — resolve the store via the FULL ladder INCLUDING the
+    // `--store-url` argv (`serve`'s channel), so a `serve --store-url pg://…`
+    // node is not invisible here. FAIL-CLOSED on THREE dispositions:
+    //   - Ok(Some(pg))  -> refuse (deferred pg twin, above).
+    //   - Err(_)        -> refuse: the backend is INDETERMINATE (e.g. a
+    //                      lax-perms STORE_URL_FILE), and we must never write
+    //                      the local sqlite sidecar of an unknown store.
+    //   - Ok(Some(sqlite://…)) / Ok(None) -> proceed (local sqlite bring-up).
+    let refuse_pg = |out: &mut CliOutput<'_>, msg: &str, reason: &str| -> Result<i32> {
+        if args.json {
+            writeln!(
+                out.stdout,
+                "{}",
+                serde_json::json!({
+                    "bootstrap_node": false,
+                    "certified_ready": false,
+                    "reason": reason,
+                })
+            )?;
+        }
+        writeln!(out.stderr, "bootstrap-node: {msg}")?;
+        Ok(1)
+    };
+    match crate::store_url::resolve_store_url(args.store_url.as_deref()) {
+        Ok(Some(url)) if crate::store_url::is_postgres_url(&url) => {
+            return refuse_pg(
+                out,
+                "the resolved store is POSTGRES. The pg signed_events spine-write bring-up twin \
+                 is deferred (like the pg re-anchor twin #2217); refusing to certify rather than \
+                 write the wrong (local sqlite) store. Run the pg node's operator enrollment \
+                 ceremonies, then confirm with `ai-memory verify-audit-trail --store-url <dsn>` \
+                 (exit 0).",
+                "pg_spine_write_twin_deferred",
+            );
+        }
+        Err(e) => {
+            return refuse_pg(
+                out,
+                &format!(
+                    "could not resolve the store URL, so the backend is INDETERMINATE; refusing \
+                     to write the local sqlite store of an unknown backend (fail-closed): {e:#}"
+                ),
+                "store_url_indeterminate",
+            );
+        }
+        Ok(_) => {} // sqlite:// URL or no URL — proceed with local sqlite bring-up.
+    }
+
+    let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
+    let conn = crate::db::open(&db_path)
+        .with_context(|| format!("bootstrap-node: open db at {}", db_path.display()))?;
+
+    let agent_id = crate::identity::resolve_agent_id(args.agent_id.as_deref(), None)
+        .context("bootstrap-node: resolve agent_id")?;
+
+    // ---- Step 1: identity-lineage GENESIS (idempotent) ----------------
+    // `enroll_lineage` itself refuses a second genesis; we pre-check
+    // `lineage_head` so a brought-up node re-runs cleanly WITHOUT needing
+    // `--recovery-pubkey` again.
+    let lineage_already = crate::db::lineage_head(&conn, &agent_id)
+        .context("bootstrap-node: read lineage head")?
+        .is_some();
+    let lineage_action = if lineage_already {
+        "already-enrolled"
+    } else {
+        let key_dir = match &args.key_dir {
+            Some(p) => p.clone(),
+            None => crate::identity::keypair::default_key_dir()
+                .context("bootstrap-node: resolve key dir")?,
+        };
+        let kp = crate::identity::keypair::load(&agent_id, &key_dir).with_context(|| {
+            format!(
+                "bootstrap-node: load keypair for {agent_id} (run `ai-memory identity generate` \
+                 first)"
+            )
+        })?;
+        let recovery = args.recovery_pubkey.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "bootstrap-node: --recovery-pubkey <B64> is REQUIRED to enroll a NEW identity \
+                 lineage (#1949) so a stolen-and-lost key is recoverable"
+            )
+        })?;
+        crate::db::enroll_lineage(&conn, &agent_id, &kp, Some(recovery))
+            .context("bootstrap-node: enroll identity-lineage genesis")?;
+        "enrolled"
+    };
+
+    // ---- Step 2: audit-head WITNESS anchor (idempotent) ---------------
+    // No-op when no witness custody key is enrolled (AI_MEMORY_WITNESS_KEY_DIR)
+    // or the head is empty; a real emit is throttle-bypassing but at-head
+    // idempotent. An unloadable-but-enrolled key surfaces as an Err.
+    crate::signed_events::try_force_emit_audit_head_witness(&conn)
+        .context("bootstrap-node: force-emit audit-head witness anchor")?;
+
+    // ---- Step 3: verify GATE under the CERTIFIED require-modes ---------
+    // MB1 (review, 2026-08-20): `verify_audit_trail` only DIRTIES a lane whose
+    // require-mode is armed IN THIS PROCESS ENV. bootstrap-node arms none, so a
+    // bare provisioning shell would verify a witness-less / role-separation-less
+    // spine as `is_clean() == true` and FALSE-CERTIFY it. bootstrap-node IS the
+    // spine-cert gate (serve does not re-verify at boot; #17 attests env, not
+    // spine content), so its verdict is load-bearing and must reflect the
+    // CERTIFIED asi-hard audit require-mode set, not the ambient env.
+    //
+    // FAIL-CLOSED: the node is CERTIFIED-READY only when ALL THREE certified
+    // audit require-modes are armed in THIS process (so the verify actually
+    // exercised the witness / role-separation / identity-lineage lanes) AND the
+    // verify is clean under them. If the modes are not armed we CANNOT claim
+    // certified — we name what to arm. If they are armed but the verify is
+    // dirty we name the remaining ceremony. The success label names EXACTLY
+    // which modes were armed for the verdict so an auditor sees the seam.
+    let witness_armed = crate::governance::audit::require_witness_enabled();
+    let role_armed = crate::governance::audit::require_role_separation_enabled();
+    let lineage_armed = crate::identity::lineage::require_identity_lineage_enabled();
+    let armed_modes: Vec<&str> = [
+        witness_armed.then_some("witness"),
+        role_armed.then_some("role_separation"),
+        lineage_armed.then_some("identity_lineage"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let unarmed_modes: Vec<&str> = [
+        (!witness_armed).then_some("AI_MEMORY_REQUIRE_WITNESS"),
+        (!role_armed).then_some("AI_MEMORY_REQUIRE_ROLE_SEPARATION"),
+        (!lineage_armed).then_some("AI_MEMORY_REQUIRE_IDENTITY_LINEAGE"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let all_modes_armed = unarmed_modes.is_empty();
+
+    let report = crate::signed_events::verify_audit_trail(&conn, None, None)
+        .context("bootstrap-node: verify_audit_trail over signed_events")?;
+    let verify_clean = report.is_clean();
+    let certified = verify_clean && all_modes_armed;
+
+    // Refusal reasons (fail-closed), most-fundamental first.
+    let remaining: Vec<String> = if certified {
+        Vec::new()
+    } else if !all_modes_armed {
+        vec![format!(
+            "the certified audit require-modes are NOT all armed in this process, so the verify \
+             did not exercise every lane — cannot claim certified. Arm them (set \
+             AI_MEMORY_SECURITY_PROFILE=asi-hard, or set {} =1) and re-run. Armed now: [{}].",
+            unarmed_modes.join(" / "),
+            armed_modes.join(", "),
+        )]
+    } else {
+        bring_up_remaining(&report)
+    };
+
+    if args.json {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "bootstrap_node": true,
+                "backend": "sqlite",
+                "db": db_path.display().to_string(),
+                "agent_id": agent_id,
+                "lineage_genesis": lineage_action,
+                "armed_require_modes": armed_modes,
+                "all_certified_modes_armed": all_modes_armed,
+                "verify_clean": verify_clean,
+                "certified_ready": certified,
+                "remaining": remaining,
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "ai-memory audit bootstrap-node (v1.0.0 #3016/#3067 — node bring-up ceremony)"
+        )?;
+        writeln!(out.stdout, "  db:              {}", db_path.display())?;
+        writeln!(out.stdout, "  agent_id:        {agent_id}")?;
+        writeln!(out.stdout, "  lineage-genesis: {lineage_action}")?;
+        writeln!(
+            out.stdout,
+            "  witness-anchor:  force-emitted (no-op without an enrolled witness custody key)"
+        )?;
+        writeln!(
+            out.stdout,
+            "  armed modes:     [{}]",
+            if armed_modes.is_empty() {
+                "none".to_string()
+            } else {
+                armed_modes.join(", ")
+            }
+        )?;
+        writeln!(out.stdout)?;
+        if certified {
+            writeln!(
+                out.stdout,
+                "  CERTIFIED-READY: verify-audit-trail is CLEAN under the certified audit \
+                 require-modes [{}] (exit 0) — the audit spine satisfies every armed lane and \
+                 this node is no longer born-dirty.",
+                armed_modes.join(", ")
+            )?;
+        } else {
+            writeln!(
+                out.stderr,
+                "  NOT CERTIFIED (exit 1) — this node is NOT certifiable until every item below \
+                 clears:"
+            )?;
+            for r in &remaining {
+                writeln!(out.stderr, "    - {r}")?;
+            }
+        }
+    }
+
+    Ok(i32::from(!certified))
+}
+
+/// Map the dirtying verdicts of a [`crate::signed_events::AuditTrailReport`]
+/// to the EXACT remaining operator ceremony, so a bring-up REFUSAL names what
+/// is left rather than a bare "dirty". Mirrors the `is_clean` predicate's
+/// dirtying arms; every item is an operator action, never a silent auto-fix.
+fn bring_up_remaining(report: &crate::signed_events::AuditTrailReport) -> Vec<String> {
+    use crate::signed_events::{
+        CauseBinding, HeadHashCheck, RoleSeparationCheck, RollbackCheck, TruncationCheck,
+        WitnessCheck,
+    };
+    let mut v: Vec<String> = Vec::new();
+    if !report.chain_intact {
+        v.push(
+            "signed_events hash chain is BROKEN — triage with `ai-memory verify-audit-trail`; \
+             do NOT certify"
+                .to_string(),
+        );
+    }
+    if !report.sequence_gaps.is_empty() {
+        v.push(
+            "signed_events has sequence GAPS — triage with `ai-memory verify-audit-trail`; do \
+             NOT certify"
+                .to_string(),
+        );
+    }
+    if matches!(report.truncation, TruncationCheck::Detected { .. }) {
+        v.push(
+            "audit tail TRUNCATION detected by the off-table anchor (a wipe-to-empty is \
+             convicted) — do NOT certify"
+                .to_string(),
+        );
+    }
+    if matches!(report.head_hash, HeadHashCheck::Mismatch { .. }) {
+        v.push(
+            "audit head-hash MISMATCH (a same-length suffix rewrite at equal sequence) — do NOT \
+             certify"
+                .to_string(),
+        );
+    }
+    if matches!(
+        report.witness,
+        WitnessCheck::Missing | WitnessCheck::Detected { .. } | WitnessCheck::Forged { .. }
+    ) {
+        v.push(
+            "audit-head WITNESS anchor unsatisfied — enrol a witness custody key \
+             (AI_MEMORY_WITNESS_KEY_DIR) and re-run bootstrap-node so the head anchor is emitted"
+                .to_string(),
+        );
+    }
+    if matches!(
+        report.role_separation,
+        RoleSeparationCheck::Missing
+            | RoleSeparationCheck::Misconfigured { .. }
+            | RoleSeparationCheck::Forged { .. }
+    ) {
+        v.push(
+            "three-key ROLE SEPARATION unsatisfied — enrol DISTINCT recorder/judge/stopper \
+             custody keys (AI_MEMORY_RECORDER_KEY_DIR / _JUDGE_KEY_DIR / _STOPPER_KEY_DIR); \
+             bring-up VERIFIES role separation, it never mints these distinct-custody keys"
+                .to_string(),
+        );
+    }
+    if matches!(
+        report.lineage,
+        crate::identity::lineage::LineageCheck::Missing
+            | crate::identity::lineage::LineageCheck::Forged { .. }
+    ) {
+        v.push(
+            "identity LINEAGE unsatisfied — re-run bootstrap-node with --recovery-pubkey, or \
+             repair the lineage chain"
+                .to_string(),
+        );
+    }
+    if matches!(
+        report.rollback,
+        RollbackCheck::Evidence { .. } | RollbackCheck::Missing
+    ) {
+        v.push(
+            "ROLLBACK verdict unsatisfied (AI_MEMORY_REQUIRE_ROLLBACK_CHECK) — either a \
+             wiped/rolled-back chain, or a missing head anchor; triage before certifying"
+                .to_string(),
+        );
+    }
+    if matches!(report.cause_binding, CauseBinding::Detected { .. }) {
+        v.push(
+            "cause-binding coverage incomplete (AI_MEMORY_REQUIRE_CAUSE_BINDING) — rows without \
+             a bound cause_hash were detected"
+                .to_string(),
+        );
+    }
+    if v.is_empty() {
+        v.push(
+            "verify-audit-trail reported dirty — run `ai-memory verify-audit-trail --json` for \
+             the full verdict set"
+                .to_string(),
+        );
+    }
+    v
+}
+
+#[cfg(test)]
+mod bring_up_remaining_tests {
+    //! v1.0.0 #3016/#3067 — exhaustive per-branch coverage of
+    //! [`bring_up_remaining`] via synthetic [`AuditTrailReport`]s (the
+    //! bring-up refusal path only reaches this fn when ALL certified
+    //! require-modes are armed AND the verify is dirty — MB1 — so the
+    //! truncation/head_hash/cause_binding/rollback branches are not otherwise
+    //! exercised by the integration suite).
+    use super::bring_up_remaining;
+    use crate::identity::lineage::LineageCheck;
+    use crate::signed_events::{
+        AuditTrailReport, CauseBinding, HeadHashCheck, RoleSeparationCheck, RollbackCheck,
+        SignatureCheck, TruncationCheck, WitnessCheck,
+    };
+
+    /// A fully CLEAN report — every lane at its non-dirtying variant.
+    fn clean_report() -> AuditTrailReport {
+        AuditTrailReport {
+            total_events: 1,
+            chain_intact: true,
+            first_break_sequence: None,
+            sequence_gaps: vec![],
+            head_sequence: 1,
+            since: None,
+            truncation: TruncationCheck::NotDetected,
+            witness: WitnessCheck::NotDetected,
+            cause_binding: CauseBinding::NotDetected,
+            signature_failures: vec![],
+            role_separation: RoleSeparationCheck::NotDetected,
+            lineage: LineageCheck::NotDetected,
+            rollback: RollbackCheck::NotDetected,
+            head_hash: HeadHashCheck::NotDetected,
+            signature_check: SignatureCheck::Unenforced {
+                checked: 0,
+                unverified: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn clean_report_yields_the_fallback_only_when_forced() {
+        // A clean report never reaches bring_up_remaining in production, but if
+        // it did, it returns exactly the one honest fallback line (never empty).
+        let r = clean_report();
+        let out = bring_up_remaining(&r);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("reported dirty"));
+    }
+
+    #[test]
+    fn each_dirty_verdict_names_its_own_remaining_ceremony() {
+        // (mutation, substring the remaining list must contain)
+        let cases: Vec<(Box<dyn Fn(&mut AuditTrailReport)>, &str)> = vec![
+            (Box::new(|r| r.chain_intact = false), "chain is BROKEN"),
+            (
+                Box::new(|r| r.sequence_gaps = vec![(1, 3)]),
+                "sequence GAPS",
+            ),
+            (
+                Box::new(|r| {
+                    r.truncation = TruncationCheck::Detected {
+                        anchored_head: 5,
+                        db_head: 2,
+                    };
+                }),
+                "TRUNCATION",
+            ),
+            (
+                Box::new(|r| {
+                    r.head_hash = HeadHashCheck::Mismatch {
+                        chain: "sqlite:signed_events".to_string(),
+                        detail: "suffix rewrite".to_string(),
+                    };
+                }),
+                "head-hash MISMATCH",
+            ),
+            (
+                Box::new(|r| r.witness = WitnessCheck::Missing),
+                "WITNESS anchor",
+            ),
+            (
+                Box::new(|r| r.role_separation = RoleSeparationCheck::Missing),
+                "ROLE SEPARATION",
+            ),
+            (
+                Box::new(|r| r.lineage = LineageCheck::Missing),
+                "identity LINEAGE",
+            ),
+            (
+                Box::new(|r| r.rollback = RollbackCheck::Missing),
+                "ROLLBACK",
+            ),
+            (
+                Box::new(|r| {
+                    r.cause_binding = CauseBinding::Detected {
+                        rows_without_cause: 4,
+                    };
+                }),
+                "cause-binding",
+            ),
+        ];
+        for (mutate, needle) in cases {
+            let mut r = clean_report();
+            mutate(&mut r);
+            let out = bring_up_remaining(&r);
+            assert!(
+                out.iter().any(|s| s.contains(needle)),
+                "a dirty verdict must name {needle:?}; got {out:?}"
+            );
+            // A single dirty lane yields exactly ONE remaining item (never the
+            // fallback), proving the branches are independent.
+            assert_eq!(
+                out.len(),
+                1,
+                "one dirty lane -> one remaining item: {out:?}"
+            );
+        }
     }
 }
 
