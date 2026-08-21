@@ -149,6 +149,12 @@ const SQL_HEAL_DANGLING_NAMESPACE_META: &str = "UPDATE namespace_meta \
        AND NOT EXISTS (SELECT 1 FROM memories WHERE memories.id = namespace_meta.standard_id)";
 const SQL_SELECT_MEMORY_ID_BY_ID: &str = "SELECT id FROM memories WHERE id = $1";
 
+/// #2542 (pm-v3.1 literal de-dup) — a namespace's bound `standard_id` (NULLABLE:
+/// a severed row holds NULL). Reused by the pool- and tx-side governance chain
+/// walks, the `-`-prefix inferred-parent detector, and the governance resolver.
+const SQL_SELECT_STANDARD_ID_BY_NS: &str =
+    "SELECT standard_id FROM namespace_meta WHERE namespace = $1";
+
 /// v1.0.0 #2578 (pm-v3.1 literal de-dup) — clear the per-session
 /// `statement_timeout` on a connection that must outlive
 /// [`DEFAULT_STATEMENT_TIMEOUT_SECS`]. Used by the bootstrap advisory-lock
@@ -14395,9 +14401,163 @@ async fn record_schema_version(
 /// pathological deep namespace cannot blow the policy resolver's bind list
 /// or its connection-hold budget. The implicit `"*"` global standard is
 /// always retained and is not counted toward the cap.
+/// #2542 — the concrete owner (`metadata.agent_id`) of `namespace`'s bound
+/// standard, or `None` when there is no standard bound, the pointer is severed /
+/// dangling, or the standard is UNOWNED (empty / exact `system`). Read through
+/// the supplied `tx` (snapshot parity with the chain walk). Postgres twin of
+/// `storage::namespace_standard_owner`.
+async fn pg_namespace_standard_owner_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    namespace: &str,
+) -> StoreResult<Option<String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
+         JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
+    )
+    .bind(namespace)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("pg_namespace_standard_owner_in_tx", e))?;
+    Ok(row
+        .and_then(|(o,)| o)
+        .filter(|o| !o.is_empty() && o != "system"))
+}
+
+/// #2542 — pool-side twin of [`pg_namespace_standard_owner_in_tx`].
+async fn pg_namespace_standard_owner_pool(
+    pool: &sqlx::PgPool,
+    namespace: &str,
+) -> StoreResult<Option<String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
+         JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
+    )
+    .bind(namespace)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| to_store_err("pg_namespace_standard_owner_pool", e))?;
+    Ok(row
+        .and_then(|(o,)| o)
+        .filter(|o| !o.is_empty() && o != "system"))
+}
+
+/// #2542 — one structured WARN per governance resolution that dropped a
+/// cross-tenant `parent_namespace` graft on postgres. Mirrors the sqlite
+/// `storage::warn_governance_graft_excluded`.
+fn pg_warn_governance_graft_excluded(resolving_for: &str, child: &str, parent: &str) {
+    tracing::warn!(
+        target: "ai_memory::governance::chain_graft",
+        resolving_for = %resolving_for,
+        child = %child,
+        parent = %parent,
+        "#2542: dropped a cross-tenant `parent_namespace` link from the postgres \
+         governance chain — the parent namespace's standard is owned by a DIFFERENT \
+         principal than the child namespace that declared the link, so its \
+         governance/approver policy was NOT layered. Declare an explicit \
+         same-principal parent (or re-bind) to establish legitimate inheritance."
+    );
+}
+
+/// #2542 — build the namespace inheritance chain through the supplied `tx`.
+///
+/// `governance` selects the VIEW, mirroring the sqlite `ChainView`:
+/// - `false` (LOOKUP): follow every `parent_namespace` link.
+/// - `true` (GOVERNANCE): follow a `parent_namespace` link ONLY when ENTITLED —
+///   the parent is UNOWNED or owned by the SAME principal as the namespace being
+///   resolved. A cross-tenant parent (and everything above it) is dropped with a
+///   WARN, so it cannot graft governance/approver policy onto this write. This is
+///   the exact Route-1 bind ownership rule re-checked at resolution; it closes a
+///   TOCTOU-bound-later parent, a `-`-auto-detected cross-tenant parent that
+///   reached pg via import, and any pre-#2542 on-disk graft — WITHOUT relying on
+///   the deferred provenance-persistence.
+/// #2542 — pool-side twin of [`build_namespace_chain_in_tx`]. `governance = false`
+/// is the LOOKUP chain (every `parent_namespace` link — the trait
+/// [`PostgresStore::build_namespace_chain`] contract); `governance = true` is the
+/// entitled-parents-only GOVERNANCE chain used by `resolve_governance_policy`.
+async fn pg_namespace_chain(
+    pool: &sqlx::PgPool,
+    namespace: &str,
+    governance: bool,
+) -> StoreResult<Vec<String>> {
+    let mut chain: Vec<String> = Vec::new();
+
+    if namespace == "*" {
+        chain.push("*".to_string());
+        return Ok(chain);
+    }
+    chain.push("*".to_string());
+
+    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
+        .into_iter()
+        .rev()
+        .collect();
+
+    if let Some(root) = hierarchy_chain.first().cloned() {
+        let mut explicit_above: Vec<String> = Vec::new();
+        let mut current = root;
+        for _ in 0..GOVERNANCE_INHERITANCE_DEPTH_CAP {
+            let row: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT parent_namespace FROM namespace_meta WHERE namespace = $1")
+                    .bind(&current)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| to_store_err("build_namespace_chain parent lookup", e))?;
+            let next = row.and_then(|(p,)| p);
+            let Some(p) = next else { break };
+            if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
+                break;
+            }
+            // #2542 — the GOVERNANCE view stops at the first UNENTITLED
+            // (cross-tenant) parent so it cannot layer governance/approver policy.
+            // PER-HOP: entitled iff the parent is unowned OR owned by `current`'s
+            // (the DECLARING namespace's) principal — the Route-1 bind rule, which
+            // keeps a federated in-scope parent whose declarer shares its owner
+            // (#2479) while dropping a cross-tenant graft (mirrors sqlite).
+            if governance {
+                let declarer_owner = pg_namespace_standard_owner_pool(pool, &current).await?;
+                let parent_owner = pg_namespace_standard_owner_pool(pool, &p).await?;
+                let entitled = match parent_owner {
+                    None => true,
+                    Some(po) => declarer_owner.as_deref() == Some(po.as_str()),
+                };
+                if !entitled {
+                    pg_warn_governance_graft_excluded(namespace, &current, &p);
+                    break;
+                }
+            }
+            explicit_above.push(p.clone());
+            current = p;
+        }
+        for p in explicit_above.into_iter().rev() {
+            if !chain.contains(&p) {
+                chain.push(p);
+            }
+        }
+    }
+    // F-A2A1.2 — cap the `/`-derived ancestor chain to the same depth as the
+    // explicit walk (most-specific N levels).
+    let drained: Vec<String> = hierarchy_chain.drain(..).collect();
+    let drained_len = drained.len();
+    let kept: Vec<String> = if drained_len > GOVERNANCE_INHERITANCE_DEPTH_CAP {
+        drained
+            .into_iter()
+            .skip(drained_len - GOVERNANCE_INHERITANCE_DEPTH_CAP)
+            .collect()
+    } else {
+        drained
+    };
+    for entry in kept {
+        if !chain.contains(&entry) {
+            chain.push(entry);
+        }
+    }
+    Ok(chain)
+}
+
 async fn build_namespace_chain_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     namespace: &str,
+    governance: bool,
 ) -> StoreResult<Vec<String>> {
     let mut chain: Vec<String> = Vec::new();
 
@@ -14423,17 +14583,27 @@ async fn build_namespace_chain_in_tx(
                     .await
                     .map_err(|e| to_store_err("build_namespace_chain_in_tx parent lookup", e))?;
             let next = row.and_then(|(p,)| p);
-            match next {
-                Some(p)
-                    if p != "*"
-                        && !explicit_above.contains(&p)
-                        && !hierarchy_chain.contains(&p) =>
-                {
-                    explicit_above.push(p.clone());
-                    current = p;
-                }
-                _ => break,
+            let Some(p) = next else { break };
+            if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
+                break;
             }
+            // #2542 — PER-HOP entitled iff the parent is unowned OR owned by
+            // `current`'s (the DECLARING namespace's) principal (mirrors sqlite /
+            // the pool twin).
+            if governance {
+                let declarer_owner = pg_namespace_standard_owner_in_tx(tx, &current).await?;
+                let parent_owner = pg_namespace_standard_owner_in_tx(tx, &p).await?;
+                let entitled = match parent_owner {
+                    None => true,
+                    Some(po) => declarer_owner.as_deref() == Some(po.as_str()),
+                };
+                if !entitled {
+                    pg_warn_governance_graft_excluded(namespace, &current, &p);
+                    break;
+                }
+            }
+            explicit_above.push(p.clone());
+            current = p;
         }
         for p in explicit_above.into_iter().rev() {
             if !chain.contains(&p) {
@@ -25122,78 +25292,13 @@ impl MemoryStore for PostgresStore {
     // resolution, multi-vote consensus state machine.
 
     async fn build_namespace_chain(&self, namespace: &str) -> StoreResult<Vec<String>> {
-        // F-A2A1.2 — the governance-inheritance walk caps at
-        // [`GOVERNANCE_INHERITANCE_DEPTH_CAP`] (= 5) intermediate levels per
-        // the v0.7.0 spec, matching the bound the in-tx companion
-        // [`build_namespace_chain_in_tx`] uses. See that helper's docstring
-        // for the rationale and trade-offs.
-        let mut chain: Vec<String> = Vec::new();
-
-        if namespace == "*" {
-            chain.push("*".to_string());
-            return Ok(chain);
-        }
-        chain.push("*".to_string());
-
-        // /-derived ancestors (root → leaf via namespace_ancestors which
-        // returns most-specific-first; reverse for top-down).
-        let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
-            .into_iter()
-            .rev()
-            .collect();
-
-        // Walk explicit `namespace_meta.parent_namespace` chain above the
-        // root, bounded + cycle-safe.
-        if let Some(root) = hierarchy_chain.first().cloned() {
-            let mut explicit_above: Vec<String> = Vec::new();
-            let mut current = root;
-            for _ in 0..GOVERNANCE_INHERITANCE_DEPTH_CAP {
-                let row: Option<(Option<String>,)> = sqlx::query_as(
-                    "SELECT parent_namespace FROM namespace_meta WHERE namespace = $1",
-                )
-                .bind(&current)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| to_store_err("build_namespace_chain parent lookup", e))?;
-                let next = row.and_then(|(p,)| p);
-                match next {
-                    Some(p)
-                        if p != "*"
-                            && !explicit_above.contains(&p)
-                            && !hierarchy_chain.contains(&p) =>
-                    {
-                        explicit_above.push(p.clone());
-                        current = p;
-                    }
-                    _ => break,
-                }
-            }
-            for p in explicit_above.into_iter().rev() {
-                if !chain.contains(&p) {
-                    chain.push(p);
-                }
-            }
-        }
-        // F-A2A1.2 — same `/`-derived cap as the in-tx companion. Keep the
-        // most-specific GOVERNANCE_INHERITANCE_DEPTH_CAP levels so a deeply
-        // nested namespace still resolves against its closest authored
-        // policy without blowing the resolver's connection-hold budget.
-        let drained: Vec<String> = hierarchy_chain.drain(..).collect();
-        let drained_len = drained.len();
-        let kept: Vec<String> = if drained_len > GOVERNANCE_INHERITANCE_DEPTH_CAP {
-            drained
-                .into_iter()
-                .skip(drained_len - GOVERNANCE_INHERITANCE_DEPTH_CAP)
-                .collect()
-        } else {
-            drained
-        };
-        for entry in kept {
-            if !chain.contains(&entry) {
-                chain.push(entry);
-            }
-        }
-        Ok(chain)
+        // #2542 (review Finding 4) — the TRAIT method is the LOOKUP chain: it
+        // follows every `parent_namespace` link, matching `SqliteStore`'s lookup
+        // contract, so a display/resolution consumer gets a consistent chain on
+        // both backends. Governance layering uses the entitled-parents-only view
+        // via `pg_namespace_chain(.., governance = true)` (see
+        // `resolve_governance_policy`), never this method.
+        pg_namespace_chain(&self.pool, namespace, false).await
     }
 
     async fn resolve_governance_policy(
@@ -25209,16 +25314,18 @@ impl MemoryStore for PostgresStore {
         // `storage::resolve_governance_policy` semantics exactly — see its doc
         // comment for why the floor composes over the walk instead of
         // short-circuiting it.
-        let chain = self.build_namespace_chain(namespace).await?;
+        //
+        // #2542 — GOVERNANCE view: entitled-parents only, so a cross-tenant
+        // `parent_namespace` graft cannot layer its policy onto this namespace.
+        let chain = pg_namespace_chain(&self.pool, namespace, true).await?;
         let mut severed = false;
         for ns in chain.into_iter().rev() {
             // Look up the standard memory.
-            let row: Option<(Option<String>,)> =
-                sqlx::query_as("SELECT standard_id FROM namespace_meta WHERE namespace = $1")
-                    .bind(&ns)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| to_store_err("resolve_governance_policy lookup", e))?;
+            let row: Option<(Option<String>,)> = sqlx::query_as(SQL_SELECT_STANDARD_ID_BY_NS)
+                .bind(&ns)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("resolve_governance_policy lookup", e))?;
             let standard_id = match row {
                 // Row present, pointer severed → governed, policy gone.
                 Some((None,)) => {
@@ -25562,16 +25669,17 @@ impl MemoryStore for PostgresStore {
         // the SAME severed-floor treatment; leaving it out would make the
         // enforcement decision disagree with the resolver on the very state
         // this issue is about, which is the #2488 opposite-directions class.
-        let chain = build_namespace_chain_in_tx(&mut tx, namespace).await?;
+        // #2542 — GOVERNANCE view (entitled parents only), mirroring the pool-side
+        // `resolve_governance_policy` so the in-tx enforce agrees with the resolver.
+        let chain = build_namespace_chain_in_tx(&mut tx, namespace, true).await?;
         let mut resolved_policy: Option<crate::models::GovernancePolicy> = None;
         let mut severed = false;
         for ns in chain.iter().rev() {
-            let row: Option<(Option<String>,)> =
-                sqlx::query_as("SELECT standard_id FROM namespace_meta WHERE namespace = $1")
-                    .bind(ns)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("resolve_governance_policy lookup (tx)", e))?;
+            let row: Option<(Option<String>,)> = sqlx::query_as(SQL_SELECT_STANDARD_ID_BY_NS)
+                .bind(ns)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("resolve_governance_policy lookup (tx)", e))?;
             let standard_id = match row {
                 // Row present, pointer severed → governed, policy gone.
                 Some((None,)) => {

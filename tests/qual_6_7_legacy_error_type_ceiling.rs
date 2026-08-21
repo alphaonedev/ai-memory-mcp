@@ -206,7 +206,16 @@ const QUAL_6_CEILING: usize = 120;
 // `handle_checkpoint_create` / `handle_routine_create`) via `?` (each enclosing
 // handler is `Result<Value, String>`). No new error contract — the same String
 // shape the coordination handlers already use. Measured 40.
-const QUAL_7_CEILING: usize = 40;
+// 2026-08-20 (#2542 GA Wave-2 namespace-standard chain graft) — raised 40 → 42
+// for the two namespace-standard parent-graft authorization helpers
+// `authorize_namespace_standard_parent` / `authorize_namespace_standard_owner`
+// in `src/mcp/tools/namespace.rs`. They mirror the SHIPPED sibling
+// `authorize_namespace_standard_bind` (already `Result<(), String>`): the String
+// refusal flows verbatim into the HTTP 403 body AND the forensic audit record on
+// the local `set_standard` funnels, so no new error contract is introduced.
+// A MemoryError migration of the whole namespace-standard authorization cluster
+// is a separate follow-up. Measured 42.
+const QUAL_7_CEILING: usize = 42;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {

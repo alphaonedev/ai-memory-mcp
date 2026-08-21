@@ -137,14 +137,70 @@ impl McpTool for NamespaceClearStandardTool {
 ///   (no ownership transfer, no scope stamp) so library/HTTP first-bind and
 ///   integration fixtures keep working; the confidentiality downgrade path
 ///   was the claim rewrite, not the pointer write.
+///
+/// #2542 — the bind also authorizes the DECLARED `parent`. Binding a standard
+/// with `parent: victim-ns` splices the victim namespace above the caller's in
+/// the chain that [`crate::storage::resolve_governance_policy`] layers governance
+/// over, so an unentitled parent graft installs the caller as (or pulls in) a
+/// foreign tenant's governance/approver authority — a tenant-isolation +
+/// approval-bypass hazard. `declared_parent_standard` is the parent namespace's
+/// currently-bound standard memory (`None` when no parent is declared OR the
+/// declared parent has no standard — both UNOWNED, both allowed); when it is
+/// owned by a DIFFERENT principal the bind is refused. This brings the LOCAL
+/// `set_standard` funnels to parity with the federation edge
+/// ([`crate::federation::receive_auth::inbound_namespace_meta_authorized`]),
+/// which already authorizes the declared parent (via peer scope, #2479/#2536);
+/// the local funnels previously authorized only the bound memory, never the
+/// declared parent.
 pub(crate) fn authorize_namespace_standard_bind(
     caller: &str,
     existing_mem: &crate::models::Memory,
+    declared_parent_standard: Option<&crate::models::Memory>,
 ) -> Result<(), String> {
     if caller == sentinels::DAEMON_PRINCIPAL {
         return Ok(());
     }
-    let recorded_owner = existing_mem
+    authorize_namespace_standard_owner(caller, existing_mem, "namespace standard")?;
+    // #2542 — the declared parent must be entitled too (unowned or same owner).
+    authorize_namespace_standard_parent(caller, declared_parent_standard)
+}
+
+/// #2542 — authorize the DECLARED `parent` of a namespace-standard bind,
+/// independently of the bound memory. Used by the funnels on the FIRST-WRITE /
+/// absent-bound-memory arm (where the #929 bound-owner gate is a no-op but a
+/// declared parent must STILL be entitled). `parent_standard` is `None` — and
+/// the bind is allowed — when no parent was declared OR the declared parent has
+/// no standard bound (both are UNOWNED). A parent whose standard is owned by a
+/// different principal is refused loudly (fail-closed).
+pub(crate) fn authorize_namespace_standard_parent(
+    caller: &str,
+    parent_standard: Option<&crate::models::Memory>,
+) -> Result<(), String> {
+    if caller == sentinels::DAEMON_PRINCIPAL {
+        return Ok(());
+    }
+    match parent_standard {
+        None => Ok(()),
+        Some(mem) => {
+            authorize_namespace_standard_owner(caller, mem, "declared parent namespace standard")
+        }
+    }
+}
+
+/// #2541 / #929 / #2542 — the shared ownership predicate applied to a
+/// namespace-standard memory (the bound standard, or the declared parent's
+/// standard). `subject` names the memory in the refusal so the two call sites
+/// produce distinct, operator-actionable errors while sharing ONE ownership
+/// rule: an UNOWNED owner passes — that is an EMPTY string, the exact literal
+/// `system`, or [`sentinels::SYSTEM_PRINCIPAL`] (also `"system"`); any other
+/// named owner that differs from the caller refuses. (Review Finding 5: there is
+/// no `system:`-PREFIX match — only these exact values pass.)
+fn authorize_namespace_standard_owner(
+    caller: &str,
+    mem: &crate::models::Memory,
+    subject: &str,
+) -> Result<(), String> {
+    let recorded_owner = mem
         .metadata
         .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
@@ -154,10 +210,34 @@ pub(crate) fn authorize_namespace_standard_bind(
         || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
     if !is_unowned && recorded_owner != caller {
         return Err(format!(
-            "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
+            "caller does not own this {subject} (caller={caller}, owner={recorded_owner})"
         ));
     }
     Ok(())
+}
+
+/// #2542 — resolve a namespace's currently-bound standard MEMORY (not just its
+/// id), used to authorize a declared `parent` graft.
+///
+/// FAIL-CLOSED (review Finding 3): a DB error is NOT swallowed into "no standard"
+/// (which would treat an unverifiable owner as UNOWNED and ALLOW the graft — fail
+/// OPEN). A read fault returns `Err`, and the funnel refuses the bind, matching
+/// the postgres twin. `Ok(None)` is returned ONLY for the two genuinely-unowned
+/// states — no standard bound, or a severed / dangling pointer (parity with the
+/// pg twin, where a `NotFound` on the standard memory maps to `None`).
+fn resolve_namespace_standard_memory(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+) -> Result<Option<crate::models::Memory>, String> {
+    let Some(standard_id) =
+        db::get_namespace_standard(conn, namespace).map_err(|e| e.to_string())?
+    else {
+        return Ok(None); // no standard bound → unowned
+    };
+    // A severed / dangling pointer (`Ok(None)`) is a genuinely-unowned state
+    // (parity with the pg twin's `NotFound → None`); a read FAULT is not, and
+    // must refuse rather than allow.
+    db::get(conn, &standard_id).map_err(|e| e.to_string())
 }
 
 /// #2721 / CB-19 — resolve the caller for a namespace-standard mutation,
@@ -268,9 +348,32 @@ fn handle_namespace_set_standard_inner(
     // is still emitted BELOW BEFORE the `db::update` storage write, so the
     // #913 intent-capture guarantee (evidence survives a failed write on
     // the allowed path) holds; a refused bind now chains "refuse".
-    let bind_refusal: Option<String> = match db::get(conn, id) {
-        Ok(Some(existing_mem)) => authorize_namespace_standard_bind(&caller, &existing_mem).err(),
-        _ => None,
+    // #2542 — resolve the DECLARED parent's currently-bound standard memory so
+    // the bind gate can refuse a graft onto a parent chain the caller does not
+    // own. A parent with no standard (or no parent declared) is UNOWNED and thus
+    // allowed; a read FAULT resolving the parent REFUSES the bind (fail-closed,
+    // review Finding 3) — an unverifiable parent owner must never be treated as
+    // unowned.
+    let parent_standard: Result<Option<crate::models::Memory>, String> = match parent {
+        Some(p) => resolve_namespace_standard_memory(conn, p),
+        None => Ok(None),
+    };
+    let bind_refusal: Option<String> = match parent_standard {
+        Err(err) => Some(format!(
+            "cannot verify declared parent namespace ownership (parent={}, error={err}); \
+             refusing the bind rather than treating the parent as unowned",
+            parent.unwrap_or("")
+        )),
+        Ok(parent_standard) => match db::get(conn, id) {
+            Ok(Some(existing_mem)) => {
+                authorize_namespace_standard_bind(&caller, &existing_mem, parent_standard.as_ref())
+                    .err()
+            }
+            // #2542 — the bound memory is absent (first-write / non-existent id),
+            // so the #929 bound-owner gate is a no-op; but a declared parent must
+            // STILL be entitled, else a graft onto a foreign parent slips through.
+            _ => authorize_namespace_standard_parent(&caller, parent_standard.as_ref()).err(),
+        },
     };
     crate::governance::audit::record_decision(
         &caller,

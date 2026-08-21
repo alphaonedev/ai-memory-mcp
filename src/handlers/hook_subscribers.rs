@@ -476,11 +476,45 @@ async fn set_namespace_standard_inner(
         let ownership_probe_ctx =
             crate::store::CallerContext::for_admin(sentinels::AI_HTTP_INTERNAL);
         let caller_principal = ctx.effective_principal();
+
+        // #2542 — resolve the DECLARED parent's currently-bound standard memory
+        // so the bind gate can refuse a graft onto a parent chain the caller
+        // does not own (a tenant-isolation + approval-bypass hazard). Fetch it
+        // under the SAME bypass-visibility probe ctx as the bound-memory gate,
+        // so a foreign `scope=private` parent standard is RESOLVED for the
+        // ownership check rather than folded into NotFound → skip-authz (the
+        // #2709 hole). `None` = no parent declared / parent has no standard /
+        // severed pointer → UNOWNED → allowed. Postgres `set_namespace_standard`
+        // never `-`-auto-detects a parent, so this authorizes only an EXPLICITLY
+        // declared graft; the federation edge and Route 2 governance filter are
+        // the backstops for an inferred parent that reached pg via replication.
+        let parent_standard: Option<Memory> = if let Some(p) = body.parent.as_deref() {
+            match app
+                .store
+                .get_namespace_standard(&ownership_probe_ctx, p)
+                .await
+            {
+                Ok(Some((parent_sid, _))) => {
+                    match app.store.get(&ownership_probe_ctx, &parent_sid).await {
+                        Ok(m) => Some(m),
+                        Err(crate::store::StoreError::NotFound { .. }) => None,
+                        Err(e) => return store_err_to_response(e),
+                    }
+                }
+                Ok(None) => None,
+                Err(e) => return store_err_to_response(e),
+            }
+        } else {
+            None
+        };
+
         match app.store.get(&ownership_probe_ctx, &standard_id).await {
             Ok(resolved_mem) => {
-                if let Err(msg) =
-                    crate::mcp::authorize_namespace_standard_bind(caller_principal, &resolved_mem)
-                {
+                if let Err(msg) = crate::mcp::authorize_namespace_standard_bind(
+                    caller_principal,
+                    &resolved_mem,
+                    parent_standard.as_ref(),
+                ) {
                     tracing::warn!(
                         target: super::AUTHZ_TRACE_TARGET,
                         "POST /namespaces/{{ns}}/standard 403 (postgres path): {msg} (ns={ns}, id={standard_id})"
@@ -495,9 +529,29 @@ async fn set_namespace_standard_inner(
                         .into_response();
                 }
             }
-            // Genuinely-absent id — parity with the sqlite `Ok(None)` arm
-            // (skip authz; first-write / non-existent id proceeds).
-            Err(crate::store::StoreError::NotFound { .. }) => {}
+            // Genuinely-absent id — parity with the sqlite `Ok(None)` arm (the
+            // #929 bound-owner gate is a no-op for a first-write / non-existent
+            // id). #2542 — the declared parent must STILL be entitled on this
+            // arm, else a graft slips through when the bound memory is absent.
+            Err(crate::store::StoreError::NotFound { .. }) => {
+                if let Err(msg) = crate::mcp::authorize_namespace_standard_parent(
+                    caller_principal,
+                    parent_standard.as_ref(),
+                ) {
+                    tracing::warn!(
+                        target: super::AUTHZ_TRACE_TARGET,
+                        "POST /namespaces/{{ns}}/standard 403 (postgres path, parent graft): {msg} (ns={ns})"
+                    );
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": msg,
+                            "caller": caller_principal
+                        })),
+                    )
+                        .into_response();
+                }
+            }
             Err(e) => return store_err_to_response(e),
         }
 
@@ -609,8 +663,11 @@ async fn set_namespace_standard_inner(
         .ok()
         .and_then(|v| v.into_iter().next());
         if let Some(m) = existing {
-            // #929 / #2541 — authorize bind; never silent claim rewrite.
-            if let Err(msg) = crate::mcp::authorize_namespace_standard_bind(&caller, &m) {
+            // #929 / #2541 — authorize bind; never silent claim rewrite. This is
+            // a pre-check on the BOUND memory only (`None` parent); the declared
+            // parent's #2542 entitlement is enforced downstream by
+            // `handle_namespace_set_standard`, which this path delegates to.
+            if let Err(msg) = crate::mcp::authorize_namespace_standard_bind(&caller, &m, None) {
                 tracing::warn!(
                     target: super::AUTHZ_TRACE_TARGET,
                     "POST /namespaces/{{ns}}/standard 403: {msg} (ns={ns})"
@@ -693,7 +750,12 @@ async fn set_namespace_standard_inner(
     // it; the body.id-supplied path goes through this gate once.
     // #2541 — body.id path uses the same authorize helper (no claim rewrite).
     if let Ok(Some(resolved_mem)) = db::get(&lock.0, &resolved_id) {
-        if let Err(msg) = crate::mcp::authorize_namespace_standard_bind(&caller, &resolved_mem) {
+        // Pre-check on the BOUND memory only (`None` parent); the declared
+        // parent's #2542 entitlement is enforced by the delegated
+        // `handle_namespace_set_standard` below.
+        if let Err(msg) =
+            crate::mcp::authorize_namespace_standard_bind(&caller, &resolved_mem, None)
+        {
             tracing::warn!(
                 target: super::AUTHZ_TRACE_TARGET,
                 "POST /namespaces/{{ns}}/standard 403 (body.id path): {msg} (ns={ns}, id={resolved_id})"
