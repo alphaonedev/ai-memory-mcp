@@ -161,6 +161,58 @@ async fn stop_refuses_writes_reads_stay_live_resume_restores() {
 }
 
 #[tokio::test]
+async fn sal_gate_enforces_stop_when_open_path_differs_from_resolved_path() {
+    // Regression (macOS enterprise-fed CI): the SAL write-funnel gate must key
+    // the record-stop registry off the connection's OWN resolved path — the
+    // same key the actuator, the `db::` gate, the status read and the seed use
+    // (`conn.path()`) — NOT the raw path handed to `SqliteStore::open`.
+    //
+    // SQLite's VFS resolves symlinks in the pathname, so opening through a
+    // symlinked directory makes `conn.path()` diverge from the open path (on
+    // macOS this happens for EVERY temp DB, since the temp dir sits under the
+    // `/var -> /private/var` symlink). Keying the SAL gate off the open path
+    // let it read a stale RUNNING registry entry while the stop was engaged
+    // under the resolved key, so `store()` fell through to the deeper `db::`
+    // gate and surfaced `StoreError::Backend` instead of the SAL
+    // `StoreError::Stopped` (a silent single-layer degradation of a
+    // fail-closed control). Pin that the SAL gate refuses with `Stopped`
+    // regardless of open-path/resolved-path divergence.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).expect("mkdir real");
+    let db_path = {
+        let link = dir.path().join("via-link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, &link).expect("symlink real dir");
+            link.join("mem.db")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &link;
+            real.join("mem.db")
+        }
+    };
+
+    let store: Arc<dyn MemoryStore> =
+        Arc::new(SqliteStore::open(&db_path).expect("open via symlinked path"));
+    let c = ctx();
+    store
+        .record_stop(&c, true, "ai:operator", SCOPE_RECORD_PLANE)
+        .await
+        .expect("engage record-stop");
+
+    let blocked = mk_memory("blocked", "must not land under stop");
+    match store.store(&c, &blocked).await {
+        Err(StoreError::Stopped { scope, .. }) => assert_eq!(scope, SCOPE_RECORD_PLANE),
+        other => panic!(
+            "SAL gate must refuse with StoreError::Stopped regardless of \
+             open-path vs resolved-path divergence, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
 async fn mcp_direct_db_funnel_is_fenced() {
     // The MCP stdio path writes through the bare-`Connection` `db::`
     // primitives, not the SAL adapter. Stopping via the SAL surface must

@@ -30,6 +30,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete real files on the persistent hosts; the native tier is always up).
   JUnit-style durable test-result log artifacts are uploaded per leg.
 
+### Fixed
+
+- **Record-stop enforcement no longer silently degrades at the SAL layer when
+  the sqlite DB path resolves through a symlink** (e.g. the macOS
+  `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
+  the shared record-stop registry off the raw path passed to `open`, while the
+  actuator, the `db::` funnel gate, the status read and the open-time seed all
+  key off the connection's OWN resolved path (`conn.path()`, which SQLite's VFS
+  symlink-follows). When the two diverged the SAL gate read a stale RUNNING
+  entry, so a write issued under an engaged stop fell through to the deeper
+  `db::` gate and surfaced `StoreError::Backend` instead of the intended
+  `StoreError::Stopped` — a single-layer, fail-closed-ONLY degradation of the
+  SAL 503 refusal contract. The gate now caches and keys off the connection's
+  resolved path at open, restoring one source of truth across every layer.
+  Surfaced by the macOS `enterprise-fed` CI leg (`record_stop_r45_1955`); a
+  symlinked-open-path regression test pins it.
+- **The self-hosted `enterprise-fed` Check legs no longer kill a still-passing
+  sal-postgres suite at the hung-test watchdog.** The 2x2 `check` job reused the
+  sqlite-oriented 1500s per-invocation watchdog for the `enterprise-fed` legs,
+  which run the sal-postgres suite SINGLE-THREADED (`--test-threads=1`) and
+  CPU-contended by the sibling `sqlite` leg on the same self-hosted host — a
+  ~2231s measured runtime that the 1500s cap terminated mid-run (the same
+  regression the release `postgres-feature` job already fixed by raising its
+  cap to 2100s on its dedicated runner; the self-hosted leg runs both linux
+  legs on ONE host, so its ~2231s is the normal max-contention case). The
+  watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
+  the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
+  the outer job cap — remains what fires on a genuine hang.
+
 ### Removed
 
 - **`postgres-parity-nightly.yml` and `self-hosted-smoke.yml` workflows deleted.**

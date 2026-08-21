@@ -483,8 +483,17 @@ jobs:
     runs-on: [self-hosted, "${{ matrix.node }}"]
     # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
     # download on the semantic-tier CLI recall path) fails fast instead of
-    # pinning a runner for hours. Normal run is well under this.
-    timeout-minutes: 45
+    # pinning a runner for hours. Sized for the SLOWEST leg: the
+    # `enterprise-fed` tier runs the sal-postgres suite SINGLE-THREADED and
+    # CPU-contended by its sibling `sqlite` leg on the same self-hosted host,
+    # so its compile (~12 min, hoisted OUTSIDE the per-invocation watchdog)
+    # plus the 3300s (55 min) hang-watchdog can legitimately approach ~67
+    # min; this outer cap must sit above that so the watchdog — not the job
+    # cap — is what fires on a genuine hang (a job-level cancel is silent and
+    # nameless, the exact #1492 failure mode). The `sqlite` legs finish far
+    # under this (parallel suite + release build + audit, ~45 min observed),
+    # so the higher ceiling only adds headroom there.
+    timeout-minutes: 80
     env:
       # Keep dev-profile debug at level 1 (line tables) for readable
       # backtraces without the full-DWARF link cost.
@@ -695,12 +704,37 @@ jobs:
           # a single line the #2500 --no-fail-fast invariant gate can see.
           FEAT=""
           TAIL=""
+          # #1492 hung-test watchdog cap (seconds), TIER-AWARE. The `sqlite`
+          # legs run the default suite in PARALLEL and finish fast, so 1500s
+          # is ample hang-detection headroom. The `enterprise-fed` legs run
+          # the sal-postgres suite SINGLE-THREADED (`-- --test-threads=1`, to
+          # serialise the shared-database DDL) — the exact discipline the
+          # release `postgres-feature` job uses, which measured a ~1605s
+          # runtime under a 2100s cap on a DEDICATED GitHub-hosted runner.
+          # On the self-hosted 2x2 the enterprise-fed leg runs CPU-CONTENDED
+          # (its sibling `sqlite` leg saturates every core of the same host
+          # while this leg is pinned to one), so the serialised run measured
+          # ~2231s on run 32515454158 (`--lib` 1019s directly timed +
+          # ~1212s integration extrapolated from 250/630 binaries reached
+          # before the old 1500s cap killed it — record_stop_r45_1955, being
+          # alphabetically late, never even started). 1500s therefore killed
+          # a suite that was still actively PASSING — the same class of
+          # regression the postgres-feature job already fixed by raising its
+          # cap. Because BOTH linux legs land on the SAME host (this leg pinned
+          # to one core while its sibling saturates the rest), that ~2231s is
+          # the NORMAL max-contention case, not an outlier, and other f2 jobs
+          # push it higher — so 3300s (~1.48x the measured runtime) buys real
+          # variance headroom rather than a knife-edge margin. The cap must
+          # stay a hang-detector, so the job-level `timeout-minutes` is the
+          # outer bound (see that key on this job).
+          WATCHDOG_SECS=1500
           if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
             FEAT="--features sal-postgres"
             TAIL="-- --test-threads=1"
-            echo "::notice::[enterprise-fed] cargo test $FEAT ... $TAIL"
+            WATCHDOG_SECS=3300
+            echo "::notice::[enterprise-fed] cargo test $FEAT ... $TAIL (watchdog ${WATCHDOG_SECS}s)"
           else
-            echo "::notice::[sqlite] cargo test (default features)"
+            echo "::notice::[sqlite] cargo test (default features) (watchdog ${WATCHDOG_SECS}s)"
           fi
           # Durable audit artifact (#4): tee ALL test output to a per-leg log
           # that the next step uploads. PIPESTATUS[0] preserves the real test
@@ -717,14 +751,14 @@ jobs:
           # #1492 hung-test watchdog. libtest has no built-in per-test
           # timeout, so a single wedged integration test (e.g. an ephemeral
           # TCP port-bind / wait_for_ready race) used to stall this step
-          # silently until the job-level `timeout-minutes: 45` killed it —
-          # ~34 min of wasted budget and ZERO diagnosability (the hung
-          # test's name never printed). Wrap each invocation in GNU
-          # `timeout` so a hang fails the STEP fast (25 min < the 45 min
-          # job cap) with a named ::error:: pointing at the logged impact
-          # set, instead of a silent job-level cancel. SIGTERM lets libtest
-          # flush partial output; --kill-after escalates to SIGKILL for a
-          # truly wedged process.
+          # silently until the job-level `timeout-minutes` killed it —
+          # wasted budget and ZERO diagnosability (the hung test's name never
+          # printed). Wrap each invocation in GNU `timeout` (cap = the
+          # tier-aware $WATCHDOG_SECS set above) so a hang fails the STEP fast
+          # (< the job cap) with a named ::error:: pointing at the logged
+          # impact set, instead of a silent job-level cancel. SIGTERM lets
+          # libtest flush partial output; --kill-after escalates to SIGKILL
+          # for a truly wedged process.
           #
           # The #1492 hang was observed ONLY on the ubuntu runner, and the
           # watchdog is gated to Linux because macOS ships no `timeout`
@@ -733,7 +767,7 @@ jobs:
           # So restrict the watchdog to Linux (reliable GNU `timeout` +
           # POSIX process-group signal semantics over native test binaries)
           # and degrade to a bare `cargo test` everywhere else — the
-          # job-level `timeout-minutes: 45` cap still applies as the
+          # job-level `timeout-minutes` cap still applies as the
           # universal backstop (the pre-#1492 behaviour).
           TIMEOUT_BIN=""
           if [ "${RUNNER_OS:-}" = "Linux" ]; then
@@ -744,7 +778,7 @@ jobs:
             fi
           fi
           if [ -n "$TIMEOUT_BIN" ]; then
-            echo "::notice::[#1492] hung-test watchdog active via '$TIMEOUT_BIN' (1500s per invocation)"
+            echo "::notice::[#1492] hung-test watchdog active via '$TIMEOUT_BIN' (${WATCHDOG_SECS}s per invocation, tier=${TIER:-sqlite})"
           else
             echo "::notice::[#1492] watchdog disabled on ${RUNNER_OS:-unknown} (Linux-only; job-level timeout-minutes still applies)"
           fi
@@ -752,13 +786,14 @@ jobs:
             local label="$1"; shift
             local rc=0
             # #1989: COMPILE the test binaries OUTSIDE the watchdog first, so
-            # the 1500s per-invocation cap times test RUNTIME (the hang-detection
-            # purpose) rather than compile+run wall-time. The __ALL__ tag path
-            # builds ~448 debug integration binaries; that compile legitimately
-            # grew past 1500s during the v1.0.0 epic, which the watchdog was
-            # misreading as a hang (it is not — the full suite runs to
-            # completion). The job-level `timeout-minutes` cap still bounds the
-            # build. A genuine runtime hang still trips the 1500s below.
+            # the $WATCHDOG_SECS per-invocation cap times test RUNTIME (the
+            # hang-detection purpose) rather than compile+run wall-time. The
+            # __ALL__ tag path builds ~448 debug integration binaries; that
+            # compile legitimately grew past the cap during the v1.0.0 epic,
+            # which the watchdog was misreading as a hang (it is not — the full
+            # suite runs to completion). The job-level `timeout-minutes` cap
+            # still bounds the build. A genuine runtime hang still trips the
+            # $WATCHDOG_SECS cap below.
             cargo test --no-run "$@" || return "$?"
             # `--no-fail-fast` (#2500) — see the identical rationale on
             # `pg_test` in the postgres-feature job below. Cargo otherwise
@@ -767,19 +802,19 @@ jobs:
             # every later binary. Probed: the flag does not change the exit
             # code (a failing run stays non-zero), so it cannot mask a real
             # failure — it only stops the run from throwing away evidence.
-            # Runtime stays bounded by the 1500s per-invocation watchdog
-            # below plus the job-level `timeout-minutes`. The tier's feature
+            # Runtime stays bounded by the $WATCHDOG_SECS per-invocation
+            # watchdog below plus the job-level `timeout-minutes`. The tier's feature
             # flag + `-- --test-threads=1` arrive via "$@" from the call sites
             # (folded into $FEAT/$TAIL there), so these two cargo lines stay the
             # exact `... "$@" ...` shape the #2657 / #2500 invariant gates pin.
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 1500 cargo test --no-fail-fast "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --no-fail-fast "$@" || rc=$?
             else
               cargo test --no-fail-fast "$@" || rc=$?
             fi
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-                echo "::error::[#1492 watchdog] '${label}' exceeded the 1500s per-invocation timeout and was terminated (previously a silent ~34min hang until the 45min job cap). Reproduce with the impact set logged above; then file a follow-up for the specific flaky test."
+                echo "::error::[#1492 watchdog] '${label}' exceeded the ${WATCHDOG_SECS}s per-invocation timeout (tier=${TIER:-sqlite}) and was terminated (previously a silent ~34min hang until the job cap). Reproduce with the impact set logged above; then file a follow-up for the specific flaky test."
               fi
               return "$rc"
             fi
