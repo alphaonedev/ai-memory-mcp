@@ -44,7 +44,7 @@ env:
 jobs:
   bench:
     name: ai-memory bench (ubuntu-latest)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
 
@@ -177,7 +177,7 @@ jobs:
   regenerate-baseline:
     name: Regenerate bench baseline (ubuntu-latest, median-of-3)
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
 

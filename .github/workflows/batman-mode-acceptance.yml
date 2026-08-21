@@ -84,7 +84,7 @@ env:
 jobs:
   rust-integration:
     name: Rust integration (issue_800_batman_mode)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -139,7 +139,7 @@ jobs:
 
   bash-integration:
     name: Bash integration (test-batman-mode-suite.sh)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     needs: rust-integration
     steps:
       - uses: actions/checkout@v4
@@ -188,7 +188,7 @@ jobs:
   # before the test fails with a confusing rustc error.
   surface-stability:
     name: Surface stability (load-bearing symbols)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
       - name: Assert load-bearing symbols are present

@@ -1,5 +1,19 @@
 # Certified Postgres + Apache AGE + pgvector tier — IN-PR cert evidence (#2548).
 #
+# v1.0.0 SELF-HOSTED REWRITE (chore/ci-self-hosted-2x2). This job now runs on
+# `[self-hosted, linux-fed]` and points AI_MEMORY_TEST_POSTGRES_URL /
+# AI_MEMORY_TEST_AGE_URL at the node's ALWAYS-UP native cert tier (pg18.6 +
+# AGE 1.8.0 + pgvector 0.8.6, TLS verify-full, port 5445), read from
+# $HOME/.ai-memory-ci-fed-url. The former per-PR `docker build`/pull of
+# deploy/docker-1461/Dockerfile.pg-age-vector + `docker run` is REMOVED (the
+# tier it constructed now exists continuously). The cert EVIDENCE is
+# preserved: "Resolve certified stack pins from deploy SSOT" still reads the
+# expected versions from deploy/docker-1461/provision/lib.sh, and "Assert
+# certified stack versions" still HARD-FAILS on ANY drift from the pinned
+# 18.6 / 1.8.0 / 0.8.6 — now measured on the live native tier. The historical
+# image-build narrative below is retained for provenance; the mechanics it
+# describes were the GitHub-hosted construction path, not what runs today.
+#
 # WHY THIS WORKFLOW EXISTS. Before #2548 the certified pg+AGE tier was NEVER
 # exercised in-PR. The `#[ignore]`-gated postgres/AGE cells ran ONLY in
 # `postgres-parity-nightly.yml` (a `schedule:` workflow that fires from the
@@ -55,9 +69,8 @@
 # here, and the printed `PostgreSQL=… Apache AGE=… pgvector=…` notice in the
 # executed run is the proof.
 #
-# Modelled on postgres-parity-nightly.yml (mold + trimmed dev debug to hold the
-# heavy sal-postgres build under the runner RSS/disk ceilings) and coverage.yml
-# (the pg-age service + AGE/pgvector extension provisioning). coverage.yml keeps
+# The heavy sal-postgres build runs on the provisioned self-hosted node with
+# ample RAM/disk (no mold/swap/disk-trim hacks needed). coverage.yml keeps
 # running the DOCUMENTED ALTERNATE matrix (PG16 + AGE 1.6.0); this job is the
 # CANONICAL certified-triple evidence. Both are honest and both are in the SSOT.
 name: "Certified Postgres + AGE + pgvector tier (#2548)"
@@ -70,14 +83,10 @@ on:
   workflow_dispatch:
 
 permissions:
+  # v1.0.0 self-hosted rewrite: the per-PR GHCR image pull / local docker
+  # build of the pg tier is GONE — the certified tier is the node's always-up
+  # native tier — so the former `packages: read` grant is dropped.
   contents: read
-  # #3089/#2960 — read-only pull of the prebuilt CI image from GHCR (build
-  # lever #3). The "Prepare certified pg image" step below prefers the
-  # published ghcr.io/<owner>/ai-memory-ci image and falls back to building
-  # the data tier locally when the pull is unavailable (fork PRs get no
-  # packages token; a not-yet-published tag; a GHCR outage) — so this grant
-  # only ever speeds the job, never gates it.
-  packages: read
 
 concurrency:
   # Event-distinct key (includes github.event_name) so a same-sha push +
@@ -89,103 +98,59 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Match postgres-feature / postgres-parity-nightly: mold linker + no dev debug
-  # info to keep the heavy sal-postgres build under the runner ceilings.
-  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+  # No dev debug info to keep the heavy sal-postgres test-compile lean. No
+  # `-fuse-ld=mold` RUSTFLAGS: mold was a GitHub-hosted-runner headroom hack;
+  # the self-hosted node uses its provisioned system linker.
   CARGO_PROFILE_DEV_DEBUG: "0"
-  AI_MEMORY_TEST_POSTGRES_URL: "postgres://ai_memory:ai_memory_ci@127.0.0.1:5432/ai_memory_ci"
-  AI_MEMORY_TEST_AGE_URL: "postgres://ai_memory:ai_memory_ci@127.0.0.1:5432/ai_memory_ci"
+  # AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_AGE_URL are NO LONGER hardcoded
+  # here — they are read at runtime from the node's $HOME/.ai-memory-ci-fed-url
+  # (the always-up native cert tier: pg18.6 + AGE 1.8.0 + pgvector 0.8.6, TLS
+  # verify-full, port 5445) by the "Point at the native enterprise-fed tier"
+  # step below, which threads them through $GITHUB_ENV to every later step.
 
 jobs:
   cert-postgres-age:
     name: "Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6)"
-    runs-on: ubuntu-latest
+    # v1.0.0 self-hosted rewrite. Re-homed onto the enterprise-fed Linux node,
+    # whose ALWAYS-UP native tier IS the certified triple. The former per-PR
+    # `docker build`/pull of deploy/docker-1461/Dockerfile.pg-age-vector +
+    # `docker run` container is GONE (the tier the job used to construct now
+    # exists continuously); the cert EVIDENCE is unchanged — the "Assert
+    # certified stack versions" step still hard-fails on ANY drift from the
+    # SSOT-pinned 18.6 / 1.8.0 / 0.8.6, now read off the live native tier.
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 60
-    # NOTE: deliberately NO `services:` block. A GitHub Actions `services:`
-    # entry can only start a bare image — it cannot pass `--build-arg`s — so
-    # it structurally cannot run the pinned-minor deploy image below. The
-    # postgres+AGE+pgvector container is built and run explicitly in the
-    # steps below instead, from the SAME Dockerfile the docker-1461 mesh
-    # ships (see the "ONE DECLARATION SOURCE" header note above).
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free disk (heavy sal-postgres build headroom)
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
-                      /usr/local/share/powershell /usr/local/share/chromium \
-                      /usr/local/share/boost /usr/local/lib/node_modules \
-                      /opt/google /usr/lib/jvm /opt/microsoft \
-                      /usr/share/swift /usr/share/miniconda || true
-          sudo apt-get autoremove --purge -y || true
-          sudo apt-get clean || true
-          df -h /
 
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
-      - name: Install mold linker + postgresql-client (#1148, pinned+bounded #3090)
-        timeout-minutes: 8
-        env:
-          MOLD_VERSION: "2.4.1"
+      - name: Point at the native enterprise-fed tier (psql PATH + URLs)
         run: |
           set -euo pipefail
-          # ------------------------------------------------------------------
-          # #3090 — bounded, pinned, fail-loud install (see ci.yml for the full
-          # rationale). The old bare `apt-get install -y mold postgresql-client`
-          # could hang on a stalled apt mirror until the job timeout fired. mold
-          # comes from a pinned first-party release tarball (apt bounded
-          # fallback); postgresql-client stays on bounded apt. No external
-          # Action added.
-          # ------------------------------------------------------------------
-          install_from_tarball() {
-            local arch tgz url dir ok attempt
-            arch="$(uname -m)"
-            tgz="mold-${MOLD_VERSION}-${arch}-linux.tar.gz"
-            url="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${tgz}"
-            dir="$(mktemp -d)"; ok=0
-            for attempt in 1 2; do
-              if timeout 120 curl -fsSL --retry 2 --retry-delay 3 -o "${dir}/${tgz}" "${url}"; then
-                ok=1; break
-              fi
-              echo "mold tarball fetch attempt ${attempt} failed; retrying" >&2; sleep 3
-            done
-            [ "${ok}" = 1 ] || return 1
-            tar -xzf "${dir}/${tgz}" -C "${dir}"
-            sudo install -m0755 "${dir}/mold-${MOLD_VERSION}-${arch}-linux/bin/mold" /usr/local/bin/mold
-            sudo ln -sf /usr/local/bin/mold /usr/local/bin/ld.mold
-          }
-          install_from_apt() {
-            local ok attempt; ok=0
-            for attempt in 1 2; do
-              if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y mold; then
-                ok=1; break
-              fi
-              echo "apt mold install attempt ${attempt} failed; retrying" >&2; sleep 5
-            done
-            [ "${ok}" = 1 ]
-          }
-          if ! { command -v mold >/dev/null 2>&1 && mold --version | grep -q "${MOLD_VERSION}"; }; then
-            if ! install_from_tarball; then
-              echo "::warning::pinned mold tarball unavailable — falling back to apt"
-              install_from_apt || { echo "::error::mold install failed (tarball + apt both failed)"; exit 1; }
-            fi
-          fi
-          command -v mold >/dev/null 2>&1 || { echo "::error::mold not on PATH after install"; exit 1; }
-          mold --version
-          # postgresql-client — bounded apt, one retry, fail loud.
-          pg_ok=0
-          for attempt in 1 2; do
-            if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y postgresql-client; then
-              pg_ok=1; break
-            fi
-            echo "apt postgresql-client attempt ${attempt} failed; retrying" >&2; sleep 5
+          # psql for the native tier lives under a versioned prefix; prepend
+          # whichever exists (linux node = postgresql-18 apt path).
+          for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do
+            [ -d "$d" ] && echo "$d" >> "$GITHUB_PATH"
           done
-          [ "${pg_ok}" = 1 ] || { echo "::error::postgresql-client install failed"; exit 1; }
-          psql --version
+          url_file="$HOME/.ai-memory-ci-fed-url"
+          if [ ! -f "$url_file" ]; then
+            echo "::error::$RUNNER_NAME is missing $url_file — the native cert tier URL is not provisioned on this node"
+            exit 1
+          fi
+          url="$(cat "$url_file")"
+          # Both the pg and AGE test URLs are the same native tier (a single
+          # PG 18.6 + AGE 1.8.0 + pgvector 0.8.6 instance). Setting
+          # AI_MEMORY_TEST_AGE_URL is what stops the AGE-backed cells from
+          # self-skipping — the whole point of the in-PR cert evidence (#2548).
+          {
+            echo "AI_MEMORY_TEST_POSTGRES_URL=$url"
+            echo "AI_MEMORY_TEST_AGE_URL=$url"
+          } >> "$GITHUB_ENV"
+          echo "::notice::cert cells pointed at the native enterprise-fed tier on $RUNNER_NAME"
 
       - uses: Swatinem/rust-cache@v2
 
@@ -199,108 +164,49 @@ jobs:
           # bump (e.g. a PG 18.5 point release) moves this job automatically.
           source deploy/docker-1461/provision/lib.sh
           {
-            echo "CERT_AGE_BASE_IMAGE=${AGE_BASE_IMAGE}"
-            echo "CERT_PG_MAJOR=${PG_MAJOR}"
-            echo "CERT_PG_APT_VERSION=${PG_APT_VERSION}"
-            echo "CERT_AGE_APT_VERSION=${AGE_APT_VERSION}"
-            echo "CERT_PGVECTOR_APT_VERSION=${PGVECTOR_APT_VERSION}"
             echo "CERT_EXPECTED_PG_VERSION=${EXPECTED_PG_VERSION}"
             echo "CERT_EXPECTED_AGE_VERSION=${EXPECTED_AGE_VERSION}"
             # pg_extension.extversion for pgvector reports the bare semver
             # (e.g. "0.8.6"), never the pgdg package suffix — strip it here
             # once so the assert step below has no literal of its own.
             echo "CERT_EXPECTED_PGVECTOR_VERSION=${PGVECTOR_APT_VERSION%%-*}"
-            # Prebuilt CI image reference (build lever #3, #3089/#2960). The
-            # tag is the SAME triple-encoded tag publish-ci-image.yml resolves
-            # from THIS SSOT, so both sides agree by construction: a pin bump
-            # yields a new tag on both, and a not-yet-republished tag simply
-            # misses the pull and falls back to the local build below.
-            echo "CERT_CI_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER}/ai-memory-ci:pg${EXPECTED_PG_VERSION}-age${EXPECTED_AGE_VERSION}-pgvector${PGVECTOR_APT_VERSION%%-*}"
           } >> "$GITHUB_ENV"
-          echo "::notice::certified pins resolved from deploy/docker-1461/provision/lib.sh — PG ${PG_APT_VERSION} (server ${EXPECTED_PG_VERSION}), AGE base ${AGE_BASE_IMAGE} (server ${EXPECTED_AGE_VERSION}), pgvector ${PGVECTOR_APT_VERSION}"
+          echo "::notice::certified pins resolved from deploy/docker-1461/provision/lib.sh — PG server ${EXPECTED_PG_VERSION}, AGE server ${EXPECTED_AGE_VERSION}, pgvector ${PGVECTOR_APT_VERSION%%-*}"
 
-      - name: Prepare certified pg image (prefer prebuilt GHCR image, else build)
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The certified pg+AGE+pgvector tier is the node's ALWAYS-UP native tier
+      # (no per-PR docker build/pull/run). Wait for it to answer, then assert
+      # its versions against the SSOT below.
+      - name: Wait for native tier readiness
         run: |
           set -euo pipefail
-          # Build lever #3 (#3089/#2960): prefer the prebuilt CI image whose
-          # certified data tier is byte-identical to the local build below —
-          # SAME apache/age base, SAME pgdg apt pins from the SAME SSOT
-          # (publish-ci-image.yml asserts the exact triple BEFORE it pushes).
-          # Pulling it skips the per-run `docker build` of the data tier.
-          #
-          # FAIL-CLOSED / DEGRADE-NEVER-BREAK: the pull is best-effort. Any
-          # failure — login denied on a fork PR (no packages token), a
-          # not-yet-published or SSOT-bumped tag, a GHCR outage — falls back
-          # to building the SAME artifact the docker-1461 mesh ships, exactly
-          # as before this lever existed. Either way the "Assert certified
-          # stack versions" step below re-verifies the running container
-          # against the SSOT and hard-fails on ANY drift, so a stale pulled
-          # image cannot silently certify the wrong versions.
-          echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin >/dev/null 2>&1 || true
-          if docker pull "${CERT_CI_IMAGE}" >/dev/null 2>&1; then
-            docker tag "${CERT_CI_IMAGE}" cert-pg-age-vector:ci
-            echo "::notice::using prebuilt CI image ${CERT_CI_IMAGE}"
-          else
-            echo "::notice::prebuilt CI image ${CERT_CI_IMAGE} unavailable — building data tier locally (unchanged fallback)"
-            # Builds the SAME artifact the docker-1461 mesh ships — extending
-            # prior art rather than forking a second recipe. Every ARG comes
-            # from the resolved SSOT env, never a literal here.
-            docker build \
-              --build-arg AGE_BASE_IMAGE="${CERT_AGE_BASE_IMAGE}" \
-              --build-arg PG_MAJOR="${CERT_PG_MAJOR}" \
-              --build-arg PG_APT_VERSION="${CERT_PG_APT_VERSION}" \
-              --build-arg AGE_APT_VERSION="${CERT_AGE_APT_VERSION}" \
-              --build-arg PGVECTOR_APT_VERSION="${CERT_PGVECTOR_APT_VERSION}" \
-              -t cert-pg-age-vector:ci \
-              -f deploy/docker-1461/Dockerfile.pg-age-vector \
-              deploy/docker-1461
-          fi
-
-      - name: Run certified pg+AGE+pgvector container
-        run: |
-          set -euo pipefail
-          docker run -d --name cert-pg-age \
-            -e POSTGRES_USER=ai_memory \
-            -e POSTGRES_PASSWORD=ai_memory_ci \
-            -e POSTGRES_DB=ai_memory_ci \
-            -p 5432:5432 \
-            cert-pg-age-vector:ci
-
-      - name: Wait for postgres readiness
-        run: |
-          set -euo pipefail
-          for i in $(seq 1 60); do
-            if pg_isready -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci >/dev/null 2>&1; then
-              echo "::notice::postgres is up"
+          for i in $(seq 1 30); do
+            if psql "$AI_MEMORY_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null 2>&1; then
+              echo "::notice::native cert tier is up"
               exit 0
             fi
             sleep 2
           done
-          echo "::error::postgres did not become ready within 120s"
-          docker logs cert-pg-age || true
+          echo "::error::native enterprise-fed tier did not answer within 60s on $RUNNER_NAME"
           exit 1
 
-      - name: Provision AGE + vector extensions (certified stack)
-        env:
-          PGPASSWORD: ai_memory_ci
+      - name: Ensure AGE + vector extensions present (best-effort — tier is pre-provisioned)
         run: |
           set -euo pipefail
-          # pgvector is already baked into the image at the pinned version
-          # by Dockerfile.pg-age-vector (built above) — no apt-get here.
-          # Provision extensions + the memory_graph AGE graph the SAL postgres
-          # adapter expects. Mirrors coverage.yml + infra/lan-parity-test/init-age.sql.
-          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -c "CREATE EXTENSION IF NOT EXISTS vector;"
-          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -c "CREATE EXTENSION IF NOT EXISTS age;"
-          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists or AGE init handled by ladder"
+          # The native cert tier is provisioned with the pinned extensions +
+          # the memory_graph AGE graph already. These statements are
+          # BEST-EFFORT self-heal only: the test user on a verify-full tier may
+          # lack CREATE EXTENSION privilege, and that is fine — the "Assert
+          # certified stack versions" step below is the load-bearing check and
+          # HARD-FAILS if any extension is actually absent or off-version.
+          PSQL="psql $AI_MEMORY_TEST_POSTGRES_URL -v ON_ERROR_STOP=0"
+          $PSQL -c "CREATE EXTENSION IF NOT EXISTS vector;" || echo "vector: pre-provisioned or no CREATE priv (asserted below)"
+          $PSQL -c "CREATE EXTENSION IF NOT EXISTS age;" || echo "age: pre-provisioned or no CREATE priv (asserted below)"
+          $PSQL -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists / no priv / AGE init handled by ladder"
 
       - name: Assert certified stack versions (cert evidence, hard-fail on drift)
-        env:
-          PGPASSWORD: ai_memory_ci
         run: |
           set -euo pipefail
-          PSQL="psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -tAX"
+          PSQL="psql $AI_MEMORY_TEST_POSTGRES_URL -tAX"
           # split_part(...,' ',1) strips the "(Debian 18.4-1.pgdg13+1)" build
           # metadata SHOW server_version / current_setting append after the
           # bare version — without this, tr -d '[:space:]' collapses that
@@ -346,7 +252,7 @@ jobs:
       - name: Run #[ignore]-gated pg + AGE cells against the certified stack
         run: |
           set -euo pipefail
-          # The pg-parity binaries mirror postgres-parity-nightly.yml (they do
+          # The pg-parity binaries are the cross-backend parity cells (they do
           # not touch AGE). The AGE-backed binaries self-skip unless
           # AI_MEMORY_TEST_AGE_URL is set (it is, in env: above), so they run
           # here — this is the in-PR cert evidence that was missing (#2548).

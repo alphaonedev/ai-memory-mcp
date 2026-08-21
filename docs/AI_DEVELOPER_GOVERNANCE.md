@@ -208,8 +208,9 @@ The SOP applies, and only applies, when **all** of the following are true:
    only as background; the operative rationale is now policy (§5.4), not
    configuration.
 4. The PR has passed all four local gates (fmt, clippy pedantic, test, audit).
-5. Both required CI status checks (`Check (ubuntu-latest)`, `Check (macos-latest)`)
-   are reporting `SUCCESS` on the PR's head commit at the moment the SOP runs.
+5. All four required `Check (…-fed, …)` 2x2 status checks (`linux-fed`/`macos-fed`
+   × `sqlite`/`enterprise-fed`) are reporting `SUCCESS` on the PR's head commit at
+   the moment the SOP runs.
 6. Every commit on the PR is SSH- or PGP-signed and GitHub-verified
    (`required_signatures: true` is satisfied).
 7. The PR description includes the **AI involvement** section per §4.2.
@@ -379,7 +380,7 @@ PROTECTION DELTA:
   enforce_admins:                     true -> false (during window) -> true (closed)
   All other rules:                    UNCHANGED throughout window
     required_signatures:              true (unchanged)
-    required_status_checks:           ["Check (ubuntu-latest)", "Check (macos-latest)"] (unchanged)
+    required_status_checks:           ["Check (linux-fed,sqlite)", "Check (linux-fed,enterprise-fed)", "Check (macos-fed,sqlite)", "Check (macos-fed,enterprise-fed)", …] (unchanged)
     require_code_owner_reviews:       true (unchanged)
     require_last_push_approval:       true (unchanged)
     required_approving_review_count:  1 (unchanged)

@@ -39,7 +39,7 @@ There is no separate development repo. `ai-memory-mcp-dev` is archived.
 | Direct pushes | Blocked — PRs required |
 | Approving reviews | **0 required** — single-authority model: no second account can supply one and self-approval is forbidden. `CODEOWNERS` (`* @alphaonedev`) is a routing marker, not a gate. See `AI_DEVELOPER_GOVERNANCE.md` §5.0. |
 | Stale review dismissal | Inert — no approving review is required, so none can become stale (§5.0). Freshness is enforced via branch-up-to-date (`strict`). |
-| CI status checks | `Check (ubuntu-latest)` + `Check (macos-latest)` must pass |
+| CI status checks | the four self-hosted 2x2 `Check (…-fed, …)` legs (`linux-fed`/`macos-fed` × `sqlite`/`enterprise-fed`) + the lint/feature-gate contexts must pass |
 | Branch up-to-date | Required before merge |
 | Force pushes | Blocked |
 | Branch deletion | Blocked |
