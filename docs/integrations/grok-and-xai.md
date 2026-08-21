@@ -145,7 +145,7 @@ ai-memory wrap grok-cli -- chat --model grok-2-latest
 `ai-memory wrap` runs `ai-memory boot` in-process, builds a system
 message, and spawns the named CLI with the system message delivered
 via the appropriate strategy. Pure Rust — same binary works on macOS
-/ Linux / Windows / Docker / Kubernetes with no shell wrapper.
+/ Linux / Docker / Kubernetes with no shell wrapper.
 
 For SDK code (the pattern below) `wrap` doesn't apply — that's for
 the launcher case.

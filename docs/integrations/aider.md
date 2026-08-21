@@ -47,7 +47,7 @@ exec aider --message-file "$TMP" "$@"
 ```
 
 Then alias `aider` to this wrapper, or invoke `aider-with-memory`
-instead. For the Rust-native version (works on Windows, no shell,
+instead. For the Rust-native version (no shell,
 no tempfile lifetime issues):
 
 ```bash

@@ -740,8 +740,7 @@ mod tests {
     fn wrap_passes_through_exit_code_via_status_propagation() {
         // We can't assume any specific binary is on PATH, but we can
         // exercise the propagation logic with a guaranteed-available
-        // command: `false` on Unix exits 1, `true` exits 0. On Windows
-        // we use `cmd /C exit N`.
+        // command: `false` on Unix exits 1, `true` exits 0.
         #[cfg(unix)]
         {
             // Exit 0
@@ -753,24 +752,13 @@ mod tests {
             let code = spawn_and_wait(cmd).unwrap();
             assert_eq!(code, 1);
         }
-        #[cfg(windows)]
-        {
-            let mut cmd = Command::new("cmd");
-            cmd.args(["/C", "exit", "0"]);
-            let code = spawn_and_wait(cmd).unwrap();
-            assert_eq!(code, 0);
-            let mut cmd = Command::new("cmd");
-            cmd.args(["/C", "exit", "7"]);
-            let code = spawn_and_wait(cmd).unwrap();
-            assert_eq!(code, 7);
-        }
     }
 
     #[test]
     fn wrap_run_returns_exit_code_for_real_subprocess() {
         // End-to-end: drive `run` itself (not just the helpers). We
-        // wrap a known-good binary (`true` on unix, `cmd /C exit` on
-        // windows) and assert the returned code matches.
+        // wrap a known-good binary (`true` on unix) and assert the
+        // returned code matches.
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let mut out = env.output();
@@ -789,25 +777,6 @@ mod tests {
             )
             .unwrap();
             assert_eq!(code, 0);
-        }
-        #[cfg(windows)]
-        {
-            let mut args = default_args("cmd");
-            args.no_boot = true;
-            // We override the strategy to SystemFlag with a no-op flag
-            // that `cmd /C` will ignore alongside the system message,
-            // then a real /C exit. Easier: override via system_env so
-            // no flag is added, then trailing carries `/C exit 5`.
-            args.system_env = Some("WRAP_DUMMY".into());
-            args.trailing = vec!["/C".into(), "exit".into(), "5".into()];
-            let code = run(
-                &db_path,
-                &args,
-                &crate::config::AppConfig::default(),
-                &mut out,
-            )
-            .unwrap();
-            assert_eq!(code, 5);
         }
     }
 

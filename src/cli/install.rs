@@ -72,9 +72,9 @@ const MANAGED_KEYS_PROPERTY: &str = "// ai-memory:managed-keys";
 const AGENT_TARGET_CLAUDE_CODE: &str = "claude-code";
 
 /// File name of Claude Desktop's MCP config under its OS-specific
-/// application-support directory. Only referenced on the macOS /
-/// Windows auto-discovery arms (Linux requires `--config`).
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// application-support directory. Only referenced on the macOS
+/// auto-discovery arm (Linux requires `--config`).
+#[cfg(target_os = "macos")]
 const CLAUDE_DESKTOP_CONFIG_FILENAME: &str = "claude_desktop_config.json";
 
 /// MCP-spec camelCase servers key used by every JSON-config harness.
@@ -689,22 +689,7 @@ fn resolve_config_path(target: Target, args: &TargetArgs) -> Result<PathBuf> {
                     .join("Claude")
                     .join(CLAUDE_DESKTOP_CONFIG_FILENAME)
             }
-            #[cfg(target_os = "windows")]
-            {
-                std::env::var_os("APPDATA")
-                    .map(|p| {
-                        std::path::PathBuf::from(p)
-                            .join("Claude")
-                            .join(CLAUDE_DESKTOP_CONFIG_FILENAME)
-                    })
-                    .unwrap_or_else(|| {
-                        home.join("AppData")
-                            .join("Roaming")
-                            .join("Claude")
-                            .join(CLAUDE_DESKTOP_CONFIG_FILENAME)
-                    })
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            #[cfg(not(target_os = "macos"))]
             {
                 bail!(
                     "claude-desktop config path is OS-specific and not auto-discovered \
@@ -765,10 +750,6 @@ fn which_ai_memory() -> Option<PathBuf> {
         let candidate = dir.join("ai-memory");
         if candidate.is_file() {
             return Some(candidate);
-        }
-        let candidate_exe = dir.join("ai-memory.exe");
-        if candidate_exe.is_file() {
-            return Some(candidate_exe);
         }
     }
     None

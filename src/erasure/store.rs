@@ -15,15 +15,11 @@
 //! crash mid-swap leaves either the old bundle or the new one (plus an
 //! orphan temp dir that the next `put` for that id clears).
 //!
-//! Per-platform durability (#2230): every shard + the manifest gets a
-//! per-FILE fsync before the publish rename. That per-file barrier holds on
-//! BOTH unix and Windows (on Windows the fsync handle is opened with write
-//! access — `FlushFileBuffers` refuses a read-only handle; see
-//! [`fsync_file`]). The DIRECTORY fsync that makes the create/rename itself
-//! durable is unix-only — Windows has no portable `fsync(dir)` equivalent
-//! ([`fsync_dir`] is a documented no-op there), so on Windows bundle-publish
-//! durability rests on the per-file fsyncs plus the atomic `MoveFileEx`
-//! rename semantics rather than an explicit directory barrier.
+//! Durability (#2230): every shard + the manifest gets a per-FILE fsync
+//! before the publish rename (see [`fsync_file`]). The DIRECTORY fsync that
+//! makes the create/rename itself durable ([`fsync_dir`]) runs on unix
+//! (Linux + macOS), the supported platforms; it degrades to a documented
+//! no-op on any non-unix target.
 //!
 //! Read discipline ([`ErasureStore::get`]): shards are hash-verified
 //! against the manifest; corrupt/missing shards are demoted to erasures and
@@ -129,29 +125,19 @@ impl Drop for PreparedBundle {
 /// that publishes the bundle (F3 — power-loss durability: a torn/empty shard
 /// behind a surviving manifest is exactly what the sweep must never leave).
 ///
-/// Per-platform handle discipline (#2230): on unix a read-only handle can be
-/// fsync'd — `fsync(2)` accepts any valid descriptor. On Windows the same
-/// `File::sync_all` maps to `FlushFileBuffers`, which REQUIRES a handle with
-/// write access (`GENERIC_WRITE`); a read-only handle returns
-/// `ERROR_ACCESS_DENIED` (os error 5). So the handle is opened with write
-/// access on Windows. The per-file durability barrier therefore holds
-/// byte-for-byte on BOTH platforms — the F3 crash-safety claim is honest on
-/// each. (The DIRECTORY-fsync step below is the one that has no portable
-/// Windows equivalent and degrades to a documented no-op there.)
+/// Handle discipline (#2230): on unix a read-only handle can be fsync'd —
+/// `fsync(2)` accepts any valid descriptor. The per-file durability barrier
+/// keeps the F3 crash-safety claim honest on Linux and macOS. (The
+/// DIRECTORY-fsync step below is the durability partner for the rename.)
 fn fsync_file(path: &Path) -> Result<(), ErasureError> {
-    // Windows: open with write access so FlushFileBuffers is permitted.
-    #[cfg(windows)]
-    let opened = std::fs::OpenOptions::new().write(true).open(path);
-    // Unix / macOS: read-only open is sufficient — byte-identical to the
-    // pre-#2230 behaviour on those platforms.
-    #[cfg(not(windows))]
+    // Unix / macOS: read-only open is sufficient to fsync the file.
     let opened = std::fs::File::open(path);
     let f = opened.map_err(|e| io_err("fsync open file", &e))?;
     f.sync_all().map_err(|e| io_err("fsync file", &e))
 }
 
 /// fsync a directory so a create/rename within it is durable. A no-op on
-/// platforms where a directory cannot be opened as a file (Windows) — the
+/// any non-unix platform where a directory cannot be opened as a file — the
 /// per-file fsyncs still hold there.
 #[cfg(unix)]
 fn fsync_dir(path: &Path) -> Result<(), ErasureError> {
@@ -213,12 +199,6 @@ pub(crate) fn read_bounded_state_file(path: &Path, max_bytes: u64) -> Option<Vec
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
     let file = options.open(path).ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() || metadata.len() > max_bytes {
@@ -263,12 +243,6 @@ fn persist_derived_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Eras
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
     let result = (|| -> Result<(), ErasureError> {
         let mut file = options
             .open(&staging)
@@ -278,11 +252,6 @@ fn persist_derived_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Eras
         file.sync_all()
             .map_err(|e| io_err("fsync derived state staging file", &e))?;
         drop(file);
-        #[cfg(windows)]
-        if destination.exists() {
-            std::fs::remove_file(&destination)
-                .map_err(|e| io_err("replace derived state destination", &e))?;
-        }
         std::fs::rename(&staging, &destination).map_err(|e| io_err("publish derived state", &e))?;
         fsync_dir(dir)
     })();
@@ -337,12 +306,6 @@ impl ErasureStore {
             options
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
         let file = options
             .open(&path)
@@ -756,12 +719,6 @@ impl ErasureStore {
                     .mode(0o600)
                     .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
             }
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::OpenOptionsExt as _;
-                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-            }
             let file = options
                 .open(&marker)
                 .map_err(|e| io_err("create purge-intent marker", &e))?;
@@ -942,20 +899,14 @@ mod tests {
 
     #[test]
     fn fsync_file_succeeds_on_freshly_written_file() {
-        // #2230 — the per-file durability barrier must not error on ANY
-        // platform. Pre-fix, `fsync_file` opened the file read-only and
-        // called `sync_all`; on windows-latest that returned
-        // `ERROR_ACCESS_DENIED` (os error 5) because FlushFileBuffers refuses
-        // a read-only handle, panicking every `put`-driven test. This pins
-        // the barrier directly: on unix it exercises the unchanged read-only
-        // path, on Windows the write-handle path.
+        // #2230 — the per-file durability barrier must not error. On unix a
+        // read-only handle can be fsync'd, so `fsync_file` opens the shard
+        // read-only and calls `sync_all`. This pins the barrier directly.
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join(shard_file_name(0));
         std::fs::write(&p, b"durable shard bytes").unwrap();
-        fsync_file(&p)
-            .expect("fsync_file must succeed on a freshly written file on every platform");
-        // The bytes are intact after the barrier (a write-open must not
-        // truncate on windows).
+        fsync_file(&p).expect("fsync_file must succeed on a freshly written file");
+        // The bytes are intact after the barrier.
         assert_eq!(std::fs::read(&p).unwrap(), b"durable shard bytes");
     }
 

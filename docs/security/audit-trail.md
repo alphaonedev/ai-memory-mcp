@@ -211,7 +211,6 @@ canonical system path without any extra configuration.
 |---|---|---|
 | **Linux** (and BSD / illumos / other Unix) | `${XDG_STATE_HOME:-$HOME/.local/state}/ai-memory/logs/` | `${XDG_STATE_HOME:-$HOME/.local/state}/ai-memory/audit/` |
 | **macOS** | `~/Library/Logs/ai-memory/` | `~/Library/Logs/ai-memory/audit/` |
-| **Windows** | `%LOCALAPPDATA%\ai-memory\logs\` | `%LOCALAPPDATA%\ai-memory\audit\` |
 | **systemd-managed daemon** (any OS, `INVOCATION_ID` set, `/var/log/ai-memory/` writable) | `/var/log/ai-memory/logs/` | `/var/log/ai-memory/audit/` |
 
 ### Worked examples

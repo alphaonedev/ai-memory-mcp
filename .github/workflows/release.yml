@@ -133,7 +133,7 @@ jobs:
 
   # --------------------------------------------------------------------
   # Cross-platform binary builds + GitHub Release page.
-  # 5 targets: linux x86_64 + aarch64, macOS x86_64 + aarch64, windows x86_64.
+  # 4 targets: linux x86_64 + aarch64, macOS x86_64 + aarch64.
   # --------------------------------------------------------------------
   release:
     name: Release (${{ matrix.target }})
@@ -170,9 +170,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: ai-memory
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: ai-memory.exe
     steps:
       - uses: actions/checkout@v4
         with:
@@ -232,8 +229,8 @@ jobs:
             amd64) host_arch="x86_64" ;;
           esac
           if [[ "$target_arch" == "$host_arch" ]]; then
-            # Native target — safe to execute (Windows artifact is .exe; the
-            # script invokes the `features` subcommand via the path).
+            # Native target — safe to execute; the script invokes the
+            # `features` subcommand via the path.
             echo "native target ($target on $host_arch): executing feature self-report assertion"
             bash scripts/assert-compiled-features.sh "$bin" \
               --require sqlite-bundled --require sal
@@ -258,21 +255,12 @@ jobs:
             echo "assert: arch verification OK ($bin is $want; non-exec #2728)"
           fi
 
-      - name: Package binary (unix)
-        if: ${{ !contains(matrix.target, 'windows') }}
+      - name: Package binary
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} dist/
           cd dist
           tar czf ai-memory-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
-
-      - name: Package binary (windows)
-        if: contains(matrix.target, 'windows')
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -Destination dist/
-          Compress-Archive -Path "dist/${{ matrix.artifact }}" -DestinationPath "dist/ai-memory-${{ matrix.target }}.zip"
 
       - name: Build deb and rpm packages
         if: matrix.nfpm_arch
@@ -306,16 +294,14 @@ jobs:
       # matching the existing SBOM/iOS/Android assets and install.sh's
       # `awk '{ print $1 }'` extraction.
       #
-      # EXCLUDED: the bare `ai-memory` / `ai-memory.exe` binary that the
-      # packaging step leaves in dist/. It is NOT architecture-qualified,
-      # so all five matrix legs publish an asset of that same name and
-      # overwrite each other. A checksum for it could be raced against a
-      # different leg's binary, and a WRONG checksum is worse than none.
-      # No installer path fetches it (install.sh and install.ps1 both
-      # fetch the arch-qualified archive). Tracked separately.
+      # EXCLUDED: the bare `ai-memory` binary that the packaging step leaves
+      # in dist/. It is NOT architecture-qualified, so all four matrix legs
+      # publish an asset of that same name and overwrite each other. A
+      # checksum for it could be raced against a different leg's binary, and
+      # a WRONG checksum is worse than none. No installer path fetches it
+      # (install.sh fetches the arch-qualified archive). Tracked separately.
       # ------------------------------------------------------------------
-      - name: Checksum every release artifact (unix)  # checksum-sweep (#2449)
-        if: ${{ !contains(matrix.target, 'windows') }}
+      - name: Checksum every release artifact  # checksum-sweep (#2449)
         shell: bash
         run: |
           set -euo pipefail
@@ -343,29 +329,6 @@ jobs:
           fi
           echo "checksummed ${emitted} artifact(s)"
           ls -la
-
-      - name: Checksum every release artifact (windows)  # checksum-sweep (#2449)
-        if: contains(matrix.target, 'windows')
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $emitted = 0
-          Get-ChildItem -Path dist -File |
-            Where-Object { $_.Name -notlike '*.sha256' -and $_.Name -ne 'ai-memory.exe' } |
-            ForEach-Object {
-              $h = (Get-FileHash -Algorithm SHA256 -Path $_.FullName).Hash.ToLower()
-              # sha256sum-compatible shape so install.sh/install.ps1 parse
-              # it identically to the unix-emitted files. Encoding must be
-              # pinned: Out-File defaults to UTF-16 on Windows PowerShell.
-              Set-Content -Path "$($_.FullName).sha256" -Value "$h  $($_.Name)" -Encoding ascii
-              $emitted++
-            }
-          if ($emitted -eq 0) {
-            Write-Host "::error::checksum sweep produced nothing - refusing to publish unverifiable artifacts"
-            exit 1
-          }
-          Write-Host "checksummed $emitted artifact(s)"
-          Get-ChildItem dist
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v5

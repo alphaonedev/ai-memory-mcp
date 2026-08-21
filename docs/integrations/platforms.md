@@ -17,8 +17,6 @@ platform-specific differences for the
 | **macOS** (Apple Silicon + Intel) | First-class — primary dogfood platform | `/opt/homebrew/bin/ai-memory` (Apple Silicon Homebrew) or `/usr/local/bin/ai-memory` (Intel Homebrew) | `${HOME}/.claude/ai-memory.db` | `bash` (default) — Claude Code's `SessionStart` hook command runs in the user's default shell |
 | **Linux** (glibc, x86_64 + aarch64) | First-class — covered by CI | `/usr/local/bin/ai-memory` (manual install) or `~/.cargo/bin/ai-memory` (cargo install) | `${HOME}/.claude/ai-memory.db` | `bash` |
 | **Linux** (musl, e.g. Alpine) | Supported — static-linked binary recommended | per package manager | `${HOME}/.claude/ai-memory.db` | `sh`/`ash` — POSIX-compatible only |
-| **Windows** (10/11, native) | Supported — see Windows-specific notes below | `C:\Users\<user>\.cargo\bin\ai-memory.exe` (cargo install) or wherever the user dropped the release zip | `%USERPROFILE%\.claude\ai-memory.db` | PowerShell or `cmd.exe`. `bash` only via WSL |
-| **Windows** (WSL2) | First-class — equivalent to Linux | as Linux (above) | as Linux | `bash` |
 | **Docker** / containers | First-class — official image at `ghcr.io/alphaonedev/ai-memory`, see "Container deployments" below | `/usr/local/bin/ai-memory` inside the image | `/data/ai-memory.db` (volume-mounted) | depends on host |
 | **Kubernetes** | First-class — production deployment target, see "Kubernetes" below | `/usr/local/bin/ai-memory` inside the pod image | `/data/ai-memory.db` from a `PersistentVolumeClaim` (or `emptyDir` for ephemeral) | sidecar (HTTP boot) or DaemonSet (localhost:9077) |
 | **ARM Linux** (Raspberry Pi, AWS Graviton, ARM servers) | First-class — covered by cross-compile docs, see "ARM Linux" below | per package manager / cargo install (`~/.cargo/bin/ai-memory`) | `${HOME}/.claude/ai-memory.db` | `bash`/`sh` |
@@ -27,8 +25,8 @@ platform-specific differences for the
 | **BSD** (FreeBSD, OpenBSD, NetBSD) | Best-effort — should build cleanly via `cargo build --release` but not regularly tested | `/usr/local/bin/ai-memory` (manual install) | `${HOME}/.claude/ai-memory.db` | `sh` |
 | **iOS / Android** | Linkable mobile artifacts ship at v0.7.0 (`ai-memory-ios.xcframework.tar.gz`, `ai-memory-android.tar.gz`); CLI use via Termux on Android — see [`../mobile-iot-deployment.md`](../mobile-iot-deployment.html) | n/a (embedded) | app-sandbox path | n/a |
 
-> CI gap callout: the GitHub Actions matrix covers `ubuntu-latest`,
-> `macos-latest`, and `windows-latest` only. Every other row above —
+> CI gap callout: the GitHub Actions matrix covers `ubuntu-latest`
+> and `macos-latest` only. Every other row above —
 > Kubernetes, ARM Linux, commercial Unix, embedded Linux, BSD — is
 > documented coverage, not CI-proven coverage. "First-class" for these
 > means recipe-tested by maintainers and supported in the issue tracker;
@@ -54,93 +52,6 @@ through the v0.6.3.1 dogfood workflow. No special notes — the recipes
   service unit), see [`docs/INSTALL.md`](../INSTALL.html). For session-boot
   integration the daemon mode is irrelevant — boot calls are stdio
   one-shots.
-
-## Windows specifics
-
-The integration recipes change on native Windows because
-`SessionStart` hook commands run in PowerShell (or `cmd.exe`),
-not in `bash`. Three things differ:
-
-### 1. Path syntax in `~/.claude/settings.json`
-
-Use forward slashes or escape backslashes — JSON requires escapes. Either
-of these works:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "C:/Users/<user>/.cargo/bin/ai-memory.exe boot --quiet --limit 10"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Or use the binary name alone if it's on `%PATH%`:
-
-```json
-{
-  "command": "ai-memory boot --quiet --limit 10"
-}
-```
-
-### 2. Default DB path env var
-
-```json
-{
-  "env": {
-    "AI_MEMORY_DB": "%USERPROFILE%\\.claude\\ai-memory.db"
-  }
-}
-```
-
-(Claude Code expands `%USERPROFILE%` before passing to the hook.)
-
-### 3. No PowerShell wrapper needed — use `ai-memory wrap`
-
-Earlier PRs in issue #487 shipped both bash and PowerShell wrapper
-snippets in [`codex-cli.md`](codex-cli.html),
-[`claude-agent-sdk.md`](claude-agent-sdk.html), etc. **PR-6 lands
-`ai-memory wrap` as a cross-platform replacement** for those shell
-wrappers: a single Rust subcommand that runs the same code path on
-Windows, Linux, macOS, Docker, and Kubernetes. No bash, no
-PowerShell, no `chmod +x`, no `Set-ExecutionPolicy` shenanigans.
-
-```powershell
-# Native Windows — no shell wrapper required.
-ai-memory wrap codex -- chat --model gpt-5
-```
-
-`ai-memory wrap`:
-
-- Calls `ai-memory boot` in-process (no subprocess hop, no shell
-  argument-parsing differences between cmd / PowerShell / bash).
-- Spawns the wrapped agent CLI with stdio inherited and the system
-  message delivered via the strategy chosen by
-  `default_strategy(<agent>)` (or an explicit `--system-flag` /
-  `--system-env` / `--message-file-flag` override).
-- Propagates the agent's exit code, so PowerShell scripts that
-  branch on `$LASTEXITCODE` still work.
-
-If you have an existing PowerShell wrapper from a prior PR, drop it
-and replace with `ai-memory wrap` — same behavior, cross-platform,
-no shell-quoting hazards.
-
-## WSL2 specifics
-
-Treat as Linux. The catch: each WSL distro has its own `~/.claude/` root.
-If you also use Claude Code on the Windows side, you'll have two separate
-ai-memory DBs unless you point both at the same path (e.g. via
-`AI_MEMORY_DB=//wsl$/Ubuntu/home/<user>/.claude/ai-memory.db` from
-Windows). Recommended: pick one side as the source of truth.
 
 ## Container deployments
 
@@ -570,8 +481,8 @@ CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
 
 These are the targets maintainers or contributors have actually
 exercised at least once. **None are in the project's CI matrix** (which
-covers `ubuntu-latest` x86_64, `macos-latest` arm64, `windows-latest`
-x86_64) — treat the list as "known to compile and run a basic boot,"
+covers `ubuntu-latest` x86_64 and `macos-latest` arm64) — treat the
+list as "known to compile and run a basic boot,"
 not as continuously gated.
 
 - `aarch64-unknown-linux-gnu` — Pi 4/5 with 64-bit Raspberry Pi OS, AWS
@@ -717,12 +628,11 @@ universal contract tests on a CI matrix:
 
 - `ubuntu-latest` (Linux x86_64)
 - `macos-latest` (Apple Silicon)
-- `windows-latest` (native Windows)
 
 Tests exercise: boot exit codes, status-header shape, recipe JSON
 validity, namespace inference, budget clamp, status diagnostics. The live
 agent smoke test (gated under `--features e2e`) currently runs only on
-macOS where the dogfood Claude Code install lives; expanding to Linux + Windows
+macOS where the dogfood Claude Code install lives; expanding to Linux
 is tracked in #487 follow-ups.
 
 **What CI does NOT cover** (be honest about the gap):

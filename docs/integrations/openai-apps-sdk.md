@@ -28,7 +28,7 @@ ai-memory wrap mycli --system-flag --instructions -- chat
 
 `ai-memory wrap` is the cross-platform Rust replacement for the
 bash / PowerShell wrappers earlier PRs shipped. Same binary works on
-macOS / Linux / Windows / Docker / Kubernetes; no shell required.
+macOS / Linux / Docker / Kubernetes; no shell required.
 
 For SDK code (the patterns below) `wrap` doesn't apply — `wrap` is
 for the launcher case where the SDK isn't in your code path.

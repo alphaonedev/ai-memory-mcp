@@ -38,7 +38,6 @@ Default storage paths (overridable with `--key-dir` or `AI_MEMORY_KEY_DIR`):
 
 - **Linux:** `~/.config/ai-memory/keys/`
 - **macOS:** `~/Library/Application Support/ai-memory/keys/`
-- **Windows:** `%APPDATA%\ai-memory\keys\`
 
 Files land with strict permissions on Unix (`0600` private key / `0644` public key). `generate` refuses an existing `--agent-id` unless you pass `--force` — rotation is opt-in. Two agents sharing a keypair is a configuration error; the substrate cannot detect it but every audit chain you produce afterwards will be ambiguous about provenance.
 

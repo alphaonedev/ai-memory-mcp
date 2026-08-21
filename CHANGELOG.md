@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Windows OS support dropped for v1.0.0 GA.** All Windows OS support is
+  removed: the PowerShell installer (`install.ps1`), the
+  `x86_64-pc-windows-msvc` release target and prebuilt `.exe`/`.zip` artifacts,
+  and Windows-specific code paths and CI legs are gone. Supported platforms are
+  now **Linux and macOS only** (both including the enterprise-federation
+  postgresql+AGE+pgvector tier).
+
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 
 Closes a tenant-isolation + approval-bypass primitive on the namespace-standard

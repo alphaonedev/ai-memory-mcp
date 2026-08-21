@@ -10602,7 +10602,7 @@ mod tests {
     // tests above cover the thin daemon_runtime dispatch arm (store resolution +
     // helper delegation) end-to-end through `run()`.
 
-    // `sal`-gated: under `--no-default-features` (the macOS/Windows Check jobs)
+    // `sal`-gated: under `--no-default-features` (the macOS Check job)
     // `cmd_undo_edit` is the stub that returns exit code 2, so the dispatch arm
     // would `process::exit(2)` and abort the whole test binary. Only the sal
     // build takes the Ok(0) path — and Per-Module Coverage runs with `sal`, so

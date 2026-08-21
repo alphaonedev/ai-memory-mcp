@@ -7,7 +7,7 @@
 # workflow.
 #
 # Reference hardware per `PERFORMANCE.md` is GitHub-hosted Linux
-# x86_64 (`ubuntu-latest`). The macOS / Windows correctness checks
+# x86_64 (`ubuntu-latest`). The macOS correctness checks
 # already live in `ci.yml`; this workflow is single-runner on purpose.
 
 name: Bench

@@ -595,13 +595,13 @@ until enforcement is flipped on.
 **entire** federation-identity core are pure Rust with no platform-bound
 logic in the trust path. The credential format, issuer, trust bundle,
 chain verification, inventory parsing, renewal worker, and reconciler
-diff behave **identically** on Linux, Windows, and macOS — the CI test
-matrix proves it by running the full suite on `ubuntu-latest`,
-`macos-latest`, and `windows-latest` on every change. A credential
-minted on a Linux root CA verifies on a Windows node and a macOS node
+diff behave **identically** on Linux and macOS — the CI test
+matrix proves it by running the full suite on `ubuntu-latest` and
+`macos-latest` on every change. A credential
+minted on a Linux root CA verifies on a macOS node
 with byte-identical results; the trust domain spans operating systems
-transparently. A federated fleet can be **heterogeneous** — Linux,
-Windows, and macOS nodes in one trust domain — with no special-casing.
+transparently. A federated fleet can be **heterogeneous** — Linux
+and macOS nodes in one trust domain — with no special-casing.
 
 The only things that differ by OS are two pieces of **operational
 plumbing**, not capability: the service supervisor and the
@@ -618,14 +618,13 @@ a capability limit:
 | Priority | Platform | Default shell | Notes |
 |---|---|---|---|
 | **Primary** | **Linux** (x86_64 / aarch64) | **Bash** | The reference enterprise target: systemd-supervised rollout, Unix key-file mode enforcement, container/Kubernetes substrate. |
-| **Primary** | **Windows** (x86_64) | **PowerShell** | First-class enterprise daemon + federation node; native Rust binary. Key-directory hardening uses NTFS ACLs (below). |
 | **Tertiary** | **macOS** (Apple Silicon / x86_64) | **Zsh** | The small-end-user / startup niche — e.g. clusters of Mac Mini nodes. Fully functional federation node; Unix mode enforcement applies as on Linux. |
 
 The shell column is the platform's **default interactive shell** — the
-one operator examples in this doc assume per OS (Linux → Bash, Windows →
-PowerShell, macOS → Zsh). The `ai-memory` binary itself is shell-agnostic;
+one operator examples in this doc assume per OS (Linux → Bash,
+macOS → Zsh). The `ai-memory` binary itself is shell-agnostic;
 only the env-var-setting syntax differs. The same `AI_MEMORY_FED_*` knob
-is set three ways:
+is set two ways:
 
 ```bash
 # Linux (Bash)
@@ -639,31 +638,18 @@ export AI_MEMORY_FED_TRUST_DOMAIN="fleet.example"
 export AI_MEMORY_FED_IDENTITY="region/nyc/node-1"
 ```
 
-```powershell
-# Windows (PowerShell)
-$env:AI_MEMORY_FED_TRUST_DOMAIN = "fleet.example"
-$env:AI_MEMORY_FED_IDENTITY     = "region/nyc/node-1"
-```
-
 ### Platform-specific behavior
 
-| Concern | Linux | Windows | macOS |
-|---|---|---|---|
-| **Default shell (for examples)** | Bash | PowerShell | Zsh |
-| **Daemon + identity core** | native | native | native |
-| **Key-file permission enforcement** | `0600`/`0400` enforced (`PermissionsExt`) | **mode bits don't apply** — files inherit the parent-directory ACL; secure the key directory with NTFS ACLs | `0600`/`0400` enforced (same as Linux) |
-| **Rollout supervisor** (`FED_ROLLOUT_SUPERVISOR`) | `systemd` (default) | `custom` start/stop hooks (Windows Service wrapper) or run the bash `federation-rollout.sh` under **WSL2** | `reexec` or `custom` (`launchd`) |
-| **`scripts/federation-rollout.sh`** | native bash | requires **WSL2** or a Git-Bash/MSYS2 shell; or supply your own equivalent via the `custom` supervisor hooks | native bash |
-
-> **Windows key hardening.** On non-Unix targets the daemon cannot set
-> POSIX `0600` bits on the private-key files, so the directory ACL is the
-> trust boundary. Restrict `%APPDATA%\ai-memory\keys\` to the service
-> account (remove inherited `Users` access). Hardware-backed key storage
-> on Windows is out of OSS scope — it lives in the AgenticMem commercial
-> layer.
+| Concern | Linux | macOS |
+|---|---|---|
+| **Default shell (for examples)** | Bash | Zsh |
+| **Daemon + identity core** | native | native |
+| **Key-file permission enforcement** | `0600`/`0400` enforced (`PermissionsExt`) | `0600`/`0400` enforced (same as Linux) |
+| **Rollout supervisor** (`FED_ROLLOUT_SUPERVISOR`) | `systemd` (default) | `reexec` or `custom` (`launchd`) |
+| **`scripts/federation-rollout.sh`** | native bash | native bash |
 
 The trust model — CA-rooted credentials, short-lived rotation, O(1)
-enrollment — is **identical across all three platforms**. Only the
+enrollment — is **identical across both platforms**. Only the
 operational plumbing (service supervisor, key-directory permission
 mechanism) differs, and each has a supported path above.
 

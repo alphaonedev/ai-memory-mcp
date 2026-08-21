@@ -34,7 +34,7 @@ ai-memory --version
 # ai-memory 0.9.0
 ```
 
-Full install reference including Windows, Docker, Fedora COPR, Debian
+Full install reference including Docker, Fedora COPR, Debian
 .deb, and Homebrew tap: `docs/INSTALL.md`.
 
 ## Path A — CLI (fastest, 60 seconds)
@@ -77,7 +77,7 @@ conversation gets persistent memory across sessions.
 }
 ```
 
-**Claude Desktop** — add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+**Claude Desktop** — add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 
 ```json
 {

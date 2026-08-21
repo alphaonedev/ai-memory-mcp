@@ -221,6 +221,8 @@ MCP is the primary integration layer. For AI platforms that do not yet support M
 
 ## Install in 60 Seconds
 
+v1.0.0 GA drops Windows support; supported platforms are Linux and macOS (both including the enterprise-federation postgresql+AGE+pgvector tier).
+
 Pre-built binaries require no dependencies. Building from source needs Rust and a C compiler.
 
 **Fastest: Pre-built binary (no Rust required)**
@@ -231,9 +233,6 @@ curl -fsSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/inst
 
 # Fedora/RHEL (COPR)
 sudo dnf copr enable alpha-one-ai/ai-memory && sudo dnf install ai-memory
-
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 | iex
 ```
 
 **Step 1: Install Rust** (skip if using pre-built binaries)
@@ -281,7 +280,7 @@ Claude Code supports three MCP configuration scopes:
 
 **User scope (recommended — works everywhere):**
 
-Add the `mcpServers` key to `~/.claude.json` (macOS/Linux) or `%USERPROFILE%\.claude.json` (Windows):
+Add the `mcpServers` key to `~/.claude.json` (macOS/Linux):
 
 ```json
 {
@@ -351,8 +350,6 @@ Verify: `ai-memory boot --quiet --limit 1` should report `llm=xai:grok-4.3`. Can
 >
 > MCP clients spawn the server as a fresh subprocess with only the `env:` keys from the MCP config — shell exports in `.zshrc` / `.bashrc` don't reach it. The `[llm]` config-file path above retires this paper-cut (every surface reads the same file). **Inline API keys in `config.toml` are rejected at parse time** — use `api_key_env` or `api_key_file`. Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146). Full per-backend recipes: [`docs/integrations/llm-backends.md`](docs/integrations/llm-backends.md).
 
-> **Windows paths:** Use forward slashes or escaped backslashes in `--db`. Example: `"--db", "C:/Users/YourName/.claude/ai-memory.db"`.
-
 > **Tier flag:** The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. Smart and autonomous tiers need an LLM backend — **post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0)** that is any of: local [Ollama](https://ollama.com), xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp server — selected via `AI_MEMORY_LLM_BACKEND`. The `--tier` flag **must** be passed in the args — the `config.toml` tier setting is not used when the MCP server is launched by an AI client.
 
 > **Important:** MCP servers are **not** configured in `settings.json` or `settings.local.json` — those files do not support `mcpServers`.
@@ -364,7 +361,7 @@ Verify: `ai-memory boot --quiet --limit 1` should report `llm=xai:grok-4.3`. Can
 <details>
 <summary><strong>OpenAI Codex CLI</strong></summary>
 
-Add to `~/.codex/config.toml` (global) or `.codex/config.toml` (project). Windows: `%USERPROFILE%\.codex\config.toml`. Override with `CODEX_HOME` env var.
+Add to `~/.codex/config.toml` (global) or `.codex/config.toml` (project). Override with `CODEX_HOME` env var.
 
 ```toml
 [mcp_servers.memory]
@@ -382,7 +379,7 @@ Or add via CLI: `codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory
 <details>
 <summary><strong>Google Gemini CLI</strong></summary>
 
-Add to `~/.gemini/settings.json` (user) or `.gemini/settings.json` (project). Windows: `%USERPROFILE%\.gemini\settings.json`.
+Add to `~/.gemini/settings.json` (user) or `.gemini/settings.json` (project).
 
 ```json
 {
@@ -405,7 +402,7 @@ Or add via CLI: `gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memor
 <details>
 <summary><strong>Cursor IDE</strong></summary>
 
-Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project). Windows: `%USERPROFILE%\.cursor\mcp.json`. Project config overrides global for same-named servers.
+Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project). Project config overrides global for same-named servers.
 
 ```json
 {
@@ -425,7 +422,7 @@ Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project). Windows: `
 <details>
 <summary><strong>Windsurf</strong> (Codeium)</summary>
 
-Add to `~/.codeium/windsurf/mcp_config.json` (global only — no project-level scope). Windows: `%USERPROFILE%\.codeium\windsurf\mcp_config.json`.
+Add to `~/.codeium/windsurf/mcp_config.json` (global only — no project-level scope).
 
 ```json
 {
@@ -445,7 +442,7 @@ Add to `~/.codeium/windsurf/mcp_config.json` (global only — no project-level s
 <details>
 <summary><strong>Continue.dev</strong></summary>
 
-Add to `~/.continue/config.yaml` (user) or `.continue/mcpServers/` directory in project root (per-server YAML/JSON files). Windows: `%USERPROFILE%\.continue\config.yaml`.
+Add to `~/.continue/config.yaml` (user) or `.continue/mcpServers/` directory in project root (per-server YAML/JSON files).
 
 ```yaml
 mcpServers:

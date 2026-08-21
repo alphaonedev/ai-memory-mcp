@@ -181,7 +181,7 @@ In addition to §3.2, AI agents must confirm with the accountable human before:
 
 - Modifying CI workflow files (`.github/workflows/*.yml`)
 - Adding, upgrading, downgrading, or removing dependencies (`Cargo.toml`, `Cargo.lock`)
-- Touching the `debian/`, `nfpm.yaml`, `Dockerfile`, `install.sh`, `install.ps1`,
+- Touching the `debian/`, `nfpm.yaml`, `Dockerfile`, `install.sh`,
   `ai-memory.spec`, `server.json`, or other packaging files
 - Schema migrations or changes to on-disk DB layout
 - Public API changes (MCP tool definitions, HTTP endpoint signatures, CLI flags)

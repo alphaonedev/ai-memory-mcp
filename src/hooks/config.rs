@@ -543,9 +543,8 @@ pub fn spawn_reload_task(
 
 // On non-unix platforms SIGHUP doesn't exist. The daemon is
 // unix-only in practice (the Linux/macOS systemd + launchd
-// units are the only supported deployments), so this is a stub
-// to keep the windows build green for tooling like `cargo
-// check --target x86_64-pc-windows-msvc`.
+// units are the only supported deployments), so this is a
+// defensive stub kept for any non-unix `cargo check`.
 #[cfg(not(unix))]
 pub fn spawn_reload_task(
     _path: PathBuf,

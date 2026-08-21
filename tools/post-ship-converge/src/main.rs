@@ -290,9 +290,6 @@ fn install_published_binary(method: InstallMethod, version: &str) -> Result<Path
                 return Err("tar -xzf failed".to_string());
             }
 
-            #[cfg(windows)]
-            let bin = install_dir.join("ai-memory.exe");
-            #[cfg(not(windows))]
             let bin = install_dir.join("ai-memory");
             if !bin.exists() {
                 return Err(format!("installed binary missing at {}", bin.display()));

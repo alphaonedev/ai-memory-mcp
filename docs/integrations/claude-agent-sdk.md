@@ -25,7 +25,7 @@ message of the form `<preamble>\n\n<boot output>`, spawns the named
 agent CLI with that message delivered via the appropriate strategy
 (`--system <msg>` for most agents, env var for Ollama, message file
 for aider), and propagates the agent's exit code. Pure Rust — same
-binary works on macOS / Linux / Windows / Docker / Kubernetes with
+binary works on macOS / Linux / Docker / Kubernetes with
 no shell wrapper.
 
 For SDK code that constructs requests directly, the patterns below

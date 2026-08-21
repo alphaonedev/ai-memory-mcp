@@ -64,9 +64,8 @@ ai-memory inverts that:
   RISC-V (BeagleV, VisionFive 2, SiFive — buildable today from
   source, prebuilt artifacts remain on the roadmap).
 - **Operating systems**: macOS, Linux, Android, iOS, FreeBSD,
-  Windows (via WSL on the desktop; native MSVC build at
-  `release.yml`'s `x86_64-pc-windows-msvc` job), and any
-  POSIX-ish system that can host a static-linked Rust binary.
+  and any POSIX-ish system that can host a static-linked Rust
+  binary.
 - **No phone-home, no telemetry, no outbound calls** unless the
   operator opts into federation or a hosted LLM provider. Plays
   cleanly on devices that may be air-gapped, intermittently
@@ -93,7 +92,6 @@ The canonical CI matrix is in
 | Desktop | macOS | x86_64 (Intel) | `x86_64-apple-darwin` | Prebuilt binary on every release |
 | Desktop | Linux | x86_64 | `x86_64-unknown-linux-gnu` | Prebuilt binary on every release |
 | Desktop | Linux | aarch64 (server / Pi / Graviton) | `aarch64-unknown-linux-gnu` | Prebuilt binary on every release |
-| Desktop | Windows | x86_64 | `x86_64-pc-windows-msvc` | Prebuilt binary on every release |
 | Phone | iOS | aarch64 device | `aarch64-apple-ios` | Build pipeline GREEN; linkable staticlib in `.xcframework.tar.gz`. FFI surface: single `ai_memory_version()` symbol shipped; broader C-ABI deferred to v1.x (#1977). |
 | Phone | iOS Simulator | aarch64 (Apple Silicon Mac) | `aarch64-apple-ios-sim` | Build + runtime test GREEN (mobile-runtime workflow) |
 | Phone | iOS Simulator | x86_64 (Intel Mac) | `x86_64-apple-ios` | Build pipeline GREEN; Intel runner image is on its EOL path so runtime arm not run in CI |
@@ -608,7 +606,6 @@ Every release tag publishes (under
 
 - `ai-memory-{aarch64,x86_64}-{apple-darwin,unknown-linux-gnu}.tar.gz`
   — desktop / server / Pi / Mac binaries
-- `ai-memory-x86_64-pc-windows-msvc.zip` — Windows binary
 - `ai-memory-ios.xcframework.tar.gz` — iOS xcframework (3 slices)
 - `ai-memory-android.tar.gz` — Android `.aar`-shaped archive
   with 4 ABIs under `jniLibs/<abi>/`

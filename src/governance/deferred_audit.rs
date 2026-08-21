@@ -81,9 +81,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
-#[cfg(windows)]
-#[path = "deferred_audit_windows.rs"]
-mod windows_private;
 use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender},
     oneshot,
@@ -130,7 +127,7 @@ const JOURNAL_SPOOL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const JOURNAL_LEGACY_REPLAY_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const JOURNAL_OVERFLOW_MARKER_LIMIT: usize = 256;
 const JOURNAL_OVERFLOW_PREFIX: &str = ".overflow-";
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 const SPOOL_ANCESTOR_LABEL: &str = "deferred-audit spool ancestor";
 const JOURNAL_OVERFLOW_SATURATED: &str = ".overflow-saturated";
 const JOURNAL_OVERFLOW_MARKER_LABEL: &str = "deferred-audit overflow marker";
@@ -970,21 +967,6 @@ fn journal_spool_dir(journal_path: &Path) -> PathBuf {
     PathBuf::from(spool_os)
 }
 
-#[cfg(windows)]
-fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File, Vec<File>)> {
-    let parent = spool_dir
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let ancestor_guards = windows_private::open_spool_ancestor_guards(parent)?;
-    let (directory, created) = windows_private::create_or_open_private_directory(spool_dir)?;
-    if created {
-        sync_directory(parent).context("fsync deferred-audit spool parent")?;
-    }
-    Ok((created, directory, ancestor_guards))
-}
-
-#[cfg(not(windows))]
 fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File, Vec<File>)> {
     #[cfg(unix)]
     validate_spool_ancestor_chain(spool_dir)?;
@@ -1176,20 +1158,7 @@ fn sync_directory(path: &Path) -> Result<()> {
         File::open(path)?.sync_all()?;
         return Ok(());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_WRITE_THROUGH)
-            .open(path)?
-            .sync_all()?;
-        return Ok(());
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     anyhow::bail!("directory durability is unsupported on this platform");
 }
 
@@ -1420,21 +1389,14 @@ fn read_journal_frame_bounded(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn open_frame_file(path: &Path) -> Result<File> {
-    #[cfg(windows)]
-    {
-        return windows_private::open_private_file(path, "deferred-audit journal frame", false);
-    }
-    #[cfg(not(windows))]
-    {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        apply_no_follow(&mut options);
-        let file = options.open(path)?;
-        ensure_regular_file(&file, "journal frame")?;
-        #[cfg(unix)]
-        validate_unix_private_file(&file, "journal frame")?;
-        Ok(file)
-    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    apply_no_follow(&mut options);
+    let file = options.open(path)?;
+    ensure_regular_file(&file, "journal frame")?;
+    #[cfg(unix)]
+    validate_unix_private_file(&file, "journal frame")?;
+    Ok(file)
 }
 
 fn ensure_regular_file(file: &File, label: &str) -> Result<()> {
@@ -1445,62 +1407,48 @@ fn ensure_regular_file(file: &File, label: &str) -> Result<()> {
 }
 
 fn open_or_create_private_file(path: &Path, label: &str) -> Result<File> {
-    #[cfg(windows)]
-    {
-        return windows_private::open_or_create_private_file(path, label);
-    }
-    #[cfg(not(windows))]
-    {
-        let open = |create_new: bool| -> std::io::Result<File> {
-            let mut options = OpenOptions::new();
-            options.read(true).write(true).create_new(create_new);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
-            }
-            apply_no_follow(&mut options);
-            options.open(path)
-        };
-        let file = match open(true) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                open(false).with_context(|| format!("open existing {label} {}", path.display()))?
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("create {label} {}", path.display()));
-            }
-        };
-        ensure_regular_file(&file, label)?;
-        #[cfg(unix)]
-        validate_unix_private_file(&file, label)?;
-        Ok(file)
-    }
-}
-
-fn create_new_private_file(path: &Path, label: &str) -> Result<File> {
-    #[cfg(windows)]
-    {
-        return windows_private::create_new_private_file(path, label);
-    }
-    #[cfg(not(windows))]
-    {
+    let open = |create_new: bool| -> std::io::Result<File> {
         let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
+        options.read(true).write(true).create_new(create_new);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
         apply_no_follow(&mut options);
-        let file = options
-            .open(path)
-            .with_context(|| format!("create private {label} {}", path.display()))?;
-        ensure_regular_file(&file, label)?;
-        #[cfg(unix)]
-        validate_unix_private_file(&file, label)?;
-        Ok(file)
+        options.open(path)
+    };
+    let file = match open(true) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            open(false).with_context(|| format!("open existing {label} {}", path.display()))?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("create {label} {}", path.display()));
+        }
+    };
+    ensure_regular_file(&file, label)?;
+    #[cfg(unix)]
+    validate_unix_private_file(&file, label)?;
+    Ok(file)
+}
+
+fn create_new_private_file(path: &Path, label: &str) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
+    apply_no_follow(&mut options);
+    let file = options
+        .open(path)
+        .with_context(|| format!("create private {label} {}", path.display()))?;
+    ensure_regular_file(&file, label)?;
+    #[cfg(unix)]
+    validate_unix_private_file(&file, label)?;
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -1694,12 +1642,6 @@ fn apply_no_follow(options: &mut OpenOptions) {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
 }
 
@@ -3906,20 +3848,9 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn fresh_tempdir() -> tempfile::TempDir {
-        #[cfg(windows)]
-        let scratch = {
-            let local_data = std::env::var_os("LOCALAPPDATA")
-                .expect("Windows deferred-audit tests require LOCALAPPDATA");
-            let scratch = PathBuf::from(local_data).join("ai-memory-deferred-audit-tests");
-            let (_guard, _created) = windows_private::create_or_open_private_directory(&scratch)
-                .expect("create protected Windows deferred-audit test scratch");
-            scratch
-        };
-        #[cfg(not(windows))]
         let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".local-runs")
             .join("test-tmp");
-        #[cfg(not(windows))]
         std::fs::create_dir_all(&scratch).expect("create repository-owned test scratch");
         #[cfg(unix)]
         {
@@ -5494,274 +5425,6 @@ mod tests {
         assert_eq!(imported, 0);
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_artifacts_use_protected_owner_only_dacls() {
-        let dir = fresh_tempdir();
-        let path = dir.path().join("windows-private.journal");
-        let event = DeferredAuditEvent::from_refusal(
-            "agent:windows-private",
-            &refusal_action(),
-            &refusal_decision(),
-        )
-        .unwrap();
-        let journal = DeferredAuditJournal::open(&path).unwrap();
-        journal.append(&event).unwrap();
-
-        windows_private::validate_private_path_for_test(&journal.spool_dir, true).unwrap();
-        windows_private::validate_private_path_for_test(&path, false).unwrap();
-        windows_private::validate_private_path_for_test(&journal.lock_path, false).unwrap();
-        windows_private::validate_private_path_for_test(
-            &journal
-                .find_spool_path(event.occurrence_id.as_deref().unwrap())
-                .unwrap()
-                .unwrap(),
-            false,
-        )
-        .unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_retained_guards_block_live_ancestor_rename() {
-        let dir = fresh_tempdir();
-        let guarded_ancestor = dir.path().join("guarded-ancestor");
-        let journal_parent = guarded_ancestor.join("journal-parent");
-        std::fs::create_dir_all(&journal_parent).unwrap();
-        let path = journal_parent.join("windows-rename-guard.journal");
-        let journal = DeferredAuditJournal::open(&path).unwrap();
-        let displaced = dir.path().join("displaced-ancestor");
-
-        assert!(
-            std::fs::rename(&guarded_ancestor, &displaced).is_err(),
-            "retained non-delete-sharing handles must block a live ancestor swap"
-        );
-        drop(journal);
-        std::fs::rename(&guarded_ancestor, &displaced).unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_rejects_lexical_ancestor_reparse() {
-        use std::os::windows::fs::symlink_dir;
-
-        let dir = fresh_tempdir();
-        let target = dir.path().join("target");
-        let target_parent = target.join("db");
-        std::fs::create_dir_all(&target_parent).unwrap();
-        let junction = dir.path().join("junction");
-        symlink_dir(&target, &junction).unwrap();
-
-        assert!(windows_private::open_spool_ancestor_guards(&junction.join("db")).is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_rejects_untrusted_ancestor_delete_authority() {
-        let dir = fresh_tempdir();
-        let exposed_parent = dir.path().join("exposed-parent");
-        windows_private::create_permissive_path_for_test(&exposed_parent, true).unwrap();
-        let path = exposed_parent.join("unsafe-ancestor.journal");
-
-        assert!(DeferredAuditJournal::open(&path).is_err());
-        assert!(!journal_spool_dir(&path).exists());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_ancestor_policy_pins_each_dangerous_right() {
-        let dir = fresh_tempdir();
-        // SDDL's `DC` mnemonic is the directory-services DELETE_CHILD bit
-        // (0x2), not the filesystem FILE_DELETE_CHILD bit (0x40). Inject the
-        // numeric filesystem mask so this integration test exercises the same
-        // right as `ancestor_mask_is_dangerous` and the pure mask test.
-        for (index, rights) in ["0x00000040", "SD", "WD", "WO", "GA"]
-            .into_iter()
-            .enumerate()
-        {
-            let ancestor = dir.path().join(format!("dangerous-{index}"));
-            windows_private::create_ancestor_grant_for_test(&ancestor, rights).unwrap();
-            assert!(
-                windows_private::open_spool_ancestor_guards(&ancestor).is_err(),
-                "untrusted {rights} grant must fail closed"
-            );
-        }
-
-        let benign = dir.path().join("benign-read-grant");
-        windows_private::create_ancestor_grant_for_test(&benign, "GRGX").unwrap();
-        assert!(windows_private::open_spool_ancestor_guards(&benign).is_ok());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_rejects_permissive_preplanted_artifacts() {
-        let dir = fresh_tempdir();
-
-        let spool_journal = dir.path().join("permissive-spool.journal");
-        let spool = journal_spool_dir(&spool_journal);
-        windows_private::create_permissive_path_for_test(&spool, true).unwrap();
-        assert!(DeferredAuditJournal::open(&spool_journal).is_err());
-
-        let legacy = dir.path().join("permissive-legacy.journal");
-        windows_private::create_permissive_path_for_test(&legacy, false).unwrap();
-        assert!(DeferredAuditJournal::open(&legacy).is_err());
-
-        let lock_journal = dir.path().join("permissive-lock.journal");
-        let lock_spool = journal_spool_dir(&lock_journal);
-        let (_created, directory, _ancestor_guards) =
-            create_or_validate_spool_dir(&lock_spool).unwrap();
-        drop(directory);
-        windows_private::create_permissive_path_for_test(&lock_spool.join(".lock"), false).unwrap();
-        assert!(DeferredAuditJournal::open(&lock_journal).is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_rejects_permissive_event_and_marker_preplants() {
-        let dir = fresh_tempdir();
-        let path = dir.path().join("permissive-spool-files.journal");
-        let event = DeferredAuditEvent::from_refusal(
-            "agent:windows-preplant",
-            &refusal_action(),
-            &refusal_decision(),
-        )
-        .unwrap();
-        let journal = DeferredAuditJournal::open(&path).unwrap();
-        journal.append(&event).unwrap();
-        let event_path = journal
-            .find_spool_path(event.occurrence_id.as_deref().unwrap())
-            .unwrap()
-            .unwrap();
-        let marker = journal
-            .spool_dir
-            .join(format!("{JOURNAL_OVERFLOW_PREFIX}000"));
-        drop(journal);
-
-        std::fs::remove_file(&event_path).unwrap();
-        windows_private::create_permissive_path_for_test(&event_path, false).unwrap();
-        assert!(DeferredAuditJournal::open(&path).is_err());
-
-        std::fs::remove_file(&event_path).unwrap();
-        windows_private::create_permissive_path_for_test(&marker, false).unwrap();
-        assert!(create_private_marker(&marker, b"must not be suppressed").is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_rejects_legacy_inherited_and_noncanonical_dacls_without_repair() {
-        let dir = fresh_tempdir();
-
-        let legacy_dir = dir.path().join("legacy-parent");
-        let inherited = legacy_dir.join("legacy-inherited.event");
-        windows_private::create_legacy_inherited_file_for_test(&legacy_dir, &inherited).unwrap();
-        assert!(windows_private::validate_private_path_for_test(&inherited, false).is_err());
-        assert!(
-            inherited.exists(),
-            "rejection must not delete legacy evidence"
-        );
-        assert!(windows_private::validate_private_path_for_test(&inherited, false).is_err());
-
-        let extra_ace = dir.path().join("extra-ace.event");
-        windows_private::create_extra_ace_path_for_test(&extra_ace).unwrap();
-        assert!(windows_private::validate_private_path_for_test(&extra_ace, false).is_err());
-        assert!(
-            extra_ace.exists(),
-            "rejection must not repair or delete evidence"
-        );
-
-        let null_dacl = dir.path().join("null-dacl.event");
-        windows_private::create_null_dacl_path_for_test(&null_dacl).unwrap();
-        assert!(windows_private::validate_private_path_for_test(&null_dacl, false).is_err());
-        assert!(
-            null_dacl.exists(),
-            "rejection must not repair or delete evidence"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_publish_ack_and_reopen_runtime() {
-        let dir = fresh_tempdir();
-        let path = dir.path().join("windows-durability.journal");
-        let event = DeferredAuditEvent::from_refusal(
-            "agent:windows",
-            &refusal_action(),
-            &refusal_decision(),
-        )
-        .unwrap();
-        let journal = DeferredAuditJournal::open(&path).unwrap();
-        journal.append(&event).unwrap();
-        let replayed = journal.replay().unwrap();
-        assert_eq!(replayed.len(), 1);
-        assert_eq!(replayed[0].occurrence_id, event.occurrence_id);
-        journal.acknowledge(&event).unwrap();
-        drop(journal);
-        assert!(
-            DeferredAuditJournal::open(path)
-                .unwrap()
-                .replay()
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_supports_extended_length_paths() {
-        use std::os::windows::ffi::OsStrExt as _;
-
-        let dir = fresh_tempdir();
-        let mut nested = dir.path().to_path_buf();
-        for index in 0..4 {
-            nested.push(format!("segment-{index}-{}", "x".repeat(70)));
-        }
-        std::fs::create_dir_all(&nested).expect("create long protected test path");
-        let journal_path = nested.join("extended-length-audit.journal");
-        assert!(
-            journal_path.as_os_str().encode_wide().count() > 260,
-            "fixture must exceed legacy MAX_PATH"
-        );
-
-        let journal = DeferredAuditJournal::open(&journal_path).expect("open long-path journal");
-        let event = DeferredAuditEvent::from_refusal(
-            "agent:long-path",
-            &refusal_action(),
-            &refusal_decision(),
-        )
-        .unwrap();
-        journal.append(&event).expect("append long-path event");
-        drop(journal);
-
-        let replayed = DeferredAuditJournal::open(&journal_path)
-            .expect("reopen long-path journal")
-            .replay()
-            .expect("replay long-path journal");
-        assert_eq!(replayed.len(), 1);
-        assert_eq!(replayed[0].agent_id, "agent:long-path");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn journal_windows_rejects_device_and_generic_verbatim_namespaces() {
-        windows_private::wide_path_for_test(Path::new(
-            r"\\?\vOlUmE{12345678-1234-1234-1234-123456789abc}\directory\audit.journal",
-        ))
-        .expect("rooted volume-GUID namespace must be accepted case-insensitively");
-
-        for path in [
-            Path::new(r"\\.\PhysicalDrive0"),
-            Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1"),
-        ] {
-            let error = windows_private::wide_path_for_test(path)
-                .expect_err("non-filesystem Windows namespace must fail closed");
-            assert!(
-                error
-                    .to_string()
-                    .contains("unsupported Windows device or verbatim path namespace")
-            );
-        }
-    }
-
     #[test]
     fn journal_quota_refuses_unjournaled_queue_delivery() {
         let dir = fresh_tempdir();
@@ -5951,7 +5614,7 @@ mod tests {
         assert!(journal.append(&event).is_err());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     #[test]
     fn journal_rejects_replaced_spool_directory_identity() {
         let dir = fresh_tempdir();

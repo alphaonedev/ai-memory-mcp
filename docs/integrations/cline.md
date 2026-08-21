@@ -40,10 +40,6 @@ Swap `Code` for `Code - Insiders` (VS Code Insiders) or `VSCodium`
 version: Cline → Settings → MCP Servers → **Configure** opens this file
 directly. Pass it to the installer via `--config <that path>`.
 
-On Windows the `command` must be the full `.exe` path and use forward
-slashes in JSON, e.g. `"command": "C:/Users/<you>/.local/bin/ai-memory.exe"`
-with `"args": ["--db", "C:/Users/<you>/.local/share/ai-memory/memories.db", "mcp", "--tier", "smart"]`.
-
 ## Part 1 — MCP server
 
 ```json
