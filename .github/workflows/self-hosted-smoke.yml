@@ -1,0 +1,56 @@
+# Self-hosted CI node smoke test — validates that the linux-fed and macos-fed
+# runners can check out, see a Rust toolchain, and reach their native
+# enterprise-federation pg tier (pg18.6 + AGE 1.8.0 + pgvector 0.8.6) over TLS.
+# Manual (workflow_dispatch) — a pre-flight for the full self-hosted CI rewrite.
+name: Self-hosted node smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - { label: linux-fed, os: Linux }
+          - { label: macos-fed, os: macOS }
+    name: smoke (${{ matrix.node.label }})
+    runs-on: [self-hosted, "${{ matrix.node.label }}"]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner + toolchain info
+        run: |
+          echo "runner=$RUNNER_NAME os=$RUNNER_OS arch=$(uname -m)"
+          for d in /opt/homebrew/opt/postgresql@18/bin /usr/lib/postgresql/18/bin "$HOME/.cargo/bin"; do
+            [ -d "$d" ] && export PATH="$d:$PATH"
+          done
+          echo "PATH=$PATH"
+          command -v cargo >/dev/null && cargo --version || { echo "::error::cargo not found on $RUNNER_NAME"; exit 1; }
+          command -v git >/dev/null && git --version
+
+      - name: Enterprise-fed tier reachability (TLS + extensions)
+        run: |
+          set -euo pipefail
+          for d in /opt/homebrew/opt/postgresql@18/bin /usr/lib/postgresql/18/bin; do
+            [ -d "$d" ] && export PATH="$d:$PATH"
+          done
+          command -v psql >/dev/null || { echo "::error::psql not found on $RUNNER_NAME"; exit 1; }
+          test -f "$HOME/.ai-memory-ci-fed-url" || { echo "::error::missing $HOME/.ai-memory-ci-fed-url"; exit 1; }
+          URL="$(cat "$HOME/.ai-memory-ci-fed-url")"
+          echo "--- TLS session ---"
+          psql "$URL" -v ON_ERROR_STOP=1 -tAc "SELECT 'ssl='||ssl||' '||version||' '||cipher FROM pg_stat_ssl WHERE pid=pg_backend_pid();"
+          echo "--- certified extensions ---"
+          psql "$URL" -v ON_ERROR_STOP=1 -tAc "SELECT extname||' '||extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname;"
+          echo "--- plaintext must be refused ---"
+          if psql "$(printf '%s' "$URL" | sed 's/sslmode=verify-full/sslmode=disable/')" -tAc "SELECT 1" 2>/dev/null; then
+            echo "::error::plaintext connection SUCCEEDED — TLS not enforced on $RUNNER_NAME"; exit 1
+          else
+            echo "plaintext refused ✓"
+          fi
+          echo "TIER OK on $RUNNER_NAME"
