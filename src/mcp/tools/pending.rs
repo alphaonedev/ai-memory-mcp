@@ -426,15 +426,15 @@ pub fn handle_pending_approve(
                 "approved": false,
                 "status": "pending",
                 "id": id,
-                "signed_votes": distinct,
-                "signed_quorum": threshold,
-                "reason": "signed approval quorum not yet met",
+                (crate::approvals::signed::SIGNED_VOTES_FIELD): distinct,
+                (crate::approvals::signed::SIGNED_QUORUM_FIELD): threshold,
+                "reason": crate::approvals::signed::SIGNED_QUORUM_NOT_YET_MET,
             }));
         }
         crate::approvals::signed::GateVerdict::Refused(e) => {
             // #2634 / #2643 — a rejected signature quorum is a refusal.
             audit_pending_verdict(&agent_id, id, "refuse");
-            return Err(format!("signed approval rejected: {e}"));
+            return Err(crate::approvals::signed::signed_approval_rejected(&e));
         }
     }
 

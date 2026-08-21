@@ -300,9 +300,9 @@ pub(crate) fn run_http_signed_gate<F: Fn(&str)>(
                     "approved": false,
                     "status": "pending",
                     "id": pending_id,
-                    "signed_votes": distinct,
-                    "signed_quorum": threshold,
-                    "reason": "signed approval quorum not yet met",
+                    (signed::SIGNED_VOTES_FIELD): distinct,
+                    (signed::SIGNED_QUORUM_FIELD): threshold,
+                    "reason": signed::SIGNED_QUORUM_NOT_YET_MET,
                 })),
             )
                 .into_response())
@@ -312,7 +312,7 @@ pub(crate) fn run_http_signed_gate<F: Fn(&str)>(
             audit_verdict("refuse");
             Err((
                 StatusCode::FORBIDDEN,
-                Json(json!({ "error": format!("signed approval rejected: {e}") })),
+                Json(json!({ "error": signed::signed_approval_rejected(&e) })),
             )
                 .into_response())
         }

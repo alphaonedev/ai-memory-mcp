@@ -376,6 +376,27 @@ pub mod signed {
     /// reason.
     pub const ESCALATION_REASON_KEY: &str = "escalation_reason";
 
+    /// #2355 — the shared `reason` text a signed-approval funnel returns when
+    /// the m-of-n quorum has been partially met but not yet reached. One
+    /// definition, referenced by every approve funnel (MCP + 4 HTTP + CLI) so
+    /// the wire message never drifts between surfaces.
+    pub const SIGNED_QUORUM_NOT_YET_MET: &str = "signed approval quorum not yet met";
+    /// #2355 — response field name: the distinct valid enrolled signer count
+    /// accumulated so far toward the m-of-n threshold.
+    pub const SIGNED_VOTES_FIELD: &str = "signed_votes";
+    /// #2355 — response field name: the m-of-n signed-approval threshold.
+    pub const SIGNED_QUORUM_FIELD: &str = "signed_quorum";
+
+    /// #2355 — the shared refusal message a signed-approval funnel returns when
+    /// the gate fails closed (missing-when-required / forged / unenrolled /
+    /// un-decodable). A helper (not a `const`) because the `QuorumError` detail
+    /// is interpolated; every funnel (MCP tool error, HTTP 403 body, CLI
+    /// `bail!`) formats it ONE way here.
+    #[must_use]
+    pub fn signed_approval_rejected(e: &QuorumError) -> String {
+        format!("signed approval rejected: {e}")
+    }
+
     /// One detached approval signature presented by an approver.
     #[derive(Debug, Clone)]
     pub struct SignedApproval {

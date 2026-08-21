@@ -529,9 +529,9 @@ pub fn run_pending(
                                 "approved": false,
                                 "status": "pending",
                                 "id": id,
-                                "signed_votes": distinct,
-                                "signed_quorum": threshold,
-                                "reason": "signed approval quorum not yet met",
+                                (crate::approvals::signed::SIGNED_VOTES_FIELD): distinct,
+                                (crate::approvals::signed::SIGNED_QUORUM_FIELD): threshold,
+                                "reason": crate::approvals::signed::SIGNED_QUORUM_NOT_YET_MET,
                             })
                         )?;
                     } else {
@@ -547,7 +547,9 @@ pub fn run_pending(
                     // Fail closed: missing-when-required / forged / unenrolled.
                     // `bail!` gives a clean refusal + nonzero exit (anyhow main),
                     // and — unlike `process::exit` — is unit-testable.
-                    anyhow::bail!("signed approval rejected: {e}");
+                    return Err(anyhow::anyhow!(
+                        crate::approvals::signed::signed_approval_rejected(&e)
+                    ));
                 }
             }
 
