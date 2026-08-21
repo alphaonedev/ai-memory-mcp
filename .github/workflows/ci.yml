@@ -823,7 +823,7 @@ jobs:
       # impact-aware dispatch invariants keep their exact `cargo test` shape;
       # the captured log is the honest durable record of what ran.
       - name: Upload test results (durable audit history)
-        if: needs.classify.outputs.docs_only != 'true' && always()
+        if: needs.classify.outputs.docs_only != 'true' && always() && env.TEST_RESULT_LOG != ''
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.node }}-${{ matrix.tier }}
