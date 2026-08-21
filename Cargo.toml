@@ -306,7 +306,7 @@ test-with-models = []
 e2e = []
 # #1765 (v0.8.0) — OS-agnostic remote syslog sink: RFC 5424 over TCP, with
 # optional rustls TLS (RFC 5425), to a collector/SIEM. Pure network I/O so it
-# behaves identically on Linux/macOS/Windows/mobile. OFF by default and
+# behaves identically on Linux/macOS/mobile. OFF by default and
 # zero-cost when off (the `LogSink::Syslog` writer + framer in `src/logging.rs`
 # are entirely `#[cfg(feature = "syslog")]`-gated). Reuses the existing rustls
 # 0.23 + chrono + gethostname deps — NO new dependency (the re-scope dropped the
@@ -405,11 +405,6 @@ libc = "0.2"
 # hash chain, not the file flag.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-# Deferred-audit crash evidence is created with an explicit protected DACL and
-# validated by handle on Windows. Keep the Win32 surface target-only.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [[bench]]
 name = "recall"
@@ -609,7 +604,7 @@ too_many_lines = { level = "warn", priority = -1 }
 # target: `libai_memory.so` lands under `jniLibs/<abi>/` in the
 # `.aar`-compatible archive produced by `release.yml`'s
 # `mobile-android` job. Neither additional crate-type changes default
-# `cargo build` behavior on linux / macOS / windows — they just emit
+# `cargo build` behavior on linux / macOS — they just emit
 # additional artifacts under `target/<profile>/`. The C-callable FFI
 # surface itself lands in a follow-up (#1068 Layer 2 v0.7.x or
 # #1069 wrapper SDK); v0.7.0 Layer 2 only validates that the BUILD

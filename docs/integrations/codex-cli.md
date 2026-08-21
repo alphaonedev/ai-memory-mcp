@@ -15,7 +15,7 @@ conversation.
 ## Use `ai-memory wrap` (recommended — pure Rust, cross-platform)
 
 PR-6 of issue #487 ships a built-in subcommand that does the wrapping
-in Rust with no shell. Same code path on macOS / Linux / Windows /
+in Rust with no shell. Same code path on macOS / Linux /
 Docker / Kubernetes. No bash, no PowerShell, no `chmod +x`, no
 `%PATH%` quirks.
 

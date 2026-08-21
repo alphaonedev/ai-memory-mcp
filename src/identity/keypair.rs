@@ -18,15 +18,13 @@
 //! | `<agent_id>.pub`      | `0o644`     | 32 raw bytes — `VerifyingKey::to_bytes()`   |
 //! | `<agent_id>.priv`     | `0o600`     | 32 raw bytes — `SigningKey::to_bytes()`     |
 //!
-//! On Windows the mode bits do not apply; the files are created with
-//! the inherited ACL of the parent directory. This is a known coverage
-//! gap for the OSS layer — see "Hardware-backed key storage" below.
+//! The supported platforms are Linux and macOS, both of which honour the
+//! Unix mode bits above.
 //!
 //! The default key directory is `dirs::config_dir().join("ai-memory/keys/")`
-//! on every platform (`~/.config/ai-memory/keys/` on Linux,
-//! `~/Library/Application Support/ai-memory/keys/` on macOS,
-//! `%APPDATA%\ai-memory\keys\` on Windows). The CLI will create it on
-//! first use.
+//! (`~/.config/ai-memory/keys/` on Linux,
+//! `~/Library/Application Support/ai-memory/keys/` on macOS). The CLI will
+//! create it on first use.
 //!
 //! # Hardware-backed key storage is OUT of OSS scope
 //!
@@ -186,7 +184,7 @@ pub fn key_dir_env_override() -> Option<PathBuf> {
 /// `dirs::config_dir().join("ai-memory/keys/")`.
 ///
 /// Errors when the OS does not advertise a config dir (extremely rare;
-/// every supported target — Linux, macOS, Windows — returns one).
+/// every supported target — Linux, macOS — returns one).
 ///
 /// `AI_MEMORY_KEY_DIR` env-var override: when set and non-empty, that
 /// path is returned verbatim. This mirrors the env-override pattern
@@ -638,11 +636,9 @@ pub fn list(dir: &Path) -> Result<Vec<AgentKeypair>> {
         let entry = entry?;
         let name = entry.file_name();
         // COVERAGE: name.to_str() None arm (line 276) reachable only
-        //           on Windows where filenames may contain non-UTF8
-        //           code units, or on Linux with weird filesystem
-        //           encoding. macOS NFD-normalises everything to
-        //           UTF-8 so the None arm doesn't fire on the dev
-        //           host. Exercised by GitHub Actions Windows CI.
+        //           on Linux with a non-UTF-8 filesystem encoding.
+        //           macOS NFD-normalises everything to UTF-8 so the None
+        //           arm doesn't fire on the dev host.
         let Some(name_str) = name.to_str() else {
             continue;
         };
@@ -849,9 +845,9 @@ pub(crate) fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Resul
 
 #[cfg(not(unix))]
 pub(crate) fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
-    // Windows/non-Unix: mode bits don't apply. The file inherits the
-    // parent directory ACL. Hardware-backed key storage on Windows is
-    // out of OSS scope — see the AgenticMem commercial layer.
+    // Non-Unix: mode bits don't apply. The file inherits the parent
+    // directory ACL. (Linux and macOS, the supported platforms, take the
+    // unix path above; this branch is a defensive fallback only.)
     //
     // v0.7.0 de-silencing: the requested restrictive `mode` cannot be
     // honored here, so the private key lands with whatever the parent

@@ -72,8 +72,8 @@ env:
 
 jobs:
   # Classify the diff so docs-only PRs can short-circuit the heavy Rust
-  # matrix instead of waiting ~12 min for Windows. Required status checks
-  # are still satisfied because the matrix jobs keep their names AND
+  # matrix instead of waiting on the full per-OS test build. Required status
+  # checks are still satisfied because the matrix jobs keep their names AND
   # complete with status SUCCESS — they just no-op on docs-only diffs.
   #
   # THE INVARIANT THIS JOB'S CONSUMERS MUST HONOUR (#2494 / #2496):
@@ -310,7 +310,7 @@ jobs:
           fi
 
   # Fast lint job — fmt + clippy on ubuntu only. Toolchain-portable, no
-  # need to run on macOS/Windows where it just duplicates work and burns
+  # need to run on macOS where it just duplicates work and burns
   # ~3 min per platform.
   #
   # #2494 doc-vs-reality fix: this comment previously read "Advisory (not
@@ -459,16 +459,7 @@ jobs:
     # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
     # download on the semantic-tier CLI recall path) fails fast instead of
     # pinning a runner for hours. Normal run is well under this.
-    #
-    # windows-latest gets a wider 60-min budget: this branch's
-    # Cargo.toml/src changes force the full test suite (TEST_IMPACT=__ALL__
-    # via scripts/ci-test-impact.sh), and the Windows runner's slower test
-    # execution + `cargo build --release` step legitimately approached the
-    # 45-min cap (run 26998232157 cancelled Check (windows-latest) at the
-    # cap with no hang). The Linux watchdog (`timeout` wrapper on the
-    # impact-aware test step, #1492) is Linux-gated, so Windows relies on
-    # this job-level budget instead.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 45 }}
+    timeout-minutes: 45
     env:
       # #1407/#1405/#1387 — the ubuntu `cargo test` link step OOM'd the
       # linker (`collect2: ld terminated with signal 7 [Bus error]`).
@@ -476,21 +467,13 @@ jobs:
       # level 1 (line tables only) to keep peak linker RSS under the
       # ~7 GB ubuntu ceiling. Cross-OS safe: only narrows debuginfo,
       # does not affect the `--release` build (debug=0). Mirrors the
-      # postgres-feature / coverage jobs' knob.
-      #
-      # CI-speed (windows): windows is the slowest of the three REQUIRED
-      # `Check (os)` gates (the only checks that block a merge to
-      # main/develop), and its `cargo test` cost is dominated by MSVC
-      # link + PDB generation. Drop dev debuginfo to 0 on windows ONLY so
-      # no PDB is generated/linked — pure link-time win, behavior-identical
-      # (tests pass/fail exactly the same; only panic backtraces lose
-      # line numbers, which ubuntu/macos still retain at debug=1). Keep
-      # ubuntu at 1 for the OOM posture above + readable backtraces.
-      CARGO_PROFILE_DEV_DEBUG: ${{ matrix.os == 'windows-latest' && '0' || '1' }}
+      # postgres-feature / coverage jobs' knob. Keep debug at 1 for the
+      # OOM posture above + readable backtraces.
+      CARGO_PROFILE_DEV_DEBUG: '1'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -553,7 +536,7 @@ jobs:
           # all integration bins under DEV_DEBUG=1 (full debug symbols)
           # exhausted the ubuntu runner disk on c3087e33 with
           # `rustc-LLVM ERROR: No space left on device`; the extra ~10 GiB
-          # restores headroom. macOS/Windows Check + Coverage were unaffected.
+          # restores headroom. macOS Check + Coverage were unaffected.
           # #1407 — add 8 GB swap on /mnt (ephemeral data disk) so the
           # heavy lib-test link step has headroom above the ~7 GB RAM
           # ceiling and stops dying with `ld ... signal 7 [Bus error]`.
@@ -595,32 +578,10 @@ jobs:
           df -h /
           echo "::endgroup::"
 
-      # #2960 — Windows reclaim. The windows-latest image ships a bundled
-      # Android SDK/NDK under C:\Android (~9-11 GiB) that a Rust build never
-      # uses; freeing it before any cargo step gives the debug test-compile
-      # +release build headroom against the same ENOSPC class. Uses pwsh
-      # (the Windows default shell) so no external tooling is required; the
-      # remove is best-effort. The drive report before/after makes the freed
-      # space (or a non-disk root cause) visible in the log.
-      - name: Free disk before tests (windows-latest, #2960)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          Write-Host "::group::Disk usage before cleanup (Windows)"
-          Get-PSDrive C | Select-Object Used,Free
-          Write-Host "::endgroup::"
-          foreach ($p in @('C:\Android', 'C:\Program Files (x86)\Android')) {
-            if (Test-Path $p) { Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue }
-          }
-          Write-Host "::group::Disk usage after cleanup (Windows)"
-          Get-PSDrive C | Select-Object Used,Free
-          Write-Host "::endgroup::"
-
       # #2452 — tests/conformance_readers.rs is now FAIL-CLOSED: an absent
       # python3/node is a test FAILURE, not a silent pass. Provision both
       # explicitly rather than relying on what each runner image happens to
-      # ship (notably, `python3` is not dependably on PATH on windows-latest
-      # — the tool-cache executable is `python.exe`). A controlled proof must
+      # ship. A controlled proof must
       # not depend on an image accident: without these steps the fix would
       # trade a silent pass for an environmental red, which is the pressure
       # that gets a test deleted. The dedicated, self-tested proof lives in
@@ -663,8 +624,8 @@ jobs:
       # via AI_MEMORY_T0_ORCHESTRATOR_BIN; the test uses the artifact and
       # skips the nested build (falling back to building when unset, so
       # local runs and the other OSes are unchanged). macOS-only: the
-      # nested build never flaked on ubuntu/windows, and skipping the step
-      # there keeps the tool build off the windows critical path.
+      # nested build never flaked on ubuntu, and skipping the step there
+      # keeps the tool build off the ubuntu critical path.
       - name: Prebuild t0 orchestrator (macOS e1 anti-flake, #1853)
         if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'macos-latest'
         shell: bash
@@ -725,17 +686,9 @@ jobs:
           # truly wedged process.
           #
           # The #1492 hang was observed ONLY on the ubuntu runner, and the
-          # watchdog is gated to Linux for two reasons:
-          #   1. macOS ships no `timeout` (coreutils, if present, is
-          #      g-prefixed `gtimeout`) — bare detection would crash the
-          #      step with `timeout: command not found`.
-          #   2. Windows' Git-bash DOES ship an MSYS coreutils `timeout`
-          #      that matches a naive `--version | grep coreutils` probe,
-          #      but it mishandles the native `cargo.exe` process-tree /
-          #      signal semantics: it fired falsely at the 1500s cap and
-          #      SIGTERM-killed the full Windows suite (exit 143 → step
-          #      exit 124) even though the suite completes under the 45-min
-          #      job cap. The original hang never occurred on Windows.
+          # watchdog is gated to Linux because macOS ships no `timeout`
+          # (coreutils, if present, is g-prefixed `gtimeout`) — bare
+          # detection would crash the step with `timeout: command not found`.
           # So restrict the watchdog to Linux (reliable GNU `timeout` +
           # POSIX process-group signal semantics over native test binaries)
           # and degrade to a bare `cargo test` everywhere else — the
@@ -840,8 +793,8 @@ jobs:
       # produced by release.yml on tag, and a release-profile-only break that
       # the debug `cargo test` build on ubuntu wouldn't already catch is
       # vanishingly rare for this pure-Rust + bundled-sqlite crate. Running it
-      # on ubuntu ONLY takes it off the windows critical path (-759s) and macos
-      # (-~400s) — the prep `cargo clean` step above is already ubuntu-only.
+      # on ubuntu ONLY takes it off the macos critical path (-~400s) — the
+      # prep `cargo clean` step above is already ubuntu-only.
       - name: Build release (ubuntu — release-profile smoke)
         if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
         run: cargo build --release

@@ -442,8 +442,8 @@ jobs:
     # `release.yml` published no `.sha256` asset for the tarballs the
     # installer downloads — so the fetch 404'd on every ordinary install,
     # the fail-open branch fired every time, and the verification step
-    # passed by DOING NOTHING. `install.ps1` verified nothing at all.
-    # HARD-BLOCKS a reintroduced fail-open branch in either installer and
+    # passed by DOING NOTHING.
+    # HARD-BLOCKS a reintroduced fail-open branch in `install.sh` and
     # any release artifact published without a sibling `.sha256`.
     name: Installer checksum fail-closed gate (#2449)
     runs-on: ubuntu-latest

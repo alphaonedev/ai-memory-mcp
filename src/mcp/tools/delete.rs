@@ -360,7 +360,7 @@ mod tests {
         // writers from each other, leaving every reader free to observe a
         // half-applied `ai:bob` and fail with "caller does not own this memory"
         // — which is exactly how `double_delete_errors_second_time` went red on
-        // the Windows leg. Readers must hold it too.
+        // a contended CI leg. Readers must hold it too.
         let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let mem = make_mem("doomed", "test");

@@ -91,7 +91,7 @@ three formats:
 |---|---|---|---|
 | **1. Hook-capable** | A documented session-start hook the user can configure | Hook runs `ai-memory boot`; stdout is injected as additional context. **100% reliable.** | Claude Code |
 | **2. MCP-capable, no hook** | An MCP client and a project-rules / system-prompt file but no session-start hook | `ai-memory-mcp` registered as an MCP server **plus** a one-line directive in the agent's rules file telling the model to call `memory_session_start` first. **Best-effort** (text-directive subject to model compliance). | Cursor, Cline, Continue, Windsurf, OpenClaw |
-| **3. Programmatic only** | An SDK or raw API where the developer assembles each request | Application code uses the SDK pattern (prepends `ai-memory boot` output to the system message). For the launcher case (just spawn a CLI), `ai-memory wrap <agent>` is the cross-platform Rust replacement for the bash / PowerShell wrappers earlier PRs shipped — it runs the same code path on macOS / Linux / Windows / Docker / Kubernetes. **100% reliable when implemented.** | Codex CLI, Claude Agent SDK, OpenAI Apps SDK / Assistants API / Responses API, Grok via xAI API, Hermes / local models via LM Studio / Ollama / vLLM |
+| **3. Programmatic only** | An SDK or raw API where the developer assembles each request | Application code uses the SDK pattern (prepends `ai-memory boot` output to the system message). For the launcher case (just spawn a CLI), `ai-memory wrap <agent>` is the cross-platform Rust replacement for the bash wrappers earlier PRs shipped — it runs the same code path on macOS / Linux / Docker / Kubernetes. **100% reliable when implemented.** | Codex CLI, Claude Agent SDK, OpenAI Apps SDK / Assistants API / Responses API, Grok via xAI API, Hermes / local models via LM Studio / Ollama / vLLM |
 
 The bar for "100% remediated" is: every supported agent has a recipe that
 loads memory on the first turn without user prompting. Categories 1 and 3
@@ -103,7 +103,7 @@ proper session-start hook (see issue #487 cross-files).
 PR-6 of issue #487 ships `ai-memory wrap <agent>`: a built-in
 cross-platform Rust subcommand that replaces the per-recipe bash and
 PowerShell wrappers earlier PRs shipped. The same binary runs on
-macOS / Linux / Windows / Docker / Kubernetes — no shell required.
+macOS / Linux / Docker / Kubernetes — no shell required.
 
 `ai-memory wrap`:
 
@@ -167,7 +167,7 @@ recipe's snippets and `ai-memory wrap <agent>` (PR-6).
 | [`grok-and-xai.md`](grok-and-xai.md) | xAI Grok | 3 (programmatic) | n/a (programmatic) | recipe |
 | [`grok-build.md`](grok-build.md) | xAI Grok Build / Grok Shell (`grok` CLI) | 1+2 hybrid (MCP stdio + session-boot hooks + permission gates) | yes (--config) | reference recipe |
 | [`local-models.md`](local-models.md) | Hermes, Llama, Mistral, etc. via LM Studio / Ollama / vLLM | 3 (programmatic) | n/a (programmatic) | recipe |
-| [`platforms.md`](platforms.md) | macOS / Linux / Windows / WSL / Docker / Kubernetes / ARM Linux / commercial Unix / embedded Linux / BSD platform notes | n/a | n/a | reference |
+| [`platforms.md`](platforms.md) | macOS / Linux / Docker / Kubernetes / ARM Linux / commercial Unix / embedded Linux / BSD platform notes | n/a | n/a | reference |
 | [`networking.md`](networking.md) | macOS + Tailscale / VPN per-app intercept gotchas (#704) and tailnet-IP workarounds | n/a | n/a | reference |
 | [`global-claude-md-template.md`](global-claude-md-template.md) | `~/.claude/CLAUDE.md` belt-and-suspenders snippet | 1 fallback | n/a | reference |
 | [`v0.6.4-system-prompt-snippet.md`](v0.6.4-system-prompt-snippet.md) | v0.6.4 discovery-aware NHI bootstrap (drop-in for any harness) | n/a | n/a | reference |
@@ -197,8 +197,8 @@ recipe's snippets and `ai-memory wrap <agent>` (PR-6).
   host's `ai-memory` binary version-drifts away from its DB. The text
   variant surfaces a `# ai-memory boot: warn — db schema vN unsupported
   by binary X.Y.Z (supports v16..v19)` header directly.
-- Platform mismatch: a recipe written for `bash` doesn't run on native
-  Windows, embedded BusyBox `ash`, or inside a Kubernetes sidecar with
+- Platform mismatch: a recipe written for `bash` doesn't run on
+  embedded BusyBox `ash`, or inside a Kubernetes sidecar with
   no shell. See
   [`platforms.md`](platforms.md) for per-platform notes —
   including the [Kubernetes HTTP boot equivalent](platforms.md#boot-hook-in-kubernetes)

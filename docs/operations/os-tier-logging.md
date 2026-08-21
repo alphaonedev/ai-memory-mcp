@@ -51,7 +51,6 @@ structured-log storage, rotation, retention, and forwarding:
 | Linux (systemd) | **systemd-journald** | `journald.conf` (`SystemMaxUse`, `MaxRetentionSec`) | `systemd-journal-upload`, rsyslog → SIEM |
 | Linux (syslog) | rsyslog/syslog-ng via stdout→journal→syslog | `/etc/logrotate.d` | rsyslog `omfwd` (RFC 5424, TCP+TLS) |
 | macOS (launchd) | **unified logging** / `StandardOutPath` | `log` subsystem retention | `log collect`, MDM log pipelines |
-| Windows (service) | **Windows Event Log** (service stdout) / NSSM | Event Log retention policy | Windows Event Forwarding (WEF) |
 
 ai-memory does not reimplement any of that — it just emits clean structured
 lines and lets the platform own the lifecycle.
@@ -131,31 +130,13 @@ launchctl load ~/Library/LaunchAgents/co.alphaone.ai-memory.plist
 log stream --predicate 'process == "ai-memory"' --style json   # unified log
 ```
 
-## Windows — service stdout → Event Log
-
-Windows services don't capture stdout by default; use a service shim such as
-**NSSM** (or `sc.exe` with a wrapper) to redirect ai-memory's stdout into the
-Event Log / a managed file that Windows Event Forwarding can collect.
-
-```powershell
-nssm install ai-memory "C:\Program Files\ai-memory\ai-memory.exe" serve
-nssm set ai-memory AppEnvironmentExtra AI_MEMORY_LOG_SINK=stdout
-# Route captured stdout to a rotating file NSSM manages, or to the Event Log:
-nssm set ai-memory AppStdout C:\ProgramData\ai-memory\logs\ai-memory.log
-nssm set ai-memory AppStdoutCreationDisposition 4   # rotate
-nssm start ai-memory
-```
-
-Configure **Windows Event Forwarding (WEF)** with a subscription to ship these
-events to a central collector.
-
 ## Tier 2 — native remote `syslog` sink (`--features syslog`)
 
 > **Issue #1765 — Tier 2.** When you'd rather ship logs **directly** to a remote
 > RFC 5424 collector / SIEM than route them through the host init system (Tier 1
 > above), build with `--features syslog` and select `sink = "syslog"`. This sink
 > is **OS-agnostic** — pure network I/O (RFC 5424 over TCP, optional rustls TLS
-> per RFC 5425), so it behaves identically on Linux, macOS, Windows, and mobile —
+> per RFC 5425), so it behaves identically on Linux, macOS, and mobile —
 > and **dependency-free** (it reuses the rustls + chrono deps already in the
 > tree). The Linux-only `journald` protocol sink was intentionally **not** added;
 > it cannot be OS-agnostic, and Linux operators already reach journald via Tier 1
@@ -212,8 +193,8 @@ path to a remote host, because `tls` requires the CA file.
 **vs Tier 1 (`stdout` → init system).** Tier 1 is zero-config, zero-dep, and lets
 each OS own rotation / retention / forwarding. Reach for Tier 2 when you want
 ai-memory to ship structured records straight to a central SIEM without an
-intermediary agent — on any OS, including platforms with no syslog daemon (e.g.
-Windows).
+intermediary agent — on any supported OS, including minimal or embedded
+targets with no syslog daemon.
 
 ## Logging policy & archival guidance
 

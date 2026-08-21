@@ -27,11 +27,6 @@ layout: doc
    curl -fsSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh | sh
    ```
 
-   **Windows (PowerShell):**
-   ```powershell
-   irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 | iex
-   ```
-
    **Cargo (crates.io):**
    ```bash
    cargo install ai-memory
@@ -120,18 +115,6 @@ layout: doc
        "memory": {
          "command": "ai-memory",
          "args": ["--db", "~/.claude/ai-memory.db", "mcp", "--tier", "semantic"]
-       }
-     }
-   }
-   ```
-
-   **Windows** (in `%USERPROFILE%\.claude.json`):
-   ```json
-   {
-     "mcpServers": {
-       "memory": {
-         "command": "ai-memory",
-         "args": ["--db", "C:/Users/YourName/.claude/ai-memory.db", "mcp", "--tier", "semantic"]
        }
      }
    }
@@ -238,7 +221,7 @@ That's it. Everything below is optional detail.
 
 ## Prerequisites
 
-> **Pre-built binaries have no prerequisites** -- just run `install.sh` or `install.ps1` as shown above. The requirements below only apply when building from source.
+> **Pre-built binaries have no prerequisites** -- just run `install.sh` as shown above. The requirements below only apply when building from source.
 
 - **Rust toolchain (1.96+; `rust-version` in `Cargo.toml`)**: Install via [rustup](https://rustup.rs/)
   ```bash
@@ -249,7 +232,6 @@ That's it. Everything below is optional detail.
   - **Ubuntu/Debian:** `sudo apt-get install build-essential pkg-config`
   - **Fedora/RHEL:** `sudo dnf install gcc pkg-config`
   - **macOS:** Xcode command line tools (`xcode-select --install`) -- usually already present
-  - **Windows:** MSVC C++ build tools via [Visual Studio Installer](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (select "Desktop development with C++")
 
 ## Install from Source (One-Liner)
 
@@ -271,16 +253,13 @@ cargo install --path .
 
 ## Pre-built Binaries
 
-Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for five targets: Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`), macOS (`x86_64-apple-darwin`, `aarch64-apple-darwin`), and Windows (`x86_64-pc-windows-msvc`, zipped). Releases are created on git tags. Note the pre-built binaries are default-feature builds — the `migrate` / `schema-init` subcommands and the postgres `--store-url` daemon path require a `--features sal,sal-postgres` source build.
+Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for four targets: Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`) and macOS (`x86_64-apple-darwin`, `aarch64-apple-darwin`). Releases are created on git tags. Note the pre-built binaries are default-feature builds — the `migrate` / `schema-init` subcommands and the postgres `--store-url` daemon path require a `--features sal,sal-postgres` source build.
 
 The easiest way to install is via the install scripts:
 
 ```bash
 # Linux/macOS
 curl -fsSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh | sh
-
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 | iex
 ```
 
 Or download and install manually:
@@ -300,9 +279,6 @@ sudo mv ai-memory /usr/local/bin/
   xattr -d com.apple.quarantine /usr/local/bin/ai-memory
   ```
 
-- **Windows**: Use the PowerShell install script (`install.ps1`) for pre-built binaries. For building from source, use `cargo install` with the MSVC toolchain (the default Rust target on Windows). MinGW is not supported.
-
-- **WSL (Windows Subsystem for Linux)**: Works as native Linux. Follow the Ubuntu/Debian instructions for both pre-built binaries and building from source.
 
 - **Docker**: A `Dockerfile` is included in the repository root. Build and run:
   ```bash
@@ -351,7 +327,7 @@ Claude Code supports three scopes for MCP server configuration. Pick the one tha
 Merge the `mcpServers` key into your existing `~/.claude.json`:
 
 <table>
-<tr><th>macOS / Linux</th><th>Windows</th></tr>
+<tr><th>macOS / Linux</th></tr>
 <tr><td>
 
 File: `~/.claude.json`
@@ -362,21 +338,6 @@ File: `~/.claude.json`
     "memory": {
       "command": "ai-memory",
       "args": ["--db", "~/.claude/ai-memory.db", "mcp", "--tier", "semantic"]
-    }
-  }
-}
-```
-
-</td><td>
-
-File: `%USERPROFILE%\.claude.json`
-
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "command": "ai-memory.exe",
-      "args": ["--db", "C:/Users/YourName/.claude/ai-memory.db", "mcp", "--tier", "semantic"]
     }
   }
 }
@@ -431,15 +392,14 @@ Add an `mcpServers` entry under the project path in `~/.claude.json`:
 |----------|---------------------|---------------------|
 | **macOS** | `~/.claude/ai-memory.db` | `$HOME/.claude/ai-memory.db` |
 | **Linux** | `~/.claude/ai-memory.db` | `$HOME/.claude/ai-memory.db` |
-| **Windows** | `C:\Users\YourName\.claude\ai-memory.db` | `%USERPROFILE%\.claude\ai-memory.db` |
 
-> Use forward slashes in JSON args on all platforms: `"C:/Users/YourName/.claude/ai-memory.db"`. The `AI_MEMORY_DB` environment variable can also be used to set the database path globally.
+> The `AI_MEMORY_DB` environment variable can also be used to set the database path globally.
 
 #### OpenAI Codex CLI
 
 | Scope | File | Notes |
 |-------|------|-------|
-| **Global** (user) | `~/.codex/config.toml` | macOS/Linux: `~/.codex/config.toml`; Windows: `%USERPROFILE%\.codex\config.toml` |
+| **Global** (user) | `~/.codex/config.toml` | macOS/Linux: `~/.codex/config.toml` |
 | **Project** | `.codex/config.toml` in project root | Only loaded for trusted projects |
 
 > Override config directory with the `CODEX_HOME` environment variable.
@@ -459,13 +419,11 @@ codex mcp add memory -- ai-memory --db ~/.local/share/ai-memory/memories.db mcp 
 
 > **Notes for Codex CLI:** Codex uses TOML format with underscored key `mcp_servers` (not camelCase, not hyphenated — this is critical). Additional supported options include `env` (explicit key/value pairs), `env_vars` (list of env vars to forward), `cwd`, `startup_timeout_sec`, `tool_timeout_sec`, `enabled_tools` (restrict which memory tools are exposed), and `disabled_tools`. Use `/mcp` in the TUI to view server status. Codex also supports HTTP-based MCP servers via `url` and `bearer_token_env_var`. See [Codex MCP docs](https://developers.openai.com/codex/mcp).
 
-> **Windows:** Use `%USERPROFILE%\.codex\config.toml`. WSL uses the Linux home directory by default — set `CODEX_HOME` to share config with the Windows host.
-
 #### Google Gemini CLI
 
 | Scope | File | Notes |
 |-------|------|-------|
-| **User** (global) | `~/.gemini/settings.json` | macOS/Linux: `~/.gemini/settings.json`; Windows: `%USERPROFILE%\.gemini\settings.json` |
+| **User** (global) | `~/.gemini/settings.json` | macOS/Linux: `~/.gemini/settings.json` |
 | **Project** | `.gemini/settings.json` in project root | Scoped to the project directory |
 
 ```json
@@ -492,7 +450,7 @@ gemini mcp add memory ai-memory -- --db ~/.local/share/ai-memory/memories.db mcp
 
 | Scope | File | Notes |
 |-------|------|-------|
-| **Global** (user) | `~/.cursor/mcp.json` | macOS/Linux: `~/.cursor/mcp.json`; Windows: `%USERPROFILE%\.cursor\mcp.json` |
+| **Global** (user) | `~/.cursor/mcp.json` | macOS/Linux: `~/.cursor/mcp.json` |
 | **Project** | `.cursor/mcp.json` in project root | Overrides global for same-named servers |
 
 ```json
@@ -514,7 +472,7 @@ Or add via Cursor Settings > Tools & MCP.
 
 | Scope | File | Notes |
 |-------|------|-------|
-| **Global only** | `~/.codeium/windsurf/mcp_config.json` | macOS/Linux: `~/.codeium/windsurf/mcp_config.json`; Windows: `%USERPROFILE%\.codeium\windsurf\mcp_config.json` |
+| **Global only** | `~/.codeium/windsurf/mcp_config.json` | macOS/Linux: `~/.codeium/windsurf/mcp_config.json` |
 
 > **No project-level scope.** Windsurf uses global configuration only.
 
@@ -535,7 +493,7 @@ Or add via Cursor Settings > Tools & MCP.
 
 | Scope | File | Notes |
 |-------|------|-------|
-| **User** (global) | `~/.continue/config.yaml` | macOS/Linux: `~/.continue/config.yaml`; Windows: `%USERPROFILE%\.continue\config.yaml` |
+| **User** (global) | `~/.continue/config.yaml` | macOS/Linux: `~/.continue/config.yaml` |
 | **Project** | `.continue/mcpServers/` directory in workspace root | Individual YAML or JSON files per server |
 
 ```yaml
@@ -982,20 +940,6 @@ ollama pull gemma3:4b     # Default LLM model for ai-memory (~3 GB) — handles 
 ollama pull nomic-embed-text:v1.5  # Default embedder (~280 MB) — semantic + autonomous tiers
 ```
 
-### Windows
-
-```powershell
-# Download installer from https://ollama.com/download/windows
-# Run OllamaSetup.exe — installs and starts as a background service
-
-# Or install via winget
-winget install Ollama.Ollama
-
-# Pull the model (in PowerShell or Command Prompt)
-ollama pull gemma3:4b     # Default LLM model for ai-memory (~3 GB) — handles smart-tier auto-tag + contradict + query expansion
-ollama pull nomic-embed-text:v1.5  # Default embedder (~280 MB) — semantic + autonomous tiers
-```
-
 ### Verify Ollama is Running
 
 ```bash
@@ -1080,15 +1024,5 @@ Memory TTLs (time-to-live) can be customized per tier via `config.toml`. When ga
 macOS / Linux (add to `~/.bashrc`, `~/.zshrc`, or equivalent):
 ```bash
 export AI_MEMORY_DB="$HOME/.claude/ai-memory.db"
-```
-
-Windows (PowerShell — persistent for current user):
-```powershell
-[Environment]::SetEnvironmentVariable("AI_MEMORY_DB", "$env:USERPROFILE\.claude\ai-memory.db", "User")
-```
-
-Windows (Command Prompt — persistent):
-```cmd
-setx AI_MEMORY_DB "%USERPROFILE%\.claude\ai-memory.db"
 ```
 {% endraw %}

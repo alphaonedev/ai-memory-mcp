@@ -73,25 +73,14 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------------------------------------------------------------------------
-# Windows / PowerShell detection
-# ---------------------------------------------------------------------------
-if [ -n "$PSModulePath" ] || [ -n "$POWERSHELL_DISTRIBUTION_CHANNEL" ]; then
-    echo "Error: It looks like you are running inside PowerShell." >&2
-    echo "Please use install.ps1 instead:" >&2
-    echo "  irm https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex" >&2
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Detect OS
+# Detect OS (Linux + macOS only -- Windows is not a supported platform)
 # ---------------------------------------------------------------------------
 OS="$(uname -s)"
 case "$OS" in
     Linux)              os="unknown-linux-gnu" ;;
     Darwin)             os="apple-darwin" ;;
-    MINGW*|MSYS*|CYGWIN*) os="pc-windows-msvc" ;;
     *)
-        echo "Error: Unsupported OS: $OS" >&2
+        echo "Error: Unsupported OS: $OS (supported: Linux, macOS)" >&2
         echo "Fallback: cargo install ai-memory" >&2
         exit 1
         ;;
@@ -114,12 +103,9 @@ esac
 TARGET="${arch}-${os}"
 
 # ---------------------------------------------------------------------------
-# File extension
+# File extension (Linux + macOS release artifacts are tarballs)
 # ---------------------------------------------------------------------------
-case "$os" in
-    *windows*) EXT="zip" ;;
-    *)         EXT="tar.gz" ;;
-esac
+EXT="tar.gz"
 
 ASSET="ai-memory-${TARGET}.${EXT}"
 
@@ -354,10 +340,7 @@ fi
 # Extract
 # ---------------------------------------------------------------------------
 echo "Extracting..."
-case "$EXT" in
-    tar.gz) tar xzf "$TMPDIR/$ASSET" -C "$TMPDIR" ;;
-    zip)    unzip -qo "$TMPDIR/$ASSET" -d "$TMPDIR" ;;
-esac
+tar xzf "$TMPDIR/$ASSET" -C "$TMPDIR"
 
 # ---------------------------------------------------------------------------
 # Validate extracted binary

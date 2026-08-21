@@ -478,7 +478,7 @@ ai-memory namespace get-standard --namespace main --json
   <div class="container">
     <span class="eyebrow">Permanence</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Making it survive reboot.</h2>
-    <p class="lede">Operator key, signed/enabled rules, and namespace policies all live on disk or in SQLite and survive reboot. The curator daemon does not — it needs the OS service manager. The full plist / unit / scheduler XML lives in the <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/batman-active-mode.md#making-it-permanent">markdown companion</a>; here is the shape:</p>
+    <p class="lede">Operator key, signed/enabled rules, and namespace policies all live on disk or in SQLite and survive reboot. The curator daemon does not — it needs the OS service manager. The full plist / unit lives in the <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/batman-active-mode.md#making-it-permanent">markdown companion</a>; here is the shape:</p>
     <div class="cards">
       <div class="card always">
         <div class="lbl">macOS</div>
@@ -489,11 +489,6 @@ ai-memory namespace get-standard --namespace main --json
         <div class="lbl">Linux</div>
         <h3>systemd user unit</h3>
         <p><code>~/.config/systemd/user/ai-memory-curator.service</code>, <code>Restart=on-failure</code>, <code>RestartSec=30s</code>, <code>Nice=5</code>. Pair with <code>loginctl enable-linger $USER</code> for headless hosts.</p>
-      </div>
-      <div class="card always">
-        <div class="lbl">Windows</div>
-        <h3>Task Scheduler</h3>
-        <p><code>New-ScheduledTask -Trigger AtLogOn</code> with <code>-RestartCount 3</code>, <code>-RestartInterval 1m</code>, <code>-StartWhenAvailable</code>.</p>
       </div>
     </div>
     <p class="lede" style="margin-top:1.25rem"><strong>Cloud-LLM key wiring.</strong> A service manager does <strong>not</strong> inherit your login-shell exports: launchd's GUI domain and systemd service units never see an <code>OPENROUTER_API_KEY</code> / <code>XAI_API_KEY</code> you <code>export</code> from <code>~/.zshrc</code>. A curator daemon that can't resolve its key reports <code>key_source=error</code> and every cycle silently logs <code>tagged=0</code>. Prefer <code>[llm].api_key_file = "&hellip;/openrouter-api.key"</code> (mode <code>0400</code>) in <code>config.toml</code> — env-independent and identical across launchd/systemd — or declare the key var inside the plist <code>EnvironmentVariables</code> dict / unit <code>Environment=</code> line.</p>

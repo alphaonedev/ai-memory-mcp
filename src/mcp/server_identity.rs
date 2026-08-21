@@ -634,8 +634,8 @@ mod tests {
     #[test]
     fn build_signed_identity_sign_is_sub_10ms_median() {
         // #1766 — a single-sample wall-clock assertion is flaky on
-        // contended / throttled shared CI runners (the windows `Check`
-        // job intermittently saw one sign exceed 10ms, then passed on
+        // contended / throttled shared CI runners (a `Check` job
+        // intermittently saw one sign exceed 10ms, then passed on
         // rerun). Smoke-check the ORDER OF MAGNITUDE robustly instead:
         // warm up once, then assert the MEDIAN over N iterations — a
         // single jittery sample is discarded by the median, so the test

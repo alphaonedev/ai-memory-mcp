@@ -33,7 +33,7 @@ You have exactly **two** ways to move forward. Pick one:
 | **B — Sign your writes** | Multi-agent / shared / federated substrate, you want every write provably authored | generate a key → register → bind → sign |
 
 Both are covered below, in copy-paste form, for **CLI, HTTP, and MCP**, on
-**Linux, macOS, Windows, iOS, and Android**.
+**Linux, macOS, iOS, and Android**.
 
 ---
 
@@ -59,7 +59,6 @@ separate key store from anything you already have:
 |---|---|
 | Linux | `~/.config/ai-memory/keys/` |
 | macOS | `~/Library/Application Support/ai-memory/keys/` |
-| Windows | `%APPDATA%\ai-memory\keys\` |
 | iOS / Android | inside the app sandbox — you set it (see [Mobile](#option-b-on-ios--android)) |
 
 Override the location anywhere with the `AI_MEMORY_KEY_DIR` environment
@@ -99,7 +98,7 @@ bind its public key → sign**. Steps 1–3 are one-time; step 4 is every write.
 
 ### Step 1 — Generate the keypair
 
-**Desktop — Linux, macOS, Windows (identical command):**
+**Desktop — Linux, macOS (identical command):**
 
 ```bash
 ai-memory identity generate --agent-id my-agent
@@ -393,13 +392,6 @@ export AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0
 
 # fish
 set -x AI_MEMORY_REQUIRE_AGENT_ATTESTATION 0
-
-# Windows PowerShell (session) / persistent
-$env:AI_MEMORY_REQUIRE_AGENT_ATTESTATION = "0"
-setx AI_MEMORY_REQUIRE_AGENT_ATTESTATION 0
-
-# Windows cmd.exe
-set AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0
 ```
 
 **Service environments:**

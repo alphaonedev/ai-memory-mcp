@@ -523,7 +523,7 @@ strategy.
 | `--budget-tokens` | int | `4096` | Boot token budget. |
 | trailing `<args>...` | — | — | Forwarded to the wrapped agent after `--`. |
 
-Fall-through is `--system`. Same binary on macOS / Linux / Windows /
+Fall-through is `--system`. Same binary on macOS / Linux /
 Docker / Kubernetes. Exit code is propagated.
 
 ```bash

@@ -21,8 +21,7 @@
 #     STATIC mode (the CI gate). Asserts, without any network:
 #       S1 `install.sh` carries the fail-closed checksum gate region and
 #          that region contains no fail-open (warn-and-continue) branch.
-#       S2 `install.ps1` carries the same fail-closed gate region.
-#       S3 every concrete artifact `release.yml` uploads to a GitHub
+#       S2 every concrete artifact `release.yml` uploads to a GitHub
 #          release has a sibling `.sha256` in the SAME `files:` list, and
 #          every GLOB upload is backed by a whole-directory checksum
 #          sweep. This is the durable half: a future PR that adds a new
@@ -65,7 +64,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER="${REPO_ROOT}/install.sh"
-INSTALLER_PS1="${REPO_ROOT}/install.ps1"
 WORKFLOW="${REPO_ROOT}/.github/workflows/release.yml"
 SCRATCH_ROOT="${REPO_ROOT}/.local-runs/check-install-checksum"
 
@@ -211,8 +209,8 @@ audit_workflow_checksums() {
     if (( glob_seen == 1 )); then
         local sweeps
         sweeps="$(grep -cF -- "$SWEEP_SENTINEL" "$WORKFLOW" || true)"
-        if (( sweeps < 2 )); then
-            violation "release.yml: a GLOB upload publishes every file in dist/, but only ${sweeps} '${SWEEP_SENTINEL}' step(s) were found (expected >= 2: one per OS leg). Without a whole-directory sweep a future artifact ships unchecksummed."
+        if (( sweeps < 1 )); then
+            violation "release.yml: a GLOB upload publishes every file in dist/, but ${sweeps} '${SWEEP_SENTINEL}' step(s) were found (expected >= 1: the whole-directory sweep covering every release leg). Without a whole-directory sweep a future artifact ships unchecksummed."
         fi
     fi
 
@@ -225,7 +223,6 @@ run_static() {
     # helper, not its definition — so deleting an abort branch (rather
     # than merely renaming the helper) is what trips the count.
     audit_installer_region "install.sh"  "$INSTALLER"     4 '^[[:space:]]+abort_unverified[[:space:]]*$'
-    audit_installer_region "install.ps1" "$INSTALLER_PS1" 4 '^[[:space:]]+Stop-UnverifiedInstall[[:space:]]*$'
     audit_workflow_checksums
 
     if (( violations > 0 )); then
@@ -244,7 +241,7 @@ run_static() {
 # tool can be withheld without withholding anything else.
 MIN_TOOLS=(sh env gzip uname mktemp rm mkdir cp chmod tar awk wc tr ls cat sed grep)
 
-# Every fail-closed abort in install.sh / install.ps1 prints this line.
+# Every fail-closed abort in install.sh prints this line.
 # Reject scenarios must see it, so that a harness-level failure (a missing
 # tool, exit 127, a typo in the invocation) can never masquerade as "the
 # installer correctly refused". Asserting only "exit != 0" is how a
@@ -391,13 +388,10 @@ run_scenario() {
         *) printf 'internal error: bad minimal mode %s\n' "$minimal" >&2; exit 1 ;;
     esac
 
-    # PSModulePath / POWERSHELL_DISTRIBUTION_CHANNEL must be scrubbed:
-    # install.sh treats either as "you are running inside PowerShell, use
-    # install.ps1" and aborts before reaching any checksum logic. GitHub's
-    # ubuntu runners ship PowerShell and export PSModulePath process-wide,
-    # so without this every scenario aborts at that guard -- reject cases
-    # would have "passed" for entirely the wrong reason had the refusal
-    # token not been asserted. `env` is resolved from the harness's own
+    # PSModulePath / POWERSHELL_DISTRIBUTION_CHANNEL are scrubbed defensively
+    # so the child sees a clean, reproducible environment regardless of the
+    # host shell (GitHub's ubuntu runners ship PowerShell and export
+    # PSModulePath process-wide). `env` is resolved from the harness's own
     # PATH before the replacement PATH is applied to the child.
     set +e
     out="$(env -u PSModulePath -u POWERSHELL_DISTRIBUTION_CHANNEL \
@@ -454,7 +448,6 @@ stage_repo_copy() {
     mkdir -p "${dst}/scripts" "${dst}/.github/workflows"
     cp "${BASH_SOURCE[0]}" "${dst}/scripts/check-install-checksum.sh"
     cp "$INSTALLER"        "${dst}/install.sh"
-    cp "$INSTALLER_PS1"    "${dst}/install.ps1"
     cp "$WORKFLOW"         "${dst}/.github/workflows/release.yml"
     chmod +x "${dst}/scripts/check-install-checksum.sh"
 }
@@ -511,25 +504,16 @@ p.write_text(s.replace("        abort_unverified\n", "        :\n", 2))
 PY
     expect_static "install.sh abort branch removed" "$d" fail
 
-    # P4 — the fail-closed region deleted from install.ps1.
-    d="${base}/p4"; stage_repo_copy "$d"
-    awk -v b="$GATE_BEGIN" -v e="$GATE_END" '
-        index($0, b) { skip = 1 }
-        !skip        { print }
-        index($0, e) { skip = 0 }
-    ' "${d}/install.ps1" >"${d}/install.ps1.tmp" && mv "${d}/install.ps1.tmp" "${d}/install.ps1"
-    expect_static "install.ps1 gate deleted" "$d" fail
-
-    # P5 — the release.yml checksum sweep steps deleted, which is how the
+    # P4 — the release.yml checksum sweep steps deleted, which is how the
     # glob-published tarballs silently lose their .sha256 again.
-    d="${base}/p5"; stage_repo_copy "$d"
+    d="${base}/p4"; stage_repo_copy "$d"
     sed -i "s|# ${SWEEP_SENTINEL}||g" "${d}/.github/workflows/release.yml"
     expect_static "release.yml sweep removed" "$d" fail
 
-    # P6 — a concrete artifact published with its sibling .sha256 entry
+    # P5 — a concrete artifact published with its sibling .sha256 entry
     # dropped from the same files: list (how a NEW artifact type would
     # ship unverified).
-    d="${base}/p6"; stage_repo_copy "$d"
+    d="${base}/p5"; stage_repo_copy "$d"
     sed -i '/dist\/ai-memory-ios\.xcframework\.tar\.gz\.sha256/d' "${d}/.github/workflows/release.yml"
     expect_static "release.yml sibling dropped" "$d" fail
 

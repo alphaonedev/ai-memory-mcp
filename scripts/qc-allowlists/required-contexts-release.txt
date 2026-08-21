@@ -132,7 +132,6 @@ Dockerfile build (no push)
 # hard-fails for it.
 Check (ubuntu-latest)
 Check (macos-latest)
-Check (windows-latest)
 Cross-compile (aarch64-apple-ios)
 Cross-compile (aarch64-linux-android)
 #
@@ -298,6 +297,6 @@ Enterprise-federation cert-expiry gate (cert §7 / F7)
 #     because those detect static defects rather than policy judgements. The
 #     gate hard-fails if a mirror context ever appears in a workflow outside
 #     the covered set, so this scope cannot silently narrow.
-#   * `main` and `develop` require only `Check (ubuntu/macos/windows-latest)`.
-#     That is the #2496 exposure: those three are the vacuous-success job, so
+#   * `main` and `develop` require only `Check (ubuntu/macos-latest)`.
+#     That is the #2496 exposure: those two are the vacuous-success job, so
 #     the branch that ships is the least protected in fact. Out of scope here.

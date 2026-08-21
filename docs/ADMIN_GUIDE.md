@@ -302,14 +302,6 @@ ollama pull gemma3:4b     # v0.7.0 compiled default for Ollama backend (~3 GB) â
 ollama pull nomic-embed-text:v1.5  # Default embedder for semantic + autonomous tiers (~280 MB)
 ```
 
-#### Windows
-```powershell
-# Download from https://ollama.com/download/windows, or:
-winget install Ollama.Ollama
-ollama pull gemma3:4b     # v0.7.0 compiled default for Ollama backend (~3 GB) â€” smart + autonomous LLM
-ollama pull nomic-embed-text:v1.5  # Default embedder for semantic + autonomous tiers (~280 MB)
-```
-
 #### Verify
 ```bash
 curl http://localhost:11434/api/tags

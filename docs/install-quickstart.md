@@ -48,9 +48,6 @@ Pick the row that matches your machine. If you're not sure, the
 | **Linux** — Docker | `docker pull ghcr.io/alphaonedev/ai-memory:0.9.0` then `docker run --rm -v ai-memory-data:/data ghcr.io/alphaonedev/ai-memory:0.9.0 --version` *(the image's entrypoint is the `ai-memory` binary — pass subcommands/flags directly)* | Zero-toolchain install. The image carries the binary and ships ready to run as a daemon. |
 | **Fedora / RHEL** — COPR | `sudo dnf copr enable alpha-one-ai/ai-memory && sudo dnf install ai-memory` | Official RPM channel. |
 | **Arch / Manjaro** — AUR | `paru -S ai-memory` *(or your AUR helper of choice)* | Community-maintained, tracking upstream. |
-| **Windows** — PowerShell (pre-built binary) | `irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 \| iex` | Drops `ai-memory.exe` into your `%USERPROFILE%\.local\bin` (or equivalent). |
-| **Windows** — cargo via WSL | Inside WSL: `cargo install ai-memory` | Treat WSL like Linux. |
-| **Windows** — cargo native | From a Developer PowerShell: `cargo install ai-memory` | Native Windows build; requires the MSVC toolchain and `rustup` installed first. |
 | **Mobile (iOS / Android) / IoT / edge** | See [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.html) | The mobile artifacts (`ai-memory-ios.xcframework.tar.gz`, `ai-memory-android.tar.gz`) ship with every release, including v0.9.0, and embed into your mobile app via the FFI layer. Not a stand-alone CLI install. |
 
 > **Don't have `cargo`?** Install Rust first:
@@ -127,11 +124,6 @@ them stay on your machine.** Nothing is uploaded.
 | `~/.local/state/ai-memory/logs/` | Operational logs (rotated). |
 | `~/.ai-memory/reflections/` | File-backed reflection chain (only if you opt into auto-export). |
 
-**Windows equivalents** — replace `~/.config/ai-memory/` with
-`%APPDATA%\ai-memory\` and `~/.local/state/ai-memory/` with
-`%LOCALAPPDATA%\ai-memory\state\`. The database default path becomes
-`%USERPROFILE%\.claude\ai-memory.db`.
-
 You can move the database anywhere with the `--db` flag, or by
 setting the `AI_MEMORY_DB` environment variable:
 
@@ -171,8 +163,8 @@ might want to set once and forget:
 | Permissions mode | `export AI_MEMORY_PERMISSIONS_MODE=advisory` | Loosens v0.7.0's enforced governance gate to the v0.6.x permissive posture. Default is `enforce` and you should leave it on unless you're debugging. |
 | Encrypted DB | `export AI_MEMORY_ENCRYPT_AT_REST=1` | Requires a sqlcipher build + `--db-passphrase-file`. See [`docs/INSTALL.md`](INSTALL.html) § encrypted-at-rest. |
 
-Put any of those in `~/.bashrc` / `~/.zshrc` (or `~/.config/fish/config.fish`,
-or Windows `setx`) and every new shell session picks them up. For
+Put any of those in `~/.bashrc` / `~/.zshrc` (or `~/.config/fish/config.fish`)
+and every new shell session picks them up. For
 the full env-var ladder, see the **Environment Variables** section
 of the project [`CLAUDE.md`](../CLAUDE.md).
 
@@ -281,7 +273,6 @@ client's config and restores the pre-install backup if one exists.
 | Docker | `docker rmi ghcr.io/alphaonedev/ai-memory:0.9.0` |
 | DNF (COPR) | `sudo dnf remove ai-memory && sudo dnf copr disable alpha-one-ai/ai-memory` |
 | AUR | `paru -R ai-memory` (or your AUR helper's remove command) |
-| Windows installer | `Remove-Item $env:USERPROFILE\.local\bin\ai-memory.exe` |
 
 **Step 3 — remove the data** (optional — skip this if you want to
 keep your memory corpus for a future reinstall):
@@ -335,7 +326,7 @@ Read on **only if** any of these is true:
 The Path-B doc set, in reading order:
 
 1. **[`INSTALL.md`](INSTALL.html)** — full SME install reference. Every
-   package channel, every flag, every Windows / Docker / Kubernetes
+   package channel, every flag, every Docker / Kubernetes
    variant.
 2. **[`production-deployment.md`](production-deployment.html)** — 10-min
    hardening checklist: keypair provisioning, mTLS allowlist, backup
@@ -374,7 +365,7 @@ The Path-B doc set, in reading order:
 - [`docs/integration-guide.md`](integration-guide.html) — wire ai-memory
   to any AI.
 - [`docs/INSTALL.md`](INSTALL.html) — full install reference (every
-  package channel, every flag, every Windows variant).
+  package channel, every flag).
 - [`docs/QUICKSTART.md`](QUICKSTART.html) — first memory in five
   minutes (CLI / MCP / HTTP path comparisons).
 - [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.html) — every CLI subcommand

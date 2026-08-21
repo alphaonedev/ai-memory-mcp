@@ -296,20 +296,10 @@ fn persist_gc_state(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()>
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
     let mut file = options.open(&staging)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
     std::fs::rename(&staging, &path)?;
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;

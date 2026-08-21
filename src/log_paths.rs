@@ -22,7 +22,6 @@
 //! |---|---|---|
 //! | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ai-memory/logs/` | `…/audit/` |
 //! | macOS | `~/Library/Logs/ai-memory/` | `~/Library/Logs/ai-memory/audit/` |
-//! | Windows | `%LOCALAPPDATA%\ai-memory\logs\` | `…\audit\` |
 //! | systemd-managed daemon | `/var/log/ai-memory/` (if writable) | `…/audit/` |
 //!
 //! ## systemd detection
@@ -37,8 +36,7 @@
 //! The resolved directory must not be world-writable. If a 0777 path is
 //! configured (or selected by default on a malformed system), the
 //! resolver returns an error pointing at the resolution chain that
-//! landed there. Created parent directories use mode `0700` on Unix; on
-//! Windows the default ACL is sufficient.
+//! landed there. Created parent directories use mode `0700` on Unix.
 //!
 //! See `docs/security/audit-trail.md` §"Log directory resolution" for
 //! the operator guide.
@@ -49,8 +47,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 
 /// Environment variable consulted for the operational log directory
-/// override. Read with `std::env::var_os` so non-UTF-8 paths on Windows
-/// pass through unchanged.
+/// override. Read with `std::env::var_os` so non-UTF-8 paths pass
+/// through unchanged.
 pub const LOG_DIR_ENV: &str = "AI_MEMORY_LOG_DIR";
 
 /// Environment variable consulted for the audit log directory override.
@@ -204,15 +202,10 @@ pub fn platform_default(kind: DirKind) -> ResolvedDir {
         }
     }
 
-    // COVERAGE: target_os="windows" branch unreachable on macOS dev
-    //           host; exercised by GitHub Actions matrix CI.
-    // COVERAGE: target_os="linux" (non-macOS, non-windows) branch
-    //           unreachable on macOS dev host; exercised by GitHub
-    //           Actions matrix CI.
+    // COVERAGE: target_os="linux" (non-macOS) branch unreachable on
+    //           macOS dev host; exercised by GitHub Actions matrix CI.
     let p = if cfg!(target_os = "macos") {
         macos_default(kind)
-    } else if cfg!(target_os = "windows") {
-        windows_default(kind)
     } else {
         // Linux + every other Unix (BSD, illumos, etc.) — XDG.
         linux_xdg_default(kind)
@@ -243,22 +236,6 @@ fn macos_default(kind: DirKind) -> PathBuf {
         DirKind::Log => base,
         DirKind::Audit => base.join("audit"),
     }
-}
-
-fn windows_default(kind: DirKind) -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .filter(|s| !s.is_empty())
-        .map_or_else(
-            || {
-                // Fallback if LOCALAPPDATA is unset (mostly tests / WSL).
-                home_dir_or_dot()
-                    .join("AppData")
-                    .join("Local")
-                    .join("ai-memory")
-            },
-            |s| PathBuf::from(s).join("ai-memory"),
-        );
-    base.join(kind.suffix())
 }
 
 fn home_dir_or_dot() -> PathBuf {
@@ -328,16 +305,15 @@ pub fn enforce_not_world_writable(rd: &ResolvedDir) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        // Windows: default ACL on `LOCALAPPDATA` and user-created dirs
-        // is "Authenticated Users" only — no world-writable concept
-        // mapping, so this is a no-op.
+        // Non-unix platforms have no POSIX world-writable mode bit to
+        // enforce, so this is a no-op.
         let _ = rd;
     }
     Ok(())
 }
 
 /// Create `dir` (and missing parents) with mode `0700` on Unix. On
-/// Windows defers to `std::fs::create_dir_all` and the default ACL.
+/// non-unix platforms defers to `std::fs::create_dir_all`.
 ///
 /// # Errors
 /// - The directory cannot be created.
@@ -479,11 +455,6 @@ mod tests {
             assert!(
                 s.contains("Library/Logs/ai-memory"),
                 "macOS default should be under Library/Logs/ai-memory, got {s}"
-            );
-        } else if cfg!(target_os = "windows") {
-            assert!(
-                s.to_lowercase().contains("ai-memory"),
-                "Windows default should contain ai-memory, got {s}"
             );
         } else {
             // Linux + BSD + others fall through to XDG.
@@ -808,13 +779,11 @@ mod tests {
 
     // -----------------------------------------------------------------
     // L0.7-2 Tier A — strategic gap closures on the always-compiled paths.
-    // Note: lines 217-228 (linux_xdg_default), 239-262 (windows_default),
-    // 259-262 (Windows HOME fallback), and 463-471 (test cfg arms for
-    // linux/windows assertions) are platform-cfg branches that the
-    // host OS (macOS in this session) does not execute. They are
-    // reachable on Linux/Windows CI but not on darwin runners.
+    // Note: linux_xdg_default and the macOS test cfg arm are platform-cfg
+    // branches that the host OS (macOS in this session) may not execute.
+    // They are reachable on Linux/macOS CI but not on every host.
     // COVERAGE: platform-specific via cfg!() runtime branch — covered
-    //           on Linux/Windows CI but unreachable on macOS.
+    //           on Linux/macOS CI but unreachable on the other host.
     // -----------------------------------------------------------------
 
     #[cfg(unix)]
@@ -925,51 +894,6 @@ mod tests {
         assert_eq!(
             p,
             PathBuf::from("/test-home-empty-xdg/.local/state/ai-memory/logs")
-        );
-    }
-
-    #[test]
-    fn windows_default_uses_localappdata_when_set() {
-        // Lines 239-253: windows_default body. Always compiled, so we
-        // unit-test the function directly on any host. The
-        // LOCALAPPDATA value, when present, is joined with `ai-memory`
-        // and then `kind.suffix()`.
-        let _g = env_lock();
-        let app = EnvGuard::capture("LOCALAPPDATA");
-        app.set("/winapp");
-        let p = super::windows_default(DirKind::Log);
-        assert_eq!(p, PathBuf::from("/winapp/ai-memory/logs"));
-        let pa = super::windows_default(DirKind::Audit);
-        assert_eq!(pa, PathBuf::from("/winapp/ai-memory/audit"));
-    }
-
-    #[test]
-    fn windows_default_falls_back_to_home_appdata_when_localappdata_unset() {
-        let _g = env_lock();
-        let app = EnvGuard::capture("LOCALAPPDATA");
-        app.unset();
-        let home = EnvGuard::capture("HOME");
-        home.set("/test-win-home");
-        let user = EnvGuard::capture("USERPROFILE");
-        user.unset();
-        let p = super::windows_default(DirKind::Log);
-        assert_eq!(
-            p,
-            PathBuf::from("/test-win-home/AppData/Local/ai-memory/logs")
-        );
-    }
-
-    #[test]
-    fn windows_default_empty_localappdata_falls_back_to_home_appdata() {
-        let _g = env_lock();
-        let app = EnvGuard::capture("LOCALAPPDATA");
-        app.set("");
-        let home = EnvGuard::capture("HOME");
-        home.set("/test-win-home-empty");
-        let p = super::windows_default(DirKind::Log);
-        assert_eq!(
-            p,
-            PathBuf::from("/test-win-home-empty/AppData/Local/ai-memory/logs")
         );
     }
 }

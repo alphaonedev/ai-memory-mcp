@@ -90,7 +90,6 @@
   "platforms": [
     "macOS (x86_64, aarch64)",
     "Linux (x86_64, aarch64)",
-    "Windows (x86_64)",
     "iOS (aarch64-apple-ios; cross-compiled per #1068)",
     "Android (aarch64-linux-android + 3 ABIs; cross-compiled per #1068)"
   ],

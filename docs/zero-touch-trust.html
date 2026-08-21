@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Zero-touch trust — CA-rooted federation identity at scale</title>
-<meta name="description" content="CA-rooted, attestation-issued, short-lived credentials replace O(N²) manual key exchange with O(1) trust-the-CA enrollment. Architected for 500-1000-agent clusters (derived topology ceiling), composed modularly in 500-agent blocks; real-mesh-measured to 2 nodes, full-scale USL capacity projection deferred to a dedicated capacity bench. OS-agnostic: Linux, Windows, macOS.">
+<meta name="description" content="CA-rooted, attestation-issued, short-lived credentials replace O(N²) manual key exchange with O(1) trust-the-CA enrollment. Architected for 500-1000-agent clusters (derived topology ceiling), composed modularly in 500-agent blocks; real-mesh-measured to 2 nodes, full-scale USL capacity projection deferred to a dedicated capacity bench. OS-agnostic: Linux, macOS.">
 <meta property="og:title" content="ai-memory · Zero-touch trust (federation identity at scale)">
 <meta property="og:description" content="O(1) CA-rooted trust replaces O(N²) per-peer .pub enrollment. Short-lived auto-rotating credentials, hierarchical trust, GitOps inventory. OS-agnostic.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/zero-touch-trust.html">
@@ -352,25 +352,20 @@ enforcement:
   <div class="container">
     <span class="eyebrow">Platform</span>
     <h2>OS-agnostic by design.</h2>
-    <p>The daemon and the <strong>entire</strong> federation-identity core are pure Rust with no platform-bound logic in the trust path. The credential format, issuer, trust bundle, chain verification, inventory parsing, renewal worker, and reconciler behave <strong>identically</strong> on Linux, Windows, and macOS — the CI matrix runs the full suite on all three on every change. A credential minted on a Linux root CA verifies on a Windows node and a macOS node with byte-identical results. A federated fleet can be <strong>heterogeneous</strong> across operating systems in one trust domain.</p>
+    <p>The daemon and the <strong>entire</strong> federation-identity core are pure Rust with no platform-bound logic in the trust path. The credential format, issuer, trust bundle, chain verification, inventory parsing, renewal worker, and reconciler behave <strong>identically</strong> on Linux and macOS — the CI matrix runs the full suite on both on every change. A credential minted on a Linux root CA verifies on a macOS node with byte-identical results. A federated fleet can be <strong>heterogeneous</strong> across operating systems in one trust domain.</p>
     <p>Support <em>focus</em> is tiered by where production enterprise fleets actually run — a priority ranking, not a capability limit:</p>
     <table>
       <thead><tr><th>Priority</th><th>Platform</th><th>Default shell</th><th>Notes</th></tr></thead>
       <tbody>
         <tr><td><span class="tier-primary">Primary</span></td><td>Linux (x86_64 / aarch64)</td><td>Bash</td><td>Reference enterprise target — systemd rollout, Unix key-mode enforcement, container / Kubernetes substrate.</td></tr>
-        <tr><td><span class="tier-primary">Primary</span></td><td>Windows (x86_64)</td><td>PowerShell</td><td>First-class daemon + federation node. Key-directory hardening via NTFS ACLs (POSIX mode bits don't apply).</td></tr>
         <tr><td><span class="tier-tertiary">Tertiary</span></td><td>macOS (Apple Silicon / x86_64)</td><td>Zsh</td><td>Startup / small-enterprise niche — e.g. Mac Mini clusters. Fully functional node; Unix mode enforcement as on Linux.</td></tr>
       </tbody>
     </table>
-    <p>The <code>ai-memory</code> binary is shell-agnostic; only the env-var-setting syntax differs per platform's default shell. The same <code>AI_MEMORY_FED_*</code> knob, set three ways:</p>
+    <p>The <code>ai-memory</code> binary is shell-agnostic; only the env-var-setting syntax differs per platform's default shell. The same <code>AI_MEMORY_FED_*</code> knob:</p>
 <pre><code># Linux (Bash) / macOS (Zsh)
 export AI_MEMORY_FED_TRUST_DOMAIN="fleet.example"
-export AI_MEMORY_FED_IDENTITY="region/nyc/node-1"
-
-# Windows (PowerShell)
-$env:AI_MEMORY_FED_TRUST_DOMAIN = "fleet.example"
-$env:AI_MEMORY_FED_IDENTITY     = "region/nyc/node-1"</code></pre>
-    <p>The only OS-specific differences are <strong>operational plumbing</strong> — the service supervisor (systemd / launchd / Windows Service or WSL2) and the key-directory permission mechanism (POSIX mode bits on Unix, NTFS ACLs on Windows). The trust model itself is identical everywhere.</p>
+export AI_MEMORY_FED_IDENTITY="region/nyc/node-1"</code></pre>
+    <p>The only OS-specific differences are <strong>operational plumbing</strong> — the service supervisor (systemd / launchd) and the key-directory permission mechanism (POSIX mode bits on Unix). The trust model itself is identical everywhere.</p>
   </div>
 </section>
 

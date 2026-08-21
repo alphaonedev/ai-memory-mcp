@@ -239,7 +239,7 @@ import the peer's public key on the destination side; graduating from
 Key storage defaults (mode 0600, refuses overwrite without `--force`,
 [`production-deployment.md §2`](production-deployment.html)): Linux
 `~/.config/ai-memory/keys/`; macOS `~/Library/Application Support/
-ai-memory/keys/`; Windows `%APPDATA%\ai-memory\keys\`.
+ai-memory/keys/`.
 
 ### 2.6 Backups
 

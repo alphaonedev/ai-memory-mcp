@@ -17,7 +17,7 @@ of the conversation when no system slot exists).
 
 The canonical Rust-native cross-platform replacement for the wrapper
 script below is `ai-memory wrap gemini` (PR-6 of issue #487) — same
-semantics, no shell required, works on Windows / Docker / Kubernetes.
+semantics, no shell required, works on Docker / Kubernetes.
 
 ## Wrapper script
 
@@ -47,7 +47,7 @@ fi
 ```
 
 Then alias `gemini` to this wrapper, or invoke `gemini-with-memory`
-instead. For the Rust-native version (no shell, works on Windows):
+instead. For the Rust-native version (no shell required):
 
 ```bash
 ai-memory wrap gemini -- <gemini args>

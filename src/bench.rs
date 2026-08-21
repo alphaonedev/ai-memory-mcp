@@ -295,7 +295,7 @@ impl Operation {
     }
 
     /// Runner-effective p95 budget — equal to [`target_p95_ms`] on
-    /// Linux/Windows, but multiplied by [`MACOS_BUDGET_MULT`] on
+    /// Linux, but multiplied by [`MACOS_BUDGET_MULT`] on
     /// macOS targets per issue #1193. The pass/fail verdict in the
     /// CLI bench tool uses this value; the JSON envelope's
     /// `target_p95_ms` field continues to report the canonical
@@ -1347,7 +1347,7 @@ mod tests {
     }
 
     /// Issue #1193 — the effective budget the pass/fail verdict uses
-    /// is the canonical budget × `MACOS_BUDGET_MULT`. On Linux/Windows
+    /// is the canonical budget × `MACOS_BUDGET_MULT`. On Linux
     /// the multiplier is 1.0 (effective == canonical); on macOS the
     /// multiplier is 3.0 (effective == 3 × canonical). Regression-pins
     /// the wiring so a future refactor can't silently revert the

@@ -555,25 +555,6 @@ For reboot-survival on a headless box, also run
 `loginctl enable-linger $USER` so user services run without a login
 session.
 
-### Windows — Task Scheduler
-
-```powershell
-$Action = New-ScheduledTaskAction `
-  -Execute "C:\Users\YOU\.local\bin\ai-memory.exe" `
-  -Argument "--db C:\Users\YOU\.claude\ai-memory.db curator --daemon --interval-secs 300 --max-ops 100"
-
-$Trigger = New-ScheduledTaskTrigger -AtLogOn -User "YOU"
-
-$Settings = New-ScheduledTaskSettingsSet `
-  -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
-  -StartWhenAvailable -DontStopOnIdleEnd
-
-Register-ScheduledTask `
-  -TaskName "ai-memory curator" `
-  -Action $Action -Trigger $Trigger -Settings $Settings `
-  -Description "ai-memory autonomous curator daemon"
-```
-
 ## Rollback
 
 To return to Batman-capable-but-inactive:
