@@ -157,6 +157,20 @@ MAP=(
   # (no I/O); the boot caller in daemon_runtime::run only gathers its live
   # inputs, so this ONE fn is the load-bearing decision on both backends.
   "admin_header_trust_boot_refusal|return|return None;|src/handlers/admin_role.rs|admin_header_trust_boot_gate_3065|dangerous_combo_refuses_boot"
+  # #2991 (GA Wave-2) — the R40 post-quorum execution EXEMPTION discrimination.
+  # The L1-6 escalate producer re-escalates an already-approved write on replay;
+  # `consume_execution_exemption` lets it through ONLY when its CID-bound,
+  # single-use exemption matches (never namespace-scoped, never "any store").
+  # `return` shape (first-statement `return true;` — the always-exempt
+  # disposition): neutralized, EVERY escalated write is admitted, so a write
+  # whose CID was never registered (a DIFFERENT, unapproved store) is wrongly
+  # exempted — reinstating the CWE-306 replay-bypass class the ballot flagged
+  # (residual risk #1). The lane test asserts an UNREGISTERED CID is never
+  # consumed (and the registered CID is single-use); the mutation makes the
+  # unregistered consume return true => `assert!(!consume(...))` goes RED. Pure
+  # process-global registry (no I/O, no backend) — both backends' approve
+  # funnels + the producer consult this ONE fn, so it is composite-covered.
+  "consume_execution_exemption|return|return true;|src/approvals.rs|r40_approval_chokepoint|exemption_discriminates_unregistered_cid"
 )
 
 # Apply MUTATION to function CTL in TARGET, per SHAPE.

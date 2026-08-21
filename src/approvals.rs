@@ -376,6 +376,27 @@ pub mod signed {
     /// reason.
     pub const ESCALATION_REASON_KEY: &str = "escalation_reason";
 
+    /// #2355 — the shared `reason` text a signed-approval funnel returns when
+    /// the m-of-n quorum has been partially met but not yet reached. One
+    /// definition, referenced by every approve funnel (MCP + 4 HTTP + CLI) so
+    /// the wire message never drifts between surfaces.
+    pub const SIGNED_QUORUM_NOT_YET_MET: &str = "signed approval quorum not yet met";
+    /// #2355 — response field name: the distinct valid enrolled signer count
+    /// accumulated so far toward the m-of-n threshold.
+    pub const SIGNED_VOTES_FIELD: &str = "signed_votes";
+    /// #2355 — response field name: the m-of-n signed-approval threshold.
+    pub const SIGNED_QUORUM_FIELD: &str = "signed_quorum";
+
+    /// #2355 — the shared refusal message a signed-approval funnel returns when
+    /// the gate fails closed (missing-when-required / forged / unenrolled /
+    /// un-decodable). A helper (not a `const`) because the `QuorumError` detail
+    /// is interpolated; every funnel (MCP tool error, HTTP 403 body, CLI
+    /// `bail!`) formats it ONE way here.
+    #[must_use]
+    pub fn signed_approval_rejected(e: &QuorumError) -> String {
+        format!("signed approval rejected: {e}")
+    }
+
     /// One detached approval signature presented by an approver.
     #[derive(Debug, Clone)]
     pub struct SignedApproval {
@@ -610,6 +631,29 @@ pub mod signed {
         )
     }
 
+    /// Parse presented approver signatures from an `approvals` JSON array
+    /// (`[{"pubkey":"<b64>","signature":"<b64>"}, …]`). Shared by every approve
+    /// funnel — MCP (`params["approvals"]`) and the HTTP branches (request-body
+    /// `approvals`) — so the wire contract is one place. Non-array / malformed
+    /// entries yield an empty slice (the gate then fails closed when signatures
+    /// are REQUIRED).
+    #[must_use]
+    pub fn parse_presented_approvals(approvals: &serde_json::Value) -> Vec<SignedApproval> {
+        let Some(arr) = approvals.as_array() else {
+            return Vec::new();
+        };
+        arr.iter()
+            .filter_map(|entry| {
+                let pubkey = entry.get("pubkey").and_then(serde_json::Value::as_str)?;
+                let signature = entry.get("signature").and_then(serde_json::Value::as_str)?;
+                Some(SignedApproval {
+                    signer_pubkey_b64: pubkey.to_string(),
+                    signature_b64: signature.to_string(),
+                })
+            })
+            .collect()
+    }
+
     /// Whether a pending action's payload was routed from a typed escalation
     /// and therefore requires a signed approval.
     #[must_use]
@@ -698,6 +742,246 @@ pub mod signed {
                 "signer_pubkeys": quorum.signer_pubkeys_b64,
             }),
         );
+    }
+
+    /// R40 (#2991/#2355) — the PURE verdict a signed-approval quorum
+    /// evaluation yields, returned by [`evaluate_signed_approval_gate`]. It is
+    /// the single chokepoint every approve funnel (MCP + the four HTTP
+    /// branches, both backends) consults so the gate cannot be enforced on one
+    /// surface and bypassed on another. The verdict carries NO side effects —
+    /// the caller finalizes (`approve_with_approver_type` /
+    /// `governance_approve_with_consensus`) and, on [`Self::Approved`], wraps
+    /// the downstream execute in a single-use [`register_execution_exemption`].
+    #[derive(Debug)]
+    pub enum GateVerdict {
+        /// Signed approval was NOT required (no stored escalation flag, no
+        /// namespace-policy escalation) and no approver signatures were
+        /// presented. The caller proceeds with the ordinary approver-type
+        /// finalizer and issues NO execution exemption.
+        NotRequired,
+        /// The m-of-n signed-approval quorum was MET. The caller MUST bind an
+        /// execution exemption (`register_execution_exemption(pending_id,
+        /// cid)`) around the downstream `execute_pending_action` so the
+        /// already-approved write is not re-escalated by the L1-6 producer
+        /// (the exemption is CID-bound + single-use — never namespace-scoped).
+        Approved(QuorumMet),
+        /// Signatures accepted so far but the distinct-signer count has not
+        /// reached the threshold — respond `{approved:false,status:"pending"}`.
+        Pending { distinct: usize, threshold: usize },
+        /// Fail-closed refusal: signed approval required but missing, or a
+        /// presented signature was forged / unenrolled / un-decodable. Maps to
+        /// HTTP `403` (MCP: a tool error).
+        Refused(QuorumError),
+    }
+
+    /// R40 (#2991/#2355) — THE single pure chokepoint. Given the SERVER-SIDE
+    /// stored pending payload, the target `pending_id`+`decision`, the presented
+    /// approver signatures, and the caller-resolved namespace-policy term,
+    /// return a [`GateVerdict`]. No DB reads, no writes, no audit emit — purely
+    /// `inputs -> verdict`, so the four HTTP funnels and the MCP funnel share
+    /// byte-identical enforcement.
+    ///
+    /// # Requirement predicate (the anti-bypass core)
+    ///
+    /// The gate engages when signed approval is REQUIRED **or** any signature
+    /// is presented. "Required" is the server-side OR of:
+    /// 1. the STORED escalation flag on the pending payload
+    ///    ([`pending_requires_signed_approval`] — read from the DB snapshot, not
+    ///    a caller-supplied request field), and
+    /// 2. `namespace_requires_signed` — the caller re-derives this from the
+    ///    live governance rule engine ([`namespace_requires_signed_approval`])
+    ///    so a payload whose flag was stripped is still gated.
+    ///
+    /// Never trusting term (1)'s `unwrap_or(false)` ALONE is the fix for the
+    /// #2355 bypass: a pending that SHOULD require signing but lost its flag is
+    /// still convicted by term (2).
+    #[must_use]
+    pub fn evaluate_signed_approval_gate(
+        stored_payload: &serde_json::Value,
+        pending_id: &str,
+        decision: super::Decision,
+        presented: &[SignedApproval],
+        namespace_requires_signed: bool,
+    ) -> GateVerdict {
+        let required =
+            pending_requires_signed_approval(stored_payload) || namespace_requires_signed;
+        // Back-compat: an ordinary (non-escalated) pending with no signatures
+        // skips the gate entirely — the ordinary approver-type path decides.
+        if !required && presented.is_empty() {
+            return GateVerdict::NotRequired;
+        }
+        match verify_quorum_from_env(pending_id, decision, presented) {
+            Ok(quorum) => GateVerdict::Approved(quorum),
+            Err(QuorumError::ThresholdNotMet {
+                distinct,
+                threshold,
+            }) => GateVerdict::Pending {
+                distinct,
+                threshold,
+            },
+            Err(e) => GateVerdict::Refused(e),
+        }
+    }
+
+    /// R40 (#2355) — term (2) of the requirement predicate: re-derive, from the
+    /// LIVE governance rule engine, whether a `memory_write` by `requested_by`
+    /// into `namespace` escalates (and therefore requires a signed approval).
+    ///
+    /// This defends the gate against a stored payload whose
+    /// [`REQUIRES_SIGNED_APPROVAL_KEY`] flag is absent/false (the strippable
+    /// term (1)): if the namespace's resolved rules STILL escalate the write,
+    /// the pending is gated regardless of the flag.
+    ///
+    /// Fails SAFE toward term (1): a rule-consultation error resolves to
+    /// `false` (the stored server-side flag remains the enforcing gate) and is
+    /// logged — the escalated pending always carries the stored flag, so a
+    /// transient rule-store error never drops the primary gate, and never
+    /// blocks an approve the operator has no signatures to satisfy.
+    #[must_use]
+    pub fn namespace_requires_signed_approval(
+        conn: &rusqlite::Connection,
+        requested_by: &str,
+        namespace: &str,
+    ) -> bool {
+        use crate::governance::agent_action::{AgentAction, RuleEngine};
+        let action = AgentAction::Custom {
+            custom_kind: "memory_write".to_string(),
+            payload: serde_json::json!({ "namespace": namespace }),
+        };
+        // PURE evaluation — `RuleEngine::load_for_action` reads the rule set and
+        // `evaluate` matches it in memory. Deliberately NOT
+        // `check_agent_action`, whose `emit_check_event` / `emit_forensic_decision`
+        // would WRITE a spurious `governance.check` audit row on every approve.
+        match RuleEngine::load_for_action(conn, &action) {
+            Ok(engine) => engine.evaluate(requested_by, &action).is_escalation(),
+            Err(e) => {
+                tracing::warn!(
+                    target: "approvals.signed",
+                    "namespace_requires_signed_approval: rule load failed for \
+                     namespace={namespace:?} requested_by={requested_by:?}: {e}; \
+                     relying on the stored escalation flag (term 1)"
+                );
+                false
+            }
+        }
+    }
+
+    /// Process-wide single-use execution-exemption registry (R40 #2991).
+    ///
+    /// When a signed-approval quorum is met and the approved pending is
+    /// replayed via `execute_pending_action`, the `store` write re-enters the
+    /// L1-6 producer ([`crate::storage::GOVERNANCE_PRE_WRITE`]), whose rule
+    /// STILL escalates — which, without an exemption, would re-queue the
+    /// already-approved write forever. The exemption lets that ONE write
+    /// through.
+    ///
+    /// The set holds `cid`s ([`execution_exemption_cid`]) that are content- +
+    /// identity-bound (agent_id, namespace, title, kind, content — NOT the
+    /// volatile id / timestamps `execute_pending_action` re-stamps). It is
+    /// NEVER namespace-scoped and NEVER "any approved store": an exemption
+    /// admits only a write whose content hashes to exactly the approved
+    /// pending's payload, and is CONSUMED on first match
+    /// ([`consume_execution_exemption`]) — closing the CWE-306 replay class the
+    /// ballot flagged (residual risk #1).
+    static EXECUTION_EXEMPTIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+
+    fn exemptions() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+        EXECUTION_EXEMPTIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// The content- + identity-bound exemption key for a memory about to be
+    /// (re-)written. Deliberately EXCLUDES `created_at` (and the id / updated_at
+    /// / access_count fields) because [`crate::storage::execute_pending_action`]
+    /// re-stamps those on replay — so the key computed at approve time
+    /// (over the stored payload) matches the key the L1-6 producer computes
+    /// over the re-stamped memory. `content` enters via the SHA-256 digest term
+    /// of [`crate::identity::cid::canonical_cid_preimage`], so two writes that
+    /// differ in ANY of (agent_id, namespace, title, kind, content) get
+    /// distinct keys — an exemption can never leak to a different write.
+    #[must_use]
+    pub fn execution_exemption_cid(mem: &crate::models::Memory) -> String {
+        let agent_id = mem
+            .metadata
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let preimage = crate::identity::cid::canonical_cid_preimage(
+            agent_id,
+            &mem.namespace,
+            &mem.title,
+            mem.memory_kind.as_str(),
+            // created_at deliberately omitted — see doc above.
+            "",
+            &mem.content,
+        );
+        crate::identity::cid::compute_cid(&preimage)
+    }
+
+    /// RAII guard that removes the execution exemption it registered when it
+    /// drops — guaranteeing SINGLE-USE even if the L1-6 producer never consumed
+    /// it (e.g. the replay took a non-`store` arm, or execute errored before
+    /// the write). Held across the `execute_pending_action` call and dropped
+    /// immediately after.
+    #[must_use = "the exemption is removed when this guard drops; hold it across execute_pending_action"]
+    pub struct ExemptionGuard {
+        cid: String,
+    }
+
+    impl Drop for ExemptionGuard {
+        fn drop(&mut self) {
+            if let Ok(mut g) = exemptions().lock() {
+                g.remove(&self.cid);
+            }
+        }
+    }
+
+    /// Register a single-use execution exemption bound to `(pending_id, cid)`.
+    /// The returned [`ExemptionGuard`] MUST be held across the downstream
+    /// `execute_pending_action` and dropped right after. The `pending_id` is
+    /// retained for forensic attribution; the L1-6 producer matches on `cid`.
+    #[must_use]
+    pub fn register_execution_exemption(pending_id: &str, cid: &str) -> ExemptionGuard {
+        if let Ok(mut g) = exemptions().lock() {
+            g.insert(cid.to_string(), pending_id.to_string());
+        }
+        ExemptionGuard {
+            cid: cid.to_string(),
+        }
+    }
+
+    /// Build the single-use [`ExemptionGuard`] a funnel must hold across
+    /// `execute_pending_action` after a signed-approval quorum is met. Returns
+    /// `None` when the stored payload is not a replayable `store` memory (a
+    /// non-`store` action's replay never re-enters the L1-6 `store` producer,
+    /// so it needs no exemption). The guard is CID-bound to exactly this
+    /// pending's content, so it can admit only the approved write.
+    #[must_use]
+    pub fn exemption_guard_for_pending(
+        pending_id: &str,
+        stored_payload: &serde_json::Value,
+    ) -> Option<ExemptionGuard> {
+        let mem: crate::models::Memory = serde_json::from_value(stored_payload.clone()).ok()?;
+        let cid = execution_exemption_cid(&mem);
+        Some(register_execution_exemption(pending_id, &cid))
+    }
+
+    /// Consume the execution exemption for `cid`: returns `true` (and REMOVES
+    /// the entry — single-use) iff a matching exemption was registered. Called
+    /// by the L1-6 producer's `Escalate` arm to let an already-approved,
+    /// quorum-met write replay through exactly once. A write whose `cid` is not
+    /// registered returns `false` and is escalated normally — this
+    /// discrimination is the load-bearing control proven by
+    /// `scripts/check-cert-removal-proof.sh` (mutating it to `return true`
+    /// re-opens the replay-bypass class and reds the negative-control test).
+    #[must_use]
+    pub fn consume_execution_exemption(cid: &str) -> bool {
+        match exemptions().lock() {
+            Ok(mut g) => g.remove(cid).is_some(),
+            // Fail-closed: a poisoned registry never grants an exemption.
+            Err(_) => false,
+        }
     }
 
     #[cfg(test)]
@@ -868,6 +1152,154 @@ pub mod signed {
             }
             assert!(pending_requires_signed_approval(&enriched));
             assert!(!pending_requires_signed_approval(&payload));
+        }
+
+        // --- R40 (#2991/#2355) chokepoint helper ---
+
+        // These verdict-mapping tests are ENV-INDEPENDENT: they assert the
+        // variant-agnostic `Refused(_)` / `NotRequired`, so whether or not a
+        // concurrent `--lib` test has enrolled approver keys, the outcome is the
+        // same (a required-but-unsatisfied gate is `Refused` either as
+        // `NoSignatures` or `NoEnrolledApprovers`). The met-quorum / pending /
+        // forged mappings — which need enrolled keys — are proven end-to-end by
+        // the integration funnel suite (`tests/r40_approval_chokepoint.rs`),
+        // each in its OWN process (no libtest env bleed).
+
+        #[test]
+        fn gate_not_required_when_no_flag_no_sigs() {
+            let payload = serde_json::json!({ "k": "v" });
+            assert!(matches!(
+                evaluate_signed_approval_gate(
+                    &payload,
+                    "pa-x",
+                    super::super::Decision::Approve,
+                    &[],
+                    false,
+                ),
+                GateVerdict::NotRequired
+            ));
+        }
+
+        #[test]
+        fn gate_fails_closed_when_stored_flag_requires_but_no_sigs() {
+            let payload = serde_json::json!({ REQUIRES_SIGNED_APPROVAL_KEY: true });
+            let v = evaluate_signed_approval_gate(
+                &payload,
+                "pa-req",
+                super::super::Decision::Approve,
+                &[],
+                false,
+            );
+            assert!(
+                matches!(v, GateVerdict::Refused(_)),
+                "missing-when-required (stored flag) must fail closed: {v:?}"
+            );
+        }
+
+        #[test]
+        fn gate_fails_closed_when_namespace_term_requires_but_no_sigs() {
+            // No stored flag on the payload — term (2) alone engages the gate.
+            let payload = serde_json::json!({ "k": "v" });
+            let v = evaluate_signed_approval_gate(
+                &payload,
+                "pa-ns",
+                super::super::Decision::Approve,
+                &[],
+                true,
+            );
+            assert!(
+                matches!(v, GateVerdict::Refused(_)),
+                "namespace-policy term must engage the gate without the stored flag: {v:?}"
+            );
+        }
+
+        #[test]
+        fn gate_engages_when_sig_presented_even_if_not_required() {
+            // No requirement, but a signature IS presented → the gate runs
+            // (never silently ignored) and fails closed absent a met quorum.
+            let stranger = kp(2);
+            let payload = serde_json::json!({ "k": "v" });
+            let v = evaluate_signed_approval_gate(
+                &payload,
+                "pa-str",
+                super::super::Decision::Approve,
+                &[sign(&stranger, "pa-str")],
+                false,
+            );
+            assert!(
+                matches!(v, GateVerdict::Refused(_)),
+                "a presented signature must engage the gate fail-closed: {v:?}"
+            );
+        }
+
+        // --- R40 (#2991) single-use execution exemption ---
+
+        fn mem_fixture(ns: &str, content: &str) -> crate::models::Memory {
+            crate::models::Memory {
+                namespace: ns.to_string(),
+                title: "t".to_string(),
+                content: content.to_string(),
+                metadata: serde_json::json!({ "agent_id": "ai:alice" }),
+                ..crate::models::Memory::default()
+            }
+        }
+
+        #[test]
+        fn exemption_cid_stable_across_execute_restamp() {
+            let mut a = mem_fixture("proj", "the body");
+            a.id = "id-A".to_string();
+            a.created_at = "2026-01-01T00:00:00Z".to_string();
+            a.updated_at = "2026-01-01T00:00:00Z".to_string();
+            a.access_count = 0;
+            let cid_before = execution_exemption_cid(&a);
+            // Mimic execute_pending_action's replay re-stamp.
+            a.id = "id-B".to_string();
+            a.created_at = "2026-09-09T09:09:09Z".to_string();
+            a.updated_at = "2026-09-09T09:09:09Z".to_string();
+            a.access_count = 42;
+            assert_eq!(
+                cid_before,
+                execution_exemption_cid(&a),
+                "re-stamp must not change the cid"
+            );
+        }
+
+        #[test]
+        fn exemption_cid_differs_on_different_content() {
+            let x = mem_fixture("proj", "alpha");
+            let y = mem_fixture("proj", "beta");
+            assert_ne!(execution_exemption_cid(&x), execution_exemption_cid(&y));
+        }
+
+        #[test]
+        fn exemption_is_single_use_and_discriminates() {
+            let m = mem_fixture("exempt-ns", "unique-content-xyz");
+            let cid = execution_exemption_cid(&m);
+            // Unregistered → not exempt.
+            assert!(!consume_execution_exemption(&cid));
+            let guard = register_execution_exemption("pa-1", &cid);
+            // A DIFFERENT cid is never exempt.
+            assert!(!consume_execution_exemption("b3:different"));
+            // Registered cid consumes exactly once.
+            assert!(consume_execution_exemption(&cid));
+            assert!(
+                !consume_execution_exemption(&cid),
+                "single-use: second consume is denied"
+            );
+            drop(guard);
+        }
+
+        #[test]
+        fn exemption_guard_drop_removes_unconsumed() {
+            let m = mem_fixture("exempt-ns2", "another-body");
+            let cid = execution_exemption_cid(&m);
+            {
+                let _g = register_execution_exemption("pa-2", &cid);
+            } // guard drops here without consume
+            assert!(
+                !consume_execution_exemption(&cid),
+                "an unconsumed exemption must be removed on guard drop"
+            );
         }
     }
 }

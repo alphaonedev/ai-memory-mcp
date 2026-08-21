@@ -4574,6 +4574,98 @@ pub(crate) const ENV_GOVERNANCE_FAIL_OPEN: &str = "AI_MEMORY_GOVERNANCE_FAIL_OPE
 /// inside `storage::insert`, which holds the main connection). When it
 /// is `None` (open failed at install time) the hook fails CLOSED per
 /// #1455.
+/// #2991 — the L1-6 escalate PRODUCER decision, factored out of the pre-write
+/// hook closure so it is unit-testable without installing the process-global
+/// [`crate::storage::GOVERNANCE_PRE_WRITE`] hook.
+///
+/// Called only for a [`RuleDecision::Escalate`](crate::governance::agent_action::Decision::Escalate)
+/// verdict on a substrate `memory_write`. Three ordered dispositions:
+///
+/// 1. **Post-quorum replay exemption.** When an approved, quorum-met pending is
+///    replayed via `execute_pending_action`, its `store` re-enters this hook and
+///    the rule STILL escalates. Consume the single-use, CID-bound exemption so
+///    the already-approved write proceeds exactly once (`Ok(())`) — never
+///    namespace-scoped, never "any store" (the CWE-306 replay class). A write
+///    whose CID is not exempted falls through.
+/// 2. **Keyless fail-closed guardrail.** With no approver keys enrolled the
+///    quorum can never be satisfied, so routing would park a forever-un-
+///    approvable pending (the availability trap). Keep the historical hard block
+///    (`Err`) instead.
+/// 3. **Route to the signed-approval gate.** Queue a `store` pending stamped
+///    `requires_signed_approval`, its payload byte-shape-identical to
+///    `execute_pending_action`'s store replay, then BLOCK the current write
+///    (`Err`) — it materialises only when an m-of-n signed quorum is met on an
+///    approve funnel. A queue failure ALSO fails closed.
+pub(crate) fn route_or_block_escalated_write(
+    conn: &rusqlite::Connection,
+    mem: &crate::models::Memory,
+    agent_id: &str,
+    rule_id: &str,
+    reason: &str,
+) -> std::result::Result<(), String> {
+    // (1) post-quorum replay exemption.
+    let exemption_cid = crate::approvals::signed::execution_exemption_cid(mem);
+    if crate::approvals::signed::consume_execution_exemption(&exemption_cid) {
+        tracing::info!(
+            "L1-6 governance pre-write: post-quorum execution exemption consumed \
+             namespace={:?} rule_id={} (approved signed-approval replay proceeds once)",
+            mem.namespace,
+            rule_id
+        );
+        return Ok(());
+    }
+    // (2) keyless fail-closed guardrail.
+    if crate::approvals::signed::enrolled_approver_keys().is_empty() {
+        tracing::warn!(
+            "L1-6 governance pre-write escalated namespace={:?} rule_id={} reason={} — \
+             NO approver keys enrolled; blocking (fail-closed) rather than queuing an \
+             un-approvable pending (enroll AI_MEMORY_OPERATOR_PUBKEY / AI_MEMORY_APPROVER_PUBKEYS)",
+            mem.namespace,
+            rule_id,
+            reason
+        );
+        return Err(reason.to_string());
+    }
+    // (3) route to the signed-approval gate.
+    let escalated_payload = serde_json::to_value(mem).unwrap_or(serde_json::Value::Null);
+    match crate::approvals::signed::route_escalation_to_approval_gate(
+        conn,
+        crate::models::GovernedAction::Store,
+        &mem.namespace,
+        None,
+        agent_id,
+        &escalated_payload,
+        rule_id,
+        reason,
+    ) {
+        Ok(pending_id) => {
+            tracing::info!(
+                "L1-6 governance pre-write escalated namespace={:?} rule_id={} reason={} — \
+                 queued signed-approval pending_id={} (blocked until m-of-n quorum met)",
+                mem.namespace,
+                rule_id,
+                reason,
+                pending_id
+            );
+            Err(format!(
+                "action escalated for signed approval (pending_id={pending_id}): {reason}"
+            ))
+        }
+        Err(e) => {
+            // Fail CLOSED if the pending could not be queued — never let an
+            // escalated write through un-approved.
+            tracing::warn!(
+                "L1-6 governance pre-write: escalation routing FAILED namespace={:?} \
+                 rule_id={} err={}; failing CLOSED",
+                mem.namespace,
+                rule_id,
+                e
+            );
+            Err(reason.to_string())
+        }
+    }
+}
+
 pub(crate) fn install_governance_pre_write_hook(
     db_path: &Path,
     deferred_audit_queue: &crate::governance::deferred_audit::DeferredAuditQueue,
@@ -4661,22 +4753,21 @@ pub(crate) fn install_governance_pre_write_hook(
                     Err(reason)
                 }
                 Ok(RuleDecision::Escalate { rule_id, reason }) => {
-                    // §22 PE-5 — an `escalate` verdict FAILS CLOSED:
-                    // it blocks the write exactly like a refusal
-                    // (`Err`). The deferred audit queue chain-logs it
-                    // (the verdict is blocking, so `submit_refusal`
-                    // enqueues it). Queue persistence + the human
-                    // review queue + timeout-sweep are the #697 PE-5
-                    // follow-on, NOT this primitive — so for now the
-                    // action is paused-as-blocked.
-                    tracing::info!(
-                        "L1-6 governance pre-write escalated namespace={:?} rule_id={} \
-                             reason={} (blocked pending human review; chain-logged)",
-                        mem.namespace,
-                        rule_id,
-                        reason
-                    );
-                    Err(reason)
+                    // #2991 — the L1-6 escalate PRODUCER. Pre-#2991 an
+                    // `escalate` verdict just FAILED CLOSED (`Err`), so the
+                    // already-written R40 signed-approval gate had no production
+                    // trigger. It now routes the escalated write to that gate as
+                    // a signed-approval pending (with the keyless fail-closed
+                    // guardrail and the post-quorum replay exemption) — factored
+                    // into `route_or_block_escalated_write` so the decision is
+                    // unit-testable without installing this process-global hook.
+                    route_or_block_escalated_write(
+                        conn_for_check,
+                        mem,
+                        &agent_id,
+                        &rule_id,
+                        &reason,
+                    )
                 }
                 Err(e) => {
                     if e.downcast_ref::<crate::governance::agent_action::AuditAdmissionError>()
@@ -12765,6 +12856,139 @@ decision = "allow"
         assert!(
             res.is_err(),
             "a postgres --store-url to an unreachable endpoint is a connect error"
+        );
+    }
+}
+
+#[cfg(test)]
+mod escalate_producer_2991_tests {
+    //! #2991 — the L1-6 escalate PRODUCER decision
+    //! ([`super::route_or_block_escalated_write`]): keyless fail-closed
+    //! guardrail, key-enrolled routing to the signed-approval gate, and the
+    //! single-use CID-bound post-quorum replay exemption. Exercised directly
+    //! (no process-global hook install needed).
+    use super::route_or_block_escalated_write;
+    use crate::models::Memory;
+
+    fn mem(ns: &str, content: &str) -> Memory {
+        Memory {
+            namespace: ns.to_string(),
+            title: "t".to_string(),
+            content: content.to_string(),
+            metadata: serde_json::json!({ "agent_id": "ai:worker" }),
+            ..Memory::default()
+        }
+    }
+
+    fn approver_pubkey_b64(seed: u8) -> String {
+        use base64::Engine as _;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
+    }
+
+    #[test]
+    fn keyless_escalation_blocks_without_queuing_a_pending() {
+        // Env-isolated: asserts the KEYLESS state, so no concurrent test's
+        // approver-key env may leak in.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::escalate_producer_2991_tests::keyless_escalation_blocks_without_queuing_a_pending",
+        ) {
+            return;
+        }
+        unsafe {
+            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
+            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
+        }
+        // Also neutralise any on-disk operator key so the fleet is TRULY keyless
+        // (a dev host may have staged an operator.key.pub).
+        let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
+        let m = mem("keyless-ns", "body-keyless");
+        let r = route_or_block_escalated_write(&conn, &m, "ai:worker", "rule-kl", "escalated");
+        assert!(r.is_err(), "keyless escalation must fail closed (block)");
+        let pend = crate::db::list_pending_actions(&conn, Some("pending"), 100).expect("list");
+        assert!(
+            pend.is_empty(),
+            "the keyless guardrail must NOT queue an un-approvable pending: {pend:?}"
+        );
+    }
+
+    #[test]
+    fn keyed_escalation_queues_store_signed_pending_and_blocks() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::escalate_producer_2991_tests::keyed_escalation_queues_store_signed_pending_and_blocks",
+        ) {
+            return;
+        }
+        unsafe {
+            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
+            std::env::set_var(
+                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
+                approver_pubkey_b64(9),
+            );
+        }
+        let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
+        let m = mem("gov-ns", "body-keyed");
+        let r =
+            route_or_block_escalated_write(&conn, &m, "ai:worker", "rule-kd", "escalated reason");
+        let err = r.expect_err("keyed escalation blocks the current write (queued for approval)");
+        assert!(
+            err.contains("pending_id="),
+            "block message names the queued pending: {err}"
+        );
+        let pend = crate::db::list_pending_actions(&conn, Some("pending"), 100).expect("list");
+        assert_eq!(pend.len(), 1, "exactly one signed-approval pending queued");
+        assert_eq!(pend[0].action_type, "store", "queued as a store replay");
+        assert!(
+            crate::approvals::signed::pending_requires_signed_approval(&pend[0].payload),
+            "queued pending must carry the signed-approval requirement"
+        );
+        // Byte-shape: the payload deserializes back to the same Memory.
+        let back: Memory =
+            serde_json::from_value(pend[0].payload.clone()).expect("payload is a Memory");
+        assert_eq!(back.content, "body-keyed");
+        assert_eq!(back.namespace, "gov-ns");
+        unsafe {
+            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
+        }
+    }
+
+    #[test]
+    fn matching_exemption_lets_the_approved_replay_through() {
+        // Env-independent: the exemption short-circuits BEFORE the keyless/route
+        // steps, and the CID is unique to this test's content.
+        let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
+        let m = mem("exempt-prod-ns", "body-exempt-unique");
+        let cid = crate::approvals::signed::execution_exemption_cid(&m);
+        let _guard = crate::approvals::signed::register_execution_exemption("pa-replay", &cid);
+        let r = route_or_block_escalated_write(&conn, &m, "ai:worker", "rule-ex", "escalated");
+        assert!(
+            r.is_ok(),
+            "a matching exemption must let the approved replay through once"
+        );
+        let pend = crate::db::list_pending_actions(&conn, Some("pending"), 100).expect("list");
+        assert!(
+            pend.is_empty(),
+            "the exemption path must not queue a new pending: {pend:?}"
+        );
+    }
+
+    #[test]
+    fn nonmatching_exemption_never_admits_a_different_write() {
+        // Env-independent: whether or not keys are enrolled, a write whose CID
+        // is not the registered one is BLOCKED (routed or hard-blocked) — never
+        // admitted through a foreign exemption (the CWE-306 replay class).
+        let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
+        let other = mem("exempt-prod-ns2", "the-DIFFERENT-approved-content");
+        let _guard = crate::approvals::signed::register_execution_exemption(
+            "pa-other",
+            &crate::approvals::signed::execution_exemption_cid(&other),
+        );
+        let m = mem("exempt-prod-ns2", "an-unapproved-write");
+        let r = route_or_block_escalated_write(&conn, &m, "ai:worker", "rule-nm", "escalated");
+        assert!(
+            r.is_err(),
+            "a non-matching exemption must never admit a different write"
         );
     }
 }
