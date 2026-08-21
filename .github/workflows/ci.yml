@@ -605,21 +605,71 @@ jobs:
       # the pg-gated tests self-skip and the default (sqlite-bundled) build is
       # what is exercised. psql for the native tier lives under a
       # platform-specific prefix; prepend whichever exists.
-      - name: Configure enterprise-fed tier (enterprise-fed legs only)
+      # v1.0.0 per-job ephemeral database (concurrent-runner safety). With 4
+      # linux-fed + 3 macos-fed runner instances, multiple pg jobs can run on
+      # ONE node at once. Pointing every job at the shared `ai_memory_test`
+      # base db would collide (concurrent CREATE/DROP schema + shared tables ->
+      # flaky). Instead each enterprise-fed leg CREATEs its OWN uniquely-named
+      # db on the native tier, points the tests at it, and DROPs it in the
+      # always() cleanup step below. The base `ai_memory_test` is used ONLY as
+      # a maintenance connection to issue CREATE/DROP DATABASE. Fail-closed:
+      # a missing URL file or a failed CREATE reds the leg.
+      - name: Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)
         if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
         shell: bash
+        env:
+          # matrix.leg via env (never inlined into the script body) so the
+          # actionlint expression-injection guard stays satisfied; sanitised
+          # in-shell below into a pg-identifier-safe suffix.
+          LEG: ${{ matrix.leg }}
         run: |
           set -euo pipefail
+          # psql lives under a platform-specific prefix. Prepend it to
+          # GITHUB_PATH (for LATER steps: the test run + the always() cleanup)
+          # AND to THIS step's own PATH (GITHUB_PATH does not affect the current
+          # step) so the CREATE DATABASE below can find psql.
           for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do
-            [ -d "$d" ] && echo "$d" >> "$GITHUB_PATH"
+            if [ -d "$d" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+              PATH="$d:$PATH"
+            fi
           done
+          export PATH
           url_file="$HOME/.ai-memory-ci-fed-url"
           if [ ! -f "$url_file" ]; then
             echo "::error::enterprise-fed leg on $RUNNER_NAME is missing $url_file — the native pg tier URL is not provisioned on this node"
             exit 1
           fi
-          echo "AI_MEMORY_TEST_POSTGRES_URL=$(cat "$url_file")" >> "$GITHUB_ENV"
-          echo "::notice::[enterprise-fed] pointed AI_MEMORY_TEST_POSTGRES_URL at the native tier on $RUNNER_NAME"
+          base_url="$(cat "$url_file")"
+          # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=63
+          # chars). run_id+attempt make it unique across concurrent runs; the
+          # sanitised matrix leg keeps the two enterprise-fed legs distinct and
+          # never sharing a name with the cert-postgres-age job.
+          leg_sanitized="$(printf '%s' "$LEG" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '_')"
+          CI_FED_DB="$(printf '%s' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${leg_sanitized}" | cut -c1-63)"
+          # Compute-once, pass to the cleanup step via $GITHUB_ENV so create
+          # and drop use the byte-identical name.
+          echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"
+          # Create the ephemeral db on the base tier (connected to ai_memory_test).
+          if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
+            echo "::error::enterprise-fed leg on $RUNNER_NAME failed to CREATE DATABASE $CI_FED_DB on the native tier"
+            exit 1
+          fi
+          # Rewrite the base URL's db-name path segment (the last path segment,
+          # before any '?') to the ephemeral db, preserving every query param
+          # (sslmode/sslrootcert). The db name is [a-z0-9_] so needs no encoding.
+          case "$base_url" in
+            *\?*) q="?${base_url#*\?}"; head="${base_url%%\?*}" ;;
+            *)    q=""; head="$base_url" ;;
+          esac
+          new_url="${head%/*}/${CI_FED_DB}${q}"
+          # Provision the ephemeral db's extensions (the tier role is SUPERUSER).
+          if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
+            echo "::error::enterprise-fed leg on $RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"
+            exit 1
+          fi
+          echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"
+          echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
@@ -801,6 +851,43 @@ jobs:
       - name: Build release (linux-fed — release-profile smoke)
         if: needs.classify.outputs.docs_only != 'true' && matrix.node == 'linux-fed' && matrix.tier == 'sqlite'
         run: cargo build --release
+
+      # Drop the per-job ephemeral db (created by "Configure enterprise-fed
+      # tier" above). always() so a failed/cancelled test run still reclaims
+      # it. Guarded on CI_FED_DB so it no-ops on the sqlite legs (where it was
+      # never set) and if the configure step failed before creating the db.
+      - name: Cleanup enterprise-fed ephemeral db
+        # always() so a failed/cancelled test run still reclaims the db, but
+        # still docs_only-guarded (rule (b3)): on a docs-only run the configure
+        # step is skipped, no db is created, so there is nothing to drop.
+        if: always() && needs.classify.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CI_FED_DB:-}" ]; then
+            echo "::notice::no ephemeral db to drop (CI_FED_DB unset — sqlite leg or configure never ran)"
+            exit 0
+          fi
+          # Re-derive psql on PATH defensively (GITHUB_PATH from the configure
+          # step normally carries it, but this step must not depend on that).
+          for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do
+            [ -d "$d" ] && PATH="$d:$PATH"
+          done
+          export PATH
+          url_file="$HOME/.ai-memory-ci-fed-url"
+          if [ ! -f "$url_file" ]; then
+            echo "::warning::cannot drop $CI_FED_DB — $url_file missing on $RUNNER_NAME (leaked ephemeral db)"
+            exit 0
+          fi
+          base_url="$(cat "$url_file")"
+          # Connect to the base ai_memory_test to drop the ephemeral db. FORCE
+          # terminates any lingering backend so the drop cannot wedge on a
+          # still-connected test process.
+          if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
+            echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"
+          else
+            echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
+          fi
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #
