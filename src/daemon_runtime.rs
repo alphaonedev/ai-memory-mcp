@@ -1018,6 +1018,65 @@ async fn dispatch_recover_previous_session(
     }
 }
 
+/// #3065 (Wave-2 Cluster B, cert-core) — resolve the LIVE `ADMIN_HEADER_TRUST`
+/// identity boot-gate inputs and apply the refusal. Extracted from [`run`] so
+/// the daemon-side WIRING (posture / header-trust env reads, mTLS-allowlist file
+/// load + fingerprint count, [`crate::handlers::admin_role::AdminHeaderTrustBootInputs`]
+/// assembly, and the refusal → boot-abort) is unit-testable end-to-end — the
+/// pure verdict fn `admin_header_trust_boot_refusal` is separately tested, but
+/// the wiring that feeds it live config is what this covers.
+///
+/// `run` calls this ONCE at boot with the resolved HTTP identity-binding mode,
+/// the enrolled per-agent api-key count, and the `--mtls-allowlist` path.
+/// `Ok(())` permits boot; `Err` refuses (the daemon aborts) — either the pure
+/// `admin_header_trust_boot_refusal` reason (dangerous header-trust topology) or
+/// a fail-closed mTLS-allowlist read error.
+///
+/// Cheap short-circuit: the allowlist file is only read when the gate could
+/// actually bite (certified/asi-hard posture engaged AND header-trust on); the
+/// pure verdict fn re-checks both defensively. Absent `--mtls-allowlist` ⇒ 0
+/// fingerprints (which the `!= 1` boundary refuses under the dangerous combo).
+///
+/// # Errors
+/// Returns the refusal reason for the dangerous header-trust topology, or the
+/// mTLS-allowlist read error (fail-closed — the same file
+/// `load_mtls_rustls_config` would reject moments later).
+pub(crate) async fn enforce_admin_header_trust_boot_gate(
+    http_identity_mode: crate::config::HttpIdentityMode,
+    agent_api_key_count: usize,
+    mtls_allowlist: Option<&std::path::Path>,
+) -> Result<()> {
+    let posture_engaged = crate::security_profile::is_asi_hard()
+        || crate::enterprise_federation_posture::enterprise_federation_posture_required();
+    if !(posture_engaged && crate::handlers::admin_role::admin_header_trust_enabled()) {
+        return Ok(());
+    }
+    let mtls_allowlist_len = match mtls_allowlist {
+        Some(path) => crate::tls::load_fingerprint_allowlist(path)
+            .await
+            .with_context(|| {
+                format!(
+                    "#3065 admin-header-trust boot gate: cannot read the inbound mTLS \
+                     allowlist {}",
+                    path.display()
+                )
+            })?
+            .len(),
+        None => 0,
+    };
+    let inputs = crate::handlers::admin_role::AdminHeaderTrustBootInputs {
+        posture_engaged,
+        header_trust_enabled: true,
+        mtls_allowlist_len,
+        attested_identity_enforced: http_identity_mode == crate::config::HttpIdentityMode::Enforce,
+        agent_api_key_count,
+    };
+    if let Some(reason) = crate::handlers::admin_role::admin_header_trust_boot_refusal(inputs) {
+        anyhow::bail!(reason);
+    }
+    Ok(())
+}
+
 /// Top-level CLI dispatch. Called from `main()` after `Cli::parse()`.
 ///
 /// Handles:
@@ -6201,54 +6260,18 @@ pub async fn bootstrap_serve(
     // boot-gate. Header-asserted identity (AI_MEMORY_ADMIN_HEADER_TRUST=1 +
     // X-Agent-Id) is sound ONLY behind a SINGLE-fingerprint mTLS proxy: one
     // client cert ⇒ one asserted identity. Under the certified / asi-hard
-    // posture we REFUSE boot when header-trust is on AND the inbound mTLS
-    // allowlist admits MORE THAN ONE fingerprint AND per-agent binding is
-    // inactive — because any of those client certs could then assert ANY agent
-    // id. Decided ONCE here at boot (never a per-request cardinality flip — that
-    // would split-brain a mid-rollout mesh). The by-the-book single-proxy-cert
-    // runbook (<=1 fingerprint) is BYTE-FOR-BYTE unaffected. The load-bearing
-    // decision is the pure `admin_header_trust_boot_refusal`
-    // (scripts/check-cert-removal-proof.sh proves it load-bearing); this block
-    // only gathers the live inputs.
-    {
-        let posture_engaged = crate::security_profile::is_asi_hard()
-            || crate::enterprise_federation_posture::enterprise_federation_posture_required();
-        // Cheap short-circuit: only bother reading the allowlist file when the
-        // gate could actually bite (posture engaged AND header-trust on). The
-        // pure verdict fn re-checks both defensively.
-        if posture_engaged && crate::handlers::admin_role::admin_header_trust_enabled() {
-            // Count the inbound client-cert fingerprints. Absent --mtls-allowlist
-            // ⇒ 0 (out of this gate's >1 scope). A present-but-unreadable
-            // allowlist fails boot HERE (fail-closed) — the same file
-            // `load_mtls_rustls_config` would reject moments later.
-            let mtls_allowlist_len = match args.mtls_allowlist.as_ref() {
-                Some(path) => crate::tls::load_fingerprint_allowlist(path)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "#3065 admin-header-trust boot gate: cannot read the inbound mTLS \
-                             allowlist {}",
-                            path.display()
-                        )
-                    })?
-                    .len(),
-                None => 0,
-            };
-            let inputs = crate::handlers::admin_role::AdminHeaderTrustBootInputs {
-                posture_engaged,
-                header_trust_enabled: true,
-                mtls_allowlist_len,
-                attested_identity_enforced: http_identity_mode
-                    == crate::config::HttpIdentityMode::Enforce,
-                agent_api_key_count: enrolled_agent_keys.len(),
-            };
-            if let Some(reason) =
-                crate::handlers::admin_role::admin_header_trust_boot_refusal(inputs)
-            {
-                anyhow::bail!(reason);
-            }
-        }
-    }
+    // posture the daemon REFUSES to boot when header-trust is on AND per-agent
+    // binding is inactive AND the inbound mTLS allowlist does not admit exactly
+    // one fingerprint. Decided ONCE here at boot (never a per-request
+    // cardinality flip — that would split-brain a mid-rollout mesh). The
+    // input-resolution + refusal wiring is factored into
+    // `enforce_admin_header_trust_boot_gate` so it is unit-testable end-to-end.
+    enforce_admin_header_trust_boot_gate(
+        http_identity_mode,
+        enrolled_agent_keys.len(),
+        args.mtls_allowlist.as_deref(),
+    )
+    .await?;
 
     // v1.0.0 #2579 — the cached FTS5 integrity verdict `/health` renders.
     // Built BEFORE the router so the handler and the background checker
@@ -8003,6 +8026,157 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
+
+    // ---- #3065 (Wave-2 Cluster B) — ADMIN_HEADER_TRUST boot-gate WIRING ---
+    //
+    // These drive the extracted `enforce_admin_header_trust_boot_gate` wiring
+    // end-to-end (posture / header-trust env reads → mTLS-allowlist file load +
+    // fingerprint count → input assembly → refusal → boot error), covering the
+    // daemon-side path `run()` calls. They run in an ISOLATED CHILD (#2905)
+    // because they set the process-global posture / header-trust env.
+
+    /// Write a temp mTLS allowlist file with `n` distinct 64-hex fingerprints.
+    fn fp_allowlist(n: usize) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        for i in 0..n {
+            // Distinct 64-hex lines: (i as hex) left-padded into 64 chars.
+            writeln!(f, "{:064x}", i + 1).expect("write fp");
+        }
+        f.flush().expect("flush");
+        f
+    }
+
+    #[tokio::test]
+    async fn admin_header_trust_boot_gate_refuses_dangerous_topologies_3065() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::admin_header_trust_boot_gate_refuses_dangerous_topologies_3065",
+        ) {
+            return;
+        }
+        let _g = crate::config::test_env_lock();
+        // Certified posture engaged + header-trust on. SAFETY: isolated child.
+        unsafe {
+            std::env::set_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+                "1",
+            );
+            std::env::set_var(crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST, "1");
+        }
+
+        // (a) TWO fingerprints + no per-agent binding → REFUSE.
+        let two = fp_allowlist(2);
+        let err = enforce_admin_header_trust_boot_gate(
+            crate::config::HttpIdentityMode::Advisory,
+            0,
+            Some(two.path()),
+        )
+        .await
+        .expect_err("multi-fingerprint header-trust combo must refuse boot");
+        assert!(
+            format!("{err:#}").contains("AI_MEMORY_ADMIN_HEADER_TRUST"),
+            "refusal names the knob: {err:#}"
+        );
+
+        // (b) NO --mtls-allowlist at all (None → 0 fingerprints) → REFUSE.
+        let err0 = enforce_admin_header_trust_boot_gate(
+            crate::config::HttpIdentityMode::Advisory,
+            0,
+            None,
+        )
+        .await
+        .expect_err("no mTLS allowlist under header-trust must refuse");
+        assert!(
+            format!("{err0:#}").contains("UNSET"),
+            "the len==0 refusal names the unset allowlist: {err0:#}"
+        );
+
+        // (c) A present-but-unreadable allowlist path fails closed (read error).
+        let err_read = enforce_admin_header_trust_boot_gate(
+            crate::config::HttpIdentityMode::Advisory,
+            0,
+            Some(std::path::Path::new(
+                "/nonexistent/does-not-exist-3065.pins",
+            )),
+        )
+        .await
+        .expect_err("an unreadable mTLS allowlist must fail boot (fail-closed)");
+        assert!(
+            format!("{err_read:#}").contains("mTLS"),
+            "the read failure is attributed to the mTLS allowlist: {err_read:#}"
+        );
+
+        unsafe {
+            std::env::remove_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+            );
+            std::env::remove_var(crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST);
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_header_trust_boot_gate_permits_safe_topologies_3065() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::admin_header_trust_boot_gate_permits_safe_topologies_3065",
+        ) {
+            return;
+        }
+        let _g = crate::config::test_env_lock();
+        unsafe {
+            std::env::set_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+                "1",
+            );
+            std::env::set_var(crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST, "1");
+        }
+
+        // (a) EXACTLY one fingerprint (the certified single-proxy runbook) → boot.
+        let one = fp_allowlist(1);
+        enforce_admin_header_trust_boot_gate(
+            crate::config::HttpIdentityMode::Advisory,
+            0,
+            Some(one.path()),
+        )
+        .await
+        .expect("single-fingerprint proxy must boot");
+
+        // (b) Multi-fingerprint BUT enforce-mode per-agent binding → backstop → boot.
+        let two = fp_allowlist(2);
+        enforce_admin_header_trust_boot_gate(
+            crate::config::HttpIdentityMode::Enforce,
+            0,
+            Some(two.path()),
+        )
+        .await
+        .expect("enforce-mode binding backstops a multi-fingerprint allowlist");
+
+        // (c) Multi-fingerprint BUT enrolled agent keys → backstop → boot.
+        enforce_admin_header_trust_boot_gate(
+            crate::config::HttpIdentityMode::Advisory,
+            3,
+            Some(two.path()),
+        )
+        .await
+        .expect("enrolled agent keys backstop a multi-fingerprint allowlist");
+
+        // (d) Header-trust OFF short-circuits (allowlist never read) → boot.
+        unsafe {
+            std::env::remove_var(crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST);
+        }
+        enforce_admin_header_trust_boot_gate(
+            crate::config::HttpIdentityMode::Advisory,
+            0,
+            Some(two.path()),
+        )
+        .await
+        .expect("header-trust off must boot (gate inert)");
+
+        unsafe {
+            std::env::remove_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+            );
+        }
+    }
 
     // ---- #2718 / CB-14 (B-5) — pull-cursor validation --------------------
 
