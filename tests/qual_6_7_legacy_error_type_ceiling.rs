@@ -215,7 +215,11 @@ const QUAL_6_CEILING: usize = 120;
 // the local `set_standard` funnels, so no new error contract is introduced.
 // A MemoryError migration of the whole namespace-standard authorization cluster
 // is a separate follow-up. Measured 42.
-const QUAL_7_CEILING: usize = 42;
+// 2026-08-21 (#2991 GA Wave-2 approval chokepoint) — raised 42 → 43 for the L1-6
+// escalate PRODUCER helper `daemon_runtime::route_or_block_escalated_write`
+// (`Result<(), String>`: the String refusal flows into the fail-closed block).
+// Measured 43.
+const QUAL_7_CEILING: usize = 43;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {
