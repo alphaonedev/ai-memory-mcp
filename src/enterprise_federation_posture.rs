@@ -524,10 +524,22 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
     ));
 
     // ---- 15. at-rest encryption — BACKEND-AWARE (#3061) ------------
-    // Resolve the backend from the store URL THIS process will actually
-    // open (`store_url::resolve_store_url`, the SAME env/file channels
-    // `serve`/`curator` open through, and the same detector the #2679
-    // wrong-store refusal uses) — NOT a bespoke `AI_MEMORY_BACKEND` hint.
+    // Resolve the backend from the store URL via `resolve_store_url(None)`
+    // — the `AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` ENV/FILE
+    // channels (and the #2679 wrong-store detector), NOT a bespoke
+    // `AI_MEMORY_BACKEND` hint.
+    //
+    // F3 CAVEAT (review, 2026-08-20): `evaluate` is a PURE fn with no argv,
+    // so it sees the ENV/FILE channels ONLY — it does NOT see `serve`'s
+    // `--store-url` ARGV flag. A pg node started via
+    // `ai-memory serve --store-url postgres://…` with NO store env would be
+    // read here as sqlite, evaluating the sqlcipher branch. Therefore
+    // `doctor --posture` (and the boot gate) MUST run in the IDENTICAL store
+    // ENV as `serve` (under systemd, the daemon's exact `EnvironmentFile`);
+    // a deployment that passes the pg DSN only on `serve`'s argv must ALSO
+    // export `AI_MEMORY_STORE_URL` so this control resolves the real backend.
+    // This mirrors the existing "doctor attests its own process, not a
+    // running daemon" caveat already documented in the cert doc.
     //   - sqlite / no store URL: the EXACT sqlcipher predicate, byte-
     //     identical to pre-#3061 — a STRUCTURAL, machine-proven control.
     //   - postgres:// DSN: a COMPENSATING pg-at-rest control. sqlcipher is

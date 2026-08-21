@@ -201,6 +201,15 @@ pub struct BootstrapNodeArgs {
     /// already-enrolled node.
     #[arg(long, value_name = "PUBKEY_B64")]
     pub recovery_pubkey: Option<String>,
+    /// v1.0.0 #3061 F3 — the store this node runs on, mirroring `serve`'s
+    /// `--store-url`. Bring-up MUST target the SAME store `serve` opens, so
+    /// this honours the identical resolution ladder
+    /// (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > this argv). A
+    /// `postgres://` DSN here (or from those env channels) FAIL-CLOSES: the pg
+    /// spine-write bring-up twin is deferred (#2217-class). Omit on a local
+    /// sqlite node.
+    #[arg(long, value_name = "URL")]
+    pub store_url: Option<String>,
     /// Emit a JSON summary instead of the human-readable lines.
     #[arg(long)]
     pub json: bool,
@@ -239,32 +248,54 @@ fn run_bootstrap_node(
     // A postgres-backed node's spine-write twin is deferred (the pg
     // signed_events GENESIS/witness ceremony, tracked like the pg re-anchor
     // twin #2217). Its verify GATE already has a pg twin
-    // (`verify_audit_trail_postgres`), so a pg node here FAIL-CLOSES with
-    // guidance rather than being falsely certified against the wrong store.
-    if let Ok(Some(url)) = crate::store_url::resolve_store_url(None) {
-        if crate::store_url::is_postgres_url(&url) {
-            if args.json {
-                writeln!(
-                    out.stdout,
-                    "{}",
-                    serde_json::json!({
-                        "bootstrap_node": false,
-                        "backend": "postgres",
-                        "certified_ready": false,
-                        "reason": "pg_spine_write_twin_deferred",
-                    })
-                )?;
-            }
+    // (`verify_audit_trail_postgres`), so a pg node here FAIL-CLOSES.
+    //
+    // #3061 F2/F3 — resolve the store via the FULL ladder INCLUDING the
+    // `--store-url` argv (`serve`'s channel), so a `serve --store-url pg://…`
+    // node is not invisible here. FAIL-CLOSED on THREE dispositions:
+    //   - Ok(Some(pg))  -> refuse (deferred pg twin, above).
+    //   - Err(_)        -> refuse: the backend is INDETERMINATE (e.g. a
+    //                      lax-perms STORE_URL_FILE), and we must never write
+    //                      the local sqlite sidecar of an unknown store.
+    //   - Ok(Some(sqlite://…)) / Ok(None) -> proceed (local sqlite bring-up).
+    let refuse_pg = |out: &mut CliOutput<'_>, msg: &str, reason: &str| -> Result<i32> {
+        if args.json {
             writeln!(
-                out.stderr,
-                "bootstrap-node: the configured store is POSTGRES. The pg signed_events \
-                 spine-write bring-up twin is deferred (like the pg re-anchor twin #2217); \
-                 refusing to certify rather than write the wrong (local sqlite) store. Run \
-                 the pg node's operator enrollment ceremonies, then confirm with \
-                 `ai-memory verify-audit-trail --store-url <dsn>` (exit 0)."
+                out.stdout,
+                "{}",
+                serde_json::json!({
+                    "bootstrap_node": false,
+                    "certified_ready": false,
+                    "reason": reason,
+                })
             )?;
-            return Ok(1);
         }
+        writeln!(out.stderr, "bootstrap-node: {msg}")?;
+        Ok(1)
+    };
+    match crate::store_url::resolve_store_url(args.store_url.as_deref()) {
+        Ok(Some(url)) if crate::store_url::is_postgres_url(&url) => {
+            return refuse_pg(
+                out,
+                "the resolved store is POSTGRES. The pg signed_events spine-write bring-up twin \
+                 is deferred (like the pg re-anchor twin #2217); refusing to certify rather than \
+                 write the wrong (local sqlite) store. Run the pg node's operator enrollment \
+                 ceremonies, then confirm with `ai-memory verify-audit-trail --store-url <dsn>` \
+                 (exit 0).",
+                "pg_spine_write_twin_deferred",
+            );
+        }
+        Err(e) => {
+            return refuse_pg(
+                out,
+                &format!(
+                    "could not resolve the store URL, so the backend is INDETERMINATE; refusing \
+                     to write the local sqlite store of an unknown backend (fail-closed): {e:#}"
+                ),
+                "store_url_indeterminate",
+            );
+        }
+        Ok(_) => {} // sqlite:// URL or no URL — proceed with local sqlite bring-up.
     }
 
     let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
@@ -313,12 +344,59 @@ fn run_bootstrap_node(
     crate::signed_events::try_force_emit_audit_head_witness(&conn)
         .context("bootstrap-node: force-emit audit-head witness anchor")?;
 
-    // ---- Step 3: verify GATE — refuse certified until CLEAN -----------
+    // ---- Step 3: verify GATE under the CERTIFIED require-modes ---------
+    // MB1 (review, 2026-08-20): `verify_audit_trail` only DIRTIES a lane whose
+    // require-mode is armed IN THIS PROCESS ENV. bootstrap-node arms none, so a
+    // bare provisioning shell would verify a witness-less / role-separation-less
+    // spine as `is_clean() == true` and FALSE-CERTIFY it. bootstrap-node IS the
+    // spine-cert gate (serve does not re-verify at boot; #17 attests env, not
+    // spine content), so its verdict is load-bearing and must reflect the
+    // CERTIFIED asi-hard audit require-mode set, not the ambient env.
+    //
+    // FAIL-CLOSED: the node is CERTIFIED-READY only when ALL THREE certified
+    // audit require-modes are armed in THIS process (so the verify actually
+    // exercised the witness / role-separation / identity-lineage lanes) AND the
+    // verify is clean under them. If the modes are not armed we CANNOT claim
+    // certified — we name what to arm. If they are armed but the verify is
+    // dirty we name the remaining ceremony. The success label names EXACTLY
+    // which modes were armed for the verdict so an auditor sees the seam.
+    let witness_armed = crate::governance::audit::require_witness_enabled();
+    let role_armed = crate::governance::audit::require_role_separation_enabled();
+    let lineage_armed = crate::identity::lineage::require_identity_lineage_enabled();
+    let armed_modes: Vec<&str> = [
+        witness_armed.then_some("witness"),
+        role_armed.then_some("role_separation"),
+        lineage_armed.then_some("identity_lineage"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let unarmed_modes: Vec<&str> = [
+        (!witness_armed).then_some("AI_MEMORY_REQUIRE_WITNESS"),
+        (!role_armed).then_some("AI_MEMORY_REQUIRE_ROLE_SEPARATION"),
+        (!lineage_armed).then_some("AI_MEMORY_REQUIRE_IDENTITY_LINEAGE"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let all_modes_armed = unarmed_modes.is_empty();
+
     let report = crate::signed_events::verify_audit_trail(&conn, None, None)
         .context("bootstrap-node: verify_audit_trail over signed_events")?;
-    let clean = report.is_clean();
-    let remaining = if clean {
+    let verify_clean = report.is_clean();
+    let certified = verify_clean && all_modes_armed;
+
+    // Refusal reasons (fail-closed), most-fundamental first.
+    let remaining: Vec<String> = if certified {
         Vec::new()
+    } else if !all_modes_armed {
+        vec![format!(
+            "the certified audit require-modes are NOT all armed in this process, so the verify \
+             did not exercise every lane — cannot claim certified. Arm them (set \
+             AI_MEMORY_SECURITY_PROFILE=asi-hard, or set {} =1) and re-run. Armed now: [{}].",
+            unarmed_modes.join(" / "),
+            armed_modes.join(", "),
+        )]
     } else {
         bring_up_remaining(&report)
     };
@@ -333,8 +411,10 @@ fn run_bootstrap_node(
                 "db": db_path.display().to_string(),
                 "agent_id": agent_id,
                 "lineage_genesis": lineage_action,
-                "certified_ready": clean,
-                "verify_clean": clean,
+                "armed_require_modes": armed_modes,
+                "all_certified_modes_armed": all_modes_armed,
+                "verify_clean": verify_clean,
+                "certified_ready": certified,
                 "remaining": remaining,
             })
         )?;
@@ -350,18 +430,29 @@ fn run_bootstrap_node(
             out.stdout,
             "  witness-anchor:  force-emitted (no-op without an enrolled witness custody key)"
         )?;
+        writeln!(
+            out.stdout,
+            "  armed modes:     [{}]",
+            if armed_modes.is_empty() {
+                "none".to_string()
+            } else {
+                armed_modes.join(", ")
+            }
+        )?;
         writeln!(out.stdout)?;
-        if clean {
+        if certified {
             writeln!(
                 out.stdout,
-                "  CERTIFIED-READY: verify-audit-trail is CLEAN (exit 0) — the audit spine is \
-                 anchored and this node is no longer born-dirty."
+                "  CERTIFIED-READY: verify-audit-trail is CLEAN under the certified audit \
+                 require-modes [{}] (exit 0) — the audit spine satisfies every armed lane and \
+                 this node is no longer born-dirty.",
+                armed_modes.join(", ")
             )?;
         } else {
             writeln!(
                 out.stderr,
-                "  NOT CERTIFIED: verify-audit-trail is DIRTY (exit 1) — this node is NOT \
-                 certifiable until every item below clears:"
+                "  NOT CERTIFIED (exit 1) — this node is NOT certifiable until every item below \
+                 clears:"
             )?;
             for r in &remaining {
                 writeln!(out.stderr, "    - {r}")?;
@@ -369,7 +460,7 @@ fn run_bootstrap_node(
         }
     }
 
-    Ok(i32::from(!clean))
+    Ok(i32::from(!certified))
 }
 
 /// Map the dirtying verdicts of a [`crate::signed_events::AuditTrailReport`]
@@ -469,6 +560,126 @@ fn bring_up_remaining(report: &crate::signed_events::AuditTrailReport) -> Vec<St
         );
     }
     v
+}
+
+#[cfg(test)]
+mod bring_up_remaining_tests {
+    //! v1.0.0 #3016/#3067 — exhaustive per-branch coverage of
+    //! [`bring_up_remaining`] via synthetic [`AuditTrailReport`]s (the
+    //! bring-up refusal path only reaches this fn when ALL certified
+    //! require-modes are armed AND the verify is dirty — MB1 — so the
+    //! truncation/head_hash/cause_binding/rollback branches are not otherwise
+    //! exercised by the integration suite).
+    use super::bring_up_remaining;
+    use crate::identity::lineage::LineageCheck;
+    use crate::signed_events::{
+        AuditTrailReport, CauseBinding, HeadHashCheck, RoleSeparationCheck, RollbackCheck,
+        SignatureCheck, TruncationCheck, WitnessCheck,
+    };
+
+    /// A fully CLEAN report — every lane at its non-dirtying variant.
+    fn clean_report() -> AuditTrailReport {
+        AuditTrailReport {
+            total_events: 1,
+            chain_intact: true,
+            first_break_sequence: None,
+            sequence_gaps: vec![],
+            head_sequence: 1,
+            since: None,
+            truncation: TruncationCheck::NotDetected,
+            witness: WitnessCheck::NotDetected,
+            cause_binding: CauseBinding::NotDetected,
+            signature_failures: vec![],
+            role_separation: RoleSeparationCheck::NotDetected,
+            lineage: LineageCheck::NotDetected,
+            rollback: RollbackCheck::NotDetected,
+            head_hash: HeadHashCheck::NotDetected,
+            signature_check: SignatureCheck::Unenforced {
+                checked: 0,
+                unverified: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn clean_report_yields_the_fallback_only_when_forced() {
+        // A clean report never reaches bring_up_remaining in production, but if
+        // it did, it returns exactly the one honest fallback line (never empty).
+        let r = clean_report();
+        let out = bring_up_remaining(&r);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("reported dirty"));
+    }
+
+    #[test]
+    fn each_dirty_verdict_names_its_own_remaining_ceremony() {
+        // (mutation, substring the remaining list must contain)
+        let cases: Vec<(Box<dyn Fn(&mut AuditTrailReport)>, &str)> = vec![
+            (Box::new(|r| r.chain_intact = false), "chain is BROKEN"),
+            (
+                Box::new(|r| r.sequence_gaps = vec![(1, 3)]),
+                "sequence GAPS",
+            ),
+            (
+                Box::new(|r| {
+                    r.truncation = TruncationCheck::Detected {
+                        anchored_head: 5,
+                        db_head: 2,
+                    };
+                }),
+                "TRUNCATION",
+            ),
+            (
+                Box::new(|r| {
+                    r.head_hash = HeadHashCheck::Mismatch {
+                        chain: "sqlite:signed_events".to_string(),
+                        detail: "suffix rewrite".to_string(),
+                    };
+                }),
+                "head-hash MISMATCH",
+            ),
+            (
+                Box::new(|r| r.witness = WitnessCheck::Missing),
+                "WITNESS anchor",
+            ),
+            (
+                Box::new(|r| r.role_separation = RoleSeparationCheck::Missing),
+                "ROLE SEPARATION",
+            ),
+            (
+                Box::new(|r| r.lineage = LineageCheck::Missing),
+                "identity LINEAGE",
+            ),
+            (
+                Box::new(|r| r.rollback = RollbackCheck::Missing),
+                "ROLLBACK",
+            ),
+            (
+                Box::new(|r| {
+                    r.cause_binding = CauseBinding::Detected {
+                        rows_without_cause: 4,
+                    };
+                }),
+                "cause-binding",
+            ),
+        ];
+        for (mutate, needle) in cases {
+            let mut r = clean_report();
+            mutate(&mut r);
+            let out = bring_up_remaining(&r);
+            assert!(
+                out.iter().any(|s| s.contains(needle)),
+                "a dirty verdict must name {needle:?}; got {out:?}"
+            );
+            // A single dirty lane yields exactly ONE remaining item (never the
+            // fallback), proving the branches are independent.
+            assert_eq!(
+                out.len(),
+                1,
+                "one dirty lane -> one remaining item: {out:?}"
+            );
+        }
+    }
 }
 
 /// The chain label the sqlite-endpoint re-anchor ceremony anchors — printed

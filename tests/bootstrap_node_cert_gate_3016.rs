@@ -7,26 +7,25 @@
 //! bring-up gate:
 //!
 //! - A bare store-only migration (agent registry copied, `signed_events`
-//!   audit spine EMPTY) is NON-certifiable / born DIRTY: under a certified
-//!   armed require-mode (here `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE`, one of
-//!   the four `asi-hard`-pinned audit require-modes) an empty spine convicts
-//!   on the identity-LINEAGE verdict, so `verify_audit_trail` is NOT clean.
-//!   That is the #3067 "must stay dirty until a mechanical bring-up runs"
-//!   property.
-//! - The single idempotent `audit bootstrap-node` command runs the EXISTING
-//!   lineage-genesis ceremony over the resolved store and REFUSES to report
-//!   certified (exit 1) until `verify-audit-trail` exits 0 — turning the
-//!   born-dirty node clean (exit 0), and re-running is an idempotent no-op.
-//! - When a require-mode the command CANNOT satisfy is armed
-//!   (`AI_MEMORY_REQUIRE_ROLE_SEPARATION`, whose distinct recorder/judge/
-//!   stopper custody keys are an operator ceremony bring-up VERIFIES but
-//!   never mints), bring-up FAIL-CLOSES (exit 1) and NAMES the remaining
-//!   ceremony rather than false-certifying.
+//!   audit spine EMPTY) is NON-certifiable / born DIRTY: under an armed
+//!   audit require-mode an empty spine convicts, so `verify_audit_trail` is
+//!   NOT clean (the #3067 "must stay dirty until a mechanical bring-up runs"
+//!   property).
+//! - MB1 — the certified verdict is FAIL-CLOSED against the ambient env.
+//!   `bootstrap-node` reports CERTIFIED-READY only when ALL THREE certified
+//!   `asi-hard` audit require-modes (`AI_MEMORY_REQUIRE_WITNESS` /
+//!   `_ROLE_SEPARATION` / `_IDENTITY_LINEAGE`) are armed in-process AND the
+//!   verify is clean under them, with the operator custody keys enrolled
+//!   (witness + recorder — a judge pubkey with no verdict checkpoint is
+//!   permanently `Missing`, an out-of-band prerequisite bring-up VERIFIES).
+//!   The tests prove the certified transition WITH keys, the fail-closed
+//!   refusal under asi-hard WITHOUT keys, and the refusal when the certified
+//!   modes are not armed at all (the false-green MB1 closes).
 //!
-//! Every `#[test]` here mutates the PROCESS-GLOBAL require-mode env that
-//! `verify_audit_trail` reads, so each holds the shared `ENV_LOCK` via
-//! `common::EnvVarGuard` for its whole body (the same discipline as
-//! `tests/identity_lineage_succession.rs`).
+//! Every `#[test]` here mutates PROCESS-GLOBAL require-mode / custody-dir env
+//! that `verify_audit_trail` reads, so each holds the shared `ENV_LOCK` via
+//! `common::{EnvVarGuard, MultiEnvVarGuard}` for its whole body (the same
+//! discipline as `tests/identity_lineage_succession.rs`).
 //!
 //! The postgres BORN-DIRTY verdict has a shipped twin
 //! (`verify_audit_trail_postgres`) exercised by the `postgres_parity`
@@ -41,13 +40,23 @@ mod common;
 use ai_memory::cli::audit::{self, AuditAction, AuditArgs, BootstrapNodeArgs};
 use ai_memory::config::AppConfig;
 use ai_memory::db;
+use ai_memory::governance::audit as roles;
 use ai_memory::identity::keypair;
 use ai_memory::identity::lineage::{LineageCheck, REQUIRE_IDENTITY_LINEAGE_ENV};
 use ai_memory::signed_events::verify_audit_trail;
-use common::EnvVarGuard;
+use common::{EnvVarGuard, MultiEnvVarGuard};
 use std::path::{Path, PathBuf};
 
 const AGENT: &str = "bootstrap-node-3016";
+
+/// Enroll a custody key (witness / recorder / …) by generating an ed25519
+/// keypair under the reserved `label` and saving it (0600) into `dir` — the
+/// operator ceremony bring-up VERIFIES but never mints. The `<label>.pub`
+/// file there satisfies the verdict's K1 pin automatically.
+fn enroll_custody_key(dir: &Path, label: &str) {
+    let kp = keypair::generate(label).expect("gen custody key");
+    keypair::save(&kp, dir).expect("save custody key");
+}
 
 /// A store-only-migrated node shape: the agent registry is populated (a
 /// migration copies it) but the `signed_events` audit spine is EMPTY.
@@ -97,6 +106,7 @@ fn bootstrap_args(key_dir: &Path, recovery_pubkey: Option<String>) -> AuditArgs 
             agent_id: Some(AGENT.to_string()),
             key_dir: Some(key_dir.to_path_buf()),
             recovery_pubkey,
+            store_url: None,
             json: false,
         }),
         audit_dir: None,
@@ -124,95 +134,152 @@ fn born_dirty_empty_spine_stays_dirty_under_armed_require_mode() {
     );
 }
 
-/// #3016 — the single idempotent bring-up command turns a born-dirty node
-/// clean, and REFUSES to report certified until verify exits 0.
-#[test]
-fn bootstrap_node_brings_up_born_dirty_node_and_is_idempotent() {
-    let (_dir, db_path, key_dir, recovery) = store_only_migrated_node();
-    let cfg = cfg_for(&db_path);
-    let _g = EnvVarGuard::set(REQUIRE_IDENTITY_LINEAGE_ENV, "1".to_string());
+/// The three certified `asi-hard` AUDIT require-modes bootstrap-node's verdict
+/// is gated on (MB1). `[(env, Some("1"))]` armed; the store-URL channels are
+/// cleared so `resolve_store_url` is deterministic (F2/F3).
+fn base_mutations() -> Vec<(&'static str, Option<&'static str>)> {
+    vec![
+        (roles::REQUIRE_WITNESS_ENV, Some("1")),
+        (roles::REQUIRE_ROLE_SEPARATION_ENV, Some("1")),
+        (REQUIRE_IDENTITY_LINEAGE_ENV, Some("1")),
+        ("AI_MEMORY_STORE_URL", None),
+        ("AI_MEMORY_STORE_URL_FILE", None),
+        (roles::WITNESS_PUBKEY_ENV, None),
+        (roles::RECORDER_PUBKEY_ENV, None),
+    ]
+}
 
-    // Precondition: born dirty.
-    {
-        let conn = db::open(&db_path).expect("open");
-        assert!(
-            !verify_audit_trail(&conn, None, None).unwrap().is_clean(),
-            "precondition: the node is born-dirty before bring-up"
-        );
-    }
-
-    // First bring-up: enrolls the lineage genesis, then the verify GATE passes.
+fn run_bootstrap(
+    cfg: &AppConfig,
+    key_dir: &Path,
+    recovery: Option<String>,
+) -> (i32, String, String) {
     let mut so = Vec::<u8>::new();
     let mut se = Vec::<u8>::new();
-    {
+    let code = {
         let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
-        let code = audit::run(bootstrap_args(&key_dir, Some(recovery)), &cfg, &mut out)
-            .expect("bootstrap-node run");
-        assert_eq!(
-            code,
-            0,
-            "bring-up must certify the born-dirty node (exit 0). stderr: {}",
-            String::from_utf8_lossy(&se)
-        );
-    }
-    assert!(String::from_utf8_lossy(&so).contains("CERTIFIED-READY"));
+        audit::run(bootstrap_args(key_dir, recovery), cfg, &mut out).expect("bootstrap-node run")
+    };
+    (
+        code,
+        String::from_utf8_lossy(&so).into_owned(),
+        String::from_utf8_lossy(&se).into_owned(),
+    )
+}
 
-    // The spine now verifies CLEAN directly.
+/// MB1 — the CERTIFIED transition under the FULL certified `asi-hard` audit
+/// require-mode set, with the operator custody keys (witness + recorder)
+/// enrolled. This is the only path on which bootstrap-node may print
+/// CERTIFIED-READY: all three modes armed AND a clean verify under them.
+/// (Recorder-only role separation is the correct fresh-node posture — a judge
+/// pubkey with no verdict checkpoint is permanently `Missing`, and no CLI mints
+/// that checkpoint; that is a verify-only operator prerequisite.)
+#[test]
+fn bootstrap_node_certifies_under_full_asi_hard_modes_with_custody_keys() {
+    let (_dir, db_path, key_dir, recovery) = store_only_migrated_node();
+    let cfg = cfg_for(&db_path);
+    let wdir = tempfile::tempdir().expect("witness dir");
+    let rdir = tempfile::tempdir().expect("recorder dir");
+    enroll_custody_key(wdir.path(), roles::WITNESS_KEY_LABEL);
+    enroll_custody_key(rdir.path(), roles::RECORDER_KEY_LABEL);
+
+    let mut muts = base_mutations();
+    muts.push((roles::WITNESS_KEY_DIR_ENV, wdir.path().to_str()));
+    muts.push((roles::RECORDER_KEY_DIR_ENV, rdir.path().to_str()));
+    let _g = MultiEnvVarGuard::apply(&muts);
+
+    let (code, so, se) = run_bootstrap(&cfg, &key_dir, Some(recovery));
+    assert_eq!(
+        code, 0,
+        "certified under full asi-hard modes with witness+recorder keys. stderr: {se}"
+    );
+    assert!(so.contains("CERTIFIED-READY"), "stdout: {so}");
+    // The success label names EXACTLY which modes were armed for the verdict.
+    assert!(
+        so.contains("witness") && so.contains("role_separation") && so.contains("identity_lineage"),
+        "CERTIFIED-READY must name the armed modes for the auditor: {so}"
+    );
+
+    // The spine now verifies CLEAN under the same armed modes.
     {
         let conn = db::open(&db_path).expect("open");
         assert!(
             verify_audit_trail(&conn, None, None).unwrap().is_clean(),
-            "after bring-up the audit spine must verify clean"
+            "after bring-up the audit spine must verify clean under the armed modes"
         );
     }
 
-    // Idempotent re-run WITHOUT a recovery pubkey (genesis already exists).
-    let mut so2 = Vec::<u8>::new();
-    let mut se2 = Vec::<u8>::new();
-    {
-        let mut out = ai_memory::cli::CliOutput::from_std(&mut so2, &mut se2);
-        let code =
-            audit::run(bootstrap_args(&key_dir, None), &cfg, &mut out).expect("idempotent re-run");
-        assert_eq!(
-            code,
-            0,
-            "idempotent re-run must stay certified (exit 0). stderr: {}",
-            String::from_utf8_lossy(&se2)
-        );
-    }
-    assert!(String::from_utf8_lossy(&so2).contains("already-enrolled"));
+    // Idempotent re-run WITHOUT a recovery pubkey stays certified (exit 0).
+    let (code2, so2, se2) = run_bootstrap(&cfg, &key_dir, None);
+    assert_eq!(
+        code2, 0,
+        "idempotent re-run must stay certified. stderr: {se2}"
+    );
+    assert!(so2.contains("already-enrolled"), "stdout: {so2}");
 }
 
-/// #3016 — bring-up FAIL-CLOSES (never false-certifies) when a require-mode
-/// it cannot satisfy is armed, and NAMES the remaining operator ceremony.
+/// MB1 — under the FULL asi-hard modes but WITHOUT the witness/recorder custody
+/// keys, bring-up FAIL-CLOSES (never false-certifies): the verify convicts on
+/// the witness + role-separation lanes, so bootstrap-node exits 1 and NAMES the
+/// remaining operator ceremony. (This is the failure DIRECTION the pre-fix gate
+/// got backwards — it would have printed CERTIFIED-READY here.)
 #[test]
-fn bootstrap_node_refuses_certified_when_role_separation_unsatisfied() {
+fn bootstrap_node_refuses_under_asi_hard_modes_without_custody_keys() {
     let (_dir, db_path, key_dir, recovery) = store_only_migrated_node();
     let cfg = cfg_for(&db_path);
-    // Role separation needs DISTINCT recorder/judge/stopper custody keys —
-    // bring-up verifies but never mints them, so this stays dirty.
-    let _g = EnvVarGuard::set(
-        ai_memory::governance::audit::REQUIRE_ROLE_SEPARATION_ENV,
-        "1".to_string(),
-    );
+    // Point the custody dirs at EMPTY dirs so no key resolves (hermetic —
+    // never the operator's real custody dir).
+    let empty_w = tempfile::tempdir().expect("empty witness dir");
+    let empty_r = tempfile::tempdir().expect("empty recorder dir");
+    let mut muts = base_mutations();
+    muts.push((roles::WITNESS_KEY_DIR_ENV, empty_w.path().to_str()));
+    muts.push((roles::RECORDER_KEY_DIR_ENV, empty_r.path().to_str()));
+    let _g = MultiEnvVarGuard::apply(&muts);
 
-    let mut so = Vec::<u8>::new();
-    let mut se = Vec::<u8>::new();
-    let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
-    let code = audit::run(bootstrap_args(&key_dir, Some(recovery)), &cfg, &mut out)
-        .expect("bootstrap-node run");
+    let (code, _so, se) = run_bootstrap(&cfg, &key_dir, Some(recovery));
     assert_eq!(
         code, 1,
-        "bring-up must REFUSE certified while role separation is unmet"
-    );
-    let err = String::from_utf8_lossy(&se);
-    assert!(
-        err.contains("NOT CERTIFIED"),
-        "refusal must be explicit: {err}"
+        "asi-hard modes armed but no custody keys must REFUSE (fail-closed). stderr: {se}"
     );
     assert!(
-        err.contains("ROLE SEPARATION"),
-        "refusal must NAME the remaining operator ceremony: {err}"
+        se.contains("NOT CERTIFIED"),
+        "refusal must be explicit: {se}"
+    );
+    assert!(
+        se.contains("WITNESS"),
+        "refusal must name the unmet witness ceremony: {se}"
+    );
+    assert!(
+        se.contains("ROLE SEPARATION"),
+        "refusal must name the unmet role-separation ceremony: {se}"
+    );
+}
+
+/// MB1 (the core false-certify) — when the certified require-modes are NOT all
+/// armed in-process, bring-up CANNOT claim certified even though the verify
+/// would be `is_clean()` under zero armed modes. This is the exact false-green
+/// the pre-fix gate produced in a bare provisioning shell.
+#[test]
+fn bootstrap_node_refuses_when_certified_modes_not_armed() {
+    let (_dir, db_path, key_dir, recovery) = store_only_migrated_node();
+    let cfg = cfg_for(&db_path);
+    // No certified require-modes armed (all explicitly cleared).
+    let _g = MultiEnvVarGuard::apply(&[
+        (roles::REQUIRE_WITNESS_ENV, None),
+        (roles::REQUIRE_ROLE_SEPARATION_ENV, None),
+        (REQUIRE_IDENTITY_LINEAGE_ENV, None),
+        ("AI_MEMORY_STORE_URL", None),
+        ("AI_MEMORY_STORE_URL_FILE", None),
+    ]);
+
+    let (code, _so, se) = run_bootstrap(&cfg, &key_dir, Some(recovery));
+    assert_eq!(
+        code, 1,
+        "unarmed certified modes must REFUSE the certified claim (fail-closed). stderr: {se}"
+    );
+    assert!(
+        se.contains("certified audit require-modes are NOT all armed"),
+        "refusal must explain the modes are not armed: {se}"
     );
 }
 

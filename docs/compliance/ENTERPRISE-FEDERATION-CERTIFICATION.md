@@ -197,6 +197,16 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
    >   operator who sets the attestation without encrypting the volume has
    >   mis-certified their own node — the posture output names exactly what
    >   was machine-checked vs vouched so an auditor can see the seam.
+   >
+   > **Backend resolution is ENV/FILE-only (#3061 F3).** `doctor --posture`
+   > resolves the backend from `AI_MEMORY_STORE_URL_FILE` /
+   > `AI_MEMORY_STORE_URL` — it does **not** see `serve`'s `--store-url`
+   > argv. So `doctor --posture` and `ai-memory audit bootstrap-node` MUST
+   > run in the **identical store environment as `serve`**: a pg node whose
+   > DSN is passed only on `serve --store-url postgres://…` must ALSO export
+   > `AI_MEMORY_STORE_URL`, or control #15 evaluates the sqlite/sqlcipher
+   > branch and `bootstrap-node` fail-closes on the wrong store. Under
+   > systemd, run both with the daemon's exact `EnvironmentFile`.
 
    `ai-memory doctor --posture` **never opens the database**; a doctor
    PASS does not prove the passphrase is present or that a row would
@@ -224,8 +234,19 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
    > bootstrap-node`**, which runs the existing operator-ceremony
    > enrollment (identity-lineage GENESIS + audit-head witness anchor) and
    > **REFUSES to report the node certified until `verify-audit-trail`
-   > exits 0**, printing the exact remaining ceremony on a refusal. It is
-   > a *command*, never a runbook checklist, so a provisioning system runs
+   > exits 0**, printing the exact remaining ceremony on a refusal. The
+   > certified verdict is **fail-closed against the ambient env**:
+   > `verify-audit-trail` only convicts a lane whose require-mode is armed
+   > in-process, so `bootstrap-node` reports CERTIFIED-READY **only when
+   > all three certified audit require-modes** (`AI_MEMORY_REQUIRE_WITNESS`
+   > / `_ROLE_SEPARATION` / `_IDENTITY_LINEAGE`) **are armed AND the verify
+   > is clean under them** — it names exactly which modes were armed, so a
+   > bare provisioning shell that arms none can never print a "certified"
+   > that exercised nothing. (Witness needs an enrolled witness custody
+   > key; role separation on a fresh node needs a recorder custody key — a
+   > judge pubkey with no verdict checkpoint is permanently `Missing`, an
+   > out-of-band operator prerequisite bring-up VERIFIES.) It is a
+   > *command*, never a runbook checklist, so a provisioning system runs
    > it unattended and a node that fails its own verify never claims cert.
    > Distinct-custody trust (witness / recorder / judge / stopper keys)
    > stays operator custody — bring-up VERIFIES it and NAMES anything

@@ -100,8 +100,17 @@ COUNT (still 19); the sqlite/sqlcipher legs are byte-identical.
   operator-ceremony enrollment (identity-lineage GENESIS + audit-head witness
   anchor) over the local sqlite store and REFUSES to report the node certified
   until `verify-audit-trail` exits 0, printing the exact remaining ceremony on a
-  refusal. Idempotent (re-running a brought-up node re-emits no genesis and simply
-  re-verifies); it NEVER copies or re-signs `signed_events` across a migration (a
+  refusal. The certified verdict is FAIL-CLOSED against ambient env: `bootstrap-node`
+  reports CERTIFIED-READY only when ALL THREE certified `asi-hard` audit
+  require-modes (`AI_MEMORY_REQUIRE_WITNESS` / `_ROLE_SEPARATION` /
+  `_IDENTITY_LINEAGE`) are armed IN-PROCESS (so the verify actually exercised each
+  lane) AND the verify is clean under them — the success label names EXACTLY which
+  modes were armed for the verdict, so a bare provisioning shell that arms none
+  can never print a bare "certified" that means nothing. It resolves the store via
+  the full ladder including `--store-url` and fail-closes on a postgres or
+  indeterminate backend. Idempotent (re-running a brought-up node re-emits no
+  genesis and simply re-verifies); it NEVER copies or re-signs `signed_events`
+  across a migration (a
   chain-identity / `db_id` fork is irreversible-if-wrong) and mints NO
   distinct-custody trust — witness / recorder / judge / stopper keys stay operator
   custody; bring-up VERIFIES them and names any that are missing. The postgres

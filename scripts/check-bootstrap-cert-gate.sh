@@ -19,10 +19,14 @@
 #   --posture` never opens the DB, so this needs no live postgres.
 #
 #   LEG B (#3016/#3067) — a store-only-migrated node (empty `signed_events`
-#   spine) is born DIRTY and STAYS dirty until the single idempotent
-#   `ai-memory audit bootstrap-node` command runs. `verify-audit-trail`
-#   exits 1 before bring-up and 0 after; bring-up is idempotent. NEGATIVE
-#   CONTROL: a node that skips bring-up stays exit 1 (never self-certifies).
+#   spine) is born DIRTY and only reaches CERTIFIED-READY through the single
+#   idempotent `ai-memory audit bootstrap-node` command run under the FULL
+#   certified asi-hard AUDIT require-mode set (witness + role + lineage all
+#   armed) WITH the operator custody keys enrolled (witness + recorder). The
+#   success label names EXACTLY which modes were armed (MB1). NEGATIVE
+#   CONTROLS: asi-hard armed WITHOUT the custody keys REFUSES and names the
+#   unmet ceremonies; certified modes NOT armed REFUSES to claim certified
+#   even though the bare verify is clean (the false-green MB1 closes).
 #
 # USAGE:
 #   scripts/check-bootstrap-cert-gate.sh          # build (if needed) + run
@@ -125,36 +129,38 @@ fi
 
 rm -rf "$KEYDIR_A" "$FPFILE_A"
 
-# ── LEG B — #3016/#3067 born-dirty → mechanical bring-up ────────────────────
+# ── LEG B — #3016/#3067 born-dirty → mechanical bring-up (asi-hard) ─────────
 echo
-echo "== LEG B — #3016/#3067 born-dirty bring-up gate =="
+echo "== LEG B — #3016/#3067 born-dirty bring-up gate (certified asi-hard modes) =="
 
 WORK_B="$(mktemp -d)"
-KEYDIR_B="$WORK_B/keys"
-mkdir -p "$KEYDIR_B"
+KEYDIR_B="$WORK_B/keys"; WDIR_B="$WORK_B/witness"; RDIR_B="$WORK_B/recorder"
+EMPTY_W="$WORK_B/empty-witness"; EMPTY_R="$WORK_B/empty-recorder"
+mkdir -p "$KEYDIR_B" "$WDIR_B" "$RDIR_B" "$EMPTY_W" "$EMPTY_R"
 AGENT_B="cert-node-3016"
 
-# HERMETIC db resolution (DATA-INTEGRITY CRITICAL). The `audit` subcommand
-# resolves its db from `AppConfig` (config.toml `db` / AGENT-CONFIG), NOT the
-# cwd, so a stray `~/.config/ai-memory/config.toml` would point bring-up at a
-# REAL operator DB and write a spine row into it. `AI_MEMORY_NO_CONFIG=1` skips
-# config loading so `effective_db` falls to the cwd-relative default
-# (`./ai-memory.db` in $WORK_B), and `AI_MEMORY_STORE_URL` / `_FILE` are cleared
-# so no external store is ever opened. Every leg-B invocation goes through
-# `am_b` to guarantee this.
-am_b() {
-  ( cd "$WORK_B" \
-    && env AI_MEMORY_NO_CONFIG=1 \
-           AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
-           AI_MEMORY_KEY_DIR="$KEYDIR_B" \
-           "$@" )
-}
+# The certified verdict is gated on the FULL asi-hard AUDIT require-mode set
+# (MB1): bootstrap-node reports CERTIFIED-READY only when witness + role +
+# lineage are ALL armed AND the verify is clean under them.
+CERT_MODES=(AI_MEMORY_REQUIRE_WITNESS=1 AI_MEMORY_REQUIRE_ROLE_SEPARATION=1 AI_MEMORY_REQUIRE_IDENTITY_LINEAGE=1)
 
-# A store-only-migrated node: the agent registry is populated, the audit
-# spine is empty. All commands operate on ./ai-memory.db in $WORK_B.
-am_b "$BIN" identity generate --agent-id "$AGENT_B" >/dev/null 2>&1
-am_b "$BIN" identity generate --agent-id "${AGENT_B}-recovery" >/dev/null 2>&1
-RECOVERY_B="$(am_b "$BIN" identity export-pub --agent-id "${AGENT_B}-recovery" 2>/dev/null)"
+# HERMETIC db resolution (DATA-INTEGRITY CRITICAL). The `audit` subcommand
+# resolves its db from `AppConfig` (config.toml `db`), NOT the cwd, so a stray
+# `~/.config/ai-memory/config.toml` would point bring-up at a REAL operator DB.
+# `AI_MEMORY_NO_CONFIG=1` skips config loading so `effective_db` falls to the
+# cwd-relative default (`./ai-memory.db` in $WORK_B); `AI_MEMORY_STORE_URL` /
+# `_FILE` are cleared so no external store is opened.
+am_b() { ( cd "$WORK_B" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= "$@" ); }
+
+# Store-only-migrated node: registry populated, spine empty. Enroll the
+# operator custody keys bring-up VERIFIES (never mints): witness + recorder.
+# NOT judge — a judge pubkey needs a verdict checkpoint no fresh-node CLI mints
+# (recorder-only is the correct fresh-node role-separation posture).
+am_b "$BIN" identity generate --agent-id "$AGENT_B" --key-dir "$KEYDIR_B" >/dev/null 2>&1
+am_b "$BIN" identity generate --agent-id "${AGENT_B}-recovery" --key-dir "$KEYDIR_B" >/dev/null 2>&1
+RECOVERY_B="$(am_b "$BIN" identity export-pub --agent-id "${AGENT_B}-recovery" --key-dir "$KEYDIR_B" 2>/dev/null)"
+"$BIN" identity generate --agent-id audit-witness --key-dir "$WDIR_B" >/dev/null 2>&1
+"$BIN" identity generate --agent-id governance-recorder --key-dir "$RDIR_B" >/dev/null 2>&1
 am_b "$BIN" agents register --agent-id "$AGENT_B" --agent-type ai:test >/dev/null 2>&1
 
 # BORN DIRTY — under an armed audit require-mode, the empty spine convicts.
@@ -165,8 +171,8 @@ else
   fail "an empty spine passed verify-audit-trail under armed require-lineage — NOT born dirty"
 fi
 
-# BRING UP — the single idempotent command.
-am_b env AI_MEMORY_REQUIRE_IDENTITY_LINEAGE=1 \
+# CERTIFIED — under the FULL asi-hard modes WITH witness + recorder keys.
+am_b env "${CERT_MODES[@]}" AI_MEMORY_WITNESS_KEY_DIR="$WDIR_B" AI_MEMORY_RECORDER_KEY_DIR="$RDIR_B" \
     "$BIN" audit bootstrap-node --agent-id "$AGENT_B" --key-dir "$KEYDIR_B" \
     --recovery-pubkey "$RECOVERY_B" > "$EVIDENCE_DIR/bring-up.out" 2>&1
 BRINGUP_CODE=$?
@@ -178,22 +184,29 @@ else
   fail "bring-up did NOT resolve the sandbox db — refusing to trust the result"
   grep -E "^  db:" "$EVIDENCE_DIR/bring-up.out" | sed 's/^/    /'
 fi
-if [[ $BRINGUP_CODE -eq 0 ]]; then
-  pass "audit bootstrap-node brought the node up: exit 0 (certified-ready)"
+if [[ $BRINGUP_CODE -eq 0 ]] && grep -q "CERTIFIED-READY" "$EVIDENCE_DIR/bring-up.out"; then
+  pass "audit bootstrap-node CERTIFIED under full asi-hard modes with witness+recorder keys (exit 0)"
 else
-  fail "bootstrap-node did not certify the node — see $EVIDENCE_DIR/bring-up.out"
+  fail "bootstrap-node did not certify under asi-hard — see $EVIDENCE_DIR/bring-up.out"
+fi
+# The success label must NAME the armed modes for the auditor (MB1).
+if grep -qE "CERTIFIED-READY.*witness.*role_separation.*identity_lineage" "$EVIDENCE_DIR/bring-up.out"; then
+  pass "CERTIFIED-READY names EXACTLY the armed require-modes for the verdict"
+else
+  fail "CERTIFIED-READY must name the armed modes (auditor seam) — see bring-up.out"
 fi
 
-# CLEAN AFTER — verify now exits 0.
-am_b env AI_MEMORY_REQUIRE_IDENTITY_LINEAGE=1 "$BIN" verify-audit-trail >/dev/null 2>&1
+# CLEAN AFTER — verify now exits 0 under the same armed modes.
+am_b env "${CERT_MODES[@]}" AI_MEMORY_WITNESS_KEY_DIR="$WDIR_B" AI_MEMORY_RECORDER_KEY_DIR="$RDIR_B" \
+    "$BIN" verify-audit-trail >/dev/null 2>&1
 if [[ $? -eq 0 ]]; then
-  pass "after bring-up, verify-audit-trail exits 0 (no longer born dirty)"
+  pass "after bring-up, verify-audit-trail exits 0 under the certified modes"
 else
-  fail "verify-audit-trail still dirty after bring-up"
+  fail "verify-audit-trail still dirty after bring-up under the certified modes"
 fi
 
 # IDEMPOTENT — re-run with NO recovery pubkey stays exit 0.
-am_b env AI_MEMORY_REQUIRE_IDENTITY_LINEAGE=1 \
+am_b env "${CERT_MODES[@]}" AI_MEMORY_WITNESS_KEY_DIR="$WDIR_B" AI_MEMORY_RECORDER_KEY_DIR="$RDIR_B" \
     "$BIN" audit bootstrap-node --agent-id "$AGENT_B" --key-dir "$KEYDIR_B" >/dev/null 2>&1
 if [[ $? -eq 0 ]]; then
   pass "bootstrap-node is idempotent: re-run without --recovery-pubkey stays certified"
@@ -201,19 +214,44 @@ else
   fail "bootstrap-node re-run was not idempotent"
 fi
 
-# NEGATIVE CONTROL — a SECOND fresh node that SKIPS bring-up stays dirty.
-WORK_C="$(mktemp -d)"
-( cd "$WORK_C" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
-    "$BIN" agents register --agent-id skip-node --agent-type ai:test >/dev/null 2>&1 )
-( cd "$WORK_C" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
-    AI_MEMORY_REQUIRE_IDENTITY_LINEAGE=1 "$BIN" verify-audit-trail >/dev/null 2>&1 )
-if [[ $? -ne 0 ]]; then
-  pass "negative control: a node that SKIPS bring-up stays dirty (never self-certifies)"
+# NEGATIVE CONTROL 1 (MB1 core) — asi-hard modes armed but NO custody keys
+# (empty dirs) MUST refuse and name the unmet ceremonies. A FRESH node.
+WORK_D="$(mktemp -d)"; KEYDIR_D="$WORK_D/keys"; mkdir -p "$KEYDIR_D"
+am_d() { ( cd "$WORK_D" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= "$@" ); }
+am_d "$BIN" identity generate --agent-id nokeys-node --key-dir "$KEYDIR_D" >/dev/null 2>&1
+am_d "$BIN" identity generate --agent-id nokeys-recovery --key-dir "$KEYDIR_D" >/dev/null 2>&1
+REC_D="$(am_d "$BIN" identity export-pub --agent-id nokeys-recovery --key-dir "$KEYDIR_D" 2>/dev/null)"
+am_d "$BIN" agents register --agent-id nokeys-node --agent-type ai:test >/dev/null 2>&1
+am_d env "${CERT_MODES[@]}" AI_MEMORY_WITNESS_KEY_DIR="$EMPTY_W" AI_MEMORY_RECORDER_KEY_DIR="$EMPTY_R" \
+    AI_MEMORY_WITNESS_PUBKEY= AI_MEMORY_RECORDER_PUBKEY= \
+    "$BIN" audit bootstrap-node --agent-id nokeys-node --key-dir "$KEYDIR_D" \
+    --recovery-pubkey "$REC_D" > "$EVIDENCE_DIR/refuse-no-keys.out" 2>&1
+if [[ $? -eq 1 ]] && grep -q "NOT CERTIFIED" "$EVIDENCE_DIR/refuse-no-keys.out" \
+   && grep -q "WITNESS" "$EVIDENCE_DIR/refuse-no-keys.out" \
+   && grep -q "ROLE SEPARATION" "$EVIDENCE_DIR/refuse-no-keys.out"; then
+  pass "negative control: asi-hard armed WITHOUT custody keys REFUSES and names witness + role"
 else
-  fail "a node that skipped bring-up self-certified — the born-dirty gate is not load-bearing"
+  fail "asi-hard without keys did NOT fail-close correctly — see $EVIDENCE_DIR/refuse-no-keys.out"
 fi
 
-rm -rf "$WORK_B" "$WORK_C"
+# NEGATIVE CONTROL 2 (MB1 core) — certified modes NOT armed MUST refuse to claim
+# certified even though the bare verify would be clean. A FRESH node.
+WORK_E="$(mktemp -d)"; KEYDIR_E="$WORK_E/keys"; mkdir -p "$KEYDIR_E"
+am_e() { ( cd "$WORK_E" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
+    AI_MEMORY_REQUIRE_WITNESS= AI_MEMORY_REQUIRE_ROLE_SEPARATION= AI_MEMORY_REQUIRE_IDENTITY_LINEAGE= "$@" ); }
+am_e "$BIN" identity generate --agent-id unarmed-node --key-dir "$KEYDIR_E" >/dev/null 2>&1
+am_e "$BIN" identity generate --agent-id unarmed-recovery --key-dir "$KEYDIR_E" >/dev/null 2>&1
+REC_E="$(am_e "$BIN" identity export-pub --agent-id unarmed-recovery --key-dir "$KEYDIR_E" 2>/dev/null)"
+am_e "$BIN" agents register --agent-id unarmed-node --agent-type ai:test >/dev/null 2>&1
+am_e "$BIN" audit bootstrap-node --agent-id unarmed-node --key-dir "$KEYDIR_E" \
+    --recovery-pubkey "$REC_E" > "$EVIDENCE_DIR/refuse-unarmed.out" 2>&1
+if [[ $? -eq 1 ]] && grep -q "require-modes are NOT all armed" "$EVIDENCE_DIR/refuse-unarmed.out"; then
+  pass "negative control: certified modes NOT armed REFUSES the certified claim (no false-green)"
+else
+  fail "unarmed certified modes did NOT refuse — see $EVIDENCE_DIR/refuse-unarmed.out"
+fi
+
+rm -rf "$WORK_B" "$WORK_D" "$WORK_E"
 
 echo
 if [[ $FAILED -eq 0 ]]; then
