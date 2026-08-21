@@ -118,7 +118,17 @@ pub enum PendingAction {
         limit: usize,
     },
     /// Approve a pending action by id.
-    Approve { id: String },
+    Approve {
+        id: String,
+        /// R40 signed approval, `<pubkey_b64>:<signature_b64>` (repeatable).
+        /// REQUIRED when the pending was routed from a governance escalation
+        /// (`requires_signed_approval`): an m-of-n Ed25519 quorum over enrolled
+        /// approver keys must be met before the CLI operator can approve it.
+        /// Each `<signature_b64>` signs
+        /// `approvals::signed::approval_signing_bytes(id, Approve)`.
+        #[arg(long = "approval", value_name = "PUBKEY_B64:SIG_B64")]
+        approvals: Vec<String>,
+    },
     /// Reject a pending action by id.
     Reject { id: String },
 }
@@ -398,6 +408,26 @@ fn enroll_subkey_cert(
     Ok(())
 }
 
+/// Parse repeatable `--approval <pubkey_b64>:<signature_b64>` CLI specs into
+/// R40 [`SignedApproval`](crate::approvals::signed::SignedApproval)s. The `:`
+/// separator is unambiguous — it never occurs in standard OR url-safe base64.
+fn parse_cli_approvals(specs: &[String]) -> Result<Vec<crate::approvals::signed::SignedApproval>> {
+    specs
+        .iter()
+        .map(|spec| {
+            let (pubkey, signature) = spec.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --approval {spec:?}: expected <pubkey_b64>:<signature_b64>"
+                )
+            })?;
+            Ok(crate::approvals::signed::SignedApproval {
+                signer_pubkey_b64: pubkey.to_string(),
+                signature_b64: signature.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// `pending` handler.
 pub fn run_pending(
     db_path: &Path,
@@ -434,10 +464,93 @@ pub fn run_pending(
                 writeln!(out.stdout, "{} pending action(s)", items.len())?;
             }
         }
-        PendingAction::Approve { id } => {
+        PendingAction::Approve { id, approvals } => {
             use db::ApproveOutcome;
             validate::validate_id(&id)?;
             let agent = identity::resolve_agent_id(cli_agent_id, None)?;
+
+            // #2991/#2355 — the CLI approve funnel routes through the SAME R40
+            // signed-approval chokepoint as MCP + the four HTTP funnels, strictly
+            // ABOVE the `approve_with_approver_type` + `execute_pending_action`
+            // finalizer below. This is load-bearing on the CLI specifically: the
+            // one-shot CLI process INTENTIONALLY does not install the
+            // `GOVERNANCE_PRE_WRITE` execute-time backstop (operator-as-actor —
+            // see `daemon_runtime::run` sqlite bootstrap), so this funnel gate is
+            // the ONLY thing between a single operator and an unsigned
+            // approve+execute of an escalation-routed (`requires_signed_approval`)
+            // pending — exactly the unilateral single-operator approval R40
+            // exists to stop. A rusqlite conn is in hand, so BOTH requirement
+            // terms are supplied: the stored escalation flag AND the live
+            // rule-engine namespace re-derivation.
+            let snapshot = db::get_pending_action(&conn, &id)?;
+            let stored_payload = snapshot
+                .as_ref()
+                .map_or(serde_json::Value::Null, |pa| pa.payload.clone());
+            let namespace_requires = snapshot.as_ref().is_some_and(|pa| {
+                crate::approvals::signed::namespace_requires_signed_approval(
+                    &conn,
+                    &pa.requested_by,
+                    &pa.namespace,
+                )
+            });
+            let presented = parse_cli_approvals(&approvals)?;
+            // Single-use execution exemption, armed only on a MET signed quorum
+            // and held across `execute_pending_action` (a no-op net on the CLI's
+            // hook-less process, but kept identical to the other funnels).
+            let mut _exemption_guard = None;
+            match crate::approvals::signed::evaluate_signed_approval_gate(
+                &stored_payload,
+                &id,
+                crate::approvals::Decision::Approve,
+                &presented,
+                namespace_requires,
+            ) {
+                crate::approvals::signed::GateVerdict::NotRequired => {}
+                crate::approvals::signed::GateVerdict::Approved(quorum) => {
+                    crate::approvals::signed::record_quorum_event(
+                        &id,
+                        crate::approvals::Decision::Approve,
+                        &quorum,
+                    );
+                    _exemption_guard =
+                        crate::approvals::signed::exemption_guard_for_pending(&id, &stored_payload);
+                    // Quorum met — fall through to the approver-type finalizer.
+                }
+                crate::approvals::signed::GateVerdict::Pending {
+                    distinct,
+                    threshold,
+                } => {
+                    // Signatures accepted so far, m-of-n quorum not yet met.
+                    if json_out {
+                        writeln!(
+                            out.stdout,
+                            "{}",
+                            serde_json::json!({
+                                "approved": false,
+                                "status": "pending",
+                                "id": id,
+                                "signed_votes": distinct,
+                                "signed_quorum": threshold,
+                                "reason": "signed approval quorum not yet met",
+                            })
+                        )?;
+                    } else {
+                        writeln!(
+                            out.stdout,
+                            "signed approval recorded: {id} ({distinct}/{threshold} signers, \
+                             quorum not yet met)"
+                        )?;
+                    }
+                    return Ok(());
+                }
+                crate::approvals::signed::GateVerdict::Refused(e) => {
+                    // Fail closed: missing-when-required / forged / unenrolled.
+                    // `bail!` gives a clean refusal + nonzero exit (anyhow main),
+                    // and — unlike `process::exit` — is unit-testable.
+                    anyhow::bail!("signed approval rejected: {e}");
+                }
+            }
+
             // #1796 (5-agent vote 4d3ea1c5) — CLI is operator-as-actor (single
             // operator); keep the Human-arm gate on the AI_MEMORY_AGENT_ID opt-in.
             match db::approve_with_approver_type(
@@ -956,6 +1069,132 @@ mod tests {
         target
     }
 
+    /// Seed an escalation-routed (`requires_signed_approval`) STORE pending, as
+    /// the L1-6 producer would, into the CLI's sqlite DB. Returns the pending id.
+    fn seed_escalated_store_pending_cli(
+        db_path: &std::path::Path,
+        ns: &str,
+        content: &str,
+    ) -> String {
+        let conn = db::open(db_path).expect("db::open");
+        let mem = crate::models::Memory {
+            namespace: ns.to_string(),
+            title: "cli-esc".to_string(),
+            content: content.to_string(),
+            metadata: serde_json::json!({ "agent_id": "ai:worker" }),
+            ..crate::models::Memory::default()
+        };
+        crate::approvals::signed::route_escalation_to_approval_gate(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:worker",
+            &serde_json::to_value(&mem).expect("memory to value"),
+            "cli-esc-rule",
+            "escalated for signed approval (cli test)",
+        )
+        .expect("route escalation")
+    }
+
+    /// #2991/#2355 — the CLI approve funnel enforces the R40 gate: an
+    /// escalation-routed pending is REFUSED without a signed quorum (fail-closed
+    /// nonzero exit) and NOT executed. Env-independent: with no key enrolled the
+    /// verdict is `NoEnrolledApprovers`, with a concurrent test's key it is
+    /// `NoSignatures` — either way `Refused`.
+    #[test]
+    fn cli_approve_refuses_escalated_pending_without_signatures() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let pid = seed_escalated_store_pending_cli(&db, "cli-esc-ns", "cli-body");
+        let args = PendingArgs {
+            action: PendingAction::Approve {
+                id: pid.clone(),
+                approvals: Vec::new(),
+            },
+        };
+        let res = {
+            let mut out = env.output();
+            run_pending(&db, args, false, Some("test-agent"), &mut out)
+        };
+        assert!(
+            res.is_err(),
+            "an escalated pending must be REFUSED on the CLI without a signed quorum"
+        );
+        assert!(
+            res.unwrap_err().to_string().contains("signed approval"),
+            "the CLI refusal must name the signed-approval gate"
+        );
+        // The row must NOT have transitioned or executed.
+        let conn = db::open(&db).expect("reopen");
+        let row = db::get_pending_action(&conn, &pid)
+            .expect("get_pending_action")
+            .expect("row exists");
+        assert_eq!(
+            row.status, "pending",
+            "a refused approve must not transition the row"
+        );
+    }
+
+    /// #2991/#2355 — the CLI approve funnel ADMITS an escalation-routed pending
+    /// once an m-of-n signed quorum is presented (approve + execute). Env-
+    /// isolated: enrolls an approver key.
+    #[test]
+    fn cli_approve_admits_escalated_pending_with_met_quorum() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::agents::tests::cli_approve_admits_escalated_pending_with_met_quorum",
+        ) {
+            return;
+        }
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let pk_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+        unsafe {
+            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
+            std::env::set_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV, &pk_b64);
+        }
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let pid = seed_escalated_store_pending_cli(&db, "cli-esc-ns2", "cli-body-2");
+        let msg = crate::approvals::signed::approval_signing_bytes(
+            &pid,
+            crate::approvals::Decision::Approve,
+        );
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sk.sign(&msg).to_bytes());
+        let args = PendingArgs {
+            action: PendingAction::Approve {
+                id: pid.clone(),
+                approvals: vec![format!("{pk_b64}:{sig_b64}")],
+            },
+        };
+        let res = {
+            let mut out = env.output();
+            run_pending(&db, args, false, Some("test-agent"), &mut out)
+        };
+        assert!(
+            res.is_ok(),
+            "a met signed quorum must approve on the CLI: {res:?}"
+        );
+        assert!(
+            env.stdout_str().contains("approved + executed"),
+            "stdout must confirm approve+execute: {}",
+            env.stdout_str()
+        );
+        let conn = db::open(&db).expect("reopen");
+        let row = db::get_pending_action(&conn, &pid)
+            .expect("get_pending_action")
+            .expect("row exists");
+        assert_eq!(
+            row.status, "approved",
+            "the row must transition to approved"
+        );
+        unsafe {
+            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
+        }
+    }
+
     #[test]
     fn test_pending_approve_happy_text() {
         // Default namespace policy (no governance row) → approver = Human →
@@ -969,6 +1208,7 @@ mod tests {
         let args = PendingArgs {
             action: PendingAction::Approve {
                 id: "pa-approve-1".to_string(),
+                approvals: Vec::new(),
             },
         };
         {
@@ -990,6 +1230,7 @@ mod tests {
         let args = PendingArgs {
             action: PendingAction::Approve {
                 id: "pa-approve-json".to_string(),
+                approvals: Vec::new(),
             },
         };
         {
@@ -1133,6 +1374,7 @@ mod tests {
         let args = PendingArgs {
             action: PendingAction::Approve {
                 id: "pa-cons-1".to_string(),
+                approvals: Vec::new(),
             },
         };
         {
@@ -1169,6 +1411,7 @@ mod tests {
         let args = PendingArgs {
             action: PendingAction::Approve {
                 id: "pa-cons-j".to_string(),
+                approvals: Vec::new(),
             },
         };
         {
@@ -1200,7 +1443,10 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = PendingArgs {
-            action: PendingAction::Approve { id: String::new() },
+            action: PendingAction::Approve {
+                id: String::new(),
+                approvals: Vec::new(),
+            },
         };
         let mut out = env.output();
         let res = run_pending(&db, args, false, Some("test-agent"), &mut out);
