@@ -419,7 +419,7 @@ script (Docker / Plan C deployments).
 | # | Variable | Type | Default | Surface | Class | Notes |
 |--|---|---|---|---|---|---|
 | 1 | `AI_MEMORY_DB` | path | `ai-memory.db` | CLI/daemon/MCP | config | clap `env=`; `--db` flag wins. Resolved by `effective_db`. |
-| 2 | `AI_MEMORY_DB_PASSPHRASE` | string | unset | CLI/daemon/MCP (sqlcipher build) | **secret** | Set by the CLI from `--db-passphrase-file` (mode 0400). Direct caller use leaks via `ps -E`. Never echoed. |
+| 2 | `AI_MEMORY_DB_PASSPHRASE` | string | unset | CLI/daemon/MCP (sqlcipher build) | **secret** | Operator-set SQLCipher passphrase. Direct caller use leaks via `ps -E`. `--db-passphrase-file` does **not** export this (#3213 / the #2905 env-leak class); it seeds process-private `OnceLock` state. Never echoed. |
 | 3 | `AI_MEMORY_API_KEY` | string | unset | entrypoint (`entrypoint.plan-c.sh`, #845) | **secret** | Injected into the rendered `config.toml` top-level `api_key` field at container boot. Never read from Rust env directly. |
 | 4 | `AI_MEMORY_NO_CONFIG` | bool (`1`) | unset | all | config | Skip loading `~/.config/ai-memory/config.toml`. Required for integration tests that bring up isolated state. |
 | 5 | `AI_MEMORY_AGENT_ID` | string | synthesized | CLI/MCP (NOT daemon) | config | clap `env=`; `--agent-id` flag wins. See §Agent Identity for full resolution ladder. |

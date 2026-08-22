@@ -500,22 +500,13 @@ backend and missing or divergently implemented on its twin). Pinned by
   case-insensitive) already used by every other `AI_MEMORY_*` boolean knob, and
   WARN once when the variable is present but not truthy. `AI_MEMORY_NO_CONFIG=1`
   behaviour is unchanged.
-### Security (secret-file handling: close the TOCTOU re-open window; give the capability token a non-argv channel)
+### Security (secret-file handling: close the TOCTOU re-open window; give the capability token a non-argv channel; stop re-publishing the SQLCipher passphrase)
 
 - **Four secret-file loaders still did stat-then-reopen (TOCTOU).** #3205. #1790
   finding 2 established the rule for this codebase — open the file ONCE and run
   the permission check on THAT handle (`f.metadata()` = fstat), then read the
   bytes from the SAME handle — and fixed `identity::keypair` (`.priv`), the
   encryption master KEK and `governance::capability` (`.caproot`) accordingly.
-  Two loaders were missed: `daemon_runtime::passphrase_from_file` (the
-  SQLCipher DB passphrase, #1055 gate) and `store_url::store_url_from_file`
-  (the Postgres DSN, which carries a password, #1927 gate). Both did
-  `fs::metadata(path)` followed by `fs::read_to_string(path)` — two path
-  lookups, so a local attacker able to write the directory could satisfy the
-  0400/0600 gate with a decoy and have a different file read in its place: the
-  fail-closed gate did not bind the bytes actually read. Both now use the
-  single-handle form; the permission logic, the opt-out env vars, the error
-  text and the trimming behaviour are byte-identical.
   Four loaders were missed: `daemon_runtime::passphrase_from_file` (the
   SQLCipher DB passphrase, #1055 gate), `store_url::store_url_from_file` (the
   Postgres DSN, which carries a password, #1927 gate),
@@ -547,6 +538,18 @@ backend and missing or divergently implemented on its twin). Pinned by
   is a hard error, never a silent downgrade to "no token presented". No default
   behaviour changes: a caller that presents nothing is unaffected, and a caller
   that presents `--capability` gets the same decision it did before.
+- **`--db-passphrase-file` no longer re-publishes the SQLCipher passphrase into
+  the process environment.** #3213. The flag exists because "passing the
+  passphrase directly as an env var or as a flag value leaks to the process
+  list (`ps -E`) and shell history"; `apply_startup_env` then voided that
+  mitigation with `unsafe { set_var("AI_MEMORY_DB_PASSPHRASE", …) }`, so every
+  subsequently spawned child (`hooks/executor`, `cli/wrap`) inherited it — the
+  #2905 env-leak class, which `audit_pubkey` already refused. The file channel
+  now seeds process-private `OnceLock` state (`storage::set_db_passphrase`);
+  `apply_sqlcipher_key` prefers that and keeps `AI_MEMORY_DB_PASSPHRASE` as
+  the documented operator-set fallback. A second seed in the same process is
+  refused, not swapped. No default change for operators who set the env
+  themselves.
 
 ### Changed
 

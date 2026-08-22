@@ -362,6 +362,47 @@ pub fn set_db_mmap_size(bytes: i64) {
     let _ = DB_MMAP_SIZE_BYTES.set(bytes);
 }
 
+/// Operator-set SQLCipher passphrase env var (`AI_MEMORY_DB_PASSPHRASE`).
+///
+/// Direct caller use leaks via `ps -E`. `--db-passphrase-file` does **not**
+/// export this (#3213 / the #2905 env-leak class); it seeds
+/// [`set_db_passphrase`] instead. Operators who want the env channel may
+/// still set this themselves — that documented fallback is unchanged.
+pub const ENV_DB_PASSPHRASE: &str = "AI_MEMORY_DB_PASSPHRASE";
+
+/// Process-private SQLCipher passphrase seeded from `--db-passphrase-file`.
+/// Never re-published to the environment (#3213).
+static DB_PASSPHRASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Seed the process-private SQLCipher passphrase. First writer wins
+/// ([`OnceLock::set`], CONCURRENCY-16).
+///
+/// # Errors
+///
+/// A passphrase was already seeded this process (a second
+/// `--db-passphrase-file` — fail-closed rather than silently swapping
+/// the key).
+pub fn set_db_passphrase(passphrase: String) -> Result<()> {
+    DB_PASSPHRASE.set(passphrase).map_err(|_| {
+        anyhow::anyhow!("--db-passphrase-file: DB passphrase already set this process")
+    })
+}
+
+/// The process-private SQLCipher passphrase, if `--db-passphrase-file`
+/// seeded one. `None` when the file channel was not used (operators
+/// may still set [`ENV_DB_PASSPHRASE`] themselves).
+///
+/// The production reader is [`apply_sqlcipher_key`], which is compiled
+/// out of the default (non-`sqlcipher`) build; tests are the other
+/// reader. Allowed unused on the default lib so `-D warnings` clippy
+/// without `--features sqlcipher` does not fail closed on a helper
+/// whose only production consumer is feature-gated.
+#[must_use]
+#[cfg_attr(not(feature = "sqlcipher"), allow(dead_code))]
+pub(crate) fn db_passphrase() -> Option<&'static str> {
+    DB_PASSPHRASE.get().map(String::as_str)
+}
+
 /// The effective `PRAGMA mmap_size` for this process.
 fn db_mmap_size() -> i64 {
     *DB_MMAP_SIZE_BYTES
@@ -780,23 +821,23 @@ fn apply_check_constraint_triggers(conn: &Connection) -> Result<()> {
 
 /// v0.6.0.0 — apply the SQLCipher passphrase (PRAGMA key) when the
 /// `sqlcipher` cargo feature is built-in AND a passphrase has been
-/// provided via `AI_MEMORY_DB_PASSPHRASE` env var. The recommended
-/// way to set the env var is via the `--db-passphrase-file <path>`
-/// CLI flag, which reads the passphrase from a root-readable file
-/// and exports the env for the daemon's lifetime only. Passing the
-/// passphrase directly as an env var works but leaks to the process
-/// list (`ps -E`, `/proc/<pid>/environ`).
+/// provided. Precedence: process-private state seeded by
+/// `--db-passphrase-file` ([`db_passphrase`]) wins; [`ENV_DB_PASSPHRASE`]
+/// is the documented operator-set fallback. The file channel does
+/// **not** re-publish into the environment (#3213 / #2905 env-leak
+/// class) so spawned children cannot inherit it.
 ///
 /// When the `sqlcipher` feature is NOT enabled, this function is a
 /// no-op — standard SQLite has no `PRAGMA key` so setting one errors.
 #[cfg(feature = "sqlcipher")]
 fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
-    let Ok(passphrase) = std::env::var("AI_MEMORY_DB_PASSPHRASE") else {
-        // #962 typed envelope — fatal boot refusal.
-        return Err(anyhow::Error::new(
-            super::error::StorageError::SqlcipherMissingPassphrase,
-        ));
-    };
+    let passphrase = db_passphrase()
+        .map(str::to_owned)
+        .or_else(|| std::env::var(ENV_DB_PASSPHRASE).ok())
+        .ok_or_else(|| {
+            // #962 typed envelope — fatal boot refusal.
+            anyhow::Error::new(super::error::StorageError::SqlcipherMissingPassphrase)
+        })?;
     // PRAGMA key must be the FIRST operation on a new connection. The
     // passphrase is quoted with SQL string-literal quoting rules.
     let escaped = passphrase.replace('\'', "''");

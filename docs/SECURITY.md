@@ -245,9 +245,11 @@ chmod 0400 /etc/ai-memory/db.key
 ai-memory --db-passphrase-file /etc/ai-memory/db.key <cmd>
 ```
 
-The CLI reads the file, exports `AI_MEMORY_DB_PASSPHRASE` for the
-process lifetime, and clears it on exit. Passphrase never appears in
-`ps`/`/proc/<pid>/environ`.
+The CLI reads the file into process-private state and does **not**
+export `AI_MEMORY_DB_PASSPHRASE` (#3213 / the #2905 env-leak class),
+so the passphrase cannot leak via `ps`, `/proc/<pid>/environ`, or
+spawned children. Operators who need the env channel may set
+`AI_MEMORY_DB_PASSPHRASE` themselves.
 
 Defaults (page size, cipher, KDF iterations) match SQLCipher 4.x. To
 open the DB manually: `sqlcipher ai-memory.db` + `PRAGMA key='…';`.

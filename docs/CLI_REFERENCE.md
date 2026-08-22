@@ -24,7 +24,7 @@ supplements `--help` with examples and context.
 | `--db <PATH>` | path | `ai-memory.db` | SQLite database path. Honours `AI_MEMORY_DB` env var. |
 | `--json` | bool | `false` | Emit machine-parseable JSON on stdout. |
 | `--agent-id <ID>` | string | synthesized NHI default | Stamps `metadata.agent_id`. Honours `AI_MEMORY_AGENT_ID` env var. |
-| `--db-passphrase-file <PATH>` | path | — | v0.6.0.0+. Root-readable file holding the SQLCipher passphrase. Only meaningful on `--features sqlcipher` builds. Exports `AI_MEMORY_DB_PASSPHRASE` for the process. |
+| `--db-passphrase-file <PATH>` | path | — | v0.6.0.0+. Root-readable file holding the SQLCipher passphrase. Only meaningful on `--features sqlcipher` builds. Seeds process-private state; does **not** export `AI_MEMORY_DB_PASSPHRASE` (#3213). |
 
 ## Environment variables
 
@@ -32,7 +32,7 @@ supplements `--help` with examples and context.
 |----------|---------|
 | `AI_MEMORY_DB` | Override default database path. |
 | `AI_MEMORY_AGENT_ID` | Default `metadata.agent_id` for memories written by this process. |
-| `AI_MEMORY_DB_PASSPHRASE` | SQLCipher passphrase (set via `--db-passphrase-file` or by operator). |
+| `AI_MEMORY_DB_PASSPHRASE` | SQLCipher passphrase (operator-set; `--db-passphrase-file` does not populate this — #3213). |
 | `AI_MEMORY_NO_CONFIG=1` | Skip loading the platform config file (`$XDG_CONFIG_HOME/ai-memory/config.toml`, else `~/.config/ai-memory/config.toml`). Used by tests. **[#3167]** Only a truthy value (`1`/`true`/`yes`/`on`) skips it; an empty value or `0` loads the config and WARNs. |
 | `AI_MEMORY_ANONYMIZE=1` | Suppress hostname/PID from fallback `agent_id` generation. |
 | `AI_MEMORY_AUTONOMOUS_HOOKS=1` | Enable post-store LLM hooks (v0.6.0.0). Overrides config. |
