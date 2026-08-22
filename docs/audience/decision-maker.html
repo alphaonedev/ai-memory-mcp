@@ -210,7 +210,7 @@ footer a{color:var(--muted)}
 <section class="wrap-mid">
   <div class="eyebrow-h2">Who is using it</div>
   <h2>The dogfooders.</h2>
-  <p>ai-memory is dogfooded by the maintainer's own multi-agent Claude Code workflow (the same workflow that builds every release). Every <code>release/v1.0.0</code> branch sits in real use for at least 24 hours against the operator's live MCP database before a tag cuts. Migration round-trips (now through schema v89) are tested against the operator's own DB on every commit. The project is also exercised by the IronClaw A2A 4-domain campaign on Docker against xAI Grok 4.3.</p>
+  <p>ai-memory is dogfooded by the maintainer's own multi-agent Claude Code workflow (the same workflow that builds every release). Every <code>release/v1.0.0</code> branch sits in real use for at least 24 hours against the operator's live MCP database before a tag cuts. Migration round-trips are exercised by per-rung regression tests on every commit, and the sqlite ladder writes its own pre-migration <code>VACUUM INTO</code> snapshot beside the database before any schema mutation. The real-corpus dogfood attestation is narrower than the ladder: it covers <strong>v78 &rarr; v86</strong> and nothing above it (see the release notes, &sect;&quot;Migration evidence, at its true bound&quot;). The project is also exercised by the IronClaw A2A 4-domain campaign on Docker against xAI Grok 4.3.</p>
   <p>External adoption is intentionally early-and-honest; if you are evaluating for production, the recommended path is to dogfood it against a non-critical agent first and reach out via GitHub issues for any gaps.</p>
 </section>
 

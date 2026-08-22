@@ -1,0 +1,47 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v1.0.0 #2385 — schema v90: ARCHIVE CID PARITY. Additive, instant, NO
+-- table rebuild (so the v63/v65 "a full-table rebuild silently drops every
+-- trigger" hazard does not arise).
+--
+-- The defect
+-- ----------
+-- The v74 (#1825) migration added the genesis content-id pair
+-- `memories.cid TEXT` / `memories.cid_genesis BLOB` — the BLAKE3 address a
+-- memory is minted with, and the canonical pre-image it was hashed from.
+-- The archive mirror never gained them. Every archive INSERT...SELECT
+-- therefore DROPPED the identity on the way into cold storage, and both
+-- `restore_archived*` paths RE-MINTED it on the way back out, recomputing
+-- `stamp_cid(agent_id, namespace, title, memory_kind, created_at,
+-- plaintext)` from six reconstructed inputs.
+--
+-- That is not a cosmetic gap. A re-mint reproduces the original address
+-- only if all six inputs are byte-identical at restore time; if any drifted
+-- (a rewritten `metadata.agent_id`, or a decrypt failure whose `unwrap_or`
+-- fallback hashes the CIPHERTEXT placeholder instead of the plaintext) the
+-- restored row silently acquires a DIFFERENT content address. The v74
+-- genesis-identity contract says the address is fixed at creation, and
+-- `memory_links.source_cid` / `target_cid` are mirrors of it — so a drifted
+-- re-mint dangles every lineage edge that resolved by cid, with no write
+-- intent anywhere and no error raised. Silent identity corruption of the
+-- durable tier.
+--
+-- The heal
+-- --------
+-- Add the two columns to `archived_memories` so the identity is a CARRIED
+-- fact: the archive funnels select `cid, cid_genesis` verbatim, and both
+-- restore paths bind `COALESCE(cid, <re-mint>)`. Pre-v90 archive rows have
+-- the columns NULL and keep the legacy re-mint behaviour exactly — the
+-- migration never invents an address it cannot prove (degrade, never
+-- corrupt), and it never rewrites a stored one.
+--
+-- The DDL below is applied by the probe-guarded in-code arm in
+-- src/storage/migrations.rs (SQLite has no `ADD COLUMN IF NOT EXISTS`);
+-- this file is the canonical doc twin, following the v79/#1945 + v85/#2035
+-- + v87/#2333 archive-column-parity precedent. The postgres twin is
+-- migrations/postgres/0047_v90_archived_cid.sql (`ADD COLUMN IF NOT
+-- EXISTS`, executed directly).
+
+ALTER TABLE archived_memories ADD COLUMN cid TEXT;
+ALTER TABLE archived_memories ADD COLUMN cid_genesis BLOB;

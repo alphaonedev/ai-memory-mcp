@@ -157,7 +157,10 @@ LADDER_EXEMPT_FILES=(
 #                     to `if version < 87` and nothing takes the const slot.
 #                     postgres stays 1 (v87 literalized, migrate_v88 takes the
 #                     const tail slot).
-EXPECTED_CONST_ARMS_SQLITE=7
+# 2026-08-22 (#2385): sqlite 7 -> 8 — the v90 archive cid-parity arm takes the
+# const-phrased tip slot sqlite left empty at v88/v89. Bumped in lockstep with
+# tests/migration_ladder_integrity.rs::EXPECTED_CONST_ARMS_SQLITE.
+EXPECTED_CONST_ARMS_SQLITE=8
 EXPECTED_CONST_ARMS_POSTGRES=1
 
 # --- Helpers ----------------------------------------------------------------

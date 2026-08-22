@@ -479,8 +479,10 @@ mod tests {
 
     /// #2571 — an archived row's live-shaped columns round-trip through
     /// `row_to_memory` exactly like a `memories[]` export: decrypted content,
-    /// typed enums, `cid` always `None` (the table never gained the v74 cid
-    /// columns).
+    /// typed enums, and — v1.0.0 #2385 — the v90 `cid` column, which the
+    /// archive now CARRIES rather than dropping (pre-#2385 this asserted
+    /// `cid == None` because `archived_memories` had no cid columns at all,
+    /// which is exactly why archive→restore had to re-mint the address).
     #[test]
     fn read_all_archived_memories_round_trips_the_archive_shape() {
         let conn = empty_db();
@@ -495,6 +497,15 @@ mod tests {
             },
         )
         .expect("seed live row");
+        // #2385 — capture the LIVE genesis cid before the archive deletes the row.
+        let live_cid: Option<String> = conn
+            .query_row("SELECT cid FROM memories WHERE id = 'm1'", [], |r| r.get(0))
+            .ok()
+            .flatten();
+        assert!(
+            live_cid.is_some(),
+            "the live row must have been stamped with a genesis cid"
+        );
         crate::storage::archive_memory_no_tx(&conn, "m1", Some("manual")).expect("archive");
 
         let rows = read_all_archived_memories(&conn).expect("read archived");
@@ -504,8 +515,8 @@ mod tests {
         assert_eq!(row.memory.title, "t");
         assert_eq!(row.memory.content, "c");
         assert_eq!(
-            row.memory.cid, None,
-            "archived_memories carries no cid column"
+            row.memory.cid, live_cid,
+            "#2385: the archive must CARRY the genesis cid byte-for-byte, not drop it"
         );
         assert_eq!(row.archive_reason, "manual");
         assert!(!row.archived_at.is_empty());

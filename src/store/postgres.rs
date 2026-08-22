@@ -122,7 +122,8 @@ const SQL_ARCHIVE_ON_CONFLICT_LAST_WINS: &str = "ON CONFLICT (id) DO UPDATE SET 
      mentioned_entity_id = EXCLUDED.mentioned_entity_id, version = EXCLUDED.version, \
      lifecycle_state = EXCLUDED.lifecycle_state, \
      encrypted_envelope = EXCLUDED.encrypted_envelope, valid_from = EXCLUDED.valid_from, \
-     valid_until = EXCLUDED.valid_until";
+     valid_until = EXCLUDED.valid_until, \
+     cid = EXCLUDED.cid, cid_genesis = EXCLUDED.cid_genesis";
 /// #1642 / #2503 — postgres twin of
 /// `storage::SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID` (`src/storage/mod.rs`).
 ///
@@ -842,6 +843,17 @@ const MIGRATION_V88_LIST_COMPOSITE_INDEXES: &str =
 const MIGRATION_V89_TSV_INCLUDE_TAGS: &str =
     include_str!("../../migrations/postgres/0046_v89_tsv_include_tags.sql");
 
+/// v1.0.0 #2385 — schema v90 canonical DDL, executed via `raw_sql` (the v87
+/// pattern). Mirrors the v74 (#1825) genesis content-id pair (`cid` TEXT /
+/// `cid_genesis` BYTEA) onto `archived_memories` so the archive funnels CARRY
+/// the address instead of dropping it and [`PostgresStore::archive_restore`]
+/// stops RE-MINTING it from six reconstructed inputs. Additive + `IF NOT
+/// EXISTS` (idempotent), no rewrite, no reindex. The sqlite twin is the
+/// probe-guarded arm in `storage::migrations` (`migrations/sqlite/
+/// 0074_v90_archived_cid.sql`). See [`PostgresStore::migrate_v90`].
+const MIGRATION_V90_ARCHIVED_CID: &str =
+    include_str!("../../migrations/postgres/0047_v90_archived_cid.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -1232,7 +1244,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 89;
+const CURRENT_SCHEMA_VERSION: i32 = 90;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -2614,8 +2626,11 @@ impl PostgresStore {
         if current_version < 88 {
             self.migrate_v88().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 89 {
             self.migrate_v89().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v90().await?;
         }
 
         Ok(())
@@ -5382,8 +5397,9 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v89 tsv-include-tags ddl", e))?;
 
-        // Tip arm — stamp the symbolic const (the current-tip convention).
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // SETTLED arm — v90 (#2385) took the tip, so v89 is LITERALIZED into
+        // the monotonic literal lane (the #2218 convention).
+        record_schema_version(&mut tx, 89).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v89 migration", e))?;
@@ -5393,6 +5409,64 @@ impl PostgresStore {
             "schema migration v89 applied (#2392: fold tags into the stored \
              generated tsv tsvector + reindex memories_tsv_gin; cross-backend \
              FTS parity with sqlite memories_fts(title, content, tags))"
+        );
+        Ok(())
+    }
+
+    /// v1.0.0 #2385 — schema v90: ARCHIVE CID PARITY.
+    ///
+    /// Adds the v74 (#1825) genesis content-id pair (`cid` TEXT,
+    /// `cid_genesis` BYTEA) to `archived_memories`. Pre-v90 the archive
+    /// mirror had no cid columns, so all seven archive `INSERT ... SELECT`
+    /// funnels DROPPED the address and [`Self::archive_restore`] RE-MINTED it
+    /// from six reconstructed inputs (`agent_id` / `namespace` / `title` /
+    /// `memory_kind` / `created_at` / decrypted plaintext). A re-mint
+    /// reproduces the original address only if ALL SIX are byte-identical at
+    /// restore time; a rewritten `metadata.agent_id`, or a decrypt failure
+    /// whose `unwrap_or` falls back to the ciphertext placeholder, silently
+    /// re-addressed the durable row and dangled every `memory_links.source_cid`
+    /// / `target_cid` mirror resolving to it — the v74 genesis-identity
+    /// contract violated with no write intent and no error.
+    ///
+    /// Purely additive and `IF NOT EXISTS`-guarded, so it is idempotent and
+    /// takes no more than a catalogue-update lock (no table rewrite, unlike
+    /// the v57/v89 STORED-generated adds). It BACKFILLS NOTHING: a pre-v90
+    /// archived row's genesis address cannot be proven from the archive alone,
+    /// so those rows keep NULL and the restore path keeps the legacy re-mint
+    /// fallback for exactly them. Inventing an address we cannot prove would
+    /// be the corruption this arm exists to stop.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the transaction / DDL / version-stamp failure; the caller
+    /// stays at v89 and retries on the next boot (fail closed).
+    async fn migrate_v90(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V90_ARCHIVED_CID.contains(TABLE_ARCHIVED_MEMORIES),
+            "#2385: the v90 DDL doc twin must ship with the binary"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v90 archived-cid ddl tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V90_ARCHIVED_CID)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v90 archived-cid ddl", e))?;
+
+        // Tip arm — stamp the symbolic const (the current-tip convention).
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v90 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v90 applied (#2385: archived_memories.cid / \
+             cid_genesis — archive->restore now CARRIES the v74 genesis \
+             content-id instead of re-minting it)"
         );
         Ok(())
     }
@@ -6134,7 +6208,7 @@ impl PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -6142,7 +6216,7 @@ impl PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -6560,7 +6634,7 @@ impl PostgresStore {
                  reflection_depth, atomised_into, atom_of, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
@@ -6568,7 +6642,7 @@ impl PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
              FROM memories WHERE id = $1
              {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
         ))
@@ -19154,7 +19228,7 @@ impl MemoryStore for PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -19162,7 +19236,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -22754,7 +22828,7 @@ impl MemoryStore for PostgresStore {
                     -- #2196 - carry lifecycle_state so a non-open archived state
                     -- survives the archive->restore round-trip (restore no longer
                     -- COALESCEs a NULL to 'open'); mirrors the sqlite archive.
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -22763,7 +22837,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 FROM memories
                 WHERE ($1::text IS NULL OR namespace = $1)
                   AND ($2::text IS NULL OR tier = $2)
@@ -25308,7 +25382,7 @@ impl MemoryStore for PostgresStore {
                     confidence_source, confidence_signals, confidence_decayed_at,
                     -- #2196 - carry lifecycle_state through the TTL archive so a
                     -- non-open state survives archive->restore (postgres parity).
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -25317,7 +25391,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 FROM memories
                 WHERE expires_at IS NOT NULL AND expires_at < $1
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
@@ -25486,7 +25560,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                     )
                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
                            source, access_count, created_at, updated_at, last_accessed_at,
@@ -25495,7 +25569,7 @@ impl MemoryStore for PostgresStore {
                            reflection_depth, atomised_into, atom_of, memory_kind,
                            entity_id, persona_version, citations, source_uri, source_span,
                            confidence_source, confidence_signals, confidence_decayed_at,
-                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                     FROM memories
                     WHERE id = $1
                     -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
@@ -25692,7 +25766,22 @@ impl MemoryStore for PostgresStore {
                    COALESCE(version, 1),
                    COALESCE(lifecycle_state, 'open'),
                    encrypted_envelope,
-                   $3::text, $4::bytea,
+                   -- v1.0.0 #2385 — the STORED genesis identity WINS. Pre-#2385
+                   -- `archived_memories` had no cid columns, so restore
+                   -- unconditionally bound the re-mint ($3/$4) recomputed from six
+                   -- reconstructed inputs (agent_id / namespace / title / kind /
+                   -- created_at / decrypted plaintext) — and a decrypt failure
+                   -- there falls back to the CIPHERTEXT placeholder. Any drift
+                   -- silently re-addressed the durable row and dangled every
+                   -- `memory_links.source_cid` / `target_cid` mirror. The v90
+                   -- columns make the identity a CARRIED fact; the re-mint is now
+                   -- the legacy fallback for pre-v90 archive rows only.
+                   -- The PAIR is selected atomically (the #2395 lesson applied
+                   -- here): `cid_genesis` is the canonical PRE-IMAGE of `cid`, so
+                   -- mixing a carried address with a re-derived pre-image would
+                   -- produce a row whose own verify disagrees with itself.
+                   CASE WHEN cid IS NOT NULL THEN cid ELSE $3::text END,
+                   CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE $4::bytea END,
                    -- v1.0.0 #2333 (FBL-03 pg mirror) — carry kind_provenance
                    -- back on restore; legacy pre-v87 archive rows re-derive
                    -- it from the metadata carrier, vocab-guarded (sqlite twin).
@@ -25977,7 +26066,7 @@ impl MemoryStore for PostgresStore {
                     confidence_source, confidence_signals, confidence_decayed_at,
                     -- #2196 - carry lifecycle_state through the manual archive so a
                     -- non-open state survives archive->restore (postgres parity).
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -25986,7 +26075,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 FROM memories WHERE id = $3
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
                 {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"

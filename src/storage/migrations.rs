@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 89).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 90).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -864,7 +864,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 89;
+const CURRENT_SCHEMA_VERSION: i64 = 90;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1536,6 +1536,17 @@ const MIGRATION_V82_SQLITE: &str =
 // upgrades. The postgres twin is `migrate_v83`.
 const MIGRATION_V83_SQLITE: &str =
     include_str!("../../migrations/sqlite/0067_v83_agent_api_keys.sql");
+
+// v90 (#2385, v1.0.0) — ARCHIVE CID PARITY. Two additive nullable
+// `archived_memories` columns (`cid TEXT`, `cid_genesis BLOB`) mirroring the
+// v74 (#1825) genesis-identity pair on `memories`, so the archive funnels
+// CARRY the content address instead of dropping it and both restore paths
+// stop RE-MINTING it. Probe-guarded ALTER (SQLite has no `ADD COLUMN IF NOT
+// EXISTS` — the v79/v82/v87 precedent). Purely additive, no full-table
+// rebuild → no trigger recreation (the v63/v65 lesson does not arise). The
+// postgres twin is `PostgresStore::migrate_v90`.
+const MIGRATION_V90_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0074_v90_archived_cid.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3856,6 +3867,67 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                          WHERE original_expires_at IS NOT NULL",
                         "UPDATE archived_memories SET original_expires_at = ?1 \
                          WHERE rowid = ?2",
+                    )?;
+                }
+            }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v90 (#2385, v1.0.0) — ARCHIVE CID PARITY: mirror the v74
+            // (#1825) genesis content-id pair (`cid` TEXT / `cid_genesis`
+            // BLOB) onto `archived_memories`, closing the archive→restore
+            // IDENTITY re-mint.
+            //
+            // Pre-v90 the archive mirror had no cid columns, so every archive
+            // INSERT...SELECT dropped the address and both `restore_archived*`
+            // paths recomputed it from six reconstructed inputs (agent_id /
+            // namespace / title / memory_kind / created_at / decrypted
+            // plaintext). A re-mint reproduces the original address ONLY if all
+            // six are byte-identical at restore time — a rewritten
+            // `metadata.agent_id`, or a decrypt failure whose `unwrap_or` falls
+            // back to the ciphertext placeholder, silently re-addressed the
+            // durable row and dangled every `memory_links.source_cid` /
+            // `target_cid` mirror resolving to it. No write intent, no error:
+            // the v74 genesis-identity contract violated in silence.
+            //
+            // Purely additive and probe-guarded (SQLite has no `ADD COLUMN IF
+            // NOT EXISTS`), table-presence-guarded for partial-schema fixtures,
+            // and idempotent — a second pass finds both columns and does
+            // nothing. NO full-table rebuild, so every `memories` /
+            // `memory_links` trigger survives (the v63/v65 lesson).
+            //
+            // The migration deliberately BACKFILLS NOTHING: a pre-v90 archived
+            // row's genesis address cannot be proven from the archive alone, so
+            // its columns stay NULL and the restore path keeps the legacy
+            // re-mint fallback for exactly those rows. Inventing an address we
+            // cannot prove would be the corruption this arm exists to stop.
+            // Canonical DDL: migrations/sqlite/0074_v90_archived_cid.sql.
+            debug_assert!(
+                MIGRATION_V90_SQLITE.contains(super::TABLE_ARCHIVED_MEMORIES),
+                "v90 doc twin must ship the archived_memories DDL"
+            );
+            let has_archive_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'archived_memories')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_archive_table {
+                if conn
+                    .prepare("SELECT cid FROM archived_memories LIMIT 0")
+                    .is_err()
+                {
+                    conn.execute("ALTER TABLE archived_memories ADD COLUMN cid TEXT", [])?;
+                }
+                if conn
+                    .prepare("SELECT cid_genesis FROM archived_memories LIMIT 0")
+                    .is_err()
+                {
+                    conn.execute(
+                        "ALTER TABLE archived_memories ADD COLUMN cid_genesis BLOB",
+                        [],
                     )?;
                 }
             }

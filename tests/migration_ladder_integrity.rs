@@ -43,7 +43,11 @@ const BACKENDS: [&str; 2] = ["sqlite", "postgres"];
 // arm; the settled v87 arm is LITERALIZED to `if version < 87` and nothing
 // takes the const slot. postgres stays 1 (v87 literalized, migrate_v88 takes
 // the const tail slot).
-const EXPECTED_CONST_ARMS_SQLITE: usize = 7;
+// 2026-08-22 (#2385): sqlite 7 -> 8 — v90 lands the archive cid-parity columns
+// on BOTH backends, so sqlite gains a const-phrased tip arm where v88/v89 had
+// none. postgres stays 1 (the settled v89 arm is LITERALIZED to
+// `if current_version < 89`; migrate_v90 takes the const tail slot).
+const EXPECTED_CONST_ARMS_SQLITE: usize = 8;
 const EXPECTED_CONST_ARMS_POSTGRES: usize = 1;
 
 /// Read a repo-relative source file (the migration ladder sources) to a String.
