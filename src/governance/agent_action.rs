@@ -449,32 +449,109 @@ pub fn matcher_status(rule: &Rule, action: &AgentAction) -> MatcherStatus {
 /// write-time schema validation, so the two can never disagree about what a
 /// well-formed matcher is.
 #[must_use]
-fn matcher_key_schema(kind: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
+fn matcher_key_schema(kind: &str) -> Option<(&'static [MatcherKey], &'static [MatcherKey])> {
+    use MatcherValueKind::{Bool, Str, Uint};
     match kind {
         action_kinds::BASH => Some((
-            &[MATCHER_COMMAND_SUBSTRING, MATCHER_COMMAND_REGEX],
+            &[
+                (MATCHER_COMMAND_SUBSTRING, Str),
+                (MATCHER_COMMAND_REGEX, Str),
+            ],
             &[],
         )),
-        action_kinds::FILESYSTEM_WRITE => Some((&["glob"], &[])),
-        action_kinds::NETWORK_REQUEST => Some((&["host"], &[])),
-        action_kinds::PROCESS_SPAWN => {
-            Some((&["binary"], &["args_contain", "disk_free_min_gib"]))
-        }
-        action_kinds::CUSTOM => Some((&["kind"], &["namespace_glob", "tier", "title_contains"])),
+        action_kinds::FILESYSTEM_WRITE => Some((&[("glob", Str)], &[])),
+        action_kinds::NETWORK_REQUEST => Some((&[("host", Str)], &[])),
+        action_kinds::PROCESS_SPAWN => Some((
+            &[("binary", Str)],
+            &[("args_contain", Str), ("disk_free_min_gib", Uint)],
+        )),
+        action_kinds::CUSTOM => Some((
+            &[("kind", Str)],
+            &[
+                ("namespace_glob", Str),
+                ("tier", Str),
+                ("title_contains", Str),
+            ],
+        )),
         action_kinds::READ_ACTION => Some((
-            &["surface", "namespace", "query_substring", "all"],
+            &[
+                ("surface", Str),
+                ("namespace", Str),
+                ("query_substring", Str),
+                ("all", Bool),
+            ],
             &[],
         )),
         _ => None,
     }
 }
 
+/// #3031 — one recognised matcher key: its name and the JSON value type the
+/// engine's `match_*` reader accepts for it.
+type MatcherKey = (&'static str, MatcherValueKind);
+
+/// #3031 — the JSON value type a matcher key's reader accepts.
+///
+/// The type is load-bearing, not cosmetic: every `match_*` reader pulls its
+/// value with a TYPED accessor (`as_str` / `as_u64` / `as_bool`) and treats a
+/// type mismatch as "field absent". So `{"glob": 123}` is exactly as INERT as
+/// `{"totally_bogus_key": 123}` — the rule can never fire — which is why the
+/// write-time validator and the inert detector both check the type, not just
+/// the key name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatcherValueKind {
+    /// Read with `serde_json::Value::as_str`.
+    Str,
+    /// Read with `serde_json::Value::as_u64`.
+    Uint,
+    /// Read with `serde_json::Value::as_bool`.
+    Bool,
+}
+
+impl MatcherValueKind {
+    /// Would the engine's reader for this key actually get a value out of `v`?
+    #[must_use]
+    fn accepts(self, v: &serde_json::Value) -> bool {
+        match self {
+            MatcherValueKind::Str => v.is_string(),
+            MatcherValueKind::Uint => v.as_u64().is_some(),
+            MatcherValueKind::Bool => v.is_boolean(),
+        }
+    }
+
+    /// Operator-facing name of the accepted JSON type.
+    #[must_use]
+    fn label(self) -> &'static str {
+        match self {
+            MatcherValueKind::Str => "string",
+            MatcherValueKind::Uint => "non-negative integer",
+            MatcherValueKind::Bool => "boolean",
+        }
+    }
+}
+
+/// #3031 — render a recognised-key set as `name:type` for an operator message.
+fn render_key_set(keys: &[MatcherKey]) -> String {
+    if keys.is_empty() {
+        return "(none)".to_string();
+    }
+    keys.iter()
+        .map(|(name, kind)| format!("{name}:{}", kind.label()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// #3031 — is `matcher` structurally unable to ever fire for `kind`?
 ///
-/// True when the body is not a JSON object, or carries NONE of the kind's
-/// required keys. A `read_action` matcher whose only required key is
-/// `{"all": false}` is deliberately NOT inert: the operator wrote an explicit
-/// blanket opt-OUT, which is an evaluable (always-false) policy, not a typo.
+/// True when the body is not a JSON object, or carries no required key WITH A
+/// VALUE THE ENGINE'S READER ACCEPTS. The type check is not pedantry:
+/// `match_filesystem_write` pulls `glob` with `as_str`, so `{"glob": 123}`
+/// never narrows anything and the rule can never fire — the same silent
+/// inertness as an unrecognised key.
+///
+/// A `read_action` matcher whose only required key is `{"all": false}` is
+/// deliberately NOT inert: the operator wrote an explicit blanket opt-OUT,
+/// which is an evaluable (always-false) policy, not a typo.
 #[must_use]
 fn matcher_is_inert_for_kind(kind: &str, matcher: &serde_json::Value) -> bool {
     let Some((required, _optional)) = matcher_key_schema(kind) else {
@@ -485,7 +562,9 @@ fn matcher_is_inert_for_kind(kind: &str, matcher: &serde_json::Value) -> bool {
     let Some(obj) = matcher.as_object() else {
         return true;
     };
-    !required.iter().any(|k| obj.contains_key(*k))
+    !required
+        .iter()
+        .any(|(name, kind)| obj.get(*name).is_some_and(|v| kind.accepts(v)))
 }
 
 /// v1.0.0 #3031 — operator-facing write-time matcher SCHEMA validation for
@@ -498,7 +577,10 @@ fn matcher_is_inert_for_kind(kind: &str, matcher: &serde_json::Value) -> bool {
 /// - a non-object matcher body;
 /// - a matcher carrying NONE of the kind's required narrowing keys;
 /// - any key the kind does not recognise (catches `command_substrng` typos,
-///   which would otherwise produce a silently inert rule).
+///   which would otherwise produce a silently inert rule);
+/// - a recognised key whose VALUE TYPE the engine's reader would reject
+///   (`{"glob": 123}` — `match_filesystem_write` pulls `glob` with `as_str`,
+///   so a number reads as ABSENT and the rule is just as inert as a typo).
 ///
 /// A kind this binary does not know is accepted unvalidated (forward
 /// compatibility with rules authored for a newer binary).
@@ -515,26 +597,52 @@ pub fn validate_matcher_for_kind(kind: &str, matcher: &serde_json::Value) -> Res
         return Err(format!(
             "matcher for kind {kind:?} must be a JSON OBJECT (got {}); recognised keys: {}",
             matcher_type_name(matcher),
-            required.join(" | ")
+            render_key_set(required)
         ));
+    };
+    let known = |name: &str| -> Option<MatcherValueKind> {
+        required
+            .iter()
+            .chain(optional.iter())
+            .find(|(k, _)| *k == name)
+            .map(|(_, kind)| *kind)
     };
     let mut unknown: Vec<&str> = obj
         .keys()
         .map(String::as_str)
-        .filter(|k| !required.contains(k) && !optional.contains(k))
+        .filter(|k| known(k).is_none())
         .collect();
     unknown.sort_unstable();
     if !unknown.is_empty() {
         return Err(format!(
             "matcher for kind {kind:?} carries unrecognised key(s) {unknown:?}; the engine \
              ignores them, so the rule would be silently INERT (enforce nothing). \
-             Recognised: required one of {required:?}, optional {optional:?}"
+             Recognised: required one of [{}], optional [{}]",
+            render_key_set(required),
+            render_key_set(optional)
         ));
     }
-    if !required.iter().any(|k| obj.contains_key(*k)) {
+    // #3031 — a recognised key with the WRONG VALUE TYPE is read as absent by
+    // the engine (`as_str` / `as_u64` / `as_bool` all yield None), so it is
+    // just as inert as a typo. Refuse it by name and say what was expected.
+    for (name, value) in obj {
+        if let Some(want) = known(name)
+            && !want.accepts(value)
+        {
+            return Err(format!(
+                "matcher for kind {kind:?} key {name:?} must be a {} (got {}); the engine \
+                 reads it with a typed accessor and treats a mismatch as ABSENT, so the \
+                 rule would be silently INERT (enforce nothing)",
+                want.label(),
+                matcher_type_name(value)
+            ));
+        }
+    }
+    if !required.iter().any(|(name, _)| obj.contains_key(*name)) {
         return Err(format!(
-            "matcher for kind {kind:?} carries none of the required key(s) {required:?}, \
-             so the rule could never fire (silently INERT). Add one of them"
+            "matcher for kind {kind:?} carries none of the required key(s) [{}], \
+             so the rule could never fire (silently INERT). Add one of them",
+            render_key_set(required)
         ));
     }
     Ok(())
@@ -594,10 +702,22 @@ fn matcher_applies_inner(matcher: &serde_json::Value, action: &AgentAction) -> b
 /// `surface` (glob on the read entry point), `namespace` (glob on the
 /// read's namespace), `query_substring` (literal substring on the query).
 /// A matcher carrying NONE of these is a blanket read rule ONLY when it
-/// sets `{"all": true}` — an empty / unrecognized matcher matches nothing,
-/// so an operator can't accidentally deny every read with a typo. A
-/// `namespace` / `query_substring` matcher against a read that carries no
-/// namespace / query does NOT match (the dimension is absent to narrow on).
+/// sets `{"all": true}`. A `namespace` / `query_substring` matcher against a
+/// read that carries no namespace / query does NOT match (the dimension is
+/// absent to narrow on).
+///
+/// # v1.0.0 #3031 — the typo carve-out, narrowed
+///
+/// This function used to be the whole story for "an empty / unrecognized
+/// matcher matches nothing, so an operator can't accidentally deny every read
+/// with a typo". That property is KEPT for the non-blocking severities, but
+/// [`RuleEngine::evaluate`] no longer reaches here for a matcher it cannot
+/// evaluate: an ENABLED `refuse` / `escalate` rule whose matcher carries no
+/// recognised, correctly-typed key is [`MatcherStatus::Inert`] and now BLOCKS
+/// loudly instead of silently allowing. A typo that DISABLES an intended
+/// refusal is the worse failure, and `ai-memory rules add` refuses to mint one
+/// in the first place. `{"all": false}` stays an evaluable (always-false)
+/// blanket opt-OUT, not a typo.
 fn match_read(
     matcher: &serde_json::Value,
     surface: &str,

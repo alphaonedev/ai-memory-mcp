@@ -2110,30 +2110,26 @@ impl PostgresStore {
         let dim_i32 = i32::try_from(active_dim).unwrap_or(i32::MAX);
         // Stamp NULL→fp for dim-matching embedded rows on BOTH tables. The
         // archived twin keeps archive→restore round-trips in-space lossless.
-        let stamped = sqlx::query(
-            &format!(
-                "UPDATE memories SET embedding_space = $1 \
+        let stamped = sqlx::query(&format!(
+            "UPDATE memories SET embedding_space = $1 \
                  WHERE embedding IS NOT NULL \
                    AND {} \
                    AND vector_dims(embedding) = $2",
-                crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
-            ),
-        )
+            crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
+        ))
         .bind(active_fp)
         .bind(dim_i32)
         .execute(&self.pool)
         .await
         .map_err(|e| to_store_err("adopt_legacy_embedding_space memories", e))?
         .rows_affected();
-        let _archived = sqlx::query(
-            &format!(
-                "UPDATE archived_memories SET embedding_space = $1 \
+        let _archived = sqlx::query(&format!(
+            "UPDATE archived_memories SET embedding_space = $1 \
                  WHERE embedding IS NOT NULL \
                    AND {} \
                    AND vector_dims(embedding) = $2",
-                crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
-            ),
-        )
+            crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
+        ))
         .bind(active_fp)
         .bind(dim_i32)
         .execute(&self.pool)

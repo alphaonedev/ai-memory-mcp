@@ -52,11 +52,11 @@
 // trait, and the drainability marker is stamped exclusively by a
 // `--features sal` sqlite-backed `serve` — so a build that cannot drain
 // never queues a row. See the module docs for the full bound.
-pub mod erasure_outbox;
 /// v1.0.0 #2672 — typed, peer-unforgeable push-DLQ error class (replaces the
 /// steerable `last_error LIKE '%429%'` substring classifier that a peer could
 /// steer with a count containing `429`).
 mod dlq_class;
+pub mod erasure_outbox;
 pub mod identity;
 pub mod peer;
 pub mod peer_attestation;

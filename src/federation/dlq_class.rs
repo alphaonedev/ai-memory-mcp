@@ -273,7 +273,10 @@ mod tests {
         // A REAL 429 does.
         let real = DlqErrorClass::from_http_status(429).stamp("http 429 Too Many Requests");
         assert!(real.starts_with(throttle_prefix));
-        assert_eq!(DlqErrorClass::from_http_status(429), DlqErrorClass::Throttle);
+        assert_eq!(
+            DlqErrorClass::from_http_status(429),
+            DlqErrorClass::Throttle
+        );
     }
 
     /// Every tag round-trips, and the legacy label vocabulary is preserved.
@@ -315,7 +318,10 @@ mod tests {
     #[test]
     fn untagged_legacy_strings_are_not_parsed_as_typed_2672() {
         assert_eq!(parse("http 429 Too Many Requests"), None);
-        assert_eq!(detail_of("http 429 Too Many Requests"), "http 429 Too Many Requests");
+        assert_eq!(
+            detail_of("http 429 Too Many Requests"),
+            "http 429 Too Many Requests"
+        );
         assert_eq!(class_of("http 429 Too Many Requests"), DlqErrorClass::Other);
         // A malformed tag body is not read as typed either.
         assert_eq!(parse("[ai-memory:class=a]b] x"), None);
@@ -341,12 +347,18 @@ mod tests {
     #[test]
     fn unclassified_statuses_degrade_to_other_2672() {
         for status in [500u16, 502, 503, 418] {
-            assert_eq!(DlqErrorClass::from_http_status(status), DlqErrorClass::Other);
+            assert_eq!(
+                DlqErrorClass::from_http_status(status),
+                DlqErrorClass::Other
+            );
         }
         assert_eq!(
             DlqErrorClass::from_http_status(401),
             DlqErrorClass::UnenrolledPeer
         );
-        assert_eq!(DlqErrorClass::from_http_status(422), DlqErrorClass::Permanent);
+        assert_eq!(
+            DlqErrorClass::from_http_status(422),
+            DlqErrorClass::Permanent
+        );
     }
 }

@@ -105,18 +105,22 @@ CREATE TABLE governance_rules (
 
 ## Per-kind matcher shapes
 
-Each kind has a REQUIRED key set (at least one must be present) and an optional
-set. `ai-memory rules add` validates both at write time (see
-[Write-time validation](#write-time-validation-and-inert-rules-3031)).
+Each kind has a REQUIRED key set (at least one must be present, with a value of
+the stated JSON type) and an optional set. `ai-memory rules add` validates key
+names AND value types at write time (see
+[Write-time validation](#write-time-validation-and-inert-rules-3031)). The value
+type is load-bearing: every matcher reader uses a typed accessor (`as_str` /
+`as_u64` / `as_bool`) and treats a mismatch as "field absent", so `{"glob": 123}`
+is exactly as inert as a misspelled key.
 
 | `kind`             | Required (one of)                                    | Optional (ANDed)                        | Notes                                                                 |
 |--------------------|------------------------------------------------------|-----------------------------------------|-----------------------------------------------------------------------|
-| `bash`             | `command_substring` (or the legacy alias `command_regex`) | —                                  | LITERAL substring match on the command line — never a regex.          |
-| `filesystem_write` | `glob`                                               | —                                       | Reuses the substrate glob vocabulary (`*` per-segment, `**` cross-`/`). |
-| `network_request`  | `host`                                               | —                                       | Glob host match (a plain host with no `*` matches exactly).           |
-| `process_spawn`    | `binary`                                             | `args_contain`, `disk_free_min_gib`     | Binary name match plus optional argv-substring / disk-threshold refusal. |
-| `custom`           | `kind`                                               | `namespace_glob`, `tier`, `title_contains` | Extension point for caller-specific actions.                       |
-| `read_action`      | `surface`, `namespace`, `query_substring`, or `all`  | —                                       | PE-2 read gating; `{"all": true}` is the explicit blanket opt-in.     |
+| `bash`             | `command_substring`:string (or the legacy alias `command_regex`:string) | —                     | LITERAL substring match on the command line — never a regex.          |
+| `filesystem_write` | `glob`:string                                        | —                                       | Reuses the substrate glob vocabulary (`*` per-segment, `**` cross-`/`). |
+| `network_request`  | `host`:string                                        | —                                       | Glob host match (a plain host with no `*` matches exactly).           |
+| `process_spawn`    | `binary`:string                                      | `args_contain`:string, `disk_free_min_gib`:uint | Binary name match plus optional argv-substring / disk-threshold refusal. |
+| `custom`           | `kind`:string                                        | `namespace_glob`:string, `tier`:string, `title_contains`:string | Extension point for caller-specific actions.  |
+| `read_action`      | `surface`:string, `namespace`:string, `query_substring`:string, or `all`:bool | —                       | PE-2 read gating; `{"all": true}` is the explicit blanket opt-in.     |
 
 ### Write-time validation and inert rules (#3031)
 
@@ -126,8 +130,9 @@ a rule could be signed and enabled, and the engine returned `allow` for every
 action it was written to block, with nothing in `rules list` to show it.
 
 - **`ai-memory rules add` REFUSES** a matcher that is not a JSON object, carries
-  an unrecognised key, or carries none of the required keys. A kind this binary
-  does not know is accepted unvalidated (forward compatibility).
+  an unrecognised key, carries a recognised key whose value has the wrong JSON
+  type, or carries none of the required keys. A kind this binary does not know is
+  accepted unvalidated (forward compatibility).
 - **`ai-memory rules list` reports `inert: true`** for any rule whose matcher
   can never fire — the way to find a legacy row written before this validation.
 - **The engine FAILS CLOSED** on an enabled inert rule whose severity BLOCKS:

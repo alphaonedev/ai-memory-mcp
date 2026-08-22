@@ -1135,7 +1135,15 @@ async fn expand_erasure_sentinel_row(
         ),
         Err(e) => {
             let _ = sink
-                .bump_dlq_attempt(row.id, &format!("erasure sentinel expansion failed: {e}"))
+                .bump_dlq_attempt(
+                    row.id,
+                    // #2672 — a LOCAL store error, but its text is not ours to
+                    // predict. Class it structurally so no digit sequence
+                    // inside a backend error message can ever be read as a
+                    // `429` throttle by the legacy untagged arm.
+                    &super::dlq_class::DlqErrorClass::Other
+                        .stamp(&format!("erasure sentinel expansion failed: {e}")),
+                )
                 .await;
             tracing::warn!(
                 target: PUSH_DLQ_TRACE_TARGET,

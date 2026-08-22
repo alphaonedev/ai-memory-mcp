@@ -2704,8 +2704,12 @@ mod tests {
         };
         run(&db_path, good, false, &mut out).expect("a well-formed matcher must still land");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let landed = rules_store::get(&conn, "R3031-good").unwrap().expect("landed");
-        assert!(!crate::governance::agent_action::rule_matcher_is_inert(&landed));
+        let landed = rules_store::get(&conn, "R3031-good")
+            .unwrap()
+            .expect("landed");
+        assert!(!crate::governance::agent_action::rule_matcher_is_inert(
+            &landed
+        ));
     }
 
     /// v1.0.0 #3031 — `rules list` must SHOW that a legacy rule is inert.

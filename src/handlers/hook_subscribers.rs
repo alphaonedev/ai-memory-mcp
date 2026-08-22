@@ -157,9 +157,7 @@ pub async fn get_inbox(
                 // #3027 — count from the SAME derived marker the filter uses.
                 let unread_count = messages
                     .iter()
-                    .filter(|m| {
-                        m.get("read").and_then(serde_json::Value::as_bool) != Some(true)
-                    })
+                    .filter(|m| m.get("read").and_then(serde_json::Value::as_bool) != Some(true))
                     .count();
                 (
                     StatusCode::OK,

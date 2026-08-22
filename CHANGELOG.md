@@ -887,10 +887,15 @@ backend and missing or divergently implemented on its twin). Pinned by
   signed, enabled, operator-attested rule that enforced NOTHING — `rules check`
   answered `allow` for every command and `rules list` showed nothing amiss. Two
   halves: `ai-memory rules add` now validates the **per-kind matcher schema**
-  (required keys present, no unrecognised keys — a `command_substrng` typo is
-  refused at write time), and `RuleEngine::evaluate` fails closed on an inert
+  (required keys present, no unrecognised keys, and every recognised key's VALUE
+  TYPE readable by the engine's typed accessor — both a `command_substrng` typo
+  and a `{"glob": 123}` are refused at write time, because the engine reads
+  `glob` with `as_str` and a number is just as inert as a misspelling), and
+  `RuleEngine::evaluate` fails closed on an inert
   enabled rule whose severity BLOCKS, emitting a loud `tracing::error!` naming
-  the rule. `rules list` gains an `inert` flag so a legacy row is visible.
+  the rule. Both `ai-memory rules list` and the MCP `memory_rule_list` gain an
+  `inert` flag, from the same predicate, so a legacy row is visible to the
+  operator and to an agent alike.
   **Documented-semantics note:** `match_read`'s doc states that for
   `read_action` "an empty / unrecognized matcher matches nothing, so an operator
   can't accidentally deny every read with a typo". That property is PRESERVED
@@ -948,6 +953,12 @@ backend and missing or divergently implemented on its twin). Pinned by
   for the `all-MiniLM-L6-v2` tier preset behind a `tracing::warn!` a CLI one-shot
   renders nowhere), and `reembed` now REFUSES rather than rewriting every vector
   under a substitute model. The daemon keeps its warn-and-degrade boot posture.
+  `ai-memory doctor` no longer states a model the binary will not load: when a
+  configured non-API `[embeddings].model` is unconstructible, the Embeddings
+  Reachability section now WARNs and adds `effective_model` /
+  `model_honoured: false` facts. (The reporter's confusion started there —
+  `doctor` echoed `qwen3-embedding:4b` while both the daemon and `reembed`
+  actually used `all-MiniLM-L6-v2`.)
 
 ### Changed
 

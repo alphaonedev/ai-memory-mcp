@@ -105,8 +105,14 @@ fn serve_boot_lines(needle: &str, budget: Duration) -> Vec<String> {
 
     let (tx, rx) = mpsc::channel::<String>();
     for stream in [
-        child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-        child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
     ]
     .into_iter()
     .flatten()

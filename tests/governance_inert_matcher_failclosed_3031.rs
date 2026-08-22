@@ -228,3 +228,63 @@ fn per_kind_matcher_schema_validation_3031() {
     // A non-object body can never be evaluated either.
     assert!(bad(action_kinds::BASH, "[1,2,3]").contains("JSON OBJECT"));
 }
+
+/// v1.0.0 #3031 — a recognised key with the WRONG VALUE TYPE is exactly as
+/// inert as a typo, because every `match_*` reader pulls its value with a
+/// TYPED accessor (`as_str` / `as_u64` / `as_bool`) and treats a mismatch as
+/// "field absent". `{"glob": 123}` therefore narrows nothing and the rule can
+/// never fire — so it must be refused at write time and must fail closed at
+/// evaluate time, not slip through the key-name check.
+#[test]
+fn wrong_value_type_is_inert_not_merely_odd_3031() {
+    let bad = |kind: &str, m: &str| {
+        validate_matcher_for_kind(kind, &serde_json::from_str(m).unwrap())
+            .expect_err(&format!("{kind} {m} must be refused"))
+    };
+    assert!(bad(action_kinds::FILESYSTEM_WRITE, r#"{"glob":123}"#).contains("must be a string"));
+    assert!(bad(action_kinds::BASH, r#"{"command_substring":true}"#).contains("must be a string"));
+    assert!(
+        bad(
+            action_kinds::PROCESS_SPAWN,
+            r#"{"binary":"cargo","disk_free_min_gib":"20"}"#
+        )
+        .contains("must be a non-negative integer")
+    );
+    assert!(bad(action_kinds::READ_ACTION, r#"{"all":"yes"}"#).contains("must be a boolean"));
+
+    // The engine agrees: a wrong-typed required key is INERT, so an enabled
+    // `refuse` rule carrying one blocks rather than silently allowing.
+    let typed_wrong = rule(
+        "R-typed-wrong",
+        action_kinds::BASH,
+        r#"{"command_substring":42}"#,
+        "refuse",
+    );
+    assert!(rule_matcher_is_inert(&typed_wrong));
+    assert_eq!(
+        matcher_status(&typed_wrong, &bash("ls")),
+        MatcherStatus::Inert
+    );
+    let engine = RuleEngine::from_rules(vec![typed_wrong]);
+    assert!(
+        engine.evaluate("ai:test", &bash("anything")).is_blocking(),
+        "#3031: a required key the engine cannot read is inert — fail closed"
+    );
+
+    // `{"all": false}` is an explicit blanket opt-OUT, NOT a typo: it is
+    // evaluable (always false), so it stays non-inert and non-blocking.
+    let opt_out = rule(
+        "R-all-false",
+        action_kinds::READ_ACTION,
+        r#"{"all":false}"#,
+        "refuse",
+    );
+    assert!(!rule_matcher_is_inert(&opt_out));
+    let engine = RuleEngine::from_rules(vec![opt_out]);
+    let read = AgentAction::Read {
+        surface: "recall".to_string(),
+        namespace: Some("secure".to_string()),
+        query: Some("q".to_string()),
+    };
+    assert_eq!(engine.evaluate("ai:test", &read), Decision::Allow);
+}

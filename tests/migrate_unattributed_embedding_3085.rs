@@ -145,7 +145,10 @@ async fn migrate_skips_and_reports_null_space_vectors_3085() {
 
     // The DURABLE TEXT — the actual source of truth — is intact either way.
     let text = dst.get(&ctx, &unattributed_id).await.expect("get migrated");
-    assert_eq!(text.content, format!("durable text for {}", "unattributed row"));
+    assert_eq!(
+        text.content,
+        format!("durable text for {}", "unattributed row")
+    );
 }
 
 /// The dry-run plan must report the SAME copied/unattributed split the live
@@ -251,4 +254,80 @@ async fn sqlite_write_funnels_refuse_an_empty_embedding_space_3085() {
     assert!(db::reject_unattributed_embedding_space("op", "").is_err());
     assert!(db::reject_unattributed_embedding_space("op", "\t \n").is_err());
     assert!(db::reject_unattributed_embedding_space("op", &fp).is_ok());
+}
+
+/// #3085 HEAL half, sqlite lane: a corpus an OLDER binary already poisoned
+/// (`embedding_space = ''`) must heal through the SAME paths a legacy
+/// NULL-space corpus heals through.
+///
+/// The empty string is the corrupt twin of NULL — `'' IS NULL` is false, so
+/// every pre-#3085 heal predicate (`... AND embedding_space IS NULL`) walked
+/// straight past it while the #2167 recall gate still excluded it. Fixing only
+/// the writer would leave every already-migrated corpus stranded forever, so
+/// each provenance-READ predicate treats `''` as NULL-equivalent.
+#[tokio::test]
+async fn sqlite_heal_paths_adopt_an_already_poisoned_empty_space_3085() {
+    use ai_memory::storage as db;
+
+    let dir = scratch("heal-empty");
+    let path = dir.path().join("heal.db");
+    let ns = "ns3085heal";
+    let ctx = CallerContext::for_admin("ai:3085-heal");
+    let poisoned = uuid::Uuid::new_v4().to_string();
+    let fp = ai_memory::embeddings::embedding_space_fingerprint("test-space-3085");
+    let vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+    {
+        let store = SqliteStore::open(path.to_str().unwrap()).expect("open store");
+        store
+            .store(&ctx, &mem(&poisoned, ns, "poisoned row"))
+            .await
+            .expect("seed row");
+        store
+            .update_embedding(&ctx, &poisoned, Some(&vec), &fp)
+            .await
+            .expect("stamp");
+    }
+    // Reproduce EXACTLY what a pre-#3085 `migrate` left behind: a real vector
+    // carrying a NON-NULL, empty provenance stamp. No funnel can mint this any
+    // more, so seed it raw.
+    let conn = db::open(&path).expect("open raw");
+    let n = conn
+        .execute(
+            "UPDATE memories SET embedding_space = '' WHERE id = ?1",
+            rusqlite::params![poisoned],
+        )
+        .expect("poison the stamp");
+    assert_eq!(n, 1, "fixture must poison exactly one row");
+
+    // [G2] must NOT read the poisoned row as "demonstrated multi-space
+    // history" — otherwise adoption would refuse and the row would stay stuck.
+    let adopted = db::adopt_legacy_embedding_space(&conn, &fp, vec.len())
+        .expect("adopt must not error on a poisoned corpus");
+    assert_eq!(
+        adopted, 1,
+        "#3085: an empty stamp must heal through adoption exactly like SQL NULL. \
+         Pre-fix the `embedding_space IS NULL` predicate skipped it AND the [G2] \
+         mismatch probe counted it as a foreign space, so the corpus could never adopt."
+    );
+    let (_v, space) = db::get_embedding_with_space(&conn, &poisoned)
+        .expect("read back")
+        .expect("still embedded");
+    assert_eq!(
+        space.as_deref(),
+        Some(fp.as_str()),
+        "the healed row now carries the ACTIVE fingerprint and is recallable again"
+    );
+
+    // The stamp-only attested path heals it too (the operator's explicit lane).
+    conn.execute(
+        "UPDATE memories SET embedding_space = '' WHERE id = ?1",
+        rusqlite::params![poisoned],
+    )
+    .expect("re-poison");
+    let report = db::stamp_embedding_space_attested(&conn, Some(ns), &fp, vec.len())
+        .expect("stamp-only must not error");
+    assert_eq!(
+        report.stamped, 1,
+        "#3085: `reembed --stamp-only` must also see an empty stamp as unattributed"
+    );
 }

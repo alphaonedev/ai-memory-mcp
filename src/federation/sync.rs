@@ -344,10 +344,12 @@ pub(super) fn success_report_non_ack_reason(v: &serde_json::Value) -> Option<Str
     // genuinely useful), but the retry/label decision now comes from the
     // typed class tag written FIRST, which no peer byte can reach.
     if unsupported > 0 {
-        return Some(super::dlq_class::DlqErrorClass::PeerUnsupported.stamp(&format!(
-            "peer 2xx but {unsupported} item(s) {} (not applied on this peer)",
-            crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD
-        )));
+        return Some(
+            super::dlq_class::DlqErrorClass::PeerUnsupported.stamp(&format!(
+                "peer 2xx but {unsupported} item(s) {} (not applied on this peer)",
+                crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD
+            )),
+        );
     }
     if skipped > 0 {
         return Some(super::dlq_class::DlqErrorClass::PeerRefused.stamp(&format!(

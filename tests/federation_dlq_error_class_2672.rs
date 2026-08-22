@@ -37,7 +37,8 @@ use std::time::Duration;
 use ai_memory::federation::push_dlq::{
     FederationDlqSink, MAX_REPLAY_ATTEMPTS, SqliteDlqSink, replay_once,
 };
-use ai_memory::federation::{FederationConfig, PeerEndpoint, QuorumPolicy};
+use ai_memory::federation::{FederationConfig, PeerEndpoint};
+use ai_memory::replication::QuorumPolicy;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -87,7 +88,11 @@ async fn spawn_mock_peer(state: PeerState) -> String {
 
 /// On-disk sqlite `Db` migrated past v48 so `federation_push_dlq` exists.
 /// Scratch under `.local-runs/` per the project no-`/tmp` HARD RULE.
-fn fresh_dlq_db() -> (tempfile::TempDir, ai_memory::handlers::Db, std::path::PathBuf) {
+fn fresh_dlq_db() -> (
+    tempfile::TempDir,
+    ai_memory::handlers::Db,
+    std::path::PathBuf,
+) {
     let tmp = tempfile::Builder::new()
         .prefix("v100-2672-dlq-class-")
         .tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/.local-runs"))
@@ -141,7 +146,13 @@ fn last_errors(db_path: &std::path::Path) -> Vec<String> {
         .unwrap()
 }
 
-async fn drive_one_replay(mode: usize) -> (tempfile::TempDir, Arc<dyn FederationDlqSink>, std::path::PathBuf) {
+async fn drive_one_replay(
+    mode: usize,
+) -> (
+    tempfile::TempDir,
+    Arc<dyn FederationDlqSink>,
+    std::path::PathBuf,
+) {
     let state = PeerState {
         mode: Arc::new(AtomicUsize::new(mode)),
     };
@@ -204,7 +215,8 @@ async fn a_real_http_429_still_resets_the_quarantine_2672() {
         .await
         .expect("reset_throttled_quarantine");
     assert_eq!(
-        reset, 1,
+        reset,
+        1,
         "a genuine 429 throttle must still un-quarantine (#1544); last_error={:?}",
         last_errors(&db_path)
     );

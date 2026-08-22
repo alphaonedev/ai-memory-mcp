@@ -108,6 +108,14 @@ pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Resul
             "enabled": r.enabled,
             "signature_b64": sig_b64,
             (field_names::ATTEST_LEVEL): r.attest_level,
+            // v1.0.0 #3031 — `true` when this rule's matcher can never fire
+            // for ANY action of its kind (malformed JSON, no recognised key,
+            // or a recognised key the engine's typed reader would reject).
+            // Such a rule enforces NOTHING. The CLI `rules list` projects the
+            // SAME flag from the SAME predicate; an agent inspecting policy
+            // through MCP must not be told a broken rule is healthy while the
+            // operator's CLI shows it as inert (the #3027 divergence class).
+            "inert": crate::governance::agent_action::rule_matcher_is_inert(r),
         }));
     }
     Ok(json!({
@@ -223,6 +231,47 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// v1.0.0 #3031 — the MCP projection must carry the SAME `inert` flag the
+    /// CLI `rules list` shows, from the same predicate. An agent told a broken
+    /// `refuse` rule is healthy while the operator's CLI flags it inert is the
+    /// exact cross-surface divergence class #3027 documents.
+    #[test]
+    fn projects_the_inert_flag_3031() {
+        let conn = fresh_conn();
+        // The shared `insert` helper writes `{"k":"v"}` — no key any kind
+        // recognises, so it is inert (and, being `refuse` + enabled, would now
+        // fail closed in the engine).
+        insert(&conn, "R-inert", "bash", true);
+        rules_store::insert(
+            &conn,
+            &Rule {
+                id: "R-healthy".into(),
+                kind: "bash".into(),
+                matcher: r#"{"command_substring":"rm -rf"}"#.into(),
+                severity: "refuse".into(),
+                reason: "r".into(),
+                namespace: "_global".into(),
+                created_by: "test".into(),
+                created_at: 0,
+                enabled: true,
+                signature: None,
+                attest_level: "unsigned".into(),
+            },
+        )
+        .unwrap();
+        let r = handle_rule_list(&conn, &json!({})).unwrap();
+        let rules = r["rules"].as_array().expect("rules array");
+        let by_id = |id: &str| {
+            rules
+                .iter()
+                .find(|v| v["id"] == id)
+                .unwrap_or_else(|| panic!("{id} listed"))
+                .clone()
+        };
+        assert_eq!(by_id("R-inert")["inert"], json!(true));
+        assert_eq!(by_id("R-healthy")["inert"], json!(false));
     }
 
     #[test]
