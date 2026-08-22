@@ -835,6 +835,74 @@ mod tests {
         assert!(format!("{err}").contains("AI_MEMORY_REQUIRE_WITNESS"));
     }
 
+    /// The env-knob names listed in this module's own `## Pinned knobs`
+    /// markdown table, in table order.
+    ///
+    /// Parsed out of this file's SOURCE rather than a hand-maintained copy, so
+    /// the assertion below cannot drift from the table it is checking.
+    /// `include_str!` embeds the file at compile time and cargo tracks it as a
+    /// build input, so editing a row re-runs this test.
+    fn documented_pinned_knob_names() -> Vec<&'static str> {
+        const SRC: &str = include_str!("security_profile.rs");
+        SRC.lines()
+            .filter_map(|line| {
+                // A table DATA row is ``//! | `AI_MEMORY_X` | ... |``. The
+                // header (`| Env knob | ...`) and the `|---|---|---|`
+                // separator have no backticked first cell, so they drop out
+                // here. Deliberately NOT filtered on an `AI_MEMORY_` prefix: a
+                // typo'd row must surface as set-difference drift, not be
+                // silently skipped.
+                let rest = line.strip_prefix("//! |")?.trim_start();
+                let (name, _) = rest.strip_prefix('`')?.split_once('`')?;
+                Some(name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pinned_knobs_doc_table_matches_the_knobs_ssot_exactly() {
+        // #3113 — the DURABLE fix for the drift this branch found by hand: the
+        // `## Pinned knobs` table had silently fallen TWO rows behind `KNOBS`
+        // (missing FED_REQUIRE_TRANSITION_SIG + FED_REQUIRE_CHECKPOINT_SIG),
+        // and nothing failed. A count-only check would not have caught it
+        // either, because the count lives in prose that drifted with it. This
+        // asserts SET EQUALITY in BOTH directions, so a knob added to `KNOBS`
+        // without a row — or a row for a knob that is not actually pinned,
+        // which is the more dangerous direction (the docs would advertise a
+        // hardening guarantee the binary does not enforce) — fails here.
+        use std::collections::BTreeSet;
+
+        let rows = documented_pinned_knob_names();
+        let documented: BTreeSet<&str> = rows.iter().copied().collect();
+        let actual: BTreeSet<&str> = KNOBS.iter().map(|k| k.env).collect();
+
+        // A name listed twice would let the sets match while the table
+        // over-states the pinned set.
+        assert_eq!(
+            rows.len(),
+            documented.len(),
+            "duplicate row in the `## Pinned knobs` table: {rows:?}"
+        );
+
+        let undocumented: Vec<&str> = actual.difference(&documented).copied().collect();
+        assert!(
+            undocumented.is_empty(),
+            "pinned by KNOBS but MISSING a `## Pinned knobs` table row: {undocumented:?} \
+             — add the row in the same commit that adds the knob"
+        );
+
+        let phantom: Vec<&str> = documented.difference(&actual).copied().collect();
+        assert!(
+            phantom.is_empty(),
+            "documented as pinned but ABSENT from KNOBS: {phantom:?} — the docs would \
+             advertise a hardening guarantee the binary does not enforce"
+        );
+
+        // Implied by set equality, but pins the NUMBER the module docstrings,
+        // `docs/deploy/asi-hard.env` and the cert doc quote.
+        assert_eq!(documented.len(), KNOBS.len());
+    }
+
     #[test]
     fn asi_hard_pins_documented_set() {
         if crate::config::run_env_isolated_child_or_spawn(
