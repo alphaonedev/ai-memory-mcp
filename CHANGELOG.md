@@ -1934,6 +1934,17 @@ Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
     executed the superseded 18.4 / 1.7.0 / 0.8.5 triple; the heading and a new
     evidence-status note now say plainly that the current triple is
     CI-asserted, not yet cited by run ID.
+  - **`docs/postgres-age-guide.md` asserted feature parity it then
+    disproved itself.** Its lead called postgres+AGE a "first-class
+    backend" with no caveat, and its schema-parity section stated "every
+    feature that works on sqlite works on postgres" — contradicted by the
+    same document's own "21 fully-501 paths" inventory further down (no
+    `skills` table, since `migrate_v82` is a version-stamp no-op; no
+    `governance_rules` table). A matching `CURRENT_SCHEMA_VERSION` does not
+    imply a matching set of tables when ladder arms are no-ops. Both places
+    now carry the 59/21 split and the SQLite-only stdio MCP limitation up
+    front; two stale "schema parity at v78" statements (in a doc stating
+    `CURRENT_SCHEMA_VERSION = 89` two lines away) are corrected to v89.
   - **`src/lib.rs` CLI-subcommand comments were stale.** The block comment
     still described the v0.7.0-era "82 variants / 80 default", one const's doc
     said "86 variants … leaving 84" against a value of 90, and both bump
@@ -1946,6 +1957,7 @@ Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
   `docs/production-deployment.md`,
   `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`,
   `src/hooks/events.rs`, `src/curator/compaction.rs`, `src/lib.rs`,
+  `docs/postgres-age-guide.md`, `ROADMAP.md`,
   `src/mcp/tools/link.rs`, `src/mcp/mod.rs`, `src/mcp/registry.rs`,
   `tests/snapshots/tool_definitions_pre_d1_6.json`,
   `sdk/typescript/src/types.ts`.
