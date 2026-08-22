@@ -292,17 +292,24 @@ fn x25519_key_paths(agent_id: &str, dir: &Path) -> (PathBuf, PathBuf) {
 
 /// Persist `kp` to `dir`: the public key at mode 0644 and the secret at
 /// mode 0600 (Unix), reusing the Ed25519 keystore's mode-aware writer.
+///
+/// #3146 — PRIVATE FIRST, same rationale (and the same now-atomic
+/// stage/fsync/rename writer) as [`crate::identity::keypair::save`]: the public
+/// key is derivable from the secret, so a crash between the two renames must
+/// leave the recoverable half-state, never a public key with no matching
+/// secret.
 fn save_keypair_to_disk(kp: &Keypair, dir: &Path) -> Result<()> {
     let (pub_path, priv_path) = x25519_key_paths(&kp.agent_id, dir);
     crate::identity::keypair::ensure_parent(&pub_path)?;
     crate::identity::keypair::ensure_parent(&priv_path)?;
-    crate::identity::keypair::write_with_mode(&pub_path, kp.public.as_bytes(), 0o644)
-        .with_context(|| format!("writing x25519 public key {}", pub_path.display()))?;
     let mut secret_bytes = kp.secret.to_bytes();
     let write_res = crate::identity::keypair::write_with_mode(&priv_path, &secret_bytes, 0o600)
         .with_context(|| format!("writing x25519 private key {}", priv_path.display()));
     secret_bytes.zeroize();
-    write_res
+    write_res?;
+    crate::identity::keypair::write_with_mode(&pub_path, kp.public.as_bytes(), 0o644)
+        .with_context(|| format!("writing x25519 public key {}", pub_path.display()))?;
+    Ok(())
 }
 
 /// Load `agent_id`'s X25519 keypair from `dir`. Returns `Ok(None)` when
@@ -311,6 +318,15 @@ fn save_keypair_to_disk(kp: &Keypair, dir: &Path) -> Result<()> {
 /// Ed25519 keystore's S4-LOW1 load-time guard) rather than silently used.
 fn load_keypair_from_disk(agent_id: &str, dir: &Path) -> Result<Option<Keypair>> {
     let (_pub_path, priv_path) = x25519_key_paths(agent_id, dir);
+
+    // #3198 — the same directory-posture gate the Ed25519 keystore takes, for
+    // the same reason: under a group-writable key directory another local UID
+    // can replace this `.x25519.priv` outright, and the `0o600` fstat check
+    // below happily accepts the planted file. Enforced on the key FILE's parent
+    // so a nested (#1514 slashed) agent_id is covered too.
+    if let Some(parent) = priv_path.parent() {
+        crate::identity::keypair::enforce_key_dir_secure(parent)?;
+    }
 
     // #1790 finding 2 — open the file ONCE, fstat the handle for the
     // perms check, then read from the SAME handle. The pre-#1790 form did

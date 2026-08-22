@@ -3446,15 +3446,43 @@ use crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
 /// pre-v0.7 posture) without aborting startup. Log lines describe
 /// which path was taken so an operator inspecting daemon logs sees
 /// the cause.
-fn ensure_and_load_daemon_keypair() -> (
+///
+/// # #3147 — the ONE case that aborts instead of degrading
+///
+/// A key directory holding `daemon.pub` with NO `daemon.priv` is not a
+/// transient failure: the daemon can verify but can never sign, it cannot
+/// self-heal (a private key is not derivable from a public one, and
+/// regenerating would mint a different identity), and before #3147 it was
+/// reported at INFO and re-entered silently on every restart. Under
+/// `asi-hard` — whose entire contract is that no security control may be
+/// silently disabled — that is a disabled control, so boot REFUSES. Under
+/// every other posture it stays a degraded-but-running WARN, unchanged.
+/// The decision itself lives in the pure
+/// [`crate::identity::keypair::public_only_refusal`].
+///
+/// # Errors
+///
+/// Only the `asi-hard` public-only refusal above. Every other failure still
+/// degrades to unsigned-link mode and returns `Ok`.
+fn ensure_and_load_daemon_keypair() -> Result<(
     Option<crate::identity::keypair::AgentKeypair>,
     Option<crate::identity::keypair::EnsureOutcome>,
-) {
+)> {
     let dir = match crate::identity::keypair::default_key_dir() {
         Ok(d) => d,
         Err(e) => {
-            tracing::info!("identity: no default key dir available, link signing disabled: {e}");
-            return (None, None);
+            // #3198 — WARN, not INFO, and render the CAUSE. This arm used to
+            // mean only "the OS advertises no config directory"; since #3198 it
+            // also carries the key-directory posture REFUSAL (group- or
+            // world-writable key store). Refusing to sign with a key another
+            // local UID can swap is the correct fail-closed outcome, but at
+            // INFO it was indistinguishable from an absent HOME and sat below
+            // the default log filter — the exact silence #3147 exists to end.
+            tracing::warn!(
+                "identity: no usable key directory, link/persona/witness signing is \
+                 DISABLED: {e:#}"
+            );
+            return Ok((None, None));
         }
     };
     // The `[identity].disabled` config field is not yet wired in
@@ -3466,14 +3494,22 @@ fn ensure_and_load_daemon_keypair() -> (
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("identity: keypair auto-gen failed: {e:#}");
-            return (None, None);
+            return Ok((None, None));
         }
     };
+    // #3147 — public-key-without-private-key is refused under `asi-hard` and
+    // WARNed (inside `ensure_keypair`) under every other posture.
+    if let Some(reason) = crate::identity::keypair::public_only_refusal(
+        &outcome,
+        crate::security_profile::is_asi_hard(),
+    ) {
+        anyhow::bail!(reason);
+    }
     if matches!(
         outcome,
         crate::identity::keypair::EnsureOutcome::SkippedDisabled
     ) {
-        return (None, Some(outcome));
+        return Ok((None, Some(outcome)));
     }
     let kp = match crate::identity::keypair::load(DAEMON_KEYPAIR_LABEL, &dir) {
         Ok(kp) if kp.can_sign() => {
@@ -3484,8 +3520,15 @@ fn ensure_and_load_daemon_keypair() -> (
             Some(kp)
         }
         Ok(_) => {
-            tracing::info!(
-                "identity: only public key on disk for {DAEMON_KEYPAIR_LABEL}; link signing disabled"
+            // #3147 — WARN, not INFO. "This daemon will sign nothing until an
+            // operator intervenes" is not an informational note: at INFO it sat
+            // below the default log filter of most deployments, so a lost
+            // `daemon.priv` produced no operator-visible signal at all.
+            tracing::warn!(
+                "identity: only the PUBLIC key is on disk for {DAEMON_KEYPAIR_LABEL} in {} — \
+                 link/persona/witness signing is DISABLED and will stay disabled across \
+                 restarts. See `ai-memory doctor` -> Identity (#3147).",
+                dir.display()
             );
             None
         }
@@ -3496,7 +3539,7 @@ fn ensure_and_load_daemon_keypair() -> (
             None
         }
     };
-    (kp, Some(outcome))
+    Ok((kp, Some(outcome)))
 }
 
 // ---------------------------------------------------------------------------
@@ -5907,7 +5950,7 @@ pub async fn bootstrap_serve(
     // is captured separately so the startup banner can surface the
     // auto-gen path. Failure at any step degrades to unsigned-link
     // mode without aborting startup.
-    let (active_keypair, daemon_keypair_outcome) = ensure_and_load_daemon_keypair();
+    let (active_keypair, daemon_keypair_outcome) = ensure_and_load_daemon_keypair()?;
 
     // v0.7.0 B3-fix2 — gate the family-descriptor embedding precompute
     // behind `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1`, default OFF.
@@ -8048,7 +8091,7 @@ pub async fn run_curator_daemon_with_shutdown(
     // auto-persona sweep can produce signed persona rows. `None`
     // (no key on disk + auto-gen disabled) leaves the sweep no-op,
     // matching the pre-#816 behaviour.
-    let (kp_opt, _outcome) = ensure_and_load_daemon_keypair();
+    let (kp_opt, _outcome) = ensure_and_load_daemon_keypair()?;
     let active_keypair = kp_opt.map(Arc::new);
     let db_owned = db_path;
     tokio::task::spawn_blocking(move || {
@@ -8103,7 +8146,7 @@ pub async fn run_curator_daemon_with_primitives(
     // both daemon entry-points need the same keypair resolution so the
     // CLI (`ai-memory curator --daemon`) and the test-driven shutdown
     // flow both honour the same on-disk state.
-    let (kp_opt, _outcome) = ensure_and_load_daemon_keypair();
+    let (kp_opt, _outcome) = ensure_and_load_daemon_keypair()?;
     let active_keypair = kp_opt.map(Arc::new);
 
     tokio::task::spawn_blocking(move || {

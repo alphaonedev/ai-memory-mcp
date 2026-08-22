@@ -1845,6 +1845,107 @@ agent -> `Ok(Some(key))`, unregistered agent -> `Ok(None)`, backend fault ->
 locked DB that must FAIL rather than report `claimed`) and its postgres twin in
 `tests/agent_pubkey_error_parity_3145.rs`.
 
+### Security (the identity keystore: no sole-key destruction, no silent inertness, no attacker-writable key directory; #3146, #3147, #3198)
+
+**#3146 — key persistence was remove-then-create, and wrote the public half
+first.** `identity::keypair::write_with_mode` did `let _ = fs::remove_file(path);`
+and only THEN opened the final path with `create_new`: the old file was gone
+before a single new byte existed. A crash, `ENOSPC`, `EIO`, or an OOM kill
+anywhere in that window destroyed `<agent>.priv` — an unrecoverable identity
+loss for any deployment without a backup, because regenerating mints a
+DIFFERENT key and makes every signature the old one produced unverifiable. The
+`save` doc asserted an atomicity that did not exist ("written atomically by the
+underlying `fs::write` (single syscall … a partial write is recoverable by
+`generate` again)"): the writer was not `fs::write`, a write is not one
+syscall, and `generate` does not recover an identity, it replaces one.
+
+Each key file is now replaced by the standard durable-replace sequence —
+staging file in the SAME directory created at the requested mode (so a `0600`
+private key is never briefly world-readable), `fsync`, atomic `rename`,
+directory `fsync` — and every failure before the rename removes the staging
+file and leaves the destination byte-for-byte as it was. `save` additionally
+writes the PRIVATE half FIRST. The pair is two files and no filesystem we
+target offers a cross-file transaction, so a crash between the two renames is
+unavoidable; the ordering decides which half-state it leaves, and `.priv`
+present + `.pub` absent is RECOVERABLE (a public key is a deterministic
+function of its private key) where the pre-#3146 inverse was not. The X25519
+keystore (`encryption::save_keypair_to_disk`), which reuses the same writer,
+takes the same ordering.
+
+`rotate` / `rotate_with_succession` named their archive of the retiring public
+key at 1-second granularity and wrote it with the same remove-then-create
+primitive, so two rotations inside one second silently OVERWROTE the earlier
+archive — destroying the only retained verification anchor for the identity
+that rotation had just retired. Archives are now claimed with `create_new`,
+collide onto a deterministic `-N` suffix, and REFUSE rather than overwrite when
+the suffixes are exhausted.
+
+**#3147 — the daemon keypair existence gate consulted the public half only.**
+`ensure_keypair` returned `AlreadyExists` whenever `<agent>.pub` existed, and
+`ensure_and_load_daemon_keypair` reported the missing-private case with
+`tracing::info!("identity: only public key on disk … link signing disabled")`
+and continued. Once `daemon.priv` was gone — the #3146 crash window, or a
+`.pub`-only backup restore — every restart signed nothing, forever, below the
+default log filter of most deployments, with no self-heal. The MIRROR half of
+that gate was worse than inert: because it branched on `<agent>.pub` alone, a
+key directory holding `<agent>.priv` WITHOUT `<agent>.pub` fell through to the
+generate-and-save arm, so the daemon minted a NEW identity and `save` overwrote
+the surviving private key with it — silent, unprompted destruction of the very
+half-state that is otherwise fully recoverable. The gate is now a
+four-way state table over BOTH halves: both present is idempotent as before;
+`.priv` without `.pub` RE-DERIVES the public key (same identity, zero signature
+loss — this is the half-state #3146's ordering deliberately leaves); `.pub`
+without `.priv` is reported as degraded and WARNed, never auto-repaired
+(regenerating would mint a different identity behind the operator's back); and
+neither present generates. The daemon's own "public key only" line is WARN, and
+under `asi-hard` — the posture whose contract is that no security control may
+be silently disabled — a daemon that can never sign refuses to boot.
+
+**#3198 — the key DIRECTORY had no posture gate at all.** `keypair::ensure_parent`
+was a bare `fs::create_dir_all`: no mode, no world/group-writable check. The log
+and audit trees have had `log_paths::enforce_not_world_writable` plus an explicit
+`0o700` `ensure_dir_secure` since v0.7, so on a `umask 0002` host — a real
+configuration in this fleet — the log material was strictly better protected than
+the signing identity that vouches for it: `~/.config/ai-memory/keys` landed
+`0o775`, and a second local UID could unlink and replace
+`daemon.priv`/`daemon.pub` with a keypair it controls. Every file-level control
+then PASSES on the planted pair — the `0o600` mode check (the attacker writes
+`0o600`), the private-derives-public cross-check in `load` (the attacker plants a
+MATCHED pair), and the #1790 single-open fstat fix (the swap happened before
+`load` ran) — so the daemon signs `signed_events` and audit witnesses with the
+attacker's identity and the forged signatures VERIFY, with tamper-evidence
+reporting CLEAN.
+
+Key directories this crate creates are now born `0o700` via `DirBuilder::mode`,
+which applies at `mkdir(2)` time so no group-writable window exists (a
+`create_dir_all` followed by a `chmod` would have one), and every directory in a
+freshly-created tree gets it, not just the leaf. `enforce_key_dir_secure` refuses
+a group- or world-WRITABLE key directory at resolution (`default_key_dir`), at
+every read (`load_public`, and so `load`), at every write (`ensure_parent`, and
+so `save` / `save_public_only` / the rotation archive), and in the existence gate
+(`ensure_keypair` — which decides from file existence, an answer an attacker with
+directory write controls). The X25519 keystore
+(`encryption::load_keypair_from_disk`) takes the same gate.
+
+The gate is the group/other WRITE bits (`0o022`), deliberately NOT `0o077`.
+Refusing a merely group/other-READABLE `0o755` directory would brick every
+deployment created under the default `umask 022` — a silent tightening of a
+shipped default. Directory read access does not enable the swap; directory write
+access does. The remediation text still names `chmod 0700`, and pre-existing
+directories are checked, never silently rewritten.
+
+Regression coverage: `tests/keypair_write_crash_injection_3146.rs` re-execs the
+test binary under `RLIMIT_FSIZE=0` so the key write fails mid-`save` exactly as
+`ENOSPC` would, and asserts the ORIGINAL keypair is byte-for-byte intact and
+still loads and signs; `tests/keypair_persistence_ordering_3146_3147.rs` pins
+the private-half-first ordering (by failing only the public write) and the
+four-way existence gate including the posture split;
+`tests/key_dir_posture_3198.rs` pins the `0o700` creation under `umask 000`, the
+refusal of a `0o775`/`0o777` directory on load / save / the existence gate, and
+the UNCHANGED acceptance of `0o755`; and unit tests in
+`src/identity/keypair.rs` pin the collision-safe archive naming at a fixed
+timestamp, the exhaustion refusal, and staging-file cleanup.
+
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 
 Closes a tenant-isolation + approval-bypass primitive on the namespace-standard
