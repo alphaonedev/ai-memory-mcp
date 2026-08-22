@@ -181,6 +181,28 @@ three are the v0.8.0 Pillar-2 typed-cognition Goal/Plan/Step relations,
 `--pattern` or `--tier` is set, the delete is global-scope and refuses
 to run without `--confirm-global`.
 
+### `--tier` fails closed (v1.0.0, [#3130](https://github.com/alphaonedev/ai-memory-mcp/issues/3130))
+
+`--tier` accepts exactly `short`, `mid`, or `long`. Anything else —
+`Long`, `longterm`, a typo — is **refused** with
+
+```text
+error: invalid tier: Long (use short, mid, long)
+```
+
+and a non-zero exit, on every surface that takes one (`forget`,
+`search`, `list`, `update`, `store`, `mine`, and the MCP
+`memory_forget` / `memory_search` / `memory_list` / `memory_update`
+tools). The refusal happens before the database is opened, so nothing
+is deleted and nothing is returned.
+
+Before v1.0.0 an unrecognised value parsed to "no tier filter", which
+WIDENED the request instead of narrowing it: `forget --tier Long`
+erased **every** tier in scope and reported success, and
+`search` / `list` answered with unfiltered rows. Omitting `--tier`
+entirely still means "all tiers" — that is the only way to ask for an
+unconstrained operation.
+
 ## Lifecycle
 
 ### `consolidate`

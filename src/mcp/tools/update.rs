@@ -179,7 +179,10 @@ pub(super) fn handle_update(
     // #1974 — the full-replacement `content`; the opt-in patch primitive
     // (assembled below) takes precedence and is mutually exclusive with it.
     let raw_content = params["content"].as_str();
-    let tier = params["tier"].as_str().and_then(Tier::from_str);
+    // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `tier`. `None` means
+    // "leave the tier alone" here, so a typo silently NO-OPed the retier
+    // and still answered success.
+    let tier = Tier::parse_optional(params["tier"].as_str())?;
     let namespace = params["namespace"].as_str();
     let tags: Option<Vec<String>> = params["tags"].as_array().map(|a| {
         a.iter()

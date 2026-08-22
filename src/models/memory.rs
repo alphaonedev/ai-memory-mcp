@@ -839,6 +839,48 @@ impl Tier {
         }
     }
 
+    /// v1.0.0 #3130 — the canonical, human-readable list of the values
+    /// [`Tier::from_str`] accepts. Rendered into every fail-closed tier
+    /// refusal so an operator who mistyped is told what IS valid, and
+    /// single-sourced here so the message cannot drift from the match
+    /// arms above (it previously appeared as a hand-copied literal in
+    /// `cli::store` and `cli::io`).
+    pub const VALUES_HINT: &'static str = "short, mid, long";
+
+    /// v1.0.0 #3130 — FAIL-CLOSED tier parse.
+    ///
+    /// [`Tier::from_str`] answers `None` for an unrecognised value, and
+    /// every filter surface in the substrate reads `None` as **"no tier
+    /// constraint"**. Chaining the two (`.and_then(Tier::from_str)`)
+    /// therefore turned a typo into a WIDENING of the operation instead
+    /// of a refusal: `forget --tier Long` matched every tier and erased
+    /// the whole corpus while printing success, and `search` / `list`
+    /// returned unfiltered rows. Any surface that accepts a
+    /// caller-supplied tier string MUST route through this (or
+    /// [`Tier::parse_optional`]) so an unrecognised value is a loud
+    /// refusal, never a silently-dropped filter.
+    ///
+    /// # Errors
+    /// The caller-facing refusal naming [`Tier::VALUES_HINT`], when
+    /// `raw` is not one of the canonical wire strings.
+    pub fn parse_strict(raw: &str) -> Result<Self, String> {
+        Self::from_str(raw)
+            .ok_or_else(|| format!("invalid tier: {raw} (use {hint})", hint = Self::VALUES_HINT))
+    }
+
+    /// v1.0.0 #3130 — optional-filter form of [`Tier::parse_strict`].
+    ///
+    /// An ABSENT tier stays `None` — genuinely unconstrained, the
+    /// documented default of every filter surface. A PRESENT-but-
+    /// unrecognised tier is REFUSED. That is exactly the distinction the
+    /// `.and_then(Tier::from_str)` shape collapsed.
+    ///
+    /// # Errors
+    /// Propagates [`Tier::parse_strict`]'s refusal.
+    pub fn parse_optional(raw: Option<&str>) -> Result<Option<Self>, String> {
+        raw.map(Self::parse_strict).transpose()
+    }
+
     /// Numeric rank for tier comparison: Short=0, Mid=1, Long=2.
     #[cfg(test)]
     pub fn rank(&self) -> u8 {

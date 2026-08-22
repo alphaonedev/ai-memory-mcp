@@ -930,8 +930,9 @@ pub fn mine(
             args.format
         )
     })?;
-    let tier = Tier::from_str(&args.tier)
-        .ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", args.tier))?;
+    // v1.0.0 #3130 — already fail-closed; routed through the shared
+    // `Tier::parse_strict` so the refusal wording is single-sourced.
+    let tier = Tier::parse_strict(&args.tier).map_err(|e| anyhow::anyhow!(e))?;
     let namespace = args.namespace.unwrap_or_else(|| match format {
         mine::Format::Claude => "claude-export".to_string(),
         mine::Format::ChatGpt => "chatgpt-export".to_string(),

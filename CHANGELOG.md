@@ -735,6 +735,28 @@ truthful.
 
 ### Fixed
 
+- **An unrecognised `--tier` / `tier` no longer widens the operation — every
+  tier-filter surface now FAILS CLOSED**
+  ([#3130](https://github.com/alphaonedev/ai-memory-mcp/issues/3130)).
+  `Tier::from_str` answers `None` for anything outside `short` / `mid` /
+  `long`, and the storage layer reads `None` as *"no tier constraint"*.
+  Six surfaces chained the two (`.and_then(Tier::from_str)`), so a typo did
+  not narrow the request, it WIDENED it: `ai-memory forget --tier Long`
+  matched **every** tier, erased the whole scope and printed
+  `forgot N memories` (silent, unintentional data loss), while
+  `search` / `list` (CLI and the MCP `memory_search` / `memory_list` tools)
+  returned **unfiltered** rows — wrong results, not fewer. The retier paths
+  (`ai-memory update --tier`, MCP `memory_update`) silently NO-OPed the
+  requested tier change and still reported success. All six now route through
+  the new fail-closed `Tier::parse_strict` / `Tier::parse_optional`, which
+  refuse with `invalid tier: <value> (use short, mid, long)` **before** the
+  store is opened or a single id is collected — non-zero exit, nothing
+  deleted, nothing returned. An ABSENT tier still means genuinely
+  unconstrained; that is exactly the distinction the old shape collapsed.
+  The HTTP `POST /api/v1/notify` Postgres branch is brought to the same
+  posture as its sqlite/MCP siblings (400 instead of a silent
+  default-tier write), and the two already-correct sites
+  (`ai-memory store`, `ai-memory mine`) now single-source the refusal wording.
 - **Record-stop enforcement no longer silently degrades at the SAL layer when
   the sqlite DB path resolves through a symlink** (e.g. the macOS
   `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed

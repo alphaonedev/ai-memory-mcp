@@ -60,8 +60,12 @@ pub fn run(
     if let Some(ref a) = args.as_agent {
         validate::validate_namespace(a)?;
     }
+    // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `--tier` (was
+    // `.and_then(Tier::from_str)`, which dropped the filter and returned
+    // UNFILTERED results — wrong results, not fewer). Validated with the
+    // other argument checks, before the DB is opened.
+    let tier = Tier::parse_optional(args.tier.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
     let conn = db::open(db_path)?;
-    let tier = args.tier.as_deref().and_then(Tier::from_str);
     // v0.8.0 #1720 A3 — owner-keyed scope=private SQL caller. CLI is
     // single-tenant operator-as-actor: `resolve_read_visibility_caller`
     // returns the agent_id when `AI_MEMORY_AGENT_ID` is set, else `None`
