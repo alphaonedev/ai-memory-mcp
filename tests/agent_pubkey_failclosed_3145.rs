@@ -78,7 +78,7 @@ fn signed_memory(kp: &ai_memory::identity::keypair::AgentKeypair) -> (Memory, Ve
         content_sha256: &content_hash,
     };
     let sig = ai_memory::identity::sign::sign_write(kp, &write).expect("sign");
-    (mem, sig.to_vec())
+    (mem, sig)
 }
 
 /// Open a probe connection on `path` in rollback-journal mode with no busy

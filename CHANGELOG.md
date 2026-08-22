@@ -1936,8 +1936,15 @@ a group- or world-WRITABLE key directory at resolution (`default_key_dir`), at
 every read (`load_public`, and so `load`), at every write (`ensure_parent`, and
 so `save` / `save_public_only` / the rotation archive), and in the existence gate
 (`ensure_keypair` — which decides from file existence, an answer an attacker with
-directory write controls). The X25519 keystore
-(`encryption::load_keypair_from_disk`) takes the same gate.
+directory write controls). The same gate is applied to every ancestor between a
+nested (#1514 slashed) key file and the caller-supplied key dir — write access
+to ANY link in that chain is enough to replace the subtree, so a leaf-only
+check would have left that layout half-guarded. The X25519 keystore
+(`encryption::{load,save}_keypair_from/to_disk`) and the capability-token
+keystore (`governance::capability::{write,read}_root_secret`) take the same
+gate: the latter previously did a bare `create_dir_all` for the directory
+holding a `0o600` bearer secret, so a directory-writable swap minted tokens
+that VERIFY.
 
 The gate is the group/other WRITE bits (`0o022`), deliberately NOT `0o077`.
 Refusing a merely group/other-READABLE `0o755` directory would brick every

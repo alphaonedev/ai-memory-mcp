@@ -198,18 +198,27 @@ pub fn key_dir_env_override() -> Option<PathBuf> {
 /// tests stand up an isolated key dir per test without shelling out to
 /// the operator's real `~/.config/ai-memory/keys/`. Operators who want
 /// to relocate the key store in production can use the same override.
+/// Path of the default key directory, WITHOUT the #3198 posture gate.
+/// `default_key_dir` is the production funnel and always gates; this is
+/// the shape-only half so tests can assert the fallback path without
+/// requiring the operator's live `~/.config/ai-memory/keys` to already
+/// be `0o700` (this fleet's `umask 0002` leaves it `0o775` — the
+/// defect #3198 exists to refuse).
+fn resolved_default_key_dir_path() -> Result<PathBuf> {
+    if let Some(p) = key_dir_env_override() {
+        return Ok(p);
+    }
+    // COVERAGE: ok_or_else closure reachable only on hosts where
+    //           dirs::config_dir() returns None — i.e. exotic
+    //           platforms with no HOME env var. Not deterministic to
+    //           trigger in tests because removing HOME breaks tempfile.
+    let base = dirs::config_dir()
+        .ok_or_else(|| anyhow!("OS did not advertise a config directory for key storage"))?;
+    Ok(base.join("ai-memory").join("keys"))
+}
+
 pub fn default_key_dir() -> Result<PathBuf> {
-    let resolved = if let Some(p) = key_dir_env_override() {
-        p
-    } else {
-        // COVERAGE: ok_or_else closure (line 131) reachable only on hosts
-        //           where dirs::config_dir() returns None — i.e. exotic
-        //           platforms with no HOME env var. Not deterministic to
-        //           trigger in tests because removing HOME breaks tempfile.
-        let base = dirs::config_dir()
-            .ok_or_else(|| anyhow!("OS did not advertise a config directory for key storage"))?;
-        base.join("ai-memory").join("keys")
-    };
+    let resolved = resolved_default_key_dir_path()?;
     // #3198 — refuse at RESOLUTION, so a group-writable key store is named once
     // at boot rather than surfacing later as a confusing per-operation failure.
     // A path that does not exist yet passes; `ensure_parent` creates it `0700`.
@@ -346,6 +355,11 @@ pub fn save(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
     // (slash-free) agent_id the parent IS `dir`, so behaviour is unchanged.
     ensure_parent(&pub_path)?;
     ensure_parent(&priv_path)?;
+    // #3198 — `ensure_parent` created (or found) the chain and checked the leaf;
+    // re-check the WHOLE chain up to the caller's key dir before any key
+    // material is written, so a nested #1514 layout cannot be planted through a
+    // loose intermediate.
+    enforce_key_path_chain_secure(dir, &priv_path)?;
 
     // #3146 — PRIVATE FIRST. See the atomicity section above: a crash between
     // the two renames must leave the RECOVERABLE half-state (`.priv` current,
@@ -367,6 +381,8 @@ pub fn save_public_only(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
     // #1514 — create the parent of the FILE (nested for slashed agent_ids),
     // not just `dir`; for a slash-free id the parent IS `dir`.
     ensure_parent(&pub_path)?;
+    // #3198 — same whole-chain gate as `save`.
+    enforce_key_path_chain_secure(dir, &pub_path)?;
     // COVERAGE: with_context closure (line 192) same class as save's
     //           pub-write closure (line 178) — reachable on EACCES/
     //           ENOSPC; not portable to unit tests on macOS/Linux.
@@ -569,7 +585,7 @@ pub fn load_public(agent_id: &str, dir: &Path) -> Result<VerifyingKey> {
     // fstat) meaningless — an attacker swaps in a matched pair they control.
     // The FILE's parent, not `dir`, because a slashed #1514 agent_id nests the
     // key files below `dir`; for a plain agent_id the two are the same.
-    enforce_key_dir_secure(&key_file_dir(&pub_path)?)?;
+    enforce_key_path_chain_secure(dir, &pub_path)?;
     let pub_bytes = fs::read(&pub_path)
         .with_context(|| format!("reading public key {}", pub_path.display()))?;
     if pub_bytes.len() != PUBLIC_KEY_LEN {
@@ -967,7 +983,7 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
     // file existence, and under a group-writable directory an attacker controls
     // that answer: they can delete `<agent>.pub` to force the self-heal arm, or
     // plant a matched pair the "both present" arm accepts.
-    enforce_key_dir_secure(&key_file_dir(&pub_path)?)?;
+    enforce_key_path_chain_secure(dir, &pub_path)?;
     // #3147 — the gate consults BOTH halves. It used to test `.pub` alone, so a
     // key directory holding only a public key (the #3146 crash window, or a
     // `.pub`-only backup restore) reported `AlreadyExists` on EVERY restart:
@@ -1136,8 +1152,8 @@ pub(crate) fn enforce_key_dir_secure(dir: &Path) -> Result<()> {
         if !dir.exists() {
             return Ok(());
         }
-        let md = fs::metadata(dir)
-            .with_context(|| format!("stat key directory {}", dir.display()))?;
+        let md =
+            fs::metadata(dir).with_context(|| format!("stat key directory {}", dir.display()))?;
         let mode = md.permissions().mode() & 0o7777;
         if mode & KEY_DIR_FORBIDDEN_BITS != 0 {
             bail!(
@@ -1159,6 +1175,36 @@ pub(crate) fn enforce_key_dir_secure(dir: &Path) -> Result<()> {
         let _ = dir;
     }
     Ok(())
+}
+
+/// #3198 — apply [`enforce_key_dir_secure`] to the directory `file` lives in
+/// AND to every ancestor up to and including `base`, the caller-supplied key
+/// directory.
+///
+/// For a plain (slash-free) `agent_id` the file's parent IS `base`, so this is
+/// one check. For a #1514 SPIFFE-style slashed id (`campaign/region/host`) the
+/// key files sit several directories below `base`, and write access to ANY link
+/// in that chain is enough to replace the subtree holding the key — checking
+/// only the leaf would leave the nested layout half-guarded.
+///
+/// Owned [`PathBuf`] walk via [`PathBuf::pop`], not a `&Path` reborrow of
+/// `.parent()`, so the loop cannot trip a 1.96 borrow-checker stall on
+/// `cur = parent` (OWNERSHIP-10 / rustc 1.96 NLL).
+pub(crate) fn enforce_key_path_chain_secure(base: &Path, file: &Path) -> Result<()> {
+    let mut cur = key_file_dir(file)?;
+    loop {
+        enforce_key_dir_secure(&cur)?;
+        if cur.as_path() == base {
+            return Ok(());
+        }
+        if !cur.starts_with(base) {
+            break;
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    enforce_key_dir_secure(base)
 }
 
 /// #3146 — how many `-N` suffixes [`archive_public_key_at`] will try before
@@ -1925,7 +1971,10 @@ mod tests {
         unsafe {
             std::env::remove_var("AI_MEMORY_KEY_DIR");
         }
-        let p = default_key_dir().expect("default dir");
+        // Shape only — do NOT go through `default_key_dir()`, which
+        // refuses a group-writable live keystore (#3198). This host's
+        // `~/.config/ai-memory/keys` is `0o775` under `umask 0002`.
+        let p = resolved_default_key_dir_path().expect("default dir path");
         let s = p.to_string_lossy();
         assert!(s.ends_with("ai-memory/keys") || s.ends_with("ai-memory\\keys"));
     }

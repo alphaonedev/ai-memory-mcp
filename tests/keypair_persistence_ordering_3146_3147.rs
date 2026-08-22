@@ -93,7 +93,7 @@ fn save_writes_the_private_half_first_3146() {
             .as_ref()
             .expect("replacement has a private key")
             .to_bytes()
-            .to_vec(),
+            .as_slice(),
         "the private half on disk must be the replacement key"
     );
 
@@ -109,8 +109,8 @@ fn save_writes_the_private_half_first_3146() {
     );
     let loaded = keypair::load(AGENT, dir).expect("the repaired pair must load");
     assert_eq!(
-        loaded.public.to_bytes().to_vec(),
-        replacement.public.to_bytes().to_vec(),
+        loaded.public.to_bytes(),
+        replacement.public.to_bytes(),
         "the re-derived public key must be the replacement's, not a new identity"
     );
 }

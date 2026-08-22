@@ -101,6 +101,8 @@ async fn postgres_agent_pubkey_contract_3145() {
                 agent_id: agent.clone(),
                 agent_type: "nhi".to_string(),
                 capabilities: Vec::new(),
+                registered_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: chrono::Utc::now().to_rfc3339(),
             },
         )
         .await

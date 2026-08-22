@@ -66,34 +66,39 @@ struct FsizeLimit(libc::rlimit);
 impl FsizeLimit {
     /// Clamp the maximum file size this process may write to zero bytes.
     fn clamp_to_zero() -> Self {
-        // SAFETY: `getrlimit`/`setrlimit` take a pointer to a caller-owned,
-        // fully-initialized `rlimit`; both are plain POSIX calls with no
-        // aliasing requirements beyond that.
+        let mut prev = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` takes a pointer to a caller-owned, fully
+        // initialized `rlimit`. Plain POSIX; no aliasing beyond that.
         unsafe {
-            let mut prev = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
             assert_eq!(
-                libc::getrlimit(libc::RLIMIT_FSIZE, &mut prev),
+                libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut prev),
                 0,
                 "getrlimit(RLIMIT_FSIZE) failed"
             );
-            // Exceeding RLIMIT_FSIZE raises SIGXFSZ, whose default disposition
-            // TERMINATES the process. Ignore it so `write(2)` returns EFBIG to
-            // Rust instead, which is the fault shape we are simulating.
+        }
+        // SAFETY: `signal` is a plain POSIX call. Exceeding RLIMIT_FSIZE
+        // raises SIGXFSZ whose default disposition TERMINATES the process;
+        // ignoring it makes `write(2)` return EFBIG, the fault we simulate.
+        unsafe {
             libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-            let zero = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: prev.rlim_max,
-            };
+        }
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: prev.rlim_max,
+        };
+        // SAFETY: `setrlimit` takes a pointer to a caller-owned initialized
+        // `rlimit`. `rlim_max` is the value `getrlimit` just returned.
+        unsafe {
             assert_eq!(
-                libc::setrlimit(libc::RLIMIT_FSIZE, &zero),
+                libc::setrlimit(libc::RLIMIT_FSIZE, &raw const zero),
                 0,
                 "setrlimit(RLIMIT_FSIZE, 0) failed"
             );
-            Self(prev)
         }
+        Self(prev)
     }
 }
 
@@ -102,7 +107,7 @@ impl Drop for FsizeLimit {
         // SAFETY: same contract as above; `self.0` is the value `getrlimit`
         // wrote, so restoring it can only widen the limit back.
         unsafe {
-            libc::setrlimit(libc::RLIMIT_FSIZE, &self.0);
+            libc::setrlimit(libc::RLIMIT_FSIZE, &raw const self.0);
         }
     }
 }
@@ -200,8 +205,8 @@ fn failing_writer_mid_save_leaves_the_original_keypair_intact_3146() {
         "the reloaded keypair must still hold its private half"
     );
     assert_eq!(
-        reloaded.public.to_bytes().to_vec(),
-        pub_before,
+        reloaded.public.to_bytes().as_slice(),
+        pub_before.as_slice(),
         "the surviving identity must be the ORIGINAL one, not the replacement"
     );
 
@@ -209,7 +214,7 @@ fn failing_writer_mid_save_leaves_the_original_keypair_intact_3146() {
     // must never leave a partial file that `list`/`load` could mistake for a key.
     let stray: Vec<String> = fs::read_dir(dir)
         .expect("read key dir")
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n != &format!("{AGENT}.pub") && n != &format!("{AGENT}.priv"))
         .collect();

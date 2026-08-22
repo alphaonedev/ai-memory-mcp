@@ -302,6 +302,10 @@ fn save_keypair_to_disk(kp: &Keypair, dir: &Path) -> Result<()> {
     let (pub_path, priv_path) = x25519_key_paths(&kp.agent_id, dir);
     crate::identity::keypair::ensure_parent(&pub_path)?;
     crate::identity::keypair::ensure_parent(&priv_path)?;
+    // #3198 — whole-chain gate (not just the leaf `ensure_parent` checks):
+    // a nested #1514 slashed `agent_id` sits under intermediates, and write
+    // access to ANY of them is enough to replace the subtree.
+    crate::identity::keypair::enforce_key_path_chain_secure(dir, &priv_path)?;
     let mut secret_bytes = kp.secret.to_bytes();
     let write_res = crate::identity::keypair::write_with_mode(&priv_path, &secret_bytes, 0o600)
         .with_context(|| format!("writing x25519 private key {}", priv_path.display()));
@@ -322,11 +326,9 @@ fn load_keypair_from_disk(agent_id: &str, dir: &Path) -> Result<Option<Keypair>>
     // #3198 — the same directory-posture gate the Ed25519 keystore takes, for
     // the same reason: under a group-writable key directory another local UID
     // can replace this `.x25519.priv` outright, and the `0o600` fstat check
-    // below happily accepts the planted file. Enforced on the key FILE's parent
-    // so a nested (#1514 slashed) agent_id is covered too.
-    if let Some(parent) = priv_path.parent() {
-        crate::identity::keypair::enforce_key_dir_secure(parent)?;
-    }
+    // below happily accepts the planted file. Whole-chain, not leaf-only: a
+    // nested (#1514 slashed) agent_id is covered at every ancestor up to `dir`.
+    crate::identity::keypair::enforce_key_path_chain_secure(dir, &priv_path)?;
 
     // #1790 finding 2 — open the file ONCE, fstat the handle for the
     // perms check, then read from the SAME handle. The pre-#1790 form did

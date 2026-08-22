@@ -38,10 +38,30 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use ai_memory::identity::keypair;
 
 const AGENT: &str = "daemon";
+
+/// `umask(2)` is process-wide. The `0o000` probe in
+/// [`a_fresh_key_directory_is_created_0700_3198`] would otherwise race
+/// sibling tests in this file and leave their `tempfile::TempDir` at
+/// `0o777`, which the #3198 gate then correctly refuses.
+fn file_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// A [`tempfile::TempDir`] that is owner-only regardless of the process
+/// umask, so tests that use the tempdir AS the key directory start from
+/// a sane posture. The umask-000 probe below creates its own nested
+/// tree instead of using this.
+fn owner_only_tempdir() -> tempfile::TempDir {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    chmod(tmp.path(), 0o700);
+    tmp
+}
 
 /// Restores the process umask on drop.
 struct Umask(libc::mode_t);
@@ -88,7 +108,10 @@ fn assert_names_the_fix(rendered: &str, dir: &Path) {
 
 #[test]
 fn a_fresh_key_directory_is_created_0700_3198() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let _g = file_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tmp = owner_only_tempdir();
     // The worst realistic umask: clears nothing, so the mode the code REQUESTS
     // is the mode that lands. Under a bare `create_dir_all` this directory
     // would be 0o777.
@@ -115,7 +138,7 @@ fn a_fresh_key_directory_is_created_0700_3198() {
 
 #[test]
 fn a_group_writable_key_directory_refuses_load_3198() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = owner_only_tempdir();
     let dir = tmp.path();
     let kp = keypair::generate(AGENT).expect("generate");
     keypair::save(&kp, dir).expect("save while the directory is still sane");
@@ -132,7 +155,7 @@ fn a_group_writable_key_directory_refuses_load_3198() {
 
 #[test]
 fn a_world_writable_key_directory_refuses_load_3198() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = owner_only_tempdir();
     let dir = tmp.path();
     let kp = keypair::generate(AGENT).expect("generate");
     keypair::save(&kp, dir).expect("save");
@@ -147,7 +170,7 @@ fn a_world_writable_key_directory_refuses_load_3198() {
 
 #[test]
 fn a_group_writable_key_directory_refuses_save_3198() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = owner_only_tempdir();
     let dir = tmp.path();
     chmod(dir, 0o775);
 
@@ -169,7 +192,7 @@ fn a_group_writable_key_directory_refuses_save_3198() {
 /// "both present" arm.
 #[test]
 fn a_group_writable_key_directory_refuses_ensure_keypair_3198() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = owner_only_tempdir();
     let dir = tmp.path();
     chmod(dir, 0o775);
 
@@ -186,7 +209,7 @@ fn a_group_writable_key_directory_refuses_ensure_keypair_3198() {
 /// refusing it would be a silent tightening that bricks running fleets.
 #[test]
 fn a_group_readable_but_not_writable_key_directory_still_works_3198() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = owner_only_tempdir();
     let dir = tmp.path();
     let kp = keypair::generate(AGENT).expect("generate");
     keypair::save(&kp, dir).expect("save");
@@ -194,7 +217,9 @@ fn a_group_readable_but_not_writable_key_directory_still_works_3198() {
     for mode in [0o755u32, 0o750, 0o711, 0o700] {
         chmod(dir, mode);
         keypair::load(AGENT, dir).unwrap_or_else(|e| {
-            panic!("mode {mode:o} is not writable by anyone but the owner and must be accepted: {e:#}")
+            panic!(
+                "mode {mode:o} is not writable by anyone but the owner and must be accepted: {e:#}"
+            )
         });
         keypair::save(&kp, dir)
             .unwrap_or_else(|e| panic!("mode {mode:o} must still accept a save: {e:#}"));
@@ -209,12 +234,14 @@ fn a_group_readable_but_not_writable_key_directory_still_works_3198() {
 /// shortened list.
 #[test]
 fn a_group_writable_key_directory_refuses_list_3198() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = owner_only_tempdir();
     let dir = tmp.path();
     let kp = keypair::generate(AGENT).expect("generate");
     keypair::save(&kp, dir).expect("save");
     assert_eq!(
-        keypair::list(dir).expect("sanity: lists before the chmod").len(),
+        keypair::list(dir)
+            .expect("sanity: lists before the chmod")
+            .len(),
         1
     );
 
@@ -226,12 +253,40 @@ fn a_group_writable_key_directory_refuses_list_3198() {
     chmod(dir, 0o700);
 }
 
+/// Whole-chain gate (#3198 follow-up): a #1514 slashed `agent_id` nests the
+/// key files under intermediates of the key dir. Write access to ANY of
+/// those ancestors is enough to replace the subtree, so checking only the
+/// leaf would leave the nested layout half-guarded. The leaf stays `0o700`;
+/// only an ancestor is loosened.
+#[test]
+fn a_group_writable_ancestor_of_a_slashed_agent_path_refuses_3198() {
+    let tmp = owner_only_tempdir();
+    let dir = tmp.path();
+    let nested = "campaign/region/host";
+    let kp = keypair::generate(nested).expect("generate");
+    keypair::save(&kp, dir).expect("save nested layout under a sane tree");
+    keypair::load(nested, dir).expect("sanity: nested layout loads");
+
+    // Leaf (`campaign/region`) stays owner-only; the ancestor `campaign`
+    // is the hole the leaf-only check cannot see.
+    let ancestor = dir.join("campaign");
+    chmod(&ancestor, 0o775);
+    let load_err = keypair::load(nested, dir)
+        .expect_err("write access to an ancestor of a nested key path must refuse load");
+    assert_names_the_fix(&format!("{load_err:#}"), &ancestor);
+    let save_err = keypair::save(&kp, dir)
+        .expect_err("write access to an ancestor of a nested key path must refuse save");
+    assert_names_the_fix(&format!("{save_err:#}"), &ancestor);
+
+    chmod(&ancestor, 0o700);
+}
+
 /// A key directory that does not exist yet must not be an error — `save`
 /// creates it `0o700`. Mirrors `log_paths::enforce_not_world_writable`'s
 /// pass-through on a nonexistent path.
 #[test]
 fn a_missing_key_directory_is_not_a_refusal_3198() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = owner_only_tempdir();
     let absent = tmp.path().join("not-created-yet");
     let kp = keypair::generate(AGENT).expect("generate");
     keypair::save(&kp, &absent).expect("a missing key directory is created, not refused");
