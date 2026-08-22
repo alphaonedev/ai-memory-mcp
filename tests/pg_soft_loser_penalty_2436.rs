@@ -156,11 +156,23 @@ fn sqlite_soft_loser_ranks_below_winner() {
 // ─────────────────────────────────────────────────────────────────────
 #[cfg(feature = "sal-postgres")]
 mod postgres_side {
+    use ai_memory::META_KEY_AGENT_ID;
     use ai_memory::models::field_names;
     use ai_memory::models::{Memory, Tier};
     use ai_memory::store::postgres::PostgresStore;
     use ai_memory::store::{CallerContext, Filter, MemoryStore};
     use serde_json::json;
+
+    /// The principal that both stores AND reads these fixtures. #3110 put the
+    /// SAL #910 scope=private visibility gate on
+    /// `PostgresStore::search_with_source_uri` (it previously had none), so a
+    /// fixture row must be OWNED by the reading caller to be recalled: an
+    /// UNSTAMPED row (no `metadata.agent_id`) defaults to `scope=private` with
+    /// an empty owner and is now correctly invisible to everyone — the same
+    /// posture the pg `search` / `list` methods and the sqlite twin have
+    /// always had. Stamping the owner keeps this test measuring the #2436
+    /// RANKING penalty rather than accidentally re-testing visibility.
+    const PG_CALLER: &str = "cb16-parity";
 
     async fn live_pg() -> Option<PostgresStore> {
         let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()?;
@@ -182,12 +194,18 @@ mod postgres_side {
     /// rows. Searched with `namespace = None`, so both compete in one
     /// ranking where the soft-loser penalty is the ONLY differentiator.
     fn sample(id: &str, namespace: &str, token: &str, priority: i32, soft_loser: bool) -> Memory {
+        // `agent_id` = the reading caller: see `PG_CALLER` — the #3110
+        // visibility gate hides an unowned (`scope` absent ⇒ private, owner
+        // empty) row from every non-bypass caller.
         let metadata = if soft_loser {
             // The EXACT value shape `conserve_contradiction` stamps: a JSON
             // boolean `true`. This is what the fixed pg predicate matches.
-            json!({ (field_names::CONTRADICTION_SOFT_LOSER): true })
+            json!({
+                (field_names::CONTRADICTION_SOFT_LOSER): true,
+                (META_KEY_AGENT_ID): PG_CALLER,
+            })
         } else {
-            json!({})
+            json!({ (META_KEY_AGENT_ID): PG_CALLER })
         };
         Memory {
             id: id.to_string(),
@@ -213,7 +231,7 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
-        let ctx = CallerContext::for_agent("cb16-parity");
+        let ctx = CallerContext::for_agent(PG_CALLER);
 
         // Distinctive tokens keep the namespace-less search from colliding
         // with any co-resident row in the shared test DB.
@@ -233,7 +251,7 @@ mod postgres_side {
             ..Filter::default()
         };
         let ranked = pg
-            .search_with_source_uri(tok, &filter, None)
+            .search_with_source_uri(&ctx, tok, &filter, None)
             .await
             .expect("search_with_source_uri");
 
@@ -269,7 +287,7 @@ mod postgres_side {
         let _ = MemoryStore::store(&pg, &ctx, &hi).await;
         let _ = MemoryStore::store(&pg, &ctx, &lo).await;
         let ranked2 = pg
-            .search_with_source_uri(tok2, &filter, None)
+            .search_with_source_uri(&ctx, tok2, &filter, None)
             .await
             .expect("search_with_source_uri");
         for id in ["pg-cb16-normal-hi", "pg-cb16-normal-lo"] {

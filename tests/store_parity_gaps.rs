@@ -2517,7 +2517,7 @@ mod postgres_side {
             ..ai_memory::store::Filter::default()
         };
         let scoped = pg
-            .search_with_source_uri("matching", &filter, Some("uri:pg-doc/a"))
+            .search_with_source_uri(&ctx, "matching", &filter, Some("uri:pg-doc/a"))
             .await
             .expect("search_with_source_uri");
         for m in &scoped {

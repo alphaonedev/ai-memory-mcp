@@ -6566,8 +6566,24 @@ impl PostgresStore {
     ///
     /// Returns up to `limit` matches ordered descending by a blended
     /// score (text-rank + priority + recency).
+    ///
+    /// # Visibility (#3110)
+    /// `ctx` drives the SAL #910 visibility gate, exactly as the pg
+    /// `search` trait method and the sqlite twin enforce it: a
+    /// `scope=private` row is returned only when the caller owns it
+    /// (`metadata.agent_id == ctx.effective_principal()`) or is its
+    /// addressed inbox recipient (`metadata.target_agent_id`), and
+    /// `team` / `unit` / `org` rows only within the caller's namespace
+    /// subtree. A context with `bypass_visibility` (admin / migrate /
+    /// federation catch-up / GC only) sees every row.
+    ///
+    /// The authority for that contract is the in-process
+    /// [`crate::visibility::is_visible_to_caller`] re-filter, NOT the SQL
+    /// predicate — the SQL arm is a coarse private-row pre-filter and is
+    /// wider than the predicate for non-private scopes.
     pub async fn search_with_source_uri(
         &self,
+        ctx: &CallerContext,
         query: &str,
         filter: &Filter,
         source_uri: Option<&str>,
@@ -6577,6 +6593,27 @@ impl PostgresStore {
             .clamp(1, crate::storage::LIST_MAX_LIMIT)
             .try_into()
             .unwrap_or(LIST_FALLBACK_LIMIT_I64);
+        // #3110 (2026-08) — SAL #910 scope=private visibility gate. The
+        // reciprocal-provenance FTS path returns `Memory` rows and MUST
+        // apply the same owner-keyed private filter as the pg `search`
+        // trait method (postgres.rs `search`) and the fail-closed sqlite
+        // twin (`crate::storage::search_with_source_uri`, bound at ?15).
+        // Without it a `scope=private` row owned by another agent could
+        // surface to any caller through the `?source_uri=` compose path
+        // — the exact cross-agent private-row leak the twin already
+        // blocks. `bypass_visibility` (admin / migrate / federation
+        // catch-up / GC) binds NULL so the SQL arm short-circuits true AND
+        // skips the in-process re-filter, IDENTICAL to pg `search`'s
+        // `caller_opt` derivation — the ONE sanctioned bypass, never a
+        // tenant path. NOTE: the SQL arm is only a coarse pre-filter; the
+        // authoritative check is `is_visible_to_caller` after the fetch
+        // (see the comment there).
+        let caller = ctx.effective_principal();
+        let caller_opt: Option<&str> = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(caller)
+        };
         // #1579 B2 — rank + match read the stored generated `tsv`
         // column (schema v57) instead of recomputing
         // to_tsvector(title||' '||content) per matched row.
@@ -6607,11 +6644,28 @@ impl PostgresStore {
                AND ($4::timestamptz IS NULL OR m.created_at >= $4)
                AND ($5::timestamptz IS NULL OR m.created_at <= $5)
                AND ($6::text IS NULL OR m.source_uri = $6)
+               -- #3110 — COARSE private-row PRE-FILTER (mirrors pg `search`
+               -- at postgres.rs `search`), NOT the authoritative gate: it is
+               -- WIDER than `visibility::is_visible_to_caller` for every
+               -- non-private scope (no subtree test for team/unit/org, and an
+               -- unrecognised scope token reads as non-private here). The
+               -- in-process `is_visible_to_caller` re-filter after the fetch
+               -- is what enforces the real semantics. $7 = caller principal;
+               -- NULL (bypass) short-circuits the arm true. Absent `scope`
+               -- defaults to 'private' (fail-closed); `target_agent_id` is the
+               -- #3070 inbox carve-out so a row addressed TO the caller stays
+               -- visible.
+               AND (
+                   $7::text IS NULL
+                   OR COALESCE(m.metadata->>'scope', 'private') <> 'private'
+                   OR m.metadata->>'agent_id' = $7
+                   OR m.metadata->>'target_agent_id' = $7
+               )
                {lifecycle_vis}
              ORDER BY rank DESC,
                       m.priority DESC,
                       m.updated_at DESC
-             LIMIT $7",
+             LIMIT $8",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
             lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
             soft_loser_factor = crate::storage::SOFT_LOSER_SCORE_FACTOR,
@@ -6622,18 +6676,47 @@ impl PostgresStore {
         .bind(filter.since)
         .bind(filter.until)
         .bind(source_uri)
+        .bind(caller_opt)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("search_with_source_uri", e))?;
 
         // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
-        Ok(rows
+        let mems: Vec<Memory> = rows
             .iter()
             .map(Self::row_to_memory_scan)
             .collect::<StoreResult<Vec<_>>>()?
             .into_iter()
             .flatten()
+            .collect();
+        // #3110 — AUTHORITATIVE visibility gate. This re-filter is
+        // LOAD-BEARING, not belt-and-suspenders: it must never be removed
+        // or made conditional on anything but `bypass_visibility`.
+        //
+        // The `$7` SQL arm above is deliberately only a COARSE
+        // PRIVATE-ROW PRE-FILTER — an index-friendly narrowing that drops
+        // the bulk of other agents' `scope=private` rows in the database.
+        // It is strictly WIDER than `crate::visibility::is_visible_to_caller`
+        // for every NON-private scope, because it admits any row whose
+        // scope merely differs from 'private':
+        //   * `team` / `unit` / `org` rows OUTSIDE the caller's namespace
+        //     subtree — the SQL has no subtree test, while the predicate
+        //     applies the #1921 (CWE-863) subtree restriction; and
+        //   * rows whose `scope` is an UNRECOGNISED token (`"privat"`,
+        //     `"Private"`, `"sharedd"`) — non-'private' to the SQL, but
+        //     #2633 (CWE-863, FBL-14) degrades them to the narrowest
+        //     owner-keyed posture in the predicate.
+        // Results are correct ONLY because `is_visible_to_caller` runs
+        // unconditionally below for every non-bypass caller and applies
+        // the full scope hierarchy. Treat the SQL arm as an optimisation;
+        // treat this call as the gate.
+        if ctx.bypass_visibility {
+            return Ok(mems);
+        }
+        Ok(mems
+            .into_iter()
+            .filter(|m| is_visible_to_caller(m, caller))
             .collect())
     }
 

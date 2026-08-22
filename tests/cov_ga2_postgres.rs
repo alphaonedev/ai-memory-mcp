@@ -163,7 +163,7 @@ async fn search_with_source_uri_filters_on_provenance() {
     };
     // With the matching source_uri the row surfaces.
     let hits = store
-        .search_with_source_uri(&token, &filter, Some(&uri))
+        .search_with_source_uri(&ctx, &token, &filter, Some(&uri))
         .await
         .expect("search_with_source_uri match");
     assert!(
@@ -174,7 +174,7 @@ async fn search_with_source_uri_filters_on_provenance() {
 
     // A non-matching source_uri filter excludes it (the $6 predicate arm).
     let none = store
-        .search_with_source_uri(&token, &filter, Some("doc:nonexistent-ga2"))
+        .search_with_source_uri(&ctx, &token, &filter, Some("doc:nonexistent-ga2"))
         .await
         .expect("search_with_source_uri miss");
     assert!(
@@ -185,10 +185,149 @@ async fn search_with_source_uri_filters_on_provenance() {
 
     // None (no source_uri narrowing) still matches on the FTS query alone.
     let any = store
-        .search_with_source_uri(&token, &filter, None)
+        .search_with_source_uri(&ctx, &token, &filter, None)
         .await
         .expect("search_with_source_uri no-uri");
     assert!(any.iter().any(|r| r.title == token));
+}
+
+// #3110 SECURITY (2026-08) — the pg `search_with_source_uri`
+// reciprocal-provenance surface MUST apply the SAL #910 scope=private
+// visibility gate, exactly as the pg `search` trait method and the
+// fail-closed sqlite twin do. Pre-fix the pg inherent method carried NO
+// caller/scope predicate: a `scope=private` row owned by ANOTHER agent
+// leaked to any caller through the `?source_uri=` compose path. This
+// pins: (a) a non-owner is fail-closed, (b) the owner is exempt, (c) the
+// #3070 `target_agent_id` inbox carve-out surfaces a row addressed TO
+// the caller, (d) `bypass_visibility` (admin) sees the private row.
+//
+// NOTE on what actually enforces this: the `$7` SQL arm is only a COARSE
+// private-row pre-filter — it is WIDER than
+// `visibility::is_visible_to_caller` for every non-private scope (no subtree
+// test for team/unit/org per #1921, and an unrecognised `scope` token reads
+// as non-private there per #2633). The in-process `is_visible_to_caller`
+// re-filter is LOAD-BEARING: it is what makes these assertions hold, and
+// deleting it would reopen the leak even with the SQL arm intact. This test
+// therefore guards that call as much as it guards the predicate.
+#[tokio::test]
+async fn search_with_source_uri_enforces_scope_private_gate_3110() {
+    let Some(store) = connect().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let alice = CallerContext::for_agent("ai:alice-3110");
+    let bob = CallerContext::for_agent("ai:bob-3110");
+    let ns = uid("s3110-uri");
+    let token = format!("s3110tok{}", uuid::Uuid::new_v4().simple());
+    let uri = format!("doc:s3110/{}", uuid::Uuid::new_v4().simple());
+
+    // (1) alice's PRIVATE row (scope=private, owner=alice).
+    let priv_id = uid("s3110-priv");
+    // DISTINCT titles: pg `store` upserts `ON CONFLICT (title, namespace)`, so
+    // two fixtures sharing a (title, namespace) key would make the SECOND
+    // store UPDATE the FIRST row instead of inserting a second one — leaving
+    // ONE row carrying the inbox metadata, which bob may legitimately see via
+    // the carve-out. The shared FTS `token` lives in the CONTENT of both rows
+    // so a single query still matches them both.
+    let mut m_priv = mem(
+        &priv_id,
+        &ns,
+        &format!("{token}-priv"),
+        &format!("private body about {token}"),
+    );
+    m_priv.source_uri = Some(uri.clone());
+    m_priv.metadata = serde_json::json!({"agent_id": "ai:alice-3110", "scope": "private"});
+    store.store(&alice, &m_priv).await.expect("store private");
+
+    // (2) alice's row addressed TO bob (inbox carve-out, #3070).
+    let inbox_id = uid("s3110-inbox");
+    let mut m_inbox = mem(
+        &inbox_id,
+        &ns,
+        &format!("{token}-inbox"),
+        &format!("inbox body about {token}"),
+    );
+    m_inbox.source_uri = Some(uri.clone());
+    m_inbox.metadata = serde_json::json!({
+        "agent_id": "ai:alice-3110",
+        "scope": "private",
+        "target_agent_id": "ai:bob-3110",
+    });
+    store.store(&alice, &m_inbox).await.expect("store inbox");
+
+    // Guard the FIXTURE itself: if the upsert collapsed the two rows into one,
+    // every visibility assertion below would be vacuous. Assert BOTH ids are
+    // live and distinct BEFORE testing the gate.
+    let seeded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = ANY($1)")
+        .bind(vec![priv_id.clone(), inbox_id.clone()])
+        .fetch_one(store.pool())
+        .await
+        .expect("count fixture rows");
+    assert_eq!(
+        seeded, 2,
+        "fixture must seed TWO distinct rows (pg upserts ON CONFLICT (title, \
+         namespace), so the two fixtures' titles must differ)"
+    );
+
+    let filter = Filter {
+        namespace: Some(ns.clone()),
+        limit: 10,
+        ..Filter::default()
+    };
+
+    // (a) bob (non-owner, non-recipient of the private row) is FAIL-CLOSED
+    //     on alice's private row, but (c) DOES see the row addressed to him.
+    let bob_hits = store
+        .search_with_source_uri(&bob, &token, &filter, Some(&uri))
+        .await
+        .expect("bob search");
+    let bob_ids: Vec<&str> = bob_hits.iter().map(|m| m.id.as_str()).collect();
+    let bob_leak = bob_ids.contains(&priv_id.as_str());
+    let bob_sees_inbox = bob_ids.contains(&inbox_id.as_str());
+
+    // (b) alice (owner) sees BOTH of her rows.
+    let alice_hits = store
+        .search_with_source_uri(&alice, &token, &filter, Some(&uri))
+        .await
+        .expect("alice search");
+    let alice_ids: Vec<&str> = alice_hits.iter().map(|m| m.id.as_str()).collect();
+    let alice_sees_priv = alice_ids.contains(&priv_id.as_str());
+    let alice_sees_inbox = alice_ids.contains(&inbox_id.as_str());
+
+    // (d) admin (bypass_visibility) sees the private row.
+    let mut admin = CallerContext::for_agent("ai:operator-3110");
+    admin.bypass_visibility = true;
+    let admin_hits = store
+        .search_with_source_uri(&admin, &token, &filter, Some(&uri))
+        .await
+        .expect("admin search");
+    let admin_sees_priv = admin_hits.iter().any(|m| m.id == priv_id);
+
+    // Teardown BEFORE asserting (#2287) so a failed assertion never strands
+    // fixture rows on a persistent DB.
+    for id in [&priv_id, &inbox_id] {
+        let _ = sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(id)
+            .execute(store.pool())
+            .await;
+    }
+
+    assert!(
+        !bob_leak,
+        "#3110: bob MUST NOT see alice's scope=private row via source_uri search"
+    );
+    assert!(
+        bob_sees_inbox,
+        "#3110: bob MUST see the row addressed to him (target_agent_id carve-out)"
+    );
+    assert!(
+        alice_sees_priv && alice_sees_inbox,
+        "#3110: alice (owner) MUST see both of her rows"
+    );
+    assert!(
+        admin_sees_priv,
+        "#3110: bypass_visibility (admin) MUST see the private row"
+    );
 }
 
 #[tokio::test]
