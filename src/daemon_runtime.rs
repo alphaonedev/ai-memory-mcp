@@ -6472,6 +6472,26 @@ pub async fn bootstrap_serve(
     )
     .await?;
 
+    // #3155 — an operator who deliberately set
+    // `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` with ZERO enrolled
+    // per-agent keys gets a control that is fully inert (the #1985
+    // unsatisfiable-default trap makes inert-when-empty correct), and used to
+    // get no signal at all that it was disarmed. Boot now says so — WARN under
+    // the default posture (never a silently-tightened default), REFUSE under
+    // `asi-hard`, which does not permit a security control to be disabled.
+    // Same shape as the #1570 admin-gate boot WARN below and the #3065 gate
+    // above. The verdict itself is the pure
+    // `identity_binding::inert_enforce_boot_reason`.
+    if let Some(reason) = crate::handlers::identity_binding::inert_enforce_boot_reason(
+        http_identity_mode,
+        enrolled_agent_keys.len(),
+    ) {
+        if crate::security_profile::is_asi_hard() {
+            anyhow::bail!(reason);
+        }
+        tracing::warn!(target: crate::handlers::HTTP_AUTH_TRACE_TARGET, "{reason}");
+    }
+
     // v1.0.0 #2579 — the cached FTS5 integrity verdict `/health` renders.
     // Built BEFORE the router so the handler and the background checker
     // share one `Arc`; the checker itself is spawned below, on its own

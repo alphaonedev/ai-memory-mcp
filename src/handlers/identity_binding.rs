@@ -157,6 +157,42 @@ pub fn enforce_for_request(
     enforce_sensitive_identity(mode, level, caller, endpoint)
 }
 
+/// #3155 (v1.0.0, security) — boot-time verdict on whether an `enforce`
+/// identity gate is actually ARMED.
+///
+/// [`enforce_for_request`] returns `None` on an EMPTY enrolled map in every
+/// mode, and that is deliberate (the #1985 unsatisfiable-default trap: an
+/// `enforce` posture that bricked every named caller when nobody COULD be
+/// key-attested would be worse than useless). The defect #3155 closes is that
+/// an operator who DELIBERATELY selected `enforce` got no signal whatsoever
+/// that the control was disarmed — no boot WARN, no readiness flag — so a
+/// deployment could believe it was refusing spoofed `X-Agent-Id` headers while
+/// serving every one of them `200`.
+///
+/// Returns `Some(reason)` only for the one silently-disarmed combination
+/// (`enforce` + zero enrolled per-agent keys). The caller decides severity by
+/// posture: WARN under the default (this changes NO request-path behaviour and
+/// must not silently tighten a documented contract), REFUSE under `asi-hard`,
+/// whose contract is that no security control may be disabled. Pure, so the
+/// wiring and its tests share one decision.
+#[must_use]
+pub fn inert_enforce_boot_reason(mode: HttpIdentityMode, enrolled_count: usize) -> Option<String> {
+    if mode != HttpIdentityMode::Enforce || enrolled_count > 0 {
+        return None;
+    }
+    Some(format!(
+        "{}=enforce is set but ZERO per-agent api-keys are enrolled, so the identity gate \
+         is INERT: every IDOR-sensitive read/mutate and every admin request is served on a \
+         self-asserted X-Agent-Id header exactly as it would be with the gate off. \
+         Enforcement engages only once at least one per-agent key exists (#1985 — an \
+         enforce posture that refused every caller when nobody could be key-attested would \
+         brick the deployment). Enrol keys with `ai-memory agents bind-api-key <agent-id>`, \
+         or set {}=advisory to match the posture you actually have (#3155).",
+        crate::config::ENV_HTTP_ATTESTED_IDENTITY,
+        crate::config::ENV_HTTP_ATTESTED_IDENTITY,
+    ))
+}
+
 /// #2044 (v1.0.0, #2032-A / H1 IDOR) — the one-line IDOR gate for the
 /// object-level read/mutate handlers (`GET/PUT/DELETE/promote /memories/{id}`).
 /// Resolves the caller from the (middleware-bound) `X-Agent-Id` header and

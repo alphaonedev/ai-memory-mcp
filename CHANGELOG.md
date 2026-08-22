@@ -1845,7 +1845,7 @@ agent -> `Ok(Some(key))`, unregistered agent -> `Ok(None)`, backend fault ->
 locked DB that must FAIL rather than report `claimed`) and its postgres twin in
 `tests/agent_pubkey_error_parity_3145.rs`.
 
-### Security (the identity keystore: no sole-key destruction, no silent inertness, no attacker-writable key directory; #3146, #3147, #3198)
+### Security (the identity keystore: no sole-key destruction, no silent inertness, no attacker-writable key directory; #3146, #3147, #3155, #3198)
 
 **#3146 — key persistence was remove-then-create, and wrote the public half
 first.** `identity::keypair::write_with_mode` did `let _ = fs::remove_file(path);`
@@ -1901,6 +1901,18 @@ neither present generates. The daemon's own "public key only" line is WARN, and
 under `asi-hard` — the posture whose contract is that no security control may
 be silently disabled — a daemon that can never sign refuses to boot.
 
+**#3155 — `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` was silently inert
+with zero enrolled keys.** `enforce_for_request` returns `None` on an empty
+enrolled map in every mode, which is deliberate and stays unchanged (the #1985
+unsatisfiable-default trap: an `enforce` posture that refused every named
+caller when nobody COULD be key-attested would brick the deployment). What was
+missing is that an operator who DELIBERATELY selected `enforce` got no signal
+that the control was disarmed — unlike the #1570 admin gate's boot WARN or the
+#3065 header-trust boot refusal — so a deployment could believe it was refusing
+spoofed `X-Agent-Id` headers while serving every one of them `200`. Boot now
+renders that one combination: a WARN under the default posture (NO request-path
+behaviour changes) and a refusal under `asi-hard`.
+
 **#3198 — the key DIRECTORY had no posture gate at all.** `keypair::ensure_parent`
 was a bare `fs::create_dir_all`: no mode, no world/group-writable check. The log
 and audit trees have had `log_paths::enforce_not_world_writable` plus an explicit
@@ -1940,6 +1952,8 @@ test binary under `RLIMIT_FSIZE=0` so the key write fails mid-`save` exactly as
 still loads and signs; `tests/keypair_persistence_ordering_3146_3147.rs` pins
 the private-half-first ordering (by failing only the public write) and the
 four-way existence gate including the posture split;
+`tests/identity_enforce_inert_boot_3155.rs` pins both the unchanged
+request-path inertness and the new boot verdict;
 `tests/key_dir_posture_3198.rs` pins the `0o700` creation under `umask 000`, the
 refusal of a `0o775`/`0o777` directory on load / save / the existence gate, and
 the UNCHANGED acceptance of `0o755`; and unit tests in
