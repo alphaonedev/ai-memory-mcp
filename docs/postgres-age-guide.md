@@ -658,7 +658,26 @@ surface-parity EPIC [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/
 
 - **Agent Skills surface** — `/api/v1/skill/*` (8 paths): postgres ships
   no skills table (`migrate_v82` is a version-stamp no-op). *(v1.x:
-  postgres skills storage.)*
+  postgres skills storage.)* The **exact** unsupported surface — every
+  HTTP method on each of these 8 paths returns `501 NOT IMPLEMENTED` on a
+  postgres-backed daemon, and the 9 `memory_skill_*` MCP tools they mirror
+  are **SQLite-only**; they read and write `app.db`, never the postgres
+  store, so a postgres deployment has no skills plane at all:
+
+  | HTTP path | Methods | MCP tool |
+  |---|---|---|
+  | `/api/v1/skill/register` | `POST` | `memory_skill_register` |
+  | `/api/v1/skill/list` | `GET` | `memory_skill_list` |
+  | `/api/v1/skill/{id}` | `GET`, `DELETE` | `memory_skill_get`, `memory_skill_delete` |
+  | `/api/v1/skill/{id}/resource` | `GET` | `memory_skill_resource` |
+  | `/api/v1/skill/{id}/export` | `POST` | `memory_skill_export` |
+  | `/api/v1/skill/{id}/promote` | `POST` | `memory_skill_promote_from_reflection` |
+  | `/api/v1/skill/{id}/compose` | `POST` | `memory_skill_compositional_context` |
+  | `/api/v1/skill/{id}/retire` | `POST` | `memory_skill_retire` |
+
+  Operators running postgres MUST NOT plan on the skills plane in v1.0:
+  it is a hard 501, not a degraded mode. Use a sqlite-backed daemon for
+  skills, or wait for the v1.x postgres skills storage.
 - **`/api/v1/find_paths`** — the bare legacy alias. Use the supported
   `/api/v1/kg/find_paths` instead.
 - **`/api/v1/share`** — the pg source-read `CallerContext` is a T3
@@ -674,6 +693,43 @@ surface-parity EPIC [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/
   governance **INSPECTION / read** API because postgres ships no
   `governance_rules` table — governance **enforcement** itself works on
   Postgres. *(v1.x: pg SAL methods + governance_rules table.)*
+
+### SQLite-only substrate planes on a postgres daemon
+
+These are NOT route-gated 501s — they are capability gaps in the
+substrate below the route layer. They are listed here so a postgres
+operator is never silently uncovered (data-integrity North Star:
+disclose, never let an operator believe a plane is protected when it is
+not).
+
+- **Persona mint / read** — `memory_persona` and
+  `memory_persona_generate` are typed on a `rusqlite::Connection`
+  (`crate::mcp::tools::persona`, `crate::persona::get_latest_persona`,
+  `crate::hooks::post_reflect::auto_persona::PersonaGenerator`). The
+  postgres store carries the persona SCHEMA (the `persona_version` /
+  `entity_id` columns and `idx_personas_by_entity` exist from
+  `MIGRATION_V36_PERSONA`), but there is no postgres executor or reader,
+  so auto-persona never runs on a postgres-backed daemon. *(v1.x: a SAL
+  `persona_latest` method + a typed `UnsupportedCapability` refusal so
+  the gap is a loud error rather than a missing behaviour.)*
+
+- **Erasure COLD TIER (bundle / quarantine / reconcile)** —
+  `crate::erasure::archive_sync` resolves its bundle directory from
+  `conn.path()` (`resolve_dir_for_conn`), so it is structurally
+  SQLite-bound. Two consequences on postgres:
+  - `archive_restore` for a row missing from `archived_memories` returns
+    `Ok(false)` permanently, where sqlite RE-MATERIALIZES the row from a
+    verified erasure bundle inside the same transaction (self-heal after
+    partial DB loss);
+  - the purge-intent refusal (`is_purge_intended`) that sqlite performs
+    before a bundle restore has no postgres counterpart.
+
+  The crypto-erase INVARIANT itself is NOT missing on postgres —
+  `PostgresStore::forget` performs the identical envelope destroy-marker
+  update and emits signed `substrate.crypto_erase` events. What is
+  sqlite-only is the standalone per-id `crypto_erase_and_attest` funnel
+  and the cold tier above. *(v1.x: parameterize the erasure store over a
+  backend-agnostic DB reference.)*
 
 Conversely, several surfaces that once 501'd on Postgres are now
 supported: `kg_query` / `kg_invalidate` / `kg_timeline` traverse all 9

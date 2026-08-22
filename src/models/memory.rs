@@ -1599,6 +1599,97 @@ pub struct CreateMemory {
 /// instead of falsely claiming `caller_provided`.
 pub const DEFAULT_CONFIDENCE: f64 = 1.0;
 
+/// Lowest semantic `priority` a memory row may carry.
+pub const PRIORITY_MIN: i32 = 1;
+
+/// Highest semantic `priority` a memory row may carry.
+pub const PRIORITY_MAX: i32 = 10;
+
+/// Compiled default `priority` stamped when a surface receives no explicit
+/// caller value.
+pub const DEFAULT_PRIORITY: i32 = 5;
+
+/// v1.0.0 batch-2 (cross-backend parity) — SSOT for turning a caller-supplied
+/// wire `priority` (an `i64` on every JSON surface) into the stored `i32`.
+///
+/// Clamps in `i64` space FIRST, which makes the subsequent narrowing total:
+/// the clamped value is always in `[PRIORITY_MIN, PRIORITY_MAX]`, so the
+/// `TryFrom` can never fail and the `unwrap_or` is unreachable defence rather
+/// than a behaviour (PERF-07 — the narrowing is explicit, never a silent `as`).
+///
+/// Saturation is DIRECTIONAL: a value below the band lands on the floor and a
+/// value above it lands on the ceiling, for ANY magnitude. The prior inline
+/// expression (`i32::try_from(raw).unwrap_or(i32::MAX).clamp(1, 10)`, in
+/// `mcp::handle_notify`) saturated a value below `i32::MIN` UPWARD, so
+/// `priority = i64::MIN` was stored as the MAXIMUM priority 10 — the exact
+/// inversion of what the caller asked for. That is corrected here.
+///
+/// Pre-fix the HTTP `POST /api/v1/notify` sqlite branch clamped through
+/// `mcp::handle_notify` while the postgres branch used
+/// `i64 -> i32 try_from().ok()`, which (a) DROPPED an out-of-`i32` priority to
+/// the default and (b) never clamped an in-`i32` but out-of-band value like
+/// `50`. Identical requests therefore produced different durable rows
+/// depending on the backend.
+#[must_use]
+pub fn normalize_priority(raw: i64) -> i32 {
+    let clamped = raw.clamp(i64::from(PRIORITY_MIN), i64::from(PRIORITY_MAX));
+    // Unreachable fallback: `clamped` is provably inside the i32 band above.
+    i32::try_from(clamped).unwrap_or(DEFAULT_PRIORITY)
+}
+
+#[cfg(test)]
+mod priority_normalization_tests {
+    use super::{DEFAULT_PRIORITY, PRIORITY_MAX, PRIORITY_MIN, normalize_priority};
+
+    #[test]
+    fn in_band_values_pass_through() {
+        for p in PRIORITY_MIN..=PRIORITY_MAX {
+            assert_eq!(
+                normalize_priority(i64::from(p)),
+                p,
+                "in-band priority {p} must pass through unchanged"
+            );
+        }
+        assert_eq!(
+            normalize_priority(i64::from(DEFAULT_PRIORITY)),
+            DEFAULT_PRIORITY
+        );
+    }
+
+    #[test]
+    fn out_of_band_and_out_of_i32_saturate_to_the_band() {
+        assert_eq!(
+            normalize_priority(0),
+            PRIORITY_MIN,
+            "0 clamps up to the floor"
+        );
+        assert_eq!(
+            normalize_priority(-9_000),
+            PRIORITY_MIN,
+            "negatives clamp to the floor"
+        );
+        assert_eq!(
+            normalize_priority(50),
+            PRIORITY_MAX,
+            "in-i32 but out-of-band clamps down"
+        );
+        assert_eq!(
+            normalize_priority(3_000_000_000),
+            PRIORITY_MAX,
+            "an i64 beyond i32::MAX saturates to the ceiling, never drops to the default"
+        );
+        // DIRECTIONAL saturation at the extremes. The pre-SSOT inline
+        // expression saturated `i64::MIN` UPWARD to the ceiling (10) — a
+        // hugely NEGATIVE caller priority became the HIGHEST priority.
+        assert_eq!(
+            normalize_priority(i64::MIN),
+            PRIORITY_MIN,
+            "a value below the band must land on the FLOOR, never invert to the ceiling"
+        );
+        assert_eq!(normalize_priority(i64::MAX), PRIORITY_MAX);
+    }
+}
+
 impl CreateMemory {
     /// #1591 — effective confidence for this request: the caller's
     /// explicit value, else the compiled [`DEFAULT_CONFIDENCE`].

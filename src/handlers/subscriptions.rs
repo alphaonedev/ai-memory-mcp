@@ -126,9 +126,25 @@ pub async fn notify(
     // is achieved by writing the subscription memory itself through the
     // shared store (see `subscribe` below) so subscribers on every peer
     // see the same `_subscriptions/<aid>` namespace.
+    // v1.0.0 batch-2 (cross-backend parity) — normalize the caller-supplied
+    // priority ONCE, ABOVE the backend branch, through the shared
+    // `crate::models::normalize_priority` SSOT, exactly as the `tier` field
+    // below routes through the canonical `Tier::from_str` SSOT (#1432).
+    //
+    // Pre-fix the two branches disagreed on the SAME request: the sqlite branch
+    // clamped into `[1, 10]` via `mcp::handle_notify`, while the postgres branch
+    // used `i32::try_from(p).ok()` — which silently DROPPED an out-of-`i32`
+    // priority to the SAL default 5 (sqlite stored 10) and never clamped an
+    // in-`i32` but out-of-band value like 50 (sqlite stored 10, postgres stored
+    // 50, outside the documented domain). Identical request, different durable
+    // row, depending on the backend. Both branches now see the same value; the
+    // sqlite path's own clamp is idempotent over it, so sqlite behaviour is
+    // unchanged and postgres is brought onto the documented domain.
+    let priority = body.priority.map(crate::models::normalize_priority);
+
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let priority_i32 = body.priority.and_then(|p| i32::try_from(p).ok());
+        let priority_i32 = priority;
         // Canonical wire deserializer for the HTTP `tier` field — the
         // raw string literals here pair byte-for-byte with
         // v0.7.0 F-C6 fix (issue #1432): route through the canonical
@@ -202,7 +218,7 @@ pub async fn notify(
         "title": body.title,
         "payload": payload,
     });
-    if let Some(p) = body.priority {
+    if let Some(p) = priority {
         params["priority"] = json!(p);
     }
     if let Some(t) = body.tier {

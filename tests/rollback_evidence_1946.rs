@@ -728,9 +728,78 @@ fn asi_hard_cold_node_boots_fresh_but_refuses_wiped_with_surviving_anchor() {
 
 #[cfg(feature = "sal-postgres")]
 mod postgres_emission {
-    use super::{clear_env, enrol_witness, fresh_dir, payload_hash};
+    use super::{
+        RollbackCheck, append_rows, clear_env, enrol_witness, fresh_dir, open_db, payload_hash,
+    };
+    use ai_memory::signed_events::force_emit_audit_head_witness;
     use ai_memory::store::postgres::PostgresStore;
     use ai_memory::store::{CallerContext, MemoryStore};
+
+    /// v1.0.0 batch-2 — #2373 CLOSED: the postgres CHECK side must scope the
+    /// #1946 D rollback-evidence verdict by THIS database's genesis-derived
+    /// `db_id`, exactly as the sqlite twin does.
+    ///
+    /// Pre-fix the pg branch hard-coded `db_id = None`, which is NOT the
+    /// conservative posture it claimed: the anchor-lane reader counts EVERY
+    /// pinned line for an id-less caller (see
+    /// `two_dbs_sharing_one_anchor_log_do_not_cross_contaminate`), so ANY
+    /// sibling database sharing the witness mount became this store's
+    /// high-water — the #2370 false-positive class, fixed on sqlite and left
+    /// live on postgres. It also made `restore_sanction_clears` short-circuit
+    /// on every db-bound sanction, so a legitimately restored pg store could
+    /// never be exonerated.
+    ///
+    /// Fixture: a FRESH witness mount holding ONLY a FOREIGN (sqlite sibling)
+    /// v3 anchor. With correct scoping the pg store sees "no anchor history for
+    /// THIS database" => `NotApplicable`. Unscoped (pre-fix) it adopts the
+    /// sibling's anchor and lands on `NotDetected` / `Evidence` instead — so
+    /// this assertion discriminates regardless of the two heads' magnitudes.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
+    async fn pg_check_side_scopes_rollback_verdict_by_db_id_2373() {
+        // No module lock: #[ignore] + live-pg, and a MutexGuard must not be
+        // held across an await (the #1822 precedent). Env cleared inline.
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pg = match PostgresStore::connect(&url).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skip: postgres connect failed: {e}");
+                return;
+            }
+        };
+
+        let kdir = fresh_dir("pg-rollback-keys");
+        let _kp = enrol_witness(kdir.path());
+
+        // A FOREIGN sqlite sibling emits the ONLY pinned v3 anchor on this mount.
+        let sib_dir = fresh_dir("pg-rollback-sibling");
+        let (_sib_path, sib_conn) = open_db(sib_dir.path());
+        append_rows(&sib_conn, 5);
+        force_emit_audit_head_witness(&sib_conn);
+        drop(sib_conn);
+        assert!(
+            ai_memory::governance::audit::read_head_anchor_high_water(None).is_some(),
+            "fixture sanity: an id-less read must see the foreign sibling's pinned anchor              (that is exactly what the pre-fix pg branch did)"
+        );
+
+        let report = pg.verify_audit_trail(None, None).await.expect("pg verify");
+        if report.head_sequence == 0 {
+            // An empty pg chain has no genesis, hence no db_id, so both the
+            // pre- and post-fix code take the identity-less path — the case
+            // cannot discriminate. Skip rather than assert vacuously.
+            eprintln!("skip: pg signed_events chain is empty (no genesis db_id to scope by)");
+            clear_env();
+            return;
+        }
+        assert_eq!(
+            report.rollback,
+            RollbackCheck::NotApplicable,
+            "#2373: the pg CHECK side must scope the rollback verdict by its own              genesis-derived db_id — a v3 anchor log containing ONLY a foreign sibling's              lines is NO anchor history for this store and must never convict (or              exonerate) it. report={report:?}"
+        );
+        clear_env();
+    }
 
     /// The pg witness EMISSION must stamp the same v3 `db_id` shape as the
     /// sqlite twin, derived from the SAME stable genesis columns. Drives ONE
