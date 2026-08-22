@@ -2912,4 +2912,69 @@ mod tests {
         assert_eq!(report.rollback_entries_simulated, 0);
         assert!(!report.rollback_log_degraded);
     }
+
+    /// REGRESSION (ox-alpha #7) — a destructive action whose rollback-log
+    /// write FAILS is irreversible, so the cycle must STOP rather than
+    /// pile further un-reversible mutations on top of it. Pre-fix the
+    /// failure pushed one line into `report.errors` and every remaining
+    /// pass ran to completion regardless.
+    ///
+    /// The failure is forced surgically: a BEFORE INSERT trigger that
+    /// aborts only for the `_curator/rollback` namespace, so the
+    /// consolidation itself still succeeds and it is precisely the
+    /// rollback row that cannot land.
+    #[test]
+    fn rollback_log_write_failure_halts_the_remaining_passes() {
+        let (_tmp, conn) = setup_conn();
+        let mut candidates = seed_mergeable_pair(&conn, "halt-ns");
+
+        // A Pass-3 candidate: hot + recently accessed, so priority
+        // feedback WOULD bump it if the pass were reached.
+        let mut hot = sample_mem(
+            "halt-hot",
+            "halt-other",
+            "Hot",
+            "this is hot content for the priority bump pass",
+            Tier::Mid,
+        );
+        hot.priority = 5;
+        hot.access_count = 100;
+        hot.last_accessed_at = Some(chrono::Utc::now().to_rfc3339());
+        db::insert(&conn, &hot).unwrap();
+        candidates.push(hot.clone());
+
+        conn.execute_batch(
+            "CREATE TRIGGER halt_rollback_writes BEFORE INSERT ON memories \
+             WHEN new.namespace = '_curator/rollback' \
+             BEGIN SELECT RAISE(ABORT, 'forced rollback-log failure'); END;",
+        )
+        .unwrap();
+
+        let llm = StubLlm::new("halting summary");
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false, usize::MAX, None);
+
+        assert!(
+            report.rollback_log_degraded,
+            "a failed rollback-log write must be flagged on the report, errors={:?}",
+            report.errors
+        );
+        assert!(
+            report.errors.iter().any(|e| e.contains("halted")),
+            "the halt must be explained to the operator, errors={:?}",
+            report.errors
+        );
+        assert_eq!(
+            report.rollback_entries_written, 0,
+            "no rollback row landed, so none may be counted"
+        );
+        assert_eq!(
+            report.priority_adjustments, 0,
+            "Pass 3 must not run after reversibility was lost"
+        );
+        assert_eq!(
+            db::get(&conn, "halt-hot").unwrap().unwrap().priority,
+            5,
+            "the halted cycle must leave the Pass-3 candidate untouched"
+        );
+    }
 }
