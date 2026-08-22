@@ -84,6 +84,8 @@ env:
 jobs:
   rust-integration:
     name: Rust integration (issue_800_batman_mode)
+    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of ci.yml):
+    # `cargo build --release` + two `cargo test --release` binaries.
     runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
@@ -139,6 +141,11 @@ jobs:
 
   bash-integration:
     name: Bash integration (test-batman-mode-suite.sh)
+    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of ci.yml):
+    # it rebuilds the release binary against the same
+    # `shared-key: batman-mode-acceptance` cache as `rust-integration` above,
+    # which it `needs:`, so splitting the two across runner classes would throw
+    # that cache away and pay a second cold release build.
     runs-on: [self-hosted, linux-fed]
     needs: rust-integration
     steps:
@@ -188,7 +195,9 @@ jobs:
   # before the test fails with a confusing rustc error.
   surface-stability:
     name: Surface stability (load-bearing symbols)
-    runs-on: [self-hosted, linux-fed]
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of ci.yml). Pure
+    # `git ls-files` + `grep` over src/: no toolchain, no cargo, no Postgres.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Assert load-bearing symbols are present

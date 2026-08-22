@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI throughput: no-pg / no-cargo gates re-homed back to GitHub-hosted; only
+  tier-bound and warm-cache jobs stay on the self-hosted fleet.** The
+  self-hosted move above put **39 job definitions (43 expanded)** onto a
+  **two-node** Linux fleet, including `Classify changes` — the root of `ci.yml`'s
+  `needs:` graph — and ~two dozen `bash scripts/check-*.sh` gates that run no
+  `cargo` and touch no Postgres. With several pull requests open, whole CI runs
+  sat `queued` for 40+ minutes because the decider could not get a slot, so the
+  four REQUIRED `Check (…)` legs never started: head-of-line blocking on the one
+  job that must never wait. Placement is now decided by what a job actually
+  needs — the native pg tier (`pg-tier`) or a warm `target/` (`warm-cache`) keep
+  a self-hosted slot; everything else (`script-only`) returns to `ubuntu-latest`,
+  where parallelism is not scarce. Moved back to GitHub-hosted: `Classify
+  changes`, `actionlint (workflow-injection guard)`, `Build-script custom-build
+  ledger gate (#2635)` (resolves the dependency graph, never compiles),
+  `Dockerfile build (no push)` (its layer cache is `type=gha`, not the host
+  `target/`), `Surface stability (load-bearing symbols)`, and all 22
+  `c8-precheck.yml` integrity gates — with `actions/setup-python` /
+  `actions/setup-node` restored on `Non-Rust conformance-reader proof gate
+  (#2452)`, whose `command -v` presence assertion existed only because the fleet
+  cannot write the hosted `RUNNER_TOOL_CACHE` default. Unchanged on the fleet:
+  the four `Check (…)` legs, `Lint (fmt + clippy)`, `MSRV (Rust 1.96)`,
+  `Postgres feature gate`, `SAL-only feature gate`, `vectorlite feature gate`,
+  the certified pg+AGE cells, the two Batman-mode release-build jobs, and the
+  `Lifetime suite (…)` legs. Self-hosted job definitions: **39 -> 10** (43 -> 14
+  expanded; at most 12 reachable from one pull request). **No required-context
+  NAME changes** — branch protection needs no edit for this change. The rule
+  itself (`pg-tier` / `warm-cache` / `script-only`, and the absolute that a job
+  other jobs `needs:` must never be self-hosted unless it is itself `pg-tier` or
+  `warm-cache`) is stated once at the head of `.github/workflows/ci.yml`, and
+  every re-homed job carries a `# RUNNER PLACEMENT` comment citing it.
+- **`bench.yml` returns to `ubuntu-latest` — the reference hardware its budgets
+  are defined against.** The self-hosted move relocated the advisory bench gate
+  and the baseline-regeneration job to `[self-hosted, linux-fed]` without moving
+  the budgets: `PERFORMANCE.md` pins CI measurement to "GitHub-hosted Linux
+  x86_64 runners (`ubuntu-latest`)" and gives that class the 1.0 hardware
+  multiplier every published p95 target is expressed in, and
+  `performance/baseline.json` describes itself as an `ubuntu-latest` median-of-3
+  artefact — so a p95 measured on the fleet was being compared against an
+  `ubuntu-latest`-calibrated target while the job name, `PERFORMANCE.md` §7 and
+  the baseline file all still said `ubuntu-latest`. Moving both jobs back makes
+  the measurement match its published methodology and makes the two job names
+  (`ai-memory bench (ubuntu-latest)`, `Regenerate bench baseline (ubuntu-latest,
+  median-of-3)`) true again without a rename, so no required-context churn.
+
 - **CI moved to a self-hosted enterprise-fed fleet with a 2x2 `Check` matrix.**
   All compute/gate jobs re-home from GitHub-hosted `ubuntu-latest`/`macos-latest`
   onto two self-hosted runner labels — `[self-hosted, linux-fed]` (host pop-os/f2)
