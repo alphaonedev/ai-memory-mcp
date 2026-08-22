@@ -1278,7 +1278,8 @@ run_all_rules() {
     # commit that introduces it.
     # Coverage as verified at this commit (a rule whose regex matches nothing
     # in a listed file is a no-op that still reports PASS, so this is stated
-    # rather than assumed): CLAUDE.md 1 line, the certification doc 2,
+    # rather than assumed): 10 anchored citations, all reading the canonical
+    # — CLAUDE.md 3 (all on env row #130), the certification doc 2,
     # src/security_profile.rs 2, src/enterprise_federation_posture.rs 2,
     # scripts/check-bootstrap-cert-gate.sh 1 — the last of those reachable
     # ONLY because the markdown-heading anchor is now scoped to .md/.html
@@ -1942,6 +1943,83 @@ PGVECGOOD
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — the certified pgvector patch (0.8.6) still PASSES"
+
+    # ---- ASI-HARD PINNED-KNOB COUNT + THE MARKDOWN-HEADING SCOPING (#3113).
+    # Two directions in one leg, because the SECOND is what makes the first
+    # real:
+    #
+    #   (a) A stale count in a SHELL COMMENT must be REJECTED. This rule is
+    #       the first to walk a .sh / .env scan target, and until #3113 the
+    #       historical-line guard treated a leading `#` as a markdown HEADING
+    #       for EVERY file type — so in a shell script every comment line was
+    #       skipped, the rule covered NOTHING in it, and the gate still
+    #       printed PASS. That is the #2444 "reports success while doing
+    #       nothing" shape, arrived at by accident rather than by decision.
+    #
+    #   (b) A stale count in a genuine MARKDOWN HEADING must still be SPARED.
+    #       The scoping narrowed the anchor to .md/.html; it did not delete
+    #       it. Without this direction the leg would pass just as well if the
+    #       guard had been removed outright, which would re-point true
+    #       historical headings at the canonical — the record-destroying
+    #       failure the guard exists to prevent.
+    #
+    # Fixture SSOT = 3 `KnobSpec` entries; both planted claims say 9.
+    rm -f "$tmpdir/docs/CONFIG_SCHEMA.md"
+    cat > "$tmpdir/src/security_profile.rs" <<'KNOBSSOT'
+const KNOBS: &[KnobSpec] = &[
+    KnobSpec {
+        env: "A",
+    },
+    KnobSpec {
+        env: "B",
+    },
+    KnobSpec {
+        env: "C",
+    },
+];
+KNOBSSOT
+    mkdir -p "$tmpdir/scripts"
+    cat > "$tmpdir/scripts/check-bootstrap-cert-gate.sh" <<'KNOBSTALESH'
+#!/bin/bash
+# Shared certified env for a pg backend. asi-hard auto-pins the 9 knobs in
+# the binary's pre-runtime phase.
+KNOBSTALESH
+    cat > CLAUDE.md <<'KNOBHEADINGMD'
+## The 9-knob era — a heading, and a TRUE statement about the past
+
+Fixture CLAUDE.md — deliberately carries no CURRENT narrative counts.
+KNOBHEADINGMD
+    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — gate did NOT catch the stale knob count in a SHELL COMMENT (9 vs SSOT 3)" >&2
+        printf '%s\n' "$knob_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    grep -qF 'ASI_HARD_PINNED_KNOB_COUNT: scripts/check-bootstrap-cert-gate.sh' <<<"$knob_out" || {
+        echo "FAIL: self-test — a shell COMMENT line is still being skipped as a markdown heading (#3113 fail-open)" >&2
+        printf '%s\n' "$knob_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    if grep -qF 'ASI_HARD_PINNED_KNOB_COUNT: CLAUDE.md' <<<"$knob_out"; then
+        echo "FAIL: self-test — the markdown-heading historical guard was LOST, not scoped (a true past-tense heading was re-pointed)" >&2
+        printf '%s\n' "$knob_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #3113 — a stale count in a SHELL COMMENT is REJECTED; the same count in a MARKDOWN HEADING is still spared"
+
+    # ---- ASI-HARD CONTROL: the correct count (matching the fixture SSOT)
+    # PASSES, so the leg above proves a real rejection rather than a rule
+    # that fires on everything.
+    cat > "$tmpdir/scripts/check-bootstrap-cert-gate.sh" <<'KNOBGOODSH'
+#!/bin/bash
+# Shared certified env for a pg backend. asi-hard auto-pins the 3 knobs in
+# the binary's pre-runtime phase.
+KNOBGOODSH
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test — the asi-hard knob-count rule fired on the CORRECT count (3)" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #3113 — the correct asi-hard knob count still PASSES"
+    rm -f "$tmpdir/scripts/check-bootstrap-cert-gate.sh" "$tmpdir/src/security_profile.rs"
 
     # ================================================================
     # #2977 — THE GITHUB-PAGES (.html) SURFACE
