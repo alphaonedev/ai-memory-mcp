@@ -478,6 +478,19 @@ pub fn cid_verify_fields(
     }
 }
 
+/// #1628 / parity finding #4 (2026-08) — wire-pinned refusal text for
+/// legacy rows carrying no `metadata.agent_id` stamp (write-path verbs).
+///
+/// ONE declaration site (pm-v3.1 hardcoded-literal rule) shared by BOTH
+/// backends' caller-owns mutation gates, so a refusal is byte-identical
+/// whichever adapter serves the request. Hoisted here from
+/// `store::postgres` when the sqlite adapter gained the mirror gate.
+pub(crate) const REASON_UNSTAMPED_TENANT_WRITE: &str =
+    "memory has no agent_id stamp; tenant writes refused (use admin path)";
+/// #1628 — delete-verb sibling of [`REASON_UNSTAMPED_TENANT_WRITE`].
+pub(crate) const REASON_UNSTAMPED_TENANT_DELETE: &str =
+    "memory has no agent_id stamp; tenant deletes refused (use admin path)";
+
 /// Identity + visibility + governance context threaded through every
 /// mutating operation. Reuses the NHI-hardened `agent_id` from the
 /// existing `crate::identity` resolution chain.

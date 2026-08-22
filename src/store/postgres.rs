@@ -1191,14 +1191,11 @@ pub struct PostgresStore {
     record_stop: crate::store::record_stop::RecordStopFlag,
 }
 
-/// #1628 — wire-pinned refusal text for legacy rows with no
-/// `metadata.agent_id` stamp (write-path verbs). One declaration site
-/// per pm-v3.1; consumed by the caller-owns mutation gate.
-const REASON_UNSTAMPED_TENANT_WRITE: &str =
-    "memory has no agent_id stamp; tenant writes refused (use admin path)";
-/// #1628 — delete-verb sibling of [`REASON_UNSTAMPED_TENANT_WRITE`].
-const REASON_UNSTAMPED_TENANT_DELETE: &str =
-    "memory has no agent_id stamp; tenant deletes refused (use admin path)";
+// #1628 / parity finding #4 — the two wire-pinned refusal texts now live
+// in `crate::store` (ONE declaration site) so the sqlite mirror gate emits
+// byte-identical errors. Re-imported under the original names so every
+// existing reference below is unchanged.
+use crate::store::{REASON_UNSTAMPED_TENANT_DELETE, REASON_UNSTAMPED_TENANT_WRITE};
 
 /// v0.8.1 W1 (#1821 / gap G29) + #1844 — postgres parity for the sqlite
 /// `db::insert` / `insert_if_newer` credential REDACT backstop. Returns a
@@ -25187,7 +25184,16 @@ impl MemoryStore for PostgresStore {
         }
         let mut moved = 0usize;
         let now = chrono::Utc::now();
-        let archive_reason = reason.unwrap_or("manual");
+        // Parity finding #1 (2026-08) — the reason-less default was
+        // `"manual"` here while BOTH sqlite funnels
+        // (`storage::archive_memory_no_tx` / `archive_memory_for_caller`)
+        // stamped `"archive"`, so the SAME reason-less archive produced a
+        // DIFFERENT audit-trail value per backend and every reason-filtered
+        // query / `archive_stats` report disagreed across backends. All
+        // three funnels now read ONE shared SSOT const; `"archive"` is the
+        // value pinned by the long-standing sqlite unit test
+        // `archive_memory_default_reason_is_archive`.
+        let archive_reason = reason.unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT);
         let mut tx = self
             .pool
             .begin()

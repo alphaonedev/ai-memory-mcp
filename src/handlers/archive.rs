@@ -473,7 +473,16 @@ pub async fn archive_by_ids(
                 .into_response();
         }
     }
-    let reason = body.reason.as_deref().unwrap_or("archive").to_string();
+    // Parity finding #1 — the HTTP surface has ALWAYS defaulted to
+    // "archive" and passes it explicitly to BOTH backends, so this is the
+    // canonical user-visible value; the pg SAL funnel's own "manual"
+    // default contradicted it and was reachable only by a direct SAL
+    // caller. All four sites now read the one SSOT const.
+    let reason = body
+        .reason
+        .as_deref()
+        .unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT)
+        .to_string();
 
     // #2125 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
     // the #940 caller-vs-row-owner bulk archive below. Under `enforce`, a

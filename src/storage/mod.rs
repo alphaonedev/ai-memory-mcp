@@ -4076,8 +4076,54 @@ fn namespace_standard_severed_signable_bytes(
 }
 
 pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
-    // #1955 R45 — record-stop fence for the delete funnel.
+    // #1955 R45 — record-stop fence for the delete funnel. Runs BEFORE the
+    // transaction so a record-stop refusal never opens (and rolls back) a tx.
     crate::storage::record_stop::gate_storage_conn(conn)?;
+    // Parity finding #3 (2026-08) — STATEMENT ATOMICITY. The three writes
+    // below (namespace-standard SEVER, the append-only TOMBSTONE leaf, and
+    // the row DELETE itself) previously ran as THREE SEPARATE autocommit
+    // statements, so a crash or error between them stranded a severed
+    // governance binding, or an emitted tombstone leaf, with the memory row
+    // STILL LIVE — an inconsistency window with no self-healing path. The
+    // postgres twin already binds the tombstone leaf + delete to one tx.
+    // One `BEGIN IMMEDIATE` now covers all three: either the memory is gone
+    // WITH its sever + leaf, or nothing changed.
+    //
+    // Transaction-aware (the `update_with_expected_version` precedent): a
+    // nested `BEGIN` fails with "cannot start a transaction within a
+    // transaction", and `delete` IS called from inside an open tx — e.g.
+    // `consolidate`'s legacy hard-DELETE arm wraps its source deletes in one
+    // `BEGIN IMMEDIATE`. So open our own tx ONLY when none is active; when
+    // the caller owns it, these three writes join the caller's tx and its
+    // commit/rollback covers atomicity (which is exactly the guarantee the
+    // caller already wanted).
+    let owns_tx = conn.is_autocommit();
+    if owns_tx {
+        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    }
+    let txn_result = delete_inner(conn, id);
+    match txn_result {
+        Ok(changed) => {
+            if owns_tx {
+                conn.execute_batch(connection::SQL_COMMIT)?;
+            }
+            Ok(changed)
+        }
+        Err(e) => {
+            if owns_tx {
+                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Parity finding #3 — the transaction-free core of [`delete`]. Callers MUST
+/// already hold an open transaction (or be [`delete`] itself, which opens
+/// one). Same `_no_tx`-style split as `archive_memory` /
+/// `archive_memory_no_tx`, kept private because every external caller wants
+/// the atomic wrapper.
+fn delete_inner(conn: &Connection, id: &str) -> Result<bool> {
     // #2503 — SEVER (never DELETE) any namespace_meta binding pointing here.
     sever_namespace_standards(conn, id)?;
     // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append ONE
@@ -4396,7 +4442,7 @@ pub(crate) fn archive_memory_no_tx(
     reason: Option<&str>,
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
-    let reason = reason.unwrap_or("archive");
+    let reason = reason.unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT);
     let result = (|| -> Result<bool> {
         let exists: bool = conn
             .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
@@ -4832,7 +4878,7 @@ pub fn archive_memory_for_caller(
     caller: &str,
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
-    let reason = reason.unwrap_or("archive");
+    let reason = reason.unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT);
     conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         // Owner gate: row must exist AND match the caller (or be an

@@ -442,6 +442,55 @@ truthful.
   watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
   the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
   the outer job cap — remains what fires on a genuine hang.
+### Fixed (cross-backend parity — write funnels: archive / delete / update)
+
+A parity audit of the sqlite and postgres write funnels found four
+divergences where the SAME operation behaved differently per backend. Three
+are data-integrity issues; one is an authorization gap. All four are closed,
+each with a regression test.
+
+- **`archive_reason` default is now ONE shared SSOT const.** A reason-less
+  archive stamped `archive_reason='archive'` on sqlite (both funnels) but
+  `'manual'` on postgres, so identical operations produced different audit
+  trails and every reason-filtered query / `archive_stats` report disagreed
+  across backends. The HTTP surface had *always* defaulted to `"archive"` and
+  passed it explicitly, so postgres' own SAL default contradicted the
+  daemon's contract. All four sites now read
+  `models::field_names::ARCHIVE_REASON_DEFAULT` (`"archive"`, the value the
+  long-standing sqlite unit test pins).
+- **`SqliteStore::archive_by_ids` is now ALL-OR-NOTHING**, matching the
+  postgres twin's single batch transaction. It previously looped
+  `db::archive_memory`, which opens its OWN transaction per id, so a
+  mid-batch failure left a PARTIALLY archived batch committed — the prefix of
+  ids had their live rows deleted and moved to `archived_memories` while the
+  remainder stayed live, and the caller got only an `Err` with no way to learn
+  how far the batch got. Replay/DR tooling could not assume the same
+  post-failure state on the two backends. The whole loop now runs in one
+  transaction (calling the tx-free `archive_memory_no_tx` core inside it), so
+  a failure rolls the entire batch back.
+- **`storage::delete` is now statement-atomic.** The namespace-standard
+  SEVER (#2503), the append-only TOMBSTONE leaf (#1823 G6), and the row
+  DELETE ran as THREE separate autocommit statements, so a failure between
+  them stranded a severed governance binding — an unrecoverable policy
+  downgrade — with the memory still live. All three now share one
+  transaction.
+- **`SqliteStore::update` / `delete` now enforce the SAL-level caller-owns
+  gate**, the mirror of `PostgresStore::assert_caller_owns_for_mutation`
+  (#1412 / #1628). Both previously discarded `ctx` entirely: the ownership
+  check existed ONLY in the sqlite HTTP handler, so any non-HTTP SAL caller
+  (CLI, internal surfaces, federation, future code paths) could rewrite or
+  delete another tenant's row by id while the postgres twin refused. Admin
+  contexts (`bypass_visibility`) skip the gate as before. **Behaviour change:**
+  a row carrying no `metadata.agent_id` stamp (legacy / pre-v0.6.3 /
+  migrated) is now refused for *tenant* mutation on sqlite and must be
+  cleaned up through the admin path — the same conservative fail-closed
+  posture postgres has had since #1628. The two wire-pinned refusal strings
+  are hoisted to `crate::store` so both backends emit byte-identical errors.
+
+Both atomicity fixes are transaction-AWARE (the `update_with_expected_version`
+precedent): they open a transaction only when the caller does not already hold
+one, so callers that already wrap these funnels — e.g. `consolidate`'s
+hard-DELETE arm — keep working and their commit/rollback covers atomicity.
 
 ### Removed
 

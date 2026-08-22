@@ -97,6 +97,76 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// Parity finding #4 (2026-08) — SAL-level caller-owns mutation gate,
+/// the sqlite mirror of `PostgresStore::assert_caller_owns_for_mutation`
+/// (#1412 / #1628).
+///
+/// Pre-fix this adapter's `update` / `delete` discarded `ctx` entirely:
+/// the ownership check existed ONLY in the sqlite HTTP handler
+/// (`handlers::parity::require_caller_owns_memory`), so any NON-HTTP SAL
+/// caller — CLI, internal surfaces, federation, any future code path —
+/// could rewrite or delete another tenant's row by id, while the
+/// postgres twin refused. That is the exact fragility class #1412 closed
+/// on postgres: the gate belongs at the SAL layer so EVERY surface is
+/// owner-checked uniformly, not at one handler that every new caller
+/// must remember to re-implement.
+///
+/// Admin/operator paths (`bypass_visibility = true`, i.e.
+/// `CallerContext::for_admin`) skip the gate, same as the SAL-level
+/// scope=private read filter. Tenant-facing handlers MUST NOT pass a
+/// bypass context. Refusal text comes from the SHARED
+/// `crate::store::REASON_UNSTAMPED_TENANT_*` consts so the wire error is
+/// byte-identical on both backends.
+///
+/// Synchronous by design (rust-1.98 CONCURRENCY-24: no `.await` in the
+/// body, and `rusqlite::Connection` is `!Sync`, so an `async fn` holding
+/// `&Connection` would produce a non-`Send` future the `#[async_trait]`
+/// boxing rejects). Callers already hold the connection guard.
+///
+/// A row that exists but carries NO `metadata.agent_id` stamp (legacy /
+/// pre-v0.6.3 / migrated) is refused for tenant mutation — the same
+/// conservative fail-closed posture postgres has taken since #1628,
+/// which leaves operator cleanup to the admin path.
+fn assert_caller_owns_for_mutation(
+    conn: &rusqlite::Connection,
+    ctx: &CallerContext,
+    id: &str,
+    action: &str,
+    unstamped_reason: &str,
+) -> StoreResult<()> {
+    if ctx.bypass_visibility {
+        return Ok(());
+    }
+    use rusqlite::OptionalExtension;
+    let owner: Option<Option<String>> = conn
+        .query_row(
+            "SELECT json_extract(metadata, '$.agent_id') FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(box_err)?;
+    match owner {
+        None => Err(StoreError::NotFound { id: id.to_string() }),
+        Some(None) => Err(StoreError::PermissionDenied {
+            action: action.to_string(),
+            target: id.to_string(),
+            reason: unstamped_reason.to_string(),
+        }),
+        Some(Some(existing_owner)) if existing_owner != ctx.effective_principal() => {
+            Err(StoreError::PermissionDenied {
+                action: action.to_string(),
+                target: id.to_string(),
+                reason: format!(
+                    "caller {:?} does not own memory (owner: {existing_owner:?})",
+                    ctx.effective_principal()
+                ),
+            })
+        }
+        Some(Some(_)) => Ok(()), // owner matches; proceed
+    }
+}
+
 // #1709 Pillar 1 — the actions SELECT column list + row mapping live in
 // `crate::actions` (shared with the MCP `memory_action_*` handlers, which hold
 // a bare Connection). Referenced below as `crate::actions::{ACTION_SELECT_SQL,
@@ -336,9 +406,17 @@ impl MemoryStore for SqliteStore {
         }
     }
 
-    async fn update(&self, _ctx: &CallerContext, id: &str, patch: UpdatePatch) -> StoreResult<()> {
+    async fn update(&self, ctx: &CallerContext, id: &str, patch: UpdatePatch) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // Parity finding #4 — SAL-level caller-owns gate (postgres parity).
+        assert_caller_owns_for_mutation(
+            &conn,
+            ctx,
+            id,
+            "update",
+            crate::store::REASON_UNSTAMPED_TENANT_WRITE,
+        )?;
         // v0.7.0 Provenance Gap 2 (#906) — thread the patch's
         // `source_uri` slot into `update_with_expected_version` so the
         // sqlite SAL adapter honors source_uri rewrites end-to-end.
@@ -396,9 +474,18 @@ impl MemoryStore for SqliteStore {
         db::dequarantine(&conn, id).map_err(box_err)
     }
 
-    async fn delete(&self, _ctx: &CallerContext, id: &str) -> StoreResult<()> {
+    async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // Parity finding #4 — SAL-level caller-owns gate (postgres parity;
+        // pg enforces the same gate in its trait `delete`).
+        assert_caller_owns_for_mutation(
+            &conn,
+            ctx,
+            id,
+            "delete",
+            crate::store::REASON_UNSTAMPED_TENANT_DELETE,
+        )?;
         let removed = db::delete(&conn, id).map_err(box_err)?;
         if removed {
             Ok(())
@@ -1857,15 +1944,53 @@ impl MemoryStore for SqliteStore {
         reason: Option<&str>,
     ) -> StoreResult<usize> {
         let conn = self.state.lock().await;
-        let mut moved = 0usize;
-        for id in ids {
-            match db::archive_memory(&conn, id, reason) {
-                Ok(true) => moved += 1,
-                Ok(false) => {}
-                Err(e) => return Err(box_err(e)),
+        // Parity finding #2 (2026-08) — ALL-OR-NOTHING batch, matching the
+        // postgres twin (`PostgresStore::archive_by_ids`, ONE `pool.begin()`
+        // spanning every id). Pre-fix this looped `db::archive_memory`, which
+        // opens its OWN `BEGIN IMMEDIATE` PER ID, so a failure part-way
+        // through left a PARTIALLY archived batch committed: the prefix of
+        // ids had their live rows DELETED and moved to `archived_memories`
+        // while the remainder stayed live, and the caller saw only an `Err`
+        // with no way to learn how far the batch got. Replay / DR tooling
+        // could not assume the same post-failure state machine on the two
+        // backends. Wrapping the whole loop in ONE transaction (and calling
+        // the tx-free `archive_memory_no_tx` core inside it) makes a
+        // mid-batch failure roll the ENTIRE batch back, so the batch is
+        // atomic on both backends.
+        //
+        // Transaction-aware for the same reason `update_with_expected_version`
+        // is (a nested `BEGIN` fails with "cannot start a transaction within
+        // a transaction"): open our own tx ONLY when the caller does not
+        // already hold one.
+        let owns_tx = conn.is_autocommit();
+        if owns_tx {
+            conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
+                .map_err(box_err)?;
+        }
+        let batch = (|| -> anyhow::Result<usize> {
+            let mut moved = 0usize;
+            for id in ids {
+                if db::archive_memory_no_tx(&conn, id, reason)? {
+                    moved += 1;
+                }
+            }
+            Ok(moved)
+        })();
+        match batch {
+            Ok(moved) => {
+                if owns_tx {
+                    conn.execute_batch(crate::storage::connection::SQL_COMMIT)
+                        .map_err(box_err)?;
+                }
+                Ok(moved)
+            }
+            Err(e) => {
+                if owns_tx {
+                    let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+                }
+                Err(box_err(e))
             }
         }
-        Ok(moved)
     }
 
     async fn export_memories(&self) -> StoreResult<Vec<Memory>> {
