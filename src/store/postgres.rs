@@ -228,6 +228,164 @@ const SQL_CLEAR_LOCK_TIMEOUT: &str = "SET lock_timeout = 0";
 /// 3,000,000 rows / 1,520 MB built in 5.24 s plain, 5.57 s CONCURRENTLY.
 const INDEX_BUILD_TIMEOUT_MS: u64 = 900_000;
 
+/// v1.0.0 #2614 — EXPLICIT `lock_timeout` (ms) for a BLOCKING-DDL migrate arm,
+/// applied on the arm's own dedicated connection.
+///
+/// The pool default ([`DEFAULT_LOCK_TIMEOUT_SECS`] = 5 s) is calibrated for
+/// the REQUEST path, where a 5 s lock wait is already pathological. A migrate
+/// arm that takes `ACCESS EXCLUSIVE` is the opposite case: it must out-wait an
+/// ordinary in-flight writer's commit, which routinely takes longer than 5 s
+/// and has nothing to do with table size. `0` (wait forever) is NOT the fix
+/// either — an unbounded wait hangs `connect()` past a supervisor's start
+/// deadline (systemd's `TimeoutStartSec` defaults to 90 s), converting a clean
+/// wait into a fleet-wide crash-loop. 10 s per attempt, retried
+/// [`DDL_ARM_MAX_ATTEMPTS`] times with [`DDL_ARM_RETRY_BACKOFF_MS`] backoff,
+/// bounds the total lock-acquisition budget at ~36 s — comfortably inside a
+/// 90 s start deadline while giving an ordinary writer several chances to
+/// drain.
+const DDL_LOCK_TIMEOUT_MS: u64 = 10_000;
+
+/// v1.0.0 #2614 — bounded `statement_timeout` (ms) for a BLOCKING-DDL migrate
+/// arm. A `GENERATED ALWAYS AS ... STORED` add rewrites the whole table and
+/// CANNOT be done `CONCURRENTLY`, so unlike the [`INDEX_BUILD_TIMEOUT_MS`]
+/// index build this one legitimately runs for minutes on a large corpus.
+///
+/// It is BOUNDED rather than cleared so the failure is DETERMINISTIC — an
+/// unbounded `statement_timeout = 0` turns a too-large rewrite into an
+/// indefinite hang inside `connect()` with no error and no log. But be exact
+/// about what this bound does and does not buy: **10 minutes does NOT fit
+/// inside systemd's default `TimeoutStartSec` of 90 s.** Unlike the LOCK
+/// budget — which is deliberately sized to fit (see [`DDL_LOCK_TIMEOUT_MS`]
+/// and the `the_ddl_retry_budget_stays_inside_a_supervisor_start_deadline_2614`
+/// test) — a corpus large enough to need minutes of rewrite CANNOT be migrated
+/// inside a 90 s start deadline by any setting of this constant. That is
+/// physics, not a defect, and the honest mitigation is operator-side: the
+/// pre-flight `reltuples` INFO ([`PostgresStore::log_ddl_preflight`]) prints
+/// the projected duration BEFORE the arm takes its lock, so an operator can
+/// raise `TimeoutStartSec` (or run the arm by hand in a maintenance window)
+/// ahead of a fleet upgrade instead of discovering it as a restart loop.
+///
+/// A `57014` abort caused by THIS bound is explicitly NOT retried — see
+/// [`SQLSTATE_QUERY_CANCELED`].
+const DDL_STATEMENT_TIMEOUT_MS: u64 = 600_000;
+
+/// v1.0.0 #2614 — how many times one blocking-DDL arm (and, at the ladder
+/// level, the whole migrate body) is retried when it aborted purely because it
+/// could not GET the lock. Lock contention is transient by nature: the
+/// blocking writer commits and the next attempt succeeds. Three attempts with
+/// [`DDL_ARM_RETRY_BACKOFF_MS`] backoff, then a CLEAR REFUSAL — never an
+/// unbounded retry loop (which is the crash-loop this issue exists to remove).
+const DDL_ARM_MAX_ATTEMPTS: u32 = 3;
+
+/// v1.0.0 #2614 — base backoff (ms) between blocking-DDL attempts; doubled per
+/// attempt (2 s, 4 s). No jitter is applied: `MIGRATION_ADVISORY_LOCK_KEY`
+/// already serialises the ladder across the whole fleet, so exactly one node
+/// is ever in this retry loop — there is no herd to spread.
+const DDL_ARM_RETRY_BACKOFF_MS: u64 = 2_000;
+
+/// v1.0.0 #2614 — rows/second used for the pre-flight rewrite PROJECTION.
+///
+/// Sourced from #2614's own reproduction on the certified tier: the pre-fix
+/// v57 arm's 30 s `statement_timeout` aborts a `GENERATED ... STORED` build at
+/// roughly 17 M rows, i.e. ~570 k rows/s. It is a single-point,
+/// order-of-magnitude calibration on ONE host — the log line says so, and no
+/// control branches on it. It exists only so an operator reading journald
+/// knows whether the next line means seconds or minutes.
+const DDL_REWRITE_ROWS_PER_SEC: f64 = 570_000.0;
+
+/// v1.0.0 #2614 (pm-v3.1 literal de-dup) — the ladder's version stamp.
+/// Shared by [`record_schema_version`] (the pooled arms) and
+/// [`PostgresStore::apply_ddl_in_tx`] (the blocking-DDL arms) so BOTH paths
+/// stamp identically — `ON CONFLICT DO NOTHING` keeps a ladder replay
+/// idempotent.
+const SQL_INSERT_SCHEMA_VERSION: &str =
+    "INSERT INTO schema_version (version) VALUES ($1) ON CONFLICT (version) DO NOTHING";
+
+/// v1.0.0 #2614 — postgres `SQLSTATE`s that mean "the statement aborted
+/// because it could not acquire a lock", i.e. a TRANSIENT contention failure
+/// that a retry can clear. Everything else (a syntax error, a constraint
+/// violation, a disk-full) is permanent and must fail immediately rather than
+/// burning the retry budget.
+///
+/// * `55P03` `lock_not_available` — `lock_timeout` expired.
+/// * `40P01` `deadlock_detected` — chosen as the deadlock victim.
+/// * `40001` `serialization_failure` — a concurrent DDL racer.
+///
+/// `57014` `query_canceled` is deliberately NOT in this list — see
+/// [`SQLSTATE_QUERY_CANCELED`], which needs the message to disambiguate.
+const DDL_RETRYABLE_SQLSTATES: &[&str] = &["55P03", "40P01", "40001"];
+
+/// v1.0.0 #2614 — `57014` `query_canceled`, which postgres emits for BOTH
+/// timeout families and which therefore MUST NOT be treated as retryable on
+/// the code alone.
+///
+/// * `canceling statement due to lock timeout` — TRANSIENT. The blocking
+///   writer commits and the next attempt succeeds. (This is the string
+///   #2614's live reproduction actually produced.)
+/// * `canceling statement due to statement timeout` — NOT transient here. It
+///   means the REWRITE ITSELF ran past [`DDL_STATEMENT_TIMEOUT_MS`], i.e. the
+///   table is too large for the budget. Retrying that burns
+///   3 x 600 s = 30 minutes of repeated ACCESS EXCLUSIVE attempts and blows
+///   through the supervisor start deadline — recreating, at a much larger
+///   scale, the crash-loop this fix exists to prevent. It must refuse on the
+///   FIRST attempt, with the operator moves the refusal already names.
+const SQLSTATE_QUERY_CANCELED: &str = "57014";
+
+/// v1.0.0 #2614 — the postgres message fragment that distinguishes a LOCK
+/// timeout from a STATEMENT timeout inside [`SQLSTATE_QUERY_CANCELED`].
+const PG_LOCK_TIMEOUT_MESSAGE: &str = "due to lock timeout";
+
+/// v1.0.0 #2614 — the pure retry decision for one postgres error, split out
+/// from [`is_lock_contention_error`] so the ambiguity handling is unit-testable
+/// without constructing a `sqlx::Error` (which has no public constructor for a
+/// database error).
+fn is_retryable_ddl_sqlstate(code: &str, message: &str) -> bool {
+    if code == SQLSTATE_QUERY_CANCELED {
+        return message.contains(PG_LOCK_TIMEOUT_MESSAGE);
+    }
+    DDL_RETRYABLE_SQLSTATES.contains(&code)
+}
+
+/// v1.0.0 #2614 — `true` when this error is a TRANSIENT lock-contention abort
+/// and a retry is therefore meaningful. See [`is_retryable_ddl_sqlstate`].
+fn is_lock_contention_error(e: &sqlx::Error) -> bool {
+    e.as_database_error().is_some_and(|db| {
+        db.code()
+            .is_some_and(|code| is_retryable_ddl_sqlstate(&code, db.message()))
+    })
+}
+
+/// v1.0.0 #2614 — `true` when a [`StoreError`] came from a transient
+/// lock-contention abort. The migrate arms wrap sqlx errors through
+/// [`to_store_err`] before they reach the ladder, so the ladder-level retry
+/// has only the rendered detail to work with; this matches on the
+/// [`DDL_RETRYABLE_SQLSTATES`] error TEXT postgres emits, which is stable and
+/// is what an operator sees in the log.
+fn is_lock_contention_store_err(e: &StoreError) -> bool {
+    let StoreError::BackendUnavailable { detail, .. } = e else {
+        return false;
+    };
+    // A blocking-DDL arm that has ALREADY spent its own retry budget must not
+    // be retried again by the ladder: its terminal refusal quotes the postgres
+    // cancel text, so a naive substring match would multiply the budget
+    // ([`DDL_ARM_MAX_ATTEMPTS`] squared) and push the total past the very
+    // supervisor start deadline this fix exists to stay inside — turning one
+    // failure mode (a brick) into the other (a crash-loop).
+    if detail.contains(DDL_BUDGET_EXHAUSTED_MARKER) {
+        return false;
+    }
+    detail.contains("due to lock timeout")
+        || detail.contains("deadlock detected")
+        || detail.contains("could not obtain lock")
+}
+
+/// v1.0.0 #2614 — marker embedded in a blocking-DDL arm's TERMINAL refusal so
+/// [`is_lock_contention_store_err`] can tell "this arm lost a lock race, retry
+/// the ladder" from "this arm already exhausted its own bounded lock budget,
+/// refuse now". Kept short and machine-recognisable; it also gives an operator
+/// grepping journald one exact token for the boot-refusal class.
+const DDL_BUDGET_EXHAUSTED_MARKER: &str = "[ddl-lock-budget-exhausted]";
+
 /// v1.0.0 #3074 — CLOSE (never return to the pool) a connection whose
 /// per-session `statement_timeout` / `lock_timeout` GUCs were RELAXED for a
 /// one-shot bootstrap, migrate, or `CREATE INDEX CONCURRENTLY` build.
@@ -911,6 +1069,9 @@ const CTX_READ_AGENT_ID_FOR_LEAF: &str = "read agent id for supersede leaf";
 const META_PUBKEY_BOUND_AT: &str = field_names::PUBKEY_BOUND_AT;
 const COL_CONTENT_LEN: &str = "content_len";
 const TABLE_ARCHIVED_MEMORIES: &str = "archived_memories";
+/// v1.0.0 #2614 — relation name the blocking-DDL migrate arms rewrite, used
+/// for the pre-flight `pg_class` size probe and the refusal message.
+const TABLE_MEMORIES: &str = "memories";
 
 /// Refusal for a pubkey bind/sync against an unregistered agent —
 /// shared by `bind_agent_pubkey` and `append_lineage_record` (pm-v3.1
@@ -1717,7 +1878,58 @@ pub const DEFAULT_EMBEDDING_DIM: u32 = 384;
 /// (MiniLmL6V2 = 384, NomicEmbedV15 = 768). The migration helper
 /// rejects any other value with a clear error so an operator typo
 /// doesn't leave the schema in an unusable state.
+///
+/// # v1.0.0 [#2626] — why this list is not simply WIDENED
+///
+/// A high-dim API model (`google/gemini-embedding-2` = 3072,
+/// `text-embedding-3-large` = 3072) resolves its NATIVE width from the
+/// compiled `KNOWN_EMBEDDING_DIMS` table, so a node configured purely by
+/// environment used to arrive here asking for `vector(3072)` against a fleet
+/// standardised on `vector(768)`. The answer is NOT to add 3072 to this list:
+///
+/// * **pgvector's ANN indexes cap out at 2000 dimensions.** `hnsw` and
+///   `ivfflat` both refuse a column wider than that, so a `vector(3072)`
+///   column is UNINDEXABLE — every semantic recall would degrade to a
+///   sequential scan over the whole corpus, silently, with no error anywhere.
+///   Widening the list would trade a loud refusal for an invisible cliff.
+/// * **The fleet's width is a deliberate, load-bearing choice.** Matryoshka
+///   models truncate server-side at the requested `dimensions`, which is
+///   exactly how a 3072-native model is made to fit a `vector(768)` schema
+///   ([`crate::config::ResolvedEmbeddings::requested_dim`]). The fix is to
+///   let the operator EXPRESS 768 on the env path
+///   ([`crate::config::ENV_EMBED_DIM`], added by #2626), not to let a node
+///   mint an incompatible column.
+///
+/// So an unsupported dim stays a boot-time REFUSAL — see
+/// [`unsupported_embedding_dim`] for the message, which names the two knobs
+/// that can express the intended width.
+///
+/// [#2626]: https://github.com/alphaonedev/ai-memory-mcp/issues/2626
 const SUPPORTED_EMBEDDING_DIMS: &[i32] = &[384, 768];
+
+/// v1.0.0 #2626 — the boot-time refusal for a dim this schema cannot carry.
+///
+/// Pre-fix the message was `unsupported embedding dim 3072: expected one of
+/// [384, 768]` — true, and useless: it named no knob, because at the time NO
+/// env var could express the dim at all, so an env-configured operator had
+/// nowhere to go. It now names both knobs and the mechanism, so the refusal
+/// is actionable on the first read.
+fn unsupported_embedding_dim(dim: u32) -> StoreError {
+    StoreError::InvalidInput {
+        detail: format!(
+            "unsupported embedding dim {dim}: this postgres schema declares \
+             vector({SUPPORTED_EMBEDDING_DIMS:?}) columns and REFUSES to bootstrap at any \
+             other width (pgvector's hnsw/ivfflat indexes cap at 2000 dimensions, so a \
+             wider column would be unindexable and every semantic recall would silently \
+             become a sequential scan). This is usually a high-dim API model resolving its \
+             NATIVE width from the compiled model table. Pin the width your fleet's \
+             columns actually use with {} (env) or `[embeddings].dim` (config file) — for \
+             a Matryoshka-capable model the vendor then truncates server-side and the \
+             vectors fit. See issue #2626.",
+            crate::config::ENV_EMBED_DIM
+        ),
+    }
+}
 
 /// Placeholder substituted in `postgres_schema.sql` at connect time.
 /// The schema file embeds `vector({EMBEDDING_DIM})` everywhere a
@@ -1888,11 +2100,7 @@ impl PostgresStore {
         pool_config: PoolConfig,
     ) -> StoreResult<Self> {
         if !SUPPORTED_EMBEDDING_DIMS.contains(&i32::try_from(dim).unwrap_or(-1)) {
-            return Err(StoreError::InvalidInput {
-                detail: format!(
-                    "unsupported embedding dim {dim}: expected one of {SUPPORTED_EMBEDDING_DIMS:?}"
-                ),
-            });
+            return Err(unsupported_embedding_dim(dim));
         }
 
         let options: PgConnectOptions =
@@ -2387,7 +2595,14 @@ impl PostgresStore {
             // the same reason the bootstrap is: the database is AHEAD, so there
             // is nothing to migrate and everything to preserve.
             if !schema_ahead {
-                store.migrate_locked().await?;
+                // v1.0.0 #2614 — the BOOT path. `connect_*` calls the lock-free
+                // body directly (it already holds the bootstrap advisory lock,
+                // so re-acquiring from another session would deadlock), which
+                // is exactly why the contention retry has to live in a wrapper
+                // BOTH call sites share: a retry that only wrapped
+                // `Self::migrate` would cover the `ai-memory migrate` CLI and
+                // miss the daemon boot this issue is about.
+                store.migrate_locked_with_contention_retry().await?;
                 // v1.0.0 #2578 — self-heal the v88 composite ordering
                 // indexes on EVERY connect, not only inside the v88 arm.
                 // The arm is FAIL-OPEN (an index is derived, disposable
@@ -2855,7 +3070,7 @@ impl PostgresStore {
 
         // Run the migration body, capturing the result so we can always
         // release the lock even on a per-migration failure.
-        let result = self.migrate_locked().await;
+        let result = self.migrate_locked_with_contention_retry().await;
 
         // Release ALL advisory locks held in this session (more robust
         // than pg_advisory_unlock(key) — defends against the body
@@ -2877,6 +3092,84 @@ impl PostgresStore {
     /// [`Self::migrate`] — do not call directly from outside that
     /// wrapper without holding the lock, or the cross-process
     /// serialization invariant is lost.
+    /// v1.0.0 #2614 — [`Self::migrate_locked`] plus a LADDER-level retry for
+    /// the transient lock-contention class.
+    ///
+    /// Every arm that is not blocking DDL still runs on a POOLED connection
+    /// carrying `after_connect`'s `lock_timeout = 5 s`, and even a
+    /// metadata-only `ALTER TABLE` / `CREATE INDEX` needs a brief exclusive
+    /// lock that an ordinary in-flight writer can hold off past 5 s. Pre-fix,
+    /// losing that race propagated straight out of `connect()` and the daemon
+    /// did not boot.
+    ///
+    /// Retrying the BODY (not the process) is safe and cheap: `migrate_locked`
+    /// re-reads `schema_version` and skips every arm already applied, and each
+    /// arm is independently idempotent by construction (`IF NOT EXISTS` DDL +
+    /// a stamp under `ON CONFLICT DO NOTHING`). The budget is bounded —
+    /// [`DDL_ARM_MAX_ATTEMPTS`] attempts on the same backoff schedule as a
+    /// blocking arm — and exhausting it is a CLEAR REFUSAL, never an unbounded
+    /// loop. A blocking arm that already spent its OWN budget is not retried
+    /// again here (see [`DDL_BUDGET_EXHAUSTED_MARKER`]), so the two budgets ADD
+    /// rather than multiply.
+    ///
+    /// # Both callers hold the advisory lock
+    ///
+    /// This MUST be called with `MIGRATION_ADVISORY_LOCK_KEY` already held, so
+    /// no other daemon thunders in behind the retries. Both call sites do:
+    /// [`Self::migrate`] takes it on its own dedicated connection, and
+    /// `connect_*` holds the BOOTSTRAP advisory lock across the whole
+    /// bootstrap + ladder.
+    ///
+    /// Calling it from `connect_*` is the point: `connect_*` invokes
+    /// `migrate_locked` DIRECTLY (it must not re-acquire an advisory lock from
+    /// a different session), so a retry that lived only inside
+    /// [`Self::migrate`] would cover the `ai-memory migrate` CLI and MISS the
+    /// boot path — which is the only path #2614 is actually about.
+    ///
+    /// # Errors
+    ///
+    /// The last attempt's [`StoreError`].
+    async fn migrate_locked_with_contention_retry(&self) -> StoreResult<()> {
+        let mut result = self.migrate_locked().await;
+        let mut attempt: u32 = 1;
+        while attempt < DDL_ARM_MAX_ATTEMPTS
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(is_lock_contention_store_err)
+        {
+            let backoff_ms = DDL_ARM_RETRY_BACKOFF_MS.saturating_mul(1_u64 << (attempt - 1));
+            tracing::warn!(
+                target: TRACE_TARGET,
+                attempt,
+                max_attempts = DDL_ARM_MAX_ATTEMPTS,
+                backoff_ms,
+                err = %result.as_ref().err().map_or_else(String::new, ToString::to_string),
+                "#2614: a migrate arm lost a lock race to an in-flight writer; backing off \
+                 and re-entering the ladder (already-applied arms are skipped)"
+            );
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            attempt += 1;
+            result = self.migrate_locked().await;
+        }
+        if let Err(e) = &result
+            && is_lock_contention_store_err(e)
+        {
+            tracing::error!(
+                target: TRACE_TARGET,
+                attempts = attempt,
+                err = %e,
+                "#2614: REFUSING to boot — a schema migration could not acquire its table \
+                 lock after {attempt} attempts. This is lock CONTENTION, not corruption: \
+                 nothing was half-applied (each arm stamps its version inside the same \
+                 transaction as its DDL), and the next start retries. Drain or terminate \
+                 the blocking writer (`SELECT pid, query FROM pg_stat_activity WHERE \
+                 state <> 'idle'`), or apply the arm by hand in a maintenance window."
+            );
+        }
+        result
+    }
+
     async fn migrate_locked(&self) -> StoreResult<()> {
         // Read the current version from schema_version table — this is
         // re-read under the lock so racers that queued while another
@@ -4393,47 +4686,44 @@ impl PostgresStore {
     /// rows this is sub-second; plan a maintenance window before
     /// running it against multi-million-row deployments.
     ///
+    /// **v1.0.0 #2614 — this arm is BLOCKING DDL and no longer runs on a
+    /// pooled connection.** Pre-fix it used `self.pool.begin()`, which retains
+    /// the `after_connect` `lock_timeout = 5 s`; a SINGLE ordinary in-flight
+    /// writer therefore aborted the `ALTER` with `canceling statement due to
+    /// lock timeout`, rolled the tx back, left the version unstamped, and made
+    /// `connect()` return `Err` — the daemon could not boot, identically on
+    /// every retry, and that is concurrency-driven rather than size-driven. It
+    /// now goes through [`Self::run_blocking_ddl_arm`]: dedicated connection,
+    /// explicit bounded `lock_timeout`, retry with backoff, pre-flight size
+    /// INFO, and a CLEAR REFUSAL naming the operator's moves if the lock never
+    /// comes free. The disposition stays fail-CLOSED — a `GENERATED STORED`
+    /// column is not disposable derived data the way the v88 indexes are.
+    ///
     /// SQLite twin is a version-stamp no-op (FTS5 already materialises
     /// the index text in the `memories_fts` virtual table — there is
     /// nothing to precompute), the inverse of the v55 arm.
     async fn migrate_v57(&self) -> StoreResult<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin v57 tx", e))?;
-
-        sqlx::query(
-            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tsv tsvector \
-             GENERATED ALWAYS AS (to_tsvector('english', \
-             coalesce(title, '') || ' ' || coalesce(content, ''))) STORED",
+        self.run_blocking_ddl_arm(
+            57,
+            "v57 (#1579 B2 stored generated tsv column)",
+            TABLE_MEMORIES,
+            &[
+                "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tsv tsvector \
+                 GENERATED ALWAYS AS (to_tsvector('english', \
+                 coalesce(title, '') || ' ' || coalesce(content, ''))) STORED",
+                "CREATE INDEX IF NOT EXISTS memories_tsv_gin ON memories USING gin (tsv)",
+                // The legacy EXPRESSION index served only the `@@` match and no
+                // query references the expression any more — keeping it would
+                // be pure write amplification on every memories INSERT/UPDATE.
+                "DROP INDEX IF EXISTS memories_content_fts",
+            ],
         )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("v57 add tsv generated column", e))?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS memories_tsv_gin ON memories USING gin (tsv)")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("v57 create memories_tsv_gin", e))?;
-
-        // The legacy EXPRESSION index served only the `@@` match and no
-        // query references the expression any more — keeping it would
-        // be pure write amplification on every memories INSERT/UPDATE.
-        sqlx::query("DROP INDEX IF EXISTS memories_content_fts")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("v57 drop memories_content_fts", e))?;
-
-        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — a
-        // mid-ladder crash after this commit must resume at v58, not skip
-        // to the head (same crash-safety invariant as the v61/v62 arms).
-        record_schema_version(&mut tx, 57).await?;
-
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("commit v57 migration", e))?;
-
+        .await?;
+        // The stamp is the LITERAL arm version, not CURRENT_SCHEMA_VERSION — a
+        // mid-ladder crash after the commit must resume at v58, not skip to the
+        // head (same crash-safety invariant as the v61/v62 arms) — and it rides
+        // INSIDE the helper's DDL transaction, so a lock abort can never leave
+        // the column half-added with the version already recorded.
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v57 applied (#1579 B2: stored generated tsv column + memories_tsv_gin; dropped expression index memories_content_fts)"
@@ -4925,34 +5215,29 @@ impl PostgresStore {
     /// Stamps the LITERAL 67 (crash-safety: a crash mid-ladder records
     /// the exact applied tip, NOT `CURRENT_SCHEMA_VERSION`).
     async fn migrate_v67(&self) -> StoreResult<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin v67 tx", e))?;
-
-        sqlx::query(
-            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS target_agent_id_idx \
-             TEXT GENERATED ALWAYS AS (metadata ->> 'target_agent_id') STORED",
+        // v1.0.0 #2614 — BLOCKING DDL. `ADD COLUMN ... GENERATED ALWAYS AS
+        // ... STORED` must compute and store the value for every existing row,
+        // so postgres REWRITES the table under ACCESS EXCLUSIVE — exactly the
+        // v57 class, not the metadata-only `ADD COLUMN <nullable, no default>`
+        // this arm's own prose calls "pure additive". #2614's audit-every-arm
+        // clause named v57 and v89; this is the third, and it was still on the
+        // pooled path (`lock_timeout = 5 s` from `after_connect`), so one
+        // ordinary in-flight writer could brick a boot here identically.
+        // Routed through the same dedicated-connection helper; the stamp is
+        // the LITERAL 67 (crash-safety) and rides INSIDE the helper's
+        // transaction with the DDL.
+        self.run_blocking_ddl_arm(
+            67,
+            "v67 (#1720 A1 target_agent_id_idx stored generated column)",
+            TABLE_MEMORIES,
+            &[
+                "ALTER TABLE memories ADD COLUMN IF NOT EXISTS target_agent_id_idx \
+                 TEXT GENERATED ALWAYS AS (metadata ->> 'target_agent_id') STORED",
+                "CREATE INDEX IF NOT EXISTS idx_memories_target_agent_id \
+                 ON memories (target_agent_id_idx)",
+            ],
         )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("v67 add memories.target_agent_id_idx", e))?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memories_target_agent_id \
-             ON memories (target_agent_id_idx)",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("v67 create idx_memories_target_agent_id", e))?;
-
-        // Literal arm version (crash-safety) — see the v57 arm note.
-        record_schema_version(&mut tx, 67).await?;
-
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("commit v67 migration", e))?;
+        .await?;
 
         tracing::info!(
             target: TRACE_TARGET,
@@ -5919,16 +6204,25 @@ impl PostgresStore {
     /// EXCLUSIVE lock and rewrites the table to backfill the column (the
     /// same posture as the v57 add). At the fleet's ~8k rows this is
     /// sub-second; plan a maintenance window before running it against
-    /// multi-million-row deployments. The arm runs on the POOLED connection
-    /// (`pool.begin()`), which RETAINS the `lock_timeout` / `statement_timeout`
-    /// from `after_connect` — DELIBERATELY, so under lock contention the arm
-    /// fails CLOSED (rolls back, stays at v88, retries next boot) rather than
-    /// waiting unbounded and hanging `connect()` past a supervisor start
-    /// timeout. Unlike the v88 index build, a STORED-generated rewrite CANNOT
-    /// be done `CONCURRENTLY`, so the brief exclusive lock is the accepted
-    /// posture (worst case at v88 is the pre-fix behaviour = fewer tag
-    /// results = DEGRADE, never a wrong result — the durable title/content/tags
-    /// TEXT is untouched and `tsv` is regenerated from it).
+    /// multi-million-row deployments. Unlike the v88 index build, a
+    /// STORED-generated rewrite CANNOT be done `CONCURRENTLY`, so the exclusive
+    /// lock is the accepted posture (worst case at v88 is the pre-fix
+    /// behaviour = fewer tag results = DEGRADE, never a wrong result — the
+    /// durable title/content/tags TEXT is untouched and `tsv` is regenerated
+    /// from it).
+    ///
+    /// **v1.0.0 #2614 — the arm no longer runs on a POOLED connection.** It
+    /// used to, DELIBERATELY, so that under lock contention it would fail
+    /// CLOSED rather than wait unbounded — but the pooled connection carries
+    /// `lock_timeout = 5 s` from `after_connect`, so "fail closed" in practice
+    /// meant a daemon that could not boot at all for as long as ANY ordinary
+    /// writer was active, with only `canceling statement due to lock timeout`
+    /// to go on. [`Self::run_blocking_ddl_arm`] keeps the fail-CLOSED
+    /// disposition and the bounded wait (both of which were right) and adds
+    /// what was missing: a dedicated connection, an EXPLICIT lock budget
+    /// instead of the request-path default, retry with backoff across a
+    /// writer's commit, pre-flight size observability, and a refusal that names
+    /// the cause and the fix.
     ///
     /// SQLite twin is a version-stamp no-op (FTS5 already indexes tags).
     async fn migrate_v89(&self) -> StoreResult<()> {
@@ -5936,23 +6230,17 @@ impl PostgresStore {
             !MIGRATION_V89_TSV_INCLUDE_TAGS.is_empty(),
             "#2392: the v89 DDL doc twin must ship with the binary"
         );
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin v89 tsv ddl tx", e))?;
-
-        sqlx::raw_sql(MIGRATION_V89_TSV_INCLUDE_TAGS)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("apply v89 tsv-include-tags ddl", e))?;
-
         // SETTLED arm — v90 (#2385) took the tip, so v89 is LITERALIZED into
-        // the monotonic literal lane (the #2218 convention).
-        record_schema_version(&mut tx, 89).await?;
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("commit v89 migration", e))?;
+        // the monotonic literal lane (the #2218 convention). #2614 routes the
+        // blocking tsv rewrite through run_blocking_ddl_arm (dedicated conn,
+        // explicit lock budget, retry) instead of a pooled 5s lock_timeout.
+        self.run_blocking_ddl_arm(
+            89,
+            "v89 (#2392 tsv-include-tags rewrite)",
+            TABLE_MEMORIES,
+            &[MIGRATION_V89_TSV_INCLUDE_TAGS],
+        )
+        .await?;
 
         tracing::info!(
             target: TRACE_TARGET,
@@ -6019,6 +6307,267 @@ impl PostgresStore {
              content-id instead of re-minting it)"
         );
         Ok(())
+    }
+
+    /// v1.0.0 #2614 — pre-flight observability for one blocking-DDL arm.
+    ///
+    /// Emits ONE INFO naming `pg_class.reltuples`, the on-disk size, the
+    /// projected rewrite duration and the bounded budget, BEFORE the arm takes
+    /// its `ACCESS EXCLUSIVE` lock — so a fleet upgrade is auditable instead of
+    /// a silent multi-minute gap, and an operator reading journald knows
+    /// whether this node is about to rewrite 8 k rows or 300 M.
+    ///
+    /// The projection is derived from the ONE measurement this repository
+    /// actually holds — #2614's reproduction on the certified tier, where the
+    /// 30 s `statement_timeout` alone aborted the build at ~17 M rows, i.e.
+    /// [`DDL_REWRITE_ROWS_PER_SEC`]. It is an ORDER-OF-MAGNITUDE aid, not a
+    /// guarantee, and says so in the log line; a fabricated precise ETA would
+    /// be worse than none.
+    ///
+    /// Best-effort and infallible by construction: a failed catalog probe
+    /// must never be the reason a migration does not run, so a probe error
+    /// degrades to a DEBUG and the arm proceeds.
+    async fn log_ddl_preflight(&self, arm_version: i32, label: &str, table: &str) {
+        let probe: Result<Option<(f32, i64)>, sqlx::Error> = sqlx::query_as(
+            "SELECT c.reltuples, pg_total_relation_size(c.oid)::bigint \
+               FROM pg_class c WHERE c.relname = $1 AND c.relkind = 'r'",
+        )
+        .bind(table)
+        .fetch_optional(&self.pool)
+        .await;
+        let Ok(Some((reltuples, bytes))) = probe else {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                arm = label,
+                table,
+                "#2614: pre-flight catalog probe unavailable; proceeding with the \
+                 blocking-DDL arm without a size estimate"
+            );
+            return;
+        };
+        // `reltuples` is -1 on a never-analyzed relation and can be stale;
+        // clamp to 0 so the projection is never negative.
+        let rows = f64::from(reltuples).max(0.0);
+        tracing::info!(
+            target: TRACE_TARGET,
+            arm = label,
+            schema_version = arm_version,
+            table,
+            estimated_rows = rows,
+            table_bytes = bytes,
+            projected_secs = rows / DDL_REWRITE_ROWS_PER_SEC,
+            lock_timeout_ms = DDL_LOCK_TIMEOUT_MS,
+            statement_timeout_ms = DDL_STATEMENT_TIMEOUT_MS,
+            "#2614: about to run a BLOCKING DDL migrate arm (rewrites `{table}` under \
+             ACCESS EXCLUSIVE). `projected_secs` is an order-of-magnitude estimate from \
+             pg_class.reltuples, not a guarantee. Writers to `{table}` block for the \
+             duration; the arm refuses (and this node does not boot) rather than \
+             half-applying if it cannot get the lock."
+        );
+    }
+
+    /// v1.0.0 #2614 — run one BLOCKING-DDL migrate arm on a DEDICATED
+    /// connection under an EXPLICIT, documented `lock_timeout`, with bounded
+    /// retry/backoff and a CLEAR REFUSAL as the terminal failure mode.
+    ///
+    /// # The defect this closes
+    ///
+    /// `PgPoolOptions::after_connect` sets `lock_timeout = 5 s`
+    /// ([`DEFAULT_LOCK_TIMEOUT_SECS`]) on EVERY pooled connection, and
+    /// `connect_*` clears it ONLY on the dedicated advisory-lock connection —
+    /// never on the connection an arm's `self.pool.begin()` hands out. Blocking
+    /// DDL needs a table lock; ANY ordinary in-flight writer holds it off. The
+    /// statement then aborts with `canceling statement due to lock timeout`,
+    /// the tx rolls back, the version is NOT stamped, `migrate_locked` returns
+    /// `Err`, and `connect()` propagates it with `?` — the daemon cannot boot,
+    /// identically on every retry, for as long as any writer is active. That
+    /// is concurrency-driven, NOT size-driven: it fires on an 8 k-row table as
+    /// readily as a 3-billion-row one (reproduced on the live tier at
+    /// 5.002 s with a single uncommitted `INSERT` open).
+    ///
+    /// # The shape
+    ///
+    /// 1. **Pre-flight** ([`Self::log_ddl_preflight`]) — one INFO with the row
+    ///    estimate and the projected duration before anything locks.
+    /// 2. **Dedicated connection** — so the relaxed GUCs cannot leak to an
+    ///    unrelated caller, and the arm is never inside anyone else's
+    ///    transaction. Closed via [`close_timeout_relaxed_conn`] (#3074) rather
+    ///    than returned to the pool outside the `after_connect` envelope.
+    /// 3. **Explicit bounded timeouts** — [`DDL_LOCK_TIMEOUT_MS`] /
+    ///    [`DDL_STATEMENT_TIMEOUT_MS`]. Neither is cleared to `0`: an unbounded
+    ///    wait hangs `connect()` past a supervisor start deadline, which turns
+    ///    clean waiters into a genuine restart loop.
+    /// 4. **Retry with backoff** on the transient lock-contention SQLSTATEs
+    ///    only ([`DDL_RETRYABLE_SQLSTATES`]) — a permanent error (syntax,
+    ///    constraint, disk) fails on the FIRST attempt rather than burning the
+    ///    budget.
+    /// 5. **Fail CLOSED, loudly.** The DDL and the `schema_version` stamp share
+    ///    ONE transaction, so a refusal leaves the ladder exactly where it was
+    ///    — never half-applied. The terminal error names the arm, the table,
+    ///    the budget that was exhausted, and the two operator moves (drain the
+    ///    writer, or apply the DDL by hand in a window), instead of the opaque
+    ///    `canceling statement due to lock timeout` an operator sees today.
+    ///
+    /// # Which arms use this, and why the rest do not
+    ///
+    /// #2614's audit-every-arm clause resolves to exactly the arms that add a
+    /// `GENERATED ALWAYS AS ... STORED` column. Postgres must COMPUTE and
+    /// STORE that value for every existing row, so it rewrites the table under
+    /// `ACCESS EXCLUSIVE` for a duration proportional to the corpus — unlike a
+    /// plain nullable `ADD COLUMN` with no default, which has been
+    /// metadata-only since PG11. Enumerated by grepping the ladder for
+    /// `GENERATED ALWAYS AS`, there are THREE:
+    ///
+    /// * [`Self::migrate_v57`] — `memories.tsv` + its GIN index.
+    /// * [`Self::migrate_v67`] — `memories.target_agent_id_idx` + its btree.
+    ///   The issue's own list named only v57 and v89; this one described
+    ///   itself as "pure additive" and was the residual.
+    /// * [`Self::migrate_v89`] — the v57 column re-expressed (`DROP COLUMN` +
+    ///   `ADD COLUMN`, PG16 has no `ALTER COLUMN ... SET EXPRESSION`), plus
+    ///   the dependent GIN index.
+    ///
+    /// Every other arm on the ladder is a metadata-only `ADD COLUMN` /
+    /// `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX` / version stamp, which
+    /// takes its lock briefly; those keep the pooled path and are covered by
+    /// the LADDER-level retry in [`Self::migrate`], so a metadata-only arm
+    /// that loses a 5 s lock race is retried rather than bricking the boot.
+    /// The v88 index build is a third disposition again — `CONCURRENTLY` +
+    /// fail-OPEN, because an index is derived, disposable data
+    /// ([`Self::ensure_list_order_indexes`]). A `GENERATED STORED` column is
+    /// NOT disposable, so this path fails CLOSED.
+    ///
+    /// # Deliberately NOT covered
+    ///
+    /// [`Self::convert_embedding_dim`]'s `ALTER TABLE ... ALTER COLUMN
+    /// embedding TYPE vector(N)` is also a full rewrite on a pooled
+    /// connection, and it is left alone ON PURPOSE: it is
+    /// OPERATOR-INITIATED (`ai-memory schema-init --embedding-dim`), not a
+    /// boot-path arm, so losing a lock race there fails one CLI invocation
+    /// that the operator can simply re-run — it cannot brick a daemon's boot,
+    /// which is the failure class #2614 is about. Named here rather than left
+    /// implicit so the audit's boundary is explicit instead of looking like an
+    /// omission.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BackendUnavailable`] carrying the refusal detail, or the
+    /// underlying sqlx error for a permanent (non-contention) failure.
+    async fn run_blocking_ddl_arm(
+        &self,
+        arm_version: i32,
+        label: &str,
+        table: &str,
+        stmts: &[&str],
+    ) -> StoreResult<()> {
+        self.log_ddl_preflight(arm_version, label, table).await;
+
+        let mut attempt: u32 = 1;
+        loop {
+            let mut conn = self
+                .pool
+                .acquire()
+                .await
+                .map_err(|e| to_store_err("acquire blocking-DDL migrate connection", e))?;
+
+            // Explicit, DOCUMENTED per-session budget (see the const docs).
+            // Two separate executes: sqlx's prepared protocol rejects
+            // multi-statement SQL (the :1094 precedent).
+            let mut relax_err = None;
+            for stmt in [
+                format!("SET lock_timeout = {DDL_LOCK_TIMEOUT_MS}"),
+                format!("SET statement_timeout = {DDL_STATEMENT_TIMEOUT_MS}"),
+            ] {
+                if let Err(e) = sqlx::query(&stmt).execute(&mut *conn).await {
+                    relax_err = Some(to_store_err(
+                        "relax timeouts on the blocking-DDL migrate connection",
+                        e,
+                    ));
+                    break;
+                }
+            }
+            if let Some(e) = relax_err {
+                // The first `SET` may already have landed; CLOSE rather than
+                // return a half-relaxed connection to the pool (#3074).
+                close_timeout_relaxed_conn(conn).await;
+                return Err(e);
+            }
+
+            let started = std::time::Instant::now();
+            let outcome = Self::apply_ddl_in_tx(&mut conn, arm_version, stmts).await;
+            close_timeout_relaxed_conn(conn).await;
+
+            let Err(e) = outcome else {
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    arm = label,
+                    attempt,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "#2614: blocking-DDL migrate arm applied on a dedicated connection"
+                );
+                return Ok(());
+            };
+
+            if !is_lock_contention_error(&e) {
+                return Err(to_store_err(&format!("apply {label} blocking ddl"), e));
+            }
+            if attempt >= DDL_ARM_MAX_ATTEMPTS {
+                return Err(StoreError::BackendUnavailable {
+                    backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
+                    detail: crate::logging::redact_urls_in_message(&format!(
+                        "{DDL_BUDGET_EXHAUSTED_MARKER} REFUSING to boot: schema migration \
+                         {label} could not acquire the \
+                         ACCESS EXCLUSIVE lock on `{table}` after {DDL_ARM_MAX_ATTEMPTS} \
+                         attempts at lock_timeout={DDL_LOCK_TIMEOUT_MS}ms (last error: {e}). \
+                         This is lock CONTENTION, not corruption: an ordinary in-flight \
+                         writer is holding the table. NOTHING was half-applied — the DDL \
+                         and the schema_version stamp share one transaction, so the \
+                         database is still at its previous version and this node will \
+                         retry on the next start. To clear it: drain or terminate the \
+                         blocking writer (`SELECT pid, query FROM pg_stat_activity WHERE \
+                         state <> 'idle'`), or apply the arm by hand inside a maintenance \
+                         window and let the ladder resume."
+                    )),
+                });
+            }
+            let backoff_ms = DDL_ARM_RETRY_BACKOFF_MS.saturating_mul(1_u64 << (attempt - 1));
+            tracing::warn!(
+                target: TRACE_TARGET,
+                arm = label,
+                table,
+                attempt,
+                max_attempts = DDL_ARM_MAX_ATTEMPTS,
+                backoff_ms,
+                err = %e,
+                "#2614: blocking-DDL migrate arm lost the lock race to an in-flight \
+                 writer; backing off and retrying (nothing was applied)"
+            );
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            attempt += 1;
+        }
+    }
+
+    /// v1.0.0 #2614 — apply one blocking-DDL arm's statements AND its
+    /// `schema_version` stamp in ONE transaction on the caller's dedicated
+    /// connection.
+    ///
+    /// Atomicity is the fail-closed half of the contract: a lock abort rolls
+    /// back the DDL *and* leaves the version unstamped, so the ladder is never
+    /// observed half-applied. Returns the raw [`sqlx::Error`] so the caller can
+    /// classify it as transient contention or a permanent failure.
+    async fn apply_ddl_in_tx(
+        conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+        arm_version: i32,
+        stmts: &[&str],
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = sqlx::Connection::begin(&mut **conn).await?;
+        for stmt in stmts {
+            sqlx::raw_sql(stmt).execute(&mut *tx).await?;
+        }
+        sqlx::query(SQL_INSERT_SCHEMA_VERSION)
+            .bind(arm_version)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
     }
 
     /// v1.0.0 #2578 — idempotently bring the three v88 composite ordering
@@ -16074,13 +16623,11 @@ async fn record_schema_version(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     version: i32,
 ) -> StoreResult<()> {
-    sqlx::query(
-        "INSERT INTO schema_version (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
-    )
-    .bind(version)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| to_store_err("insert schema_version", e))?;
+    sqlx::query(SQL_INSERT_SCHEMA_VERSION)
+        .bind(version)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("insert schema_version", e))?;
     Ok(())
 }
 
@@ -18138,6 +18685,140 @@ impl MemoryStore for PostgresStore {
     /// inherent [`PostgresStore::dequarantine_raw`]).
     async fn dequarantine(&self, id: &str) -> StoreResult<bool> {
         self.dequarantine_raw(id).await
+    }
+
+    /// v1.0.0 #2402 — the AUDITED operator release (postgres twin). ONE
+    /// transaction carries the guarded `UPDATE` out of `quarantined` and the
+    /// `memory.dequarantined` chain row, so this backend cannot silently ship
+    /// the state change without the audit — the #1552 SAL-port-fanout failure
+    /// mode this method is explicitly written against.
+    async fn operator_dequarantine(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("operator_dequarantine begin", e))?;
+        let changed = sqlx::query(
+            "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), \
+             version = version + 1 WHERE id = $2 AND lifecycle_state = $3",
+        )
+        .bind(crate::models::LifecycleState::Open.as_str())
+        .bind(id)
+        .bind(crate::models::LifecycleState::Quarantined.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("operator_dequarantine update", e))?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now();
+        let action_kind = crate::signed_events::event_types::MEMORY_DEQUARANTINED;
+        let ph = crate::signed_events::payload_hash(
+            format!("{action_kind}|{id}|{}", ctx.agent_id).as_bytes(),
+        );
+        let cause = crate::signed_events::compute_cause_hash(&ctx.agent_id, action_kind, id, id);
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            ph,
+            ctx.agent_id.clone(),
+            action_kind.to_string(),
+            now.to_rfc3339(),
+            Some(&cause),
+        );
+        pg_append_signed_event_with_chain_in_tx(
+            &mut tx,
+            PgSignedEventInsert {
+                id: &event.id,
+                agent_id: &event.agent_id,
+                event_type: &event.event_type,
+                payload_hash: &event.payload_hash,
+                signature: event.signature.as_deref(),
+                attest_level: &event.attest_level,
+                timestamp: now,
+                cause_hash: event.cause_hash.as_deref(),
+            },
+        )
+        .await
+        .map_err(|e| to_store_err("operator_dequarantine append signed_event", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("operator_dequarantine commit", e))?;
+        // #2402 — the SAME observability the sqlite funnel emits, at the same
+        // point (post-commit, release-only). Emitted from the backend primitive
+        // so neither surface nor backend can skip it — the #1552 SAL-port-fanout
+        // failure mode applied to the observability half.
+        tracing::warn!(
+            target: "ai_memory::quarantine",
+            memory_id = %id,
+            operator = %ctx.agent_id,
+            "quarantine.operator_release: an operator RELEASED a quarantined memory back to \
+             lifecycle_state=open, overriding the #1948 federation containment decision; a \
+             memory.dequarantined signed-chain row was appended in the same transaction (#2402)"
+        );
+        crate::metrics::inc_operator_dequarantined();
+        Ok(true)
+    }
+
+    /// v1.0.0 #2402 — operator quarantine listing (postgres twin of
+    /// [`crate::storage::list_quarantined`]). Identifying metadata only; the
+    /// `content` column is deliberately not projected (it may be an at-rest
+    /// seal sentinel, and a quarantined row is untrusted input).
+    async fn list_quarantined(
+        &self,
+        namespace: Option<&str>,
+        limit: i64,
+    ) -> StoreResult<Vec<crate::models::QuarantinedMemory>> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        )> = match namespace {
+            Some(ns) => {
+                sqlx::query_as(
+                    "SELECT id, namespace, title, source, memory_kind, created_at, updated_at \
+                       FROM memories WHERE lifecycle_state = $1 AND namespace = $2 \
+                      ORDER BY updated_at DESC LIMIT $3",
+                )
+                .bind(crate::models::LifecycleState::Quarantined.as_str())
+                .bind(ns)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT id, namespace, title, source, memory_kind, created_at, updated_at \
+                       FROM memories WHERE lifecycle_state = $1 \
+                      ORDER BY updated_at DESC LIMIT $2",
+                )
+                .bind(crate::models::LifecycleState::Quarantined.as_str())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| to_store_err("list quarantined memories", e))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, namespace, title, source, memory_kind, created_at, updated_at)| {
+                    crate::models::QuarantinedMemory {
+                        id,
+                        namespace,
+                        title,
+                        source,
+                        memory_kind,
+                        created_at: created_at.to_rfc3339(),
+                        updated_at: updated_at.to_rfc3339(),
+                    }
+                },
+            )
+            .collect())
     }
 
     /// v0.7.0.1 S75 — read `MAX(version)` from the live `schema_version`
@@ -20212,11 +20893,18 @@ impl MemoryStore for PostgresStore {
         match row {
             Some(r) => {
                 let mem = Self::row_to_memory(&r)?;
+                // Ordinary read lane (#2402): fold non-visible lifecycle
+                // states (quarantined / tombstoned) into NotFound so
+                // existence does not leak. Shared SQL stays unfiltered
+                // so update()'s pre-read can still see those rows.
                 // #910 SAL-level scope=private gate — fold permission
                 // denials into NotFound so the trait does not leak
                 // existence to callers that lack read permission.
                 // Admin/migrate paths set `bypass_visibility`.
-                if ctx.bypass_visibility || is_visible_to_caller(&mem, ctx.effective_principal()) {
+                if mem.lifecycle_state.is_recall_visible()
+                    && (ctx.bypass_visibility
+                        || is_visible_to_caller(&mem, ctx.effective_principal()))
+                {
                     Ok(mem)
                 } else {
                     Err(StoreError::NotFound { id: id.to_string() })
@@ -31358,6 +32046,206 @@ mod tests {
             kg_query_row_cap(Some(usize::MAX)),
             KG_QUERY_MAX_LIMIT_SAL,
             "an absurd limit clamps to the hard ceiling, never unbounded"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v1.0.0 #2614 — the blocking-DDL boot-brick class.
+    //
+    // A migrate arm that runs blocking DDL on a POOLED connection carries
+    // `after_connect`'s `lock_timeout = 5 s`, so a SINGLE ordinary in-flight
+    // writer aborts it, the version is never stamped, and `connect()`
+    // propagates the error — the daemon cannot boot, identically on every
+    // retry. The fix's two decision points are (a) is this failure TRANSIENT
+    // contention (retry) or PERMANENT (fail now), and (b) is the total
+    // retry budget bounded well inside a supervisor's start deadline. Both
+    // are pure and pinned here; the wire behaviour rides the pg lane.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sqlstate_57014_is_disambiguated_by_its_message_2614() {
+        // Postgres emits `57014 query_canceled` for BOTH timeout families.
+        // Only the LOCK-timeout half is transient: retrying a STATEMENT-timeout
+        // abort means 3 x DDL_STATEMENT_TIMEOUT_MS of repeated ACCESS
+        // EXCLUSIVE attempts, which is a far worse crash-loop than the brick
+        // this fix removes.
+        assert!(is_retryable_ddl_sqlstate(
+            SQLSTATE_QUERY_CANCELED,
+            "canceling statement due to lock timeout"
+        ));
+        assert!(
+            !is_retryable_ddl_sqlstate(
+                SQLSTATE_QUERY_CANCELED,
+                "canceling statement due to statement timeout"
+            ),
+            "a statement-timeout abort means the rewrite outran its budget — \
+             retrying it burns {} ms x {} attempts and blows the supervisor deadline",
+            DDL_STATEMENT_TIMEOUT_MS,
+            DDL_ARM_MAX_ATTEMPTS
+        );
+        assert!(
+            !is_retryable_ddl_sqlstate(
+                SQLSTATE_QUERY_CANCELED,
+                "canceling statement due to user request"
+            ),
+            "an operator cancel is not a contention retry either"
+        );
+
+        // The unambiguous codes still decide on the code alone.
+        for code in DDL_RETRYABLE_SQLSTATES {
+            assert!(is_retryable_ddl_sqlstate(code, ""), "{code} must retry");
+        }
+        assert!(
+            !DDL_RETRYABLE_SQLSTATES.contains(&SQLSTATE_QUERY_CANCELED),
+            "57014 must never be decidable on the code alone"
+        );
+        // A permanent failure class: syntax error, undefined column, disk full.
+        for code in ["42601", "42703", "53100", "23505"] {
+            assert!(
+                !is_retryable_ddl_sqlstate(code, "canceling statement due to lock timeout"),
+                "{code} is permanent regardless of any message text"
+            );
+        }
+    }
+
+    #[test]
+    fn only_lock_contention_errors_are_retried_2614() {
+        let contention = [
+            "backend unavailable: postgres: apply v57 blocking ddl: error returned from \
+             database: canceling statement due to lock timeout",
+            "backend unavailable: postgres: apply v89 blocking ddl: deadlock detected",
+            "backend unavailable: postgres: could not obtain lock on relation \"memories\"",
+        ];
+        for detail in contention {
+            let e = StoreError::BackendUnavailable {
+                backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
+                detail: detail.to_string(),
+            };
+            assert!(
+                is_lock_contention_store_err(&e),
+                "must be retried: {detail}"
+            );
+        }
+
+        // PERMANENT failures must fail on the FIRST attempt rather than burn
+        // the budget: retrying a syntax error or a disk-full three times just
+        // delays the refusal by the whole backoff schedule.
+        let permanent = [
+            "backend unavailable: postgres: apply v57 blocking ddl: syntax error at or near",
+            "backend unavailable: postgres: could not extend file: No space left on device",
+            "backend unavailable: postgres: canceling statement due to statement timeout",
+        ];
+        for detail in permanent {
+            let e = StoreError::BackendUnavailable {
+                backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
+                detail: detail.to_string(),
+            };
+            assert!(
+                !is_lock_contention_store_err(&e),
+                "must NOT be retried: {detail}"
+            );
+        }
+
+        // A non-backend variant is never a contention retry.
+        assert!(!is_lock_contention_store_err(&StoreError::InvalidInput {
+            detail: "canceling statement due to lock timeout".to_string(),
+        }));
+
+        // An arm that ALREADY spent its own bounded budget must not be
+        // retried again by the ladder: its refusal quotes the postgres cancel
+        // text, so without the marker the budgets would MULTIPLY
+        // (DDL_ARM_MAX_ATTEMPTS squared) and blow past the supervisor start
+        // deadline — converting the brick this fix removes into the
+        // crash-loop it also refuses to create.
+        let exhausted = StoreError::BackendUnavailable {
+            backend: crate::storage::schema_guard::BACKEND_POSTGRES.to_string(),
+            detail: format!(
+                "{DDL_BUDGET_EXHAUSTED_MARKER} REFUSING to boot: schema migration v57 \
+                 could not acquire the ACCESS EXCLUSIVE lock on `memories` after 3 \
+                 attempts (last error: canceling statement due to lock timeout)."
+            ),
+        };
+        assert!(
+            !is_lock_contention_store_err(&exhausted),
+            "an exhausted blocking-DDL budget must terminate the ladder, not restart it"
+        );
+    }
+
+    #[test]
+    fn the_ddl_retry_budget_stays_inside_a_supervisor_start_deadline_2614() {
+        // systemd's `TimeoutStartSec` defaults to 90 s. The lock-acquisition
+        // budget (attempts x lock_timeout + the backoff between them) must
+        // fit inside that with room for the DDL itself, or the fix converts
+        // one failure mode (a brick) into another (a crash-loop).
+        let mut budget_ms = 0_u64;
+        for attempt in 1..=DDL_ARM_MAX_ATTEMPTS {
+            budget_ms += DDL_LOCK_TIMEOUT_MS;
+            if attempt < DDL_ARM_MAX_ATTEMPTS {
+                budget_ms += DDL_ARM_RETRY_BACKOFF_MS * (1_u64 << (attempt - 1));
+            }
+        }
+        const SYSTEMD_DEFAULT_START_TIMEOUT_MS: u64 = 90_000;
+        assert!(
+            budget_ms < SYSTEMD_DEFAULT_START_TIMEOUT_MS / 2,
+            "lock-acquisition budget {budget_ms}ms must leave most of the \
+             {SYSTEMD_DEFAULT_START_TIMEOUT_MS}ms start deadline for the DDL itself"
+        );
+        assert!(
+            DDL_LOCK_TIMEOUT_MS > DEFAULT_LOCK_TIMEOUT_SECS * 1_000,
+            "the DDL lock budget must EXCEED the request-path default, or the \
+             dedicated connection buys nothing"
+        );
+        assert!(
+            DDL_LOCK_TIMEOUT_MS > 0 && DDL_STATEMENT_TIMEOUT_MS > 0,
+            "neither timeout may be cleared to 0 — an unbounded wait hangs \
+             connect() past the supervisor deadline"
+        );
+        assert!(
+            DDL_STATEMENT_TIMEOUT_MS > DDL_LOCK_TIMEOUT_MS,
+            "the statement bound must outlast the lock bound or the lock wait \
+             can never complete"
+        );
+
+        // The LADDER-level retry runs the whole body again for the pooled,
+        // metadata-only arms (5 s `after_connect` lock_timeout each). Its own
+        // budget must ALSO fit, and — because a blocking arm's exhausted
+        // refusal is marked non-retryable — the two budgets ADD rather than
+        // multiply. Pin the sum, not each half: that is the number a
+        // supervisor actually sees.
+        let mut ladder_ms = 0_u64;
+        for attempt in 1..=DDL_ARM_MAX_ATTEMPTS {
+            ladder_ms += DEFAULT_LOCK_TIMEOUT_SECS * 1_000;
+            if attempt < DDL_ARM_MAX_ATTEMPTS {
+                ladder_ms += DDL_ARM_RETRY_BACKOFF_MS * (1_u64 << (attempt - 1));
+            }
+        }
+        assert!(
+            ladder_ms + budget_ms < SYSTEMD_DEFAULT_START_TIMEOUT_MS,
+            "ladder budget {ladder_ms}ms + blocking-arm budget {budget_ms}ms must stay \
+             inside the {SYSTEMD_DEFAULT_START_TIMEOUT_MS}ms start deadline"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_embedding_dim_refusal_names_the_knobs_2626() {
+        let e = unsupported_embedding_dim(3072);
+        let StoreError::InvalidInput { detail } = e else {
+            panic!("must be an InvalidInput refusal");
+        };
+        assert!(detail.contains("3072"));
+        assert!(
+            detail.contains(crate::config::ENV_EMBED_DIM),
+            "the refusal must name the ENV knob — pre-#2626 no env var could \
+             express the dim at all, so the operator had nowhere to go"
+        );
+        assert!(
+            detail.contains("[embeddings].dim"),
+            "and the config-file knob"
+        );
+        assert!(
+            detail.contains("2000"),
+            "and WHY the list is not simply widened: pgvector ANN indexes cap \
+             at 2000 dimensions, so a wider column is unindexable"
         );
     }
 

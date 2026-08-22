@@ -411,7 +411,13 @@ pub const META_KEY_FAMILY: &str = "family";
 // 2026-07-28 (#2391) — bumped 93 → 94: the commit-checkpoint resolve write
 // surface `POST /api/v1/checkpoints/{id}/resolve`
 // (`handlers::resolve_checkpoint`) — local resolve + W-of-N federation fanout.
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 94;
+// 2026-08-22 (#2402) — bumped 94 → 96: the operator quarantine route-OUT pair
+// `GET /api/v1/admin/quarantine` (`handlers::list_quarantined`) +
+// `POST /api/v1/admin/quarantine/{id}/release`
+// (`handlers::release_quarantined`) — admin-gated inspect + audited release of
+// rows the #1948 federation containment posture holds. Both are new PATHS, so
+// EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 2 as well.
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 96;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -441,7 +447,10 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // `/api/v1/skill/{id}/retire` (skill retire/unretire write surface).
 // 2026-07-28 (#2391) — bumped 79 → 80: the new unique path
 // `/api/v1/checkpoints/{id}/resolve` (commit-checkpoint resolve write surface).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 80;
+// 2026-08-22 (#2402) — bumped 80 → 82: the two new unique paths
+// `/api/v1/admin/quarantine` (operator inspect) and
+// `/api/v1/admin/quarantine/{id}/release` (audited operator release).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 82;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -486,8 +495,10 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 80;
 /// `ai-memory watch [--once|--daemon]` L3 substrate poll-based
 /// filesystem-watcher capture daemon, bumping 88 → 89; v1.0.0 #2676
 /// added `Features` for the `ai-memory features` build-feature
-/// self-report, bumping 89 → 90.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 90;
+/// self-report, bumping 89 → 90; v1.0.0 #2402 added `Quarantine` for
+/// the `ai-memory quarantine list|release <id>` operator route-OUT of the
+/// #1948 federation quarantine, bumping 90 → 91.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 91;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -506,8 +517,9 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 90;
 /// (substrate record-stop actuator), bumping 89 → 90; v1.0.0 #1978
 /// added `Watch` (L3 substrate poll-based filesystem-watcher capture
 /// daemon), bumping 90 → 91; v1.0.0 #2676 added `Features` (build-feature
-/// self-report), bumping 91 → 92.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 92;
+/// self-report), bumping 91 → 92; v1.0.0 #2402 added `Quarantine` (operator
+/// route-OUT of the #1948 federation quarantine), bumping 92 → 93.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 93;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
@@ -1247,6 +1259,18 @@ pub fn build_router_with_timeout(
         .route(
             handlers::routes::QUOTA_STATUS,
             post(handlers::quota_status_handler),
+        )
+        // v1.0.0 #2402 — the operator route OUT of quarantine. Both are
+        // admin-gated inside the handler (`require_admin`), and the release
+        // lands its `memory.dequarantined` signed audit row in the same
+        // transaction as the state change on both backends.
+        .route(
+            handlers::routes::ADMIN_QUARANTINE,
+            get(handlers::list_quarantined),
+        )
+        .route(
+            handlers::routes::ADMIN_QUARANTINE_ID_RELEASE,
+            post(handlers::release_quarantined),
         )
         .route(handlers::routes::STATS, get(handlers::get_stats))
         .route(handlers::routes::GC, post(handlers::run_gc))

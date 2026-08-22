@@ -77,6 +77,9 @@ use ai_memory::handlers::{path_is_registered_route, postgres_endpoint_supported}
 fn all_registered_paths() -> Vec<&'static str> {
     vec![
         routes::ACTIONS_ID_TRANSITION,
+        // v1.0.0 #2402 — the operator quarantine route-OUT pair.
+        routes::ADMIN_QUARANTINE,
+        routes::ADMIN_QUARANTINE_ID_RELEASE,
         routes::AGENTS,
         routes::AGENTS_ID_PUBKEY,
         routes::APPROVALS_PENDING_ID,
@@ -214,15 +217,29 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 
 /// Authoritative counts pinned 2026-08-09 (Phase-1). Bump in lockstep
 /// with a dated justification when the allow-list legitimately changes.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 59;
+// 2026-08-22 (#2402) — bumped 59 -> 61 pg-supported / 80 -> 82 total: the two
+// operator quarantine route-OUT paths (`GET /api/v1/admin/quarantine`,
+// `POST /api/v1/admin/quarantine/{id}/release`). Both are pg-SUPPORTED and the
+// BINDING SAFETY INVARIANT is met by construction: each handler takes the
+// `StorageBackend::Postgres` branch and dispatches to `app.store`
+// (`MemoryStore::list_quarantined` / `operator_dequarantine`, both implemented
+// by `PostgresStore`), never `app.db.lock()`. Proof-of-dispatch:
+// `tests/quarantine_operator_surface_2402.rs::
+// postgres_operator_quarantine_surface_parity_2402` drives both verbs against a
+// live postgres and asserts the row AND its `memory.dequarantined` signed-chain
+// audit row land on that backend. The fully-501 inventory is unchanged.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 61;
 const EXPECTED_FULLY_501_PATHS: usize = 21;
-const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 80;
+const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 82;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
 /// names the allow-list body references. A silent match-arm add/remove
 /// (the drift class that produced the audit's count disagreement) fails
 /// here until this SSOT is updated — forcing a reviewed edit.
 const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
+    // v1.0.0 #2402 — operator quarantine inspect (the release half is a
+    // path-parameter route, frozen as a helper below).
+    "ADMIN_QUARANTINE",
     "AGENTS",
     "APPROVALS_STREAM",
     "ARCHIVE",
@@ -274,6 +291,8 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
 
 const EXPECTED_ALLOWLIST_HELPERS: &[&str] = &[
     "actions_transition_path",
+    // v1.0.0 #2402 — /api/v1/admin/quarantine/{id}/release
+    "admin_quarantine_release_path",
     "agents_pubkey_path",
     "approvals_decide_path",
     "archive_restore_path",

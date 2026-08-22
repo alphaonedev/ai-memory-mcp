@@ -1301,13 +1301,14 @@ fn lookup_namespace_standard(
     let Ok(Some(mem)) = db::get(conn, &standard_id) else {
         return StandardLookup::Absent;
     };
-    // #2544 — a bound standard must be LIVE to govern. `db::get` carries NO
-    // lifecycle/expiry predicate, so an expired / tombstoned / quarantined
-    // memory would otherwise be served as the governing namespace standard
-    // into every recall / session_start (with its tokens uncounted). Gate it
-    // with the SAME fail-closed lifecycle allow-list (`is_recall_visible`, the
-    // Rust twin of the SQL `lifecycle_visible_clause`) + the expiry guard the
-    // read lanes apply, so a non-live standard is treated as if none is bound.
+    // #2544 — a bound standard must be LIVE to govern. `db::get` now hides
+    // non-recall-visible lifecycle states (#2402) but still has no expiry
+    // predicate, so an expired (yet still-open) memory would otherwise be
+    // served as the governing namespace standard into every recall /
+    // session_start (with its tokens uncounted). Gate it with the SAME
+    // fail-closed lifecycle allow-list (`is_recall_visible`, the Rust twin
+    // of the SQL `lifecycle_visible_clause`) + the expiry guard the read
+    // lanes apply, so a non-live standard is treated as if none is bound.
     if !mem.lifecycle_state.is_recall_visible()
         || crate::storage::lifecycle::is_expired(
             mem.expires_at.as_deref(),
@@ -4417,11 +4418,29 @@ pub fn run_mcp_server(
             || crate::embeddings::embedding_space_fingerprint("mock-embedder"),
             |e| e.space_fingerprint(),
         );
+        // v1.0.0 #2606 — the fingerprint omits the vector dim, so the seed set
+        // is narrowed by the live embedder's WIDTH as well; without it a
+        // config-only `dim` change seeds this graph with two dim populations
+        // under one stamp and the ANN phase compares prefix-truncated vectors.
+        // `None` (an embedder that reports no width) SKIPS the warm build
+        // entirely: recall then linear-scans with the fail-closed full-dim
+        // rescoring — slower, always correct — rather than seeding a graph at
+        // a guessed width.
+        let warm_active_dim = embedder.as_ref().and_then(|e| e.embedding_dim());
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
-            let Some(entries) =
-                crate::daemon_runtime::load_boot_index_entries(&warm_db_path, &warm_active_space)
-            else {
+            let Some(active_dim) = warm_active_dim else {
+                eprintln!(
+                    "ai-memory: embedder reports no vector dimension; skipping the HNSW \
+                     warm build and using linear scan (#2606)"
+                );
+                return;
+            };
+            let Some(entries) = crate::daemon_runtime::load_boot_index_entries(
+                &warm_db_path,
+                &warm_active_space,
+                active_dim,
+            ) else {
                 return;
             };
             if entries.is_empty() {

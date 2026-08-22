@@ -279,6 +279,38 @@ impl std::fmt::Display for MemoryKind {
     }
 }
 
+/// v1.0.0 [#2402] — one row in the operator's quarantine listing.
+///
+/// Plaintext IDENTIFYING metadata ONLY — deliberately NOT `content`. A
+/// quarantined row is untrusted input by construction (the #1948 route-IN is
+/// an UNATTRIBUTED federation write), and its content may additionally be
+/// sealed at rest, where the `content` column holds an empty sentinel rather
+/// than the memory. Projecting it into this new operator lane would either
+/// surface untrusted bytes where nothing asked for them or render the
+/// sentinel as though it were the text. The operator adjudicates from the
+/// identity, releases, and then reads the row through the ordinary
+/// decrypting, governed lanes.
+///
+/// [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantinedMemory {
+    /// Memory id — the argument to `ai-memory quarantine release`.
+    pub id: String,
+    /// Namespace the row was written into.
+    pub namespace: String,
+    /// Row title (never sealed at rest; only `content` is).
+    pub title: String,
+    /// `memories.source` role label (e.g. `federation`), i.e. WHICH lane
+    /// admitted it — the first thing an operator needs to adjudicate.
+    pub source: String,
+    /// `memories.memory_kind` discriminator.
+    pub memory_kind: String,
+    /// RFC3339 creation timestamp.
+    pub created_at: String,
+    /// RFC3339 last-update timestamp (quarantining bumps it).
+    pub updated_at: String,
+}
+
 /// v0.8.0 Pillar 2 (#1709) — typed-cognition lifecycle state stored on the
 /// `memories.lifecycle_state` column (schema v64).
 ///

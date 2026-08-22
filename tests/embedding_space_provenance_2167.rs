@@ -810,13 +810,70 @@ fn t_hnsw_boot_seeds_active_space_rows_only_2182() {
     let n1 = seed_embedded(&conn, "boot null", &qe, &active);
     null_out_space(&conn, &n1);
 
-    let entries = db::get_all_embeddings(&conn, &active).unwrap();
+    let entries = db::get_all_embeddings(&conn, &active, qe.len()).unwrap();
     let ids: std::collections::HashSet<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(
         ids,
         [a1.as_str()].into_iter().collect(),
         "the boot HNSW seed must include ONLY active-space rows (foreign + NULL excluded); \
          got {ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #2606 — the seed set is filtered by DIM as well as by space.
+//
+// `embedding_space_fingerprint` deliberately omits the vector dimension, and
+// the dim for a given model id is CONFIG-determined, so the same model at two
+// dims stamps the IDENTICAL fingerprint. A space-only seed filter therefore
+// admitted both populations and the #2167 §3.3 layer-1 claim ("a foreign
+// vector can never be an ANN candidate") did not hold: `cosine_distance` falls
+// through to a zip-truncated prefix comparison under the tolerant #114
+// default, so the off-dim rows out-ranked true neighbours inside `ann_limit`
+// and were then dropped by the fail-closed full-dim rescoring — silent recall
+// LOSS. This pins the restored invariant.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t_hnsw_boot_excludes_same_space_off_dim_rows_2606() {
+    let _strict_read = strict_flag_read(); // #2189 flip-vs-read guard
+    let (conn, _p) = fresh_db();
+    let active = embedding_space_fingerprint("google/gemini-embedding-2");
+
+    // SAME fingerprint, two different widths — exactly what a config-only
+    // `[embeddings].dim` change (or its absence on one fleet node) mints.
+    let four = [1.0_f32, 0.0, 0.0, 0.0];
+    let eight = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    // `set_embedding`'s dim guard is PER-NAMESPACE, so the two populations
+    // co-exist in one corpus whenever they were written under different
+    // namespaces (or by a `reembed` that re-stamps the SAME fingerprint).
+    // `seed_embedded_raw` reproduces that state directly.
+    let in_dim = seed_embedded_raw(&conn, "active dim row", &four, Some(&active));
+    let off_dim = seed_embedded_raw(&conn, "same space, other dim", &eight, Some(&active));
+
+    let entries = db::get_all_embeddings(&conn, &active, four.len()).unwrap();
+    let ids: std::collections::HashSet<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [in_dim.as_str()].into_iter().collect(),
+        "the seed must admit ONLY the ACTIVE dim; the same-space off-dim row poisons the \
+         graph with prefix-truncated distances. got {ids:?}"
+    );
+    assert!(
+        !ids.contains(off_dim.as_str()),
+        "#2606: an off-dim row under the same fingerprint must never enter the ANN index"
+    );
+
+    // Symmetry: seeding at the OTHER dim admits only the other population.
+    let other = db::get_all_embeddings(&conn, &active, eight.len()).unwrap();
+    assert_eq!(
+        other.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        vec![off_dim.as_str()],
+        "the filter selects the ACTIVE dim, it does not hard-code one"
+    );
+    assert!(
+        other.iter().all(|(_, v)| v.len() == eight.len()),
+        "every seeded vector is exactly active_dim wide"
     );
 }
 

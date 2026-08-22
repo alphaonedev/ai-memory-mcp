@@ -2795,7 +2795,10 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
     let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     match rows.next() {
-        Some(Ok(m)) => Ok(Some(m)),
+        // Ordinary read lane: hide system-only states (quarantined /
+        // tombstoned). The shared SQL stays unfiltered so update() can
+        // still see those rows (#2402).
+        Some(Ok(m)) => Ok(m.lifecycle_state.is_recall_visible().then_some(m)),
         Some(Err(e)) => Err(e.into()),
         None => Ok(None),
     }
@@ -3369,6 +3372,173 @@ pub fn set_lifecycle_state(
         params![state.as_str(), now, id],
     )?;
     Ok(n > 0)
+}
+
+/// v1.0.0 [#2402] — the operator INSPECTION half of the quarantine route-OUT
+/// contract: list the rows currently held in
+/// [`crate::models::LifecycleState::Quarantined`].
+///
+/// # Why a dedicated read
+///
+/// Quarantine hides a row from EVERY ordinary lane — `get`, `list`, `recall`,
+/// federation relay — via [`crate::models::lifecycle_visible_clause`]. That is
+/// correct as a containment posture and fatal as a permanent one: under
+/// `asi-hard`, `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` is PINNED on, so an
+/// unattributed inbound memory is quarantined and then invisible to the very
+/// operator who is supposed to adjudicate it. #1948 advertised "operator
+/// dequarantine" as the route OUT, but the primitive had no caller, so in
+/// practice there was neither a way to SEE what was held nor a way to release
+/// it. This is the see half; [`dequarantine`] is the release half.
+///
+/// # What it returns, and what it deliberately does not
+///
+/// Plaintext IDENTIFYING metadata only — never `content`. A quarantined row is
+/// by definition untrusted input, and its content may additionally be sealed
+/// at rest (`encrypted_envelope`), where the `content` column holds an empty
+/// sentinel rather than text. Projecting it here would either leak untrusted
+/// bytes into a new lane or, worse, render the sentinel as though it were the
+/// memory. The operator decides from the identifying metadata, releases, and
+/// then reads the row through the ordinary (decrypting, governed) lanes.
+///
+/// `namespace` narrows the listing; `None` lists across namespaces. `limit`
+/// bounds the page — a quarantine backlog under a federation storm can be
+/// large, and an unbounded operator read is its own availability hazard.
+///
+/// [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
+///
+/// # Errors
+///
+/// Propagates the rusqlite query error.
+pub fn list_quarantined(
+    conn: &Connection,
+    namespace: Option<&str>,
+    limit: i64,
+) -> Result<Vec<crate::models::QuarantinedMemory>> {
+    let sql = format!(
+        "SELECT id, namespace, title, source, memory_kind, created_at, updated_at \
+           FROM memories WHERE lifecycle_state = ?1{} \
+          ORDER BY updated_at DESC LIMIT ?2",
+        if namespace.is_some() {
+            " AND namespace = ?3"
+        } else {
+            ""
+        }
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let quarantined = crate::models::LifecycleState::Quarantined.as_str();
+    let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<crate::models::QuarantinedMemory> {
+        Ok(crate::models::QuarantinedMemory {
+            id: row.get(0)?,
+            namespace: row.get(1)?,
+            title: row.get(2)?,
+            source: row.get(3)?,
+            memory_kind: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    };
+    let rows = match namespace {
+        Some(ns) => stmt
+            .query_map(params![quarantined, limit, ns], map)?
+            .collect::<rusqlite::Result<Vec<_>>>(),
+        None => stmt
+            .query_map(params![quarantined, limit], map)?
+            .collect::<rusqlite::Result<Vec<_>>>(),
+    };
+    Ok(rows?)
+}
+
+/// v1.0.0 [#2402] — the AUDITED OPERATOR release: clear a quarantined row AND
+/// append a `memory.dequarantined` signed-chain row in ONE transaction.
+///
+/// The sqlite half of the operator route-OUT that #1948 advertised and never
+/// exposed. It is deliberately SEPARATE from [`dequarantine`]:
+///
+/// * [`dequarantine`] is the SYSTEM path (dequarantine-on-attest) — the
+///   substrate re-deciding when a later write from the author's now-enrolled
+///   key verifies. Nothing is being overridden, so no operator attribution
+///   exists to record.
+/// * This is a HUMAN overriding a containment decision. Under `asi-hard` the
+///   quarantine knob is pinned on and this is the only lever that exists, so
+///   WHO released WHAT must land in the append-only chain — and it must land
+///   ATOMICALLY with the state change, or a crash between the two leaves a
+///   released row with no trace (the #1552 audit-lags-the-write class).
+///
+/// `agent_id` is the recorded actor and MUST be the authenticated principal
+/// (the CLI's resolved identity, or the HTTP admin caller's key-derived
+/// principal) — never a self-asserted request field.
+///
+/// The `WHERE lifecycle_state = 'quarantined'` guard makes it idempotent: a
+/// row that is not quarantined is a strict no-op that returns `false` and
+/// writes NO audit row, so a released row cannot be re-released and a
+/// tombstoned row cannot be revived.
+///
+/// [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
+///
+/// # Errors
+///
+/// Propagates the rusqlite transaction / update / audit-append error. A
+/// failure to append the audit row ROLLS BACK the release — the release is
+/// not worth having without its trace.
+pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) -> Result<bool> {
+    // #1955 R45 — record-stop fence. This is a WRITE funnel (it moves
+    // `lifecycle_state` and appends to `signed_events`), and the CLI-local and
+    // HTTP-sqlite lanes reach it WITHOUT passing through `SqliteStore`, so the
+    // adapter's `gate_record_stop` does not cover them. Gating here — the same
+    // place every other sqlite write funnel gates — is what makes the fence
+    // hold on every reachable path rather than only the SAL one.
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    // BEGIN IMMEDIATE, not the rusqlite DEFERRED default. This transaction
+    // pairs a write with a signed-chain append, and the chain append READS the
+    // previous head before inserting; that read-then-INSERT pair must be
+    // serialized at the SQLite layer or two writers on sibling connections can
+    // both read a stale head (`signed_events.rs` SEC-3 — the deferred-audit
+    // drainer opens its own connection on the same file). Taking the WAL write
+    // lock at BEGIN also makes the ordering of the statements inside this
+    // function non-load-bearing, so a later edit cannot silently reintroduce
+    // the race by moving a read above the UPDATE.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
+         WHERE id = ?3 AND lifecycle_state = ?4",
+        params![
+            crate::models::LifecycleState::Open.as_str(),
+            Utc::now().to_rfc3339(),
+            id,
+            crate::models::LifecycleState::Quarantined.as_str(),
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    let action_kind = crate::signed_events::event_types::MEMORY_DEQUARANTINED;
+    let ph =
+        crate::signed_events::payload_hash(format!("{action_kind}|{id}|{agent_id}").as_bytes());
+    // v73 (#1822, G5a) — bind the TRIGGERING CAUSE (caller identity + the
+    // release action + the memory id) into the signed chain; the inputs are
+    // secret-screened inside `compute_cause_hash`.
+    let cause = crate::signed_events::compute_cause_hash(agent_id, action_kind, id, id);
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        ph,
+        agent_id.to_string(),
+        action_kind.to_string(),
+        Utc::now().to_rfc3339(),
+        Some(&cause),
+    );
+    crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
+    tx.commit()?;
+    // #2402 — observability. The chain row is the forensic record; this WARN +
+    // counter are the fleet-watchable signal, and they are emitted from the
+    // BACKEND primitive rather than each caller so no surface (CLI, admin
+    // HTTP, either backend) can be added later and silently skip them.
+    tracing::warn!(
+        target: "ai_memory::quarantine",
+        memory_id = %id,
+        operator = %agent_id,
+        "quarantine.operator_release: an operator RELEASED a quarantined memory back to          lifecycle_state=open, overriding the #1948 federation containment decision; a          memory.dequarantined signed-chain row was appended in the same transaction (#2402)"
+    );
+    crate::metrics::inc_operator_dequarantined();
+    Ok(true)
 }
 
 /// v1.0.0 R19/A3 (#1948, decision `560c8007`) — system-only RAW dequarantine.
@@ -17076,27 +17246,100 @@ pub fn count_embedded_memories(conn: &Connection) -> Result<i64> {
 /// dim-matching NULL row would already have been stamped active, so a
 /// surviving NULL row is a genuinely-unverified vector that must not be
 /// indexed. The §1 partial index keeps this cheap.
+///
+/// # v1.0.0 [#2606] — the seed set is filtered by DIM as well
+///
+/// The space fingerprint is `<model_id>#<prefix_scheme>` and
+/// [DELIBERATELY excludes the dimension](crate::embeddings::Embedder::space_fingerprint)
+/// — sound for its original consumer (the federation receive lane, which
+/// carries a companion `receiver_dim == se.dim` gate) but NOT for this one,
+/// where no companion gate existed. The dim for a given model id is
+/// CONFIG-determined (`[embeddings].dim` / `AI_MEMORY_EMBED_DIM` selecting a
+/// Matryoshka truncation), so the same model at 768 and at 3072 stamps the
+/// IDENTICAL fingerprint. A space-only filter therefore admitted BOTH
+/// populations and the claim above — "a foreign vector can never be an ANN
+/// candidate" — did not hold: `hnsw::cosine_distance` falls through to
+/// `a.iter().zip(b.iter())` under the tolerant default (#114), silently
+/// comparing the shared prefix, so out-of-space rows out-ranked true
+/// neighbours inside the `ann_limit` cutoff and were then dropped by the
+/// fail-closed full-dim rescoring — a silent recall LOSS (degrade, never a
+/// wrong result).
+///
+/// `active_dim` closes it structurally. This is a pure NARROWING of an
+/// already-filtered set — it cannot admit anything new — and it is applied
+/// twice on purpose:
+///
+/// * in SQL, on the two byte-lengths the blob format allows for `active_dim`
+///   (`1 + 4n` headed since v17, bare `4n` legacy — see
+///   [`crate::embeddings::decode_embedding_blob`]), so the mismatched rows are
+///   never even read; and
+/// * in Rust after decoding, which is AUTHORITATIVE — the decoder is the SSOT
+///   for what a blob actually contains, and a length arithmetic bug must not
+///   be able to widen the set.
+///
+/// The filter is on the BLOB, deliberately, not on the `memories.embedding_dim`
+/// column: that column is nullable and legacy rows predate it, so
+/// `AND embedding_dim = ?` would silently DROP correctly-sized legacy vectors
+/// from the index — trading this recall loss for a different one. A byte
+/// length cannot be stale with respect to the bytes it measures.
+///
+/// **Named residual.** This restores layer 1 for the boot/rebuild SEED. The
+/// LIVE `VectorIndex::insert` path keeps its own dim guard behind
+/// `AI_MEMORY_REQUIRE_DIM_MATCH` (#1005 G4), which is default-OFF; flipping
+/// that default is #2606's F3 and rides a WARN cycle in v1.x rather than
+/// being smuggled in here. Until then a mixed-dim corpus can still re-admit a
+/// foreign-dim vector between rebuilds, and every rebuild sweeps it back out.
+///
+/// [#2606]: https://github.com/alphaonedev/ai-memory-mcp/issues/2606
+///
+/// # Errors
+///
+/// Bubbles the rusqlite error from the seed query.
 pub fn get_all_embeddings(
     conn: &Connection,
     active_space: &str,
+    active_dim: usize,
 ) -> Result<Vec<(String, Vec<f32>)>> {
     let mut stmt = conn.prepare(
         "SELECT id, embedding FROM memories \
-         WHERE embedding IS NOT NULL AND embedding_space = ?1",
+         WHERE embedding IS NOT NULL AND embedding_space = ?1 \
+           AND (length(embedding) = ?2 OR length(embedding) = ?3)",
     )?;
-    let rows = stmt.query_map(params![active_space], |row| {
+    // The two legal encodings of an `active_dim`-wide vector. `i64` because
+    // that is what SQLite's `length()` yields; saturating because a
+    // nonsensical dim must produce an EMPTY seed set, never a wrapped length
+    // that happens to match some other population.
+    let payload_len = i64::try_from(active_dim)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(4);
+    let headed_len = payload_len.saturating_add(1);
+    let rows = stmt.query_map(params![active_space, headed_len, payload_len], |row| {
         let id: String = row.get(0)?;
         let bytes: Vec<u8> = row.get(1)?;
         Ok((id, bytes))
     })?;
     let mut entries = Vec::new();
+    let mut dim_mismatch: u64 = 0;
     for row in rows {
         let (id, bytes) = row?;
         if bytes.is_empty() {
             continue;
         }
         match crate::embeddings::decode_embedding_blob(&bytes) {
-            Ok(floats) => entries.push((id, floats)),
+            // #2606 — the AUTHORITATIVE dim gate: the decoder, not byte
+            // arithmetic, decides what the blob holds.
+            Ok(floats) if floats.len() == active_dim => entries.push((id, floats)),
+            Ok(floats) => {
+                dim_mismatch = dim_mismatch.saturating_add(1);
+                tracing::debug!(
+                    memory_id = %id,
+                    stored_dim = floats.len(),
+                    active_dim,
+                    "#2606: excluding a same-space vector of a different dimension from the \
+                     HNSW seed set (it would only be compared prefix-truncated, then dropped \
+                     by the full-dim rescoring)"
+                );
+            }
             Err(e) => {
                 tracing::warn!(
                     memory_id = %id,
@@ -17105,6 +17348,18 @@ pub fn get_all_embeddings(
                 );
             }
         }
+    }
+    if dim_mismatch > 0 {
+        tracing::warn!(
+            active_space = %active_space,
+            active_dim,
+            dim_mismatch,
+            "#2606: {dim_mismatch} row(s) carry the ACTIVE embedding-space fingerprint at a \
+             DIFFERENT vector dimension and were excluded from the ANN index. The fingerprint \
+             omits the dim, so a config-only dim change mints this state silently. Recall \
+             degrades (fewer semantic candidates), it is never wrong. Heal with \
+             `ai-memory reembed`."
+        );
     }
     Ok(entries)
 }

@@ -65,6 +65,12 @@ pub mod namespace;
 /// Substrate-only wrappers over `crate::offload::ContextOffloader`.
 pub mod offload;
 pub mod promote;
+/// v1.0.0 #2402 — `ai-memory quarantine list | release <id>`: the operator
+/// route OUT of the #1948 federation quarantine, which #1948 advertised and
+/// shipped with no caller. `list` is read-only and projects identifying
+/// metadata only; `release` appends a `memory.dequarantined` signed audit row
+/// in the same transaction as the state change.
+pub mod quarantine;
 pub mod recall;
 /// v0.8.0 #1709/#1720 WS-B B2 — `ai-memory reown` subcommand. Rewrite
 /// the `metadata.agent_id` ownership stamp on a namespace's memories

@@ -48,6 +48,44 @@
 //! split, a transient lock would 503 a healthy node — a NEW false-failure
 //! class this change would otherwise have introduced.
 //!
+//! **Why the verdict is also DURABLE (v1.0.0 [#2630]).** The cached verdict
+//! above lives in process memory, and `/health` is framed as a liveness probe
+//! — which is exactly the signal an orchestrator answers by RESTARTING the
+//! container. A `Failed` verdict was therefore erased by the orchestrator's
+//! own remediation: the new process started at [`Verdict::Pending`],
+//! `/health` answered `200`, and the node served keyword recall over a corrupt
+//! index for the whole [`initial_delay`] window before the next check
+//! re-failed it — every restart, in a loop driven by the very signal that was
+//! supposed to take it out of rotation. The fail-closed contract held WITHIN
+//! one process lifetime and broke exactly at the restart boundary where the
+//! consumer lives.
+//!
+//! So a completed verdict is now written beside the database
+//! ([`verdict_path`]) and ADOPTED at boot ([`adopt_persisted_verdict`]): a
+//! `Failed` verdict survives restart until a fresh check clears it. Three
+//! deliberate asymmetries keep that honest:
+//!
+//! * Only a FAILURE is adopted. A persisted `Ok` is NOT re-presented as this
+//!   process's assertion — that would be a pass the running binary never
+//!   performed, the #2444 shape. A clean boot still starts `Pending`.
+//! * The record is a sidecar FILE, not a row in the database. The event being
+//!   recorded is "this database's index disagrees with its content", so
+//!   depending on that same database to store it is a control that fails
+//!   precisely when it is needed.
+//! * A DISABLED checker does not adopt. Nothing would ever run to clear an
+//!   adopted failure, so adopting there would fence the node at `503` with no
+//!   in-band way back — and would silently tighten a documented default
+//!   ([`ENV_INTERVAL_SECS`] `= 0` means "the control is absent", not "refuse
+//!   traffic"). The record is kept and announced at WARN instead; see
+//!   [`adopt_persisted_verdict_if_enforceable`].
+//!
+//! A node that boots with an adopted failure ALSO skips [`initial_delay`] and
+//! re-checks immediately, so a genuine repair is re-verified in seconds rather
+//! than after a jittered 6 h interval. Only already-failed nodes skip the
+//! spread, so the fleet-desynchronisation property is untouched.
+//!
+//! [#2630]: https://github.com/alphaonedev/ai-memory-mcp/issues/2630
+//!
 //! Design resolved by the 5-agent adversarial vote (`4d3ea1c5`), 4-1 for the
 //! cached-background-verdict shape over liveness-only-plus-`doctor`.
 
@@ -358,6 +396,196 @@ pub fn classify_error(err: &anyhow::Error) -> Outcome {
     Outcome::Unavailable
 }
 
+/// v1.0.0 #2630 — file-name suffix of the DURABLE verdict record, appended to
+/// the database path (`memories.db` → `memories.db.fts-verdict`). Beside the
+/// database rather than in it, so the record survives exactly as well as the
+/// corpus it describes (same volume, same backup) without depending on the
+/// database whose corruption it exists to record.
+pub const VERDICT_FILE_SUFFIX: &str = ".fts-verdict";
+
+/// v1.0.0 #2630 — first token of the durable verdict record. Versioned so a
+/// future format change is a recognisable mismatch rather than a silent
+/// mis-parse.
+pub const VERDICT_FILE_TAG: &str = "ai-memory-fts-verdict-v1";
+
+/// Path of the durable verdict record for `db_path`.
+#[must_use]
+pub fn verdict_path(db_path: &Path) -> PathBuf {
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push(VERDICT_FILE_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// v1.0.0 #2630 — write (or clear) the DURABLE record for a COMPLETED check.
+///
+/// * [`Outcome::Corrupt`] writes the record — the next boot adopts it.
+/// * [`Outcome::Verified`] REMOVES it — a fresh pass is what clears a failure,
+///   and the removal is what keeps a repaired node from being permanently
+///   fenced by a stale file.
+/// * [`Outcome::Unavailable`] leaves it exactly as-is, mirroring the in-memory
+///   rule that an operational error never moves the verdict.
+///
+/// The write is a single small `write`, not a temp-file rename: PRESENCE alone
+/// means "the last completed check failed", so even a torn or truncated record
+/// fails CLOSED. Best-effort — an I/O failure is loud (WARN on the failure
+/// path, where losing the record matters) but never propagates, because a
+/// checker that cannot write its sidecar must still record its verdict in
+/// memory and still 503 this process.
+pub fn persist_verdict(db_path: &Path, outcome: Outcome, now_unix: i64) {
+    let path = verdict_path(db_path);
+    match outcome {
+        Outcome::Corrupt => {
+            let body = format!("{VERDICT_FILE_TAG} {VERDICT_FAILED} {now_unix}\n");
+            if let Err(e) = std::fs::write(&path, body) {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    path = %path.display(),
+                    error = %e,
+                    "could not persist the FAILED FTS verdict; this process still answers \
+                     503, but a restart would clear the verdict until the next check (#2630)"
+                );
+            }
+        }
+        Outcome::Verified => {
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    path = %path.display(),
+                    error = %e,
+                    "could not clear the persisted FTS verdict after a passing check; \
+                     the next boot will adopt a stale failure and 503 until its first \
+                     check clears it (#2630)"
+                );
+            }
+        }
+        Outcome::Unavailable => {}
+    }
+}
+
+/// v1.0.0 #2630 — read the durable record. `Some(unix_secs)` when a FAILURE is
+/// recorded (`0` when the record exists but its timestamp is unreadable).
+///
+/// FAIL CLOSED on anything ambiguous: only `NotFound` — the file genuinely is
+/// not there — reads as "no recorded failure". A record that exists but cannot
+/// be read or parsed is treated as a failure, because the alternative
+/// (assuming health from an unreadable control) is the one error that serves
+/// traffic over a corrupt index. It is self-healing: the first passing check
+/// of this process clears both the in-memory verdict and the file.
+#[must_use]
+pub fn load_persisted_failure(db_path: &Path) -> Option<i64> {
+    let path = verdict_path(db_path);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                path = %path.display(),
+                error = %e,
+                "the persisted FTS verdict exists but could not be read; treating it as a \
+                 FAILURE (fail closed) until a fresh check completes (#2630)"
+            );
+            return Some(0);
+        }
+    };
+    let mut tokens = raw.split_whitespace();
+    match (tokens.next(), tokens.next()) {
+        // Forward-compat: this version CLEARS the record on a pass rather than
+        // writing an `ok` one, but a future version that persists passes too
+        // must not have them misread as failures by an older binary.
+        (Some(VERDICT_FILE_TAG), Some(VERDICT_OK)) => None,
+        (Some(VERDICT_FILE_TAG), Some(VERDICT_FAILED)) => Some(
+            tokens
+                .next()
+                .and_then(|t| t.parse::<i64>().ok())
+                .unwrap_or(0),
+        ),
+        _ => {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                path = %path.display(),
+                "the persisted FTS verdict is unrecognised; treating it as a FAILURE \
+                 (fail closed) until a fresh check completes (#2630)"
+            );
+            Some(0)
+        }
+    }
+}
+
+/// v1.0.0 #2630 — adopt a durably-recorded FAILURE into `status` at boot.
+///
+/// Returns `true` when a failure was adopted, so the caller can log it and the
+/// checker can skip its startup spread and re-verify immediately. Call this
+/// ONLY on a backend that actually runs the checker: a postgres-backed daemon
+/// leaves the status disabled and its sqlite sidecar is not the served corpus,
+/// so adopting a verdict there would 503 the node over a database nobody
+/// reads.
+pub fn adopt_persisted_verdict(db_path: &Path, status: &IntegrityStatus) -> bool {
+    let Some(at) = load_persisted_failure(db_path) else {
+        return false;
+    };
+    status.record_failure(at);
+    tracing::error!(
+        target: TRACE_TARGET,
+        path = %verdict_path(db_path).display(),
+        recorded_at = at,
+        "adopting a DURABLE failed FTS5 integrity verdict recorded by a previous process: \
+         /health answers 503 until a fresh check verifies the index. A restart does NOT \
+         clear this (#2630) — rebuild the index \
+         (`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`) and the next check \
+         clears it. The durable memory TEXT is intact; the index is derived and regenerable."
+    );
+    true
+}
+
+/// v1.0.0 #2630 — adopt a durably-recorded FAILURE only when the checker is
+/// actually going to RUN, i.e. `interval > 0`.
+///
+/// # Why the cadence gates the adoption
+///
+/// An adopted failure is cleared by exactly one thing: a fresh PASSING check.
+/// With the checker DISABLED (`AI_MEMORY_FTS_INTEGRITY_INTERVAL_SECS=0`) no
+/// check ever runs, so adopting there would fence the node at `503` with NO
+/// in-band way back — an unclearable state that only a hand-deleted sidecar
+/// file resolves. That is neither self-healing nor manageable at scale, and it
+/// would silently TIGHTEN a documented default: `0` is documented as "the
+/// checker is disabled; `/health` reports `fts_integrity: disabled` rather
+/// than a pass", not as "the node refuses traffic forever".
+///
+/// So a disabled checker leaves the verdict `Disabled` and the RECORD ON DISK
+/// — nothing is lost, and simply re-enabling the cadence adopts it on the next
+/// boot — but the record is announced at WARN, because "a previous process
+/// recorded a corrupt index and this node is not enforcing it" is precisely
+/// the fact an operator must not have to infer from a file listing.
+///
+/// Returns `true` only when a failure was actually adopted.
+pub fn adopt_persisted_verdict_if_enforceable(
+    db_path: &Path,
+    status: &IntegrityStatus,
+    interval: Duration,
+) -> bool {
+    if interval.as_secs() > 0 {
+        return adopt_persisted_verdict(db_path, status);
+    }
+    if let Some(at) = load_persisted_failure(db_path) {
+        tracing::warn!(
+            target: TRACE_TARGET,
+            env = ENV_INTERVAL_SECS,
+            path = %verdict_path(db_path).display(),
+            recorded_at = at,
+            "a previous process recorded a FAILED FTS5 integrity verdict, but the checker \
+             is DISABLED by configuration, so it is NOT being enforced and /health reports \
+             `fts_integrity: disabled`. The record is kept, not cleared — re-enable the \
+             cadence to have it adopted and re-verified. Keyword recall on this node may be \
+             served over a corrupt index; the durable memory TEXT is intact and the index \
+             is regenerable (#2630)."
+        );
+    }
+    false
+}
+
 /// Run one integrity check against an already-open connection and fold the
 /// result into `status`. Returns the [`Outcome`] so callers (`doctor`, the
 /// loop, tests) can report it.
@@ -407,9 +635,19 @@ pub const TRACE_TARGET: &str = "ai_memory::fts_integrity";
 /// [`crate::storage::open_unmigrated`] is the right funnel: it applies the
 /// writer pragmas without replaying the bootstrap schema or the migration
 /// ladder (the daemon already did), and the check writes no rows.
+///
+/// v1.0.0 #2630 — a COMPLETED verdict is also persisted beside the database
+/// ([`persist_verdict`]) so it survives the restart an orchestrator performs in
+/// response to the 503 this verdict produces. This is the path-taking entry
+/// point, so it is where the durable record belongs; [`run_once`] stays a pure
+/// in-memory fold for callers that hold their own connection.
 pub fn run_once_on_path(path: &Path, status: &IntegrityStatus, now_unix: i64) -> Outcome {
     match crate::storage::open_unmigrated(path) {
-        Ok(conn) => run_once(&conn, status, now_unix),
+        Ok(conn) => {
+            let outcome = run_once(&conn, status, now_unix);
+            persist_verdict(path, outcome, now_unix);
+            outcome
+        }
         Err(e) => {
             tracing::warn!(
                 target: TRACE_TARGET,
@@ -443,7 +681,24 @@ pub fn spawn(db_path: PathBuf, status: Arc<IntegrityStatus>, interval: Duration)
             );
             return;
         }
-        tokio::time::sleep(initial_delay(interval, process_seed())).await;
+        // v1.0.0 #2630 — a node that booted with a DURABLE failed verdict is
+        // already 503 and already out of rotation, so the startup spread buys
+        // nothing and costs recovery time: an operator who has just repaired
+        // the index would otherwise wait up to INITIAL_SPREAD for the node to
+        // notice. Re-verify immediately instead. Only already-failed nodes take
+        // this branch, so a healthy fleet restarting together still spreads.
+        if status
+            .verdict_at(chrono::Utc::now().timestamp())
+            .is_unhealthy()
+        {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                "booting with a durable FAILED FTS verdict; running the integrity check \
+                 immediately instead of waiting out the startup spread (#2630)"
+            );
+        } else {
+            tokio::time::sleep(initial_delay(interval, process_seed())).await;
+        }
         loop {
             let path = db_path.clone();
             let st = Arc::clone(&status);
@@ -614,6 +869,163 @@ mod tests {
         assert_eq!(run_once(&conn, &s, 42), Outcome::Verified);
         assert_eq!(s.verdict_at(42), Verdict::Ok);
         assert_eq!(s.checked_at_unix(), Some(42));
+    }
+
+    // ---------------------------------------------------------------
+    // v1.0.0 #2630 — the DURABLE verdict. Each test asserts one half of
+    // "a failed verdict survives a restart until a fresh check clears it".
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn verdict_path_is_a_sidecar_beside_the_database() {
+        let p = verdict_path(Path::new("/var/lib/ai-memory/memories.db"));
+        assert_eq!(
+            p,
+            PathBuf::from("/var/lib/ai-memory/memories.db.fts-verdict"),
+            "the record must sit beside the corpus so it shares its volume and backup"
+        );
+    }
+
+    #[test]
+    fn a_failed_verdict_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("memories.db");
+
+        // Process 1: the check finds corruption.
+        persist_verdict(&db, Outcome::Corrupt, 1_000);
+
+        // Process 2 (the orchestrator restarted us): a fresh status would
+        // answer `Pending` → 200 without the adoption.
+        let fresh = IntegrityStatus::new(HOUR);
+        assert_eq!(fresh.verdict_at(2_000), Verdict::Pending);
+        assert!(adopt_persisted_verdict(&db, &fresh));
+        assert_eq!(fresh.verdict_at(2_000), Verdict::Failed);
+        assert!(
+            fresh.verdict_at(2_000).is_unhealthy(),
+            "a restart must NOT convert a fail-closed verdict back into 200"
+        );
+        assert_eq!(fresh.checked_at_unix(), Some(1_000));
+    }
+
+    #[test]
+    fn a_passing_check_clears_the_persisted_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("memories.db");
+        persist_verdict(&db, Outcome::Corrupt, 1_000);
+        assert_eq!(load_persisted_failure(&db), Some(1_000));
+
+        persist_verdict(&db, Outcome::Verified, 2_000);
+        assert_eq!(
+            load_persisted_failure(&db),
+            None,
+            "a repaired node must be releasable — only a fresh PASS clears the record"
+        );
+        let fresh = IntegrityStatus::new(HOUR);
+        assert!(!adopt_persisted_verdict(&db, &fresh));
+        assert_eq!(fresh.verdict_at(3_000), Verdict::Pending);
+    }
+
+    #[test]
+    fn an_operational_error_leaves_the_persisted_record_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("memories.db");
+        persist_verdict(&db, Outcome::Corrupt, 1_000);
+        // A transient SQLITE_BUSY must not clear a real failure...
+        persist_verdict(&db, Outcome::Unavailable, 2_000);
+        assert_eq!(load_persisted_failure(&db), Some(1_000));
+        // ...nor manufacture one on a clean node.
+        let clean = dir.path().join("clean.db");
+        persist_verdict(&clean, Outcome::Unavailable, 2_000);
+        assert_eq!(load_persisted_failure(&clean), None);
+    }
+
+    #[test]
+    fn an_unrecognised_record_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("memories.db");
+        // A torn write, a hand-edit, or a future format: anything that is not
+        // a recognised PASS must read as a failure.
+        std::fs::write(verdict_path(&db), b"ai-memory-fts-verd").expect("write");
+        assert_eq!(load_persisted_failure(&db), Some(0));
+        let fresh = IntegrityStatus::new(HOUR);
+        assert!(adopt_persisted_verdict(&db, &fresh));
+        assert!(fresh.verdict_at(1).is_unhealthy());
+    }
+
+    #[test]
+    fn a_recorded_pass_is_not_adopted_as_this_processs_assertion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("memories.db");
+        // Forward-compat shape: a future version may persist passes too. They
+        // must neither fence the node nor be re-presented as a live pass.
+        std::fs::write(
+            verdict_path(&db),
+            format!("{VERDICT_FILE_TAG} {VERDICT_OK} 1000\n"),
+        )
+        .expect("write");
+        assert_eq!(load_persisted_failure(&db), None);
+        let fresh = IntegrityStatus::new(HOUR);
+        assert!(!adopt_persisted_verdict(&db, &fresh));
+        assert_eq!(
+            fresh.verdict_at(1_001),
+            Verdict::Pending,
+            "a pass a PREVIOUS process performed is not an assertion this one may make"
+        );
+    }
+
+    #[test]
+    fn a_disabled_checker_does_not_adopt_an_unclearable_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("memories.db");
+        persist_verdict(&db, Outcome::Corrupt, 1_000);
+
+        // Cadence 0 = the operator DISABLED the checker. Nothing will ever run
+        // to clear an adopted failure, so adopting it would fence the node at
+        // 503 forever — an unclearable state, and a silent tightening of a
+        // documented default ("disabled", not "refuses traffic").
+        let disabled = IntegrityStatus::new(0);
+        assert!(!adopt_persisted_verdict_if_enforceable(
+            &db,
+            &disabled,
+            Duration::from_secs(0)
+        ));
+        assert_eq!(disabled.verdict_at(2_000), Verdict::Disabled);
+
+        // The record is KEPT, not cleared: re-enabling the cadence adopts it.
+        assert_eq!(load_persisted_failure(&db), Some(1_000));
+        let enabled = IntegrityStatus::new(HOUR);
+        assert!(adopt_persisted_verdict_if_enforceable(
+            &db,
+            &enabled,
+            Duration::from_secs(HOUR)
+        ));
+        assert_eq!(enabled.verdict_at(2_000), Verdict::Failed);
+    }
+
+    #[test]
+    fn an_enforceable_clean_node_is_still_pending_not_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("memories.db");
+        let s = IntegrityStatus::new(HOUR);
+        assert!(!adopt_persisted_verdict_if_enforceable(
+            &db,
+            &s,
+            Duration::from_secs(HOUR)
+        ));
+        assert_eq!(s.verdict_at(1), Verdict::Pending);
+    }
+
+    #[test]
+    fn run_once_on_path_persists_a_pass_by_clearing_the_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fts-integrity-durable.db");
+        let conn = crate::storage::open(&path).expect("open");
+        drop(conn);
+        // Seed a stale failure, then let a real passing check clear it.
+        persist_verdict(&path, Outcome::Corrupt, 1_000);
+        let s = IntegrityStatus::new(HOUR);
+        assert_eq!(run_once_on_path(&path, &s, 2_000), Outcome::Verified);
+        assert_eq!(load_persisted_failure(&path), None);
     }
 
     #[test]

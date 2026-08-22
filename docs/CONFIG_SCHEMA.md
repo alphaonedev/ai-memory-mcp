@@ -82,7 +82,13 @@ model          = "nomic-embed-text-v1.5"   # e.g. "google/gemini-embedding-2"
 # api_key_env  = "OPENROUTER_API_KEY"
 # api_key_file = "/etc/ai-memory/keys/embed.key"  # mode 0400 enforced
 
-# dim          = 768             # explicit vector-dim override for models
+# dim          = 768             # env override: AI_MEMORY_EMBED_DIM (#2626 —
+#                                 # env BEATS this field; a non-positive /
+#                                 # unparseable env value FAILS CLOSED to an
+#                                 # UNKNOWN dim rather than falling through to
+#                                 # the compiled table, which would resolve the
+#                                 # exact width the operator was overriding).
+#                                 # Explicit vector-dim override for models
 #                                 # not in KNOWN_EMBEDDING_DIMS. #1598 fleet
 #                                 # follow-up: for OpenAI-compatible backends an
 #                                 # EXPLICIT dim is also sent as the wire
