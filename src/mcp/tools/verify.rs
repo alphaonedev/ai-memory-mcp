@@ -87,8 +87,14 @@ impl McpTool for VerifyTool {
 ///
 /// # Errors
 ///
-/// Returned as JSON-RPC error strings (the dispatcher wraps them as
-/// `-32602` invalid params). Specifically:
+/// Returned as plain error strings. #3171 — the previous claim that the
+/// dispatcher wraps these as JSON-RPC `-32602 invalid params` was FALSE:
+/// per the MCP 2025-03-26 tool-result convention (documented on
+/// `crate::mcp::tools::atomise`), a handler-level error collapses to a
+/// SUCCESSFUL JSON-RPC result carrying `isError: true` and a text body.
+/// `-32602`/`-32601` are reserved for envelope-level faults (unknown tool,
+/// malformed request), never for a handler refusal — a client that
+/// switches on the JSON-RPC error code would never see these. Causes:
 /// - missing required arguments (no `link_id` and no
 ///   `source_id`+`target_id`)
 /// - `link_id` shape doesn't match the composite form

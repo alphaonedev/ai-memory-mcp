@@ -640,14 +640,20 @@ Get all links for a memory (both directions -- where the memory is source or tar
       "valid_from": "2026-05-18T12:00:00Z",
       "valid_until": null,
       "observed_by": "ai:claude-opus-4.7@host:pid-3812",
-      "signature": null,
-      "attest_level": "unsigned",
-      "signed_at": null
+      "attest_level": "unsigned"
     }
   ],
   "count": 1
 }
 ```
+
+> **#3171 correction.** Two keys shown here previously do not exist on the
+> response. `signed_at` is not a field of a link on any surface, and
+> `signature` is deliberately never emitted by `memory_get_links` — the
+> signature bytes are the verification surface owned by `memory_verify`.
+> `valid_from` / `valid_until` / `observed_by` are omitted entirely (not
+> rendered as `null`) when the column is NULL. `attest_level` is always
+> present: it fails closed to `"unsigned"` for a row whose column is NULL.
 
 Relations accepted by `memory_link` and surfaced by `memory_get_links` (nine at v0.8.0; six at v0.7.0; was four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from` (WT-1-A atomisation), `decomposes_into`, `depends_on`, `advances`.
 

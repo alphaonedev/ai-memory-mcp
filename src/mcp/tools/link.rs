@@ -27,6 +27,13 @@ pub struct LinkRequest {
 
     #[serde(default)]
     pub relation: Option<String>,
+
+    /// #3171 — operator-as-actor: the id recorded as the ACTOR of this
+    /// operation (audit / provenance). Honoured since before v1.0.0 but
+    /// undeclared until the tool-contract audit. Under the multi-tenant
+    /// posture (`AI_MEMORY_AGENT_ID` set) it is BOUND to the caller.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_link`.
@@ -139,8 +146,14 @@ pub(super) fn handle_link(
             Ok(Some(m)) => m.namespace,
             _ => crate::DEFAULT_NAMESPACE.to_string(),
         };
-        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-            .map_err(|e| e.to_string())?;
+        // #3171 — bind the K9 permission SUBJECT to the enforced-read caller;
+        // single-operator default unchanged.
+        let agent_id = crate::identity::resolve_governance_subject(
+            params[param_names::AGENT_ID].as_str(),
+            None,
+            "link",
+        )
+        .map_err(|e| e.to_string())?;
         let ctx = PermissionContext {
             op: Op::MemoryLink,
             namespace: link_ns,

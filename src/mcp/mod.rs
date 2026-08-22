@@ -47,6 +47,13 @@ pub mod server_identity;
 // `src/mcp/` is allowlist-pinned by `tests/mcp_param_names_invariant.rs`.
 pub mod param_names;
 
+// #3171 — fail-closed boundary guards for `tools/call` argument
+// extraction. There is NO runtime JSON-Schema validation on the MCP
+// path, so a value contradicting the advertised schema silently takes
+// the handler's fallback branch (empty-success / filter dropped /
+// negative-as-absent / stringy-bool). These helpers refuse instead.
+pub mod param_guard;
+
 // #1558 batch 3 — JSON-RPC 2.0 wire-layer SSOT: version tag, reserved
 // error codes, method names, MCP protocol revision.
 pub mod jsonrpc;
@@ -213,8 +220,18 @@ fn audit_emit_for_mcp_dispatch(
 /// L1 capture-nag observer so both key on the same identity.
 fn resolve_mcp_agent_id(arguments: &Value, mcp_client: Option<&str>) -> String {
     arguments
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(Value::as_str)
+        // #3171 — SHAPE-VALIDATE the wire value before it lands in the
+        // enterprise-audit `actor` field. This is the one site where an
+        // UNVALIDATED, arbitrary caller string reached the SIEM emitter: a
+        // value carrying newlines / control characters is a log-injection
+        // vector into the audit record for every store/update/delete/promote/
+        // forget/link/consolidate/approve/reject call. A shape-invalid value
+        // falls through to the synthesized client id, exactly like an absent
+        // one — the audit row then names an unforgeable id rather than a
+        // forged one.
+        .filter(|id| crate::validate::validate_agent_id_shape(id).is_ok())
         .map(str::to_string)
         .unwrap_or_else(|| {
             mcp_client
@@ -619,7 +636,8 @@ pub(crate) use namespace::authorize_namespace_standard_parent;
 // regression at `tests/issue_1326_*.rs` can pin the surface without
 // stdio JSON-RPC scaffolding.
 pub use namespace::{
-    handle_namespace_clear_standard, handle_namespace_get_standard, handle_namespace_set_standard,
+    handle_namespace_clear_standard, handle_namespace_clear_standard_trusted,
+    handle_namespace_get_standard, handle_namespace_set_standard,
     handle_namespace_set_standard_trusted,
 };
 pub use notify::{handle_inbox, handle_notify};
@@ -2732,17 +2750,24 @@ fn dispatch_memory_skill_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 /// (explicit > metadata.agent_id > `mcp_client` > host fallback) so
 /// the substrate row is correctly attributed.
 fn dispatch_memory_offload(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #3171 — `metadata.agent_id` was a SECOND, undeclared identity channel
+    // for the same value on a tool that has no `metadata` input at all, so no
+    // schema-conformant caller could ever reach it. Dropped; `agent_id` is now
+    // a declared field.
     let explicit_agent_id = ctx
         .arguments
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            ctx.arguments
-                .get("metadata")
-                .and_then(|m| m.get("agent_id"))
-                .and_then(Value::as_str)
-        });
-    match crate::identity::resolve_agent_id(explicit_agent_id, ctx.mcp_client) {
+        .get(param_names::AGENT_ID)
+        .and_then(Value::as_str);
+    // #3171 — this id is the OWNER STAMP on `offloaded_blobs.agent_id`, and its
+    // read twin (`memory_deref`) gates on `caller == agent_id`. Both being
+    // caller-chosen makes the SEC-4 gate inert in BOTH directions, so bind the
+    // stamp to the enforced-read caller under the multi-tenant posture
+    // (single-operator default unchanged).
+    match crate::identity::resolve_governance_subject(
+        explicit_agent_id,
+        ctx.mcp_client,
+        "offload",
+    ) {
         Ok(agent_id) => offload::handle_offload(ctx.conn, ctx.arguments, &agent_id),
         Err(e) => Err(e.to_string()),
     }
@@ -2753,17 +2778,22 @@ fn dispatch_memory_offload(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 /// refuse cross-agent leaks (NotFound, leak-resistant). Mirrors the
 /// `memory_offload` shape.
 fn dispatch_memory_deref(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #3171 — `metadata.agent_id` was a SECOND, undeclared identity channel
+    // for the same value on a tool that has no `metadata` input at all, so no
+    // schema-conformant caller could ever reach it. Dropped; `agent_id` is now
+    // a declared field.
     let explicit_agent_id = ctx
         .arguments
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            ctx.arguments
-                .get("metadata")
-                .and_then(|m| m.get("agent_id"))
-                .and_then(Value::as_str)
-        });
-    match crate::identity::resolve_agent_id(explicit_agent_id, ctx.mcp_client) {
+        .get(param_names::AGENT_ID)
+        .and_then(Value::as_str);
+    // #3171 — `ContextOffloader::deref`'s SEC-4 IDOR gate is literally
+    // `if caller_agent_id != blob.agent_id { NotFound }`, and its source note
+    // asserts "the MCP `handle_deref` handler always passes an AUTHENTICATED
+    // `caller_agent_id`" — which was false: the value came verbatim from the
+    // request body (or `metadata.agent_id`), so the gate compared the blob's
+    // owner against a string the caller supplied. Bind it to the enforced-read
+    // caller under the multi-tenant posture; single-operator default unchanged.
+    match crate::identity::resolve_governance_subject(explicit_agent_id, ctx.mcp_client, "deref") {
         Ok(agent_id) => offload::handle_deref(ctx.conn, ctx.arguments, &agent_id),
         Err(e) => Err(e.to_string()),
     }

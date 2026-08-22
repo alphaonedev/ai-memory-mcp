@@ -55,8 +55,20 @@ pub(super) fn handle_archive_purge(
     // so the audit trail captures intent regardless of downstream
     // permission-gate / storage outcome. Mirrors the #911 HTTP
     // `purge_archive` fix.
-    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    // #3171 — `agent_id` selects WHOSE archive is purged
+    // (`purge_archive_for_caller`) and `as_admin` escalates to EVERY owner's,
+    // both from UNDECLARED wire params on an IRREVERSIBLE bulk delete. Bind the
+    // caller-scoped subject to the enforced-read caller under the multi-tenant
+    // posture so a caller cannot purge another owner's archive by naming them;
+    // the single-operator default is unchanged. Resolved ONCE and reused below
+    // (pre-fix the same param was resolved twice with different failure modes —
+    // `unwrap_or_else(ANONYMOUS_INVALID)` here and `?` in the K9 block).
+    let caller = crate::identity::resolve_governance_subject(
+        params[param_names::AGENT_ID].as_str(),
+        None,
+        "purge the archive",
+    )
+    .map_err(|e| e.to_string())?;
     // #936 (security-critical, 2026-05-20) — MCP-side owner gate.
     // The MCP entry is a second attack surface for the same gap the
     // HTTP `purge_archive` handler had: pre-#936 the dispatch reached
@@ -66,9 +78,10 @@ pub(super) fn handle_archive_purge(
     // requires the explicit `as_admin: true` parameter (no separate
     // MCP-side admin-config block today — operators use either the
     // CLI or the HTTP admin allowlist for cross-tenant deletes).
-    let as_admin = params
-        .get("as_admin")
-        .and_then(Value::as_bool)
+    // #3171 — `as_admin` is the cross-tenant escalation switch on an
+    // irreversible purge, so a present-but-non-boolean value must not silently
+    // take the caller-scoped branch either (fail loudly, the `dry_run` rule).
+    let as_admin = crate::mcp::param_guard::optional_bool(params, param_names::AS_ADMIN)?
         .unwrap_or(false);
     crate::governance::audit::record_decision(
         &caller,
@@ -87,8 +100,7 @@ pub(super) fn handle_archive_purge(
     // Operators can still scope rules via `namespace_pattern = "**"`.
     {
         use crate::permissions::{Op, PermissionContext, Permissions};
-        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-            .map_err(|e| e.to_string())?;
+        let agent_id = caller.clone();
         let ctx = PermissionContext {
             op: Op::MemoryArchive,
             namespace: crate::DEFAULT_NAMESPACE.to_string(),
@@ -150,7 +162,10 @@ pub(super) fn handle_gc(
     if let Err(e) = db::fold_recall_accesses(conn, crate::SECS_PER_HOUR, crate::SECS_PER_DAY) {
         tracing::warn!("recall-access fold failed (pre-gc, memory_gc): {e}");
     }
-    let dry_run = params["dry_run"].as_bool().unwrap_or(false);
+    // #3171 — same SAFETY-flag shape as `memory_forget` (see there): a
+    // present-but-non-boolean `dry_run` used to run a REAL sweep.
+    let dry_run = crate::mcp::param_guard::optional_bool(params, param_names::DRY_RUN)?
+        .unwrap_or(false);
     if dry_run {
         // Just count expired without deleting
         let now = chrono::Utc::now().to_rfc3339();
@@ -161,10 +176,17 @@ pub(super) fn handle_gc(
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        return Ok(json!({"collected": count, "dry_run": true}));
+        // #3171 — surface `archived` on BOTH shapes. The tool advertises
+        // "archives first", but that is conditional on the daemon's
+        // `archive_on_gc` setting: with it OFF the sweep is a permanent
+        // hard-delete + crypto-erase, and the pre-fix response gave the
+        // caller NO way to tell a recoverable move from an unrecoverable
+        // erase. (The archive path's own link-cascade loss is #3161, not
+        // fixed here — see the tool docs.)
+        return Ok(json!({"collected": count, "dry_run": true, "archived": archive}));
     }
     let count = db::gc(conn, archive).map_err(|e| e.to_string())?;
-    Ok(json!({"collected": count, "dry_run": false}))
+    Ok(json!({"collected": count, "dry_run": false, "archived": archive}))
 }
 
 // --- D1.5 (#986): per-tool McpTool impls for the 4 archive-family tools ---
@@ -219,6 +241,18 @@ pub struct ArchivePurgeRequest {
     /// Only purge entries older than N days.
     #[serde(default)]
     pub older_than_days: Option<i64>,
+
+    /// #3171 — the owner whose archived rows are purged. DEFAULT SCOPE IS
+    /// CALLER-ONLY (#936): omitting this purges only the resolved caller's
+    /// archive, never every owner's. Bound to the caller under the
+    /// multi-tenant posture.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    /// #3171 — CROSS-TENANT escalation (#936): `true` purges EVERY owner's
+    /// archived rows, not just the caller's. Irreversible. Default `false`.
+    #[serde(default)]
+    pub as_admin: Option<bool>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_archive_purge`.
@@ -233,7 +267,11 @@ impl McpTool for ArchivePurgeTool {
         "Permanently delete archived memories."
     }
     fn docs() -> &'static str {
-        "Purge archive. Scope via older_than_days. Unrecoverable."
+        "Purge archive. Scope via older_than_days. Unrecoverable. #3171: the DEFAULT SCOPE IS \
+         CALLER-ONLY — only the resolved caller's archived rows are purged; `as_admin: true` \
+         escalates to EVERY owner's. A governance Ask rule returns a SUCCESS-SHAPED \
+         `{status:\"ask\"}` envelope with NOTHING purged — check `status`, not just the \
+         absence of an error."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ArchivePurgeRequest>()
@@ -297,10 +335,16 @@ impl McpTool for GcTool {
         crate::mcp::registry::tool_names::MEMORY_GC
     }
     fn description() -> &'static str {
-        "Trigger garbage collection on expired memories (archives first)."
+        "Trigger garbage collection on expired memories (archives first WHEN ENABLED)."
     }
     fn docs() -> &'static str {
-        "GC expired memories. Archives first when archive_on_gc is on (default). dry_run previews."
+        "GC expired memories. Archives first when archive_on_gc is on (default); with it OFF \
+         this is a PERMANENT hard-delete + crypto-erase with no recoverable copy. #3171: the \
+         response carries `archived` so a caller can tell a recoverable move from an \
+         unrecoverable erase — do not infer it from the tool name. The sweep is \
+         SUBSTRATE-WIDE and ungated (every namespace, every owner) and also prunes the \
+         recall_observations ledger and expired signals. Per #3161 the gc archive path does \
+         not archive link edges, so edges of archived rows are lost. dry_run previews."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<GcRequest>()

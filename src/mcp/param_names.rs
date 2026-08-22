@@ -46,6 +46,10 @@ pub const ALIASES: &str = "aliases";
 pub const ALLOWED_AGENTS: &str = "allowed_agents";
 pub const APPROVALS: &str = "approvals";
 pub const ARGUMENTS: &str = "arguments";
+// v1.0.0 #3171 — the cross-tenant escalation switch on `memory_archive_purge`
+// (`as_admin: true` purges EVERY owner's archived rows, not just the
+// caller's). Honoured since #936 but never declared on the request schema.
+pub const AS_ADMIN: &str = "as_admin";
 pub const AS_AGENT: &str = "as_agent";
 pub const BODY: &str = "body";
 pub const BY_SOURCE_URI: &str = "by_source_uri";
@@ -129,6 +133,11 @@ pub const PARENT: &str = "parent";
 pub const PATTERN: &str = "pattern";
 pub const PAYLOAD: &str = "payload";
 pub const PIPELINE_OVERRIDE: &str = "pipeline_override";
+// v1.0.0 #3171 — the `memory_ingest_multistep` pipeline selector. Declared on
+// the request struct and read by the handler since #756, but read as a bare
+// literal (the only `params.get("…")` in that file) until the tool-contract
+// audit routed it through the SSOT.
+pub const PIPELINE_VARIANT: &str = "pipeline_variant";
 pub const PARAMETERS: &str = "parameters";
 pub const PRIORITY: &str = "priority";
 pub const QUERY: &str = "query";
@@ -222,6 +231,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     ALLOWED_AGENTS,
     APPROVALS,
     ARGUMENTS,
+    AS_ADMIN,
     AS_AGENT,
     BY_SOURCE_URI,
     BYTE_ESTIMATE,
@@ -293,6 +303,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     PATTERN,
     PAYLOAD,
     PIPELINE_OVERRIDE,
+    PIPELINE_VARIANT,
     PRIORITY,
     QUERY,
     REASON,
@@ -378,9 +389,14 @@ mod tests {
         // v1.0.0 #3007 (2026-08-16) — 132 -> 133: RESOLVED_AT (the resolver-
         //   signed epoch seconds consumed by the local epoch_advance
         //   freeze-anchor authz gate on memory_checkpoint_resolve).
+        // v1.0.0 #3171 (2026-08-22) — 133 -> 135: AS_ADMIN (the cross-tenant
+        //   escalation switch on memory_archive_purge, honoured since #936 and
+        //   read as a bare literal until the tool-contract audit) and
+        //   PIPELINE_VARIANT (the memory_ingest_multistep pipeline selector,
+        //   likewise read as a bare literal).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            133,
+            135,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

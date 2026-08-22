@@ -129,8 +129,9 @@ pub fn run_check(
 /// # Errors
 ///
 /// Returns a `String` error when `kind` is not one of the five
-/// canonical kinds or when the required per-kind fields are missing
-/// (`command` for bash, `path` for filesystem_write, etc.).
+/// canonical kinds, when the required per-kind fields are missing
+/// (`command` for bash, `path` for filesystem_write, etc.), or when
+/// `byte_estimate` is present and negative (#3171).
 pub fn build_action(kind: &str, arguments: &Value) -> Result<AgentAction, String> {
     use std::path::PathBuf;
 
@@ -153,9 +154,14 @@ pub fn build_action(kind: &str, arguments: &Value) -> Result<AgentAction, String
                 .and_then(Value::as_str)
                 .ok_or_else(|| "filesystem_write kind requires `path`".to_string())?
                 .to_string();
-            let byte_estimate = arguments
-                .get(param_names::BYTE_ESTIMATE)
-                .and_then(Value::as_u64);
+            // #3171 — `byte_estimate` is declared `integer` (i64) but read
+            // via `as_u64`, so a NEGATIVE read as `None` and the write-size
+            // policy check silently evaluated as if no size had been declared
+            // (fail-open on a governance input). Refuse the negative.
+            let byte_estimate = crate::mcp::param_guard::optional_non_negative_u64(
+                arguments,
+                param_names::BYTE_ESTIMATE,
+            )?;
             Ok(AgentAction::FilesystemWrite {
                 path: PathBuf::from(path),
                 byte_estimate,
@@ -273,6 +279,11 @@ pub struct CheckAgentActionRequest {
     /// Caller id (audit).
     #[serde(default)]
     pub agent_id: Option<String>,
+
+    /// #3171 — legacy alias for `custom_kind` (kind=custom). Honoured but
+    /// undeclared until the tool-contract audit; prefer `custom_kind`.
+    #[serde(default)]
+    pub kind_inner: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_check_agent_action`.
@@ -792,6 +803,29 @@ mod tests {
             "#1023 + #1114: the documentation block above the substrate \
              read must describe either the un-cached operator path or the \
              cache-served hook path — neither marker found"
+        );
+    }
+
+    /// #3171 — `byte_estimate` is declared `integer` (i64) but was read
+    /// via `as_u64`, so a NEGATIVE read as ABSENT and the write-size
+    /// policy evaluated as if no size had been declared: fail-open on a
+    /// governance input. Refuse the negative at the boundary.
+    #[test]
+    fn build_action_refuses_negative_byte_estimate_3171() {
+        let e = build_action(
+            "filesystem_write",
+            &json!({ "path": "/tmp/x", "byte_estimate": -1 }),
+        )
+        .expect_err("negative refused");
+        assert_eq!(e, "byte_estimate must be a non-negative integer");
+        // CONTROL: absent and non-negative both still work.
+        assert!(build_action("filesystem_write", &json!({ "path": "/tmp/x" })).is_ok());
+        assert!(
+            build_action(
+                "filesystem_write",
+                &json!({ "path": "/tmp/x", "byte_estimate": 4096 })
+            )
+            .is_ok()
         );
     }
 }

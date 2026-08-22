@@ -379,23 +379,32 @@ pub fn handle_checkpoint_resolve(
 /// newest-first, capped at `limit` (default 50).
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on query failure.
+/// Returns `"namespace is required"` when the schema-required `namespace` is
+/// missing/blank, `"invalid condition_type: .."` / `"invalid state: .."` when
+/// a filter names no known variant (#3171), or the stringified `rusqlite`
+/// error on query failure.
 pub fn handle_checkpoint_query(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
-    let namespace = params
-        .get(param_names::NAMESPACE)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let condition_type = params
-        .get(param_names::CONDITION_TYPE)
-        .and_then(Value::as_str)
-        .and_then(crate::models::ConditionType::from_str);
-    let state = params
-        .get(param_names::STATE)
-        .and_then(Value::as_str)
-        .and_then(crate::models::CheckpointState::from_str);
+    // #3171 — `namespace` is schema-REQUIRED; an `unwrap_or_default()` read
+    // answered an empty-namespace query with a plausible empty list.
+    let namespace = crate::mcp::param_guard::require_str(params, param_names::NAMESPACE)?;
+    // #3171 — an UNKNOWN `condition_type` / `state` used to drop the filter
+    // and return strictly MORE checkpoints than the caller asked for (e.g. a
+    // typo'd `state: "pendingg"` surfaced already-resolved gates as if they
+    // were open). REJECT the unknown discriminant, mirroring the #3007
+    // `handle_checkpoint_create` gate. An ABSENT filter still means "all".
+    let condition_type = crate::mcp::param_guard::optional_enum(
+        params,
+        param_names::CONDITION_TYPE,
+        crate::models::ConditionType::from_str,
+    )?;
+    let state = crate::mcp::param_guard::optional_enum(
+        params,
+        param_names::STATE,
+        crate::models::CheckpointState::from_str,
+    )?;
     let limit = params
         .get(param_names::LIMIT)
         .and_then(Value::as_i64)
@@ -490,6 +499,21 @@ pub struct CheckpointResolveRequest {
     /// Human-readable note explaining the resolution.
     #[serde(default)]
     pub resolution_note: Option<String>,
+
+    /// #3171 / #3007 — the resolver's DETACHED Ed25519 signature over the
+    /// canonical resolution, URL-safe base64. Consumed only on the
+    /// `epoch_advance` freeze-anchor lane under the certified / asi-hard
+    /// posture, where an absent or unverifiable signature DEGRADES the
+    /// resolution to `verify:false` instead of daemon-signing it. Honoured
+    /// but undeclared until the tool-contract audit, so an operator had no
+    /// documented way to supply it.
+    #[serde(default)]
+    pub signature: Option<String>,
+
+    /// #3171 / #3007 — the exact `resolved_at` (epoch seconds) the
+    /// `signature` above was computed over; ignored on every other lane.
+    #[serde(default)]
+    pub resolved_at: Option<i64>,
 }
 
 /// v0.8.0 Pillar 1 (#1709) — request body for `memory_checkpoint_query`.
@@ -1090,5 +1114,45 @@ mod handler_tests {
             );
             std::env::remove_var(crate::identity::keypair::KEY_DIR_ENV);
         }
+    }
+
+    /// #3171 — an UNKNOWN `condition_type` / `state` filter must be
+    /// REFUSED, not silently dropped. Pre-fix `.and_then(from_str)`
+    /// turned a typo into "no filter", so a caller asking for the
+    /// still-open gates got the RESOLVED ones back too — strictly more
+    /// rows than requested, on a coordination-safety surface.
+    #[test]
+    fn checkpoint_query_refuses_unknown_discriminants_3171() {
+        let conn = fresh();
+        handle_checkpoint_create(
+            &conn,
+            &json!({ "namespace": "_cp", "title": "t", "created_by": "ai:w" }),
+        )
+        .expect("create ok");
+
+        let e = handle_checkpoint_query(&conn, &json!({ "namespace": "_cp", "state": "pendingg" }))
+            .expect_err("unknown state refused");
+        assert_eq!(e, "invalid state: pendingg");
+        let e = handle_checkpoint_query(
+            &conn,
+            &json!({ "namespace": "_cp", "condition_type": "quorumm" }),
+        )
+        .expect_err("unknown condition_type refused");
+        assert_eq!(e, "invalid condition_type: quorumm");
+        let e = handle_checkpoint_query(&conn, &json!({ "namespace": "_cp", "state": 3 }))
+            .expect_err("non-string state refused");
+        assert_eq!(e, "invalid state: expected a string");
+
+        // Missing/blank namespace is refused (was an empty-namespace query).
+        let e = handle_checkpoint_query(&conn, &json!({})).expect_err("ns required");
+        assert_eq!(e, "namespace is required");
+
+        // CONTROL: known discriminants still filter, absent still means "all".
+        let all = handle_checkpoint_query(&conn, &json!({ "namespace": "_cp" })).expect("all");
+        assert_eq!(all["checkpoints"].as_array().expect("array").len(), 1);
+        let pending =
+            handle_checkpoint_query(&conn, &json!({ "namespace": "_cp", "state": "pending" }))
+                .expect("pending");
+        assert_eq!(pending["checkpoints"].as_array().expect("array").len(), 1);
     }
 }

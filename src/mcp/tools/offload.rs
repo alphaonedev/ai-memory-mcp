@@ -52,7 +52,13 @@ pub fn handle_offload(
         .and_then(Value::as_str)
         .ok_or(crate::errors::msg::CONTENT_REQUIRED)?;
     let namespace = resolve_namespace(params);
-    let ttl_seconds = params.get(param_names::TTL_SECONDS).and_then(Value::as_u64);
+    // #3171 — `ttl_seconds` is declared `integer` (i64) but read via
+    // `as_u64`, so a schema-valid NEGATIVE read as `None` and the blob
+    // silently took the CONFIGURED DEFAULT retention instead of the caller's
+    // (much shorter, or explicitly-zero) intent — a retention-integrity gap
+    // that keeps caller data alive longer than asked. Refuse the negative.
+    let ttl_seconds =
+        crate::mcp::param_guard::optional_non_negative_u64(params, param_names::TTL_SECONDS)?;
 
     // #1690 — pure-MCP (`ai-memory mcp`) deployments never run the
     // serve-only background offload TTL sweep
@@ -144,6 +150,11 @@ pub struct OffloadRequest {
     /// Retention hint (seconds).
     #[serde(default)]
     pub ttl_seconds: Option<i64>,
+
+    /// #3171 — the id stamped as the blob's owner. Bound to the caller under
+    /// the multi-tenant posture (its read twin `memory_deref` gates on it).
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_offload`.
@@ -174,6 +185,12 @@ impl McpTool for OffloadTool {
 pub struct DerefRequest {
     /// Ref from memory_offload.
     pub ref_id: String,
+
+    /// #3171 — the principal the blob's ownership gate (SEC-4) compares
+    /// against. Under the multi-tenant posture it is BOUND to the caller, so
+    /// a self-asserted value can no longer read another agent's blob.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_deref`.
@@ -370,5 +387,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ttl, Some(crate::SECS_PER_HOUR));
+    }
+
+    /// #3171 — `ttl_seconds` is declared `integer` (i64) but was read via
+    /// `as_u64`, so a schema-valid NEGATIVE read as ABSENT and the blob
+    /// silently took the CONFIGURED DEFAULT retention instead of the
+    /// caller's intent (retention-integrity gap: data kept alive longer
+    /// than asked, with a success response). Refuse the negative.
+    #[test]
+    fn offload_refuses_negative_ttl_seconds_3171() {
+        let conn = fresh_conn();
+        for bad in [json!({"content": "c", "ttl_seconds": -1}),
+                    json!({"content": "c", "ttl_seconds": "60"}),
+                    json!({"content": "c", "ttl_seconds": 1.5})] {
+            let e = handle_offload(&conn, &bad, "ai:alice").expect_err("refused");
+            assert_eq!(e, "ttl_seconds must be a non-negative integer", "{bad}");
+        }
+        // CONTROL: an absent ttl still takes the default, and 0 is honoured.
+        handle_offload(&conn, &json!({"content": "c1"}), "ai:alice").expect("absent ok");
+        handle_offload(&conn, &json!({"content": "c2", "ttl_seconds": 0}), "ai:alice")
+            .expect("zero ok");
     }
 }

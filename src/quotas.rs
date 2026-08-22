@@ -961,6 +961,48 @@ pub fn get_status(conn: &Connection, agent_id: &str, namespace: &str) -> Result<
     ensure_row(conn, agent_id, namespace)
 }
 
+/// #3171 — NON-MATERIALISING twin of [`get_status`] for pure REPORTING
+/// surfaces. `get_status` calls [`ensure_row`], so a *read* WRITES: an
+/// ungated `memory_quota_status` call with an arbitrary
+/// `(agent_id, namespace)` pair INSERTs a row, giving any MCP caller an
+/// unbounded row-injection primitive into `agent_quotas` (fleet-manageability
+/// hazard: the operator's quota census fills with rows for principals that
+/// never existed). This variant returns the SAME wire shape from a
+/// synthesised default when no row exists, and writes nothing. The real
+/// write paths (`check_and_record` / `record_*`) still materialise the row on
+/// the first actual write, so no accounting is lost.
+///
+/// # Errors
+/// Wrapped SQL errors on read failure.
+pub fn peek_status(conn: &Connection, agent_id: &str, namespace: &str) -> Result<QuotaStatus> {
+    if let Some(row) = load_row(conn, agent_id, namespace)? {
+        return Ok(row);
+    }
+    Ok(default_status(agent_id, namespace))
+}
+
+/// #3171 — the unwritten default row [`peek_status`] reports for an
+/// `(agent_id, namespace)` tuple that has never been written to. Byte-identical
+/// to the row [`ensure_row`] would have INSERTed, minus the INSERT.
+#[must_use]
+pub fn default_status(agent_id: &str, namespace: &str) -> QuotaStatus {
+    let now = chrono::Utc::now().to_rfc3339();
+    let defaults = quota_defaults();
+    QuotaStatus {
+        agent_id: agent_id.to_string(),
+        namespace: namespace.to_string(),
+        max_memories_per_day: defaults.max_memories_per_day,
+        max_storage_bytes: defaults.max_storage_bytes,
+        max_links_per_day: defaults.max_links_per_day,
+        current_memories_today: 0,
+        current_storage_bytes: 0,
+        current_links_today: 0,
+        day_started_at: day_bucket(&now),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
 /// v0.7 K8 / #1156 — read the aggregate quota row for an agent,
 /// summing every per-namespace row. Returns a synthesised
 /// [`QuotaStatus`] with `namespace = "_global"` and the *summed*
@@ -1031,6 +1073,28 @@ pub fn get_aggregate_status(conn: &Connection, agent_id: &str) -> Result<QuotaSt
     }
     // No rows at all: fall back to ensure_row at the global sentinel.
     ensure_row(conn, agent_id, GLOBAL_NAMESPACE)
+}
+
+/// #3171 — NON-MATERIALISING twin of [`get_aggregate_status`] (see
+/// [`peek_status`] for the rationale): identical rollup, but an agent with no
+/// rows at all reports the synthesised `_global` default instead of INSERTing
+/// one.
+///
+/// # Errors
+/// Wrapped SQL errors on read failure.
+pub fn peek_aggregate_status(conn: &Connection, agent_id: &str) -> Result<QuotaStatus> {
+    let has_row: bool = conn
+        .query_row(
+            "SELECT 1 FROM agent_quotas WHERE agent_id = ?1 LIMIT 1",
+            params![agent_id],
+            |_| Ok(1i32),
+        )
+        .optional()?
+        .is_some();
+    if has_row {
+        return get_aggregate_status(conn, agent_id);
+    }
+    Ok(default_status(agent_id, GLOBAL_NAMESPACE))
 }
 
 /// v0.7 K8 — read every quota row in the substrate. Backs the

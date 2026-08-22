@@ -37,6 +37,11 @@ pub struct PromoteRequest {
         description = "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this promote to Allow within its caveats."
     )]
     pub capability: Option<String>,
+
+    /// #3171 — the governance / capability-binding subject for this promote.
+    /// Bound to the caller under the multi-tenant posture.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_promote`.
@@ -51,7 +56,7 @@ impl McpTool for PromoteTool {
         "Promote a memory to long (or chosen tier) / ancestor namespace."
     }
     fn docs() -> &'static str {
-        "Default: bump to long (clears expiry); short->long and mid->long are single-call. #831: target_tier ('mid'|'long') stops on intermediate. Task 1.7: to_namespace clones to an ancestor + derived_from link."
+        "Default: bump to long (clears expiry); short->long and mid->long are single-call. #831: target_tier ('mid'|'long') stops on intermediate. Task 1.7: to_namespace clones to an ancestor + derived_from link. #3171: `id` also accepts a UNIQUE ID PREFIX — an over-short prefix resolves to whichever row matches first."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<PromoteRequest>()
@@ -126,8 +131,19 @@ pub(super) fn handle_promote(
     // Task 1.9: governance enforcement (promote-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
-        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .map_err(|e| e.to_string())?;
+        // #3171 — the governance / capability-binding / mandatory-hook SUBJECT
+        // must not be caller-chosen. `resolve_agent_id` gives the WIRE
+        // `params.agent_id` precedence over the env identity, so a caller could
+        // pick the principal its own promote was judged as while the #1786
+        // ownership gate above stayed keyed on the ENV caller — two controls
+        // that can never agree. Bind the subject to the enforced-read caller
+        // under the multi-tenant posture; single-operator default unchanged.
+        let agent_id = crate::identity::resolve_governance_subject(
+            params[param_names::AGENT_ID].as_str(),
+            mcp_client,
+            "promote",
+        )
+        .map_err(|e| e.to_string())?;
         let mem_owner = target
             .metadata
             .get(param_names::AGENT_ID)

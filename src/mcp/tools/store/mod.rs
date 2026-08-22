@@ -178,6 +178,20 @@ pub struct StoreRequest {
         description = "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this store to Allow within its caveats."
     )]
     pub capability: Option<String>,
+
+    // #3171 / #1421 — Form-4 provenance. Both have been PARSED, VALIDATED and
+    // PERSISTED by the MCP store path since #1421, but were never declared on
+    // the request schema, so no MCP client could discover them. Plain `//` for
+    // the same schema-`title` reason documented on `signature` above.
+    #[serde(default)]
+    #[schemars(
+        description = "#757 citations array: [{uri, accessed_at, hash?, span?}]; validated on write."
+    )]
+    pub citations: Option<serde_json::Value>,
+
+    #[serde(default)]
+    #[schemars(description = "#757 source_span {start, end} byte offsets into source_uri.")]
+    pub source_span: Option<serde_json::Value>,
 }
 
 /// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_store`.

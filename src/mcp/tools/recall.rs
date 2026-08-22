@@ -42,7 +42,7 @@ impl McpTool for RecallTool {
         "Recall memories relevant to a context (ranked)."
     }
     fn docs() -> &'static str {
-        "Fuzzy OR recall ranked by relevance + priority + access + tier. Optional: budget_tokens (cl100k cap), context_tokens (query-embed bias), session_id (+0.05 recency boost per #518), session_default (splice [agents.defaults.recall_scope]), include_archived, kinds filter. Default format toon_compact (~79% smaller)."
+        "Fuzzy OR recall ranked by relevance + priority + access + tier. Optional: budget_tokens (cl100k cap), context_tokens (query-embed bias), session_id (+0.05 recency boost per #518), session_default (splice [agents.defaults.recall_scope]), include_archived, kinds filter. Default format toon_compact (~79% smaller). #3171: `limit` is CAPPED AT 50 by the recall engine — a larger value is silently clamped, so reaching past 50 needs a narrower query, not a bigger limit."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<RecallRequest>()
@@ -837,16 +837,20 @@ pub fn handle_recall_caller(
     // read_action rules are configured; a matched refuse/escalate rule
     // denies the recall with the standard governance-refusal wire shape.
     let actor = caller
-        .or_else(|| params["agent_id"].as_str())
+        .or_else(|| params[crate::mcp::param_names::AGENT_ID].as_str())
         .unwrap_or_default();
+    // #3171 — the `.or_else(params["query"])` fallback was DEAD: `query` is
+    // not a declared `memory_recall` input and `RecallRequest::from_mcp_params`
+    // (below) refuses the call outright when `context` is absent, so the
+    // fallback could only ever colour the gate for a request that then failed.
+    // Dropped rather than declared — advertising `query` would promise an
+    // alias the recall path does not actually accept.
     crate::governance::agent_action::gate_read_surface(
         conn,
         actor,
         "recall",
-        params["namespace"].as_str(),
-        params["context"]
-            .as_str()
-            .or_else(|| params["query"].as_str()),
+        params[crate::mcp::param_names::NAMESPACE].as_str(),
+        params[crate::mcp::param_names::CONTEXT].as_str(),
     )
     .map_err(|r| {
         crate::governance::deny_message(

@@ -453,7 +453,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // what it now refuses, why the disposition is surface-keyed rather than
     // unconditional (3x3 vote 7-2), and which residual is deliberate.
     // MEASURED post-change: 28_047. Ceiling 27_900 -> 28_120 (+73 headroom).
-    ("src/storage/mod.rs", 29_600), /* 2026-08-23 (#3216 Fable fail-closed): RE-MEASURED 29_516 after the sqlite corroboration-probe / boot-status follow-up (this file unchanged). Ceiling 29_600 stays (never lower a floor); +84 headroom. PRIOR: 2026-08-23 (#3216 rebase onto 8fb6e9eb / #3215) pending-remeasure placeholder 29_400 -> 29_600. PRIOR HEAD: 2026-08-23 (#3133 rebase onto #3115) MEASURED 29_314; ceiling 29_400. */
+    ("src/storage/mod.rs", 29_600), /* 2026-08-23 (#3216 Fable fail-closed): RE-MEASURED 29_516 after the sqlite corroboration-probe / boot-status follow-up (this file unchanged). Ceiling 29_600 stays (never lower a floor); +84 headroom. PRIOR: 2026-08-22 (#3171 MCP tool-contract audit): STRICT `forget_fts_query` builder — forget no longer shares clamping `sanitize_fts_query` with ranked reads. Ceiling was 29_320 on that branch; folded into 29_600 at rebase onto d674047f/#3218. PRIOR: 2026-08-23 (#3216 rebase onto 8fb6e9eb / #3215) pending-remeasure placeholder 29_400 -> 29_600. PRIOR HEAD: 2026-08-23 (#3133 rebase onto #3115) MEASURED 29_314; ceiling 29_400. */
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).

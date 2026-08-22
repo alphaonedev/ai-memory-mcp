@@ -395,6 +395,13 @@ pub struct SkillPromoteFromReflectionRequest {
     /// Optional JSON schema spliced as Parameters section.
     #[serde(default)]
     pub parameters_schema: Option<serde_json::Value>,
+
+    /// #3171 — operator-as-actor: the id recorded as the ACTOR of this
+    /// operation (audit / provenance). Honoured since before v1.0.0 but
+    /// undeclared until the tool-contract audit. Under the multi-tenant
+    /// posture (`AI_MEMORY_AGENT_ID` set) it is BOUND to the caller.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for

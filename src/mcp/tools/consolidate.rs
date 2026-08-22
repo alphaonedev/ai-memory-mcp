@@ -7,6 +7,7 @@ use crate::embeddings::Embed;
 use crate::hnsw::VectorSearchIndex;
 use crate::llm::OllamaClient;
 use crate::models::Tier;
+use crate::mcp::param_names;
 use crate::models::field_names;
 use crate::{db, validate};
 use serde_json::{Value, json};
@@ -68,8 +69,14 @@ pub(super) fn handle_consolidate(
     // v0.7.0 K9 — unified permission pipeline (consolidate-side).
     {
         use crate::permissions::{Op, PermissionContext, Permissions};
-        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .map_err(|e| e.to_string())?;
+        // #3171 — bind the K9 permission SUBJECT to the enforced-read caller;
+        // single-operator default unchanged.
+        let agent_id = crate::identity::resolve_governance_subject(
+            params[param_names::AGENT_ID].as_str(),
+            mcp_client,
+            crate::audit::OP_CONSOLIDATE,
+        )
+        .map_err(|e| e.to_string())?;
         let ctx = PermissionContext {
             op: Op::MemoryConsolidate,
             namespace: namespace.to_string(),
@@ -113,8 +120,17 @@ pub(super) fn handle_consolidate(
     // NHI: the caller (consolidator) owns the new memory's agent_id;
     // source authors are preserved as a forensic array by db::consolidate.
     let explicit_agent_id = params["agent_id"].as_str();
-    let consolidator_agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
-        .map_err(|e| e.to_string())?;
+    // #3171 — the consolidator owns the new row AND is the QUOTA KEY charged
+    // for it, so a self-asserted value could bill another principal's daily
+    // write budget and mint a row owned by them. Bind to the enforced-read
+    // caller; single-operator default unchanged.
+    let consolidator_agent_id =
+        crate::identity::resolve_governance_subject(
+            explicit_agent_id,
+            mcp_client,
+            crate::audit::OP_CONSOLIDATE,
+        )
+            .map_err(|e| e.to_string())?;
     // #1788 (5-agent vote 4d3ea1c5) — charge the per-agent daily write quota
     // for the one net-new consolidated memory. consolidate is a tenant-facing
     // authoring write (it mints a fresh attributable row), so it is gated like

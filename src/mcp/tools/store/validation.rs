@@ -206,8 +206,16 @@ pub(super) fn parse_and_build_memory(
             .get(param_names::AGENT_ID)
             .and_then(serde_json::Value::as_str)
     });
-    let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
-        .map_err(|e| e.to_string())?;
+    // #3171 — this id is not mere attribution: it is stamped as
+    // `metadata.agent_id` (the OWNER every later owner gate compares against),
+    // and it is the permission subject, the capability-token binding and the
+    // QUOTA KEY. Both channels above are self-asserted, so under the
+    // multi-tenant posture a caller could stamp another principal as the owner
+    // of a row it wrote (and charge that principal's quota). Bind the subject
+    // to the enforced-read caller; single-operator default unchanged.
+    let agent_id =
+        crate::identity::resolve_governance_subject(explicit_agent_id, mcp_client, "store")
+            .map_err(|e| e.to_string())?;
     if let Some(obj) = metadata.as_object_mut() {
         obj.insert(
             "agent_id".to_string(),

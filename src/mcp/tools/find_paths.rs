@@ -3,6 +3,7 @@
 
 //! MCP `memory_find_paths` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::{db, validate};
 use schemars::JsonSchema;
@@ -94,12 +95,16 @@ pub fn handle_find_paths(
         return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
     }
 
-    let max_depth = params["max_depth"]
-        .as_u64()
-        .and_then(|n| usize::try_from(n).ok());
-    let max_results = params["max_results"]
-        .as_u64()
-        .and_then(|n| usize::try_from(n).ok());
+    // #3171 — both are declared `integer` (i64) but read via `as_u64`, so a
+    // schema-valid NEGATIVE read as ABSENT and silently took the server
+    // default (`max_depth` 4 / `max_results` 10) — a caller asking for a
+    // narrower traversal got a WIDER one, with a success response.
+    let max_depth =
+        crate::mcp::param_guard::optional_non_negative_u64(params, param_names::MAX_DEPTH)?
+            .and_then(|n| usize::try_from(n).ok());
+    let max_results =
+        crate::mcp::param_guard::optional_non_negative_u64(params, param_names::MAX_RESULTS)?
+            .and_then(|n| usize::try_from(n).ok());
     // NHI-P3-T7 (v0.7.0 NHI testing): default to "current view" —
     // exclude edges whose `valid_until` lies in the past. Caller can
     // pass `include_invalidated=true` to traverse the full historical

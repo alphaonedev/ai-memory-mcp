@@ -197,8 +197,13 @@ pub fn handle_atomise(
 
     // ── Calling agent resolution (NHI) ──────────────────────────────
     let explicit_agent_id = params.get(param_names::AGENT_ID).and_then(Value::as_str);
-    let calling_agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
-        .map_err(|e| e.to_string())?;
+    // #3171 — `atomise_sync` runs the governance gate against this id (it can
+    // return `AtomiseError::GovernanceRefused`) and stamps it as the owner of
+    // every minted atom, so it is an authz SUBJECT, not attribution. Bind it to
+    // the enforced-read caller; single-operator default unchanged.
+    let calling_agent_id =
+        crate::identity::resolve_governance_subject(explicit_agent_id, mcp_client, "atomise")
+            .map_err(|e| e.to_string())?;
 
     // ── Engine dispatch ─────────────────────────────────────────────
     match handler.atomiser.atomise_sync(
@@ -277,6 +282,12 @@ pub struct AtomiseRequest {
     /// Skip idempotency; mint fresh atoms (old retained).
     #[serde(default)]
     pub force_re_atomise: Option<bool>,
+
+    /// #3171 — the id stamped as the owner/actor on every minted atom and
+    /// used as the governance subject of each atom write. Honoured but
+    /// undeclared until the tool-contract audit.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_atomise`.

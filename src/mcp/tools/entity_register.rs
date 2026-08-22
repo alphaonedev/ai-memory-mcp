@@ -27,11 +27,15 @@ pub struct EntityRegisterRequest {
     #[serde(default)]
     pub aliases: Option<Vec<String>>,
 
-    /// Metadata; 'kind' is forced to 'entity'.
+    /// Metadata; 'kind' is forced to 'entity'. #3171 — applied ONLY when
+    /// this call MINTS the entity; on the idempotent re-register path it is
+    /// silently discarded (see the tool docs).
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
 
-    /// Override metadata.agent_id.
+    /// Owner stamp written to `metadata.agent_id`. #3171 — it now WINS over
+    /// an inline `metadata.agent_id` (which never crosses `validate_agent_id`),
+    /// and like `metadata` it applies only on first registration.
     #[serde(default)]
     pub agent_id: Option<String>,
 }
@@ -48,7 +52,12 @@ impl McpTool for EntityRegisterTool {
         "Register an entity (canonical name + aliases) under a namespace."
     }
     fn docs() -> &'static str {
-        "Pillar 2 / Stream B: register entity as long-tier memory (metadata.kind='entity'). Idempotent on (canonical_name, namespace); merges new aliases. Errors if name collides with a non-entity row."
+        "Pillar 2 / Stream B: register entity as long-tier memory (metadata.kind='entity'). \
+         Idempotent on (canonical_name, namespace); merges new aliases. Errors if name \
+         collides with a non-entity row. #3171: the idempotent path merges ALIASES ONLY — \
+         on a re-register (`created:false`) `metadata` and `agent_id` are silently \
+         DISCARDED, not merged, so this tool cannot be used to re-stamp an existing \
+         entity's metadata or owner."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<EntityRegisterRequest>()
@@ -69,20 +78,29 @@ pub fn handle_entity_register(
     let namespace = params["namespace"]
         .as_str()
         .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
-    let aliases: Vec<String> = params["aliases"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let extra_metadata = if params["metadata"].is_object() {
-        params["metadata"].clone()
-    } else {
-        json!({})
+    // #3171 — a PRESENT-but-wrong-typed `aliases` / `metadata` used to be
+    // silently dropped and the call answered `created: true`, so a caller that
+    // sent `aliases: "alpha"` (a bare string) registered an entity with NO
+    // aliases and no way to tell. Refuse the contradictory value; ABSENT still
+    // takes the documented default.
+    let aliases: Vec<String> = match params.get(param_names::ALIASES) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| "aliases must be an array of strings".to_string())
+            })
+            .collect::<Result<Vec<String>, String>>()?,
+        Some(_) => return Err("aliases must be an array of strings".to_string()),
     };
-    let explicit_agent_id = params["agent_id"].as_str();
+    let extra_metadata = match params.get(param_names::METADATA) {
+        None | Some(Value::Null) => json!({}),
+        Some(v @ Value::Object(_)) => v.clone(),
+        Some(_) => return Err("metadata must be an object".to_string()),
+    };
+    let explicit_agent_id = params[param_names::AGENT_ID].as_str();
 
     validate::validate_title(canonical_name).map_err(|e| e.to_string())?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;

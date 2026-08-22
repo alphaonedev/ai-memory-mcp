@@ -22775,6 +22775,17 @@ impl MemoryStore for PostgresStore {
                 detail: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
             });
         }
+        // #3171 — REFUSE a pattern the sanitiser would silently WIDEN, exactly
+        // as the sqlite twin's `forget_fts_query` does. Defence in depth behind
+        // the HTTP boundary check: this trait method is also reachable from the
+        // CLI and curator on a `--store-url postgres://` daemon, and a bulk
+        // DELETE that is wider than the caller's pattern is unrecoverable data
+        // loss. Backend-agnostic tokeniser, so the refusal set cannot diverge.
+        if let Some(pat) = pattern
+            && let Err(reason) = crate::storage::strict_forget_tokens(pat)
+        {
+            return Err(StoreError::InvalidInput { detail: reason });
+        }
         // #2312 — token-AND pattern semantics, matching the sqlite twin.
         // sqlite routes the DESTRUCTIVE forget pattern through
         // `forget_fts_query` -> `sanitize_fts_query(pat, false)` (#1601):

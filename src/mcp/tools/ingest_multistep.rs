@@ -113,10 +113,14 @@ pub fn handle_ingest_multistep(
         return Err("content must not be empty".to_string());
     }
 
+    // #3171 — VALIDATE at the boundary. The namespace reaches
+    // `IngestExecutor::run` (and from there the retrieval helpers) unchecked,
+    // the same gap #3171 closed on `memory_quota_status`.
     let namespace = params
         .get(param_names::NAMESPACE)
         .and_then(Value::as_str)
         .unwrap_or(crate::DEFAULT_NAMESPACE);
+    crate::validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
 
     // ── Tier gate ───────────────────────────────────────────────────
     if tier == FeatureTier::Keyword || handler.is_none() {
@@ -159,7 +163,7 @@ pub fn handle_ingest_multistep(
 
 fn resolve_variant(params: &Value) -> Result<Pipeline, String> {
     let variant_tag = params
-        .get("pipeline_variant")
+        .get(param_names::PIPELINE_VARIANT)
         .and_then(Value::as_str)
         .unwrap_or("two_phase");
     let variant = PipelineVariant::from_str(variant_tag).ok_or_else(|| {
@@ -225,7 +229,9 @@ impl McpTool for IngestMultistepTool {
         "Form 3 multi-step ingest: deterministic helpers + LLM stages."
     }
     fn docs() -> &'static str {
-        "Form 3 (#756): two_phase (FTS + Jaccard -> synthesise) or four_step (load_context -> classify -> enrich -> emit). Helpers run first; LLM stages receive helper output under explicit-trust banner + SHARED PREFIX for cache-key reuse. Response carries trace + cache-key set + final output. Smart+ tier only."
+        "Form 3 (#756): two_phase (FTS + Jaccard -> synthesise) or four_step (load_context -> classify -> enrich -> emit). Helpers run first; LLM stages receive helper output under explicit-trust banner + SHARED PREFIX for cache-key reuse. Response carries trace + cache-key set + final output. Smart+ tier only. #3171: \
+         `ingested_memory_ids` is ALWAYS an empty array — this tool RETURNS a synthesis \
+         trace and stores NOTHING; persist `final_output` yourself with memory_store."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<IngestMultistepRequest>()

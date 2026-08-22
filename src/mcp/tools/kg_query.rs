@@ -46,6 +46,11 @@ pub struct KgQueryRequest {
     /// Restrict to namespace.
     #[serde(default)]
     pub namespace: Option<String>,
+
+    /// #3171 — #151 scope-visibility agent (honoured but undeclared until the
+    /// tool-contract audit); mirrors `memory_search.as_agent`.
+    #[serde(default)]
+    pub as_agent: Option<String>,
 }
 
 /// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_kg_query`.

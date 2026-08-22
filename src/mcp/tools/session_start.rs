@@ -162,6 +162,11 @@ pub struct SessionStartRequest {
     /// Output envelope: `json`, `toon`, or `toon_compact` (default).
     #[serde(default)]
     pub format: Option<String>,
+
+    /// #3171 — read-governance actor (single-tenant fallback; the resolved
+    /// caller wins when present).
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_session_start`.

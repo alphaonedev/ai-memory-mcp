@@ -34,10 +34,27 @@ pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Resul
     let agent_id = params.get(param_names::AGENT_ID).and_then(Value::as_str);
     let namespace = params.get(param_names::NAMESPACE).and_then(Value::as_str);
 
+    // #3171 — VALIDATE at the boundary. Pre-fix both were passed straight into
+    // the quota lookup unvalidated, so an arbitrary string (control chars,
+    // 100 KB, path-traversal) became a durable `agent_quotas` key.
+    if let Some(aid) = agent_id {
+        crate::validate::validate_agent_id_shape(aid).map_err(|e| e.to_string())?;
+    }
+    if let Some(ns) = namespace {
+        crate::validate::validate_namespace(ns).map_err(|e| e.to_string())?;
+    }
+
     match (agent_id, namespace) {
         // Single (agent, namespace) row.
         (Some(aid), Some(ns)) => {
-            let row = crate::quotas::get_status(conn, aid, ns).map_err(|e| e.to_string())?;
+            // #3171 — a REPORTING read must not WRITE. `get_status` calls
+            // `ensure_row`, which `INSERT OR IGNORE`s a row for whatever
+            // `(agent_id, namespace)` the caller names — an ungated
+            // row-injection primitive on an unauthenticated MCP surface. The
+            // `peek_*` twins return the identical wire shape from a
+            // synthesised default; the real write paths still materialise the
+            // row on the first actual write, so no accounting is lost.
+            let row = crate::quotas::peek_status(conn, aid, ns).map_err(|e| e.to_string())?;
             Ok(json!({
                 "agent_id": aid,
                 "namespace": ns,
@@ -46,7 +63,8 @@ pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Resul
         }
         // Per-agent aggregate (rolled-up across every namespace).
         (Some(aid), None) => {
-            let row = crate::quotas::get_aggregate_status(conn, aid).map_err(|e| e.to_string())?;
+            let row =
+                crate::quotas::peek_aggregate_status(conn, aid).map_err(|e| e.to_string())?;
             Ok(json!({
                 "agent_id": aid,
                 "namespace": crate::quotas::GLOBAL_NAMESPACE,
@@ -105,13 +123,16 @@ impl McpTool for QuotaStatusTool {
         crate::mcp::registry::tool_names::MEMORY_QUOTA_STATUS
     }
     fn description() -> &'static str {
-        "Report per-agent + per-namespace quota usage. Operator-facing."
+        "Report per-agent + per-namespace quota usage (read-only)."
     }
     fn docs() -> &'static str {
         "K8/#1156: per-agent + per-namespace quota usage (memories/day, \
          storage bytes, links/day). Omit agent_id for all. Omit namespace \
          for the aggregate view (sum across namespaces). Supply both for \
-         the single row."
+         the single row. #3171: a pure READ — it materialises no quota row for an \
+         (agent_id, namespace) pair that has never been written to; an unwritten pair \
+         reports the configured defaults with zero usage. Not access-gated on the MCP \
+         path: any caller may read any agent's usage."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<QuotaStatusRequest>()

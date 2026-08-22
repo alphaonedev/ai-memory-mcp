@@ -108,6 +108,13 @@ pub struct UpdateRequest {
         description = "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this update to Allow within its caveats."
     )]
     pub capability: Option<String>,
+
+    /// #3171 — operator-as-actor: the id recorded as the ACTOR of this
+    /// operation (audit / provenance). Honoured since before v1.0.0 but
+    /// undeclared until the tool-contract audit. Under the multi-tenant
+    /// posture (`AI_MEMORY_AGENT_ID` set) it is BOUND to the caller.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_update`.
@@ -257,8 +264,16 @@ pub(super) fn handle_update(
     // #1600 — resolve the caller agent id ONCE, up front: it feeds
     // both the omitted-`edit_source` default below and the K9 /
     // governance write gate further down.
-    let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-        .map_err(|e| e.to_string())?;
+    // #3171 — bind the permission / governance / capability-binding SUBJECT to
+    // the enforced-read caller; the sibling owner gate is env-keyed, so a wire
+    // value here meant the two controls judged different principals.
+    // Single-operator default (env unset) unchanged.
+    let agent_id = crate::identity::resolve_governance_subject(
+        params[param_names::AGENT_ID].as_str(),
+        mcp_client,
+        "update",
+    )
+    .map_err(|e| e.to_string())?;
     // #1786 — owner gate: refuse a cross-owner update. The MCP update path calls
     // raw `db::update_with_*` directly (bypassing the SAL trait + the HTTP
     // `require_caller_owns_memory`). Keyed on the ENFORCED-read caller

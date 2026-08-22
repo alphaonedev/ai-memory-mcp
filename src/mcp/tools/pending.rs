@@ -38,7 +38,9 @@ impl McpTool for PendingListTool {
         "List pending governance-queued actions."
     }
     fn docs() -> &'static str {
-        "Task 1.9: list governance-queued actions. status filter (default pending). Limit cap 1000."
+        "Task 1.9: list governance-queued actions. Limit cap 1000. #3171: omitting `status` \
+         returns EVERY status (approved/rejected/pending), NOT just pending — pass \
+         status=\"pending\" for the open queue."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<PendingListRequest>()
@@ -79,6 +81,12 @@ pub struct PendingApproveRequest {
     /// signature quorum must be met before the underlying approve proceeds.
     #[serde(default)]
     pub approvals: Option<Vec<ApproverSignatureArg>>,
+
+    /// #3171 — the APPROVER identity: the subject of the self-approval
+    /// refusal, the named-approver equality, and the `Consensus(n)`
+    /// distinct-vote key. Bound to the caller under the multi-tenant posture.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_pending_approve`.
@@ -113,6 +121,11 @@ pub struct PendingRejectRequest {
     /// K10 persistence horizon.
     #[serde(default)]
     pub remember: Option<String>,
+
+    /// #3171 — the id written as `decided_by` on the governance-ledger row.
+    /// Bound to the caller under the multi-tenant posture.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_pending_reject`.
@@ -234,8 +247,9 @@ pub(super) fn handle_pending_list(
     params: &Value,
 ) -> Result<Value, String> {
     let status = params["status"].as_str();
-    let limit = params["limit"]
-        .as_u64()
+    // #3171 — `limit` is declared `integer` (i64) but was read via `as_u64`,
+    // so a NEGATIVE read as ABSENT and silently took the default page size.
+    let limit = crate::mcp::param_guard::optional_non_negative_u64(params, param_names::LIMIT)?
         .map_or(crate::storage::PENDING_DEFAULT_PAGE_LIMIT, |v| {
             usize::try_from(v).unwrap_or(usize::MAX)
         })
@@ -352,8 +366,22 @@ pub fn handle_pending_approve(
         .as_str()
         .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
-    let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-        .map_err(|e| e.to_string())?;
+    // #3171 — the APPROVER identity is the subject of the separation-of-duties
+    // gate itself: `approve_with_approver_type` refuses self-approval
+    // (`approver_agent_id == requested_by`), enforces the named-approver
+    // equality, and counts DISTINCT `approver_agent_id`s for
+    // `ApproverType::Consensus(n)`. Reading it from the wire let one caller
+    // pick a non-requester id to defeat self-approval refusal — and forge a
+    // full quorum by varying the param across N calls. Bind it to the
+    // enforced-read caller under the multi-tenant posture (the posture that
+    // arms the gate at `storage::enforce_approver_identity_gate`); the
+    // single-operator default is unchanged.
+    let agent_id = crate::identity::resolve_governance_subject(
+        params[param_names::AGENT_ID].as_str(),
+        mcp_client,
+        "approve",
+    )
+    .map_err(|e| e.to_string())?;
     let remember = parse_remember_param(params);
 
     // #913 + #2634 / CB-24 — admin governance audit. Pre-fix a
@@ -605,6 +633,46 @@ mod tests {
         .expect("queue")
     }
 
+    /// #3171 — the APPROVER identity is the SUBJECT of the
+    /// separation-of-duties gate itself, so it must not be caller-chosen.
+    ///
+    /// `approve_with_approver_type` refuses self-approval by comparing the
+    /// approver against `requested_by`, enforces the named-approver equality,
+    /// and counts DISTINCT approver ids for `ApproverType::Consensus(n)`.
+    /// Reading that id from the wire let ONE caller (a) defeat the
+    /// self-approval refusal by naming any id other than its own, and
+    /// (b) forge a full human quorum by varying the parameter across N calls.
+    /// Under the multi-tenant posture the approver is now the enforced-read
+    /// caller and a disagreeing wire `agent_id` is REFUSED outright.
+    #[test]
+    fn pending_approve_refuses_wire_chosen_approver_under_posture_3171() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        let id = queue_pending(&conn, "ai:alice");
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+
+        // ai:alice queued it, so approving AS ai:bob would sidestep the
+        // self-approval refusal. Refused before any decision is recorded.
+        let err = handle_pending_approve(&conn, &json!({"id": id, "agent_id": "ai:bob"}), None)
+            .expect_err("a wire-chosen approver must be refused");
+        assert!(err.contains("agent_id mismatch"), "got: {err}");
+
+        // The same forgery on the REJECT twin writes a forged `decided_by`
+        // into the tamper-evident governance ledger.
+        let err = handle_pending_reject(&conn, &json!({"id": id, "agent_id": "ai:bob"}), None)
+            .expect_err("a wire-chosen decider must be refused");
+        assert!(err.contains("agent_id mismatch"), "got: {err}");
+
+        // The row is untouched by either refusal.
+        let row = db::get_pending_action(&conn, &id)
+            .expect("read")
+            .expect("row present");
+        assert_eq!(row.status, "pending", "a refused decision must not decide");
+        assert!(row.decided_by.is_none(), "no decider may be recorded");
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+    }
+
     // parse_remember_param: each of the four branches.
     #[test]
     fn parse_remember_param_returns_session() {
@@ -844,8 +912,15 @@ pub fn handle_pending_reject(
         .as_str()
         .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
-    let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-        .map_err(|e| e.to_string())?;
+    // #3171 — mirror the approve binding: `decided_by` is a governance-ledger
+    // row, so a caller-chosen value writes a forged decider into the
+    // tamper-evident record.
+    let agent_id = crate::identity::resolve_governance_subject(
+        params[param_names::AGENT_ID].as_str(),
+        mcp_client,
+        "reject",
+    )
+    .map_err(|e| e.to_string())?;
     let remember = parse_remember_param(params);
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
