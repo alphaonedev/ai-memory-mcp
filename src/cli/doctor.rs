@@ -770,9 +770,10 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
                  arms that create them were skipped, so the integrity controls this stamp \
                  implies are NOT in force. On a populated database this indicates relation \
                  LOSS (corruption / partial restore), not a fresh install: restore from a \
-                 backup containing them. Set AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1 to \
+                 backup containing them. Set {env}=1 to \
                  make the migration refuse to stamp rather than warn.",
                 missing.len(),
+                env = crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES,
             );
             // COMPOSE, never overwrite: the dim-violation branch above may
             // already have set a note, and dropping an operator diagnostic to

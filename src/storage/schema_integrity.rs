@@ -237,11 +237,14 @@ pub fn report(conn: &Connection, effective_version: i64) -> Result<Vec<CoreTable
             missing_count = missing.len(),
             missing = %describe(&missing),
             corpus_rows = rows.unwrap_or(-1),
+            // The knob NAME is a structured field, not prose, so it is typed
+            // once (at its const) and a rename cannot leave this message stale.
+            enforce_env = crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES,
             "core relations are ABSENT from a database at this schema version — the ladder \
              arms that create them were skipped, so the integrity controls this stamp implies \
              are NOT in force. A database with rows here indicates relation LOSS (corruption / \
-             partial restore), not a fresh fixture. Run `ai-memory doctor`; set \
-             AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1 to refuse the stamp instead of warning."
+             partial restore), not a fresh fixture. Run `ai-memory doctor`; set the \
+             `enforce_env` knob above to 1 to refuse the stamp instead of warning."
         );
     }
     Ok(missing)
@@ -300,9 +303,10 @@ pub fn refusal_message(missing: &[CoreTable], effective_version: i64) -> String 
         "refusing to stamp schema v{effective_version}: {} core relation(s) absent — {}. \
          The database is UNCHANGED (the migration rolled back) and remains readable at its \
          current version. Restore from a backup that contains these relations, or unset \
-         AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES to proceed with a warning instead.",
+         {env} to proceed with a warning instead.",
         missing.len(),
         describe(missing),
+        env = crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES,
     )
 }
 
@@ -418,7 +422,7 @@ mod tests {
         let msg = refusal_message(&missing, 89);
         assert!(msg.contains("UNCHANGED"), "{msg}");
         assert!(
-            msg.contains("AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES"),
+            msg.contains(crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES),
             "{msg}"
         );
     }
