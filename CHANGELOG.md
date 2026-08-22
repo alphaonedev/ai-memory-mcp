@@ -959,6 +959,98 @@ backend and missing or divergently implemented on its twin). Pinned by
   `model_honoured: false` facts. (The reporter's confusion started there —
   `doctor` echoed `qwen3-embedding:4b` while both the daemon and `reembed`
   actually used `all-MiniLM-L6-v2`.)
+### Security (CLI destructive-op guards + tamper-evidence preservation; R-405 cluster — #3013 #3012 #3021)
+
+- **`archive purge` no longer wipes every namespace unconfirmed, unscoped and
+  unpreviewed (#3013).** `archive purge`'s ENTIRE argument surface was
+  `--older-than-days N` ("all if omitted") — it destroys the LAST copy of an
+  archived memory's text, including the `in_place_edit` undo snapshots and the
+  rows `delete` / `forget` left recoverable, and it had none of the guards the
+  strictly LESS destructive `forget` already required. It now mirrors
+  `forget`'s F11 rail: `--namespace <NS>` bounds the blast radius,
+  `--confirm-global` is REQUIRED when `--namespace` is omitted (a refused purge
+  destroys nothing), and `--dry-run` reports what WOULD be purged and exits —
+  reachable without `--confirm-global` because it destroys nothing, and
+  short-circuiting above the audit emit so a preview is not recorded as an
+  `allow` for a purge that never happened. The preview and the delete are
+  single-sourced on one predicate (`db::archive_purge_predicate`), so the count
+  can never understate the blast radius. This is a LOUD refusal with the exact
+  remediation in the message, not a silent behaviour change.
+- **CLI `delete <id>` is now ARCHIVE-FIRST, restoring the documented
+  recoverability contract (#3012).** `docs/CLI_REFERENCE.md` stated "`delete`
+  archives first", but `cmd_delete` called the raw `db::delete`: the TARGETED
+  single-row verb destroyed the last copy of the memory's CURRENT text with no
+  recovery, while the BULK `forget` always archived and stayed restorable. That
+  is the inverse of operator expectation and, under the North Star, an
+  unintentional-data-loss default on the substrate's durable truth. It was also
+  silently WRONG where a #1725 `in_place_edit` snapshot existed: `db::delete`
+  is `DELETE FROM memories` only (no FK, no trigger onto `archived_memories`),
+  so the pre-edit snapshot survived and `archive restore <id>` then resurrected
+  STALE content under that id — a restore that looks successful and is not.
+  `delete` now routes through
+  `db::delete_archive_first` (one transaction: copy the row + its
+  `memory_links` edges into `archived_memories` under
+  `archive_reason = "delete"`, sever namespace standards, remove from the live
+  set), so `ai-memory archive restore <id>` brings it back; JSON output carries
+  `archived: true|false`. The exact previous behaviour remains available as an
+  explicit `--hard` opt-in. Both paths keep the #1955 R45 record-stop fence —
+  the fence is applied in `delete_archive_first` itself so a delete funnel
+  cannot lose it by changing which primitive it calls.
+- **`memory_verify` no longer collapses a FORGED signature into
+  `attest_level="unsigned"` (#3021).** The pubkey-found/verify-FAILED arm in
+  `src/mcp/tools/verify.rs` returned `(false, AttestLevel::Unsigned)` — i.e.
+  "signature present but INVALID" was reported as "never signed", while the
+  adjacent no-pubkey arm correctly returned the STORED level. That erased the
+  tamper evidence at exactly the row where it matters: an auditor sweeping
+  `attest_level != 'unsigned'` to re-check signed edges skipped every forged
+  one, and the DB row still held the 64-byte signature + `self_signed`. The
+  failed-verify arm now returns the stored level with `signature_verified:
+  false` and null `signed_by` / `signed_at`; the verdict rides on
+  `signature_verified`, never on `attest_level`. Pinning tests updated in
+  lockstep (`tests/memory_verify.rs`, `tests/identity_e2e.rs`,
+  `src/mcp/mod.rs`).
+
+### Fixed (CLI surface: declared-but-inert flags; R-405 cluster — #3005 #3017 #3019 #2815)
+
+- **`recall --format {human,json,toon}` actually selects a renderer (#3005).**
+  `RecallArgs.format` was declared with a `value_parser`, marshalled into the
+  `RecallRequest` DTO and pinned by a parity test — but nothing in
+  `src/cli/recall.rs` ever read it. The only renderer branch was the global
+  `--json`, so all three values produced byte-identical HUMAN output:
+  `--format json` silently lied, and TOON was unreachable from the CLI even
+  though MCP and HTTP have honoured it since v0.6.x. The render path now
+  branches on `args.format`, emitting the identical envelope through the
+  shared `crate::toon` encoder for `toon`. The global `--json` keeps
+  precedence, so every existing `--json` script is byte-unchanged.
+- **`agents subkey-certs` is filtered by `--principal`, never silently by
+  `AI_MEMORY_AGENT_ID` (#3017).** The subcommand's own `--agent-id` collided
+  with the root `--agent-id` (`global = true`, `env = "AI_MEMORY_AGENT_ID"`);
+  clap propagates a matched global DOWN into every subcommand's `ArgMatches`,
+  OVERWRITING the same-named subcommand-local arg. The certified posture always
+  exports `AI_MEMORY_AGENT_ID`, so the node-wide sub-key certificate inventory
+  was silently filtered to that one principal and reported `{"count":0}` over a
+  populated `agent_subkey_certs` table — a security-inventory FALSE NEGATIVE on
+  exactly the surface an operator audits. The flag is now `--principal`, a
+  distinct arg id with no `env`, which cannot be shadowed.
+- **`agents bind-key --pubkey <KEY>` accepts keys beginning with `-` / `_`
+  (#3019).** `identity export-pub` emits url-safe-no-pad base64, so ~1 key in
+  40 (2 of the 64 possible leading characters) was parsed by clap as a flag and
+  the enrollment died with a usage error (exit 2) — on the recipe the
+  documentation itself prints. The argument now sets `allow_hyphen_values`, so
+  both `--pubkey <KEY>` and `--pubkey=<KEY>` work for every key.
+- **`doctor --remote` can reach a hardened daemon (#2815).** `doctor --remote`
+  is the disclosed remediation for #2810 (no `--store-url` Postgres path yet),
+  but it exposed NO transport-auth knobs, so on the CERTIFIED enterprise
+  posture (TLS + mandatory client-cert mTLS + top-level `api_key`) it could not
+  complete a request and a certified Postgres deployment had no working
+  first-party `doctor` path at all. Added `--ca-cert`, `--client-cert` /
+  `--client-key`, `--api-key` and the non-argv `--api-key-file` (#1927: a key
+  on argv is world-readable via `/proc/<pid>/cmdline`), reusing the sibling
+  fleet verbs' flag names and TLS builders — `cli::sync::parse_ca_certificate`
+  and `cli::sync::sync_client_identity` are now shared rather than forked. With
+  none of the flags passed the client is byte-for-byte the pre-fix one; nothing
+  is loosened. A malformed `--api-key-file` fails LOUD instead of degrading
+  into an unauthenticated probe that renders a misleading `critical`.
 
 ### Changed
 
