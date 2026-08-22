@@ -168,7 +168,6 @@ pub(crate) const SIGNED_EVENTS_TRACE_TARGET: &str = "signed_events";
 // Mirrors the `errors::error_codes` pattern (ARCH-9 / FX-C4-batch2).
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 /// #3178 — the `signed_events.agent_id` fallback for an audit row whose
 /// originating actor cannot be resolved from the row it describes (e.g. a
 /// legacy signed `memory_links` row carrying no `observed_by` claim).
@@ -179,6 +178,7 @@ pub(crate) const SIGNED_EVENTS_TRACE_TARGET: &str = "signed_events";
 /// byte-identical audit row on either backend.
 pub const UNKNOWN_OBSERVER: &str = "unknown";
 
+#[allow(dead_code)]
 pub mod event_types {
     /// `signed_events.event_type` for `db::create_link` /
     /// `db::create_link_signed` writes (the canonical link-write audit

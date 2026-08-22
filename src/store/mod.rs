@@ -711,8 +711,7 @@ pub(crate) enum NamespaceStandardBinding {
 /// by both adapters so the refusal is byte-identical whichever backend serves
 /// the request. Lifted verbatim from `store::postgres` when the sqlite SAL
 /// adapter gained the mirror gate (#3176).
-pub(crate) const REASON_CLEAR_STANDARD_UNRESOLVABLE: &str =
-    "cannot clear namespace standard: the bound standard memory is \
+pub(crate) const REASON_CLEAR_STANDARD_UNRESOLVABLE: &str = "cannot clear namespace standard: the bound standard memory is \
      unresolvable (severed or dangling). Re-point the standard \
      first, then clear — or use an admin/bypass surface.";
 

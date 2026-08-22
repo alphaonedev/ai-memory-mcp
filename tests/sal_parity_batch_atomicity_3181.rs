@@ -1,7 +1,11 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::doc_markdown, clippy::missing_panics_doc, clippy::too_many_lines)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::missing_panics_doc,
+    clippy::too_many_lines
+)]
 #![cfg(feature = "sal")]
 
 //! #3181 — the sqlite SAL adapter silently inherited trait defaults that do
@@ -214,7 +218,10 @@ async fn sqlite_set_embeddings_batch_does_not_count_ghost_ids_3181() {
     let ctx = CallerContext::for_agent("alice");
 
     let real = store
-        .store(&ctx, &memory("parity/3181/emb", "embed-me", "body", "alice"))
+        .store(
+            &ctx,
+            &memory("parity/3181/emb", "embed-me", "body", "alice"),
+        )
         .await
         .expect("store");
     let ghost = uuid::Uuid::new_v4().to_string();

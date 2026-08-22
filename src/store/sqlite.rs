@@ -3414,10 +3414,7 @@ mod tests {
             test_memory("def-batch-1", "batch row one body"),
             test_memory("def-batch-2", "batch row two body"),
         ];
-        let ids = store
-            .store_batch(&ctx, &batch)
-            .await
-            .expect("store_batch");
+        let ids = store.store_batch(&ctx, &batch).await.expect("store_batch");
         assert_eq!(ids.len(), 2);
 
         // A row the remaining assertions can key on.

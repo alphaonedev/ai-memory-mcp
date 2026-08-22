@@ -1,7 +1,11 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::doc_markdown, clippy::missing_panics_doc, clippy::too_many_lines)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::missing_panics_doc,
+    clippy::too_many_lines
+)]
 #![cfg(feature = "sal")]
 
 //! #3182 — four sqlite reads turned a substrate fault into a benign answer.
@@ -17,8 +21,17 @@
 //! migration-ladder INPUT, so a populated-but-damaged database presented
 //! itself as FRESH.
 //!
+//! The scout fold-in on the issue adds `db::find_by_title_namespace`, whose
+//! `.ok()` made a fault read as "no such (title, namespace)" on the
+//! DEDUPLICATION probe every `on_conflict` caller trusts — while its own
+//! doc claimed it "returns the underlying SQLite error".
+//!
 //! The fifth site in this class, `agent_pubkey`, is #3145 and is deliberately
-//! not touched here.
+//! not touched here. `auto_detect_parent` (the other scout fold-in) is NOT
+//! touched here either: propagating it requires changing
+//! `db::get_namespace_standard`, which fans into five governance-policy
+//! resolution sites that share the same fail-open shape, and #3188 owns that
+//! decision (it must also settle the pg parent-detection contract).
 //!
 //! **R-203.** Parent behaviour per cell:
 //!
@@ -75,7 +88,6 @@ fn memory(ns: &str, title: &str, content: &str, owner: &str) -> Memory {
         ..Memory::default()
     }
 }
-
 
 #[tokio::test]
 async fn sqlite_schema_version_propagates_substrate_fault_3182() {
@@ -185,4 +197,42 @@ async fn sqlite_watermark_is_microsecond_normalised_3182() {
     // PRE-FIX: the raw nanosecond string, which the postgres twin can never
     // produce for the same instant.
     assert_eq!(wm, "2026-05-06T07:08:09.123456+00:00");
+}
+
+#[tokio::test]
+async fn sqlite_find_by_title_namespace_propagates_substrate_fault_3182() {
+    permissive_attestation_for_tests();
+    let (_dir, path) = fresh_db_path();
+    // Hold the connection open across the fault so `db::open`'s migrations
+    // cannot silently repair the dropped table.
+    let raw = ai_memory::db::open(&path).expect("raw conn");
+    let store = SqliteStore::open(&path).expect("open SqliteStore");
+    let ctx = CallerContext::for_agent("alice");
+
+    store
+        .store(&ctx, &memory("parity/3182/dedup", "seed", "body", "alice"))
+        .await
+        .expect("store");
+
+    // CONTROL — a healthy DB distinguishes hit from miss.
+    assert!(
+        ai_memory::db::find_by_title_namespace(&raw, "seed", "parity/3182/dedup")
+            .expect("healthy hit")
+            .is_some()
+    );
+    assert!(
+        ai_memory::db::find_by_title_namespace(&raw, "absent", "parity/3182/dedup")
+            .expect("healthy miss")
+            .is_none(),
+        "a genuine miss must stay Ok(None)"
+    );
+
+    raw.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE memories;")
+        .expect("drop memories");
+
+    // PRE-FIX: `Ok(None)` — indistinguishable from the healthy miss above, so
+    // every `on_conflict` caller read it as "safe to insert a new row" and
+    // forked a duplicate lineage instead of updating the existing memory.
+    ai_memory::db::find_by_title_namespace(&raw, "seed", "parity/3182/dedup")
+        .expect_err("a substrate fault must not read as 'no such (title, namespace)'");
 }

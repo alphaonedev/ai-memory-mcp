@@ -3,7 +3,11 @@
 
 // Test scaffolding: pedantic lints on the narrative header / fixtures have no
 // behavioural impact (mirrors `tests/parity_write_funnels.rs`).
-#![allow(clippy::doc_markdown, clippy::missing_panics_doc, clippy::too_many_lines)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::missing_panics_doc,
+    clippy::too_many_lines
+)]
 // The whole harness threads the SAL `MemoryStore` trait, which only exists
 // under `sal`.
 #![cfg(feature = "sal")]
@@ -59,8 +63,7 @@ use serde_json::json;
 /// The two wire-pinned refusal strings, spelled out HERE so the test is an
 /// independent pin on the bytes both adapters must emit (the consts
 /// themselves are `pub(crate)`).
-const REASON_UNRESOLVABLE: &str =
-    "cannot clear namespace standard: the bound standard memory is unresolvable \
+const REASON_UNRESOLVABLE: &str = "cannot clear namespace standard: the bound standard memory is unresolvable \
      (severed or dangling). Re-point the standard first, then clear — or use an \
      admin/bypass surface.";
 
@@ -335,7 +338,12 @@ async fn sqlite_reflect_cannot_read_foreign_private_source_3176() {
         tags: vec![],
         priority: 5,
         confidence: 1.0,
-        source: "parity-3176".to_string(),
+        // `ReflectInput.source` is validated against the closed provenance
+        // vocabulary (`user|nhi|claude|hook|api|cli|import|consolidation|
+        // system|chaos|notify`) BEFORE the source rows are loaded, so it has
+        // to be a real member — otherwise the cell would pass on the
+        // validation refusal and never reach the gate under test.
+        source: "nhi".to_string(),
         agent_id: "bob".to_string(),
         metadata: json!({}),
     };
@@ -367,6 +375,16 @@ fn governance_store_owner_is_namespace_owner_not_caller_claim_3176() {
     use ai_memory::models::GovernedAction;
 
     permissive_attestation_for_tests();
+    // `enforce_governance` reads the process-wide permissions mode, and the
+    // PRE-BOOT fallback is `Advisory`, which downgrades EVERY `Deny` to
+    // `Allow` before returning. Without installing `Enforce` this cell would
+    // read `Allow` on both the fixed and the parent build and pin nothing.
+    //
+    // The write is process-global, but it cannot perturb the other cells in
+    // this binary: none of them binds a `governance` blob, so
+    // `resolve_governance_policy` returns `None` and `enforce_governance`
+    // short-circuits to `Allow` under every mode.
+    ai_memory::config::set_active_permissions_mode(ai_memory::config::PermissionsMode::Enforce);
     let (_dir, path) = fresh_db_path();
     let conn = ai_memory::db::open(&path).expect("db::open");
 

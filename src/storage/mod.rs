@@ -7939,6 +7939,21 @@ pub fn promote_to_namespace(
 /// `on_conflict='error'` callers to short-circuit before the full upsert
 /// machinery runs. Returns the existing row id if there is one.
 ///
+/// #3182 — PROPAGATE. The doc line below has always promised "returns the
+/// underlying SQLite error", but the body ended in `.ok()`, so EVERY rusqlite
+/// failure — dropped table, `SQLITE_BUSY`, corruption — was answered as
+/// `Ok(None)` = "no row with this (title, namespace)". That is a
+/// fail-open answer on a DEDUPLICATION probe: the `on_conflict` callers
+/// (`db::upsert`, `handlers::create`, `handlers::bulk`, `cli::io`,
+/// `portability::import`) read `None` as "safe to insert a new row", so a
+/// transient fault silently forks a duplicate lineage instead of updating the
+/// existing memory; `next_versioned_title` reads it as "this suffix is free"
+/// and hands back a title that is already taken. Both are unintentional data
+/// divergence, and both were invisible because the false claim in the doc was
+/// what every caller trusted.
+///
+/// "No matching row" is still `Ok(None)`; a substrate fault is now an error.
+///
 /// # Errors
 ///
 /// Returns the underlying SQLite error.
@@ -7947,13 +7962,14 @@ pub fn find_by_title_namespace(
     title: &str,
     namespace: &str,
 ) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
     let id: Option<String> = conn
         .query_row(
             "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 LIMIT 1",
             params![title, namespace],
             |r| r.get(0),
         )
-        .ok();
+        .optional()?;
     Ok(id)
 }
 
@@ -8635,9 +8651,7 @@ pub fn create_link_signed_with_window(
     // Field labels come from the `field_names` SSOT (pm-v3.1 no-scattered-
     // literal rule) so a refusal names the same spelling the column does.
     let created_at_dt = match window.created_at {
-        Some(raw) if !raw.is_empty() => {
-            parse_claim(crate::models::field_names::CREATED_AT, raw)?
-        }
+        Some(raw) if !raw.is_empty() => parse_claim(crate::models::field_names::CREATED_AT, raw)?,
         _ => now_dt,
     };
     let valid_from_dt = match window.valid_from {
@@ -11382,9 +11396,9 @@ pub fn invalidate_link(
                     // no observed_by — vanishingly rare for signed
                     // rows since H2 always populates the column on
                     // self-signed inserts.
-                    agent_id: observed_by.clone().unwrap_or_else(|| {
-                        crate::signed_events::UNKNOWN_OBSERVER.to_string()
-                    }),
+                    agent_id: observed_by
+                        .clone()
+                        .unwrap_or_else(|| crate::signed_events::UNKNOWN_OBSERVER.to_string()),
                     event_type: crate::signed_events::event_types::MEMORY_LINK_INVALIDATED
                         .to_string(),
                     payload_hash: crate::signed_events::payload_hash(&cbor),

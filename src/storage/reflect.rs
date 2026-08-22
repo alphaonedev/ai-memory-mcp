@@ -406,10 +406,7 @@ pub fn reflect_with_hooks_for_caller(
             // #3176 — a TENANT caller only sees what it may read; an invisible
             // source folds to the SAME `SourceNotFound` a missing id produces
             // (no existence leak). `None` caller = substrate/admin read.
-            Some(m)
-                if caller
-                    .is_none_or(|c| crate::visibility::is_visible_to_caller(&m, c)) =>
-            {
+            Some(m) if caller.is_none_or(|c| crate::visibility::is_visible_to_caller(&m, c)) => {
                 sources.push(m);
             }
             Some(_) | None => return Err(ReflectError::SourceNotFound(id.clone())),

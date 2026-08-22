@@ -3070,6 +3070,14 @@ decision to a place both adapters share, not by adding a second copy of it.
   RFC3339 string to microsecond precision so the sqlite and postgres watermarks
   are byte-identical for the same instant (postgres re-renders through a
   microsecond-quantised `TIMESTAMPTZ`; sqlite returned a nanosecond string).
+- **`db::find_by_title_namespace` swallowed faults on the deduplication
+  probe.** Its `.ok()` answered "no row with this (title, namespace)" for any
+  rusqlite failure, while its own docblock promised it "returns the underlying
+  SQLite error". Every `on_conflict` caller (`db::upsert`, the create and bulk
+  handlers, `cli::io`, `portability::import`) reads `None` as "safe to insert a
+  new row", so a transient fault forked a duplicate lineage instead of updating
+  the existing memory, and `next_versioned_title` handed back a title that was
+  already taken. A genuine miss is still `Ok(None)`; a fault is now an error.
 
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 

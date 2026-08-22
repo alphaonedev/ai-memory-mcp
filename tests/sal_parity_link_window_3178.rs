@@ -1,7 +1,11 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::doc_markdown, clippy::missing_panics_doc, clippy::too_many_lines)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::missing_panics_doc,
+    clippy::too_many_lines
+)]
 #![cfg(feature = "sal")]
 
 //! #3178 — `MemoryStore::link` / `link_signed` must persist AND SIGN the

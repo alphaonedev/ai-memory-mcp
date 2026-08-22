@@ -12672,12 +12672,6 @@ async fn pg_append_signed_event_with_chain(
     Ok(())
 }
 
-/// Transaction-scoped twin of [`pg_append_signed_event_with_chain`].
-/// Computes the chain head and INSERTs the new `signed_events` row
-/// against a caller-owned transaction so multi-row writes (e.g. the L4
-/// `capture_turn_idempotent` path, #1416) can append the audit row in
-/// the SAME transaction as the data rows — the chain never lags the
-/// data, and a rollback discards both. The caller owns BEGIN/COMMIT.
 /// #3178 — the RELATIONAL half of a link supersession, run inside a caller's
 /// transaction. Shared by [`PostgresStore::kg_invalidate_cte`] (the
 /// vanilla-pgvector path) and [`PostgresStore::kg_invalidate_cypher`]'s
@@ -12783,8 +12777,8 @@ async fn pg_invalidate_link_relational_in_tx(
         // Best-effort actor: the `observed_by` claim from the original signed
         // row, falling back to the shared UNKNOWN sentinel the sqlite twin
         // uses for a legacy row that carried none.
-        let event_agent = observed_by
-            .unwrap_or_else(|| crate::signed_events::UNKNOWN_OBSERVER.to_string());
+        let event_agent =
+            observed_by.unwrap_or_else(|| crate::signed_events::UNKNOWN_OBSERVER.to_string());
         let event_id = uuid::Uuid::new_v4().to_string();
         pg_append_signed_event_with_chain_in_tx(
             tx,
@@ -12808,6 +12802,12 @@ async fn pg_invalidate_link_relational_in_tx(
     Ok(Some((prior, now_until)))
 }
 
+/// Transaction-scoped twin of [`pg_append_signed_event_with_chain`].
+/// Computes the chain head and INSERTs the new `signed_events` row
+/// against a caller-owned transaction so multi-row writes (e.g. the L4
+/// `capture_turn_idempotent` path, #1416) can append the audit row in
+/// the SAME transaction as the data rows — the chain never lags the
+/// data, and a rollback discards both. The caller owns BEGIN/COMMIT.
 async fn pg_append_signed_event_with_chain_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: PgSignedEventInsert<'_>,
