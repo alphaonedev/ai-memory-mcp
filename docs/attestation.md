@@ -153,14 +153,21 @@ ai-memory agents register --agent-id my-agent --agent-type ai:claude-opus-4.8
 
 ### Step 3 — Bind the public key
 
-Paste the `pub_b64` from step 1 — use the `--pubkey=<key>` form (with the `=`):
+Paste the `pub_b64` from step 1:
 
 ```bash
 ai-memory agents bind-key --agent-id my-agent \
-  --pubkey=cuOFCoGj1UCDK9H52vsoRJKbKlcktsyMVaAaHg52_3U
+  --pubkey cuOFCoGj1UCDK9H52vsoRJKbKlcktsyMVaAaHg52_3U
 ```
 
-> **Tip — keys starting with `-`.** Public keys are URL-safe base64, so they can begin with `-` (e.g. `-nLCEF…`). Always use the `--pubkey=<key>` form (with the `=`); `--pubkey -nLCEF…` makes the shell read `-n` as a flag and errors.
+> **Keys starting with `-` or `_`.** Public keys are URL-safe base64, so
+> ~1 key in 40 begins with `-` or `_` (e.g. `-nLCEF…`). Since
+> [#3019](https://github.com/alphaonedev/ai-memory-mcp/issues/3019) the
+> `--pubkey` argument takes such a value verbatim, so **both** the spaced
+> (`--pubkey -nLCEF…`) and the `=` (`--pubkey=-nLCEF…`) form work. Before
+> that fix the spaced form was parsed as a flag and the enrollment failed
+> with a usage error (exit 2) — a documented recipe that failed on ~3% of
+> generated keys.
 
 Now the daemon can verify signatures from `my-agent`. Re-binding
 overwrites in place (that's how you rotate — see below).

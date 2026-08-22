@@ -45,8 +45,16 @@ pub enum AgentsAction {
         #[arg(long)]
         agent_id: String,
         /// Base64-encoded Ed25519 public key (URL-safe-no-pad or
-        /// standard padding accepted)
-        #[arg(long)]
+        /// standard padding accepted).
+        ///
+        /// #3019 — `allow_hyphen_values` is LOAD-BEARING, not cosmetic:
+        /// `identity export-pub` emits url-safe-no-pad base64, whose
+        /// alphabet includes `-` and `_`, so ~1 key in 40 (2 of the 64
+        /// possible leading characters) starts with `-` and was parsed by
+        /// clap as a flag — a hard usage error (exit 2) on an otherwise
+        /// valid enrollment, and the documented `--pubkey <KEY>` recipe in
+        /// `docs/attestation.md` used exactly that failing space form.
+        #[arg(long, allow_hyphen_values = true)]
         pubkey: String,
     },
     /// Revoke the Ed25519 public key bound to an agent (#626 Layer-3).

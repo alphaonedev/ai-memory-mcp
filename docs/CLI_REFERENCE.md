@@ -451,6 +451,11 @@ ai-memory pending reject pending-id
 agent's Ed25519 public key for #626 Layer-3 store-path attestation
 (pairs with `ai-memory store --sign`).
 
+| Flag | Applies to | Notes |
+|---|---|---|
+| `--pubkey <KEY>` | `agents bind-key` | Base64 Ed25519 public key (URL-safe-no-pad or standard padding). Accepts a value whose first character is `-` / `_` verbatim ([#3019](https://github.com/alphaonedev/ai-memory-mcp/issues/3019) — `allow_hyphen_values`); before that fix ~1 key in 40 was parsed as a flag and the enrollment died with a usage error. Both `--pubkey <KEY>` and `--pubkey=<KEY>` work. |
+| `--principal <AGENT_ID>` | `agents subkey-certs` | Filter the sub-key certificate inventory to one principal. Omit for the **node-wide** list. Deliberately **not** named `--agent-id` and **not** env-backed ([#3017](https://github.com/alphaonedev/ai-memory-mcp/issues/3017)): the root `--agent-id` is `global` + `env = AI_MEMORY_AGENT_ID`, and clap propagates a matched global over a same-named subcommand-local flag, so the certified posture (which always exports `AI_MEMORY_AGENT_ID`) silently filtered the node-wide inventory to one id and reported `{"count":0}` over a populated table. |
+
 ## Backup & restore (v0.6.0.0)
 
 ```bash
