@@ -59,6 +59,16 @@
 #  - MemoryLinkRelation::COUNT (=6) → docs claims of "<N> variants" /
 #    "<N> typed link relations".
 #  - MemoryScope::COUNT (=5) → docs claims of "<N> visibility scopes".
+#  - `src/security_profile.rs::KNOBS` entry count -> the asi-hard
+#    pinned-knob narration in SECURITY.md / README.md / docs/deploy/*
+#    / docs/enterprise-deployment.md ("is **N** knobs", "N-knob",
+#    "N-entry pin-and-refuse", "PINS **N** security env knobs", "all
+#    **N** `KNOBS` entries"). CHANGELOG + the cert doc's evidence notes
+#    are EXCLUDED: their 17-knob text is a true pre-#3033 record.
+#  - `enterprise_federation_posture::ENTERPRISE_FEDERATION_CHECK_COUNT`
+#    -> the cert doc's normative exit contract ("returns **0 iff all N
+#    checks pass, else 2**"). The same doc's 18/19-check EVIDENCE notes
+#    are deliberately NOT anchored - they record a past capture.
 #  - pgvector certified PATCH (deploy/docker-1461/provision/lib.sh
 #    DOCKER_1461_PGVECTOR_APT_VERSION, reduced x.y.z — the SAME SSOT
 #    tests/provisioning_pgvector_pin_parity.rs reads) → current-cert doc
@@ -122,6 +132,37 @@ CANONICAL_CLI_SAL=$(extract_const_value src/lib.rs EXPECTED_CLI_SUBCOMMANDS_SAL 
 CANONICAL_MEMORY_FIELDS=$(extract_const_value src/models/memory.rs FIELD_COUNT 'usize')
 CANONICAL_LINK_COUNT=$(extract_const_value src/models/link.rs COUNT 'usize')
 CANONICAL_SCOPE_COUNT=$(extract_const_value src/models/namespace.rs COUNT 'usize')
+
+# asi-hard pinned-knob count — the `KnobSpec` entries in
+# `src/security_profile.rs::KNOBS`, which IS the no-disable contract:
+# every knob in that table is pinned ON at boot and a value below its
+# hard floor REFUSES boot. Five operator-facing surfaces narrate the
+# count (SECURITY.md twice, README.md, docs/deploy/README.md,
+# docs/deploy/enterprise-federation.env, docs/enterprise-deployment.md)
+# and ALL FIVE shipped `17` after #3033 raised the table to 21 by adding
+# the four outer federation-transport gates — a procurement-read
+# understatement of the hardened posture that no gate saw. Counted from
+# the table BODY (`^const KNOBS: &[KnobSpec] = &[` .. `^];`) so the
+# `struct KnobSpec {` definition above it is never counted.
+#
+# `|| true` + the empty-normalisation below keep a genuinely-absent SSOT
+# (the --self-test fixture tree) from aborting the gate under
+# `set -euo pipefail`; an unresolved canonical then FAILS CLOSED inside
+# the rule, but ONLY if a scan-set doc actually narrates a count (no
+# claim to validate = nothing to fail).
+# enterprise-federation posture check count — the SSOT the doctor
+# posture asserts against (`evaluate()` must return exactly this many
+# checks). The cert doc states it as the normative exit contract
+# ("returns **0 iff all N checks pass, else 2**"), and that one sentence
+# is what a procurement reader treats as the gate. It has moved four
+# times (16 -> 18 -> 19 -> 20) and each move had to be caught by hand.
+CANONICAL_EF_CHECK_COUNT="$(
+    extract_const_value src/enterprise_federation_posture.rs \
+        ENTERPRISE_FEDERATION_CHECK_COUNT 'usize' || true
+)"
+if [[ -z "$CANONICAL_EF_CHECK_COUNT" ]]; then
+    CANONICAL_EF_CHECK_COUNT="<unresolved>"
+fi
 
 # Certified pgvector PATCH — the single fleet-wide provisioning pin. It
 # lives ONCE, in the docker-1461 lane's `DOCKER_1461_PGVECTOR_APT_VERSION`
@@ -364,6 +405,35 @@ PGVECTOR_DOC_FILES=(
     docs/CONFIG_SCHEMA.md
     docs/enterprise-deployment.md
     docs/postgres-age-guide.md
+    docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
+)
+
+# Doc surfaces the asi-hard KNOBS-count rule walks. Its OWN scan set
+# ("one rule, one scan set"): the surfaces that narrate the pinned-knob
+# count as a PRESENT fact. Three of them (SECURITY.md, docs/deploy/*)
+# are in no other scan set at all, which is exactly why the post-#3033
+# 17-vs-21 drift was invisible.
+#
+# DELIBERATELY EXCLUDES:
+#   * CHANGELOG.md — every entry is a landing-time snapshot; "the
+#     existing 17-knob asi-hard hardened set" was TRUE when written.
+#   * docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md — it
+#     already says 21 in its current-state row AND carries a signed
+#     `17`-knob EVIDENCE note recording what the captured `.out`
+#     artifacts rendered PRE-#3033. Re-pointing an evidence note at the
+#     canonical would falsify the record the cert rests on.
+#   * infra/federation-lab/README.md — a campaign log, same class.
+KNOB_DOC_FILES=(
+    SECURITY.md
+    README.md
+    docs/deploy/README.md
+    docs/deploy/asi-hard.env
+    docs/deploy/enterprise-federation.env
+    docs/enterprise-deployment.md
+)
+
+# Doc surface the enterprise-federation posture check-count rule walks.
+CERT_CHECK_DOC_FILES=(
     docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
 )
 
@@ -1425,6 +1495,30 @@ run_all_rules() {
         "$CANONICAL_CLI_SAL" \
         'default build / ([0-9]+) under' \
         "${HTML_DOC_FILES[@]}"
+    # asi-hard pinned-knob count (src/security_profile.rs::KNOBS).
+    # FIVE anchors, all BOLD- or hyphen-delimited so a bare integer next
+    # to the word "knobs" can never match. The bold delimiter on the
+    # `is **N** knobs` form is load-bearing: docs/deploy/README.md says
+    # "the config-backed PE-1 knobs and", and a bare `([0-9]+) knobs`
+    # anchor captures the `1` out of `PE-1` and reports phantom drift.
+    check_narrative_count_rule \
+        "asi-hard KNOBS count (src/security_profile.rs::KNOBS)" \
+        "$CANONICAL_ASI_HARD_KNOBS" \
+        'is \*\*([0-9]+) knobs\*\*|PINS \*\*([0-9]+)\*\* security env knobs|([0-9]+)-knob\b|([0-9]+)-entry pin-and-refuse|all \*\*([0-9]+)\*\* `KNOBS` entries' \
+        "${KNOB_DOC_FILES[@]}"
+    # enterprise-federation posture check count
+    # (enterprise_federation_posture::ENTERPRISE_FEDERATION_CHECK_COUNT).
+    # ONE anchor: the cert doc's NORMATIVE exit contract. Scoped that
+    # tightly on purpose — the same document carries `18`/`19`-check
+    # EVIDENCE NOTES describing what the committed `cert-54/*.out`
+    # captures actually rendered at the tree they were taken on. Those
+    # are TRUE statements about a past capture; a broader anchor would
+    # "fix" them into a lie about the evidence bundle.
+    check_narrative_count_rule \
+        "ENTERPRISE_FEDERATION_CHECK_COUNT" \
+        "$CANONICAL_EF_CHECK_COUNT" \
+        'returns \*\*0 iff all ([0-9]+) checks pass' \
+        "${CERT_CHECK_DOC_FILES[@]}"
 
     if [[ "$fail_count" -gt 0 ]]; then
         printf '\n❌ docs-vs-SSOT drift gate: %d violation(s)\n' "$fail_count" >&2
@@ -1442,10 +1536,12 @@ run_all_rules() {
         printf '     HookEvent variants = %s\n' "$CANONICAL_HOOK_EVENTS" >&2
         printf '     pgvector patch = %s (deploy/docker-1461/provision/lib.sh DOCKER_1461_PGVECTOR_APT_VERSION)\n' "$CANONICAL_PGVECTOR_PATCH" >&2
         printf '     Current release version (Cargo.toml) = %s\n' "$CANONICAL_RELEASE_VERSION" >&2
+        printf '     asi-hard KNOBS entries = %s (src/security_profile.rs::KNOBS)\n' "$CANONICAL_ASI_HARD_KNOBS" >&2
+        printf '     ENTERPRISE_FEDERATION_CHECK_COUNT = %s\n' "$CANONICAL_EF_CHECK_COUNT" >&2
         exit 1
     fi
     printf '✅ docs-vs-SSOT drift gate: PASS\n'
-    printf '   Canonical values: schema=%s, full_tools=%s, core_tools=%s, routes=%s, paths=%s, cli_default=%s, cli_sal=%s, mem_fields=%s, link=%s, scope=%s, hooks=%s, pgvector=%s, release=%s\n' \
+    printf '   Canonical values: schema=%s, full_tools=%s, core_tools=%s, routes=%s, paths=%s, cli_default=%s, cli_sal=%s, mem_fields=%s, link=%s, scope=%s, hooks=%s, pgvector=%s, release=%s, asi_hard_knobs=%s, ef_checks=%s\n' \
         "$CANONICAL_SCHEMA_VERSION" \
         "$CANONICAL_FULL_TOOL_COUNT" \
         "$CANONICAL_CORE_TOOL_COUNT" \
@@ -1458,7 +1554,9 @@ run_all_rules() {
         "$CANONICAL_SCOPE_COUNT" \
         "$CANONICAL_HOOK_EVENTS" \
         "$CANONICAL_PGVECTOR_PATCH" \
-        "$CANONICAL_RELEASE_VERSION"
+        "$CANONICAL_RELEASE_VERSION" \
+        "$CANONICAL_ASI_HARD_KNOBS" \
+        "$CANONICAL_EF_CHECK_COUNT"
 }
 
 # --------------------------------------------------------------------
@@ -2040,6 +2138,118 @@ KNOBGOODSH
     fi
     echo "PASS: self-test #3113 — the correct asi-hard knob count still PASSES"
     rm -f "$tmpdir/scripts/check-bootstrap-cert-gate.sh" "$tmpdir/src/security_profile.rs"
+
+    # ================================================================
+    # asi-hard KNOBS count + ENTERPRISE_FEDERATION_CHECK_COUNT
+    # ================================================================
+    # Until this wave neither number had an SSOT rule, and both drifted:
+    # five live surfaces said the asi-hard profile pins 17 knobs after
+    # #3033 raised `KNOBS` to 21. Fixture SSOTs: 3 knobs / 5 checks, so a
+    # planted 4 / 6 must be REJECTED and the true values ACCEPTED.
+    mkdir -p "$tmpdir/docs/deploy" "$tmpdir/docs/compliance"
+    cat > "$tmpdir/src/security_profile.rs" <<'KNOBSSSOT'
+struct KnobSpec {
+    env: &'static str,
+}
+const KNOBS: &[KnobSpec] = &[
+    KnobSpec {
+        env: "A",
+    },
+    KnobSpec {
+        env: "B",
+    },
+    KnobSpec {
+        env: "C",
+    },
+];
+KNOBSSSOT
+    cat > "$tmpdir/src/enterprise_federation_posture.rs" <<'EFSSOT'
+pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 5;
+EFSSOT
+    cat > "$tmpdir/SECURITY.md" <<'KNOBSTALE'
+- The pinned SSOT (`src/security_profile.rs::KNOBS`) is **4 knobs** — see the deploy template.
+Last updated: 2026-08-21 (`asi-hard` 4-knob hardened profile cross-referenced).
+KNOBSTALE
+    cat > "$tmpdir/docs/deploy/README.md" <<'KNOBSTALEDEPLOY'
+This template layers the config-backed PE-1 knobs and the egress posture on top.
+(That list is all **4** `KNOBS` entries.)
+KNOBSTALEDEPLOY
+    cat > "$tmpdir/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md" <<'EFSTALE'
+`run_posture` returns **0 iff all 6 checks pass, else 2**.
+> Evidence note: the captures below PREDATE the last two checks and reflect the 4-check posture.
+EFSTALE
+    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — gate did NOT catch the stale asi-hard knob / EF check counts" >&2
+        printf '%s\n' "$knob_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    for _want in \
+        'asi-hard KNOBS count (src/security_profile.rs::KNOBS): SECURITY.md:1 claims "4"' \
+        'asi-hard KNOBS count (src/security_profile.rs::KNOBS): SECURITY.md:2 claims "4"' \
+        'asi-hard KNOBS count (src/security_profile.rs::KNOBS): docs/deploy/README.md:2 claims "4"' \
+        'ENTERPRISE_FEDERATION_CHECK_COUNT: docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md:1 claims "6"'
+    do
+        grep -qF "$_want" <<<"$knob_out" || {
+            echo "FAIL: self-test — expected drift not flagged: $_want" >&2
+            printf '%s\n' "$knob_out" >&2
+            cd "$REPO_ROOT"; exit 1; }
+    done
+    # The `PE-1 knobs` prose must NOT match: a bare `([0-9]+) knobs`
+    # anchor would capture the `1` out of `PE-1` and report phantom drift.
+    if grep -qF 'KNOBS): docs/deploy/README.md:1' <<<"$knob_out"; then
+        echo "FAIL: self-test — the knob rule falsely matched 'PE-1 knobs' prose" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    # The cert doc's EVIDENCE NOTE (a true record of a past capture) must
+    # NOT be re-pointed at the canonical.
+    if grep -qF 'ENTERPRISE_FEDERATION_CHECK_COUNT: docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md:2' <<<"$knob_out"; then
+        echo "FAIL: self-test — the EF check rule falsely flagged a historical evidence note" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test — asi-hard KNOBS + EF check-count rules REJECT stale counts, spare 'PE-1 knobs' and the evidence note"
+
+    # ---- CONTROL: the canonical counts (3 knobs / 5 checks) PASS.
+    cat > "$tmpdir/SECURITY.md" <<'KNOBGOOD'
+- The pinned SSOT (`src/security_profile.rs::KNOBS`) is **3 knobs** — see the deploy template.
+Last updated: 2026-08-21 (`asi-hard` 3-knob hardened profile cross-referenced).
+KNOBGOOD
+    cat > "$tmpdir/docs/deploy/README.md" <<'KNOBGOODDEPLOY'
+This template layers the config-backed PE-1 knobs and the egress posture on top.
+(That list is all **3** `KNOBS` entries.)
+KNOBGOODDEPLOY
+    cat > "$tmpdir/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md" <<'EFGOOD'
+`run_posture` returns **0 iff all 5 checks pass, else 2**.
+EFGOOD
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test — the knob / EF check rules fired on the CANONICAL counts" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test — the canonical asi-hard knob (3) + EF check (5) counts PASS"
+
+    # ---- FAIL-CLOSED-ONLY-WITH-A-CLAIM: remove both SSOTs. A doc that
+    # narrates NO count has nothing to validate and must stay green;
+    # a doc that DOES narrate one must fail rather than silently pass.
+    rm -f "$tmpdir/src/security_profile.rs" "$tmpdir/src/enterprise_federation_posture.rs"
+    rm -f "$tmpdir/SECURITY.md" "$tmpdir/docs/deploy/README.md"
+    rm -f "$tmpdir/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test — an ABSENT knob/EF SSOT with no claim to validate did not stay green" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    cat > "$tmpdir/SECURITY.md" <<'KNOBORPHAN'
+- The pinned SSOT (`src/security_profile.rs::KNOBS`) is **3 knobs** — see the deploy template.
+KNOBORPHAN
+    if orphan_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — a knob claim with an UNRESOLVABLE SSOT passed silently (fail-open)" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    grep -qF '<unresolved>' <<<"$orphan_out" || {
+        echo "FAIL: self-test — the unresolved-SSOT failure did not name the unresolved canonical" >&2
+        printf '%s\n' "$orphan_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    rm -f "$tmpdir/SECURITY.md"
+    echo "PASS: self-test — an unresolvable knob SSOT FAILS CLOSED only when a doc actually narrates the count"
 
     # ================================================================
     # #2977 — THE GITHUB-PAGES (.html) SURFACE

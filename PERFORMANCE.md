@@ -11,7 +11,9 @@ subcommand (Stream E) and the Bench workflow (`.github/workflows/bench.yml`,
 Stream F) both read from these targets. `ai-memory bench` exits non-zero
 when any measured p95 exceeds its target by more than the published 10%
 tolerance (`P95_TOLERANCE = 1.10`, `src/bench.rs`), and the workflow
-propagates that exit code.
+propagates that exit code (`--report-only` suppresses the non-zero exit:
+it measures and prints the same FAIL status but always exits 0 —
+`src/bench.rs::verdict`).
 
 > **The Bench workflow is ADVISORY — it does not block a merge.** Its own
 > header says so verbatim ("Bench is advisory (not in required-status-checks)",
@@ -21,6 +23,12 @@ propagates that exit code.
 > Bench run red and lands the failing table in the run summary; it does not
 > stop the pull request. Treat these budgets as a published contract plus a
 > loud, unmissable signal — not as a merge gate.
+>
+> As of [#3137](https://github.com/alphaonedev/ai-memory-mcp/issues/3137)
+> this is total: the two `ai-memory bench` invocations inside the required
+> `Check` legs (`tests/integration.rs`, the CLI smoke and the eight-result
+> test) both run `--report-only`, so no test in any required status check
+> asserts a budget either. A p95 breach is red-in-Bench and nothing else.
 
 ## Budget Table
 
@@ -28,8 +36,11 @@ Every row below sits in **exactly one** of four buckets, marked inline:
 
 - **(no marker)** — exercised by `ai-memory bench` in the advisory Bench
   workflow on every non-docs PR + trunk push. These rows have a real
-  `Operation` variant in `src/bench.rs` and a mechanically-pinned budget
-  (`operation_targets_match_performance_md`).
+  `Operation` variant in `src/bench.rs` and a budget mirrored in
+  `src/bench.rs::Operation::target_p95_ms`. The mirror is **discipline,
+  not mechanism**: `operation_targets_match_performance_md` asserts the
+  Rust consts against hardcoded literals and never parses this file, so a
+  one-sided edit to the table is not detected by any gate.
 - **\*[advisory]\*** — a published target with **no** bench in `src/bench.rs`.
   Nothing measures it and nothing enforces it; it is an operator-facing
   contract pending the Stream E embedder fixture and related follow-ups
@@ -41,9 +52,12 @@ Every row below sits in **exactly one** of four buckets, marked inline:
   it publishes no target.
 
 Counted at HEAD, the table holds **17 rows: 7 exercised by `ai-memory bench`
-(8 `Operation` variants — the "depth ≤ 3" row covers both `KgQueryDepth1`
-and `KgQueryDepth3`), 8 advisory with no producer, 1 measured by the
-separate `hnsw_rebuild_async` bench, and 1 that is not a budget at all.**
+(8 of the 10 `Operation` variants in `src/bench.rs` — the "depth ≤ 3" row
+covers both `KgQueryDepth1` and `KgQueryDepth3`; the other two,
+`VerifiedStore` / `VerifiedRecall`, are `--verified`-only and covered in
+§"Verified-path benchmarks", not this table), 8 advisory with no producer,
+1 measured by the separate `hnsw_rebuild_async` bench, and 1 that is not a
+budget at all.**
 
 | Operation | Target (p95) | Target (p99) | Notes |
 |---|---|---|---|
@@ -187,7 +201,7 @@ Two limits on that coverage, both load-bearing:
 
 1. **It does not run on every PR.** Both the `pull_request` and `push`
    triggers carry `paths-ignore: ['docs/**', '**/*.md']`
-   (`.github/workflows/bench.yml:20-28`), so a PR touching only docs or
+   (`.github/workflows/bench.yml:21-23`, `:26-28`), so a PR touching only docs or
    Markdown never runs the bench at all.
 2. **A failure blocks nothing.** The Bench workflow is advisory and is not
    in the required-status-check set (see the note at the top of this
@@ -585,7 +599,10 @@ mechanism.
 
 The 10% figure is real and single-sourced: `P95_TOLERANCE = 1.10` in
 `src/bench.rs`, and the independent relative-regression default is
-`DEFAULT_REGRESSION_THRESHOLD_PCT = 10.0`.
+`DEFAULT_REGRESSION_THRESHOLD_PCT = 10.0` — though the advisory CI step
+overrides it to **50%** (`bench.yml` `--regression-threshold 50`, mirrored
+by `regression_threshold_pct_default: 50` in `performance/baseline.json`),
+because a shared-runner p95 at 10% is a flake generator.
 
 p99 targets in the table above are **informational** until the v0.6.3
 soak window closes. They are recorded here to make the long-tail goal
@@ -670,7 +687,9 @@ SQLite database (the operator's main DB is untouched) and reports
 per-operation p50/p95/p99 against the budgets above. Exit code is
 non-zero when any p95 exceeds its budget by more than the published
 10% tolerance — the same subcommand the advisory `bench.yml` workflow
-runs.
+runs (`--report-only` suppresses the non-zero exit: it measures and
+prints the same FAIL status but always exits 0 —
+`src/bench.rs::verdict`).
 
 Two caveats before you compare your run to the published table:
 

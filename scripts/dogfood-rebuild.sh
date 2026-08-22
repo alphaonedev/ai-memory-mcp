@@ -29,7 +29,11 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIVE_DB="${AI_MEMORY_DB:-$HOME/.claude/ai-memory.db}"
-BACKUP_DB="/tmp/ai-memory-dogfood-test-$(date +%Y%m%dT%H%M%S).db"
+# Scratch lives in the repo-local, gitignored .local-runs/ (CLAUDE.md
+# §"Allowed scratch location"), never /tmp: a /tmp backup of the LIVE MCP
+# database is reaped by tmpfiles/reboot, so the one artifact that makes
+# this script recoverable would silently disappear.
+BACKUP_DB="$REPO/.local-runs/ai-memory-dogfood-test-$(date +%Y%m%dT%H%M%S).db"
 HOMEBREW_BIN="/opt/homebrew/bin/ai-memory"
 
 cd "$REPO"
@@ -45,6 +49,7 @@ echo
 
 echo "==> 2/5  backup live DB → $BACKUP_DB"
 if [[ -f "$LIVE_DB" ]]; then
+  mkdir -p "$REPO/.local-runs"
   cp "$LIVE_DB" "$BACKUP_DB"
   schema_before=$(sqlite3 "$BACKUP_DB" "SELECT MAX(version) FROM schema_version" 2>/dev/null || echo "?")
   echo "    backup OK; schema_version before = $schema_before"

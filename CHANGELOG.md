@@ -186,6 +186,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Claims-audit batch 2: eleven operator-facing claims corrected against their
+  in-tree SSOTs, and two of them pinned so they cannot drift again.** Every item
+  was re-verified against `release/v1.0.0` before editing. Documentation only —
+  no runtime behaviour changes.
+  - **asi-hard pinned-knob count `17` -> `21`** on all five surfaces that
+    narrate it (`SECURITY.md` x2, `README.md`, `docs/deploy/README.md`,
+    `docs/deploy/enterprise-federation.env`, `docs/enterprise-deployment.md`).
+    `src/security_profile.rs::KNOBS` has held 21 entries since
+    [#3033](https://github.com/alphaonedev/ai-memory-mcp/issues/3033) added the
+    four outer federation-transport gates (`AI_MEMORY_FED_REQUIRE_SIG`,
+    `_NONCE`, `_PEER_ENROLLMENT`, `_PUSH_NAMESPACE_SCOPE`); every doc still said
+    17, understating the hardened posture to a procurement reader.
+    `docs/deploy/README.md` gains the four missing bullets.
+  - **NSA CSI MCP badge `10/10` -> `9/10`** (`README.md`, `docs/index.html`,
+    `docs/at-a-glance.html`), matching the project's own
+    `docs/compliance/nsa-csi-mcp-security-mapping.md` and
+    `docs/compliance/honest-limitations.md`: concern (a), access control, is
+    posture-conditional (finding H1) and the mapping deliberately publishes no
+    flat 10/10. `README.md` also gains the "self-assessed, not independently
+    audited" framing and the **NSA non-endorsement** disclaimer that
+    `docs/index.html` already carried.
+  - **Test-attribute count `11,900` -> `12,549`** (badge + body + the four
+    inline `#` comments in `README.md`'s own re-derivation block), re-derived by
+    running those four commands at this tree: `src/` 6,660 + 1,222; `tests/`
+    2,793 + 1,874.
+  - **`15,951 / 0` regression figure now carries its provenance inline**
+    (`docs/index.html`): 2026-05-31 final baseline, v0.7.0 tree. The number is
+    real and provenanced in `docs/evidence.html`; it was being read as current.
+  - **HTTP body-limit anchor** (`README.md`) cites the symbol
+    (`.layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))`) instead of the
+    stale `src/lib.rs:1333` line number (the layer is at 1338 today).
+  - **TOON compression claims** (`README.md` x2) drop the unqualified
+    "40-60%" / "79% smaller" guarantees in favour of what is mechanically
+    enforced: on the pinned 5-memory fixture in `src/toon.rs` the compact form
+    is held below 65% of JSON bytes
+    (`test_toon_size_invariant_5_memories_under_threshold`). The
+    1,600/626/336-byte figures are labelled as one illustrative 3-memory
+    example, not a ratio.
+  - **Federation "three unscoped inbound write lanes" was stale and
+    UNDER-claimed shipped controls.** `docs/federation.md`,
+    `docs/federation-identity.md` and `docs/enterprise-deployment.md` still
+    warned that `links[]`, `signals[]` and the pull-accept path never consult
+    `allowed_namespaces`. Under an enrolled posture they all do:
+    `federation_receive.rs` gates `memories[]`, `links[]` (source AND target
+    stored namespace), `signals[]`, `deletions[]`, `archives[]`, `restores[]`,
+    `action_transitions[]`, `checkpoints[]` and `namespace_meta` through
+    `federation::receive_auth`
+    ([#2489](https://github.com/alphaonedev/ai-memory-mcp/issues/2489)), and
+    `federation::receive::catchup_memory_namespace_authorized` gates the
+    pull-accept path
+    ([#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480)). The
+    residual limit is restated honestly: federation replicates plaintext
+    ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968)), and
+    `CallerContext::for_admin(FEDERATION_CATCHUP)` still bypasses SAL
+    *visibility* — the scope gate runs before it.
+  - **DO runbook quorum semantics `503` -> `202`**
+    (`docs/RUNBOOK-digitalocean-testing.md`). `under_replicated_response`
+    (`src/handlers/parity.rs`) returns **202 Accepted** with `quorum_met:false`
+    for a write whose local commit landed but whose acks missed the deadline
+    (v0.8.1 G12). A tester following the old text would have recorded a durable
+    write as a failure; the pass criteria now count 202 as under-replicated,
+    not failed.
+  - **Chaos runbook set the wrong env var**
+    (`docs/RUNBOOK-chaos-campaign.md`): `AI_MEMORY_DB` is the SQLite `--db`
+    file path, so `export AI_MEMORY_DB=postgres://...` creates a file with that
+    name and silently runs the whole campaign on SQLite. Corrected to
+    `AI_MEMORY_STORE_URL`, with the trap stated inline.
+  - **`scripts/dogfood-rebuild.sh` backed the LIVE MCP database up to `/tmp`**,
+    contradicting the project's own scratch rule; the one artifact that makes
+    the script recoverable was on a reaped filesystem. It now writes to the
+    repo-local, gitignored `.local-runs/`. `CLAUDE.md` is updated to match, and
+    its stale absolute scratch path (`/Users/fate/v07/v07-fixes/.local-runs/`)
+    becomes `<repo-root>/.local-runs/`.
+  - **`90 CLI subcommands`** on `docs/index.html` is qualified as the default
+    build (92 with `sal` features).
+  - **`PERFORMANCE.md`: the budget contract is stated as what it is.** The
+    advisory-Bench note now records that since
+    [#3137](https://github.com/alphaonedev/ai-memory-mcp/issues/3137) the two
+    `ai-memory bench` calls inside the required `Check` legs both run
+    `--report-only`, so NO test in any required status check asserts a budget
+    — a p95 breach is red-in-Bench and nothing else. Both "exits non-zero"
+    sentences now name the `--report-only` carve-out (`src/bench.rs::verdict`
+    measures, prints the same FAIL status, and exits 0). The
+    "mechanically-pinned budget" claim is corrected to discipline-not-mechanism:
+    `operation_targets_match_performance_md` asserts the Rust consts against
+    hardcoded literals and never parses `PERFORMANCE.md`, so a one-sided table
+    edit is caught by nothing. "8 `Operation` variants" is qualified as 8 of
+    10 (`VerifiedStore`/`VerifiedRecall` are `--verified`-only). The
+    `paths-ignore` anchor `bench.yml:20-28` is corrected to `:21-23`, `:26-28`.
+    And the single-sourced 10% regression default now discloses that the
+    advisory CI step overrides it to **50%** (`--regression-threshold 50`,
+    mirrored by `regression_threshold_pct_default: 50` in
+    `performance/baseline.json`).
+  - **`.github/workflows/bench.yml` (comment-only + one word).** The
+    `RUNNER PLACEMENT` comment cited `PERFORMANCE.md §"Measurement
+    methodology"`, "its hardware multiplier table" and `PERFORMANCE.md §7` —
+    none of which exist; the section is `## Hardware Baseline` and the
+    document has no numbered sections. It also claimed
+    `performance/baseline.json` "documents itself as a
+    regenerate-baseline-on-ubuntu-latest median-of-3 artefact", where the
+    committed file is `runner_class: local-dev-bootstrap`, `bootstrap: true`
+    — a placeholder, which is why the compare step skips. Both corrected. The
+    scale-gate summary line said "same 7 operations"; `baseline.json` carries
+    8 results and `PERFORMANCE.md` §"Corpus-scale budgets" says 8.
+  - **`scripts/check-docs-vs-ssot.sh` gains two rules** so two of the above
+    cannot drift again: the asi-hard knob narration is pinned to the
+    `KnobSpec` entry count in `src/security_profile.rs::KNOBS`, and the cert
+    doc's normative exit contract is pinned to
+    `enterprise_federation_posture::ENTERPRISE_FEDERATION_CHECK_COUNT`. Both
+    ship with `--self-test` legs proving they reject stale counts, spare the
+    `PE-1 knobs` prose and the cert doc's historical evidence notes, and fail
+    closed on an unresolvable SSOT only when a doc actually narrates the count.
+
 - **The required `Check` legs are no longer undeclared performance gates:
   `ai-memory bench` gains `--report-only`.** `cmd_bench` bails non-zero
   whenever any operation's measured p95 exceeds its target by more than 10%, so

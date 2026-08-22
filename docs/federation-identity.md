@@ -127,10 +127,13 @@ control.
 `src/handlers/`, or in the storage layer. Inside one trust domain it
 enforces nothing at all between the parties that hold valid credentials
 for it. The in-domain confinement primitive is
-`PeerScope.allowed_namespaces` — and three inbound write lanes do not
-consult that either (`links[]`, `signals[]`, and the pull-accept path;
-see [`docs/federation.md`](federation.html) §"Layer 3 — Peer
-attestation" for the table and the tracking issues).
+`PeerScope.allowed_namespaces`, which every inbound write lane —
+`links[]`, `signals[]` and the pull-accept path included — now
+consults under an enrolled posture (#2489/#2480); what still makes
+this not a mutually-distrusting-tenant boundary is that federation
+replicates plaintext (#1968), not an unscoped lane (see
+[`docs/federation.md`](federation.html) §"Layer 3 — Peer
+attestation").
 
 **Therefore:**
 
