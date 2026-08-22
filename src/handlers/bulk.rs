@@ -925,6 +925,8 @@ pub async fn bulk_create(
         };
         let expires_at = crate::handlers::parity::resolve_create_expires_at(
             now,
+            // v1.0.0 #2399 — the long-tier permanence gate lives in the SSOT.
+            &body.tier,
             body.expires_at.clone(),
             body.ttl_secs,
             resolved_ttl.ttl_for_tier(&body.tier),

@@ -1142,7 +1142,10 @@ impl Memory {
     /// An explicit value the caller supplied wins; otherwise a non-`Long`
     /// row is stamped with `created_at + Tier::default_ttl_secs()` so it
     /// is reapable by GC (`expires_at IS NOT NULL AND expires_at < now`).
-    /// `Long` rows have no TTL and stay immortal (returns `None`).
+    /// `Long` rows have no TTL and stay immortal (returns `None`) — v1.0.0
+    /// #2399: including when the caller supplied an explicit `expires_at`,
+    /// which the long-tier gate overrides so a fresh long-tier insert can
+    /// never be handed to the tier-blind GC reap predicate.
     ///
     /// Single SSOT for the tier-default backfill across every store
     /// backend (SQLite `storage::insert` + the `insert_with_conflict` /
@@ -1158,6 +1161,26 @@ impl Memory {
     /// than silently dropping the expiry.
     #[must_use]
     pub fn effective_expires_at(&self) -> Option<String> {
+        // v1.0.0 #2399 — the #1626 long-tier immortality coupling, enforced at
+        // the SHARED write funnel (this helper is the SSOT every store path
+        // binds `expires_at` through: sqlite `insert_inner` / the
+        // `ConflictMode::Error` arm / `consolidate` / both federation funnels,
+        // and ~10 postgres write sites). Pre-#2399 the explicit-value
+        // passthrough BELOW was tier-blind, so a FRESH insert of a `long` row
+        // that carried a caller-supplied `expires_at` kept that expiry — while
+        // EVERY other lane forces NULL for long: the insert `ON CONFLICT` arms
+        // (`expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier =
+        // 'long' THEN NULL ...`), both update funnels (#2331 FBL-01) and the
+        // supersede funnel. Because the GC reap predicate is TIER-BLIND
+        // (`expires_at IS NOT NULL AND expires_at < now`), that left a
+        // documented-permanent row archived — or hard-deleted + crypto-erased
+        // under `archive_on_gc=false` — at the caller's deadline. Silent
+        // destruction of a documented-permanent row is a direct North-Star
+        // data-integrity violation, so the tier gate runs FIRST and overrides
+        // the caller value, exactly as the other lanes do.
+        if matches!(self.tier, Tier::Long) {
+            return None;
+        }
         if self.expires_at.is_some() {
             return self.expires_at.clone();
         }
@@ -2461,7 +2484,10 @@ mod tests {
     #[test]
     fn effective_expires_at_preserves_explicit_value() {
         let explicit = "2027-06-15T12:00:00+00:00".to_string();
-        for tier in [Tier::Short, Tier::Mid, Tier::Long] {
+        // v1.0.0 #2399 — Long is DELIBERATELY excluded: the long-tier gate
+        // overrides a caller expiry (see
+        // `effective_expires_at_long_forces_none_over_explicit_caller_expiry`).
+        for tier in [Tier::Short, Tier::Mid] {
             let mut m = Memory::default();
             m.tier = tier;
             m.created_at = "2026-01-01T00:00:00+00:00".to_string();
@@ -2472,6 +2498,26 @@ mod tests {
                 "an explicit expiry must win over the tier default"
             );
         }
+    }
+
+    /// v1.0.0 #2399 — a FRESH long-tier row carrying a caller-supplied
+    /// `expires_at` must come back immortal. Pre-#2399 the explicit value was
+    /// preserved verbatim and the TIER-BLIND GC reap predicate
+    /// (`expires_at IS NOT NULL AND expires_at < now`) then destroyed a
+    /// documented-permanent row at the caller's deadline, while the SAME
+    /// logical write through the upsert / update lanes survived forever.
+    #[test]
+    fn effective_expires_at_long_forces_none_over_explicit_caller_expiry() {
+        let mut m = Memory::default();
+        m.tier = Tier::Long;
+        m.created_at = "2026-01-01T00:00:00+00:00".to_string();
+        m.expires_at = Some("2026-01-01T01:00:00+00:00".to_string());
+        assert_eq!(
+            m.effective_expires_at(),
+            None,
+            "long-tier permanence must override a caller-supplied expiry \
+             (#2399): the GC reap predicate is tier-blind"
+        );
     }
 
     #[test]

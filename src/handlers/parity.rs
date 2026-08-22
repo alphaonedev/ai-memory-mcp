@@ -33,7 +33,7 @@ use serde_json::json;
 
 use super::transport::AppState;
 use crate::federation::QuorumNotMetPayload;
-use crate::models::Memory;
+use crate::models::{Memory, Tier};
 use crate::validate;
 
 /// Build the canonical under-replication response for a write whose
@@ -272,7 +272,24 @@ pub(crate) fn http_caller_ctx(
 /// 2. else a caller-supplied `ttl_secs` → `now + ttl_secs`;
 /// 3. else the operator-configured tier default (`ResolvedTtl::ttl_for_tier`).
 ///
-/// Returns `None` (an immortal row) only when all three are absent.
+/// Returns `None` (an immortal row) when all three are absent — and,
+/// v1.0.0 #2399, whenever `tier` is [`Tier::Long`], which SHORT-CIRCUITS the
+/// whole ladder above.
+///
+/// # v1.0.0 #2399 — the long-tier gate
+///
+/// Pre-#2399 this helper was TIER-BLIND, so a fresh `POST /api/v1/memories`
+/// (or a bulk row) carrying `tier=long` + an explicit `expires_at` / `ttl_secs`
+/// produced a `long` row with a live expiry. EVERY other lane forces NULL for
+/// long — the insert `ON CONFLICT` arms, both update funnels (#2331 FBL-01)
+/// and the supersede funnel — and the GC reap predicate is TIER-BLIND
+/// (`expires_at IS NOT NULL AND expires_at < now`), so the "permanent" row was
+/// archived (or hard-deleted + crypto-erased under `archive_on_gc=false`) at
+/// the caller's deadline while the same logical write via upsert survived
+/// forever. The gate lives HERE as well as at the shared store funnel
+/// ([`crate::models::Memory::effective_expires_at`]) so the projected
+/// `Memory` — and therefore the create response echoed to the caller — never
+/// carries a value the durable row will not have.
 ///
 /// Pre-#1886 the Postgres single-create path bound `expires_at` from the
 /// explicit field ONLY, silently dropping a validated `ttl_secs` — an
@@ -284,10 +301,15 @@ pub(crate) fn http_caller_ctx(
 #[must_use]
 pub fn resolve_create_expires_at(
     now: chrono::DateTime<chrono::Utc>,
+    tier: &Tier,
     explicit: Option<String>,
     ttl_secs: Option<i64>,
     tier_default_secs: Option<i64>,
 ) -> Option<String> {
+    // v1.0.0 #2399 — long is permanent on EVERY lane; see the doc comment.
+    if matches!(tier, Tier::Long) {
+        return None;
+    }
     explicit.or_else(|| {
         ttl_secs
             .or(tier_default_secs)
@@ -298,6 +320,7 @@ pub fn resolve_create_expires_at(
 #[cfg(test)]
 mod resolve_create_expires_at_tests {
     use super::resolve_create_expires_at;
+    use crate::models::Tier;
     use chrono::{Duration, TimeZone, Utc};
 
     fn fixed_now() -> chrono::DateTime<Utc> {
@@ -308,6 +331,7 @@ mod resolve_create_expires_at_tests {
     fn explicit_expires_at_wins_verbatim() {
         let out = resolve_create_expires_at(
             fixed_now(),
+            &Tier::Short,
             Some("2030-01-01T00:00:00+00:00".to_string()),
             Some(3600),
             Some(60),
@@ -320,14 +344,14 @@ mod resolve_create_expires_at_tests {
         // #1886 regression: a caller-supplied `ttl_secs` MUST become an
         // expiry. Pre-fix the postgres single-create path returned `None`
         // here (immortal row).
-        let out = resolve_create_expires_at(fixed_now(), None, Some(3600), None);
+        let out = resolve_create_expires_at(fixed_now(), &Tier::Short, None, Some(3600), None);
         let expected = (fixed_now() + Duration::seconds(3600)).to_rfc3339();
         assert_eq!(out.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
     fn ttl_secs_takes_precedence_over_tier_default() {
-        let out = resolve_create_expires_at(fixed_now(), None, Some(3600), Some(60));
+        let out = resolve_create_expires_at(fixed_now(), &Tier::Short, None, Some(3600), Some(60));
         let expected = (fixed_now() + Duration::seconds(3600)).to_rfc3339();
         assert_eq!(out.as_deref(), Some(expected.as_str()));
     }
@@ -337,15 +361,60 @@ mod resolve_create_expires_at_tests {
         // #1911 regression: with neither explicit expiry nor `ttl_secs`,
         // the configured tier default must still expire the row. Pre-fix
         // the postgres bulk path returned `None` (immortal row).
-        let out = resolve_create_expires_at(fixed_now(), None, None, Some(21600));
+        let out = resolve_create_expires_at(fixed_now(), &Tier::Short, None, None, Some(21600));
         let expected = (fixed_now() + Duration::seconds(21600)).to_rfc3339();
         assert_eq!(out.as_deref(), Some(expected.as_str()));
+    }
+
+    /// v1.0.0 #2399 — the long-tier gate short-circuits EVERY rung of the
+    /// precedence ladder: an explicit caller `expires_at`, a caller
+    /// `ttl_secs`, and the operator-configured tier default all yield `None`
+    /// so the fresh row is immortal, matching the upsert / update / supersede
+    /// lanes. Without this a `tier=long` create was reaped by the tier-blind
+    /// GC predicate at the caller's deadline.
+    #[test]
+    fn long_tier_forces_immortal_over_every_precedence_rung_2399() {
+        assert_eq!(
+            resolve_create_expires_at(
+                fixed_now(),
+                &Tier::Long,
+                Some("2030-01-01T00:00:00+00:00".to_string()),
+                Some(3600),
+                Some(60),
+            ),
+            None,
+            "explicit caller expires_at must not survive on a long row"
+        );
+        assert_eq!(
+            resolve_create_expires_at(fixed_now(), &Tier::Long, None, Some(3600), None),
+            None,
+            "caller ttl_secs must not survive on a long row"
+        );
+        assert_eq!(
+            resolve_create_expires_at(fixed_now(), &Tier::Long, None, None, Some(21600)),
+            None,
+            "an operator tier default must not survive on a long row"
+        );
+        // Non-long tiers keep the pre-#2399 ladder byte-for-byte.
+        for tier in [Tier::Short, Tier::Mid] {
+            assert_eq!(
+                resolve_create_expires_at(
+                    fixed_now(),
+                    &tier,
+                    Some("2030-01-01T00:00:00+00:00".to_string()),
+                    None,
+                    None,
+                )
+                .as_deref(),
+                Some("2030-01-01T00:00:00+00:00"),
+            );
+        }
     }
 
     #[test]
     fn none_when_all_absent_stays_immortal() {
         assert_eq!(
-            resolve_create_expires_at(fixed_now(), None, None, None),
+            resolve_create_expires_at(fixed_now(), &Tier::Short, None, None, None),
             None
         );
     }

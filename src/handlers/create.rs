@@ -1121,6 +1121,8 @@ async fn create_memory_postgres(
         let tier_default = app.db.lock().await.2.ttl_for_tier(&body.tier);
         crate::handlers::parity::resolve_create_expires_at(
             now,
+            // v1.0.0 #2399 — the long-tier permanence gate lives in the SSOT.
+            &body.tier,
             body.expires_at.clone(),
             body.ttl_secs,
             tier_default,
@@ -1681,6 +1683,8 @@ pub async fn create_memory(
     // branches) so every backend resolves the expiry identically.
     let expires_at = crate::handlers::parity::resolve_create_expires_at(
         now,
+        // v1.0.0 #2399 — the long-tier permanence gate lives in the SSOT.
+        &body.tier,
         body.expires_at.clone(),
         body.ttl_secs,
         lock.2.ttl_for_tier(&body.tier),
