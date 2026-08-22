@@ -39,6 +39,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other jobs `needs:` must never be self-hosted unless it is itself `pg-tier` or
   `warm-cache`) is stated once at the head of `.github/workflows/ci.yml`, and
   every re-homed job carries a `# RUNNER PLACEMENT` comment citing it.
+- **`Swatinem/rust-cache` no longer runs on the self-hosted fleet, and the
+  toolchain action can no longer curl-pipe an installer into a shared `$HOME`.**
+  Two failure modes observed on the fleet, both from a hosted-runner action
+  meeting a PERSISTENT workspace:
+  - PR #3116's self-hosted build died in 18 s with `could not parse/generate dep
+    info at: …/target/debug/deps/getrandom-*.d — No such file or directory`
+    (disk was fine). On the fleet the workspace `target/` already IS the warm
+    cache; `Swatinem/rust-cache` then restores an archive saved by a DIFFERENT
+    runner instance OVER that live tree and prunes it in its post-step, leaving
+    mixed-provenance artifacts. The action is now gated
+    `if: runner.environment == 'github-hosted'` on all nine self-hosted job
+    definitions (`check`, `lint`, `msrv`, `postgres-feature`, `sal-feature`,
+    `vectorlite-feature`, the two Batman-mode jobs, `lifetime-tests`); hosted
+    jobs are untouched. `~/.cargo/{registry,git}` persist natively in `$HOME` on
+    the fleet, so no cache is lost. **`CARGO_INCREMENTAL: "0"` — which that
+    action used to export — is now declared explicitly** in the workflow `env:`
+    block of each affected workflow, rather than left to the action or to the
+    runner `.env`: incremental state is the most fragile thing in a `target/`
+    tree, and the fleet's is persistent and reused across branches.
+  - On 2026-08-22 at 05:40:33Z `dtolnay/rust-toolchain`'s "Install rustup if
+    needed" path ran `curl https://sh.rustup.rs | sh` inside a CI job on f2,
+    because `~/.cargo/bin/rustup` was momentarily absent during a rustup
+    self-update. On a hosted runner that is a throwaway image; on the fleet it
+    installs into a SHARED `$HOME` and the job then builds against whatever that
+    produced. Every self-hosted job that installs a toolchain now runs a
+    fail-closed `test -x "$HOME/.cargo/bin/rustup"` assertion FIRST — a node
+    missing its toolchain reds the job loudly instead of silently repairing
+    itself from the network. Both guards are written `!= 'github-hosted'` /
+    `== 'github-hosted'` so that an unset or unrecognised `runner.environment`
+    still runs the assertion and still skips the cache action.
 - **`bench.yml` returns to `ubuntu-latest` — the reference hardware its budgets
   are defined against.** The self-hosted move relocated the advisory bench gate
   and the baseline-regeneration job to `[self-hosted, linux-fed]` without moving

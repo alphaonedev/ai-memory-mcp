@@ -116,6 +116,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
+  # CARGO_INCREMENTAL=0, and it is now skipped on the self-hosted fleet (see the
+  # rust-cache guards below), so the value must be declared here. Incremental
+  # state is the most fragile thing in a `target/` tree, and the fleet's
+  # `target/` is PERSISTENT and reused across branches — leaving incremental on
+  # there would be a worse version of the very inconsistency the guard closes.
+  # Declaring it at workflow level also means no job depends on the runner
+  # `.env` supplying it.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   # Classify the diff so docs-only PRs can short-circuit the heavy Rust
@@ -400,11 +409,49 @@ jobs:
     runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
+      # FAIL CLOSED if rustup is missing on a self-hosted node (#3128).
+      # `dtolnay/rust-toolchain` has an "Install rustup if needed" path that
+      # runs `curl https://sh.rustup.rs | sh`. On a GitHub-hosted runner that is
+      # a clean, throwaway image. On the fleet it curl-pipes an installer into a
+      # SHARED $HOME — which is what happened on f2 at 05:40:33Z on 2026-08-22
+      # ("downloading installer … Rust is installed now") when `~/.cargo/bin/rustup`
+      # was momentarily absent during a rustup self-update, and the job then
+      # built against whatever that install produced. A node missing its
+      # toolchain is a BROKEN NODE: it must red the job loudly, not silently
+      # repair itself from the network. Skipped on hosted runners, where
+      # provisioning the toolchain is exactly the action's job.
+      #
+      # The condition is `!= 'github-hosted'`, NOT `== 'self-hosted'`, so that an
+      # unset or unrecognised `runner.environment` STILL RUNS the assertion. An
+      # unknown runner class must not silently switch a fail-closed control off.
+      # The rust-cache guards below use the opposite polarity for the same
+      # reason: unknown => skip the cache action, whose worst case is a cold
+      # build, never a mixed-provenance `target/`.
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — refusing to let the toolchain action curl-pipe an installer into a shared home. Repair the node."
+            exit 1
+          }
+          echo "rustup=$("$HOME/.cargo/bin/rustup" --version 2>&1 | head -1)"
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
@@ -520,9 +567,30 @@ jobs:
     runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.96.0 (declared MSRV)
         uses: dtolnay/rust-toolchain@1.96.0
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
       - name: cargo check on MSRV
         run: cargo check --all-targets
 
@@ -623,12 +691,32 @@ jobs:
           command -v node    >/dev/null || { echo "::error::node not on PATH on $RUNNER_NAME"; exit 1; }
           echo "python3=$(python3 --version) node=$(node --version)"
 
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted' && needs.classify.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         if: needs.classify.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@1.96.0
 
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
         with:
           # CI-speed (#3089) — SAVE the cache only on trunk `push` events
           # (push.branches = main/develop/release/**). `pull_request` and
@@ -1039,12 +1127,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
         with:
           # CI-speed (#3089) — save the cache only on trunk `push` events;
           # PR + merge_group runs restore-only. See the `check` job for the
@@ -1202,12 +1311,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
 
       - name: Clippy (sal feature)
         run: cargo clippy --features sal -- -D warnings -D clippy::all -D clippy::pedantic
@@ -1243,12 +1373,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
 
       - name: Clippy (vectorlite feature, all targets)
         run: cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic
