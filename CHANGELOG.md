@@ -1445,6 +1445,13 @@ backend and missing or divergently implemented on its twin). Pinned by
   Two arms are now correctly flagged `DataLossRisk::Column` (v43, v50) and the
   irreversible set is 21 arms, not the three the old comment in `migrate()`
   named.
+- **Migration-file header drift: `0030_v07_atomisation.sql` named the wrong arm
+  (#3160).** Its idempotency header said the `memory_links` rebuild is gated by
+  `if version < 35` and builds `memory_links_v35`; the arm has been
+  `if version < 36` / `memory_links_v36` since the file landed. A header that
+  names the wrong version sends an operator debugging a stuck ladder to the
+  wrong arm.
+
 - **The required `Check` legs are no longer undeclared performance gates:
   `ai-memory bench` gains `--report-only`.** `cmd_bench` bails non-zero
   whenever any operation's measured p95 exceeds its target by more than 10%, so
@@ -2503,6 +2510,33 @@ requirement was unenforced on the wire + CLI surfaces and never fired in product
   new `doctor --posture` check #20 asserting the escalate producer routes to a
   SATISFIABLE gate (approver keys enrolled). `ENTERPRISE_FEDERATION_CHECK_COUNT`
   19 → 20.
+
+### Tests (full-table-rebuild regression coverage; #3160)
+
+- **The two unexercised sqlite full-table rebuilds now have per-arm tests, and
+  the v63 rebuild test no longer passes without its triggers.** A SQLite
+  rebuild (`CREATE <shadow>` / `INSERT … SELECT` / `DROP TABLE` / `RENAME`)
+  silently drops EVERY trigger and secondary index on the table — the v63 → v65
+  lesson. The ladder carries six rebuilds; v50 (`agent_quotas` PK widening) and
+  v80 (`agent_lineage` custody/revocation) had NO regression test at all, and
+  `v63_rebuild_preserves_links_and_accepts_typed_cognition_relations` asserted
+  ONE of four indexes and ZERO of four triggers — so deleting
+  `CREATE TRIGGER memory_links_ck_attest_signature_ins` from
+  `0054_v65_*.sql` left `cargo test --lib storage::migrations` green, i.e. the
+  test would not have caught the defect it was written for. Added: per-arm v50
+  and v80 tests that seed the legacy shape WITH rows, stamp N-1, migrate, and
+  assert every row (and every BLOB — lineage `signature` / `prev_record_hash` /
+  `record_bytes`) survives verbatim plus the recreated PK, indexes and trigger
+  set read from `sqlite_master`; the full four-trigger / four-index tip-shape
+  assertion on the v63 test, on a new v62→tip replay test that also proves the
+  restored trigger REFUSES a phantom-signed edge, and on
+  `historical_replay_from_v1_reaches_current_schema`; and a generic
+  `rebuilt_tables_reach_the_same_trigger_and_index_set_on_both_paths_3160` gate
+  asserting that for every rebuilt table the UPGRADE path and the FRESH-INSTALL
+  path converge on the identical trigger + index set — the
+  `bootstrap(fresh) ≡ ladder(v0→tip)` invariant applied to triggers, which is
+  exactly the shape of the v63 → v65 defect. With the trigger pair deleted, four
+  tests now fail.
 
 ### Tests (deterministic atomise-worker drain; fix #2986 coverage-instrumentation flake)
 

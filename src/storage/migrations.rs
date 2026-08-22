@@ -4557,6 +4557,13 @@ mod tests {
             rel_index_present,
             "v63 rebuild must recreate idx_links_relation"
         );
+
+        // #3160 — this test used to stop at ONE of the four indexes and
+        // ZERO of the four triggers, so it would NOT have caught the very
+        // defect it was written for (the v63 rebuild dropping the
+        // memory_links signature triggers, which v65 had to restore).
+        // Assert the COMPLETE tip shape from sqlite_master.
+        assert_memory_links_tip_shape(&conn, "v63 rebuild arm");
     }
 
     #[test]
@@ -5447,6 +5454,16 @@ mod tests {
             "agent_lineage",
             "suspected_compromise_from_seq"
         ));
+
+        // #3160 — the UPGRADE path crosses THREE `memory_links` full-table
+        // rebuilds (v33 / v36 / v63), each of which drops every trigger and
+        // secondary index on the table. This headline replay asserted none
+        // of them, so the v63 -> v65 trigger loss was invisible here.
+        // Assert the complete tip shape: all four triggers, all four
+        // rebuild-owned indexes, plus the v75 lineage-cid index that the
+        // rebuilds predate.
+        assert_memory_links_tip_shape(&conn, "historical replay from v1");
+        assert!(index_exists(&conn, "idx_memory_links_target_cid"));
     }
 
     /// v1.0.0 crypto-core stage 2 (#1942/#1941/#1945/#1834) — the
@@ -5916,5 +5933,531 @@ mod tests {
             res.is_err(),
             "migrate must propagate err when terminal INSERT fails"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #3160 (v1.0.0) — FULL-TABLE-REBUILD regression coverage.
+    //
+    // A SQLite full-table rebuild (`CREATE <shadow>` / `INSERT … SELECT` /
+    // `DROP TABLE` / `RENAME`) silently drops EVERY trigger and EVERY
+    // secondary index attached to the old table — the project's hard
+    // lesson (v63 dropped the memory_links signature triggers; v65 had to
+    // restore them). The ladder carries SIX rebuilds: v33, v36, v50, v63,
+    // v66 and v80. Before #3160 only v63 and v66 had a per-arm test, and
+    // the v63 one asserted ONE of four indexes and ZERO of four triggers —
+    // so it would NOT have caught the very defect it was written for.
+    // The helpers + tests below close that.
+    // -----------------------------------------------------------------
+
+    /// Every trigger `memory_links` must carry at the ladder tip: the v43
+    /// (0037) `(attest_level, signature)` atomicity pair, restored by v65
+    /// (0054) after the v63 rebuild dropped them, plus the v33/v63
+    /// attest_level enumeration pair recreated by the rebuild itself.
+    const MEMORY_LINKS_TIP_TRIGGERS: &[&str] = &[
+        "memory_links_ck_attest_level_ins",
+        "memory_links_ck_attest_level_upd",
+        "memory_links_ck_attest_signature_ins",
+        "memory_links_ck_attest_signature_upd",
+    ];
+
+    /// Every secondary index the v63 rebuild DROPS and must recreate.
+    /// (`idx_memory_links_target_cid` arrives later, at v75, and is
+    /// asserted separately by the tip-shape comparison.)
+    const MEMORY_LINKS_REBUILD_INDEXES: &[&str] = &[
+        "idx_links_relation",
+        "idx_links_temporal_src",
+        "idx_links_temporal_tgt",
+        "idx_memory_links_attest_level",
+    ];
+
+    /// Trigger names attached to `table`, sorted.
+    fn triggers_on(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'trigger' AND tbl_name = ?1 ORDER BY name",
+            )
+            .expect("prepare trigger probe");
+        let names: Vec<String> = stmt
+            .query_map(params![table], |r| r.get::<_, String>(0))
+            .expect("query triggers")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect triggers");
+        names
+    }
+
+    /// Named secondary index names attached to `table`, sorted. Implicit
+    /// `sqlite_autoindex_*` entries (PRIMARY KEY / UNIQUE) are excluded —
+    /// a rebuild recreates those from the new table definition, so they
+    /// are not part of the "did the rebuild forget something" question.
+    fn indexes_on(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' AND tbl_name = ?1 \
+                   AND name NOT LIKE 'sqlite_autoindex_%' ORDER BY name",
+            )
+            .expect("prepare index probe");
+        let names: Vec<String> = stmt
+            .query_map(params![table], |r| r.get::<_, String>(0))
+            .expect("query indexes")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect indexes");
+        names
+    }
+
+    /// Assert `memory_links` carries its full tip trigger + rebuild-index
+    /// set. `ctx` names the path under test in the failure message.
+    fn assert_memory_links_tip_shape(conn: &Connection, ctx: &str) {
+        let triggers = triggers_on(conn, "memory_links");
+        for want in MEMORY_LINKS_TIP_TRIGGERS {
+            assert!(
+                triggers.iter().any(|t| t == want),
+                "#3160 [{ctx}]: memory_links is MISSING trigger `{want}` \
+                 (present: {triggers:?}). A full-table rebuild drops every \
+                 trigger; the rebuild — or a later arm — must recreate ALL of \
+                 them. This is the exact v63 -> v65 defect class: without the \
+                 signature pair a phantom-signed edge (attest_level = \
+                 self_signed with no 64-byte signature) writes cleanly."
+            );
+        }
+        let indexes = indexes_on(conn, "memory_links");
+        for want in MEMORY_LINKS_REBUILD_INDEXES {
+            assert!(
+                indexes.iter().any(|i| i == want),
+                "#3160 [{ctx}]: memory_links is MISSING index `{want}` \
+                 (present: {indexes:?}) — the rebuild dropped it and did not \
+                 recreate it."
+            );
+        }
+    }
+
+    /// #3160 — the v63 rebuild must leave `memory_links` with its COMPLETE
+    /// tip trigger + index set, not just the one index the original test
+    /// checked. Runs the same v62 -> tip replay as
+    /// `v63_rebuild_preserves_links_and_accepts_typed_cognition_relations`
+    /// and then asserts the full shape.
+    #[test]
+    fn v63_rebuild_leaves_memory_links_with_its_full_trigger_and_index_set_3160() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        conn.execute_batch(
+            "DROP TABLE memory_links;
+             CREATE TABLE memory_links (
+                 source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                 target_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                 relation     TEXT NOT NULL DEFAULT 'related_to',
+                 created_at   TEXT NOT NULL,
+                 valid_from   TEXT,
+                 valid_until  TEXT,
+                 observed_by  TEXT,
+                 signature    BLOB,
+                 attest_level TEXT,
+                 PRIMARY KEY (source_id, target_id, relation),
+                 CHECK (relation IN ('related_to', 'supersedes', 'contradicts',
+                                     'derived_from', 'reflects_on', 'derives_from'))
+             );",
+        )
+        .expect("recreate pre-v63 memory_links");
+
+        let now = "2026-08-22T00:00:00Z";
+        for (id, title) in [("src-3160", "source"), ("tgt-3160", "target")] {
+            conn.execute(
+                "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at) \
+                 VALUES (?1, 'long', 'v63-3160', ?2, 'body', ?3, ?3)",
+                params![id, title, now],
+            )
+            .expect("seed memory");
+        }
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at) \
+             VALUES ('src-3160', 'tgt-3160', 'related_to', ?1)",
+            params![now],
+        )
+        .expect("seed pre-v63 link");
+
+        conn.execute("DELETE FROM schema_version", [])
+            .expect("clear schema_version");
+        conn.execute("INSERT INTO schema_version (version) VALUES (62)", [])
+            .expect("stamp v62");
+        super::migrate(&conn).expect("migrate v62 -> tip");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        assert_memory_links_tip_shape(&conn, "v62 -> tip replay");
+
+        // The triggers must be LOAD-BEARING, not merely present: a
+        // phantom-signed edge (self_signed with no 64-byte signature) must
+        // be REFUSED. Deleting the trigger pair from
+        // `0054_v65_*.sql` used to leave this whole module green (#3160).
+        let phantom = conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at, attest_level) \
+             VALUES ('src-3160', 'tgt-3160', 'supersedes', ?1, 'self_signed')",
+            params![now],
+        );
+        assert!(
+            phantom.is_err(),
+            "#3160: the restored memory_links signature trigger must REFUSE an \
+             attest_level = 'self_signed' edge carrying no 64-byte signature"
+        );
+    }
+
+    /// #3160 — the v50 `agent_quotas` rebuild (0042) had NO regression
+    /// test: no fixture built the pre-v50 `(agent_id)`-PK shape and
+    /// replayed the ladder over it. Seed the legacy shape WITH rows and
+    /// its v28 index, stamp v49, migrate, and assert (a) every row + every
+    /// column survives verbatim onto the `_global` sentinel, (b) the
+    /// widened PK admits a second row for the same agent in another
+    /// namespace, and (c) BOTH indexes exist (a `DROP TABLE` drops every
+    /// attached index — the rebuild must recreate them).
+    #[test]
+    fn v50_rebuild_preserves_agent_quotas_and_recreates_indexes_3160() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+
+        // The pre-v50 shape: PRIMARY KEY (agent_id), no `namespace` column.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS agent_quotas;
+             CREATE TABLE agent_quotas (
+                 agent_id                TEXT PRIMARY KEY,
+                 max_memories_per_day    INTEGER NOT NULL DEFAULT 1000,
+                 max_storage_bytes       INTEGER NOT NULL DEFAULT 104857600,
+                 max_links_per_day       INTEGER NOT NULL DEFAULT 5000,
+                 current_memories_today  INTEGER NOT NULL DEFAULT 0,
+                 current_storage_bytes   INTEGER NOT NULL DEFAULT 0,
+                 current_links_today     INTEGER NOT NULL DEFAULT 0,
+                 day_started_at          TEXT NOT NULL,
+                 created_at              TEXT NOT NULL,
+                 updated_at              TEXT NOT NULL
+             );
+             CREATE INDEX idx_agent_quotas_agent_id ON agent_quotas (agent_id);",
+        )
+        .expect("recreate pre-v50 agent_quotas");
+
+        // Seed live accounting — the thing an operator must not lose.
+        conn.execute(
+            "INSERT INTO agent_quotas (agent_id, max_memories_per_day, max_storage_bytes, \
+                 max_links_per_day, current_memories_today, current_storage_bytes, \
+                 current_links_today, day_started_at, created_at, updated_at) \
+             VALUES ('ai:alice', 42, 4242, 424, 7, 777, 77, '2026-08-22T00:00:00Z', \
+                     '2026-01-01T00:00:00Z', '2026-08-22T00:00:00Z')",
+            [],
+        )
+        .expect("seed legacy quota row");
+
+        conn.execute("DELETE FROM schema_version", [])
+            .expect("clear schema_version");
+        conn.execute("INSERT INTO schema_version (version) VALUES (49)", [])
+            .expect("stamp v49");
+        super::migrate(&conn).expect("migrate v49 -> tip");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        // (a) the row survives VERBATIM, on the `_global` sentinel.
+        let (ns, maxmem, maxbytes, maxlinks, curmem, curbytes, curlinks, day, created, updated): (
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT namespace, max_memories_per_day, max_storage_bytes, max_links_per_day, \
+                        current_memories_today, current_storage_bytes, current_links_today, \
+                        day_started_at, created_at, updated_at \
+                 FROM agent_quotas WHERE agent_id = 'ai:alice'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                    ))
+                },
+            )
+            .expect("#3160: the pre-v50 quota row must survive the rebuild");
+        assert_eq!(
+            ns, "_global",
+            "pre-v50 rows carry onto the _global sentinel"
+        );
+        assert_eq!(
+            (maxmem, maxbytes, maxlinks, curmem, curbytes, curlinks),
+            (42, 4242, 424, 7, 777, 77),
+            "#3160: every quota counter must be carried verbatim by the rebuild"
+        );
+        assert_eq!(day, "2026-08-22T00:00:00Z");
+        assert_eq!(created, "2026-01-01T00:00:00Z");
+        assert_eq!(updated, "2026-08-22T00:00:00Z");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_quotas", [], |r| r.get(0))
+            .expect("count quota rows");
+        assert_eq!(rows, 1, "the rebuild must neither drop nor duplicate rows");
+
+        // (b) the widened PK admits (same agent, different namespace).
+        conn.execute(
+            "INSERT INTO agent_quotas (agent_id, namespace, day_started_at, created_at, updated_at) \
+             VALUES ('ai:alice', 'team/policies', '2026-08-22T00:00:00Z', \
+                     '2026-08-22T00:00:00Z', '2026-08-22T00:00:00Z')",
+            [],
+        )
+        .expect("#3160: the v50 PK must admit a second namespace for one agent");
+
+        // (c) both indexes exist — a DROP TABLE drops every attached index.
+        let indexes = indexes_on(&conn, "agent_quotas");
+        for want in ["idx_agent_quotas_agent_id", "idx_agent_quotas_namespace"] {
+            assert!(
+                indexes.iter().any(|i| i == want),
+                "#3160: the v50 rebuild must recreate index `{want}` \
+                 (present: {indexes:?})"
+            );
+        }
+        // `agent_quotas` carries no triggers — pin that so a future arm
+        // that adds one is forced to prove the rebuild recreates it.
+        assert!(
+            triggers_on(&conn, "agent_quotas").is_empty(),
+            "#3160: agent_quotas is expected to carry NO triggers; if one was \
+             added, the v50 rebuild must recreate it and this pin must move"
+        );
+    }
+
+    /// #3160 — the v80 `agent_lineage` rebuild (0064) had NO regression
+    /// test either. Seed the pre-v80 shape (3-value `reason` CHECK, no
+    /// custody columns) with a signed genesis record, stamp v79, migrate,
+    /// and assert every column survives byte-for-byte, the widened CHECK
+    /// admits `revocation`, and the composite PK is back in force.
+    ///
+    /// The v63/v65 trigger hazard genuinely does not arise here
+    /// (`agent_lineage` has no triggers and no secondary indexes) — this
+    /// test PINS that, so an arm that later adds one cannot silently rely
+    /// on a rebuild that would drop it.
+    #[test]
+    fn v80_rebuild_preserves_agent_lineage_and_widens_reason_check_3160() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+
+        // The pre-v80 shape (v76's table, before the custody widening).
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS agent_lineage;
+             CREATE TABLE agent_lineage (
+                 agent_id            TEXT    NOT NULL,
+                 epoch               INTEGER NOT NULL,
+                 reason              TEXT    NOT NULL
+                     CHECK (reason IN ('genesis', 'rotation', 'recovery')),
+                 predecessor_pubkey  TEXT    NOT NULL,
+                 successor_pubkey    TEXT    NOT NULL,
+                 recovery_pubkey     TEXT,
+                 not_before          TEXT    NOT NULL,
+                 prev_record_hash    BLOB    NOT NULL,
+                 signature           BLOB    NOT NULL,
+                 record_bytes        BLOB    NOT NULL,
+                 created_at          TEXT    NOT NULL,
+                 PRIMARY KEY (agent_id, epoch)
+             );",
+        )
+        .expect("recreate pre-v80 agent_lineage");
+
+        // (b) pre-v80 the CHECK must REJECT 'revocation'.
+        let pre = conn.execute(
+            "INSERT INTO agent_lineage (agent_id, epoch, reason, predecessor_pubkey, \
+                 successor_pubkey, not_before, prev_record_hash, signature, record_bytes, created_at) \
+             VALUES ('ai:x', 9, 'revocation', 'p', 's', '2026-01-01T00:00:00Z', \
+                     x'00', x'00', x'00', '2026-01-01T00:00:00Z')",
+            [],
+        );
+        assert!(
+            pre.is_err(),
+            "pre-v80 CHECK must reject the 'revocation' reason"
+        );
+
+        // Seed a signed genesis record — the succession chain is identity
+        // truth; a rebuild that dropped or truncated it is unrecoverable.
+        let prev_hash = vec![0x11u8; 32];
+        let sig = vec![0xEEu8; 64];
+        let record = vec![0xA5u8; 17];
+        conn.execute(
+            "INSERT INTO agent_lineage (agent_id, epoch, reason, predecessor_pubkey, \
+                 successor_pubkey, recovery_pubkey, not_before, prev_record_hash, \
+                 signature, record_bytes, created_at) \
+             VALUES ('ai:lineage', 0, 'genesis', 'pk-pred', 'pk-succ', 'pk-rec', \
+                     '2026-02-02T00:00:00Z', ?1, ?2, ?3, '2026-02-02T00:00:01Z')",
+            params![prev_hash, sig, record],
+        )
+        .expect("seed pre-v80 lineage record");
+
+        conn.execute("DELETE FROM schema_version", [])
+            .expect("clear schema_version");
+        conn.execute("INSERT INTO schema_version (version) VALUES (79)", [])
+            .expect("stamp v79");
+        super::migrate(&conn).expect("migrate v79 -> tip");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        // (a) every column survived the rebuild verbatim.
+        let (reason, pred, succ, rec, not_before, created): (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT reason, predecessor_pubkey, successor_pubkey, recovery_pubkey, \
+                        not_before, created_at \
+                 FROM agent_lineage WHERE agent_id = 'ai:lineage' AND epoch = 0",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .expect("#3160: the pre-v80 lineage record must survive the rebuild");
+        assert_eq!(reason, "genesis");
+        assert_eq!(pred, "pk-pred");
+        assert_eq!(succ, "pk-succ");
+        assert_eq!(rec.as_deref(), Some("pk-rec"));
+        assert_eq!(not_before, "2026-02-02T00:00:00Z");
+        assert_eq!(created, "2026-02-02T00:00:01Z");
+
+        // The BLOB columns survived byte-for-byte (a truncated signature or
+        // prev_record_hash silently breaks succession verification).
+        let (got_hash, got_sig, got_record): (Vec<u8>, Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT prev_record_hash, signature, record_bytes FROM agent_lineage \
+                 WHERE agent_id = 'ai:lineage' AND epoch = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("read lineage blobs");
+        assert_eq!(
+            got_hash, prev_hash,
+            "prev_record_hash must survive verbatim"
+        );
+        assert_eq!(got_sig, sig, "signature must survive verbatim");
+        assert_eq!(got_record, record, "record_bytes must survive verbatim");
+
+        // The v80 columns landed, defaulting to NULL on the legacy row.
+        let (custody, from_seq): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT custody_class, suspected_compromise_from_seq FROM agent_lineage \
+                 WHERE agent_id = 'ai:lineage' AND epoch = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("read v80 columns");
+        assert_eq!(
+            custody, None,
+            "legacy rows read as the software-file default"
+        );
+        assert_eq!(from_seq, None);
+
+        // (c) the widened CHECK now admits 'revocation'.
+        conn.execute(
+            "INSERT INTO agent_lineage (agent_id, epoch, reason, predecessor_pubkey, \
+                 successor_pubkey, not_before, prev_record_hash, signature, record_bytes, created_at) \
+             VALUES ('ai:lineage', 1, 'revocation', 'pk-succ', 'pk-next', \
+                     '2026-03-03T00:00:00Z', x'22', x'33', x'44', '2026-03-03T00:00:00Z')",
+            [],
+        )
+        .expect("#3160: post-v80 the CHECK must admit 'revocation'");
+
+        // (d) the composite PK is back in force (C5 anti-equivocation).
+        let dup = conn.execute(
+            "INSERT INTO agent_lineage (agent_id, epoch, reason, predecessor_pubkey, \
+                 successor_pubkey, not_before, prev_record_hash, signature, record_bytes, created_at) \
+             VALUES ('ai:lineage', 1, 'rotation', 'a', 'b', '2026-04-04T00:00:00Z', \
+                     x'55', x'66', x'77', '2026-04-04T00:00:00Z')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "#3160: the v80 rebuild must recreate the (agent_id, epoch) PRIMARY \
+             KEY — it is the anti-equivocation constraint on the succession chain"
+        );
+
+        // Pin the "nothing to recreate" claim the v80 arm relies on.
+        assert!(
+            triggers_on(&conn, "agent_lineage").is_empty(),
+            "#3160: the v80 arm documents that agent_lineage carries NO triggers; \
+             if one was added, the rebuild must recreate it and this pin must move"
+        );
+        assert!(
+            indexes_on(&conn, "agent_lineage").is_empty(),
+            "#3160: the v80 arm documents that agent_lineage carries NO secondary \
+             indexes (only the composite PK); if one was added, the rebuild must \
+             recreate it and this pin must move"
+        );
+    }
+
+    /// #3160 — the GENERIC post-ladder gate: for every table the ladder
+    /// REBUILDS, the trigger + index set reached by the UPGRADE path
+    /// (legacy v1 schema, replay every arm) must be IDENTICAL to the set
+    /// reached by the FRESH-INSTALL path (bootstrap SCHEMA, then migrate).
+    ///
+    /// This is the `bootstrap(fresh) ≡ ladder(v0→tip)` invariant applied
+    /// to triggers and indexes rather than columns, and it is exactly the
+    /// shape of the v63 -> v65 defect: the bootstrap SCHEMA does NOT ship
+    /// the `memory_links` signature triggers, so on a FRESH install the
+    /// v43 arm creates them and the v63 rebuild's probe skips (the
+    /// 9-relation CHECK is already inline) — they survive. On an UPGRADE
+    /// the v63 rebuild runs and DROPS them. Pre-v65 the two paths
+    /// therefore disagreed, and nothing in the suite noticed.
+    #[test]
+    fn rebuilt_tables_reach_the_same_trigger_and_index_set_on_both_paths_3160() {
+        /// Every table a ladder arm rebuilds via the shadow-table swap.
+        const REBUILT_TABLES: &[&str] = &[
+            "memory_links",     // v33 (0027), v36, v63 (0053)
+            "agent_quotas",     // v50 (0042)
+            "governance_rules", // v66 (0055)
+            "agent_lineage",    // v80 (0064)
+        ];
+
+        let upgraded = replay_from_v1();
+        let fresh = fresh_db_via_migrate();
+        assert_eq!(current_version(&upgraded), CURRENT_SCHEMA_VERSION);
+        assert_eq!(current_version(&fresh), CURRENT_SCHEMA_VERSION);
+
+        for table in REBUILT_TABLES {
+            let up_triggers = triggers_on(&upgraded, table);
+            let fresh_triggers = triggers_on(&fresh, table);
+            assert_eq!(
+                up_triggers, fresh_triggers,
+                "#3160: `{table}` reaches a DIFFERENT trigger set on the upgrade \
+                 path ({up_triggers:?}) than on the fresh-install path \
+                 ({fresh_triggers:?}). A full-table rebuild drops every trigger; \
+                 when the rebuild (or a later arm) forgets to recreate one, only \
+                 the upgrade path loses it — silently, because the bootstrap \
+                 SCHEMA keeps the fresh path green. That is the v63 -> v65 defect."
+            );
+            let up_indexes = indexes_on(&upgraded, table);
+            let fresh_indexes = indexes_on(&fresh, table);
+            assert_eq!(
+                up_indexes, fresh_indexes,
+                "#3160: `{table}` reaches a DIFFERENT index set on the upgrade \
+                 path ({up_indexes:?}) than on the fresh-install path \
+                 ({fresh_indexes:?}) — a rebuild dropped an index it did not \
+                 recreate."
+            );
+        }
+
+        // And the memory_links tip set is not merely EQUAL on both paths —
+        // it is COMPLETE on both (two empty sets would satisfy equality).
+        assert_memory_links_tip_shape(&upgraded, "v1 replay");
+        assert_memory_links_tip_shape(&fresh, "fresh install");
     }
 }

@@ -1519,7 +1519,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
     // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
     // Additive ALTER-ADD-COLUMN migration only.
-    ("src/storage/migrations.rs", 5_980), /* 2026-08-23 (#3216 Fable fail-closed): database_holds_durable_rows table-presence then `?` (never unwrap_or false). MEASURED 5_915; ceiling 5_910 -> 5_980 (+65 headroom, lockstep). Never lower a floor. PRIOR: 2026-08-23 (#3216 rebase onto 8fb6e9eb) placeholder 5_910. PRIOR HEAD: 2026-08-21 #3113 core-relation integrity gate, measured 5_770; ceiling 5_850. */
+    ("src/storage/migrations.rs", 6_400), /* 2026-08-24 (#3221 rebase onto 5cb2dc31): #3160 full-table-rebuild coverage. Incoming measured 6_301; ceiling 6_400 (+99). HEAD was 5_980 after #3216; floor never falls. PRIOR: 2026-08-23 (#3216 Fable fail-closed) 5_915 measured, ceiling 5_980. PRIOR: 2026-08-22 (#3160 GA) rebuild tests. */
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.
