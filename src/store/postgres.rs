@@ -10748,7 +10748,17 @@ impl PostgresStore {
                         .map_err(|e| to_store_err("commit drop kg unprojection marker", e))?;
                     continue;
                 }
-                unproject_memory_from_age(&mut tx, &source_id).await
+                // Call the INNER (propagating) detach, NOT the
+                // `unproject_memory_from_age` wrapper: that wrapper deliberately
+                // SWALLOWS an AGE runtime failure and returns `Ok(())` for the
+                // hot delete path, which here would stamp the marker
+                // `projected_at` while the ghost node is still attached — the
+                // reconciler reporting work it did not do. Propagating instead
+                // routes an AGE failure into this drainer's own retry /
+                // attempt-bump / quarantine ladder, exactly as the projection
+                // arm below does with `project_link_into_age`. The `Err` arm
+                // rolls this tx back, so an aborted tx is not a problem.
+                unproject_memory_from_age_inner(&mut tx, &source_id).await
             } else {
                 let existing: Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> =
                     sqlx::query_as(
@@ -10930,6 +10940,27 @@ impl PostgresStore {
         if !failed.is_empty() {
             self.record_unreconciled_unprojections(&failed).await;
         }
+    }
+
+    /// v1.0.0 batch-2 TEST SEAM — drive
+    /// [`Self::record_unreconciled_unprojections`] from the live-tier parity
+    /// suite (`tests/pg_parity_batch_2.rs`).
+    ///
+    /// In production the recording path is reached ONLY when an AGE runtime
+    /// failure prevents an unprojection. A test cannot induce that on a SHARED
+    /// live tier without revoking the role's AGE access, which would break
+    /// every concurrent test on that tier. This wrapper lets the suite
+    /// reproduce the exact post-failure state — relational row deleted, ghost
+    /// `:Memory` node still attached — and then assert the real recording and
+    /// drain-reconciliation behaviour end to end.
+    ///
+    /// `#[doc(hidden)]` + the `_for_test` suffix follow the crate's established
+    /// test-seam convention (see
+    /// `crate::config::override_active_permissions_mode_for_test`): production
+    /// code must NEVER call this; it only forwards.
+    #[doc(hidden)]
+    pub async fn record_unreconciled_unprojections_for_test(&self, ids: &[&str]) {
+        self.record_unreconciled_unprojections(ids).await;
     }
 
     /// v1.0.0 batch-2 (cross-backend parity, AGE projection fail-open) —

@@ -648,3 +648,327 @@ async fn pg_list_by_namespace_prefix_saturates_a_huge_limit() {
         rows.len()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// (7) AGE fail-open closure — the unprojection MARKER lane, end to end.
+//
+// This is the fail-open closure itself, so it gets live-tier evidence rather
+// than only the `from_str` unforgeability unit assertion.
+//
+// In production the recording path fires when an AGE runtime failure prevents
+// the post-hard-delete detach. A test cannot induce that on a SHARED live tier
+// without revoking the role's AGE access (which would break every concurrent
+// test on it), so these tests reproduce the exact resulting STATE — relational
+// row deleted, ghost `:Memory` node still attached — by deleting the row with
+// raw SQL, then drive the REAL `record_unreconciled_unprojections` through the
+// `#[doc(hidden)]` seam and the REAL drainer arm.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Count AGE `:Memory` vertices carrying `id`. The id is test-minted
+/// (`prefix-<uuid>`), so embedding it in the cypher body is injection-safe;
+/// this keeps the helper free of an `agtype` encode/decode shim.
+#[cfg(feature = "sal-postgres")]
+async fn age_vertex_count(pool: &sqlx::PgPool, id: &str) -> usize {
+    let mut tx = pool.begin().await.expect("begin age tx");
+    // A non-superuser role may be refused LOAD; shared_preload_libraries then
+    // provides the library. Tolerate it exactly as the adapter does.
+    let _ = sqlx::query("LOAD 'age'").execute(&mut *tx).await;
+    sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
+        .execute(&mut *tx)
+        .await
+        .expect("set search_path");
+    let sql = format!(
+        "SELECT v FROM cypher('memory_graph', $$ MATCH (m:Memory {{id: '{id}'}}) RETURN m $$) \
+         AS (v agtype)"
+    );
+    let rows = sqlx::query(&sql)
+        .persistent(false)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap_or_else(|e| panic!("cypher vertex count failed: {e}"));
+    tx.commit().await.expect("commit age probe tx");
+    rows.len()
+}
+
+/// Pending (unreconciled) outbox rows carrying the unprojection marker for `id`.
+#[cfg(feature = "sal-postgres")]
+async fn pending_marker_rows(pool: &sqlx::PgPool, id: &str) -> i64 {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM kg_projection_outbox \
+          WHERE source_id = $1 AND relation = '__ai_memory_unproject__' \
+            AND projected_at IS NULL",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("count pending marker rows");
+    n
+}
+
+#[cfg(feature = "sal-postgres")]
+async fn reconciled_marker_rows(pool: &sqlx::PgPool, id: &str) -> i64 {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM kg_projection_outbox \
+          WHERE source_id = $1 AND relation = '__ai_memory_unproject__' \
+            AND projected_at IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("count reconciled marker rows");
+    n
+}
+
+/// Seed `root -> leaf` so AGE holds a projected `:Memory` vertex for `root`,
+/// then hard-delete `root`'s RELATIONAL row with raw SQL — reproducing the
+/// ghost state a swallowed unprojection leaves behind. Returns `root`'s id.
+#[cfg(feature = "sal-postgres")]
+async fn seed_ghost_age_node(
+    store: &ai_memory::store::postgres::PostgresStore,
+    pool: &sqlx::PgPool,
+    ns: &str,
+) -> String {
+    let ctx = CallerContext::for_agent("ai:parity-unproject");
+    let root = uid("ghost-root");
+    let leaf = uid("ghost-leaf");
+    store
+        .store(&ctx, &mem(&root, ns, &uid("ghost-root-title"), "root"))
+        .await
+        .expect("store root");
+    store
+        .store(&ctx, &mem(&leaf, ns, &uid("ghost-leaf-title"), "leaf"))
+        .await
+        .expect("store leaf");
+    store
+        .link(&ctx, &chain_link(&root, &leaf))
+        .await
+        .expect("link root->leaf (projects into AGE)");
+    assert_eq!(
+        age_vertex_count(pool, &root).await,
+        1,
+        "fixture sanity: the link write must project a :Memory vertex for the root"
+    );
+
+    // Raw-SQL delete: the relational row goes, the AGE projection stays — the
+    // exact divergence a swallowed unprojection used to leave PERMANENTLY.
+    sqlx::query("DELETE FROM memories WHERE id = $1")
+        .bind(&root)
+        .execute(pool)
+        .await
+        .expect("raw relational delete");
+    assert_eq!(
+        age_vertex_count(pool, &root).await,
+        1,
+        "fixture sanity: the ghost :Memory vertex must SURVIVE the relational delete"
+    );
+    root
+}
+
+/// The fail-open closure end to end: RECORD an unreconcilable unprojection,
+/// prove it is durable and deduped, then prove the drainer actually detaches
+/// the ghost vertex and stamps the row reconciled.
+///
+/// Pre-fix every failure arm swallowed the error, so this drift was invisible
+/// and PERMANENT in sync mode: `kg_query` / `kg_timeline` would serve an edge to
+/// a memory that no longer exists once AGE recovered, with no retry, no
+/// reconcile and no operator-visible signal.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL + a live AGE backend"]
+async fn pg_age_unprojection_marker_records_dedupes_and_reconciles() {
+    let Some(store) = live_pg().await else { return };
+    if store.kg_backend() != ai_memory::store::KgBackend::Age {
+        eprintln!("skip: postgres backend is not AGE (no graph projection to reconcile)");
+        return;
+    }
+    let pool = store.pool().clone();
+    let ns = uid("parity-unproject");
+    let root = seed_ghost_age_node(&store, &pool, &ns).await;
+
+    // (1) RECORD — the real production recording path.
+    store
+        .record_unreconciled_unprojections_for_test(&[root.as_str()])
+        .await;
+    assert_eq!(
+        pending_marker_rows(&pool, &root).await,
+        1,
+        "a failed unprojection MUST leave exactly one durable, pending marker row — \
+         a log line that scrolls away is not a reconcilable record"
+    );
+
+    // (2) DEDUPE — a second failure for the same id while one is still pending
+    // is a no-op, not a duplicate row (the `WHERE NOT EXISTS` arm).
+    store
+        .record_unreconciled_unprojections_for_test(&[root.as_str()])
+        .await;
+    assert_eq!(
+        pending_marker_rows(&pool, &root).await,
+        1,
+        "re-recording an id that already has a PENDING marker must be idempotent — \
+         a retry loop must not pile up outbox rows"
+    );
+
+    // (3) RECONCILE — the drainer's marker arm detaches the ghost and stamps it.
+    store
+        .drain_kg_projection_outbox(256)
+        .await
+        .expect("drain outbox");
+    assert_eq!(
+        pending_marker_rows(&pool, &root).await,
+        0,
+        "the drainer must consume the pending marker"
+    );
+    assert_eq!(
+        reconciled_marker_rows(&pool, &root).await,
+        1,
+        "the consumed marker must be STAMPED reconciled, not deleted — the record of \
+         what was repaired survives for the operator"
+    );
+    assert_eq!(
+        age_vertex_count(&pool, &root).await,
+        0,
+        "the ghost :Memory vertex MUST be gone: this is the whole point of the marker — \
+         kg_query must stop serving an edge to a memory the relational store deleted"
+    );
+
+    // Cleanup: leave the shared tier as we found it.
+    let _ = sqlx::query("DELETE FROM kg_projection_outbox WHERE source_id = $1")
+        .bind(&root)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+        .bind(&ns)
+        .execute(&pool)
+        .await;
+}
+
+/// The SAFETY property that makes the marker sound: the drainer must NEVER
+/// detach a vertex whose relational row EXISTS again.
+///
+/// A marker says "no `memories` row with this id should have a graph node". If
+/// the id was re-created after the delete, acting on the stale marker would
+/// destroy a LIVE projection — turning a repair tool into a data-loss tool. The
+/// mirror-image liveness guard drops the marker instead.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL + a live AGE backend"]
+async fn pg_age_unprojection_marker_never_detaches_a_recreated_id() {
+    let Some(store) = live_pg().await else { return };
+    if store.kg_backend() != ai_memory::store::KgBackend::Age {
+        eprintln!("skip: postgres backend is not AGE");
+        return;
+    }
+    let pool = store.pool().clone();
+    let ctx = CallerContext::for_agent("ai:parity-unproject");
+    let ns = uid("parity-unproject-recreate");
+    let root = seed_ghost_age_node(&store, &pool, &ns).await;
+
+    store
+        .record_unreconciled_unprojections_for_test(&[root.as_str()])
+        .await;
+    assert_eq!(pending_marker_rows(&pool, &root).await, 1);
+
+    // The id comes BACK before the drainer runs.
+    store
+        .store(&ctx, &mem(&root, &ns, &uid("recreated-title"), "recreated"))
+        .await
+        .expect("re-create the memory under the same id");
+
+    store
+        .drain_kg_projection_outbox(256)
+        .await
+        .expect("drain outbox");
+
+    assert_eq!(
+        reconciled_marker_rows(&pool, &root).await,
+        1,
+        "the stale marker must be CONSUMED (dropped), not left to fire later"
+    );
+    assert_eq!(
+        age_vertex_count(&pool, &root).await,
+        1,
+        "the LIVE projection of the re-created id MUST survive — a reconciler that \
+         detaches a vertex whose relational row exists again is a data-loss tool, not \
+         a repair tool"
+    );
+
+    let _ = sqlx::query("DELETE FROM kg_projection_outbox WHERE source_id = $1")
+        .bind(&root)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+        .bind(&ns)
+        .execute(&pool)
+        .await;
+}
+
+/// QUARANTINE semantics for the marker lane: a row at the attempt ceiling is
+/// EXCLUDED from the take-query, so a poison marker cannot head-of-line-block
+/// the drain — a healthy marker enqueued behind it still reconciles in the SAME
+/// pass. Driven by seeding `attempt_count = MAX_AGE_PROJECTION_ATTEMPTS`
+/// directly (exhausting 100 real attempts against a live tier is not cheap).
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL + a live AGE backend"]
+async fn pg_age_quarantined_marker_does_not_block_the_drain() {
+    let Some(store) = live_pg().await else { return };
+    if store.kg_backend() != ai_memory::store::KgBackend::Age {
+        eprintln!("skip: postgres backend is not AGE");
+        return;
+    }
+    let pool = store.pool().clone();
+    let ns = uid("parity-unproject-quarantine");
+
+    // Poison marker: at the ceiling, so the take-query must skip it.
+    let poison = uid("quarantined-ghost");
+    sqlx::query(
+        "INSERT INTO kg_projection_outbox (source_id, target_id, relation, attempt_count) \
+         VALUES ($1, $1, '__ai_memory_unproject__', $2)",
+    )
+    .bind(&poison)
+    .bind(ai_memory::store::postgres::PostgresStore::MAX_AGE_PROJECTION_ATTEMPTS)
+    .execute(&pool)
+    .await
+    .expect("seed quarantined marker");
+
+    // Healthy marker enqueued BEHIND it, with a real ghost vertex to detach.
+    let healthy = seed_ghost_age_node(&store, &pool, &ns).await;
+    store
+        .record_unreconciled_unprojections_for_test(&[healthy.as_str()])
+        .await;
+
+    store
+        .drain_kg_projection_outbox(256)
+        .await
+        .expect("drain outbox");
+
+    assert_eq!(
+        pending_marker_rows(&pool, &poison).await,
+        1,
+        "a marker at the attempt ceiling stays PENDING (quarantined) — it is never \
+         silently stamped reconciled, so the unrepaired drift remains visible in the \
+         pending-depth gauge and to the operator"
+    );
+    assert_eq!(
+        pending_marker_rows(&pool, &healthy).await,
+        0,
+        "the quarantined row must NOT head-of-line-block the drain: the healthy marker \
+         behind it reconciles in the same pass"
+    );
+    assert_eq!(
+        age_vertex_count(&pool, &healthy).await,
+        0,
+        "the healthy marker's ghost vertex is detached despite the poison row"
+    );
+
+    for id in [&poison, &healthy] {
+        let _ = sqlx::query("DELETE FROM kg_projection_outbox WHERE source_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+    }
+    let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+        .bind(&ns)
+        .execute(&pool)
+        .await;
+}

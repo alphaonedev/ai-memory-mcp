@@ -196,10 +196,14 @@ backend and missing or divergently implemented on its twin). Pinned by
   SQL CHECK constraint; pinned by a unit test). The existing drainer reconciles
   both kinds with mirror-image existence guards — a since-deleted link is never
   resurrected, a re-created id is never detached — under the same
-  attempt/quarantine ceiling and pending-depth gauge. The drainer is now spawned
-  on ANY postgres+AGE backend, not only `age_projection_mode=deferred`, so sync
-  deployments self-heal; on a healthy sync deployment the queue is empty and
-  each tick is one indexed no-op count.
+  attempt/quarantine ceiling and pending-depth gauge. The drainer's marker arm
+  calls the PROPAGATING inner detach, never the swallow-wrapper the hot delete
+  path uses — otherwise an AGE failure during reconciliation would stamp the
+  marker reconciled while the ghost node stayed attached, i.e. the reconciler
+  reporting work it did not do. The drainer is now spawned on ANY postgres+AGE
+  backend, not only `age_projection_mode=deferred`, so sync deployments
+  self-heal; on a healthy sync deployment the queue is empty and each tick is
+  one indexed no-op count.
 
 - **`PostgresStore::search_with_source_uri` silently ignored `tags_any` and
   `agent_id`.** The reciprocal-provenance FTS surface bound only
