@@ -229,6 +229,18 @@ impl MemoryStore for SqliteStore {
     /// hard-coded constant. Returns `0` when the table is empty (a
     /// fresh DB that didn't run migrations yet) so the daemon never
     /// 503s the capabilities endpoint on a cold-start race.
+    ///
+    /// #3182 — PROPAGATE a substrate fault. This used to end in
+    /// `.unwrap_or(0)`, so a MISSING or unreadable `schema_version` table
+    /// reported the SAME `0` a genuinely fresh database reports. That is the
+    /// most dangerous benign answer in the codebase: `0` is a
+    /// MIGRATION-LADDER INPUT, so a populated-but-damaged DB could be
+    /// presented as fresh and have the ladder replayed from the beginning over
+    /// live rows. The empty-table case still yields `0` WITHOUT an error —
+    /// `SELECT_SCHEMA_VERSION_SQL` is `COALESCE(MAX(version), 0)`, so it
+    /// returns a non-NULL `0` row on an empty table — which is exactly the
+    /// cold-start race the doc above describes, and exactly what the postgres
+    /// twin does (`v.unwrap_or(0)` on a NULL aggregate, `?` on the query).
     async fn schema_version(&self) -> StoreResult<i64> {
         let conn = self.state.lock().await;
         let v: i64 = conn
@@ -237,7 +249,7 @@ impl MemoryStore for SqliteStore {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or(0);
+            .map_err(box_err)?;
         Ok(v)
     }
 
@@ -280,6 +292,73 @@ impl MemoryStore for SqliteStore {
             db::insert(&conn, &stamped).map_err(box_err)
         } else {
             db::insert(&conn, memory).map_err(box_err)
+        }
+    }
+
+    /// #3181 — REAL `store_batch`. The trait's documented contract says the
+    /// batch "is atomic (all rows commit or none do)" and that "SQLite
+    /// inherits it unchanged"; in fact sqlite had NO override, so it inherited
+    /// the trait DEFAULT — a per-row `self.store(...)` loop in autocommit. A
+    /// mid-batch failure therefore left a COMMITTED PREFIX durable and
+    /// returned only `Err`, with no way for the caller to learn how far the
+    /// batch got, while the postgres twin rolled the whole batch back. The
+    /// documented contract enterprise consumers rely on was simply false on
+    /// the default backend.
+    ///
+    /// One `BEGIN IMMEDIATE` now spans the whole loop, so a failure on row N
+    /// rolls rows 1..N back. Transaction-AWARE, the same precedent
+    /// `db::insert` / `db::delete` / `archive_by_ids` follow: a nested `BEGIN`
+    /// fails with "cannot start a transaction within a transaction", so the tx
+    /// is opened ONLY when this call owns it; when the caller already holds
+    /// one, the rows join the caller's tx and its commit/rollback provides the
+    /// same guarantee.
+    ///
+    /// Everything else is byte-identical to the default loop — the SAME
+    /// `db::insert` funnel per row, in input order — so the #2551 returned-id
+    /// contract (ids never rewritten by the conflict arm; in-batch
+    /// `(title, namespace)` duplicates collapse LAST-WINS) is unchanged.
+    async fn store_batch(
+        &self,
+        ctx: &CallerContext,
+        memories: &[Memory],
+    ) -> StoreResult<Vec<String>> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        let owns_tx = conn.is_autocommit();
+        if owns_tx {
+            conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
+                .map_err(box_err)?;
+        }
+        let batch = (|| -> anyhow::Result<Vec<String>> {
+            let mut ids = Vec::with_capacity(memories.len());
+            for memory in memories {
+                // #2110 — same authenticated-origin why_trace stamp `store`
+                // applies, so a batch write and a single write are governed
+                // identically.
+                if ctx.bypass_visibility {
+                    let mut stamped = memory.clone();
+                    crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
+                    ids.push(db::insert(&conn, &stamped)?);
+                } else {
+                    ids.push(db::insert(&conn, memory)?);
+                }
+            }
+            Ok(ids)
+        })();
+        match batch {
+            Ok(ids) => {
+                if owns_tx {
+                    conn.execute_batch(crate::storage::connection::SQL_COMMIT)
+                        .map_err(box_err)?;
+                }
+                Ok(ids)
+            }
+            Err(e) => {
+                if owns_tx {
+                    let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+                }
+                Err(box_err(e))
+            }
         }
     }
 
@@ -393,7 +472,29 @@ impl MemoryStore for SqliteStore {
 
     /// #1693 — L2 recovery fast-path watermark (indexed
     /// `MAX(created_at) WHERE agent_id_idx`). Mirrors the inline sqlite query
-    /// the sync `recover_from_transcript` uses.
+    /// the sync `recover_from_transcript` uses. (`agent_id_idx` is the
+    /// generated projection of `metadata.agent_id`, so it selects exactly the
+    /// rows the postgres twin's `metadata->>'agent_id' = $1` selects.)
+    ///
+    /// #3182 — two corrections:
+    ///
+    /// 1. **PROPAGATE.** This used to end in `.unwrap_or(None)`, so a
+    ///    substrate fault answered "this agent has NO watermark" — the same
+    ///    value a brand-new agent produces. A caller reading that re-pulls
+    ///    from zero (or, on a federation catch-up, silently widens its
+    ///    window) believing the substrate answered honestly. The postgres
+    ///    twin propagates.
+    /// 2. **Byte parity with postgres.** postgres stores `TIMESTAMPTZ`
+    ///    (microsecond quantised) and re-renders through chrono, while sqlite
+    ///    returns the raw stored TEXT — which `Utc::now().to_rfc3339()` writes
+    ///    at NANOSECOND precision. The same logical instant therefore produced
+    ///    two DIFFERENT watermark strings per backend. Normalising through
+    ///    `parse → truncate-to-microseconds → to_rfc3339` makes them
+    ///    byte-identical. A value that does not parse as RFC3339 (legacy /
+    ///    hand-written row) is returned VERBATIM rather than dropped: degrade,
+    ///    never discard the durable value. Truncation can only move the
+    ///    watermark EARLIER (by < 1 µs), which makes the recover fast-path
+    ///    marginally more conservative — never skip-happy.
     async fn agent_max_created_at(&self, agent_id: &str) -> StoreResult<Option<String>> {
         let conn = self.state.lock().await;
         let v: Option<String> = conn
@@ -402,8 +503,13 @@ impl MemoryStore for SqliteStore {
                 rusqlite::params![agent_id],
                 |row| row.get::<_, Option<String>>(0),
             )
-            .unwrap_or(None);
-        Ok(v)
+            .map_err(box_err)?;
+        Ok(v.map(|raw| {
+            chrono::DateTime::parse_from_rfc3339(&raw).map_or(raw, |dt| {
+                crate::storage::truncate_to_microseconds(dt.with_timezone(&chrono::Utc))
+                    .to_rfc3339()
+            })
+        }))
     }
 
     async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
@@ -680,11 +786,23 @@ impl MemoryStore for SqliteStore {
             .collect())
     }
 
-    async fn verify(&self, _ctx: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
+    async fn verify(&self, ctx: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
         let conn = self.state.lock().await;
         let Some(mem) = db::get(&conn, id).map_err(box_err)? else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
+        // #3176 — the #910 SAL-level scope=private gate. Pre-fix this method
+        // DISCARDED `ctx` and read the row through the raw `db::get`, so any
+        // trait-routed caller could confirm the EXISTENCE of another agent's
+        // scope=private memory and read its integrity findings + CID
+        // mismatch — while the postgres twin (which routes through
+        // `self.get(ctx, id)`) folded the same request to `NotFound`. Fold to
+        // `NotFound` here too so the two adapters leak identically (i.e. not
+        // at all). Admin/migrate contexts (`bypass_visibility`) verify every
+        // row, exactly as they read every row.
+        if !ctx.bypass_visibility && !is_visible_to_caller(&mem, ctx.effective_principal()) {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        }
         // #1624 — shared finding-checks (see `store::integrity_findings`)
         // so sqlite and postgres report identical findings for
         // identical rows. Real signature verification lands with #302.
@@ -711,12 +829,22 @@ impl MemoryStore for SqliteStore {
     async fn link(&self, _ctx: &CallerContext, link: &MemoryLink) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::create_link(
+        // #3178 — thread the record's temporal claim
+        // (`created_at`/`valid_from`/`valid_until`) into the funnel. Pre-fix
+        // this passed ONLY the triple, so a federation replay or any caller
+        // supplying explicit stamps had them silently overwritten with
+        // wall-clock `now` while the postgres twin (`link_internal`) honoured
+        // them — the same `MemoryStore::link(link)` produced different durable
+        // rows per backend.
+        db::create_link_signed_with_window(
             &conn,
             &link.source_id,
             &link.target_id,
             link.relation.as_str(),
+            None,
+            crate::storage::LinkClaimWindow::from_link(link),
         )
+        .map(|_| ())
         .map_err(box_err)
     }
 
@@ -753,12 +881,18 @@ impl MemoryStore for SqliteStore {
         // so the caller-observable wire shape is byte-identical across
         // backends.
         let conn = self.state.lock().await;
-        db::create_link_signed(
+        // #3178 — sign and persist the window the CALLER supplied. Pre-fix the
+        // adapter dropped `created_at`/`valid_from`/`valid_until` on the floor
+        // and the funnel signed `valid_from = now, valid_until = None`, so a
+        // link signed on sqlite could not verify on postgres (and vice versa)
+        // and every caller-supplied claim window was lost.
+        db::create_link_signed_with_window(
             &conn,
             &link.source_id,
             &link.target_id,
             link.relation.as_str(),
             keypair,
+            crate::storage::LinkClaimWindow::from_link(link),
         )
         .map_err(box_err)
     }
@@ -1287,10 +1421,59 @@ impl MemoryStore for SqliteStore {
 
     async fn clear_namespace_standard(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         namespace: &str,
     ) -> StoreResult<bool> {
         let conn = self.state.lock().await;
+        // #3176 — SAL-level #1777 owner gate + #2545 fail-closed
+        // unresolvable-standard refusal, the sqlite mirror of the postgres
+        // twin. Pre-fix this adapter DISCARDED `ctx` and went straight to the
+        // bare `DELETE FROM namespace_meta`: the gate existed only on the MCP
+        // (`handle_namespace_clear_standard`) and postgres surfaces, so a
+        // trait-routed sqlite caller could DISARM the governance standard
+        // protecting every memory in another tenant's namespace — an
+        // un-bind primitive postgres refuses. Clearing a standard reverts the
+        // namespace to permissive allow-on-silence, so it is gated exactly
+        // like SETTING one.
+        //
+        // The DECISION (and both refusal strings) live in
+        // `crate::store::authorize_clear_namespace_standard`; this adapter
+        // only reads the three-state binding, mirroring the postgres reads
+        // one-for-one so the two cannot classify the same row differently.
+        // `CAST(... AS TEXT)` is the sqlite analogue of postgres' `->>`
+        // (both yield the unquoted scalar as text, NULL-preserving) so a
+        // non-string `agent_id` cannot become a hard decode error on one
+        // backend and a value on the other.
+        if !ctx.bypass_visibility {
+            let meta_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = ?1)",
+                    rusqlite::params![namespace],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(box_err)?
+                != 0;
+            let binding = if meta_exists {
+                let owner_row: Option<Option<String>> = conn
+                    .query_row(
+                        "SELECT CAST(json_extract(m.metadata, '$.agent_id') AS TEXT) \
+                         FROM namespace_meta nm \
+                         JOIN memories m ON m.id = nm.standard_id \
+                         WHERE nm.namespace = ?1",
+                        rusqlite::params![namespace],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map_err(box_err)?;
+                match owner_row {
+                    Some(owner) => crate::store::NamespaceStandardBinding::Resolved(owner),
+                    None => crate::store::NamespaceStandardBinding::Unresolvable,
+                }
+            } else {
+                crate::store::NamespaceStandardBinding::NoMetaRow
+            };
+            crate::store::authorize_clear_namespace_standard(ctx, namespace, &binding)?;
+        }
         db::clear_namespace_standard(&conn, namespace).map_err(box_err)
     }
 
@@ -1424,7 +1607,8 @@ impl MemoryStore for SqliteStore {
         if ctx.bypass_visibility {
             let mut stamped = input.clone();
             crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
-            db::reflect_with_hooks(&conn, &stamped, &hooks)
+            // Admin/substrate context: unscoped source read, as before (#3176).
+            db::reflect_with_hooks_for_caller(&conn, &stamped, &hooks, None)
         } else {
             // #3014 — a TENANT reflect crosses the attestation posture. The
             // production tenant reflect surfaces (MCP + HTTP-sqlite) route
@@ -1436,7 +1620,19 @@ impl MemoryStore for SqliteStore {
             let mut stamped = input.clone();
             crate::identity::attest::gate_unsigned_surface_attestation(&mut stamped.metadata)
                 .map_err(|e| crate::storage::reflect::ReflectError::Validation(e.to_string()))?;
-            db::reflect_with_hooks(&conn, &stamped, &hooks)
+            // #3176 — TENANT reflect: scope the SOURCE READ to the caller so a
+            // source the caller cannot read folds to `SourceNotFound`, exactly
+            // as the postgres twin does by loading each source through the
+            // #910-gated `MemoryStore::get(ctx, id)`. Pre-fix this ran the raw
+            // unscoped `db::get`, so a tenant could confirm the existence of —
+            // and pull the content of — another agent's `scope=private`
+            // memory into its own reflection.
+            db::reflect_with_hooks_for_caller(
+                &conn,
+                &stamped,
+                &hooks,
+                Some(ctx.effective_principal()),
+            )
         }
     }
 
@@ -2136,7 +2332,14 @@ impl MemoryStore for SqliteStore {
 
     async fn is_registered_agent(&self, agent_id: &str) -> StoreResult<bool> {
         let conn = self.state.lock().await;
-        Ok(db::is_registered_agent(&conn, agent_id))
+        // #3182 — PROPAGATE. `db::is_registered_agent` used to swallow every
+        // rusqlite error into `false`, so a dropped/locked/corrupt `memories`
+        // table answered "this agent is not registered" — a benign-looking
+        // answer that feeds the governance `Registered` level and the
+        // pending-action approver gates, and that the postgres twin reports as
+        // an error. A substrate fault must not be indistinguishable from a
+        // negative registration lookup.
+        db::is_registered_agent(&conn, agent_id).map_err(box_err)
     }
 
     async fn enforce_governance_action(
@@ -2178,6 +2381,51 @@ impl MemoryStore for SqliteStore {
     }
 
     // -------- v0.7.0 Wave-3 Continuation 6 — quota + verify-link ---------
+
+    /// #3181 — REAL sqlite quota gate. The trait default is a silent no-op
+    /// `Ok(())`, documented as safe because "non-postgres adapters … enforce
+    /// at the handler layer (sqlite)" — true for the HTTP/MCP handlers (which
+    /// call `quotas::check_and_record`) but NOT for a TRAIT-routed caller,
+    /// which got no quota gate at all while the postgres twin enforced one.
+    ///
+    /// Delegates to `quotas::check_memory_quota`, the read-only multi-row twin
+    /// of the postgres arithmetic (day-rolled daily counter, cumulative
+    /// storage bytes, defaults when no row exists yet), and maps the typed
+    /// breach onto the SAME `StoreError::QuotaExceeded` envelope postgres
+    /// returns so the 429 wire shape is byte-identical across backends.
+    ///
+    /// An empty/anonymous principal is UNCHARGED, mirroring both the postgres
+    /// twin and the sqlite handler's skip-on-empty.
+    async fn check_memory_quota(
+        &self,
+        ctx: &CallerContext,
+        namespace: &str,
+        additional_count: i64,
+        additional_bytes: i64,
+    ) -> StoreResult<()> {
+        let agent_id = ctx.agent_id.as_str();
+        if agent_id.is_empty() {
+            return Ok(());
+        }
+        let conn = self.state.lock().await;
+        match quotas::check_memory_quota(
+            &conn,
+            agent_id,
+            namespace,
+            additional_count,
+            additional_bytes,
+        ) {
+            Ok(()) => Ok(()),
+            Err(quotas::QuotaCheckError::Quota(q)) => Err(StoreError::QuotaExceeded {
+                agent_id: q.agent_id,
+                namespace: q.namespace,
+                limit: q.limit.as_str().to_string(),
+                current: q.current,
+                max: q.max,
+            }),
+            Err(quotas::QuotaCheckError::Sql(e)) => Err(box_err(e)),
+        }
+    }
 
     async fn quota_status(&self, agent_id: &str) -> StoreResult<QuotaStatus> {
         // v0.7.0 #1156 — SAL trait keeps the legacy single-arg shape;
@@ -2718,6 +2966,28 @@ impl MemoryStore for SqliteStore {
         db::get_unembedded_ids_batch(&conn, limit).map_err(box_err)
     }
 
+    /// #3181 — REAL `set_embeddings_batch`. The trait default loops
+    /// `update_embedding` in autocommit and increments `written` UNCONDITIONALLY
+    /// once per entry, so it reported a write for an id that no longer exists
+    /// (a GHOST count — a claims-truth defect: the embedding-backfill logs and
+    /// the caller's progress accounting both consumed that number), and a
+    /// mid-batch fault left a committed prefix. The postgres twin already ran
+    /// one transaction per chunk and counted `rows_affected`.
+    ///
+    /// This delegates to the sqlite SSOT `db::set_embeddings_batch`, which the
+    /// trait doc has always named as the shape to mirror: ONE transaction per
+    /// chunk, per-namespace dim validation, and `changes()`-derived counts, so
+    /// a vanished id contributes 0 and a fault aborts at most one chunk.
+    async fn set_embeddings_batch(
+        &self,
+        _ctx: &CallerContext,
+        entries: &[(String, Vec<f32>)],
+        space: &str,
+    ) -> StoreResult<usize> {
+        let mut conn = self.state.lock().await;
+        db::set_embeddings_batch(&mut conn, entries, space).map_err(box_err)
+    }
+
     async fn find_by_title_namespace(
         &self,
         title: &str,
@@ -3111,15 +3381,13 @@ mod tests {
 
     #[tokio::test]
     async fn inherited_trait_defaults_roundtrip_cov() {
-        // Coverage: the SAL default arms SqliteStore inherits.
-        //
-        // v1.0.0 #2638 — `store_with_embedding` and `store_batch` no longer
-        // have permissive defaults. The old bodies silently DISCARDED the
-        // embedding vector and silently downgraded batch atomicity to
-        // partially-applied; both now REFUSE, and sqlite deliberately does
-        // not implement them (its create funnel writes the vector
-        // out-of-band and its bulk ingest is the transactional
-        // `bulk_create_sqlite` path, neither of which routes here).
+        // Coverage: SqliteStore inherits the #2638 `store_with_embedding`
+        // refuse (embeddings are written out-of-band; a success here would
+        // drop the vector). #3181 — `store_batch` and `set_embeddings_batch`
+        // are overrides (atomic batch / actual-row counts), pinned further
+        // by `tests/sal_parity_batch_atomicity_3181.rs`. `list_unembedded`
+        // is implemented (#2639) but admin-gated (#1586): a tenant context
+        // still gets empty.
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
@@ -3146,15 +3414,11 @@ mod tests {
             test_memory("def-batch-1", "batch row one body"),
             test_memory("def-batch-2", "batch row two body"),
         ];
-        match store.store_batch(&ctx, &batch).await {
-            Err(StoreError::UnsupportedCapability { capability }) => {
-                assert_eq!(capability, "STORE_BATCH");
-            }
-            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
-            Ok(_) => {
-                panic!("store_batch must never approximate the all-or-nothing contract silently")
-            }
-        }
+        let ids = store
+            .store_batch(&ctx, &batch)
+            .await
+            .expect("store_batch");
+        assert_eq!(ids.len(), 2);
 
         // A row the remaining assertions can key on.
         store.store(&ctx, &m).await.expect("store");
@@ -3164,6 +3428,7 @@ mod tests {
         // empty result (the #1586 cross-tenant-content gate), never the
         // corpus. The real scan is covered by
         // `list_unembedded_scans_null_embedding_rows_for_admin_2639`.
+        // `set_embeddings_batch` counts ROWS ACTUALLY UPDATED (#3181).
         let unembedded = store
             .list_unembedded(&ctx, 10)
             .await
@@ -3181,10 +3446,10 @@ mod tests {
                 &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .await
-            .expect("set_embeddings_batch default");
+            .expect("set_embeddings_batch");
         assert_eq!(
             written, 1,
-            "default set_embeddings_batch counts the no-op writes"
+            "set_embeddings_batch counts the row it actually updated"
         );
     }
 

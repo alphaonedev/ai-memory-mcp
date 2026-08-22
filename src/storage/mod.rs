@@ -845,7 +845,7 @@ pub use migrations::pre_migration_backup_infix_for_tests;
 pub use reflect::{
     ReflectError, ReflectHookDecision, ReflectHooks, ReflectInput, ReflectOutcome,
     canonical_cbor_reflection_decorrelation_refused, canonical_cbor_reflection_depth_exceeded,
-    reflect, reflect_with_hooks,
+    reflect, reflect_with_hooks, reflect_with_hooks_for_caller,
 };
 // `emit_reflection_depth_exceeded_audit` is `pub(crate)` — preserve
 // the same visibility on the re-export so it remains reachable from
@@ -8460,6 +8460,99 @@ pub fn create_link_signed(
     relation: &str,
     keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> Result<&'static str> {
+    // #3178 — the historical entry point: no caller-supplied temporal claim,
+    // so `created_at = valid_from = now` and `valid_until` is open-ended. The
+    // signature and the row are produced by the SAME core as the windowed
+    // form, so the two can never sign different bytes.
+    create_link_signed_with_window(
+        conn,
+        source_id,
+        target_id,
+        relation,
+        keypair,
+        LinkClaimWindow::UNCLAIMED,
+    )
+}
+
+/// #3178 — the caller's TEMPORAL CLAIM over a link, threaded into
+/// [`create_link_signed_with_window`] as one named value rather than three
+/// bare `Option<&str>` positional arguments (rust-1.98 API-09: a descriptive
+/// type, not an anonymous tuple of look-alike options that are trivially
+/// transposed at a call site — `valid_from` and `valid_until` have identical
+/// types and opposite meanings).
+///
+/// Every field is `None`-or-empty ⇒ "no claim", which resolves to wall-clock
+/// `now` for `created_at`/`valid_from` and SQL NULL for `valid_until` — the
+/// pre-#3178 shape, so [`LinkClaimWindow::UNCLAIMED`] is byte-identical to the
+/// legacy behaviour.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LinkClaimWindow<'a> {
+    /// RFC3339 instant the edge was recorded.
+    pub created_at: Option<&'a str>,
+    /// RFC3339 instant the edge became true.
+    pub valid_from: Option<&'a str>,
+    /// RFC3339 instant the edge stopped being true; `None` = open-ended.
+    pub valid_until: Option<&'a str>,
+}
+
+impl<'a> LinkClaimWindow<'a> {
+    /// No caller-supplied claim — the historical [`create_link`] /
+    /// [`create_link_signed`] shape.
+    pub const UNCLAIMED: Self = Self {
+        created_at: None,
+        valid_from: None,
+        valid_until: None,
+    };
+
+    /// Read the claim off a wire/SAL [`MemoryLink`] record.
+    #[must_use]
+    pub fn from_link(link: &'a MemoryLink) -> Self {
+        Self {
+            created_at: Some(link.created_at.as_str()),
+            valid_from: link.valid_from.as_deref(),
+            valid_until: link.valid_until.as_deref(),
+        }
+    }
+}
+
+/// #3178 — [`create_link_signed`] that HONOURS the caller's temporal claim
+/// (`created_at` / `valid_from` / `valid_until`), the sqlite twin of
+/// `PostgresStore::link_internal`.
+///
+/// Pre-fix the sqlite SAL adapter passed only `(source_id, target_id,
+/// relation)` and this funnel had no `valid_until` in its INSERT at all: a
+/// caller-supplied claim window was SILENTLY DISCARDED, `created_at` and
+/// `valid_from` were both forced to wall-clock `now`, and — worse — the
+/// Ed25519 pre-image signed `valid_from: Some(now), valid_until: None`, i.e.
+/// a window the caller never supplied. The same
+/// `MemoryStore::link_signed(link)` therefore produced DIFFERENT durable rows
+/// AND different signature pre-images per backend, so a link minted on one
+/// backend could not verify on the other.
+///
+/// Semantics mirror the postgres twin exactly:
+/// * `created_at` / `valid_from` — `None` or empty ⇒ wall-clock now.
+/// * `valid_until` — `None` or empty ⇒ SQL NULL (open-ended).
+/// * All three are truncated to MICROSECOND precision before they are both
+///   signed and persisted (v0.7.0 H6 / G3): postgres' `TIMESTAMPTZ`
+///   quantises at microseconds, so a nanosecond-precision string would sign
+///   bytes the postgres round-trip can never reproduce. SQLite stores
+///   RFC3339 TEXT losslessly, so truncating here is what makes the
+///   sign/verify CBOR byte-stable ACROSS the storage boundary.
+/// * A malformed timestamp is a hard error, never a silent substitution of
+///   `now` — silently re-writing an attested claim is the defect this closes.
+///
+/// # Errors
+///
+/// Every error [`create_link_signed`] returns, plus an
+/// [`anyhow::Error`] when any supplied timestamp is not valid RFC3339.
+pub fn create_link_signed_with_window(
+    conn: &Connection,
+    source_id: &str,
+    target_id: &str,
+    relation: &str,
+    keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    window: LinkClaimWindow<'_>,
+) -> Result<&'static str> {
     // #1955 R45 — record-stop fence for the link funnel (every caller —
     // MCP, HTTP, SAL, federation — reaches this one primitive).
     crate::storage::record_stop::gate_storage_conn(conn)?;
@@ -8527,7 +8620,39 @@ pub fn create_link_signed(
     // round-trip and break the Ed25519 signature. Truncating here
     // makes the sign/verify CBOR byte-stable across the storage
     // boundary regardless of which adapter wrote the row originally.
-    let now = truncate_to_microseconds(Utc::now()).to_rfc3339();
+    // #3178 — resolve the caller's temporal claim. `None`/empty falls back to
+    // wall-clock now (the historical shape); a SUPPLIED value is honoured and
+    // a malformed one is refused outright rather than silently replaced.
+    // Every value is truncated to microseconds BEFORE it is signed or
+    // persisted (see the H6/G3 rationale above and on this function's
+    // docblock) so the CBOR pre-image survives a postgres round-trip.
+    let now_dt = Utc::now();
+    let parse_claim = |label: &str, raw: &str| -> Result<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|e| anyhow::anyhow!("invalid rfc3339 link {label} {raw}: {e}"))
+    };
+    // Field labels come from the `field_names` SSOT (pm-v3.1 no-scattered-
+    // literal rule) so a refusal names the same spelling the column does.
+    let created_at_dt = match window.created_at {
+        Some(raw) if !raw.is_empty() => {
+            parse_claim(crate::models::field_names::CREATED_AT, raw)?
+        }
+        _ => now_dt,
+    };
+    let valid_from_dt = match window.valid_from {
+        Some(raw) if !raw.is_empty() => parse_claim(crate::models::field_names::VALID_FROM, raw)?,
+        _ => now_dt,
+    };
+    let valid_until_dt = match window.valid_until {
+        Some(raw) if !raw.is_empty() => {
+            Some(parse_claim(crate::models::field_names::VALID_UNTIL, raw)?)
+        }
+        _ => None,
+    };
+    let created_at_str = truncate_to_microseconds(created_at_dt).to_rfc3339();
+    let valid_from_str = truncate_to_microseconds(valid_from_dt).to_rfc3339();
+    let valid_until_str = valid_until_dt.map(|t| truncate_to_microseconds(t).to_rfc3339());
 
     // v0.7 H2 — sign if we have a private key. We compute the signature
     // BEFORE issuing INSERT so a CBOR/sign failure surfaces as an
@@ -8550,8 +8675,13 @@ pub fn create_link_signed(
                     dst_id: target_id,
                     relation,
                     observed_by: Some(kp.agent_id.as_str()),
-                    valid_from: Some(now.as_str()),
-                    valid_until: None,
+                    // #3178 — sign the window that is actually PERSISTED.
+                    // Pre-fix this signed `valid_from: Some(now),
+                    // valid_until: None` regardless of what the caller
+                    // supplied, so the signature committed to a claim the row
+                    // never carried (and postgres signed a different one).
+                    valid_from: Some(valid_from_str.as_str()),
+                    valid_until: valid_until_str.as_deref(),
                 };
                 let sig = crate::identity::sign::sign(kp, &link)?;
                 (
@@ -8583,15 +8713,21 @@ pub fn create_link_signed(
         } else {
             (None, None)
         };
+    // #3178 — `valid_until` is now IN the column list (pre-fix it was absent
+    // entirely, so a caller-supplied expiry could never land), and
+    // `created_at` / `valid_from` bind SEPARATE parameters instead of sharing
+    // `?4` — the postgres twin has always bound all three independently.
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO memory_links \
-            (source_id, target_id, relation, created_at, valid_from, signature, attest_level, observed_by, source_cid, target_cid) \
-         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9)",
+            (source_id, target_id, relation, created_at, valid_from, valid_until, signature, attest_level, observed_by, source_cid, target_cid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             source_id,
             target_id,
             relation,
-            now,
+            created_at_str,
+            valid_from_str,
+            valid_until_str,
             signature,
             attest_level,
             observed_by_col,
@@ -8629,8 +8765,10 @@ pub fn create_link_signed(
             dst_id: target_id,
             relation,
             observed_by: observed_by_col,
-            valid_from: Some(now.as_str()),
-            valid_until: None,
+            // #3178 — the audit pre-image must be re-derivable from the ROW,
+            // so it commits to the persisted window, not to `now`/`None`.
+            valid_from: Some(valid_from_str.as_str()),
+            valid_until: valid_until_str.as_deref(),
         };
         match crate::identity::sign::canonical_cbor(&signable) {
             Ok(cbor) => {
@@ -11244,7 +11382,9 @@ pub fn invalidate_link(
                     // no observed_by — vanishingly rare for signed
                     // rows since H2 always populates the column on
                     // self-signed inserts.
-                    agent_id: observed_by.clone().unwrap_or_else(|| "unknown".to_string()),
+                    agent_id: observed_by.clone().unwrap_or_else(|| {
+                        crate::signed_events::UNKNOWN_OBSERVER.to_string()
+                    }),
                     event_type: crate::signed_events::event_types::MEMORY_LINK_INVALIDATED
                         .to_string(),
                     payload_hash: crate::signed_events::payload_hash(&cbor),
@@ -15938,13 +16078,22 @@ pub fn set_embeddings_batch(
 /// Returns [`EmbeddingFormatError`](crate::embeddings::EmbeddingFormatError)
 /// when the on-disk BLOB is malformed.
 pub fn get_embedding(conn: &Connection, id: &str) -> Result<Option<Vec<f32>>> {
+    use rusqlite::OptionalExtension;
+    // #3182 — PROPAGATE. This used to end in `.ok()`, which collapsed EVERY
+    // rusqlite failure into `Ok(None)` = "this memory has no embedding". A
+    // dropped column, a locked/corrupt DB, or a decode fault therefore read as
+    // a benign "unembedded" row — so recall silently degraded to keyword-only
+    // and a backfill sweep would happily re-embed rows it could not read. The
+    // two states that genuinely mean "no embedding" — NO ROW and a SQL-NULL
+    // column — are still `Ok(None)`; everything else is now an error.
     let result: Option<Vec<u8>> = conn
         .query_row(
             "SELECT embedding FROM memories WHERE id = ?1",
             params![id],
-            |row| row.get(0),
+            |row| row.get::<_, Option<Vec<u8>>>(0),
         )
-        .ok();
+        .optional()?
+        .flatten();
     match result {
         Some(bytes) if !bytes.is_empty() => {
             let floats = crate::embeddings::decode_embedding_blob(&bytes)?;
@@ -19400,14 +19549,30 @@ pub fn resolve_skill_promotion_min_depth(conn: &Connection, namespace: &str) -> 
 }
 
 /// Return true if `agent_id` matches a registered agent in `_agents`.
-pub fn is_registered_agent(conn: &Connection, agent_id: &str) -> bool {
+///
+/// #3182 — this used to end in `.is_ok()`, collapsing EVERY rusqlite failure
+/// (dropped table, missing migration, `SQLITE_BUSY`, corruption) into the
+/// benign answer "this agent is not registered". That answer is consumed by
+/// the governance `Registered` level and by all three pending-action approver
+/// gates, and it is INDISTINGUISHABLE from a genuine negative lookup — while
+/// the postgres twin (`PostgresStore::is_registered_agent`) propagates. A
+/// substrate fault now surfaces as a fault; the callers already sit in
+/// `Result` contexts and fail closed on it.
+///
+/// # Errors
+///
+/// Any rusqlite failure other than "no matching row".
+pub fn is_registered_agent(conn: &Connection, agent_id: &str) -> Result<bool> {
+    use rusqlite::OptionalExtension;
     let title = crate::models::agent_registration_title(agent_id);
-    conn.query_row(
-        "SELECT 1 FROM memories WHERE namespace = ?1 AND title = ?2",
-        params![AGENTS_NAMESPACE, &title],
-        |r| r.get::<_, i64>(0),
-    )
-    .is_ok()
+    let row: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM memories WHERE namespace = ?1 AND title = ?2",
+            params![AGENTS_NAMESPACE, &title],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(row.is_some())
 }
 
 /// Evaluate a governance level against caller context.
@@ -19427,6 +19592,11 @@ pub fn is_registered_agent(conn: &Connection, agent_id: &str) -> bool {
 /// header). Pre-#963 the same path produced
 /// `Deny(format!("governance: ..."))` which doubled the prefix when
 /// consumers re-wrapped via `deny_message`.
+///
+/// # Errors
+///
+/// #3182 — propagates a substrate failure from the `Registered`-level
+/// registration lookup instead of silently reading it as "not registered".
 fn evaluate_level(
     conn: &Connection,
     action: GovernedAction,
@@ -19435,12 +19605,12 @@ fn evaluate_level(
     agent_id: &str,
     memory_owner: Option<&str>,
     namespace_owner: Option<&str>,
-) -> GovernanceDecision {
+) -> Result<GovernanceDecision> {
     use crate::governance::GovernanceRefusal;
-    match level {
+    Ok(match level {
         GovernanceLevel::Any => GovernanceDecision::Allow,
         GovernanceLevel::Registered => {
-            if is_registered_agent(conn, agent_id) {
+            if is_registered_agent(conn, agent_id)? {
                 GovernanceDecision::Allow
             } else {
                 GovernanceDecision::Deny(
@@ -19455,7 +19625,25 @@ fn evaluate_level(
             }
         }
         GovernanceLevel::Owner => {
-            let owner = memory_owner.or(namespace_owner);
+            // #3176 — ACTION-KEYED owner selection, aligning with the postgres
+            // twin (`PostgresStore::enforce_governance_action`) verbatim.
+            //
+            // Pre-fix this was `memory_owner.or(namespace_owner)` for EVERY
+            // action. `enforce_governance` only resolves `namespace_owner` for
+            // `Store`, so for delete/promote/reflect the `.or()` arm was
+            // already dead — but on `Store` it made a caller-supplied
+            // `memory_owner` WIN over the namespace's standard owner, so a
+            // `Store` where `memory_owner == agent != ns_owner` was ALLOWED on
+            // sqlite and DENIED on postgres: the same call, the same policy,
+            // opposite verdicts. The documented contract on this function is
+            // already the postgres mapping ("`namespace_owner` … used as the
+            // 'owner' for store operations"; "`memory_owner` … (delete/promote
+            // paths). Pass `None` for store operations"), so this restores the
+            // documented behaviour AND takes the fail-closed direction.
+            let owner = match action {
+                GovernedAction::Store => namespace_owner,
+                _ => memory_owner,
+            };
             match owner {
                 Some(o) if o == agent_id => GovernanceDecision::Allow,
                 Some(o) => GovernanceDecision::Deny(
@@ -19485,7 +19673,7 @@ fn evaluate_level(
             // of truth for pending ids.
             GovernanceDecision::Pending(String::new())
         }
-    }
+    })
 }
 
 /// Resolve the namespace-owner (`metadata.agent_id` of the namespace's
@@ -19676,7 +19864,7 @@ pub fn enforce_governance(
         agent_id,
         memory_owner,
         ns_owner.as_deref(),
-    );
+    )?;
 
     // #1720 C — per-namespace `required_scope` (refuse-only, fail-closed;
     // see `governance::required_scope_refusal`). Only overrides an `Allow`,
@@ -20243,7 +20431,7 @@ pub fn approve_with_approver_type(
                         crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
                     ));
                 }
-                if !is_registered_agent(conn, approver_agent_id) {
+                if !is_registered_agent(conn, approver_agent_id)? {
                     return Ok(ApproveOutcome::Rejected(format!(
                         "Human approver '{approver_agent_id}' is not a registered agent"
                     )));
@@ -20291,7 +20479,7 @@ pub fn approve_with_approver_type(
                         crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
                     ));
                 }
-                if !is_registered_agent(conn, approver_agent_id) {
+                if !is_registered_agent(conn, approver_agent_id)? {
                     return Ok(ApproveOutcome::Rejected(format!(
                         "designated approver '{approver_agent_id}' is not a registered agent"
                     )));
@@ -20318,7 +20506,7 @@ pub fn approve_with_approver_type(
             //   2. Canonicalize the agent_id to lowercase for both the
             //      duplicate-vote check and storage so case-variants of the
             //      same id collapse to a single vote.
-            if !is_registered_agent(conn, approver_agent_id) {
+            if !is_registered_agent(conn, approver_agent_id)? {
                 return Ok(ApproveOutcome::Rejected(format!(
                     "consensus voter '{approver_agent_id}' is not a registered agent"
                 )));
