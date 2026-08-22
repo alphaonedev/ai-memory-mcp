@@ -358,6 +358,25 @@ const KNOBS: &[KnobSpec] = &[
         hard_value: "FULL",
         meets_floor: synchronous_meets_floor,
     },
+    // #3113 — the migration ladder's core-relation gate. The sqlite ladder's
+    // existence-probe arms SKIP a relation that is absent and the tail stamps
+    // the tip regardless, so a POPULATED database that LOST a core relation
+    // (corruption / partial file-level restore / operator DROP) "upgrades
+    // successfully" with the integrity controls that stamp implies never
+    // applied. Detection is unconditional in every posture; this pin makes a
+    // CERTIFIED deployment REFUSE the stamp rather than warn — the #3033
+    // "asi-hard no-disable" contract applied to schema integrity.
+    //
+    // Safe to pin ON: refusal additionally requires a POSITIVELY OBSERVED
+    // populated corpus (`storage::schema_integrity::refusal_required`), so a
+    // fresh or archive-less hardened deployment with an empty corpus is never
+    // bricked, and the refusal itself mutates nothing — it rolls the ladder
+    // back and leaves the database readable at its old version.
+    KnobSpec {
+        env: crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES,
+        hard_value: "1",
+        meets_floor: is_truthy,
+    },
 ];
 
 /// What happened to one knob during enforcement (for the boot log).
@@ -783,7 +802,7 @@ mod tests {
         // The pinned set must match the documented count so the module
         // docs table and the KNOBS SSOT cannot silently drift.
         let pins = pinned_knobs();
-        assert_eq!(pins.len(), 21, "documented asi-hard knob count");
+        assert_eq!(pins.len(), 22, "documented asi-hard knob count");
         // Every pin's env name is non-empty and the durability pin is FULL.
         assert!(pins.iter().all(|(e, _)| !e.is_empty()));
         assert!(
@@ -800,6 +819,16 @@ mod tests {
             pins.iter()
                 .any(|(e, v)| *e == crate::tls::FED_REQUIRE_SERVER_VERIFY_ENV && *v == "1"),
             "asi-hard must pin outbound server-cert verification (#2448)"
+        );
+        // #3113 — the first SCHEMA-INTEGRITY pin. The migration ladder's
+        // existence-probe arms fail OPEN: a populated database that lost a
+        // core relation stamps the tip anyway, with the integrity controls
+        // that stamp implies never applied. A certified deployment must
+        // REFUSE that stamp, not merely warn about it.
+        assert!(
+            pins.iter()
+                .any(|(e, v)| *e == crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES && *v == "1"),
+            "asi-hard must pin the migration core-relation gate (#3113)"
         );
         // #2477 — the SECOND network access-control pin, and the second
         // PERMISSIVE one (hard floor = the hatch is NOT in force). Without

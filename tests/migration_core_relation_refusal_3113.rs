@@ -18,6 +18,7 @@
 //! database would be a worse outcome than the fail-open hole it replaces.
 
 use ai_memory::db;
+use ai_memory::storage::schema_integrity;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -66,7 +67,7 @@ fn enforced_posture_refuses_the_stamp_and_leaves_the_database_untouched() {
     let err = db::open(&path).expect_err("enforced posture must refuse a lost core relation");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("governance_rules"),
+        msg.contains(schema_integrity::TABLE_GOVERNANCE_RULES),
         "the refusal must name the missing relation: {msg}",
     );
     assert!(

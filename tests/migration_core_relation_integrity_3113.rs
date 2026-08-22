@@ -96,12 +96,12 @@ fn a_lost_relation_on_a_populated_database_is_detected() {
     // The finding's exact scenario: governance_rules (v30) dropped from a
     // database still claiming v89. Pre-#3113 this was completely silent.
     let tmp = TempDir::new().unwrap();
-    let path = populated_db_missing(&tmp, "governance_rules", 89);
+    let path = populated_db_missing(&tmp, schema_integrity::TABLE_GOVERNANCE_RULES, 89);
 
     let conn = Connection::open(&path).unwrap();
     let missing = schema_integrity::missing_core_tables(&conn, 89).unwrap();
     let names: Vec<&str> = missing.iter().map(|t| t.name).collect();
-    assert_eq!(names, vec!["governance_rules"]);
+    assert_eq!(names, vec![schema_integrity::TABLE_GOVERNANCE_RULES]);
     // The diagnostic must name the control that is NOT in force, not merely
     // the table — that is what makes the WARN actionable.
     assert!(
@@ -119,7 +119,7 @@ fn report_only_posture_preserves_legacy_behaviour_exactly() {
     // stamps the tip, and the durable row is untouched. #3113 adds detection,
     // it does not change what happens.
     let tmp = TempDir::new().unwrap();
-    let path = populated_db_missing(&tmp, "signed_events", 73);
+    let path = populated_db_missing(&tmp, schema_integrity::TABLE_SIGNED_EVENTS, 73);
 
     let conn = db::open(&path).expect("report-only posture must not refuse the open");
     assert_eq!(
@@ -139,7 +139,7 @@ fn relations_above_the_stamp_are_not_reported_as_lost() {
     // A database legitimately BELOW a relation's introduction version is not
     // missing it. This is what keeps a genuine mid-ladder database quiet.
     let tmp = TempDir::new().unwrap();
-    let path = populated_db_missing(&tmp, "governance_rules", 29);
+    let path = populated_db_missing(&tmp, schema_integrity::TABLE_GOVERNANCE_RULES, 29);
     let conn = Connection::open(&path).unwrap();
     assert!(
         schema_integrity::missing_core_tables(&conn, 29)
@@ -154,7 +154,7 @@ fn the_check_issues_no_ddl_and_no_dml() {
     // Data-integrity contract: the gate reads sqlite_master and COUNT(*) only.
     // Prove it by round-tripping the full catalogue + row count across a probe.
     let tmp = TempDir::new().unwrap();
-    let path = populated_db_missing(&tmp, "governance_rules", 89);
+    let path = populated_db_missing(&tmp, schema_integrity::TABLE_GOVERNANCE_RULES, 89);
     let conn = Connection::open(&path).unwrap();
 
     let catalogue_before: Vec<String> = conn

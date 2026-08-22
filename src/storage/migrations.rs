@@ -3860,7 +3860,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // itself reads `sqlite_master` + `COUNT(*)` and issues no DDL/DML, so
         // this gate can neither lose nor corrupt data.
         let missing_core = super::schema_integrity::report(conn, CURRENT_SCHEMA_VERSION)?;
-        if !missing_core.is_empty() && crate::config::migration_require_core_tables() {
+        // Refusal additionally requires a POSITIVELY OBSERVED populated corpus
+        // (`refusal_required`): an empty database with a high stamp is the
+        // ordinary fixture / archive-less shape and holds no lost data, so
+        // refusing it would brick a fresh deployment for nothing — and since
+        // `asi-hard` PINS enforcement on, that would make the hardened posture
+        // strictly more fragile than the standard one with no integrity gain.
+        if super::schema_integrity::refusal_required(conn, &missing_core) {
             return Err(anyhow::anyhow!(super::schema_integrity::refusal_message(
                 &missing_core,
                 CURRENT_SCHEMA_VERSION

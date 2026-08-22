@@ -765,7 +765,7 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
                 crate::storage::schema_integrity::describe(&missing),
             ));
             severity = Severity::Critical;
-            note = Some(format!(
+            let core_note = format!(
                 "{} core relation(s) required at schema v{stamped} are ABSENT — the ladder \
                  arms that create them were skipped, so the integrity controls this stamp \
                  implies are NOT in force. On a populated database this indicates relation \
@@ -773,10 +773,24 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
                  backup containing them. Set AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1 to \
                  make the migration refuse to stamp rather than warn.",
                 missing.len(),
+            );
+            // COMPOSE, never overwrite: the dim-violation branch above may
+            // already have set a note, and dropping an operator diagnostic to
+            // make room for this one would be its own small data loss.
+            note = Some(note.take().map_or_else(
+                || core_note.clone(),
+                |existing| format!("{existing} | {core_note}"),
             ));
         }
         Err(e) => {
+            // A failed probe means the integrity claim is UNVERIFIED, which is
+            // not the same as verified-good. Surface it rather than letting a
+            // read failure read as a clean bill of health — but never downgrade
+            // a Critical already raised above.
             facts.push((format!("{FACT_CORE_RELATIONS}_error"), e.to_string()));
+            if severity == Severity::Info {
+                severity = Severity::Warning;
+            }
         }
     }
 

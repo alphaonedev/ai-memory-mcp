@@ -81,6 +81,27 @@ const SQL_TABLE_PRESENT: &str =
 /// vs empty fixture). Never a gate.
 const SQL_MEMORIES_COUNT: &str = "SELECT COUNT(*) FROM memories";
 
+/// Storage-layer SSOT for the ladder-created core relation NAMES.
+///
+/// These are referenced by the [`CORE_TABLES`] entries, by the migration
+/// ladder's own probes, and by the tests, so the name of a relation whose
+/// existence is a data-integrity invariant is typed ONCE (the operator's
+/// no-hardcoded-literals directive, `scripts/check-hardcoded-literals.sh`).
+///
+/// Deliberately NOT reusing the same-valued consts elsewhere in the tree:
+/// `export_scope::OMITTED_CLASS_*` is a portability omission LABEL,
+/// `erasure::archive_sync::ARCHIVED_TABLE` selects an erasure-store table, and
+/// `store::postgres::TABLE_ARCHIVED_MEMORIES` is postgres-local and private.
+/// Binding a schema invariant to any of those would couple this check to an
+/// unrelated subsystem's naming.
+pub const TABLE_ARCHIVED_MEMORIES: &str = "archived_memories";
+/// See [`TABLE_ARCHIVED_MEMORIES`].
+pub const TABLE_NAMESPACE_META: &str = "namespace_meta";
+/// See [`TABLE_ARCHIVED_MEMORIES`].
+pub const TABLE_SIGNED_EVENTS: &str = "signed_events";
+/// See [`TABLE_ARCHIVED_MEMORIES`].
+pub const TABLE_GOVERNANCE_RULES: &str = "governance_rules";
+
 /// One ladder-created relation whose presence is implied by a schema stamp.
 ///
 /// A relation qualifies for this table only when BOTH hold:
@@ -115,25 +136,25 @@ pub struct CoreTable {
 /// the same commit — that is what keeps the stamp honest.
 pub const CORE_TABLES: &[CoreTable] = &[
     CoreTable {
-        name: "archived_memories",
+        name: TABLE_ARCHIVED_MEMORIES,
         introduced_at: 4,
         integrity_note: "archive/restore has no destination relation: archiving a memory \
                          (GC, supersede, in-place edit) cannot preserve the prior row",
     },
     CoreTable {
-        name: "namespace_meta",
+        name: TABLE_NAMESPACE_META,
         introduced_at: 5,
         integrity_note: "namespace standards and parent-namespace inheritance cannot be \
                          recorded or resolved",
     },
     CoreTable {
-        name: "signed_events",
+        name: TABLE_SIGNED_EVENTS,
         introduced_at: 26,
         integrity_note: "the append-only audit chain is absent, so the v34 prev_hash/sequence \
                          chain columns and the v73 cause_hash column were never applied",
     },
     CoreTable {
-        name: "governance_rules",
+        name: TABLE_GOVERNANCE_RULES,
         introduced_at: 30,
         integrity_note: "governance rules cannot be stored or evaluated, and the v66 widened \
                          severity CHECK was never applied",
@@ -226,6 +247,50 @@ pub fn report(conn: &Connection, effective_version: i64) -> Result<Vec<CoreTable
     Ok(missing)
 }
 
+/// Pure refusal predicate: should a missing-relation report REFUSE the schema
+/// stamp? Takes the enforcement flag and the corpus size explicitly so the
+/// decision is testable without mutating process-global env.
+///
+/// Refusal requires ALL THREE:
+///
+/// 1. at least one core relation is missing;
+/// 2. enforcement is engaged (`AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1`, or
+///    the `asi-hard` pin); and
+/// 3. the corpus is POSITIVELY OBSERVED to hold rows.
+///
+/// Condition 3 is the load-bearing one. The whole reason the ladder's
+/// existence probes skip rather than fail is that an EMPTY database with a
+/// high stamp is the ordinary fixture / archive-less shape — there is no lost
+/// data there, because there is no data. Refusing it would brick a fresh
+/// deployment for nothing, and since `asi-hard` PINS enforcement on, that
+/// would make the hardened posture strictly more fragile than the standard one
+/// with no integrity gain. Loss is only DEMONSTRABLE when rows exist alongside
+/// a relation that should have been created before them.
+///
+/// `corpus_rows == None` (the count could not be read) also does NOT refuse:
+/// the check refuses only on a fact it positively established, never on an
+/// absence of information. An unreadable corpus surfaces through the WARN and
+/// the `doctor` signal instead.
+#[must_use]
+pub fn refusal_required_with(
+    missing: &[CoreTable],
+    enforced: bool,
+    corpus_rows: Option<i64>,
+) -> bool {
+    enforced && !missing.is_empty() && matches!(corpus_rows, Some(n) if n > 0)
+}
+
+/// [`refusal_required_with`] resolved against this process's enforcement flag
+/// and this database's corpus size.
+#[must_use]
+pub fn refusal_required(conn: &Connection, missing: &[CoreTable]) -> bool {
+    refusal_required_with(
+        missing,
+        crate::config::migration_require_core_tables(),
+        corpus_row_count(conn),
+    )
+}
+
 /// The typed refusal raised when enforcement is enabled and relations are
 /// missing. Kept separate from [`report`] so the message has ONE definition
 /// shared by the migrate refusal and the doctor note.
@@ -285,13 +350,13 @@ mod tests {
     fn relations_above_the_stamp_are_not_yet_expected() {
         // At v4 only `archived_memories` is due; signed_events (v26) and
         // governance_rules (v30) are correctly not reported.
-        let conn = conn_with(&["archived_memories"]);
+        let conn = conn_with(&[TABLE_ARCHIVED_MEMORIES]);
         assert!(missing_core_tables(&conn, 4).expect("probe").is_empty());
         assert!(
             missing_core_tables(&conn, 5)
                 .expect("probe")
                 .iter()
-                .any(|t| t.name == "namespace_meta")
+                .any(|t| t.name == TABLE_NAMESPACE_META)
         );
     }
 
@@ -299,19 +364,19 @@ mod tests {
     fn a_tip_stamped_database_missing_the_audit_chain_is_reported() {
         // The finding's exact shape: a database claiming the tip whose
         // ladder-only relations were skipped.
-        let conn = conn_with(&["archived_memories", "namespace_meta"]);
+        let conn = conn_with(&[TABLE_ARCHIVED_MEMORIES, TABLE_NAMESPACE_META]);
         let missing = missing_core_tables(&conn, 89).expect("probe");
         let names: Vec<&str> = missing.iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["signed_events", "governance_rules"]);
+        assert_eq!(names, vec![TABLE_SIGNED_EVENTS, TABLE_GOVERNANCE_RULES]);
     }
 
     #[test]
     fn a_complete_database_at_the_tip_reports_nothing() {
         let conn = conn_with(&[
-            "archived_memories",
-            "namespace_meta",
-            "signed_events",
-            "governance_rules",
+            TABLE_ARCHIVED_MEMORIES,
+            TABLE_NAMESPACE_META,
+            TABLE_SIGNED_EVENTS,
+            TABLE_GOVERNANCE_RULES,
         ]);
         assert!(missing_core_tables(&conn, 89).expect("probe").is_empty());
     }
@@ -337,7 +402,7 @@ mod tests {
         let missing = missing_core_tables(&conn_with(&[]), 89).expect("probe");
         let text = describe(&missing);
         assert!(
-            text.contains("signed_events"),
+            text.contains(TABLE_SIGNED_EVENTS),
             "must name the relation: {text}"
         );
         assert!(
@@ -358,11 +423,57 @@ mod tests {
         );
     }
 
+    // --- refusal predicate: the populated-corpus gate ---
+
+    fn one_missing() -> Vec<CoreTable> {
+        missing_core_tables(&conn_with(&[]), 89).expect("probe")
+    }
+
+    #[test]
+    fn an_empty_corpus_never_refuses_even_when_enforced() {
+        // THE anti-brick invariant. `asi-hard` PINS enforcement on, so a fresh
+        // or archive-less deployment with an empty corpus MUST still open. Loss
+        // is only demonstrable when rows exist alongside a relation that should
+        // have been created before them.
+        assert!(!refusal_required_with(&one_missing(), true, Some(0)));
+    }
+
+    #[test]
+    fn an_unreadable_corpus_never_refuses_even_when_enforced() {
+        // Refuse only on a positively established fact, never on an absence of
+        // information. An unreadable corpus surfaces via the WARN + doctor.
+        assert!(!refusal_required_with(&one_missing(), true, None));
+    }
+
+    #[test]
+    fn a_populated_corpus_refuses_when_enforced() {
+        assert!(refusal_required_with(&one_missing(), true, Some(1)));
+    }
+
+    #[test]
+    fn a_populated_corpus_reports_only_when_enforcement_is_off() {
+        // The default posture: detect and warn, never refuse.
+        assert!(!refusal_required_with(
+            &one_missing(),
+            false,
+            Some(1_000_000)
+        ));
+    }
+
+    #[test]
+    fn a_complete_schema_never_refuses() {
+        assert!(!refusal_required_with(&[], true, Some(1_000_000)));
+    }
+
     #[test]
     fn report_returns_the_same_list_it_warns_about() {
-        let conn = conn_with(&["archived_memories", "namespace_meta", "signed_events"]);
+        let conn = conn_with(&[
+            TABLE_ARCHIVED_MEMORIES,
+            TABLE_NAMESPACE_META,
+            TABLE_SIGNED_EVENTS,
+        ]);
         let missing = report(&conn, 89).expect("report");
         assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].name, "governance_rules");
+        assert_eq!(missing[0].name, TABLE_GOVERNANCE_RULES);
     }
 }

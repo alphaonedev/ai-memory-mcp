@@ -563,6 +563,22 @@ force.
   defaulting to refuse would turn every existing high-stamp fixture and
   archive-less deployment into a hard boot failure, a fleet-wide availability
   regression for no data-integrity gain.
+- **Pinned ON by `asi-hard`.** `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES` joins
+  the `asi-hard` `KNOBS` SSOT (`src/security_profile.rs`), taking the pinned set
+  from 21 to 22 — the first SCHEMA-INTEGRITY pin, alongside the crypto,
+  attestation, durability and network pins. A certified enterprise-federation
+  deployment therefore REFUSES to stamp a schema version whose core relations
+  were lost, rather than merely warning: the #3033 "no-disable" contract applied
+  to schema integrity. Safe to pin because refusal additionally requires a
+  positively observed POPULATED corpus, so a fresh hardened node with an empty
+  database is never bricked. `docs/deploy/asi-hard.env`, the cert doc's knob
+  count, and the CLAUDE.md enumeration move in lockstep.
+- **Refusal requires demonstrable loss.** The populated-corpus discriminator
+  GATES the refusal, it does not merely colour the log: refusal needs a missing
+  relation AND enforcement AND a positively observed non-empty corpus. An empty
+  corpus (the ordinary fixture / archive-less shape — no lost data, because no
+  data) and an unreadable corpus both report without refusing. The check refuses
+  only on a fact it positively established, never on an absence of information.
 - **The gate cannot itself lose data.** It issues no DDL and no DML — it reads
   `sqlite_master` and one `COUNT(*)`. A regression test round-trips the full
   catalogue and row count across a probe to pin that. Under the default posture
