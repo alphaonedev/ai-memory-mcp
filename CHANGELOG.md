@@ -501,6 +501,7 @@ backend and missing or divergently implemented on its twin). Pinned by
   WARN once when the variable is present but not truthy. `AI_MEMORY_NO_CONFIG=1`
   behaviour is unchanged.
 ### Security (secret-file handling: close the TOCTOU re-open window; give the capability token a non-argv channel; stop re-publishing the SQLCipher passphrase)
+### Security (secret-file handling: close the TOCTOU re-open window; give the capability token a non-argv channel; stop re-publishing the SQLCipher passphrase; caproot directory posture)
 
 - **Four secret-file loaders still did stat-then-reopen (TOCTOU).** #3205. #1790
   finding 2 established the rule for this codebase — open the file ONCE and run
@@ -550,6 +551,17 @@ backend and missing or divergently implemented on its twin). Pinned by
   the documented operator-set fallback. A second seed in the same process is
   refused, not swapped. No default change for operators who set the env
   themselves.
+- **`write_root_secret` used a bare `create_dir_all` for the `.caproot`
+  keystore.** #3214. The identity cluster (#3198) closed this class for
+  Ed25519 `.priv`/`.pub` and left the capability HMAC secret as an
+  out-of-scope residual. A group/world-writable directory lets another local
+  UID replace `<issuer>.caproot`; the per-file 0600 check then PASSES on the
+  planted bearer secret, so `mint` produces tokens that `verify` under the
+  attacker's HMAC (there is no private-derives-public cross-check here). Both
+  `write_root_secret` and `read_root_secret` now create at `0o700`
+  (`mkdir(2)`-time) and refuse an existing directory whose `mode & 0o022 !=
+  0`. A merely group-readable `0o755` directory (default `umask 022`) is
+  still accepted — directory read does not enable the swap.
 
 ### Changed
 

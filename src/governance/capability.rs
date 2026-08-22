@@ -1340,6 +1340,73 @@ pub fn caproot_path(dir: &std::path::Path, issuer: &str) -> Result<std::path::Pa
     Ok(dir.join(format!("{issuer}{CAPROOT_SUFFIX}")))
 }
 
+/// Unix mode applied at `mkdir(2)` for a freshly-created caproot directory.
+#[cfg(unix)]
+const CAPROOT_DIR_MODE: u32 = 0o700;
+
+/// Group/other WRITE bits (#3214 / the #3198 class). Directory *read*
+/// does not enable a swap; write does. Refusing `0o077` would brick
+/// every default-`umask 022` (`0o755`) deployment — a silent tightening
+/// of a shipped default this fix must not do.
+#[cfg(unix)]
+const CAPROOT_DIR_FORBIDDEN_BITS: u32 = 0o022;
+
+/// `create_dir_all` that gives every directory it CREATES mode
+/// [`CAPROOT_DIR_MODE`]. `DirBuilder::mode` applies at `mkdir(2)` time,
+/// so the window in which a freshly-created directory is group-writable
+/// does not exist — unlike a `create_dir_all` followed by a `chmod`.
+/// Pre-existing directories are left exactly as they are (checked,
+/// never rewritten).
+fn create_caproot_dir_secure(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(CAPROOT_DIR_MODE);
+    }
+    builder.create(dir)
+}
+
+/// #3214 — refuse to read or write `.caproot` material under a directory
+/// another local UID can write to. A missing directory passes (there is
+/// nothing to attack yet, and [`write_root_secret`] creates it `0o700`).
+/// On non-Unix this is a no-op: there are no POSIX mode bits to enforce.
+///
+/// # Errors
+///
+/// The directory exists and is group- or world-WRITABLE, or it cannot be
+/// `stat`ed.
+fn enforce_caproot_dir_secure(dir: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !dir.exists() {
+            return Ok(());
+        }
+        let md = std::fs::metadata(dir)
+            .with_context(|| format!("stat caproot directory {}", dir.display()))?;
+        let mode = md.permissions().mode() & 0o7777;
+        if mode & CAPROOT_DIR_FORBIDDEN_BITS != 0 {
+            anyhow::bail!(
+                "caproot directory {} is group- or world-writable (mode {mode:o}); refusing to \
+                 use it. Another local user can replace {}/<issuer>.caproot with a secret they \
+                 control — the per-file 0600 check then PASSES on the planted file, so mint \
+                 produces tokens that verify under the attacker's HMAC. Restore with: chmod \
+                 0700 {} (#3214)",
+                dir.display(),
+                dir.display(),
+                dir.display(),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 /// Generate and persist a fresh 32-byte `root_secret` for `issuer` at
 /// `<dir>/<issuer>.caproot`, mode `0o600`. Refuses to overwrite an
 /// existing secret (rotation is an explicit delete-then-keygen so the
@@ -1347,11 +1414,15 @@ pub fn caproot_path(dir: &std::path::Path, issuer: &str) -> Result<std::path::Pa
 ///
 /// # Errors
 /// - the path already exists;
+/// - the caproot directory is group- or world-writable (#3214);
 /// - directory creation or the exclusive create/write fails.
 pub fn write_root_secret(dir: &std::path::Path, issuer: &str) -> Result<std::path::PathBuf> {
     use rand_core::RngCore;
     let path = caproot_path(dir, issuer)?;
-    std::fs::create_dir_all(dir).with_context(|| format!("creating key dir {}", dir.display()))?;
+    enforce_caproot_dir_secure(dir)?;
+    create_caproot_dir_secure(dir)
+        .with_context(|| format!("creating key dir {}", dir.display()))?;
+    enforce_caproot_dir_secure(dir)?;
     let mut secret = [0u8; ROOT_SECRET_LEN];
     rand_core::OsRng.fill_bytes(&mut secret);
     let mut opts = std::fs::OpenOptions::new();
@@ -1382,10 +1453,12 @@ pub fn write_root_secret(dir: &std::path::Path, issuer: &str) -> Result<std::pat
 ///
 /// # Errors
 /// - missing/unreadable file;
+/// - the caproot directory is group- or world-writable (#3214);
 /// - insecure mode bits;
 /// - wrong length (must be exactly [`ROOT_SECRET_LEN`] bytes).
 pub fn read_root_secret(dir: &std::path::Path, issuer: &str) -> Result<Vec<u8>> {
     let path = caproot_path(dir, issuer)?;
+    enforce_caproot_dir_secure(dir)?;
     let mut f = std::fs::File::open(&path)
         .with_context(|| format!("reading root secret {}", path.display()))?;
     #[cfg(unix)]
@@ -2038,6 +2111,27 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             let err = read_root_secret(dir, "ai:iss").unwrap_err();
             assert!(err.to_string().contains("insecure mode"), "{err:#}");
+        }
+        // #3214 — a group/world-WRITABLE caproot directory is refused
+        // (the #3198 class). A merely group-readable `0o755` directory
+        // (default `umask 022`) still works — directory read does not
+        // enable the swap.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let writable = dir.join("writable");
+            std::fs::create_dir(&writable).unwrap();
+            std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o775)).unwrap();
+            let err = write_root_secret(&writable, "ai:iss2").unwrap_err();
+            assert!(
+                err.to_string().contains("group- or world-writable"),
+                "{err:#}"
+            );
+            let readable = dir.join("readable");
+            std::fs::create_dir(&readable).unwrap();
+            std::fs::set_permissions(&readable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(write_root_secret(&readable, "ai:iss3").is_ok());
+            assert!(read_root_secret(&readable, "ai:iss3").is_ok());
         }
     }
 
