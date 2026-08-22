@@ -382,6 +382,17 @@ const KNOBS: &[KnobSpec] = &[
     },
 ];
 
+/// The number of env knobs `asi-hard` pins — ONE named SSOT for a count that
+/// the module doc table, `docs/deploy/asi-hard.env`, the enterprise-federation
+/// certification doc, `scripts/check-bootstrap-cert-gate.sh` and
+/// `src/enterprise_federation_posture.rs` all quote in prose.
+///
+/// Derived from [`KNOBS`], so adding a knob moves it automatically. The prose
+/// sites cannot derive it, which is exactly how they drifted (the table sat two
+/// rows behind for an entire release); `scripts/check-docs-vs-ssot.sh` resolves
+/// this same count from source and fails the build when a prose site disagrees.
+pub const PINNED_KNOB_COUNT: usize = KNOBS.len();
+
 /// What happened to one knob during enforcement (for the boot log).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinAction {
@@ -911,9 +922,26 @@ mod tests {
             return;
         }
         // The pinned set must match the documented count so the module
-        // docs table and the KNOBS SSOT cannot silently drift.
+        // docs table and the KNOBS SSOT cannot silently drift. Asserting
+        // against [`PINNED_KNOB_COUNT`] rather than a literal is deliberate:
+        // the literal was the ONE place the count had to be hand-bumped, and
+        // a hand-bumped number is exactly what drifted (#3113). The pin is
+        // not weakened by dropping it — the count is enforced against the
+        // module doc TABLE on the next line, against the table by SET
+        // equality in `pinned_knobs_doc_table_matches_the_knobs_ssot_exactly`,
+        // and against every PROSE site by the ASI_HARD_PINNED_KNOB_COUNT rule
+        // in `scripts/check-docs-vs-ssot.sh`.
         let pins = pinned_knobs();
-        assert_eq!(pins.len(), 22, "documented asi-hard knob count");
+        assert_eq!(
+            pins.len(),
+            PINNED_KNOB_COUNT,
+            "pinned_knobs() must enumerate every KNOBS entry, unfiltered"
+        );
+        assert_eq!(
+            documented_pinned_knob_names().len(),
+            PINNED_KNOB_COUNT,
+            "the `## Pinned knobs` module doc table must carry one row per KNOBS entry"
+        );
         // Every pin's env name is non-empty and the durability pin is FULL.
         assert!(pins.iter().all(|(e, _)| !e.is_empty()));
         assert!(

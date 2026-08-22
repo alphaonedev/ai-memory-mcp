@@ -599,6 +599,36 @@ force.
   rolling the ladder back) instead of being coerced into "nothing missing" —
   reporting integrity as intact on the strength of a failed read is the same
   fail-open shape this change removes.
+- **The knob-count drift the pin exposed, closed mechanically.** Adding the
+  22nd knob surfaced that the `asi-hard` pinned set was documented by
+  HAND-MAINTAINED numbers in six places, and that they had already drifted: the
+  `## Pinned knobs` module doc table in `src/security_profile.rs` sat TWO rows
+  behind `KNOBS` for a full release (no row for
+  `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` or `_CHECKPOINT_SIG`) with nothing
+  failing, and CLAUDE.md's env row #130 claimed `docs/deploy/asi-hard.env` was
+  "pinned by `tests/deploy_templates.rs`" when that file's only link to the SSOT
+  was `!pinned_knobs().is_empty()` — true of any non-empty set. Three
+  mechanical pins replace the hand-maintained ones, each failing in BOTH
+  directions: (1) `security_profile::tests::pinned_knobs_doc_table_matches_the_knobs_ssot_exactly`
+  asserts SET equality between the doc table and `KNOBS`, so a table row for a
+  knob that is NOT pinned — the dangerous direction, since the docs would
+  advertise a hardening guarantee the binary does not enforce — fails too;
+  (2) `tests/deploy_templates.rs::asi_hard_env_names_every_pinned_knob` requires
+  the operator-facing deploy template to name every pinned knob, matching on
+  whole identifier TOKENS rather than substrings (`AI_MEMORY_FED_REQUIRE_SIG` is
+  a strict prefix of `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG`, so a `contains` check
+  would report the shorter knob as documented because the longer one is
+  present); and (3) a new `ASI_HARD_PINNED_KNOB_COUNT` rule in
+  `scripts/check-docs-vs-ssot.sh` resolves the count from the `KnobSpec` entries
+  themselves and fails the build on any prose site that disagrees. The count
+  literal in `asi_hard_pins_documented_set` becomes the derived
+  `security_profile::PINNED_KNOB_COUNT` (`= KNOBS.len()`), so the number can no
+  longer be hand-bumped anywhere. **A fail-open in the docs gate itself is fixed
+  in the same change**: its historical-line guard treated a leading `#` as a
+  markdown HEADING for every file type, so in a `.sh`/`.env` scan target — where
+  `#` is the COMMENT marker — every comment line was skipped and a rule listing
+  such a file covered nothing in it while still reporting PASS. That anchor is
+  now scoped to `.md`/`.html`.
 
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 

@@ -144,6 +144,12 @@ CANONICAL_PGVECTOR_PATCH="$(
 
 # Profile::full().expected_tool_count() — count of RegisteredTool::of::<>() entries
 CANONICAL_FULL_TOOL_COUNT=$(grep -cE '^\s*RegisteredTool::of::<' src/mcp/registry.rs 2>/dev/null || echo 0)
+# asi-hard pinned-knob count (#3113). SSOT = the `KnobSpec` entries in the
+# `KNOBS` table (mirrored by the derived const
+# `security_profile::PINNED_KNOB_COUNT`). Counted from source for the same
+# reason as the tool count above: the entries ARE the definition, so a knob
+# cannot be added without moving this number.
+CANONICAL_ASI_HARD_KNOBS=$(grep -cE '^[[:space:]]*KnobSpec \{' src/security_profile.rs 2>/dev/null || echo 0)
 
 # Profile::core().expected_tool_count() — count of tn::* refs in the
 # `Self::Core => &[ ... ]` arm of Profile::tool_names(). 7 at v0.7.0.
@@ -509,8 +515,18 @@ if os.environ.get("AI_MEMORY_DOCS_GATE_SELFTEST_FAULT"):
 # made that accident stop holding: the README prior-release paragraph and
 # the ROADMAP frozen v0.7.1 baseline both legitimately say 25.
 PARA_LEAD = re.compile(r"^\s*\*\*v([0-9]+\.[0-9]+\.[0-9]+)")
+# MARKDOWN-ONLY (#3113). A leading `#` is a HEADING in .md/.html prose, but
+# it is the COMMENT marker in .sh / .env / .toml / .yml. Held in the shared
+# `HIST` ladder this anchor silently swallowed EVERY comment line of a
+# non-markdown scan file, so a rule that listed such a file covered nothing
+# in it and still reported PASS -- the fail-open shape this gate exists to
+# refuse. Harmless until now only because every previous scan set was
+# .md/.html; the asi-hard pinned-knob rule below is the first to walk a
+# shell script and an env template. Rust is unaffected either way (`#[...]`
+# / `#![...]` attributes are not `#` + space, and `//! # Heading` starts
+# with `//!`), but it is scoped by the same test rather than by luck.
+MD_HEADING = re.compile(r"^\s*#{1,6}\s")
 HIST = [
-    re.compile(r"^\s*#{1,6}\s"),
     re.compile(r"\b[Aa]t the v[0-9]+\.[0-9]+\.[0-9]+ release\b"),
     re.compile(r"\brelease, surface was\b"),
     re.compile(r"\bv[0-9]+ added\b"),
@@ -549,9 +565,11 @@ def plain(s):
     return WS.sub(" ", htmlmod.unescape(TAG.sub(" ", s))).strip()
 
 
-def is_historical(line):
+def is_historical(line, markdownish=True):
     m = PARA_LEAD.match(line)
     if m and m.group(1) != release:
+        return True
+    if markdownish and MD_HEADING.search(line):
         return True
     return any(p.search(line) for p in HIST)
 
@@ -568,14 +586,15 @@ for f in os.environ["GATE_NC_FILES"].split():
     if not os.path.isfile(f):
         continue
     is_html = f.endswith(".html")
+    markdownish = f.endswith((".md", ".html"))
     lines = open(f, encoding="utf-8").read().splitlines()
     for ln, line in enumerate(lines, 1):
         if is_html:
-            if is_historical(plain(line)):
+            if is_historical(plain(line), markdownish):
                 continue
             if html_window_historical(lines[max(0, ln - 1 - HTML_WINDOW):ln]):
                 continue
-        elif is_historical(line):
+        elif is_historical(line, markdownish):
             continue
         for m in pat.finditer(line):
             # Alternation groups: take the FIRST non-None capture
@@ -1248,6 +1267,35 @@ run_all_rules() {
     fail_count=0
     check_schema_version_rule
     check_env_var_census_rule
+    # asi-hard pinned-knob count (#3113). The count is quoted in PROSE across
+    # six files that cannot derive it; the module doc table sat two rows behind
+    # `KNOBS` for a full release with nothing failing. Set equality of the
+    # TABLE is pinned in-code by
+    # `security_profile::tests::pinned_knobs_doc_table_matches_the_knobs_ssot_exactly`;
+    # this rule pins the NARRATIVE count everywhere else.
+    # Known limitation (stated, not hidden): a NEW phrasing that none of these
+    # alternatives match would evade the rule. Add its shape here in the same
+    # commit that introduces it.
+    # Coverage as verified at this commit (a rule whose regex matches nothing
+    # in a listed file is a no-op that still reports PASS, so this is stated
+    # rather than assumed): CLAUDE.md 1 line, the certification doc 2,
+    # src/security_profile.rs 2, src/enterprise_federation_posture.rs 2,
+    # scripts/check-bootstrap-cert-gate.sh 1 — the last of those reachable
+    # ONLY because the markdown-heading anchor is now scoped to .md/.html
+    # (see MD_HEADING above); it is a `#` shell comment. docs/deploy/asi-hard.env
+    # quotes NO count today and is enrolled so that a future one is policed on
+    # arrival; the knob NAMES in that template are pinned instead by
+    # tests/deploy_templates.rs::asi_hard_env_names_every_pinned_knob.
+    check_narrative_count_rule \
+        "ASI_HARD_PINNED_KNOB_COUNT" \
+        "$CANONICAL_ASI_HARD_KNOBS" \
+        '([0-9]+)-knob|(?:auto-)?[Pp]ins the ([0-9]+)(?: asi-hard)? knobs|holds \*\*([0-9]+)\*\* entries|names all ([0-9]+) correctly|SSOT for the ([0-9]+)|\*\*([0-9]+)\*\* post-#|shows `([0-9]+)/[0-9]+`|`PINNED_KNOB_COUNT` \(([0-9]+)\)' \
+        CLAUDE.md \
+        docs/deploy/asi-hard.env \
+        docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md \
+        src/security_profile.rs \
+        src/enterprise_federation_posture.rs \
+        scripts/check-bootstrap-cert-gate.sh
     check_generalised_numeric_claims
     check_pgvector_version_rule
     check_html_version_stamp_rule
@@ -1362,6 +1410,7 @@ run_all_rules() {
         printf '   Canonical values resolved from source:\n' >&2
         printf '     CURRENT_SCHEMA_VERSION = %s (src/storage/migrations.rs)\n' "$CANONICAL_SCHEMA_VERSION" >&2
         printf '     Profile::full() tool count = %s (registry RegisteredTool::of entries)\n' "$CANONICAL_FULL_TOOL_COUNT" >&2
+        printf '     asi-hard pinned knobs = %s (security_profile KNOBS entries / PINNED_KNOB_COUNT)\n' "$CANONICAL_ASI_HARD_KNOBS" >&2
         printf '     EXPECTED_PRODUCTION_ROUTES_COUNT = %s\n' "$CANONICAL_ROUTES_COUNT" >&2
         printf '     EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = %s\n' "$CANONICAL_UNIQUE_PATHS_COUNT" >&2
         printf '     EXPECTED_CLI_SUBCOMMANDS_DEFAULT = %s\n' "$CANONICAL_CLI_DEFAULT" >&2

@@ -63,7 +63,7 @@ PG_DSN_REQUIRE_ONLY="postgres://u@db.internal:5432/mem?sslmode=require"
 echo
 echo "== LEG A — #3061 pg posture armability =="
 
-# Shared certified env for a pg backend. asi-hard auto-pins the 21 knobs in
+# Shared certified env for a pg backend. asi-hard auto-pins the 22 knobs in
 # the binary's pre-runtime phase (src/main.rs); the rest are the federation
 # additions the posture requires. A fingerprints file + attestation JSON +
 # trust domain satisfy checks #9/#10/#11/#12; append-only + a daemon audit
