@@ -598,6 +598,55 @@ pub(crate) fn handle_store(
     let existing =
         db::find_synthesis_candidates(conn, &mem.title, &mem.namespace).unwrap_or_default();
 
+    // #3173 (authz / data-integrity) — OWNERSHIP GATE on the synthesis merge
+    // plane.
+    //
+    // `db::find_synthesis_candidates` is NAMESPACE-scoped only
+    // (`storage::find_similar_title_candidates(conn, title, namespace, 20)` —
+    // no owner predicate), and every mutate site downstream of it runs on a
+    // bare `rusqlite::Connection` with NONE of the #1786
+    // `visibility::caller_owns_for_mutation` gates the explicit
+    // `memory_update` / `memory_delete` / `memory_promote` MCP handlers apply.
+    // Under `AI_MEMORY_AGENT_ID` multi-tenancy in a shared namespace, an
+    // autonomous LLM synthesis verdict (`update` / `delete`) — or the
+    // exact-dup merge detour below — could therefore overwrite or HARD-DELETE
+    // a row owned by a DIFFERENT agent, silently, with the caller's identity
+    // never checked against the victim row.
+    //
+    // Two layers, mirroring `mcp::tools::delete`:
+    //   1. Filter the candidate pool to rows the caller may mutate BEFORE the
+    //      curator ever sees them. That is also a confidentiality fix — the
+    //      pre-#3173 prompt inlined another agent's title + content.
+    //   2. Re-check ownership at EVERY mutate site (`synthesis::…`) and REFUSE
+    //      — never silently skip — when a verdict names a row the caller does
+    //      not own.
+    //
+    // Keyed on the ENFORCED-read caller (`resolve_read_visibility_caller`,
+    // env-only) so it fires ONLY when `AI_MEMORY_AGENT_ID` is set, leaving the
+    // single-operator trust-all default byte-unchanged (#1468/#1720 B1).
+    let mutation_caller = crate::identity::resolve_read_visibility_caller();
+    let synthesis_candidates: std::borrow::Cow<'_, [crate::models::Memory]> =
+        match mutation_caller.as_deref() {
+            None => std::borrow::Cow::Borrowed(existing.as_slice()),
+            Some(caller) => {
+                let kept: Vec<crate::models::Memory> = existing
+                    .iter()
+                    .filter(|c| synthesis::caller_may_mutate(c, caller))
+                    .cloned()
+                    .collect();
+                if kept.len() != existing.len() {
+                    tracing::warn!(
+                        target: "synthesis",
+                        namespace = %mem.namespace,
+                        caller = %caller,
+                        withheld = existing.len() - kept.len(),
+                        "synthesis.candidates_withheld_not_owned",
+                    );
+                }
+                std::borrow::Cow::Owned(kept)
+            }
+        };
+
     // v0.7.x Form 1 (#754) — the namespace policy was resolved ONCE
     // at the auto-classify hook above (#1579 A1); the synthesis path
     // (Form 1) and the synchronous-atomise mode (Form 2) consume that
@@ -676,7 +725,14 @@ pub(crate) fn handle_store(
             ));
         }
         let llm_client = llm.expect("synthesis_eligible guarantees llm.is_some()");
-        synthesis::run_synthesis_pass(llm_client, &mem, &agent_id, &existing, &ns_policy)?
+        // #3173 — the curator sees ONLY the caller-mutable pool.
+        synthesis::run_synthesis_pass(
+            llm_client,
+            &mem,
+            &agent_id,
+            &synthesis_candidates,
+            &ns_policy,
+        )?
     } else {
         synthesis::SynthesisOutcome::empty()
     };
@@ -714,12 +770,14 @@ pub(crate) fn handle_store(
     if let Some(resp) = synthesis::apply_synthesis_updates_and_deletes(
         conn,
         &mem,
-        &existing,
+        &synthesis_candidates,
         embedder,
         vector_index,
         &synthesis_outcome,
         active_keypair,
-    ) {
+        // #3173 — re-checked at every `db::update` / `db::delete` inside.
+        mutation_caller.as_deref(),
+    )? {
         return Ok(resp);
     }
     // When no update fired, capture the list of to-be-deleted
@@ -730,6 +788,17 @@ pub(crate) fn handle_store(
     // deletes, this is a zero-cost empty list.
     let pending_synthesis_delete_targets =
         synthesis::pending_synthesis_delete_targets(&synthesis_outcome);
+    // #3173 — vet the deferred delete queue BEFORE the standard insert, so an
+    // ownership violation REFUSES the whole store call instead of hard-deleting
+    // another agent's row after the new row has already landed. The queue is
+    // drawn from the already-filtered pool, so this is the structural backstop
+    // (the mutate-site re-check inside
+    // `apply_pending_synthesis_deletes_with_links` is the last one).
+    synthesis::assert_caller_may_mutate_all(
+        &synthesis_candidates,
+        mutation_caller.as_deref(),
+        &pending_synthesis_delete_targets,
+    )?;
 
     let exact_dup = if matches!(on_conflict, OnConflict::Merge) {
         existing
@@ -739,6 +808,21 @@ pub(crate) fn handle_store(
         None
     };
     if let Some(dup) = exact_dup {
+        // #3173 — owner gate on the exact-dup merge detour. This branch applies
+        // the incoming CALLER content over an EXISTING row via `db::update` on a
+        // bare connection; without the gate a second agent storing the same
+        // (title, namespace) in a shared namespace silently overwrote the first
+        // agent's content. The search deliberately runs over the FULL candidate
+        // pool (not the #3173-filtered one) so a cross-owner collision REFUSES
+        // loudly here rather than falling through to the insert tail and
+        // surfacing as an opaque `(title, namespace)` UNIQUE violation.
+        // `allow_inbox = false` mirrors the `memory_update` gate (#1786).
+        if let Some(caller) = mutation_caller.as_deref()
+            && !synthesis::caller_may_mutate(dup, caller)
+        {
+            synthesis::audit_mutation_refusal(crate::audit::AuditAction::Update, dup, caller);
+            return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
+        }
         // #2121/#2122 funnel audit — clause-1 gate on the exact-dup merge
         // detour. This tool-layer `(title, namespace)` dedup applies the
         // incoming CALLER content via `db::update` and returns before the
@@ -964,6 +1048,10 @@ pub(crate) fn handle_store(
         &actual_id,
         &pending_synthesis_delete_targets,
         active_keypair,
+        // #3173 — last-resort mutate-site re-check (the refusing gate ran
+        // before the insert above).
+        &synthesis_candidates,
+        mutation_caller.as_deref(),
     );
 
     // PR-5 (issue #487): security audit trail. No-op when disabled.
