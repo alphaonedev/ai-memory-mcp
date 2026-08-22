@@ -900,6 +900,23 @@ this clause for the changed surface — the posture is strictly STRONGER,
 never weaker, than at `e22bc93c` (a silent-downgrade path in the
 declarative operator flow was closed).
 
+**Re-cert trigger — FIRED, pending re-affirmation (PR #3212, #3140
+bounded test HTTP client).** The §7-watched path
+`src/federation/receive.rs` changed. The delta is **test-only**: the
+`issue_1928_tests` hostile-peer probes replaced unbounded
+`reqwest::Client::new()` with a 10 s / 5 s `timeout` /
+`connect_timeout` builder (`bounded_test_client`). Production receive
+code, the `/sync/*` wire, the schema, and every `AI_MEMORY_FED_*`
+identifier are **byte-identical**. It REMOVES **no** certified control
+(the removal-proof set is unchanged). The change exists so a HOSTILE
+peer that accepts the TCP connection and then stalls cannot park the
+test forever — the posture those tests exist to prove we survive.
+**This PR does NOT re-mint the certification:** re-running
+§5.4(2)–(5) at the new SHA and re-affirming this document against it
+is the operator/reviewer gate. Until that re-affirmation lands, treat
+the certification as EXPIRED per this clause for the changed path —
+the shipped federation posture is UNCHANGED from `e22bc93c`.
+
 **Named signer.** The determination at `580d8427` is a **GitHub
 squash-merge** of PR #2910, committed by `GitHub` on behalf of the
 operator account (`alphaonedev`). GitHub signature verification is
