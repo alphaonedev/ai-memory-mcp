@@ -236,7 +236,13 @@ pub fn report(conn: &Connection, effective_version: i64) -> Result<Vec<CoreTable
             effective_version,
             missing_count = missing.len(),
             missing = %describe(&missing),
-            corpus_rows = rows.unwrap_or(-1),
+            // Recorded as the Option itself (`Some(n)` / `None`), NOT flattened
+            // to a sentinel: "the corpus could not be read" is a different fact
+            // from "the corpus is empty", and collapsing the two into `-1` (or
+            // worse, `0`) is the same unknown-as-a-value mistake this whole
+            // check exists to remove. It is also the input to the refusal
+            // predicate, so the log must show exactly what that predicate saw.
+            corpus_rows = ?rows,
             // The knob NAME is a structured field, not prose, so it is typed
             // once (at its const) and a rename cannot leave this message stale.
             enforce_env = crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES,

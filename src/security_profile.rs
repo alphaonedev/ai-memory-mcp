@@ -680,6 +680,46 @@ mod tests {
     }
 
     #[test]
+    fn asi_hard_actually_enables_the_migration_core_relation_gate() {
+        // #3113 END-TO-END. `asi_hard_pins_documented_set` proves the knob is
+        // in the KNOBS table; this proves the pin has its INTENDED EFFECT —
+        // that after boot enforcement the migration ladder's own reader
+        // returns true, so a certified deployment really does refuse to stamp
+        // a schema version whose core relations were lost. The reader is a
+        // DIRECT env read (the ladder runs before the boot-seeded config
+        // globals exist), so "pinned in a table" and "in force at the read
+        // site" are genuinely separate claims and the second is the one the
+        // cert language rests on.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_actually_enables_the_migration_core_relation_gate",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = KnobsGuard;
+
+        // Baseline: with no posture the gate reports only, never refuses.
+        assert!(
+            !crate::config::migration_require_core_tables(),
+            "the default posture must be report-only"
+        );
+
+        unsafe {
+            std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+        }
+        let (posture, _reports) = enforce_at_boot().unwrap();
+        assert_eq!(posture, SecurityPosture::AsiHard);
+        assert!(
+            crate::config::migration_require_core_tables(),
+            "asi-hard must leave the migration core-relation gate ENFORCING at its \
+             read site, not merely listed in KNOBS (#3113)"
+        );
+    }
+
+    #[test]
     fn asi_hard_pins_every_unset_knob() {
         if crate::config::run_env_isolated_child_or_spawn(
             "security_profile::tests::asi_hard_pins_every_unset_knob",
