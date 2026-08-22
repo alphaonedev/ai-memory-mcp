@@ -144,9 +144,8 @@ pub(super) fn handle_forget(
     // (the shapes a hand-rolled or weakly-typed client emits) into a REAL,
     // irreversible delete when a PREVIEW was requested. Refuse a
     // present-but-non-boolean value; ABSENT still defaults to `false`.
-    let dry_run =
-        crate::mcp::param_guard::optional_bool(params, crate::mcp::param_names::DRY_RUN)?
-            .unwrap_or(false);
+    let dry_run = crate::mcp::param_guard::optional_bool(params, crate::mcp::param_names::DRY_RUN)?
+        .unwrap_or(false);
 
     // #1772 — owner gate: when the multi-tenant opt-in is on
     // (`AI_MEMORY_AGENT_ID` set), bulk forget only ever touches the CALLER's

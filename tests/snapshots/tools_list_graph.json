@@ -16,6 +16,7 @@
               "null"
             ]
           },
+          "citations": {},
           "confidence": {
             "format": "double",
             "type": [
@@ -94,6 +95,7 @@
               "null"
             ]
           },
+          "source_span": {},
           "source_uri": {
             "type": [
               "string",
@@ -158,6 +160,13 @@
           }
         },
         "properties": {
+          "agent_id": {
+            "title": "3171 — read-governance actor (single-tenant fallback; the resolved",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "as_agent": {
             "type": [
               "string",
@@ -330,6 +339,13 @@
           },
           "query": {
             "type": "string"
+          },
+          "source_uri": {
+            "title": "3171 — exact `source_uri` filter (honoured but undeclared until the",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "tier": {
             "type": [
@@ -571,6 +587,13 @@
       "description": "Mark a KG link as superseded by",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — operator-as-actor: the id recorded as the ACTOR of this",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "relation": {
             "type": "string"
           },
@@ -606,6 +629,13 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "as_agent": {
+            "title": "3171 — #151 scope-visibility agent (honoured but undeclared until the",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -729,6 +759,13 @@
       "description": "Get a specific memory by ID,",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — read-governance actor (single-tenant fallback; the resolved",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           }
@@ -744,6 +781,13 @@
       "description": "Create a typed link between two",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — operator-as-actor: the id recorded as the ACTOR of this",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "relation": {
             "type": [
               "string",

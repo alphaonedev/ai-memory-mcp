@@ -1488,7 +1488,10 @@ mod d1_6_987_tests {
     /// `tests/snapshots/tools_list_*.json` profiles.
     const PROPERTY_ADDITIONS: &[(&str, &[&str])] = &[
         // #2258 — bitemporal validity on the write schema.
-        ("memory_store", &["valid_from", "valid_until", "citations", "source_span"]),
+        (
+            "memory_store",
+            &["valid_from", "valid_until", "citations", "source_span"],
+        ),
         // #3011 — optional signal TTL, wiring `signals.expires_at`.
         ("memory_signal_send", &["ttl_secs"]),
         // ------------------------------------------------------------------
@@ -1580,6 +1583,7 @@ mod d1_6_987_tests {
         "memory_export_reflection",
         "memory_forget",
         "memory_gc",
+        "memory_ingest_multistep",
         "memory_kg_invalidate",
         "memory_lease_release",
         "memory_lease_renew",
@@ -1614,7 +1618,10 @@ mod d1_6_987_tests {
     ];
 
     /// Look up a tool's allowed-diff row, defaulting to "no exception".
-    fn lookup_exception<'a>(table: &'a [(&'a str, &'a [&'a str])], name: &str) -> BTreeSet<&'a str> {
+    fn lookup_exception<'a>(
+        table: &'a [(&'a str, &'a [&'a str])],
+        name: &str,
+    ) -> BTreeSet<&'a str> {
         table
             .iter()
             .find(|(tool, _)| *tool == name)

@@ -641,7 +641,10 @@ mod tests {
         let cap = crate::transcripts::storage::MAX_DECOMPRESSED_BYTES;
         let bomb_plain = vec![0u8; cap + 1024];
         let blob = zstd::encode_all(bomb_plain.as_slice(), 19).unwrap();
-        assert!(blob.len() < cap, "precondition: the blob is tiny compressed");
+        assert!(
+            blob.len() < cap,
+            "precondition: the blob is tiny compressed"
+        );
         let digest = vec![0u8; 32];
         conn.execute(
             "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, created_at) \

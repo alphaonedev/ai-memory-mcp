@@ -44,37 +44,10 @@
 //!    field or per-property `description` text in
 //!    `src/mcp/registry.rs`.
 
-use ai_memory::sizes::{full_profile_total_tokens, trimmed_full_profile_total_tokens};
-
-/// Hard ceiling for the verbose source-of-truth catalog.
-///
-/// Source of truth for the figure: the v0.7.0 #829 playbook (operator
-/// target). The pre-#829 measured baseline was ~15570 cl100k tokens
-/// (every tool carried multi-paragraph `docs` prose); after the #829
-/// trim every `docs` string is a single condensed sentence.
-///
-/// **v0.7.0 #987 update.** D1.6 collapsed `tool_definitions()` to
-/// iterate over per-tool `McpTool` impls; the schemars-derived
-/// `inputSchema` carries metadata the legacy hand-coded macro didn't
-/// (`additionalProperties: false`, `default: null`, `$schema`,
-/// `title`, request-struct `description`). Measured total ~15K
-/// post-D1.6. Ceiling re-raised to 17K to leave 2K headroom for
-/// future field additions; partial compensation comes from D1.7
-/// (#988) when the trimmer's allow-list filtering of schemars
-/// metadata lands.
-///
-/// **v0.8.0 #1709 update.** The Pillar-1 coordination tools landed in
-/// waves: `memory_action_create`/`get` nudged the verbose total to ~17K
-/// (ceiling 17K->18K); the `memory_action_transition`/`list`/`add_edge`/
-/// `edges` DAG tools + the `memory_lease_acquire`/`renew`/`release`/`get`
-/// lease tools brought the 84-tool catalog to ~18.2K, so the ceiling is
-/// re-raised to 20K to restore ~1.8K headroom.
-///
-/// 2026-06-16 — re-raised 20K -> 22K for the v0.8.0 #1709 Pillar-1
-/// `memory_routine_*` tool family (create/freeze/run/status/list): the
-/// 98-tool catalog measures ~20.6K, so the ceiling moves to 22K to
-/// restore ~1.4K headroom.
-const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 25_000;
+use ai_memory::sizes::{
+    VERBOSE_FULL_PROFILE_CEILING_TOKENS, full_profile_total_tokens,
+    trimmed_full_profile_total_tokens,
+};
 
 /// Hard ceiling for the trimmed wire (`tools/list`) catalog.
 ///

@@ -1892,7 +1892,12 @@ mod handler_tests {
     #[test]
     fn frontier_and_next_refuse_missing_or_blank_namespace_3171() {
         let conn = fresh();
-        for bad in [json!({}), json!({ "namespace": "" }), json!({ "namespace": "   " }), json!({ "namespace": 7 })] {
+        for bad in [
+            json!({}),
+            json!({ "namespace": "" }),
+            json!({ "namespace": "   " }),
+            json!({ "namespace": 7 }),
+        ] {
             let e = handle_action_frontier(&conn, &bad).expect_err("frontier refuses");
             assert_eq!(e, "namespace is required", "frontier: {bad}");
             let e = handle_action_next(&conn, &bad).expect_err("next refuses");

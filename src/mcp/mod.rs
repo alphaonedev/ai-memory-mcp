@@ -2768,11 +2768,8 @@ fn dispatch_memory_offload(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // caller-chosen makes the SEC-4 gate inert in BOTH directions, so bind the
     // stamp to the enforced-read caller under the multi-tenant posture
     // (single-operator default unchanged).
-    match crate::identity::resolve_governance_subject(
-        explicit_agent_id,
-        ctx.mcp_client,
-        "offload",
-    ) {
+    match crate::identity::resolve_governance_subject(explicit_agent_id, ctx.mcp_client, "offload")
+    {
         Ok(agent_id) => offload::handle_offload(ctx.conn, ctx.arguments, &agent_id),
         Err(e) => Err(e.to_string()),
     }
@@ -7937,6 +7934,63 @@ mod tests {
         let resp = invoke_handle_request(&conn, &req);
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32602);
+    }
+
+    /// #3204 item 4 — a PRESENT-but-non-object `arguments` is a protocol
+    /// violation, not "no arguments". Coercing it to `{}` ran the tool with
+    /// every argument absent (a destructive tool took its unscoped defaults).
+    #[test]
+    fn tools_call_non_object_arguments_is_minus_32602_3204() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        for arguments in [
+            json!("namespace=acme"),
+            json!(["namespace", "acme"]),
+            json!(1),
+            json!(true),
+        ] {
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(1)),
+                method: "tools/call".into(),
+                params: json!({ "name": "memory_list", "arguments": arguments }),
+            };
+            let resp = invoke_handle_request(&conn, &req);
+            let err = resp.error.expect("non-object arguments must be -32602");
+            assert_eq!(err.code, jsonrpc::INVALID_PARAMS, "{arguments}");
+            assert!(err.message.contains("JSON object"), "got: {}", err.message);
+        }
+    }
+
+    /// #3204 item 4 — an ABSENT `arguments` still means "no arguments".
+    #[test]
+    fn tools_call_absent_arguments_means_empty_object_3204() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({ "name": "memory_list" }),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(
+            resp.error.is_none(),
+            "absent arguments must still dispatch; got {:?}",
+            resp.error
+        );
+    }
+
+    /// #3204 item 4 — a reserved sentinel must not stamp the audit actor.
+    #[test]
+    fn resolve_mcp_agent_id_rejects_reserved_sentinel_3204() {
+        let forged = resolve_mcp_agent_id(&json!({"agent_id": "daemon"}), Some("claude"));
+        assert_eq!(
+            forged, "ai:claude",
+            "reserved sentinel must fall through to the synthesized client id"
+        );
+        let ok = resolve_mcp_agent_id(&json!({"agent_id": "alice"}), None);
+        assert_eq!(ok, "alice");
+        let newline = resolve_mcp_agent_id(&json!({"agent_id": "a\nb"}), Some("claude"));
+        assert_eq!(newline, "ai:claude");
     }
 
     #[test]

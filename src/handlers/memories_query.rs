@@ -559,11 +559,7 @@ pub async fn forget_memories(
     if let Some(pattern) = body.pattern.as_deref()
         && let Err(reason) = crate::storage::strict_forget_tokens(pattern)
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": reason })),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": reason }))).into_response();
     }
     // #1849 (CWE-862) — admin bulk forget with the namespace OMITTED spans
     // EVERY namespace, so the per-namespace delete-governance gate (the

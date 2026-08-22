@@ -137,7 +137,11 @@ mod tests {
 
     #[test]
     fn require_str_refuses_missing_blank_and_non_string() {
-        for bad in [json!({}), json!({ "namespace": "" }), json!({"namespace":"  "})] {
+        for bad in [
+            json!({}),
+            json!({ "namespace": "" }),
+            json!({"namespace":"  "}),
+        ] {
             assert_eq!(
                 require_str(&bad, "namespace").unwrap_err(),
                 "namespace is required"
@@ -163,7 +167,10 @@ mod tests {
 
     #[test]
     fn optional_enum_absent_is_none_known_is_some() {
-        assert_eq!(optional_enum(&json!({}), "state", parse_state).unwrap(), None);
+        assert_eq!(
+            optional_enum(&json!({}), "state", parse_state).unwrap(),
+            None
+        );
         assert_eq!(
             optional_enum(&json!({ "state": Value::Null }), "state", parse_state).unwrap(),
             None

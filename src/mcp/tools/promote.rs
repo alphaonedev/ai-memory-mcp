@@ -445,6 +445,10 @@ mod tests {
     fn promote_to_namespace_enforces_destination_governance_3202() {
         use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
         let _envg = crate::identity::agent_id_env_test_lock();
+        let _modeg = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
         let conn = open_conn();
 
         // Destination `acme` — write: Owner, and the standard is owned by
@@ -512,6 +516,10 @@ mod tests {
     fn promote_destination_approve_queues_and_allow_restamps_3202() {
         use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
         let _envg = crate::identity::agent_id_env_test_lock();
+        let _modeg = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
         let conn = open_conn();
 
         let dest_std = insert_owned(&conn, "acme2-std", "acme2", "ai:alice");
@@ -555,6 +563,9 @@ mod tests {
 
         // Now open the destination and re-promote: the clone lands, owned by
         // the ACTING caller, with the origin preserved (never overwritten).
+        // Drop the multi-tenant env so the #1786 source-owner gate does not
+        // refuse bob promoting alice's row; pass `agent_id` on the wire so
+        // the single-operator ladder still restamps the clone as bob.
         let open = serde_json::to_value(GovernancePolicy::default()).expect("serialises");
         crate::db::set_row_metadata(
             &conn,
@@ -562,11 +573,12 @@ mod tests {
             &json!({"agent_id": "ai:alice", "governance": open}).to_string(),
         )
         .expect("reopen");
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
         let row3 = insert_owned(&conn, "row3", "acme2/sub", "ai:alice");
         handle_promote(
             &conn,
             Path::new(":memory:"),
-            &json!({"id": row3, "to_namespace": "acme2"}),
+            &json!({"id": row3, "to_namespace": "acme2", "agent_id": "ai:bob"}),
             None,
         )
         .expect("open destination allows");

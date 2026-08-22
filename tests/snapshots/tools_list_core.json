@@ -16,6 +16,7 @@
               "null"
             ]
           },
+          "citations": {},
           "confidence": {
             "format": "double",
             "type": [
@@ -94,6 +95,7 @@
               "null"
             ]
           },
+          "source_span": {},
           "source_uri": {
             "type": [
               "string",
@@ -158,6 +160,13 @@
           }
         },
         "properties": {
+          "agent_id": {
+            "title": "3171 — read-governance actor (single-tenant fallback; the resolved",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "as_agent": {
             "type": [
               "string",
@@ -331,6 +340,13 @@
           "query": {
             "type": "string"
           },
+          "source_uri": {
+            "title": "3171 — exact `source_uri` filter (honoured but undeclared until the",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "tier": {
             "type": [
               "string",
@@ -452,6 +468,13 @@
       "description": "Get a specific memory by ID,",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — read-governance actor (single-tenant fallback; the resolved",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           }

@@ -53,14 +53,34 @@ use std::path::{Path, PathBuf};
 /// declared properties of the tool's own input schema. Every entry needs a
 /// reason; an entry that stops being read is itself a failure (the test
 /// asserts the allowlist is not stale).
-const ALLOWED_READS: &[(&str, &str)] = &[
-    // Sub-object traversal: the handler reads the bag, then a nested key of
-    // a DECLARED object-typed property. The nested key is part of that
-    // property's value shape, not a top-level input.
-    ("governance", "nested key of the declared `metadata` object"),
-    ("scope", "nested key of the declared `metadata` object (#151)"),
-    // Dispatcher plumbing in `src/mcp/mod.rs`: read across all tools.
-    ("name", "tools/call envelope field, not a tool input"),
+///
+/// Tuple is `(module_unit, key, reason)`. `module_unit` is `"*"` for every
+/// unit, or a directory/file stem (`"store"`) so a co-located helper cannot
+/// punch a global hole in the guard (an `"id"` allowlist on every tool would
+/// hide the exact undeclared-id class #3171 exists to catch).
+const ALLOWED_READS: &[(&str, &str, &str)] = &[
+    // `store/transport.rs` hosts MCP→HTTP forward helpers for OTHER tools
+    // (`memory_action_transition`, `memory_signal_send`) because they share
+    // the generic-bridge pattern with `forward_store_to_http`. Those keys
+    // ARE declared on those tools' own request structs; they must not be
+    // declared on `StoreRequest` (that would advertise a fake store input).
+    //
+    // Unit-scoped on purpose: a global `"id"` exception would hide the
+    // exact undeclared-id class #3171 exists to catch. The original
+    // speculative `"*"` entries (`governance`/`scope`/`name`) were never
+    // undeclared reads under `src/mcp/tools/` — nested metadata keys
+    // don't match the `params["k"]` receiver, and `name` lives in the
+    // dispatcher (`src/mcp/mod.rs`), which this test does not scan.
+    (
+        "store",
+        "id",
+        "forward_action_transition_to_http in store/transport.rs; `id` is memory_action_transition's input",
+    ),
+    (
+        "store",
+        "from_agent",
+        "forward_signal_send_to_http in store/transport.rs; `from_agent` is memory_signal_send's input",
+    ),
 ];
 
 /// Resolve `pub const NAME: &str = "value";` declarations from a SSOT
@@ -153,7 +173,10 @@ fn strip_comments(src: &str) -> String {
 fn read_keys(src: &str, params: &BTreeMap<String, String>) -> BTreeSet<String> {
     let cleaned = strip_comments(src);
     let mut out = BTreeSet::new();
-    for (idx, _) in cleaned.match_indices("params").chain(cleaned.match_indices("arguments")) {
+    for (idx, _) in cleaned
+        .match_indices("params")
+        .chain(cleaned.match_indices("arguments"))
+    {
         // Reject a longer identifier that merely ENDS in `params`
         // (e.g. `extra_params`) — only a path segment counts.
         let before = cleaned[..idx].chars().next_back();
@@ -161,7 +184,9 @@ fn read_keys(src: &str, params: &BTreeMap<String, String>) -> BTreeSet<String> {
             continue;
         }
         let tail = &cleaned[idx..];
-        let tail = tail.trim_start_matches("params").trim_start_matches("arguments");
+        let tail = tail
+            .trim_start_matches("params")
+            .trim_start_matches("arguments");
         let tail = tail.trim_start();
         let inner = if let Some(rest) = tail.strip_prefix('[') {
             let Some(end) = rest.find(']') else { continue };
@@ -174,14 +199,14 @@ fn read_keys(src: &str, params: &BTreeMap<String, String>) -> BTreeSet<String> {
         };
         if let Some(lit) = inner.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
             out.insert(lit.to_string());
-        } else if let Some(cname) = inner.strip_prefix("param_names::") {
-            if let Some(v) = params.get(cname.trim()) {
-                out.insert(v.clone());
-            }
-        } else if let Some(cname) = inner.rsplit("::").next() {
-            if let Some(v) = params.get(cname.trim()) {
-                out.insert(v.clone());
-            }
+        } else if let Some(cname) = inner.strip_prefix("param_names::")
+            && let Some(v) = params.get(cname.trim())
+        {
+            out.insert(v.clone());
+        } else if let Some(cname) = inner.rsplit("::").next()
+            && let Some(v) = params.get(cname.trim())
+        {
+            out.insert(v.clone());
         }
     }
     out
@@ -260,7 +285,16 @@ fn handler_param_reads_are_declared_in_the_tool_schema_3171() {
     );
 
     let tools_root = manifest.join("src/mcp/tools");
-    let allowed: BTreeSet<&str> = ALLOWED_READS.iter().map(|(k, _)| *k).collect();
+    let allowed_star: BTreeSet<&str> = ALLOWED_READS
+        .iter()
+        .filter(|(unit, _, _)| *unit == "*")
+        .map(|(_, k, _)| *k)
+        .collect();
+    let allowed_unit: BTreeSet<(&str, &str)> = ALLOWED_READS
+        .iter()
+        .filter(|(unit, _, _)| *unit != "*")
+        .map(|(unit, k, _)| (*unit, *k))
+        .collect();
 
     // Accumulate per module unit: reads, and the union of the properties of
     // every tool whose `tool_names::` const is referenced in that unit.
@@ -301,11 +335,17 @@ fn handler_param_reads_are_declared_in_the_tool_schema_3171() {
             if declared.contains(key) {
                 continue;
             }
-            if allowed.contains(key.as_str()) {
-                seen_allowed.insert(key.clone());
+            if allowed_star.contains(key.as_str()) {
+                seen_allowed.insert(format!("*:{key}"));
                 continue;
             }
-            failures.push(format!("  {unit}: reads `{key}`, which no tool in that unit declares"));
+            if allowed_unit.contains(&(unit.as_str(), key.as_str())) {
+                seen_allowed.insert(format!("{unit}:{key}"));
+                continue;
+            }
+            failures.push(format!(
+                "  {unit}: reads `{key}`, which no tool in that unit declares"
+            ));
         }
     }
 
@@ -326,10 +366,10 @@ fn handler_param_reads_are_declared_in_the_tool_schema_3171() {
         failures.join("\n")
     );
 
-    let stale: Vec<&str> = ALLOWED_READS
+    let stale: Vec<String> = ALLOWED_READS
         .iter()
-        .map(|(k, _)| *k)
-        .filter(|k| !seen_allowed.contains(*k))
+        .map(|(unit, k, _)| format!("{unit}:{k}"))
+        .filter(|tag| !seen_allowed.contains(tag))
         .collect();
     assert!(
         stale.is_empty(),

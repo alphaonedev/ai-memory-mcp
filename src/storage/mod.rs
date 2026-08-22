@@ -5114,11 +5114,16 @@ fn forget_fts_query(pat: &str) -> Result<String> {
 /// dropped narrowing AND-conjunct.
 pub fn strict_forget_tokens(pat: &str) -> std::result::Result<Vec<String>, String> {
     let cleaned = strip_invisible(pat);
-    let raw: Vec<&str> = cleaned.split_whitespace().filter(|t| !t.is_empty()).collect();
+    let raw: Vec<&str> = cleaned
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .collect();
     if raw.is_empty() {
-        return Err("forget pattern is empty after sanitisation; refusing rather than \
+        return Err(
+            "forget pattern is empty after sanitisation; refusing rather than \
                     widening the delete"
-            .to_string());
+                .to_string(),
+        );
     }
     if raw.len() > MAX_FTS_OR_TERMS {
         return Err(format!(
@@ -23644,10 +23649,7 @@ mod tests {
         // sanitiser; on forget that silently drops a conjunct.
         for op in ["AND", "or", "NoT", "near"] {
             let err = forget_fts_query(&format!("alpha {op} beta")).expect_err("refused");
-            assert!(
-                err.to_string().contains("boolean operator"),
-                "{op}: {err}"
-            );
+            assert!(err.to_string().contains("boolean operator"), "{op}: {err}");
         }
         // Over the term cap, the clamp would drop the tail conjuncts.
         let huge = (0..MAX_FTS_OR_TERMS + 1)

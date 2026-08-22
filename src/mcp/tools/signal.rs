@@ -423,8 +423,7 @@ pub fn handle_signal_thread(conn: &rusqlite::Connection, params: &Value) -> Resu
     // `unwrap_or_default()`, so a malformed call threaded on `""` and got an
     // empty `signals` array back: a plausible "this thread has no messages"
     // answer to a question that was never actually asked. Refuse instead.
-    let correlation_id =
-        crate::mcp::param_guard::require_str(params, param_names::CORRELATION_ID)?;
+    let correlation_id = crate::mcp::param_guard::require_str(params, param_names::CORRELATION_ID)?;
     let signals = crate::signals::thread(conn, correlation_id).map_err(|e| e.to_string())?;
     Ok(json!({
         "signals": serde_json::to_value(&signals).map_err(|e| e.to_string())?,

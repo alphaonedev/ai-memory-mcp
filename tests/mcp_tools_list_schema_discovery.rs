@@ -23,7 +23,10 @@
 
 use ai_memory::mcp::tool_definitions_for_profile;
 use ai_memory::profile::Profile;
-use ai_memory::sizes::{full_profile_total_tokens, trimmed_full_profile_total_tokens};
+use ai_memory::sizes::{
+    VERBOSE_FULL_PROFILE_CEILING_TOKENS, full_profile_total_tokens,
+    trimmed_full_profile_total_tokens,
+};
 use serde_json::Value;
 
 /// Issue #859 ceilings.
@@ -54,7 +57,7 @@ use serde_json::Value;
 // (98-tool catalog ~20.6K). v1.0.0 #2024: 22K → 25K for the skill
 // retire/delete tools (103-tool catalog ~22.6K).
 const TRIMMED_TOKEN_CEILING: usize = 11_000;
-const VERBOSE_TOKEN_CEILING: usize = 25_000;
+const VERBOSE_TOKEN_CEILING: usize = VERBOSE_FULL_PROFILE_CEILING_TOKENS;
 
 /// v0.7.0 #1058 (Agent-4 F4) — regression pin: the trimmed wire form
 /// must not carry `default: null` keys on optional property fields.

@@ -712,12 +712,19 @@ backend and missing or divergently implemented on its twin). Pinned by
   A real sweep now clears three gates: a K9 `Permissions::evaluate` (op chosen by
   disposition — `MemoryArchive` for an archiving sweep, `MemoryDelete` for a
   reaping one) evaluated at the default namespace with `namespace_pattern = "**"`
-  scoping, the #1849 bulk-delete governance rule (REFUSE the sweep if any
-  namespace holding reapable rows carries a non-`Any` `delete` level — otherwise
-  a `delete: Approve` legal-hold is no defence at all, since the held rows simply
-  expire and vanish on the next tick), and an `allow` forensic row chained before
-  the write. `dry_run` stays ungated so an operator can always SEE what would be
-  reaped.
+  scoping, the #1849 bulk-delete governance rule on the DESTRUCTIVE disposition
+  (refuse the sweep if any namespace holding reapable rows carries a non-`Any`
+  `delete` level — otherwise a `delete: Approve` legal-hold is no defence at all,
+  since the held rows simply expire and vanish on the next tick, with no approval
+  and no trace), and an `allow` forensic row chained before the write. The
+  governance refusal deliberately does NOT apply to an ARCHIVING sweep: the row
+  moves to `archived_memories` and `memory_archive_restore` recovers it, so the
+  hold is not defeated, and refusing there would strand expired rows in every
+  deployment with any delete-governed namespace — a reliability cost with no
+  integrity benefit. `dry_run` stays ungated so an operator can always SEE what
+  would be reaped. A `Decision::Ask` REFUSES here rather than returning the
+  success-shaped `{status:"ask"}` envelope its sibling returns; a success-shaped
+  body on an unperformed destructive op is itself one of the findings above.
 - **A non-object `tools/call` `arguments` is now `-32602`, not `{}` (#3204
   item 4).** Coercing it meant `{"arguments": "namespace=acme"}` (or an array, or
   a number) silently ran the tool with EVERY argument absent — a destructive tool
@@ -768,6 +775,11 @@ backend and missing or divergently implemented on its twin). Pinned by
   unpinning a tool.
 - `param_names` SSOT census 133 -> 135: `AS_ADMIN` and `PIPELINE_VARIANT`, both
   honoured but read as bare literals until the audit.
+- **Verbose tool-catalog token ceiling 25_000 → 28_000**, hoisted to the SSOT
+  `crate::sizes::VERBOSE_FULL_PROFILE_CEILING_TOKENS` (was five duplicated
+  `25_000` pins). The honest-docs rewrite + 26 newly declared properties
+  measured 26_691 cl100k on the verbose drill-down; the trimmed `tools/list`
+  wire is unchanged and still under 11_000. rust-1.98: one named const.
 
 ### Fixed (MCP tool descriptions that overclaimed or omitted destructive behaviour; #3171)
 

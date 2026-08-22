@@ -180,15 +180,13 @@ mod tests {
 
     #[test]
     fn handle_entity_register_happy_path_with_metadata_and_aliases() {
-        // Drives lines 27-31 (metadata.is_object() arm), the aliases
-        // filter_map collection, and the final success-return JSON.
         let conn = open_conn();
         let result = handle_entity_register(
             &conn,
             &json!({
                 "canonical_name": "Bob the Builder",
                 "namespace": "characters",
-                "aliases": ["bob", "builder", 42 /* non-string is filtered */],
+                "aliases": ["bob", "builder"],
                 "metadata": {"role": "construction"},
                 "agent_id": "alice",
             }),
@@ -199,8 +197,94 @@ mod tests {
         assert_eq!(result["namespace"], "characters");
         assert_eq!(result["created"], true);
         let aliases = result["aliases"].as_array().expect("aliases array");
-        // The non-string `42` was filtered by the filter_map.
         assert!(aliases.iter().all(|v| v.is_string()));
+    }
+
+    /// #3171 — a PRESENT-but-wrong-typed `aliases` used to be dropped so
+    /// `aliases: "alpha"` registered an entity with NO aliases and answered
+    /// `created: true`. Refuse the contradictory value.
+    #[test]
+    fn entity_register_refuses_non_array_aliases_3171() {
+        let conn = open_conn();
+        let err = handle_entity_register(
+            &conn,
+            &json!({
+                "canonical_name": "Alice",
+                "namespace": "people",
+                "aliases": "alpha",
+            }),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("aliases"), "got: {err}");
+    }
+
+    /// #3171 — a PRESENT-but-wrong-typed `metadata` used to be dropped.
+    #[test]
+    fn entity_register_refuses_non_object_metadata_3171() {
+        let conn = open_conn();
+        let err = handle_entity_register(
+            &conn,
+            &json!({
+                "canonical_name": "Alice",
+                "namespace": "people",
+                "metadata": ["not", "an", "object"],
+            }),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("metadata"), "got: {err}");
+    }
+
+    /// #3171 U2 — an inline `metadata.agent_id` used to WIN over the id the
+    /// handler had just put through `validate_agent_id`, so a reserved
+    /// sentinel (`daemon`) never crossed `RESERVED_AGENT_IDS` (#977). The
+    /// resolved id now overwrites the inline value.
+    #[test]
+    fn entity_register_resolved_id_wins_over_inline_metadata_agent_id_3171() {
+        let conn = open_conn();
+        let result = handle_entity_register(
+            &conn,
+            &json!({
+                "canonical_name": "Eve",
+                "namespace": "people",
+                "agent_id": "alice",
+                "metadata": {"agent_id": "daemon", "team": "x"},
+            }),
+            None,
+        )
+        .expect("alice-stamped register must succeed");
+        let id = result["entity_id"].as_str().expect("entity_id");
+        let mem = db::get(&conn, id).expect("get").expect("row");
+        assert_eq!(
+            mem.metadata["agent_id"].as_str(),
+            Some("alice"),
+            "resolved id must win over inline metadata.agent_id; got {}",
+            mem.metadata
+        );
+        assert_eq!(mem.metadata["team"].as_str(), Some("x"));
+        assert_eq!(mem.metadata["kind"].as_str(), Some("entity"));
+    }
+
+    /// #3171 — an explicit reserved sentinel is refused at the wire
+    /// validator, not laundered into the owner stamp.
+    #[test]
+    fn entity_register_refuses_reserved_explicit_agent_id_3171() {
+        let conn = open_conn();
+        let err = handle_entity_register(
+            &conn,
+            &json!({
+                "canonical_name": "Eve",
+                "namespace": "people",
+                "agent_id": "daemon",
+            }),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("reserved") || err.contains("agent_id"),
+            "got: {err}"
+        );
     }
 }
 

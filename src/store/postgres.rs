@@ -34763,6 +34763,28 @@ mod tests {
             .await;
     }
 
+    /// #3171 — `PostgresStore::forget` refuses a pattern the sanitiser would
+    /// silently WIDEN, matching sqlite `forget_fts_query`. A standalone FTS5
+    /// boolean operator is the smallest such input.
+    #[tokio::test]
+    async fn postgres_forget_refuses_widening_operator_token_3171() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let err = store
+            .forget(&ctx, Some("ns-3171"), Some("AND"), None, false)
+            .await
+            .expect_err("standalone AND must refuse, not widen");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("boolean operator") || msg.contains("InvalidInput"),
+            "got: {msg}"
+        );
+    }
+
     /// #2313 — a HARD forget (archive = false) must NOT snapshot the
     /// victims' `memory_links` into `archived_memory_links` (the sqlite
     /// contract: "a hard (non-recoverable) forget keeps its documented

@@ -63,8 +63,7 @@ pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Resul
         }
         // Per-agent aggregate (rolled-up across every namespace).
         (Some(aid), None) => {
-            let row =
-                crate::quotas::peek_aggregate_status(conn, aid).map_err(|e| e.to_string())?;
+            let row = crate::quotas::peek_aggregate_status(conn, aid).map_err(|e| e.to_string())?;
             Ok(json!({
                 "agent_id": aid,
                 "namespace": crate::quotas::GLOBAL_NAMESPACE,

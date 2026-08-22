@@ -1148,6 +1148,10 @@ mod tests {
     /// namespace to permissive allow-on-silence).
     #[test]
     fn clear_standard_omitted_agent_id_still_gates_owned_row_3171() {
+        // Single-operator posture (env unset): a sibling `_3171` test that
+        // mutates `AI_MEMORY_AGENT_ID` must not leak a multi-tenant caller
+        // into this assertion.
+        let _g = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = insert_owned(&conn, "ns-clear-3171", "std", "ai:alice-3171");
         handle_namespace_set_standard(
@@ -1187,6 +1191,7 @@ mod tests {
     /// zero-config single-operator posture are byte-unchanged.
     #[test]
     fn clear_standard_unowned_still_passes_unclaimed_3171() {
+        let _g = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = insert_one(&conn, "ns-clear-unowned-3171", "std");
         handle_namespace_set_standard(

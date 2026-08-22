@@ -397,15 +397,21 @@ mod tests {
     #[test]
     fn offload_refuses_negative_ttl_seconds_3171() {
         let conn = fresh_conn();
-        for bad in [json!({"content": "c", "ttl_seconds": -1}),
-                    json!({"content": "c", "ttl_seconds": "60"}),
-                    json!({"content": "c", "ttl_seconds": 1.5})] {
+        for bad in [
+            json!({"content": "c", "ttl_seconds": -1}),
+            json!({"content": "c", "ttl_seconds": "60"}),
+            json!({"content": "c", "ttl_seconds": 1.5}),
+        ] {
             let e = handle_offload(&conn, &bad, "ai:alice").expect_err("refused");
             assert_eq!(e, "ttl_seconds must be a non-negative integer", "{bad}");
         }
         // CONTROL: an absent ttl still takes the default, and 0 is honoured.
         handle_offload(&conn, &json!({"content": "c1"}), "ai:alice").expect("absent ok");
-        handle_offload(&conn, &json!({"content": "c2", "ttl_seconds": 0}), "ai:alice")
-            .expect("zero ok");
+        handle_offload(
+            &conn,
+            &json!({"content": "c2", "ttl_seconds": 0}),
+            "ai:alice",
+        )
+        .expect("zero ok");
     }
 }
