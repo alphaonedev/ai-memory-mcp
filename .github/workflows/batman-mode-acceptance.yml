@@ -93,21 +93,13 @@ env:
 jobs:
   rust-integration:
     name: Rust integration (issue_800_batman_mode)
-    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of ci.yml):
-    # `cargo build --release` + two `cargo test --release` binaries.
-    runs-on: [self-hosted, linux-fed]
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of ci.yml). Linux
+    # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
+    # `cargo build --release` + two `cargo test --release` binaries; the warm
+    # `target/` comes from `Swatinem/rust-cache` below, as it did before #3109.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
-      # `lint` job in ci.yml for the full rationale (#3128).
-      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted'
-        shell: bash
-        run: |
-          test -x "$HOME/.cargo/bin/rustup" || {
-            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
-            exit 1
-          }
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -171,25 +163,17 @@ jobs:
 
   bash-integration:
     name: Bash integration (test-batman-mode-suite.sh)
-    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of ci.yml):
-    # it rebuilds the release binary against the same
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of ci.yml). Linux
+    # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
+    # It rebuilds the release binary against the same
     # `shared-key: batman-mode-acceptance` cache as `rust-integration` above,
-    # which it `needs:`, so splitting the two across runner classes would throw
-    # that cache away and pay a second cold release build.
-    runs-on: [self-hosted, linux-fed]
+    # which it `needs:`, so the two must share a runner class — they now share
+    # the hosted one, and the shared rust-cache key works again (on the fleet
+    # the cache action was skipped, so the key bought nothing).
+    runs-on: ubuntu-latest
     needs: rust-integration
     steps:
       - uses: actions/checkout@v4
-      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
-      # `lint` job in ci.yml for the full rationale (#3128).
-      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted'
-        shell: bash
-        run: |
-          test -x "$HOME/.cargo/bin/rustup" || {
-            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
-            exit 1
-          }
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is

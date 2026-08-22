@@ -24,48 +24,58 @@ name: CI
 # RUNNER PLACEMENT — THE RULE (cited by every `# RUNNER PLACEMENT` comment in
 # this repository's workflows; this block is its single statement).
 # ---------------------------------------------------------------------------
-# Self-hosted concurrency is SIX runner instances for the whole repository —
-# four `linux-fed` on one Linux host, two `macos-fed` on one macOS host — shared
-# across every open pull request, and GitHub does not priority-order that queue.
-# GitHub-hosted capacity, at this repository's volume, is not a constraint.
+# OPERATOR DIRECTIVE, 2026-08-22: "Linux CI: push all Linux CI back onto GitHub
+# except for the PostgreSQL, which we can do local here faster — that will
+# prevent all these OOM events."
 #
-# So a self-hosted slot is spent ONLY where the node offers something the hosted
-# pool cannot:
+# So on LINUX there is now exactly ONE reason to be self-hosted:
 #
-#   pg-tier      the always-up native PG 18.6 + AGE 1.8.0 + pgvector 0.8.6
-#                instance on :5445. A job qualifies if it reads the node-local
-#                tier-URL file, CREATE DATABASEs an ephemeral db on it, or points
-#                AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_AGE_URL at it.
-#   warm-cache   the persistent `target/` tree. A job qualifies if it runs
-#                `cargo build` / `cargo test` / `cargo clippy` over a non-trivial
-#                slice of the crate, where warm-vs-cold is minutes.
-#   script-only  EVERYTHING ELSE — `bash scripts/check-*.sh`, git/grep/python3
-#                over the checked-out tree, container-action steps,
-#                dependency-graph RESOLUTION that never compiles, and Docker
-#                builds whose layer cache is `type=gha` (a container build cannot
-#                see the host's cargo cache). These run on `ubuntu-latest`.
+#   pg-tier   the always-up native PG 18.6 + AGE 1.8.0 + pgvector 0.8.6
+#             instance on :5445. A job qualifies if it reads the node-local
+#             tier-URL file, CREATE DATABASEs an ephemeral db on it, or points
+#             AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_AGE_URL at it. TWO
+#             jobs qualify — this workflow's `Check (linux-fed,enterprise-fed)`
+#             leg and `cert-postgres-age.yml`. That is the entire Linux fleet
+#             workload.
 #
-# WHY THIS IS A RULE AND NOT A PREFERENCE. #3109 put 39 job definitions (43
-# expanded) onto the fleet, `Classify changes` — the root of this workflow's
-# `needs:` graph — among them. With several PRs open, whole runs sat `queued`
-# 40+ minutes because the decider could not get a slot, so the four REQUIRED
-# `Check (…)` legs never started. One absolute follows: A JOB THAT OTHER JOBS
-# `needs:` MUST NEVER BE SELF-HOSTED UNLESS IT IS ITSELF pg-tier OR warm-cache.
-# A queued decider stalls its whole graph.
+# EVERYTHING ELSE ON LINUX IS `ubuntu-latest`. In particular, WARM-CACHE IS NO
+# LONGER A REASON TO BE SELF-HOSTED ON LINUX. It was, under #3129's rule, and
+# the measurements since say that trade was wrong:
 #
-# A job moving BACK to the hosted pool must not keep anything the fleet supplied
+#   * f2 is ONE shared box. Four runner instances each running a compile+test
+#     job oversubscribed 14 cores ~2x. #3139: `SAL-only feature gate` took
+#     34.5 min under low contention and was CANCELLED at 40:15 under high
+#     contention — mid-step, healthy, just slow. #3137: `Check (linux-fed,
+#     sqlite)` panicked in `tests/integration.rs` step 19 at load 36 on a
+#     bench assertion that passed on every isolated hosted VM. Contention did
+#     not merely slow the fleet down, it produced FALSE RED on jobs whose code
+#     was fine — and OOM pressure on the operator's own dev box.
+#   * GitHub-hosted runners are effectively unbounded in parallelism and give
+#     each job a whole VM. A cold `target/` costs minutes; a false red costs a
+#     re-run of the entire required matrix plus the reviewer time to tell the
+#     two apart.
+#
+# macOS is UNCHANGED and stays on the f1 node: the directive is Linux-only, and
+# there is no GitHub-hosted arm64 macOS class these legs are calibrated for.
+#
+# One absolute survives from #3128 and still binds: A JOB THAT OTHER JOBS
+# `needs:` MUST NEVER BE SELF-HOSTED UNLESS IT IS ITSELF pg-tier. A queued
+# decider stalls its whole graph — that was #3128, where `Classify changes` sat
+# behind ~37 fleet jobs and the required `Check (…)` legs never started.
+#
+# A job moving to the hosted pool must not keep anything the fleet supplied
 # implicitly — a PATH entry for ~/.cargo/bin, CARGO_BUILD_JOBS, a runner-managed
-# RUNNER_TOOL_CACHE, a job-started hook. Where #3109 replaced
-# actions/setup-python / actions/setup-node with a `command -v` presence
-# assertion (the fleet cannot write the hosted RUNNER_TOOL_CACHE default), the
-# setup-* actions are restored with the move back — see `conformance-readers-gate`
-# in c8-precheck.yml. AI_MEMORY_NO_CONFIG=1 is unaffected either way: the runner
-# .env sets it on the fleet and the workflows set it per-step, so hosted jobs
-# behave identically.
+# RUNNER_TOOL_CACHE, a job-started hook — and must give BACK what the fleet made
+# unnecessary: `Swatinem/rust-cache` (already gated
+# `runner.environment == 'github-hosted'`, so it simply starts firing again) and
+# actions/setup-python / actions/setup-node wherever a job needs the #2452
+# fail-closed interpreter guarantee. The fleet-only `rustup` presence assertion
+# is dropped from every job that no longer runs there. CARGO_INCREMENTAL=0 stays
+# declared in each workflow `env:` block — not inherited from the runner .env,
+# and not from rust-cache.
 #
-# Adding a job: answer (1) does it need the :5445 tier? (2) does it compile a
-# non-trivial slice of the crate? (3) otherwise hosted — and record the answer as
-# a `# RUNNER PLACEMENT` comment on the job.
+# Adding a job: does it need the :5445 tier? If not, it is `ubuntu-latest` — and
+# record the answer as a `# RUNNER PLACEMENT` comment on the job.
 
 on:
   push:
@@ -402,40 +412,14 @@ jobs:
     name: Lint (fmt + clippy)
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of this
-    # file). Two full pedantic clippy passes (default + `--all-targets
-    # --features sal`); the node's warm `target/` turns a multi-minute cold
-    # compile into an incremental one.
-    runs-on: [self-hosted, linux-fed]
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
+    # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
+    # Two full pedantic clippy passes (default + `--all-targets --features
+    # sal`). `Swatinem/rust-cache` below carries the warm `target/` on the
+    # hosted pool, as it did before #3109.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # FAIL CLOSED if rustup is missing on a self-hosted node (#3128).
-      # `dtolnay/rust-toolchain` has an "Install rustup if needed" path that
-      # runs `curl https://sh.rustup.rs | sh`. On a GitHub-hosted runner that is
-      # a clean, throwaway image. On the fleet it curl-pipes an installer into a
-      # SHARED $HOME — which is what happened on f2 at 05:40:33Z on 2026-08-22
-      # ("downloading installer … Rust is installed now") when `~/.cargo/bin/rustup`
-      # was momentarily absent during a rustup self-update, and the job then
-      # built against whatever that install produced. A node missing its
-      # toolchain is a BROKEN NODE: it must red the job loudly, not silently
-      # repair itself from the network. Skipped on hosted runners, where
-      # provisioning the toolchain is exactly the action's job.
-      #
-      # The condition is `!= 'github-hosted'`, NOT `== 'self-hosted'`, so that an
-      # unset or unrecognised `runner.environment` STILL RUNS the assertion. An
-      # unknown runner class must not silently switch a fail-closed control off.
-      # The rust-cache guards below use the opposite polarity for the same
-      # reason: unknown => skip the cache action, whose worst case is a cold
-      # build, never a mixed-provenance `target/`.
-      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted'
-        shell: bash
-        run: |
-          test -x "$HOME/.cargo/bin/rustup" || {
-            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — refusing to let the toolchain action curl-pipe an installer into a shared home. Repair the node."
-            exit 1
-          }
-          echo "rustup=$("$HOME/.cargo/bin/rustup" --version 2>&1 | head -1)"
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
@@ -562,21 +546,12 @@ jobs:
     name: MSRV (Rust 1.96)
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of this
-    # file). `cargo check --all-targets` over the whole crate.
-    runs-on: [self-hosted, linux-fed]
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
+    # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
+    # `cargo check --all-targets` over the whole crate.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
-      # `lint` job in ci.yml for the full rationale (#3128).
-      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted'
-        shell: bash
-        run: |
-          test -x "$HOME/.cargo/bin/rustup" || {
-            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
-            exit 1
-          }
       - name: Install Rust 1.96.0 (declared MSRV)
         uses: dtolnay/rust-toolchain@1.96.0
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
@@ -623,20 +598,52 @@ jobs:
   check:
     name: Check (${{ matrix.leg }})
     needs: classify
-    runs-on: [self-hosted, "${{ matrix.node }}"]
+    # RUNNER PLACEMENT — PER-LEG (rule at the head of this file). Only the leg
+    # that needs the native pg tier is self-hosted on Linux; the Linux sqlite
+    # leg is GitHub-hosted. `runs-on` therefore cannot be a fixed shape, so it
+    # comes from the matrix: `runner` is a JSON array of runner LABELS, which
+    # `fromJSON` turns into the list `runs-on` wants. A one-element
+    # `["ubuntu-latest"]` is the hosted form; `["self-hosted","linux-fed"]` is
+    # the label-set form. macOS is unchanged (operator directive is Linux-only).
+    runs-on: ${{ fromJSON(matrix.runner) }}
     # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
     # download on the semantic-tier CLI recall path) fails fast instead of
-    # pinning a runner for hours. Sized for the SLOWEST leg: the
-    # `enterprise-fed` tier runs the sal-postgres suite SINGLE-THREADED and
-    # CPU-contended by its sibling `sqlite` leg on the same self-hosted host,
-    # so its compile (~12 min, hoisted OUTSIDE the per-invocation watchdog)
-    # plus the 3300s (55 min) hang-watchdog can legitimately approach ~67
-    # min; this outer cap must sit above that so the watchdog — not the job
-    # cap — is what fires on a genuine hang (a job-level cancel is silent and
-    # nameless, the exact #1492 failure mode). The `sqlite` legs finish far
-    # under this (parallel suite + release build + audit, ~45 min observed),
-    # so the higher ceiling only adds headroom there.
-    timeout-minutes: 80
+    # pinning a runner for hours.
+    #
+    # PER-LEG (#3139), because the legs no longer share a runner class and a
+    # single cap sized for the slowest one is a 35-minute blind spot on the
+    # fastest. Values and their basis:
+    #
+    #   ubuntu-latest,sqlite      55  Pre-#3109 this exact workload ran on this
+    #                                 exact runner class under a 45-min cap and
+    #                                 passed (`Check (ubuntu-latest)`), so 45 is
+    #                                 a MEASURED hosted value, not an f2 value.
+    #                                 The 2x2 rewrite added the release build +
+    #                                 `cargo audit` steps to the leg, so +10.
+    #                                 The 1500s (25 min) sqlite watchdog stays
+    #                                 well inside it.
+    #   linux-fed,enterprise-fed  80  Unchanged. Compile ~12 min (hoisted
+    #                                 OUTSIDE the per-invocation watchdog) plus
+    #                                 the 3300s (55 min) hang-watchdog can
+    #                                 legitimately approach ~67 min, so the
+    #                                 outer cap must sit above that — the
+    #                                 watchdog, not the job cap, must be what
+    #                                 fires on a genuine hang (a job-level
+    #                                 cancel is silent and nameless, the exact
+    #                                 #1492 failure mode). #3139 proposed 60 for
+    #                                 the self-hosted compile+test jobs; 60 is
+    #                                 BELOW compile+watchdog here, so applying
+    #                                 it to this leg would re-introduce #1492.
+    #                                 It also no longer needs the contention
+    #                                 headroom #3139 measured: this is now the
+    #                                 ONLY Linux `check` leg on the fleet.
+    #   macos-fed,*               80  Unchanged. With the #3140 watchdog fix
+    #                                 below, a macOS hang is now cut at the
+    #                                 per-invocation cap instead of burning
+    #                                 this whole 80-min budget (#3140 observed
+    #                                 72 wasted minutes on a nondeterministic
+    #                                 `Check (macos-fed,sqlite)` hang).
+    timeout-minutes: ${{ matrix.timeout }}
     env:
       # Keep dev-profile debug at level 1 (line tables) for readable
       # backtraces without the full-DWARF link cost.
@@ -645,24 +652,51 @@ jobs:
       fail-fast: false
       matrix:
         # 2x2 via `include:` so the single name variable `leg` co-varies with
-        # `node` (runs-on label) and `tier` (feature/URL selection).
+        # `runner` (runs-on labels), `node` (a descriptive tag used by the
+        # macOS-only prebuild step + the artifact name) and `tier`
+        # (feature/URL selection).
         include:
           # `leg` carries NO whitespace: scripts/check-required-contexts.sh's
           # name-expander word-splits matrix values on IFS, so a space in the
           # value would fracture the expanded context name. Comma-without-space
           # keeps both dimensions legible while staying one token.
-          - leg: linux-fed,sqlite
-            node: linux-fed
+          #
+          # NAME CHANGE (operator directive 2026-08-22): this leg was
+          # `linux-fed,sqlite`. `linux-fed` is a self-hosted RUNNER LABEL, so
+          # the old name asserted a node this leg no longer runs on — the name
+          # would have become false the moment the leg moved to the hosted
+          # pool. Renamed rather than kept, and the required-context mirror
+          # `scripts/qc-allowlists/required-contexts-release.txt` is updated in
+          # lockstep. This is the ONLY context name that changes.
+          - leg: ubuntu-latest,sqlite
+            runner: '["ubuntu-latest"]'
+            node: ubuntu-latest
             tier: sqlite
+            timeout: 55
+            # `once` marks the ONE leg that carries the 2x2-invariant extras
+            # (cargo-audit, the release-profile smoke build) so they do not
+            # multiply across four legs. It is an explicit flag rather than a
+            # `matrix.node == '<label>'` comparison ON PURPOSE: those
+            # comparisons silently stopped matching when this leg was renamed
+            # from `linux-fed` to `ubuntu-latest`, which would have switched
+            # `cargo audit` — a supply-chain control — off with no signal at
+            # all. A named flag cannot drift out of a rename.
+            once: true
           - leg: linux-fed,enterprise-fed
+            runner: '["self-hosted","linux-fed"]'
             node: linux-fed
             tier: enterprise-fed
+            timeout: 80
           - leg: macos-fed,sqlite
+            runner: '["self-hosted","macos-fed"]'
             node: macos-fed
             tier: sqlite
+            timeout: 80
           - leg: macos-fed,enterprise-fed
+            runner: '["self-hosted","macos-fed"]'
             node: macos-fed
             tier: enterprise-fed
+            timeout: 80
     steps:
       - uses: actions/checkout@v4
 
@@ -671,20 +705,117 @@ jobs:
         run: echo "::notice::docs-only PR — ${{ matrix.leg }} matrix leg is a no-op"
 
       # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
-      # python3/node is a test FAILURE, not a silent pass. On the self-hosted
-      # fleet we do NOT use actions/setup-python / actions/setup-node: those
-      # actions try to populate the GitHub-hosted RUNNER_TOOL_CACHE default
-      # (/Users/runner/hostedtoolcache), which the `fate`/`fate_two` runner user
-      # cannot create (`mkdir: /Users/runner: Permission denied`), and
-      # RUNNER_TOOL_CACHE is runner-managed so .env cannot override it. The
-      # runners ship python3 + node pre-installed on PATH (f2 /usr/bin/python3
-      # 3.12 + /usr/bin/node v22; f1 /opt/homebrew/bin python3 3.14 + node v26),
-      # so ASSERT their presence instead of downloading — same fail-closed
-      # guarantee (an absent tool reds the step), no tool-cache write. The
-      # dedicated self-tested proof lives in c8-precheck.yml
-      # (`Non-Rust conformance-reader proof gate (#2452)`).
+      # python3/node is a test FAILURE, not a silent pass. This job now spans
+      # BOTH runner classes, so the guarantee is met two ways:
+      #
+      #   HOSTED  — PROVISION with actions/setup-python / actions/setup-node,
+      #             the #2452 pattern. The interpreters are pinned, not
+      #             inherited from whatever the image happens to ship.
+      #   FLEET   — ASSERT presence instead. Those actions try to populate the
+      #             GitHub-hosted RUNNER_TOOL_CACHE default
+      #             (/Users/runner/hostedtoolcache), which the `fate`/`fate_two`
+      #             runner user cannot create (`mkdir: /Users/runner: Permission
+      #             denied`), and RUNNER_TOOL_CACHE is runner-managed so .env
+      #             cannot override it. The nodes ship python3 + node on PATH
+      #             (f1 /opt/homebrew/bin python3 3.14 + node v26), so assert —
+      #             same fail-closed guarantee (an absent tool reds the step),
+      #             no tool-cache write.
+      #
+      # The dedicated self-tested proof lives in c8-precheck.yml
+      # (`Non-Rust conformance-reader proof gate (#2452)`), on the hosted pool.
+      # RESTORED (operator directive 2026-08-22) together with this leg's move
+      # back to `ubuntu-latest`. #3109 removed it as a hosted-image hack — true,
+      # and precisely why it must come back with the hosted image. It is
+      # LOAD-BEARING for this leg specifically, on measured evidence: run
+      # 31911087758 died here with `rustc-LLVM ERROR: No space left on device`
+      # before the reclaim was widened (#2960/#1810), and #1407 added the 8 GB
+      # swapfile because the lib-test LINK step hit `ld … signal 7 [Bus error]`
+      # against the hosted ~7 GB RAM ceiling. This is the heaviest job in CI —
+      # full integration compile at DEV_DEBUG=1 plus a release build.
+      #
+      # The `if:` is keyed on `runner.environment == 'github-hosted'`, NOT on a
+      # matrix value: this step deletes SYSTEM PATHS, and on an ephemeral hosted
+      # image that is routine while on the persistent fleet it would destroy
+      # real files. Keying it to the runner CLASS makes that structural — no
+      # future matrix edit can route it onto a self-hosted node.
+      #
+      # ORDERING IS LOAD-BEARING: it frees $AGENT_TOOLSDIRECTORY, so it must run
+      # BEFORE the setup-python / setup-node steps that repopulate exactly the
+      # versions the #2452 conformance readers need.
+      - name: Free disk before tests (hosted image only, #1407/#1405/#1387 fix)
+        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        run: |
+          set -eu
+          echo "::group::Disk usage before cleanup"
+          df -h /
+          echo "::endgroup::"
+          sudo rm -rf /usr/share/dotnet              || true  # ~17 GiB
+          sudo rm -rf /opt/hostedtoolcache/CodeQL    || true  # ~5 GiB
+          sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
+          sudo rm -rf /opt/ghc                       || true  # ~5 GiB
+          sudo rm -rf /usr/local/.ghcup              || true  # ~6 GiB (#1810)
+          # #2960 — the existing pruning above (dotnet/CodeQL/android/ghc/
+          # ghcup) was no longer enough headroom for the grown ~200k-LOC +
+          # ~600-dep debug test-compile: run 31911087758 died with
+          # `rustc-LLVM ERROR: No space left on device` on this Check
+          # (ubuntu-latest) leg. Bring the Check reclaim up to parity with
+          # the (heavier, already-passing-on-space) Postgres + Coverage
+          # legs and additionally free the whole tool cache
+          # ($AGENT_TOOLSDIRECTORY = /opt/hostedtoolcache, ~10 GiB of
+          # Python/Node/Go/Ruby/PyPy) — safe here because setup-python /
+          # setup-node run AFTER this step and repopulate exactly the
+          # versions the conformance readers (#2452) need. Pure first-party
+          # shell per the no-external-code-injection rule; each rm is
+          # best-effort so a shifting runner image never fails the step.
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}"    || true  # ~10 GiB (#2960)
+          sudo rm -rf /usr/local/share/powershell /usr/local/share/chromium \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/google /usr/lib/jvm /opt/microsoft \
+                      /usr/share/swift /usr/share/miniconda || true  # ~15 GiB (#2960)
+          sudo docker system prune -af --volumes     || true  # ~4 GiB (#1810)
+          sudo apt-get autoremove --purge -y         || true
+          sudo apt-get clean
+          # #1810 — bring the Check job's pre-test disk cleanup up to parity
+          # with the (passing, heavier-llvm-cov) Coverage job, which already
+          # frees `.ghcup` + docker images. The full `cargo test` compile of
+          # all integration bins under DEV_DEBUG=1 (full debug symbols)
+          # exhausted the ubuntu runner disk on c3087e33 with
+          # `rustc-LLVM ERROR: No space left on device`; the extra ~10 GiB
+          # restores headroom. macOS Check + Coverage were unaffected.
+          # #1407 — add 8 GB swap on /mnt (ephemeral data disk) so the
+          # heavy lib-test link step has headroom above the ~7 GB RAM
+          # ceiling and stops dying with `ld ... signal 7 [Bus error]`.
+          # Mirrors the postgres-feature / coverage swap recipe.
+          sudo fallocate -l 8G /mnt/swapfile-1407
+          sudo chmod 600 /mnt/swapfile-1407
+          sudo mkswap /mnt/swapfile-1407
+          sudo swapon /mnt/swapfile-1407
+          echo "::group::Disk + memory after cleanup"
+          df -h /
+          free -h
+          echo "::endgroup::"
+
+      # #2960 — macOS reclaim. The macos-latest image ships a large bundled
+      # iOS/tvOS/watchOS Simulator runtime set (each ~7-13 GiB) that a
+      # pure-Rust host build + test suite never touches, plus their caches.
+      # Freeing them before any cargo/toolchain step gives the grown
+      # ~200k-LOC debug test-compile headroom on the same
+      # `rustc-LLVM ERROR: No space left on device` class the ubuntu leg
+      # hit (run 31911087758). Pure first-party shell (no external action)
+      # per the no-external-code-injection rule; every rm is best-effort so
+      # a shifting runner image never fails the step. The df -h before/after
+      # makes the freed space (or a non-disk root cause) visible in the log.
+
+      - uses: actions/setup-python@v5
+        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        with:
+          node-version: '22'
       - name: Ensure python3 + node present (self-hosted; #2452 fail-closed)
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.docs_only != 'true' && runner.environment != 'github-hosted'
         shell: bash
         run: |
           command -v python3 >/dev/null || { echo "::error::python3 not on PATH on $RUNNER_NAME"; exit 1; }
@@ -923,27 +1054,34 @@ jobs:
           # libtest flush partial output; --kill-after escalates to SIGKILL
           # for a truly wedged process.
           #
-          # The #1492 hang was observed ONLY on the ubuntu runner, and the
-          # watchdog is gated to Linux because macOS ships no `timeout`
-          # (coreutils, if present, is g-prefixed `gtimeout`) — bare
-          # detection would crash the step with `timeout: command not found`.
-          # So restrict the watchdog to Linux (reliable GNU `timeout` +
-          # POSIX process-group signal semantics over native test binaries)
-          # and degrade to a bare `cargo test` everywhere else — the
-          # job-level `timeout-minutes` cap still applies as the
-          # universal backstop (the pre-#1492 behaviour).
+          # PLATFORM DETECTION, NOT A PLATFORM GATE (#3140 item 2). This block
+          # used to be wrapped in `if [ "$RUNNER_OS" = "Linux" ]`, because the
+          # #1492 hang was first seen on ubuntu and macOS ships no GNU
+          # `timeout` (coreutils, when installed, is g-prefixed `gtimeout`) —
+          # bare detection would have crashed the step with
+          # `timeout: command not found`.
+          #
+          # That gate cost 72 minutes on 2026-08-22: `Check (macos-fed,sqlite)`
+          # (run 32565464216) went silent after its last unit test and burned
+          # the ENTIRE 80-minute job cap before a nameless job-level cancel —
+          # the exact diagnosability failure #1492 exists to prevent, on the
+          # one platform the watchdog was switched off. `coreutils` is now
+          # installed on both f1 runners, so DETECT the binary on every
+          # platform instead of gating on the OS: `gtimeout` if present, else a
+          # `timeout` that identifies itself as coreutils. Where neither exists
+          # the step still degrades to a bare `cargo test` and the job-level
+          # `timeout-minutes` remains the universal backstop, so a node without
+          # coreutils loses hang-NAMING, never correctness.
           TIMEOUT_BIN=""
-          if [ "${RUNNER_OS:-}" = "Linux" ]; then
-            if command -v gtimeout >/dev/null 2>&1; then
-              TIMEOUT_BIN=gtimeout
-            elif timeout --version 2>/dev/null | grep -qi coreutils; then
-              TIMEOUT_BIN=timeout
-            fi
+          if command -v gtimeout >/dev/null 2>&1; then
+            TIMEOUT_BIN=gtimeout
+          elif timeout --version 2>/dev/null | grep -qi coreutils; then
+            TIMEOUT_BIN=timeout
           fi
           if [ -n "$TIMEOUT_BIN" ]; then
             echo "::notice::[#1492] hung-test watchdog active via '$TIMEOUT_BIN' (${WATCHDOG_SECS}s per invocation, tier=${TIER:-sqlite})"
           else
-            echo "::notice::[#1492] watchdog disabled on ${RUNNER_OS:-unknown} (Linux-only; job-level timeout-minutes still applies)"
+            echo "::notice::[#1492] watchdog disabled on ${RUNNER_OS:-unknown} — no coreutils gtimeout/timeout found (job-level timeout-minutes still applies)"
           fi
           run_tests() {
             local label="$1"; shift
@@ -1033,9 +1171,9 @@ jobs:
           retention-days: 30
 
       # cargo-audit runs once (the advisory DB is platform-independent) — on
-      # the linux-fed sqlite leg so it does not multiply across the 2x2.
+      # the `once` leg so it does not multiply across the 2x2.
       - name: Security audit
-        if: needs.classify.outputs.docs_only != 'true' && matrix.node == 'linux-fed' && matrix.tier == 'sqlite'
+        if: needs.classify.outputs.docs_only != 'true' && matrix.once
         run: |
           cargo install cargo-audit --locked
           cargo audit
@@ -1044,13 +1182,40 @@ jobs:
       # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are
       # produced by release.yml on tag, and a release-profile-only break that
       # the debug `cargo test` build wouldn't already catch is vanishingly rare
-      # for this pure-Rust + bundled-sqlite crate. Run it on ONE leg
-      # (linux-fed / sqlite) so it does not multiply across the 2x2. No
-      # target/debug trim step: the self-hosted host has ample disk (the old
-      # `cargo clean --profile dev` was a hosted-runner tmpfs workaround and
-      # would only cold-start the shared cache here).
-      - name: Build release (linux-fed — release-profile smoke)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.node == 'linux-fed' && matrix.tier == 'sqlite'
+      # for this pure-Rust + bundled-sqlite crate. Run it on the `once` leg
+      # so it does not multiply across the 2x2.
+      # RESTORED with the hosted move (see the free-disk step above). The
+      # release build follows a full debug test compile; pre-#3109 this leg
+      # needed the debug artifacts dropped first to fit. Tradeoff, stated: when
+      # this job saves the rust-cache (trunk `push` only — `save-if` above), the
+      # saved `target/` no longer carries debug artifacts, so PR restores are
+      # cooler. That is the pre-#3109 behaviour exactly, and it degrades speed,
+      # never correctness. `cargo clean --profile dev` touches only the
+      # workspace `target/`, never a system path.
+      - name: Trim target/debug before release build (hosted)
+        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
+        run: |
+          set -eu
+          echo "::group::Disk usage before cargo clean"
+          df -h /
+          du -sh target 2>/dev/null || true
+          echo "::endgroup::"
+          cargo clean --profile dev || true
+          echo "::group::Disk usage after cargo clean"
+          df -h /
+          du -sh target 2>/dev/null || true
+          echo "::endgroup::"
+
+      # CI-speed: the release build here is only a release-PROFILE compile
+      # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are
+      # produced by release.yml on tag, and a release-profile-only break that
+      # the debug `cargo test` build on ubuntu wouldn't already catch is
+      # vanishingly rare for this pure-Rust + bundled-sqlite crate. Running it
+      # on ubuntu ONLY takes it off the macos critical path (-~400s) — the
+      # prep `cargo clean` step above is already ubuntu-only.
+
+      - name: Build release (once leg — release-profile smoke)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.once
         run: cargo build --release
 
       # Drop the per-job ephemeral db (created by "Configure enterprise-fed
@@ -1114,29 +1279,24 @@ jobs:
     name: Postgres feature gate
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of this
-    # file). NOTE the reason is the cache, NOT the pg tier: since the #3109
-    # rewrite this job no longer talks to Postgres at all (no `services:`, no
-    # `AI_MEMORY_TEST_POSTGRES_URL`) — the live-tier coverage moved to the
-    # `enterprise-fed` legs of `check`. What is left is a full
-    # `--features sal-postgres --tests` compile for pedantic clippy, which is
-    # exactly the workload the warm `target/` exists for.
-    runs-on: [self-hosted, linux-fed]
-    # #1487 — bound the job so a wedged compile can't pin the runner.
-    timeout-minutes: 40
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
+    # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
+    #
+    # DESPITE THE NAME, this job does not need the tier: since the #3109 rewrite
+    # it does not talk to Postgres at all (no `services:`, no
+    # `AI_MEMORY_TEST_POSTGRES_URL`) — the live-tier coverage lives in the
+    # `enterprise-fed` legs of `check`. What is left is a
+    # `--features sal-postgres --tests` compile for pedantic clippy, which is a
+    # cache workload, so under the Linux rule it goes hosted. The context NAME
+    # is unchanged, so branch protection is unaffected.
+    runs-on: ubuntu-latest
+    # #1487 — bound the job so a wedged compile can't pin the runner. 45 is the
+    # pre-#3109 value MEASURED on this runner class; #3109 tightened it to 40
+    # for a dedicated self-hosted node, which is not this job's world any more.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
-      # `lint` job in ci.yml for the full rationale (#3128).
-      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted'
-        shell: bash
-        run: |
-          test -x "$HOME/.cargo/bin/rustup" || {
-            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
-            exit 1
-          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
@@ -1296,31 +1456,31 @@ jobs:
   # gates (clippy / build / lib tests) at the same feature combo.
   # Skipped on docs-only PRs alongside the rest of the heavy matrix.
   sal-feature:
-    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of this
-    # file): clippy + `cargo build --release --features sal` + `cargo test`.
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
+    # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
+    # clippy + `cargo build --release --features sal` + `cargo test`.
     name: SAL-only feature gate
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    # v1.0.0 self-hosted — re-homed onto the enterprise-fed Linux node. The
-    # old GitHub-hosted `Free disk` step (sudo rm -rf /usr/share/dotnet …) is
-    # removed: it targeted the ephemeral hosted image and would delete real
-    # files on the persistent host. The self-hosted host has ample disk.
-    runs-on: [self-hosted, linux-fed]
-    # #1487 — bound the job so a wedged test can't pin the runner.
-    timeout-minutes: 40
+    # NOTE the `Free disk` step that #3109 removed (it recursively deleted
+    # system paths such as the bundled dotnet SDK to make headroom on the
+    # ephemeral hosted image) is deliberately NOT restored. This job has since
+    # proven it does not need it, and a step that deletes system paths must
+    # never come back on the word of a revert — if hosted disk pressure
+    # returns, that is a measured decision with its own change.
+    runs-on: ubuntu-latest
+    # #1487 — bound the job so a wedged test can't pin the runner. 40 was the
+    # pre-#3109 value on this runner class AND the self-hosted value; #3139
+    # measured 34.5 min here under low fleet contention and a cancel at 40:15
+    # under high contention. On the hosted pool this job is alone on its VM, so
+    # the contention term disappears — but 34.5 min against a 40 min cap is a
+    # 16% margin, a knife edge on a 2-core VM. 55 restores real headroom without
+    # masking a genuine hang (this job has no #1492 watchdog, so its cap is its
+    # only bound).
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
 
-      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
-      # `lint` job in ci.yml for the full rationale (#3128).
-      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted'
-        shell: bash
-        run: |
-          test -x "$HOME/.cargo/bin/rustup" || {
-            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
-            exit 1
-          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
@@ -1362,27 +1522,19 @@ jobs:
   # It also runs `config_precedence` under the feature so the #2256
   # feature-gated env-resolution pin is exercised. Skipped on docs-only PRs.
   vectorlite-feature:
-    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of this
-    # file): `--all-targets --features vectorlite` clippy + two test binaries.
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
+    # warm-cache is no longer a reason to be self-hosted; only the pg tier is.
+    # `--all-targets --features vectorlite` clippy + two test binaries.
     name: vectorlite feature gate
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    runs-on: [self-hosted, linux-fed]
-    # #1487 — bound the job so a wedged test can't pin the runner.
+    runs-on: ubuntu-latest
+    # #1487 — bound the job so a wedged test can't pin the runner. 30 is the
+    # pre-#3109 value measured on this runner class and is unchanged by #3109.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
-      # `lint` job in ci.yml for the full rationale (#3128).
-      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted'
-        shell: bash
-        run: |
-          test -x "$HOME/.cargo/bin/rustup" || {
-            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
-            exit 1
-          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:

@@ -380,7 +380,7 @@ PROTECTION DELTA:
   enforce_admins:                     true -> false (during window) -> true (closed)
   All other rules:                    UNCHANGED throughout window
     required_signatures:              true (unchanged)
-    required_status_checks:           ["Check (linux-fed,sqlite)", "Check (linux-fed,enterprise-fed)", "Check (macos-fed,sqlite)", "Check (macos-fed,enterprise-fed)", …] (unchanged)
+    required_status_checks:           ["Check (ubuntu-latest,sqlite)", "Check (linux-fed,enterprise-fed)", "Check (macos-fed,sqlite)", "Check (macos-fed,enterprise-fed)", …] (unchanged)
     require_code_owner_reviews:       true (unchanged)
     require_last_push_approval:       true (unchanged)
     required_approving_review_count:  1 (unchanged)

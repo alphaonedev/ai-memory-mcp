@@ -132,15 +132,30 @@ Dockerfile build (no push)
 # hard-fails for it.
 #
 # v1.0.0 self-hosted 2x2 (chore/ci-self-hosted-2x2): the `check` job is now a
-# {linux-fed, macos-fed} × {sqlite, enterprise-fed} matrix over a single
-# `matrix.leg` display variable (one `${{ matrix.* }}` per name, so the gate's
-# name-expander resolves it; `node`/`tier` drive runs-on + features without
-# appearing in the name). This REPLACES the former GitHub-hosted
-# `Check (ubuntu-latest)` / `Check (macos-latest)` pair. All FOUR expansions
-# are required — rule (f) fails partial matrix coverage — and the companion
-# branch-protection edit (drop the two old, add the four new) is the
-# ADDITION-half / REMOVAL-half swap described in the ORDER doctrine above.
-Check (linux-fed,sqlite)
+# 2x2 matrix over a single `matrix.leg` display variable (one `${{ matrix.* }}`
+# per name, so the gate's name-expander resolves it; `runner`/`node`/`tier`
+# drive runs-on + features without appearing in the name). This REPLACES the
+# former GitHub-hosted `Check (ubuntu-latest)` / `Check (macos-latest)` pair.
+# All FOUR expansions are required — rule (f) fails partial matrix coverage —
+# and the companion branch-protection edit (drop the two old, add the four new)
+# is the ADDITION-half / REMOVAL-half swap described in the ORDER doctrine
+# above.
+#
+# ONE-CONTEXT RENAME, operator directive 2026-08-22 ("Linux CI: push all Linux
+# CI back onto GitHub except for the PostgreSQL"). The Linux `sqlite` leg moved
+# from the self-hosted fleet to `ubuntu-latest`, so its old name
+# `Check (linux-fed,sqlite)` asserted a runner label it no longer runs on — a
+# false name is exactly the class the L3 truncation above exists to prevent, so
+# it is RENAMED rather than kept:
+#
+#     Check (linux-fed,sqlite)   ->   Check (ubuntu-latest,sqlite)
+#
+# This is a SWAP, and the ORDER doctrine above governs it exactly as it governed
+# #2473: protection DROPS the old context first (it stops being reported the
+# moment the rename is on the base branch), this mirror + the workflow land
+# together, then protection ADDS the new one. The other three `Check (…)` names
+# and every other required context are UNCHANGED — this is the only one.
+Check (ubuntu-latest,sqlite)
 Check (linux-fed,enterprise-fed)
 Check (macos-fed,sqlite)
 Check (macos-fed,enterprise-fed)
