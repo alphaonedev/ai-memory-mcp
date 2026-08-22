@@ -40,6 +40,13 @@ pub const ACTION_TYPE: &str = "action_type";
 pub const AGENT_FILTER: &str = "agent_filter";
 /// `agent_pubkey` — wire/row field name.
 pub const AGENT_PUBKEY: &str = "agent_pubkey";
+/// `pubkey_bound_at` — RFC3339 stamp written next to [`AGENT_PUBKEY`] on
+/// every bind/rotate so key provenance is auditable. The two keys are a
+/// PAIR: they are written together by `bind_agent_pubkey`, stripped
+/// together by `revoke_agent_pubkey`, and preserved together across an
+/// upsert (see `crate::RESERVED_UPSERT_METADATA_KEYS`) — a row carrying a
+/// pubkey with no bind stamp, or the reverse, is a torn state.
+pub const PUBKEY_BOUND_AT: &str = "pubkey_bound_at";
 /// `agent_type` — wire/row field name.
 pub const AGENT_TYPE: &str = "agent_type";
 /// `allowed_tools` — wire/row field name.

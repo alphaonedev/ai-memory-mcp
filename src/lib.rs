@@ -294,6 +294,75 @@ pub const META_KEY_IMPORTED_FROM_AGENT_ID: &str = "imported_from_agent_id";
 /// keys".
 pub const META_KEY_CONSOLIDATED_FROM_AGENTS: &str = "consolidated_from_agents";
 
+/// `metadata.derived_from` — the source memory ids a consolidation /
+/// reflection row was synthesised from. Preserved across upsert alongside
+/// [`META_KEY_CONSOLIDATED_FROM_AGENTS`] (#1784) so a re-store of the same
+/// `(title, namespace)` cannot erase the lineage pointer back to the rows
+/// this one summarises.
+pub const META_KEY_DERIVED_FROM: &str = "derived_from";
+
+/// v1.0.0 #2941 — the `metadata` keys an upsert MUST carry over from the
+/// STORED row instead of adopting the incoming row's value.
+///
+/// `db::insert`'s `ON CONFLICT … DO UPDATE` overwrites `metadata`
+/// wholesale, so any key not named here is silently ERASED by a re-store
+/// of the same `(title, namespace)` that does not happen to carry it.
+/// That is a durable-provenance loss, not a stale read: nothing in the
+/// cycle reports it and nothing regenerates the key.
+///
+/// The #1784 set (agent_id + the consolidation lineage arrays) is
+/// extended here with the agent-registration key pair
+/// ([`field_names::AGENT_PUBKEY`] / [`field_names::PUBKEY_BOUND_AT`]).
+/// `storage::register_agent` is documented as "register or refresh" and
+/// builds FRESH metadata with no pubkey, so before #2941 ANY idempotent
+/// re-register — MCP `memory_agent`, `POST /agents`, the SAL trait, the
+/// CLI — silently unbound the agent's key on both backends. Downstream
+/// (`identity::verify::attest_write`) the strict posture then 403s every
+/// signed write, and the DEFAULT permissive posture is worse: a genuinely
+/// signed write is persisted as `claimed` instead of `agent_attested`,
+/// with no error, no WARN and no counter. Preserving the pair in the
+/// upsert itself — rather than only re-reading it in `register_agent` —
+/// is what makes the fix race-free: a `bind-key` landing between a
+/// caller's pre-read and its upsert cannot be clobbered, because the
+/// preserve is evaluated INSIDE the conflicting statement.
+///
+/// Rotation and revocation are unaffected: `bind_agent_pubkey` and
+/// `revoke_agent_pubkey` write through their own explicit `UPDATE`
+/// (sqlite `json_set` / postgres `jsonb` set-and-strip), never through
+/// this upsert funnel, so "existing wins" here never freezes a key.
+///
+/// [`field_names::AGENT_PUBKEY`]: crate::models::field_names::AGENT_PUBKEY
+/// [`field_names::PUBKEY_BOUND_AT`]: crate::models::field_names::PUBKEY_BOUND_AT
+pub const RESERVED_UPSERT_METADATA_KEYS: [&str; 5] = [
+    META_KEY_AGENT_ID,
+    META_KEY_DERIVED_FROM,
+    META_KEY_CONSOLIDATED_FROM_AGENTS,
+    crate::models::field_names::AGENT_PUBKEY,
+    crate::models::field_names::PUBKEY_BOUND_AT,
+];
+
+/// The [`RESERVED_UPSERT_METADATA_KEYS`] set rendered as a SQL quoted
+/// element list, for splicing into the `IN (…)` of BOTH backends' upsert
+/// preserve-clause (sqlite `json_group_object`/`json_patch`, postgres
+/// `jsonb_object_agg`/`||`).
+///
+/// The set is open-coded in THIRTEEN separate SQL literals across the two
+/// backends (3 sqlite: the insert funnel, the `memory_update` metadata
+/// patch, the newer-wins federation merge; 10 postgres). Restructuring all
+/// thirteen to splice this text at compile time would touch far more of the
+/// hot write path than the #2941 fix warrants, so `tests/
+/// reserved_upsert_metadata_keys_2941.rs` scans both source files instead
+/// and asserts EVERY preserve-site renders exactly this list, and that this
+/// list names exactly [`RESERVED_UPSERT_METADATA_KEYS`]. Drift between any
+/// two sites, or between the SQL and the typed set, is therefore not
+/// mergeable.
+#[macro_export]
+macro_rules! reserved_upsert_metadata_keys_sql {
+    () => {
+        "'agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at'"
+    };
+}
+
 /// `metadata.mined_from` — source-format tag (`claude` / `chatgpt` /
 /// `slack`) stamped by `ai-memory mine` alongside the caller's
 /// `agent_id`. Documented at CLAUDE.md §"Agent Identity (NHI)" →

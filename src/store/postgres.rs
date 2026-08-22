@@ -414,7 +414,11 @@ const CTX_APPEND_SUPERSEDE_LEAF: &str = "append supersede revision leaf";
 const CTX_READ_AGENT_ID_FOR_LEAF: &str = "read agent id for supersede leaf";
 /// Metadata key stamped next to `agent_pubkey` on every bind/sync so
 /// rotation provenance is auditable (pm-v3.1 literal de-dup).
-const META_PUBKEY_BOUND_AT: &str = "pubkey_bound_at";
+///
+/// v1.0.0 #2941 — aliased to the crate SSOT spelling rather than repeating
+/// the literal, so this backend and the reserved-upsert preserve-set
+/// (`crate::RESERVED_UPSERT_METADATA_KEYS`) can never disagree on the key.
+const META_PUBKEY_BOUND_AT: &str = field_names::PUBKEY_BOUND_AT;
 const COL_CONTENT_LEN: &str = "content_len";
 const TABLE_ARCHIVED_MEMORIES: &str = "archived_memories";
 
@@ -6007,7 +6011,8 @@ impl PostgresStore {
                     ELSE ($9::JSONB || (
                         SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                         FROM jsonb_each(metadata) AS prov(k, v)
-                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                        -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
                     ))
                 END,
                 source_uri = COALESCE($10, source_uri),
@@ -11474,7 +11479,8 @@ impl PostgresStore {
                     -- (the superset of the pre-#1784 agent_id-only CASE).
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
                 )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
@@ -16677,7 +16683,8 @@ impl MemoryStore for PostgresStore {
                     -- (the superset of the pre-#1784 agent_id-only CASE).
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
                 )),
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert so a
                 -- newer reflection at higher depth doesn't lose its provenance
@@ -17191,7 +17198,8 @@ impl MemoryStore for PostgresStore {
                     -- (the superset of the pre-#1784 agent_id-only CASE).
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
                 )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
@@ -17573,7 +17581,8 @@ impl MemoryStore for PostgresStore {
                     -- (the superset of the pre-#1784 agent_id-only CASE).
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
                 )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
@@ -17903,7 +17912,8 @@ impl MemoryStore for PostgresStore {
                     -- (the superset of the pre-#1784 agent_id-only CASE).
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
                 )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
@@ -18618,7 +18628,8 @@ impl MemoryStore for PostgresStore {
                     ELSE ($9::JSONB || (
                         SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                         FROM jsonb_each(metadata) AS prov(k, v)
-                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                        -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
                     ))
                 END,
                 source_uri = COALESCE($10, source_uri),
@@ -19958,7 +19969,8 @@ impl MemoryStore for PostgresStore {
                         (EXCLUDED.metadata || (
                             SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                             FROM jsonb_each(memories.metadata) AS prov(k, v)
-                            WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                            -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                            WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
                         ))
                     ELSE memories.metadata
                 END,
@@ -21261,7 +21273,7 @@ impl MemoryStore for PostgresStore {
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| now_rfc.clone(), str::to_string);
 
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "agent_id": agent.agent_id,
             (field_names::AGENT_TYPE): agent.agent_type,
             (field_names::CAPABILITIES): agent.capabilities,
@@ -21271,6 +21283,30 @@ impl MemoryStore for PostgresStore {
             // are a public roster. Mirrors the sqlite path's stamp.
             "scope": crate::models::MemoryScope::Collective.as_str(),
         });
+
+        // v1.0.0 #2941 — carry the bound-key PAIR through the refresh, from
+        // the same pre-read that preserves `registered_at`. This function is
+        // "register or refresh" and rebuilds metadata from scratch, so any
+        // key it does not carry forward is erased by the upsert; before this
+        // an idempotent re-register silently unbound the agent's key, and
+        // under the DEFAULT permissive posture every later signed write was
+        // then persisted as `claimed` instead of `agent_attested` with no
+        // error at all. Absent keys stay absent (never-bound or REVOKED must
+        // not re-acquire a key here). Mirrors the sqlite twin exactly.
+        if let Some(obj) = metadata.as_object_mut() {
+            for key in [field_names::AGENT_PUBKEY, META_PUBKEY_BOUND_AT] {
+                if let Some(value) = existing
+                    .as_ref()
+                    .and_then(|(m,)| m.get(key))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    obj.insert(
+                        key.to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    );
+                }
+            }
+        }
 
         let content =
             serde_json::to_string(&metadata).map_err(|e| StoreError::IntegrityFailed {
@@ -22694,7 +22730,8 @@ impl MemoryStore for PostgresStore {
                     -- onto a colliding (title, namespace) can't drop provenance.
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
                 ))
                 -- reflection_depth intentionally not surfaced here: the
                 -- consolidate path mints a fresh memory and the DB column
@@ -28370,7 +28407,8 @@ impl PostgresStore {
                     -- (the superset of the pre-#1784 agent_id-only CASE).
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
                 )),
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert.
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),

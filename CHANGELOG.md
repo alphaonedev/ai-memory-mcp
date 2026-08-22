@@ -263,6 +263,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   production caller reached the method (the postgres HTTP search path dispatches
   through the SAL trait `search`), so this closes a latent leak and restores
   cross-backend parity rather than fixing an actively exploited route.
+
 ### Fixed (curator/autonomy correctness — namespace config, op cap, silent-error surfacing)
 
 Nine defects found by a rust-1.98-grounded code review of `src/curator/*` and
@@ -325,6 +326,37 @@ truthful.
 - **Dry runs inflated `rollback_entries_written`.** The counter is documented as
   rows persisted, but a dry run — which persists nothing — incremented it. Dry
   runs now report `rollback_entries_simulated` instead.
+- **An idempotent re-register silently UNBOUND an agent's public key
+  (HIGH, both backends).** `storage::register_agent` is documented as
+  "register or refresh" and rebuilds the registration row's `metadata`
+  from scratch with no `agent_pubkey`, then hands it to `insert()`, whose
+  `ON CONFLICT … DO UPDATE` overwrote `metadata` wholesale while
+  preserving only `agent_id`, `derived_from` and
+  `consolidated_from_agents`. So ANY idempotent re-register — MCP
+  `memory_agent`, `POST /agents`, the SAL trait, the CLI — erased the
+  bound key on sqlite AND postgres. Under the strict posture
+  (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`) every later signed write then
+  403s; under the DEFAULT permissive posture it is worse — a genuinely
+  signed write is persisted as `attest_level=claimed` instead of
+  `agent_attested`, with no error, no WARN and no counter, so a durable
+  provenance downgrade is indistinguishable from an agent that never
+  signed. Fixed in two layers: `register_agent` now carries the
+  `agent_pubkey` / `pubkey_bound_at` PAIR through its existing pre-read on
+  both backends, and — the load-bearing half — the upsert preserve-list is
+  now the reserved-key set `RESERVED_UPSERT_METADATA_KEYS`, which covers
+  the pair. The preserve is evaluated INSIDE the conflicting statement, so
+  a `bind-key` landing between any caller's pre-read and its upsert cannot
+  be clobbered either. The same set now also guards the `memory_update`
+  metadata-patch path (a full-object patch that omits the pair) and the
+  newer-wins federation merge (a stale peer's row unbinding a local key).
+  Rotation and revocation are unaffected: `bind_agent_pubkey` /
+  `revoke_agent_pubkey` write through their own explicit `UPDATE`, never
+  this upsert funnel. All thirteen open-coded preserve-sites (3 sqlite,
+  10 postgres) are held in lockstep with the crate SSOT by
+  `tests/reserved_upsert_metadata_keys_2941.rs`, so drift between any two
+  of them — or between the SQL and the typed set — is not mergeable.
+  (#2941)
+
 - **Pass-1 consolidation could be starved of budget forever (HIGH).** Charging
   the autonomy passes against `max_ops_per_cycle` (above) shares ONE cycle
   budget between the auto-tag / contradiction loop and the passes, and both are
