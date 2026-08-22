@@ -516,7 +516,7 @@ async fn kg_query_with_history_includes_invalidated_edges() {
 
     // Invalidate the edge — the "current view" must then drop it.
     let inv = store
-        .invalidate_link(&a, &b, "related_to", None)
+        .invalidate_link(&a, &b, "related_to", None, None)
         .await
         .expect("invalidate_link");
     assert!(inv.found);

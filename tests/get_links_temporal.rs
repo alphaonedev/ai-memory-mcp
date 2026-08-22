@@ -101,7 +101,7 @@ fn get_links_surfaces_valid_until_after_invalidate() {
     // Stamp the invalidation. `invalidate_link` writes `valid_until` to
     // the row (and also clears the signing surface if any, per H5).
     let stamp = "2026-05-18T12:34:56+00:00";
-    let outcome = db::invalidate_link(&conn, &src, &tgt, "related_to", Some(stamp))
+    let outcome = db::invalidate_link(&conn, &src, &tgt, "related_to", Some(stamp), None)
         .expect("invalidate_link must succeed");
     assert!(
         outcome.is_some(),

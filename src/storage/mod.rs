@@ -8998,7 +8998,16 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
         }));
     }
 
-    let now = Utc::now().to_rfc3339();
+    // #3204 item 3 — TRUNCATE the receiver-side substitute to microseconds.
+    // `Utc::now().to_rfc3339()` renders NANOSECONDS, but every outbound
+    // signer truncates first (`create_link_signed_with_window`, v0.7.0 H6/G3)
+    // because postgres `TIMESTAMPTZ` quantises at microseconds. Persisting an
+    // untruncated substitute meant a genuinely `peer_attested` edge whose peer
+    // sent `valid_from: None` could NEVER re-verify locally — `memory_verify`
+    // re-derives the pre-image from the stored row and reported `Tampered`
+    // (fail-closed, but FALSE). A peer-SUPPLIED value is still preserved
+    // byte-identical below: the receiver must never rewrite an attested claim.
+    let now = truncate_to_microseconds(Utc::now()).to_rfc3339();
     // Preserve peer's `valid_from` byte-identical so `memory_verify`
     // (H4) can re-derive the signed payload from the stored row.
     let valid_from = link.valid_from.clone().unwrap_or_else(|| now.clone());
@@ -11270,19 +11279,47 @@ pub struct InvalidateResult {
 ///    row AND the matching `memory_link.invalidated` row to prove the
 ///    supersession was an intentional act by the same agent.
 ///
-/// The audit append is best-effort: if the `signed_events` write
-/// fails (vanishingly unlikely outside disk-full / schema-drift
-/// scenarios), the supersession still persists and the failure is
-/// surfaced in `tracing::warn!`. Cratering the supersession on an
-/// audit-write failure would punish the legitimate caller for a
-/// substrate problem they cannot fix.
+/// The audit append is NOT best-effort (an earlier revision of this
+/// paragraph said it was — P2 / #628 agent-3 changed the code and left
+/// the claim behind; corrected under #3178). A failed `signed_events`
+/// write ROLLS THE WHOLE TRANSACTION BACK, including the signature
+/// clearing, because a supersession that cleared the signing surface
+/// without leaving its audit row is precisely the silent state H5
+/// exists to prevent.
+///
+/// # #3203 — who the audit row is attributed to
+///
+/// `agent_id` is the ACTING principal (`actor`), not the original
+/// attester. Pre-#3203 it was `observed_by` — the agent that signed the
+/// edge — so an audit replay showed the original attesting peer as the
+/// actor of an invalidation it never performed. `actor: None` (a
+/// substrate path with no authenticated principal) records the
+/// [`crate::identity::sentinels::SYSTEM_PRINCIPAL`] sentinel rather
+/// than borrowing someone else's identity.
+///
+/// The superseded signer is NOT lost, and stays in a field distinct
+/// from `agent_id`: its Ed25519 `signature` is carried verbatim on the
+/// audit row (so an auditor can match it byte-for-byte against the
+/// original `memory_link.created` row), and its IDENTITY travels as
+/// `observed_by` inside the canonical CBOR that `payload_hash` commits
+/// to. `attest_level` stays `unsigned`, which is what tells a verifier
+/// the `signature` blob is the SUPERSEDED row's, not `agent_id`'s.
 pub fn invalidate_link(
     conn: &Connection,
     source_id: &str,
     target_id: &str,
     relation: &str,
     valid_until: Option<&str>,
+    actor: Option<&str>,
 ) -> Result<Option<InvalidateResult>> {
+    // #3203 — record-stop fence. `invalidate_link` MUTATES `memory_links`
+    // (and appends a `signed_events` leaf), so it belongs behind the same
+    // #1955 R45 fence every other link-plane write sits behind — the create
+    // twin `create_link_signed_with_window` has had it since R45. Without it
+    // a supersession landed while the record plane was STOPPED, which is the
+    // #3175 class on the sqlite link plane. Placed BEFORE the BEGIN so a
+    // refusal leaves no transaction open.
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let stamp = valid_until.map_or_else(|| Utc::now().to_rfc3339(), str::to_string);
 
     // P2 (#628 agent-3 follow-up): wrap the SELECT-then-UPDATE-then-
@@ -11389,16 +11426,19 @@ pub fn invalidate_link(
             Ok(cbor) => {
                 let event = crate::signed_events::SignedEvent {
                     id: uuid::Uuid::new_v4().to_string(),
-                    // Best-effort agent_id: the `observed_by` claim
-                    // from the original signed row (the agent that
-                    // attested the supersession's source row). Falls
-                    // back to "unknown" when the legacy row carried
-                    // no observed_by — vanishingly rare for signed
-                    // rows since H2 always populates the column on
-                    // self-signed inserts.
-                    agent_id: observed_by
-                        .clone()
-                        .unwrap_or_else(|| crate::signed_events::UNKNOWN_OBSERVER.to_string()),
+                    // #3203 — the ACTING principal. This used to be
+                    // `observed_by` (the original ATTESTER), so an
+                    // audit replay named the peer that signed the edge
+                    // as the actor of an invalidation it never
+                    // performed. `None` records the `system` sentinel
+                    // — an honest "unattributed substrate path" — never
+                    // another principal's identity. The superseded
+                    // signer survives in the `signature` column and,
+                    // as `observed_by`, inside the CBOR that
+                    // `payload_hash` commits to (see the docblock).
+                    agent_id: actor
+                        .unwrap_or(crate::identity::sentinels::SYSTEM_PRINCIPAL)
+                        .to_string(),
                     event_type: crate::signed_events::event_types::MEMORY_LINK_INVALIDATED
                         .to_string(),
                     payload_hash: crate::signed_events::payload_hash(&cbor),
@@ -26476,7 +26516,7 @@ mod tests {
         insert(&conn, &tgt).unwrap();
         create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
         let stamp = "2026-12-31T23:59:59+00:00";
-        let res = invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(stamp))
+        let res = invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(stamp), None)
             .unwrap()
             .expect("link must exist");
         assert_eq!(res.valid_until, stamp);
@@ -26500,7 +26540,7 @@ mod tests {
         insert(&conn, &src).unwrap();
         insert(&conn, &tgt).unwrap();
         create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
-        let res = invalidate_link(&conn, &src.id, &tgt.id, "related_to", None)
+        let res = invalidate_link(&conn, &src.id, &tgt.id, "related_to", None, None)
             .unwrap()
             .expect("link must exist");
         // The default is wall-clock now; assert it parses as RFC3339 and
@@ -26521,7 +26561,15 @@ mod tests {
     fn invalidate_link_returns_none_for_unknown_triple() {
         let conn = test_db();
         // No memories or links created.
-        let res = invalidate_link(&conn, "missing-src", "missing-tgt", "related_to", None).unwrap();
+        let res = invalidate_link(
+            &conn,
+            "missing-src",
+            "missing-tgt",
+            "related_to",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(res.is_none());
     }
 
@@ -26534,7 +26582,7 @@ mod tests {
         insert(&conn, &src).unwrap();
         insert(&conn, &tgt).unwrap();
         create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
-        let res = invalidate_link(&conn, &src.id, &tgt.id, "supersedes", None).unwrap();
+        let res = invalidate_link(&conn, &src.id, &tgt.id, "supersedes", None, None).unwrap();
         assert!(res.is_none(), "must not match across relation values");
     }
 
@@ -26548,11 +26596,11 @@ mod tests {
         create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
         let first = "2026-06-01T00:00:00+00:00";
         let second = "2026-12-01T00:00:00+00:00";
-        let r1 = invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(first))
+        let r1 = invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(first), None)
             .unwrap()
             .unwrap();
         assert!(r1.previous_valid_until.is_none());
-        let r2 = invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(second))
+        let r2 = invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(second), None)
             .unwrap()
             .unwrap();
         assert_eq!(r2.previous_valid_until.as_deref(), Some(first));
@@ -26571,7 +26619,7 @@ mod tests {
         create_link(&conn, &src.id, &tgt.id, "related_to").unwrap();
         create_link(&conn, &src.id, &tgt.id, "supersedes").unwrap();
         let stamp = "2026-07-15T12:00:00+00:00";
-        invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(stamp))
+        invalidate_link(&conn, &src.id, &tgt.id, "related_to", Some(stamp), None)
             .unwrap()
             .unwrap();
         let related: Option<String> = conn
@@ -26620,6 +26668,7 @@ mod tests {
             &tgt.id,
             "related_to",
             Some("2026-12-31T23:59:59+00:00"),
+            None,
         )
         .unwrap()
         .unwrap();

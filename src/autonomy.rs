@@ -1223,6 +1223,10 @@ pub async fn reverse_rollback_entry_store(
                     canonical_tgt,
                     crate::models::MemoryLinkRelation::Contradicts.as_str(),
                     None,
+                    // #3203 — a substrate rollback has no authenticated
+                    // principal, so the audit leaf records the `system`
+                    // sentinel. Honest, and never a borrowed identity.
+                    None,
                 )
                 .await
             {

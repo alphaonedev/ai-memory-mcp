@@ -566,14 +566,14 @@ async fn link_list_links_get_links_for_anchor_and_invalidate() {
 
     // invalidate_link marks the row found.
     let inv = store
-        .invalidate_link(&a, &b, "related_to", None)
+        .invalidate_link(&a, &b, "related_to", None, None)
         .await
         .expect("invalidate_link");
     assert!(inv.found, "existing link must be found on invalidate");
 
     // invalidate of an unknown triple returns found=false.
     let miss = store
-        .invalidate_link(&uid("x"), &uid("y"), "related_to", None)
+        .invalidate_link(&uid("x"), &uid("y"), "related_to", None, None)
         .await
         .expect("invalidate miss");
     assert!(!miss.found);

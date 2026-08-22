@@ -168,16 +168,6 @@ pub(crate) const SIGNED_EVENTS_TRACE_TARGET: &str = "signed_events";
 // Mirrors the `errors::error_codes` pattern (ARCH-9 / FX-C4-batch2).
 // ---------------------------------------------------------------------------
 
-/// #3178 — the `signed_events.agent_id` fallback for an audit row whose
-/// originating actor cannot be resolved from the row it describes (e.g. a
-/// legacy signed `memory_links` row carrying no `observed_by` claim).
-///
-/// ONE declaration site (pm-v3.1 no-scattered-literal rule) shared by the
-/// sqlite `db::invalidate_link` twin and the postgres
-/// `PostgresStore::kg_invalidate_cte` twin, so the SAME supersession writes a
-/// byte-identical audit row on either backend.
-pub const UNKNOWN_OBSERVER: &str = "unknown";
-
 #[allow(dead_code)]
 pub mod event_types {
     /// `signed_events.event_type` for `db::create_link` /

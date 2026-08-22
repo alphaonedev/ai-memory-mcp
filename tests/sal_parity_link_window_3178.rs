@@ -42,6 +42,25 @@
 //! | `sqlite_link_signed_refuses_malformed_window_3178` | garbage silently replaced by `now` |
 //! | `pg_and_sqlite_sign_identical_bytes_3178` | signatures DIFFER (different pre-images) |
 //! | `pg_invalidate_clears_signature_and_emits_event_3178` | `attest_level` stays `self_signed`, no event row |
+//! | `sqlite_invalidate_audit_names_the_actor_not_the_attester_3203` | `agent_id` == the ATTESTER (`bob`) |
+//! | `sqlite_invalidate_is_fenced_by_record_stop_3203` | the supersession COMMITS with the record plane stopped |
+//! | `sqlite_inbound_link_substitute_stamp_is_microsecond_truncated_3204` | nanosecond `valid_from`, never locally re-verifiable |
+//!
+//! ## Folded in
+//!
+//! **#3203 — the `memory_link.invalidated` leaf named the wrong actor, and
+//! `invalidate_link` had no record-stop fence.** `agent_id` was taken from the
+//! row's `observed_by`, i.e. the agent that ATTESTED the edge, so an audit
+//! replay showed the original attesting peer as the actor of an invalidation
+//! it never performed. It is now the acting principal (`system` when there is
+//! none); the superseded signer's proof stays in the `signature` column and
+//! its identity inside the CBOR `payload_hash` commits to. The mutation also
+//! now sits behind `record_stop::gate_storage_conn`, like its create twin.
+//!
+//! **#3204 item 3 — `create_link_inbound` substituted an UNTRUNCATED
+//! receiver-`now`** for a peer's absent `valid_from`, while every outbound
+//! signer truncates to microseconds. A genuinely `peer_attested` edge whose
+//! peer sent `valid_from: None` therefore never re-verified locally.
 //!
 //! The postgres twins soft-skip without `AI_MEMORY_TEST_POSTGRES_URL`.
 
@@ -330,7 +349,13 @@ async fn sqlite_invalidate_clears_signature_and_emits_event_3178() {
         .expect("link_signed");
 
     let outcome = store
-        .invalidate_link(&src, &dst, MemoryLinkRelation::RelatedTo.as_str(), None)
+        .invalidate_link(
+            &src,
+            &dst,
+            MemoryLinkRelation::RelatedTo.as_str(),
+            None,
+            None,
+        )
         .await
         .expect("invalidate_link");
     assert!(outcome.found);
@@ -355,6 +380,183 @@ async fn sqlite_invalidate_clears_signature_and_emits_event_3178() {
         )
         .expect("count events");
     assert_eq!(events, 1, "supersession must leave exactly one audit leaf");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 5 — #3203 / #3204 fold-ins.
+// ─────────────────────────────────────────────────────────────────────
+
+/// #3203 — the audit leaf names the ACTOR, never the edge's attester.
+#[tokio::test]
+async fn sqlite_invalidate_audit_names_the_actor_not_the_attester_3203() {
+    permissive_attestation_for_tests();
+    let (_dir, path) = fresh_db_path();
+    let store = SqliteStore::open(&path).expect("open SqliteStore");
+    let ctx = CallerContext::for_agent("alice");
+    let (src, dst) = seeded_pair(&store, &ctx).await;
+
+    // BOB attests the edge — `observed_by` is set to the keypair's agent_id by
+    // the H2 signer, so pre-#3203 the audit leaf was stamped `bob`.
+    let bob_kp = ai_memory::identity::keypair::generate("bob").expect("keypair");
+    store
+        .link_signed(&ctx, &windowed_link(&src, &dst), Some(&bob_kp))
+        .await
+        .expect("link_signed");
+    assert_eq!(
+        read_raw_link(&path, &src, &dst).observed_by.as_deref(),
+        Some("bob"),
+        "fixture precondition: the edge must be attested by bob"
+    );
+
+    // ALICE performs the supersession.
+    store
+        .invalidate_link(
+            &src,
+            &dst,
+            MemoryLinkRelation::RelatedTo.as_str(),
+            None,
+            Some("alice"),
+        )
+        .await
+        .expect("invalidate_link");
+
+    let conn = ai_memory::db::open(&path).expect("reopen");
+    let actor: String = conn
+        .query_row(
+            "SELECT agent_id FROM signed_events WHERE event_type = ?1",
+            rusqlite::params!["memory_link.invalidated"],
+            |r| r.get(0),
+        )
+        .expect("invalidated audit row");
+    // PRE-FIX: "bob" — the attester, credited with an act he never performed.
+    assert_eq!(
+        actor, "alice",
+        "the supersession audit leaf must name the ACTING principal"
+    );
+
+    // An unattributed substrate path records the `system` sentinel rather than
+    // borrowing anyone's identity.
+    let (src2, dst2) = seeded_pair(&store, &CallerContext::for_agent("alice")).await;
+    store
+        .link_signed(&ctx, &windowed_link(&src2, &dst2), Some(&bob_kp))
+        .await
+        .expect("link_signed 2");
+    store
+        .invalidate_link(
+            &src2,
+            &dst2,
+            MemoryLinkRelation::RelatedTo.as_str(),
+            None,
+            None,
+        )
+        .await
+        .expect("invalidate_link 2");
+    let actors: Vec<String> = conn
+        .prepare("SELECT agent_id FROM signed_events WHERE event_type = ?1 ORDER BY sequence")
+        .expect("prepare")
+        .query_map(rusqlite::params!["memory_link.invalidated"], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(actors, vec!["alice".to_string(), "system".to_string()]);
+}
+
+/// #3203 — `invalidate_link` mutates `memory_links` (and appends a
+/// `signed_events` leaf), so it must sit behind the same #1955 R45 fence its
+/// create twin has. PRE-FIX the supersession committed with the record plane
+/// STOPPED.
+#[tokio::test]
+async fn sqlite_invalidate_is_fenced_by_record_stop_3203() {
+    permissive_attestation_for_tests();
+    let (_dir, path) = fresh_db_path();
+    let store = SqliteStore::open(&path).expect("open SqliteStore");
+    let ctx = CallerContext::for_agent("alice");
+    let (src, dst) = seeded_pair(&store, &ctx).await;
+    let kp = ai_memory::identity::keypair::generate("alice").expect("keypair");
+    store
+        .link_signed(&ctx, &windowed_link(&src, &dst), Some(&kp))
+        .await
+        .expect("link_signed");
+
+    store
+        .record_stop(&ctx, true, "operator", "all")
+        .await
+        .expect("engage record stop");
+
+    let err = store
+        .invalidate_link(
+            &src,
+            &dst,
+            MemoryLinkRelation::RelatedTo.as_str(),
+            None,
+            Some("alice"),
+        )
+        .await
+        .expect_err("a link-plane mutation must refuse while the record plane is stopped");
+    assert!(
+        format!("{err}").to_lowercase().contains("record"),
+        "the refusal must name the record stop, got {err}"
+    );
+
+    // The edge is untouched: still signed, still open-ended.
+    let raw = read_raw_link(&path, &src, &dst);
+    assert!(raw.signature.is_some(), "signature must survive a refusal");
+    assert_eq!(raw.valid_until.as_deref(), Some(VALID_UNTIL));
+
+    // CONTROL — released, the same call succeeds.
+    store
+        .record_stop(&ctx, false, "operator", "all")
+        .await
+        .expect("release record stop");
+    store
+        .invalidate_link(
+            &src,
+            &dst,
+            MemoryLinkRelation::RelatedTo.as_str(),
+            None,
+            Some("alice"),
+        )
+        .await
+        .expect("invalidate after release");
+}
+
+/// #3204 item 3 — the receiver-side substitute for a peer's absent
+/// `valid_from` must be microsecond-truncated, or the edge can never
+/// re-verify locally.
+#[test]
+fn sqlite_inbound_link_substitute_stamp_is_microsecond_truncated_3204() {
+    permissive_attestation_for_tests();
+    let (_dir, path) = fresh_db_path();
+    let conn = ai_memory::db::open(&path).expect("open");
+
+    let src = memory("parity/3204", "inb-src", "alice");
+    let dst = memory("parity/3204", "inb-dst", "alice");
+    ai_memory::db::insert(&conn, &src).expect("insert src");
+    ai_memory::db::insert(&conn, &dst).expect("insert dst");
+
+    // A peer that sent NO temporal claim at all — the receiver substitutes its
+    // own clock for both stamps.
+    let mut link = windowed_link(&src.id, &dst.id);
+    link.created_at = String::new();
+    link.valid_from = None;
+    link.valid_until = None;
+    ai_memory::db::create_link_inbound(&conn, &link, "peer_attested").expect("inbound link");
+
+    let raw = read_raw_link(&path, &src.id, &dst.id);
+    let vf = raw.valid_from.expect("valid_from substituted");
+    // PRE-FIX: `Utc::now().to_rfc3339()` verbatim — NINE fractional digits,
+    // a precision the postgres TIMESTAMPTZ round-trip (and therefore the
+    // signed pre-image) can never reproduce.
+    for stamp in [&vf, &raw.created_at] {
+        let frac = stamp
+            .split('.')
+            .nth(1)
+            .map_or(0, |t| t.chars().take_while(char::is_ascii_digit).count());
+        assert!(
+            frac <= 6,
+            "a receiver-substituted stamp must be microsecond-truncated, got {stamp}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -389,6 +591,16 @@ mod pg {
     fn unique_ns() -> String {
         format!("parity3178/{}", uuid::Uuid::new_v4())
     }
+
+    /// The four durable columns #3178 is about, as postgres returns them
+    /// (`clippy::type_complexity` — the inline tuple is over the pedantic
+    /// threshold).
+    type PgLinkWindowRow = (
+        Option<Vec<u8>>,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
 
     /// The strongest cross-backend pin available: Ed25519 (RFC 8032) is
     /// DETERMINISTIC, so the same key over the same pre-image yields the same
@@ -435,12 +647,7 @@ mod pg {
             .connect(&url)
             .await
             .expect("pool");
-        let (pg_sig, pg_created, pg_from, pg_until): (
-            Option<Vec<u8>>,
-            chrono::DateTime<chrono::Utc>,
-            Option<chrono::DateTime<chrono::Utc>>,
-            Option<chrono::DateTime<chrono::Utc>>,
-        ) = sqlx::query_as(
+        let (pg_sig, pg_created, pg_from, pg_until): PgLinkWindowRow = sqlx::query_as(
             "SELECT signature, created_at, valid_from, valid_until FROM memory_links \
              WHERE source_id = $1 AND target_id = $2",
         )
@@ -486,7 +693,13 @@ mod pg {
             .expect("link_signed");
 
         let outcome = store
-            .invalidate_link(&src, &dst, MemoryLinkRelation::RelatedTo.as_str(), None)
+            .invalidate_link(
+                &src,
+                &dst,
+                MemoryLinkRelation::RelatedTo.as_str(),
+                None,
+                None,
+            )
             .await
             .expect("invalidate_link");
         assert!(outcome.found);

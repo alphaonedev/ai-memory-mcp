@@ -174,6 +174,11 @@ fn signed_link_invalidation_clears_signature_and_audits_event() {
         &f.dst_id,
         "supersedes",
         Some(invalidated_at),
+        // #3203 — the ACTING principal. alice both signed the edge and
+        // invalidates it here, so the `agent_id` assertion below is unchanged;
+        // what changed is WHY it holds — pre-#3203 the row was attributed to
+        // the edge's `observed_by` attester whoever the actor was.
+        Some("alice"),
     )
     .expect("invalidate_link Ok")
     .expect("link must exist");
@@ -212,7 +217,11 @@ fn signed_link_invalidation_clears_signature_and_audits_event() {
         "audit payload_hash must be SHA-256 (32 bytes)"
     );
     // The audit row preserves the PRIOR signature so an auditor can
-    // bind it back to the original `memory_link.created` row.
+    // bind it back to the original `memory_link.created` row. #3203 keeps
+    // this: the superseded signer's PROOF stays in the `signature` column
+    // (and its identity inside the CBOR `payload_hash` commits to) while
+    // `agent_id` now names the ACTOR — two distinct fields, as they should
+    // always have been.
     assert_eq!(
         invalidated.signature, sig_before,
         "audit signature blob must mirror the pre-invalidate signature \
@@ -236,9 +245,16 @@ fn unsigned_link_invalidation_does_not_create_audit_row() {
         .expect("create unsigned");
     assert_eq!(attest, "unsigned");
 
-    let res = db::invalidate_link(&f.conn, &f.src_id, &f.dst_id, "related_to", None)
-        .expect("invalidate")
-        .expect("found");
+    let res = db::invalidate_link(
+        &f.conn,
+        &f.src_id,
+        &f.dst_id,
+        "related_to",
+        None,
+        Some("alice"),
+    )
+    .expect("invalidate")
+    .expect("found");
     assert!(!res.valid_until.is_empty());
 
     // No audit row should be appended for an unsigned-link

@@ -4054,6 +4054,15 @@ pub trait MemoryStore: Send + Sync {
     /// `valid_until` (the prior value is returned in
     /// `previous_valid_until` so callers can detect the overwrite).
     ///
+    /// `actor` is the ACTING principal, stamped as the `agent_id` of the
+    /// `memory_link.invalidated` audit leaf both adapters append when they
+    /// clear a signed row's signing surface (#3203). Pre-#3203 that leaf was
+    /// attributed to the edge's ORIGINAL attester, so an audit replay named
+    /// the peer that signed the edge as the actor of an invalidation it never
+    /// performed. Pass the authenticated caller; `None` records the `system`
+    /// sentinel for a substrate path that has no principal — never another
+    /// principal's identity.
+    ///
     /// # Errors
     ///
     /// Returns `Backend` when the underlying store reports an error.
@@ -4063,6 +4072,7 @@ pub trait MemoryStore: Send + Sync {
         _target_id: &str,
         _relation: &str,
         _valid_until: Option<&str>,
+        _actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
         Err(StoreError::UnsupportedCapability {
             capability: "INVALIDATE_LINK".to_string(),
@@ -5625,9 +5635,15 @@ mod tests {
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(
-            s.invalidate_link("src", "tgt", "related_to", Some("2026-01-01T00:00:00Z"))
-                .await
-                .unwrap_err(),
+            s.invalidate_link(
+                "src",
+                "tgt",
+                "related_to",
+                Some("2026-01-01T00:00:00Z"),
+                None
+            )
+            .await
+            .unwrap_err(),
             StoreError::UnsupportedCapability { .. }
         ));
     }

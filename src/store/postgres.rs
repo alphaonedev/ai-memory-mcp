@@ -9725,6 +9725,7 @@ impl PostgresStore {
         target_id: &str,
         relation: &str,
         valid_until: Option<&str>,
+        actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
         // v0.7.0 S6-M3 — AGE Cypher dispatcher. Same dual-path
         // discipline as `kg_query` / `kg_timeline`. When AGE is
@@ -9742,7 +9743,7 @@ impl PostgresStore {
         match self.kg_backend {
             KgBackend::Age => {
                 match self
-                    .kg_invalidate_cypher(source_id, target_id, relation, valid_until)
+                    .kg_invalidate_cypher(source_id, target_id, relation, valid_until, actor)
                     .await
                 {
                     Ok(row) => Ok(row),
@@ -9752,14 +9753,14 @@ impl PostgresStore {
                             source_id,
                             &err,
                         );
-                        self.kg_invalidate_cte(source_id, target_id, relation, valid_until)
+                        self.kg_invalidate_cte(source_id, target_id, relation, valid_until, actor)
                             .await
                     }
                     Err(err) => Err(err),
                 }
             }
             KgBackend::Cte => {
-                self.kg_invalidate_cte(source_id, target_id, relation, valid_until)
+                self.kg_invalidate_cte(source_id, target_id, relation, valid_until, actor)
                     .await
             }
         }
@@ -9800,6 +9801,7 @@ impl PostgresStore {
         target_id: &str,
         relation: &str,
         valid_until: Option<&str>,
+        actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
         let stamp = valid_until.map_or_else(|| Utc::now().to_rfc3339(), str::to_string);
 
@@ -9879,7 +9881,7 @@ impl PostgresStore {
                 .await
                 .map_err(|e| to_store_err(CTX_COMMIT_AGE_TX, e))?;
             return self
-                .kg_invalidate_cte(source_id, target_id, relation, valid_until)
+                .kg_invalidate_cte(source_id, target_id, relation, valid_until, actor)
                 .await;
         }
 
@@ -9959,9 +9961,10 @@ impl PostgresStore {
         // reintroduced had only the CTE branch been repaired. The AGE branch
         // keeps its OWN `previous_valid_until` (read from the graph above), so
         // the helper's return is deliberately discarded here.
-        let _ =
-            pg_invalidate_link_relational_in_tx(&mut tx, source_id, target_id, relation, &stamp)
-                .await?;
+        let _ = pg_invalidate_link_relational_in_tx(
+            &mut tx, source_id, target_id, relation, &stamp, actor,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -9999,6 +10002,7 @@ impl PostgresStore {
         target_id: &str,
         relation: &str,
         valid_until: Option<&str>,
+        actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
         let stamp = valid_until.map_or_else(|| Utc::now().to_rfc3339(), str::to_string);
         let mut tx = self
@@ -10006,9 +10010,10 @@ impl PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin kg_invalidate tx", e))?;
-        let Some((prior, _)) =
-            pg_invalidate_link_relational_in_tx(&mut tx, source_id, target_id, relation, &stamp)
-                .await?
+        let Some((prior, _)) = pg_invalidate_link_relational_in_tx(
+            &mut tx, source_id, target_id, relation, &stamp, actor,
+        )
+        .await?
         else {
             // Triple did not exist — nothing written, so the tx just drops.
             return Ok(KgInvalidateRow {
@@ -12714,6 +12719,7 @@ async fn pg_invalidate_link_relational_in_tx(
     target_id: &str,
     relation: &str,
     stamp: &str,
+    actor: Option<&str>,
 ) -> StoreResult<Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
     let prior_row: Option<(
         Option<DateTime<Utc>>,
@@ -12774,11 +12780,16 @@ async fn pg_invalidate_link_relational_in_tx(
             }
         })?;
         let payload_hash = crate::signed_events::payload_hash(&cbor);
-        // Best-effort actor: the `observed_by` claim from the original signed
-        // row, falling back to the shared UNKNOWN sentinel the sqlite twin
-        // uses for a legacy row that carried none.
-        let event_agent =
-            observed_by.unwrap_or_else(|| crate::signed_events::UNKNOWN_OBSERVER.to_string());
+        // #3203 — the ACTING principal, byte-identical to the sqlite twin.
+        // NEVER the original attester (`observed_by`): that would name the
+        // peer which signed the edge as the actor of an invalidation it never
+        // performed. `observed_by`'s identity instead travels inside the CBOR
+        // that `payload_hash` commits to, and its Ed25519 proof stays in the
+        // `signature` column below. `None` records the `system` sentinel — an
+        // honest "unattributed substrate path", never a borrowed identity.
+        let event_agent = actor
+            .unwrap_or(crate::identity::sentinels::SYSTEM_PRINCIPAL)
+            .to_string();
         let event_id = uuid::Uuid::new_v4().to_string();
         pg_append_signed_event_with_chain_in_tx(
             tx,
@@ -28778,13 +28789,14 @@ impl MemoryStore for PostgresStore {
         target_id: &str,
         relation: &str,
         valid_until: Option<&str>,
+        actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
         // Delegate to the inherent `kg_invalidate` method which carries
         // the AGE↔CTE dual-path fallback discipline. The trait method
         // is the canonical surface; `kg_invalidate_via_store` (the
         // pre-trait `as_any_for_postgres` downcast hatch) is preserved
         // for back-compat but new callers should reach via the trait.
-        self.kg_invalidate(source_id, target_id, relation, valid_until)
+        self.kg_invalidate(source_id, target_id, relation, valid_until, actor)
             .await
     }
 
@@ -29354,9 +29366,10 @@ pub async fn kg_invalidate_via_store(
     target_id: &str,
     relation: &str,
     valid_until: Option<&str>,
+    actor: Option<&str>,
 ) -> StoreResult<crate::store::KgInvalidateRow> {
     let pg = downcast_postgres(store)?;
-    pg.kg_invalidate(source_id, target_id, relation, valid_until)
+    pg.kg_invalidate(source_id, target_id, relation, valid_until, actor)
         .await
 }
 
@@ -31601,6 +31614,7 @@ mod tests {
                 "nonexistent-target",
                 "related_to",
                 None,
+                None,
             )
             .await
         {
@@ -31649,6 +31663,7 @@ mod tests {
                 "nonexistent-target",
                 "related_to",
                 None,
+                None,
             )
             .await
             .expect("cte direct");
@@ -31657,6 +31672,7 @@ mod tests {
                 "nonexistent-source",
                 "nonexistent-target",
                 "related_to",
+                None,
                 None,
             )
             .await
@@ -33524,7 +33540,13 @@ mod tests {
         };
         store.link(&ctx, &link).await.expect("create link");
         let row = store
-            .invalidate_link(&src_id, &dst_id, "related_to", Some("2030-01-01T00:00:00Z"))
+            .invalidate_link(
+                &src_id,
+                &dst_id,
+                "related_to",
+                Some("2030-01-01T00:00:00Z"),
+                None,
+            )
             .await
             .expect("invalidate_link");
         assert!(row.found, "link must be marked found");
@@ -33533,7 +33555,13 @@ mod tests {
         assert!(!row.valid_until.is_empty());
         // Calling again should surface the prior value.
         let row2 = store
-            .invalidate_link(&src_id, &dst_id, "related_to", Some("2031-02-02T00:00:00Z"))
+            .invalidate_link(
+                &src_id,
+                &dst_id,
+                "related_to",
+                Some("2031-02-02T00:00:00Z"),
+                None,
+            )
             .await
             .expect("re-invalidate");
         assert!(row2.found);
@@ -34174,7 +34202,7 @@ mod tests {
         };
         let store = PostgresStore::connect(&url).await.expect("connect");
         let row = store
-            .invalidate_link("nope-src", "nope-dst", "related_to", None)
+            .invalidate_link("nope-src", "nope-dst", "related_to", None, None)
             .await
             .expect("invalidate_link miss");
         assert!(!row.found);

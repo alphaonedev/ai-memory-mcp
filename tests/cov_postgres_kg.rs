@@ -168,13 +168,13 @@ async fn kg_invalidate_marks_edge_and_misses_unknown() {
     store.link(&ctx, &link(&a, &b)).await.unwrap();
 
     let found = store
-        .invalidate_link(&a, &b, "related_to", None)
+        .invalidate_link(&a, &b, "related_to", None, None)
         .await
         .expect("invalidate found");
     assert!(found.found);
 
     let miss = store
-        .invalidate_link(&uid("nope"), &uid("nope2"), "related_to", None)
+        .invalidate_link(&uid("nope"), &uid("nope2"), "related_to", None, None)
         .await
         .expect("invalidate miss");
     assert!(!miss.found);

@@ -355,7 +355,14 @@ impl MemoryStore for SqliteStore {
             }
             Err(e) => {
                 if owns_tx {
-                    let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+                    // Surface a FAILED rollback: it means the batch's partial
+                    // rows may still be in an open transaction on this
+                    // connection, which is the one state that would break the
+                    // all-or-nothing contract above. Follows the
+                    // `db::touch` / `db::touch_batch` precedent.
+                    if let Err(rb) = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK) {
+                        tracing::error!("ROLLBACK failed in store_batch: {rb}");
+                    }
                 }
                 Err(box_err(e))
             }
@@ -3027,9 +3034,11 @@ impl MemoryStore for SqliteStore {
         target_id: &str,
         relation: &str,
         valid_until: Option<&str>,
+        actor: Option<&str>,
     ) -> StoreResult<crate::store::KgInvalidateRow> {
         let conn = self.state.lock().await;
-        match db::invalidate_link(&conn, source_id, target_id, relation, valid_until)
+        // #3203 — carry the ACTING principal into the audit leaf.
+        match db::invalidate_link(&conn, source_id, target_id, relation, valid_until, actor)
             .map_err(box_err)?
         {
             Some(res) => Ok(crate::store::KgInvalidateRow {
@@ -5285,7 +5294,13 @@ mod tests {
         };
         store.link(&ctx, &link).await.expect("create link");
         let row = store
-            .invalidate_link(&src_id, &dst_id, "related_to", Some("2030-01-01T00:00:00Z"))
+            .invalidate_link(
+                &src_id,
+                &dst_id,
+                "related_to",
+                Some("2030-01-01T00:00:00Z"),
+                None,
+            )
             .await
             .expect("invalidate_link");
         assert!(row.found, "link must be marked found");
@@ -5299,7 +5314,7 @@ mod tests {
         // not an error.
         let store = fresh_store();
         let row = store
-            .invalidate_link("nope-src", "nope-dst", "related_to", None)
+            .invalidate_link("nope-src", "nope-dst", "related_to", None, None)
             .await
             .expect("invalidate_link miss");
         assert!(!row.found);

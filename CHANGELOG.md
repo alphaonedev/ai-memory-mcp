@@ -3025,6 +3025,38 @@ decision to a place both adapters share, not by adding a second copy of it.
   #628 H5 contract (including its refusal to commit the update when the audit
   row cannot be appended).
 
+### Fixed (link supersession audit named the wrong actor and had no record-stop fence; #3203, #3204 item 3)
+
+- **The `memory_link.invalidated` audit leaf was attributed to the edge's
+  ORIGINAL ATTESTER (#3203).** Both backends stamped `signed_events.agent_id`
+  from the row's `observed_by` — the agent that signed the edge — so an audit
+  replay showed the original attesting peer as the actor of an invalidation it
+  never performed, on a chain whose whole purpose is establishing who did what.
+  `MemoryStore::invalidate_link` / `db::invalidate_link` /
+  `PostgresStore::kg_invalidate{,_cte,_cypher}` now take the ACTING principal
+  and stamp that; the HTTP handler passes its authenticated caller and the MCP
+  handler passes the ENFORCED read-visibility caller (deliberately not the
+  self-asserted `arguments["agent_id"]` — an audit actor must not be forgeable
+  from the wire), while an unattributed substrate path records the `system`
+  sentinel rather than borrowing an identity. The superseded signer is not
+  lost: its Ed25519 proof stays in the leaf's `signature` column and its
+  identity travels as `observed_by` inside the canonical CBOR that
+  `payload_hash` commits to.
+- **`invalidate_link` had no record-stop fence (#3203).** It mutates
+  `memory_links` and appends to `signed_events`, but unlike its create twin it
+  sat outside the #1955 R45 fence, so a supersession landed while the record
+  plane was STOPPED. `record_stop::gate_storage_conn` now guards it, before the
+  transaction opens so a refusal leaves nothing half-done.
+- **`create_link_inbound` substituted an untruncated receiver-clock stamp
+  (#3204 item 3).** When a peer sent no `valid_from` (or no `created_at`) the
+  receiver wrote `Utc::now().to_rfc3339()` verbatim — nanosecond precision —
+  while every outbound signer truncates to microseconds because postgres
+  `TIMESTAMPTZ` quantises there. A genuinely `peer_attested` edge could
+  therefore never re-verify locally: `memory_verify` re-derives the pre-image
+  from the stored row and reported `Tampered` (fail-closed, but false). The
+  substitute is now truncated. A peer-SUPPLIED value is still stored
+  byte-identical — a receiver must never rewrite an attested claim.
+
 ### Fixed (sqlite silently inherited trait defaults that do not meet their documented contracts; #3181)
 
 - **`store_batch` was not atomic on sqlite, despite the trait doc saying it is

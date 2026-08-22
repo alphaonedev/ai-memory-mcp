@@ -452,7 +452,7 @@ async fn issue_1689_age_excludes_invalidated_edges() {
     // relational memory_links row, so both backends see the retraction.
     let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
     store
-        .kg_invalidate_cypher(&ids[0], &ids[1], "related_to", Some(&past))
+        .kg_invalidate_cypher(&ids[0], &ids[1], "related_to", Some(&past), None)
         .await
         .expect("kg_invalidate_cypher 0->1");
 
@@ -607,7 +607,7 @@ async fn kg_invalidate_equivalence() {
     // CTE half — invalidate a real edge then re-invalidate to capture
     // the prior value.
     let cte_first = store
-        .kg_invalidate_cte(&ids[0], &ids[1], "related_to", Some(stamp))
+        .kg_invalidate_cte(&ids[0], &ids[1], "related_to", Some(stamp), None)
         .await
         .expect("cte invalidate first");
     assert!(cte_first.found, "CTE must find the seeded edge");
@@ -616,7 +616,7 @@ async fn kg_invalidate_equivalence() {
         "CTE first invalidation has no prior valid_until"
     );
     let cte_second = store
-        .kg_invalidate_cte(&ids[0], &ids[1], "related_to", Some(stamp))
+        .kg_invalidate_cte(&ids[0], &ids[1], "related_to", Some(stamp), None)
         .await
         .expect("cte invalidate second");
     assert!(cte_second.found);
@@ -628,7 +628,13 @@ async fn kg_invalidate_equivalence() {
     // CTE miss path — synthetic ids that don't exist must surface
     // `found = false` and an empty `valid_until`.
     let cte_miss = store
-        .kg_invalidate_cte("synthetic-src", "synthetic-dst", "related_to", Some(stamp))
+        .kg_invalidate_cte(
+            "synthetic-src",
+            "synthetic-dst",
+            "related_to",
+            Some(stamp),
+            None,
+        )
         .await
         .expect("cte invalidate miss");
     assert_no_match(&cte_miss);
@@ -647,7 +653,7 @@ async fn kg_invalidate_equivalence() {
     // the CTE-side mutation above (the AGE branch reads/writes the
     // property graph and mirrors back into memory_links).
     let age_first = match store
-        .kg_invalidate_cypher(&ids[1], &ids[2], "related_to", Some(stamp))
+        .kg_invalidate_cypher(&ids[1], &ids[2], "related_to", Some(stamp), None)
         .await
     {
         Ok(r) => r,
@@ -657,7 +663,7 @@ async fn kg_invalidate_equivalence() {
         }
     };
     let age_second = store
-        .kg_invalidate_cypher(&ids[1], &ids[2], "related_to", Some(stamp))
+        .kg_invalidate_cypher(&ids[1], &ids[2], "related_to", Some(stamp), None)
         .await
         .expect("age invalidate second");
     let age_miss = store
@@ -666,6 +672,7 @@ async fn kg_invalidate_equivalence() {
             "synthetic-dst-2",
             "related_to",
             Some(stamp),
+            None,
         )
         .await
         .expect("age invalidate miss");
