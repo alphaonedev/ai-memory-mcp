@@ -303,15 +303,42 @@ pub async fn cmd_reembed(
     let tier_config = feature_tier.config();
     let resolved = app_config.resolve_embeddings();
 
-    // Mirror `daemon_runtime::build_embedder` (#1598): API backends
-    // wire the operator's model id verbatim (tier only gates Some vs
-    // None); local/ollama backends go through the model picker.
-    let tier_model = if crate::config::is_api_embed_backend(&resolved.backend) {
-        tier_config.embedding_model
-    } else {
-        crate::daemon_runtime::resolve_embedder_model(&tier_config, app_config)
-    };
-    let Some(tier_model) = tier_model else {
+    // v1.0.0 #2972 — consume the SINGLE shared resolver
+    // (`daemon_runtime::resolve_boot_embedder_model`) that
+    // `daemon_runtime::build_embedder` uses, instead of a local COPY of its
+    // two-branch rule. `reembed` REPLACES every vector in the corpus, so if
+    // its copy ever drifted from the daemon's, the sweep would rewrite the
+    // whole corpus into a space the daemon refuses to score (#2167 gate) —
+    // the #322 drift class, applied to the one verb that rewrites everything.
+    let boot_model = crate::daemon_runtime::resolve_boot_embedder_model(&tier_config, app_config);
+    // #2972 — FAIL CLOSED on a silently-substituted model.
+    //
+    // The reporter's case: `[embeddings] backend = "ollama", model =
+    // "qwen3-embedding:4b"`. `doctor` echoes the CONFIGURED model, but the
+    // resolver cannot construct that id, so it falls back to the tier preset
+    // (`all-MiniLM-L6-v2`, 384-dim) with only a `tracing::warn!` — which a
+    // CLI one-shot renders nowhere. `reembed` then REPLACED every stored
+    // vector with MiniLM vectors under a NEW space fingerprint. The memory
+    // TEXT is never at risk (vectors are derived + regenerable), but a
+    // corpus-wide rewrite under a model the operator did not ask for is not
+    // something to do silently. Refuse and say exactly what happened; the
+    // daemon keeps its warn-and-degrade boot posture (refusing to BOOT on an
+    // unsupported model id would be a strictly worse failure mode).
+    if let Some(raw) = boot_model.unhonoured_config_model.as_deref() {
+        writeln!(
+            out.stderr,
+            "reembed: REFUSED — the configured embedding model {raw:?} (backend={}) is not \
+             constructible by this binary, so the resolver would silently substitute the \
+             tier preset and REPLACE every stored vector under that substitute's space \
+             (#2972). Supported model ids for a local/ollama backend: \
+             nomic-embed-text-v1.5, all-MiniLM-L6-v2. Either set a supported \
+             `[embeddings].model`, or use an API backend (whose model id is wired \
+             verbatim). No vector was written.",
+            resolved.backend,
+        )?;
+        return Ok(EXIT_EMBEDDER_INIT_FAILED);
+    }
+    let Some(tier_model) = boot_model.model else {
         writeln!(
             out.stderr,
             "reembed: tier '{}' is keyword-only (no embedding model) — reembed \

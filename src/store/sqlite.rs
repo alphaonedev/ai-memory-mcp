@@ -2600,6 +2600,13 @@ impl MemoryStore for SqliteStore {
         embedding: Option<&[f32]>,
         space: &str,
     ) -> StoreResult<()> {
+        // #3085 — refuse an unattributed (empty) space stamp for a REAL
+        // vector with the SAME typed error the pg twin returns (the sqlite
+        // funnel `db::set_embedding` also refuses, but as a boxed backend
+        // error — pin the parity here).
+        if embedding.is_some_and(|v| !v.is_empty()) {
+            crate::store::reject_unattributed_space("update_embedding", space)?;
+        }
         let conn = self.state.lock().await;
         match embedding {
             // #2167 — vector + space stamped atomically; a cleared embedding

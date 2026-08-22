@@ -85,6 +85,24 @@ pub struct MigrationReport {
     /// number of source memories that carried a stored embedding.
     #[serde(default)]
     pub embeddings_copied: usize,
+    /// v1.0.0 #3085 — count of source memories that carry a stored embedding
+    /// VECTOR whose `embedding_space` provenance is SQL NULL (unverified /
+    /// legacy), and which were therefore NOT copied.
+    ///
+    /// Such a vector has NO provenance to preserve, and the SAL
+    /// `set_embeddings_batch(&str)` surface cannot express a NULL stamp — the
+    /// pre-#3085 code mapped it to the empty string, which lands NON-NULL on
+    /// postgres and is excluded BOTH from the #2167 recall gate (`AND
+    /// embedding_space = <active_fp>`) and from the serve-boot NULL-space heal
+    /// scan: permanently non-recallable and unhealable, while `errors` stayed
+    /// empty. We now leave the destination row UNEMBEDDED instead, so the
+    /// destination's own backfill sweep re-derives the vector from the durable
+    /// TEXT under the LIVE embedder and stamps the ACTIVE space (the
+    /// self-healing, pre-#3060 behaviour). The count is reported so the
+    /// operator sees exactly how many vectors were not attributable rather
+    /// than inferring it from a silent success.
+    #[serde(default)]
+    pub embeddings_unattributed: usize,
     pub batches: usize,
     pub errors: Vec<String>,
     pub dry_run: bool,
@@ -291,12 +309,21 @@ pub async fn migrate(
     // `set_embeddings_batch` stamps ONE space per call (#2167
     // M-PARAMETER-CONSISTENCY: every vector in a batch shares one space),
     // then write each bucket to the destination in pages of `page_size`.
-    // A legacy row whose space is SQL NULL (unverified provenance) buckets
-    // under the empty string — the trait's `&str` space param cannot
-    // express NULL, so its vector is still copied while its NULL→"" space
-    // is the closest the SAL surface allows (does not arise on a
-    // space-stamped corpus; skipping the row would be a silent embedding
-    // LOSS, which the North Star ranks worse).
+    // v1.0.0 #3085 — a legacy row whose space is SQL NULL (unverified
+    // provenance) is NOT copied. The trait's `&str` space param cannot
+    // express NULL, and the pre-#3085 `unwrap_or_default()` mapped it to the
+    // EMPTY STRING, which persists NON-NULL: excluded from the #2167 recall
+    // gate (`AND embedding_space = <active_fp>` never matches `''`) AND from
+    // `PostgresStore::list_unembedded`'s NULL-space heal arm — permanently
+    // non-recallable and unhealable, with `errors: []`. Skipping is the
+    // provenance-honest choice: a NULL-space vector has NO provenance to
+    // preserve, so leaving the destination row unembedded lets the
+    // destination's backfill re-derive it from the DURABLE TEXT under the
+    // live embedder and stamp the ACTIVE space (self-healing, exactly the
+    // pre-#3060 behaviour). Nothing durable is lost — the text is the source
+    // of truth and the vector is a disposable derived artifact — and the
+    // count is REPORTED (`embeddings_unattributed`) rather than silently
+    // absorbed.
     let mut source_embedded: usize = 0;
     let mut by_space: std::collections::BTreeMap<String, Vec<(String, Vec<f32>)>> =
         std::collections::BTreeMap::new();
@@ -309,10 +336,14 @@ pub async fn migrate(
         match from.get_embedding_with_space(&ctx, id).await {
             Ok(Some((vector, space))) => {
                 source_embedded += 1;
-                by_space
-                    .entry(space.unwrap_or_default())
-                    .or_default()
-                    .push((id.clone(), vector));
+                // #3085 — an empty stamp is the corrupt twin of NULL (a
+                // fingerprint is never empty); treat BOTH as unattributed so
+                // a source corpus already poisoned by a pre-#3085 migrate is
+                // not re-poisoned on the destination.
+                match space.filter(|s| !s.trim().is_empty()) {
+                    Some(fp) => by_space.entry(fp).or_default().push((id.clone(), vector)),
+                    None => report.embeddings_unattributed += 1,
+                }
             }
             Ok(None) => {} // no stored source embedding — nothing to copy
             Err(crate::store::StoreError::UnsupportedCapability { .. }) => {
@@ -329,11 +360,35 @@ pub async fn migrate(
     }
     // When embeddings are unsupported we fall through to the links phase
     // with nothing copied (byte-identical to pre-#3060 on such a store).
-    if !embeddings_unsupported {
+    if embeddings_unsupported {
+        // The scan aborted mid-way, so any partial unattributed tally is not
+        // a fact about the corpus — do not report a half-count.
+        report.embeddings_unattributed = 0;
+    } else {
+        // #3085 — REPORT the vectors we could not attribute. Silence here is
+        // exactly what made the pre-fix loss invisible: `errors: []` on a
+        // corpus whose semantic recall had been permanently disabled.
+        if report.embeddings_unattributed > 0 {
+            tracing::warn!(
+                unattributed = report.embeddings_unattributed,
+                "migrate: {} source embedding vector(s) carry NO embedding_space \
+                 provenance (SQL NULL / empty) and were NOT copied (#3085). Their memory \
+                 TEXT migrated intact; the destination re-derives each vector from that \
+                 text on its next embedding-backfill sweep and stamps the ACTIVE space, \
+                 so those rows become recallable once the destination has an embedder. \
+                 Copying them would have stamped a non-NULL empty space, which is \
+                 excluded from BOTH recall and every heal scan.",
+                report.embeddings_unattributed
+            );
+        }
         if dry_run {
             // Size the copy without writing (mirrors the memories/links
-            // dry-run tally): every embedded source row WOULD be copied.
-            report.embeddings_copied = source_embedded;
+            // dry-run tally). #3085 — an unattributed source vector is NOT
+            // copied, so the dry-run plan must report the same split the live
+            // run produces (`embeddings_unattributed` is already tallied by
+            // the scan above).
+            report.embeddings_copied =
+                source_embedded.saturating_sub(report.embeddings_unattributed);
         } else {
             for (space, entries) in &by_space {
                 for chunk in entries.chunks(page_size) {
@@ -349,11 +404,17 @@ pub async fn migrate(
             // copied is silent semantic-recall data loss on the destination,
             // so refuse to report success on a short copy (the memories-phase
             // posture).
-            if report.errors.is_empty() && report.embeddings_copied != source_embedded {
+            // #3085 — the unattributed rows are a DELIBERATE, reported skip,
+            // not a short copy, so they are accounted for explicitly here
+            // rather than tripping the refusal.
+            if report.errors.is_empty()
+                && report.embeddings_copied + report.embeddings_unattributed != source_embedded
+            {
                 report.errors.push(format!(
                     "incomplete embedding copy: source has {source_embedded} embedded \
-                     memories but only {} vectors were copied — refusing to report success",
-                    report.embeddings_copied
+                     memories but only {} vectors were copied ({} were unattributed and \
+                     deliberately skipped) — refusing to report success",
+                    report.embeddings_copied, report.embeddings_unattributed
                 ));
             }
         }

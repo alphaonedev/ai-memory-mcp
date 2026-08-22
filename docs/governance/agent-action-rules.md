@@ -105,13 +105,44 @@ CREATE TABLE governance_rules (
 
 ## Per-kind matcher shapes
 
-| `kind`             | Matcher JSON                                       | Notes                                                                 |
-|--------------------|----------------------------------------------------|-----------------------------------------------------------------------|
-| `bash`             | `{"command_regex":"..."}`                          | Substring match on the command line.                                  |
-| `filesystem_write` | `{"glob":"/tmp/**"}`                               | Reuses the substrate glob vocabulary (`*` per-segment, `**` cross-`/`). |
-| `network_request`  | `{"host":"evil.example.com"}`                      | Exact host match.                                                     |
-| `process_spawn`    | `{"binary":"cargo","disk_free_min_gib":20}`        | Binary name match plus optional disk-threshold refusal.               |
-| `custom`           | `{"kind":"<your_kind>"}`                           | Extension point for caller-specific actions.                          |
+Each kind has a REQUIRED key set (at least one must be present) and an optional
+set. `ai-memory rules add` validates both at write time (see
+[Write-time validation](#write-time-validation-and-inert-rules-3031)).
+
+| `kind`             | Required (one of)                                    | Optional (ANDed)                        | Notes                                                                 |
+|--------------------|------------------------------------------------------|-----------------------------------------|-----------------------------------------------------------------------|
+| `bash`             | `command_substring` (or the legacy alias `command_regex`) | —                                  | LITERAL substring match on the command line — never a regex.          |
+| `filesystem_write` | `glob`                                               | —                                       | Reuses the substrate glob vocabulary (`*` per-segment, `**` cross-`/`). |
+| `network_request`  | `host`                                               | —                                       | Glob host match (a plain host with no `*` matches exactly).           |
+| `process_spawn`    | `binary`                                             | `args_contain`, `disk_free_min_gib`     | Binary name match plus optional argv-substring / disk-threshold refusal. |
+| `custom`           | `kind`                                               | `namespace_glob`, `tier`, `title_contains` | Extension point for caller-specific actions.                       |
+| `read_action`      | `surface`, `namespace`, `query_substring`, or `all`  | —                                       | PE-2 read gating; `{"all": true}` is the explicit blanket opt-in.     |
+
+### Write-time validation and inert rules (#3031)
+
+A matcher carrying NONE of its kind's required keys — or any key the kind does
+not recognise (a `command_substrng` typo) — can never fire. Before v1.0.0 such
+a rule could be signed and enabled, and the engine returned `allow` for every
+action it was written to block, with nothing in `rules list` to show it.
+
+- **`ai-memory rules add` REFUSES** a matcher that is not a JSON object, carries
+  an unrecognised key, or carries none of the required keys. A kind this binary
+  does not know is accepted unvalidated (forward compatibility).
+- **`ai-memory rules list` reports `inert: true`** for any rule whose matcher
+  can never fire — the way to find a legacy row written before this validation.
+- **The engine FAILS CLOSED** on an enabled inert rule whose severity BLOCKS:
+  a `refuse` rule REFUSES and an `escalate` rule ESCALATES, each with a loud
+  `tracing::error!` naming the rule id, rather than silently allowing. `warn`
+  and `log` are non-blocking by definition, so an inert one is reported and
+  otherwise skipped.
+
+  This deliberately inverts one previously-documented property: for
+  `read_action`, an unrecognised matcher used to match NOTHING so an operator
+  "can't accidentally deny every read with a typo". That still holds for
+  `warn`/`log`, but for `refuse`/`escalate` a typo that silently DISABLES an
+  intended refusal is the worse failure — and the typo is now unmintable
+  through `rules add` in the first place. To disable enforcement, disable the
+  rule (`ai-memory rules disable <id> --sign`); never rely on a broken matcher.
 
 ## Seed rules (land at `enabled=0`)
 

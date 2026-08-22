@@ -359,6 +359,7 @@ impl Severity {
 /// | `NetworkRequest`     | `{"host":"*.evil.example.com"}` — glob host match (plain host = exact)   |
 /// | `ProcessSpawn`       | `{"binary":"cargo","disk_free_min_gib":20,"args_contain":"..."}` — binary + disk + optional argv substring |
 /// | `Custom`             | `{"kind":"<kind>","namespace_glob":"secure/**","tier":"long","title_contains":"..."}` — kind + optional payload predicates (ANDed) |
+/// | `Read` (`read_action`) | `{"surface":"...","namespace":"...","query_substring":"..."}` or `{"all":true}` — PE-2 read gating |
 ///
 /// # Bash field naming (SEC-12 / COR-10, Cluster D, issue #767)
 ///
@@ -374,33 +375,217 @@ impl Severity {
 /// Returns `false` on a kind/matcher mismatch (e.g. a `bash` rule
 /// against a `FilesystemWrite` action) — the caller pre-filters on
 /// `kind` so this should not happen, but the engine is defensive.
+///
+/// v1.0.0 #3031 — this predicate means "the matcher POSITIVELY selected this
+/// action", and nothing more. It deliberately does NOT distinguish "was
+/// evaluated and did not match" from "could not be evaluated at all"; use
+/// [`matcher_status`] for that (and [`RuleEngine::evaluate`] does, so a broken
+/// BLOCKING rule fails closed instead of silently allowing). Keeping this
+/// signature honest is what lets [`count_matching_rules`] stay a count of real
+/// matches.
 #[must_use]
 pub fn matcher_applies(rule: &Rule, action: &AgentAction) -> bool {
+    matches!(matcher_status(rule, action), MatcherStatus::Applies)
+}
+
+/// v1.0.0 #3031 — the THREE distinguishable outcomes of evaluating a rule's
+/// matcher against an action.
+///
+/// Pre-#3031 the engine collapsed all three into `false`, so an ENABLED,
+/// operator-SIGNED `refuse` rule whose matcher was malformed — or carried no
+/// key the rule's kind recognises (`--kind bash --matcher
+/// '{"totally_bogus_key":123}'`) — silently ALLOWED every action it was
+/// written to block, with nothing in `rules list` or `rules check` to show it
+/// was inert. "Cannot evaluate" is not "does not match": the first is a
+/// broken policy, the second is a policy that was consulted and did not fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatcherStatus {
+    /// The matcher was evaluated and POSITIVELY selected this action.
+    Applies,
+    /// The matcher was evaluated and did NOT select this action (including a
+    /// `kind` that does not match the action — the engine pre-filters on kind,
+    /// so this is defense in depth).
+    DoesNotApply,
+    /// The matcher could NOT be evaluated: malformed JSON, a non-object body,
+    /// or no field this kind recognises. The rule is structurally INERT — it
+    /// can never fire for any action of its kind.
+    Inert,
+}
+
+/// v1.0.0 #3031 — evaluate `rule`'s matcher against `action`, distinguishing
+/// "did not match" from "could not be evaluated" (see [`MatcherStatus`]).
+///
+/// [`RuleEngine::evaluate`] uses this to FAIL CLOSED: an enabled `refuse` /
+/// `escalate` rule whose matcher is [`MatcherStatus::Inert`] blocks the
+/// action (loudly) instead of silently permitting it.
+#[must_use]
+pub fn matcher_status(rule: &Rule, action: &AgentAction) -> MatcherStatus {
     if rule.kind != action.kind() {
-        return false;
+        return MatcherStatus::DoesNotApply;
     }
     let Ok(matcher) = serde_json::from_str::<serde_json::Value>(&rule.matcher) else {
-        // Malformed matcher JSON — treat as non-matching rather than
-        // panic. The operator-facing `ai-memory rules add` validates
-        // the JSON at write time so this is a defense-in-depth
-        // fallback.
+        // Malformed matcher JSON. `ai-memory rules add` refuses this at write
+        // time, so reaching here means the row was written by an older binary
+        // or edited outside the CLI — it is INERT, not "does not match".
+        return MatcherStatus::Inert;
+    };
+    if matcher_is_inert_for_kind(&rule.kind, &matcher) {
+        return MatcherStatus::Inert;
+    }
+    if matcher_applies_inner(&matcher, action) {
+        MatcherStatus::Applies
+    } else {
+        MatcherStatus::DoesNotApply
+    }
+}
+
+/// #3031 — per-kind recognised matcher keys. The FIRST tuple element is the
+/// set of keys whose presence makes the matcher evaluable (at least one is
+/// REQUIRED); the second is the additional OPTIONAL narrowing keys. Returns
+/// `None` for a kind this binary does not know (forward-compatible: a rule
+/// authored for a newer binary is left alone rather than declared broken).
+///
+/// This table is the SSOT for both the engine's inert-detection and the CLI's
+/// write-time schema validation, so the two can never disagree about what a
+/// well-formed matcher is.
+#[must_use]
+fn matcher_key_schema(kind: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    match kind {
+        action_kinds::BASH => Some((
+            &[MATCHER_COMMAND_SUBSTRING, MATCHER_COMMAND_REGEX],
+            &[],
+        )),
+        action_kinds::FILESYSTEM_WRITE => Some((&["glob"], &[])),
+        action_kinds::NETWORK_REQUEST => Some((&["host"], &[])),
+        action_kinds::PROCESS_SPAWN => {
+            Some((&["binary"], &["args_contain", "disk_free_min_gib"]))
+        }
+        action_kinds::CUSTOM => Some((&["kind"], &["namespace_glob", "tier", "title_contains"])),
+        action_kinds::READ_ACTION => Some((
+            &["surface", "namespace", "query_substring", "all"],
+            &[],
+        )),
+        _ => None,
+    }
+}
+
+/// #3031 — is `matcher` structurally unable to ever fire for `kind`?
+///
+/// True when the body is not a JSON object, or carries NONE of the kind's
+/// required keys. A `read_action` matcher whose only required key is
+/// `{"all": false}` is deliberately NOT inert: the operator wrote an explicit
+/// blanket opt-OUT, which is an evaluable (always-false) policy, not a typo.
+#[must_use]
+fn matcher_is_inert_for_kind(kind: &str, matcher: &serde_json::Value) -> bool {
+    let Some((required, _optional)) = matcher_key_schema(kind) else {
+        // Unknown kind — this binary cannot judge the shape. The kind-scoped
+        // rule load means such a rule never reaches an action anyway.
         return false;
     };
+    let Some(obj) = matcher.as_object() else {
+        return true;
+    };
+    !required.iter().any(|k| obj.contains_key(*k))
+}
 
+/// v1.0.0 #3031 — operator-facing write-time matcher SCHEMA validation for
+/// `ai-memory rules add`.
+///
+/// Pre-#3031 the CLI validated only that the matcher parsed as JSON, so
+/// `--kind bash --matcher '{"totally_bogus_key":123}' --severity refuse --sign`
+/// happily minted an ENABLED, operator-signed rule that enforced NOTHING. This
+/// refuses at input time on:
+/// - a non-object matcher body;
+/// - a matcher carrying NONE of the kind's required narrowing keys;
+/// - any key the kind does not recognise (catches `command_substrng` typos,
+///   which would otherwise produce a silently inert rule).
+///
+/// A kind this binary does not know is accepted unvalidated (forward
+/// compatibility with rules authored for a newer binary).
+///
+/// # Errors
+///
+/// Returns `Err(String)` with an operator-facing explanation naming the kind,
+/// the offending key(s), and the recognised key set.
+pub fn validate_matcher_for_kind(kind: &str, matcher: &serde_json::Value) -> Result<(), String> {
+    let Some((required, optional)) = matcher_key_schema(kind) else {
+        return Ok(());
+    };
+    let Some(obj) = matcher.as_object() else {
+        return Err(format!(
+            "matcher for kind {kind:?} must be a JSON OBJECT (got {}); recognised keys: {}",
+            matcher_type_name(matcher),
+            required.join(" | ")
+        ));
+    };
+    let mut unknown: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !required.contains(k) && !optional.contains(k))
+        .collect();
+    unknown.sort_unstable();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "matcher for kind {kind:?} carries unrecognised key(s) {unknown:?}; the engine \
+             ignores them, so the rule would be silently INERT (enforce nothing). \
+             Recognised: required one of {required:?}, optional {optional:?}"
+        ));
+    }
+    if !required.iter().any(|k| obj.contains_key(*k)) {
+        return Err(format!(
+            "matcher for kind {kind:?} carries none of the required key(s) {required:?}, \
+             so the rule could never fire (silently INERT). Add one of them"
+        ));
+    }
+    Ok(())
+}
+
+/// v1.0.0 #3031 — is this rule structurally INERT (able to fire for NO action
+/// of its kind)?
+///
+/// Surfaced by `ai-memory rules list` as the `inert` flag so an operator can
+/// SEE a broken rule without having to guess from a `rules check` that
+/// unexpectedly returned `allow`. Kind-only (no action needed): a malformed
+/// matcher, a non-object body, or one carrying none of the kind's required
+/// keys can never fire regardless of the action.
+#[must_use]
+pub fn rule_matcher_is_inert(rule: &Rule) -> bool {
+    match serde_json::from_str::<serde_json::Value>(&rule.matcher) {
+        Ok(v) => matcher_is_inert_for_kind(&rule.kind, &v),
+        Err(_) => true,
+    }
+}
+
+/// #3031 — JSON type name for the operator-facing validation message.
+fn matcher_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// #3031 — the per-kind positive-match dispatch, split out of
+/// [`matcher_applies`] so [`matcher_status`] can run it AFTER the
+/// inert-detection pass without duplicating the match arms.
+fn matcher_applies_inner(matcher: &serde_json::Value, action: &AgentAction) -> bool {
     match action {
-        AgentAction::Bash { command, .. } => match_bash(&matcher, command),
-        AgentAction::FilesystemWrite { path, .. } => match_filesystem_write(&matcher, path),
-        AgentAction::NetworkRequest { host, .. } => match_network_request(&matcher, host),
-        AgentAction::ProcessSpawn { binary, args } => match_process_spawn(&matcher, binary, args),
+        AgentAction::Bash { command, .. } => match_bash(matcher, command),
+        AgentAction::FilesystemWrite { path, .. } => match_filesystem_write(matcher, path),
+        AgentAction::NetworkRequest { host, .. } => match_network_request(matcher, host),
+        AgentAction::ProcessSpawn { binary, args } => match_process_spawn(matcher, binary, args),
         AgentAction::Custom {
             custom_kind,
             payload,
-        } => match_custom(&matcher, custom_kind, payload),
+        } => match_custom(matcher, custom_kind, payload),
         AgentAction::Read {
             surface,
             namespace,
             query,
-        } => match_read(&matcher, surface, namespace.as_deref(), query.as_deref()),
+        } => match_read(matcher, surface, namespace.as_deref(), query.as_deref()),
     }
 }
 
@@ -678,6 +863,18 @@ fn disk_free_gib_at_path(_path: &std::path::Path) -> Option<u64> {
 // RuleEngine — unified rule-load + decision-routing core (issue #850)
 // ---------------------------------------------------------------------------
 
+/// v1.0.0 #3031 — operator-facing explanation appended to an inert blocking
+/// rule's own `reason`, so the refusal names WHY it fired without a matcher.
+#[must_use]
+fn inert_matcher_reason(rule_reason: &str, kind: &str) -> String {
+    format!(
+        "{rule_reason} [#3031 fail-closed: this rule is ENABLED but its matcher could not be \
+         evaluated (malformed JSON, or no field recognised for kind '{kind}'), so it can never \
+         fire. A blocking rule that cannot be evaluated REFUSES rather than silently allowing. \
+         Fix the matcher or disable the rule.]"
+    )
+}
+
 /// Refactor Wave-2 Tier-A2 (issue #850) — unified rule engine consumed
 /// by every governance entry point.
 ///
@@ -782,10 +979,58 @@ impl RuleEngine {
     pub fn evaluate(&self, _agent_id: &str, action: &AgentAction) -> Decision {
         let mut first_warn: Option<(String, String)> = None;
         for rule in self.rules.iter() {
-            if !matcher_applies(rule, action) {
-                continue;
-            }
             let severity = Severity::from_str(&rule.severity).unwrap_or(Severity::Log);
+            match matcher_status(rule, action) {
+                MatcherStatus::Applies => {}
+                MatcherStatus::DoesNotApply => continue,
+                MatcherStatus::Inert => {
+                    // v1.0.0 #3031 — this ENABLED rule's matcher cannot be
+                    // evaluated (malformed JSON, or no field its kind
+                    // recognises), so the engine has no way to know whether it
+                    // would have fired. Pre-fix this silently returned
+                    // `Allow` — an operator-signed `refuse` rule that
+                    // enforced NOTHING with no signal anywhere.
+                    //
+                    // FAIL CLOSED for the BLOCKING severities: a broken
+                    // `refuse` / `escalate` policy blocks (degrade) rather
+                    // than permits (corrupt-by-omission). `warn` / `log` are
+                    // non-blocking by definition, so an inert one is reported
+                    // loudly and otherwise skipped — upgrading them to a block
+                    // would invent an enforcement the operator never asked
+                    // for.
+                    tracing::error!(
+                        target: "governance.rules",
+                        rule_id = %rule.id,
+                        kind = %rule.kind,
+                        severity = %rule.severity,
+                        attest_level = %rule.attest_level,
+                        "governance rule {} is ENABLED but its matcher is INERT (malformed \
+                         JSON, or no field recognised for kind '{}') — it can never fire. \
+                         #3031: a blocking (refuse/escalate) inert rule now REFUSES the \
+                         action instead of silently allowing it. Fix the matcher \
+                         (`ai-memory rules add` validates the per-kind schema at write \
+                         time) or `ai-memory rules disable {}`.",
+                        rule.id,
+                        rule.kind,
+                        rule.id,
+                    );
+                    match severity {
+                        Severity::Refuse => {
+                            return Decision::Refuse {
+                                rule_id: rule.id.clone(),
+                                reason: inert_matcher_reason(&rule.reason, &rule.kind),
+                            };
+                        }
+                        Severity::Escalate => {
+                            return Decision::Escalate {
+                                rule_id: rule.id.clone(),
+                                reason: inert_matcher_reason(&rule.reason, &rule.kind),
+                            };
+                        }
+                        Severity::Warn | Severity::Log => continue,
+                    }
+                }
+            }
             match severity {
                 Severity::Refuse => {
                     return Decision::Refuse {

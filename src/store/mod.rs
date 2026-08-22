@@ -444,6 +444,28 @@ impl BoxBackendError {
 /// Convenience alias — every trait method returns this.
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// v1.0.0 #3085 — SAL-side wrapper over
+/// [`crate::storage::reject_unattributed_embedding_space`], surfacing the
+/// refusal as a typed [`StoreError::InvalidInput`] so BOTH adapters (and the
+/// trait default) refuse an EMPTY `embedding_space` stamp identically.
+///
+/// An empty stamp is neither a fingerprint nor SQL NULL, so a row carrying one
+/// is excluded from the #2167 recall gate AND from every NULL-space heal scan
+/// — permanent, silent semantic-recall loss with `errors: []`. No production
+/// writer can legitimately produce it (`Embed::space_fingerprint()` is never
+/// empty), so the funnel refuses rather than trusting callers.
+///
+/// # Errors
+///
+/// [`StoreError::InvalidInput`] when `space` is empty or whitespace-only.
+pub fn reject_unattributed_space(op: &str, space: &str) -> StoreResult<()> {
+    crate::storage::reject_unattributed_embedding_space(op, space).map_err(|e| {
+        StoreError::InvalidInput {
+            detail: e.to_string(),
+        }
+    })
+}
+
 /// #1709 Pillar 1 — capability tag returned by the default (unsupported)
 /// `checkpoint_*` trait methods. One named const referenced at every default
 /// arm (the sibling `"SIGNALS"` / `"ACTIONS"` / `"LEASES"` tags stay bare
@@ -1083,6 +1105,11 @@ pub trait MemoryStore: Send + Sync {
         entries: &[(String, Vec<f32>)],
         space: &str,
     ) -> StoreResult<usize> {
+        // #3085 — fail closed on an unattributed (empty) space stamp before
+        // any row is written. See `reject_unattributed_space`.
+        if entries.iter().any(|(_, v)| !v.is_empty()) {
+            reject_unattributed_space("set_embeddings_batch", space)?;
+        }
         let mut written = 0usize;
         for (id, vec) in entries {
             // #2167 — all vectors in a batch share ONE space (minted by the
