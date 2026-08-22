@@ -134,6 +134,52 @@ fn report_only_posture_preserves_legacy_behaviour_exactly() {
     );
 }
 
+/// #3159 — the contract, asserted for EVERY relation in the SSOT rather than
+/// once per hand-written copy. Table-driven so a relation added later is
+/// covered the moment it lands in `CORE_TABLES`, with no test to remember to
+/// write: drop it, restamp the tip, and the loss must be detected, must
+/// warrant refusal under enforcement on a POPULATED corpus, must NOT refuse
+/// under the default posture, and must NEVER refuse on an empty corpus.
+#[test]
+fn every_core_relation_when_lost_is_detected_and_obeys_the_refusal_contract() {
+    for entry in schema_integrity::CORE_TABLES {
+        let tmp = TempDir::new().unwrap();
+        let path = populated_db_missing(&tmp, entry.name, 89);
+        let conn = Connection::open(&path).unwrap();
+
+        let missing = schema_integrity::missing_core_tables(&conn, 89).unwrap();
+        assert!(
+            missing.iter().any(|t| t.name == entry.name),
+            "losing {} must be detected at the tip stamp",
+            entry.name,
+        );
+
+        let rows = schema_integrity::corpus_row_count(&conn);
+        assert_eq!(
+            rows,
+            Some(1),
+            "precondition: {} case is populated",
+            entry.name
+        );
+        assert!(
+            schema_integrity::refusal_required_with(&missing, true, rows),
+            "a populated corpus missing {} must refuse under enforcement",
+            entry.name,
+        );
+        assert!(
+            !schema_integrity::refusal_required_with(&missing, false, rows),
+            "the default posture must report, never refuse, for {}",
+            entry.name,
+        );
+        assert!(
+            !schema_integrity::refusal_required_with(&missing, true, Some(0)),
+            "an EMPTY corpus missing {} must never be refused (asi-hard pins \
+             enforcement ON, so this is the anti-brick invariant)",
+            entry.name,
+        );
+    }
+}
+
 #[test]
 fn relations_above_the_stamp_are_not_reported_as_lost() {
     // A database legitimately BELOW a relation's introduction version is not

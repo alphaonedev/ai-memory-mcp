@@ -563,6 +563,17 @@ force.
   defaulting to refuse would turn every existing high-stamp fixture and
   archive-less deployment into a hard boot failure, a fleet-wide availability
   regression for no data-integrity gain.
+- **`agent_quotas` covered too (#3159, partial).** A follow-up ladder audit found
+  three more probe-skips. Only one is this class: the v50 arm skips a
+  per-namespace PRIMARY KEY widening when `agent_quotas` is absent, and that
+  relation is created unconditionally at **v28** and is not in bootstrap
+  `SCHEMA` — so it is now a `CORE_TABLES` row (recorded at its v28 CREATE site,
+  not the v50 skip site, which would have silently under-reported every database
+  stamped 28..49). The other two are NOT fail-open data-integrity holes: the v56
+  skip is guarded on `archived_memories`, already covered here since v4, and the
+  object it skips is a non-UNIQUE performance index; and `agent_lineage` (v80)
+  ships in the bootstrap `SCHEMA`, which `db::open` replays before every
+  migration, so it is always present and a row for it would be permanently dead.
 - **Pinned ON by `asi-hard`.** `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES` joins
   the `asi-hard` `KNOBS` SSOT (`src/security_profile.rs`), taking the pinned set
   from 21 to 22 — the first SCHEMA-INTEGRITY pin, alongside the crypto,

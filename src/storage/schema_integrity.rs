@@ -100,6 +100,8 @@ pub const TABLE_NAMESPACE_META: &str = "namespace_meta";
 /// See [`TABLE_ARCHIVED_MEMORIES`].
 pub const TABLE_SIGNED_EVENTS: &str = "signed_events";
 /// See [`TABLE_ARCHIVED_MEMORIES`].
+pub const TABLE_AGENT_QUOTAS: &str = "agent_quotas";
+/// See [`TABLE_ARCHIVED_MEMORIES`].
 pub const TABLE_GOVERNANCE_RULES: &str = "governance_rules";
 
 /// One ladder-created relation whose presence is implied by a schema stamp.
@@ -152,6 +154,18 @@ pub const CORE_TABLES: &[CoreTable] = &[
         introduced_at: 26,
         integrity_note: "the append-only audit chain is absent, so the v34 prev_hash/sequence \
                          chain columns and the v73 cause_hash column were never applied",
+    },
+    CoreTable {
+        // #3159 — the v50 arm skips a per-namespace PRIMARY KEY widening when
+        // this relation is absent. NOTE the version: the SSOT records where a
+        // relation is CREATED (v28, an unconditional `CREATE TABLE IF NOT
+        // EXISTS` batch), not where a later arm SKIPS over it (v50). Recording
+        // 50 would silently under-report every database stamped 28..49.
+        name: TABLE_AGENT_QUOTAS,
+        introduced_at: 28,
+        integrity_note: "per-agent quota rows cannot be stored, so the K8 write-path blast-radius \
+                         caps (memories/day, storage bytes, links/day) cannot bind and the v50 \
+                         per-namespace PRIMARY KEY widening was never applied",
     },
     CoreTable {
         name: TABLE_GOVERNANCE_RULES,
@@ -371,13 +385,43 @@ mod tests {
     }
 
     #[test]
+    fn agent_quotas_is_expected_from_v28_not_v50() {
+        // #3159 boundary. The finding cites the v50 SKIP site; the SSOT must
+        // record the v28 CREATE site. Getting this wrong is silent and
+        // one-directional: every database stamped 28..49 would stop being
+        // checked at all. Pin both sides of the boundary.
+        let conn = conn_with(&[]);
+        assert!(
+            !missing_core_tables(&conn, 27)
+                .expect("probe")
+                .iter()
+                .any(|t| t.name == TABLE_AGENT_QUOTAS),
+            "agent_quotas must not be expected below its v28 create arm"
+        );
+        assert!(
+            missing_core_tables(&conn, 28)
+                .expect("probe")
+                .iter()
+                .any(|t| t.name == TABLE_AGENT_QUOTAS),
+            "agent_quotas must be expected from v28 on, NOT only from v50"
+        );
+    }
+
+    #[test]
     fn a_tip_stamped_database_missing_the_audit_chain_is_reported() {
         // The finding's exact shape: a database claiming the tip whose
         // ladder-only relations were skipped.
         let conn = conn_with(&[TABLE_ARCHIVED_MEMORIES, TABLE_NAMESPACE_META]);
         let missing = missing_core_tables(&conn, 89).expect("probe");
         let names: Vec<&str> = missing.iter().map(|t| t.name).collect();
-        assert_eq!(names, vec![TABLE_SIGNED_EVENTS, TABLE_GOVERNANCE_RULES]);
+        assert_eq!(
+            names,
+            vec![
+                TABLE_SIGNED_EVENTS,
+                TABLE_AGENT_QUOTAS,
+                TABLE_GOVERNANCE_RULES
+            ]
+        );
     }
 
     #[test]
@@ -386,6 +430,7 @@ mod tests {
             TABLE_ARCHIVED_MEMORIES,
             TABLE_NAMESPACE_META,
             TABLE_SIGNED_EVENTS,
+            TABLE_AGENT_QUOTAS,
             TABLE_GOVERNANCE_RULES,
         ]);
         assert!(missing_core_tables(&conn, 89).expect("probe").is_empty());
@@ -481,6 +526,7 @@ mod tests {
             TABLE_ARCHIVED_MEMORIES,
             TABLE_NAMESPACE_META,
             TABLE_SIGNED_EVENTS,
+            TABLE_AGENT_QUOTAS,
         ]);
         let missing = report(&conn, 89).expect("report");
         assert_eq!(missing.len(), 1);
