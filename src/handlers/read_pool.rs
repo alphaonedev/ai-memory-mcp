@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::config::ResolvedTtl;
 
-use super::transport::Db;
+use super::transport::{Db, DbOpError};
 
 /// The inner type behind the [`Db`] `Arc<tokio::sync::Mutex<…>>`.
 /// Declared here so the registry can hold a [`Weak`] to exactly that
@@ -227,36 +227,69 @@ fn pool_for(db: &Db) -> anyhow::Result<Arc<ReadPool>> {
 /// resolved TTL or DB path read them from `AppState`, not the writer
 /// tuple).
 ///
-/// **Infallible + graceful**: if the pool cannot be built (e.g. a
+/// **Graceful on pool failure**: if the pool cannot be built (e.g. a
 /// read-only open failure), the call logs a WARN and falls back to the
 /// existing writer connection so the request still succeeds — never a
 /// hard failure introduced by the optimization. The return type matches
-/// `db_op` (`T`, not `Result<T>`) so migrating a handler from `db_op` to
-/// `db_read_op` is a drop-in change.
+/// `db_op` (`Result<T, DbOpError>`) so migrating a handler from `db_op` to
+/// `db_read_op` is still a drop-in change.
 ///
-/// # Panics
+/// v1.0.0 #3164 — this used to return `T` and `.expect()` the `JoinError`, so
+/// a panic in a read closure (or a `spawn_blocking` cancelled during graceful
+/// shutdown) re-panicked the request task. The unwind is now contained and
+/// reported as a logged 500. The #1580 fast path is unchanged: the pooled
+/// read-only connection is still acquired the same way, and `catch_unwind`
+/// costs nothing when nothing panics.
 ///
-/// Panics only if the `spawn_blocking` worker itself panics or the
-/// runtime is shutting down (same contract as `db_op`).
-pub async fn db_read_op<T, F>(db: Db, op: F) -> T
+/// The writer-connection FALLBACK arm additionally runs the #3163 sweep,
+/// because that arm — and only that arm — touches the shared writer.
+pub async fn db_read_op<T, F>(db: Db, op: F) -> Result<T, DbOpError>
 where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || match pool_for(&db) {
-        Ok(pool) => pool.with_conn(op),
-        Err(e) => {
-            tracing::warn!(
-                target: "ai_memory::read_pool",
-                error = %e,
-                "read-pool unavailable; falling back to the writer connection"
-            );
-            let guard = db.blocking_lock();
-            op(&guard.0)
+    tokio::task::spawn_blocking(move || {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<T, DbOpError> {
+                match pool_for(&db) {
+                    Ok(pool) => Ok(pool.with_conn(op)),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "ai_memory::read_pool",
+                            error = %e,
+                            "read-pool unavailable; falling back to the writer connection"
+                        );
+                        let guard = db.blocking_lock();
+                        // #3163 — this arm borrows the SHARED writer. A read
+                        // issued inside a foreign, unowned transaction would
+                        // observe that transaction's uncommitted rows, so sweep
+                        // first and fail the read closed if it cannot be
+                        // cleared. Wrong results are never an acceptable
+                        // degradation; fewer results are.
+                        if let Err(sweep) = crate::storage::connection::ensure_autocommit(&guard.0)
+                        {
+                            return Err(DbOpError::WriterTransactionUnclearable(sweep.to_string()));
+                        }
+                        Ok(op(&guard.0))
+                    }
+                }
+            }));
+        match outcome {
+            Ok(value) => value,
+            Err(payload) => {
+                let detail = super::transport::panic_payload_detail(payload.as_ref());
+                tracing::error!(
+                    target: "ai_memory::read_pool",
+                    detail = %detail,
+                    "#3164: db_read_op closure panicked; the request fails with 500 instead of \
+                     re-panicking the connection task"
+                );
+                Err(DbOpError::ClosurePanicked(detail))
+            }
         }
     })
     .await
-    .expect("#1580: db_read_op spawn_blocking worker panicked or runtime shut down")
+    .map_err(|e| DbOpError::WorkerJoin(e.to_string()))?
 }
 
 #[cfg(test)]
@@ -328,7 +361,10 @@ mod tests {
         }));
 
         let joined = tokio::time::timeout(Duration::from_secs(10), async {
-            (h1.await.unwrap(), h2.await.unwrap())
+            (
+                h1.await.unwrap().expect("reader 1 dispatch"),
+                h2.await.unwrap().expect("reader 2 dispatch"),
+            )
         })
         .await
         .expect("both readers must be in flight concurrently (barrier would hang if serialized)");
@@ -348,7 +384,8 @@ mod tests {
             })
             .unwrap_or(-1)
         })
-        .await;
+        .await
+        .expect("dispatch");
         assert_eq!(got, 1, "pooled read must see the just-committed row");
     }
 
@@ -370,9 +407,36 @@ mod tests {
         let read =
             tokio::time::timeout(Duration::from_secs(10), db_read_op(db.clone(), count_rows))
                 .await
-                .expect("pooled read must complete while the writer mutex is held");
+                .expect("pooled read must complete while the writer mutex is held")
+                .expect("dispatch");
         assert_eq!(read, 1);
         drop(writer_guard);
+    }
+
+    /// v1.0.0 #3164 — a panic inside a READ closure must be contained and
+    /// reported, not re-panicked into the request task by an `.expect()` on
+    /// the `JoinError`. The pooled connection is read-only and holds no
+    /// transaction, so the only casualty is the one request.
+    #[tokio::test]
+    async fn db_read_op_contains_a_closure_panic_3164() {
+        let (_tmp, db) = file_db();
+        seed_row(&db, "panic1").await;
+
+        let err = db_read_op(db.clone(), |_conn| -> i64 {
+            panic!("#3164: injected panic in a read closure");
+        })
+        .await
+        .expect_err("the panic must surface as a typed dispatch error");
+        assert!(
+            matches!(err, DbOpError::ClosurePanicked(_)),
+            "expected a contained closure panic, got {err:?}"
+        );
+
+        // The pool survives: the next read still works.
+        let got = db_read_op(db.clone(), count_rows)
+            .await
+            .expect("the read pool must still serve after a contained panic");
+        assert_eq!(got, 1);
     }
 
     /// The pool is disabled for `:memory:` (per-connection databases) and
@@ -390,7 +454,7 @@ mod tests {
         seed_row(&db, "mem1").await;
         // pool_for returns Err for :memory:; db_read_op falls back to the
         // writer guard, which DOES hold the row.
-        let got = db_read_op(db.clone(), count_rows).await;
+        let got = db_read_op(db.clone(), count_rows).await.expect("dispatch");
         assert_eq!(got, 1, "in-memory fallback reads the writer connection");
     }
 }

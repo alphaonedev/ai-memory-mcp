@@ -290,16 +290,23 @@ pub fn handle_checkpoint_resolve(
             enrolled.as_ref(),
             true,
         ) {
-            crate::federation::receive_auth::CheckpointResolutionAuthz::Accept => {
-                // Accept ⇒ `enrolled` verified the signature, so it is Some.
-                let pubkey = enrolled
-                    .expect("Accept implies an enrolled verifying key")
-                    .to_bytes()
-                    .to_vec();
-                (None, signed_at, Some((presented_sig, pubkey)))
-            }
-            // RejectUnsigned / RejectNotEnrolled / RejectForged: withhold the
-            // daemon key so the anchor resolves Unsigned (verify:false).
+            // v1.0.0 #3164 (ERRORS-09) — the verdict CARRIES the verifying key
+            // that authenticated the resolution, so the attestation is built
+            // from the value the gate actually verified against. The prior
+            // `enrolled.expect("Accept implies an enrolled verifying key")`
+            // was sound only because `require_sig` is hardcoded `true` two
+            // lines up; the sibling HTTP caller already passes the RUNTIME
+            // flag, so wiring the same flag here would have turned a remote
+            // peer's unsigned resolution into a panic on an MCP tool.
+            crate::federation::receive_auth::CheckpointResolutionAuthz::Accept(verified_key) => (
+                None,
+                signed_at,
+                Some((presented_sig, verified_key.to_bytes().to_vec())),
+            ),
+            // AcceptUnverified (unreachable while `require_sig = true`, but no
+            // longer a panic if that ever changes) / RejectUnsigned /
+            // RejectNotEnrolled / RejectForged: withhold the daemon key so the
+            // anchor resolves Unsigned (verify:false).
             _ => (None, now, None),
         }
     } else {

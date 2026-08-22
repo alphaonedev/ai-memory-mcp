@@ -407,6 +407,57 @@ backend and missing or divergently implemented on its twin). Pinned by
   from a POOL rather than sharing one behind a mutex, so an unwind cannot hand a
   dirty connection to the next caller.
 
+### Fixed (availability: production-reachable panics — JoinError re-panic, boot-time thread spawn, silent dead audit drainer, checkpoint authz; #3164)
+
+- **`db_op` / `db_read_op` return `Result` instead of re-panicking the request
+  task.** Both helpers ended in `.expect("… spawn_blocking worker panicked or
+  runtime shut down")`, so a panic in any handler closure — or a
+  `spawn_blocking` cancelled during graceful shutdown — propagated into the
+  connection task instead of producing a 500. Panics are now contained, logged
+  with their payload, and surfaced as a typed `DbOpError`. The PERF-1 (#982)
+  and #1580 dispatch fast paths are unchanged: the same `spawn_blocking` hop,
+  the same pooled read-only connection, and `catch_unwind` costs nothing when
+  nothing panics.
+- **The forensic-audit writer thread spawn no longer aborts boot.**
+  `governance::audit::writer()` `.expect()`ed the `thread::Builder::spawn`
+  result on the MAIN thread during `init_forensic_audit`, so a `clone(2)`
+  refusal (`EAGAIN` from a pids-cgroup cap or `RLIMIT_NPROC` on a dense host) —
+  a resource condition, not a programmer bug — killed the process with exit
+  101 before it served a request. It now returns `Result` (ERRORS-01/02) and
+  every caller degrades: the boot path applies its existing "continuing
+  unsigned" policy, `flush_blocking` logs and returns, and emission surfaces a
+  typed error. A failure does not poison the `OnceLock`, so a later call
+  retries the spawn.
+- **A dead deferred-audit drainer is now visible while the daemon is still
+  running.** The supervisor `panic!`ed when a sink exhausted `max_restarts`.
+  That was deliberately fail-loud, but a panic in a `tokio::spawn`ed task kills
+  only THAT task: the daemon kept serving with the audit drainer permanently
+  dead, and nothing observed it until shutdown finally awaited the
+  `JoinHandle`. `spawn_supervised_drainer` now returns
+  `JoinHandle<Result<(), DrainError>>` with a typed `DrainTerminalState`
+  (`sink_unresolved` / `sink_panicked`) published on the shared
+  `DeferredAuditMetrics` and on a new Prometheus gauge
+  `ai_memory_deferred_audit_drainer_terminal_state` (0 = running/graceful,
+  1 = unresolved, 2 = panicked) that a fleet can alert on. Fail-loud semantics
+  are unchanged — the supervisor still refuses to advance past an unresolved
+  occurrence, and `close_and_flush` still refuses to report a clean drain,
+  now with a machine-readable cause (`DrainFlushError`) instead of a panic
+  payload.
+- **`CheckpointResolutionAuthz::Accept` now CARRIES the verifying key
+  (ERRORS-09).** `authorize_remote_checkpoint_resolution` returned a bare
+  `Accept` from three branches, only one of which had authenticated anything:
+  the two permissive (`require_sig == false`) branches returned `Accept` with
+  `enrolled_key == None`. `mcp::tools::checkpoint` turned that into
+  `enrolled.expect("Accept implies an enrolled verifying key")`, sound ONLY
+  because that one call site hardcodes `require_sig = true` — while its HTTP
+  sibling in `handlers::federation_receive` already passes the RUNTIME flag.
+  Wiring the same flag into the MCP tool would have made a remote peer's
+  unsigned resolution panic an MCP tool. The unsound pairing is now
+  unrepresentable: `Accept(VerifyingKey)` for the authenticated verdict, a
+  distinct `AcceptUnverified` for the permissive rollout window. Behaviour at
+  both call sites is byte-identical; the split exists so no caller can mistake
+  a permissive accept for an authenticated one.
+
 
 ### Changed
 

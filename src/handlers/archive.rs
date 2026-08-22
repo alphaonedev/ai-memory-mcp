@@ -110,10 +110,12 @@ pub async fn list_archive(
     // the LIMIT/OFFSET scan can take 50ms+ at the tail and would
     // otherwise pin a tokio worker.
     let namespace = q.namespace.clone();
-    let result = super::db_op(app.db.clone(), move |guard| {
-        db::list_archived(&guard.0, namespace.as_deref(), limit, offset)
-    })
-    .await;
+    let result = super::transport::flatten_db_op(
+        super::db_op(app.db.clone(), move |guard| {
+            db::list_archived(&guard.0, namespace.as_deref(), limit, offset)
+        })
+        .await,
+    );
     match result {
         Ok(items) => Json(json!({"archived": items, "count": items.len()})).into_response(),
         Err(e) => crate::handlers::errors::handler_error_500(&e),
@@ -229,11 +231,12 @@ pub async fn restore_archive(
     // on the calling thread pre-fix.
     let id_for_restore = id.clone();
     let caller_for_restore = caller.clone();
-    let restored = match super::db_op(app.db.clone(), move |guard| {
-        db::restore_archived_for_caller(&guard.0, &id_for_restore, &caller_for_restore)
-    })
-    .await
-    {
+    let restored = match super::transport::flatten_db_op(
+        super::db_op(app.db.clone(), move |guard| {
+            db::restore_archived_for_caller(&guard.0, &id_for_restore, &caller_for_restore)
+        })
+        .await,
+    ) {
         Ok(v) => v,
         Err(e) => {
             return crate::handlers::errors::handler_error_500(&e);
@@ -373,14 +376,16 @@ pub async fn purge_archive(
     // tokio worker pinned the runtime for the whole DELETE.
     let caller_for_purge = caller.clone();
     let older_than_days = q.older_than_days;
-    let purge_result = super::db_op(app.db.clone(), move |guard| {
-        if is_admin {
-            db::purge_archive(&guard.0, older_than_days)
-        } else {
-            db::purge_archive_for_caller(&guard.0, &caller_for_purge, older_than_days)
-        }
-    })
-    .await;
+    let purge_result = super::transport::flatten_db_op(
+        super::db_op(app.db.clone(), move |guard| {
+            if is_admin {
+                db::purge_archive(&guard.0, older_than_days)
+            } else {
+                db::purge_archive_for_caller(&guard.0, &caller_for_purge, older_than_days)
+            }
+        })
+        .await,
+    );
     match purge_result {
         Ok(n) => Json(json!({
             "purged": n,
@@ -416,7 +421,9 @@ pub async fn archive_stats(
     // archive_stats reads multiple GROUP BY queries off
     // archived_memories and is admin-only — low rate but high tail
     // latency on a saturated archive table.
-    let result = super::db_op(app.db.clone(), move |guard| db::archive_stats(&guard.0)).await;
+    let result = super::transport::flatten_db_op(
+        super::db_op(app.db.clone(), move |guard| db::archive_stats(&guard.0)).await,
+    );
     match result {
         Ok(archive_stats) => Json(archive_stats).into_response(),
         Err(e) => crate::handlers::errors::handler_error_500(&e),

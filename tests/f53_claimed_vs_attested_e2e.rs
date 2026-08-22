@@ -338,14 +338,14 @@ async fn checkpoint_attestation_claimed_vs_attested() {
     // Attested: signed by the resolver's enrolled key → Accept (both modes).
     assert_eq!(
         authorize_remote_checkpoint_resolution(&r, &sig, Some(&resolver.public), true),
-        CheckpointResolutionAuthz::Accept,
+        CheckpointResolutionAuthz::Accept(resolver.public),
         "signed + enrolled → attested Accept (fail-closed mode)"
     );
 
     // Claimed lane: unsigned → permissive Accept, fail-closed RejectUnsigned.
     assert_eq!(
         authorize_remote_checkpoint_resolution(&r, &[], None, false),
-        CheckpointResolutionAuthz::Accept,
+        CheckpointResolutionAuthz::AcceptUnverified,
         "unsigned → permissive Accept (claimed data lane)"
     );
     assert_eq!(

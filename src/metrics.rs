@@ -176,6 +176,21 @@ pub struct Metrics {
     /// to 0 within one replay interval after the peer recovers.
     pub federation_push_dlq_depth: IntGauge,
 
+    /// v1.0.0 #3164 — the deferred-audit drainer supervisor's TERMINAL state:
+    /// `0` = running (or exited gracefully on a fully-drained queue), `1` =
+    /// the sink stayed unresolved and exhausted its restart budget, `2` = the
+    /// sink panicked and exhausted its restart budget.
+    ///
+    /// Pre-#3164 the supervisor `panic!`ed on exhaustion. A panic in a
+    /// `tokio::spawn`ed task kills only THAT task, so the daemon kept serving
+    /// while the audit drainer was permanently dead — and nothing observed it
+    /// until the shutdown path awaited the `JoinHandle`, possibly days later.
+    /// A NON-ZERO value here means governance refusals are no longer reaching
+    /// `signed_events` on this node: alert on it, and treat the node as
+    /// audit-degraded. It is monotonic-by-first-writer, so the ORIGINAL cause
+    /// survives.
+    pub deferred_audit_drainer_terminal_state: IntGauge,
+
     /// #1032 (HIGH, 2026-05-21) — monotonic counter for DLQ rows the
     /// replay worker has marked as quarantined (`attempt_count >=
     /// MAX_REPLAY_ATTEMPTS`). Pre-#1032 the replay loop retried
@@ -665,6 +680,17 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_push_dlq_depth.clone()))?;
 
+        // v1.0.0 #3164 — deferred-audit drainer terminal-state gauge.
+        let deferred_audit_drainer_terminal_state = IntGauge::new(
+            "ai_memory_deferred_audit_drainer_terminal_state",
+            "Terminal state of the deferred-audit drainer supervisor: 0 = \
+             running/graceful, 1 = sink unresolved past max_restarts, 2 = \
+             sink panicked past max_restarts. Non-zero means governance \
+             refusals are NO LONGER reaching signed_events on this node; the \
+             daemon keeps serving but is audit-degraded until restarted.",
+        )?;
+        registry.register(Box::new(deferred_audit_drainer_terminal_state.clone()))?;
+
         // #1032 (HIGH, 2026-05-21) — federation push DLQ quarantine counter.
         let federation_push_dlq_quarantined = IntCounter::new(
             "ai_memory_federation_push_dlq_quarantined_total",
@@ -1016,6 +1042,7 @@ impl Metrics {
             corrupt_provenance_rows_total,
             auto_export_spawn_failed_total,
             federation_push_dlq_depth,
+            deferred_audit_drainer_terminal_state,
             federation_push_dlq_quarantined,
             federation_push_dlq_quarantined_by_cause,
             federation_push_dlq_legacy_positional,

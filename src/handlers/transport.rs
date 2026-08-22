@@ -45,12 +45,11 @@ pub type Db = Arc<Mutex<(rusqlite::Connection, std::path::PathBuf, ResolvedTtl, 
 ///   `tokio::sync::Mutex` API explicitly supports this from a
 ///   spawn_blocking worker; the worker is OFF the tokio runtime threads
 ///   so no await-deadlock risk.
-/// - Returns `T` directly. Join errors from `spawn_blocking` (panic
-///   propagation, runtime shutdown) surface via `expect`; a panic
-///   inside the closure unwinds the blocking worker and the join error
-///   is logged before the handler aborts with a 500 — the caller's
-///   `Result<T, _>` is the right shape to surface domain errors. Join
-///   failures are runtime bugs, not request-shape failures.
+/// - Returns `Result<T, DbOpError>`. v1.0.0 #3164: this used to return `T`
+///   and `.expect()` the `JoinError`, so a panic anywhere in the closure —
+///   or a `spawn_blocking` cancelled during graceful shutdown — RE-PANICKED
+///   the request task instead of producing a 500. Join and panic failures
+///   are now typed and logged; domain errors still ride inside `T`.
 ///
 /// The helper deliberately does NOT take `headers: HeaderMap` /
 /// `caller: &str` etc. — every closure already captures whatever extra
@@ -71,7 +70,16 @@ pub type Db = Arc<Mutex<(rusqlite::Connection, std::path::PathBuf, ResolvedTtl, 
 /// Type parameter `T` requires `Send + 'static` because the closure's
 /// return value crosses the spawn_blocking boundary back to the tokio
 /// runtime.
-pub async fn db_op<T, F>(db: Db, op: F) -> T
+///
+/// # Errors
+///
+/// Returns [`DbOpError`] only for DISPATCH failures — the closure
+/// panicked, the blocking worker could not be joined, or the shared
+/// writer connection was left in (or found in) a transaction that had to
+/// be swept. Domain errors still ride inside `T`, so a handler that
+/// already renders `Result<T, E>` can fold the two with
+/// [`flatten_db_op`].
+pub async fn db_op<T, F>(db: Db, op: F) -> Result<T, DbOpError>
 where
     T: Send + 'static,
     F: FnOnce(&mut (rusqlite::Connection, std::path::PathBuf, ResolvedTtl, bool)) -> T
@@ -80,10 +88,148 @@ where
 {
     tokio::task::spawn_blocking(move || {
         let mut guard = db.blocking_lock();
-        op(&mut guard)
+
+        // v1.0.0 #3163 PRE-SWEEP — the writer is a SINGLE connection behind a
+        // NON-poisoning `tokio::sync::Mutex`, so acquiring the guard proves
+        // nothing about the connection's transaction state. Before running any
+        // statement, prove the connection is in autocommit. If it is not and
+        // it cannot be cleared, REFUSE: running new writes inside a foreign,
+        // unowned transaction is exactly the mixed-state outcome the prime
+        // directive forbids. Because the check is on ACQUISITION, a transient
+        // failure self-heals on the next request without any poison flag,
+        // reopen, or extra state on the `Db` tuple.
+        if let Err(e) = crate::storage::connection::ensure_autocommit(&guard.0) {
+            return Err(DbOpError::WriterTransactionUnclearable(e.to_string()));
+        }
+
+        // Contain an unwind out of `op` so the guard below always runs and the
+        // mutex is never released with a half-finished transaction on it.
+        // `AssertUnwindSafe` is required because `&mut guard` is not
+        // `UnwindSafe`; it is justified precisely because the ONE shared
+        // invariant that an unwind could break — the connection's transaction
+        // state — is re-established immediately afterwards rather than
+        // assumed.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(&mut guard)));
+
+        // v1.0.0 #3163 POST-SWEEP — runs on EVERY exit: a clean return, a
+        // closure that returned an `Err`-shaped `T` with the transaction still
+        // open, and a panic unwind. `WriteTxn` already makes the substrate's
+        // own BEGIN sites unwind-safe; this is the defense-in-depth layer that
+        // holds even for a transaction this crate did not open.
+        let swept = crate::storage::connection::ensure_autocommit(&guard.0);
+        drop(guard);
+
+        match (outcome, swept) {
+            (Err(payload), _) => {
+                let detail = panic_payload_detail(payload.as_ref());
+                tracing::error!(
+                    target: DB_OP_TRACE_TARGET,
+                    detail = %detail,
+                    "#3164: db_op closure panicked; the writer transaction was swept and the \
+                     request fails with 500 instead of re-panicking the connection task"
+                );
+                Err(DbOpError::ClosurePanicked(detail))
+            }
+            (Ok(_), Err(e)) => Err(DbOpError::WriterTransactionUnclearable(e.to_string())),
+            (Ok(_), Ok(true)) => {
+                // The closure returned normally but left a transaction open,
+                // which the sweep has just ROLLED BACK. Its writes are gone, so
+                // reporting success would be a wrong result — fail closed.
+                tracing::error!(
+                    target: DB_OP_TRACE_TARGET,
+                    "#3163: db_op closure returned with an OPEN write transaction; it has been \
+                     rolled back and the request fails closed rather than reporting a write \
+                     that no longer exists"
+                );
+                Err(DbOpError::OrphanedTransaction)
+            }
+            (Ok(value), Ok(false)) => Ok(value),
+        }
     })
     .await
-    .expect("PERF-1: db_op spawn_blocking worker panicked or runtime shut down")
+    .map_err(|e| DbOpError::WorkerJoin(e.to_string()))?
+}
+
+/// Tracing target for the #3163/#3164 writer-lane integrity events.
+pub(crate) const DB_OP_TRACE_TARGET: &str = "ai_memory::handlers::db_op";
+
+/// Render a caught panic payload as a log-safe string. `panic!` payloads are
+/// `&'static str` or `String` in practice; anything else is reported by shape.
+pub(crate) fn panic_payload_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// v1.0.0 #3163/#3164 — why a `db_op` / `db_read_op` dispatch did not deliver
+/// a result.
+///
+/// Every variant is an INFRASTRUCTURE failure, never a request-shape failure:
+/// domain errors continue to ride inside the closure's own return type. All
+/// of them map to a 5xx. Keeping them typed (rather than a re-panic or a
+/// stringly-typed `anyhow`) is what lets a handler log the exact cause and
+/// lets the fleet distinguish "a handler has a bug" from "this daemon's writer
+/// connection is wedged".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbOpError {
+    /// The closure panicked. The unwind was contained; the writer connection
+    /// was swept back to autocommit before the mutex was released.
+    ClosurePanicked(String),
+    /// The `spawn_blocking` worker could not be joined — in practice a runtime
+    /// shutdown or a cancelled task, not a closure fault.
+    WorkerJoin(String),
+    /// The closure returned normally but left an open write transaction, which
+    /// was rolled back. Its writes did NOT persist, so the request fails
+    /// closed rather than reporting a phantom success.
+    OrphanedTransaction,
+    /// The shared writer connection is inside a transaction that could not be
+    /// rolled back. The daemon refuses to write through it; the next
+    /// acquisition retries the sweep.
+    WriterTransactionUnclearable(String),
+}
+
+impl std::fmt::Display for DbOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClosurePanicked(detail) => write!(f, "database worker panicked: {detail}"),
+            Self::WorkerJoin(detail) => write!(f, "database worker did not complete: {detail}"),
+            Self::OrphanedTransaction => {
+                f.write_str("database worker left an open write transaction; it was rolled back")
+            }
+            Self::WriterTransactionUnclearable(detail) => write!(
+                f,
+                "writer connection is stuck inside a transaction that could not be rolled back: \
+                 {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DbOpError {}
+
+/// v1.0.0 #3164 — fold a `db_op` / `db_read_op` DISPATCH failure into the
+/// closure's own error type, so a handler that already renders `Result<T, E>`
+/// keeps exactly one error path instead of a nested `Result<Result<..>, ..>`.
+///
+/// `anyhow::Error` satisfies the `From<DbOpError>` bound for free (`DbOpError`
+/// is `Error + Send + Sync + 'static`), which covers every substrate closure.
+///
+/// # Errors
+///
+/// Returns the closure's own `E` when the closure ran and failed, and
+/// `E::from(DbOpError)` when the dispatch itself failed.
+pub fn flatten_db_op<T, E>(outcome: Result<Result<T, E>, DbOpError>) -> Result<T, E>
+where
+    E: From<DbOpError>,
+{
+    match outcome {
+        Ok(inner) => inner,
+        Err(dispatch) => Err(E::from(dispatch)),
+    }
 }
 
 /// v0.7.0 Wave-3 — declared storage backend for the daemon.
@@ -1129,6 +1275,9 @@ pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
 /// The sqlite half of [`health`]: one blocking-pool hop, two fixed
 /// statements, no write lock.
 async fn sqlite_liveness(app: &AppState) -> (bool, &'static str) {
+    // #3164 — a dispatch failure IS a liveness failure: the writer connection
+    // could not be reached (or is wedged inside a transaction it will not
+    // leave), which is exactly what `/health` exists to report.
     db_op(app.db.clone(), |guard| {
         if db::ping(&guard.0).is_err() {
             return (false, PROBE_ERROR);
@@ -1139,6 +1288,14 @@ async fn sqlite_liveness(app: &AppState) -> (bool, &'static str) {
         (true, PROBE_REACHABLE)
     })
     .await
+    .unwrap_or_else(|e| {
+        tracing::error!(
+            target: DB_OP_TRACE_TARGET,
+            error = %e,
+            "health: sqlite liveness probe could not be dispatched"
+        );
+        (false, PROBE_ERROR)
+    })
 }
 
 /// v0.6.0.0 — Prometheus scrape endpoint.
@@ -1205,15 +1362,191 @@ async fn cold_prime_memories_gauge(app: &AppState) {
         return;
     }
     let db = app.db.clone();
-    db_op(db, move |guard| {
+    // #3164 — the gauge is an observability convenience; a dispatch failure is
+    // logged and the stale value is served rather than failing the scrape.
+    if let Err(e) = db_op(db, move |guard| {
         crate::background::memories_gauge::refresh_once(&guard.0, now);
     })
-    .await;
+    .await
+    {
+        tracing::error!(
+            target: DB_OP_TRACE_TARGET,
+            error = %e,
+            "metrics: cold-prime of the corpus gauge could not be dispatched"
+        );
+    }
 }
 
 #[cfg(test)]
 mod transport_helpers_tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // v1.0.0 #3163 / #3164 — db_op writer-lane integrity
+    // ---------------------------------------------------------------
+
+    /// A minimal shared writer `Db`: one table, the real
+    /// `Arc<tokio::sync::Mutex<..>>` shape every handler uses.
+    fn txn_test_db() -> Db {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create t");
+        Arc::new(Mutex::new((
+            conn,
+            std::path::PathBuf::new(),
+            ResolvedTtl::default(),
+            false,
+        )))
+    }
+
+    async fn db_row_count(db: &Db) -> i64 {
+        let guard = db.lock().await;
+        guard
+            .0
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .expect("count")
+    }
+
+    async fn db_is_autocommit(db: &Db) -> bool {
+        db.lock().await.0.is_autocommit()
+    }
+
+    /// THE #3163 regression, end to end on the real shared writer: a panic
+    /// between BEGIN and COMMIT must leave (a) no partial write visible,
+    /// (b) a writer the next request can still use, and (c) a connection back
+    /// in autocommit. Pre-fix the `tokio::sync::Mutex` (which does not poison)
+    /// released a connection still inside `BEGIN IMMEDIATE`, and #3164's
+    /// `.expect()` on the `JoinError` re-panicked the request task on top.
+    #[tokio::test]
+    async fn db_op_panic_between_begin_and_commit_leaves_a_usable_writer_3163() {
+        let db = txn_test_db();
+
+        // `::<(), _>` pins the closure's return type, which panic-only bodies
+        // cannot infer (and `|guard| -> ()` would trip `clippy::unused_unit`).
+        let err = db_op::<(), _>(db.clone(), |guard| {
+            let _write_txn = crate::storage::connection::WriteTxn::begin(&guard.0).expect("begin");
+            guard
+                .0
+                .execute("INSERT INTO t (id) VALUES (1)", [])
+                .expect("partial write");
+            panic!("#3163: injected panic between BEGIN and COMMIT");
+        })
+        .await
+        .expect_err("#3164: db_op must REPORT the panic, not re-panic the caller");
+        assert!(
+            matches!(err, DbOpError::ClosurePanicked(_)),
+            "expected a contained closure panic, got {err:?}"
+        );
+
+        // (c) the writer is back in autocommit …
+        assert!(
+            db_is_autocommit(&db).await,
+            "#3163: the shared writer must not stay inside a transaction"
+        );
+        // (a) … the partial write is NOT visible …
+        assert_eq!(
+            db_row_count(&db).await,
+            0,
+            "#3163: partial write must be rolled back"
+        );
+        // (b) … and the NEXT write on the same `Db` succeeds.
+        db_op(db.clone(), |guard| {
+            let write_txn = crate::storage::connection::WriteTxn::begin(&guard.0)?;
+            guard.0.execute("INSERT INTO t (id) VALUES (2)", [])?;
+            write_txn.commit()
+        })
+        .await
+        .expect("#3163: the next db_op must dispatch")
+        .expect("#3163: the next write on the same Db must succeed");
+        assert_eq!(
+            db_row_count(&db).await,
+            1,
+            "the post-unwind write must persist"
+        );
+    }
+
+    /// The defense-in-depth half of #3163: even a transaction opened WITHOUT
+    /// the `WriteTxn` guard — a future call site, or code this crate does not
+    /// own — cannot be handed to the next writer. The post-closure sweep rolls
+    /// it back at the mutex boundary.
+    #[tokio::test]
+    async fn db_op_sweeps_an_unguarded_open_transaction_3163() {
+        let db = txn_test_db();
+
+        let err = db_op::<(), _>(db.clone(), |guard| {
+            guard
+                .0
+                .execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
+                .expect("raw BEGIN, deliberately unguarded");
+            guard
+                .0
+                .execute("INSERT INTO t (id) VALUES (1)", [])
+                .expect("partial write");
+            panic!("#3163: unguarded transaction abandoned by an unwind");
+        })
+        .await
+        .expect_err("the panic must be contained");
+        assert!(matches!(err, DbOpError::ClosurePanicked(_)), "got {err:?}");
+
+        assert!(
+            db_is_autocommit(&db).await,
+            "#3163: the mutex-boundary sweep must clear an unguarded transaction"
+        );
+        assert_eq!(
+            db_row_count(&db).await,
+            0,
+            "the unguarded write must be rolled back"
+        );
+    }
+
+    /// A closure that returns NORMALLY while leaving a transaction open used
+    /// to report success for writes that the next caller's rollback would
+    /// erase. The sweep rolls them back and the request fails CLOSED, because
+    /// a wrong result is never an acceptable degradation.
+    #[tokio::test]
+    async fn db_op_fails_closed_when_a_closure_returns_with_an_open_transaction_3163() {
+        let db = txn_test_db();
+
+        let err = db_op(db.clone(), |guard| {
+            guard
+                .0
+                .execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
+                .expect("raw BEGIN");
+            guard
+                .0
+                .execute("INSERT INTO t (id) VALUES (1)", [])
+                .expect("write");
+            // Returns Ok WITHOUT committing.
+        })
+        .await
+        .expect_err("#3163: an orphaned transaction must fail the request closed");
+        assert_eq!(err, DbOpError::OrphanedTransaction);
+        assert!(db_is_autocommit(&db).await);
+        assert_eq!(
+            db_row_count(&db).await,
+            0,
+            "the uncommitted write must be gone"
+        );
+    }
+
+    /// The happy path must be untouched: `Ok(value)` through, connection
+    /// clean, PERF-1 dispatch shape unchanged.
+    #[tokio::test]
+    async fn db_op_happy_path_returns_the_closure_value() {
+        let db = txn_test_db();
+        let got = db_op(db.clone(), |guard| {
+            guard
+                .0
+                .execute("INSERT INTO t (id) VALUES (7)", [])
+                .expect("write");
+            42_u32
+        })
+        .await
+        .expect("dispatch");
+        assert_eq!(got, 42);
+        assert_eq!(db_row_count(&db).await, 1);
+        assert!(db_is_autocommit(&db).await);
+    }
 
     #[test]
     fn constant_time_eq_handles_equal_and_diff_inputs() {

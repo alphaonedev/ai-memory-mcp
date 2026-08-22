@@ -77,7 +77,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -300,6 +300,169 @@ impl DeferredAuditEvent {
     }
 }
 
+/// v1.0.0 #3164 — the TERMINAL state of a deferred-audit drainer supervisor.
+///
+/// The supervisor used to `panic!` when a sink exhausted `max_restarts`. That
+/// was deliberately fail-loud, but a panic in a `tokio::spawn`ed task kills
+/// only THAT task: the daemon kept serving with the audit drainer permanently
+/// dead, and nothing observed it until shutdown awaited the `JoinHandle`. The
+/// state is now typed, returned from the supervisor, published on the shared
+/// metrics the instant it is entered, and reported by `ai-memory doctor` —
+/// so a fleet can SEE a dead drainer while the process is still running.
+///
+/// Fail-loud semantics are unchanged: the supervisor still stops rather than
+/// advancing past an unresolved occurrence, and [`close_and_flush`] still
+/// refuses to report a clean drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrainTerminalState {
+    /// The sink kept returning `Err` and exhausted the restart budget.
+    SinkUnresolved,
+    /// The sink kept PANICKING and exhausted the restart budget.
+    SinkPanicked,
+}
+
+impl DrainTerminalState {
+    /// Numeric code published on the shared metrics. `0` is reserved for
+    /// "running / never terminally failed".
+    const CODE_RUNNING: u8 = 0;
+    const CODE_SINK_UNRESOLVED: u8 = 1;
+    const CODE_SINK_PANICKED: u8 = 2;
+
+    /// The metric code for this state.
+    #[must_use]
+    pub fn code(self) -> u8 {
+        match self {
+            Self::SinkUnresolved => Self::CODE_SINK_UNRESOLVED,
+            Self::SinkPanicked => Self::CODE_SINK_PANICKED,
+        }
+    }
+
+    /// Decode a metric code. `None` means the drainer has not terminally
+    /// failed.
+    #[must_use]
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            Self::CODE_SINK_UNRESOLVED => Some(Self::SinkUnresolved),
+            Self::CODE_SINK_PANICKED => Some(Self::SinkPanicked),
+            _ => None,
+        }
+    }
+
+    /// Stable lowercase tag for logs, metrics labels, and the `doctor` fact.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SinkUnresolved => "sink_unresolved",
+            Self::SinkPanicked => "sink_panicked",
+        }
+    }
+}
+
+/// v1.0.0 #3164 — the typed terminal failure of a deferred-audit drainer.
+///
+/// Replaces the two `panic!` sites in the supervisor. Carrying the cause as a
+/// value (rather than a panic payload that only `JoinError::is_panic` could
+/// observe) is what lets the shutdown path distinguish "the drainer stopped
+/// because the sink is unresolvable" from "the supervisor task itself was
+/// cancelled or aborted".
+#[derive(Debug)]
+pub enum DrainError {
+    /// The sink remained unresolved across the whole restart budget. The
+    /// in-flight occurrence was NOT advanced past.
+    SinkUnresolved {
+        /// The exhausted restart budget.
+        max_restarts: u32,
+        /// Rendered cause of the final failed append.
+        detail: String,
+    },
+    /// The sink panicked on every attempt across the whole restart budget.
+    /// The in-flight event is unflushed; journal recovery is available only
+    /// when journaling was successfully enabled.
+    SinkPanicked {
+        /// The exhausted restart budget.
+        max_restarts: u32,
+    },
+}
+
+impl DrainError {
+    /// The terminal state this error represents.
+    #[must_use]
+    pub fn terminal_state(&self) -> DrainTerminalState {
+        match self {
+            Self::SinkUnresolved { .. } => DrainTerminalState::SinkUnresolved,
+            Self::SinkPanicked { .. } => DrainTerminalState::SinkPanicked,
+        }
+    }
+}
+
+impl std::fmt::Display for DrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SinkUnresolved {
+                max_restarts,
+                detail,
+            } => write!(
+                f,
+                "deferred_audit supervisor: sink remained unresolved and exhausted \
+                 max_restarts={max_restarts}; refusing to advance beyond the in-flight \
+                 occurrence: {detail}"
+            ),
+            Self::SinkPanicked { max_restarts } => write!(
+                f,
+                "deferred_audit supervisor: sink panicked and exhausted \
+                 max_restarts={max_restarts}; drain is incomplete and the in-flight event \
+                 is unflushed (journal recovery is available only when journaling was \
+                 successfully enabled)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DrainError {}
+
+/// v1.0.0 #3164 — the outcome of awaiting a deferred-audit supervisor.
+///
+/// `close_and_flush` used to return only `tokio::task::JoinError`, which
+/// conflated "the supervisor panicked" with "the drainer gave up for a stated
+/// reason". Both are still hard failures; they are now distinguishable.
+#[derive(Debug)]
+pub enum DrainFlushError {
+    /// The supervisor task itself failed to join (panicked or was aborted).
+    Join(tokio::task::JoinError),
+    /// The supervisor exited with a typed terminal state.
+    Drain(DrainError),
+}
+
+impl std::fmt::Display for DrainFlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Join(e) => write!(f, "deferred-audit supervisor join failed: {e}"),
+            Self::Drain(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for DrainFlushError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Join(e) => Some(e),
+            Self::Drain(e) => Some(e),
+        }
+    }
+}
+
+impl From<tokio::task::JoinError> for DrainFlushError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        Self::Join(e)
+    }
+}
+
+impl From<DrainError> for DrainFlushError {
+    fn from(e: DrainError) -> Self {
+        Self::Drain(e)
+    }
+}
+
 /// Shared counters surfaced for observability. Cloning is cheap
 /// (just `Arc` bumps); the public read path is on the queue handle.
 #[derive(Debug, Clone, Default)]
@@ -341,9 +504,52 @@ pub struct DeferredAuditMetrics {
     /// burst of refusals while the substrate writer is also churning
     /// out `memory_link.created` rows).
     pub unique_race_retries: Arc<AtomicU64>,
+    /// v1.0.0 #3164 — the drainer supervisor's TERMINAL state, as a
+    /// [`DrainTerminalState::code`] (`0` = running / never terminally failed).
+    ///
+    /// Published the instant the supervisor gives up, so the condition is
+    /// observable while the daemon is still serving instead of only when the
+    /// shutdown path finally awaits the `JoinHandle`. Read it through
+    /// [`DeferredAuditMetrics::terminal_state`].
+    pub terminal_state: Arc<AtomicU8>,
 }
 
 impl DeferredAuditMetrics {
+    /// v1.0.0 #3164 — the drainer supervisor's terminal state, or `None` while
+    /// it is running (or exited gracefully on a closed, fully-drained queue).
+    ///
+    /// A `Some(_)` here means audit delivery is DEAD for this process: the
+    /// daemon may still be serving, but no further refusal will reach
+    /// `signed_events`. Fleet operators alert on this.
+    #[must_use]
+    pub fn terminal_state(&self) -> Option<DrainTerminalState> {
+        DrainTerminalState::from_code(self.terminal_state.load(Ordering::Relaxed))
+    }
+
+    /// Record the supervisor's terminal state. First writer wins, so the
+    /// ORIGINAL cause survives a later observation.
+    ///
+    /// Also publishes the state on the Prometheus registry
+    /// (`ai_memory_deferred_audit_drainer_terminal_state`), which is the
+    /// surface a fleet alerts on: a daemon whose audit drainer is dead keeps
+    /// serving requests, so the condition is invisible without it.
+    fn record_terminal_state(&self, state: DrainTerminalState) {
+        if self
+            .terminal_state
+            .compare_exchange(
+                DrainTerminalState::CODE_RUNNING,
+                state.code(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            crate::metrics::registry()
+                .deferred_audit_drainer_terminal_state
+                .set(i64::from(state.code()));
+        }
+    }
+
     /// Number of events submitted since process boot.
     #[must_use]
     pub fn submitted_count(&self) -> u64 {
@@ -2511,21 +2717,29 @@ pub fn spawn_drainer_task<S: DeferredAuditSink + 'static>(
 ///   - The channel sender is dropped and the channel is fully
 ///     drained (graceful shutdown).
 ///   - A sink exhausts `max_restarts` while retrying one in-flight event, in
-///     which case the supervisor panics so [`close_and_flush`] returns a
-///     `JoinError` instead of falsely reporting a complete drain.
+///     which case the supervisor returns a typed [`DrainError`] so
+///     [`close_and_flush`] fails instead of falsely reporting a complete
+///     drain — and, unlike the `panic!` this replaced (v1.0.0 #3164), the
+///     terminal state is published on [`DeferredAuditMetrics::terminal_state`]
+///     and the `ai_memory_deferred_audit_drainer_terminal_state` gauge the
+///     INSTANT it happens, so a dead drainer is visible while the daemon is
+///     still serving.
 ///
 /// Panic retries use capped exponential backoff. This gives Tokio a
 /// suspension point even under a persistently panicking sink and prevents a
 /// tight panic-hook/log-amplification loop from monopolizing a runtime worker.
 ///
-/// The returned `JoinHandle` resolves when the supervisor exits.
+/// The returned `JoinHandle` resolves when the supervisor exits, carrying
+/// `Ok(())` for a graceful drain and a typed [`DrainError`] for a terminal
+/// give-up (v1.0.0 #3164 — this used to be a `panic!`, which killed only the
+/// supervisor task and left the daemon serving with a silently dead drainer).
 #[must_use]
 pub fn spawn_supervised_drainer<F, S>(
     receiver: UnboundedReceiver<DeferredAuditEvent>,
     make_sink: F,
     metrics: DeferredAuditMetrics,
     max_restarts: u32,
-) -> JoinHandle<()>
+) -> JoinHandle<std::result::Result<(), DrainError>>
 where
     F: Fn() -> S + Send + 'static,
     S: DeferredAuditSink + 'static,
@@ -2539,7 +2753,7 @@ fn spawn_supervised_drainer_inner<F, S>(
     metrics: DeferredAuditMetrics,
     max_restarts: u32,
     mut shutdown: Option<oneshot::Receiver<()>>,
-) -> JoinHandle<()>
+) -> JoinHandle<std::result::Result<(), DrainError>>
 where
     F: Fn() -> S + Send + 'static,
     S: DeferredAuditSink + 'static,
@@ -2594,11 +2808,19 @@ where
                     Ok(Err(e)) => {
                         metrics.append_failures.fetch_add(1, Ordering::Relaxed);
                         if consecutive_restarts == max_restarts {
-                            panic!(
-                                "deferred_audit supervisor: sink remained unresolved and \
-                                 exhausted max_restarts={max_restarts}; refusing to advance \
-                                 beyond the in-flight occurrence: {e:#}"
+                            // #3164 — fail-loud, but as a TYPED terminal state
+                            // instead of a panic that only this task observes.
+                            let err = DrainError::SinkUnresolved {
+                                max_restarts,
+                                detail: format!("{e:#}"),
+                            };
+                            metrics.record_terminal_state(err.terminal_state());
+                            tracing::error!(
+                                terminal_state = err.terminal_state().as_str(),
+                                max_restarts,
+                                "{err}"
                             );
+                            return Err(err);
                         }
                         consecutive_restarts += 1;
                         is_retry = true;
@@ -2615,12 +2837,14 @@ where
                         metrics.drainer_panics.fetch_add(1, Ordering::Relaxed);
                         if consecutive_restarts == max_restarts {
                             metrics.append_failures.fetch_add(1, Ordering::Relaxed);
-                            panic!(
-                                "deferred_audit supervisor: sink panicked and exhausted \
-                                 max_restarts={max_restarts}; drain is incomplete and the \
-                                 in-flight event is unflushed (journal recovery is available \
-                                 only when journaling was successfully enabled)"
+                            let err = DrainError::SinkPanicked { max_restarts };
+                            metrics.record_terminal_state(err.terminal_state());
+                            tracing::error!(
+                                terminal_state = err.terminal_state().as_str(),
+                                max_restarts,
+                                "{err}"
                             );
+                            return Err(err);
                         }
 
                         consecutive_restarts += 1;
@@ -2637,6 +2861,8 @@ where
                 }
             }
         }
+        // Sender dropped + channel drained → graceful shutdown.
+        Ok(())
     })
 }
 
@@ -2645,7 +2871,7 @@ where
 /// not prevent the already-admitted channel prefix from draining to `None`.
 pub(crate) struct DeferredAuditShutdown {
     close: Option<oneshot::Sender<()>>,
-    supervisor: JoinHandle<()>,
+    supervisor: JoinHandle<std::result::Result<(), DrainError>>,
 }
 
 impl DeferredAuditShutdown {
@@ -2655,12 +2881,16 @@ impl DeferredAuditShutdown {
     pub(crate) async fn close_and_flush(
         mut self,
         timeout: std::time::Duration,
-    ) -> std::result::Result<bool, tokio::task::JoinError> {
+    ) -> std::result::Result<bool, DrainFlushError> {
         if let Some(close) = self.close.take() {
             let _ = close.send(());
         }
         match tokio::time::timeout(timeout, &mut self.supervisor).await {
-            Ok(result) => result.map(|()| true),
+            // #3164 — a typed terminal give-up is now distinguishable from a
+            // supervisor join failure; both remain hard, fail-loud errors.
+            Ok(Ok(Ok(()))) => Ok(true),
+            Ok(Ok(Err(drain))) => Err(DrainFlushError::Drain(drain)),
+            Ok(Err(join)) => Err(DrainFlushError::Join(join)),
             Err(_) => {
                 self.supervisor.abort();
                 // Do not await after abort: a synchronous SQLite/fsync/lock
@@ -2687,18 +2917,21 @@ fn panic_retry_backoff(restart: u32) -> std::time::Duration {
 ///
 /// # Errors
 ///
-/// Returns the `tokio::task::JoinError` if the supervisor itself panics or if
-/// the sink exhausts its configured panic-restart budget. An `Ok(())` result
-/// therefore continues to mean that the queue drained completely.
+/// Returns [`DrainFlushError::Join`] if the supervisor task itself fails to
+/// join, and [`DrainFlushError::Drain`] if the sink exhausted its configured
+/// restart budget (v1.0.0 #3164 — previously this arrived as a `JoinError`
+/// wrapping a panic, which carried no machine-readable cause). An `Ok(())`
+/// result therefore continues to mean that the queue drained completely.
 pub async fn close_and_flush(
     queue: DeferredAuditQueue,
-    supervisor: JoinHandle<()>,
-) -> std::result::Result<(), tokio::task::JoinError> {
+    supervisor: JoinHandle<std::result::Result<(), DrainError>>,
+) -> std::result::Result<(), DrainFlushError> {
     // Drop the producer-side sender — once every clone is dropped,
     // the receiver's `recv().await` returns None and the drainer
     // exits gracefully.
     drop(queue);
-    supervisor.await
+    supervisor.await??;
+    Ok(())
 }
 
 /// Default daemon shutdown deadline for background-writer quiescence and
@@ -2782,7 +3015,12 @@ fn drain_accounted(metrics: &DeferredAuditMetrics) -> u64 {
 /// the sink is rebuilt verbatim. No connection is shared with the
 /// substrate writer.
 #[must_use]
-pub fn install_deferred_audit_drainer(db_path: &Path) -> (DeferredAuditQueue, JoinHandle<()>) {
+pub fn install_deferred_audit_drainer(
+    db_path: &Path,
+) -> (
+    DeferredAuditQueue,
+    JoinHandle<std::result::Result<(), DrainError>>,
+) {
     let (queue, receiver) = DeferredAuditQueue::new();
     let metrics = queue.metrics();
     let db_path_buf = db_path.to_path_buf();
@@ -2826,7 +3064,10 @@ pub fn deferred_audit_journal_path(db_path: &Path) -> PathBuf {
 #[must_use]
 pub fn install_deferred_audit_drainer_with_journal(
     db_path: &Path,
-) -> (DeferredAuditQueue, JoinHandle<()>) {
+) -> (
+    DeferredAuditQueue,
+    JoinHandle<std::result::Result<(), DrainError>>,
+) {
     let journal_path = deferred_audit_journal_path(db_path);
     // Boot recovery FIRST (replay-all-then-go-live): chain any pre-crash
     // refusals into signed_events before the live queue/hooks exist.
@@ -2837,7 +3078,7 @@ pub fn install_deferred_audit_drainer_with_journal(
         );
         let (queue, receiver) = DeferredAuditQueue::new();
         drop(receiver);
-        return (queue, tokio::spawn(async {}));
+        return (queue, tokio::spawn(async { Ok(()) }));
     }
     let journal = match DeferredAuditJournal::open(&journal_path) {
         Ok(j) => Arc::new(j),
@@ -2848,7 +3089,7 @@ pub fn install_deferred_audit_drainer_with_journal(
             );
             let (queue, receiver) = DeferredAuditQueue::new();
             drop(receiver);
-            return (queue, tokio::spawn(async {}));
+            return (queue, tokio::spawn(async { Ok(()) }));
         }
     };
     let (queue, receiver) = DeferredAuditQueue::new_with_journal(Some(journal));
@@ -2890,7 +3131,7 @@ pub(crate) fn install_deferred_audit_drainer_with_shutdown(
             queue,
             DeferredAuditShutdown {
                 close: None,
-                supervisor: tokio::spawn(async {}),
+                supervisor: tokio::spawn(async { Ok(()) }),
             },
         );
     }
@@ -2907,7 +3148,7 @@ pub(crate) fn install_deferred_audit_drainer_with_shutdown(
                 queue,
                 DeferredAuditShutdown {
                     close: None,
-                    supervisor: tokio::spawn(async {}),
+                    supervisor: tokio::spawn(async { Ok(()) }),
                 },
             );
         }
@@ -3328,7 +3569,10 @@ mod tests {
             );
         }
         drop(queue);
-        supervisor.await.unwrap();
+        supervisor
+            .await
+            .expect("supervisor join")
+            .expect("#3164: a drained queue must exit with Ok, not a terminal state");
 
         let agents: Vec<_> = recorded
             .lock()
@@ -3365,8 +3609,18 @@ mod tests {
         drop(queue);
         let error = supervisor
             .await
+            .expect("supervisor join")
             .expect_err("retry exhaustion must terminate visibly");
-        assert!(error.is_panic());
+        // #3164 — visible as a TYPED terminal state rather than a panic that
+        // only this task could observe.
+        assert!(
+            matches!(error, DrainError::SinkUnresolved { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            metrics.terminal_state(),
+            Some(DrainTerminalState::SinkUnresolved)
+        );
         assert_eq!(attempts.lock().unwrap().as_slice(), ["agent:blocked"; 4]);
         assert_eq!(metrics.append_failure_count(), 4);
         assert_eq!(metrics.appended_count(), 0);
@@ -3474,7 +3728,18 @@ mod tests {
         let err = close_and_flush(queue, supervisor)
             .await
             .expect_err("restart exhaustion must not report a complete drain");
-        assert!(err.is_panic());
+        // #3164 — a TYPED terminal state, not an opaque panic payload.
+        match err {
+            DrainFlushError::Drain(DrainError::SinkPanicked { max_restarts }) => {
+                assert_eq!(max_restarts, 0);
+            }
+            other => panic!("expected a typed SinkPanicked terminal state, got {other:?}"),
+        }
+        assert_eq!(
+            metrics.terminal_state(),
+            Some(DrainTerminalState::SinkPanicked),
+            "#3164: the terminal state must be observable on the shared metrics"
+        );
         assert_eq!(metrics.panic_count(), 1);
         assert_eq!(metrics.append_failure_count(), 1);
         assert_eq!(metrics.appended_count(), 0);
@@ -3770,7 +4035,17 @@ mod tests {
         assert_eq!(metrics.append_failure_count(), 1);
         drop(hook_held);
         drop(queue);
-        assert!(supervisor.await.unwrap_err().is_panic());
+        // #3164 — exhaustion is a TYPED terminal state now, not a panic; the
+        // fail-loud property (the supervisor stops, visibly) is unchanged.
+        let terminal = supervisor
+            .await
+            .expect("supervisor join")
+            .expect_err("an unresolved occurrence must terminate the supervisor");
+        assert!(matches!(terminal, DrainError::SinkUnresolved { .. }));
+        assert_eq!(
+            metrics.terminal_state(),
+            Some(DrainTerminalState::SinkUnresolved)
+        );
     }
 
     #[tokio::test]
@@ -4383,7 +4658,10 @@ mod tests {
             install_deferred_audit_drainer_with_journal(&blocker.join("db.sqlite"));
         assert!(!queue.is_open());
         assert!(!queue.submit_refusal("agent:closed", &refusal_action(), &refusal_decision()));
-        supervisor.await.unwrap();
+        supervisor
+            .await
+            .expect("supervisor join")
+            .expect("#3164: the fail-closed stub supervisor must exit with Ok");
     }
 
     // -----------------------------------------------------------------

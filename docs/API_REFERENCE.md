@@ -430,6 +430,7 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_fed_quarantined_unattributed_total` | counter | Inbound relayed memories quarantined by the route-IN provenance gate (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, #2966). Always zero when the quarantine knob is off (the default); a non-zero rate means a peer is relaying provenance-less content this node is black-holing until dequarantine. Pairs with the `federation.quarantine.unattributed` WARN. |
 | `ai_memory_hnsw_evictions_total`, `ai_memory_hnsw_size` | counter, gauge | Vector-index pressure; see `AI_MEMORY_VECTOR_INDEX_CAPACITY`. |
 | `ai_memory_federation_push_dlq_depth`, `..._quarantined_by_cause_total{cause}` | gauge, counter | Federation push-DLQ backlog and its cause breakdown. |
+| `ai_memory_deferred_audit_drainer_terminal_state` | gauge | Terminal state of the deferred-audit drainer supervisor: `0` = running/graceful, `1` = sink unresolved past `max_restarts`, `2` = sink panicked past `max_restarts` (#3164). **Page on any non-zero value** — the daemon keeps serving requests, but governance refusals are no longer reaching `signed_events` on that node, so it is audit-degraded until restarted. |
 
 This table is the operationally load-bearing subset, not the full
 registry — scrape the endpoint for the complete list.

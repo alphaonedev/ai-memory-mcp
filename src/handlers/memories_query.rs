@@ -200,23 +200,25 @@ pub async fn list_memories(
     // the closure (its fields are only read by `db::list`); the
     // visibility post-filter is pure CPU on the owned rows and stays
     // outside the pool connection.
-    let listed = super::read_pool::db_read_op(app.db.clone(), move |conn| {
-        db::list(
-            conn,
-            p.namespace.as_deref(),
-            p.tier.as_ref(),
-            limit,
-            p.offset.unwrap_or(0),
-            p.min_priority,
-            p.since.as_deref(),
-            p.until.as_deref(),
-            p.tags.as_deref(),
-            p.agent_id.as_deref(),
-            // v1.0.0 #1834 — claim-bitemporal AS-OF (validated at entry).
-            p.valid_at.as_deref(),
-        )
-    })
-    .await;
+    let listed = super::transport::flatten_db_op(
+        super::read_pool::db_read_op(app.db.clone(), move |conn| {
+            db::list(
+                conn,
+                p.namespace.as_deref(),
+                p.tier.as_ref(),
+                limit,
+                p.offset.unwrap_or(0),
+                p.min_priority,
+                p.since.as_deref(),
+                p.until.as_deref(),
+                p.tags.as_deref(),
+                p.agent_id.as_deref(),
+                // v1.0.0 #1834 — claim-bitemporal AS-OF (validated at entry).
+                p.valid_at.as_deref(),
+            )
+        })
+        .await,
+    );
     match listed {
         Ok(mems) => {
             // #910 — see postgres branch comment above. `db::list` does
@@ -464,17 +466,19 @@ pub async fn search_memories(
             let ns = p.namespace.clone();
             let eaa = effective_as_agent.clone();
             let vc = visibility_caller.clone();
-            let listed = super::read_pool::db_read_op(app.db.clone(), move |conn| {
-                db::list_by_source_uri(
-                    conn,
-                    &uri_owned,
-                    ns.as_deref(),
-                    Some(limit),
-                    eaa.as_deref(),
-                    vc.as_deref(),
-                )
-            })
-            .await;
+            let listed = super::transport::flatten_db_op(
+                super::read_pool::db_read_op(app.db.clone(), move |conn| {
+                    db::list_by_source_uri(
+                        conn,
+                        &uri_owned,
+                        ns.as_deref(),
+                        Some(limit),
+                        eaa.as_deref(),
+                        vc.as_deref(),
+                    )
+                })
+                .await,
+            );
             return match listed {
                 // #1579 B4 — serialize per the negotiated format.
                 Ok(r) => crate::handlers::wire_format::search_response(
@@ -496,25 +500,27 @@ pub async fn search_memories(
     let eaa = effective_as_agent.clone();
     let su_owned: Option<String> = source_uri.map(str::to_string);
     let vc = visibility_caller.clone();
-    let searched = super::read_pool::db_read_op(app.db.clone(), move |conn| {
-        db::search_with_source_uri(
-            conn,
-            &q,
-            ns.as_deref(),
-            tier.as_ref(),
-            limit,
-            min_priority,
-            since.as_deref(),
-            until.as_deref(),
-            tags.as_deref(),
-            agent_id.as_deref(),
-            eaa.as_deref(),
-            false,
-            su_owned.as_deref(),
-            vc.as_deref(),
-        )
-    })
-    .await;
+    let searched = super::transport::flatten_db_op(
+        super::read_pool::db_read_op(app.db.clone(), move |conn| {
+            db::search_with_source_uri(
+                conn,
+                &q,
+                ns.as_deref(),
+                tier.as_ref(),
+                limit,
+                min_priority,
+                since.as_deref(),
+                until.as_deref(),
+                tags.as_deref(),
+                agent_id.as_deref(),
+                eaa.as_deref(),
+                false,
+                su_owned.as_deref(),
+                vc.as_deref(),
+            )
+        })
+        .await,
+    );
     match searched {
         // #1579 B4 — serialize per the negotiated format.
         Ok(r) => crate::handlers::wire_format::search_response(
