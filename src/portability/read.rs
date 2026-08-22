@@ -248,48 +248,74 @@ pub struct ArchivedMemoryRow {
 pub fn read_all_archived_memories(conn: &Connection) -> Result<Vec<ArchivedMemoryRow>> {
     let mut stmt =
         conn.prepare("SELECT * FROM archived_memories ORDER BY archived_at ASC, id ASC")?;
-    let rows = stmt.query_map([], |row| {
-        let memory = crate::storage::row_to_memory(row)?;
-        let original_tier = row
-            .get::<_, Option<String>>("original_tier")
-            .unwrap_or(None)
-            .and_then(|s| Tier::from_str(&s));
-        Ok(ArchivedMemoryRow {
-            memory,
-            archived_at: row.get(field_names::ARCHIVED_AT)?,
-            archive_reason: row
-                .get(field_names::ARCHIVE_REASON)
-                .unwrap_or_else(|_| "ttl_expired".to_string()),
-            original_tier,
-            original_expires_at: row
-                .get::<_, Option<String>>("original_expires_at")
-                .unwrap_or(None),
-            embedding: row.get::<_, Option<Vec<u8>>>("embedding").unwrap_or(None),
-            embedding_dim: row
-                .get::<_, Option<i32>>(field_names::EMBEDDING_DIM)
-                .unwrap_or(None),
-            embedding_space: row
-                .get::<_, Option<String>>("embedding_space")
-                .unwrap_or(None),
-            atomised_into: row
-                .get::<_, Option<i64>>(field_names::ATOMISED_INTO)
-                .unwrap_or(None),
-            atom_of: row
-                .get::<_, Option<String>>(field_names::ATOM_OF)
-                .unwrap_or(None),
-            mentioned_entity_id: row
-                .get::<_, Option<String>>(field_names::MENTIONED_ENTITY_ID)
-                .unwrap_or(None),
-            kind_provenance: row
-                .get::<_, Option<String>>("kind_provenance")
-                .unwrap_or(None),
-        })
-    })?;
+    let rows = stmt.query_map([], row_to_archived_memory)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
     Ok(out)
+}
+
+/// v1.0.0 #3151 — read ONE `archived_memories` row by id through the SAME
+/// mapper [`read_all_archived_memories`] uses (so the content is DECRYPTED
+/// exactly as the export path decrypts it).
+///
+/// The Portability-v2 importer's divergence probe needs the destination's
+/// row in COMPARABLE form: the archived insert RE-SEALS content against the
+/// destination's at-rest policy with a fresh per-record DEK, so the stored
+/// ciphertext of a byte-identical re-import differs every time — a raw
+/// column comparison would report divergence on every faithful re-import.
+///
+/// # Errors
+/// The underlying `rusqlite` query fails, or the row's at-rest envelope
+/// cannot be decrypted (fail-closed, same policy as the export read).
+pub fn read_archived_memory(conn: &Connection, id: &str) -> Result<Option<ArchivedMemoryRow>> {
+    let mut stmt = conn.prepare("SELECT * FROM archived_memories WHERE id = ?1")?;
+    let mut rows = stmt.query_map([id], row_to_archived_memory)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+/// The shared `archived_memories` row mapper (one SSOT for the read-all
+/// export path and the #3151 single-row divergence probe).
+fn row_to_archived_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchivedMemoryRow> {
+    let memory = crate::storage::row_to_memory(row)?;
+    let original_tier = row
+        .get::<_, Option<String>>("original_tier")
+        .unwrap_or(None)
+        .and_then(|s| Tier::from_str(&s));
+    Ok(ArchivedMemoryRow {
+        memory,
+        archived_at: row.get(field_names::ARCHIVED_AT)?,
+        archive_reason: row
+            .get(field_names::ARCHIVE_REASON)
+            .unwrap_or_else(|_| "ttl_expired".to_string()),
+        original_tier,
+        original_expires_at: row
+            .get::<_, Option<String>>("original_expires_at")
+            .unwrap_or(None),
+        embedding: row.get::<_, Option<Vec<u8>>>("embedding").unwrap_or(None),
+        embedding_dim: row
+            .get::<_, Option<i32>>(field_names::EMBEDDING_DIM)
+            .unwrap_or(None),
+        embedding_space: row
+            .get::<_, Option<String>>("embedding_space")
+            .unwrap_or(None),
+        atomised_into: row
+            .get::<_, Option<i64>>(field_names::ATOMISED_INTO)
+            .unwrap_or(None),
+        atom_of: row
+            .get::<_, Option<String>>(field_names::ATOM_OF)
+            .unwrap_or(None),
+        mentioned_entity_id: row
+            .get::<_, Option<String>>(field_names::MENTIONED_ENTITY_ID)
+            .unwrap_or(None),
+        kind_provenance: row
+            .get::<_, Option<String>>("kind_provenance")
+            .unwrap_or(None),
+    })
 }
 
 // ── namespace_meta (#2571, spec §6.1) ───────────────────────────────────────

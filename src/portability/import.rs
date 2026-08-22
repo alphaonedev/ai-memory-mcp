@@ -229,6 +229,28 @@ pub struct ImportReport {
     /// path's per-row skip disposition). Counts BOTH the live `memories[]`
     /// lane and — since #3150 — the `archived_memories[]` lane.
     pub forged_signature_skipped: usize,
+    /// v1.0.0 #3151 — `archived_memories[]` snapshots NOT staged because the
+    /// destination already holds a DIFFERENT archived snapshot under that id
+    /// (durable title/content, or `archived_at` / `archive_reason`, differ).
+    /// The destination's row is KEPT and the bundle's is not applied — the
+    /// same disposition the LIVE `memories[]` lane takes on a divergent id
+    /// ([`Self::idempotent_skipped`] + a warning): the substrate never
+    /// silently overwrites a durable row, and since #3151 it never silently
+    /// swallows the incoming one either.
+    pub archived_memories_skipped_divergent: usize,
+    /// v1.0.0 #3151 — `archived_memory_links[]` edges NOT staged because a
+    /// DIFFERENT archived edge already occupies that
+    /// `(source_id, target_id, relation)` at the destination. Same
+    /// keep-destination + WARN + count disposition as
+    /// [`Self::archived_memories_skipped_divergent`].
+    pub archived_memory_links_skipped_divergent: usize,
+    /// v1.0.0 #3151 — `namespace_meta[]` bindings NOT staged because the
+    /// destination already governs that namespace with a DIFFERENT binding.
+    /// The `ON CONFLICT DO NOTHING` policy itself is DELIBERATE (an import
+    /// must never silently override policy the destination operator
+    /// established), but pre-fix the drop was UNACCOUNTED — no counter, no
+    /// warning, no signal at all.
+    pub namespace_meta_skipped_divergent: usize,
     /// v1.0.0 #3149/#3151 — bundle rows on a RAW `INSERT OR IGNORE` /
     /// `ON CONFLICT DO NOTHING` lane whose insert was suppressed because a
     /// BYTE-IDENTICAL row is already at the destination: a genuine idempotent
@@ -238,7 +260,9 @@ pub struct ImportReport {
     /// struct's own "a report can only exist for a bundle that fully landed"
     /// contract). A DIVERGENT surviving row is never counted here: on the
     /// SIGNED write-once lanes (#3149 — `forget_tombstones`,
-    /// `model_attestations`) it REFUSES the bundle.
+    /// `model_attestations`) it REFUSES the bundle, and on the #2571 lanes
+    /// (#3151) it is counted + warned via the matching
+    /// `*_skipped_divergent` field.
     pub idempotent_rows_already_present: usize,
     /// `true` when the imported audit spine re-verified in the transaction.
     pub reverify_chain_ok: bool,
@@ -282,6 +306,18 @@ pub struct ImportReport {
 ///   twin carries different bytes). Silently keeping the destination row while
 ///   REPORTING the bundle's as staged would falsify the report, so the import
 ///   refuses instead.
+///
+/// The `#2571` lanes (`archived_memories`, `archived_memory_links`,
+/// `namespace_meta`) are deliberately NOT in that list. A same-key row there
+/// is a MERGE outcome between two independently-running nodes, not evidence
+/// that the bundle is corrupt — two nodes that each edited a federated memory
+/// hold different `in_place_edit` snapshots under the same id as a matter of
+/// course. Refusing the bundle would make a repeat restore permanently red on
+/// a steady-state condition (the same objection-O9 reasoning `cli::io`'s
+/// import exit code already records), so #3151 gives them the LIVE lane's
+/// disposition instead: keep the destination's row, do NOT count it as
+/// staged, and emit a per-row WARN + a `*_skipped_divergent` counter so the
+/// drop is never silent.
 pub fn import_full_envelope(
     conn: &Connection,
     env: &ExportEnvelope,
@@ -511,10 +547,11 @@ fn apply_all_classes(
                 })?;
             if !identical {
                 anyhow::bail!(
-                    "import forget_tombstone for memory {}: a DIFFERENT erasure receipt already \
-                     occupies this memory_id at the destination (different forgotten_at / \
-                     agent_id / signature) — refusing rather than silently dropping the \
-                     bundle's receipt while reporting it as staged",
+                    "import forget_tombstone for memory {}: the INSERT was suppressed and the \
+                     destination does NOT hold a byte-identical receipt — a DIFFERENT erasure \
+                     receipt occupies this memory_id (different forgotten_at / agent_id / \
+                     signature), or a table constraint rejected the row. Refusing rather than \
+                     silently dropping the bundle's receipt while reporting it as staged",
                     t.memory_id
                 );
             }
@@ -1010,6 +1047,86 @@ fn apply_all_classes(
                 ],
             )
             .with_context(|| format!("import archived_memory {}", mem.id))?;
+        // #3151 — an `OR IGNORE` that IGNORED means a row already occupies
+        // this id. Pre-fix that was DROPPED SILENTLY: a restore/merge onto a
+        // destination holding a DIFFERENT snapshot kept its bytes and
+        // discarded the bundle's with zero signal — no probe, no warning, no
+        // counter. Probe it and SAY so.
+        //
+        // Disposition = the LIVE `memories[]` lane's, deliberately: keep the
+        // destination's durable row, do not report the bundle's as staged,
+        // WARN. NOT a refusal — two independently-running nodes hold
+        // different `in_place_edit` snapshots under the same id as a matter
+        // of course (#1725 writes one on every edit), so refusing would pin a
+        // repeat restore permanently red on a steady-state merge condition
+        // (objection O9) and train operators to `|| true` the import. The
+        // bundle is not corrupt here; the two nodes simply disagree, and the
+        // report now says which rows.
+        //
+        // Divergence is measured on the DURABLE truth via the same
+        // `imported_row_diverges` SSOT the live lane uses (title + content,
+        // NEVER the restamped metadata — a metadata compare would report
+        // divergence on every faithful cross-caller re-import), plus the two
+        // archive-truth columns. Content is compared DECRYPTED
+        // (`read_archived_memory`), because the insert above re-seals with a
+        // fresh per-record DEK — a raw ciphertext compare would flag every
+        // byte-identical re-import as divergent.
+        //
+        // The probe itself must never be able to FAIL the import. Two of its
+        // three outcomes are NOT "a divergent twin":
+        //   * the destination row is UNREADABLE — `row_to_memory` is
+        //     fail-closed on an at-rest envelope it cannot open, and a
+        //     crypto-ERASED row (#1956: a forget destroys the wrapped DEK) is
+        //     undecryptable BY DESIGN. Propagating that would let one
+        //     forgotten id abort an otherwise valid restore. It cannot be
+        //     PROVEN identical, so it is treated as divergent — which is also
+        //     the covenant-correct outcome: the erased row stays, and the
+        //     bundle's pre-erasure copy is NOT resurrected;
+        //   * NO row is there at all — `INSERT OR IGNORE` also swallows CHECK
+        //     / NOT NULL / FK failures, so `n == 0` does not always mean
+        //     "already present". That was silent too; it is now named.
+        if n == 0 {
+            let probe = crate::portability::read::read_archived_memory(conn, &mem.id);
+            let (identical, why) = match &probe {
+                Ok(Some(existing)) => (
+                    !crate::storage::imported_row_diverges(&existing.memory, mem)
+                        && existing.archived_at == row.archived_at
+                        && existing.archive_reason == row.archive_reason,
+                    "a DIFFERENT archived snapshot already occupies this id at the \
+                     destination (durable title/content or archived_at / archive_reason \
+                     differ); the destination's snapshot is KEPT"
+                        .to_string(),
+                ),
+                Ok(None) => (
+                    false,
+                    "the INSERT was suppressed by a table constraint and NO row occupies \
+                     this id at the destination"
+                        .to_string(),
+                ),
+                Err(e) => (
+                    false,
+                    format!(
+                        "a row already occupies this id at the destination but could not be \
+                         read for comparison ({e:#}) — it is KEPT and the bundle's copy is \
+                         NOT applied"
+                    ),
+                ),
+            };
+            if identical {
+                report.idempotent_rows_already_present += 1;
+            } else {
+                report.archived_memories_skipped_divergent += 1;
+                report
+                    .warnings
+                    .push(format!("archived memory {} NOT applied: {why}", mem.id));
+                tracing::warn!(
+                    target: IMPORT_TRACE_TARGET,
+                    memory_id = %mem.id,
+                    reason = %why,
+                    "bundle archived snapshot NOT applied; destination row is kept"
+                );
+            }
+        }
         report.archived_memories += n;
     }
 
@@ -1027,6 +1144,12 @@ fn apply_all_classes(
          ON CONFLICT(namespace) DO NOTHING",
         crate::export_scope::OMITTED_CLASS_NAMESPACE_META
     );
+    let namespace_meta_identity_sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM {} \
+         WHERE namespace = ?1 AND standard_id IS ?2 AND parent_namespace IS ?3 \
+           AND updated_at = ?4)",
+        crate::export_scope::OMITTED_CLASS_NAMESPACE_META
+    );
     for dto in &env.namespace_meta {
         let row: crate::portability::read::NamespaceMetaRow = dto.clone().into();
         let n = conn
@@ -1040,6 +1163,46 @@ fn apply_all_classes(
                 ],
             )
             .with_context(|| format!("import namespace_meta {}", row.namespace))?;
+        // #3151 — the `DO NOTHING` policy is deliberate (never override the
+        // destination operator's own governance binding), but the DROP was
+        // unaccounted: no counter, no warning. Signal it. A byte-identical
+        // surviving binding is an idempotent no-op; a DIFFERENT one is a real
+        // merge outcome the operator must be able to see.
+        if n == 0 {
+            let identical: bool = conn
+                .query_row(
+                    &namespace_meta_identity_sql,
+                    params![
+                        row.namespace,
+                        row.standard_id,
+                        row.parent_namespace,
+                        row.updated_at
+                    ],
+                    |r| r.get(0),
+                )
+                .with_context(|| {
+                    format!(
+                        "import: identity probe for namespace_meta {}",
+                        row.namespace
+                    )
+                })?;
+            if identical {
+                report.idempotent_rows_already_present += 1;
+            } else {
+                report.namespace_meta_skipped_divergent += 1;
+                report.warnings.push(format!(
+                    "namespace_meta binding for {} NOT applied: the destination already \
+                     governs this namespace with a DIFFERENT binding, which is KEPT (an \
+                     import never overrides destination policy)",
+                    row.namespace
+                ));
+                tracing::warn!(
+                    target: IMPORT_TRACE_TARGET,
+                    namespace = %row.namespace,
+                    "bundle namespace_meta binding dropped: destination binding differs and is kept"
+                );
+            }
+        }
         report.namespace_meta += n;
     }
 
@@ -1076,6 +1239,81 @@ fn apply_all_classes(
                     link.source_id, link.target_id
                 )
             })?;
+        // #3151 — same silent-drop class as the `archived_memories` lane
+        // above, and the same keep-destination + WARN + count disposition: an
+        // ignore on the `(source_id, target_id, relation)` PK kept the
+        // destination's edge and discarded the bundle's with no signal. No
+        // re-seal here (the table stores no content), so a straight column
+        // probe is byte-exact. As on the lane above, `INSERT OR IGNORE` also
+        // swallows non-PK constraint failures, so a second probe distinguishes
+        // "a divergent edge is already there" from "nothing landed and nothing
+        // is there" — both were silent pre-fix, and they are different facts.
+        if n == 0 {
+            let identical: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM archived_memory_links \
+                     WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3 \
+                       AND created_at = ?4 AND valid_from IS ?5 AND valid_until IS ?6 \
+                       AND observed_by IS ?7 AND signature IS ?8 AND attest_level IS ?9 \
+                       AND archived_at = ?10)",
+                    params![
+                        link.source_id,
+                        link.target_id,
+                        link.relation,
+                        link.created_at,
+                        link.valid_from,
+                        link.valid_until,
+                        link.observed_by,
+                        link.signature.as_ref().map(|h| h.0.as_slice()),
+                        link.attest_level,
+                        link.archived_at,
+                    ],
+                    |r| r.get(0),
+                )
+                .with_context(|| {
+                    format!(
+                        "import: identity probe for archived_memory_link {}->{}",
+                        link.source_id, link.target_id
+                    )
+                })?;
+            if identical {
+                report.idempotent_rows_already_present += 1;
+            } else {
+                let occupied: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM archived_memory_links \
+                         WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3)",
+                        params![link.source_id, link.target_id, link.relation],
+                        |r| r.get(0),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "import: occupancy probe for archived_memory_link {}->{}",
+                            link.source_id, link.target_id
+                        )
+                    })?;
+                let why = if occupied {
+                    "a DIFFERENT archived edge already occupies this \
+                     (source_id, target_id, relation) at the destination, which is KEPT"
+                } else {
+                    "the INSERT was suppressed by a table constraint and NO edge occupies \
+                     this (source_id, target_id, relation) at the destination"
+                };
+                report.archived_memory_links_skipped_divergent += 1;
+                report.warnings.push(format!(
+                    "archived memory link {}->{} ({}) NOT applied: {why}",
+                    link.source_id, link.target_id, link.relation
+                ));
+                tracing::warn!(
+                    target: IMPORT_TRACE_TARGET,
+                    source_id = %link.source_id,
+                    target_id = %link.target_id,
+                    relation = %link.relation,
+                    reason = %why,
+                    "bundle archived link NOT applied"
+                );
+            }
+        }
         report.archived_memory_links += n;
     }
 
@@ -1369,10 +1607,11 @@ fn apply_all_classes(
                 })?;
             if !identical {
                 anyhow::bail!(
-                    "import model_attestation {} ({} {}): a DIFFERENT attestation already \
-                     occupies this id — or this (provider, model_ref, model_family, agent_id) \
-                     TOFU pin — at the destination; refusing rather than silently dropping the \
-                     bundle's pin while reporting it as staged",
+                    "import model_attestation {} ({} {}): the INSERT was suppressed and the \
+                     destination does NOT hold a byte-identical pin — a DIFFERENT attestation \
+                     occupies this id or this (provider, model_ref, model_family, agent_id) \
+                     TOFU pin, or a table constraint rejected the row. Refusing rather than \
+                     silently dropping the bundle's pin while reporting it as staged",
                     m.id,
                     m.provider,
                     m.model_ref
@@ -3126,6 +3365,331 @@ mod tests {
         assert!(
             second.idempotent_rows_already_present >= 1,
             "the byte-identical pin is reported as an idempotent no-op"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // #3151 — the #2571 lanes must SIGNAL a same-id row they could not
+    // apply. Pre-fix `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` dropped a
+    // DIVERGENT bundle row with no identity probe, no warning and no
+    // counter, so a restore/merge onto an older destination snapshot kept
+    // the stale bytes and discarded the newer ones silently.
+    // ───────────────────────────────────────────────────────────────────
+
+    fn archived_dto(
+        id: &str,
+        content: &str,
+        archived_at: &str,
+    ) -> crate::portability::dto::ArchivedMemoryDto {
+        let mut mem = memory_fixture(id, "archived snapshot", "alice");
+        mem.content = content.into();
+        crate::portability::dto::ArchivedMemoryDto {
+            memory: mem,
+            archived_at: archived_at.into(),
+            archive_reason: "ttl_expired".into(),
+            original_tier: None,
+            original_expires_at: None,
+            embedding: None,
+            embedding_dim: None,
+            embedding_space: None,
+            atomised_into: None,
+            atom_of: None,
+            mentioned_entity_id: None,
+            kind_provenance: None,
+        }
+    }
+
+    /// ★ #3151: a bundle `archived_memories` row whose id is already occupied
+    /// by a DIFFERENT archived snapshot is COUNTED + WARNed, never silently
+    /// dropped — and the destination's snapshot is KEPT (the LIVE lane's
+    /// disposition, not a refusal: divergent archived snapshots are an
+    /// ordinary steady-state merge outcome between two nodes). Fails on
+    /// pre-fix code: `archived_memories == 0` with no counter and no warning.
+    #[test]
+    fn divergent_archived_memory_is_counted_and_warned_3151() {
+        let src = fresh_conn("arch-diverge-src-");
+        let base = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        let dst = fresh_conn("arch-diverge-dst-");
+        let mut first = base.clone();
+        first.archived_memories.push(archived_dto(
+            "mem-arch-3151",
+            "the DESTINATION's older snapshot",
+            "2026-01-01T00:00:00Z",
+        ));
+        let seeded = import_full_envelope(&dst, &first, &opts_trusted()).expect("seed import");
+        assert_eq!(seeded.archived_memories, 1);
+
+        let mut second = base.clone();
+        second.archived_memories.push(archived_dto(
+            "mem-arch-3151",
+            "the BUNDLE's newer snapshot",
+            "2026-08-01T00:00:00Z",
+        ));
+        let report = import_full_envelope(&dst, &second, &opts_trusted()).expect("import");
+        assert_eq!(
+            report.archived_memories, 0,
+            "the destination's snapshot is KEPT, so nothing was staged"
+        );
+        assert_eq!(
+            report.archived_memories_skipped_divergent, 1,
+            "the unapplied snapshot is ACCOUNTED for"
+        );
+        assert_eq!(
+            report.idempotent_rows_already_present, 0,
+            "a DIVERGENT survivor is never miscounted as an idempotent no-op"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("mem-arch-3151") && w.contains("DIFFERENT archived snapshot")),
+            "a WARN names the dropped snapshot, got: {:?}",
+            report.warnings
+        );
+
+        // The destination's snapshot is untouched.
+        let kept: String = dst
+            .query_row(
+                "SELECT content FROM archived_memories WHERE id = ?1",
+                params!["mem-arch-3151"],
+                |r| r.get(0),
+            )
+            .expect("dest snapshot still present");
+        assert_eq!(kept, "the DESTINATION's older snapshot");
+    }
+
+    /// ★ #3151: a byte-identical archived re-import is an honest idempotent
+    /// no-op — counted, not reported as staged, and never a refusal.
+    #[test]
+    fn identical_archived_memory_reimport_is_idempotent_3151() {
+        let src = fresh_conn("arch-idem-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.archived_memories.push(archived_dto(
+            "mem-arch-idem-3151",
+            "a stable archived snapshot",
+            "2026-01-01T00:00:00Z",
+        ));
+
+        let dst = fresh_conn("arch-idem-dst-");
+        let first = import_full_envelope(&dst, &env, &opts_trusted()).expect("first import");
+        assert_eq!(first.archived_memories, 1);
+
+        let second = import_full_envelope(&dst, &env, &opts_trusted()).expect("re-import");
+        assert_eq!(
+            second.archived_memories, 0,
+            "no row landed, so none is reported as staged"
+        );
+        assert!(
+            second.idempotent_rows_already_present >= 1,
+            "the byte-identical snapshot is reported as an idempotent no-op"
+        );
+    }
+
+    fn archived_link_dto(
+        created_at: &str,
+        attest_level: Option<&str>,
+    ) -> crate::portability::dto::ArchivedMemoryLinkDto {
+        crate::portability::dto::ArchivedMemoryLinkDto {
+            source_id: "arch-link-src-3151".into(),
+            target_id: "arch-link-dst-3151".into(),
+            relation: "related_to".into(),
+            created_at: created_at.into(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: attest_level.map(ToString::to_string),
+            archived_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    /// ★ #3151: a divergent `archived_memory_links` edge at the same
+    /// `(source_id, target_id, relation)` PK is COUNTED + WARNed and the
+    /// destination's edge is KEPT — never silently dropped. Fails on pre-fix
+    /// code (edge count 0, no counter, no signal).
+    #[test]
+    fn divergent_archived_memory_link_is_counted_and_warned_3151() {
+        let src = fresh_conn("archlink-diverge-src-");
+        let base = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        let dst = fresh_conn("archlink-diverge-dst-");
+        let mut first = base.clone();
+        first
+            .archived_memory_links
+            .push(archived_link_dto("2026-01-01T00:00:00Z", None));
+        let seeded = import_full_envelope(&dst, &first, &opts_trusted()).expect("seed import");
+        assert_eq!(seeded.archived_memory_links, 1);
+
+        let mut second = base.clone();
+        second
+            .archived_memory_links
+            .push(archived_link_dto("2026-08-01T00:00:00Z", Some("claimed")));
+        let report = import_full_envelope(&dst, &second, &opts_trusted()).expect("import");
+        assert_eq!(
+            report.archived_memory_links, 0,
+            "the destination's edge is KEPT, so nothing was staged"
+        );
+        assert_eq!(
+            report.archived_memory_links_skipped_divergent, 1,
+            "the unapplied edge is ACCOUNTED for"
+        );
+        assert!(
+            report.warnings.iter().any(|w| {
+                w.contains("arch-link-src-3151") && w.contains("DIFFERENT archived edge")
+            }),
+            "a WARN names the dropped edge, got: {:?}",
+            report.warnings
+        );
+
+        let kept: String = dst
+            .query_row(
+                "SELECT created_at FROM archived_memory_links \
+                 WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
+                params!["arch-link-src-3151", "arch-link-dst-3151", "related_to"],
+                |r| r.get(0),
+            )
+            .expect("dest edge still present");
+        assert_eq!(kept, "2026-01-01T00:00:00Z");
+    }
+
+    /// ★ #3151: `namespace_meta`'s `ON CONFLICT DO NOTHING` policy is
+    /// DELIBERATE and unchanged — an import never overrides a binding the
+    /// destination operator established — but the drop is no longer SILENT:
+    /// it is counted in `namespace_meta_skipped_divergent` and carries a WARN.
+    /// A byte-identical binding stays an idempotent no-op. Fails on pre-fix
+    /// code (counter absent, `warnings` empty).
+    #[test]
+    fn divergent_namespace_meta_is_counted_and_warned_3151() {
+        let src = fresh_conn("nsmeta-diverge-src-");
+        let base = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        let dst = fresh_conn("nsmeta-diverge-dst-");
+        let mut first = base.clone();
+        first
+            .namespace_meta
+            .push(crate::portability::dto::NamespaceMetaDto {
+                namespace: "ns-3151".into(),
+                standard_id: Some("dest-standard".into()),
+                parent_namespace: None,
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            });
+        let seeded = import_full_envelope(&dst, &first, &opts_trusted()).expect("seed import");
+        assert_eq!(seeded.namespace_meta, 1);
+        assert_eq!(seeded.namespace_meta_skipped_divergent, 0);
+
+        let mut second = base.clone();
+        second
+            .namespace_meta
+            .push(crate::portability::dto::NamespaceMetaDto {
+                namespace: "ns-3151".into(),
+                standard_id: Some("bundle-standard".into()),
+                parent_namespace: None,
+                updated_at: "2026-08-01T00:00:00Z".into(),
+            });
+        let report = import_full_envelope(&dst, &second, &opts_trusted()).expect("import");
+        assert_eq!(
+            report.namespace_meta, 0,
+            "the destination binding is KEPT (DO NOTHING is deliberate)"
+        );
+        assert_eq!(
+            report.namespace_meta_skipped_divergent, 1,
+            "the unapplied binding is now ACCOUNTED for"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("ns-3151") && w.contains("DIFFERENT binding")),
+            "a WARN names the dropped binding, got: {:?}",
+            report.warnings
+        );
+
+        let kept: String = dst
+            .query_row(
+                "SELECT standard_id FROM namespace_meta WHERE namespace = ?1",
+                params!["ns-3151"],
+                |r| r.get(0),
+            )
+            .expect("dest binding still present");
+        assert_eq!(kept, "dest-standard");
+
+        // Control: re-importing the destination's OWN binding is a silent,
+        // counted idempotent no-op — never a divergence warning.
+        let idem = import_full_envelope(&dst, &first, &opts_trusted()).expect("idempotent import");
+        assert_eq!(idem.namespace_meta_skipped_divergent, 0);
+        assert!(idem.idempotent_rows_already_present >= 1);
+    }
+
+    /// ★ #3151: the divergence probe must never be able to FAIL an import.
+    /// `read_archived_memory` is fail-closed on an at-rest envelope it cannot
+    /// open, and a crypto-ERASED row (#1956 — a forget destroys the wrapped
+    /// DEK) is undecryptable BY DESIGN. An unreadable destination row is
+    /// therefore treated as "cannot be proven identical": the destination's
+    /// row is KEPT (never resurrect content an erasure destroyed), the
+    /// bundle's copy is NOT applied, and it is counted + WARNed — the import
+    /// as a whole still succeeds.
+    #[test]
+    fn unreadable_destination_archived_row_does_not_abort_the_import_3151() {
+        let src = fresh_conn("arch-erased-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.archived_memories.push(archived_dto(
+            "mem-arch-erased-3151",
+            "pre-erasure archived text",
+            "2026-01-01T00:00:00Z",
+        ));
+
+        let dst = fresh_conn("arch-erased-dst-");
+        let seeded = import_full_envelope(&dst, &env, &opts_trusted()).expect("seed import");
+        assert_eq!(seeded.archived_memories, 1);
+
+        // Simulate the #1956 crypto-erasure of the destination's snapshot:
+        // the content column is emptied and the envelope is rewritten to the
+        // ERASED marker, exactly the shape `open_content` refuses.
+        dst.execute(
+            "UPDATE archived_memories SET content = '', encrypted_envelope = ?2 WHERE id = ?1",
+            params![
+                "mem-arch-erased-3151",
+                [crate::encryption::ERASED_ENVELOPE_VERSION].as_slice()
+            ],
+        )
+        .expect("erase the destination snapshot");
+
+        let report = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect("an unreadable destination row must NOT abort the import");
+        assert_eq!(
+            report.archived_memories, 0,
+            "the erased destination row is KEPT, so nothing was staged"
+        );
+        assert_eq!(
+            report.archived_memories_skipped_divergent, 1,
+            "the unapplied snapshot is ACCOUNTED for"
+        );
+        assert_eq!(
+            report.idempotent_rows_already_present, 0,
+            "an UNREADABLE survivor is never miscounted as byte-identical"
+        );
+        assert!(
+            report.warnings.iter().any(|w| {
+                w.contains("mem-arch-erased-3151") && w.contains("could not be read")
+            }),
+            "a WARN names the unreadable row, got: {:?}",
+            report.warnings
+        );
+
+        // The erasure stands: the bundle's pre-erasure copy is NOT resurrected.
+        let (content, envelope): (String, Option<Vec<u8>>) = dst
+            .query_row(
+                "SELECT content, encrypted_envelope FROM archived_memories WHERE id = ?1",
+                params!["mem-arch-erased-3151"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("erased row still present");
+        assert_eq!(content, "");
+        assert_eq!(
+            envelope.as_deref(),
+            Some([crate::encryption::ERASED_ENVELOPE_VERSION].as_slice()),
+            "the erased envelope is untouched"
         );
     }
 }
