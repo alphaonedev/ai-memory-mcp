@@ -1519,7 +1519,8 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
     // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
     // Additive ALTER-ADD-COLUMN migration only.
-    ("src/storage/migrations.rs", 5_750), /* 2026-07-23 STORAGE-CHAIN #2333 v87 arm (archived kind_provenance + the #2332 normalize_expiry_rows heal), measured 5_671; was 5_650 (2026-07-19 #1834 v86 arm, 5_569) */
+    ("src/storage/migrations.rs", 5_850), /* 2026-08-21 #3113 core-relation integrity gate: the ~24-line pre-stamp check + rationale block (why the existence-probe arms fail open and why the gate is sited inside the tx BEFORE the stamp) landed the file at 5_770; ceiling 5_750 -> 5_850 (+80 headroom). The SSOT + probe live in the new src/storage/schema_integrity.rs, not here. */
+    /* 2026-07-23 STORAGE-CHAIN #2333 v87 arm (archived kind_provenance + the #2332 normalize_expiry_rows heal), measured 5_671; was 5_650 (2026-07-19 #1834 v86 arm, 5_569) */
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

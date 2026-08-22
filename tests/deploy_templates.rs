@@ -23,7 +23,7 @@
 //! [`ai_memory::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE`]
 //! boot-refusing gate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ai_memory::egress::InferenceEgressMode;
@@ -231,6 +231,46 @@ fn asi_hard_config_pins_the_pe1_knobs() {
             .and_then(toml::Value::as_bool),
         Some(true),
         "asi-hard must pin governance.require_operator_pubkey=true"
+    );
+}
+
+/// #3113 — `docs/deploy/asi-hard.env` is the operator-facing enumeration of
+/// the hardened posture, and CLAUDE.md's env-table row #130 states it "names
+/// all N correctly". NOTHING enforced that claim: the template names the
+/// knobs in PROSE (comment lines), so a knob added to `KNOBS` left the
+/// template silently one short while every assertion here still passed —
+/// `!pinned_knobs().is_empty()` is true for any non-empty set. A deploy
+/// template that under-states the pinned set is a procurement document
+/// describing a weaker posture than the binary actually enforces.
+///
+/// TOKENISED membership, deliberately NOT `str::contains`:
+/// `AI_MEMORY_FED_REQUIRE_SIG` is a strict prefix of
+/// `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG`, so a substring search would report the
+/// shorter knob as documented purely because the longer one is present — the
+/// fail-open shape this test exists to close. The un-prefixed short form is
+/// accepted because the template's prose legitimately uses it (e.g.
+/// `FED_REQUIRE_SERVER_VERIFY / MIGRATION_REQUIRE_CORE_TABLES = 1;`).
+#[test]
+fn asi_hard_env_names_every_pinned_knob() {
+    let text = read("asi-hard.env");
+    let tokens: HashSet<&str> = text
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let missing: Vec<&str> = pinned_knobs()
+        .iter()
+        .map(|&(env, _)| env)
+        .filter(|&env| {
+            let short = env.strip_prefix("AI_MEMORY_").unwrap_or(env);
+            !tokens.contains(env) && !tokens.contains(short)
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "docs/deploy/asi-hard.env must name every knob `asi-hard` pins (SSOT \
+         `security_profile::KNOBS`); undocumented: {missing:?}"
     );
 }
 

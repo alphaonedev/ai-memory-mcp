@@ -330,15 +330,19 @@ code.)
 2. `asi-hard pinned knobs` — post-#2927 this row **FAILs honestly under
    a `standard` profile** (`profile=standard — asi-hard pins not in
    force; the N-knob hard floor was not evaluated`, where N is
-   `pinned_knobs().len()` — **21** post-#3033, 17 in the captured
+   `pinned_knobs().len()` — **22** post-#3113, 17 in the captured
    evidence below) instead of the pre-#2927 vacuous
-   `N/N at floor` PASS (#2923). **Evidence note (#3033):** the
-   `cert-54/` `.out` captures in §2 predate #3033 and render the
+   `N/N at floor` PASS (#2923). **Evidence note (#3033, #3113):** the
+   `cert-54/` `.out` captures in §2 predate both and render the
    `17`-knob text; the count rose to 21 when the four outer
-   federation-transport gates were pinned, and the doctor render is
-   `pinned_knobs().len()`-driven, so re-capture on the post-#3033
-   release binary shows `21/21`. The PASS/FAIL verdict per leg is
-   unchanged (the row is one check regardless of the knob count).
+   federation-transport gates were pinned (#3033) and to 22 when the
+   migration core-relation gate was pinned (#3113 — the first
+   SCHEMA-INTEGRITY pin: under `asi-hard` a migration REFUSES to stamp a
+   schema version whose core relations were lost, rather than warning),
+   and the doctor render is `pinned_knobs().len()`-driven, so re-capture
+   on the post-#3113 release binary shows `22/22`. The PASS/FAIL verdict
+   per leg is unchanged (the row is one check regardless of the knob
+   count).
 3. `AI_MEMORY_FED_TRUST_DOMAIN` (unset)
 4. `AI_MEMORY_FED_PEER_FINGERPRINTS` (unset)
 5. `AI_MEMORY_FED_PEER_ATTESTATION` (unset)

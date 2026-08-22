@@ -771,6 +771,11 @@ pub mod record_stop;
 // verdict is shared verbatim by the sqlite and postgres funnels.
 pub(crate) mod reflect;
 pub mod schema_guard;
+/// v1.0.0 (#3113) — core-relation integrity for the migration ladder.
+/// The existence-probe arms in [`migrations::migrate`] skip when a
+/// ladder-only relation is absent; this module reports that skip instead
+/// of letting the tail stamp assert integrity controls that never ran.
+pub mod schema_integrity;
 
 // #1802 S1 — itemized re-export shim for the extracted doctor module
 // (M-NO-GLOB-REEXPORTS: explicit list, so any accidental visibility

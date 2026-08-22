@@ -522,6 +522,139 @@ hard-DELETE arm — keep working and their commit/rollback covers atomicity.
   now **Linux and macOS only** (both including the enterprise-federation
   postgresql+AGE+pgvector tier).
 
+### Fixed (migration ladder fail-open: a lost core relation no longer stamps silently; #3113)
+
+Closes a fail-OPEN hole in the sqlite migration ladder. Several arms are gated
+on an existence probe and SKIP when the relation is absent — the v34
+`signed_events` chain columns, the v66 `governance_rules` severity-CHECK
+widening, the v73 `signed_events.cause_hash` column. Skipping is correct for the
+case the probes were written for (a test fixture that stamped a high
+`schema_version` over a database bootstrapped from the `SCHEMA` constant alone,
+which deliberately omits the later-added ladder-only relations). What was
+missing is the other reading of the same observation: after every such skip the
+tail of `migrate` unconditionally stamped `CURRENT_SCHEMA_VERSION` and returned
+`Ok(())`, so a POPULATED database that LOST one of these relations (corruption,
+a partial file-level restore, an operator `DROP`) "upgraded successfully" to the
+tip while the integrity controls that stamp asserts — signature-atomicity
+triggers, the relation CHECK, the widened severity CHECK — were never applied.
+Subsequent writes then bypassed constraints the version stamp claimed were in
+force.
+
+- **The discriminator.** Every relation in the new
+  `storage::schema_integrity::CORE_TABLES` SSOT (`archived_memories` v4,
+  `namespace_meta` v5, `signed_events` v26, `governance_rules` v30) is created
+  UNCONDITIONALLY by its ladder arm and is NOT in the bootstrap `SCHEMA`
+  constant. So for a database stamped at version `V`, a relation whose
+  `introduced_at <= V` being ABSENT can only mean its create arm never ran
+  against this file. The module reports that fact rather than guessing which of
+  the two causes produced it.
+- **Detection is unconditional.** A structured `WARN` under
+  `ai_memory::storage::schema_integrity` names each missing relation, the version
+  that introduced it, the integrity control that is therefore not in force, and
+  the live-corpus row count — the signal that separates a populated database
+  (relation LOSS) from an empty fixture. `ai-memory doctor` carries the standing
+  signal as a `core_relations` fact that raises the Storage section to
+  `Critical`, readable at any time and independent of who ran the migration.
+- **Enforcement is opt-in.** `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1`
+  escalates the report to a REFUSAL. The check is sited inside the migrate
+  transaction and BEFORE the stamp, so a refusal rolls the whole ladder back and
+  leaves the database EXACTLY as found — old version, every row intact, still
+  readable — and is reversible by unsetting the knob. Default-off is deliberate:
+  defaulting to refuse would turn every existing high-stamp fixture and
+  archive-less deployment into a hard boot failure, a fleet-wide availability
+  regression for no data-integrity gain.
+- **`agent_quotas` covered too (#3159, partial).** A follow-up ladder audit found
+  three more probe-skips. Only one is this class: the v50 arm skips a
+  per-namespace PRIMARY KEY widening when `agent_quotas` is absent, and that
+  relation is created unconditionally at **v28** and is not in bootstrap
+  `SCHEMA` — so it is now a `CORE_TABLES` row (recorded at its v28 CREATE site,
+  not the v50 skip site, which would have silently under-reported every database
+  stamped 28..49). The other two are NOT fail-open data-integrity holes: the v56
+  skip is guarded on `archived_memories`, already covered here since v4, and the
+  object it skips is a non-UNIQUE performance index; and `agent_lineage` (v80)
+  ships in the bootstrap `SCHEMA`, which `db::open` replays before every
+  migration, so it is always present and a row for it would be permanently dead.
+- **Pinned ON by `asi-hard`.** `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES` joins
+  the `asi-hard` `KNOBS` SSOT (`src/security_profile.rs`), taking the pinned set
+  from 21 to 22 — the first SCHEMA-INTEGRITY pin, alongside the crypto,
+  attestation, durability and network pins. A certified enterprise-federation
+  deployment therefore REFUSES to stamp a schema version whose core relations
+  were lost, rather than merely warning: the #3033 "no-disable" contract applied
+  to schema integrity. Safe to pin because refusal additionally requires a
+  positively observed POPULATED corpus, so a fresh hardened node with an empty
+  database is never bricked. `docs/deploy/asi-hard.env`, the cert doc's knob
+  count, and the CLAUDE.md enumeration move in lockstep.
+- **Refusal requires demonstrable loss.** The populated-corpus discriminator
+  GATES the refusal, it does not merely colour the log: refusal needs a missing
+  relation AND enforcement AND a positively observed non-empty corpus. An empty
+  corpus (the ordinary fixture / archive-less shape — no lost data, because no
+  data) and an unreadable corpus both report without refusing. The check refuses
+  only on a fact it positively established, never on an absence of information.
+- **The gate cannot itself lose data.** It issues no DDL and no DML — it reads
+  `sqlite_master` and one `COUNT(*)`. A regression test round-trips the full
+  catalogue and row count across a probe to pin that. Under the default posture
+  behaviour is byte-identical to before: the open still succeeds, the ladder
+  still advances to the tip, no row is touched. The one exception is
+  deliberate: a `sqlite_master` probe read ERROR fails closed (propagates,
+  rolling the ladder back) instead of being coerced into "nothing missing" —
+  reporting integrity as intact on the strength of a failed read is the same
+  fail-open shape this change removes.
+- **The knob-count drift the pin exposed, closed mechanically.** Adding the
+  22nd knob surfaced that the `asi-hard` pinned set was documented by
+  HAND-MAINTAINED numbers in six places, and that they had already drifted: the
+  `## Pinned knobs` module doc table in `src/security_profile.rs` sat TWO rows
+  behind `KNOBS` for a full release (no row for
+  `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` or `_CHECKPOINT_SIG`) with nothing
+  failing, and CLAUDE.md's env row #130 claimed `docs/deploy/asi-hard.env` was
+  "pinned by `tests/deploy_templates.rs`" when that file's only link to the SSOT
+  was `!pinned_knobs().is_empty()` — true of any non-empty set. Three
+  mechanical pins replace the hand-maintained ones, each failing in BOTH
+  directions: (1) `security_profile::tests::pinned_knobs_doc_table_matches_the_knobs_ssot_exactly`
+  asserts SET equality between the doc table and `KNOBS`, so a table row for a
+  knob that is NOT pinned — the dangerous direction, since the docs would
+  advertise a hardening guarantee the binary does not enforce — fails too;
+  (2) `tests/deploy_templates.rs::asi_hard_env_names_every_pinned_knob` requires
+  the operator-facing deploy template to name every pinned knob, matching on
+  whole identifier TOKENS rather than substrings (`AI_MEMORY_FED_REQUIRE_SIG` is
+  a strict prefix of `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG`, so a `contains` check
+  would report the shorter knob as documented because the longer one is
+  present); and (3) a new `ASI_HARD_PINNED_KNOB_COUNT` rule in
+  `scripts/check-docs-vs-ssot.sh` resolves the count from the `KnobSpec` entries
+  themselves and fails the build on any prose site that disagrees. The count
+  literal in `asi_hard_pins_documented_set` becomes the derived
+  `security_profile::PINNED_KNOB_COUNT` (`= KNOBS.len()`), so the number can no
+  longer be hand-bumped anywhere. **A fail-open in the docs gate itself is fixed
+  in the same change**: its historical-line guard treated a leading `#` as a
+  markdown HEADING for every file type, so in a `.sh`/`.env` scan target — where
+  `#` is the COMMENT marker — every comment line was skipped and a rule listing
+  such a file covered nothing in it while still reporting PASS. That anchor is
+  now scoped to `.md`/`.html`. That same fail-open also silently disarmed the
+  knob-count rule proposed in [#3169](https://github.com/alphaonedev/ai-memory-mcp/pull/3169)
+  on `docs/deploy/enterprise-federation.env` — the exact line that PR exists to
+  correct — so the fix is load-bearing for both. The rule here is the CANONICAL
+  one for this SSOT (it walks a strict superset of surfaces); #3169's duplicate
+  is to be collapsed into it at that PR's rebase.
+- **Every operator- and procurement-facing statement of the pinned set moved to
+  22, and the SECOND documented pinned-knob table is now pinned too.**
+  `PERFORMANCE.md` §"Hardened `asi-hard` security posture" — the table CLAUDE.md
+  env row #130 sends operators to BY NAME — listed **15 of 22**, missing the four
+  #3033 outer-transport gates, both PERMISSIVE-shaped pins and the #3113
+  schema-integrity pin: a procurement document describing a WEAKER hardened
+  posture than the binary enforces. It is completed and mechanically pinned by
+  `security_profile::tests::performance_md_pinned_knobs_table_matches_the_knobs_ssot_exactly`,
+  which asserts SET equality against `KNOBS` in both directions and is
+  SECTION-SCOPED (the file carries other tables whose first cell is a backticked
+  `AI_MEMORY_*` name) and FAILS CLOSED on a missing heading or an empty row set,
+  so a rename cannot turn it into a vacuous pass. Alongside it, `SECURITY.md`
+  (count **and** enumeration — it had claimed 17 while naming 15),
+  `docs/deploy/README.md` (bullet list completed 17 → 22), `README.md`,
+  `docs/enterprise-deployment.md` and `docs/deploy/enterprise-federation.env` all
+  move to 22, and all of them are enrolled in the `ASI_HARD_PINNED_KNOB_COUNT`
+  rule — 17 anchored citations across 11 surfaces, each verified to actually
+  match rather than assumed. Historical statements are left intact: the CHANGELOG
+  entries, the certification doc's signed pre-#3033 evidence notes and the
+  `infra/federation-lab` campaign logs still record what was true when written.
+
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 
 Closes a tenant-isolation + approval-bypass primitive on the namespace-standard

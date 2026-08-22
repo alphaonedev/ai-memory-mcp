@@ -144,6 +144,12 @@ CANONICAL_PGVECTOR_PATCH="$(
 
 # Profile::full().expected_tool_count() — count of RegisteredTool::of::<>() entries
 CANONICAL_FULL_TOOL_COUNT=$(grep -cE '^\s*RegisteredTool::of::<' src/mcp/registry.rs 2>/dev/null || echo 0)
+# asi-hard pinned-knob count (#3113). SSOT = the `KnobSpec` entries in the
+# `KNOBS` table (mirrored by the derived const
+# `security_profile::PINNED_KNOB_COUNT`). Counted from source for the same
+# reason as the tool count above: the entries ARE the definition, so a knob
+# cannot be added without moving this number.
+CANONICAL_ASI_HARD_KNOBS=$(grep -cE '^[[:space:]]*KnobSpec \{' src/security_profile.rs 2>/dev/null || echo 0)
 
 # Profile::core().expected_tool_count() — count of tn::* refs in the
 # `Self::Core => &[ ... ]` arm of Profile::tool_names(). 7 at v0.7.0.
@@ -509,8 +515,18 @@ if os.environ.get("AI_MEMORY_DOCS_GATE_SELFTEST_FAULT"):
 # made that accident stop holding: the README prior-release paragraph and
 # the ROADMAP frozen v0.7.1 baseline both legitimately say 25.
 PARA_LEAD = re.compile(r"^\s*\*\*v([0-9]+\.[0-9]+\.[0-9]+)")
+# MARKDOWN-ONLY (#3113). A leading `#` is a HEADING in .md/.html prose, but
+# it is the COMMENT marker in .sh / .env / .toml / .yml. Held in the shared
+# `HIST` ladder this anchor silently swallowed EVERY comment line of a
+# non-markdown scan file, so a rule that listed such a file covered nothing
+# in it and still reported PASS -- the fail-open shape this gate exists to
+# refuse. Harmless until now only because every previous scan set was
+# .md/.html; the asi-hard pinned-knob rule below is the first to walk a
+# shell script and an env template. Rust is unaffected either way (`#[...]`
+# / `#![...]` attributes are not `#` + space, and `//! # Heading` starts
+# with `//!`), but it is scoped by the same test rather than by luck.
+MD_HEADING = re.compile(r"^\s*#{1,6}\s")
 HIST = [
-    re.compile(r"^\s*#{1,6}\s"),
     re.compile(r"\b[Aa]t the v[0-9]+\.[0-9]+\.[0-9]+ release\b"),
     re.compile(r"\brelease, surface was\b"),
     re.compile(r"\bv[0-9]+ added\b"),
@@ -549,9 +565,11 @@ def plain(s):
     return WS.sub(" ", htmlmod.unescape(TAG.sub(" ", s))).strip()
 
 
-def is_historical(line):
+def is_historical(line, markdownish=True):
     m = PARA_LEAD.match(line)
     if m and m.group(1) != release:
+        return True
+    if markdownish and MD_HEADING.search(line):
         return True
     return any(p.search(line) for p in HIST)
 
@@ -568,14 +586,15 @@ for f in os.environ["GATE_NC_FILES"].split():
     if not os.path.isfile(f):
         continue
     is_html = f.endswith(".html")
+    markdownish = f.endswith((".md", ".html"))
     lines = open(f, encoding="utf-8").read().splitlines()
     for ln, line in enumerate(lines, 1):
         if is_html:
-            if is_historical(plain(line)):
+            if is_historical(plain(line), markdownish):
                 continue
             if html_window_historical(lines[max(0, ln - 1 - HTML_WINDOW):ln]):
                 continue
-        elif is_historical(line):
+        elif is_historical(line, markdownish):
             continue
         for m in pat.finditer(line):
             # Alternation groups: take the FIRST non-None capture
@@ -1248,6 +1267,56 @@ run_all_rules() {
     fail_count=0
     check_schema_version_rule
     check_env_var_census_rule
+    # asi-hard pinned-knob count (#3113). The count is quoted in PROSE across
+    # six files that cannot derive it; the module doc table sat two rows behind
+    # `KNOBS` for a full release with nothing failing. Set equality of the
+    # TABLE is pinned in-code by
+    # `security_profile::tests::pinned_knobs_doc_table_matches_the_knobs_ssot_exactly`;
+    # this rule pins the NARRATIVE count everywhere else.
+    # Known limitation (stated, not hidden): a NEW phrasing that none of these
+    # alternatives match would evade the rule. Add its shape here in the same
+    # commit that introduces it.
+    # CANONICAL RULE for this SSOT. PR #3169 proposes a second, overlapping
+    # asi-hard knob-count rule with its own scan set; this one supersedes it
+    # (it walks a strict superset of those surfaces) and the duplicate is to be
+    # collapsed into this rule at #3169's rebase — one rule, one SSOT, one
+    # scan set.
+    # Coverage as verified at this commit (a rule whose regex matches nothing
+    # in a listed file is a no-op that still reports PASS, so this is stated
+    # rather than assumed, and re-verified whenever a file is enrolled):
+    # 17 anchored citations across 11 of the 12 surfaces, all reading the
+    # canonical — CLAUDE.md 3, README.md 1, SECURITY.md 2, PERFORMANCE.md 1,
+    # docs/deploy/README.md 1, docs/deploy/enterprise-federation.env 1, the
+    # certification doc 2, docs/enterprise-deployment.md 1,
+    # src/security_profile.rs 2, src/enterprise_federation_posture.rs 2,
+    # scripts/check-bootstrap-cert-gate.sh 1.
+    # Two of the twelve surfaces are reachable ONLY because the markdown-heading
+    # anchor is now scoped to .md/.html (see MD_HEADING above): the `#` shell
+    # comment in scripts/check-bootstrap-cert-gate.sh and the `#` env-template
+    # comment in docs/deploy/enterprise-federation.env — the latter being
+    # precisely the line whose 17-vs-current drift went unseen.
+    # docs/deploy/asi-hard.env quotes NO count today and is enrolled so that a
+    # future one is policed on arrival; the knob NAMES in that template are
+    # pinned instead by
+    # tests/deploy_templates.rs::asi_hard_env_names_every_pinned_knob, and the
+    # two documented pinned-knob TABLES (this module's and PERFORMANCE.md's)
+    # by set equality in security_profile's own tests.
+    check_narrative_count_rule \
+        "ASI_HARD_PINNED_KNOB_COUNT" \
+        "$CANONICAL_ASI_HARD_KNOBS" \
+        '([0-9]+)-knob|(?:auto-)?[Pp]ins the ([0-9]+)(?: asi-hard)? knobs|holds \*\*([0-9]+)\*\* entries|names all ([0-9]+) correctly|SSOT for the ([0-9]+)|\*\*([0-9]+)\*\* post-#|shows `([0-9]+)/[0-9]+`|`PINNED_KNOB_COUNT` \(([0-9]+)\)|is \*\*([0-9]+) knobs\*\*|PINS \*\*([0-9]+)\*\* security env knobs|([0-9]+)-entry pin-and-refuse|all \*\*([0-9]+)\*\* `KNOBS` entries|All \*\*([0-9]+)\*\* of them' \
+        CLAUDE.md \
+        README.md \
+        SECURITY.md \
+        PERFORMANCE.md \
+        docs/deploy/README.md \
+        docs/deploy/asi-hard.env \
+        docs/deploy/enterprise-federation.env \
+        docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md \
+        docs/enterprise-deployment.md \
+        src/security_profile.rs \
+        src/enterprise_federation_posture.rs \
+        scripts/check-bootstrap-cert-gate.sh
     check_generalised_numeric_claims
     check_pgvector_version_rule
     check_html_version_stamp_rule
@@ -1362,6 +1431,7 @@ run_all_rules() {
         printf '   Canonical values resolved from source:\n' >&2
         printf '     CURRENT_SCHEMA_VERSION = %s (src/storage/migrations.rs)\n' "$CANONICAL_SCHEMA_VERSION" >&2
         printf '     Profile::full() tool count = %s (registry RegisteredTool::of entries)\n' "$CANONICAL_FULL_TOOL_COUNT" >&2
+        printf '     asi-hard pinned knobs = %s (security_profile KNOBS entries / PINNED_KNOB_COUNT)\n' "$CANONICAL_ASI_HARD_KNOBS" >&2
         printf '     EXPECTED_PRODUCTION_ROUTES_COUNT = %s\n' "$CANONICAL_ROUTES_COUNT" >&2
         printf '     EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = %s\n' "$CANONICAL_UNIQUE_PATHS_COUNT" >&2
         printf '     EXPECTED_CLI_SUBCOMMANDS_DEFAULT = %s\n' "$CANONICAL_CLI_DEFAULT" >&2
@@ -1893,6 +1963,83 @@ PGVECGOOD
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — the certified pgvector patch (0.8.6) still PASSES"
+
+    # ---- ASI-HARD PINNED-KNOB COUNT + THE MARKDOWN-HEADING SCOPING (#3113).
+    # Two directions in one leg, because the SECOND is what makes the first
+    # real:
+    #
+    #   (a) A stale count in a SHELL COMMENT must be REJECTED. This rule is
+    #       the first to walk a .sh / .env scan target, and until #3113 the
+    #       historical-line guard treated a leading `#` as a markdown HEADING
+    #       for EVERY file type — so in a shell script every comment line was
+    #       skipped, the rule covered NOTHING in it, and the gate still
+    #       printed PASS. That is the #2444 "reports success while doing
+    #       nothing" shape, arrived at by accident rather than by decision.
+    #
+    #   (b) A stale count in a genuine MARKDOWN HEADING must still be SPARED.
+    #       The scoping narrowed the anchor to .md/.html; it did not delete
+    #       it. Without this direction the leg would pass just as well if the
+    #       guard had been removed outright, which would re-point true
+    #       historical headings at the canonical — the record-destroying
+    #       failure the guard exists to prevent.
+    #
+    # Fixture SSOT = 3 `KnobSpec` entries; both planted claims say 9.
+    rm -f "$tmpdir/docs/CONFIG_SCHEMA.md"
+    cat > "$tmpdir/src/security_profile.rs" <<'KNOBSSOT'
+const KNOBS: &[KnobSpec] = &[
+    KnobSpec {
+        env: "A",
+    },
+    KnobSpec {
+        env: "B",
+    },
+    KnobSpec {
+        env: "C",
+    },
+];
+KNOBSSOT
+    mkdir -p "$tmpdir/scripts"
+    cat > "$tmpdir/scripts/check-bootstrap-cert-gate.sh" <<'KNOBSTALESH'
+#!/bin/bash
+# Shared certified env for a pg backend. asi-hard auto-pins the 9 knobs in
+# the binary's pre-runtime phase.
+KNOBSTALESH
+    cat > CLAUDE.md <<'KNOBHEADINGMD'
+## The 9-knob era — a heading, and a TRUE statement about the past
+
+Fixture CLAUDE.md — deliberately carries no CURRENT narrative counts.
+KNOBHEADINGMD
+    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — gate did NOT catch the stale knob count in a SHELL COMMENT (9 vs SSOT 3)" >&2
+        printf '%s\n' "$knob_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    grep -qF 'ASI_HARD_PINNED_KNOB_COUNT: scripts/check-bootstrap-cert-gate.sh' <<<"$knob_out" || {
+        echo "FAIL: self-test — a shell COMMENT line is still being skipped as a markdown heading (#3113 fail-open)" >&2
+        printf '%s\n' "$knob_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    if grep -qF 'ASI_HARD_PINNED_KNOB_COUNT: CLAUDE.md' <<<"$knob_out"; then
+        echo "FAIL: self-test — the markdown-heading historical guard was LOST, not scoped (a true past-tense heading was re-pointed)" >&2
+        printf '%s\n' "$knob_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #3113 — a stale count in a SHELL COMMENT is REJECTED; the same count in a MARKDOWN HEADING is still spared"
+
+    # ---- ASI-HARD CONTROL: the correct count (matching the fixture SSOT)
+    # PASSES, so the leg above proves a real rejection rather than a rule
+    # that fires on everything.
+    cat > "$tmpdir/scripts/check-bootstrap-cert-gate.sh" <<'KNOBGOODSH'
+#!/bin/bash
+# Shared certified env for a pg backend. asi-hard auto-pins the 3 knobs in
+# the binary's pre-runtime phase.
+KNOBGOODSH
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test — the asi-hard knob-count rule fired on the CORRECT count (3)" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #3113 — the correct asi-hard knob count still PASSES"
+    rm -f "$tmpdir/scripts/check-bootstrap-cert-gate.sh" "$tmpdir/src/security_profile.rs"
 
     # ================================================================
     # #2977 — THE GITHUB-PAGES (.html) SURFACE

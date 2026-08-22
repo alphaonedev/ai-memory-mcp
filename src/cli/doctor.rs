@@ -56,6 +56,10 @@ use std::time::Duration;
 
 // ── #1558 batch 6 — repeated doctor fact / section labels ──────────────
 const FACT_DIM_VIOLATIONS: &str = "dim_violations";
+
+/// v1.0.0 (#3113) — `doctor` fact naming the core-relation integrity state
+/// (see [`crate::storage::schema_integrity`]).
+const FACT_CORE_RELATIONS: &str = "core_relations";
 const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
 const FACT_RECALL_MODE_ACTIVE: &str = "recall_mode_active";
 const FACT_RERANKER_ACTIVE: &str = "reranker_active";
@@ -681,6 +685,23 @@ fn run_local(db_path: &Path) -> Report {
     }
 }
 
+/// v1.0.0 (#3113) — read the recorded schema stamp and report every core
+/// relation that stamp implies but the database does not contain.
+///
+/// # Errors
+///
+/// Propagates a failed stamp read or `sqlite_master` probe. A read failure is
+/// NOT flattened into "complete": reporting integrity as intact on the
+/// strength of a failed read is the fail-open shape this whole check exists
+/// to remove.
+fn core_relation_status(
+    conn: &rusqlite::Connection,
+) -> anyhow::Result<(i64, Vec<crate::storage::schema_integrity::CoreTable>)> {
+    let stamped = crate::storage::connection::probe_schema_stamp(conn)?.version();
+    let missing = crate::storage::schema_integrity::missing_core_tables(conn, stamped)?;
+    Ok((stamped, missing))
+}
+
 fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection {
     let mut facts = Vec::new();
     let mut severity = Severity::Info;
@@ -725,6 +746,52 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
         }
         Err(e) => {
             facts.push(("dim_violations_error".into(), e.to_string()));
+        }
+    }
+
+    // v1.0.0 (#3113) — CORE-RELATION INTEGRITY. The migration ladder's
+    // existence-probe arms SKIP a relation that is absent and the tail stamps
+    // the tip regardless, so a database can claim a schema version whose
+    // integrity controls were never applied. `migrate` warns at the moment it
+    // happens; this is the standing operator-facing signal, readable at any
+    // time and independent of who ran that migration or when.
+    match core_relation_status(conn) {
+        Ok((stamped, missing)) if missing.is_empty() => {
+            facts.push((FACT_CORE_RELATIONS.into(), format!("complete (v{stamped})")));
+        }
+        Ok((stamped, missing)) => {
+            facts.push((
+                FACT_CORE_RELATIONS.into(),
+                crate::storage::schema_integrity::describe(&missing),
+            ));
+            severity = Severity::Critical;
+            let core_note = format!(
+                "{} core relation(s) required at schema v{stamped} are ABSENT — the ladder \
+                 arms that create them were skipped, so the integrity controls this stamp \
+                 implies are NOT in force. On a populated database this indicates relation \
+                 LOSS (corruption / partial restore), not a fresh install: restore from a \
+                 backup containing them. Set {env}=1 to \
+                 make the migration refuse to stamp rather than warn.",
+                missing.len(),
+                env = crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES,
+            );
+            // COMPOSE, never overwrite: the dim-violation branch above may
+            // already have set a note, and dropping an operator diagnostic to
+            // make room for this one would be its own small data loss.
+            note = Some(note.take().map_or_else(
+                || core_note.clone(),
+                |existing| format!("{existing} | {core_note}"),
+            ));
+        }
+        Err(e) => {
+            // A failed probe means the integrity claim is UNVERIFIED, which is
+            // not the same as verified-good. Surface it rather than letting a
+            // read failure read as a clean bill of health — but never downgrade
+            // a Critical already raised above.
+            facts.push((format!("{FACT_CORE_RELATIONS}_error"), e.to_string()));
+            if severity == Severity::Info {
+                severity = Severity::Warning;
+            }
         }
     }
 
@@ -3799,6 +3866,65 @@ enabled = true
         let s = String::from_utf8(stdout).unwrap();
         assert!(s.contains("Hooks loaded: 1"), "got: {s}");
         assert!(s.contains("notify-hook.sh"), "got: {s}");
+    }
+
+    /// #3113 — a healthy, fully-migrated database reports its core relations
+    /// complete and does NOT raise the Storage section.
+    #[test]
+    fn storage_section_reports_core_relations_complete_on_a_healthy_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doctor-3113-ok.db");
+        let conn = crate::db::open(&path).expect("open");
+        let section = section_storage(&conn, &path);
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == FACT_CORE_RELATIONS && v.starts_with("complete")),
+            "facts: {:?}",
+            section.facts
+        );
+        assert_ne!(
+            section.severity,
+            Severity::Critical,
+            "a healthy database must not raise Storage to Critical"
+        );
+    }
+
+    /// #3113 — the standing operator signal. A database that LOST a
+    /// ladder-only core relation while keeping a high stamp must raise Storage
+    /// to Critical and NAME the relation, so the fail-open migration is
+    /// visible long after the migration that skipped it.
+    #[test]
+    fn storage_section_is_critical_when_a_core_relation_was_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doctor-3113-lost.db");
+        drop(crate::db::open(&path).expect("open"));
+        let raw = rusqlite::Connection::open(&path).expect("reopen");
+        raw.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {};",
+            crate::storage::schema_integrity::TABLE_GOVERNANCE_RULES
+        ))
+        .expect("drop core relation");
+
+        let section = section_storage(&raw, &path);
+        assert_eq!(
+            section.severity,
+            Severity::Critical,
+            "a lost core relation must raise Storage to Critical: {:?}",
+            section.facts
+        );
+        assert!(
+            section.facts.iter().any(|(k, v)| k == FACT_CORE_RELATIONS
+                && v.contains(crate::storage::schema_integrity::TABLE_GOVERNANCE_RULES)),
+            "the fact must NAME the missing relation: {:?}",
+            section.facts
+        );
+        assert!(
+            section.note.as_ref().is_some_and(|n| n.contains("ABSENT")),
+            "note: {:?}",
+            section.note
+        );
     }
 
     /// A connection with no schema at all: `db::stats` fails, the

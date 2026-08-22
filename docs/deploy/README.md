@@ -39,6 +39,16 @@ floor (the "no-disable" contract). SSOT: `src/security_profile.rs::KNOBS`.
 - `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG=1`
 - `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=1`
 - `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG=1`
+- `AI_MEMORY_FED_REQUIRE_SIG=1` (#3033 — the first of the four OUTER
+  federation-TRANSPORT gates: a per-message Ed25519 signature on the
+  request itself, applied before any object in it is inspected)
+- `AI_MEMORY_FED_REQUIRE_NONCE=1` (#3033 — per-message nonce freshness)
+- `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1` (#3033 — the inbound
+  `X-Peer-Id` must resolve to an enrolled Ed25519 key)
+- `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=1` (#3033 — inbound-write
+  namespace confinement). All four already default fail-closed at
+  v1.0.0, so pinning them is a no-op for a compliant deployment: it
+  only removes the ability to DISABLE them under `asi-hard`.
 - `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1`
 - `AI_MEMORY_CID_ENFORCE=1`
 - `AI_MEMORY_REQUIRE_ROLLBACK_CHECK=1`
@@ -50,6 +60,12 @@ floor (the "no-disable" contract). SSOT: `src/security_profile.rs::KNOBS`.
   must verify the peer's SERVER cert; `ai-memory sync-daemon
   --insecure-skip-server-verify` is refused under this posture)
 - `AI_MEMORY_DB_SYNCHRONOUS=FULL` (power-loss durability)
+- `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1` (#3113 — the first
+  SCHEMA-INTEGRITY pin: a migration REFUSES to stamp a schema version
+  whose ladder-created core relations were lost, rather than merely
+  warning. Safe to pin ON because refusal additionally requires a
+  positively observed POPULATED corpus, so a fresh hardened node with
+  an empty database is never bricked)
 - `AI_MEMORY_ALLOW_SCHEMA_AHEAD` **must be UNSET** (#2445) — the first
   PERMISSIVE-shaped pin, so its hard floor is the inverse: under
   `asi-hard` the schema-downgrade hatch may not be set at all, and
@@ -61,10 +77,18 @@ floor (the "no-disable" contract). SSOT: `src/security_profile.rs::KNOBS`.
 - plus `[governance].require_operator_pubkey=true` (bridged at the
   governance boot check).
 
-(That list is all **17** `KNOBS` entries. It enumerated only 15 through
-v1.0.0, silently omitting the two permissive-shaped pins above — the ones
-whose violation REFUSES BOOT — while claiming `src/security_profile.rs::KNOBS`
-as its SSOT. `docs/deploy/asi-hard.env` had them right.)
+(That list is all **22** `KNOBS` entries. It has drifted from its own
+declared SSOT twice: it enumerated only 15 of the then-17 through v1.0.0,
+silently omitting the two permissive-shaped pins above — the ones whose
+violation REFUSES BOOT — and it then sat at 17 after #3033 raised the table
+to 21. Both gaps were invisible because the count was maintained by hand.
+It is now mechanically pinned: `src/security_profile.rs::KNOBS` membership
+by set equality in
+`src/security_profile.rs::tests::pinned_knobs_doc_table_matches_the_knobs_ssot_exactly`,
+and this count by the `ASI_HARD_PINNED_KNOB_COUNT` rule in
+`scripts/check-docs-vs-ssot.sh`. `docs/deploy/asi-hard.env` had the
+permissive pins right all along, and is now itself pinned knob-by-knob by
+`tests/deploy_templates.rs::asi_hard_env_names_every_pinned_knob`.)
 
 ### What the config template pins (config-backed PE-1, #1962)
 

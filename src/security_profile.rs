@@ -43,6 +43,8 @@
 //! | `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` | `1` | unsigned direct writes refused on EVERY surface |
 //! | `AI_MEMORY_FED_REQUIRE_WRITE_SIG` | `1` | inbound relayed memories must carry a verified per-write signature |
 //! | `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` | `1` | inbound relayed signals must verify against the enrolled author key |
+//! | `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` | `1` | inbound relayed lifecycle transitions must verify against the enrolled author key |
+//! | `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` | `1` | inbound relayed checkpoints must verify against the enrolled author key |
 //! | `AI_MEMORY_FED_REQUIRE_SIG` | `1` | inbound federation requests must carry a verified per-message Ed25519 signature (#3033 outer-transport gate) |
 //! | `AI_MEMORY_FED_REQUIRE_NONCE` | `1` | inbound federation requests must carry a fresh per-message nonce (#3033 outer-transport gate) |
 //! | `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` | `1` | an inbound peer's `X-Peer-Id` must resolve to an enrolled Ed25519 key (#3033 outer-transport gate) |
@@ -57,6 +59,7 @@
 //! | `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` | `1` | outbound federation TLS must verify the PEER SERVER cert — `--insecure-skip-server-verify` is refused (#2448) |
 //! | `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` | *(unset)* | the plaintext-peer hatch is NOT in force — an `http://` peer on a non-loopback host is refused (#2477) |
 //! | `AI_MEMORY_DB_SYNCHRONOUS` | `FULL` | power-loss durability (fsync every commit) — #1961 part C |
+//! | `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES` | `1` | a migration REFUSES to stamp a schema version whose ladder-created core relations were lost, instead of warning (#3113) |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
 //! `[governance].require_operator_pubkey` to `true` (see
@@ -358,7 +361,37 @@ const KNOBS: &[KnobSpec] = &[
         hard_value: "FULL",
         meets_floor: synchronous_meets_floor,
     },
+    // #3113 — the migration ladder's core-relation gate. The sqlite ladder's
+    // existence-probe arms SKIP a relation that is absent and the tail stamps
+    // the tip regardless, so a POPULATED database that LOST a core relation
+    // (corruption / partial file-level restore / operator DROP) "upgrades
+    // successfully" with the integrity controls that stamp implies never
+    // applied. Detection is unconditional in every posture; this pin makes a
+    // CERTIFIED deployment REFUSE the stamp rather than warn — the #3033
+    // "asi-hard no-disable" contract applied to schema integrity.
+    //
+    // Safe to pin ON: refusal additionally requires a POSITIVELY OBSERVED
+    // populated corpus (`storage::schema_integrity::refusal_required`), so a
+    // fresh or archive-less hardened deployment with an empty corpus is never
+    // bricked, and the refusal itself mutates nothing — it rolls the ladder
+    // back and leaves the database readable at its old version.
+    KnobSpec {
+        env: crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES,
+        hard_value: "1",
+        meets_floor: is_truthy,
+    },
 ];
+
+/// The number of env knobs `asi-hard` pins — ONE named SSOT for a count that
+/// the module doc table, `docs/deploy/asi-hard.env`, the enterprise-federation
+/// certification doc, `scripts/check-bootstrap-cert-gate.sh` and
+/// `src/enterprise_federation_posture.rs` all quote in prose.
+///
+/// Derived from [`KNOBS`], so adding a knob moves it automatically. The prose
+/// sites cannot derive it, which is exactly how they drifted (the table sat two
+/// rows behind for an entire release); `scripts/check-docs-vs-ssot.sh` resolves
+/// this same count from source and fails the build when a prose site disagrees.
+pub const PINNED_KNOB_COUNT: usize = KNOBS.len();
 
 /// What happened to one knob during enforcement (for the boot log).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,7 +431,7 @@ pub fn pinned_knobs() -> Vec<(&'static str, &'static str)> {
 /// [`enforce_at_boot`], which may only run in the synchronous
 /// pre-runtime phase of `fn main()` (#2386), this is safe to call from
 /// any live process (e.g. `ai-memory doctor --posture
-/// enterprise-federation`, which reuses this as ONE SSOT for the 21
+/// enterprise-federation`, which reuses this as ONE SSOT for the 22
 /// `asi-hard` pinned knobs rather than re-deriving the KNOBS table).
 ///
 /// Returns `(env, current_value, hard_value)` triples.
@@ -661,6 +694,46 @@ mod tests {
     }
 
     #[test]
+    fn asi_hard_actually_enables_the_migration_core_relation_gate() {
+        // #3113 END-TO-END. `asi_hard_pins_documented_set` proves the knob is
+        // in the KNOBS table; this proves the pin has its INTENDED EFFECT —
+        // that after boot enforcement the migration ladder's own reader
+        // returns true, so a certified deployment really does refuse to stamp
+        // a schema version whose core relations were lost. The reader is a
+        // DIRECT env read (the ladder runs before the boot-seeded config
+        // globals exist), so "pinned in a table" and "in force at the read
+        // site" are genuinely separate claims and the second is the one the
+        // cert language rests on.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_actually_enables_the_migration_core_relation_gate",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = KnobsGuard;
+
+        // Baseline: with no posture the gate reports only, never refuses.
+        assert!(
+            !crate::config::migration_require_core_tables(),
+            "the default posture must be report-only"
+        );
+
+        unsafe {
+            std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+        }
+        let (posture, _reports) = enforce_at_boot().unwrap();
+        assert_eq!(posture, SecurityPosture::AsiHard);
+        assert!(
+            crate::config::migration_require_core_tables(),
+            "asi-hard must leave the migration core-relation gate ENFORCING at its \
+             read site, not merely listed in KNOBS (#3113)"
+        );
+    }
+
+    #[test]
     fn asi_hard_pins_every_unset_knob() {
         if crate::config::run_env_isolated_child_or_spawn(
             "security_profile::tests::asi_hard_pins_every_unset_knob",
@@ -773,6 +846,167 @@ mod tests {
         assert!(format!("{err}").contains("AI_MEMORY_REQUIRE_WITNESS"));
     }
 
+    /// The env-knob names listed in this module's own `## Pinned knobs`
+    /// markdown table, in table order.
+    ///
+    /// Parsed out of this file's SOURCE rather than a hand-maintained copy, so
+    /// the assertion below cannot drift from the table it is checking.
+    /// `include_str!` embeds the file at compile time and cargo tracks it as a
+    /// build input, so editing a row re-runs this test.
+    fn documented_pinned_knob_names() -> Vec<&'static str> {
+        const SRC: &str = include_str!("security_profile.rs");
+        SRC.lines()
+            .filter_map(|line| {
+                // A table DATA row is ``//! | `AI_MEMORY_X` | ... |``. The
+                // header (`| Env knob | ...`) and the `|---|---|---|`
+                // separator have no backticked first cell, so they drop out
+                // here. Deliberately NOT filtered on an `AI_MEMORY_` prefix: a
+                // typo'd row must surface as set-difference drift, not be
+                // silently skipped.
+                let rest = line.strip_prefix("//! |")?.trim_start();
+                let (name, _) = rest.strip_prefix('`')?.split_once('`')?;
+                Some(name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pinned_knobs_doc_table_matches_the_knobs_ssot_exactly() {
+        // #3113 — the DURABLE fix for the drift this branch found by hand: the
+        // `## Pinned knobs` table had silently fallen TWO rows behind `KNOBS`
+        // (missing FED_REQUIRE_TRANSITION_SIG + FED_REQUIRE_CHECKPOINT_SIG),
+        // and nothing failed. A count-only check would not have caught it
+        // either, because the count lives in prose that drifted with it. This
+        // asserts SET EQUALITY in BOTH directions, so a knob added to `KNOBS`
+        // without a row — or a row for a knob that is not actually pinned,
+        // which is the more dangerous direction (the docs would advertise a
+        // hardening guarantee the binary does not enforce) — fails here.
+        use std::collections::BTreeSet;
+
+        let rows = documented_pinned_knob_names();
+        let documented: BTreeSet<&str> = rows.iter().copied().collect();
+        let actual: BTreeSet<&str> = KNOBS.iter().map(|k| k.env).collect();
+
+        // A name listed twice would let the sets match while the table
+        // over-states the pinned set.
+        assert_eq!(
+            rows.len(),
+            documented.len(),
+            "duplicate row in the `## Pinned knobs` table: {rows:?}"
+        );
+
+        let undocumented: Vec<&str> = actual.difference(&documented).copied().collect();
+        assert!(
+            undocumented.is_empty(),
+            "pinned by KNOBS but MISSING a `## Pinned knobs` table row: {undocumented:?} \
+             — add the row in the same commit that adds the knob"
+        );
+
+        let phantom: Vec<&str> = documented.difference(&actual).copied().collect();
+        assert!(
+            phantom.is_empty(),
+            "documented as pinned but ABSENT from KNOBS: {phantom:?} — the docs would \
+             advertise a hardening guarantee the binary does not enforce"
+        );
+
+        // Implied by set equality, but pins the NUMBER the module docstrings,
+        // `docs/deploy/asi-hard.env` and the cert doc quote.
+        assert_eq!(documented.len(), KNOBS.len());
+    }
+
+    /// The env-knob names in `PERFORMANCE.md`'s `## Hardened \`asi-hard\`
+    /// security posture` "Pinned knobs" table, in table order.
+    ///
+    /// SECTION-SCOPED deliberately. `PERFORMANCE.md` carries OTHER tables
+    /// whose first cell is a backticked `AI_MEMORY_*` name (the read-path
+    /// degrade-budget table a few sections up), so a whole-file scan would
+    /// fold those in and report phantom drift against `KNOBS`. The parse
+    /// starts at this section's heading and stops at the next `## ` heading.
+    ///
+    /// FAILS CLOSED in both no-data directions: a missing heading panics and
+    /// an empty row set panics, rather than yielding an empty set. An empty
+    /// set would make the set-equality assertion below silently VACUOUS the
+    /// moment the section is renamed or the table reformatted — which is
+    /// exactly the "reports success while doing nothing" shape this change
+    /// exists to remove, and it would be indistinguishable from a pass.
+    fn performance_md_pinned_knob_names() -> Vec<&'static str> {
+        const SRC: &str = include_str!("../PERFORMANCE.md");
+        const HEADING: &str = "## Hardened `asi-hard` security posture";
+
+        let Some(start) = SRC.lines().position(|l| l.starts_with(HEADING)) else {
+            panic!(
+                "PERFORMANCE.md has no `{HEADING}` section — the pinned-knob table \
+                 cannot be located, so this gate would be vacuous"
+            )
+        };
+
+        let rows: Vec<&'static str> = SRC
+            .lines()
+            .skip(start + 1)
+            .take_while(|l| !l.starts_with("## "))
+            .filter_map(|line| {
+                // A DATA row is ``| `AI_MEMORY_X` | ... |``. The header
+                // (`| Env knob | ...`) has no backticked first cell and the
+                // `|---|---|` separator has no space after the pipe, so both
+                // drop out here. Deliberately NOT filtered on an
+                // `AI_MEMORY_` prefix: a typo'd row must surface as
+                // set-difference drift, not be silently skipped.
+                let rest = line.strip_prefix("| ")?;
+                let (name, _) = rest.strip_prefix('`')?.split_once('`')?;
+                Some(name)
+            })
+            .collect();
+
+        assert!(
+            !rows.is_empty(),
+            "the `{HEADING}` section carries no `| `ENV` |` table rows — refusing \
+             to report a vacuous pass"
+        );
+        rows
+    }
+
+    #[test]
+    fn performance_md_pinned_knobs_table_matches_the_knobs_ssot_exactly() {
+        // #3113 — the SECOND documented pinned-knob table, pinned the same way
+        // as the module doc table above. `PERFORMANCE.md`'s §"Hardened
+        // `asi-hard` security posture" table is what CLAUDE.md env row #130
+        // sends an operator to by name, and it had fallen SEVEN rows behind
+        // `KNOBS` (no row for the four #3033 outer-transport gates, neither
+        // PERMISSIVE-shaped pin, nor the #3113 schema-integrity pin) with
+        // nothing failing — a procurement-facing document describing a WEAKER
+        // hardened posture than the binary actually enforces.
+        use std::collections::BTreeSet;
+
+        let rows = performance_md_pinned_knob_names();
+        let documented: BTreeSet<&str> = rows.iter().copied().collect();
+        let actual: BTreeSet<&str> = KNOBS.iter().map(|k| k.env).collect();
+
+        // A name listed twice would let the sets match while the table
+        // over-states the pinned set.
+        assert_eq!(
+            rows.len(),
+            documented.len(),
+            "duplicate row in the PERFORMANCE.md pinned-knobs table: {rows:?}"
+        );
+
+        let undocumented: Vec<&str> = actual.difference(&documented).copied().collect();
+        assert!(
+            undocumented.is_empty(),
+            "pinned by KNOBS but MISSING a PERFORMANCE.md pinned-knobs row: \
+             {undocumented:?} — add the row in the same commit that adds the knob"
+        );
+
+        let phantom: Vec<&str> = documented.difference(&actual).copied().collect();
+        assert!(
+            phantom.is_empty(),
+            "documented in PERFORMANCE.md as pinned but ABSENT from KNOBS: \
+             {phantom:?} — the docs would advertise a hardening guarantee the \
+             binary does not enforce"
+        );
+
+        assert_eq!(documented.len(), PINNED_KNOB_COUNT);
+    }
+
     #[test]
     fn asi_hard_pins_documented_set() {
         if crate::config::run_env_isolated_child_or_spawn(
@@ -781,9 +1015,26 @@ mod tests {
             return;
         }
         // The pinned set must match the documented count so the module
-        // docs table and the KNOBS SSOT cannot silently drift.
+        // docs table and the KNOBS SSOT cannot silently drift. Asserting
+        // against [`PINNED_KNOB_COUNT`] rather than a literal is deliberate:
+        // the literal was the ONE place the count had to be hand-bumped, and
+        // a hand-bumped number is exactly what drifted (#3113). The pin is
+        // not weakened by dropping it — the count is enforced against the
+        // module doc TABLE on the next line, against the table by SET
+        // equality in `pinned_knobs_doc_table_matches_the_knobs_ssot_exactly`,
+        // and against every PROSE site by the ASI_HARD_PINNED_KNOB_COUNT rule
+        // in `scripts/check-docs-vs-ssot.sh`.
         let pins = pinned_knobs();
-        assert_eq!(pins.len(), 21, "documented asi-hard knob count");
+        assert_eq!(
+            pins.len(),
+            PINNED_KNOB_COUNT,
+            "pinned_knobs() must enumerate every KNOBS entry, unfiltered"
+        );
+        assert_eq!(
+            documented_pinned_knob_names().len(),
+            PINNED_KNOB_COUNT,
+            "the `## Pinned knobs` module doc table must carry one row per KNOBS entry"
+        );
         // Every pin's env name is non-empty and the durability pin is FULL.
         assert!(pins.iter().all(|(e, _)| !e.is_empty()));
         assert!(
@@ -800,6 +1051,16 @@ mod tests {
             pins.iter()
                 .any(|(e, v)| *e == crate::tls::FED_REQUIRE_SERVER_VERIFY_ENV && *v == "1"),
             "asi-hard must pin outbound server-cert verification (#2448)"
+        );
+        // #3113 — the first SCHEMA-INTEGRITY pin. The migration ladder's
+        // existence-probe arms fail OPEN: a populated database that lost a
+        // core relation stamps the tip anyway, with the integrity controls
+        // that stamp implies never applied. A certified deployment must
+        // REFUSE that stamp, not merely warn about it.
+        assert!(
+            pins.iter()
+                .any(|(e, v)| *e == crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES && *v == "1"),
+            "asi-hard must pin the migration core-relation gate (#3113)"
         );
         // #2477 — the SECOND network access-control pin, and the second
         // PERMISSIVE one (hard floor = the hatch is NOT in force). Without
@@ -894,7 +1155,7 @@ mod tests {
             return;
         }
         // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
-        // reuses this accessor as the SSOT for the 21-knob asi-hard set
+        // reuses this accessor as the SSOT for the 22-knob asi-hard set
         // rather than re-deriving KNOBS; pin its own read-only contract
         // directly (in addition to the exhaustive coverage the
         // `enterprise_federation_posture::tests` module gives it

@@ -387,16 +387,26 @@ contract). Under the default `standard` posture every knob keeps its
 own default (byte-identical legacy). SSOT: `src/security_profile.rs`.
 
 Pinned knobs (unset → pinned to the hard value; already-compliant →
-accepted; set-below-floor → boot REFUSED):
+accepted; set-below-floor → boot REFUSED). All **22** of them, in `KNOBS`
+order — this table is mechanically pinned to the SSOT by SET equality in
+`src/security_profile.rs::tests::performance_md_pinned_knobs_table_matches_the_knobs_ssot_exactly`,
+so a knob can no longer be added to `KNOBS` without a row here, and a row
+here cannot claim a hardening guarantee the binary does not enforce
+(#3113 — before that pin this table listed 15 of the then-21):
 
 | Env knob | Hard floor |
 |---|---|
 | `AI_MEMORY_SECRET_SCREEN_MODE` | `refuse` |
+| `AI_MEMORY_ALLOW_SCHEMA_AHEAD` | *(unset)* — PERMISSIVE-shaped: the schema-downgrade hatch must be ABSENT; setting it REFUSES boot (#149/#2445) |
 | `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` | `1` |
 | `AI_MEMORY_FED_REQUIRE_WRITE_SIG` | `1` |
 | `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` | `1` |
 | `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` | `1` |
 | `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` | `1` |
+| `AI_MEMORY_FED_REQUIRE_SIG` | `1` (outer federation-TRANSPORT gate: per-message Ed25519 signature — #3033) |
+| `AI_MEMORY_FED_REQUIRE_NONCE` | `1` (outer transport gate: per-message nonce freshness — #3033) |
+| `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` | `1` (outer transport gate: `X-Peer-Id` must resolve to an enrolled key — #3033) |
+| `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` | `1` (outer transport gate: inbound-write namespace confinement — #3033) |
 | `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` | `1` |
 | `AI_MEMORY_CID_ENFORCE` | `1` |
 | `AI_MEMORY_REQUIRE_ROLLBACK_CHECK` | `1` |
@@ -405,7 +415,9 @@ accepted; set-below-floor → boot REFUSED):
 | `AI_MEMORY_REQUIRE_ROLE_SEPARATION` | `1` |
 | `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE` | `1` |
 | `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` | `1` (outbound federation TLS must verify the PEER SERVER cert; `--insecure-skip-server-verify` is refused — #2448) |
+| `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` | *(unset)* — PERMISSIVE-shaped: the plaintext-peer hatch must be non-truthy; a truthy value REFUSES boot (#154/#2477) |
 | `AI_MEMORY_DB_SYNCHRONOUS` | `FULL` (power-loss durability, above) |
+| `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES` | `1` (a migration REFUSES to stamp a schema version whose ladder-created core relations were lost, rather than warning — #3113) |
 
 In addition, `asi-hard` forces the config-backed governance knob
 `[governance].require_operator_pubkey` to `true` at the governance boot
