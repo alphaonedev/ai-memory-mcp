@@ -127,8 +127,14 @@ replacement contract), auto-promote mid→long at 5 accesses.
 | `--valid-at` | RFC3339 | — | #1834 claim-bitemporal as-of: return only claims asserted to hold at this instant (`valid_from`/`valid_until` window). |
 | `--confidence-tier` | enum | — | v0.7.0 (#1098) — restrict to `high`/`medium`/`low`. Closes the CLI side of the three-surface parity gap. |
 | `--verbose-provenance` | bool | `false` | v0.7.0 (#1098, Gap-7 #890) — request the per-row provenance decoration (`citations`, `source_uri`, `source_span`, `confidence_source`, `confidence_signals`). |
-| `--format` | enum | `human` | v0.7.0 (#1098) — `human` / `json` / `toon`. `toon` is the compact TOON envelope. Same vocabulary as the MCP/HTTP `format` param. |
+| `--format` | enum | `human` | `human` / `json` / `toon`. v1.0.0 [#3005](https://github.com/alphaonedev/ai-memory-mcp/issues/3005) — this selector now actually selects the renderer. `json` emits the same envelope the global `--json` produces; `toon` emits TOON (~79% smaller; the same encoder MCP / HTTP use). The global `--json` still takes precedence, so existing `--json` scripts are unchanged. |
 | `--session-id` | string | — | v0.7.0 (#1257) — in-session ring boost (+0.05 rerank under #518); MCP/HTTP parity flag. |
+
+Until v1.0.0 `--format` was declared, validated and marshalled into the
+recall DTO but never read by the CLI render path: all three values produced
+byte-identical **human** output, so `--format json` silently lied and TOON was
+unreachable from the CLI even though the MCP and HTTP surfaces had honoured it
+since v0.6.x ([#3005](https://github.com/alphaonedev/ai-memory-mcp/issues/3005)).
 
 ```bash
 ai-memory recall "what deployment pattern did we agree on" \
