@@ -238,7 +238,7 @@ scripts/dogfood-rebuild.sh
 
 What it does (idempotent — safe to re-run after every commit):
 1. `cargo build --release`
-2. Backs up the live MCP DB to `/tmp/ai-memory-dogfood-test-<ts>.db`
+2. Backs up the live MCP DB to `.local-runs/ai-memory-dogfood-test-<ts>.db`
 3. Dry-runs migrations against the backup (proves v17→v18→v19 etc. round-trip cleanly on real data)
 4. Re-points `/opt/homebrew/bin/ai-memory` → `target/release/ai-memory` (via `brew unlink` + symlink)
 5. Lists running MCP processes that need a Claude Code restart to pick up the new binary
@@ -2621,7 +2621,7 @@ harness's own session cache).
 **Allowed scratch location.** All agent-created scratch lives under:
 
 ```
-/Users/fate/v07/v07-fixes/.local-runs/
+<repo-root>/.local-runs/
 ```
 
 This directory is gitignored (see `.gitignore`). It is the canonical

@@ -47,17 +47,21 @@ jobs:
     # (the rule is stated at the head of ci.yml).
     #
     # `ubuntu-latest` is not a convenience here, it is the REFERENCE HARDWARE
-    # the published budgets are defined against: `PERFORMANCE.md` §"Measurement
-    # methodology" pins CI to "GitHub-hosted Linux x86_64 runners
-    # (`ubuntu-latest`)" and its hardware multiplier table gives that class the
-    # 1.0 multiplier every p95 target in the budget table is expressed in.
-    # `performance/baseline.json` likewise documents itself as a
-    # `regenerate-baseline`-on-`ubuntu-latest` median-of-3 artefact. #3109 moved
-    # the job to `[self-hosted, linux-fed]` WITHOUT moving the budgets, so a
-    # p95 measured on the f2 node was being compared against an
-    # `ubuntu-latest`-calibrated target while the job name, PERFORMANCE.md §7
-    # and the baseline file all still said `ubuntu-latest` — a measurement read
-    # off the wrong machine and a doc-vs-reality drift in the same move.
+    # the published budgets are defined against: `PERFORMANCE.md`
+    # §"Hardware Baseline" pins CI to "GitHub-hosted Linux x86_64 runners
+    # (`ubuntu-latest`)" and its platform multiplier (`MACOS_BUDGET_MULT`)
+    # gives that class the 1.0 multiplier every p95 target in the budget
+    # table is expressed in. `performance/baseline.json` documents the
+    # runner class it must be CAPTURED on (`ubuntu-latest`, via the
+    # `regenerate-baseline` median-of-3 job) — the committed file is still a
+    # dev bootstrap placeholder (`runner_class: local-dev-bootstrap`,
+    # `bootstrap: true`), which is exactly why the compare step skips.
+    # #3109 moved the job to `[self-hosted, linux-fed]` WITHOUT moving the
+    # budgets, so a p95 measured on the f2 node was being compared against an
+    # `ubuntu-latest`-calibrated target while the job name,
+    # PERFORMANCE.md §"Hardware Baseline" and the baseline file all still
+    # said `ubuntu-latest` — a measurement read off the wrong machine and a
+    # doc-vs-reality drift in the same move.
     #
     # Moving it back both makes the job name TRUE again (no rename, so no
     # required-context churn — this job is advisory, see the `paths-ignore`
@@ -115,7 +119,7 @@ jobs:
           {
             echo '## ai-memory bench --scale 10000'
             echo ''
-            echo 'Corpus-scale gate (#1579 B8): same 7 operations over a '
+            echo 'Corpus-scale gate (#1579 B8): same 8 operations over a '
             echo '10k-row seeded corpus, gated against the `[scale]` '
             echo 'budget table in PERFORMANCE.md §"Corpus-scale budgets".'
             echo ''

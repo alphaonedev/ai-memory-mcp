@@ -1079,29 +1079,21 @@ ai-memory does not provide a turnkey GDPR layer; it provides the
 The operator's data-residency policy is encoded in the **namespace
 allowlist** + the **federation peer attestation** + the **`forget`
 operation** + the **archive-purge cadence**. The operator owns the
-policy; the substrate enforces it **in one direction**.
+policy; the substrate enforces it **in both directions** under an
+enrolled posture (#2489/#2480).
 
-> ⚠️ **Residency has two directions and only the outbound one is
-> gated.** On the **SERVE** direction (`/sync/since`, a peer pulling
-> from you) `namespace_allowed_test_glob` is applied default-deny
-> before any row crosses the wire — that half is real. On the
-> **ACCEPT** direction the pull-accept path
-> (`src/federation/receive.rs`) runs as
-> `CallerContext::for_admin(FEDERATION_CATCHUP)` with
-> `bypass_visibility = true` and never consults `PeerAttestationConfig`
-> at all, so a peer you pull from can place rows into any namespace on
-> your node — including `(title, namespace)` dedup-overwrites of rows
-> already there
-> ([#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480)).
-> The `links[]` and `signals[]` push lanes are likewise unscoped
+> ✅ **Residency is gated in both directions.** On **SERVE**
+> (`/sync/since`) `namespace_allowed_test_glob` is applied default-deny
+> before any row crosses the wire. On **ACCEPT** the catchup path now
+> applies the SAME operator-authored `allowed_namespaces` list before
+> insert (`catchup_memory_namespace_authorized`,
+> [#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480)),
+> as do the `links[]` / `signals[]` push lanes
 > ([#2489](https://github.com/alphaonedev/ai-memory-mcp/issues/2489)).
->
-> For a residency control, that means: **what leaves your region is
-> gated; what arrives is not.** If your obligation is only "our data
-> must not leave region X", the serve-direction gate meets it. If it is
-> also "no foreign-origin data may land in region X's namespaces", the
-> substrate does not yet enforce that — pull only from peers you
-> administer.
+> `CallerContext::for_admin(FEDERATION_CATCHUP)` still bypasses SAL
+> visibility so the peer snapshot round-trips — it no longer bypasses
+> scope. Enforcement requires an ENROLLED posture; zero-config
+> federation is unchanged.
 
 ### 7.5 DNS + routing strategy
 
@@ -1352,10 +1344,11 @@ For an operator piloting a hive in v0.7.0, the responsible shape is:
    same document: *"if subsets of peers should NOT see each other's
    data, the swarm shape is wrong."* Cross-cluster federation replicates
    **plaintext** memory content ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968))
-   and `PeerScope.allowed_namespaces` is not consulted on three inbound
-   write lanes ([`federation.md`](federation.html) §"Layer 3 — Peer
-   attestation"), so a per-tenant mesh is a topology this substrate
-   disclaims elsewhere. For mutually distrusting tenants use **separate
+   — every inbound write lane now consults
+   `PeerScope.allowed_namespaces` under an enrolled posture
+   (#2489/#2480, see [`federation.md`](federation.html) §"Layer 3 — Peer
+   attestation"), but plaintext replication alone makes a per-tenant
+   mesh a topology this substrate disclaims elsewhere. For mutually distrusting tenants use **separate
    deployments**, not one federated hive with scopes.
 2. **Mesh federation between the three** via the T6 wire shape (signed + nonce + attestation).
 3. **Strict trust gates** — every cross-cluster `PeerScope` row narrows to specific allowed namespaces. No `**` globs cross-cluster.

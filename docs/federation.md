@@ -189,30 +189,22 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   (`AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE`) for the disposition of
   an enrolled peer that declares no namespaces at all.
 
-> ⚠️ **Three inbound write lanes are NOT namespace-scoped today.**
-> A previous revision of this sentence read "every lane that can
-> reach a write". That universal quantifier was false, and it is the
-> sentence an operator builds tenant isolation on, so it is stated
-> plainly here instead:
->
-> | Unscoped lane | Code | Tracking |
-> |---|---|---|
-> | `/sync/push` `links[]` | `src/handlers/federation_receive.rs` — the `links` loop reaches `db::create_link_inbound` with no scope check | [#2489](https://github.com/alphaonedev/ai-memory-mcp/issues/2489) |
-> | `/sync/push` `signals[]` | same file — `sig.namespace` is read only at the quota call, never compared to `allowed_namespaces` | [#2489](https://github.com/alphaonedev/ai-memory-mcp/issues/2489) |
-> | the entire **pull-accept** path | `src/federation/receive.rs` builds `CallerContext::for_admin(sentinels::FEDERATION_CATCHUP)` (`bypass_visibility = true`) and inserts; `PeerAttestationConfig` is never consulted in that file | [#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480) |
->
-> **What that means concretely.** A peer scoped `["public/*"]` can
-> still write graph edges into a namespace it is denied, deliver
-> signals into a denied inbox, and — on any node that *pulls* from
-> it — insert rows into any namespace. Because `contradicts` /
-> `supersedes` edges feed the recall down-weight, the `links[]` gap
-> is a **read-path influence primitive against data the peer cannot
-> read**. The accepted threat model for #2480 is "a configured peer
-> turns hostile / is compromised" — exactly this case.
->
-> Until #2489 and #2480 land, do **not** rely on `allowed_namespaces`
-> as a boundary between mutually distrusting tenants. See
-> §"Multi-peer scaling guidance" for the delivered boundary.
+> ✅ **Inbound write lanes are namespace-confined.**
+> Under an ENROLLED posture (`AI_MEMORY_FED_PEER_ATTESTATION`
+> configured), every inbound write lane routes through the shared
+> by-id / by-namespace choke in `federation::receive_auth`:
+> `/sync/push` `memories[]`, `links[]` (source AND target stored
+> namespace, [#2489](https://github.com/alphaonedev/ai-memory-mcp/issues/2489)),
+> `signals[]` (claimed namespace, #2489), `deletions[]`, `archives[]`,
+> `restores[]`, `action_transitions[]`, `checkpoints[]`,
+> `namespace_meta`, and the catchup pull-accept path
+> (`src/federation/receive.rs::catchup_memory_namespace_authorized`,
+> [#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480)).
+> An endpoint whose namespace cannot be resolved is REFUSED, not
+> admitted. Zero-config (no allowlist) is unchanged, byte-identical
+> faith replication. `CallerContext::for_admin(FEDERATION_CATCHUP)`
+> still bypasses SAL *visibility* so a peer snapshot can round-trip —
+> the scope gate runs before it.
 
 The attestation core is
 [`peer_attestation::attest_sender`](../src/federation/peer_attestation.rs)
@@ -766,13 +758,10 @@ PROVISIONAL — believe that marking.
 **Blast radius of a single compromised peer.** Default-deny on both
 `allowed_namespaces` and `allowed_sender_agent_ids` keeps a compromised
 peer from **authoring as other agents** and from **pulling unrelated
-namespaces**. Those two verbs are genuinely contained. What is **not**
-contained today: per the unscoped-lane table in §"Peer attestation"
-above, a compromised peer can still write graph edges into a denied
-namespace (#2489), deliver signals into a denied inbox (#2489), and
-inject rows into any namespace on a node that pulls from it (#2480).
-It can also read the plaintext of everything replicated to it —
-federation is **not** end-to-end encrypted
+namespaces**. Those verbs are contained, and since #2489/#2480 so are the
+link, signal and pull-accept lanes (enrolled posture). What remains
+uncontained: the peer can read the plaintext of everything replicated
+to it — federation is **not** end-to-end encrypted
 ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968); see
 §"At-rest encryption and federation" below).
 
@@ -801,7 +790,11 @@ credential minted for another fleet and enforces nothing between
 tenants *inside* one domain — it is consulted only under
 `src/federation/identity/`, never on the receive path), and the stated
 in-domain confinement primitive is `PeerScope.allowed_namespaces`,
-which the three lanes above never consult. For heterogeneous trust,
+**which every inbound write lane now consults under an enrolled
+posture (#2489/#2480)**. The residual reason this is not a
+mutually-distrusting-tenant boundary is that federation replicates
+plaintext (#1968) and `trust_domain` is credential-replay scope only.
+For heterogeneous trust,
 §8.8 of `docs/enterprise-deployment.md` gives the correct answer:
 **use multiple disjoint swarms**, not one mesh with scopes.
 

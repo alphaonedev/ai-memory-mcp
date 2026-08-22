@@ -11,16 +11,30 @@
 [![Rust](https://img.shields.io/badge/rust-1.96%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![SQLite](https://img.shields.io/badge/sqlite-FTS5-003B57?logo=sqlite)](https://www.sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-11%2C900_%E2%80%A2_%E2%89%A590%25_cov-brightgreen)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
+[![Tests](https://img.shields.io/badge/tests-12%2C549_%E2%80%A2_%E2%89%A590%25_cov-brightgreen)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
 [![Evidence Hub](https://img.shields.io/badge/evidence--hub-campaigns-6ee7ff?logo=githubpages)](https://alphaonedev.github.io/ai-memory-mcp/evidence/)
 [![v0.6.4 Cert](https://img.shields.io/badge/v0.6.4_cert-CERT_GREEN-2ea043?logo=github)](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md)
 [![MCP](https://img.shields.io/badge/MCP-7_default_%2B_1_bootstrap_%E2%80%A2_103_full-blueviolet)]()
-[![NSA CSI](https://img.shields.io/badge/NSA_CSI_MCP-10%2F10_concerns_%E2%80%A2_7%2F7_recs-2ea043)](https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-csi-mcp.html)
+[![NSA CSI](https://img.shields.io/badge/NSA_CSI_MCP-9%2F10_concerns_%E2%80%A2_7%2F7_recs-2ea043)](https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-csi-mcp.html)
 [![Evidence v0.6.4](https://img.shields.io/badge/claims-frozen_v0.6.4-c8a2ff)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
 [![Evidence v0.7.0](https://img.shields.io/badge/claims-frozen_v0.7.0-7e57c2)](docs/v0.7.0/release-notes.md)
 [![Crates.io Version](https://img.shields.io/crates/v/ai-memory)](https://crates.io/crates/ai-memory)
 [![npm](https://img.shields.io/npm/v/@alphaone/ai-memory?label=npm&logo=npm)](https://www.npmjs.com/package/@alphaone/ai-memory)
 [![PyPI](https://img.shields.io/pypi/v/ai-memory-mcp?label=pypi&logo=pypi&logoColor=white)](https://pypi.org/project/ai-memory-mcp/)
+
+> **On the NSA CSI badge.** ai-memory is **self-assessed** against the NSA
+> Cybersecurity Information document on MCP security (U/OO/6030316-26 |
+> PP-26-1834, May 2026 v1.0): **9 of 10** concerns structurally addressed
+> (concern (a), access control, is posture-conditional — see H1), 7/7
+> recommendations — **not independently audited**. Full mapping:
+> [`docs/compliance/nsa-csi-mcp-security-mapping.md`](docs/compliance/nsa-csi-mcp-security-mapping.md).
+>
+> **NSA non-endorsement.** References to the National Security Agency
+> Cybersecurity Information document on MCP security (U/OO/6030316-26 |
+> PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture
+> relative to NSA-issued guidance. The NSA, the Department of Defense, and
+> the United States Government do not endorse, certify, or recommend
+> ai-memory, AgenticMem, AlphaOne LLC, or any commercial product.
 
 **ai-memory is a persistent memory system for AI assistants.** It works with **any AI that supports MCP** -- Claude, ChatGPT, Grok, Llama, and more. It stores what your AI learns in a local SQLite database, ranks memories by relevance when recalling, and auto-promotes important knowledge to permanent storage. Install it once, and every AI assistant you use remembers your architecture, your preferences, your corrections -- forever.
 
@@ -166,7 +180,7 @@ The MCP, HTTP, and CLI surfaces are reactive. The curator is the part that makes
 
 **Substrate for multi-agent AI.** ai-memory is not an agent runtime and not "autonomous AI" on its own. It is the memory layer that *multi-agent* autonomous deployments need underneath them. Federation (`broadcast_store_quorum` + `spawn_catchup_loop`) handles W-of-N consistency across peers when many agents write in parallel; the curator daemon keeps the shared corpus from degrading into noise as a swarm scribbles into it; webhook subscriptions (HMAC-signed, namespace/agent-filtered, SSRF-hardened) turn the store into a message bus that triggers downstream agents on memory events; namespace hierarchy with N-level inheritance and per-namespace governance policies (write/promote/delete authority, approver type, optional N-of-M consensus) bound the swarm. Stack this under a 24/7 multi-machine agent runner with auto-generated skills, and the combined system clears the *behavioral* bar for autonomous AI. The remaining gaps (no weight-level learning, stateless reasoning kernel, human-seeded root goals) are real and not what ai-memory addresses; ai-memory provides the multi-agent memory substrate that any serious attempt at closing those gaps will need.
 
-**Zero token cost until recall.** Unlike built-in memory systems (Claude Code auto-memory, ChatGPT memory) that load your entire memory into every conversation -- burning tokens and money on every message -- ai-memory uses zero context tokens until the AI explicitly calls `memory_recall`. Only relevant memories come back, ranked by a 6-factor scoring algorithm. **TOON format** (Token-Oriented Object Notation) cuts response tokens by another 40-60% by eliminating repeated field names -- 3 memories in JSON = 1,600 bytes; in TOON = 626 bytes (61% smaller); in TOON compact = 336 bytes (79% smaller). For Claude Code users: **disable auto-memory** (`"autoMemoryEnabled": false` in settings.json) and replace it with ai-memory to stop paying for 200+ lines of memory context on every single message.
+**Zero token cost until recall.** Unlike built-in memory systems (Claude Code auto-memory, ChatGPT memory) that load your entire memory into every conversation -- burning tokens and money on every message -- ai-memory uses zero context tokens until the AI explicitly calls `memory_recall`. Only relevant memories come back, ranked by a 6-factor scoring algorithm. **TOON format** (Token-Oriented Object Notation) eliminates repeated field names; on the pinned 5-memory fixture in `src/toon.rs` the compact form is mechanically held **below 65% of JSON bytes** (`test_toon_size_invariant_5_memories_under_threshold`). The 1,600/626/336-byte figures are a single illustrative 3-memory example, not a guaranteed ratio. For Claude Code users: **disable auto-memory** (`"autoMemoryEnabled": false` in settings.json) and replace it with ai-memory to stop paying for 200+ lines of memory context on every single message.
 
 ---
 
@@ -768,20 +782,20 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (94 route registrations 
 - **Color CLI output** -- ANSI tier labels (red/yellow/green), priority bars, bold titles, cyan namespaces
 
 ### Quality
-- **11,900 test attributes across the workspace** — **7,634** under `src/` (6,438 `#[test]` + 1,196 `#[tokio::test]`) and **4,266** under `tests/` (2,577 `#[test]` + 1,689 `#[tokio::test]`), grown from the v0.6.4-era ~2,400-test baseline. Measured at this commit, re-derivable in four commands:
+- **12,549 test attributes across the workspace** — **7,882** under `src/` (6,660 `#[test]` + 1,222 `#[tokio::test]`) and **4,667** under `tests/` (2,793 `#[test]` + 1,874 `#[tokio::test]`), grown from the v0.6.4-era ~2,400-test baseline. Measured at this commit, re-derivable in four commands:
 
   ```bash
-  rg -c --no-filename '^\s*#\[test\]'      src/   | awk '{s+=$1} END {print s}'   # 6438
-  rg -c --no-filename '^\s*#\[tokio::test' src/   | awk '{s+=$1} END {print s}'   # 1196
-  rg -c --no-filename '^\s*#\[test\]'      tests/ | awk '{s+=$1} END {print s}'   # 2577
-  rg -c --no-filename '^\s*#\[tokio::test' tests/ | awk '{s+=$1} END {print s}'   # 1689
+  rg -c --no-filename '^\s*#\[test\]'      src/   | awk '{s+=$1} END {print s}'   # 6660
+  rg -c --no-filename '^\s*#\[tokio::test' src/   | awk '{s+=$1} END {print s}'   # 1222
+  rg -c --no-filename '^\s*#\[test\]'      tests/ | awk '{s+=$1} END {print s}'   # 2793
+  rg -c --no-filename '^\s*#\[tokio::test' tests/ | awk '{s+=$1} END {print s}'   # 1874
   ```
 
   The `#[tokio::test` prefix (no closing bracket) is deliberate — it also counts `#[tokio::test(flavor = "multi_thread")]`, which is a test. This is a count of test *attributes*, not of test cases executed by any one `cargo test` invocation. Re-derive before citing; the numbers move every release.
 - **Line coverage is held above the 90% workspace floor** enforced by `coverage/thresholds.toml` `[global].min_line_coverage`, plus a per-module floor for every module (see [Coverage Floor](#coverage-floor-hard-ci-gate)). Net-new v0.6.4 modules measured 100% (`sizes.rs`), 99.50% (`profile.rs`), 97.58% (`cli/audit.rs`), 97.05% (`cli/doctor.rs`), 92.56% (`handlers.rs`), 92.26% (`cli/install.rs`). v0.6.3.x baselines (1,809 / 93.08% and 1,886 / 93.84%) remain frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.6.4 metrics in the release notes and on the [test-hub campaign](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md). Empirical NHI discovery acceptance proven separately by the Discovery Gate (T1–T4 matrix vs. live xAI Grok 4.3, 6/6 PASS, **GATE GREEN**) — see the [Evidence Hub](https://alphaonedev.github.io/ai-memory-mcp/evidence/) (the `ai-memory-discovery-gate` Pages site is retired per #2034).
 - **LongMemEval benchmark** -- on ICLR 2025 LongMemEval-S (500 questions, 6 categories), the **shipped binary** measures **96.4% R@5** on the pure FTS5 keyword tier — LLM-independent, fully local, zero API cost — and **96.8% R@5** on the semantic tier. Those come from `harness.py`, which drives one real `ai-memory recall` subprocess per question; it is the binary-faithful path. LLM query expansion with the current-generation Gemma 4 model measures **97.2% R@5 / 99.6% R@10 / 99.8% R@20** on the *shadow* harness (`harness_99.py`, which re-implements scoring outside the binary; cloud-API venue; the historical `gemma3:4b` 97.8% figure is retired as headline per [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975)). Binary-faithful and shadow numbers are comparable **within** a harness, never across. Full per-tier and per-category disclosure: [`benchmarks/longmemeval/results.md`](benchmarks/longmemeval/results.md).
 - **MCP Prompts** -- `recall-first` and `memory-workflow` prompts teach AI clients to use memory proactively
-- **TOON-default** -- recall/list/search responses use TOON compact by default (79% smaller than JSON)
+- **TOON-default** -- recall/list/search responses use TOON compact by default. TOON eliminates repeated field names; on the pinned 5-memory fixture in `src/toon.rs` the compact form is mechanically held **below 65% of JSON bytes** (`test_toon_size_invariant_5_memories_under_threshold`). The 1,600/626/336-byte figures quoted elsewhere are a single illustrative 3-memory example, not a guaranteed ratio.
 - **Criterion benchmarks** -- insert, recall, search at 1K scale
 - **GitHub Actions CI/CD** -- fmt, clippy, test, build on Ubuntu + macOS, release on tag
 
@@ -1291,7 +1305,7 @@ ai-memory includes hardening across all input paths:
 - **Transaction safety** -- all multi-step database operations use transactions; no partial writes on failure
 - **FTS injection prevention** -- user input is sanitized before reaching FTS5 queries; special characters are escaped
 - **Error sanitization** -- internal database paths and system details are stripped from error responses; clients see structured error types (NOT_FOUND, VALIDATION_FAILED, DATABASE_ERROR, CONFLICT)
-- **Body size limits** -- HTTP request bodies are capped at **2 MiB** (`HTTP_BODY_LIMIT_BYTES`, `src/lib.rs:87`) via Axum's `DefaultBodyLimit`, applied as a **root-level router layer** (`src/lib.rs:1333`) — so it covers every route, including `POST /api/v1/memories/bulk`, `POST /api/v1/import` and `POST /api/v1/sync/push`. Size your bulk ingest and federation batches against 2 MiB, not against a per-route exception; there is none. The MCP stdio line cap is separately 16 MiB (`-32700` on overrun)
+- **Body size limits** -- HTTP request bodies are capped at **2 MiB** (`HTTP_BODY_LIMIT_BYTES`, `src/lib.rs:87`) via Axum's `DefaultBodyLimit`, applied as a **root-level router layer** (the `.layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))` on the root router in `src/lib.rs`) — so it covers every route, including `POST /api/v1/memories/bulk`, `POST /api/v1/import` and `POST /api/v1/sync/push`. Size your bulk ingest and federation batches against 2 MiB, not against a per-route exception; there is none. The MCP stdio line cap is separately 16 MiB (`-32700` on overrun)
 - **Bulk operation limits** -- bulk create endpoints enforce maximum batch sizes to prevent resource exhaustion
 - **CORS** -- permissive CORS layer enabled for localhost development workflows
 - **Input validation** -- every write path validates title length, content length, namespace format, source values, priority range (1-10), confidence range (0.0-1.0), tag format, tier values, relation types, and ID format

@@ -214,15 +214,18 @@ done
 ### Quorum-not-met probe
 
 Explicit kill of node-b, write 10 memories to node-a with
-`--quorum-writes 2` against peers b+c. Expected: each write returns
-503 `{"error":"quorum_not_met","got":2,"needed":2,"reason":"timeout"}`
-because only c is reachable (1 ack vs needed 1). Actually with N=3
+`--quorum-writes 2` against peers b+c. Expected: each write whose
+local commit lands but whose acks miss the deadline returns
+**202 Accepted** with `quorum_met:false` (v0.8.1 G12 — the row IS
+durable locally), body
+`{"quorum_met":false,"acks":<n>,"needed":<w>,"reason":"timeout","durability":"local"}`
+(`under_replicated_response`, `src/handlers/parity.rs`). With N=3
 and W=2, local + c should meet quorum. Revise:
 
 With **node-b AND node-c down** (both peers killed), node-a writes
-should **always** return 503. With **node-b down only**, writes
-should succeed via node-c. Both branches must be observed in the
-report.
+should **always** return **202 with `quorum_met:false`**. With
+**node-b down only**, writes should succeed via node-c. Both branches
+must be observed in the report.
 
 ## Phase 3 — Cross-backend migration
 
@@ -271,7 +274,10 @@ Repeat with `--fault partition_minority`, `--fault drop_random_acks`,
 **Pass criteria** per fault class (from ADR-0001):
 
 - `convergence_bound >= 0.995`.
-- `total_fail == 0` (no non-201/non-503 responses).
+- `total_fail == 0` (no responses outside {201, **202**}). Count a
+  202-with-`quorum_met:false` as under-replicated, not as failure: the
+  local commit is durable and the sync daemon drives it to
+  convergence.
 - Post-campaign node counts agree within 1 memory across all three
   peers.
 
