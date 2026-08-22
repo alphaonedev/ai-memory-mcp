@@ -73,7 +73,7 @@ const CATCHUP_HEADER_VALUE_BULK: &str = "bulk";
 /// ## What it does, in order
 ///
 /// 1. **Gate.** Resolves the target host/scheme and consults the
-///    `NetworkRequest` wire-point ([`crate::governance::wire_check::check`]).
+///    `NetworkRequest` wire-point ([`crate::governance::wire_check::check_governed`]).
 ///    A refusal short-circuits with the operator-authored reason and NO bytes
 ///    leave the process. The daemon-side hook emits the `governance.check`
 ///    `signed_events` row, so a refused catch-up is now auditable exactly like
@@ -120,7 +120,7 @@ fn build_governed_peer_post(
         host: host.clone(),
         scheme,
     };
-    if let Err(refusal) = crate::governance::wire_check::check(&net_action) {
+    if let Err(refusal) = crate::governance::wire_check::check_governed(&net_action) {
         return Err(format!(
             "governance refused outbound to {host}: {}",
             refusal.reason

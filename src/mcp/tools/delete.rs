@@ -174,7 +174,8 @@ pub(super) fn handle_delete(
         let capability = crate::governance::capability::parse_presented_token(
             params[param_names::CAPABILITY].as_str(),
             &agent_id,
-        );
+        )
+        .map_err(|rej| crate::governance::capability::edge_reject_message(&rej))?;
         // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
         // consult BEFORE the governance decision dispatches.
         crate::mcp::consult_pre_governance_decision_gate(

@@ -1194,6 +1194,110 @@ force.
   match rather than assumed. Historical statements are left intact: the CHANGELOG
   entries, the certification doc's signed pre-#3033 evidence notes and the
   `infra/federation-lab` campaign logs still record what was true when written.
+### Security (fail-open gates closed: governance admission + capability edge + federation trust)
+
+Five security gates that FAILED OPEN now fail closed. Each preserves the
+documented operator opt-out where one already existed and never silently widens
+a gate. Two change DEFAULT behaviour and are called out as such; the governance-admission one ships as an OPT-IN posture because its default is a cutline-protected ship-gate contract. Related but
+deliberately NOT changed here: the capability-token `Deny`→`Allow` joiner
+(design decision, #3111) and the unsigned-Accept arms under
+`AI_MEMORY_FED_REQUIRE_SIG=0` (#3033).
+
+- **NEW opt-in strict admission posture
+  `AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE=1` — under
+  `permissions.mode = "enforce"` it REFUSES a write into a namespace whose
+  chain resolves no governance policy.** `storage::enforce_governance` (and
+  its postgres `enforce_governance_action` twin) returns `Allow` whenever
+  `resolve_governance_policy` finds no policy anywhere in the chain, so a
+  namespace the operator BELIEVED was covered (a typo, or a sibling of a
+  governed tree) skips the approval / owner / `required_scope` gates
+  entirely. With the knob engaged that becomes a typed `GovernanceRefusal`
+  (403 `GOVERNANCE_REFUSED`) whose reason names every remedy; both backends
+  share one SSOT (`governance::ungoverned_namespace_refusal`).
+  **DEFAULT UNCHANGED — unset is byte-identical to the previous behaviour**,
+  and deliberately so: `tests/ship_gate_governance_inheritance.rs` is
+  CUTLINE-PROTECTED on "ungoverned subtrees remain opt-in (compatibility
+  preserved)" *while a sibling subtree IS governed*, and
+  `AppConfig::effective_permissions_mode` resolves an unconfigured
+  `[permissions]` block to **`enforce`**
+  (`governance::default_v07_secure_mode` — the serde-derived `Advisory` on
+  the struct is bypassed), so a default flip would refuse every write on a
+  fresh install and would let one tenant's governance config refuse writes
+  into another tenant's ungoverned subtree. **Flipping the default is
+  deferred to [#3125](https://github.com/alphaonedev/ai-memory-mcp/issues/3125)**
+  (filed alongside #3111) — a product-semantics decision, not remediation.
+  The knob is deliberately NOT pinned in `asi-hard`: every entry in that
+  KNOBS table already defaults fail-closed so pinning is a no-op, whereas
+  pinning this one would change behaviour for existing `asi-hard`
+  deployments and pre-empt #3125 for them. `ai-memory doctor` reports the
+  posture as the `require_governed_namespace` fact beside
+  `namespaces_without_policy` (together, the blast radius). `advisory` and `off` are
+  unaffected in every case. Certified enterprise-federation deployments
+  SHOULD engage the knob (see `docs/compliance`).
+- **BREAKING (all surfaces) — a PRESENTED-but-unparseable capability credential
+  is now refused instead of downgraded to anonymous.**
+  `governance::capability::parse_presented_token` returned `Option` and collapsed
+  a parse failure into `None`, so a request carrying an unusable
+  `X-AI-Memory-Capability` header / `capability` param / `--capability` flag was
+  byte-indistinguishable from one carrying nothing and proceeded on the bare ACL.
+  It now returns `Result<Option<CapabilityToken>, CapReject>`; every edge (8 HTTP
+  handlers, 6 MCP tools, 3 CLI commands) maps the rejection to 403
+  `GOVERNANCE_REFUSED` with an actionable message. **Omitting the credential is
+  unchanged** (`Ok(None)`, bare ACL decides), and the `[capabilities].enabled =
+  false` leg still returns `Ok(None)` WITHOUT parsing (zero new audit bytes). The
+  forensic `capability-reject` edge-parse row's decision changes `warn` → `deny`.
+- **Daemon-side agent-action wire-points now fail closed when the governance hook
+  is not installed.** `wire_check::check` treats an unset `GOVERNANCE_PRE_ACTION`
+  `OnceLock` as `Ok(())`. That is the documented CLI one-shot exemption, so
+  `check` keeps it; the new `wire_check::check_governed` refuses instead, and the
+  daemon/MCP-only wire-points — hook process-spawns (×2) and the federation
+  outbound POST (`build_governed_peer_post`) — now use it. `llm.rs` **and**
+  `skill_export.rs` stay on `check` because both are reached by CLI one-shots
+  (`curator` / `atomise` / `expand` / `ai-memory skill export`); `check_governed`
+  there would hard-refuse with `HOOK_NOT_INSTALLED_REASON` (Fable HIGH #3133).
+  No production behaviour change on the daemon path: `serve` and
+  `run_mcp_server` both install the hook during bootstrap before dispatching
+  anything, so this is a structural guarantee against a broken bootstrap rather
+  than a posture flip.
+- **BREAKING (`AI_MEMORY_FED_CERT_PEER_BINDING=enforce` only) — the mTLS↔`x-peer-id`
+  cross-check no longer skips unbound certs or missing headers.** Under `enforce`,
+  a client cert whose fingerprint carries no operator binding ("legacy"), and a
+  bound cert presented with no `X-Peer-Id`, both used to proceed — so any holder
+  of a TLS-accepted-but-unmapped cert could assert an arbitrary peer identity and
+  skip the check entirely. Since this check is the documented compensating control
+  for the `FED_REQUIRE_SIG=0` window, skipping it left that window on forgeable,
+  header-asserted identity. Both shapes now return `401 peer_id_cert_unbound`
+  with an actionable note. **`warn` (the DEFAULT posture) and `off` are
+  unchanged**, and `warn` remains the documented non-bricking rollout path.
+- **FED-RQ-03 stale-policy gate no longer converts a governance-read `Err` into
+  ACCEPT.** `refuse_if_stale_policy` swallowed a failed
+  `current_policy_version` read and accepted the push, so a peer could ride out
+  the gate by inducing a transient fault (e.g. `SQLITE_BUSY` from parallel pushes
+  it generates itself) and apply under a stale policy. The read is now retried
+  three times with a linear 10/20 ms backoff; if every attempt fails the push is
+  refused `503 policy_read_unavailable` (retryable, so a genuine transient fault
+  degrades to a peer retry rather than a silently-applied stale write). The
+  documented opt-out is unchanged: with
+  `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0` the gate is disabled and a read fault
+  still accepts. The 503 body carries only the closed-set
+  `policy_read_unavailable` tag + retry note — the raw rusqlite/IO error stays
+  on the attestation trace target, never on the federation-peer wire.
+
+Gate follow-ups applied before merge (Fable HIGH #3133): the
+`AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE` resolver reuses the house
+truthy grammar (`1`/`true`/`yes`/`on` via `env_flag_enabled`) so `=yes` cannot
+silently stay FAIL-OPEN; a PRESENTED non-UTF-8 `X-AI-Memory-Capability` header
+is now 403 `GOVERNANCE_REFUSED` rather than collapsing to "absent";
+`ai-memory doctor`'s Governance section composes notes (`append_note`) so the
+strict-admission blast-radius warning is not overwritten by the pending-age
+line.
+
+REFUTED and deliberately not changed: `peer_attestation::namespace_allowed`'s
+"unknown/absent peer" arm is NOT fail-open — it defaults to DENY
+(`sync_trust_peer_bypass()` is false unless the operator sets the documented
+legacy `AI_MEMORY_FED_SYNC_TRUST_PEER=1`), `/sync/since` resolves scope itself
+with an explicit `None => false`, the write/delete lanes gate through the
+`has_allowlist()` wrappers, and the third call site is WARN-only observability.
 
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 

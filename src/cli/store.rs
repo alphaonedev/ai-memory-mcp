@@ -402,7 +402,8 @@ pub fn run(
         let capability = crate::governance::capability::parse_presented_token(
             args.capability.as_deref(),
             &agent_id,
-        );
+        )
+        .map_err(|rej| anyhow::anyhow!(crate::governance::capability::edge_reject_message(&rej)))?;
         match enforce_governance(
             &conn,
             GovernedAction::Store,

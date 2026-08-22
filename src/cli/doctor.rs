@@ -1209,6 +1209,33 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
     facts.push(("namespaces_with_policy".into(), with.to_string()));
     facts.push(("namespaces_without_policy".into(), without.to_string()));
 
+    // v1.0.0 fail-open remediation — the OPT-IN strict admission posture
+    // (`AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE`). Reported right
+    // beside `namespaces_without_policy` because the two together ARE the
+    // blast radius: with the posture engaged under `mode = enforce`, a
+    // `store`/`delete`/`promote` into any of those namespaces is refused.
+    // Default OFF; flipping that default is deferred to #3125.
+    let strict_admission = crate::governance::require_governed_namespace();
+    facts.push((
+        "require_governed_namespace".into(),
+        strict_admission.to_string(),
+    ));
+    if strict_admission && mode == crate::config::PermissionsMode::Enforce && without > 0 {
+        if !matches!(severity, Severity::Critical) {
+            severity = Severity::Warning;
+        }
+        append_note(
+            &mut note,
+            &format!(
+                "strict admission posture is engaged under mode=enforce and {without} namespace(s) \
+                 resolve no governance policy — writes into them are refused. Declare a \
+                 substrate-wide default on the '*' namespace, or unset \
+                 {}.",
+                crate::governance::ENV_REQUIRE_GOVERNED_NAMESPACE,
+            ),
+        );
+    }
+
     let dist = db::doctor_governance_depth_distribution(conn).unwrap_or_default();
     let depth_summary: String = dist
         .iter()
@@ -1231,10 +1258,15 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
             facts.push(("oldest_pending_age_secs".into(), age.to_string()));
             if age > crate::SECS_PER_DAY {
                 severity = Severity::Critical;
-                note = Some(format!(
-                    "oldest pending action is {age}s old (>{} threshold = 24h)",
-                    crate::SECS_PER_DAY,
-                ));
+                // Fable HIGH (#3133): compose, do not overwrite the
+                // strict-admission warning that may already occupy `note`.
+                append_note(
+                    &mut note,
+                    &format!(
+                        "oldest pending action is {age}s old (>{} threshold = 24h)",
+                        crate::SECS_PER_DAY,
+                    ),
+                );
             }
         }
         Ok(None) => {
@@ -1268,14 +1300,12 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
             if !matches!(severity, Severity::Critical) {
                 severity = Severity::Warning;
             }
-            if note.is_none() {
-                note = Some(
-                    "governance policy digest drifted from the last signed policy \
-                     advance (advisory in v0.9; a rule was likely mutated outside the \
-                     signed path)"
-                        .into(),
-                );
-            }
+            append_note(
+                &mut note,
+                "governance policy digest drifted from the last signed policy \
+                 advance (advisory in v0.9; a rule was likely mutated outside the \
+                 signed path)",
+            );
         }
         Err(_) => {}
     }

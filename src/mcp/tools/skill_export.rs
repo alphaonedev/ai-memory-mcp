@@ -162,6 +162,12 @@ pub fn handle_skill_export(
         path: skill_md_path.clone(),
         byte_estimate: Some(skill_md_content.len() as u64),
     };
+    // Fable HIGH (#3133): this sink is reachable from the CLI one-shot
+    // `ai-memory skill export` (`cli::commands::skill` → here), which never
+    // installs `GOVERNANCE_PRE_ACTION`. `check_governed` would hard-refuse
+    // with `HOOK_NOT_INSTALLED_REASON`. Use `check` (the documented CLI
+    // exemption, same rationale as `llm.rs`). MCP/`serve` still consult
+    // the installed hook because they install it during bootstrap.
     if let Err(refusal) = crate::governance::wire_check::check(&skill_md_action) {
         return Err(format!(
             "governance refused SKILL.md write: {}",
@@ -243,6 +249,8 @@ pub fn handle_skill_export(
                 path: res_file.clone(),
                 byte_estimate: Some(content.len() as u64),
             };
+            // Fable HIGH (#3133): CLI `skill export` one-shot — `check`, not
+            // `check_governed`. See the SKILL.md write above.
             if let Err(refusal) = crate::governance::wire_check::check(&res_action) {
                 return Err(format!(
                     "governance refused resource '{res_path}' write: {}",

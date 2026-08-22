@@ -182,20 +182,94 @@ pub use transport::*;
 
 /// v0.9.0 G10.1 (#1827) — parse the optional `X-AI-Memory-Capability`
 /// header ONCE at the HTTP edge into a macaroon capability token. Inert
-/// (`None`, zero audit bytes) when the header is absent or
-/// `[capabilities].enabled = false`; a malformed header WARNs + audits and
-/// yields `None` (never a 4xx/5xx — the bare ACL decides).
-#[must_use]
+/// (`Ok(None)`, zero audit bytes) when the header is absent or
+/// `[capabilities].enabled = false`.
+///
+/// FAIL-CLOSED (behaviour change): a PRESENTED-but-unparseable header is
+/// now `Err(403 GOVERNANCE_REFUSED)` instead of being downgraded to `None`
+/// / "the bare ACL decides". Omitting the header is unchanged.
+///
+/// # Errors
+///
+/// Returns a ready-to-return `403 FORBIDDEN` [`axum::response::Response`]
+/// when a non-blank `X-AI-Memory-Capability` header failed to parse.
 pub(crate) fn capability_from_headers(
     headers: &axum::http::HeaderMap,
     actor: &str,
-) -> Option<crate::governance::capability::CapabilityToken> {
-    crate::governance::capability::parse_presented_token(
-        headers
-            .get(crate::governance::capability::HTTP_CAPABILITY_HEADER)
-            .and_then(|v| v.to_str().ok()),
-        actor,
-    )
+) -> std::result::Result<
+    Option<crate::governance::capability::CapabilityToken>,
+    axum::response::Response,
+> {
+    use axum::response::IntoResponse as _;
+    let presented = match headers.get(crate::governance::capability::HTTP_CAPABILITY_HEADER) {
+        None => None,
+        Some(v) => match v.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => {
+                // Fable HIGH (#3133): a PRESENTED non-UTF-8 header used to
+                // collapse via `to_str().ok()` to `None` = absent = bare ACL
+                // — the exact fail-open `parse_presented_token` closed for
+                // unparseable tokens. A garbled credential is never
+                // "omitted"; refuse 403. The `enabled=false` short-circuit
+                // applies to a decodeable-but-ignored credential, not to an
+                // undecodable one.
+                tracing::warn!(
+                    target: crate::governance::GOVERNANCE_TRACE_TARGET,
+                    actor = %actor,
+                    "capability header presented but is not valid UTF-8; \
+                     REFUSING (fail-closed: a presented-but-unusable \
+                     credential is never downgraded to anonymous)"
+                );
+                crate::governance::audit::record_decision(
+                    actor,
+                    "deny",
+                    crate::governance::capability::AUDIT_KIND_REJECT,
+                    crate::governance::capability::CapReject::Malformed.code(),
+                    serde_json::json!({ "stage": "edge-parse", "cause": "non-utf8-header" }),
+                );
+                return Err((
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({
+                        "code": crate::errors::error_codes::GOVERNANCE_REFUSED,
+                        "error": crate::governance::capability::edge_reject_message(
+                            &crate::governance::capability::CapReject::Malformed,
+                        ),
+                    })),
+                )
+                    .into_response());
+            }
+        },
+    };
+    crate::governance::capability::parse_presented_token(presented, actor).map_err(|rej| {
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "code": crate::errors::error_codes::GOVERNANCE_REFUSED,
+                "error": crate::governance::capability::edge_reject_message(&rej),
+            })),
+        )
+            .into_response()
+    })
+}
+
+#[cfg(test)]
+mod capability_from_headers_tests {
+    use super::capability_from_headers;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+    /// Fable HIGH (#3133): a PRESENTED non-UTF-8 capability header must
+    /// 403, never collapse to "absent = bare ACL".
+    #[test]
+    fn presented_non_utf8_capability_header_is_403() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::governance::capability::HTTP_CAPABILITY_HEADER,
+            HeaderValue::from_bytes(&[0x80, 0x81]).expect("raw header bytes"),
+        );
+        let err = capability_from_headers(&headers, "test-actor")
+            .expect_err("non-UTF-8 presented credential must FAIL CLOSED");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
 }
 
 // Inline test scaffold (`#[cfg(test)] mod tests`) preserved verbatim

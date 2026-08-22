@@ -18838,6 +18838,41 @@ fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
     None
 }
 
+/// Decide a `Store`/`Delete`/`Promote` whose namespace chain resolves NO
+/// governance policy. Extracted from [`enforce_governance`] so the sqlite and
+/// postgres gates share one decision shape.
+///
+/// See [`crate::governance::ENV_REQUIRE_GOVERNED_NAMESPACE`] for why the
+/// refusal is OPT-IN rather than the default. `Off` never reaches here (the
+/// caller short-circuits it).
+fn ungoverned_namespace_decision(
+    mode: crate::config::PermissionsMode,
+    action: GovernedAction,
+    namespace: &str,
+    agent_id: &str,
+) -> GovernanceDecision {
+    // Advisory logs rather than blocks by contract; the strict posture is
+    // Enforce-only and opt-in. Both legs are byte-identical to the legacy
+    // behaviour when the knob is unset.
+    if mode == crate::config::PermissionsMode::Advisory
+        || !crate::governance::require_governed_namespace()
+    {
+        return GovernanceDecision::Allow;
+    }
+    tracing::warn!(
+        target: crate::governance::GOVERNANCE_GATE_TRACE_TARGET,
+        namespace = %namespace,
+        agent_id = %agent_id,
+        action = ?action,
+        env = crate::governance::ENV_REQUIRE_GOVERNED_NAMESPACE,
+        "permissions.mode=enforce + strict admission posture: REFUSING a write into a \
+         namespace whose chain resolves no governance policy"
+    );
+    GovernanceDecision::Deny(crate::governance::ungoverned_namespace_refusal(
+        action, agent_id, namespace,
+    ))
+}
+
 /// Enforce governance for a `GovernedAction`. On [`GovernanceDecision::Pending`],
 /// a row is inserted into `pending_actions` and the returned `pending_id` is
 /// embedded in the decision.
@@ -18894,9 +18929,32 @@ pub fn enforce_governance(
         return Ok(GovernanceDecision::Allow);
     }
 
-    // Opt-in enforcement: namespaces without an explicit policy are unaffected.
+    // FAIL-CLOSED admission (security fix — behaviour change under Enforce).
+    //
+    // Pre-fix this arm returned `Allow` in EVERY mode: a namespace with no
+    // policy anywhere in its chain (a fresh tenant namespace, a typo'd one)
+    // skipped the approval / owner / `required_scope` gates entirely — the
+    // classic allow-on-silence admission posture, and precisely in the mode
+    // whose contract is "govern everything". The #2503 severed floor only
+    // covered chains whose standard was REAPED, never the never-configured
+    // ones.
+    //
+    // - `Advisory` is UNCHANGED and silent: it logs rather than blocks by
+    //   contract, and warning on every write into an unconfigured namespace
+    //   would be a fleet-wide log-volume regression.
+    // - `Enforce` REFUSES only when the OPT-IN strict posture
+    //   `AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE=1` is engaged. It is
+    //   opt-in because "ungoverned subtrees remain opt-in" is a
+    //   CUTLINE-PROTECTED ship-gate contract, and because
+    //   `AppConfig::effective_permissions_mode` resolves an unconfigured
+    //   `[permissions]` block to `enforce` — see
+    //   `governance::ENV_REQUIRE_GOVERNED_NAMESPACE` for the full rationale.
+    // The refusal returns EARLY, so it never reaches the capability-grant
+    // joiner below — see `governance::ungoverned_namespace_refusal` for why.
     let Some(policy) = resolve_governance_policy(conn, namespace) else {
-        return Ok(GovernanceDecision::Allow);
+        return Ok(ungoverned_namespace_decision(
+            mode, action, namespace, agent_id,
+        ));
     };
     // #880 — `write`/`delete`/`promote` live on `policy.core` after
     // the governance decomposition.
@@ -18954,7 +19012,7 @@ pub fn enforce_governance(
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
                 tracing::warn!(
-                    target: "ai_memory::governance",
+                    target: crate::governance::GOVERNANCE_GATE_TRACE_TARGET,
                     namespace = %namespace,
                     agent_id = %agent_id,
                     action = ?action,
@@ -18965,7 +19023,7 @@ pub fn enforce_governance(
             }
             GovernanceDecision::Pending(_) => {
                 tracing::warn!(
-                    target: "ai_memory::governance",
+                    target: crate::governance::GOVERNANCE_GATE_TRACE_TARGET,
                     namespace = %namespace,
                     agent_id = %agent_id,
                     action = ?action,

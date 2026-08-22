@@ -26278,8 +26278,33 @@ impl MemoryStore for PostgresStore {
             (None, false) => None,
         };
         let Some(policy) = resolved_policy else {
-            // No policy in the chain → Allow. Drop the tx (no writes).
-            return Ok(GovernanceDecision::Allow);
+            // FAIL-CLOSED admission — sqlite-parity twin of
+            // `storage::ungoverned_namespace_decision` (security fix). Absence
+            // of a policy stops being an unconditional Allow ONLY under the
+            // OPT-IN strict posture; see
+            // `governance::ENV_REQUIRE_GOVERNED_NAMESPACE` for why the default
+            // is unchanged. Drop the tx (no writes) on every leg.
+            if mode == PermissionsMode::Advisory || !crate::governance::require_governed_namespace()
+            {
+                return Ok(GovernanceDecision::Allow);
+            }
+            let model_action = match action {
+                super::GovernedAction::Store => crate::models::GovernedAction::Store,
+                super::GovernedAction::Delete => crate::models::GovernedAction::Delete,
+                super::GovernedAction::Promote => crate::models::GovernedAction::Promote,
+                super::GovernedAction::Reflect => crate::models::GovernedAction::Reflect,
+            };
+            tracing::warn!(
+                target: crate::governance::GOVERNANCE_GATE_TRACE_TARGET,
+                namespace = %namespace,
+                agent_id = %agent_id,
+                env = crate::governance::ENV_REQUIRE_GOVERNED_NAMESPACE,
+                "permissions.mode=enforce + strict admission posture: REFUSING a write into \
+                 a namespace whose chain resolves no governance policy"
+            );
+            return Ok(GovernanceDecision::Deny(
+                crate::governance::ungoverned_namespace_refusal(model_action, agent_id, namespace),
+            ));
         };
         let level = match action {
             super::GovernedAction::Store => &policy.core.write,

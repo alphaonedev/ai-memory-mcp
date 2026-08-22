@@ -87,8 +87,9 @@ pub const ENV_CAPABILITIES: &str = "AI_MEMORY_CAPABILITIES";
 ///   **before** it ever consults `enabled`, so a caller that presents NO
 ///   capability token is byte-identical whether the layer is on or off.
 /// - [`parse_presented_token`] only does extra work for a caller that
-///   *actively presents* a token (an opt-in act); an invalid token still
-///   yields `None` and the request proceeds on the bare ACL.
+///   *actively presents* a token (an opt-in act); an invalid token is a
+///   typed `Err(CapReject)` that REFUSES the request (fail-closed), while
+///   an ABSENT token still yields `Ok(None)` and the bare ACL decides.
 /// - The grant path ([`apply_capability_grant`]) only ever flips a
 ///   `Deny`/`Ask` base to `Allow` (attenuation-only widening); it can
 ///   never turn an `Allow` into a denial.
@@ -1102,41 +1103,84 @@ pub fn apply_at_gate(
     decision
 }
 
+/// Actionable operator guidance appended to every edge-parse refusal, so a
+/// 403 names the two remedies rather than only the failure code. One const
+/// (pm-v3.1 no-scattered-literals discipline) — the message is rendered at
+/// every surface (HTTP / MCP / CLI) through [`edge_reject_message`].
+pub const EDGE_REJECT_REMEDY: &str = "present a valid, unexpired capability token minted by an \
+     allowlisted issuer, or omit the credential entirely to be evaluated on the bare ACL";
+
+/// Render the operator-facing refusal text for a capability credential that
+/// was PRESENTED at a transport edge but could not be parsed/decoded.
+///
+/// Used by every edge call site of [`parse_presented_token`] so the wire
+/// message is byte-identical across HTTP, MCP and CLI.
+#[must_use]
+pub fn edge_reject_message(rej: &CapReject) -> String {
+    format!("capability rejected at the edge ({rej}); {EDGE_REJECT_REMEDY}")
+}
+
 /// Parse an optionally presented wire token at a transport edge (MCP
 /// `capability` param / HTTP `X-AI-Memory-Capability` header / CLI
 /// `--capability`). Additive posture (T8):
 ///
-/// - absent/blank ⇒ `None` (zero work);
-/// - `[capabilities].enabled = false` ⇒ `None` WITHOUT parsing — a
+/// - absent/blank ⇒ `Ok(None)` (zero work);
+/// - `[capabilities].enabled = false` ⇒ `Ok(None)` WITHOUT parsing — a
 ///   presented-but-malformed token emits ZERO new audit bytes while the
 ///   feature is off;
-/// - parse failure ⇒ `None` + a WARN trace + a `capability-reject`
-///   forensic row (never a hard error — the request proceeds on the bare
-///   ACL).
-#[must_use]
-pub fn parse_presented_token(raw: Option<&str>, actor: &str) -> Option<CapabilityToken> {
-    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+/// - parse failure ⇒ `Err(CapReject)` + a WARN trace + a `capability-reject`
+///   forensic row.
+///
+/// # FAIL-CLOSED (behaviour change, security fix)
+///
+/// Pre-fix this returned `Option` and collapsed a parse failure into `None`
+/// — a request that PRESENTED an unusable bearer credential proceeded
+/// anonymously on the bare ACL, byte-indistinguishable from a request that
+/// presented nothing. That erased the illegal state "credential presented
+/// but unverifiable" instead of representing it (ERRORS-09) and made a
+/// security gate recoverable-failure-into-success (ERRORS-01/ERRORS-06).
+/// A presented-but-unusable credential is now a typed rejection every
+/// caller must handle (`#[must_use]` on `Result`), surfaced as
+/// `403 GOVERNANCE_REFUSED`.
+///
+/// The absent-credential path is UNCHANGED: omitting the header/param/flag
+/// still yields `Ok(None)` and the bare ACL decides. Only a caller that
+/// actively presents an unusable credential is refused.
+///
+/// # Errors
+///
+/// Returns the typed [`CapReject`] when a non-blank credential was
+/// presented while `[capabilities].enabled` and it failed
+/// [`CapabilityToken::from_wire`].
+pub fn parse_presented_token(
+    raw: Option<&str>,
+    actor: &str,
+) -> std::result::Result<Option<CapabilityToken>, CapReject> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
     if !crate::config::active_capability_config().enabled {
-        return None;
+        return Ok(None);
     }
     match CapabilityToken::from_wire(raw) {
-        Ok(tok) => Some(tok),
+        Ok(tok) => Ok(Some(tok)),
         Err(rej) => {
             tracing::warn!(
                 target: crate::governance::GOVERNANCE_TRACE_TARGET,
                 actor = %actor,
                 code = rej.code(),
                 "capability token failed to parse at the edge; \
-                 proceeding without a token (bare ACL decides)"
+                 REFUSING the request (fail-closed: a presented-but-unusable \
+                 credential is never downgraded to anonymous)"
             );
             crate::governance::audit::record_decision(
                 actor,
-                "warn",
+                "deny",
                 AUDIT_KIND_REJECT,
                 rej.code(),
                 serde_json::json!({ "stage": "edge-parse" }),
             );
-            None
+            Err(rej)
         }
     }
 }
@@ -1775,22 +1819,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_presented_token_is_feature_gated_and_lenient() {
+    fn parse_presented_token_is_feature_gated_and_fail_closed() {
         let _cap = crate::config::lock_capability_config_for_test();
         crate::config::clear_capability_config_for_test();
-        // Absent/blank ⇒ None regardless of the flag.
-        assert!(parse_presented_token(None, "a").is_none());
-        assert!(parse_presented_token(Some("   "), "a").is_none());
-        // Disabled ⇒ None WITHOUT parsing, even for garbage AND even for
-        // a well-formed token (zero behavioural delta while off).
+        // Absent/blank ⇒ Ok(None) regardless of the flag — the bare-ACL
+        // path for a caller that presents NO credential is unchanged.
+        assert_eq!(parse_presented_token(None, "a"), Ok(None));
+        assert_eq!(parse_presented_token(Some("   "), "a"), Ok(None));
+        // Disabled ⇒ Ok(None) WITHOUT parsing, even for garbage AND even
+        // for a well-formed token (zero behavioural delta while off).
         let (tok, cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
         let wire = tok.to_wire().unwrap();
-        assert!(parse_presented_token(Some("cap1:!!!garbage"), "a").is_none());
-        assert!(parse_presented_token(Some(&wire), "a").is_none());
-        // Enabled ⇒ a valid token parses; garbage degrades to None.
+        assert_eq!(
+            parse_presented_token(Some("cap1:!!!garbage"), "a"),
+            Ok(None)
+        );
+        assert_eq!(parse_presented_token(Some(&wire), "a"), Ok(None));
+        // Enabled ⇒ a valid token parses.
         crate::config::set_active_capability_config(cfg);
-        assert_eq!(parse_presented_token(Some(&wire), "a"), Some(tok));
-        assert!(parse_presented_token(Some("cap1:!!!garbage"), "a").is_none());
+        assert_eq!(parse_presented_token(Some(&wire), "a"), Ok(Some(tok)));
+        crate::config::clear_capability_config_for_test();
+    }
+
+    /// REGRESSION (fail-open fix): a PRESENTED-but-unparseable credential
+    /// must be a typed refusal, never silently downgraded to "anonymous,
+    /// bare ACL decides". Pre-fix this returned `None` — byte-identical to
+    /// presenting nothing at all.
+    #[test]
+    fn presented_but_unparseable_token_is_refused_not_downgraded() {
+        let _cap = crate::config::lock_capability_config_for_test();
+        crate::config::clear_capability_config_for_test();
+        let (_tok, cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        crate::config::set_active_capability_config(cfg);
+        let err = parse_presented_token(Some("cap1:!!!garbage"), "a")
+            .expect_err("a presented-but-unparseable credential must FAIL CLOSED");
+        // The rejection is typed and carries a stable audit code.
+        assert!(!err.code().is_empty());
+        // The operator-facing message names the remedy.
+        let msg = edge_reject_message(&err);
+        assert!(
+            msg.contains(EDGE_REJECT_REMEDY),
+            "message must be actionable: {msg}"
+        );
+        // A DIFFERENT well-formed-but-wrong-version envelope also refuses.
+        assert!(parse_presented_token(Some("cap9:aGk="), "a").is_err());
         crate::config::clear_capability_config_for_test();
     }
 

@@ -668,7 +668,7 @@ impl ExecExecutor {
             binary,
             args: Vec::new(),
         };
-        if let Err(refusal) = crate::governance::wire_check::check(&spawn_action) {
+        if let Err(refusal) = crate::governance::wire_check::check_governed(&spawn_action) {
             return Err(ExecutorError::GovernanceRefused {
                 command: command_str,
                 reason: refusal.reason,
@@ -1043,7 +1043,7 @@ impl DaemonExecutor {
             binary: command_str.clone(),
             args: Vec::new(),
         };
-        if let Err(refusal) = crate::governance::wire_check::check(&spawn_action) {
+        if let Err(refusal) = crate::governance::wire_check::check_governed(&spawn_action) {
             return Err(ExecutorError::GovernanceRefused {
                 command: command_str,
                 reason: refusal.reason,

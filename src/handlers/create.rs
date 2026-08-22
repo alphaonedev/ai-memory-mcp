@@ -1609,7 +1609,10 @@ pub async fn create_memory(
     // `X-AI-Memory-Capability` header ONCE; inert unless
     // `[capabilities].enabled`. Threaded to whichever backend gate runs
     // (sqlite `enforce_create_governance` / postgres SAL branch).
-    let capability = crate::handlers::capability_from_headers(&headers, &agent_id);
+    let capability = match crate::handlers::capability_from_headers(&headers, &agent_id) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     // Postgres-backed daemons take a separate SAL-trait path with no
     // shared `Mutex<Connection>`. Kept as a top-level helper so the
     // sqlite stages below stay focused.

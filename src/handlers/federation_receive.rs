@@ -62,6 +62,38 @@ pub(super) fn extract_peer_id(headers: &HeaderMap) -> Option<&str> {
     Some(raw)
 }
 
+/// Operator guidance for an `enforce`-mode refusal of a client cert that
+/// carries no operator binding. One const per note (pm-v3.1
+/// no-scattered-literals discipline); both are rendered by
+/// [`unbound_cert_refusal_response`].
+const CERT_BINDING_UNBOUND_NOTE: &str = "#2045: this client certificate's fingerprint has no entry in \
+     AI_MEMORY_FED_CERT_PEER_BINDING_MAP, so its peer identity cannot be \
+     cross-checked against the asserted x-peer-id. Add the fingerprint→peer-id \
+     binding, or set AI_MEMORY_FED_CERT_PEER_BINDING=warn to downgrade to a WARN \
+     during rollout.";
+
+/// Operator guidance for an `enforce`-mode refusal of a bound cert that
+/// asserted no `X-Peer-Id` header.
+const CERT_BINDING_NO_HEADER_NOTE: &str = "#2045: this client certificate carries an operator binding but the request \
+     asserted no x-peer-id header, so the cross-check cannot run. Send x-peer-id, \
+     or set AI_MEMORY_FED_CERT_PEER_BINDING=warn to downgrade to a WARN during \
+     rollout.";
+
+/// Render the `401 peer_id_cert_unbound` envelope for an `enforce`-mode
+/// refusal where the cross-check could not run at all (unbound cert /
+/// missing header), as distinct from `peer_id_cert_mismatch` where it ran
+/// and disagreed.
+fn unbound_cert_refusal_response(note: &'static str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "peer_id_cert_unbound",
+            "note": note,
+        })),
+    )
+        .into_response()
+}
+
 /// #2045 L6 — cross-check the mTLS client cert's operator-bound peer
 /// identity against the `X-Peer-Id` the request asserts. Returns
 /// `Some(Response)` (a `401 peer_id_cert_mismatch`) to short-circuit the
@@ -72,9 +104,27 @@ pub(super) fn extract_peer_id(headers: &HeaderMap) -> Option<&str> {
 ///   - posture `off`;
 ///   - no [`crate::tls::ClientCertPeerId`] extension (plain HTTP, or no
 ///     `AI_MEMORY_FED_CERT_PEER_BINDING_MAP` configured so the peer-binding
-///     acceptor was not installed);
-///   - the presenting cert's fingerprint carries no binding ("legacy" cert);
+///     acceptor was not installed).
+///
+/// # FAIL-CLOSED under `enforce` (behaviour change, security fix)
+///
+/// Two further degradations used to proceed in EVERY posture, including
+/// `enforce`:
+///
+///   - the presenting cert's fingerprint carries no binding ("legacy" cert —
+///     which, because [`crate::tls::ClientCertPeerId`] is `None` both for an
+///     unmapped fingerprint AND for a connection that presented no client
+///     cert at all, also covers a non-mTLS request arriving over the
+///     peer-binding acceptor);
 ///   - the request asserts no `X-Peer-Id`.
+///
+/// Both are now refused under `enforce` (they still proceed under `warn` /
+/// `off`). The doc for this gate calls it "the compensating control for the
+/// `FED_REQUIRE_SIG=0` window" — a control that any holder of an UNBOUND
+/// TLS-accepted cert could skip by simply not being in the binding map (or
+/// by omitting the header) was not a control at all: it left that window
+/// with header-asserted, forgeable identity. `warn` remains the default and
+/// the documented rollout posture for reaching `enforce` without bricking.
 ///
 /// A mismatch under `warn` logs and proceeds; under `enforce` it is refused.
 /// This is INDEPENDENT of `AI_MEMORY_FED_REQUIRE_SIG` — it is the
@@ -87,13 +137,22 @@ pub(super) fn enforce_cert_peer_binding(
     if mode == crate::tls::CertPeerBindingMode::Off {
         return None;
     }
+    let enforce = mode == crate::tls::CertPeerBindingMode::Enforce;
     // No extension at all ⇒ the request did not arrive over the peer-binding
     // mTLS acceptor (plain HTTP / no binding map) — nothing to cross-check.
     let cert_peer = cert_peer?;
     let Some(bound) = cert_peer.0.as_deref() else {
         // mTLS cert present but its fingerprint carries NO operator binding
-        // (a "legacy" cert). De-silenced: emit a trace so the degrade is
-        // observable, then proceed — a bound-less cert must never brick.
+        // (a "legacy" cert).
+        if enforce {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                asserted_peer_id = asserted_peer_id.unwrap_or(""),
+                "cert↔x-peer-id: presenting client cert has NO operator binding \
+                 (legacy) — refusing (AI_MEMORY_FED_CERT_PEER_BINDING=enforce)"
+            );
+            return Some(unbound_cert_refusal_response(CERT_BINDING_UNBOUND_NOTE));
+        }
         tracing::debug!(
             target: ATTESTATION_TRACE_TARGET,
             asserted_peer_id = asserted_peer_id.unwrap_or(""),
@@ -102,8 +161,21 @@ pub(super) fn enforce_cert_peer_binding(
         );
         return None;
     };
-    // A bound cert with no asserted peer-id has nothing to contradict.
-    let asserted = asserted_peer_id?;
+    // A bound cert with no asserted peer-id has nothing to contradict —
+    // but under `enforce` an absent header is the same forgeable-identity
+    // hole as an unbound cert: the cross-check simply does not run.
+    let Some(asserted) = asserted_peer_id else {
+        if enforce {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                bound_peer_id = %bound,
+                "cert↔x-peer-id: bound client cert presented WITHOUT an x-peer-id \
+                 header — refusing (AI_MEMORY_FED_CERT_PEER_BINDING=enforce)"
+            );
+            return Some(unbound_cert_refusal_response(CERT_BINDING_NO_HEADER_NOTE));
+        }
+        return None;
+    };
     if asserted == bound {
         return None;
     }
@@ -162,6 +234,48 @@ fn attestation_refusal_response(err: &AttestError) -> Response {
         .into_response()
 }
 
+/// FED-RQ-03 — bounded-retry budget for the local governance policy read.
+/// Three attempts with a linear 10/20 ms backoff bounds the added latency at
+/// ~30 ms on the fault path and zero on the happy path, well under the 2 s
+/// daemon p99 SLO.
+const POLICY_READ_ATTEMPTS: u32 = 3;
+
+/// Base backoff between policy-read attempts, in milliseconds (multiplied by
+/// the attempt index for a linear ramp).
+const POLICY_READ_BACKOFF_MS: u64 = 10;
+
+/// FED-RQ-03 — closed-set error tag for a push refused because the LOCAL
+/// governance policy could not be read (as distinct from
+/// [`crate::federation::receive_auth::STALE_POLICY_ERROR_TAG`], where it was
+/// read and the sender was behind).
+const POLICY_READ_UNAVAILABLE_TAG: &str = "policy_read_unavailable";
+
+/// Render the `503` fail-closed refusal for a push whose staleness could not
+/// be determined because the local governance policy read kept failing.
+///
+/// `503` (not `409`) is deliberate: the condition is transient and the peer
+/// SHOULD retry, so a genuine fault degrades to a retry rather than a
+/// dropped write.
+fn policy_read_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": POLICY_READ_UNAVAILABLE_TAG,
+            // Fable HIGH (#3133): never echo the raw rusqlite/IO error to a
+            // federation PEER. The detail is already logged at
+            // ATTESTATION_TRACE_TARGET at the call site; the wire carries
+            // only the closed-set tag + the operator-facing retry note.
+            "note": "FED-RQ-03: the receiver could not read its own committed governance \
+                     policy_version after a bounded retry, so this push's staleness is \
+                     undeterminable and it is refused fail-closed. This is retryable — \
+                     re-send once the receiver's governance store recovers. Set \
+                     AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0 to disable the freshness gate \
+                     entirely during a heterogeneous-policy rollout window.",
+        })),
+    )
+        .into_response()
+}
+
 /// FED-RQ-03 (#1947, 5-agent vote wd8wtmg0n) — render the receive-path refusal
 /// for a push governed by a STALE governance `policy_version`. A `409 CONFLICT`
 /// (the sender's governance state conflicts with / is behind the receiver's
@@ -195,10 +309,22 @@ fn stale_policy_refusal_response(sender_seq: i64, local_seq: i64) -> Response {
 /// (`app.db`) — the sole rules store on every backend (amendment 7); on a node
 /// with no governance tables `current_policy_version` degrades to the `seq=0`
 /// sentinel, under which nothing is ever strictly-lower, so the gate is a
-/// natural no-op (fail-OPEN). A policy-read ERROR is also fail-OPEN: staleness
-/// is undeterminable and a transient governance-read fault must not hard-refuse
-/// a peer (rust-skills `err-*`: the fallible read is deliberately swallowed to
-/// ACCEPT, never surfaced to the peer as a refusal).
+/// natural no-op (fail-OPEN).
+///
+/// # FAIL-CLOSED on a policy-read fault (behaviour change, security fix)
+///
+/// A policy-read ERROR used to be fail-OPEN: the `Err` was swallowed and the
+/// push ACCEPTED. That let a peer ride out the gate by inducing a transient
+/// governance-read fault (e.g. `SQLITE_BUSY` from concurrent pushes it
+/// generates itself) and apply under a stale policy — an authority gate that
+/// maps `Err` → accept (ERRORS-19/ERRORS-06).
+///
+/// The read is now retried with a short bounded backoff; if every attempt
+/// fails the push is refused `503` (retryable — the peer re-sends once the
+/// fault clears, so a genuine transient fault degrades to a retry rather than
+/// data loss). The documented operator opt-out is UNCHANGED: with
+/// `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0` the gate is disabled and a read
+/// fault still accepts, exactly as before.
 async fn refuse_if_stale_policy(app: &AppState, body: &SyncPushBody) -> Option<Response> {
     use crate::federation::receive_auth::{
         PolicyFreshnessVerdict, evaluate_inbound_policy_freshness, require_policy_current_enabled,
@@ -206,20 +332,56 @@ async fn refuse_if_stale_policy(app: &AppState, body: &SyncPushBody) -> Option<R
     let require = require_policy_current_enabled();
     // Short-lived lock: read the local committed governance policy version,
     // then release before the (independently-locked) apply loops run.
-    let local = {
-        let lock = app.db.lock().await;
-        match crate::governance::policy_version::current_policy_version(&lock.0) {
-            Ok(pv) => pv,
-            Err(e) => {
-                tracing::warn!(
-                    target: ATTESTATION_TRACE_TARGET,
-                    error = %e,
-                    "sync_push: FED-RQ-03 local policy read failed — accepting (fail-open; \
-                     staleness undeterminable, never hard-refuse on a transient read fault)"
-                );
-                return None;
+    //
+    // Bounded retry (SQLITE_BUSY and friends are transient by construction).
+    // Each attempt re-acquires the lock so a competing writer can make
+    // progress between tries.
+    //
+    // The retry budget applies ONLY when the gate is enabled: with
+    // `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0` a read fault still accepts, so
+    // retrying would add latency a peer could amplify for nothing.
+    let attempts = if require { POLICY_READ_ATTEMPTS } else { 1 };
+    let mut last_err: Option<String> = None;
+    let mut local = None;
+    for attempt in 0..attempts {
+        {
+            let lock = app.db.lock().await;
+            match crate::governance::policy_version::current_policy_version(&lock.0) {
+                Ok(pv) => {
+                    local = Some(pv);
+                    break;
+                }
+                Err(e) => last_err = Some(e.to_string()),
             }
         }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                POLICY_READ_BACKOFF_MS * u64::from(attempt + 1),
+            ))
+            .await;
+        }
+    }
+    let Some(local) = local else {
+        let error = last_err.unwrap_or_default();
+        if !require {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                error = %error,
+                "sync_push: FED-RQ-03 local policy read failed — accepting because the \
+                 gate is disabled (AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0)"
+            );
+            return None;
+        }
+        tracing::error!(
+            target: ATTESTATION_TRACE_TARGET,
+            sender = %body.sender_agent_id,
+            error = %error,
+            attempts,
+            "sync_push: FED-RQ-03 local policy read failed after bounded retry — \
+             REFUSING 503 (fail-closed: staleness is undeterminable, so the push \
+             must not be applied under an unknown policy)"
+        );
+        return Some(policy_read_unavailable_response());
     };
     match evaluate_inbound_policy_freshness(body.sender_policy_seq, local.seq, require) {
         PolicyFreshnessVerdict::Accept => None,

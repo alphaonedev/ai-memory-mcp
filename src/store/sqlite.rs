@@ -4109,6 +4109,14 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_governance_action_allow_on_fresh_db() {
+        // Pin the mode explicitly. The ungoverned-namespace fail-closed fix
+        // makes "no policy in the chain" mode-DEPENDENT (Advisory allows,
+        // Enforce refuses), so a sibling test flipping the process-wide mode
+        // would otherwise make this assertion racy.
+        let _mode = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Advisory,
+        );
         let store = fresh_store();
         let decision = store
             .enforce_governance_action(
@@ -4123,6 +4131,7 @@ mod tests {
             .await
             .expect("enforce_governance_action");
         assert!(matches!(decision, crate::models::GovernanceDecision::Allow));
+        crate::config::clear_permissions_mode_override_for_test();
     }
 
     #[tokio::test]

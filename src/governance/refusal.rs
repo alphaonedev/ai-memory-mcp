@@ -117,6 +117,117 @@ impl GovernanceRefusal {
     }
 }
 
+/// OPT-IN strict admission posture: under `permissions.mode = "enforce"`,
+/// refuse a `Store`/`Delete`/`Promote` whose namespace chain resolves NO
+/// governance policy.
+///
+/// **Default OFF — unset is byte-identical to the legacy behaviour.**
+///
+/// # Why this is opt-in rather than the default
+///
+/// "Absence of policy == Allow" looks like a classic fail-open admission
+/// gate, and structurally it is one. But in this substrate it is a
+/// deliberate, multiply-pinned product contract, not an oversight:
+///
+/// - `tests/ship_gate_governance_inheritance.rs` is CUTLINE-PROTECTED
+///   ("failures here are release blockers") and asserts that an ungoverned
+///   subtree still Allows *while a sibling subtree IS governed* —
+///   "ungoverned subtrees remain opt-in (compatibility preserved)".
+/// - `tests/governance_postgres_inheritance.rs` (S60) asserts the same
+///   across siblings, as the proof that a parent's policy does not LEAK
+///   into an unrelated namespace.
+/// - The shipped runtime mode is `enforce`
+///   ([`crate::governance::default_v07_secure_mode`] — the serde-derived
+///   `Advisory` on the config struct is bypassed by
+///   `AppConfig::effective_permissions_mode`), so opt-in enforcement is
+///   precisely what makes that secure default shippable: flipping the
+///   default here would refuse every write on a fresh install, and on a
+///   multi-tenant substrate would let one tenant's governance config
+///   refuse writes into another tenant's ungoverned subtree.
+///
+/// Flipping the default is therefore a product-semantics decision (an
+/// owner ruling / T3 vote), not remediation — **deferred to #3125**, filed
+/// alongside #3111. This knob delivers the fail-closed posture NOW to
+/// operators — and to the certified enterprise-federation deployment — who
+/// genuinely mean "govern everything", with zero behaviour change for
+/// everyone else.
+///
+/// Deliberately NOT pinned in [`crate::security_profile`]'s `asi-hard`
+/// KNOBS table: every entry there already defaults fail-closed, so pinning
+/// is a no-op for a compliant deployment (the #3033 invariant). This knob
+/// defaults OFF, so pinning it would be a behaviour change for existing
+/// `asi-hard` deployments — i.e. it would pre-empt #3125 for a subset of
+/// the fleet. Revisit as part of #3125: if the default flips ON, the pin
+/// becomes a no-op and belongs in the table.
+pub const ENV_REQUIRE_GOVERNED_NAMESPACE: &str = "AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE";
+
+/// Is the OPT-IN strict admission posture engaged? See
+/// [`ENV_REQUIRE_GOVERNED_NAMESPACE`]. Grammar is the shared house truthy
+/// set (`1` / `true` / `yes` / `on`, case-insensitive) via
+/// [`crate::governance::audit::env_flag_enabled`] — a `=yes` must never
+/// silently stay FAIL-OPEN (Fable HIGH #3133). Default UNSET = legacy Allow.
+#[must_use]
+pub fn require_governed_namespace() -> bool {
+    crate::governance::audit::env_flag_enabled(ENV_REQUIRE_GOVERNED_NAMESPACE)
+}
+
+/// The operator-facing reason carried by an ungoverned-namespace refusal.
+///
+/// Deliberately names EVERY remedy so a refused write is actionable from the
+/// wire message alone — the gate must degrade manageably, never silently
+/// brick a fleet.
+pub const UNGOVERNED_NAMESPACE_REASON: &str = concat!(
+    "no governance policy resolves for this namespace or any of its ",
+    "ancestors, and the strict admission posture ",
+    "AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE=1 is engaged under ",
+    "permissions.mode=enforce (fail-closed: absence of a policy is not ",
+    "treated as Allow). Remedies: (1) declare a policy for this namespace ",
+    "\u{2014} or a substrate-wide default on the '*' namespace, which covers ",
+    "every namespace at once \u{2014} with `memory_namespace_set_standard`; ",
+    "(2) unset AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE to restore ",
+    "the default opt-in-enforcement posture, in which ungoverned namespaces ",
+    "are allowed; (3) run permissions.mode=advisory to log rather than block",
+);
+
+/// FAIL-CLOSED admission refusal for a namespace whose governance chain
+/// resolves NO policy while `permissions.mode = "enforce"` **and the opt-in
+/// strict posture [`ENV_REQUIRE_GOVERNED_NAMESPACE`] is engaged**.
+///
+/// SSOT shared by the sqlite (`storage::enforce_governance`) and postgres
+/// (`PostgresStore::enforce_governance_action`) gates so the two backends
+/// cannot drift — the same reason for the two adapters to share
+/// [`required_scope_refusal`].
+///
+/// `denied_level` is [`GovernanceLevel::Owner`], matching the #2503
+/// SEVERED-FLOOR convention: an unresolvable policy floors the required
+/// authority at owner rather than pretending a level was evaluated.
+///
+/// # Why the gates return this EARLY, before the capability-grant joiner
+///
+/// Both gates return this refusal before
+/// [`crate::governance::capability::apply_at_gate`] runs, so a presented
+/// capability token cannot flip it to `Allow`. Two reasons: (1) fail-closed
+/// — a token's caveats say what its holder may do, they say nothing about
+/// whether the namespace is governed at all, so letting one satisfy an
+/// admission gate that could not evaluate ANY policy would re-open exactly
+/// the hole this refusal closes; (2) scope — whether a rule-derived `Deny`
+/// should be token-flippable at all is an open design decision (#3111), and
+/// this refusal deliberately does not depend on how that is resolved.
+#[must_use]
+pub fn ungoverned_namespace_refusal(
+    action: GovernedAction,
+    agent_id: &str,
+    namespace: &str,
+) -> GovernanceRefusal {
+    GovernanceRefusal::new(
+        action,
+        GovernanceLevel::Owner,
+        agent_id,
+        UNGOVERNED_NAMESPACE_REASON,
+    )
+    .with_namespace(namespace)
+}
+
 /// #1720 C — build the per-namespace `required_scope` refusal for a
 /// `Store` when the write's effective scope does not match the policy's
 /// pinned scope. Refuse-only: this NEVER mutates the write; it only

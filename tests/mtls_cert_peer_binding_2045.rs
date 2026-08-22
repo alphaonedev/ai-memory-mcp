@@ -232,23 +232,108 @@ async fn mismatched_peer_id_allowed_under_warn() {
     );
 }
 
+/// REGRESSION (fail-open fix) — an UNBOUND ("legacy") cert must be REFUSED
+/// under `enforce`.
+///
+/// Pre-fix the unbound arm returned `None` (proceed) in every posture, so
+/// any holder of a TLS-accepted cert that simply was not in
+/// `AI_MEMORY_FED_CERT_PEER_BINDING_MAP` could assert an ARBITRARY
+/// `X-Peer-Id` and skip the cross-check entirely — and this check is the
+/// documented compensating control for the `FED_REQUIRE_SIG=0` window, so
+/// skipping it left that window on forgeable, header-asserted identity.
+/// `warn` (the DEFAULT posture) remains the non-bricking rollout path.
 #[tokio::test(flavor = "current_thread")]
-async fn legacy_cert_without_binding_never_bricks_under_enforce() {
+async fn legacy_cert_without_binding_is_refused_under_enforce() {
     let _g = env_lock();
     relax_other_gates();
     unsafe {
         std::env::set_var(FED_CERT_PEER_BINDING_ENV, "enforce");
     }
     let router = setup_router();
-    // The presenting cert's fingerprint carries NO binding — degrade to a
-    // WARN even under enforce, so an unmapped legacy peer is not bricked.
+    // The presenting cert's fingerprint carries NO binding.
+    let (status, body) = post_sync_push(&router, Some("peer-b"), Some(None)).await;
+    clear_env();
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "#2045 fail-closed: an unbound cert cannot be cross-checked, so under enforce it MUST \
+         be refused; body={body}"
+    );
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "peer_id_cert_unbound",
+        "the refusal must carry the distinct unbound tag (not the mismatch tag); body={body}"
+    );
+    // ACTIONABLE: the note names the map to fix and the warn rollback.
+    let note = body["note"].as_str().unwrap_or("");
+    assert!(
+        note.contains("AI_MEMORY_FED_CERT_PEER_BINDING_MAP"),
+        "{note}"
+    );
+    assert!(note.contains("=warn"), "{note}");
+}
+
+/// The `warn` rollout posture is UNCHANGED for an unbound cert — the fix
+/// never removes the documented non-bricking path.
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_cert_without_binding_still_proceeds_under_warn() {
+    let _g = env_lock();
+    relax_other_gates();
+    unsafe {
+        std::env::set_var(FED_CERT_PEER_BINDING_ENV, "warn");
+    }
+    let router = setup_router();
     let (status, body) = post_sync_push(&router, Some("peer-b"), Some(None)).await;
     clear_env();
     assert_ne!(
         status,
         StatusCode::UNAUTHORIZED,
-        "#2045: a cert with no operator binding MUST degrade to WARN, never brick; body={body}"
+        "#2045: under warn an unbound cert still proceeds; body={body}"
     );
+}
+
+/// REGRESSION (fail-open fix) — a BOUND cert that asserts NO `X-Peer-Id`
+/// must be REFUSED under `enforce`.
+///
+/// Pre-fix `let asserted = asserted_peer_id?;` returned `None` (proceed):
+/// simply omitting the header skipped the cross-check just as effectively
+/// as presenting an unbound cert.
+#[tokio::test(flavor = "current_thread")]
+async fn bound_cert_without_asserted_peer_id_is_refused_under_enforce() {
+    let _g = env_lock();
+    relax_other_gates();
+    unsafe {
+        std::env::set_var(FED_CERT_PEER_BINDING_ENV, "enforce");
+    }
+    let router = setup_router();
+    // Cert IS bound to peer-a; the request asserts no X-Peer-Id at all.
+    let (status, body) = post_sync_push(&router, None, Some(Some("peer-a"))).await;
+    clear_env();
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "#2045 fail-closed: a bound cert with no asserted x-peer-id cannot be cross-checked, \
+         so under enforce it MUST be refused; body={body}"
+    );
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "peer_id_cert_unbound",
+        "body={body}"
+    );
+}
+
+/// `warn` is unchanged for the missing-header shape too.
+#[tokio::test(flavor = "current_thread")]
+async fn bound_cert_without_asserted_peer_id_proceeds_under_warn() {
+    let _g = env_lock();
+    relax_other_gates();
+    unsafe {
+        std::env::set_var(FED_CERT_PEER_BINDING_ENV, "warn");
+    }
+    let router = setup_router();
+    let (status, body) = post_sync_push(&router, None, Some(Some("peer-a"))).await;
+    clear_env();
+    assert_ne!(status, StatusCode::UNAUTHORIZED, "body={body}");
 }
 
 #[tokio::test(flavor = "current_thread")]

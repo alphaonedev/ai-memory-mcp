@@ -571,14 +571,16 @@ mod gate_wiring {
             .unwrap();
             assert_eq!(kind(&d), *want, "enabled+no-token: {ns}/{agent}");
         }
-        // Pass 3 — edge parse while DISABLED emits nothing and yields None.
+        // Pass 3 — edge parse while DISABLED emits nothing and yields
+        // Ok(None) WITHOUT parsing (the feature-off leg is unchanged by the
+        // fail-closed fix: a disabled feature must stay byte-inert).
         set_active_capability_config(config(OpLevel::Admin, false));
-        assert!(
+        assert_eq!(
             ai_memory::governance::capability::parse_presented_token(
                 Some("cap1:!!!garbage"),
                 "ai:mallory"
-            )
-            .is_none()
+            ),
+            Ok(None)
         );
 
         // ZERO capability-* audit rows across all three passes.
@@ -602,7 +604,9 @@ mod gate_wiring {
 
     /// Every grant and every reject at the wired gate lands a forensic
     /// audit row (capability-grant / capability-reject), and a malformed
-    /// edge presentation (feature ON) lands a WARN capability-reject.
+    /// edge presentation (feature ON) lands a DENY capability-reject
+    /// (fail-closed fix: the edge parse now refuses the request, so the
+    /// forensic decision is `deny`, not the pre-fix advisory `warn`).
     #[test]
     fn audit_rows_for_grant_reject_and_edge_parse() {
         let (_perm, _cap) = pin_gates(config(OpLevel::Admin, true));
@@ -641,13 +645,14 @@ mod gate_wiring {
             Some(&expired),
         )
         .unwrap();
-        // Malformed edge presentation with the feature ON.
+        // Malformed edge presentation with the feature ON is now a TYPED
+        // REFUSAL (fail-closed) rather than a silent downgrade to `None`.
         assert!(
             ai_memory::governance::capability::parse_presented_token(
                 Some("cap1:!!!garbage"),
                 "ai:mallory"
             )
-            .is_none()
+            .is_err()
         );
 
         ai_memory::governance::audit::flush_blocking();
@@ -668,12 +673,15 @@ mod gate_wiring {
         });
         assert!(reject.is_some(), "a capability-reject row must land");
 
-        let parse_warn = rows.iter().find(|r| {
+        let parse_deny = rows.iter().find(|r| {
             r["kind"].as_str() == Some("capability-reject")
-                && r["decision"] == "warn"
+                && r["decision"] == "deny"
                 && r["payload"]["stage"] == "edge-parse"
         });
-        assert!(parse_warn.is_some(), "malformed edge parse must WARN-audit");
+        assert!(
+            parse_deny.is_some(),
+            "malformed edge parse must DENY-audit (fail-closed)"
+        );
 
         ai_memory::governance::audit::shutdown();
         clear_capability_config_for_test();
