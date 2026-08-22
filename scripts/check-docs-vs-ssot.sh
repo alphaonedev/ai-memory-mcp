@@ -1276,24 +1276,44 @@ run_all_rules() {
     # Known limitation (stated, not hidden): a NEW phrasing that none of these
     # alternatives match would evade the rule. Add its shape here in the same
     # commit that introduces it.
+    # CANONICAL RULE for this SSOT. PR #3169 proposes a second, overlapping
+    # asi-hard knob-count rule with its own scan set; this one supersedes it
+    # (it walks a strict superset of those surfaces) and the duplicate is to be
+    # collapsed into this rule at #3169's rebase — one rule, one SSOT, one
+    # scan set.
     # Coverage as verified at this commit (a rule whose regex matches nothing
     # in a listed file is a no-op that still reports PASS, so this is stated
-    # rather than assumed): 10 anchored citations, all reading the canonical
-    # — CLAUDE.md 3 (all on env row #130), the certification doc 2,
+    # rather than assumed, and re-verified whenever a file is enrolled):
+    # 17 anchored citations across 11 of the 12 surfaces, all reading the
+    # canonical — CLAUDE.md 3, README.md 1, SECURITY.md 2, PERFORMANCE.md 1,
+    # docs/deploy/README.md 1, docs/deploy/enterprise-federation.env 1, the
+    # certification doc 2, docs/enterprise-deployment.md 1,
     # src/security_profile.rs 2, src/enterprise_federation_posture.rs 2,
-    # scripts/check-bootstrap-cert-gate.sh 1 — the last of those reachable
-    # ONLY because the markdown-heading anchor is now scoped to .md/.html
-    # (see MD_HEADING above); it is a `#` shell comment. docs/deploy/asi-hard.env
-    # quotes NO count today and is enrolled so that a future one is policed on
-    # arrival; the knob NAMES in that template are pinned instead by
-    # tests/deploy_templates.rs::asi_hard_env_names_every_pinned_knob.
+    # scripts/check-bootstrap-cert-gate.sh 1.
+    # Two of the twelve surfaces are reachable ONLY because the markdown-heading
+    # anchor is now scoped to .md/.html (see MD_HEADING above): the `#` shell
+    # comment in scripts/check-bootstrap-cert-gate.sh and the `#` env-template
+    # comment in docs/deploy/enterprise-federation.env — the latter being
+    # precisely the line whose 17-vs-current drift went unseen.
+    # docs/deploy/asi-hard.env quotes NO count today and is enrolled so that a
+    # future one is policed on arrival; the knob NAMES in that template are
+    # pinned instead by
+    # tests/deploy_templates.rs::asi_hard_env_names_every_pinned_knob, and the
+    # two documented pinned-knob TABLES (this module's and PERFORMANCE.md's)
+    # by set equality in security_profile's own tests.
     check_narrative_count_rule \
         "ASI_HARD_PINNED_KNOB_COUNT" \
         "$CANONICAL_ASI_HARD_KNOBS" \
-        '([0-9]+)-knob|(?:auto-)?[Pp]ins the ([0-9]+)(?: asi-hard)? knobs|holds \*\*([0-9]+)\*\* entries|names all ([0-9]+) correctly|SSOT for the ([0-9]+)|\*\*([0-9]+)\*\* post-#|shows `([0-9]+)/[0-9]+`|`PINNED_KNOB_COUNT` \(([0-9]+)\)' \
+        '([0-9]+)-knob|(?:auto-)?[Pp]ins the ([0-9]+)(?: asi-hard)? knobs|holds \*\*([0-9]+)\*\* entries|names all ([0-9]+) correctly|SSOT for the ([0-9]+)|\*\*([0-9]+)\*\* post-#|shows `([0-9]+)/[0-9]+`|`PINNED_KNOB_COUNT` \(([0-9]+)\)|is \*\*([0-9]+) knobs\*\*|PINS \*\*([0-9]+)\*\* security env knobs|([0-9]+)-entry pin-and-refuse|all \*\*([0-9]+)\*\* `KNOBS` entries|All \*\*([0-9]+)\*\* of them' \
         CLAUDE.md \
+        README.md \
+        SECURITY.md \
+        PERFORMANCE.md \
+        docs/deploy/README.md \
         docs/deploy/asi-hard.env \
+        docs/deploy/enterprise-federation.env \
         docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md \
+        docs/enterprise-deployment.md \
         src/security_profile.rs \
         src/enterprise_federation_posture.rs \
         scripts/check-bootstrap-cert-gate.sh

@@ -914,6 +914,99 @@ mod tests {
         assert_eq!(documented.len(), KNOBS.len());
     }
 
+    /// The env-knob names in `PERFORMANCE.md`'s `## Hardened \`asi-hard\`
+    /// security posture` "Pinned knobs" table, in table order.
+    ///
+    /// SECTION-SCOPED deliberately. `PERFORMANCE.md` carries OTHER tables
+    /// whose first cell is a backticked `AI_MEMORY_*` name (the read-path
+    /// degrade-budget table a few sections up), so a whole-file scan would
+    /// fold those in and report phantom drift against `KNOBS`. The parse
+    /// starts at this section's heading and stops at the next `## ` heading.
+    ///
+    /// FAILS CLOSED in both no-data directions: a missing heading panics and
+    /// an empty row set panics, rather than yielding an empty set. An empty
+    /// set would make the set-equality assertion below silently VACUOUS the
+    /// moment the section is renamed or the table reformatted — which is
+    /// exactly the "reports success while doing nothing" shape this change
+    /// exists to remove, and it would be indistinguishable from a pass.
+    fn performance_md_pinned_knob_names() -> Vec<&'static str> {
+        const SRC: &str = include_str!("../PERFORMANCE.md");
+        const HEADING: &str = "## Hardened `asi-hard` security posture";
+
+        let Some(start) = SRC.lines().position(|l| l.starts_with(HEADING)) else {
+            panic!(
+                "PERFORMANCE.md has no `{HEADING}` section — the pinned-knob table \
+                 cannot be located, so this gate would be vacuous"
+            )
+        };
+
+        let rows: Vec<&'static str> = SRC
+            .lines()
+            .skip(start + 1)
+            .take_while(|l| !l.starts_with("## "))
+            .filter_map(|line| {
+                // A DATA row is ``| `AI_MEMORY_X` | ... |``. The header
+                // (`| Env knob | ...`) has no backticked first cell and the
+                // `|---|---|` separator has no space after the pipe, so both
+                // drop out here. Deliberately NOT filtered on an
+                // `AI_MEMORY_` prefix: a typo'd row must surface as
+                // set-difference drift, not be silently skipped.
+                let rest = line.strip_prefix("| ")?;
+                let (name, _) = rest.strip_prefix('`')?.split_once('`')?;
+                Some(name)
+            })
+            .collect();
+
+        assert!(
+            !rows.is_empty(),
+            "the `{HEADING}` section carries no `| `ENV` |` table rows — refusing \
+             to report a vacuous pass"
+        );
+        rows
+    }
+
+    #[test]
+    fn performance_md_pinned_knobs_table_matches_the_knobs_ssot_exactly() {
+        // #3113 — the SECOND documented pinned-knob table, pinned the same way
+        // as the module doc table above. `PERFORMANCE.md`'s §"Hardened
+        // `asi-hard` security posture" table is what CLAUDE.md env row #130
+        // sends an operator to by name, and it had fallen SEVEN rows behind
+        // `KNOBS` (no row for the four #3033 outer-transport gates, neither
+        // PERMISSIVE-shaped pin, nor the #3113 schema-integrity pin) with
+        // nothing failing — a procurement-facing document describing a WEAKER
+        // hardened posture than the binary actually enforces.
+        use std::collections::BTreeSet;
+
+        let rows = performance_md_pinned_knob_names();
+        let documented: BTreeSet<&str> = rows.iter().copied().collect();
+        let actual: BTreeSet<&str> = KNOBS.iter().map(|k| k.env).collect();
+
+        // A name listed twice would let the sets match while the table
+        // over-states the pinned set.
+        assert_eq!(
+            rows.len(),
+            documented.len(),
+            "duplicate row in the PERFORMANCE.md pinned-knobs table: {rows:?}"
+        );
+
+        let undocumented: Vec<&str> = actual.difference(&documented).copied().collect();
+        assert!(
+            undocumented.is_empty(),
+            "pinned by KNOBS but MISSING a PERFORMANCE.md pinned-knobs row: \
+             {undocumented:?} — add the row in the same commit that adds the knob"
+        );
+
+        let phantom: Vec<&str> = documented.difference(&actual).copied().collect();
+        assert!(
+            phantom.is_empty(),
+            "documented in PERFORMANCE.md as pinned but ABSENT from KNOBS: \
+             {phantom:?} — the docs would advertise a hardening guarantee the \
+             binary does not enforce"
+        );
+
+        assert_eq!(documented.len(), PINNED_KNOB_COUNT);
+    }
+
     #[test]
     fn asi_hard_pins_documented_set() {
         if crate::config::run_env_isolated_child_or_spawn(

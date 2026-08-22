@@ -1936,7 +1936,7 @@ shortcuts so a fleet operator does not audit each knob by hand:
 
 **`AI_MEMORY_SECURITY_PROFILE=asi-hard` — the NO-DISABLE hardened
 posture.** One named knob pins the fail-closed security floor: at boot
-the profile PINS **17** security env knobs to their hard value (SSOT
+the profile PINS **22** security env knobs to their hard value (SSOT
 `src/security_profile.rs::KNOBS`; the copy-deployable template is
 [`deploy/asi-hard.env`](deploy/asi-hard.env), pinned by
 `tests/deploy_templates.rs`) and **refuses to boot** if an operator set

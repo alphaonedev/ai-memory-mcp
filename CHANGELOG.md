@@ -628,7 +628,32 @@ force.
   markdown HEADING for every file type, so in a `.sh`/`.env` scan target — where
   `#` is the COMMENT marker — every comment line was skipped and a rule listing
   such a file covered nothing in it while still reporting PASS. That anchor is
-  now scoped to `.md`/`.html`.
+  now scoped to `.md`/`.html`. That same fail-open also silently disarmed the
+  knob-count rule proposed in [#3169](https://github.com/alphaonedev/ai-memory-mcp/pull/3169)
+  on `docs/deploy/enterprise-federation.env` — the exact line that PR exists to
+  correct — so the fix is load-bearing for both. The rule here is the CANONICAL
+  one for this SSOT (it walks a strict superset of surfaces); #3169's duplicate
+  is to be collapsed into it at that PR's rebase.
+- **Every operator- and procurement-facing statement of the pinned set moved to
+  22, and the SECOND documented pinned-knob table is now pinned too.**
+  `PERFORMANCE.md` §"Hardened `asi-hard` security posture" — the table CLAUDE.md
+  env row #130 sends operators to BY NAME — listed **15 of 22**, missing the four
+  #3033 outer-transport gates, both PERMISSIVE-shaped pins and the #3113
+  schema-integrity pin: a procurement document describing a WEAKER hardened
+  posture than the binary enforces. It is completed and mechanically pinned by
+  `security_profile::tests::performance_md_pinned_knobs_table_matches_the_knobs_ssot_exactly`,
+  which asserts SET equality against `KNOBS` in both directions and is
+  SECTION-SCOPED (the file carries other tables whose first cell is a backticked
+  `AI_MEMORY_*` name) and FAILS CLOSED on a missing heading or an empty row set,
+  so a rename cannot turn it into a vacuous pass. Alongside it, `SECURITY.md`
+  (count **and** enumeration — it had claimed 17 while naming 15),
+  `docs/deploy/README.md` (bullet list completed 17 → 22), `README.md`,
+  `docs/enterprise-deployment.md` and `docs/deploy/enterprise-federation.env` all
+  move to 22, and all of them are enrolled in the `ASI_HARD_PINNED_KNOB_COUNT`
+  rule — 17 anchored citations across 11 surfaces, each verified to actually
+  match rather than assumed. Historical statements are left intact: the CHANGELOG
+  entries, the certification doc's signed pre-#3033 evidence notes and the
+  `infra/federation-lab` campaign logs still record what was true when written.
 
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 

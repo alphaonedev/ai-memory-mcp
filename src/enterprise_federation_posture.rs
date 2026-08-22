@@ -250,7 +250,7 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
         "set AI_MEMORY_SECURITY_PROFILE=asi-hard",
     ));
 
-    // ---- 2. every asi-hard pinned knob (21) at its hard floor ------
+    // ---- 2. every asi-hard pinned knob (22) at its hard floor ------
     // Reuses `security_profile::KNOBS` via the read-only accessor — NO
     // knob name or floor value is re-declared here (see module docs).
     //
@@ -258,7 +258,7 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
     // check when the pins are not in force. `asi_hard_below_floor()`
     // reports only knobs a HARDENED process would pin below their floor,
     // so under `standard` it is VACUOUSLY empty and the row rendered
-    // `[PASS] … 21/21 at floor` for a deployment where not one knob is
+    // `[PASS] … N/N at floor` for a deployment where not one knob is
     // pinned — false assurance in committed, publicly-auditable cert
     // evidence. The floor is only EVALUABLE once the posture engages, so
     // a non-`asi-hard` profile now FAILS with an `actual` that says the
@@ -606,7 +606,7 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
     }
 
     // ---- 16. peer URLs https-only ------------------------------------
-    // Same underlying knob as one of the 21 asi-hard pins (#154) —
+    // Same underlying knob as one of the 22 asi-hard pins (#154) —
     // named separately here because §5.3 calls it out as its own
     // enumerated requirement ("peer URLs: https:// only").
     let plaintext_allowed = crate::tls::plaintext_peers_allowed();
@@ -805,7 +805,7 @@ mod tests {
     use super::*;
 
     /// Every env var this module (or the `asi-hard` KNOBS it reuses)
-    /// reads or pins, for test isolation. Delegates the 21 `asi-hard`
+    /// reads or pins, for test isolation. Delegates the 22 `asi-hard`
     /// knobs + the profile selector to `security_profile::pinned_knobs`
     /// / `ENV_SECURITY_PROFILE` rather than re-listing them (single
     /// source of truth even inside the test cleanup).
@@ -1043,7 +1043,7 @@ mod tests {
     /// as a satisfied hardened-floor check. `asi_hard_below_floor()` is
     /// vacuously empty there (its own docs say to pair it with
     /// `is_asi_hard`), so the pre-fix row printed
-    /// `[PASS] … 21/21 at floor` while NOT ONE knob was pinned.
+    /// `[PASS] … N/N at floor` while NOT ONE knob was pinned.
     #[test]
     fn pins_row_fails_and_states_floor_unevaluated_under_standard_profile_2923() {
         if crate::config::run_env_isolated_child_or_spawn(
@@ -1177,7 +1177,7 @@ mod tests {
         }
         let _cleanup = EnvGuard;
         let _fp_file = set_fully_hardened_env();
-        // Loosen ONE of the 21 pinned knobs after the fact.
+        // Loosen ONE of the 22 pinned knobs after the fact.
         unsafe {
             std::env::set_var("AI_MEMORY_SECRET_SCREEN_MODE", "off");
         }
@@ -1625,7 +1625,7 @@ mod tests {
             std::env::set_var(crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV, "1");
         }
         let checks = evaluate(&AppConfig::default());
-        // #2477's KNOB is ALSO one of the 21 asi-hard pins, so BOTH
+        // #2477's KNOB is ALSO one of the 22 asi-hard pins, so BOTH
         // the aggregate knobs row and the dedicated https-only row must
         // go red — never silently absorbed into only one.
         let knobs_row = find(&checks, "asi-hard pinned knobs");
