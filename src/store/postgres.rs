@@ -25187,7 +25187,16 @@ impl MemoryStore for PostgresStore {
         }
         let mut moved = 0usize;
         let now = chrono::Utc::now();
-        let archive_reason = reason.unwrap_or("manual");
+        // Parity finding #1 (2026-08) — the reason-less default was
+        // `"manual"` here while BOTH sqlite funnels
+        // (`storage::archive_memory_no_tx` / `archive_memory_for_caller`)
+        // stamped `"archive"`, so the SAME reason-less archive produced a
+        // DIFFERENT audit-trail value per backend and every reason-filtered
+        // query / `archive_stats` report disagreed across backends. All
+        // three funnels now read ONE shared SSOT const; `"archive"` is the
+        // value pinned by the long-standing sqlite unit test
+        // `archive_memory_default_reason_is_archive`.
+        let archive_reason = reason.unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT);
         let mut tx = self
             .pool
             .begin()

@@ -442,6 +442,67 @@ truthful.
   watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
   the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
   the outer job cap — remains what fires on a genuine hang.
+### Fixed (cross-backend parity — write funnels: archive / delete / update)
+
+A parity audit of the sqlite and postgres write funnels found four
+divergences where the SAME operation behaved differently per backend. Three
+are data-integrity issues; one is an authorization gap. All four are closed,
+each with a regression test.
+
+- **`archive_reason` default is now ONE shared SSOT const.** A reason-less
+  archive stamped `archive_reason='archive'` on sqlite (both funnels) but
+  `'manual'` on postgres, so identical operations produced different audit
+  trails and every reason-filtered query / `archive_stats` report disagreed
+  across backends. The HTTP surface had *always* defaulted to `"archive"` and
+  passed it explicitly, so postgres' own SAL default contradicted the
+  daemon's contract. All four sites now read
+  `models::field_names::ARCHIVE_REASON_DEFAULT` (`"archive"`, the value the
+  long-standing sqlite unit test pins).
+- **`SqliteStore::archive_by_ids` is now ALL-OR-NOTHING**, matching the
+  postgres twin's single batch transaction. It previously looped
+  `db::archive_memory`, which opens its OWN transaction per id, so a
+  mid-batch failure left a PARTIALLY archived batch committed — the prefix of
+  ids had their live rows deleted and moved to `archived_memories` while the
+  remainder stayed live, and the caller got only an `Err` with no way to learn
+  how far the batch got. Replay/DR tooling could not assume the same
+  post-failure state on the two backends. The whole loop now runs in one
+  transaction (calling the tx-free `archive_memory_no_tx` core inside it), so
+  a failure rolls the entire batch back.
+- **`storage::delete` is now statement-atomic.** The namespace-standard
+  SEVER (#2503), the append-only TOMBSTONE leaf (#1823 G6), and the row
+  DELETE ran as THREE separate autocommit statements, so a failure between
+  them stranded a severed governance binding — an unrecoverable policy
+  downgrade — with the memory still live. All three now share one
+  transaction.
+- **`SqliteStore::update` / `delete` now enforce a SAL-level caller-owns
+  gate.** Both previously discarded `ctx` entirely: the ownership check
+  existed only in the sqlite HTTP handler and the MCP mutate tools, so any
+  other SAL caller (CLI, internal surfaces, federation, future code paths)
+  could rewrite or delete another tenant's row by id. The gate now delegates
+  to the canonical shared `visibility::caller_owns_for_mutation` predicate —
+  the same one every MCP mutate tool uses and the twin of the HTTP
+  `require_caller_owns_memory` carve-out set — so sqlite is internally
+  consistent (HTTP == MCP == SAL). An **unstamped row (no
+  `metadata.agent_id`) stays mutable**, preserving the legacy-unowned
+  carve-out and the single-operator default where rows may carry no stamp;
+  a row owned by a *different, named* agent is refused. The inbox carve-out
+  is wired per-verb exactly as HTTP/MCP wire it: enabled for `delete` (the
+  addressed recipient may delete a message sent to it), disabled for
+  `update`. Admin contexts (`bypass_visibility`) skip the gate as before.
+  **No behaviour change for any shipping path** — every HTTP/worker
+  `MemoryStore::update`/`delete` call site sits inside a
+  `StorageBackend::Postgres` branch, and the one backend-agnostic caller
+  (`autonomy::reverse_rollback_entry_store`) is driven only by
+  `CallerContext::for_admin`. Note this deliberately does NOT adopt the
+  postgres #1628 posture of refusing unstamped rows: that would turn
+  today-writable legacy rows into permanently inaccessible ones. Unifying
+  the two backends (stamp legacy rows via migration, then refuse everywhere)
+  is tracked as #3124.
+
+Both atomicity fixes are transaction-AWARE (the `update_with_expected_version`
+precedent): they open a transaction only when the caller does not already hold
+one, so callers that already wrap these funnels — e.g. `consolidate`'s
+hard-DELETE arm — keep working and their commit/rollback covers atomicity.
 
 ### Removed
 

@@ -61,6 +61,18 @@ pub const ARCHIVE_REASON: &str = "archive_reason";
 /// content under the SAME memory_id, no fork). Shared SSOT so the
 /// sqlite + postgres backends and the parity test agree on the marker.
 pub const ARCHIVE_REASON_IN_PLACE_EDIT: &str = "in_place_edit";
+/// Parity finding #1 (2026-08) — the DEFAULT `archive_reason` VALUE
+/// stamped when an archive is requested with no explicit reason.
+///
+/// Shared SSOT so the sqlite funnel (`storage::archive_memory_no_tx`)
+/// and the postgres funnel (`PostgresStore::archive_by_ids`) cannot
+/// drift: they previously defaulted to `"archive"` and `"manual"`
+/// respectively, so the SAME reason-less operation produced two
+/// different audit-trail values depending on the backend, and any
+/// reason-filtered query / `archive_stats` report disagreed across
+/// backends. `"archive"` is the value the sqlite unit test
+/// `archive_memory_default_reason_is_archive` has pinned since v0.6.
+pub const ARCHIVE_REASON_DEFAULT: &str = "archive";
 /// `atomisation_archived_at` — wire/row field name.
 pub const ATOMISATION_ARCHIVED_AT: &str = "atomisation_archived_at";
 /// `atom_count` — wire/row field name.
