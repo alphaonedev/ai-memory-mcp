@@ -254,7 +254,7 @@ fn asi_hard_config_pins_the_pe1_knobs() {
 fn asi_hard_env_names_every_pinned_knob() {
     let text = read("asi-hard.env");
     let tokens: HashSet<&str> = text
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .filter(|t| !t.is_empty())
         .collect();
 
