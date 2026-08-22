@@ -4517,6 +4517,45 @@ pub fn cid_enforce_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// v1.0.0 (#3113) — env knob turning the migration core-relation report
+/// into a REFUSAL.
+///
+/// Several sqlite ladder arms are gated on an existence probe and SKIP when
+/// the relation is absent (a legitimate test-fixture / archive-less shape),
+/// but the tail of `migrate` then stamps the tip anyway — so a POPULATED
+/// database that LOST a core relation upgrades "successfully" with the
+/// integrity controls that version implies never applied. See
+/// [`crate::storage::schema_integrity`].
+///
+/// Unset / falsy (the default) = report only: a loud structured WARN plus a
+/// `doctor` signal, behaviour otherwise byte-identical to pre-#3113. Truthy
+/// (`1` / `true` / `yes` / `on`, case-insensitive) = the migration REFUSES to
+/// stamp, rolling back with the database unchanged and still readable at its
+/// current version.
+///
+/// Default-off is deliberate: defaulting to refuse would turn every existing
+/// high-stamp fixture and archive-less deployment into a hard boot failure —
+/// a fleet-wide availability regression for no data-integrity gain, since the
+/// check mutates nothing. Reporting is unconditional; enforcement is a fleet
+/// decision.
+pub const ENV_MIGRATION_REQUIRE_CORE_TABLES: &str = "AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES";
+
+/// v1.0.0 (#3113) — whether a missing core relation REFUSES the schema stamp
+/// (see [`ENV_MIGRATION_REQUIRE_CORE_TABLES`]). Reads the env var directly,
+/// mirroring [`cid_enforce_enabled`]: the migration ladder runs before the
+/// boot-seeded config globals exist, so a boot-seeded atomic would always
+/// read its compile-time default here.
+#[must_use]
+pub fn migration_require_core_tables() -> bool {
+    std::env::var(ENV_MIGRATION_REQUIRE_CORE_TABLES)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 /// v0.8.1 W1 (#1821 / gap G29) — the `[security]` config block.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {

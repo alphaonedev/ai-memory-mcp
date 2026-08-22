@@ -1,0 +1,368 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! v1.0.0 (#3113) — core-relation integrity for the sqlite migration ladder.
+//!
+//! # The fail-open hole this closes
+//!
+//! Several ladder arms in [`super::migrations::migrate`] are gated on an
+//! existence probe rather than applied unconditionally, e.g. the v34
+//! `signed_events` chain columns, the v66 `governance_rules` severity-CHECK
+//! widening, and the v73 `signed_events.cause_hash` column:
+//!
+//! ```text
+//! let has_governance_rules = conn.prepare("SELECT 1 FROM governance_rules LIMIT 0").is_ok();
+//! if has_governance_rules { conn.execute_batch(MIGRATION_V66_SQLITE)?; }
+//! ```
+//!
+//! Those probes exist for a real and benign reason: a test fixture may stamp
+//! `schema_version` to a high value over a database bootstrapped from the
+//! `SCHEMA` constant alone, and `SCHEMA` deliberately omits the later-added
+//! ladder-only relations. Skipping is correct there.
+//!
+//! What was missing is the OTHER reading of the same observation. After every
+//! such skip the tail of `migrate` unconditionally stamps
+//! `CURRENT_SCHEMA_VERSION` and returns `Ok(())`, so a POPULATED database that
+//! LOST one of these relations (corruption, a partial file-level restore, an
+//! operator `DROP`) "upgrades successfully" to the tip while the integrity
+//! constraints that version claims — the signature-atomicity triggers, the
+//! relation CHECK, the widened severity CHECK — were never applied. Subsequent
+//! writes then bypass constraints the stamp asserts are in force. That is
+//! fail-OPEN exactly where the project's north star requires fail-CLOSED.
+//!
+//! # The discriminator
+//!
+//! Every relation listed in [`CORE_TABLES`] is created UNCONDITIONALLY by its
+//! ladder arm — `if version < N { CREATE TABLE ... }` with no probe in front
+//! of the create itself. So for a database stamped at version `V`, a relation
+//! whose `introduced_at <= V` is ABSENT can only mean the create arm never ran
+//! against this file: either it was never a real ladder upgrade (the benign
+//! fixture case) or the relation was lost after the fact (the corruption
+//! case). The two are indistinguishable from inside the file, which is
+//! precisely why this module REPORTS rather than guesses.
+//!
+//! # Posture
+//!
+//! * ALWAYS: a loud, structured `WARN` naming each missing relation, the
+//!   version that introduced it, and the integrity control that is therefore
+//!   not in force, plus the live-corpus row count so an operator can tell a
+//!   populated database from an empty fixture at a glance.
+//! * ALWAYS: a `doctor` signal — [`crate::cli::doctor`] runs the same probe
+//!   against the stored stamp and raises the Storage section to `Critical`.
+//! * OPT-IN: [`crate::config::migration_require_core_tables`]
+//!   (`AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1`) turns the report into a
+//!   REFUSAL. The check runs inside the migrate transaction and BEFORE the
+//!   `schema_version` stamp, so a refusal rolls the whole ladder back and
+//!   leaves the database exactly as found, still stamped at its old version
+//!   and still fully readable — the stamp is never written over a database
+//!   whose integrity controls could not be applied.
+//!
+//! The refusal is opt-in rather than the default deliberately. Defaulting to
+//! refuse would convert every pre-existing high-stamp fixture and every
+//! archive-less deployment into a hard boot failure — an availability
+//! regression across a fleet, with no data-integrity gain, since this module
+//! MUTATES NOTHING. Reporting is unconditional; enforcement is a fleet
+//! decision. This module reads `sqlite_master` and `COUNT(*)`; it issues no
+//! DDL and no DML, so it can neither lose nor corrupt data.
+
+use anyhow::{Context, Result};
+use rusqlite::Connection;
+
+/// Structured-log target for every event emitted by this module.
+pub const TRACE_TARGET: &str = "ai_memory::storage::schema_integrity";
+
+/// Existence probe against `sqlite_master`. Bound parameter, never
+/// interpolated — the table name still comes from the [`CORE_TABLES`]
+/// compile-time SSOT, never from caller input.
+const SQL_TABLE_PRESENT: &str =
+    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)";
+
+/// Live-corpus size, used ONLY to colour the diagnostic (populated database
+/// vs empty fixture). Never a gate.
+const SQL_MEMORIES_COUNT: &str = "SELECT COUNT(*) FROM memories";
+
+/// One ladder-created relation whose presence is implied by a schema stamp.
+///
+/// A relation qualifies for this table only when BOTH hold:
+///
+/// 1. Its ladder arm creates it UNCONDITIONALLY (no existence probe wrapping
+///    the `CREATE TABLE`), so every genuine upgrade through that version has
+///    it; and
+/// 2. it is NOT in the bootstrap `SCHEMA` constant, which `db::open` replays
+///    on every single open — a `SCHEMA` relation is re-created (empty) before
+///    `migrate` ever runs, so its absence is unobservable here and this probe
+///    would be dead weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CoreTable {
+    /// The sqlite relation name.
+    pub name: &'static str,
+    /// The schema version whose ladder arm creates it unconditionally.
+    pub introduced_at: i64,
+    /// The integrity control that is NOT in force while it is absent. Quoted
+    /// verbatim into the operator-facing diagnostic.
+    pub integrity_note: &'static str,
+}
+
+/// SSOT of ladder-created core relations. Verified against
+/// [`super::migrations::migrate`] at schema v89.
+///
+/// Each `introduced_at` below was read off the arm that creates the relation:
+/// `if version < 4` / `< 5` / `< 26` / `< 30`, each an unconditional
+/// `CREATE TABLE IF NOT EXISTS` (or `execute_batch` of a create-only SQL
+/// file). None of the four appears in the bootstrap `SCHEMA` constant.
+///
+/// When a future arm adds another ladder-only core relation, add it here in
+/// the same commit — that is what keeps the stamp honest.
+pub const CORE_TABLES: &[CoreTable] = &[
+    CoreTable {
+        name: "archived_memories",
+        introduced_at: 4,
+        integrity_note: "archive/restore has no destination relation: archiving a memory \
+                         (GC, supersede, in-place edit) cannot preserve the prior row",
+    },
+    CoreTable {
+        name: "namespace_meta",
+        introduced_at: 5,
+        integrity_note: "namespace standards and parent-namespace inheritance cannot be \
+                         recorded or resolved",
+    },
+    CoreTable {
+        name: "signed_events",
+        introduced_at: 26,
+        integrity_note: "the append-only audit chain is absent, so the v34 prev_hash/sequence \
+                         chain columns and the v73 cause_hash column were never applied",
+    },
+    CoreTable {
+        name: "governance_rules",
+        introduced_at: 30,
+        integrity_note: "governance rules cannot be stored or evaluated, and the v66 widened \
+                         severity CHECK was never applied",
+    },
+];
+
+/// Probe whether `table` exists in this database.
+///
+/// # Errors
+///
+/// Propagates the `sqlite_master` read failure. A failed READ is deliberately
+/// NOT coerced to "absent" (nor to "present"): an unreadable catalogue is a
+/// different fact from a missing relation, and collapsing the two is the same
+/// mistake #2445 fixed on the `schema_version` stamp read.
+pub fn table_present(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(SQL_TABLE_PRESENT, [table], |r| r.get::<_, bool>(0))
+        .with_context(|| format!("probe sqlite_master for the {table} relation"))
+}
+
+/// Every [`CORE_TABLES`] entry that a database stamped at `effective_version`
+/// must contain but does not.
+///
+/// Entries introduced ABOVE `effective_version` are not expected yet and are
+/// skipped, so this is safe to call at any point on the ladder.
+///
+/// # Errors
+///
+/// Propagates a `sqlite_master` probe failure (see [`table_present`]).
+pub fn missing_core_tables(conn: &Connection, effective_version: i64) -> Result<Vec<CoreTable>> {
+    let mut missing = Vec::new();
+    for entry in CORE_TABLES {
+        if entry.introduced_at <= effective_version && !table_present(conn, entry.name)? {
+            missing.push(*entry);
+        }
+    }
+    Ok(missing)
+}
+
+/// Live-corpus row count, for colouring the diagnostic only.
+///
+/// Returns `None` when the count cannot be read — a bare fixture connection
+/// with no `memories` relation is the ordinary case. DELIBERATE discard: this
+/// value never gates anything, and a diagnostic that fails to render must not
+/// convert a warning into an error.
+#[must_use]
+pub fn corpus_row_count(conn: &Connection) -> Option<i64> {
+    conn.query_row(SQL_MEMORIES_COUNT, [], |r| r.get::<_, i64>(0))
+        .ok()
+}
+
+/// Render the missing-relation list into the one-line operator diagnostic.
+#[must_use]
+pub fn describe(missing: &[CoreTable]) -> String {
+    missing
+        .iter()
+        .map(|t| {
+            format!(
+                "{} (introduced at v{}: {})",
+                t.name, t.introduced_at, t.integrity_note
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Probe for missing core relations and, when any are missing, emit the loud
+/// structured WARN. Returns the list so the caller can decide whether to
+/// refuse.
+///
+/// # Errors
+///
+/// Propagates a `sqlite_master` probe failure (see [`table_present`]).
+pub fn report(conn: &Connection, effective_version: i64) -> Result<Vec<CoreTable>> {
+    let missing = missing_core_tables(conn, effective_version)?;
+    if !missing.is_empty() {
+        let rows = corpus_row_count(conn);
+        tracing::warn!(
+            target: TRACE_TARGET,
+            effective_version,
+            missing_count = missing.len(),
+            missing = %describe(&missing),
+            corpus_rows = rows.unwrap_or(-1),
+            "core relations are ABSENT from a database at this schema version — the ladder \
+             arms that create them were skipped, so the integrity controls this stamp implies \
+             are NOT in force. A database with rows here indicates relation LOSS (corruption / \
+             partial restore), not a fresh fixture. Run `ai-memory doctor`; set \
+             AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1 to refuse the stamp instead of warning."
+        );
+    }
+    Ok(missing)
+}
+
+/// The typed refusal raised when enforcement is enabled and relations are
+/// missing. Kept separate from [`report`] so the message has ONE definition
+/// shared by the migrate refusal and the doctor note.
+#[must_use]
+pub fn refusal_message(missing: &[CoreTable], effective_version: i64) -> String {
+    format!(
+        "refusing to stamp schema v{effective_version}: {} core relation(s) absent — {}. \
+         The database is UNCHANGED (the migration rolled back) and remains readable at its \
+         current version. Restore from a backup that contains these relations, or unset \
+         AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES to proceed with a warning instead.",
+        missing.len(),
+        describe(missing),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn_with(tables: &[&str]) -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        for t in tables {
+            conn.execute(&format!("CREATE TABLE {t} (id TEXT PRIMARY KEY)"), [])
+                .expect("create fixture table");
+        }
+        conn
+    }
+
+    #[test]
+    fn every_core_table_entry_is_distinct_and_ordered_by_introduction() {
+        // SSOT hygiene: no duplicate relation, and the table reads in ladder
+        // order so a reviewer can diff it against `migrate` top-to-bottom.
+        let mut names: Vec<&str> = CORE_TABLES.iter().map(|t| t.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            CORE_TABLES.len(),
+            "duplicate CORE_TABLES entry"
+        );
+        let versions: Vec<i64> = CORE_TABLES.iter().map(|t| t.introduced_at).collect();
+        let mut sorted = versions.clone();
+        sorted.sort_unstable();
+        assert_eq!(versions, sorted, "CORE_TABLES must read in ladder order");
+    }
+
+    #[test]
+    fn a_fresh_database_expects_nothing() {
+        // effective_version 0: nothing has been introduced yet, so an empty
+        // database is NOT missing anything. This is what keeps a genuinely
+        // fresh bootstrap silent.
+        let conn = conn_with(&[]);
+        assert!(missing_core_tables(&conn, 0).expect("probe").is_empty());
+    }
+
+    #[test]
+    fn relations_above_the_stamp_are_not_yet_expected() {
+        // At v4 only `archived_memories` is due; signed_events (v26) and
+        // governance_rules (v30) are correctly not reported.
+        let conn = conn_with(&["archived_memories"]);
+        assert!(missing_core_tables(&conn, 4).expect("probe").is_empty());
+        assert!(
+            missing_core_tables(&conn, 5)
+                .expect("probe")
+                .iter()
+                .any(|t| t.name == "namespace_meta")
+        );
+    }
+
+    #[test]
+    fn a_tip_stamped_database_missing_the_audit_chain_is_reported() {
+        // The finding's exact shape: a database claiming the tip whose
+        // ladder-only relations were skipped.
+        let conn = conn_with(&["archived_memories", "namespace_meta"]);
+        let missing = missing_core_tables(&conn, 89).expect("probe");
+        let names: Vec<&str> = missing.iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["signed_events", "governance_rules"]);
+    }
+
+    #[test]
+    fn a_complete_database_at_the_tip_reports_nothing() {
+        let conn = conn_with(&[
+            "archived_memories",
+            "namespace_meta",
+            "signed_events",
+            "governance_rules",
+        ]);
+        assert!(missing_core_tables(&conn, 89).expect("probe").is_empty());
+    }
+
+    #[test]
+    fn corpus_row_count_is_none_without_a_memories_relation() {
+        // Diagnostic-only: a bare fixture connection must not turn the WARN
+        // path into an error.
+        let conn = conn_with(&[]);
+        assert_eq!(corpus_row_count(&conn), None);
+    }
+
+    #[test]
+    fn corpus_row_count_reads_a_populated_corpus() {
+        let conn = conn_with(&["memories"]);
+        conn.execute("INSERT INTO memories (id) VALUES ('m1')", [])
+            .expect("seed");
+        assert_eq!(corpus_row_count(&conn), Some(1));
+    }
+
+    #[test]
+    fn describe_names_the_relation_and_its_integrity_control() {
+        let missing = missing_core_tables(&conn_with(&[]), 89).expect("probe");
+        let text = describe(&missing);
+        assert!(
+            text.contains("signed_events"),
+            "must name the relation: {text}"
+        );
+        assert!(
+            text.contains("append-only audit chain"),
+            "must name the control: {text}"
+        );
+    }
+
+    #[test]
+    fn refusal_message_states_the_database_is_unchanged() {
+        // The operator-facing guarantee: a refusal is not a mutation.
+        let missing = missing_core_tables(&conn_with(&[]), 89).expect("probe");
+        let msg = refusal_message(&missing, 89);
+        assert!(msg.contains("UNCHANGED"), "{msg}");
+        assert!(
+            msg.contains("AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn report_returns_the_same_list_it_warns_about() {
+        let conn = conn_with(&["archived_memories", "namespace_meta", "signed_events"]);
+        let missing = report(&conn, 89).expect("report");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].name, "governance_rules");
+    }
+}

@@ -3842,6 +3842,31 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // reversed vs v55, exactly as v57's docstring notes).
         // Doc twin: migrations/sqlite/0073_v89_tsv_tags_noop.sql.
 
+        // v1.0.0 (#3113) — CORE-RELATION INTEGRITY GATE, immediately before the
+        // stamp. Several arms above are gated on an existence probe (v34
+        // `signed_events`, v66 `governance_rules`, v73 `signed_events.cause_hash`)
+        // and SKIP when the relation is absent. Skipping is correct for a test
+        // fixture that stamped a high version over a `SCHEMA`-only database, but
+        // NOTHING previously distinguished that from a POPULATED database whose
+        // relation was LOST (corruption / partial file-level restore / operator
+        // DROP) — and the stamp below fires either way, asserting integrity
+        // controls that were never applied. That is fail-OPEN.
+        //
+        // Reporting is unconditional (a loud WARN + a `doctor` signal); the
+        // REFUSAL is opt-in via AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES. Sited
+        // INSIDE the migrate transaction and BEFORE the stamp, so a refusal
+        // rolls the entire ladder back: the database is left EXACTLY as found,
+        // still stamped at its old version and still fully readable. The probe
+        // itself reads `sqlite_master` + `COUNT(*)` and issues no DDL/DML, so
+        // this gate can neither lose nor corrupt data.
+        let missing_core = super::schema_integrity::report(conn, CURRENT_SCHEMA_VERSION)?;
+        if !missing_core.is_empty() && crate::config::migration_require_core_tables() {
+            return Err(anyhow::anyhow!(super::schema_integrity::refusal_message(
+                &missing_core,
+                CURRENT_SCHEMA_VERSION
+            )));
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",

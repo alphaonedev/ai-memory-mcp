@@ -522,6 +522,53 @@ hard-DELETE arm — keep working and their commit/rollback covers atomicity.
   now **Linux and macOS only** (both including the enterprise-federation
   postgresql+AGE+pgvector tier).
 
+### Fixed (migration ladder fail-open: a lost core relation no longer stamps silently; #3113)
+
+Closes a fail-OPEN hole in the sqlite migration ladder. Several arms are gated
+on an existence probe and SKIP when the relation is absent — the v34
+`signed_events` chain columns, the v66 `governance_rules` severity-CHECK
+widening, the v73 `signed_events.cause_hash` column. Skipping is correct for the
+case the probes were written for (a test fixture that stamped a high
+`schema_version` over a database bootstrapped from the `SCHEMA` constant alone,
+which deliberately omits the later-added ladder-only relations). What was
+missing is the other reading of the same observation: after every such skip the
+tail of `migrate` unconditionally stamped `CURRENT_SCHEMA_VERSION` and returned
+`Ok(())`, so a POPULATED database that LOST one of these relations (corruption,
+a partial file-level restore, an operator `DROP`) "upgraded successfully" to the
+tip while the integrity controls that stamp asserts — signature-atomicity
+triggers, the relation CHECK, the widened severity CHECK — were never applied.
+Subsequent writes then bypassed constraints the version stamp claimed were in
+force.
+
+- **The discriminator.** Every relation in the new
+  `storage::schema_integrity::CORE_TABLES` SSOT (`archived_memories` v4,
+  `namespace_meta` v5, `signed_events` v26, `governance_rules` v30) is created
+  UNCONDITIONALLY by its ladder arm and is NOT in the bootstrap `SCHEMA`
+  constant. So for a database stamped at version `V`, a relation whose
+  `introduced_at <= V` being ABSENT can only mean its create arm never ran
+  against this file. The module reports that fact rather than guessing which of
+  the two causes produced it.
+- **Detection is unconditional.** A structured `WARN` under
+  `ai_memory::storage::schema_integrity` names each missing relation, the version
+  that introduced it, the integrity control that is therefore not in force, and
+  the live-corpus row count — the signal that separates a populated database
+  (relation LOSS) from an empty fixture. `ai-memory doctor` carries the standing
+  signal as a `core_relations` fact that raises the Storage section to
+  `Critical`, readable at any time and independent of who ran the migration.
+- **Enforcement is opt-in.** `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1`
+  escalates the report to a REFUSAL. The check is sited inside the migrate
+  transaction and BEFORE the stamp, so a refusal rolls the whole ladder back and
+  leaves the database EXACTLY as found — old version, every row intact, still
+  readable — and is reversible by unsetting the knob. Default-off is deliberate:
+  defaulting to refuse would turn every existing high-stamp fixture and
+  archive-less deployment into a hard boot failure, a fleet-wide availability
+  regression for no data-integrity gain.
+- **The gate cannot itself lose data.** It issues no DDL and no DML — it reads
+  `sqlite_master` and one `COUNT(*)`. A regression test round-trips the full
+  catalogue and row count across a probe to pin that. Under the default posture
+  behaviour is byte-identical to before: the open still succeeds, the ladder
+  still advances to the tip, no row is touched.
+
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 
 Closes a tenant-isolation + approval-bypass primitive on the namespace-standard
