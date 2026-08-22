@@ -785,6 +785,22 @@ truthful.
   posture as its sqlite/MCP siblings (400 instead of a silent
   default-tier write), and the two already-correct sites
   (`ai-memory store`, `ai-memory mine`) now single-source the refusal wording.
+
+  **Operator-visible behaviour change.** An unrecognised `--tier` / `tier`
+  value is now REFUSED with `invalid tier: <value> (use short, mid, long)` and
+  a non-zero exit on `forget` / `search` / `list` / `update` across the CLI,
+  the MCP tools and the HTTP notify Postgres branch. Previously the same value
+  was silently treated as *"no tier constraint"* and the command exited 0 — on
+  `forget`, after erasing EVERY tier in scope. A script that relied on the old
+  leniency must now pass a canonical tier.
+
+  Four in-tree tests had PINNED the lenient behaviour and are rewritten to
+  assert the refusal:
+  `mcp::tools::forget::tests::forget_with_invalid_tier_string_treated_as_none`,
+  `mcp::tests::handle_list_invalid_tier_treated_as_none`,
+  `mcp::tests::chunkc_forget_invalid_tier_string_silently_dropped`, and the
+  "silently falls through" arm of
+  `mcp::tools::list::tests::filters_by_tier`.
 - **Record-stop enforcement no longer silently degrades at the SAL layer when
   the sqlite DB path resolves through a symlink** (e.g. the macOS
   `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
