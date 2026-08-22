@@ -17,8 +17,9 @@
 //!    `attest_level="unsigned"`, `signed_by`/`signed_at` both `null`.
 //! 2. Self-signed link (H2 outbound path) → `signature_verified=true`,
 //!    `attest_level="self_signed"`, `signed_by`/`signed_at` populated.
-//! 3. Tampered signature byte → `signature_verified=false`,
-//!    `attest_level="unsigned"`.
+//! 3. Tampered signature byte → `signature_verified=false`, with the
+//!    STORED `attest_level` PRESERVED (#3021 — collapsing a forged
+//!    signature into `"unsigned"` erased the tamper evidence).
 //! 4. Peer-attested link (simulating H3's inbound path) →
 //!    `signature_verified=true`, `attest_level="peer_attested"`.
 //! 5. `link_id` composite form parses identically to explicit-args.
@@ -279,10 +280,18 @@ fn tampered_signature_byte_does_not_verify() {
     .expect("handle_verify Ok (tampered → false, not Err)");
 
     assert_eq!(body["signature_verified"], json!(false));
+    // #3021 — the FORGED arm must PRESERVE the stored level. Pre-#3021 this
+    // pinned `"unsigned"`, i.e. a forged edge was relabelled "never signed"
+    // and every auditor sweeping `attest_level != 'unsigned'` for signed
+    // edges to re-check skipped exactly the tampered rows. The verdict lives
+    // in `signature_verified` (false) + the null `signed_by`/`signed_at`;
+    // `attest_level` reports what the substrate has RECORDED, which is still
+    // `self_signed` — that is the tamper evidence.
     assert_eq!(
         body["attest_level"],
-        json!("unsigned"),
-        "tampered → on-demand verify reports unsigned regardless of stored column"
+        json!("self_signed"),
+        "tampered → verify preserves the stored attest_level (tamper evidence) \
+         and reports the failure via signature_verified=false"
     );
     assert_eq!(body["signed_by"], json!(null));
     assert_eq!(body["signed_at"], json!(null));

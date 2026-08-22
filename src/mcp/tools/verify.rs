@@ -70,6 +70,9 @@ impl McpTool for VerifyTool {
 /// {
 ///   "signature_verified": bool,
 ///   "attest_level": "unsigned" | "self_signed" | "peer_attested",
+///   //   ^ the STORED level; on a failed re-verify it is preserved
+///   //     (#3021) so tamper evidence is not erased. Trust
+///   //     `signature_verified`, never `attest_level`, for the verdict.
 ///   "signed_by": <observed_by string or null>,
 ///   "signed_at": <valid_from string or null>
 /// }
@@ -152,7 +155,10 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
     //     verify and report the actual outcome. We deliberately recheck
     //     here even when the column already says "self_signed" or
     //     "peer_attested": the whole point of `memory_verify` is on-
-    //     demand re-validation, not a stored-flag readback.
+    //     demand re-validation, not a stored-flag readback. On a verify
+    //     FAILURE (#3021) the STORED level is preserved — the row is
+    //     "signed and INVALID", not "never signed"; only
+    //     `signature_verified` carries the verdict.
     let stored_attest = record
         .attest_level
         .as_deref()
@@ -192,7 +198,18 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
                             };
                             (true, level)
                         } else {
-                            (false, crate::models::AttestLevel::Unsigned)
+                            // #3021 — a FORGED signature must NOT be relabelled
+                            // `unsigned`. Collapsing "signature present but
+                            // INVALID" into "never signed" ERASES the tamper
+                            // evidence: an auditor sweeping
+                            // `attest_level != 'unsigned'` for signed edges to
+                            // re-check would skip exactly the forged rows. Report
+                            // the STORED level (what the inbound path recorded)
+                            // alongside `signature_verified: false` — the same
+                            // posture the adjacent pubkey-not-found arm already
+                            // takes. `signed_by` / `signed_at` stay `null`
+                            // because nothing was proven.
+                            (false, stored_attest)
                         }
                     }
                     None => {

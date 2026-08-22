@@ -701,7 +701,10 @@ fn tampered_signature_byte_does_not_verify() {
     .expect("handle_verify Ok (tampered → false, not Err)");
 
     assert_eq!(body["signature_verified"], json!(false));
-    assert_eq!(body["attest_level"], json!("unsigned"));
+    // #3021 — the FORGED arm PRESERVES the stored level (`self_signed`);
+    // relabelling it `unsigned` erased the tamper evidence. The verdict is
+    // `signature_verified=false` + the null `signed_by`/`signed_at`.
+    assert_eq!(body["attest_level"], json!("self_signed"));
     assert_eq!(body["signed_by"], json!(null));
     assert_eq!(body["signed_at"], json!(null));
 }
