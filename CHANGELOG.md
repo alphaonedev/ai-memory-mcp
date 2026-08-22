@@ -252,8 +252,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the SAME owner-keyed predicate the postgres `search` uses — absent `scope`
   defaults to `private` (fail-closed), the owner (`metadata.agent_id`) and the
   addressed inbox recipient (`metadata.target_agent_id`, the #3070 carve-out) stay
-  visible — pushed into SQL and re-applied in-process via `is_visible_to_caller`
-  (belt-and-suspenders, identical to `search`). `bypass_visibility` (admin /
+  visible — pushed into SQL as a coarse, index-friendly PRE-FILTER and then
+  ENFORCED in-process by `is_visible_to_caller`, which is the authoritative
+  gate. The SQL arm is deliberately WIDER than the Rust predicate for every
+  non-`private` scope (it applies no team/unit/org subtree test, and an
+  unrecognised scope token reads as non-private there), so the in-process
+  re-filter is LOAD-BEARING, not belt-and-suspenders — the same shape the
+  postgres `search` carries. `bypass_visibility` (admin /
   migrate / federation catch-up / GC) remains the one sanctioned bypass. No
   production caller reached the method (the postgres HTTP search path dispatches
   through the SAL trait `search`), so this closes a latent leak and restores

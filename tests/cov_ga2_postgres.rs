@@ -200,6 +200,15 @@ async fn search_with_source_uri_filters_on_provenance() {
 // pins: (a) a non-owner is fail-closed, (b) the owner is exempt, (c) the
 // #3070 `target_agent_id` inbox carve-out surfaces a row addressed TO
 // the caller, (d) `bypass_visibility` (admin) sees the private row.
+//
+// NOTE on what actually enforces this: the `$7` SQL arm is only a COARSE
+// private-row pre-filter — it is WIDER than
+// `visibility::is_visible_to_caller` for every non-private scope (no subtree
+// test for team/unit/org per #1921, and an unrecognised `scope` token reads
+// as non-private there per #2633). The in-process `is_visible_to_caller`
+// re-filter is LOAD-BEARING: it is what makes these assertions hold, and
+// deleting it would reopen the leak even with the SQL arm intact. This test
+// therefore guards that call as much as it guards the predicate.
 #[tokio::test]
 async fn search_with_source_uri_enforces_scope_private_gate_3110() {
     let Some(store) = connect().await else {
