@@ -192,6 +192,9 @@ fn print_curator_report(r: &curator::CuratorReport, out: &mut CliOutput<'_>) -> 
         "  skipped (cap):     {}",
         r.operations_skipped_cap
     )?;
+    // v1.0.0 — starvation gauge: zero here on a cycle with eligible
+    // memories means Pass-1 consolidation got no budget at all.
+    writeln!(out.stdout, "  autonomy budget:   {}", r.autonomy_ops_budget)?;
     writeln!(out.stdout, "  errors:            {}", r.errors.len())?;
     writeln!(out.stdout, "  dry_run:           {}", r.dry_run)?;
     for e in &r.errors {
@@ -1100,7 +1103,19 @@ fn load_curator_keypair_best_effort() -> Option<identity_keypair::AgentKeypair> 
     // set the daemon `AI_MEMORY_AGENT_ID` env var.
     let listed = identity_keypair::list(&dir).ok()?;
     let first = listed.into_iter().next()?;
-    identity_keypair::load(&first.agent_id, &dir).ok()
+    let loaded = identity_keypair::load(&first.agent_id, &dir).ok()?;
+    // v1.0.0 — the selected identity is AMBIENT (lexicographically-first key
+    // in the key dir) and it is what every row this curator signs will be
+    // attributed to, including the `__persona_*` rows the auto-persona sweep
+    // mints. An operator running several keys on one host must be able to see
+    // WHICH one the curator adopted without reverse-engineering the key dir
+    // ordering, so announce it once at load.
+    tracing::info!(
+        agent_id = %first.agent_id,
+        key_dir = %dir.display(),
+        "curator signing identity selected"
+    );
+    Some(loaded)
 }
 
 #[cfg_attr(not(feature = "sal"), allow(dead_code))]

@@ -325,6 +325,91 @@ truthful.
 - **Dry runs inflated `rollback_entries_written`.** The counter is documented as
   rows persisted, but a dry run — which persists nothing — incremented it. Dry
   runs now report `rollback_entries_simulated` instead.
+- **Pass-1 consolidation could be starved of budget forever (HIGH).** Charging
+  the autonomy passes against `max_ops_per_cycle` (above) shares ONE cycle
+  budget between the auto-tag / contradiction loop and the passes, and both are
+  fed by the SAME `needs_curation` predicate — so whenever the eligible backlog
+  reached the cap (default 100) the loop consumed all of it and Pass 1 ran with
+  a budget of exactly ZERO, every cycle. That is permanent whenever the backlog
+  rows keep yielding empty auto-tags, since an empty tag list persists nothing
+  and the row stays eligible forever: consolidation would never run again on a
+  busy corpus, silently, with a healthy-looking cycle report. The passes now
+  hold a RESERVED share of the cap
+  (`max_ops_per_cycle / AUTONOMY_OP_RESERVE_DIVISOR`, floored at one op): the
+  loop's own budget shrinks by exactly that amount, so the reserve is carved
+  OUT of `max_ops_per_cycle` and never added on top of it — the documented hard
+  cap still holds. Deferred auto-tag work is counted in
+  `operations_skipped_cap` (never dropped), and the new
+  `CuratorReport.autonomy_ops_budget` field publishes what Pass 1 actually
+  received — a zero there against a non-zero `memories_eligible` is the
+  starvation signal, and it also prints in the human-readable
+  `curator --once` report.
+
+### Changed
+
+- **`curator --once` now ARMS the auto-persona sweep (behaviour change).**
+  Threading the daemon's authenticated signing identity into the one-shot path
+  (part of the ambient-key fix above) passes `Some(keypair)` where the
+  pre-change code passed `None`, and the `run_once` auto-persona sweep is gated
+  on exactly that: it was skipped unconditionally on the `--once` path before
+  and now runs whenever a keypair is present on the host. A `curator --once`
+  invocation can therefore MINT new signed `__persona_<entity>_v<n>` memory
+  rows (counted in `CuratorReport.personas_generated`) where it previously
+  wrote none. The identity used is still ambient — the lexicographically-first
+  key in the resolved key dir — so the selected `agent_id` and key dir are now
+  logged at `INFO` when the key is loaded; operators running several keys on
+  one host should pin the curator's with `AI_MEMORY_KEY_DIR`. Run
+  `curator --once --dry-run` first if persona minting is not wanted.
+
+- **CI moved to a self-hosted enterprise-fed fleet with a 2x2 `Check` matrix.**
+  All compute/gate jobs re-home from GitHub-hosted `ubuntu-latest`/`macos-latest`
+  onto two self-hosted runner labels — `[self-hosted, linux-fed]` (host pop-os/f2)
+  and `[self-hosted, macos-fed]` (host f1/FROSTYi) — EXCEPT the two mobile
+  cross-compile jobs (`Cross-compile (aarch64-linux-android)` / `(aarch64-apple-ios)`),
+  which stay GitHub-hosted. The `Check` job becomes a **2x2 matrix** over
+  {`linux-fed`, `macos-fed`} × {`sqlite` (default features), `enterprise-fed`
+  (`sal-postgres` against each node's always-up native pg18.6 + AGE 1.8.0 +
+  pgvector 0.8.6 tier, read from `$HOME/.ai-memory-ci-fed-url`)}. This **renames**
+  the two former required contexts `Check (ubuntu-latest)` / `Check (macos-latest)`
+  to the four `Check (linux-fed,sqlite)`, `Check (linux-fed,enterprise-fed)`,
+  `Check (macos-fed,sqlite)`, `Check (macos-fed,enterprise-fed)` — the mirror
+  `scripts/qc-allowlists/required-contexts-release.txt` is updated in lockstep and
+  branch protection must be updated to match. The `enterprise-fed` Check legs
+  absorb the old `Postgres feature gate` test run (now against the real cert tier);
+  that job is slimmed to the `sal-postgres` clippy-parity leg (name unchanged).
+  GitHub-hosted-only disk-freeing / swap / simulator-purge steps and all
+  `services: postgres:` blocks + per-PR pg image builds are removed (they would
+  delete real files on the persistent hosts; the native tier is always up).
+  JUnit-style durable test-result log artifacts are uploaded per leg.
+
+### Fixed
+
+- **Record-stop enforcement no longer silently degrades at the SAL layer when
+  the sqlite DB path resolves through a symlink** (e.g. the macOS
+  `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
+  the shared record-stop registry off the raw path passed to `open`, while the
+  actuator, the `db::` funnel gate, the status read and the open-time seed all
+  key off the connection's OWN resolved path (`conn.path()`, which SQLite's VFS
+  symlink-follows). When the two diverged the SAL gate read a stale RUNNING
+  entry, so a write issued under an engaged stop fell through to the deeper
+  `db::` gate and surfaced `StoreError::Backend` instead of the intended
+  `StoreError::Stopped` — a single-layer, fail-closed-ONLY degradation of the
+  SAL 503 refusal contract. The gate now caches and keys off the connection's
+  resolved path at open, restoring one source of truth across every layer.
+  Surfaced by the macOS `enterprise-fed` CI leg (`record_stop_r45_1955`); a
+  symlinked-open-path regression test pins it.
+- **The self-hosted `enterprise-fed` Check legs no longer kill a still-passing
+  sal-postgres suite at the hung-test watchdog.** The 2x2 `check` job reused the
+  sqlite-oriented 1500s per-invocation watchdog for the `enterprise-fed` legs,
+  which run the sal-postgres suite SINGLE-THREADED (`--test-threads=1`) and
+  CPU-contended by the sibling `sqlite` leg on the same self-hosted host — a
+  ~2231s measured runtime that the 1500s cap terminated mid-run (the same
+  regression the release `postgres-feature` job already fixed by raising its
+  cap to 2100s on its dedicated runner; the self-hosted leg runs both linux
+  legs on ONE host, so its ~2231s is the normal max-contention case). The
+  watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
+  the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
+  the outer job cap — remains what fires on a genuine hang.
 
 ### Removed
 

@@ -82,6 +82,25 @@ pub const DEFAULT_INTERVAL_SECS: u64 = crate::SECS_PER_HOUR as u64;
 /// Default per-cycle operation cap (stops runaway LLM calls).
 pub const DEFAULT_MAX_OPS_PER_CYCLE: usize = 100;
 
+/// v1.0.0 — divisor fixing the autonomy passes' RESERVED share of
+/// [`CuratorConfig::max_ops_per_cycle`].
+///
+/// The auto-tag / contradiction loop and the autonomy passes draw on ONE
+/// cycle budget, and both are fed by the same `needs_curation` predicate.
+/// Without a reservation the loop runs first and can legitimately spend the
+/// entire cap, handing the autonomy passes a budget of exactly zero — and it
+/// does so on EVERY cycle for as long as the untagged backlog stays at or
+/// above the cap, which is permanent whenever those rows keep yielding empty
+/// auto-tags (an empty tag list persists nothing, so the row stays eligible
+/// forever). Consolidation would then never run again on a busy corpus.
+///
+/// Reserving `max_ops_per_cycle / AUTONOMY_OP_RESERVE_DIVISOR` ops for the
+/// passes makes that starvation structurally impossible while keeping
+/// `max_ops_per_cycle` a TRUE hard cap: the reserve is carved OUT of the cap
+/// (the loop's own budget shrinks by the same amount), never added on top of
+/// it, so a cycle can still never exceed the operator's authorised LLM spend.
+pub const AUTONOMY_OP_RESERVE_DIVISOR: usize = 4;
+
 /// Minimum content length before the curator will touch a memory —
 /// matches the synchronous hook threshold in `src/mcp.rs`.
 pub const MIN_CONTENT_LEN: usize = 50;
@@ -230,6 +249,19 @@ pub struct CuratorReport {
     /// disabled or no verify failed.
     #[serde(default)]
     pub compaction_pass_rolled_back: usize,
+    /// v1.0.0 — LLM-op budget the autonomy passes were handed this cycle,
+    /// i.e. what was left of `max_ops_per_cycle` after the auto-tag /
+    /// contradiction loop, floored at the
+    /// [`AUTONOMY_OP_RESERVE_DIVISOR`] reserve. This is the operator's
+    /// starvation gauge: a ZERO here on a cycle with a non-zero
+    /// `memories_eligible` means Pass-1 consolidation could not run at all.
+    /// Read it together with `operations_skipped_cap` (auto-tag work
+    /// deferred to the next cycle because the loop's share ran out) —
+    /// sustained non-zero deferrals mean the corpus is growing faster than
+    /// the configured cap can curate it and `max_ops_per_cycle` needs
+    /// raising.
+    #[serde(default)]
+    pub autonomy_ops_budget: usize,
     pub errors: Vec<String>,
     pub dry_run: bool,
 }
@@ -244,6 +276,20 @@ impl CuratorReport {
             ..Self::default()
         }
     }
+}
+
+/// Ops carved out of `max_ops_per_cycle` and held for the autonomy passes.
+///
+/// Returns `max_ops_per_cycle / AUTONOMY_OP_RESERVE_DIVISOR`, floored at one
+/// op so a small-but-splittable cap still reaches Pass 1, and zero when the
+/// cap is `0` or `1` (nothing to split — a one-op cycle can only afford the
+/// auto-tag loop's first op, which is the pre-v1.0.0 behaviour).
+#[must_use]
+fn autonomy_op_reserve(max_ops_per_cycle: usize) -> usize {
+    if max_ops_per_cycle <= 1 {
+        return 0;
+    }
+    (max_ops_per_cycle / AUTONOMY_OP_RESERVE_DIVISOR).max(1)
 }
 
 /// Run one curator cycle. Safe to call repeatedly. Returns a structured
@@ -299,8 +345,15 @@ pub fn run_once(
         return Ok(report);
     };
 
+    // v1.0.0 — the auto-tag / contradiction loop draws on its SHARE of the
+    // cycle budget, not the whole cap: `autonomy_op_reserve` is withheld for
+    // the autonomy passes below (see `AUTONOMY_OP_RESERVE_DIVISOR`). Deferred
+    // rows are counted in `operations_skipped_cap` and picked up next cycle;
+    // no eligible row is dropped, only postponed.
+    let autonomy_reserve = autonomy_op_reserve(cfg.max_ops_per_cycle);
+    let autotag_op_budget = cfg.max_ops_per_cycle.saturating_sub(autonomy_reserve);
     for mem in eligible {
-        if report.operations_attempted >= cfg.max_ops_per_cycle {
+        if report.operations_attempted >= autotag_op_budget {
             report.operations_skipped_cap += 1;
             continue;
         }
@@ -392,9 +445,23 @@ pub fn run_once(
     // the auto_tag / contradiction loop above, and fold the ops they spend
     // back into the cycle counters so the persona sweep below sees a true
     // remaining budget.
+    //
+    // The subtraction below CANNOT reach zero on a cycle with a non-empty
+    // budget: the loop above is bounded by `autotag_op_budget ==
+    // max_ops_per_cycle - autonomy_reserve`, and it is the only writer of
+    // `operations_attempted` before this point, so at least
+    // `autonomy_reserve` ops always survive for the passes. That structural
+    // floor is the fix for the starvation described on
+    // `AUTONOMY_OP_RESERVE_DIVISOR`; `report.autonomy_ops_budget` publishes
+    // the figure so an operator can see it in the cycle report.
     let remaining_ops = cfg
         .max_ops_per_cycle
         .saturating_sub(report.operations_attempted);
+    debug_assert!(
+        remaining_ops >= autonomy_reserve,
+        "autonomy reserve must survive the auto-tag loop"
+    );
+    report.autonomy_ops_budget = remaining_ops;
     let pass_report = crate::autonomy::run_autonomy_passes(
         conn,
         llm_client,
@@ -878,13 +945,24 @@ pub fn run_daemon(
                 let llm_ref = llm.as_deref();
                 let kp_ref = active_keypair.as_deref();
                 match run_once(&conn, llm_ref, &cfg, kp_ref) {
+                    // v1.0.0 — `deferred` / `autonomy_budget` are the
+                    // budget-pressure pair. A steady non-zero `deferred` means
+                    // the corpus is growing faster than `max_ops_per_cycle`
+                    // can curate it; an `autonomy_budget` of 0 against a
+                    // non-zero `eligible` means Pass-1 consolidation did not
+                    // run at all this cycle. Neither was visible from the
+                    // daemon log before, which is how the Pass-1 starvation
+                    // this reserve fixes could have run unnoticed for the life
+                    // of a deployment.
                     Ok(report) => tracing::info!(
-                        "curator cycle: scanned={} eligible={} tagged={} contradictions={} personas={} errors={} ({}ms, dry_run={})",
+                        "curator cycle: scanned={} eligible={} tagged={} contradictions={} personas={} deferred={} autonomy_budget={} errors={} ({}ms, dry_run={})",
                         report.memories_scanned,
                         report.memories_eligible,
                         report.auto_tagged,
                         report.contradictions_found,
                         report.personas_generated,
+                        report.operations_skipped_cap,
+                        report.autonomy_ops_budget,
                         report.errors.len(),
                         report.cycle_duration_ms,
                         report.dry_run
@@ -2247,6 +2325,120 @@ mod tests {
         assert!(server.chat_calls.load(StdOrdering::Relaxed) >= 3);
         // Autonomy pass found at least the one cluster.
         assert!(report.autonomy.clusters_formed >= 1, "report: {report:?}");
+    }
+
+    /// v1.0.0 REGRESSION — Pass-1 STARVATION.
+    ///
+    /// The auto-tag / contradiction loop and the autonomy passes are fed by
+    /// the SAME `needs_curation` predicate and drew on the same
+    /// `max_ops_per_cycle` budget, loop first. So whenever the eligible
+    /// backlog reached the cap the loop consumed all of it and Pass-1
+    /// consolidation was handed a budget of exactly ZERO — every cycle, and
+    /// permanently whenever those rows keep yielding empty auto-tags (an
+    /// empty tag list persists nothing, so the row stays eligible forever).
+    /// Consolidation would then never run again on a busy corpus, silently:
+    /// the cycle report looked healthy.
+    ///
+    /// Backlog of 5 eligible rows against a cap of 4 (one over the cap even
+    /// before the reserve). The assertions are the two halves of the
+    /// contract: Pass 1 gets a NON-ZERO budget and actually consolidates,
+    /// AND the cycle still never exceeds `max_ops_per_cycle` — the reserve is
+    /// carved out of the cap, never added on top of it.
+    #[test]
+    fn run_once_reserves_autonomy_budget_when_autotag_backlog_fills_cap() {
+        let server = FakeOllama::start(FakeOllamaCfg::default());
+        let llm = ollama_for(&server);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+
+        // One mergeable near-duplicate pair: `make_eligible_memory` gives both
+        // rows identical content (clears the jaccard pre-filter) and aligned
+        // embeddings clear the #1774 cosine gate.
+        for i in 0..2 {
+            let m = make_eligible_memory("starve", &format!("dup-{i}"));
+            db::insert(&conn, &m).unwrap();
+            db::set_embedding(
+                &conn,
+                &m.id,
+                &[1.0, 0.0],
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
+            )
+            .unwrap();
+        }
+        // Backlog filler: eligible for auto-tag, but NOT mergeable — with no
+        // stored embedding the cosine gate blocks every pair they are in
+        // (#1774), so the only cluster available to Pass 1 is the pair above.
+        for i in 0..3 {
+            let m = make_eligible_memory("starve", &format!("filler-{i}"));
+            db::insert(&conn, &m).unwrap();
+        }
+
+        let cfg = CuratorConfig {
+            max_ops_per_cycle: 4,
+            include_namespaces: vec!["starve".to_string()],
+            ..CuratorConfig::default()
+        };
+        let report = run_once(&conn, Some(&llm), &cfg, None).unwrap();
+
+        assert_eq!(
+            report.memories_eligible, 5,
+            "backlog must exceed the cap for this to be the starving case: {report:?}"
+        );
+        assert!(
+            report.autonomy_ops_budget >= 1,
+            "Pass 1 must get a non-zero budget even with a cap-filling backlog: {report:?}"
+        );
+        assert!(
+            report.autonomy.clusters_formed >= 1,
+            "Pass-1 consolidation must actually run with the reserved budget: {report:?}"
+        );
+        assert!(
+            report.operations_attempted <= cfg.max_ops_per_cycle,
+            "the reserve is carved OUT of max_ops_per_cycle, so the documented \
+             hard cap must still hold: {report:?}"
+        );
+        assert!(
+            report.operations_skipped_cap >= 1,
+            "auto-tag work the reserve deferred must be COUNTED, not dropped: {report:?}"
+        );
+    }
+
+    /// The reserve is a share OF the cap, never an addition to it, and it
+    /// floors at one op so a small-but-splittable cap still reaches Pass 1.
+    /// A cap of 0 or 1 has nothing to split and reserves nothing (a one-op
+    /// cycle can only afford the auto-tag loop's first op).
+    #[test]
+    fn autonomy_op_reserve_is_a_share_of_the_cap_never_an_addition() {
+        assert_eq!(autonomy_op_reserve(0), 0);
+        assert_eq!(autonomy_op_reserve(1), 0);
+        assert_eq!(autonomy_op_reserve(2), 1, "floors at one op");
+        assert_eq!(autonomy_op_reserve(3), 1, "floors at one op");
+        assert_eq!(
+            autonomy_op_reserve(DEFAULT_MAX_OPS_PER_CYCLE),
+            DEFAULT_MAX_OPS_PER_CYCLE / AUTONOMY_OP_RESERVE_DIVISOR
+        );
+        for cap in [
+            0_usize,
+            1,
+            2,
+            3,
+            4,
+            7,
+            99,
+            DEFAULT_MAX_OPS_PER_CYCLE,
+            10_000,
+        ] {
+            let reserve = autonomy_op_reserve(cap);
+            assert!(
+                reserve <= cap,
+                "reserve {reserve} must be carved out of cap {cap}, never added on top"
+            );
+            assert!(
+                cap <= 1 || reserve >= 1,
+                "a splittable cap {cap} must reserve at least one op for Pass 1"
+            );
+        }
     }
 
     /// Issue #816 — auto-persona sweep generates a signed persona row
