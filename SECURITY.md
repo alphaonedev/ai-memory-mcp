@@ -6,6 +6,8 @@ ai-memory is a substrate for persistent AI/agent memory. Customers and AgenticMe
 
 | Version    | Supported |
 |------------|-----------|
+| v1.0.x     | 🚧 In development — **no `v1.0.0*` tag is cut yet**; the version stamp is `Cargo.toml`'s. Report against the release branch. |
+| v0.10.x    | ✅ Active (newest PUBLISHED release — v0.10.0, 2026-07-12, the `warn-carrier` line) |
 | v0.9.x     | ✅ Active  |
 | v0.8.x     | ✅ Active  |
 | v0.7.x     | ✅ Active  |
@@ -13,7 +15,7 @@ ai-memory is a substrate for persistent AI/agent memory. Customers and AgenticMe
 | v0.6.3.1   | ⚠️  Security fixes only |
 | v0.6.3 and earlier | ❌ End of life |
 
-When v1.0 ships (Q2 2027), only the two most recent minor versions receive security fixes.
+Until a `v1.0.0` tag is cut, **v0.10.x is the newest published line** and every v0.7.x–v0.10.x line above stays active; v0.6.4 remains LTS through the v1.0 ship. Once v1.0 ships, the window narrows to the two most recent minor versions — v1.0.x plus the one before it — and the older 0.x lines move to end of life. The v1.0 ship date is operator-gated and not committed here.
 
 ## v0.9.0 secure-default changes (BREAKING) — operator action may be required
 

@@ -302,26 +302,26 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 > **Evidence note (#2954 + #2991, 2026-08-22):** the `cert-54/` §2 captures
 > below PREDATE BOTH #2954 and #2991 and reflect the **18**-check posture.
 > The shipped binary now renders **20** checks — `ENTERPRISE_FEDERATION_CHECK_COUNT
-> = 20` (`src/enterprise_federation_posture.rs`), pinned by that module's own
+> = 20` (`src/enterprise_federation_posture.rs:129`), pinned by that module's own
 > `evaluate() must return exactly …` assertion. #2954 added check **#19**
 > (append-only spine flag + daemon audit signing key); #2991 added check **#20**
-> (escalate-producer approver-key enrollment). On a re-capture at the current
-> release tip: the **bare leg** gains one FAIL per added check → **10 FAIL of
-> 20**; the **certified pass leg** is expected to stay `overall: PASS`
-> (→ **20 `[PASS]`, 0 `[FAIL]`**) because the checked-in
-> `enterprise-federation.env` profile sets `AI_MEMORY_APPEND_ONLY=1` and a
-> certified deployment provisions both the daemon audit signing key and the
-> approver pubkey enrollment.
+> (escalate-producer approver-key enrollment). A re-capture at the current
+> release tip **is expected to show** 20 checks — **bare leg 10 FAIL of 20**,
+> certified leg **20 `[PASS]`, 0 `[FAIL]`** — derived from the #19/#20 unit
+> tests (`src/enterprise_federation_posture.rs:1663-1676`); **not re-captured**.
+> The `cert-54/` captures remain the evidence of record (`grep -c '[PASS]'
+> posture-sqlcipher-pass.out` = 18). The certified pass leg is expected to stay
+> `overall: PASS` because the checked-in `enterprise-federation.env` profile
+> sets `AI_MEMORY_APPEND_ONLY=1` and a certified deployment provisions both
+> the daemon audit signing key and the approver pubkey enrollment.
 >
-> **These post-#2954/#2991 tallies are DERIVED, not measured** — no re-captured
-> evidence bundle is committed for them; the committed `.out` files in
-> `cert-54/` are the 18-check round (`grep -c '[PASS]'
-> posture-sqlcipher-pass.out` = 18). The PASS/FAIL *verdict per leg* is
-> unchanged for the certified config; only the check count and the bare-leg
-> FAIL tally grew. Re-capturing the four legs on a release-built binary at the
-> current tip, committing them under `docs/compliance/evidence/cert-<next>/`,
-> and re-binding §2/§8 to that bundle is tracked as remaining certification
-> hygiene. (Same handling precedent as the #3033 knob-count note below.)
+> **These post-#2954/#2991 tallies are DERIVED, not measured.** The PASS/FAIL
+> *verdict per leg* is unchanged for the certified config; only the check
+> count and the bare-leg FAIL tally grew. Re-capturing the four legs on a
+> release-built binary at the current tip, committing them under
+> `docs/compliance/evidence/cert-<next>/`, and re-binding §2/§8 to that
+> bundle is tracked as remaining certification hygiene. (Same handling
+> precedent as the #3033 knob-count note below.)
 
 | Environment | Exit | Result |
 |---|---|---|
@@ -657,17 +657,21 @@ control is the SOLE decisive gate.
 
 > **Live-harness reconciliation (a reader running the harness today sees
 > MORE than the confinement subset).** `scripts/check-cert-removal-proof.sh`
-> at the current release tip carries **11 control rows**, not the six
+> at the current release tip carries **14 control rows**, not the six
 > tabulated above: the confinement subset here PLUS controls the
 > forensic-audit-trail wave (`compute_signature_verdict` / L4,
 > `audit_watermark_exoneration_authenticated` / L7,
 > `emit_upsert_supersede_leaf_if_enabled` / #2948,
-> `scan_file_last_watermark_db_id_scope_2955` / #2955) and the
+> `emit_federation_newer_wins_supersede_leaf_if_enabled` / #2954,
+> `scan_file_last_watermark_db_id_scope_2955` / #2955), the
 > consolidation-laundering 2x7 re-audit
 > (`consolidate_confidence_floor_2935`,
-> `consolidate_derived_kind_2935` / #2935) added AFTER the §5.4(5)
+> `consolidate_derived_kind_2935` / #2935), and the GA Wave-2 cluster
+> (`admin_header_trust_boot_refusal` / #3065,
+> `consume_execution_exemption` / #2991) added AFTER the §5.4(5)
 > capture. Those additions span `src/signed_events.rs`,
-> `src/governance/audit.rs`, and `src/storage/mod.rs` — so the statement
+> `src/governance/audit.rs`, `src/storage/mod.rs`,
+> `src/handlers/admin_role.rs`, and `src/approvals.rs` — so the statement
 > elsewhere in this section that "the harness MAP covers only these
 > `receive_auth` confinement controls" describes the **captured** map,
 > not the live one. The additions are strictly-stronger (each is a
@@ -924,9 +928,11 @@ PRE-#2954 and PRE-#2991: bare→exit 2 / **8 FAIL**,
 hardened-non-sqlcipher→exit 2 / 2 FAIL, hardened-with-boot-gate-armed→
 **boot refusal** demonstrated, hardened-sqlcipher-armed→exit 0 /
 18 PASS. The shipped binary now renders **20** checks; see the §2
-#2954+#2991 evidence note for the derived post-#2991 tallies and for
-the outstanding re-capture. The gate mechanism and the per-leg
-PASS/FAIL verdicts are unchanged; only the check count grew); §5.4(3) executed pg+AGE+pgvector = green on the cert SHA at
+#2954+#2991 evidence note for the **derived** post-#2991 tallies
+(expected bare 10 FAIL of 20 / certified 20 PASS — not re-captured;
+`cert-54/` remains the evidence of record) and for the outstanding
+re-capture. The gate mechanism and the per-leg PASS/FAIL verdicts are
+unchanged; only the check count grew); §5.4(3) executed pg+AGE+pgvector = green on the cert SHA at
 the pinned triple (single-node CI; see §3 stack-evidence note);
 §5.4(4) adversarial negative lanes = covered (including the five
 previously-omitted in-tree lanes named in §4); §5.4(5) removal proof =

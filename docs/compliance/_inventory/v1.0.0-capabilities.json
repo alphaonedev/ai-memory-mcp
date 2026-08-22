@@ -27,11 +27,11 @@
     "core_profile": 7,
     "graph_profile": 19,
     "admin_profile": 21,
-    "power_profile": 77,
+    "power_profile": 56,
     "full_profile": 103,
     "registered_tools_vec": 103,
     "tool_names_all_len": 103,
-    "authority_source": "Profile::<name>().expected_tool_count() derived from Family::tool_names() slices in src/profile.rs: Core=7, Lifecycle=6, Graph=12, Governance=8, Power=70. core=[Core]=7; graph=[Core,Graph]=19; admin=[Core,Lifecycle,Governance]=21; power=[Core,Power]=77; full=Family::all() sum = tool_names::ALL.len() = 103. src/mcp/registry.rs::registered_tools() has 103 RegisteredTool::of::<\u2026> entries matching ALL. Pinned by profile_full_matches_registry_all / ALL-length pin.",
+    "authority_source": "Profile::<name>().expected_tool_count() derived from Family::tool_names() slices in src/profile.rs: Core=7, Lifecycle=6, Graph=12, Governance=8, Power=49, Meta=6, Archive=4, Other=11. core=[Core]=7; graph=[Core,Graph]=19; admin=[Core,Lifecycle,Governance]=21; power=[Core,Power]=56; full=Family::all() sum = tool_names::ALL.len() = 103. src/mcp/registry.rs::registered_tools() has 103 RegisteredTool::of::<\u2026> entries matching ALL. Pinned by profile_full_matches_registry_all / ALL-length pin.",
     "note": "v0.7.0 inventory: core=7, graph=18, admin=21, power=30, full=74. Deltas: graph +memory_lineage (#1859); power absorbed the v0.8 Pillar-1 coordination surface + skills + archive/session/notify; full 74\u2192103."
   },
   "http_routes": {

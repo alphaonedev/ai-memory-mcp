@@ -271,6 +271,82 @@ backend and missing or divergently implemented on its twin). Pinned by
   row from a verified bundle, and the purge-intent refusal has no postgres
   counterpart. The crypto-erase invariant itself is explicitly noted as present
   on postgres, so the disclosure neither overstates nor understates the gap.
+### Docs
+
+- **Claims audit, batch 3 — 13 false or stale documentation claims corrected
+  against the code they cite.** Docs-only (plus one shell comment and two JSON
+  metadata fields); zero Rust, zero behavior change. Every replacement figure is
+  re-derived from a named symbol or gate at this tree, not restated from another
+  doc.
+  - `docs/INSTALL.md`: `--profile full` surface **101 -> 103** advertised
+    entries (**100 -> 102** callable + `memory_capabilities`), matching
+    `mcp::registry::tool_names::ALL`. Removed the fabricated assertion that the
+    inventory is "asserted by `Profile::full().expected_tool_count() = 101` in
+    `src/profile.rs`" — no literal count is asserted anywhere; the union is
+    pinned by the `family_tool_names_cover_registry_all` test against `ALL`.
+  - `docs/compliance/_inventory/v1.0.0-capabilities.json`: `power_profile`
+    **77 -> 56** and the matching `authority_source` census (`Power` **70 ->
+    49**, `power=[Core,Power]` **77 -> 56**). Measured family census: Core 7 /
+    Lifecycle 6 / Graph 12 / Governance 8 / Power 49 / Meta 6 / Archive 4 /
+    Other 11 = **103**.
+  - `docs/compliance/_inventory/mcp-registry-submission.json`: marked
+    `superseded_by` the v1.0.0 capabilities inventory — its counts are the
+    frozen v0.7.0 snapshot and must not be quoted as current.
+  - `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`: posture evidence
+    restated for the CURRENT **20**-check count
+    (`ENTERPRISE_FEDERATION_CHECK_COUNT = 20`) — bare leg **9 FAIL of 19 -> 10
+    FAIL of 20**; the removal-proof harness carries **11 -> 14** control rows
+    (adding `emit_federation_newer_wins_supersede_leaf_if_enabled`,
+    `admin_header_trust_boot_refusal`, `consume_execution_exemption`, spanning
+    `src/approvals.rs` and `src/handlers/admin_role.rs`); and the §5.4(2)
+    four-leg proof is explicitly labelled a PRE-#2954 / PRE-#2991 **18**-check
+    CAPTURE rather than the live posture.
+  - `scripts/check-cert-removal-proof.sh`: `--self-test` header comment
+    corrected from "all 5 shipped rows" / "BOTH mutation grammars" to all **14**
+    shipped rows across the **three** shapes (`return` / `body` / `subst`).
+  - `docs/CLI_REFERENCE.md`: retracted "`list` supports the same filters as
+    `search`" (it does not — `list` has `--offset` and `--valid-at`, `search`
+    has `--as-agent` and `--include-archived`) and documented the flags that
+    existed in the clap structs but not in the reference: `store`
+    `--valid-from` / `--valid-until` / `--write-v2` / `--capability`; `recall`
+    `--valid-at` / `--confidence-tier` / `--verbose-provenance` / `--format` /
+    `--session-id`; a full `update` flag table (`--content-append`,
+    `--content-replace-from` / `--content-replace-to`, `--metadata`,
+    `--source-uri`, `--valid-until`, `--expected-version`); `promote`
+    `--target-tier`; `forget` `--show-receipt` / `--verify-receipt`; and full
+    `export` / `import` tables (`--full`, `--store-url`, `--expect-withheld`,
+    `--on-conflict`).
+  - `ROADMAP.md`: newest PUBLISHED tag **v0.9.0 -> v0.10.0** (2026-07-12
+    `warn-carrier`, schema v80). FED-RQ-01 (#1936) qualified as LANDED **on the
+    SQLite backend**: a postgres-backed daemon counts `checkpoints` into
+    `unsupported_on_postgres` — an explicit non-ack, not a silent drop
+    (`src/handlers/federation_signing_check.rs:969-975`) — with the full pg lane
+    tracked as #2464.
+  - `docs/postgres-age-guide.md`: retracted "every HTTP endpoint … no residual
+    501 envelope on standard endpoints"; replaced with the gate-pinned
+    **59 pg-supported / 21 fully-501 / 80 total** unique-path inventory
+    (`tests/pg_supported_route_inventory_gate_2799.rs:217-219`), remainder
+    tracked as #2803.
+  - `docs/ADMIN_GUIDE.md`: `max_memory_mb` flagged **parsed but NOT enforced**
+    (FBL-13) with `[limits].max_storage_bytes` named as the real ceiling;
+    `DEFAULT_PORT` / `GC_INTERVAL_SECS` location corrected `main.rs` ->
+    `src/daemon_runtime.rs:97-98`; added the missing
+    `AI_MEMORY_MAX_INFLIGHT_REQUESTS` row (`0` disables; unset ⇒ CPU-scaled
+    `cores x 64` clamped 256..4096, #2032 M3); dropped the claim that
+    `AI_MEMORY_API_KEY` configures the HTTP shared key (it is read nowhere in
+    `src/`); and the three quota knobs relabelled per-agent -> **per-(agent,
+    namespace)** (#1156 / schema v50 extended the `agent_quotas` PRIMARY KEY).
+  - `SECURITY.md`: supported-versions table gains **v0.10.x** and **v1.0.x**
+    rows and restates the post-v1.0 support window.
+  - `docs/rfc/RFC-0001-mcp-turn-capture.md`: the `capture_layer_4` capability
+    advertisement is labelled **PROPOSED, not implemented in v1.0.0** — the
+    identifier appears nowhere in `src/` or `tests/`, so `memory_capabilities`
+    does not advertise it (the `memory_capture_turn` tool itself IS shipped).
+  - `docs/security/audit-trail.md`: container examples bumped off the retired
+    `:0.6.3` tag to `:0.10.0`, the newest tag actually published to GHCR.
+  - This file: the #3129 "unchanged on the fleet" list and the nine-job
+    `rust-cache` enumeration are marked SUPERSEDED by #3141 — the current total
+    is **5 self-hosted legs**.
 
 ### Changed
 
@@ -448,7 +524,14 @@ backend and missing or divergently implemented on its twin). Pinned by
   `Postgres feature gate`, `SAL-only feature gate`, `vectorlite feature gate`,
   the certified pg+AGE cells, the two Batman-mode release-build jobs, and the
   `Lifetime suite (…)` legs. Self-hosted job definitions: **39 -> 10** (43 -> 14
-  expanded; at most 12 reachable from one pull request). **No required-context
+  expanded; at most 12 reachable from one pull request).
+  **[SUPERSEDED by #3141 — see the entry at the head of `[Unreleased]`.** This
+  "unchanged on the fleet" list and the `39 -> 10` figure describe the #3129
+  state and are NO LONGER true: on Linux only the native-pg tier stays
+  self-hosted, and the CURRENT total is **5 self-hosted legs** —
+  `Check (linux-fed,enterprise-fed)`, `Check (macos-fed,sqlite)`,
+  `Check (macos-fed,enterprise-fed)`, the `macos-fed` `Lifetime suite` leg, and
+  `cert-postgres-age.yml`.**] **No required-context
   NAME changes** — branch protection needs no edit for this change. The rule
   itself (`pg-tier` / `warm-cache` / `script-only`, and the absolute that a job
   other jobs `needs:` must never be self-hosted unless it is itself `pg-tier` or
@@ -467,7 +550,11 @@ backend and missing or divergently implemented on its twin). Pinned by
     `if: runner.environment == 'github-hosted'` on all nine self-hosted job
     definitions (`check`, `lint`, `msrv`, `postgres-feature`, `sal-feature`,
     `vectorlite-feature`, the two Batman-mode jobs, `lifetime-tests`); hosted
-    jobs are untouched. `~/.cargo/{registry,git}` persist natively in `$HOME` on
+    jobs are untouched. **[SUPERSEDED by #3141: that nine-job enumeration is the
+    #3128/#3129 state. The gate itself still holds — it is keyed on
+    `runner.environment`, not on a job list — but only **5 legs** are
+    self-hosted now (enumerated in the supersession note above), so the other
+    job definitions in that list simply take the hosted branch.]** `~/.cargo/{registry,git}` persist natively in `$HOME` on
     the fleet, so no cache is lost. **`CARGO_INCREMENTAL: "0"` — which that
     action used to export — is now declared explicitly** in the workflow `env:`
     block of each affected workflow, rather than left to the action or to the

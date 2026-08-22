@@ -76,8 +76,12 @@ never downgrades.
 | `--citations` | JSON | — | Form-4 provenance: JSON array of `{uri, accessed_at, hash?, span?}`. |
 | `--source-uri` | string | — | Form-4 source pointer; `uri:` / `doc:` / `file:` schemes. |
 | `--source-span` | JSON | — | Form-4 byte-range pin: `{start, end}`. |
+| `--valid-from` | RFC3339 | — | #2258/#1834 claim-bitemporal VALID-time start — when the fact BECAME true (distinct from `created_at` transaction-time). IMMUTABLE after create. |
+| `--valid-until` | RFC3339 | — | #2258/#1834 claim-bitemporal VALID-time end bound; half-open `[valid_from, valid_until)`. Stays updatable via `ai-memory update --valid-until`. |
 | `--entity-id` | string | — | QW-2 persona binding; required with `--kind persona`. |
 | `--sign` | bool | `false` | **#626 Layer-3** — sign the write with the resolved agent's local Ed25519 keypair so the stored row is *attested* (`attest_level = "agent_attested"`) rather than merely *claimed*. Requires a `<agent_id>.priv` under the key directory (`AI_MEMORY_KEY_DIR` or the platform default) and a matching bound public key (`ai-memory agents bind-key`). Without `--sign`, the CLI `store` surface is **permissive by default** (operator-as-actor, #1985) — an unsigned write lands *claimed*, not rejected. It is rejected only when the operator has forced strict enforcement via `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` (or `=true`); see the env-var table above for the full surface-scoped default. |
+| `--write-v2` | path | — | v1.0.0 crypto-core (#1942/#1941) — path to a JSON `write_v2` presentation envelope (certified sub-key signature over the v2 CBOR-array pre-image). Takes precedence over `--sign`; on success stamps `agent_attested`. An invalid/forged envelope is REJECTED. See `docs/attestation.md` §"v2". |
+| `--capability` | string | — | v0.9.0 G10.1 (#1827) — macaroon capability token (`cap1:...`) that may flip a governance Deny/Pending to Allow within its caveats. Inert unless `[capabilities].enabled`. |
 
 ```bash
 ai-memory store --title "Q2 roadmap" \
@@ -120,6 +124,11 @@ replacement contract), auto-promote mid→long at 5 accesses.
 | `--has-citations` | bool | `false` | v0.7.0 Form 4 (#757) — only memories with a non-empty `citations` array. |
 | `--source-uri-prefix` | string | — | v0.7.0 Form 4 (#757) — only memories whose `source_uri` starts with this prefix. |
 | `--kind` / `--kinds` | comma-list | — | v0.7.x Form 6 (#759) — Batman-taxonomy kind filter (`concept,entity,claim`, …; `all` or omit = no filter). |
+| `--valid-at` | RFC3339 | — | #1834 claim-bitemporal as-of: return only claims asserted to hold at this instant (`valid_from`/`valid_until` window). |
+| `--confidence-tier` | enum | — | v0.7.0 (#1098) — restrict to `high`/`medium`/`low`. Closes the CLI side of the three-surface parity gap. |
+| `--verbose-provenance` | bool | `false` | v0.7.0 (#1098, Gap-7 #890) — request the per-row provenance decoration (`citations`, `source_uri`, `source_span`, `confidence_source`, `confidence_signals`). |
+| `--format` | enum | `human` | v0.7.0 (#1098) — `human` / `json` / `toon`. `toon` is the compact TOON envelope. Same vocabulary as the MCP/HTTP `format` param. |
+| `--session-id` | string | — | v0.7.0 (#1257) — in-session ring boost (+0.05 rerank under #518); MCP/HTTP parity flag. |
 
 ```bash
 ai-memory recall "what deployment pattern did we agree on" \
@@ -157,9 +166,32 @@ ai-memory update abc123 --title "Renamed" --priority 8
 ai-memory delete abc123
 ```
 
-`list` supports the same filters as `search`. `get` accepts a UUID or
-unique prefix. `update` omits any flag you don't pass. `delete`
-archives first when `archive_on_gc=true` (default).
+`get` accepts a UUID or unique prefix. `update` omits any flag you
+don't pass. `delete` archives first when `archive_on_gc=true` (default).
+
+**`list` filters (`ListArgs`, `src/cli/crud.rs:29-50`) — NOT identical
+to `search`.** `list` accepts `--namespace`/`-n`, `--tier`/`-t`,
+`--since`, `--until`, `--tags`, `--agent-id`, plus `--limit` (default
+`20`), `--offset` (default `0`) and `--valid-at` (#1834 bitemporal
+as-of). It does **not** accept `--as-agent` or `--include-archived` —
+those are `search`/`recall` flags. Conversely `search` has no
+`--offset` and no `--valid-at`.
+
+#### `update` flags
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `<id>` | positional | required | UUID or unique prefix. |
+| `--title`/`-T`, `--content`/`-c` | string | — | Full-value replacement. |
+| `--tier`/`-t`, `--namespace`/`-n`, `--tags`, `--priority`/`-p`, `--confidence` | — | — | Unset flags are left untouched. |
+| `--expires-at` | RFC3339 | — | Empty string clears the expiry. |
+| `--content-append` | string | — | #1974/#2079 content patch — raw text appended verbatim (no separator). Mutually exclusive with `--content` and the `--content-replace-*` pair; an empty fragment is rejected. |
+| `--content-replace-from` | string | — | #1974/#2079 content patch — substring to replace. MUST occur **exactly once** (0 or >1 matches → typed error, never a silent first-match). Requires `--content-replace-to`. |
+| `--content-replace-to` | string | — | #1974/#2079 — replacement for the unique `--content-replace-from` match; may be empty (deletion). Requires `--content-replace-from`. |
+| `--metadata` | JSON object | — | v0.7.0 F2.4 (#1428) — REPLACES the `metadata` blob but PRESERVES the immutable provenance keys (`agent_id`, `derived_from`, `consolidated_from_agents`) and the substrate-stamped attestation keys (`attest_level`, `write_signature`, `kind_provenance`, `version_vector`) from the current row (#3015), so a patch cannot strip authorship or attestation. |
+| `--source-uri` | string | — | v0.7.0 F2.4 (#1428) — Form-4 URI pointer; `uri:` / `doc:` / `file:` schemes. |
+| `--valid-until` | RFC3339 | — | #1834 — close/move the claim's valid-time end. `valid_from` is immutable (the genesis assertion instant). |
+| `--expected-version` | int | — | v0.7.0 F2.4 (#1428, per #884) — optimistic-concurrency gate: the update proceeds only if the row's current `version` matches, else `VERSION_CONFLICT`. Unset skips the gate. |
 
 ### `promote`, `forget`, `link`
 
@@ -176,6 +208,11 @@ Relations (nine at v0.8.0; was six at v0.7.0): `related_to` (default),
 three are the v0.8.0 Pillar-2 typed-cognition Goal/Plan/Step relations,
 #1709). Canonical enum in `src/models/link.rs::MemoryLinkRelation`
 (`COUNT = 9`).
+
+`promote` also accepts `--target-tier <mid|long>` (#1623, #831 parity):
+stop the tier bump at an intermediate tier instead of jumping straight
+to `long`. `short` is rejected (it would be a downgrade). A `mid`
+landing keeps the row's live TTL; a `long` landing clears it.
 
 `forget` safety rail (Round-2 F11): when `--namespace` is omitted and
 `--pattern` or `--tier` is set, the delete is global-scope and refuses
@@ -202,6 +239,17 @@ erased **every** tier in scope and reported success, and
 `search` / `list` answered with unfiltered rows. Omitting `--tier`
 entirely still means "all tiers" — that is the only way to ask for an
 unconstrained operation.
+
+`forget` also carries two **QUERY-ONLY** sub-modes (#1832, TRACT-gap
+G18) that forget nothing and short-circuit before the delete path:
+`--show-receipt <MEMORY_ID>` prints the signed erasure attestation the
+substrate recorded at forget time (identity + time, NEVER content; its
+`signed` flag is `false` on an unsigned daemon), and
+`--verify-receipt <MEMORY_ID>` re-verifies that receipt against the
+daemon audit key by recomputing the canonical signable bytes from the
+receipt itself, printing `valid` / `invalid` / `unsigned` / `no key`.
+Neither is a covenant-enforcement guarantee — see
+`docs/spec/TRACT-L1-CLAIM-CONTRACT.md` §8.
 
 ## Lifecycle
 
@@ -268,6 +316,22 @@ ai-memory import --trust-source < trusted.json # preserves agent_id
 `--trust-source` is only safe when the source is your own backup or a
 fully-trusted peer. Without it, `metadata.imported_from_agent_id`
 records the original claim.
+
+#### `export` flags (`ExportArgs`, `src/cli/io.rs:63-92`)
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--full` | bool | `false` | v1.0.0 #2006 — emit the FULL Portability-v2 integrity envelope: every signed record class (audit chain, revisions, tombstones, lineage, attestations, governance rules + trust anchors) byte-preserved and re-verifiable at import, with a computed `conformance_level` (L1/L2/L3). Without it, `export` stays the memories+links convenience view. |
+| `--store-url` | string | — | v1.0.0 #2490 — the configured store, read through the SAME channels `serve` uses (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > this flag, #1927). `export` acts on a local SQLite database; naming a Postgres store makes the command **REFUSE** rather than conjure an empty SQLite file and emit a `count: 0` artifact that exits 0. |
+| `--expect-withheld` | int | — | v1.0.0 #2490 — acknowledge up to N rows withheld by the export confidentiality boundary without failing. A partial export otherwise exits `EXIT_EXPORT_INCOMPLETE` so a backup job cannot mistake it for a complete one. This is a **ratchet, not a mute**: exit stays 0 while `withheld <= N` and goes non-zero the moment it EXCEEDS the acknowledged number, so a NEW withholding still alarms. The in-band counts are emitted either way. |
+
+#### `import` flags (`ImportArgs`, `src/cli/io.rs:95-116`)
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--trust-source` | bool | `false` | Trust `metadata.agent_id` in the imported JSON instead of restamping it with the caller's id. |
+| `--on-conflict` | enum | `version` | Disposition on a `(title, namespace)` collision with a DIFFERENT existing memory: `version` (default — auto-suffix `title (N)`, never clobber), `merge` (legacy silent upsert — the way to OVERWRITE a diverged row on restore), or `error` (refuse + skip the colliding row, continue). A row whose `id` already exists is an idempotent no-op under `version`/`error` (kept, never overwritten; #2569). |
+| `--store-url` | string | — | v1.0.0 #2490 — same resolution channels as `serve`. `import` WRITES to a local SQLite database; naming a Postgres store makes the command **REFUSE** rather than write rows into a conjured SQLite file the served store never reads. A `sqlite://` URL that DISAGREES with `--db` is also refused, never silently redirected. |
 
 ## Integration surfaces
 

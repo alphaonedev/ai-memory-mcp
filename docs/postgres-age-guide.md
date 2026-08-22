@@ -563,11 +563,26 @@ hybrid recall pipeline, and accept governance write paths.
 
 ### Wave-3 Continuation 3 (Phase 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20)
 
-The eight remaining sqlite-only surfaces land here. After
-Continuation 3, **every** HTTP endpoint that works on a sqlite-backed
-daemon also works on a postgres-backed daemon — there is no residual
-501 envelope on standard endpoints (the route gate keeps the 501
-envelope as a safety net for unknown / future endpoints).
+The eight remaining sqlite-only surfaces land here.
+
+> **Scope correction (#2799 / [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)).**
+> An earlier revision of this section claimed that after Continuation 3
+> **every** HTTP endpoint working on a sqlite-backed daemon also works
+> on a postgres-backed daemon, with "no residual 501 envelope on
+> standard endpoints" — the 501 being merely a safety net for unknown
+> or future routes. That OVERSTATED the delivered surface and is
+> **RETRACTED**. The measured, gate-pinned inventory is **59
+> pg-supported unique paths, 21 fully-501 paths, 80 unique paths
+> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 59` /
+> `EXPECTED_FULLY_501_PATHS = 21` / `EXPECTED_TOTAL_UNIQUE_PATHS = 80`,
+> `tests/pg_supported_route_inventory_gate_2799.rs:217-219`), and the
+> same gate freezes the allow-list membership so a silent match-arm
+> add or remove fails until the SSOT is updated in a reviewed edit. The
+> 501 envelope is therefore a LIVE, load-bearing refusal on 21 standard
+> paths on a postgres-backed daemon — fail-closed, never a silent
+> wrong-answer. Closing the remainder is tracked by
+> [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803).
+> The tables below list what Continuation 3 DID land.
 
 | HTTP method | Path | SAL dispatch |
 |---|---|---|
