@@ -905,6 +905,37 @@ fn database_main_file_path(conn: &Connection) -> Option<PathBuf> {
     .map(PathBuf::from)
 }
 
+/// v1.0.0 #2564 — does this database hold any durable rows worth snapshotting?
+///
+/// Best-effort by construction: a database with no such relation (a genuinely
+/// fresh open, or a partial-schema fixture) errors and reads as `false`, so
+/// the probe can never manufacture a snapshot attempt on a database that has
+/// nothing to lose. Used ONLY to widen the pre-migration snapshot gate, never
+/// to refuse — so every failure mode here costs at most a missing backup on a
+/// database with no data, and never a refused open.
+///
+/// BOTH tiers are probed, and each in its OWN statement. `archived_memories`
+/// is durable text too — a corpus that has been fully archived (or restored
+/// from a bundle into cold storage) holds no `memories` rows at all, and the
+/// v86/v87 ladder arms rewrite `archived_memories` renderings — so a
+/// `memories`-only probe would skip the snapshot on exactly that database.
+/// Two statements rather than one `OR` because SQLite resolves relations at
+/// PREPARE time: a single statement naming both would fail outright on a
+/// pre-v4 database that has `memories` but not yet `archived_memories`,
+/// silently turning a populated database back into an unsnapshotted one.
+fn database_holds_durable_rows(conn: &Connection) -> bool {
+    [super::TABLE_MEMORIES, super::TABLE_ARCHIVED_MEMORIES]
+        .iter()
+        .any(|table| {
+            conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+                [],
+                |r| r.get::<_, i64>(0).map(|n| n != 0),
+            )
+            .unwrap_or(false)
+        })
+}
+
 /// Snapshot the live DB file immediately BEFORE a schema-mutating upgrade
 /// runs, so an interrupted or partial migration is recoverable. Returns
 /// the snapshot path on success, or `None` when no snapshot applies (an
@@ -1530,7 +1561,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     // replayed the whole v1 -> tip ladder over a POPULATED database WITH THE
     // SNAPSHOT SUPPRESSED. An absent `schema_version` relation still reads as
     // 0 (a genuinely fresh database); a failed READ now propagates.
-    let version = super::connection::probe_schema_stamp(conn)?.version();
+    // v1.0.0 #2564 — `operable_version`, never `version()`. #2445 closed the
+    // "stamp too HIGH" hole; a stamp too LOW was the strictly better attack and
+    // was undefended: `DELETE FROM schema_version` reads as 0 through
+    // `COALESCE(MAX(version), 0)`, which replays the ENTIRE v1 -> tip ladder
+    // over a POPULATED database with the pre-migration safety snapshot below
+    // SUPPRESSED (it was gated on `version > 0`). A ZEROED stamp now refuses
+    // here with a typed error instead of resolving to a permissive `0`.
+    let version = super::connection::probe_schema_stamp(conn)?.operable_version(
+        super::schema_guard::BACKEND_SQLITE,
+        conn.path().unwrap_or(""),
+    )?;
 
     // v1.0.0 #2445 — DOWNGRADE guard, defense-in-depth behind the pre-bootstrap
     // gate in `db::open`. `>` refuses (this binary would write a schema it does
@@ -1559,7 +1600,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     // before any schema mutation, rather than leaving it to an external
     // step. Runs before `BEGIN EXCLUSIVE` because `VACUUM INTO` cannot
     // execute inside a transaction.
-    if version > 0 {
+    // v1.0.0 #2564 (a) — the gate is no longer `version > 0` ALONE. A stamp of
+    // 0 on a database that holds durable rows now refuses above, but a legacy
+    // pre-v2 database legitimately stamps 0 AND holds rows, and it is exactly
+    // the database with the longest ladder still to replay — precisely the one
+    // that most needs a snapshot. Probe for durable rows so the snapshot can
+    // never again be suppressed on a populated database.
+    if version > 0 || database_holds_durable_rows(conn) {
         if let Some(snapshot) = snapshot_before_migration(conn, version, CURRENT_SCHEMA_VERSION)? {
             tracing::info!(
                 from_version = version,

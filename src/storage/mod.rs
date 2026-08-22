@@ -16,6 +16,19 @@ use std::collections::HashMap;
 use std::path::Path;
 
 // ── #1558 batch 6 — file-local SQL SSOT (pm-v3.1 hardcoded-literal gate) ──
+/// v1.0.0 #2564 — the two DURABLE row tiers, named ONCE.
+///
+/// The memory TEXT is the source of truth and it lives in exactly these two
+/// relations: the live tier and its cold mirror. Several probes have to name
+/// them as data rather than bake them into a SQL string — the pre-migration
+/// snapshot gate, the erasure orphan reconciler — and a table name retyped at
+/// each such site is precisely the hardcoded-literal class the operator
+/// directive forbids. Single-sourced here, in the module that owns the sqlite
+/// schema, so `erasure::archive_sync` and `storage::migrations` cannot drift.
+pub(crate) const TABLE_MEMORIES: &str = "memories";
+/// Cold mirror of [`TABLE_MEMORIES`]; see its docs.
+pub(crate) const TABLE_ARCHIVED_MEMORIES: &str = "archived_memories";
+
 const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = ?1";
 /// Reused dynamic-query namespace-filter fragment (pm-v3.1 no-scattered-literals
 /// gate — one named const referenced by the `list` + `reembed` keyset builders).

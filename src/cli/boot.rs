@@ -536,16 +536,30 @@ pub fn run(
                 // `boot` is one of the two verbs an operator reaches for to
                 // find out WHY a downgraded node will not start; degrading it
                 // to an opaque unavailability message would take the answer
-                // away at the exact moment it is needed. ABOVE-MAX is the only
-                // reachable `WarnSchemaUnsupported` (see
-                // `boot_warns_on_schema_below_min`), so without this arm the
-                // status becomes structurally dead code.
-                let status = crate::storage::schema_guard::schema_ahead_of(&e).map_or(
-                    BootStatus::WarnDbUnavailable,
-                    |ahead| BootStatus::WarnSchemaUnsupported {
+                // away at the exact moment it is needed.
+                //
+                // v1.0.0 #2564 — the LOW-end twin is reported the same way, and
+                // it is what makes BELOW-MIN a reachable `WarnSchemaUnsupported`
+                // rather than the structurally-dead status it was when
+                // above-max was the only refusal (see
+                // `boot_warns_on_schema_below_min`). The clamp differs by
+                // direction on purpose: a schema-ahead stamp saturates HIGH
+                // (`u32::MAX`), a destroyed stamp saturates LOW (`0`), so a
+                // negative stamp can never be reported as an implausibly NEW
+                // schema and send the operator hunting for a newer binary that
+                // does not exist.
+                let status = crate::storage::schema_guard::schema_ahead_of(&e)
+                    .map(|ahead| BootStatus::WarnSchemaUnsupported {
                         db_schema: u32::try_from(ahead.observed).unwrap_or(u32::MAX),
-                    },
-                );
+                    })
+                    .or_else(|| {
+                        crate::storage::schema_guard::schema_stamp_zeroed(&e).map(|zeroed| {
+                            BootStatus::WarnSchemaUnsupported {
+                                db_schema: u32::try_from(zeroed.observed).unwrap_or(0),
+                            }
+                        })
+                    })
+                    .unwrap_or(BootStatus::WarnDbUnavailable);
                 let manifest = BootManifest::build(
                     status,
                     &namespace,

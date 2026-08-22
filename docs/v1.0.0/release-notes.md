@@ -625,16 +625,20 @@ rewrites and are labelled as such below.
 
 **Migration evidence, at its true bound.** The Gate-3 dogfood
 (§"Gate-3 evidence" step 5) attested a lossless **v78 → v86**
-round-trip on a real corpus. **v87, v88 and v89 are outside that
+round-trip on a real corpus. **v87, v88, v89 and v90 are outside that
 attestation** — all landed on `release/v1.0.0` after the dogfood ran.
 They are covered by their own regression tests, not by a
 real-corpus dogfood. Per the North Star, data-integrity evidence is
 under-claimed rather than stretched: if you are upgrading a populated
-database across v86 → v89, take a backup first (`ai-memory backup`).
+database across v86 → v90, take a backup first (`ai-memory backup`).
 The sqlite ladder additionally writes its own pre-migration
-`VACUUM INTO` snapshot beside the database file on any `version > 0`
-upgrade, before any schema mutation
-(`src/storage/migrations.rs:1562`).
+`VACUUM INTO` snapshot beside the database file before any schema
+mutation. v1.0.0 [#2564](https://github.com/alphaonedev/ai-memory-mcp/issues/2564)
+widened that gate: it was `version > 0` alone, which meant a database
+whose `schema_version` row had been deleted or zeroed replayed the whole
+ladder with the snapshot SUPPRESSED. It is now `version > 0` **OR** a
+durable-row probe, so a populated database can never migrate unsnapshotted
+(`src/storage/migrations.rs`).
 
 | Schema | Change |
 |---|---|

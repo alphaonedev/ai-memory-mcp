@@ -460,6 +460,10 @@ pub fn classify_store_err(e: &crate::store::StoreError) -> BulkRowErrorClass {
     } else if code == codes::STORE_BACKEND_UNAVAILABLE
         || code == codes::RECORD_STOPPED
         || code == codes::SCHEMA_AHEAD_OF_BINARY
+        // #2564 — the low-end schema refusal is the same operational shape:
+        // the node is temporarily un-writable until the operator fixes the
+        // posture, so a fleet loader should back off, not quarantine the rows.
+        || code == codes::SCHEMA_STAMP_INVALID
     {
         // Reachable again once the operator resolves the posture, so a fleet
         // loader SHOULD back off and retry rather than quarantine the rows.

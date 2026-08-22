@@ -533,6 +533,93 @@ const SELECT_SCHEMA_VERSION_BIGINT_SQL: &str =
 /// Context label for a failed `schema_version` relation probe (#2445).
 const MSG_PROBE_SCHEMA_VERSION_RELATION: &str = "probe for the schema_version relation";
 
+/// v1.0.0 #2564, step 1 of 2 — CATALOGUE-ONLY half of the POSTGRES twin of
+/// `storage::connection::SQL_SCHEMA_STAMP_ZERO_IS_IMPOSSIBLE`.
+///
+/// True when `memories` exists AND carries the `confidence` column that the
+/// **v2** ladder arm adds. The column half is what rules out a legacy pre-v2
+/// database mid-upgrade, which legitimately stamps 0 with rows present and
+/// must keep migrating.
+///
+/// This query touches ONLY `to_regclass` and `pg_attribute`, so it can be run
+/// against a database with no application tables at all and still answer —
+/// which is the whole reason the probe is split in two. **A single statement
+/// cannot do this job.** PostgreSQL resolves every relation reference at
+/// PARSE time, so `to_regclass('memories') IS NOT NULL AND EXISTS(SELECT 1
+/// FROM memories …)` does NOT short-circuit: on a fresh database the whole
+/// statement fails with `relation "memories" does not exist` before the guard
+/// is ever evaluated (verified against a live server, not assumed). Since
+/// `connect_*` runs this gate PRE-BOOTSTRAP, a one-statement probe would fail
+/// EVERY fresh postgres install — turning an integrity guard into a total
+/// availability outage. Step 2 below is only ever reached once this one has
+/// proven the relation exists.
+///
+/// `pg_attribute` is used rather than `information_schema.columns` because the
+/// latter matches on a bare `table_name` and would answer for a `memories` in
+/// ANY schema the role can see; `attrelid = to_regclass('memories')` resolves
+/// through `search_path` to exactly the relation the rest of this adapter
+/// reads and writes. When `to_regclass` returns NULL the join matches nothing
+/// and the answer is `false` — no error, no false corroboration.
+const SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL: &str = "SELECT to_regclass('memories') IS NOT NULL \
+     AND EXISTS(SELECT 1 FROM pg_attribute \
+                WHERE attrelid = to_regclass('memories') \
+                  AND attname = 'confidence' AND NOT attisdropped)";
+
+/// v1.0.0 #2564, step 2 of 2 — the DURABLE-ROW half.
+///
+/// Run ONLY after [`SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL`] has proven
+/// the relation exists (see the parse-time note there). The row test is what
+/// rules out a genuinely fresh database: the bootstrap DDL creates every table
+/// BEFORE the first stamp is written, so between those two steps a brand-new
+/// database legitimately has the whole schema and a stamp of 0. What it does
+/// not have is data.
+const SELECT_SCHEMA_STAMP_MEMORIES_HAS_ROWS_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)";
+
+/// Context label for a failed zeroed-stamp corroboration probe (#2564).
+const MSG_PROBE_SCHEMA_STAMP_CORROBORATION: &str =
+    "probe whether a zero schema stamp is structurally impossible";
+
+/// v1.0.0 #2564 — is a recorded schema stamp of ZERO structurally impossible
+/// for this database?
+///
+/// `true` only when `memories` carries the v2 `confidence` column AND holds at
+/// least one row — i.e. the database is provably neither a fresh bootstrap nor
+/// a legacy pre-v2 upgrade, the only two states that legitimately stamp 0. The
+/// caller uses it to WIDEN a refusal, never to grant anything, so a `false`
+/// answer is always the permissive one.
+///
+/// Two round trips by necessity, not by preference: PostgreSQL resolves
+/// relation references at PARSE time, so a single statement guarding
+/// `EXISTS(SELECT 1 FROM memories …)` behind `to_regclass('memories') IS NOT
+/// NULL` still fails outright on a database that has no `memories` — and this
+/// probe runs PRE-BOOTSTRAP in `connect_*`, where exactly that is the normal
+/// case. The catalogue-only step answers safely there and short-circuits in
+/// Rust before the row test is ever prepared.
+///
+/// # Errors
+///
+/// Propagates a genuine connection / query failure. It does NOT swallow one:
+/// an unreachable server is not evidence that a zero stamp is legitimate, and
+/// the surrounding `connect_*` / `migrate_locked` paths cannot proceed on a
+/// dead pool anyway.
+async fn schema_stamp_zero_is_impossible(pool: &PgPool) -> StoreResult<bool> {
+    let post_v2: bool = sqlx::query_scalar(SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| to_store_err(MSG_PROBE_SCHEMA_STAMP_CORROBORATION, e))?;
+    if !post_v2 {
+        // No `memories` relation at all (a fresh database), or a pre-v2 shape
+        // that has not yet acquired `confidence`. Either way a stamp of 0 is
+        // legitimate and there is nothing to corroborate.
+        return Ok(false);
+    }
+    sqlx::query_scalar(SELECT_SCHEMA_STAMP_MEMORIES_HAS_ROWS_SQL)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| to_store_err(MSG_PROBE_SCHEMA_STAMP_CORROBORATION, e))
+}
+
 /// v1.0.0 #2445 — store label used by `migrate_locked`'s defense-in-depth
 /// guard, which has no DSN in scope. The `connect_*` gate that fires FIRST on
 /// every real open carries the redacted URL; this arm is only reachable by a
@@ -1517,11 +1604,38 @@ impl PostgresStore {
                     .await
                     .map_err(|e| to_store_err(MSG_PROBE_SCHEMA_VERSION_RELATION, e))?;
             let mut schema_ahead = false;
-            if relation.is_some() {
-                let observed: i64 = sqlx::query_scalar(SELECT_SCHEMA_VERSION_BIGINT_SQL)
+            // v1.0.0 #2564 — an ABSENT relation is no longer a free pass: on
+            // postgres the schema is SHARED by every daemon on the cluster, so
+            // `DROP TABLE schema_version` / `DELETE FROM schema_version` moves
+            // every node into a full v1 -> tip ladder replay over live data at
+            // once. Read the stamp as 0 when the relation is missing and let
+            // the SAME structural corroboration decide, exactly as the sqlite
+            // `probe_schema_stamp` twin does.
+            let observed: i64 = if relation.is_some() {
+                sqlx::query_scalar(SELECT_SCHEMA_VERSION_BIGINT_SQL)
                     .fetch_one(&pool)
                     .await
-                    .map_err(|e| to_store_err(crate::errors::msg::READ_SCHEMA_VERSION, e))?;
+                    .map_err(|e| to_store_err(crate::errors::msg::READ_SCHEMA_VERSION, e))?
+            } else {
+                0
+            };
+            if observed < 1 {
+                // A negative stamp is illegal outright; a zero stamp is illegal
+                // only when the database is provably not fresh.
+                let impossible: bool = if observed < 0 {
+                    true
+                } else {
+                    schema_stamp_zero_is_impossible(&pool).await?
+                };
+                if impossible {
+                    crate::storage::schema_guard::SchemaStamp::Zeroed(observed)
+                        .operable_version(
+                            crate::storage::schema_guard::BACKEND_POSTGRES,
+                            &store_label,
+                        )?;
+                }
+            }
+            if relation.is_some() {
                 crate::storage::schema_guard::evaluate(
                     observed,
                     i64::from(CURRENT_SCHEMA_VERSION),
@@ -2220,6 +2334,27 @@ impl PostgresStore {
                 .map_err(|e| to_store_err(crate::errors::msg::READ_SCHEMA_VERSION, e))?;
 
         let current_version = current_version.unwrap_or(0);
+
+        // v1.0.0 #2564 — LOW-end guard, defense-in-depth behind the
+        // pre-bootstrap gate in `connect_*` (the #2445 twin, one rung down).
+        // `unwrap_or(0)` above is exactly the coercion the issue names: a
+        // deleted / zeroed / negative stamp lands here as 0 and would replay
+        // the whole ladder over live data. Refuse when the database is provably
+        // not fresh; a negative stamp is illegal outright.
+        if current_version < 1 {
+            let impossible: bool = if current_version < 0 {
+                true
+            } else {
+                schema_stamp_zero_is_impossible(&self.pool).await?
+            };
+            if impossible {
+                crate::storage::schema_guard::SchemaStamp::Zeroed(i64::from(current_version))
+                    .operable_version(
+                        crate::storage::schema_guard::BACKEND_POSTGRES,
+                        POSTGRES_STORE_LABEL,
+                    )?;
+            }
+        }
 
         // v1.0.0 #2445 — DOWNGRADE guard, defense-in-depth behind the
         // pre-bootstrap gate in `connect_*`. `>` refuses (an older binary
@@ -30919,6 +31054,92 @@ mod tests {
             valid_from: None,
             valid_until: None,
         }
+    }
+
+    /// v1.0.0 #2564 — the zeroed-stamp corroboration probe must be VALID and
+    /// CORRECT against a real PostgreSQL server, not merely plausible.
+    ///
+    /// This is the one arm of the low-end guard that cannot be exercised by
+    /// simply connecting: `connect_*` and `migrate_locked` run the probe only
+    /// when the observed stamp is `< 1`, and a healthy test database is at the
+    /// tip. So the SQL would otherwise ship never having been parsed by
+    /// postgres — a fail-CLOSED guard whose refusal path errors on a syntax or
+    /// catalogue mistake is a guard that converts a repairable incident into an
+    /// opaque one. Run it directly instead.
+    ///
+    /// It must answer `true` here: this database holds `memories` rows AND
+    /// carries `memories.confidence`, which is exactly the structural
+    /// corroboration that a stamp of 0 would be impossible. (The negative
+    /// cases — no relation, no rows, pre-v2 shape — are covered backend-
+    /// agnostically in `tests/schema_stamp_zeroed_guard_2564.rs`.)
+    #[tokio::test]
+    async fn live_schema_stamp_zero_corroboration_probe_is_valid_sql_2564() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        // Guarantee at least one durable row so the EXISTS half is true
+        // regardless of what else ran against this shared database.
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("stamp-probe-2564-{}", uuid::Uuid::new_v4());
+        let mem = sample_memory(
+            &format!("test-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "stamp probe row",
+            "durable row so the corroboration probe has something to see",
+        );
+        store.store(&ctx, &mem).await.expect("store");
+
+        let impossible = schema_stamp_zero_is_impossible(&store.pool)
+            .await
+            .expect("#2564: the corroboration probe must be valid postgres SQL");
+        assert!(
+            impossible,
+            "#2564: a populated, post-v2 database must corroborate that a zero \
+             schema stamp is structurally impossible"
+        );
+
+        // The half that a one-statement probe got WRONG. PostgreSQL resolves
+        // relation references at PARSE time, so guarding
+        // `EXISTS(SELECT 1 FROM memories …)` behind `to_regclass('memories')
+        // IS NOT NULL` in ONE statement still fails with
+        // `relation "memories" does not exist` on a database that has none —
+        // and `connect_*` runs this gate PRE-BOOTSTRAP, where that is the
+        // NORMAL state of every fresh install. A probe that errors there turns
+        // an integrity guard into a total availability outage: no fresh
+        // postgres deployment could ever bootstrap.
+        //
+        // Prove the catalogue-only step answers `false` — not an error — for a
+        // relation that does not exist, using an empty throwaway schema as the
+        // stand-in for a fresh database.
+        let scratch = format!("stamp_probe_2564_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA \"{scratch}\""))
+            .execute(&store.pool)
+            .await
+            .expect("create scratch schema");
+        let empty_schema_answer: Result<bool, _> = sqlx::query_scalar(
+            "SELECT to_regclass($1 || '.memories') IS NOT NULL \
+             AND EXISTS(SELECT 1 FROM pg_attribute \
+                        WHERE attrelid = to_regclass($1 || '.memories') \
+                          AND attname = 'confidence' AND NOT attisdropped)",
+        )
+        .bind(&scratch)
+        .fetch_one(&store.pool)
+        .await;
+        sqlx::query(&format!("DROP SCHEMA \"{scratch}\" CASCADE"))
+            .execute(&store.pool)
+            .await
+            .expect("drop scratch schema");
+        let answered = empty_schema_answer.expect(
+            "#2564: the catalogue-only step must ANSWER for a missing relation, \
+             never error — every fresh install depends on it",
+        );
+        assert!(
+            !answered,
+            "#2564: a database with no `memories` relation offers no \
+             corroboration, so a zero stamp there is legitimate"
+        );
     }
 
     #[tokio::test]

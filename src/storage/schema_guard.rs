@@ -93,30 +93,182 @@ pub const BACKEND_SQLITE: &str = "sqlite";
 /// Postgres twin of [`BACKEND_SQLITE`].
 pub const BACKEND_POSTGRES: &str = "postgres";
 
-/// v1.0.0 #2445 — tri-state result of the pre-bootstrap schema-version probe.
+/// v1.0.0 #2445 / #2564 — result of the pre-bootstrap schema-version probe.
 ///
 /// The distinction between [`Self::Fresh`] and a read FAILURE is load-bearing;
 /// see the module docs. A probe that cannot answer returns `Err`, never
-/// `Fresh`.
+/// `Fresh`. #2564 adds the third state the type was missing — see
+/// [`Self::Zeroed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaStamp {
-    /// No `schema_version` relation exists — a genuinely fresh database that
-    /// is about to be bootstrapped. Equivalent to version 0 for the guard's
-    /// purposes, but arrived at structurally rather than by coercing an error.
+    /// No `schema_version` relation exists, or it exists but the database
+    /// holds no durable rows — a genuinely fresh database that is about to be
+    /// bootstrapped. Equivalent to version 0 for the guard's purposes, but
+    /// arrived at structurally rather than by coercing an error.
     Fresh,
-    /// The recorded `MAX(version)`.
+    /// v1.0.0 #2564 — the stamp reads as ZERO (or negative, or absent) on a
+    /// database that provably is NOT fresh. Carries the raw recorded number
+    /// for the operator message.
+    ///
+    /// This is the state [`Self::Fresh`] used to swallow, and it is the
+    /// STRICTLY BETTER attack than the #2445 one this module was built for.
+    /// #2445 refuses a stamp that is too HIGH; a stamp that is too LOW was
+    /// undefended, and low is worse: `DELETE FROM schema_version` (or an
+    /// inserted `0`) makes `COALESCE(MAX(version), 0)` read 0, which replays
+    /// the ENTIRE v1 → tip ladder over a POPULATED database under
+    /// `BEGIN EXCLUSIVE` — with the pre-migration safety snapshot suppressed,
+    /// because that snapshot is gated on `version > 0`. Faced with `999`
+    /// (a loud refusal) or `0` (a silent full-ladder replay with the backup
+    /// disabled), an adversary picks 0 every time.
+    ///
+    /// The discriminator is STRUCTURAL, not heuristic, so it has no false
+    /// positives on the two legitimate stamp-0 cases:
+    ///
+    /// * a genuinely fresh database — no `memories` relation at all, or an
+    ///   EMPTY one (the bootstrap DDL creates tables before the first stamp
+    ///   is written, so "tables exist" alone cannot discriminate);
+    /// * a legacy pre-v2 database mid-upgrade — it has rows but CANNOT have
+    ///   `memories.confidence`, which the v2 ladder arm adds.
+    ///
+    /// So the refusal fires only when a database claims version 0 while
+    /// carrying BOTH durable rows AND a column no version-0 schema ever had.
+    ///
+    /// DELIBERATE RESIDUAL: the row half names `memories` only, so a corpus
+    /// that has been FULLY ARCHIVED (zero live rows, all its durable text in
+    /// `archived_memories`) offers no corroboration and is allowed to replay.
+    /// That is reasoned, not overlooked. Naming `archived_memories` in the
+    /// probe would make the whole statement fail to PREPARE on a pre-v4
+    /// database — which has `memories` but not yet the archive table — turning
+    /// the guard OFF for exactly the oldest databases it exists to protect.
+    /// The bounded harm is a no-op: the only ladder arms that touch that tier
+    /// (v86/v87) are instant-preserving, idempotent and fail-safe. The
+    /// pre-migration snapshot is NOT residual — `database_holds_durable_rows`
+    /// probes both tiers, in separate statements for that same prepare-time
+    /// reason, so an archive-only database is still backed up before a replay.
+    /// A negative stamp is illegal unconditionally: no ladder ever writes one,
+    /// and `cli::boot::read_schema_version`'s `u32::try_from(v).ok()` silently
+    /// mapped it to "unsupported" with no warning while `observed > CURRENT`
+    /// stayed false — waving it into the same full-ladder replay.
+    Zeroed(i64),
+    /// The recorded `MAX(version)`, which is always `>= 1` here.
     Known(i64),
 }
 
 impl SchemaStamp {
-    /// The version this stamp represents, with [`Self::Fresh`] as `0`.
+    /// The number RECORDED in the database, with [`Self::Fresh`] as `0`.
+    ///
+    /// This is a diagnostic reading, NOT a permission: a [`Self::Zeroed`]
+    /// stamp reports its raw (0 or negative) value here even though the
+    /// database must not be operated. Every caller that is about to WRITE
+    /// must go through [`Self::operable_version`] instead, which cannot
+    /// return a version for a stamp that fails the guard.
     #[must_use]
     pub const fn version(self) -> i64 {
         match self {
             Self::Fresh => 0,
-            Self::Known(v) => v,
+            Self::Zeroed(v) | Self::Known(v) => v,
         }
     }
+
+    /// v1.0.0 #2564 — the version this stamp authorises the caller to operate
+    /// at, or a typed refusal.
+    ///
+    /// This is the accessor every WRITE funnel uses. [`Self::version`] cannot
+    /// express "this reading is not a permission", so a caller that reached
+    /// for it got `0` for a zeroed stamp and marched into the full-ladder
+    /// replay — the illegal state was representable. This method makes it
+    /// unrepresentable: there is no path from [`Self::Zeroed`] to an `i64`
+    /// here.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaStampZeroed`] when the stamp is [`Self::Zeroed`].
+    pub fn operable_version(
+        self,
+        backend: &'static str,
+        target: &str,
+    ) -> Result<i64, SchemaStampZeroed> {
+        match self {
+            Self::Fresh => Ok(0),
+            Self::Known(v) => Ok(v),
+            Self::Zeroed(observed) => {
+                let supported = crate::storage::migrations::current_schema_version();
+                let refusal = SchemaStampZeroed {
+                    observed,
+                    supported,
+                    backend,
+                    target: target.to_string(),
+                    detail: render_zeroed(observed, supported, backend, target),
+                };
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    observed,
+                    backend,
+                    target,
+                    "schema-stamp guard REFUSED an open — the recorded schema version is \
+                     zero/negative on a database that is provably not fresh"
+                );
+                Err(refusal)
+            }
+        }
+    }
+}
+
+/// v1.0.0 #2564 — the typed refusal for a ZEROED (or negative, or deleted)
+/// schema stamp on a populated database.
+///
+/// Deliberately a separate type from [`SchemaAheadOfBinary`]: the two failures
+/// need opposite operator actions (that one says "run a newer binary"; this one
+/// says "your stamp row was destroyed — restore it or restore a snapshot"), and
+/// the diagnostic verbs downcast on the concrete type to say which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaStampZeroed {
+    /// The number recorded in `schema_version` (`0` when the row set is empty
+    /// or the relation is absent; negative when a bogus value was inserted).
+    pub observed: i64,
+    /// The tip this binary's ladder produces (`CURRENT_SCHEMA_VERSION`).
+    pub supported: i64,
+    /// [`BACKEND_SQLITE`] or [`BACKEND_POSTGRES`].
+    pub backend: &'static str,
+    /// The database file path (sqlite) or a redacted store label (postgres).
+    pub target: String,
+    /// The fully rendered operator-facing message.
+    pub detail: String,
+}
+
+impl fmt::Display for SchemaStampZeroed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for SchemaStampZeroed {}
+
+/// Render the operator-facing refusal for a zeroed / negative stamp.
+fn render_zeroed(observed: i64, supported: i64, backend: &str, target: &str) -> String {
+    format!(
+        "database schema stamp is INVALID: {target} ({backend}) records schema version \
+         {observed}, but the database is provably NOT a fresh one — it holds durable rows \
+         AND carries schema structure no version-0 database ever had. A `schema_version` \
+         row that was deleted, zeroed or set negative reads as 0, which would replay the \
+         ENTIRE v1 -> v{supported} migration ladder over your populated data — with the \
+         pre-migration safety snapshot SUPPRESSED, because that snapshot is gated on a \
+         non-zero stamp. Refusing to operate it. `ai-memory backup` STILL WORKS against \
+         this database (it copies the bytes through the read-oriented funnel without \
+         migrating them) — snapshot it before doing anything else; `ai-memory boot` and \
+         `ai-memory doctor` report this refusal by name rather than an opaque open \
+         failure. To proceed: restore the correct `schema_version` row (the version this \
+         database was last migrated to), or restore a snapshot taken before the stamp \
+         was lost (#2564)."
+    )
+}
+
+/// v1.0.0 #2564 — recover the zeroed-stamp verdict from an `anyhow` chain, the
+/// [`schema_ahead_of`] twin, so `boot` / `doctor` / `backup` can report the
+/// drift instead of dying with an opaque open failure.
+#[must_use]
+pub fn schema_stamp_zeroed(err: &anyhow::Error) -> Option<&SchemaStampZeroed> {
+    err.downcast_ref::<SchemaStampZeroed>()
 }
 
 /// v1.0.0 #2445 — the typed refusal: this database's schema is AHEAD of what
@@ -213,11 +365,26 @@ pub fn evaluate(
     backend: &'static str,
     target: &str,
 ) -> Result<(), SchemaAheadOfBinary> {
-    if observed <= supported {
+    // v1.0.0 #2564 (b) — a RANGE check, not a ceiling check. A NEGATIVE stamp
+    // is illegal at both ends: no ladder ever writes one, `cli::boot`'s
+    // `u32::try_from(v).ok()` silently mapped it to "unsupported" with NO warn
+    // emitted, and `observed > supported` is false for it — so it sailed
+    // through this gate into a full ladder replay. It is reported through the
+    // same typed refusal (the operator action is identical: this binary must
+    // not operate this database) with `supported` naming the tip.
+    if (0..=supported).contains(&observed) {
         return Ok(());
     }
 
-    let raw = std::env::var(ENV_ALLOW_SCHEMA_AHEAD).unwrap_or_default();
+    // v1.0.0 #2564 — the hatch authorises a database that is AHEAD, never one
+    // whose stamp is structurally illegal. A negative version is not a schema
+    // this or any binary can operate, so it is refused with the hatch ignored
+    // (an unrecognised token must never widen — the #131 FBL-14 rule).
+    let raw = if observed < 0 {
+        String::new()
+    } else {
+        std::env::var(ENV_ALLOW_SCHEMA_AHEAD).unwrap_or_default()
+    };
     let trimmed = raw.trim();
     // Fail CLOSED on anything that is not the exact observed version: unset,
     // malformed, or naming a different version. An unrecognised token must
