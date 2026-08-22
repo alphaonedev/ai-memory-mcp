@@ -7294,13 +7294,29 @@ fn resolve_api_key_ladder(
         let path = expand_tilde(raw_path);
         let path_display = path.display().to_string();
 
+        // #1790 finding 2 — open the file ONCE and run the 0400 gate on THAT
+        // handle, then read the key from the SAME handle. The pre-fix form did
+        // `fs::metadata(path)` then `fs::read_to_string(path)`: two path
+        // lookups, so a local attacker able to write the directory could
+        // satisfy the gate with a decoy and have a different file (holding the
+        // vendor API key) read in its place.
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    None,
+                    KeySource::Error(format!("{field} = {path_display:?} could not be read: {e}")),
+                );
+            }
+        };
         // Mode 0400 enforcement (#1055-style escape hatch).
-        if let Err(reason) = enforce_api_key_file_perms(&path, &field) {
+        if let Err(reason) = enforce_api_key_file_perms(&file, &path, &field) {
             return (None, KeySource::Error(reason));
         }
 
-        return match std::fs::read_to_string(&path) {
-            Ok(contents) => {
+        let mut contents = String::new();
+        return match std::io::Read::read_to_string(&mut file, &mut contents) {
+            Ok(_) => {
                 let key = contents.lines().next().unwrap_or("").trim().to_string();
                 if key.is_empty() {
                     (
@@ -7333,11 +7349,19 @@ fn resolve_api_key_ladder(
 /// On non-Unix platforms (the `staticlib` mobile target, future
 /// Windows builds) the check is a no-op — the perm bits are not
 /// expressible on those platforms.
-fn enforce_api_key_file_perms(path: &Path, field: &str) -> Result<(), String> {
+///
+/// Takes the ALREADY-OPEN handle (not the path) so the gate is an `fstat` on
+/// the same descriptor the key bytes are read from — #1790 finding 2, no
+/// stat-then-reopen window. `path` is used for error text only.
+fn enforce_api_key_file_perms(
+    file: &std::fs::File,
+    path: &Path,
+    field: &str,
+) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(path).map_err(|e| {
+        let metadata = file.metadata().map_err(|e| {
             format!(
                 "{field} = {:?} could not be stat'd for perms check: {e}",
                 path.display(),
@@ -7376,7 +7400,7 @@ fn enforce_api_key_file_perms(path: &Path, field: &str) -> Result<(), String> {
     #[cfg(not(unix))]
     {
         // Permission bits do not apply on non-Unix platforms.
-        let _ = (path, field);
+        let _ = (file, path, field);
     }
     Ok(())
 }

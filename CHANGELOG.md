@@ -500,6 +500,53 @@ backend and missing or divergently implemented on its twin). Pinned by
   case-insensitive) already used by every other `AI_MEMORY_*` boolean knob, and
   WARN once when the variable is present but not truthy. `AI_MEMORY_NO_CONFIG=1`
   behaviour is unchanged.
+### Security (secret-file handling: close the TOCTOU re-open window; give the capability token a non-argv channel)
+
+- **Four secret-file loaders still did stat-then-reopen (TOCTOU).** #3205. #1790
+  finding 2 established the rule for this codebase — open the file ONCE and run
+  the permission check on THAT handle (`f.metadata()` = fstat), then read the
+  bytes from the SAME handle — and fixed `identity::keypair` (`.priv`), the
+  encryption master KEK and `governance::capability` (`.caproot`) accordingly.
+  Two loaders were missed: `daemon_runtime::passphrase_from_file` (the
+  SQLCipher DB passphrase, #1055 gate) and `store_url::store_url_from_file`
+  (the Postgres DSN, which carries a password, #1927 gate). Both did
+  `fs::metadata(path)` followed by `fs::read_to_string(path)` — two path
+  lookups, so a local attacker able to write the directory could satisfy the
+  0400/0600 gate with a decoy and have a different file read in its place: the
+  fail-closed gate did not bind the bytes actually read. Both now use the
+  single-handle form; the permission logic, the opt-out env vars, the error
+  text and the trimming behaviour are byte-identical.
+  Four loaders were missed: `daemon_runtime::passphrase_from_file` (the
+  SQLCipher DB passphrase, #1055 gate), `store_url::store_url_from_file` (the
+  Postgres DSN, which carries a password, #1927 gate),
+  `cli::rules::load_operator_signing_key` (the Ed25519 OPERATOR SIGNING SEED
+  that authenticates every `governance_rules` row, 0600 gate) and the
+  `[llm]` / `[embeddings]` `api_key_file` reader in `config.rs` (the vendor API
+  key, #1146 0400 gate). Each did `fs::metadata(path)` followed by a separate
+  `fs::read*(path)` — two path lookups, so a local attacker able to write the
+  directory could satisfy the 0400/0600 gate with a decoy and have a different
+  file read in its place: the fail-closed gate did not bind the bytes actually
+  read. All four now use the single-handle form; the permission logic, the
+  opt-out env vars, the refusal text and the trimming behaviour are unchanged.
+  The one observable delta is that a MISSING path now fails at the open (with
+  the read context) instead of at the separate stat — pinned by a regression
+  test on each loader.
+- **The macaroon capability token had no channel other than argv.** #3206.
+  `--capability <cap1:…>` on `store` / `delete` / `promote` puts a bearer
+  credential that can flip a governance `Deny`/`Ask` to `Allow` into
+  world-readable `/proc/<pid>/cmdline`, `ps auxww`, shell history and systemd
+  unit files, where any co-tenant local UID can lift and replay it within its
+  caveats — the exact exposure class #1927 closed for the Postgres DSN, which
+  the capability path never got. Adds `--capability-file <path>` and
+  `AI_MEMORY_CAPABILITY_FILE`: a `0600` file (owner-only enforced fail-closed,
+  opt out with `AI_MEMORY_CAPABILITY_FILE_ALLOW_LAX_PERMS=1`), read through the
+  same single-handle open+fstat discipline. Resolution order is
+  `--capability-file` > `AI_MEMORY_CAPABILITY_FILE` > `--capability`; the two
+  flags conflict at clap parse; `--capability` still works and now emits a WARN
+  naming the exposure and the alternatives. A NAMED-but-unusable file channel
+  is a hard error, never a silent downgrade to "no token presented". No default
+  behaviour changes: a caller that presents nothing is unaffected, and a caller
+  that presents `--capability` gets the same decision it did before.
 
 ### Changed
 

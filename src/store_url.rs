@@ -61,10 +61,17 @@ pub const STORE_URL_FILE_ENV: &str = "AI_MEMORY_STORE_URL_FILE";
 /// mode is refused fail-closed (opt out with
 /// `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS=1`).
 pub fn store_url_from_file(path: &Path) -> Result<String> {
+    // #1790 finding 2 (parity) — open ONCE, fstat that handle, read the bytes
+    // from the SAME handle. The pre-fix form did `fs::metadata(path)` then
+    // `fs::read_to_string(path)`: two path lookups, so the 0600 gate could be
+    // satisfied by a decoy and a lax-mode file (holding a Postgres DSN
+    // password) read in its place. Same fix as `passphrase_from_file`.
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("reading store-url file {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path).with_context(|| {
+        let meta = f.metadata().with_context(|| {
             format!(
                 "stat store-url file {} for permission check (#1927)",
                 path.display()
@@ -94,8 +101,12 @@ pub fn store_url_from_file(path: &Path) -> Result<String> {
             }
         }
     }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading store-url file {}", path.display()))?;
+    let mut raw = String::new();
+    {
+        use std::io::Read as _;
+        f.read_to_string(&mut raw)
+            .with_context(|| format!("reading store-url file {}", path.display()))?;
+    }
     let url = raw.trim().to_string();
     if url.is_empty() {
         anyhow::bail!("store-url file {} is empty", path.display());
@@ -290,6 +301,18 @@ mod tests {
         assert_eq!(
             store_url_from_file(&path).unwrap(),
             "postgres://u:hunter2@db.internal/mem"
+        );
+    }
+
+    /// #1790 parity — single-handle loader: a missing path fails at the open
+    /// with the read context, not at a separate stat.
+    #[test]
+    fn store_url_missing_file_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = store_url_from_file(&dir.path().join("nope")).unwrap_err();
+        assert!(
+            err.to_string().contains("store-url file"),
+            "expected a contextualised error, got: {err}"
         );
     }
 

@@ -756,10 +756,20 @@ fn pub_sibling_path(seed_path: &Path) -> PathBuf {
 ///   see `src/identity/keypair.rs` "Hardware-backed key storage"
 ///   section).
 pub fn load_operator_signing_key(path: &Path) -> Result<SigningKey> {
+    // #1790 finding 2 — open the file ONCE and run the 0600 gate on THAT
+    // handle (`f.metadata()` = fstat), then read the seed from the SAME
+    // handle. The pre-fix form did `fs::metadata(path)` then
+    // `fs::read(path)`: two path lookups, so a local attacker able to write
+    // the directory could satisfy the 0600 gate with a decoy and have a
+    // different file read as the OPERATOR SIGNING SEED in its place — the
+    // key that authenticates every `governance_rules` row.
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("load_operator_signing_key: read {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path)
+        let meta = f
+            .metadata()
             .with_context(|| format!("load_operator_signing_key: stat {}", path.display()))?;
         let mode = meta.permissions().mode() & 0o777;
         if mode != 0o600 {
@@ -771,8 +781,12 @@ pub fn load_operator_signing_key(path: &Path) -> Result<SigningKey> {
             );
         }
     }
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("load_operator_signing_key: read {}", path.display()))?;
+    let mut bytes = Vec::new();
+    {
+        use std::io::Read as _;
+        f.read_to_end(&mut bytes)
+            .with_context(|| format!("load_operator_signing_key: read {}", path.display()))?;
+    }
     if bytes.len() != ED25519_SEED_LEN {
         bail!(
             "load_operator_signing_key: {} has {} bytes, expected {ED25519_SEED_LEN}",
@@ -1301,6 +1315,44 @@ mod tests {
         other[0] = 1;
         let fp3 = pub_fingerprint(&other);
         assert_ne!(fp1, fp3);
+    }
+
+    /// #1790 finding 2 parity — the loader is single-handle now (open once,
+    /// `fstat` that handle, read the seed from the same handle), so a missing
+    /// path fails at the open with the read context rather than at a separate
+    /// `fs::metadata` stat. The 0600 refusal and the 32-byte length refusal
+    /// are unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn load_operator_signing_key_is_single_handle_and_still_gates_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) missing file -> contextualised error from the single open.
+        let missing = dir.path().join("nope.key");
+        let err = load_operator_signing_key(&missing).unwrap_err();
+        assert!(
+            err.to_string().contains("load_operator_signing_key"),
+            "expected a contextualised error, got: {err}"
+        );
+
+        // (b) group/world-readable seed -> still refused fail-closed.
+        let lax = dir.path().join("lax.key");
+        std::fs::write(&lax, [7u8; ED25519_SEED_LEN]).unwrap();
+        std::fs::set_permissions(&lax, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = load_operator_signing_key(&lax).unwrap_err();
+        assert!(
+            err.to_string().contains("permissions too open"),
+            "lax mode must fail closed, got: {err}"
+        );
+
+        // (c) 0600 seed -> loads, and the bytes come from THAT file.
+        let good = dir.path().join("good.key");
+        std::fs::write(&good, [9u8; ED25519_SEED_LEN]).unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let key = load_operator_signing_key(&good).expect("0600 seed loads");
+        assert_eq!(key.to_bytes(), [9u8; ED25519_SEED_LEN]);
     }
 
     #[cfg(unix)]

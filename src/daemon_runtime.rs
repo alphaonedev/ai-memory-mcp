@@ -2727,6 +2727,18 @@ pub fn is_write_command(cmd: &Command) -> bool {
 /// - (Unix only, post-#1055) the file's mode allows group or world
 ///   access without the env-var escape hatch.
 pub fn passphrase_from_file(path: &Path) -> Result<String> {
+    // #1790 finding 2 (parity) — open the file ONCE and perform the #1055
+    // permission check on THAT handle (`f.metadata()` = fstat), then read the
+    // bytes from the SAME handle. The pre-fix form did `fs::metadata(path)`
+    // then `fs::read_to_string(path)` — two path lookups, so a local attacker
+    // could swap a 0400 decoy past the gate and have the real, lax-mode
+    // passphrase file read instead (TOCTOU): the fail-closed gate no longer
+    // bound the bytes actually read. `identity::keypair::load_keypair_from_disk`
+    // (.priv), `encryption` (master KEK) and `governance::capability`
+    // (.caproot) were all fixed to the single-handle form by #1790; this
+    // secret-file loader was the one that was missed.
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("reading passphrase file {}", path.display()))?;
     // v0.7.0 #1055 — Unix permission check. We use the `mode & 0o077`
     // bitmask which fires on any group or world rwx bit. Windows
     // has no equivalent file-mode ACL primitive; the check is
@@ -2735,7 +2747,7 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path).with_context(|| {
+        let meta = f.metadata().with_context(|| {
             format!(
                 "stat passphrase file {} for permission check (#1055)",
                 path.display()
@@ -2769,8 +2781,12 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
             }
         }
     }
-    let mut raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading passphrase file {}", path.display()))?;
+    let mut raw = String::new();
+    {
+        use std::io::Read as _;
+        f.read_to_string(&mut raw)
+            .with_context(|| format!("reading passphrase file {}", path.display()))?;
+    }
     let passphrase = raw.trim_end_matches(['\n', '\r']).to_string();
     // #1258 — zeroize the intermediate `raw` buffer so the secret bytes
     // do not linger on the heap after we hand the trimmed copy to the
@@ -9708,6 +9724,19 @@ mod tests {
         let p = dir.path().join("pass");
         write_passphrase_strict(&p, "secret\r\n");
         assert_eq!(passphrase_from_file(&p).unwrap(), "secret");
+    }
+
+    /// #1790 parity — the loader now opens the file ONCE and fstats that
+    /// handle, so a missing path fails at the open with the read context
+    /// (previously it failed at the separate `fs::metadata` stat call).
+    #[test]
+    fn test_passphrase_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = passphrase_from_file(&dir.path().join("nope")).unwrap_err();
+        assert!(
+            err.to_string().contains("passphrase file"),
+            "expected a contextualised error, got: {err}"
+        );
     }
 
     #[test]
