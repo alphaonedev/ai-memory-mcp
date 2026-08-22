@@ -1369,6 +1369,14 @@ const REASON_UNSTAMPED_TENANT_WRITE: &str =
 /// #1628 — delete-verb sibling of [`REASON_UNSTAMPED_TENANT_WRITE`].
 const REASON_UNSTAMPED_TENANT_DELETE: &str =
     "memory has no agent_id stamp; tenant deletes refused (use admin path)";
+/// #3193 — archive-verb sibling of [`REASON_UNSTAMPED_TENANT_WRITE`].
+/// `archive_by_ids` is a caller-scoped MUTATION (cold-store copy + hard
+/// delete of the live row), so it takes the same postgres unstamped-row
+/// posture the write/delete verbs take (REFUSE — see #3124 for the
+/// cross-backend policy decision). Refusing leaves the row LIVE, so the
+/// fail-closed arm can never lose data.
+const REASON_UNSTAMPED_TENANT_ARCHIVE: &str =
+    "memory has no agent_id stamp; tenant archives refused (use admin path)";
 
 /// v0.8.1 W1 (#1821 / gap G29) + #1844 — postgres parity for the sqlite
 /// `db::insert` / `insert_if_newer` credential REDACT backstop. Returns a
@@ -5847,13 +5855,47 @@ impl PostgresStore {
         action: &str,
         unstamped_reason: &str,
     ) -> StoreResult<()> {
+        Self::assert_caller_owns_for_mutation_on(
+            &self.pool,
+            ctx,
+            id,
+            action,
+            unstamped_reason,
+        )
+        .await
+    }
+
+    /// #3193 — executor-parameterised core of
+    /// [`Self::assert_caller_owns_for_mutation`]. Identical logic and
+    /// byte-identical refusal envelopes; the only difference is WHERE the
+    /// owner probe runs.
+    ///
+    /// The `&self.pool` wrapper above is the right shape for the
+    /// single-statement verbs (`update` / `delete` /
+    /// `update_with_expected_version`) whose write is its own statement.
+    /// `archive_by_ids` is different: it copies the row to cold storage and
+    /// then HARD-DELETES the live row inside one multi-statement
+    /// transaction, so its gate MUST read through that same transaction —
+    /// a pool-borrowed probe would run on a different connection and could
+    /// observe a pre-tx snapshot of `metadata.agent_id` (a TOCTOU window
+    /// against a concurrent re-own). Passing `&mut *tx` closes it.
+    async fn assert_caller_owns_for_mutation_on<'e, E>(
+        executor: E,
+        ctx: &CallerContext,
+        id: &str,
+        action: &str,
+        unstamped_reason: &str,
+    ) -> StoreResult<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         if ctx.bypass_visibility {
             return Ok(());
         }
         let owner: Option<Option<String>> =
             sqlx::query_scalar(Self::SQL_SELECT_OWNER_AGENT_ID_BY_ID)
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(executor)
                 .await
                 .map_err(|e| to_store_err(&format!("{action}: pre-fetch owner"), e))?;
         match owner {
@@ -26118,9 +26160,17 @@ impl MemoryStore for PostgresStore {
         Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
     }
 
+    /// # Errors
+    ///
+    /// * `StoreError::PermissionDenied` — when `ctx` does not own one of the
+    ///   `ids` (#3193; same gate as [`MemoryStore::update`] /
+    ///   [`MemoryStore::delete`]). The refusal aborts the batch transaction,
+    ///   so NOTHING is archived — every row stays live (fail-closed with no
+    ///   data loss).
+    /// * `StoreError::BackendUnavailable` — on SQL failure.
     async fn archive_by_ids(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         ids: &[String],
         reason: Option<&str>,
     ) -> StoreResult<usize> {
@@ -26155,6 +26205,33 @@ impl MemoryStore for PostgresStore {
             if exists.is_none() {
                 continue;
             }
+            // #3193 (SECURITY-high, 2026-08-22) — SAL-side caller-owns gate,
+            // the archive-verb sibling of the #1412/#1628 gates on the trait
+            // `update` / `delete`. Pre-fix this funnel discarded its
+            // `_ctx: &CallerContext` entirely and the INSERT..SELECT below
+            // matched on `WHERE id = $3` with NO owner predicate, so ANY
+            // authenticated tenant on a postgres-backed daemon could
+            // bulk-soft-delete up to `max_batch` of ANOTHER tenant's live
+            // rows through `POST /api/v1/archive` (links cascaded; the rows
+            // vanished from get/list/search/recall). The sqlite branch has
+            // refused since #940 via `db::archive_memory_for_caller`; #3115
+            // fixed only that side of this class.
+            //
+            // Runs INSIDE the batch transaction (see
+            // `assert_caller_owns_for_mutation_on`) and AFTER the existence
+            // probe, so a genuinely-absent id stays a silent `continue`
+            // (the count-delta contract the handler relies on) and only a
+            // LIVE row owned by someone else raises `PermissionDenied`.
+            // Admin/operator lanes (`ctx.bypass_visibility`) skip the gate,
+            // exactly as they do on update/delete.
+            Self::assert_caller_owns_for_mutation_on(
+                &mut *tx,
+                ctx,
+                id,
+                "archive",
+                REASON_UNSTAMPED_TENANT_ARCHIVE,
+            )
+            .await?;
             sqlx::query(&format!(
                 "INSERT INTO archived_memories (
                     id, tier, namespace, title, content, tags, priority, confidence,

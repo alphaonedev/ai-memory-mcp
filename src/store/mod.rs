@@ -3228,6 +3228,29 @@ pub trait MemoryStore: Send + Sync {
     /// the archive table. Adapters MUST stamp `archive_reason` (defaults
     /// to `"manual"` when None) and preserve the original tier + expiry.
     ///
+    /// ## Caller-owns contract (#3193)
+    ///
+    /// Archiving copies a live row to cold storage and then HARD-DELETES
+    /// it, so it is a caller-scoped MUTATION, not a read. Adapters MUST
+    /// NOT archive an id whose `metadata.agent_id` is neither
+    /// `ctx.effective_principal()` nor an inbox-target for it — the same
+    /// gate the trait [`update`](MemoryStore::update) and
+    /// [`delete`](MemoryStore::delete) apply — UNLESS
+    /// `ctx.bypass_visibility` is set (the operator lane).
+    ///
+    /// The DISPOSITION of a refusal is per-adapter and matches each
+    /// backend's sibling verbs: postgres raises
+    /// `StoreError::PermissionDenied` and aborts the batch (nothing is
+    /// archived, every row stays live); sqlite declines to move the row
+    /// and simply does not count it. Both are fail-closed — the live row
+    /// survives either way. The unstamped (legacy-unowned) row split
+    /// between the backends is the deliberate #3124 divergence: postgres
+    /// refuses, sqlite carves it out.
+    ///
+    /// An id with no live row is NOT an error on either adapter: it is
+    /// skipped and not counted, which is what lets the HTTP handler split
+    /// `archived` from `missing` by the count delta.
+    ///
     /// Default returns `UnsupportedCapability`.
     async fn archive_by_ids(
         &self,
