@@ -214,10 +214,16 @@ async fn search_with_source_uri_enforces_scope_private_gate_3110() {
 
     // (1) alice's PRIVATE row (scope=private, owner=alice).
     let priv_id = uid("s3110-priv");
+    // DISTINCT titles: pg `store` upserts `ON CONFLICT (title, namespace)`, so
+    // two fixtures sharing a (title, namespace) key would make the SECOND
+    // store UPDATE the FIRST row instead of inserting a second one — leaving
+    // ONE row carrying the inbox metadata, which bob may legitimately see via
+    // the carve-out. The shared FTS `token` lives in the CONTENT of both rows
+    // so a single query still matches them both.
     let mut m_priv = mem(
         &priv_id,
         &ns,
-        &token,
+        &format!("{token}-priv"),
         &format!("private body about {token}"),
     );
     m_priv.source_uri = Some(uri.clone());
@@ -226,7 +232,12 @@ async fn search_with_source_uri_enforces_scope_private_gate_3110() {
 
     // (2) alice's row addressed TO bob (inbox carve-out, #3070).
     let inbox_id = uid("s3110-inbox");
-    let mut m_inbox = mem(&inbox_id, &ns, &token, &format!("inbox body about {token}"));
+    let mut m_inbox = mem(
+        &inbox_id,
+        &ns,
+        &format!("{token}-inbox"),
+        &format!("inbox body about {token}"),
+    );
     m_inbox.source_uri = Some(uri.clone());
     m_inbox.metadata = serde_json::json!({
         "agent_id": "ai:alice-3110",
@@ -234,6 +245,20 @@ async fn search_with_source_uri_enforces_scope_private_gate_3110() {
         "target_agent_id": "ai:bob-3110",
     });
     store.store(&alice, &m_inbox).await.expect("store inbox");
+
+    // Guard the FIXTURE itself: if the upsert collapsed the two rows into one,
+    // every visibility assertion below would be vacuous. Assert BOTH ids are
+    // live and distinct BEFORE testing the gate.
+    let seeded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = ANY($1)")
+        .bind(vec![priv_id.clone(), inbox_id.clone()])
+        .fetch_one(store.pool())
+        .await
+        .expect("count fixture rows");
+    assert_eq!(
+        seeded, 2,
+        "fixture must seed TWO distinct rows (pg upserts ON CONFLICT (title, \
+         namespace), so the two fixtures' titles must differ)"
+    );
 
     let filter = Filter {
         namespace: Some(ns.clone()),
