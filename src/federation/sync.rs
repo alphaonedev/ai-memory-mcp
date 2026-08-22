@@ -46,76 +46,95 @@ fn http_status_reason(status: reqwest::StatusCode) -> String {
     format!("http {status}")
 }
 
-/// Single-attempt POST to a peer, classifying the response into an
-/// `AckOutcome`. No retries — callers that want retry-on-transient-fail
-/// should use [`post_and_classify`].
+/// #3148 — the wire header marking a batched S40 catch-up POST, so the
+/// receiver can tell an idempotent catch-up replay from a per-row fanout.
+/// One named const (pm-v3.1 no-scattered-literals discipline).
+const CATCHUP_HEADER: &str = "X-Catchup";
+/// [`CATCHUP_HEADER`] value for the `bulk_catchup_push` batch lane.
+const CATCHUP_HEADER_VALUE_BULK: &str = "bulk";
+
+/// #3148 — the SINGLE governed outbound-POST builder shared by EVERY
+/// federation egress lane in this module (`post_once`'s per-row fanout AND
+/// `bulk_catchup_push`'s S40 catch-up batch).
 ///
-/// `api_key` (v0.7.0 fold-A2A1.4, #702) is the operator-configured
-/// `[api] api_key` from the local daemon's `AppConfig`. When `Some`,
-/// an `x-api-key: <value>` header is attached so peers that themselves
-/// run with api-key auth accept the outbound POST. When `None`, no
-/// header is attached — backwards-compatible with mTLS-only and
-/// no-auth deployments.
-pub(super) async fn post_once(
+/// ## Why this exists (the defect it closes)
+///
+/// The `NetworkRequest` governance egress gate and the FED-P3a/P4d identity
+/// headers were open-coded inside `post_once` only. `bulk_catchup_push` built
+/// its own `client.post(&url)…` — so an operator `refuse` rule for a peer host
+/// blocked the per-row fanout while the catch-up lane still shipped FULL
+/// memory batches to that host, with no `governance.check` `signed_events` row
+/// (an audit asymmetry) and without the credential/chain headers. Ungoverned
+/// egress of memory content is a fail-OPEN defect: a gate that only covers
+/// some of the sinks does not cover the data. Every lane now builds its
+/// request HERE, so a new lane cannot forget the gate — the only way to get a
+/// `RequestBuilder` for a peer is to pass through the gate first.
+///
+/// ## What it does, in order
+///
+/// 1. **Gate.** Resolves the target host/scheme and consults the
+///    `NetworkRequest` wire-point ([`crate::governance::wire_check::check`]).
+///    A refusal short-circuits with the operator-authored reason and NO bytes
+///    leave the process. The daemon-side hook emits the `governance.check`
+///    `signed_events` row, so a refused catch-up is now auditable exactly like
+///    a refused per-row push.
+/// 2. **Serialise once** so the signature covers the exact wire bytes the
+///    receiver sees (#791).
+/// 3. Attaches, in the `post_once` order: content-type + body, the
+///    operator-configured `x-api-key` (#702), the Ed25519 signature + nonce
+///    (#791/#922), `x-peer-id` from the body's `sender_agent_id` (#238), and
+///    the FED-P3a credential + FED-P4d intermediate-chain headers.
+///
+/// Lane-specific headers (`Idempotency-Key` on the per-row lane, the
+/// [`CATCHUP_HEADER`] marker on the batch lane) are attached by the caller on
+/// the returned builder.
+///
+/// # Errors
+///
+/// Returns the caller-facing failure reason string when the governance gate
+/// refuses the egress, or when the body cannot be serialised. Both are
+/// terminal for that peer: the caller maps the string into its own
+/// non-ack/error shape.
+fn build_governed_peer_post(
     client: &reqwest::Client,
     url: &str,
     body: &serde_json::Value,
-    expected_id: &str,
-    idempotency_key: Option<&str>,
     api_key: Option<&str>,
     signing_key: Option<&ed25519_dalek::SigningKey>,
-) -> AckOutcome {
-    // Ultrareview #346: attach an idempotency key so peers can dedupe
-    // on retry. If a tokio::timeout fires locally but the HTTP POST
-    // already reached the peer, the peer applies the write once; a
-    // subsequent catchup sync carrying the same memory.id will be a
-    // no-op via `insert_if_newer`. The key is set from the outgoing
-    // memory id by default, which is stable across retries.
-    // v0.7.0 (issue #691 fold-1) — wire the NetworkRequest governance
-    // gate BEFORE the outbound HTTPS POST. A refuse rule
-    // (`{"host":"evil.example.com"}` etc.) short-circuits the fan-out
-    // for that peer with a typed `AckOutcome::Fail` carrying the
-    // refusal reason. The quorum combiner already treats `Fail` as
-    // "this peer did not ack", so a refusal counts as a peer-miss
-    // without crashing the broadcast (allowing the remaining peers to
-    // reach quorum). The audit chain records the refusal via the
-    // governance.check signed_events row emitted on the daemon side.
-    let host = reqwest::Url::parse(url)
-        .ok()
+) -> std::result::Result<reqwest::RequestBuilder, String> {
+    // v0.7.0 (issue #691 fold-1) — wire the NetworkRequest governance gate
+    // BEFORE any outbound HTTPS POST. A refuse rule
+    // (`{"host":"evil.example.com"}` etc.) short-circuits the egress for that
+    // peer with the refusal reason. Callers map that into a peer-miss
+    // (`AckOutcome::Fail` / a catch-up error row), so a refusal never crashes
+    // the broadcast and the remaining peers can still reach quorum. The audit
+    // chain records the refusal via the `governance.check` signed_events row
+    // emitted on the daemon side.
+    let parsed = reqwest::Url::parse(url).ok();
+    let host = parsed
+        .as_ref()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_else(|| url.to_string());
-    let scheme = reqwest::Url::parse(url)
-        .ok()
-        .map(|u| u.scheme().to_string())
-        .unwrap_or_default();
+    let scheme = parsed.map(|u| u.scheme().to_string()).unwrap_or_default();
     let net_action = crate::governance::agent_action::AgentAction::NetworkRequest {
         host: host.clone(),
         scheme,
     };
     if let Err(refusal) = crate::governance::wire_check::check(&net_action) {
-        return AckOutcome::Fail(format!(
+        return Err(format!(
             "governance refused outbound to {host}: {}",
             refusal.reason
         ));
     }
-    // v0.7.0 #791 — serialise the body ONCE so the signature input
-    // matches the wire bytes the receiver sees. Sending via
-    // `.body(bytes)` + explicit content-type bypasses reqwest's
-    // re-serialisation (which could perturb whitespace / key order
-    // across versions and break the signature).
-    let body_bytes = match serde_json::to_vec(body) {
-        Ok(b) => b,
-        Err(e) => {
-            return AckOutcome::Fail(format!("serialise body: {e}"));
-        }
-    };
+    // v0.7.0 #791 — serialise the body ONCE so the signature input matches the
+    // wire bytes the receiver sees. Sending via `.body(bytes)` + explicit
+    // content-type bypasses reqwest's re-serialisation (which could perturb
+    // whitespace / key order across versions and break the signature).
+    let body_bytes = serde_json::to_vec(body).map_err(|e| format!("serialise body: {e}"))?;
     let mut req = client
         .post(url)
         .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
         .body(body_bytes.clone());
-    if let Some(key) = idempotency_key {
-        req = req.header("Idempotency-Key", key);
-    }
     // v0.7.0 fold-A2A1.4 (#702) — forward the operator-configured
     // `[api] api_key` on every outbound federation POST. Peers that
     // themselves run with api-key auth otherwise reject with 401 and
@@ -179,6 +198,46 @@ pub(super) async fn post_once(
                     "failed to encode outbound federation chain header; omitting");
             }
         }
+    }
+    Ok(req)
+}
+
+/// Single-attempt POST to a peer, classifying the response into an
+/// `AckOutcome`. No retries — callers that want retry-on-transient-fail
+/// should use [`post_and_classify`].
+///
+/// `api_key` (v0.7.0 fold-A2A1.4, #702) is the operator-configured
+/// `[api] api_key` from the local daemon's `AppConfig`. When `Some`,
+/// an `x-api-key: <value>` header is attached so peers that themselves
+/// run with api-key auth accept the outbound POST. When `None`, no
+/// header is attached — backwards-compatible with mTLS-only and
+/// no-auth deployments.
+pub(super) async fn post_once(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+    expected_id: &str,
+    idempotency_key: Option<&str>,
+    api_key: Option<&str>,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
+) -> AckOutcome {
+    // Ultrareview #346: attach an idempotency key so peers can dedupe
+    // on retry. If a tokio::timeout fires locally but the HTTP POST
+    // already reached the peer, the peer applies the write once; a
+    // subsequent catchup sync carrying the same memory.id will be a
+    // no-op via `insert_if_newer`. The key is set from the outgoing
+    // memory id by default, which is stable across retries.
+    //
+    // #3148 — the governance egress gate, the body serialisation and the
+    // api-key / signature / peer-id / credential / chain headers all live in
+    // the shared `build_governed_peer_post` builder, so this lane and the
+    // `bulk_catchup_push` batch lane are gated and headed IDENTICALLY.
+    let mut req = match build_governed_peer_post(client, url, body, api_key, signing_key) {
+        Ok(req) => req,
+        Err(reason) => return AckOutcome::Fail(reason),
+    };
+    if let Some(key) = idempotency_key {
+        req = req.header("Idempotency-Key", key);
     }
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -2378,51 +2437,29 @@ pub async fn bulk_catchup_push(
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
         joins.spawn(async move {
-            // v0.7.0 #791 — serialise once so the X-Memory-Sig
-            // signature matches the wire bytes the receiver sees.
-            let body_bytes = match serde_json::to_vec(&payload) {
-                Ok(b) => b,
-                Err(e) => {
-                    return (id, Err(format!("serialise body: {e}")));
-                }
+            // #3148 — the catch-up batch is a FULL memory-content egress, so
+            // it goes through the SAME `build_governed_peer_post` builder the
+            // per-row fanout uses: the `NetworkRequest` governance gate runs
+            // BEFORE any byte leaves the process (an operator refuse-rule for
+            // this peer host now blocks the batch lane too, and the daemon
+            // hook emits the `governance.check` signed_events row), and the
+            // FED-P3a credential / FED-P4d chain headers ride along with the
+            // signature / nonce / api-key / peer-id set. Pre-fix this lane
+            // open-coded its own request and honoured NEITHER.
+            let mut req = match build_governed_peer_post(
+                &client,
+                &url,
+                &payload,
+                api_key.as_deref(),
+                signing_key.as_deref(),
+            ) {
+                Ok(req) => req,
+                Err(reason) => return (id, Err(reason)),
             };
-            let mut req = client
-                .post(&url)
-                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .body(body_bytes.clone());
             // No Idempotency-Key on the batch — the batch is itself an
             // idempotent replay, and the peer's `insert_if_newer`
             // dedupes per row by (id, updated_at).
-            req = req.header("X-Catchup", "bulk");
-            // v0.7.0 #791 + #922 — signature + nonce header.
-            if let Some(sk) = signing_key.as_deref() {
-                let nonce = uuid::Uuid::new_v4().to_string();
-                let sig_header = crate::federation::signing::sign_body_with_nonce_header(
-                    sk,
-                    &body_bytes,
-                    &nonce,
-                );
-                req = req
-                    .header(crate::federation::signing::SIGNATURE_HEADER, sig_header)
-                    .header(crate::federation::signing::NONCE_HEADER, nonce);
-            }
-            // v0.7.0 fold-A2A1.4 (#702) — forward the operator-configured
-            // `x-api-key` on the catchup batch as well. Without this, a
-            // catchup against a peer that runs with api-key auth fails
-            // 401 and the row gap stays open.
-            if let Some(key) = api_key.as_deref() {
-                req = req.header(crate::HEADER_API_KEY, key);
-            }
-            // v0.7.0 #238 — attach `x-peer-id` so catchup batches
-            // attest against the receiver's allowlist exactly like
-            // the per-row fanout in `post_once`.
-            if let Some(peer_id) = payload
-                .get(field_names::SENDER_AGENT_ID)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                req = req.header(crate::federation::peer_attestation::PEER_ID_HEADER, peer_id);
-            }
+            req = req.header(CATCHUP_HEADER, CATCHUP_HEADER_VALUE_BULK);
             let outcome = match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
                     // #1579 B5 — drain the (success) body so the
@@ -2435,7 +2472,9 @@ pub async fn bulk_catchup_push(
                     // `post_once` for the fresh-handshake rationale.
                     let status = resp.status();
                     let _ = resp.bytes().await;
-                    Err(format!("http {status}"))
+                    // #3148 — reuse the canonical `http {status}` shape helper
+                    // rather than re-inlining the literal (pm-v3.1).
+                    Err(http_status_reason(status))
                 }
                 Err(e) => Err(crate::errors::msg::network(e)),
             };
