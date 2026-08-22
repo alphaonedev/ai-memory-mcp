@@ -96,9 +96,21 @@ pub enum AgentsAction {
     /// v1.0.0 crypto-core (#1942, spec §2.3) — list persisted sub-key
     /// certificates (optionally for one principal).
     SubkeyCerts {
-        /// Filter to a single principal (agent id).
-        #[arg(long)]
-        agent_id: Option<String>,
+        /// Filter the inventory to a single principal (agent id). Omit to
+        /// list EVERY persisted sub-key certificate on this node.
+        ///
+        /// #3017 — this is `--principal`, NOT `--agent-id`, and it is
+        /// deliberately NOT env-backed. The clap `--agent-id` at
+        /// `daemon_runtime::Cli` is `global = true, env = "AI_MEMORY_AGENT_ID"`,
+        /// and clap propagates a matched global DOWN into every subcommand's
+        /// `ArgMatches`, OVERWRITING a same-named subcommand-local arg. The
+        /// certified posture always exports `AI_MEMORY_AGENT_ID`, so the
+        /// node-wide cert inventory was silently filtered to that one id and
+        /// an operator auditing per-instance sub-keys was told
+        /// `{"count":0}` while the table held rows — a security-inventory
+        /// FALSE NEGATIVE. A distinct arg id cannot be shadowed.
+        #[arg(long = "principal", value_name = "AGENT_ID")]
+        principal: Option<String>,
     },
 }
 
@@ -292,8 +304,8 @@ pub fn run_agents(
         AgentsAction::EnrollSubkeyCert { file } => {
             enroll_subkey_cert(&conn, &file, json_out, out)?;
         }
-        AgentsAction::SubkeyCerts { agent_id } => {
-            let rows = db::list_subkey_certs(&conn, agent_id.as_deref())?;
+        AgentsAction::SubkeyCerts { principal } => {
+            let rows = db::list_subkey_certs(&conn, principal.as_deref())?;
             if json_out {
                 use base64::Engine as _;
                 let b64 = base64::engine::general_purpose::STANDARD;
@@ -1996,7 +2008,7 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = AgentsArgs {
-            action: Some(AgentsAction::SubkeyCerts { agent_id: None }),
+            action: Some(AgentsAction::SubkeyCerts { principal: None }),
         };
         {
             let mut out = env.output();
@@ -2010,7 +2022,7 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = AgentsArgs {
-            action: Some(AgentsAction::SubkeyCerts { agent_id: None }),
+            action: Some(AgentsAction::SubkeyCerts { principal: None }),
         };
         {
             let mut out = env.output();
@@ -2047,7 +2059,7 @@ mod tests {
             run_agents(
                 &db,
                 AgentsArgs {
-                    action: Some(AgentsAction::SubkeyCerts { agent_id: None }),
+                    action: Some(AgentsAction::SubkeyCerts { principal: None }),
                 },
                 false,
                 &mut out,
@@ -2086,7 +2098,7 @@ mod tests {
                 &db,
                 AgentsArgs {
                     action: Some(AgentsAction::SubkeyCerts {
-                        agent_id: Some("ai:curator".to_string()),
+                        principal: Some("ai:curator".to_string()),
                     }),
                 },
                 true,

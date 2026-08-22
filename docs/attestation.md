@@ -523,12 +523,22 @@ future revocation. An operator may also **pre-enroll** a cert:
 ```bash
 # The JSON file carries the same fields as write_v2.cert + cert_signature.
 ai-memory agents enroll-subkey-cert --file subkey-cert.json
-ai-memory agents subkey-certs [--agent-id <id>]      # inspect
+ai-memory agents subkey-certs [--principal <agent-id>]   # inspect
 ```
 
 The enrolled principal root (`ai-memory agents bind-key`) is the only trust
 input; the principal-root pubkey is deliberately **not** stored in the cert
 table.
+
+> **The filter flag is `--principal`, not `--agent-id`**
+> ([#3017](https://github.com/alphaonedev/ai-memory-mcp/issues/3017)). The
+> root `--agent-id` is `global = true, env = "AI_MEMORY_AGENT_ID"`, and clap
+> propagates a matched global into every subcommand, overwriting a
+> same-named subcommand-local flag. The certified posture always exports
+> `AI_MEMORY_AGENT_ID`, so `agents subkey-certs` silently filtered the
+> node-wide inventory to that one principal and reported `{"count":0}` over a
+> populated `agent_subkey_certs` table — a security-inventory false negative.
+> `--principal` cannot be shadowed; omit it for the full node-wide list.
 
 ## Epistemic-typing provenance (`kind_provenance`, #1945)
 
