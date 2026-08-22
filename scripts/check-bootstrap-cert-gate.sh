@@ -68,7 +68,13 @@ echo "== LEG A — #3061 pg posture armability =="
 # additions the posture requires. A fingerprints file + attestation JSON +
 # trust domain satisfy checks #9/#10/#11/#12; append-only + a daemon audit
 # signing key satisfy #19.
-KEYDIR_A="$(mktemp -d)"
+# HERMETIC key dir: a fresh PRIVATE parent, not bare $TMPDIR. `enrolled_
+# approver_keys` -> `resolve_operator_pubkey` walks BOTH the key dir and its
+# PARENT for an on-disk `operator.key.pub`, so a shared /tmp could otherwise
+# make the keyless negative control below silently un-negative on a dev host.
+WORK_A="$(mktemp -d)"
+KEYDIR_A="$WORK_A/keys"
+mkdir -p "$KEYDIR_A"
 FPFILE_A="$(mktemp)"
 printf 'example.org 0000000000000000000000000000000000000000000000000000000000000000\n' > "$FPFILE_A"
 # The daemon audit signing key for check #19 (resolve_agent_id honours
@@ -76,9 +82,22 @@ printf 'example.org 000000000000000000000000000000000000000000000000000000000000
 AGENT_A="cert-node-3061"
 env AI_MEMORY_KEY_DIR="$KEYDIR_A" AI_MEMORY_AGENT_ID="$AGENT_A" \
   "$BIN" identity generate --agent-id "$AGENT_A" >/dev/null 2>&1 || true
+# #2991 check #20 — the certified config MUST enroll at least one R40
+# approver key so the wired L1-6 escalate producer routes to a SATISFIABLE
+# signed-approval gate (keyless, the producer's fail-closed guardrail would
+# block escalated writes forever). Mint a REAL Ed25519 key with the SAME
+# binary and enroll its pubkey — never a hardcoded literal.
+APPROVER_AGENT_A="cert-approver-2991"
+"$BIN" identity generate --agent-id "$APPROVER_AGENT_A" --key-dir "$KEYDIR_A" \
+  >/dev/null 2>&1 || true
+APPROVER_PUBKEY_A="$("$BIN" identity export-pub --agent-id "$APPROVER_AGENT_A" \
+  --key-dir "$KEYDIR_A" 2>/dev/null)"
+[[ -n "$APPROVER_PUBKEY_A" ]] || { echo "could not mint an R40 approver pubkey"; exit 3; }
 
 posture_pg_env() {
-  # $1 = attestation value ("1" or ""), $2 = DSN
+  # $1 = attestation value ("1" or ""), $2 = DSN,
+  # $3 = OPTIONAL override of the R40 approver enrollment assignment; pass ""
+  #      to strip it entirely (the #2991 check-#20 negative control).
   env \
     AI_MEMORY_SECURITY_PROFILE=asi-hard \
     AI_MEMORY_FED_TRUST_DOMAIN=test-fleet \
@@ -89,6 +108,7 @@ posture_pg_env() {
     AI_MEMORY_APPEND_ONLY=1 \
     AI_MEMORY_KEY_DIR="$KEYDIR_A" \
     AI_MEMORY_AGENT_ID="$AGENT_A" \
+    ${3-AI_MEMORY_APPROVER_PUBKEYS=$APPROVER_PUBKEY_A} \
     AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1 \
     "$BIN" doctor --posture enterprise-federation --json
 }
@@ -96,16 +116,31 @@ posture_pg_env() {
 # Certified pg config → doctor --posture exits 0, and #15 is the pg
 # compensating control (NOT the sqlcipher predicate).
 OUT_A="$EVIDENCE_DIR/pg-posture-pass.json"
-posture_pg_env 1 "$PG_DSN_VERIFY_FULL" > "$OUT_A" 2>/dev/null
+ERR_A="$EVIDENCE_DIR/pg-posture-pass.err"
+posture_pg_env 1 "$PG_DSN_VERIFY_FULL" > "$OUT_A" 2>"$ERR_A"
 CODE_A=$?
 if [[ $CODE_A -eq 0 ]]; then
   pass "fresh pg node in the certified config: doctor --posture exit 0 (#3061 armable)"
 else
   fail "certified pg config did NOT reach exit 0 (got $CODE_A) — see $OUT_A"
-  grep -o '"control":"[^"]*"[^}]*"pass":false' "$OUT_A" 2>/dev/null | sed 's/^/    FAIL-ROW /' || true
+  # `run_posture --json` emits serde_json PRETTY output ("control": "…" with a
+  # space, one key per line), so the failing rows must be read line-wise — a
+  # compact-JSON grep silently matches NOTHING and leaves the auditor with a
+  # bare exit code. stderr is echoed too: a NON-doctor exit (e.g. a boot
+  # refusal) writes there and leaves this file empty, and that distinction is
+  # the whole diagnosis.
+  grep -A 5 '"pass": false' "$OUT_A" 2>/dev/null | grep '"control"' \
+    | sed 's/^/    FAIL-ROW /' || true
+  sed 's/^/    STDERR /' "$ERR_A" 2>/dev/null | head -20 || true
 fi
-if grep -q 'AI_MEMORY_PG_AT_REST_ATTESTED' "$OUT_A" 2>/dev/null \
-   && ! grep -q '"control":"AI_MEMORY_ENCRYPT_AT_REST"' "$OUT_A" 2>/dev/null; then
+# Both halves match the "control" FIELD (not any occurrence of the name in a
+# required/actual/remediation string), and tolerate compact OR pretty JSON —
+# `run_posture --json` emits `to_string_pretty`, so the pre-existing
+# compact-only spelling of the NEGATIVE half could never match and the "not
+# the sqlcipher predicate" clause was vacuously true.
+CONTROL_FIELD_RE='"control": *"'
+if grep -qE "${CONTROL_FIELD_RE}AI_MEMORY_PG_AT_REST_ATTESTED" "$OUT_A" 2>/dev/null \
+   && ! grep -qE "${CONTROL_FIELD_RE}AI_MEMORY_ENCRYPT_AT_REST\"" "$OUT_A" 2>/dev/null; then
   pass "control #15 is the pg COMPENSATING control, not the sqlcipher predicate"
 else
   fail "control #15 did not resolve to the pg compensating control on a postgres DSN"
@@ -127,7 +162,19 @@ else
   fail "the sslmode=verify-full TLS half is NOT load-bearing — posture passed without it"
 fi
 
-rm -rf "$KEYDIR_A" "$FPFILE_A"
+# NEGATIVE CONTROL 3 (#2991 check #20) — strip the R40 approver enrollment
+# from the otherwise-certified config → gate goes RED. Proves the newly
+# required enrollment is LOAD-BEARING, not decorative, and pins the certified
+# config's #2991 half so a future control addition cannot silently drift the
+# gate's notion of "the certified pg config" again.
+posture_pg_env 1 "$PG_DSN_VERIFY_FULL" "" > "$EVIDENCE_DIR/pg-posture-no-approver.json" 2>/dev/null
+if [[ $? -ne 0 ]]; then
+  pass "negative control: certified pg config WITHOUT an enrolled R40 approver key refuses (non-zero)"
+else
+  fail "the #2991 approver-key enrollment is NOT load-bearing — posture passed without it"
+fi
+
+rm -rf "$WORK_A" "$FPFILE_A"
 
 # ── LEG B — #3016/#3067 born-dirty → mechanical bring-up (asi-hard) ─────────
 echo
