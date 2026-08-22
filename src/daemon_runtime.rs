@@ -1596,7 +1596,7 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::link::cmd_link(&db_path, &a, j, &mut out)
+            cli::link::cmd_link(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)
         }
         Command::Consolidate(a) => {
             let stdout = std::io::stdout();

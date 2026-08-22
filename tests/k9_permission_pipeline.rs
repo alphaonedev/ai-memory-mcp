@@ -384,3 +384,57 @@ fn k9_off_mode_skips_entire_pipeline() {
     );
     assert_eq!(d, Decision::Allow, "Off mode must short-circuit to Allow");
 }
+
+/// v1.0.0 #3051 (R-405) — pins BOTH rungs of the CLI `link` actor change
+/// introduced by #3036. `storage::create_link_signed` derives the K9
+/// evaluation actor from the keypair (`kp.agent_id`) and falls back to
+/// `"system"` when there is none. Before #3036 the CLI always took the
+/// `None` path, so it always evaluated as `"system"`; it now evaluates as the
+/// SIGNING IDENTITY. Under an operator-authored agent-scoped `memory_link`
+/// rule those two actors can decide differently — which is exactly what this
+/// test fixes in place, so the CHANGELOG's operator warning cannot silently
+/// rot away.
+#[test]
+fn k9_link_actor_system_vs_signing_identity_diverges_3051() {
+    let rules = vec![rule(
+        "**",
+        "memory_link",
+        "ai:*",
+        RuleDecision::Deny,
+        Some("ai agents may not link"),
+    )];
+
+    // Rung 1 — no keypair: storage evaluates as "system", which the
+    // agent-scoped rule does not match. This is the pre-#3036 CLI behaviour.
+    let system = Permissions::evaluate_with(
+        &ctx(Op::MemoryLink, "ns", "system"),
+        &[],
+        &rules,
+        PermissionsMode::Enforce,
+    );
+    assert_eq!(
+        system,
+        Decision::Allow,
+        "`system` must not match an `ai:*`-scoped memory_link rule"
+    );
+
+    // Rung 2 — keypair present: storage evaluates as the signing identity,
+    // which DOES match, so the same operator rule now denies a CLI link that
+    // previously succeeded.
+    let signer = Permissions::evaluate_with(
+        &ctx(Op::MemoryLink, "ns", "ai:linker"),
+        &[],
+        &rules,
+        PermissionsMode::Enforce,
+    );
+    match signer {
+        Decision::Deny(reason) => assert!(
+            reason.contains("ai agents may not link"),
+            "deny reason should surface verbatim, got: {reason}"
+        ),
+        other => panic!(
+            "the signing identity must be evaluated against agent-scoped \
+             memory_link rules (#3051); got {other:?}"
+        ),
+    }
+}

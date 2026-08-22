@@ -3481,9 +3481,11 @@ fn load_active_keypair_for_mcp_in(
             Ok(kp) if kp.can_sign() => return Some(kp),
             Ok(_) => {}
             Err(e) => {
-                let msg = format!("{e:#}");
-                if !(msg.contains("No such file") || msg.contains("not found")) {
-                    eprintln!("ai-memory: keypair load failed for {agent_id}: {msg}");
+                // v1.0.0 #3051 — one shared not-found predicate with the CLI
+                // twin (`cli::link::warn_unless_not_found`); see
+                // `identity::keypair::is_key_absent_error`.
+                if !crate::identity::keypair::is_key_absent_error(&e) {
+                    eprintln!("ai-memory: keypair load failed for {agent_id}: {e:#}");
                 }
             }
         }
@@ -3494,9 +3496,9 @@ fn load_active_keypair_for_mcp_in(
         Ok(kp) if kp.can_sign() => Some(kp),
         Ok(_) => None,
         Err(e) => {
-            let msg = format!("{e:#}");
-            if !(msg.contains("No such file") || msg.contains("not found")) {
-                eprintln!("ai-memory: daemon keypair load failed: {msg}");
+            // v1.0.0 #3051 — shared predicate (see the per-agent rung above).
+            if !crate::identity::keypair::is_key_absent_error(&e) {
+                eprintln!("ai-memory: daemon keypair load failed: {e:#}");
             }
             None
         }

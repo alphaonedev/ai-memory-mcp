@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Two CLI paths diverged from the guard the MCP/HTTP reference surface already
 enforces. Both are precedent-copies — the fail-closed posture was already
-decided on the reference surface — and neither tightens behaviour beyond that
-precedent.
+decided on the reference surface. Neither tightens behaviour beyond that
+precedent, but the #3036 alignment does change the identity the CLI `link`
+write is permission-evaluated as; see the operator note below.
 
 - **#3036 — CLI `link` edges were permanently unattestable.** `ai-memory link`
   called the unsigned `db::create_link` while MCP `memory_link` routes through
@@ -23,8 +24,17 @@ precedent.
   `load_active_keypair_for_mcp_in`) and signs through the same
   `create_link_signed` funnel, reporting the resulting `attest_level`. With no
   keypair resolvable the edge still lands `unsigned`, byte-identical to the
-  prior behaviour — this adds attestation where a key exists, it does not
-  refuse anything that previously succeeded.
+  prior behaviour. **Operator action:** the CLI link is now
+  permission-evaluated as the signing identity rather than `system`; operators
+  with agent-scoped `memory_link` rules must re-check them. (`create_link_signed`
+  derives the K9 actor from the keypair's `agent_id`, falling back to `system`
+  only when no key resolves — so a rule that denies e.g. `ai:*` can now Deny a
+  CLI link that previously evaluated as `system` and succeeded.) A key-load
+  failure that is not a plain "no such key" now warns on stderr instead of
+  silently degrading the edge to `unsigned`, and re-linking an
+  already-existing edge reports the level that is actually STORED on the row
+  rather than the signature level it computed but never persisted (the write
+  is an `INSERT OR IGNORE` no-op).
 - **#2988 — the recall ledger bound a NAMESPACE into the identity column.**
   Both CLI recall paths wrote `--as-agent` (a namespace) into
   `recall_observations.agent_id`: `src/cli/recall.rs` passed
