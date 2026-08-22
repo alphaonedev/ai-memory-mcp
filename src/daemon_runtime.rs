@@ -3124,8 +3124,9 @@ pub async fn build_embedder(
 /// **FX-D1 (v0.7.0, 2026-05-27).** Pre-FX-D1 this function wrapped
 /// the sync [`llm::OllamaClient::build_from_resolved`] in
 /// `tokio::task::spawn_blocking`. The sync constructor went through
-/// `block_on_local`, whose FX-C1 design panicked on the current-thread
-/// arm. Production tests that defaulted to `#[tokio::test]`
+/// the sync↔async bridge (`block_on_local`, retired in favour of
+/// `block_on_local_bounded` by #3140), whose FX-C1 design panicked on the
+/// current-thread arm. Production tests that defaulted to `#[tokio::test]`
 /// (current-thread) hit the panic — `spawn_blocking`'s blocking-pool
 /// thread inherits the outer runtime handle, so `Handle::try_current()`
 /// resolved to a `CurrentThread` flavor and tripped the panic. The
@@ -3134,9 +3135,9 @@ pub async fn build_embedder(
 ///
 /// The surgical fix is to call the async constructor
 /// [`llm::OllamaClient::build_from_resolved_async`] directly — no
-/// `spawn_blocking`, no `block_on_local`, no sync→async bridge — so
+/// `spawn_blocking`, no bridge call, no sync→async bridge — so
 /// the construction runs on whichever tokio runtime the caller
-/// brought. The defensive fix in `block_on_local` (replace the panic
+/// brought. The defensive fix in the bridge (replace the panic
 /// with a fresh-OS-thread bridge) catches every other unknown
 /// callsite that might hit the same shape; this surgical fix is the
 /// optimal path at this known callsite.
@@ -3218,7 +3219,7 @@ pub async fn build_llm_client(
 
     // FX-D1 (2026-05-27): call the async constructor directly. The
     // pre-FX-D1 `spawn_blocking` wrapper drove the sync constructor
-    // through `block_on_local`, which panicked on the current-thread
+    // through the sync↔async bridge, which panicked on the current-thread
     // tokio arm (the default `#[tokio::test]` flavor). The async
     // path skips the sync→async bridge entirely so the construction
     // runs on whichever tokio runtime the caller brought, with no

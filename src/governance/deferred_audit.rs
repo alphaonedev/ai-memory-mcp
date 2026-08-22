@@ -5860,8 +5860,8 @@ mod tests {
             "admission must remain blocked while another process holds the spool lock"
         );
         fs2::FileExt::unlock(&blocker.spool_lock).unwrap();
-        for (mut child, _) in children {
-            assert!(child.wait().unwrap().success());
+        for (child, _) in children {
+            assert!(wait_for_test_child(child, "spool-lock admission").success());
         }
         let admitted = result_paths
             .iter()
@@ -6062,11 +6062,10 @@ mod tests {
                 .unwrap();
             (child, started, ready, release, result)
         };
-        let (mut first, first_started, first_ready, first_release, first_result) =
-            spawn_child("first");
+        let (first, first_started, first_ready, first_release, first_result) = spawn_child("first");
         wait_for_test_path(&first_started);
         wait_for_test_path(&first_ready);
-        let (mut second, second_started, second_ready, second_release, second_result) =
+        let (second, second_started, second_ready, second_release, second_result) =
             spawn_child("second");
         wait_for_test_path(&second_started);
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -6075,10 +6074,10 @@ mod tests {
             "a second recovery must not snapshot while the first claim is active"
         );
         std::fs::write(&first_release, b"release").unwrap();
-        assert!(first.wait().unwrap().success());
+        assert!(wait_for_test_child(first, "first recovery claim").success());
         wait_for_test_path(&second_ready);
         std::fs::write(&second_release, b"release").unwrap();
-        assert!(second.wait().unwrap().success());
+        assert!(wait_for_test_child(second, "second recovery claim").success());
 
         let recovered: usize = [&first_result, &second_result]
             .iter()
@@ -6124,6 +6123,42 @@ mod tests {
                 .is_empty()
         );
     }
+
+    /// v1.0.0 #3140 — reap a spawned test child under a deadline.
+    ///
+    /// A bare `child.wait()` is unbounded: if the child wedges (a lock it can
+    /// never take, a marker it never sees) the parent blocks forever and the
+    /// hang is charged to the CI job cap rather than to this test. The
+    /// parent-side barriers in this module are already deadline-guarded (see
+    /// [`wait_for_test_path`]); this closes the reap that was not.
+    ///
+    /// The budget is deliberately generous — these children re-exec the whole
+    /// test binary and are expected to take seconds, not milliseconds — so it
+    /// can only fire on a genuine wedge, never on a slow runner.
+    fn wait_for_test_child(mut child: std::process::Child, what: &str) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + TEST_CHILD_REAP_BUDGET;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "test child {what} still running after {TEST_CHILD_REAP_BUDGET:?} (#3140)"
+                    );
+                }
+                Ok(None) => std::thread::sleep(TEST_CHILD_POLL_INTERVAL),
+                Err(e) => panic!("try_wait on test child {what}: {e}"),
+            }
+        }
+    }
+
+    /// v1.0.0 #3140 — wall-clock ceiling for [`wait_for_test_child`].
+    const TEST_CHILD_REAP_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
+
+    /// v1.0.0 #3140 — poll interval for [`wait_for_test_child`], matching the
+    /// existing [`wait_for_test_path`] barrier cadence.
+    const TEST_CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
     fn wait_for_test_path(path: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

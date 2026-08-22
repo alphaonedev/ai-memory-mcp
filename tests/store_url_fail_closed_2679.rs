@@ -30,7 +30,17 @@ use std::time::Duration;
 use assert_cmd::cargo::cargo_bin;
 use tempfile::TempDir;
 
-const PG_STORE_URL: &str = "postgres://ai_memory:hunter2@127.0.0.1:5432/ai_memory";
+/// v1.0.0 #3140 — the port is `1`, an address nothing ever listens on.
+///
+/// This is a REFUSAL probe: the guard must fire on the URL scheme, before
+/// any connection. Aiming it at the real Postgres port (5432) made the
+/// assertion VACUOUS on any host running Postgres — a regression that moved
+/// the refusal after connect would still pass, and a regression that removed
+/// it could WRITE to that live database. Pointing at a dead address means a
+/// refusal can never be manufactured by a live server; the reason-text
+/// assertions below keep it from being manufactured by a connection error
+/// either.
+const PG_STORE_URL: &str = "postgres://ai_memory:hunter2@127.0.0.1:1/ai_memory";
 const PG_PASSWORD: &str = "hunter2";
 
 /// Spawn `ai-memory serve` with a short timeout. On success the daemon would
@@ -122,11 +132,12 @@ fn serve_refuses_postgres_store_url_env_without_creating_sqlite() {
         "serve must exit non-zero on postgres:// without sal-postgres; status={:?} out={combined}",
         output.status
     );
+    // #3140 — the accepted reason text must be SPECIFIC to the #2679 guard. A
+    // bare "Postgres" substring would also match a plain connection error, so
+    // the test could pass without the guard ever firing.
     assert!(
-        combined.contains("#2679")
-            || combined.contains("sal-postgres")
-            || combined.contains("Postgres"),
-        "refusal must name the defect: {combined}"
+        combined.contains("#2679") || combined.contains("sal-postgres"),
+        "refusal must name the #2679 guard, not merely fail to connect: {combined}"
     );
     assert!(
         !combined.contains(PG_PASSWORD),

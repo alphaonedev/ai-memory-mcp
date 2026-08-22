@@ -450,19 +450,14 @@ async fn test_capabilities_db_schema_version_reports_36() {
         .await
     });
 
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(&format!("http://{addr}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "WT-1-A: in-process HTTP daemon never bound");
+    // v1.0.0 #3140 — was a bare `reqwest::get` inside a `for _ in 0..50` loop:
+    // an unbounded probe against a daemon that accepts and then stalls parks
+    // the test forever, because the loop counts iterations, not wall-clock.
+    common::wait_for_http_ready(&addr, common::IN_PROCESS_READY_TIMEOUT)
+        .await
+        .expect("WT-1-A: in-process HTTP daemon never bound");
 
-    let client = reqwest::Client::new();
+    let client = common::bounded_test_client();
     let caps: Value = client
         .get(format!("http://{addr}/api/v1/capabilities"))
         .send()
@@ -491,7 +486,15 @@ async fn test_capabilities_db_schema_version_reports_36() {
     );
 
     shutdown.notify_one();
-    let _ = handle.await;
+    // v1.0.0 #3140 — bounded join (mirrors `tests/serve_postgres_smoke.rs`): an
+    // unbounded `handle.await` parks the test for the whole job cap if the
+    // daemon never observes the notify.
+    let joined = tokio::time::timeout(common::DAEMON_SHUTDOWN_TIMEOUT, handle).await;
+    assert!(
+        joined.is_ok(),
+        "daemon task did not terminate within {:?} of shutdown notify (WT-1-A, #3140)",
+        common::DAEMON_SHUTDOWN_TIMEOUT
+    );
 }
 
 /// v0.7.0 #1112 — v49 archive-column-carry migration idempotency pin.

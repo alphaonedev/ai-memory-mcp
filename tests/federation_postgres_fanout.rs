@@ -283,7 +283,8 @@ async fn notify_fanout_postgres_reaches_w_of_n_peers() {
     let cfg = federation_cfg_for_test(&peer_urls, 2);
 
     let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
 
     let recipient = format!("ai:bob-{}", uuid::Uuid::new_v4());
     let title = format!("notify-{}", uuid::Uuid::new_v4());
@@ -383,7 +384,8 @@ async fn subscribe_postgres_replays_history() {
     let cfg = federation_cfg_for_test(&peer_urls, 2);
 
     let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
 
     let subscriber_aid = format!("ai:carol-{}", uuid::Uuid::new_v4());
     let target_ns = format!("team-{}", uuid::Uuid::new_v4());
@@ -512,7 +514,8 @@ async fn cross_namespace_dispatch_on_postgres() {
     let cfg = federation_cfg_for_test(&peer_urls, 2);
 
     let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
 
     let carol = format!("ai:carol-{}", uuid::Uuid::new_v4());
     let target_ns = format!("target/observed-{}", uuid::Uuid::new_v4());
@@ -656,7 +659,8 @@ async fn create_postgres_pipelines_broadcast_with_local_write() {
     let cfg = federation_cfg_for_test(&peer_urls, 2);
 
     let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
 
     let agent = "ai:alice-create-pipeline";
     let title = format!("pipelined-create-{}", uuid::Uuid::new_v4());
@@ -773,7 +777,8 @@ async fn bulk_create_postgres_fans_out_to_peers_2724() {
     let cfg = federation_cfg_for_test(&peer_urls, 2);
 
     let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
 
     let agent = "ai:alice-bulk-fanout";
     let ns = format!("bulk-2724-{}", uuid::Uuid::new_v4());

@@ -1738,6 +1738,48 @@ mod tests {
         let _ = stream.shutdown(std::net::Shutdown::Write);
     }
 
+    /// v1.0.0 #3140 — outer wall-clock guard for a curator test that drives
+    /// the sync↔async LLM bridge.
+    ///
+    /// `run_once_with_llm_dry_run_skips_writes` is a plain `#[test]`, so every
+    /// `auto_tag` / `detect_contradiction` call reaches the no-runtime arm of
+    /// the sync↔async bridge. That bridge is now bounded structurally
+    /// ([`crate::llm::block_on_local_bounded`]); this is the test-level
+    /// backstop so a future wedge fails in a minute with a message instead of
+    /// burning the whole CI job cap the way #3140 did (72 min on macOS).
+    const HUNG_TEST_GUARD: std::time::Duration = std::time::Duration::from_mins(1);
+
+    /// v1.0.0 #3140 — run `body` on its own thread and give up waiting after
+    /// [`HUNG_TEST_GUARD`].
+    ///
+    /// The thread is deliberately detached (not scoped) on expiry: abandoning
+    /// a wedged worker is what lets the assertion fire at all. A panic inside
+    /// `body` drops the sender, so it is re-raised immediately via `join`
+    /// rather than being misreported as a hang — and re-raised with
+    /// `resume_unwind`, which carries the ORIGINAL payload through, so a failed
+    /// assertion inside `body` is reported by the harness verbatim rather than
+    /// being flattened into this wrapper's message.
+    fn run_under_hung_test_guard<F>(what: &str, body: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let worker = std::thread::spawn(move || {
+            body();
+            let _ = tx.send(());
+        });
+        match rx.recv_timeout(HUNG_TEST_GUARD) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Err(payload) = worker.join() {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{what} still running after {HUNG_TEST_GUARD:?} — hung (#3140)")
+            }
+        }
+    }
+
     /// Build an `OllamaClient` pointed at a running fake server.
     fn ollama_for(server: &FakeOllama) -> crate::llm::OllamaClient {
         crate::llm::OllamaClient::new_with_url(&server.url, "fake-model")
@@ -1817,40 +1859,44 @@ mod tests {
     /// no `_curator/reports` self-report row appears.
     #[test]
     fn run_once_with_llm_dry_run_skips_writes() {
-        let server = FakeOllama::start(FakeOllamaCfg::default());
-        let llm = ollama_for(&server);
+        // #3140 — this test hung for 72 min on a macOS CI runner (the sync↔async
+        // LLM bridge parked with no wall-clock bound). Body runs under a guard.
+        run_under_hung_test_guard("run_once_with_llm_dry_run_skips_writes", || {
+            let server = FakeOllama::start(FakeOllamaCfg::default());
+            let llm = ollama_for(&server);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let conn = db::open(tmp.path()).unwrap();
-        let mem = make_eligible_memory("dry-llm-ns", "anchor");
-        db::insert(&conn, &mem).unwrap();
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let conn = db::open(tmp.path()).unwrap();
+            let mem = make_eligible_memory("dry-llm-ns", "anchor");
+            db::insert(&conn, &mem).unwrap();
 
-        let cfg = CuratorConfig {
-            dry_run: true,
-            include_namespaces: vec!["dry-llm-ns".to_string()],
-            ..CuratorConfig::default()
-        };
-        let report = run_once(&conn, Some(&llm), &cfg, None).unwrap();
-        assert!(report.dry_run);
+            let cfg = CuratorConfig {
+                dry_run: true,
+                include_namespaces: vec!["dry-llm-ns".to_string()],
+                ..CuratorConfig::default()
+            };
+            let report = run_once(&conn, Some(&llm), &cfg, None).unwrap();
+            assert!(report.dry_run);
 
-        // No DB writes: original metadata unchanged, no self-report.
-        let after = db::get(&conn, &mem.id).unwrap().unwrap();
-        assert!(after.metadata.get("auto_tags").is_none());
-        let reports = db::list(
-            &conn,
-            Some("_curator/reports"),
-            None,
-            10,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None, // #1834 valid_at (no as-of)
-        )
-        .unwrap();
-        assert!(reports.is_empty(), "dry-run must not persist self-report");
+            // No DB writes: original metadata unchanged, no self-report.
+            let after = db::get(&conn, &mem.id).unwrap().unwrap();
+            assert!(after.metadata.get("auto_tags").is_none());
+            let reports = db::list(
+                &conn,
+                Some("_curator/reports"),
+                None,
+                10,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None, // #1834 valid_at (no as-of)
+            )
+            .unwrap();
+            assert!(reports.is_empty(), "dry-run must not persist self-report");
+        });
     }
 
     /// `max_ops_per_cycle` caps how many memories the LLM loop touches.

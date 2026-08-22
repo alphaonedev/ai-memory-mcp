@@ -831,6 +831,76 @@ backend and missing or divergently implemented on its twin). Pinned by
     ship with `--self-test` legs proving they reject stale counts, spare the
     `PE-1 knobs` prose and the cert doc's historical evidence notes, and fail
     closed on an unresolvable SSOT only when a doc actually narrates the count.
+- **The sync&#8596;async LLM bridge is bounded: a wedged runtime driver can no
+  longer park a caller forever (#3140).** On PR #3137 the macOS `Check
+  (macos-fed,sqlite)` leg printed its last unit-test completion and then went
+  silent for **72 minutes**, until the 80-minute job cap cancelled it; the same
+  leg took 19 minutes twice that day. Diffing completed tests against the green
+  run left exactly two that never finished, both on the LLM path
+  (`llm::wiremock_tests::test_generate_returns_error_on_500`,
+  `curator::tests::run_once_with_llm_dry_run_skips_writes`). The HTTP client was
+  never the problem — every `reqwest` call already carries a `timeout` +
+  `connect_timeout`. The unbounded chokepoint was the **bridge**: the
+  multi-thread arm's `block_in_place(|| handle.block_on(..))` parks a
+  blocking-pool thread on the ambient runtime's driver, so when that driver
+  never advances the future the inner request timeout never gets a chance to
+  fire. The unbounded `block_on_local` has been **retired** and replaced by
+  `block_on_local_bounded(budget, ..)`, which applies
+  `tokio::time::timeout(budget, ..)` on all three runtime-flavor arms — expiry
+  is now enforced by the runtime that is actually driving the future, not by a
+  caller who may never be scheduled again. Every budget is derived as **twice**
+  the largest inner `reqwest` timeout of the call it wraps (`BRIDGE_HEALTH_BUDGET`,
+  `BRIDGE_GENERATE_BUDGET`, `BRIDGE_PULL_BUDGET`, and an input-scaled
+  `bridge_embed_batch_budget` for batched embeds), so the bridge can only fire
+  when the inner timeout has *already* failed to release the caller — it never
+  truncates a request the HTTP client would have completed. **Fail-closed:**
+  expiry returns a named error, never a partial or fabricated value, and
+  dropping the future also cancels the in-flight request. Two panic sites went
+  with it: a failed `Runtime::build()` (fd/thread/memory exhaustion — a real
+  fleet-density condition) used to `panic!` on a curator daemon thread or a
+  `spawn_blocking` worker, and a panicking bridge thread was re-raised into an
+  unrelated caller's stack; both are now `Err`. The two MCP hook-chain
+  enforcement gates (`pre_signal_send`, the pre-event `hooks.enforce` gate) run
+  through the same bounded bridge and **refuse** when the gate cannot be
+  evaluated (`503`) — an unevaluated deny-capable gate is not an allow.
+- **Unbounded waits removed across the test suites (#3140).** The same class,
+  swept: EVERY `reqwest::Client::new()` (no request timeout) in `src/` tests and
+  `tests/` replaced with a bounded client — the LLM tests, the federation
+  hostile-peer tests, the capabilities suites, and all ten Postgres-backed
+  suites, via a shared `common::bounded_test_client()`; `common::wait_for_http_ready`'s probe bounded (its
+  `elapsed >= timeout` check runs only at loop top, so ONE hung probe defeated
+  the whole 5-minute budget); `-m` riders on every `curl` argv in `tests/`;
+  deadline+kill reaps replacing bare `child.wait()` / `Command::output()` /
+  `wait_with_output()` in the deferred-audit, reembed-CLI and
+  transcript-extractor suites; bounded joins on the in-process daemon tasks in
+  the schema-version suites; and outer guards on the two tests that actually
+  hung. The transcript-extractor build also stops using a **per-PID** target
+  dir — cargo already locks a target dir, so the PID suffix bought nothing but a
+  cold rebuild and a multi-gigabyte tree per runner process.
+- **Fail-closed refusal probes are no longer vacuous (#3140).** Three tests
+  (`cli_write_verb_pg_refuse_ceiling_2572`, `backup_fail_closed_2444`,
+  `store_url_fail_closed_2679`) proved a `postgres://` store URL is REFUSED
+  while pointing at `127.0.0.1:5432`. On any host actually running Postgres the
+  probe could pass for the wrong reason — and a regression that removed the
+  guard could have WRITTEN to that live database. They now point at
+  `127.0.0.1:1`, where nothing listens, and the #2679 probe's accepted reason
+  text no longer admits a bare `Postgres` substring that a mere connection
+  error would also match.
+- **Wall-clock assertions that measured the CI runner, not the product, are
+  now shape guards (#3140).** The `record_stop` effect-latency assertion moved
+  from `<= 100 ms` to a `<= 2 s` SHAPE guard: it fails if the stop plane ever
+  becomes eventually-consistent (a background reconcile, a network round-trip)
+  and cannot fire on a loaded shared runner. Stated plainly, because the old
+  assertion implied otherwise: the product's `<= 100 ms` record-stop figure is
+  a REFERENCE-HARDWARE claim, it needs a bench producer to be enforced, and no
+  such bench exists — the 100 ms assertion in a CI unit test never established
+  it either. The load-bearing `Err(StoreError::Stopped { .. })` property is
+  unchanged. Elsewhere: the
+  fold-before-gc race tests moved from a 1.33x to a 5x expiry margin; the
+  `/health`-not-blocked-by-precompute test uses one 60 s budget in both
+  execution modes instead of 10 s uninstrumented; and the abandoned-download
+  watchdog test's detached sleeper drops from 30 s to 5 s (still
+  unconditionally over the assertion's ceiling, so the property is intact).
 
 - **The required `Check` legs are no longer undeclared performance gates:
   `ai-memory bench` gains `--report-only`.** `cmd_bench` bails non-zero

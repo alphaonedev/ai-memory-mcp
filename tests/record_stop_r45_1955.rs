@@ -19,7 +19,13 @@
 //! - RESUME restores the write path.
 //! - Issuing stop/resume emits ONE signed `substrate.record_stop` /
 //!   `substrate.record_resume` attestation, chained + chain-intact.
-//! - EFFECT-LATENCY: stop issued → next write refused in ≤ 100 ms.
+//! - EFFECT: stop issued → the very NEXT write is refused, SYNCHRONOUSLY
+//!   with the write attempt. (v1.0.0 #3140: the wall-clock bound here was
+//!   `≤ 100 ms`, which on a loaded shared CI runner measures the runner,
+//!   not the stop plane. It is now a shape guard — see
+//!   `STOP_EFFECT_SYNCHRONOUS_CEILING`. The product's ≤100 ms figure is a
+//!   REFERENCE-HARDWARE claim and needs a bench producer to be enforced;
+//!   this suite does not, and never truthfully did, establish it.)
 //! - PERSISTENCE: the stop is derivable from the audit chain after a
 //!   fresh open (survives a daemon restart).
 //! - Federation-receive IS stopped (the "atomic write-fence" — inbound
@@ -267,8 +273,22 @@ async fn federation_receive_is_stopped() {
     );
 }
 
+/// v1.0.0 #3140 — ceiling on how long the refusal may take.
+///
+/// This is a SHAPE guard, not a performance budget: it fails if the stop plane
+/// ever becomes eventually-consistent (a background reconcile, a network
+/// round-trip, a retry loop), which would take seconds or never refuse at all.
+/// It is deliberately ~20x the product's reference-hardware ≤100 ms figure so
+/// it can only fire on that structural regression, never on a loaded shared CI
+/// runner. Enforcing the ≤100 ms figure itself requires a bench producer on
+/// reference hardware; no such bench exists today, and the previous 100 ms
+/// assertion here did not establish it either — it only made this suite flaky.
+const STOP_EFFECT_SYNCHRONOUS_CEILING: Duration = Duration::from_secs(2);
+
+/// R-45 (#1955) — once a stop is engaged the very next write is refused,
+/// synchronously with the write attempt.
 #[tokio::test]
-async fn effect_latency_under_100ms() {
+async fn effect_refuses_next_write_synchronously() {
     let (store, _f) = fresh_store();
     let c = ctx();
 
@@ -286,8 +306,10 @@ async fn effect_latency_under_100ms() {
         "next write refused"
     );
     assert!(
-        elapsed <= Duration::from_millis(100),
-        "stop effect-latency {elapsed:?} exceeds the 100ms target"
+        elapsed <= STOP_EFFECT_SYNCHRONOUS_CEILING,
+        "the stop must refuse SYNCHRONOUSLY with the write attempt; \
+         {elapsed:?} exceeds {STOP_EFFECT_SYNCHRONOUS_CEILING:?}, which means the \
+         refusal became eventually-consistent"
     );
 }
 

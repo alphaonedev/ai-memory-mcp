@@ -165,7 +165,8 @@ async fn pg_single_create_enforces_daily_quota_1795() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
     let suffix = uuid::Uuid::new_v4();
     let agent = format!("g6-single-{suffix}");
     let ns = format!("g6-single-ns-{suffix}");
@@ -216,7 +217,8 @@ async fn pg_bulk_create_partial_fills_at_quota_1795() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
     let suffix = uuid::Uuid::new_v4();
     let agent = format!("g6-bulk-{suffix}");
     let ns = format!("g6-bulk-ns-{suffix}");
@@ -282,7 +284,8 @@ async fn pg_consolidate_enforces_daily_quota_1795() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
     let suffix = uuid::Uuid::new_v4();
     let agent = format!("g6-cons-{suffix}");
     let ns = format!("g6-cons-ns-{suffix}");

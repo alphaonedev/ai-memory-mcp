@@ -1565,7 +1565,23 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // tests (pure + wiremock), growing the file to 6_344; 6_360 = 16 headroom.
     // Refactor-split into `src/llm/{…}.rs` remains the tracked post-ship
     // ARCH cleanup.
-    ("src/llm.rs", 6_360),
+    // 2026-08-22 (#3140 sync↔async bridge bound): 6_360 -> 6_780. The
+    // unbounded `block_on_local` was RETIRED and replaced by
+    // `block_on_local_bounded`, which wraps all three runtime-flavor arms in
+    // `tokio::time::timeout` and adds a driver-independent OS-thread alarm
+    // (`spawn_wallclock_alarm` + `WallclockAlarmGuard` + the
+    // `BRIDGE_ALARM_GRACE`/`BRIDGE_ALARM_POLL` consts) on the multi-thread
+    // arm, whose timer belongs to a runtime this thread does not drive. Adds
+    // the four derived budget constants (`BRIDGE_BUDGET_FACTOR`,
+    // `BRIDGE_{GENERATE,HEALTH,PULL}_BUDGET`), `bridge_embed_batch_budget`,
+    // `EPHEMERAL_RUNTIME_BUILD_MSG`, the `bridge_budget_tests_3140` module
+    // (6 tests incl. a deterministic starved-time-driver reproduction), and
+    // the wiremock-test `bridge_call` / `bounded_test_client` guards. Growth
+    // is bound-and-proof, not feature surface: a bridge with no wall-clock
+    // ceiling burned a full 80-minute macOS CI job. Measured 6_714; ceiling
+    // 6_780 (+66 headroom). Refactor-split into `src/llm/{…}.rs` remains the
+    // tracked post-ship ARCH cleanup.
+    ("src/llm.rs", 6_780),
 ];
 
 #[test]

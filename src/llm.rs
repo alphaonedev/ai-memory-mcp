@@ -55,140 +55,253 @@ use std::time::{Duration, Instant};
 
 pub(crate) const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
-/// PERF-9 (v0.7.0 FX-C1, 2026-05-26) — bridge sync API to the new async
-/// `reqwest::Client` without double-blocking or panicking.
+/// The sync↔async bridge: drive an async future to completion from a
+/// synchronous caller, under a hard wall-clock `budget`.
 ///
-/// **FX-D1 (v0.7.0, 2026-05-27) — regression fix.** The original
-/// FX-C1 design panicked on the current-thread arm because every
-/// in-repo `#[tokio::test]` used `flavor = "multi_thread"`. Production
-/// hit the panic via `daemon_runtime::build_llm_client` →
-/// `spawn_blocking(|| OllamaClient::build_from_resolved(...))`:
-/// `tokio::task::spawn_blocking` inherits the runtime handle on its
-/// blocking pool thread, so `Handle::try_current()` resolves and
-/// `runtime_flavor()` is `CurrentThread` whenever the outer runtime
-/// is current-thread (the default for `#[tokio::test]`). The panic
-/// surfaced as a `task panicked with message "OllamaClient sync
-/// wrapper called from inside a current-thread tokio runtime."`
-/// warning in the daemon log.
+/// # The three runtime flavors it must handle
 ///
-/// The fix is to never panic — instead, on the current-thread arm,
-/// spawn a fresh OS thread (which has no inherited tokio context),
-/// build a one-shot current-thread runtime on it, drive the future
-/// there, and join the thread back. This costs one thread spawn +
-/// one join per current-thread bridge call, but it keeps every
-/// existing sync wrapper signature intact and removes the
-/// recurrence-risk panic surface entirely. Multi-thread runtimes
-/// still use the productive `block_in_place` path; no runtime at
-/// all still uses the in-line ephemeral runtime path.
+/// PERF-9 (v0.7.0 FX-C1, 2026-05-26) introduced this bridge so the sync
+/// client API could keep its signatures while the HTTP I/O underneath moved
+/// to an async `reqwest::Client`. Three ambient-runtime shapes reach it:
 ///
-/// Three cases the helper handles:
+/// 1. **Inside a multi-thread runtime** (the `#[tokio::main]` daemon, every
+///    HTTP handler, every `#[tokio::test(flavor = "multi_thread")]`) —
+///    `tokio::task::block_in_place` + `Handle::block_on`, which hands the
+///    worker thread back to the scheduler while the call is in flight.
+/// 2. **Inside a current-thread runtime** — `block_in_place` panics there and
+///    re-entering the runtime with a fresh `block_on` deadlocks. FX-D1
+///    (2026-05-27) fixed a production panic on this arm, reached via
+///    `daemon_runtime::build_llm_client` → `spawn_blocking`, whose pool
+///    thread INHERITS the runtime handle: the future moves to a freshly
+///    scoped OS thread that owns a one-shot current-thread runtime, so the
+///    outer runtime is never re-entered. Scoped (not detached) because the
+///    future borrows the caller's `&self`.
+/// 3. **No runtime at all** (a plain `#[test]`, the legacy synchronous CLI) —
+///    build a one-shot current-thread runtime in line.
 ///
-/// 1. **Inside a multi-thread tokio runtime** (the `#[tokio::main]`
-///    daemon + every HTTP request handler + every `cargo test`
-///    annotated `#[tokio::test(flavor = "multi_thread")]`) — uses
-///    `tokio::task::block_in_place` + `Handle::current().block_on` so
-///    the runtime keeps the worker thread productive for other tasks
-///    while the LLM HTTP call is in flight.
-/// 2. **Inside a current-thread tokio runtime** (the default
-///    `#[tokio::test]` flavor; production hit through
-///    `daemon_runtime::build_llm_client` → `spawn_blocking` when the
-///    outer runtime was current-thread) — `block_in_place` panics
-///    there, and re-entering the existing runtime via a fresh
-///    `block_on` deadlocks. We construct an ephemeral current-thread
-///    runtime on a freshly-spawned OS thread (via
-///    `std::thread::spawn`) so the outer runtime is not re-entered
-///    and the future drives to completion on an isolated thread.
-/// 3. **No tokio runtime at all** (a `#[test]` regression in a
-///    non-async test file, the legacy synchronous CLI path that
-///    bypasses `#[tokio::main]`) — build a fresh current-thread
-///    runtime in-line and `block_on` it directly.
+/// Production hot paths (HTTP handlers, daemon dispatch) should prefer the
+/// `*_async` variants and skip the bridge entirely.
 ///
-/// Returning a `Future`'s output through three different bridging
-/// shapes keeps the every-callsite-stays-sync contract intact while
-/// allowing the underlying HTTP I/O to migrate to async. Production
-/// hot paths (HTTP handlers, daemon dispatch) should prefer the
-/// `*_async` variants and skip the bridge entirely — the FX-D1
-/// surgical fix at `daemon_runtime::build_llm_client` does exactly
-/// this for the known callsite that surfaced the regression.
-/// #1752 — exposed `pub(crate)` so the MCP `pre_signal_send` enforcement
-/// bridge (`src/mcp/mod.rs`) can drive the async `HookChain::fire` synchronously
-/// from the sync stdio dispatch through the SAME three-flavor bridge (the
-/// `spawn_blocking`-under-multi-thread case uses `block_in_place`, never a
-/// panicking `Handle::current().block_on`).
-pub(crate) fn block_on_local<F, Fut, T>(make_fut: F) -> T
+/// # Why the budget exists (v1.0.0 #3140)
+///
+/// Every `reqwest` call under this bridge is already bounded (a client
+/// `timeout` + `connect_timeout`, plus per-send overrides). What was NOT
+/// bounded was the **bridge itself**: `block_in_place(|| handle.block_on(..))`
+/// parks a blocking-pool thread on the ambient runtime's driver, so if that
+/// driver never advances the future — a wedged mock server, a timer driver
+/// that is not being polled, a runtime whose only worker is the thread we
+/// just parked — the inner reqwest timeout never gets a chance to fire and
+/// the caller waits forever. #3140 burned a full 80-minute macOS CI job on
+/// exactly that shape.
+///
+/// `tokio::time::timeout(budget, ..)` is applied on **all three** arms, so
+/// expiry is enforced by whichever runtime is actually driving the future
+/// rather than by a caller who may never be scheduled again.
+///
+/// The multi-thread arm carries a second, independent bound. There the bridge
+/// blocks on a runtime it does not itself drive, so a starved time driver
+/// would defeat a tokio timer too; [`spawn_wallclock_alarm`] adds an ordinary
+/// OS-thread alarm that signals through a `oneshot` waker — nothing the
+/// wedged runtime can starve. Arms 2 and 3 each OWN the runtime driving their
+/// future, so their timer cannot be starved and they need no alarm.
+///
+/// # Choosing `budget`
+///
+/// The budget must strictly EXCEED the largest inner reqwest timeout on the
+/// wrapped call ([`BRIDGE_GENERATE_BUDGET`] / [`BRIDGE_HEALTH_BUDGET`] /
+/// [`BRIDGE_PULL_BUDGET`] / [`bridge_embed_batch_budget`] are the derived
+/// values). A budget tighter than the inner timeout would truncate requests
+/// the HTTP client would still have completed — degrading a working
+/// deployment instead of only catching a wedged one.
+///
+/// # Fail-closed
+///
+/// Every failure mode returns `Err`; none panics and none hangs.
+///
+/// * budget elapsed — the error names the budget;
+/// * the ephemeral runtime could not be built (fd/thread/memory exhaustion,
+///   a real fleet-density condition) — previously a `panic!` that killed the
+///   curator daemon thread or a `spawn_blocking` worker mid-request;
+/// * the bridge thread panicked — reported as an error rather than re-raised
+///   into an unrelated caller's stack.
+///
+/// The caller never gets a fabricated or partial value. Dropping the future
+/// on expiry also cancels the in-flight request (reqwest aborts on drop), so
+/// the socket is released too — the bridge does not merely stop waiting while
+/// the work continues.
+///
+/// # Residual bound on the scoped-thread arm
+///
+/// Arm 2 must move the future to a scoped OS thread, and
+/// `std::thread::scope` cannot return before joining — a scoped thread cannot
+/// be abandoned without unsoundness. The timeout is nonetheless *effective*
+/// there because the ephemeral runtime that thread builds owns its own timer
+/// driver and is driven by that thread alone: it is structurally immune to
+/// the parked-on-a-dead-driver wedge above. Only a future that blocks
+/// synchronously without ever reaching an await point could outlive the
+/// budget on that arm — and every future reaching this bridge is `reqwest`-
+/// or hook-chain-shaped, i.e. await-driven.
+///
+/// # Errors
+///
+/// Returns an error when `budget` elapses before the future completes, when
+/// the ephemeral runtime cannot be built, or when the bridge thread panicked.
+/// The future's own `Output` is returned verbatim inside `Ok` — when `T` is
+/// itself a `Result`, callers propagate with `?` and keep the inner `Result`
+/// as their return value.
+///
+/// #1752 — `pub(crate)` so the MCP `pre_signal_send` / pre-event enforcement
+/// gates (`src/mcp/mod.rs`) can drive `HookChain::fire` synchronously from
+/// the sync stdio dispatch through this SAME bridge.
+/// v1.0.0 #3140 — extra time the wall-clock alarm allows past the caller's
+/// budget before it fires.
+///
+/// The alarm is a BACKSTOP, not the primary bound: on a healthy runtime the
+/// `tokio::time::timeout` inside the bridge expires first and produces the
+/// precise, canonical error. The grace makes that ordering deterministic so
+/// the alarm's message only ever appears when the tokio timer genuinely could
+/// not fire.
+const BRIDGE_ALARM_GRACE: Duration = Duration::from_secs(5);
+
+/// v1.0.0 #3140 — how often the alarm thread re-checks for early completion.
+///
+/// Bounds how long a finished call leaves its alarm thread alive: at most one
+/// poll interval, so sequential callers never accumulate alarm threads.
+const BRIDGE_ALARM_POLL: Duration = Duration::from_millis(50);
+
+/// v1.0.0 #3140 — cancels a [`spawn_wallclock_alarm`] thread on drop.
+struct WallclockAlarmGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for WallclockAlarmGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// v1.0.0 #3140 — a wall-clock alarm that does NOT depend on any tokio timer.
+///
+/// # Why a plain OS thread
+///
+/// On the multi-thread arm the bridge blocks the CURRENT thread on a runtime
+/// it does not drive. `tokio::time::timeout` there registers with that
+/// runtime's time driver, so if the driver is starved — every worker wedged,
+/// nothing parked to advance it — the timeout never fires and the bound is
+/// theatre. That is precisely the failure #3140 could not rule out.
+///
+/// This alarm sleeps on an ordinary OS thread and signals through a
+/// `oneshot`, whose `send` wakes the parked `block_on` thread directly via its
+/// `Waker`. No timer wheel, no IO driver, no worker: nothing the wedged
+/// runtime can starve. Losing the `select!` race also DROPS the request
+/// future, so reqwest cancels the in-flight socket rather than leaking it.
+///
+/// # Cost
+///
+/// One thread per bridged multi-thread call, terminating within
+/// [`BRIDGE_ALARM_POLL`] of the call finishing (the returned guard flips the
+/// completion flag on drop). Negligible next to the HTTP round-trip the call
+/// is making, and the bridge is a last-resort surface — production hot paths
+/// use the `*_async` variants.
+///
+/// If the thread cannot be spawned (thread exhaustion), the returned future is
+/// simply never ready: the caller degrades to the tokio-timer bound rather
+/// than being handed a spurious immediate expiry.
+fn spawn_wallclock_alarm(
+    budget: Duration,
+) -> (impl std::future::Future<Output = ()>, WallclockAlarmGuard) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let flag = std::sync::Arc::clone(&done);
+    let spawned = std::thread::Builder::new()
+        .name("llm-bridge-alarm".to_string())
+        .spawn(move || {
+            let deadline = Instant::now() + budget;
+            while !flag.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    let _ = tx.send(());
+                    return;
+                }
+                std::thread::sleep(BRIDGE_ALARM_POLL);
+            }
+        })
+        .is_ok();
+
+    let fired = async move {
+        // A dropped sender (thread exhaustion, or a panic in the alarm thread)
+        // must NOT read as "budget exceeded" — degrade to never-ready instead.
+        if !spawned || rx.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    (fired, WallclockAlarmGuard(done))
+}
+
+pub(crate) fn block_on_local_bounded<F, Fut, T>(budget: Duration, make_fut: F) -> Result<T>
 where
     F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = T>,
     T: Send,
 {
+    // Built lazily INSIDE whichever arm runs: on the scoped-thread arm the
+    // `Fut` must be constructed on the bridge thread (only `F: Send` is
+    // required by this helper's contract, never `Fut: Send`).
+    async fn bounded<F, Fut, T>(budget: Duration, make_fut: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        tokio::time::timeout(budget, make_fut())
+            .await
+            .map_err(|_| anyhow!("llm bridge budget {budget:?} exceeded"))
+    }
+
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => {
-                // Productive case — block_in_place yields the worker
-                // thread back to the scheduler while we wait. Safe
-                // even when called from inside another spawn_blocking
-                // closure because block_in_place is a no-op when not
-                // running on a worker thread (the inner block_on then
-                // simply parks the current OS thread).
-                tokio::task::block_in_place(|| handle.block_on(make_fut()))
-            }
-            _ => {
-                // Current-thread runtime — `block_in_place` panics
-                // there, and re-entering the runtime via a fresh
-                // `block_on` deadlocks. FX-D1 (2026-05-27): the
-                // previous design panicked here, but production hit
-                // this branch via `daemon_runtime::build_llm_client`'s
-                // `spawn_blocking` (the blocking pool thread inherits
-                // the outer current-thread runtime handle). We now
-                // move the `FnOnce` future-builder onto a freshly-
-                // scoped OS thread that owns its own one-shot
-                // current-thread runtime. That thread has no
-                // inherited tokio context, so the inner `block_on`
-                // does not re-enter the outer runtime and does not
-                // deadlock.
-                //
-                // We use `std::thread::scope` instead of
-                // `std::thread::spawn` so the closure can borrow
-                // non-`'static` data from the caller (e.g. the
-                // `&self` capture every `block_on_local(|| self.foo_async(...))`
-                // wrapper carries). Scoped threads guarantee the
-                // borrow outlives the spawn-and-join pair.
-                //
-                // Cost: one thread spawn + one join per call. The sync
-                // wrapper is a bridge-of-last-resort surface — every
-                // production hot path either runs on a multi-thread
-                // runtime (which uses the productive arm above) or
-                // calls the `*_async` variant directly. The
-                // current-thread arm is exercised only by tests that
-                // defaulted to current-thread and by the legacy
-                // `spawn_blocking → sync wrapper` chain that FX-D1
-                // surgically migrated to the async path at known
-                // callsites.
-                std::thread::scope(|s| {
-                    s.spawn(move || {
-                        tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("ephemeral runtime builds")
-                            .block_on(make_fut())
+                // The ONLY arm whose timer belongs to a runtime this thread
+                // does not drive, so it is also the only arm that needs the
+                // driver-independent alarm (see `spawn_wallclock_alarm`).
+                // Arms 2 and 3 each own the runtime driving their future, so
+                // their `tokio::time::timeout` cannot be starved.
+                let (alarm, _alarm_guard) =
+                    spawn_wallclock_alarm(budget.saturating_add(BRIDGE_ALARM_GRACE));
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        tokio::select! {
+                            out = bounded(budget, make_fut) => out,
+                            () = alarm => Err(anyhow!(
+                                "llm bridge budget {budget:?} exceeded \
+                                 (wall-clock alarm: the ambient runtime never advanced \
+                                  the request future)"
+                            )),
+                        }
                     })
-                    .join()
-                    .expect(
-                        "block_on_local current-thread bridge thread panicked; \
-                         underlying future panicked",
-                    )
                 })
             }
+            _ => std::thread::scope(|s| -> Result<T> {
+                s.spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context(EPHEMERAL_RUNTIME_BUILD_MSG)?
+                        .block_on(bounded(budget, make_fut))
+                })
+                .join()
+                .map_err(|_| {
+                    anyhow!(
+                        "block_on_local_bounded current-thread bridge thread panicked; \
+                         underlying future panicked"
+                    )
+                })?
+            }),
         }
     } else {
-        // No runtime at all (e.g. a plain `#[test]` that constructs
-        // an `OllamaClient` for unit testing). Build a one-shot
-        // current-thread runtime.
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("ephemeral runtime builds")
-            .block_on(make_fut())
+            .context(EPHEMERAL_RUNTIME_BUILD_MSG)?
+            .block_on(bounded(budget, make_fut))
     }
 }
 
@@ -495,6 +608,53 @@ const PULL_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// v0.7.0 F6 — health-probe timeout. Quick check at /api/tags.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// v1.0.0 #3140 — multiplier applied to the largest *inner* reqwest
+/// timeout of a call to derive that call's **bridge budget**, the outer
+/// wall-clock ceiling enforced by [`block_on_local_bounded`].
+///
+/// The outer budget must strictly EXCEED the inner per-request timeout so
+/// the bridge never truncates a request the HTTP client would still have
+/// completed. It fires only when the inner timeout failed to release the
+/// caller at all — the wedge shape #3140 hit, where the future was parked
+/// on a runtime driver that never ran.
+const BRIDGE_BUDGET_FACTOR: u64 = 2;
+
+/// v1.0.0 #3140 — bridge budget for a single chat/embed generation
+/// round-trip (inner ceiling [`GENERATE_TIMEOUT`]).
+const BRIDGE_GENERATE_BUDGET: Duration =
+    Duration::from_secs(GENERATE_TIMEOUT.as_secs() * BRIDGE_BUDGET_FACTOR);
+
+/// v1.0.0 #3140 — bridge budget for a health probe (inner ceiling
+/// [`HEALTH_TIMEOUT`]).
+const BRIDGE_HEALTH_BUDGET: Duration =
+    Duration::from_secs(HEALTH_TIMEOUT.as_secs() * BRIDGE_BUDGET_FACTOR);
+
+/// v1.0.0 #3140 — bridge budget for a `/api/tags` listing followed by a
+/// model `/api/pull` (inner ceiling [`PULL_TIMEOUT`], which already
+/// dominates [`GENERATE_TIMEOUT`]).
+const BRIDGE_PULL_BUDGET: Duration =
+    Duration::from_secs(PULL_TIMEOUT.as_secs() * BRIDGE_BUDGET_FACTOR);
+
+/// v1.0.0 #3140 — bridge budget for a BATCHED embed.
+///
+/// A batch fans out to an input-dependent number of round-trips (one per
+/// sub-batch, degrading to one per text when a sub-batch is rejected), so a
+/// fixed constant would either truncate a legitimate large backfill or be so
+/// large as to be meaningless. Scaling with the input keeps the budget an
+/// honest ceiling: the true worst case is one [`GENERATE_TIMEOUT`]-bounded
+/// request per text, and this is twice that.
+fn bridge_embed_batch_budget(n_texts: usize) -> Duration {
+    let factor = u32::try_from(n_texts.max(1)).unwrap_or(u32::MAX);
+    BRIDGE_GENERATE_BUDGET.saturating_mul(factor)
+}
+
+/// v1.0.0 #3140 — single source for the ephemeral-runtime build-failure
+/// message shared by both sync↔async bridge helpers (the
+/// no-hardcoded-literals gate requires a literal on 3+ production sites to
+/// be a named `const`).
+const EPHEMERAL_RUNTIME_BUILD_MSG: &str = "ephemeral runtime builds";
+
 /// v0.7.0 F6 — circuit-breaker window. After [`CIRCUIT_BREAKER_THRESHOLD`]
 /// consecutive failures the client fast-fails until this window elapses.
 /// Re-establishes a probe attempt after the window.
@@ -1146,18 +1306,18 @@ impl OllamaClient {
     /// FX-D1 (v0.7.0, 2026-05-27) — async sibling of
     /// [`Self::build_from_resolved`]. Surgical fix for the
     /// `daemon_runtime::build_llm_client` callsite that hit the
-    /// FX-C1 `block_on_local` current-thread panic: the daemon
+    /// FX-C1 sync↔async-bridge current-thread panic: the daemon
     /// wrapped this sync constructor in `tokio::task::spawn_blocking`,
     /// and the blocking pool thread inherited the outer (current-
     /// thread, in `#[tokio::test]`) runtime handle, which drove
-    /// `block_on_local` into its panic arm.
+    /// the bridge into its (since-removed) panic arm.
     ///
     /// Callers already on a tokio runtime — the daemon's
     /// `build_llm_client`, `mcp/mod.rs::run_mcp_server` once it
     /// migrates, and CLI atomise/curator builders — should call this
     /// directly to bypass the sync→async bridge entirely. The Ollama
     /// arm now goes through [`Self::new_with_url_async`] (no
-    /// `block_on_local`); the non-Ollama arm uses
+    /// `block_on_local_bounded`); the non-Ollama arm uses
     /// [`Self::new_openai_compatible`] which is already pure-sync
     /// (no I/O — just a `reqwest::Client::builder`).
     ///
@@ -1257,7 +1417,7 @@ impl OllamaClient {
     /// `timeout` is preserved at [`GENERATE_TIMEOUT`].
     ///
     /// **PERF-9 (v0.7.0 FX-C1, 2026-05-26).** Sync wrapper around
-    /// [`Self::new_with_url_async`] via the `block_on_local` helper.
+    /// [`Self::new_with_url_async`] via the `block_on_local_bounded` helper.
     /// Callers already on a tokio runtime should prefer the async
     /// constructor directly.
     ///
@@ -1269,7 +1429,9 @@ impl OllamaClient {
     /// verification to first-use should use
     /// [`Self::new_with_url_no_health_check`] instead.
     pub fn new_with_url(base_url: &str, model: &str) -> Result<Self> {
-        block_on_local(|| Self::new_with_url_async(base_url, model))
+        block_on_local_bounded(BRIDGE_HEALTH_BUDGET, || {
+            Self::new_with_url_async(base_url, model)
+        })?
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async constructor variant. Builds the
@@ -1366,7 +1528,9 @@ impl OllamaClient {
     /// [`Self::is_available_async`]. The async variant should be
     /// preferred by every callsite already on a tokio runtime.
     pub fn is_available(&self) -> bool {
-        block_on_local(|| self.is_available_async())
+        // #3140 — a health probe that outlives its bridge budget IS
+        // "not available"; degrade to false rather than park the caller.
+        block_on_local_bounded(BRIDGE_HEALTH_BUDGET, || self.is_available_async()).unwrap_or(false)
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async variant of [`Self::is_available`].
@@ -1398,7 +1562,7 @@ impl OllamaClient {
     /// **PERF-9 (v0.7.0 FX-C1)** — sync wrapper around
     /// [`Self::ensure_model_async`].
     pub fn ensure_model(&self) -> Result<()> {
-        block_on_local(|| self.ensure_model_async())
+        block_on_local_bounded(BRIDGE_PULL_BUDGET, || self.ensure_model_async())?
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async variant of [`Self::ensure_model`].
@@ -1484,13 +1648,15 @@ impl OllamaClient {
     /// runtime (HTTP handlers, the daemon path) should prefer the
     /// async variant directly to skip the bridge overhead.
     pub fn generate(&self, prompt: &str, system: Option<&str>) -> Result<String> {
-        block_on_local(|| self.generate_async(prompt, system))
+        block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || {
+            self.generate_async(prompt, system)
+        })?
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async variant of [`Self::generate`].
     /// Same circuit-breaker semantics; same wire shape; same error
     /// branches. Use this from any caller already inside a tokio
-    /// runtime to avoid the `block_on_local` bridge.
+    /// runtime to avoid the `block_on_local_bounded` bridge.
     ///
     /// # Errors
     ///
@@ -1613,7 +1779,9 @@ impl OllamaClient {
         system: Option<&str>,
         tools: &[ToolDef],
     ) -> Result<ChatOutcome> {
-        block_on_local(|| self.generate_with_tools_async(prompt, system, tools))
+        block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || {
+            self.generate_with_tools_async(prompt, system, tools)
+        })?
     }
 
     /// #1866 (§11.5 B7-FC-1) — tool/function-calling variant of
@@ -1765,7 +1933,7 @@ impl OllamaClient {
 
     /// Uses the LLM to expand a search query into additional search terms.
     pub fn expand_query(&self, query: &str) -> Result<Vec<String>> {
-        block_on_local(|| self.expand_query_async(query))
+        block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || self.expand_query_async(query))?
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async variant of [`Self::expand_query`].
@@ -1790,7 +1958,9 @@ impl OllamaClient {
 
     /// Takes (title, content) pairs and returns a consolidated summary.
     pub fn summarize_memories(&self, memories: &[(String, String)]) -> Result<String> {
-        block_on_local(|| self.summarize_memories_async(memories))
+        block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || {
+            self.summarize_memories_async(memories)
+        })?
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async variant of [`Self::summarize_memories`].
@@ -1851,7 +2021,9 @@ impl OllamaClient {
         content: &str,
         model_override: Option<&str>,
     ) -> Result<Vec<String>> {
-        block_on_local(|| self.auto_tag_async(title, content, model_override))
+        block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || {
+            self.auto_tag_async(title, content, model_override)
+        })?
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async variant of [`Self::auto_tag`].
@@ -1896,7 +2068,9 @@ impl OllamaClient {
         system: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<String> {
-        block_on_local(|| self.generate_with_model_override_async(prompt, system, model_override))
+        block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || {
+            self.generate_with_model_override_async(prompt, system, model_override)
+        })?
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async variant of
@@ -2062,7 +2236,9 @@ impl OllamaClient {
     /// shape). Any new caller should use the provider-aware path.
     #[allow(dead_code)]
     fn generate_with_body(&self, body: &Value) -> Result<String> {
-        block_on_local(|| self.generate_with_body_async(body))
+        block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || {
+            self.generate_with_body_async(body)
+        })?
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async legacy `/api/generate` helper.
@@ -2134,7 +2310,9 @@ impl OllamaClient {
     /// by the same circuit breaker so a dead ollama endpoint doesn't
     /// block every store/recall path on a per-call timeout.
     pub fn embed_text(&self, text: &str, embed_model: &str) -> Result<Vec<f32>> {
-        block_on_local(|| self.embed_text_async(text, embed_model))
+        block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || {
+            self.embed_text_async(text, embed_model)
+        })?
     }
 
     /// v1.0.0 #2577 — [`Self::embed_text`] under an explicit wall-clock
@@ -2157,7 +2335,9 @@ impl OllamaClient {
     ) -> Result<Vec<f32>> {
         match budget {
             None => self.embed_text(text, embed_model),
-            Some(b) => block_on_local(|| self.embed_text_async_with_budget(text, embed_model, b)),
+            Some(b) => block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || {
+                self.embed_text_async_with_budget(text, embed_model, b)
+            })?,
         }
     }
 
@@ -2321,7 +2501,7 @@ impl OllamaClient {
 
     /// #1603 — generate embeddings for MANY texts, batching the wire
     /// where the provider supports it. Sync wrapper over
-    /// [`Self::embed_texts_async`] (same `block_on_local` discipline as
+    /// [`Self::embed_texts_async`] (same `block_on_local_bounded` discipline as
     /// [`Self::embed_text`]).
     ///
     /// # Errors
@@ -2329,7 +2509,9 @@ impl OllamaClient {
     /// Propagates the first per-request error (see
     /// [`Self::embed_texts_async`]).
     pub fn embed_texts(&self, texts: &[&str], embed_model: &str) -> Result<Vec<Vec<f32>>> {
-        block_on_local(|| self.embed_texts_async(texts, embed_model))
+        block_on_local_bounded(bridge_embed_batch_budget(texts.len()), || {
+            self.embed_texts_async(texts, embed_model)
+        })?
     }
 
     /// #1603 — async batched embed. Provider behaviour:
@@ -2495,7 +2677,7 @@ impl OllamaClient {
     /// - OpenAI-compatible: **no-op** — vendor-side concern (operator
     ///   confirms model availability on their plan).
     pub fn ensure_embed_model(&self, model: &str) -> Result<()> {
-        block_on_local(|| self.ensure_embed_model_async(model))
+        block_on_local_bounded(BRIDGE_PULL_BUDGET, || self.ensure_embed_model_async(model))?
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async variant of [`Self::ensure_embed_model`].
@@ -2559,7 +2741,9 @@ impl OllamaClient {
 
     /// Returns true if two memory contents contradict each other.
     pub fn detect_contradiction(&self, mem_a: &str, mem_b: &str) -> Result<bool> {
-        block_on_local(|| self.detect_contradiction_async(mem_a, mem_b))
+        block_on_local_bounded(BRIDGE_GENERATE_BUDGET, || {
+            self.detect_contradiction_async(mem_a, mem_b)
+        })?
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async variant of
@@ -3664,6 +3848,41 @@ mod wiremock_tests {
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// v1.0.0 #3140 — outer wall-clock guard for any test that drives the
+    /// sync↔async bridge from the blocking pool.
+    ///
+    /// The bridge itself is now bounded structurally
+    /// ([`super::block_on_local_bounded`]); this is the test-level backstop
+    /// so a future wedge fails in seconds with a message instead of burning
+    /// the whole CI job cap the way #3140 did (72 min on macOS). It is
+    /// deliberately far larger than any legitimate mock round-trip, so it can
+    /// never fire on a merely slow runner.
+    const HUNG_TEST_GUARD: std::time::Duration = std::time::Duration::from_mins(1);
+
+    /// v1.0.0 #3140 — run a blocking bridge call under [`HUNG_TEST_GUARD`].
+    async fn bridge_call<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::time::timeout(HUNG_TEST_GUARD, tokio::task::spawn_blocking(f))
+            .await
+            .expect("sync↔async bridge call must not hang past the guard (#3140)")
+            .expect("bridge call task must not panic")
+    }
+
+    /// v1.0.0 #3140 — a bounded `reqwest` client for tests.
+    ///
+    /// `reqwest::Client::new()` has NO request timeout, so a mock server that
+    /// accepts a connection and then never answers parks the test forever.
+    fn bounded_test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(super::HEALTH_TIMEOUT)
+            .connect_timeout(super::CONNECT_TIMEOUT)
+            .build()
+            .expect("bounded test client builds")
+    }
+
     /// Mount a default permissive `/api/tags` responder so `new_with_url`'s
     /// embedded `is_available()` health check succeeds.
     async fn mount_tags_ok(server: &MockServer, models: serde_json::Value) {
@@ -3688,7 +3907,7 @@ mod wiremock_tests {
             .mount(&server)
             .await;
         let url = format!("{}/big", server.uri());
-        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let resp = bounded_test_client().get(&url).send().await.unwrap();
         let err = read_capped_bytes_inner(resp, 64)
             .await
             .expect_err("oversize body MUST be rejected by the cap");
@@ -3710,7 +3929,7 @@ mod wiremock_tests {
             .mount(&server)
             .await;
         let url = format!("{}/ok", server.uri());
-        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let resp = bounded_test_client().get(&url).send().await.unwrap();
         let v = read_capped_json(resp).await.unwrap();
         assert_eq!(v["hello"], "world");
     }
@@ -3775,7 +3994,7 @@ mod wiremock_tests {
         // out before returning. Instead, build a client by hand by going
         // through reqwest directly and asserting the health-probe path
         // returns false.
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             // Use the same builder OllamaClient uses internally so the
             // assertion exercises the same code path semantically.
             let client = reqwest::blocking::Client::builder()
@@ -3788,8 +4007,7 @@ mod wiremock_tests {
                 .send()
                 .is_ok_and(|r| r.status().is_success())
         })
-        .await
-        .unwrap();
+        .await;
 
         assert!(
             !result,
@@ -3807,13 +4025,12 @@ mod wiremock_tests {
             .await;
 
         let uri = server.uri();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             // Constructor will fail (since is_available returns false)
             // — verify that path explicitly.
             OllamaClient::new_with_url(&uri, "test-model")
         })
-        .await
-        .unwrap();
+        .await;
 
         // Avoid `unwrap_err()` here because `OllamaClient` doesn't impl
         // Debug — match on the Result and pull the message out manually.
@@ -3869,12 +4086,11 @@ mod wiremock_tests {
             .await;
 
         let uri = server.uri();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
             client.ensure_model()
         })
-        .await
-        .unwrap();
+        .await;
         assert!(
             result.is_ok(),
             "ensure_model should succeed; got {result:?}"
@@ -3900,12 +4116,11 @@ mod wiremock_tests {
             .await;
 
         let uri = server.uri();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
             client.ensure_model()
         })
-        .await
-        .unwrap();
+        .await;
         assert!(
             result.is_ok(),
             "ensure_model should succeed; got {result:?}"
@@ -3931,12 +4146,11 @@ mod wiremock_tests {
             .await;
 
         let uri = server.uri();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
             client.generate("ping", None)
         })
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(result.unwrap(), "hello");
     }
@@ -3956,12 +4170,11 @@ mod wiremock_tests {
             .await;
 
         let uri = server.uri();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
             client.generate("ping", None)
         })
-        .await
-        .unwrap();
+        .await;
 
         assert!(result.is_err(), "malformed JSON should surface an error");
         let err = result.unwrap_err().to_string();
@@ -3982,12 +4195,11 @@ mod wiremock_tests {
             .await;
 
         let uri = server.uri();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
             client.generate("ping", None)
         })
-        .await
-        .unwrap();
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -4144,12 +4356,11 @@ mod wiremock_tests {
             .await;
 
         let uri = server.uri();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
             client.embed_text("hi", "nomic-embed-text")
         })
-        .await
-        .unwrap();
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -4169,12 +4380,11 @@ mod wiremock_tests {
             .await;
 
         let uri = server.uri();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
             client.embed_text("hi", "nomic-embed-text")
         })
-        .await
-        .unwrap();
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("500"));
     }
@@ -4328,15 +4538,14 @@ mod wiremock_tests {
             .await;
 
         let uri = server.uri();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
             client.detect_contradiction(
                 "The database migration completed successfully",
                 "The frontend build pipeline failed",
             )
         })
-        .await
-        .unwrap();
+        .await;
         assert!(
             !result.unwrap(),
             "different-subject pair must be suppressed by the pre-check even when the LLM says yes"
@@ -4360,15 +4569,14 @@ mod wiremock_tests {
             .await;
 
         let uri = server.uri();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = bridge_call(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
             client.detect_contradiction(
                 "The API endpoint returns status 200",
                 "The API endpoint returns status 500",
             )
         })
-        .await
-        .unwrap();
+        .await;
         assert!(
             result.unwrap(),
             "shared-subject genuine contradiction must reach the LLM and return true"
@@ -4831,7 +5039,7 @@ mod c5_breaker_tests {
 // PERF-9 (v0.7.0 FX-C1, 2026-05-26) — async-path coverage.
 //
 // The pre-PERF-9 wiremock tests above drive every public surface through
-// the SYNC API (which now block_on_local's into the async impl). These
+// the SYNC API (which now block_on_local_bounded's into the async impl). These
 // tests drive the SAME wire shapes through the `*_async` API directly,
 // so the async path itself is line-covered. Every error branch is
 // exercised in addition to the happy path so the operator's "maximum
@@ -5892,7 +6100,7 @@ mod perf9_async_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn sync_wrapper_runs_under_block_in_place_path() {
-        // The block_on_local bridge inside a multi_thread runtime
+        // The block_on_local_bounded bridge inside a multi_thread runtime
         // dispatches through block_in_place + Handle::current().block_on.
         // Drive `OllamaClient::generate` (sync) inside a multi_thread
         // tokio runtime so the production daemon's call path is
@@ -6268,14 +6476,14 @@ mod perf9_async_tests {
         assert!(err.contains("API key"));
     }
 
-    // ============ no-runtime path of block_on_local ============
+    // ============ no-runtime path of block_on_local_bounded ============
 
     #[test]
     fn sync_wrapper_outside_runtime_constructs_ephemeral() {
         // Stand up a wiremock server inside an explicit tokio runtime
         // (because wiremock requires async to start), but drive the
         // OllamaClient sync API from a plain `#[test]` (no #[tokio::test])
-        // so `Handle::try_current()` returns Err and `block_on_local`
+        // so `Handle::try_current()` returns Err and `block_on_local_bounded`
         // hits the ephemeral-runtime arm.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -6306,6 +6514,168 @@ mod perf9_async_tests {
             .unwrap();
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3140 — sync↔async bridge budget enforcement.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod bridge_budget_tests_3140 {
+    use super::block_on_local_bounded;
+    use std::time::{Duration, Instant};
+
+    /// A budget small enough that any real wait blows it, large enough that a
+    /// loaded runner still schedules the timer.
+    const TINY_BUDGET: Duration = Duration::from_millis(50);
+
+    /// Far longer than [`TINY_BUDGET`]; the test asserts we return WITHOUT
+    /// waiting for it.
+    const LONG_SLEEP: Duration = Duration::from_secs(30);
+
+    /// Ceiling on how long the bridge itself may take to give up, once its
+    /// bound has fired.
+    const RETURN_CEILING: Duration = Duration::from_secs(5);
+
+    fn assert_budget_error_within(res: anyhow::Result<()>, elapsed: Duration, ceiling: Duration) {
+        let err = res.expect_err("an over-budget bridge call MUST return Err, not hang");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("budget"),
+            "the error must name the budget it exceeded: {msg}"
+        );
+        assert!(
+            elapsed < ceiling,
+            "the bridge must release the caller at the budget, not wait for the \
+             future: {elapsed:?}"
+        );
+    }
+
+    fn assert_budget_error(res: anyhow::Result<()>, elapsed: Duration) {
+        assert_budget_error_within(res, elapsed, RETURN_CEILING);
+    }
+
+    /// Arm 3 — no ambient runtime (a plain `#[test]`, the shape
+    /// `curator::tests::run_once_with_llm_dry_run_skips_writes` hung on).
+    #[test]
+    fn budget_expiry_is_an_error_with_no_ambient_runtime() {
+        let t0 = Instant::now();
+        let res = block_on_local_bounded(TINY_BUDGET, || async {
+            tokio::time::sleep(LONG_SLEEP).await;
+        });
+        assert_budget_error(res, t0.elapsed());
+    }
+
+    /// Arm 1 — multi-thread runtime via `block_in_place` (the shape
+    /// `llm::wiremock_tests::test_generate_returns_error_on_500` hung on).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn budget_expiry_is_an_error_under_a_multi_thread_runtime() {
+        let res = tokio::task::spawn_blocking(|| {
+            let t0 = Instant::now();
+            let res = block_on_local_bounded(TINY_BUDGET, || async {
+                tokio::time::sleep(LONG_SLEEP).await;
+            });
+            (res, t0.elapsed())
+        })
+        .await
+        .expect("bridge probe task must not panic");
+        assert_budget_error(res.0, res.1);
+    }
+
+    /// Arm 2 — current-thread ambient runtime, which moves the future to a
+    /// scoped thread owning its own ephemeral runtime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn budget_expiry_is_an_error_under_a_current_thread_runtime() {
+        let t0 = Instant::now();
+        let res = block_on_local_bounded(TINY_BUDGET, || async {
+            tokio::time::sleep(LONG_SLEEP).await;
+        });
+        assert_budget_error(res, t0.elapsed());
+    }
+
+    /// The wall-clock alarm fires on its own budget, with no tokio timer
+    /// involved beyond awaiting the `oneshot`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wallclock_alarm_fires_after_its_budget() {
+        let alarm_budget = Duration::from_millis(100);
+        let (alarm, _guard) = super::spawn_wallclock_alarm(alarm_budget);
+        let t0 = Instant::now();
+        alarm.await;
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= alarm_budget,
+            "the alarm must not fire EARLY (that would truncate a healthy call): {elapsed:?}"
+        );
+        assert!(
+            elapsed < RETURN_CEILING,
+            "the alarm must fire promptly after its budget: {elapsed:?}"
+        );
+    }
+
+    /// The #3140 wedge, reproduced deterministically: a multi-thread runtime
+    /// whose ONLY worker is occupied by a task that never yields, so the
+    /// runtime's time driver can never be advanced and the bridge's
+    /// `tokio::time::timeout` is structurally unable to fire.
+    ///
+    /// Whichever bound wins the race, the contract this pins is the one that
+    /// matters: the caller is RELEASED with an error naming the budget instead
+    /// of parking until the CI job cap.
+    #[test]
+    fn starved_time_driver_still_releases_the_caller() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_task = Arc::clone(&stop);
+
+        let (res, elapsed) = rt.block_on(async move {
+            tokio::spawn(async move {
+                while !stop_for_task.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            tokio::task::spawn_blocking(|| {
+                let t0 = Instant::now();
+                let res = block_on_local_bounded(TINY_BUDGET, || async {
+                    tokio::time::sleep(LONG_SLEEP).await;
+                });
+                (res, t0.elapsed())
+            })
+            .await
+            .expect("bridge probe task must not panic")
+        });
+
+        stop.store(true, Ordering::Release);
+        rt.shutdown_background();
+
+        // The alarm's grace window is added on top: whichever bound wins, the
+        // caller is released well inside it.
+        assert_budget_error_within(res, elapsed, super::BRIDGE_ALARM_GRACE + RETURN_CEILING);
+    }
+
+    /// The happy path is untouched: a future that finishes inside its budget
+    /// returns its value verbatim.
+    #[test]
+    fn under_budget_call_returns_its_value() {
+        let out = block_on_local_bounded(Duration::from_secs(30), || async { 41_u32 + 1 })
+            .expect("an under-budget call must succeed");
+        assert_eq!(out, 42);
+    }
+
+    // NOT TESTED, deliberately: the `Runtime::build()` failure path (fd /
+    // thread / memory exhaustion). Tokio exposes no injection point for a
+    // failing builder, and the only way to force it — exhausting the process
+    // fd or thread limit — would be a process-wide side effect that corrupts
+    // every other test in this binary. The fix is nonetheless load-bearing:
+    // that path now returns `Err` through `?` rather than `panic!`-ing on a
+    // curator daemon thread or a `spawn_blocking` worker, which is verified by
+    // the type (the function returns `anyhow::Result<T>` and contains no
+    // `expect` on the builder).
 }
 
 #[cfg(test)]

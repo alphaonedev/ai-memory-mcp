@@ -463,12 +463,31 @@ fn spawn_healthy_serve(
     unreachable!("loop returns or panics on the final attempt")
 }
 
+/// v1.0.0 #3140 — `curl --max-time` (`-m`) rider, in seconds, for a
+/// READINESS PROBE issued inside a bounded retry loop.
+///
+/// Without it a probe that connects and then stalls parks the whole test
+/// binary: the surrounding `for _ in 0..N` loop counts iterations, not
+/// wall-clock, so one wedged probe defeats the loop's own bound.
+const CURL_PROBE_MAX_SECS: &str = "2";
+
+/// v1.0.0 #3140 — `curl --max-time` (`-m`) rider, in seconds, for a real
+/// API call (not a probe).
+///
+/// Deliberately far larger than [`CURL_PROBE_MAX_SECS`]: these carry bodies
+/// and run against an instrumented daemon under `cargo-llvm-cov` (3-5x
+/// slower), so a probe-tight cap would convert a slow runner into a red
+/// test. The point is a bound that exists, not a tight one.
+const CURL_REQUEST_MAX_SECS: &str = "30";
+
 fn wait_for_health(port: u16) -> bool {
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if let Ok(out) = std::process::Command::new("curl")
             .args([
                 "-s",
+                "-m",
+                CURL_PROBE_MAX_SECS,
                 "-o",
                 "/dev/null",
                 "-w",
@@ -550,6 +569,8 @@ fn refusal_maps_to_http_403() {
     let curl_with_body = std::process::Command::new("curl")
         .args([
             "-s",
+            "-m",
+            CURL_REQUEST_MAX_SECS,
             "-w",
             "\nSTATUS:%{http_code}",
             "-X",

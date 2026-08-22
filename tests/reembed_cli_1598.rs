@@ -29,6 +29,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::time::Duration;
 
 use ai_memory::db;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
@@ -131,8 +132,61 @@ fn run_reembed(db_path: &Path, base_url: &str, model: &str, extra_args: &[&str])
         .env("AI_MEMORY_EMBED_API_KEY", "reembed-key-1598")
         .env_remove("AI_MEMORY_EMBED_BACKFILL_BATCH")
         .env_remove("AI_MEMORY_DB");
-    cmd.output()
-        .expect("spawning the ai-memory binary must succeed")
+    output_within(cmd, db_path)
+}
+
+/// v1.0.0 #3140 — wall-clock ceiling for one `reembed` child.
+///
+/// The binary talks to a local wiremock `/embeddings` server; a healthy run is
+/// sub-second. This bound only ever fires on a genuine wedge — and when it
+/// does the child is KILLED, so a hung reembed cannot hold the job cap (or a
+/// sqlite write lock on the scratch DB) the way #3140's hang did.
+const REEMBED_CHILD_BUDGET: Duration = Duration::from_mins(2);
+
+/// v1.0.0 #3140 — poll cadence while waiting on the child.
+const REEMBED_CHILD_POLL: Duration = Duration::from_millis(25);
+
+/// v1.0.0 #3140 — `Command::output()` under [`REEMBED_CHILD_BUDGET`].
+///
+/// `output()` reads both pipes to EOF with no deadline, so a child that never
+/// exits parks the test forever. Redirecting to files instead of pipes keeps
+/// the reap free of the classic full-pipe deadlock: the child can always make
+/// progress, so `try_wait` is a truthful liveness signal. Capture files live
+/// beside the scratch DB (never `/tmp`, per the project hard rule).
+fn output_within(mut cmd: std::process::Command, db_path: &Path) -> Output {
+    let stem = db_path.with_extension(format!("{}", std::process::id()));
+    let out_path = PathBuf::from(format!("{}.stdout", stem.display()));
+    let err_path = PathBuf::from(format!("{}.stderr", stem.display()));
+    let out_file = std::fs::File::create(&out_path).expect("create stdout capture");
+    let err_file = std::fs::File::create(&err_path).expect("create stderr capture");
+    let mut child = cmd
+        .stdout(out_file)
+        .stderr(err_file)
+        .spawn()
+        .expect("spawning the ai-memory binary must succeed");
+
+    let deadline = std::time::Instant::now() + REEMBED_CHILD_BUDGET;
+    let status = loop {
+        match child.try_wait().expect("try_wait on the reembed child") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("`ai-memory reembed` still running after {REEMBED_CHILD_BUDGET:?} (#3140)");
+            }
+            None => std::thread::sleep(REEMBED_CHILD_POLL),
+        }
+    };
+
+    let stdout = std::fs::read(&out_path).unwrap_or_default();
+    let stderr = std::fs::read(&err_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&err_path);
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 /// Parse the last non-empty stdout line as JSON (the `--json` contract:
