@@ -29,8 +29,8 @@
 //! run on EVERY CI leg and pin:
 //!
 //! 1. Control #15 resolves from the STORE URL — the pg compensating control
-//!    on a `postgres://` DSN (PASSing on `sslmode=verify-full` + attested,
-//!    FAILing below that), and the byte-identical sqlcipher predicate
+//!    on a `postgres://` DSN (passing on `sslmode=verify-full` + attested,
+//!    failing below that), and the byte-identical sqlcipher predicate
 //!    otherwise. Asserted INDEPENDENTLY of every other control, so a future
 //!    control addition can never again masquerade as a #15 failure.
 //! 2. The certified pg config is SATISFIABLE end-to-end: with the certified
@@ -157,7 +157,7 @@ fn row(rows: &[(String, bool)], prefix: &str) -> Option<bool> {
 }
 
 /// LEG 1 — on a `postgres://` DSN, control #15 IS the pg compensating control
-/// and PASSes on `sslmode=verify-full` + the operator at-rest attestation.
+/// and passes on `sslmode=verify-full` + the operator at-rest attestation.
 ///
 /// Asserted with the rest of the posture deliberately DEVIATING: #15's
 /// resolution must be readable on its own, never inferred from the overall
@@ -195,7 +195,7 @@ fn pg_dsn_resolves_control_15_to_the_compensating_control() {
 }
 
 /// LEG 2 — the pg compensating control is genuinely load-bearing: weakening
-/// the DSN below `verify-full` FAILs the same row (a real check, not a
+/// the DSN below `verify-full` fails the same row (a real check, not a
 /// backend-shaped rubber stamp).
 #[test]
 fn pg_control_15_fails_below_verify_full() {
