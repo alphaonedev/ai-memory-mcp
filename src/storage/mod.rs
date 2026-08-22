@@ -1982,12 +1982,17 @@ fn insert_inner(
                 -- provenance object on top of excluded (existing-wins) and
                 -- preserves nested array values that the prior agent_id-only
                 -- json_set handled but the array keys would have double-encoded.
+                -- v1.0.0 #2941 — reserved set, lockstep-gated across all 13
+                -- preserve-sites on `crate::RESERVED_UPSERT_METADATA_KEYS`. Now
+                -- covers the agent-registration pubkey PAIR, whose absence let
+                -- an idempotent re-register silently unbind an agent's key and
+                -- downgrade every later signed write to `claimed`.
                 metadata = json_patch(
                     excluded.metadata,
                     COALESCE(
                         (SELECT json_group_object(key, value)
                          FROM json_each(memories.metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
+                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
                         '{}'
                     )
                 ),
@@ -3585,9 +3590,12 @@ pub fn update_with_expected_version(
                 metadata = json_patch(
                     ?10,
                     COALESCE(
+                        -- #2941 — same reserved set as the insert funnel: a
+                        -- full-object metadata patch that OMITS the pubkey pair
+                        -- must not silently unbind the agent's key either.
                         (SELECT json_group_object(key, value)
                          FROM json_each(metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
+                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
                         '{}'
                     )
                 ),
@@ -11447,23 +11455,39 @@ pub fn register_agent(
     let now = Utc::now().to_rfc3339();
 
     // Preserve original registered_at across re-registration.
-    let registered_at = conn
+    //
+    // v1.0.0 #2941 — read the WHOLE existing metadata, not just
+    // `registered_at`. This function is documented as "register or refresh"
+    // and rebuilds the metadata object from scratch, so every key it does
+    // not explicitly carry forward is dropped from the row it re-stores.
+    // The agent-registration pubkey PAIR is carried here so the metadata
+    // handed to `insert` is already correct, rather than relying on the
+    // upsert conflict arm to repair it after the fact; the preserve-list in
+    // that arm (`crate::RESERVED_UPSERT_METADATA_KEYS`) remains the
+    // race-free backstop for every OTHER writer of this row.
+    let existing: Option<serde_json::Value> = conn
         .query_row(
-            "SELECT json_extract(metadata, '$.registered_at') FROM memories
-             WHERE namespace = ?1 AND title = ?2",
+            "SELECT metadata FROM memories WHERE namespace = ?1 AND title = ?2",
             params![AGENTS_NAMESPACE, &title],
-            |row| row.get::<_, Option<String>>(0),
+            |row| row.get::<_, String>(0),
         )
         .ok()
-        .flatten()
-        .unwrap_or_else(|| now.clone());
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let existing_str = |key: &str| -> Option<String> {
+        existing
+            .as_ref()
+            .and_then(|m| m.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let registered_at = existing_str(field_names::REGISTERED_AT).unwrap_or_else(|| now.clone());
 
     let caps_json: Vec<serde_json::Value> = capabilities
         .iter()
         .map(|c| serde_json::Value::String(c.clone()))
         .collect();
 
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "agent_id": agent_id,
         (field_names::AGENT_TYPE): agent_type,
         (field_names::CAPABILITIES): caps_json,
@@ -11477,6 +11501,18 @@ pub fn register_agent(
         // them on cross-agent reads.
         "scope": crate::models::MemoryScope::Collective.as_str(),
     });
+
+    // v1.0.0 #2941 — carry the bound-key pair through the refresh. Absent
+    // keys stay absent (a never-bound or explicitly REVOKED agent must not
+    // acquire a key here); a present pair is copied verbatim, so a refresh
+    // is what it claims to be — a refresh — and never a silent unbind.
+    if let Some(obj) = metadata.as_object_mut() {
+        for key in [field_names::AGENT_PUBKEY, field_names::PUBKEY_BOUND_AT] {
+            if let Some(value) = existing_str(key) {
+                obj.insert(key.to_string(), serde_json::Value::String(value));
+            }
+        }
+    }
 
     let content = serde_json::to_string(&metadata)
         .context("failed to serialize agent registration content")?;
@@ -14343,9 +14379,11 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                          THEN excluded.metadata
                          ELSE memories.metadata END,
                     COALESCE(
+                        -- #2941 — same reserved set: a newer-wins federation
+                        -- merge must not unbind a locally-bound key.
                         (SELECT json_group_object(key, value)
                          FROM json_each(memories.metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
+                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
                         '{}'
                     )
                 ),

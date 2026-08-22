@@ -264,6 +264,185 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the SAL trait `search`), so this closes a latent leak and restores
   cross-backend parity rather than fixing an actively exploited route.
 
+### Fixed (curator/autonomy correctness — namespace config, op cap, silent-error surfacing)
+
+Nine defects found by a rust-1.98-grounded code review of `src/curator/*` and
+`src/autonomy.rs`. Every one is a case of the daemon either ignoring operator
+configuration, exceeding its documented budget, or self-reporting work it did
+not do — all of which make the fleet less manageable and the report less
+truthful.
+
+- **`persona_sweep` ignored the operator's include/exclude namespace
+  configuration (HIGH).** The sweep's scan filtered on the reserved `_`-prefix
+  only, so `PersonaGenerator` ran — and wrote SIGNED persona rows — in
+  namespaces the operator had excluded, or outside a non-empty
+  `include_namespaces`, while `run_size_gc_pass` in the same file filtered
+  correctly. Both lists are now pushed into the scan SQL (so out-of-scope rows
+  cannot consume the `LIMIT` window and starve in-scope entities either) and
+  re-checked per row. All three passes — `needs_curation`, size-GC, and the
+  persona sweep — now route through ONE `namespace_in_scope` predicate so
+  scope can never be honoured by one pass and ignored by another.
+- **Autonomy passes ran outside the documented per-cycle op cap (HIGH).**
+  `max_ops_per_cycle` is documented as a hard cap on LLM-invoking operations
+  per cycle, but `run_autonomy_passes` had no budget check: Pass 1 issued one
+  `summarize_memories` call per cluster over a candidate batch capped at
+  `max_ops_per_cycle * 4`, so a single cycle could make several times the
+  authorised number of LLM invocations. `run_once` now threads its REMAINING
+  budget in; over-budget clusters are deferred to the next cycle and counted in
+  `operations_skipped_cap` (never dropped). Passes 2 and 3 invoke no LLM and
+  stay bounded by the candidate batch, so they are deliberately uncharged.
+- **A destructive action proceeded after its rollback-log write failed.** The
+  corpus was already mutated and the only reversibility record had failed to
+  persist, yet the cycle carried on issuing further irreversible actions with
+  one line in `report.errors` as the sole trace. The passes now HALT for the
+  rest of the cycle and set a new `rollback_log_degraded` flag on the report.
+- **Silent no-op that counted as success in `persist_auto_tags` /
+  `persist_contradiction`.** A row whose `metadata` is non-object JSON made both
+  helpers write the metadata back unchanged, return `Ok(())`, and let `run_once`
+  increment `auto_tagged` / `contradictions_found`. They now refuse with an
+  error naming the row and the offending shape.
+- **A DB failure in `adjacent_memory` silently skipped contradiction
+  detection.** `if let Ok(Some(..))` discarded the `Err` half with no report
+  entry; the failure is now recorded in `report.errors`.
+- **`block_on` reachable from a public API could panic the caller.** The SAL
+  consolidation pass builds its own current-thread runtime; reached from a
+  thread with an ambient tokio runtime that `block_on` panicked ("Cannot start
+  a runtime from within a runtime"), and only a doc comment stood in the way —
+  the `curator --once` CLI path did exactly this. The pass now detects the
+  in-runtime case and degrades to a reported skip, and the CLI runs the sweep
+  under `spawn_blocking`.
+- **The conserved `contradicts` edge was signed with an arbitrary key.**
+  `forget_if_superseded` loaded "the lexicographically-first key under the
+  active key dir" ambiently, so on a multi-key host the edge could be attested
+  to an identity that is not the one the daemon runs as. The authenticated
+  `active_keypair` is now plumbed from `run_once` through
+  `run_autonomy_passes`, and the ambient loader is gone.
+- **Embedding-read failures were indistinguishable from missing embeddings.**
+  `.ok().flatten()` in both clusterers collapsed a failing store into "no
+  embedding", so a database that had started failing reads looked exactly like
+  an un-embedded corpus and consolidation silently did nothing, cycle after
+  cycle. Both now log the error before degrading (the degrade itself is
+  unchanged and still blocks the merge, per #1774).
+- **Dry runs inflated `rollback_entries_written`.** The counter is documented as
+  rows persisted, but a dry run — which persists nothing — incremented it. Dry
+  runs now report `rollback_entries_simulated` instead.
+- **An idempotent re-register silently UNBOUND an agent's public key
+  (HIGH, both backends).** `storage::register_agent` is documented as
+  "register or refresh" and rebuilds the registration row's `metadata`
+  from scratch with no `agent_pubkey`, then hands it to `insert()`, whose
+  `ON CONFLICT … DO UPDATE` overwrote `metadata` wholesale while
+  preserving only `agent_id`, `derived_from` and
+  `consolidated_from_agents`. So ANY idempotent re-register — MCP
+  `memory_agent`, `POST /agents`, the SAL trait, the CLI — erased the
+  bound key on sqlite AND postgres. Under the strict posture
+  (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`) every later signed write then
+  403s; under the DEFAULT permissive posture it is worse — a genuinely
+  signed write is persisted as `attest_level=claimed` instead of
+  `agent_attested`, with no error, no WARN and no counter, so a durable
+  provenance downgrade is indistinguishable from an agent that never
+  signed. Fixed in two layers: `register_agent` now carries the
+  `agent_pubkey` / `pubkey_bound_at` PAIR through its existing pre-read on
+  both backends, and — the load-bearing half — the upsert preserve-list is
+  now the reserved-key set `RESERVED_UPSERT_METADATA_KEYS`, which covers
+  the pair. The preserve is evaluated INSIDE the conflicting statement, so
+  a `bind-key` landing between any caller's pre-read and its upsert cannot
+  be clobbered either. The same set now also guards the `memory_update`
+  metadata-patch path (a full-object patch that omits the pair) and the
+  newer-wins federation merge (a stale peer's row unbinding a local key).
+  Rotation and revocation are unaffected: `bind_agent_pubkey` /
+  `revoke_agent_pubkey` write through their own explicit `UPDATE`, never
+  this upsert funnel. All thirteen open-coded preserve-sites (3 sqlite,
+  10 postgres) are held in lockstep with the crate SSOT by
+  `tests/reserved_upsert_metadata_keys_2941.rs`, so drift between any two
+  of them — or between the SQL and the typed set — is not mergeable.
+  (#2941)
+
+- **Pass-1 consolidation could be starved of budget forever (HIGH).** Charging
+  the autonomy passes against `max_ops_per_cycle` (above) shares ONE cycle
+  budget between the auto-tag / contradiction loop and the passes, and both are
+  fed by the SAME `needs_curation` predicate — so whenever the eligible backlog
+  reached the cap (default 100) the loop consumed all of it and Pass 1 ran with
+  a budget of exactly ZERO, every cycle. That is permanent whenever the backlog
+  rows keep yielding empty auto-tags, since an empty tag list persists nothing
+  and the row stays eligible forever: consolidation would never run again on a
+  busy corpus, silently, with a healthy-looking cycle report. The passes now
+  hold a RESERVED share of the cap
+  (`max_ops_per_cycle / AUTONOMY_OP_RESERVE_DIVISOR`, floored at one op): the
+  loop's own budget shrinks by exactly that amount, so the reserve is carved
+  OUT of `max_ops_per_cycle` and never added on top of it — the documented hard
+  cap still holds. Deferred auto-tag work is counted in
+  `operations_skipped_cap` (never dropped), and the new
+  `CuratorReport.autonomy_ops_budget` field publishes what Pass 1 actually
+  received — a zero there against a non-zero `memories_eligible` is the
+  starvation signal, and it also prints in the human-readable
+  `curator --once` report.
+
+### Changed
+
+- **`curator --once` now ARMS the auto-persona sweep (behaviour change).**
+  Threading the daemon's authenticated signing identity into the one-shot path
+  (part of the ambient-key fix above) passes `Some(keypair)` where the
+  pre-change code passed `None`, and the `run_once` auto-persona sweep is gated
+  on exactly that: it was skipped unconditionally on the `--once` path before
+  and now runs whenever a keypair is present on the host. A `curator --once`
+  invocation can therefore MINT new signed `__persona_<entity>_v<n>` memory
+  rows (counted in `CuratorReport.personas_generated`) where it previously
+  wrote none. The identity used is still ambient — the lexicographically-first
+  key in the resolved key dir — so the selected `agent_id` and key dir are now
+  logged at `INFO` when the key is loaded; operators running several keys on
+  one host should pin the curator's with `AI_MEMORY_KEY_DIR`. Run
+  `curator --once --dry-run` first if persona minting is not wanted.
+
+- **CI moved to a self-hosted enterprise-fed fleet with a 2x2 `Check` matrix.**
+  All compute/gate jobs re-home from GitHub-hosted `ubuntu-latest`/`macos-latest`
+  onto two self-hosted runner labels — `[self-hosted, linux-fed]` (host pop-os/f2)
+  and `[self-hosted, macos-fed]` (host f1/FROSTYi) — EXCEPT the two mobile
+  cross-compile jobs (`Cross-compile (aarch64-linux-android)` / `(aarch64-apple-ios)`),
+  which stay GitHub-hosted. The `Check` job becomes a **2x2 matrix** over
+  {`linux-fed`, `macos-fed`} × {`sqlite` (default features), `enterprise-fed`
+  (`sal-postgres` against each node's always-up native pg18.6 + AGE 1.8.0 +
+  pgvector 0.8.6 tier, read from `$HOME/.ai-memory-ci-fed-url`)}. This **renames**
+  the two former required contexts `Check (ubuntu-latest)` / `Check (macos-latest)`
+  to the four `Check (linux-fed,sqlite)`, `Check (linux-fed,enterprise-fed)`,
+  `Check (macos-fed,sqlite)`, `Check (macos-fed,enterprise-fed)` — the mirror
+  `scripts/qc-allowlists/required-contexts-release.txt` is updated in lockstep and
+  branch protection must be updated to match. The `enterprise-fed` Check legs
+  absorb the old `Postgres feature gate` test run (now against the real cert tier);
+  that job is slimmed to the `sal-postgres` clippy-parity leg (name unchanged).
+  GitHub-hosted-only disk-freeing / swap / simulator-purge steps and all
+  `services: postgres:` blocks + per-PR pg image builds are removed (they would
+  delete real files on the persistent hosts; the native tier is always up).
+  JUnit-style durable test-result log artifacts are uploaded per leg.
+
+### Fixed
+
+- **Record-stop enforcement no longer silently degrades at the SAL layer when
+  the sqlite DB path resolves through a symlink** (e.g. the macOS
+  `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
+  the shared record-stop registry off the raw path passed to `open`, while the
+  actuator, the `db::` funnel gate, the status read and the open-time seed all
+  key off the connection's OWN resolved path (`conn.path()`, which SQLite's VFS
+  symlink-follows). When the two diverged the SAL gate read a stale RUNNING
+  entry, so a write issued under an engaged stop fell through to the deeper
+  `db::` gate and surfaced `StoreError::Backend` instead of the intended
+  `StoreError::Stopped` — a single-layer, fail-closed-ONLY degradation of the
+  SAL 503 refusal contract. The gate now caches and keys off the connection's
+  resolved path at open, restoring one source of truth across every layer.
+  Surfaced by the macOS `enterprise-fed` CI leg (`record_stop_r45_1955`); a
+  symlinked-open-path regression test pins it.
+- **The self-hosted `enterprise-fed` Check legs no longer kill a still-passing
+  sal-postgres suite at the hung-test watchdog.** The 2x2 `check` job reused the
+  sqlite-oriented 1500s per-invocation watchdog for the `enterprise-fed` legs,
+  which run the sal-postgres suite SINGLE-THREADED (`--test-threads=1`) and
+  CPU-contended by the sibling `sqlite` leg on the same self-hosted host — a
+  ~2231s measured runtime that the 1500s cap terminated mid-run (the same
+  regression the release `postgres-feature` job already fixed by raising its
+  cap to 2100s on its dedicated runner; the self-hosted leg runs both linux
+  legs on ONE host, so its ~2231s is the normal max-contention case). The
+  watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
+  the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
+  the outer job cap — remains what fires on a genuine hang.
+
 ### Removed
 
 - **`postgres-parity-nightly.yml` and `self-hosted-smoke.yml` workflows deleted.**

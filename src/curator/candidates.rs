@@ -75,14 +75,31 @@ pub(super) fn collect_candidates(conn: &Connection, cfg: &CuratorConfig) -> Resu
     })
 }
 
+/// v1.0.0 — SINGLE-SOURCE namespace-scope predicate for the whole curator.
+///
+/// A namespace is in scope iff it is not reserved (`_`-prefixed), is on
+/// `cfg.include_namespaces` when that list is non-empty, and is not on
+/// `cfg.exclude_namespaces`. Every curator pass that touches rows —
+/// [`needs_curation`], the size-GC pass, and the auto-persona sweep —
+/// routes through THIS function so an operator's include / exclude
+/// configuration can never be honoured by one pass and ignored by
+/// another. Before this existed, `persona_sweep` filtered on the
+/// `_`-prefix only and wrote signed persona rows into namespaces the
+/// operator had excluded.
+#[must_use]
+pub(crate) fn namespace_in_scope(namespace: &str, cfg: &CuratorConfig) -> bool {
+    if namespace.starts_with('_') {
+        return false;
+    }
+    if !cfg.include_namespaces.is_empty() && !cfg.include_namespaces.iter().any(|n| n == namespace)
+    {
+        return false;
+    }
+    !cfg.exclude_namespaces.iter().any(|n| n == namespace)
+}
+
 pub(crate) fn needs_curation(mem: &Memory, cfg: &CuratorConfig) -> bool {
-    if mem.namespace.starts_with('_') {
-        return false;
-    }
-    if !cfg.include_namespaces.is_empty() && !cfg.include_namespaces.contains(&mem.namespace) {
-        return false;
-    }
-    if cfg.exclude_namespaces.contains(&mem.namespace) {
+    if !namespace_in_scope(&mem.namespace, cfg) {
         return false;
     }
     if mem.content.len() < MIN_CONTENT_LEN {

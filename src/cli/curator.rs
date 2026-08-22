@@ -192,6 +192,9 @@ fn print_curator_report(r: &curator::CuratorReport, out: &mut CliOutput<'_>) -> 
         "  skipped (cap):     {}",
         r.operations_skipped_cap
     )?;
+    // v1.0.0 — starvation gauge: zero here on a cycle with eligible
+    // memories means Pass-1 consolidation got no budget at all.
+    writeln!(out.stdout, "  autonomy budget:   {}", r.autonomy_ops_budget)?;
     writeln!(out.stdout, "  errors:            {}", r.errors.len())?;
     writeln!(out.stdout, "  dry_run:           {}", r.dry_run)?;
     for e in &r.errors {
@@ -287,14 +290,32 @@ pub async fn run(
     let llm = build_curator_llm(feature_tier, db_path);
 
     if args.once {
-        let conn = db::open(db_path)?;
-        // v0.9.0 §25.3 S1 (D3-012, #1870) — TOFU-capture the substrate's
-        // resolved model family at the LLM boundary. Best-effort: a
-        // capture failure never blocks the curator cycle. Only
-        // substrate-invoked generation is attestable, so loader coverage
-        // hard-caps ~40% (ROADMAP.md:1229).
-        capture_loader_attestation(&conn, llm.as_ref());
-        let report = curator::run_once(&conn, llm.as_ref(), &cfg, None)?;
+        // CONCURRENCY-22 / ERRORS-08 — `curator::run_once` is a BLOCKING
+        // sweep, and its SAL consolidation pass drives its own
+        // current-thread runtime via `block_on`. Calling it directly from
+        // this `async fn` put it on a tokio worker, where that `block_on`
+        // panics ("Cannot start a runtime from within a runtime") and
+        // stalls the worker even when it does not. Run it on a blocking
+        // thread, which is also what the daemon path does.
+        //
+        // #816 / v1.0.0 — pass the curator's signing identity through:
+        // the autonomy conserve path used to load a key ambiently (the
+        // lexicographically-first key on the host), which could attest an
+        // edge to an identity that is not the one this process runs as.
+        let db_path_owned = db_path.to_path_buf();
+        let cfg_owned = cfg.clone();
+        let keypair = load_curator_keypair_best_effort();
+        let report = tokio::task::spawn_blocking(move || -> Result<curator::CuratorReport> {
+            let conn = db::open(&db_path_owned)?;
+            // v0.9.0 §25.3 S1 (D3-012, #1870) — TOFU-capture the substrate's
+            // resolved model family at the LLM boundary. Best-effort: a
+            // capture failure never blocks the curator cycle. Only
+            // substrate-invoked generation is attestable, so loader coverage
+            // hard-caps ~40% (ROADMAP.md:1229).
+            capture_loader_attestation(&conn, llm.as_ref());
+            curator::run_once(&conn, llm.as_ref(), &cfg_owned, keypair.as_ref())
+        })
+        .await??;
         if args.json {
             writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
         } else {
@@ -1082,7 +1103,19 @@ fn load_curator_keypair_best_effort() -> Option<identity_keypair::AgentKeypair> 
     // set the daemon `AI_MEMORY_AGENT_ID` env var.
     let listed = identity_keypair::list(&dir).ok()?;
     let first = listed.into_iter().next()?;
-    identity_keypair::load(&first.agent_id, &dir).ok()
+    let loaded = identity_keypair::load(&first.agent_id, &dir).ok()?;
+    // v1.0.0 — the selected identity is AMBIENT (lexicographically-first key
+    // in the key dir) and it is what every row this curator signs will be
+    // attributed to, including the `__persona_*` rows the auto-persona sweep
+    // mints. An operator running several keys on one host must be able to see
+    // WHICH one the curator adopted without reverse-engineering the key dir
+    // ordering, so announce it once at load.
+    tracing::info!(
+        agent_id = %first.agent_id,
+        key_dir = %dir.display(),
+        "curator signing identity selected"
+    );
+    Some(loaded)
 }
 
 #[cfg_attr(not(feature = "sal"), allow(dead_code))]

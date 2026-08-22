@@ -256,12 +256,24 @@ impl<'a> ConsolidationPass<'a> {
             // Best-effort: a fetch error degrades that row to "no embedding"
             // (which, per #1774, blocks the merge for its pairs), never aborts
             // the sweep.
-            let fetched = self
-                .store
-                .get_embedding_with_space(&self.ctx, &m.id)
-                .await
-                .ok()
-                .flatten();
+            // ERRORS-19 — degrade a FAILED read to "no embedding" (which,
+            // per #1774, blocks the merge for its pairs) but LOG it first:
+            // the pre-fix `.ok().flatten()` made a failing store
+            // indistinguishable from an un-embedded corpus, so repeated
+            // cycles could do zero consolidation with no operator signal.
+            let fetched = match self.store.get_embedding_with_space(&self.ctx, &m.id).await {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(
+                        target: COMPACTION_TRACE_TARGET,
+                        pass = self.name(),
+                        memory_id = %m.id,
+                        error = %e,
+                        "embedding read failed; treating as no-embedding (row will not merge)"
+                    );
+                    None
+                }
+            };
             let (emb, space) = match fetched {
                 Some((v, s)) => (Some(v), s),
                 None => (None, None),

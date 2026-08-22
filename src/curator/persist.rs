@@ -15,9 +15,43 @@ use rusqlite::Connection;
 use crate::db;
 use crate::models::Memory;
 
+/// ERRORS-19 / fail-closed — borrow a memory's metadata as a JSON object,
+/// or return a descriptive error naming the row and what was refused.
+///
+/// `Memory::metadata` is a bare `serde_json::Value`, so a row whose stored
+/// `metadata` column holds any non-object JSON (`null`, an array, a bare
+/// string) yields `None` from `as_object_mut`. The pre-fix helpers below
+/// treated that as a no-op, wrote the metadata back UNCHANGED, returned
+/// `Ok(())`, and let `run_once` increment `auto_tagged` /
+/// `contradictions_found` — a lost write self-reported as a success. A
+/// curator that claims work it did not do is worse than one that refuses:
+/// the caller now records the failure in `report.errors` and the counter
+/// stays honest.
+fn metadata_object_mut<'a>(
+    value: &'a mut serde_json::Value,
+    mem_id: &str,
+    what: &str,
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>> {
+    let kind = match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    };
+    value.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "refusing to write {what} for memory {mem_id}: metadata is a JSON {kind}, not an \
+             object — the update would silently discard the write"
+        )
+    })
+}
+
 pub(super) fn persist_auto_tags(conn: &Connection, mem: &Memory, tags: &[String]) -> Result<()> {
     let mut updated = mem.metadata.clone();
-    if let Some(obj) = updated.as_object_mut() {
+    {
+        let obj = metadata_object_mut(&mut updated, &mem.id, "auto_tags")?;
         obj.insert("auto_tags".to_string(), serde_json::json!(tags));
         obj.insert(
             "curated_at".to_string(),
@@ -46,7 +80,9 @@ pub(super) fn persist_contradiction(
     against_id: &str,
 ) -> Result<()> {
     let mut updated = mem.metadata.clone();
-    if let Some(obj) = updated.as_object_mut() {
+    {
+        let obj =
+            metadata_object_mut(&mut updated, &mem.id, field_names::CONFIRMED_CONTRADICTIONS)?;
         let existing = obj
             .get(field_names::CONFIRMED_CONTRADICTIONS)
             .and_then(|v| v.as_array())

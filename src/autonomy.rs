@@ -221,8 +221,78 @@ pub struct AutonomyPassReport {
     pub memories_consolidated: usize,
     pub memories_forgotten: usize,
     pub priority_adjustments: usize,
+    /// Rollback rows actually PERSISTED this pass. A dry-run persists
+    /// nothing, so this stays `0` there (the would-be count lands in
+    /// [`Self::rollback_entries_simulated`]); a live pass whose
+    /// rollback-log write FAILED does not count the row either.
     pub rollback_entries_written: usize,
+    /// v1.0.0 — dry-run companion to [`Self::rollback_entries_written`]:
+    /// rollback rows a live cycle WOULD have written. Split out so
+    /// `rollback_entries_written` can keep meaning "rows persisted"
+    /// (the pre-fix code incremented it on the dry-run path, so an
+    /// operator reading a `--dry-run` report saw writes that never
+    /// happened).
+    #[serde(default)]
+    pub rollback_entries_simulated: usize,
+    /// v1.0.0 — LLM-invoking operations this pass actually attempted,
+    /// charged against the caller's `max_ops_per_cycle` budget.
+    #[serde(default)]
+    pub operations_attempted: usize,
+    /// v1.0.0 — LLM-invoking operations skipped because the per-cycle op
+    /// budget was exhausted. Non-zero means work deferred to the next
+    /// cycle, NOT work lost.
+    #[serde(default)]
+    pub operations_skipped_cap: usize,
+    /// v1.0.0 — set when a rollback-log write FAILED during this pass.
+    /// The already-applied mutation is then irreversible, so the passes
+    /// HALT rather than compounding un-reversible changes; see
+    /// [`run_autonomy_passes`].
+    #[serde(default)]
+    pub rollback_log_degraded: bool,
     pub errors: Vec<String>,
+}
+
+/// Record the outcome of a rollback-log write for one just-applied action.
+///
+/// Returns `true` when the pass may CONTINUE, `false` when it must halt.
+///
+/// Reversibility is the whole point of the rollback log: once an autonomy
+/// action has mutated the corpus and its rollback row failed to persist,
+/// that action is irreversible. The pre-fix code pushed one line into
+/// `report.errors` and carried straight on, so a single failing log write
+/// could be followed by an unbounded run of further irreversible
+/// mutations. We now HALT the destructive passes for the rest of the
+/// cycle (fail-closed: fewer actions, never un-reversible ones) and flag
+/// `rollback_log_degraded` so the condition is visible in the
+/// self-report, not just buried in an error string.
+fn note_rollback_write(
+    conn: &Connection,
+    entry: &RollbackEntry,
+    dry_run: bool,
+    report: &mut AutonomyPassReport,
+) -> bool {
+    if dry_run {
+        // Dry-run persists nothing; count the would-be row separately so
+        // `rollback_entries_written` keeps meaning "rows persisted".
+        report.rollback_entries_simulated += 1;
+        return true;
+    }
+    match persist_rollback_entry(conn, entry) {
+        Ok(()) => {
+            report.rollback_entries_written += 1;
+            true
+        }
+        Err(e) => {
+            report.errors.push(rollback_log_write_failed(&e));
+            report.rollback_log_degraded = true;
+            report.errors.push(
+                "autonomy passes halted for this cycle: the last action is irreversible \
+                 (its rollback row did not persist); remaining destructive work is deferred"
+                    .to_string(),
+            );
+            false
+        }
+    }
 }
 
 /// Run all autonomy passes over the provided candidates in order:
@@ -236,6 +306,25 @@ pub struct AutonomyPassReport {
 /// consolidators are mutually exclusive, driven from a single
 /// `compaction.enabled` predicate in `curator::run_once`.
 ///
+/// `llm_op_budget` is the caller's REMAINING share of
+/// `CuratorConfig::max_ops_per_cycle` — documented as a "hard cap on
+/// LLM-invoking operations per cycle". Pass 1 is the only LLM-invoking
+/// pass (`consolidate_cluster` → `AutonomyLlm::summarize_memories`), and
+/// it was previously uncapped: it ran one LLM call per cluster found over
+/// up to `max_ops_per_cycle * 4` candidates, so a single cycle could make
+/// far more LLM invocations than the operator authorised. Clusters beyond
+/// the budget are now skipped and counted in
+/// `report.operations_skipped_cap`; they are deferred to the next cycle,
+/// never dropped. Passes 2 and 3 invoke no LLM and stay bounded by the
+/// candidate batch itself, so they are deliberately NOT charged against
+/// this budget.
+///
+/// `active_keypair` is the caller's authenticated signing identity, used
+/// to sign the conserved `contradicts` edge in Pass 2. It is threaded in
+/// (rather than loaded ambiently inside the pass) so the edge is attested
+/// to the identity the daemon actually runs as; `None` writes the edge
+/// unsigned, which is the honest degrade.
+///
 /// Returns an `AutonomyPassReport` rather than `Result<…>` because
 /// per-pass errors are already aggregated into `report.errors`;
 /// the function itself cannot fail at the outer level.
@@ -245,26 +334,36 @@ pub fn run_autonomy_passes(
     candidates: &[Memory],
     dry_run: bool,
     skip_consolidation: bool,
+    llm_op_budget: usize,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> AutonomyPassReport {
     let mut report = AutonomyPassReport::default();
 
     // Pass 1 — consolidation. Skipped when the SAL ConsolidationPass owns
     // consolidation (#1746); the curator folds that pass's counts into this
     // report so the self-report stays accurate.
+    let mut halted = false;
     if !skip_consolidation {
         let clusters = find_consolidation_clusters(conn, candidates);
         report.clusters_formed = clusters.len();
         for cluster in clusters {
+            if halted {
+                break;
+            }
+            // Op-budget gate — one `summarize_memories` LLM call per
+            // cluster. Skipped clusters resurface next cycle.
+            if report.operations_attempted >= llm_op_budget {
+                report.operations_skipped_cap += 1;
+                continue;
+            }
+            report.operations_attempted += 1;
             match consolidate_cluster(conn, llm, &cluster, dry_run) {
                 Ok(Some(entry)) => {
-                    if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                        report.errors.push(rollback_log_write_failed(&e));
-                    } else {
-                        report.rollback_entries_written += 1;
-                    }
+                    let proceed = note_rollback_write(conn, &entry, dry_run, &mut report);
                     if let RollbackEntry::Consolidate { originals, .. } = entry {
                         report.memories_consolidated += originals.len();
                     }
+                    halted = !proceed;
                 }
                 Ok(None) => {}
                 Err(e) => report.errors.push(format!("consolidate failed: {e}")),
@@ -272,15 +371,14 @@ pub fn run_autonomy_passes(
         }
     }
 
-    // Pass 2 — forget superseded.
+    // Pass 2 — forget superseded (CONSERVE; LLM-free, so uncharged).
     for mem in candidates {
-        match forget_if_superseded(conn, mem, candidates, dry_run) {
+        if halted {
+            break;
+        }
+        match forget_if_superseded(conn, mem, candidates, dry_run, active_keypair) {
             Ok(Some(entry)) => {
-                if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                    report.errors.push(rollback_log_write_failed(&e));
-                } else {
-                    report.rollback_entries_written += 1;
-                }
+                halted = !note_rollback_write(conn, &entry, dry_run, &mut report);
                 report.memories_forgotten += 1;
             }
             Ok(None) => {}
@@ -288,16 +386,14 @@ pub fn run_autonomy_passes(
         }
     }
 
-    // Pass 3 — priority feedback.
-    #[allow(unused_assignments)]
+    // Pass 3 — priority feedback (LLM-free, so uncharged).
     for mem in candidates {
+        if halted {
+            break;
+        }
         match apply_priority_feedback(conn, mem, dry_run) {
             Ok(Some(entry)) => {
-                if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                    report.errors.push(rollback_log_write_failed(&e));
-                } else {
-                    report.rollback_entries_written += 1;
-                }
+                halted = !note_rollback_write(conn, &entry, dry_run, &mut report);
                 report.priority_adjustments += 1;
             }
             Ok(None) => {}
@@ -306,6 +402,31 @@ pub fn run_autonomy_passes(
     }
 
     report
+}
+
+/// ERRORS-19 — read a row's stored embedding + space for the clustering
+/// gate, distinguishing a genuinely-missing embedding from a FAILED read.
+///
+/// Both degrade to `None`, which per #1774 blocks the merge for that
+/// row's pairs (fail-safe: no cosine, no destructive merge). The pre-fix
+/// `.ok().flatten()` collapsed the two cases with no operator signal, so
+/// a database that had started failing embedding reads looked exactly
+/// like a corpus with no embeddings: consolidation silently did nothing,
+/// cycle after cycle, with nothing in the logs. Log the `Err` before
+/// degrading.
+fn embedding_for_clustering(conn: &Connection, id: &str) -> Option<(Vec<f32>, Option<String>)> {
+    match db::get_embedding_with_space(conn, id) {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(
+                memory_id = %id,
+                error = %e,
+                "autonomy: embedding read failed; treating as no-embedding \
+                 (this row will not be considered for consolidation this cycle)"
+            );
+            None
+        }
+    }
 }
 
 /// v0.7.0 R3-S2 — Two-stage clustering per playbook §2.7 /
@@ -360,9 +481,7 @@ pub(crate) fn find_consolidation_clusters(
             // means "embedding missing for this memory" — per #1774 a
             // missing embedding on either side blocks the merge for that
             // pair.
-            let seed_emb = db::get_embedding_with_space(conn, &group[i].id)
-                .ok()
-                .flatten();
+            let seed_emb = embedding_for_clustering(conn, &group[i].id);
             for j in (i + 1)..group.len() {
                 if used[j] {
                     continue;
@@ -377,9 +496,7 @@ pub(crate) fn find_consolidation_clusters(
                 }
                 // Stage 2 — cosine primary, when embeddings exist
                 // for both sides of the pair.
-                let pair_emb = db::get_embedding_with_space(conn, &group[j].id)
-                    .ok()
-                    .flatten();
+                let pair_emb = embedding_for_clustering(conn, &group[j].id);
                 let matches_cluster = match (seed_emb.as_ref(), pair_emb.as_ref()) {
                     // v1.0.0 #2167 (#2181) — a stored-vs-stored cosine is
                     // meaningful ONLY when both vectors share the SAME
@@ -520,21 +637,6 @@ fn tier_rank(t: &Tier) -> u8 {
     }
 }
 
-/// v0.9.0 G7 (#1824) — best-effort load of the curator's signing keypair
-/// so the conserved `contradicts` edge is SIGNED when an operator has
-/// configured a key. Mirrors the CLI curator's best-effort loader: pick
-/// the lexicographically-first key under the active key dir. Returns
-/// `None` when no dir / no keys exist (the edge is then written unsigned —
-/// the same posture as every other `create_link_signed(None)` caller).
-fn curator_keypair_best_effort() -> Option<crate::identity::keypair::AgentKeypair> {
-    let dir = crate::identity::keypair::default_key_dir().ok()?;
-    let first = crate::identity::keypair::list(&dir)
-        .ok()?
-        .into_iter()
-        .next()?;
-    crate::identity::keypair::load(&first.agent_id, &dir).ok()
-}
-
 /// v0.9.0 G7 (#1824) — CONSERVE a confirmed contradiction instead of
 /// hard-deleting the loser. When a contradicting memory is both newer AND
 /// carries higher-or-equal confidence, the current `mem` is the LOSER of
@@ -542,11 +644,22 @@ fn curator_keypair_best_effort() -> Option<crate::identity::keypair::AgentKeypai
 /// `contradicts` edge, emit one identity-only SUPERSEDE leaf (flag-gated),
 /// and mark the loser with a reversible node-local soft down-weight — via
 /// [`crate::db::conserve_contradiction`]. NEITHER memory is deleted.
+///
+/// `active_keypair` is the caller's AUTHENTICATED signing identity. It is
+/// threaded in from `run_autonomy_passes` rather than loaded ambiently:
+/// the pre-fix code called a `curator_keypair_best_effort()` helper that
+/// picked the lexicographically-first key under the active key dir, so on
+/// a host with more than one key the conserved `contradicts` edge could be
+/// signed by an identity that is not the daemon's — precisely the kind of
+/// mis-attribution the #816 attestation trail exists to prevent. `None`
+/// writes the edge unsigned (the honest degrade), matching every other
+/// `create_link_signed(None)` caller.
 fn forget_if_superseded(
     conn: &Connection,
     mem: &Memory,
     all: &[Memory],
     dry_run: bool,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> Result<Option<RollbackEntry>> {
     // Only act on memories whose `confirmed_contradictions` list is
     // non-empty — i.e., a previous detect_contradiction pass already
@@ -661,12 +774,7 @@ fn forget_if_superseded(
 
     // Live: CONSERVE the pair (retain both; one canonical signed edge; one
     // identity-only SUPERSEDE leaf; reversible soft-down-weight marker).
-    db::conserve_contradiction(
-        conn,
-        loser,
-        &winner.id,
-        curator_keypair_best_effort().as_ref(),
-    )?;
+    db::conserve_contradiction(conn, loser, &winner.id, active_keypair)?;
     Ok(Some(entry))
 }
 
@@ -843,6 +951,15 @@ pub fn persist_self_report(
         "memories_forgotten": pass_report.memories_forgotten,
         "priority_adjustments": pass_report.priority_adjustments,
         "rollback_entries_written": pass_report.rollback_entries_written,
+        // v1.0.0 — dry-run companion (rows a live cycle WOULD have written)
+        // and the reversibility-degraded flag. `rollback_log_degraded` is
+        // the one an operator must never miss: it means an applied action
+        // has no rollback row, so the cycle halted its remaining
+        // destructive work rather than compounding irreversible changes.
+        "rollback_entries_simulated": pass_report.rollback_entries_simulated,
+        "rollback_log_degraded": pass_report.rollback_log_degraded,
+        "autonomy_ops_attempted": pass_report.operations_attempted,
+        "autonomy_ops_skipped_cap": pass_report.operations_skipped_cap,
         "errors_total": errors_total,
     });
     let mem = Memory {
@@ -1788,7 +1905,7 @@ mod tests {
             m_old.clone(),
             m_new.clone(),
         ];
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false, usize::MAX, None);
 
         // Consolidated at least once (deploy cluster).
         assert!(report.clusters_formed >= 1);
@@ -1828,6 +1945,7 @@ mod tests {
             priority_adjustments: 1,
             rollback_entries_written: 2,
             errors: vec![],
+            ..AutonomyPassReport::default()
         };
         persist_self_report(&conn, 1234, &pass, 3, 0, 0, 0).unwrap();
         let reports = db::list(
@@ -1889,7 +2007,7 @@ mod tests {
         let llm = StubLlm::new("LLM-generated consolidated summary");
         let candidates = vec![a, b];
 
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false, usize::MAX, None);
 
         // Key assertions: LLM was used (clusters formed and consolidation happened)
         assert!(report.clusters_formed > 0);
@@ -1936,7 +2054,7 @@ mod tests {
         let llm = StubLlm::new("mock summary result");
         let candidates = vec![a, b];
 
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false, usize::MAX, None);
 
         // Report should reflect successful cycle
         assert_eq!(report.errors.len(), 0, "autonomy cycle should not error");
@@ -2121,7 +2239,7 @@ mod tests {
 
         let llm = StubLlm::new("consolidated");
         let candidates = vec![a, b];
-        let _report = run_autonomy_passes(&conn, &llm, &candidates, true, false);
+        let _report = run_autonomy_passes(&conn, &llm, &candidates, true, false, usize::MAX, None);
 
         let final_count = db::list(
             &conn,
@@ -2152,7 +2270,7 @@ mod tests {
         let mem = sample_mem("id", "ns", "Title", "content", Tier::Mid);
         let llm = StubLlm::new("summary");
         let candidates = vec![mem];
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false, usize::MAX, None);
 
         // At minimum, report structure should be valid
         assert!(report.clusters_formed > 0 || report.clusters_formed == 0);
@@ -2305,7 +2423,8 @@ mod tests {
         db::insert(&conn, &older).unwrap();
         db::insert(&conn, &newer).unwrap();
 
-        let result = forget_if_superseded(&conn, &older, &[older.clone(), newer], true).unwrap();
+        let result =
+            forget_if_superseded(&conn, &older, &[older.clone(), newer], true, None).unwrap();
         match result {
             // v0.9.0 G7 (#1824) — dry-run now returns the CONSERVE
             // descriptor (retain both), not a Forget.
@@ -2349,7 +2468,8 @@ mod tests {
         db::insert(&conn, &newer).unwrap();
 
         let result =
-            forget_if_superseded(&conn, &newer, &[older.clone(), newer.clone()], false).unwrap();
+            forget_if_superseded(&conn, &newer, &[older.clone(), newer.clone()], false, None)
+                .unwrap();
         match result {
             Some(RollbackEntry::ConserveContradiction {
                 loser_id,
@@ -2400,6 +2520,7 @@ mod tests {
             &refreshed_new,
             &[refreshed_old, refreshed_new.clone()],
             false,
+            None,
         )
         .unwrap();
         assert!(again.is_none(), "re-entry gate holds on the listed side");
@@ -2414,7 +2535,8 @@ mod tests {
         let mut mem = sample_mem("m", "facts", "T", "content body word", Tier::Mid);
         // Mix invalid (number) and valid-but-missing (no matching id) entries.
         mem.metadata["confirmed_contradictions"] = serde_json::json!([42, "missing-id"]);
-        let result = forget_if_superseded(&conn, &mem, std::slice::from_ref(&mem), false).unwrap();
+        let result =
+            forget_if_superseded(&conn, &mem, std::slice::from_ref(&mem), false, None).unwrap();
         // No superseder identified (numeric id skipped, "missing-id" not in `all`).
         assert!(result.is_none());
     }
@@ -2519,7 +2641,7 @@ mod tests {
         assert!(db::get(&conn, "mold").unwrap().is_some());
 
         let llm = StubLlm::new("dry-run summary");
-        let report = run_autonomy_passes(&conn, &llm, &candidates, true, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, true, false, usize::MAX, None);
 
         // Report still reflects the would-be actions.
         assert!(report.clusters_formed >= 1);
@@ -2629,5 +2751,230 @@ mod tests {
             }
             _ => panic!("expected PriorityAdjust"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // v1.0.0 curator/autonomy correctness regressions (ox-alpha review).
+    // -----------------------------------------------------------------
+
+    /// Seed a namespace with a mergeable near-duplicate PAIR (aligned
+    /// embeddings so the #1774 cosine gate opens) and return the pair.
+    fn seed_mergeable_pair(conn: &Connection, ns: &str) -> Vec<Memory> {
+        let a = sample_mem(
+            &format!("{ns}-a"),
+            ns,
+            &format!("{ns} canary deploy plan"),
+            "kubernetes canary rolling deploy strategy",
+            Tier::Long,
+        );
+        let b = sample_mem(
+            &format!("{ns}-b"),
+            ns,
+            &format!("{ns} canary deploy overview"),
+            "kubernetes rolling canary deploy strategy",
+            Tier::Long,
+        );
+        for m in [&a, &b] {
+            db::insert(conn, m).unwrap();
+            db::set_embedding(
+                conn,
+                &m.id,
+                &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
+            )
+            .unwrap();
+        }
+        vec![a, b]
+    }
+
+    fn summarize_calls(llm: &StubLlm) -> usize {
+        llm.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("summarize:"))
+            .count()
+    }
+
+    /// REGRESSION (ox-alpha #2) — Pass 1 is LLM-invoking and MUST honour
+    /// the caller's remaining `max_ops_per_cycle` budget. Pre-fix it ran
+    /// one `summarize_memories` call per cluster with no budget check at
+    /// all, so a cycle could exceed the operator's authorised LLM budget
+    /// by up to 4x the candidate cap. Two mergeable clusters + a budget of
+    /// 1 must produce exactly ONE LLM call, one consolidation, and one
+    /// counted skip (deferred, not dropped).
+    #[test]
+    fn run_autonomy_passes_charges_pass1_against_llm_op_budget() {
+        let (_tmp, conn) = setup_conn();
+        let mut candidates = seed_mergeable_pair(&conn, "budget-one");
+        candidates.extend(seed_mergeable_pair(&conn, "budget-two"));
+
+        let llm = StubLlm::new("budget summary");
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false, 1, None);
+
+        assert_eq!(
+            report.clusters_formed, 2,
+            "fixture must produce two mergeable clusters, got {}",
+            report.clusters_formed
+        );
+        assert_eq!(
+            summarize_calls(&llm),
+            1,
+            "budget of 1 must permit exactly one LLM-invoking consolidation"
+        );
+        assert_eq!(report.operations_attempted, 1);
+        assert_eq!(
+            report.operations_skipped_cap, 1,
+            "the over-budget cluster must be COUNTED as deferred, not silently dropped"
+        );
+        assert_eq!(
+            report.memories_consolidated, 2,
+            "only the in-budget cluster's members are consolidated"
+        );
+    }
+
+    /// A zero budget performs no LLM-invoking consolidation at all, and
+    /// still reports the skip so an operator can see work was deferred.
+    #[test]
+    fn run_autonomy_passes_zero_llm_budget_consolidates_nothing() {
+        let (_tmp, conn) = setup_conn();
+        let candidates = seed_mergeable_pair(&conn, "zero-budget");
+
+        let llm = StubLlm::new("never called");
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false, 0, None);
+
+        assert_eq!(summarize_calls(&llm), 0, "zero budget must invoke no LLM");
+        assert_eq!(report.operations_attempted, 0);
+        assert_eq!(report.operations_skipped_cap, 1);
+        assert_eq!(report.memories_consolidated, 0);
+        // Both source rows survive — a skipped consolidation is a no-op,
+        // never a partial merge.
+        for m in &candidates {
+            assert!(
+                db::get(&conn, &m.id).unwrap().is_some(),
+                "skipped cluster must leave {} intact",
+                m.id
+            );
+        }
+    }
+
+    /// REGRESSION (ox-alpha #6) — a dry run persists NOTHING, so
+    /// `rollback_entries_written` (documented as "rows persisted") must
+    /// stay 0. Pre-fix the `!dry_run && let Err(..) { .. } else { +1 }`
+    /// shape took the else-arm on every dry-run action and inflated the
+    /// counter. The would-be count now lands in the explicit
+    /// `rollback_entries_simulated` companion instead.
+    #[test]
+    fn dry_run_reports_simulated_not_written_rollback_entries() {
+        let (_tmp, conn) = setup_conn();
+        let candidates = seed_mergeable_pair(&conn, "dry-counters");
+
+        let llm = StubLlm::new("dry summary");
+        let report = run_autonomy_passes(&conn, &llm, &candidates, true, false, usize::MAX, None);
+
+        assert!(
+            report.rollback_entries_simulated >= 1,
+            "dry run must report the would-be rollback rows"
+        );
+        assert_eq!(
+            report.rollback_entries_written, 0,
+            "dry run persists no rollback rows, so the 'written' counter must be 0"
+        );
+        assert!(!report.rollback_log_degraded);
+        let log = db::list(
+            &conn,
+            Some("_curator/rollback"),
+            None,
+            100,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(log.is_empty(), "dry run must not write rollback memories");
+    }
+
+    /// A live cycle counts rollback rows it actually persisted and leaves
+    /// the dry-run companion at zero — the mirror image of the test above.
+    #[test]
+    fn live_run_reports_written_not_simulated_rollback_entries() {
+        let (_tmp, conn) = setup_conn();
+        let candidates = seed_mergeable_pair(&conn, "live-counters");
+
+        let llm = StubLlm::new("live summary");
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false, usize::MAX, None);
+
+        assert!(report.rollback_entries_written >= 1);
+        assert_eq!(report.rollback_entries_simulated, 0);
+        assert!(!report.rollback_log_degraded);
+    }
+
+    /// REGRESSION (ox-alpha #7) — a destructive action whose rollback-log
+    /// write FAILS is irreversible, so the cycle must STOP rather than
+    /// pile further un-reversible mutations on top of it. Pre-fix the
+    /// failure pushed one line into `report.errors` and every remaining
+    /// pass ran to completion regardless.
+    ///
+    /// The failure is forced surgically: a BEFORE INSERT trigger that
+    /// aborts only for the `_curator/rollback` namespace, so the
+    /// consolidation itself still succeeds and it is precisely the
+    /// rollback row that cannot land.
+    #[test]
+    fn rollback_log_write_failure_halts_the_remaining_passes() {
+        let (_tmp, conn) = setup_conn();
+        let mut candidates = seed_mergeable_pair(&conn, "halt-ns");
+
+        // A Pass-3 candidate: hot + recently accessed, so priority
+        // feedback WOULD bump it if the pass were reached.
+        let mut hot = sample_mem(
+            "halt-hot",
+            "halt-other",
+            "Hot",
+            "this is hot content for the priority bump pass",
+            Tier::Mid,
+        );
+        hot.priority = 5;
+        hot.access_count = 100;
+        hot.last_accessed_at = Some(chrono::Utc::now().to_rfc3339());
+        db::insert(&conn, &hot).unwrap();
+        candidates.push(hot.clone());
+
+        conn.execute_batch(
+            "CREATE TRIGGER halt_rollback_writes BEFORE INSERT ON memories \
+             WHEN new.namespace = '_curator/rollback' \
+             BEGIN SELECT RAISE(ABORT, 'forced rollback-log failure'); END;",
+        )
+        .unwrap();
+
+        let llm = StubLlm::new("halting summary");
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false, usize::MAX, None);
+
+        assert!(
+            report.rollback_log_degraded,
+            "a failed rollback-log write must be flagged on the report, errors={:?}",
+            report.errors
+        );
+        assert!(
+            report.errors.iter().any(|e| e.contains("halted")),
+            "the halt must be explained to the operator, errors={:?}",
+            report.errors
+        );
+        assert_eq!(
+            report.rollback_entries_written, 0,
+            "no rollback row landed, so none may be counted"
+        );
+        assert_eq!(
+            report.priority_adjustments, 0,
+            "Pass 3 must not run after reversibility was lost"
+        );
+        assert_eq!(
+            db::get(&conn, "halt-hot").unwrap().unwrap().priority,
+            5,
+            "the halted cycle must leave the Pass-3 candidate untouched"
+        );
     }
 }

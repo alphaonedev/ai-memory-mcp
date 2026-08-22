@@ -71,7 +71,8 @@ use crate::models::Memory;
 use crate::models::Tier;
 
 use candidates::{
-    CandidateBatch, adjacent_memory, collect_candidates, needs_curation, record_truncation,
+    CandidateBatch, adjacent_memory, collect_candidates, namespace_in_scope, needs_curation,
+    record_truncation,
 };
 use persist::{persist_auto_tags, persist_contradiction};
 
@@ -80,6 +81,25 @@ pub const DEFAULT_INTERVAL_SECS: u64 = crate::SECS_PER_HOUR as u64;
 
 /// Default per-cycle operation cap (stops runaway LLM calls).
 pub const DEFAULT_MAX_OPS_PER_CYCLE: usize = 100;
+
+/// v1.0.0 — divisor fixing the autonomy passes' RESERVED share of
+/// [`CuratorConfig::max_ops_per_cycle`].
+///
+/// The auto-tag / contradiction loop and the autonomy passes draw on ONE
+/// cycle budget, and both are fed by the same `needs_curation` predicate.
+/// Without a reservation the loop runs first and can legitimately spend the
+/// entire cap, handing the autonomy passes a budget of exactly zero — and it
+/// does so on EVERY cycle for as long as the untagged backlog stays at or
+/// above the cap, which is permanent whenever those rows keep yielding empty
+/// auto-tags (an empty tag list persists nothing, so the row stays eligible
+/// forever). Consolidation would then never run again on a busy corpus.
+///
+/// Reserving `max_ops_per_cycle / AUTONOMY_OP_RESERVE_DIVISOR` ops for the
+/// passes makes that starvation structurally impossible while keeping
+/// `max_ops_per_cycle` a TRUE hard cap: the reserve is carved OUT of the cap
+/// (the loop's own budget shrinks by the same amount), never added on top of
+/// it, so a cycle can still never exceed the operator's authorised LLM spend.
+pub const AUTONOMY_OP_RESERVE_DIVISOR: usize = 4;
 
 /// Minimum content length before the curator will touch a memory —
 /// matches the synchronous hook threshold in `src/mcp.rs`.
@@ -229,6 +249,19 @@ pub struct CuratorReport {
     /// disabled or no verify failed.
     #[serde(default)]
     pub compaction_pass_rolled_back: usize,
+    /// v1.0.0 — LLM-op budget the autonomy passes were handed this cycle,
+    /// i.e. what was left of `max_ops_per_cycle` after the auto-tag /
+    /// contradiction loop, floored at the
+    /// [`AUTONOMY_OP_RESERVE_DIVISOR`] reserve. This is the operator's
+    /// starvation gauge: a ZERO here on a cycle with a non-zero
+    /// `memories_eligible` means Pass-1 consolidation could not run at all.
+    /// Read it together with `operations_skipped_cap` (auto-tag work
+    /// deferred to the next cycle because the loop's share ran out) —
+    /// sustained non-zero deferrals mean the corpus is growing faster than
+    /// the configured cap can curate it and `max_ops_per_cycle` needs
+    /// raising.
+    #[serde(default)]
+    pub autonomy_ops_budget: usize,
     pub errors: Vec<String>,
     pub dry_run: bool,
 }
@@ -245,6 +278,20 @@ impl CuratorReport {
     }
 }
 
+/// Ops carved out of `max_ops_per_cycle` and held for the autonomy passes.
+///
+/// Returns `max_ops_per_cycle / AUTONOMY_OP_RESERVE_DIVISOR`, floored at one
+/// op so a small-but-splittable cap still reaches Pass 1, and zero when the
+/// cap is `0` or `1` (nothing to split — a one-op cycle can only afford the
+/// auto-tag loop's first op, which is the pre-v1.0.0 behaviour).
+#[must_use]
+fn autonomy_op_reserve(max_ops_per_cycle: usize) -> usize {
+    if max_ops_per_cycle <= 1 {
+        return 0;
+    }
+    (max_ops_per_cycle / AUTONOMY_OP_RESERVE_DIVISOR).max(1)
+}
+
 /// Run one curator cycle. Safe to call repeatedly. Returns a structured
 /// report regardless of outcome — LLM failures are recorded in
 /// `report.errors` rather than propagated.
@@ -254,7 +301,8 @@ impl CuratorReport {
 /// the sweep at the end of the cycle scans freshly-tagged reflections
 /// (rows with `mentioned_entity_id` set, in non-reserved namespaces)
 /// and calls [`crate::persona::PersonaGenerator`] for each entity that
-/// lacks a current persona row. When `None`, the sweep skips entirely
+/// lacks a current persona row, within the operator's configured
+/// namespace scope. When `None`, the sweep skips entirely
 /// — the substrate refuses to emit unsigned persona rows from the
 /// curator path, matching the pre-#816 posture for daemons started
 /// without a keypair on disk.
@@ -297,8 +345,15 @@ pub fn run_once(
         return Ok(report);
     };
 
+    // v1.0.0 — the auto-tag / contradiction loop draws on its SHARE of the
+    // cycle budget, not the whole cap: `autonomy_op_reserve` is withheld for
+    // the autonomy passes below (see `AUTONOMY_OP_RESERVE_DIVISOR`). Deferred
+    // rows are counted in `operations_skipped_cap` and picked up next cycle;
+    // no eligible row is dropped, only postponed.
+    let autonomy_reserve = autonomy_op_reserve(cfg.max_ops_per_cycle);
+    let autotag_op_budget = cfg.max_ops_per_cycle.saturating_sub(autonomy_reserve);
     for mem in eligible {
-        if report.operations_attempted >= cfg.max_ops_per_cycle {
+        if report.operations_attempted >= autotag_op_budget {
             report.operations_skipped_cap += 1;
             continue;
         }
@@ -329,7 +384,20 @@ pub fn run_once(
         // contradict this one. We don't do an N^2 scan — just the nearest
         // sibling by created_at. Broader contradiction analysis remains
         // an explicit `memory_detect_contradiction` call.
-        if let Ok(Some(sibling)) = adjacent_memory(conn, mem) {
+        // ERRORS-19 — a DB failure here must NOT masquerade as "no sibling":
+        // the pre-fix `if let Ok(Some(..))` discarded the `Err` half with no
+        // report entry, so a transient read failure silently skipped
+        // contradiction detection while the cycle report looked clean.
+        let sibling = match adjacent_memory(conn, mem) {
+            Ok(s) => s,
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("adjacent_memory failed for {}: {e}", mem.id));
+                None
+            }
+        };
+        if let Some(sibling) = sibling {
             match llm_client.detect_contradiction(&mem.content, &sibling.content) {
                 Ok(true) => {
                     if !cfg.dry_run
@@ -368,14 +436,48 @@ pub fn run_once(
     // (both run) or zero-consolidation (neither runs). Default false → autonomy
     // Pass-1 runs and the SAL pass is a no-op (production byte-unchanged).
     let compaction_owns_consolidation = cfg.compaction.enabled;
+    // v1.0.0 — `max_ops_per_cycle` is documented as a HARD cap on
+    // LLM-invoking operations per cycle, but the autonomy passes used to
+    // run outside it entirely: Pass 1 issued one `summarize_memories` call
+    // per cluster over a candidate batch capped at `max_ops_per_cycle * 4`,
+    // so a cycle could exceed the operator's authorised LLM budget several
+    // times over. Hand the passes what is LEFT of the cycle budget after
+    // the auto_tag / contradiction loop above, and fold the ops they spend
+    // back into the cycle counters so the persona sweep below sees a true
+    // remaining budget.
+    //
+    // The subtraction below CANNOT reach zero on a cycle with a non-empty
+    // budget: the loop above is bounded by `autotag_op_budget ==
+    // max_ops_per_cycle - autonomy_reserve`, and it is the only writer of
+    // `operations_attempted` before this point, so at least
+    // `autonomy_reserve` ops always survive for the passes. That structural
+    // floor is the fix for the starvation described on
+    // `AUTONOMY_OP_RESERVE_DIVISOR`; `report.autonomy_ops_budget` publishes
+    // the figure so an operator can see it in the cycle report.
+    let remaining_ops = cfg
+        .max_ops_per_cycle
+        .saturating_sub(report.operations_attempted);
+    debug_assert!(
+        remaining_ops >= autonomy_reserve,
+        "autonomy reserve must survive the auto-tag loop"
+    );
+    report.autonomy_ops_budget = remaining_ops;
     let pass_report = crate::autonomy::run_autonomy_passes(
         conn,
         llm_client,
         &autonomy_candidates,
         cfg.dry_run,
         /* skip_consolidation = */ compaction_owns_consolidation,
+        /* llm_op_budget = */ remaining_ops,
+        active_keypair,
     );
     report.errors.extend(pass_report.errors.clone());
+    report.operations_attempted = report
+        .operations_attempted
+        .saturating_add(pass_report.operations_attempted);
+    report.operations_skipped_cap = report
+        .operations_skipped_cap
+        .saturating_add(pass_report.operations_skipped_cap);
     report.autonomy = pass_report;
 
     // SAL `ConsolidationPass`. When `compaction.enabled` it is the LIVE
@@ -490,13 +592,7 @@ fn run_size_gc_pass(
     let mut namespaces: BTreeSet<&str> = BTreeSet::new();
     for mem in candidates {
         let ns = mem.namespace.as_str();
-        if ns.starts_with('_') {
-            continue;
-        }
-        if !cfg.include_namespaces.is_empty() && !cfg.include_namespaces.iter().any(|n| n == ns) {
-            continue;
-        }
-        if cfg.exclude_namespaces.iter().any(|n| n == ns) {
+        if !namespace_in_scope(ns, cfg) {
             continue;
         }
         namespaces.insert(ns);
@@ -547,6 +643,23 @@ fn run_consolidation_pass(
     report: &mut CuratorReport,
 ) {
     if !cfg.compaction.enabled {
+        return;
+    }
+    // ERRORS-08 / CONCURRENCY-22 — the `rt.block_on` below PANICS
+    // ("Cannot start a runtime from within a runtime") when `run_once` is
+    // reached from a thread that already has an ambient tokio runtime. That
+    // contract used to be documentation-only on a `pub fn`, so an async
+    // caller crashed instead of getting a `Result`. Detect the in-runtime
+    // case and DEGRADE (skip this pass, surface the reason) rather than
+    // unwinding the caller: the corpus is untouched either way, but a
+    // reported skip is recoverable and a panic is not.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        report.errors.push(
+            "consolidation pass: skipped — curator::run_once was called from inside an async \
+             runtime; wrap the call in tokio::task::spawn_blocking so the pass can drive its \
+             own runtime"
+                .to_string(),
+        );
         return;
     }
     let Some(path) = conn.path().map(std::path::PathBuf::from) else {
@@ -621,6 +734,17 @@ fn run_consolidation_pass(
 /// `attest_level='self_signed'` and a 64-byte Ed25519 signature on every
 /// `derived_from` link.
 ///
+/// **Namespace scope (v1.0.0)**: every candidate `(entity_id, namespace)`
+/// pair is filtered through [`namespace_in_scope`] — the same predicate
+/// `needs_curation` and the size-GC pass use — so the operator's
+/// `include_namespaces` / `exclude_namespaces` configuration governs this
+/// sweep exactly as it governs the rest of the cycle. Pre-fix the scan
+/// filtered on the reserved `_`-prefix ONLY, so a namespace the operator
+/// had excluded still grew signed persona rows. The predicate is applied
+/// twice on purpose: once pushed into the scan SQL (so out-of-scope rows
+/// cannot consume the `LIMIT` window and starve in-scope entities) and
+/// once per row in the loop (fail-closed backstop).
+///
 /// **Gating**: skips the entire sweep when `active_keypair` is `None`.
 /// The pre-#816 contract on the curator path was "no auto-generated
 /// persona at all" rather than "unsigned auto-generated persona", so
@@ -661,18 +785,51 @@ fn persona_sweep(
     // existence check inside the loop short-circuit.
     use std::collections::BTreeSet;
     let limit = (cfg.max_ops_per_cycle.saturating_mul(2)).max(64);
+    // PERF-07 — `limit` is a `usize` derived from operator config; a lossy
+    // `as i64` would WRAP NEGATIVE on a pathological `max_ops_per_cycle`
+    // and turn the LIMIT clause into "no rows" (or worse). Clamp instead.
+    let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
+
+    // v1.0.0 — the operator's include / exclude namespace configuration is
+    // pushed into the SCAN, not just applied after it. Filtering only in
+    // the loop would still let out-of-scope rows consume the `LIMIT`
+    // window and starve in-scope entities in a busy corpus, so the
+    // predicate goes into SQL; the loop below re-checks via
+    // `namespace_in_scope` as a fail-closed backstop should this SQL and
+    // the predicate ever drift.
+    let mut sql = String::from(
+        "SELECT mentioned_entity_id, namespace \
+         FROM memories \
+         WHERE memory_kind = 'reflection' \
+           AND mentioned_entity_id IS NOT NULL \
+           AND namespace NOT LIKE '\\_%' ESCAPE '\\'",
+    );
+    let mut binds: Vec<rusqlite::types::Value> =
+        Vec::with_capacity(cfg.include_namespaces.len() + cfg.exclude_namespaces.len() + 1);
+    for (clause, list) in [
+        (" AND namespace IN (", &cfg.include_namespaces),
+        (" AND namespace NOT IN (", &cfg.exclude_namespaces),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        sql.push_str(clause);
+        for (i, ns) in list.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            binds.push(rusqlite::types::Value::Text(ns.clone()));
+        }
+        sql.push(')');
+    }
+    sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+    binds.push(rusqlite::types::Value::Integer(limit_sql));
+
     let mut entity_pairs: BTreeSet<(String, String)> = BTreeSet::new();
     let scan_result = (|| -> Result<()> {
-        let mut stmt = conn.prepare(
-            "SELECT mentioned_entity_id, namespace
-             FROM memories
-             WHERE memory_kind = 'reflection'
-               AND mentioned_entity_id IS NOT NULL
-               AND namespace NOT LIKE '\\_%' ESCAPE '\\'
-             ORDER BY created_at DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -699,6 +856,12 @@ fn persona_sweep(
     let generator = PersonaGenerator::new(conn, _llm_client, Some(keypair), config);
 
     for (entity_id, namespace) in entity_pairs {
+        // Fail-closed backstop for the SQL scope predicate above: a persona
+        // row is a SIGNED artifact, so it must never land in a namespace
+        // the operator put out of scope, even if the scan drifts.
+        if !namespace_in_scope(&namespace, cfg) {
+            continue;
+        }
         if report.operations_attempted >= cfg.max_ops_per_cycle {
             report.operations_skipped_cap += 1;
             continue;
@@ -782,13 +945,24 @@ pub fn run_daemon(
                 let llm_ref = llm.as_deref();
                 let kp_ref = active_keypair.as_deref();
                 match run_once(&conn, llm_ref, &cfg, kp_ref) {
+                    // v1.0.0 — `deferred` / `autonomy_budget` are the
+                    // budget-pressure pair. A steady non-zero `deferred` means
+                    // the corpus is growing faster than `max_ops_per_cycle`
+                    // can curate it; an `autonomy_budget` of 0 against a
+                    // non-zero `eligible` means Pass-1 consolidation did not
+                    // run at all this cycle. Neither was visible from the
+                    // daemon log before, which is how the Pass-1 starvation
+                    // this reserve fixes could have run unnoticed for the life
+                    // of a deployment.
                     Ok(report) => tracing::info!(
-                        "curator cycle: scanned={} eligible={} tagged={} contradictions={} personas={} errors={} ({}ms, dry_run={})",
+                        "curator cycle: scanned={} eligible={} tagged={} contradictions={} personas={} deferred={} autonomy_budget={} errors={} ({}ms, dry_run={})",
                         report.memories_scanned,
                         report.memories_eligible,
                         report.auto_tagged,
                         report.contradictions_found,
                         report.personas_generated,
+                        report.operations_skipped_cap,
+                        report.autonomy_ops_budget,
                         report.errors.len(),
                         report.cycle_duration_ms,
                         report.dry_run
@@ -2153,6 +2327,120 @@ mod tests {
         assert!(report.autonomy.clusters_formed >= 1, "report: {report:?}");
     }
 
+    /// v1.0.0 REGRESSION — Pass-1 STARVATION.
+    ///
+    /// The auto-tag / contradiction loop and the autonomy passes are fed by
+    /// the SAME `needs_curation` predicate and drew on the same
+    /// `max_ops_per_cycle` budget, loop first. So whenever the eligible
+    /// backlog reached the cap the loop consumed all of it and Pass-1
+    /// consolidation was handed a budget of exactly ZERO — every cycle, and
+    /// permanently whenever those rows keep yielding empty auto-tags (an
+    /// empty tag list persists nothing, so the row stays eligible forever).
+    /// Consolidation would then never run again on a busy corpus, silently:
+    /// the cycle report looked healthy.
+    ///
+    /// Backlog of 5 eligible rows against a cap of 4 (one over the cap even
+    /// before the reserve). The assertions are the two halves of the
+    /// contract: Pass 1 gets a NON-ZERO budget and actually consolidates,
+    /// AND the cycle still never exceeds `max_ops_per_cycle` — the reserve is
+    /// carved out of the cap, never added on top of it.
+    #[test]
+    fn run_once_reserves_autonomy_budget_when_autotag_backlog_fills_cap() {
+        let server = FakeOllama::start(FakeOllamaCfg::default());
+        let llm = ollama_for(&server);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+
+        // One mergeable near-duplicate pair: `make_eligible_memory` gives both
+        // rows identical content (clears the jaccard pre-filter) and aligned
+        // embeddings clear the #1774 cosine gate.
+        for i in 0..2 {
+            let m = make_eligible_memory("starve", &format!("dup-{i}"));
+            db::insert(&conn, &m).unwrap();
+            db::set_embedding(
+                &conn,
+                &m.id,
+                &[1.0, 0.0],
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
+            )
+            .unwrap();
+        }
+        // Backlog filler: eligible for auto-tag, but NOT mergeable — with no
+        // stored embedding the cosine gate blocks every pair they are in
+        // (#1774), so the only cluster available to Pass 1 is the pair above.
+        for i in 0..3 {
+            let m = make_eligible_memory("starve", &format!("filler-{i}"));
+            db::insert(&conn, &m).unwrap();
+        }
+
+        let cfg = CuratorConfig {
+            max_ops_per_cycle: 4,
+            include_namespaces: vec!["starve".to_string()],
+            ..CuratorConfig::default()
+        };
+        let report = run_once(&conn, Some(&llm), &cfg, None).unwrap();
+
+        assert_eq!(
+            report.memories_eligible, 5,
+            "backlog must exceed the cap for this to be the starving case: {report:?}"
+        );
+        assert!(
+            report.autonomy_ops_budget >= 1,
+            "Pass 1 must get a non-zero budget even with a cap-filling backlog: {report:?}"
+        );
+        assert!(
+            report.autonomy.clusters_formed >= 1,
+            "Pass-1 consolidation must actually run with the reserved budget: {report:?}"
+        );
+        assert!(
+            report.operations_attempted <= cfg.max_ops_per_cycle,
+            "the reserve is carved OUT of max_ops_per_cycle, so the documented \
+             hard cap must still hold: {report:?}"
+        );
+        assert!(
+            report.operations_skipped_cap >= 1,
+            "auto-tag work the reserve deferred must be COUNTED, not dropped: {report:?}"
+        );
+    }
+
+    /// The reserve is a share OF the cap, never an addition to it, and it
+    /// floors at one op so a small-but-splittable cap still reaches Pass 1.
+    /// A cap of 0 or 1 has nothing to split and reserves nothing (a one-op
+    /// cycle can only afford the auto-tag loop's first op).
+    #[test]
+    fn autonomy_op_reserve_is_a_share_of_the_cap_never_an_addition() {
+        assert_eq!(autonomy_op_reserve(0), 0);
+        assert_eq!(autonomy_op_reserve(1), 0);
+        assert_eq!(autonomy_op_reserve(2), 1, "floors at one op");
+        assert_eq!(autonomy_op_reserve(3), 1, "floors at one op");
+        assert_eq!(
+            autonomy_op_reserve(DEFAULT_MAX_OPS_PER_CYCLE),
+            DEFAULT_MAX_OPS_PER_CYCLE / AUTONOMY_OP_RESERVE_DIVISOR
+        );
+        for cap in [
+            0_usize,
+            1,
+            2,
+            3,
+            4,
+            7,
+            99,
+            DEFAULT_MAX_OPS_PER_CYCLE,
+            10_000,
+        ] {
+            let reserve = autonomy_op_reserve(cap);
+            assert!(
+                reserve <= cap,
+                "reserve {reserve} must be carved out of cap {cap}, never added on top"
+            );
+            assert!(
+                cap <= 1 || reserve >= 1,
+                "a splittable cap {cap} must reserve at least one op for Pass 1"
+            );
+        }
+    }
+
     /// Issue #816 — auto-persona sweep generates a signed persona row
     /// for an entity that a recent reflection mentions, when the daemon
     /// has a signing keypair on disk and the LLM is reachable.
@@ -2354,6 +2642,169 @@ mod tests {
             persona.is_none(),
             "dry-run must NOT write a persona row, got: {persona:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // v1.0.0 curator correctness regressions (ox-alpha review).
+    // -----------------------------------------------------------------
+
+    /// Insert one reflection carrying `mentioned_entity_id` in `ns` and
+    /// return the entity id. Mirrors the fixture used by the existing
+    /// persona-sweep tests: the column is patched post-insert because the
+    /// public `Memory` struct does not expose it.
+    fn seed_reflection_with_entity(conn: &Connection, ns: &str, entity_id: &str) {
+        let obs = make_eligible_memory(ns, "observation");
+        let obs_id = db::insert(conn, &obs).unwrap();
+        let mut rfl = make_eligible_memory(ns, "reflection-of-obs");
+        rfl.memory_kind = crate::models::MemoryKind::Reflection;
+        rfl.reflection_depth = 1;
+        rfl.content = "This reflection mentions the entity under test.".to_string();
+        let rfl_id = db::insert(conn, &rfl).unwrap();
+        conn.execute(
+            "UPDATE memories SET mentioned_entity_id = ?1 WHERE id = ?2",
+            rusqlite::params![entity_id, &rfl_id],
+        )
+        .unwrap();
+        db::create_link(conn, &rfl_id, &obs_id, "reflects_on").unwrap();
+    }
+
+    /// REGRESSION (ox-alpha #1) — `persona_sweep` must honour the
+    /// operator's `exclude_namespaces`. Pre-fix its scan filtered on the
+    /// reserved `_`-prefix ONLY, so the sweep wrote SIGNED persona rows
+    /// into namespaces the operator had explicitly excluded — while
+    /// `run_size_gc_pass` in the same file filtered correctly. The
+    /// in-scope namespace is asserted too, so a filter that simply
+    /// disabled the sweep could not pass this test.
+    #[test]
+    fn persona_sweep_honours_exclude_namespaces() {
+        let server = FakeOllama::start(FakeOllamaCfg::default());
+        let llm = ollama_for(&server);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+
+        seed_reflection_with_entity(&conn, "persona-kept", "entity-kept");
+        seed_reflection_with_entity(&conn, "persona-dropped", "entity-dropped");
+
+        let kp = crate::identity::keypair::generate("daemon").unwrap();
+        let cfg = CuratorConfig {
+            exclude_namespaces: vec!["persona-dropped".to_string()],
+            ..CuratorConfig::default()
+        };
+        let report = run_once(&conn, Some(&llm), &cfg, Some(&kp)).unwrap();
+
+        assert!(
+            crate::persona::get_latest_persona(&conn, "entity-kept", "persona-kept")
+                .unwrap()
+                .is_some(),
+            "in-scope namespace must still get a persona, report.errors={:?}",
+            report.errors
+        );
+        assert!(
+            crate::persona::get_latest_persona(&conn, "entity-dropped", "persona-dropped")
+                .unwrap()
+                .is_none(),
+            "excluded namespace must NEVER receive a curator-signed persona row"
+        );
+        assert_eq!(
+            report.personas_generated, 1,
+            "exactly one in-scope persona expected, errors={:?}",
+            report.errors
+        );
+    }
+
+    /// REGRESSION (ox-alpha #1, include half) — with a non-empty
+    /// `include_namespaces`, `persona_sweep` must touch ONLY the listed
+    /// namespaces.
+    #[test]
+    fn persona_sweep_honours_include_namespaces() {
+        let server = FakeOllama::start(FakeOllamaCfg::default());
+        let llm = ollama_for(&server);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+
+        seed_reflection_with_entity(&conn, "persona-in", "entity-in");
+        seed_reflection_with_entity(&conn, "persona-out", "entity-out");
+
+        let kp = crate::identity::keypair::generate("daemon").unwrap();
+        let cfg = CuratorConfig {
+            include_namespaces: vec!["persona-in".to_string()],
+            ..CuratorConfig::default()
+        };
+        let report = run_once(&conn, Some(&llm), &cfg, Some(&kp)).unwrap();
+
+        assert!(
+            crate::persona::get_latest_persona(&conn, "entity-in", "persona-in")
+                .unwrap()
+                .is_some(),
+            "included namespace must get a persona, report.errors={:?}",
+            report.errors
+        );
+        assert!(
+            crate::persona::get_latest_persona(&conn, "entity-out", "persona-out")
+                .unwrap()
+                .is_none(),
+            "namespace outside include_namespaces must NEVER receive a persona row"
+        );
+    }
+
+    /// The single-source namespace-scope predicate every curator pass
+    /// routes through.
+    #[test]
+    fn namespace_in_scope_predicate() {
+        let mut cfg = CuratorConfig::default();
+        assert!(namespace_in_scope("app", &cfg));
+        assert!(
+            !namespace_in_scope("_curator/reports", &cfg),
+            "reserved namespaces are always out of scope"
+        );
+
+        cfg.include_namespaces = vec!["app".to_string()];
+        assert!(namespace_in_scope("app", &cfg));
+        assert!(!namespace_in_scope("other", &cfg));
+
+        cfg.include_namespaces.clear();
+        cfg.exclude_namespaces = vec!["noisy".to_string()];
+        assert!(namespace_in_scope("app", &cfg));
+        assert!(!namespace_in_scope("noisy", &cfg));
+
+        // Exclude wins over include for the same namespace (fail closed).
+        cfg.include_namespaces = vec!["noisy".to_string()];
+        assert!(!namespace_in_scope("noisy", &cfg));
+    }
+
+    /// REGRESSION (ox-alpha #4) — a row whose `metadata` column holds
+    /// non-object JSON used to make both persist helpers a SILENT no-op:
+    /// they wrote the metadata back unchanged, returned `Ok(())`, and let
+    /// `run_once` increment `auto_tagged` / `contradictions_found`. A lost
+    /// write must be refused loudly, not self-reported as a success.
+    #[test]
+    fn persist_helpers_refuse_non_object_metadata() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+
+        let mut mem = make_eligible_memory("meta-ns", "non-object-metadata");
+        mem.metadata = serde_json::json!([1, 2, 3]);
+        db::insert(&conn, &mem).unwrap();
+
+        let tag_err = persist_auto_tags(&conn, &mem, &["t".to_string()])
+            .expect_err("non-object metadata must be refused, not silently dropped");
+        assert!(
+            tag_err.to_string().contains("auto_tags"),
+            "error must name the refused write: {tag_err}"
+        );
+
+        let contra_err = persist_contradiction(&conn, &mem, "other-id")
+            .expect_err("non-object metadata must be refused, not silently dropped");
+        assert!(
+            contra_err.to_string().contains("array"),
+            "error must name the offending metadata shape: {contra_err}"
+        );
+
+        // An object-metadata row on the same path still succeeds.
+        let ok_mem = make_eligible_memory("meta-ns", "object-metadata");
+        db::insert(&conn, &ok_mem).unwrap();
+        persist_auto_tags(&conn, &ok_mem, &["t".to_string()])
+            .expect("object metadata must still persist");
     }
 }
 
@@ -2787,5 +3238,55 @@ mod consolidation_pass_tests_1746 {
             "no errors expected: {:?}",
             report.errors
         );
+    }
+
+    /// REGRESSION (ox-alpha #8) — `run_once` is a `pub fn` whose SAL
+    /// consolidation pass drives its own runtime via `block_on`. Reached
+    /// from a thread that already has an ambient tokio runtime that call
+    /// PANICS ("Cannot start a runtime from within a runtime"), and the
+    /// only thing standing between a caller and that panic used to be a
+    /// doc comment. The in-runtime case is now detected and DEGRADED to a
+    /// reported skip: the caller gets its report back instead of an
+    /// unwind, and the corpus is untouched either way.
+    #[tokio::test]
+    async fn consolidation_pass_degrades_instead_of_panicking_inside_a_runtime() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let cfg = CuratorConfig {
+            compaction: CompactionConfig {
+                enabled: true,
+                ..CompactionConfig::default()
+            },
+            ..CuratorConfig::default()
+        };
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(false);
+
+        // Pre-fix: this line panicked and took the test thread with it.
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("inside an async runtime")),
+            "the in-runtime skip must be surfaced to the operator, got {:?}",
+            report.errors
+        );
+        assert_eq!(
+            *llm.summarize_calls.lock().unwrap(),
+            0,
+            "a skipped pass must invoke no LLM"
+        );
+        assert_eq!(report.autonomy.memories_consolidated, 0);
+        for m in &candidates {
+            assert!(
+                db::get(&conn, &m.id).unwrap().is_some(),
+                "a skipped pass must leave every source row intact"
+            );
+        }
     }
 }
