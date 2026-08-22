@@ -599,13 +599,31 @@ operation's measured p95 exceeds its target by more than 10%.
 | `--regression-threshold <PCT>` | f64 | `bench::DEFAULT_REGRESSION_THRESHOLD_PCT` | Growth threshold for regression flagging (clamped `[0.0, 1000.0]`). |
 | `--history <PATH>` | path | — | Append the run as one JSONL row to a history file (rolling p95 trend). |
 | `--scale <ROWS>` | usize | — | #1579 B8: seed a scratch corpus of `<ROWS>` rows first and gate against the `PERFORMANCE.md` §"Corpus-scale budgets" table (clamped `[1, 1_000_000]`). |
+| `--report-only` | bool | `false` | Measure and report, but never exit non-zero on a budget or regression verdict. Adds `"report_only": true` to the `--json` envelope and a one-line notice on stderr in table mode. |
 
 ```bash
 ai-memory bench
 ai-memory bench --json --history ./bench/history.jsonl
 ai-memory bench --baseline ./bench/baseline-v0.6.3.json
 ai-memory bench --scale 10000
+ai-memory bench --json --iterations 2 --warmup 0 --report-only
 ```
+
+**`--report-only` (diagnostic / smoke use).** Every operation is still
+timed and its `pass`/`fail` status still printed — only the exit code
+changes. The absolute p95 budgets are calibrated to specific reference
+hardware: `PERFORMANCE.md` §"Measurement methodology" defines them against
+GitHub-hosted `ubuntu-latest`, the runner class its hardware multiplier
+table gives 1.0. Exactly one gate measures them there —
+`.github/workflows/bench.yml`, which runs on `ubuntu-latest` and builds
+`--release`. Anywhere else — a self-hosted runner sharing the box with
+another test suite, a developer laptop, an unoptimized debug build — you
+are comparing a different machine against `ubuntu-latest`-calibrated
+targets, so the measured latencies say nothing about the performance
+contract and failing on them turns machine load into a red build. Use
+`--report-only` when the caller only needs to prove the subcommand runs
+and emits well-formed output; leave it off wherever the budget verdict is
+the point.
 
 Operations covered by `src/bench.rs`: `memory_store` (no embedding),
 `memory_search` (FTS5), `memory_recall` (hot, depth=1),

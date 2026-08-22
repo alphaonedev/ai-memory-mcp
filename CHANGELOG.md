@@ -106,6 +106,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The required `Check` legs are no longer undeclared performance gates:
+  `ai-memory bench` gains `--report-only`.** `cmd_bench` bails non-zero
+  whenever any operation's measured p95 exceeds its target by more than 10%, so
+  the TWO integration tests that ran `bench` and asserted `status.success()`
+  were in effect asserting the performance contract from inside the required
+  `Check` matrix. On GitHub-hosted VMs they ran isolated and passed; on the
+  self-hosted `Check (linux-fed,sqlite)` leg
+  `tests/integration.rs::test_cli_smoke_canonical_paths` step 19 ran while the
+  rest of the suite had the box at load 36 and went red (CI run 32556214239).
+  `PERFORMANCE.md` §"Measurement methodology" calibrates the budgets to
+  GitHub-hosted `ubuntu-latest` (hardware multiplier 1.0) and exactly one gate
+  measures them there — `.github/workflows/bench.yml`, which runs on that
+  runner class and builds `--release`. A debug binary on a contended
+  self-hosted box compared against an `ubuntu-latest`-calibrated target is a
+  measurement read off the wrong machine. The new `--report-only` flag
+  still measures every operation, still prints each `pass`/`fail` status and
+  every regression row, and adds `"report_only": true` to the `--json` envelope
+  plus a one-line stderr notice in table mode — it only stops the
+  budget/regression verdict from failing the process. Both tests now pass
+  `--report-only` and assert envelope SHAPE instead: step 19 gains non-empty
+  `results` plus per-row `operation`, `measured_p95_ms`, `target_p95_ms` and
+  `status` in `{pass, fail}`; `test_cli_bench_emits_json_with_seven_results_and_passes_budget`
+  keeps all eight-operation and per-field assertions, gains `report_only ==
+  true`, and is renamed
+  `test_cli_bench_emits_json_with_eight_results_report_only` (the old name
+  claimed seven results while asserting eight, and claimed a budget pass it no
+  longer makes). Fatal semantics are unchanged when the flag is absent.
 - **Record-stop enforcement no longer silently degrades at the SAL layer when
   the sqlite DB path resolves through a symlink** (e.g. the macOS
   `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed

@@ -8017,28 +8017,53 @@ fn test_hier_recall_touches_only_ancestor_matches() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_cli_bench_emits_json_with_seven_results_and_passes_budget() {
+fn test_cli_bench_emits_json_with_eight_results_report_only() {
     // End-to-end CLI integration test for the `ai-memory bench`
     // subcommand (Pillar 3 / Stream E). Verifies that:
-    //   1. The binary exits 0 (no operation exceeded its p95 budget).
+    //   1. The binary exits 0.
     //   2. --json output is parseable and well-shaped.
     //   3. All 8 hot-path operations are reported (incl. the #1871
     //      handler-layer rerank-stage recall op).
     //   4. Each result carries the fields documented in PERFORMANCE.md.
+    //   5. The `--report-only` mode is surfaced in the envelope.
     //
     // The bench subcommand seeds a disposable :memory: SQLite DB
     // internally, so no fixture is required. Iterations are kept tiny
-    // to keep CI time bounded — the fact that the budgets are met
-    // even at 5 iterations is itself a smoke test of the budget math.
+    // to keep CI time bounded.
+    //
+    // WHERE THE BUDGET VERDICT LIVES: `.github/workflows/bench.yml` — one job,
+    // on GitHub-hosted `ubuntu-latest`, building `--release`. That runner class
+    // is not incidental: `PERFORMANCE.md` §"Measurement methodology" defines
+    // every p95 target against it and its hardware multiplier table gives it
+    // 1.0. The verdict is deliberately NOT asserted here. This test runs inside
+    // the required `Check` matrix on SELF-HOSTED runners that execute the rest
+    // of the suite concurrently on the same box, against an unoptimized debug
+    // build — a p95 measured there compared against an `ubuntu-latest`-
+    // calibrated target is a measurement read off the wrong machine, so
+    // asserting it turns machine load into a red build (that is exactly how the
+    // `test_cli_smoke_canonical_paths` bench step went red on CI run
+    // 32556214239, job `Check (linux-fed,sqlite)`, at load 36). `--report-only`
+    // keeps every measurement and every per-operation `pass`/`fail` status in
+    // the payload — the assertions below still pin the full envelope SHAPE —
+    // while leaving budget ENFORCEMENT to the gate on the calibrated hardware.
     let bin = env!("CARGO_BIN_EXE_ai-memory");
     let out = cmd(bin)
-        .args(["bench", "--json", "--iterations", "5", "--warmup", "0"])
+        .args([
+            "bench",
+            "--json",
+            "--iterations",
+            "5",
+            "--warmup",
+            "0",
+            "--report-only",
+        ])
         .output()
         .expect("failed to spawn ai-memory bench");
 
     assert!(
         out.status.success(),
-        "bench exited non-zero (a budget regression?): stderr={}",
+        "bench --report-only exited non-zero (it must never fail on a budget \
+         or regression verdict): stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -8049,6 +8074,11 @@ fn test_cli_bench_emits_json_with_seven_results_and_passes_budget() {
     // Envelope shape.
     assert_eq!(parsed["iterations"], serde_json::json!(5));
     assert_eq!(parsed["warmup"], serde_json::json!(0));
+    assert_eq!(
+        parsed["report_only"],
+        serde_json::json!(true),
+        "bench --report-only must surface the mode in the JSON envelope"
+    );
     let results = parsed["results"]
         .as_array()
         .expect("results must be a JSON array");
@@ -12430,7 +12460,18 @@ fn test_cli_smoke_canonical_paths() {
     );
     assert!(backup_output.status.success(), "backup failed");
 
-    // 19. bench: run microbench (with minimal iterations to stay fast)
+    // 19. bench: run microbench (with minimal iterations to stay fast).
+    //
+    // `--report-only` is REQUIRED here: this is a CLI smoke, not a perf gate.
+    // Without it `cmd_bench` bails whenever any measured p95 exceeds its
+    // budget by >10%, which made this step an undeclared performance
+    // assertion — and it duly went red on a self-hosted runner that was at
+    // load 36 running the rest of this suite (CI run 32556214239, job
+    // `Check (linux-fed,sqlite)`). The budgets are calibrated to GitHub-hosted
+    // `ubuntu-latest` (`PERFORMANCE.md` §"Measurement methodology", hardware
+    // multiplier 1.0) and are enforced by the one gate that runs there,
+    // `.github/workflows/bench.yml`. What this step must prove is that the
+    // subcommand runs and emits a well-formed JSON envelope.
     let bench_output = cmd_output_or_panic(
         binary,
         &[
@@ -12442,12 +12483,44 @@ fn test_cli_smoke_canonical_paths() {
             "2",
             "--warmup",
             "0",
+            "--report-only",
         ],
     );
     assert!(bench_output.status.success(), "bench failed");
     let bench_result: serde_json::Value =
         serde_json::from_slice(&bench_output.stdout).expect("bench --json must be valid JSON");
     assert!(bench_result["results"].is_array());
+    assert_eq!(
+        bench_result["report_only"],
+        serde_json::json!(true),
+        "bench --report-only must surface the mode in the JSON envelope"
+    );
+    let bench_rows = bench_result["results"]
+        .as_array()
+        .expect("bench results must be a JSON array");
+    assert!(
+        !bench_rows.is_empty(),
+        "bench must report at least one operation"
+    );
+    for r in bench_rows {
+        assert!(
+            r["operation"].is_string(),
+            "each bench result needs an `operation`: {r}"
+        );
+        assert!(
+            r["measured_p95_ms"].is_number(),
+            "each bench result needs a numeric `measured_p95_ms`: {r}"
+        );
+        assert!(
+            r["target_p95_ms"].is_number(),
+            "each bench result needs a numeric `target_p95_ms`: {r}"
+        );
+        let verdict = r["status"].as_str().unwrap_or_default();
+        assert!(
+            verdict == "pass" || verdict == "fail",
+            "each bench result needs a `status` of pass|fail, got {verdict:?}: {r}"
+        );
+    }
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&backup_dir);

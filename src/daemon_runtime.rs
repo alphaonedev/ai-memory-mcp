@@ -735,6 +735,11 @@ pub struct DoctorCliArgs {
 }
 
 #[derive(Args)]
+// Four independent on/off switches (`--json`, `--verified`, `--relevance`,
+// `--report-only`) that clap maps 1:1 onto CLI flags; collapsing them into an
+// enum/struct would change the published CLI surface, so the pedantic
+// three-bool ceiling is waived here.
+#[allow(clippy::struct_excessive_bools)]
 pub struct BenchArgs {
     /// Measured iterations per operation. Clamped to `[1, 100_000]`.
     #[arg(long, default_value_t = bench::DEFAULT_ITERATIONS)]
@@ -797,6 +802,27 @@ pub struct BenchArgs {
     /// (only consulted under `--relevance`). Clamped to `>= 1`.
     #[arg(long, value_name = "K", default_value_t = bench_relevance::DEFAULT_RELEVANCE_K)]
     pub k: usize,
+    /// Measure and report, but never fail the process on a budget or
+    /// regression verdict. Every operation is still timed and its
+    /// `pass`/`fail` status still printed (and `report_only: true` is added to
+    /// the `--json` envelope), so nothing is hidden — only the exit code
+    /// changes.
+    ///
+    /// WHY: the absolute p95 budgets are pinned to specific reference
+    /// hardware — `PERFORMANCE.md` §"Measurement methodology" defines them
+    /// against GitHub-hosted `ubuntu-latest`, the runner class its hardware
+    /// multiplier table gives 1.0 — and exactly ONE gate measures them there:
+    /// `.github/workflows/bench.yml`, which runs on `ubuntu-latest` and builds
+    /// `--release`. A smoke or diagnostic invocation anywhere else — a
+    /// self-hosted runner sharing the box with the rest of a test suite, a
+    /// developer laptop, an unoptimized debug build — is measuring a different
+    /// machine against `ubuntu-latest`-calibrated targets, so its latencies say
+    /// nothing about the performance contract and failing on them turns machine
+    /// load into a red build. Use this flag whenever the caller only needs to
+    /// prove the subcommand runs and emits well-formed output; leave it off
+    /// wherever the budget verdict is the point.
+    #[arg(long)]
+    pub report_only: bool,
 }
 
 /// Default `--batch` page-size hint for `ai-memory migrate`. Currently
@@ -7344,6 +7370,7 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
                 "warmup": warmup,
                 "scale": scale,
                 "verified": args.verified,
+                "report_only": args.report_only,
                 "results": results,
                 "regressions": regressions,
             }))?
@@ -7353,6 +7380,15 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         if let Some(rows) = &regressions {
             println!();
             print!("{}", bench::render_regression_table(rows));
+        }
+        if args.report_only {
+            // stderr, mirroring the `--history` notice below, so the rendered
+            // table on stdout stays byte-identical for downstream consumers.
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "bench: --report-only — measured and reported, budgets NOT enforced (they are calibrated to ubuntu-latest per PERFORMANCE.md and gated only by .github/workflows/bench.yml, which runs there)"
+            );
         }
     }
 
@@ -7374,27 +7410,16 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         );
     }
 
-    let budget_failed = results
-        .iter()
-        .any(|r| matches!(r.status, bench::Status::Fail));
-    let regression_failed = regressions
-        .as_ref()
-        .is_some_and(|rows| rows.iter().any(|r| r.regressed));
-
-    if budget_failed && regression_failed {
-        anyhow::bail!(
-            "bench: at least one operation exceeded its p95 budget by >10% AND regressed >{regression_threshold:.1}% vs baseline"
-        );
-    }
-    if budget_failed {
-        anyhow::bail!("bench: at least one operation exceeded its p95 budget by >10%");
-    }
-    if regression_failed {
-        anyhow::bail!(
-            "bench: at least one operation regressed >{regression_threshold:.1}% vs baseline"
-        );
-    }
-    Ok(())
+    // The verdict lives in `bench::verdict` so the fatal-vs-advisory decision
+    // is unit-testable without spawning the binary. `--report-only` downgrades
+    // both gates to advisory; every status/regression row above is printed
+    // either way.
+    bench::verdict(
+        &results,
+        regressions.as_deref(),
+        regression_threshold,
+        args.report_only,
+    )
 }
 
 /// L10 (Wave-2) — the relevance-at-scale sub-mode of `ai-memory bench`.
@@ -12397,6 +12422,7 @@ decision = "allow"
             verified: false,
             relevance: true,
             k: 5,
+            report_only: false,
         };
         // Table render arm.
         cmd_bench(&base).expect("cmd_bench relevance (table) must return Ok");
