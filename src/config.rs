@@ -4528,7 +4528,11 @@ pub fn cid_enforce_enabled() -> bool {
 /// [`crate::storage::schema_integrity`].
 ///
 /// Unset / falsy (the default) = report only: a loud structured WARN plus a
-/// `doctor` signal, behaviour otherwise byte-identical to pre-#3113. Truthy
+/// `doctor` signal, behaviour otherwise byte-identical to pre-#3113 — apart
+/// from a `sqlite_master` probe read error, which FAILS CLOSED: it propagates
+/// and rolls the ladder back rather than being coerced into "nothing missing"
+/// (the #2445 tri-state-stamp-read precedent). That is the one behavioural
+/// difference the default posture can produce, and it is deliberate. Truthy
 /// (`1` / `true` / `yes` / `on`, case-insensitive) = the migration REFUSES to
 /// stamp, rolling back with the database unchanged and still readable at its
 /// current version.

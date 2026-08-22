@@ -594,7 +594,11 @@ force.
   `sqlite_master` and one `COUNT(*)`. A regression test round-trips the full
   catalogue and row count across a probe to pin that. Under the default posture
   behaviour is byte-identical to before: the open still succeeds, the ladder
-  still advances to the tip, no row is touched.
+  still advances to the tip, no row is touched. The one exception is
+  deliberate: a `sqlite_master` probe read ERROR fails closed (propagates,
+  rolling the ladder back) instead of being coerced into "nothing missing" —
+  reporting integrity as intact on the strength of a failed read is the same
+  fail-open shape this change removes.
 
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 

@@ -11,7 +11,9 @@
 //!
 //! This file pins the DEFAULT posture: the loss is DETECTED and reported, and
 //! behaviour is otherwise byte-identical to pre-#3113 (the open still
-//! succeeds, the stamp still advances, no row is touched). The refusal leg
+//! succeeds, the stamp still advances, no row is touched) — apart from a
+//! `sqlite_master` probe read error, which FAILS CLOSED and propagates rather
+//! than being read as "nothing missing". The refusal leg
 //! lives in `migration_core_relation_refusal_3113.rs`, alone in its own test
 //! binary so its env var cannot leak into a concurrent test.
 

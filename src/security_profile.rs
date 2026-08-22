@@ -43,6 +43,8 @@
 //! | `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` | `1` | unsigned direct writes refused on EVERY surface |
 //! | `AI_MEMORY_FED_REQUIRE_WRITE_SIG` | `1` | inbound relayed memories must carry a verified per-write signature |
 //! | `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` | `1` | inbound relayed signals must verify against the enrolled author key |
+//! | `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` | `1` | inbound relayed lifecycle transitions must verify against the enrolled author key |
+//! | `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` | `1` | inbound relayed checkpoints must verify against the enrolled author key |
 //! | `AI_MEMORY_FED_REQUIRE_SIG` | `1` | inbound federation requests must carry a verified per-message Ed25519 signature (#3033 outer-transport gate) |
 //! | `AI_MEMORY_FED_REQUIRE_NONCE` | `1` | inbound federation requests must carry a fresh per-message nonce (#3033 outer-transport gate) |
 //! | `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` | `1` | an inbound peer's `X-Peer-Id` must resolve to an enrolled Ed25519 key (#3033 outer-transport gate) |
@@ -57,6 +59,7 @@
 //! | `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` | `1` | outbound federation TLS must verify the PEER SERVER cert — `--insecure-skip-server-verify` is refused (#2448) |
 //! | `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` | *(unset)* | the plaintext-peer hatch is NOT in force — an `http://` peer on a non-loopback host is refused (#2477) |
 //! | `AI_MEMORY_DB_SYNCHRONOUS` | `FULL` | power-loss durability (fsync every commit) — #1961 part C |
+//! | `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES` | `1` | a migration REFUSES to stamp a schema version whose ladder-created core relations were lost, instead of warning (#3113) |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
 //! `[governance].require_operator_pubkey` to `true` (see
@@ -417,7 +420,7 @@ pub fn pinned_knobs() -> Vec<(&'static str, &'static str)> {
 /// [`enforce_at_boot`], which may only run in the synchronous
 /// pre-runtime phase of `fn main()` (#2386), this is safe to call from
 /// any live process (e.g. `ai-memory doctor --posture
-/// enterprise-federation`, which reuses this as ONE SSOT for the 21
+/// enterprise-federation`, which reuses this as ONE SSOT for the 22
 /// `asi-hard` pinned knobs rather than re-deriving the KNOBS table).
 ///
 /// Returns `(env, current_value, hard_value)` triples.
@@ -963,7 +966,7 @@ mod tests {
             return;
         }
         // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
-        // reuses this accessor as the SSOT for the 21-knob asi-hard set
+        // reuses this accessor as the SSOT for the 22-knob asi-hard set
         // rather than re-deriving KNOBS; pin its own read-only contract
         // directly (in addition to the exhaustive coverage the
         // `enterprise_federation_posture::tests` module gives it

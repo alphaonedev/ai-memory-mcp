@@ -307,6 +307,18 @@ pub fn refusal_required_with(
 /// and this database's corpus size.
 #[must_use]
 pub fn refusal_required(conn: &Connection, missing: &[CoreTable]) -> bool {
+    // Short-circuit BEFORE the corpus count. `refusal_required_with` would
+    // return false for an empty `missing` anyway, but Rust evaluates call
+    // arguments EAGERLY — so without this guard every migration pays a full
+    // `SELECT COUNT(*) FROM memories` inside the `BEGIN EXCLUSIVE` ladder
+    // transaction to compute a value that cannot change the answer. The
+    // healthy database (nothing missing) is the overwhelmingly common case,
+    // and it is also the one whose corpus is largest, so the cost lands
+    // exactly where it is least affordable. Mirrors `report`'s own emptiness
+    // guard; semantics are identical.
+    if missing.is_empty() {
+        return false;
+    }
     refusal_required_with(
         missing,
         crate::config::migration_require_core_tables(),
