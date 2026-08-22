@@ -40,22 +40,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v1.0.0 self-hosted — the enterprise-fed Linux + macOS nodes.
-        os: [linux-fed, macos-fed]
-    runs-on: [self-hosted, "${{ matrix.os }}"]
+        # Linux runs GitHub-hosted (operator directive 2026-08-22: Linux CI is
+        # self-hosted ONLY for the native pg tier, which this suite does not
+        # use). macOS stays on the f1 node — the directive is Linux-only, and
+        # there is no GitHub-hosted arm64 macOS class this suite is calibrated
+        # for. `runner` is a JSON array of runner LABELS so one matrix can carry
+        # both shapes; see the `check` job in ci.yml for the same pattern.
+        include:
+          - os: ubuntu-latest
+            runner: '["ubuntu-latest"]'
+          - os: macos-fed
+            runner: '["self-hosted","macos-fed"]'
+    runs-on: ${{ fromJSON(matrix.runner) }}
     steps:
       - uses: actions/checkout@v4
 
-      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
-      # `lint` job in ci.yml for the full rationale (#3128).
-      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted'
-        shell: bash
-        run: |
-          test -x "$HOME/.cargo/bin/rustup" || {
-            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
-            exit 1
-          }
       - uses: dtolnay/rust-toolchain@stable
 
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is

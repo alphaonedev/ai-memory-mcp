@@ -9,6 +9,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Linux CI returns to GitHub-hosted runners except for the Postgres tier.**
+  Operator directive, 2026-08-22: *"Linux CI: push all Linux CI back onto GitHub
+  except for the PostgreSQL, which we can do local here faster — that will
+  prevent all these OOM events."* On Linux there is now exactly ONE reason for a
+  job to be self-hosted — it needs the always-up native PG 18.6 + AGE 1.8.0 +
+  pgvector 0.8.6 tier on `:5445`. **Warm cargo cache is no longer a reason**,
+  which reverses the rule #3129 codified, on measured evidence that the trade
+  was wrong: f2 is one shared box, and four runner instances each running a
+  compile+test job oversubscribed 14 cores about 2x. That did not merely slow
+  CI down, it produced FALSE RED on healthy code — #3139 saw `SAL-only feature
+  gate` take 34.5 min under low contention and get cancelled at 40:15 under
+  high contention, mid-step; #3137 saw `Check (linux-fed,sqlite)` panic in
+  `tests/integration.rs` step 19 at load 36 on a bench assertion that passed on
+  every isolated hosted VM — plus OOM pressure on the operator's own dev box.
+  - **Still self-hosted on Linux (pg-tier), 2 jobs:** the
+    `Check (linux-fed,enterprise-fed)` leg and `cert-postgres-age.yml`.
+  - **Back on `ubuntu-latest`:** the Linux `sqlite` `Check` leg,
+    `Lint (fmt + clippy)`, `MSRV (Rust 1.96)`, `Postgres feature gate` (which
+    despite its name has not touched Postgres since #3109), `SAL-only feature
+    gate`, `vectorlite feature gate`, both `batman-mode-acceptance.yml`
+    integration jobs, and the `session-boot-lifetime.yml` Linux leg.
+  - **macOS is unchanged** and stays on the f1 node — the directive is
+    Linux-only and there is no hosted arm64 macOS class these legs are
+    calibrated for.
+  - **ONE REQUIRED-CONTEXT RENAME:** `Check (linux-fed,sqlite)` ->
+    **`Check (ubuntu-latest,sqlite)`**. `linux-fed` is a self-hosted runner
+    label, so keeping the name on a hosted leg would have asserted a node the
+    job no longer runs on. `scripts/qc-allowlists/required-contexts-release.txt`
+    and `docs/AI_DEVELOPER_GOVERNANCE.md` are updated in lockstep; **branch
+    protection must swap that one context at merge** (drop old, add new, per the
+    ORDER doctrine in the mirror). The other three `Check (…)` names and every
+    other required context are unchanged. `Lifetime suite (linux-fed)` ->
+    `Lifetime suite (ubuntu-latest)` also renames but is not a required context.
+  - Moved jobs give back what the fleet made unnecessary: `Swatinem/rust-cache`
+    starts firing again on them (its `runner.environment == 'github-hosted'`
+    guard needed no edit), `actions/setup-python` / `actions/setup-node` return
+    to the `Check` job for the #2452 fail-closed interpreter guarantee, and the
+    fleet-only `rustup` presence assertion is dropped from every job that no
+    longer runs there. `CARGO_INCREMENTAL: "0"` stays declared at workflow level.
+
+### Fixed
+
+- **`cargo audit` and the release-profile smoke build would have silently
+  stopped running.** Both were pinned to the singleton leg by
+  `matrix.node == 'linux-fed' && matrix.tier == 'sqlite'`, a comparison that
+  quietly stops matching when that leg is renamed — switching a supply-chain
+  control off with no signal at all. They now key on an explicit `matrix.once`
+  flag that cannot drift out of a rename.
+- **The hosted `Check` leg's disk and memory headroom is restored with it.**
+  #3109 deleted the `Free disk before tests` and `Trim target/debug before
+  release build` steps as hosted-image hacks — correct, and precisely why they
+  return with the hosted image. Both are load-bearing for this leg on measured
+  evidence: run 31911087758 died here with `rustc-LLVM ERROR: No space left on
+  device` before the reclaim was widened (#2960/#1810), and #1407 added the 8 GB
+  swapfile because the lib-test LINK step hit `ld … signal 7 [Bus error]`
+  against the hosted ~7 GB RAM ceiling. The reclaim step is keyed on
+  `runner.environment == 'github-hosted'`, not on a matrix value, so a step that
+  deletes system paths can never be routed onto a persistent node by a future
+  matrix edit.
+- **#3140: the #1492 hung-test watchdog now covers macOS.** It was gated to
+  Linux because macOS ships no GNU `timeout`; on 2026-08-22
+  `Check (macos-fed,sqlite)` went silent after its last unit test and burned the
+  entire 80-minute job cap before a nameless job-level cancel — the exact
+  diagnosability failure #1492 exists to prevent, on the one platform where the
+  watchdog was switched off. `coreutils` is now installed on both f1 runners, so
+  the watchdog DETECTS `gtimeout`/`timeout` on every platform instead of gating
+  on the OS. Where neither exists it still degrades to a bare `cargo test` with
+  `timeout-minutes` as the backstop, so a node without coreutils loses
+  hang-naming, never correctness.
+- **#3139: per-leg and per-job `timeout-minutes`, each with a stated basis.**
+  The `Check` legs no longer share one cap sized for the slowest — a 35-minute
+  blind spot on the fastest — but take it from the matrix: 55 for
+  `ubuntu-latest,sqlite` (pre-#3109 measured 45 on this runner class, +10 for
+  the release build + audit steps the 2x2 rewrite added), 80 for the pg and
+  macOS legs (compile ~12 min plus the 3300s watchdog can legitimately reach
+  ~67 min, so #3139's proposed 60 would have re-introduced #1492 on that leg).
+  `SAL-only feature gate` goes 40 -> 55 (34.5 min measured against a 40 min cap
+  is a 16% margin, a knife edge on a 2-core VM, and this job has no watchdog);
+  `Postgres feature gate` returns to its pre-#3109 measured 45.
+
 - **CI throughput: no-pg / no-cargo gates re-homed back to GitHub-hosted; only
   tier-bound and warm-cache jobs stay on the self-hosted fleet.** The
   self-hosted move above put **39 job definitions (43 expanded)** onto a
