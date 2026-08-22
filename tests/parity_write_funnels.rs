@@ -340,12 +340,20 @@ async fn sqlite_sal_update_and_delete_enforce_the_caller_owns_gate() {
 }
 
 #[tokio::test]
-async fn sqlite_sal_mutation_of_an_unstamped_row_is_refused_for_tenants() {
-    // Fail-closed posture, byte-parity with postgres (#1628): a row carrying
-    // NO `metadata.agent_id` stamp (legacy / pre-v0.6.3 / migrated) cannot be
-    // mutated by a tenant context — operator cleanup goes through the admin
-    // path. Also pins the SHARED wire-refusal text so the two backends
-    // cannot drift.
+async fn unstamped_row_is_allowed_through_sqlite_sal_gate() {
+    // Option B (gatekeeper decision, 2026-08-22) — the sqlite SAL gate mirrors
+    // SQLITE'S OWN contract, not postgres's #1628 refusal. An UNSTAMPED row
+    // (no `metadata.agent_id`: legacy / pre-v0.6.3 / migrated) stays MUTABLE,
+    // exactly as the canonical `visibility::caller_owns_for_mutation`
+    // predicate specifies and as the HTTP `require_caller_owns_memory`
+    // carve-out and every MCP mutate tool already behave.
+    //
+    // Why this matters (the reason the tighter posture was rejected): refusing
+    // unstamped rows would turn today-writable legacy rows into permanently
+    // inaccessible ones for every non-admin caller — a data-loss mode — and it
+    // would break the single-operator default, where rows may carry no stamp
+    // at all. Cross-backend unification (stamp legacy rows via migration, then
+    // refuse everywhere) is tracked as #3124.
     let (_guard, db_path) = fresh_db_path();
     let conn = db::open(&db_path).expect("db::open");
     let now = chrono::Utc::now().to_rfc3339();
@@ -367,7 +375,7 @@ async fn sqlite_sal_mutation_of_an_unstamped_row_is_refused_for_tenants() {
     };
     let id = db::insert(&conn, &mem).expect("insert unstamped");
     // `insert` may stamp a provenance agent_id; strip it so the row is truly
-    // unstamped, which is the legacy shape the gate must refuse.
+    // unstamped — the legacy shape the carve-out exists for.
     conn.execute(
         "UPDATE memories SET metadata = json_remove(metadata, '$.agent_id') WHERE id = ?1",
         rusqlite::params![&id],
@@ -377,24 +385,74 @@ async fn sqlite_sal_mutation_of_an_unstamped_row_is_refused_for_tenants() {
 
     let store = SqliteStore::open(&db_path).expect("SqliteStore::open");
     let tenant = CallerContext::for_agent("ai:alice");
-    let err = store
+
+    // UPDATE by an unrelated tenant is ALLOWED (legacy-unowned carve-out).
+    let patch = UpdatePatch {
+        content: Some("legacy row edited by a tenant".to_string()),
+        ..UpdatePatch::default()
+    };
+    store.update(&tenant, &id, patch).await.expect(
+        "an UNSTAMPED row must stay mutable at the SAL layer — refusing it would \
+         strand legacy rows and break the single-operator default",
+    );
+
+    // DELETE by an unrelated tenant is likewise ALLOWED.
+    store
         .delete(&tenant, &id)
         .await
-        .expect_err("an unstamped row must refuse tenant mutation");
-    match err {
-        StoreError::PermissionDenied { reason, .. } => assert!(
-            reason.contains("no agent_id stamp"),
-            "expected the shared unstamped-refusal text, got: {reason}"
-        ),
-        other => panic!("parity #4: expected PermissionDenied, got {other:?}"),
-    }
+        .expect("an UNSTAMPED row must stay deletable at the SAL layer");
+}
 
-    // The admin path is the sanctioned cleanup route.
-    let admin = CallerContext::for_admin("ai:operator");
-    store
-        .delete(&admin, &id)
+/// The inbox carve-out is wired per-verb exactly as HTTP/MCP wire it:
+/// DELETE passes `allow_inbox = true` (the addressed recipient may delete a
+/// message sent to it after consuming it) while UPDATE passes `false` (the
+/// recipient must NOT rewrite the sender's row).
+#[tokio::test]
+async fn sqlite_sal_inbox_recipient_may_delete_but_not_update() {
+    let (_guard, db_path) = fresh_db_path();
+    let conn = db::open(&db_path).expect("db::open");
+    let now = chrono::Utc::now().to_rfc3339();
+    let mem = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Mid,
+        namespace: "parity/ns7".to_string(),
+        title: "inbox-msg".to_string(),
+        content: "message addressed to bob".to_string(),
+        priority: 5,
+        confidence: 1.0,
+        source: "parity-test".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: json!({ "agent_id": "ai:alice", "target_agent_id": "ai:bob" }),
+        memory_kind: MemoryKind::Observation,
+        version: 1,
+        ..Memory::default()
+    };
+    let id = db::insert(&conn, &mem).expect("insert inbox row");
+    drop(conn);
+
+    let store = SqliteStore::open(&db_path).expect("SqliteStore::open");
+    let bob = CallerContext::for_agent("ai:bob");
+
+    // UPDATE: inbox carve-out DISABLED -> refused.
+    let patch = UpdatePatch {
+        content: Some("bob rewrites alice's message".to_string()),
+        ..UpdatePatch::default()
+    };
+    let err = store
+        .update(&bob, &id, patch)
         .await
-        .expect("the admin path must still be able to clean up an unstamped row");
+        .expect_err("the inbox recipient must NOT rewrite the sender's row");
+    assert!(
+        matches!(err, StoreError::PermissionDenied { .. }),
+        "expected PermissionDenied on update, got {err:?}"
+    );
+
+    // DELETE: inbox carve-out ENABLED -> allowed.
+    store
+        .delete(&bob, &id)
+        .await
+        .expect("the addressed recipient MAY delete a message sent to it");
 }
 
 // ─────────────────────────────────────────────────────────────────────

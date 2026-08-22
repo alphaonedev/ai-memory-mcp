@@ -97,74 +97,77 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
-/// Parity finding #4 (2026-08) — SAL-level caller-owns mutation gate,
-/// the sqlite mirror of `PostgresStore::assert_caller_owns_for_mutation`
-/// (#1412 / #1628).
+/// Parity finding #4 (2026-08) — SAL-level caller-owns mutation gate for
+/// the sqlite adapter's `update` / `delete`.
 ///
-/// Pre-fix this adapter's `update` / `delete` discarded `ctx` entirely:
-/// the ownership check existed ONLY in the sqlite HTTP handler
-/// (`handlers::parity::require_caller_owns_memory`), so any NON-HTTP SAL
-/// caller — CLI, internal surfaces, federation, any future code path —
-/// could rewrite or delete another tenant's row by id, while the
-/// postgres twin refused. That is the exact fragility class #1412 closed
-/// on postgres: the gate belongs at the SAL layer so EVERY surface is
-/// owner-checked uniformly, not at one handler that every new caller
-/// must remember to re-implement.
+/// Pre-fix this adapter discarded `ctx` entirely: the ownership check
+/// existed ONLY in the sqlite HTTP handler
+/// (`handlers::parity::require_caller_owns_memory`) and the MCP mutate
+/// tools, so any OTHER SAL caller — CLI, internal surfaces, federation,
+/// any future code path — could rewrite or delete another tenant's row by
+/// id. The gate belongs at the SAL layer so every surface is owner-checked
+/// uniformly, not at handlers each new caller must remember to re-implement.
+///
+/// SEMANTICS — deliberately sqlite's OWN contract, not postgres's.
+/// This delegates to the canonical, shared
+/// [`crate::visibility::caller_owns_for_mutation`] predicate — the same
+/// one every MCP mutate tool uses (`mcp::tools::{update, delete, promote,
+/// link, kg_invalidate}`) and the twin of the HTTP
+/// `require_caller_owns_memory` carve-out set (src/handlers/parity.rs).
+/// So an UNSTAMPED row (no `metadata.agent_id`: legacy / pre-v0.6.3 /
+/// migrated) stays MUTABLE, which is what keeps the single-operator
+/// default — where rows may carry no stamp at all — working.
+///
+/// This is NOT the postgres #1628 posture, which REFUSES unstamped rows.
+/// Adopting that here would turn today-writable legacy rows into
+/// permanently inaccessible ones for every non-admin caller — a data-loss
+/// mode — and it would be a posture tightening, which a parity change must
+/// not ship silently. Sqlite therefore stays internally consistent
+/// (HTTP == MCP == SAL); unifying the two BACKENDS (stamp legacy rows via
+/// migration, then refuse everywhere) is the cross-backend policy decision
+/// tracked in #3124 — do NOT tighten this arm here ahead of that issue.
+///
+/// `allow_inbox` mirrors the established per-verb convention exactly:
+/// `false` for update/promote (an inbox recipient must not rewrite the
+/// sender's row) and `true` for delete (the recipient MAY delete a message
+/// addressed to it after consuming it).
 ///
 /// Admin/operator paths (`bypass_visibility = true`, i.e.
 /// `CallerContext::for_admin`) skip the gate, same as the SAL-level
 /// scope=private read filter. Tenant-facing handlers MUST NOT pass a
-/// bypass context. Refusal text comes from the SHARED
-/// `crate::store::REASON_UNSTAMPED_TENANT_*` consts so the wire error is
-/// byte-identical on both backends.
+/// bypass context.
 ///
 /// Synchronous by design (rust-1.98 CONCURRENCY-24: no `.await` in the
 /// body, and `rusqlite::Connection` is `!Sync`, so an `async fn` holding
 /// `&Connection` would produce a non-`Send` future the `#[async_trait]`
 /// boxing rejects). Callers already hold the connection guard.
-///
-/// A row that exists but carries NO `metadata.agent_id` stamp (legacy /
-/// pre-v0.6.3 / migrated) is refused for tenant mutation — the same
-/// conservative fail-closed posture postgres has taken since #1628,
-/// which leaves operator cleanup to the admin path.
 fn assert_caller_owns_for_mutation(
     conn: &rusqlite::Connection,
     ctx: &CallerContext,
     id: &str,
     action: &str,
-    unstamped_reason: &str,
+    allow_inbox: bool,
 ) -> StoreResult<()> {
     if ctx.bypass_visibility {
         return Ok(());
     }
-    use rusqlite::OptionalExtension;
-    let owner: Option<Option<String>> = conn
-        .query_row(
-            "SELECT json_extract(metadata, '$.agent_id') FROM memories WHERE id = ?1",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(box_err)?;
-    match owner {
-        None => Err(StoreError::NotFound { id: id.to_string() }),
-        Some(None) => Err(StoreError::PermissionDenied {
-            action: action.to_string(),
-            target: id.to_string(),
-            reason: unstamped_reason.to_string(),
-        }),
-        Some(Some(existing_owner)) if existing_owner != ctx.effective_principal() => {
-            Err(StoreError::PermissionDenied {
-                action: action.to_string(),
-                target: id.to_string(),
-                reason: format!(
-                    "caller {:?} does not own memory (owner: {existing_owner:?})",
-                    ctx.effective_principal()
-                ),
-            })
-        }
-        Some(Some(_)) => Ok(()), // owner matches; proceed
+    let Some(target) = db::get(conn, id).map_err(box_err)? else {
+        return Err(StoreError::NotFound { id: id.to_string() });
+    };
+    let caller = ctx.effective_principal();
+    if crate::visibility::caller_owns_for_mutation(&target, caller, allow_inbox) {
+        return Ok(());
     }
+    let owner = target
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    Err(StoreError::PermissionDenied {
+        action: action.to_string(),
+        target: id.to_string(),
+        reason: format!("caller {caller:?} does not own memory (owner: {owner:?})"),
+    })
 }
 
 // #1709 Pillar 1 — the actions SELECT column list + row mapping live in
@@ -410,13 +413,9 @@ impl MemoryStore for SqliteStore {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
         // Parity finding #4 — SAL-level caller-owns gate (postgres parity).
-        assert_caller_owns_for_mutation(
-            &conn,
-            ctx,
-            id,
-            "update",
-            crate::store::REASON_UNSTAMPED_TENANT_WRITE,
-        )?;
+        // Inbox carve-out DISABLED for update, mirroring the HTTP
+        // `update_memory` / MCP `memory_update` convention.
+        assert_caller_owns_for_mutation(&conn, ctx, id, "update", false)?;
         // v0.7.0 Provenance Gap 2 (#906) — thread the patch's
         // `source_uri` slot into `update_with_expected_version` so the
         // sqlite SAL adapter honors source_uri rewrites end-to-end.
@@ -479,13 +478,10 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         // Parity finding #4 — SAL-level caller-owns gate (postgres parity;
         // pg enforces the same gate in its trait `delete`).
-        assert_caller_owns_for_mutation(
-            &conn,
-            ctx,
-            id,
-            "delete",
-            crate::store::REASON_UNSTAMPED_TENANT_DELETE,
-        )?;
+        // Inbox carve-out ENABLED for delete: the addressed recipient may
+        // delete a message sent to it, mirroring HTTP `delete_memory` /
+        // MCP `memory_delete`.
+        assert_caller_owns_for_mutation(&conn, ctx, id, "delete", true)?;
         let removed = db::delete(&conn, id).map_err(box_err)?;
         if removed {
             Ok(())

@@ -474,18 +474,30 @@ each with a regression test.
   them stranded a severed governance binding — an unrecoverable policy
   downgrade — with the memory still live. All three now share one
   transaction.
-- **`SqliteStore::update` / `delete` now enforce the SAL-level caller-owns
-  gate**, the mirror of `PostgresStore::assert_caller_owns_for_mutation`
-  (#1412 / #1628). Both previously discarded `ctx` entirely: the ownership
-  check existed ONLY in the sqlite HTTP handler, so any non-HTTP SAL caller
-  (CLI, internal surfaces, federation, future code paths) could rewrite or
-  delete another tenant's row by id while the postgres twin refused. Admin
-  contexts (`bypass_visibility`) skip the gate as before. **Behaviour change:**
-  a row carrying no `metadata.agent_id` stamp (legacy / pre-v0.6.3 /
-  migrated) is now refused for *tenant* mutation on sqlite and must be
-  cleaned up through the admin path — the same conservative fail-closed
-  posture postgres has had since #1628. The two wire-pinned refusal strings
-  are hoisted to `crate::store` so both backends emit byte-identical errors.
+- **`SqliteStore::update` / `delete` now enforce a SAL-level caller-owns
+  gate.** Both previously discarded `ctx` entirely: the ownership check
+  existed only in the sqlite HTTP handler and the MCP mutate tools, so any
+  other SAL caller (CLI, internal surfaces, federation, future code paths)
+  could rewrite or delete another tenant's row by id. The gate now delegates
+  to the canonical shared `visibility::caller_owns_for_mutation` predicate —
+  the same one every MCP mutate tool uses and the twin of the HTTP
+  `require_caller_owns_memory` carve-out set — so sqlite is internally
+  consistent (HTTP == MCP == SAL). An **unstamped row (no
+  `metadata.agent_id`) stays mutable**, preserving the legacy-unowned
+  carve-out and the single-operator default where rows may carry no stamp;
+  a row owned by a *different, named* agent is refused. The inbox carve-out
+  is wired per-verb exactly as HTTP/MCP wire it: enabled for `delete` (the
+  addressed recipient may delete a message sent to it), disabled for
+  `update`. Admin contexts (`bypass_visibility`) skip the gate as before.
+  **No behaviour change for any shipping path** — every HTTP/worker
+  `MemoryStore::update`/`delete` call site sits inside a
+  `StorageBackend::Postgres` branch, and the one backend-agnostic caller
+  (`autonomy::reverse_rollback_entry_store`) is driven only by
+  `CallerContext::for_admin`. Note this deliberately does NOT adopt the
+  postgres #1628 posture of refusing unstamped rows: that would turn
+  today-writable legacy rows into permanently inaccessible ones. Unifying
+  the two backends (stamp legacy rows via migration, then refuse everywhere)
+  is tracked as #3124.
 
 Both atomicity fixes are transaction-AWARE (the `update_with_expected_version`
 precedent): they open a transaction only when the caller does not already hold

@@ -1191,11 +1191,14 @@ pub struct PostgresStore {
     record_stop: crate::store::record_stop::RecordStopFlag,
 }
 
-// #1628 / parity finding #4 — the two wire-pinned refusal texts now live
-// in `crate::store` (ONE declaration site) so the sqlite mirror gate emits
-// byte-identical errors. Re-imported under the original names so every
-// existing reference below is unchanged.
-use crate::store::{REASON_UNSTAMPED_TENANT_DELETE, REASON_UNSTAMPED_TENANT_WRITE};
+/// #1628 — wire-pinned refusal text for legacy rows with no
+/// `metadata.agent_id` stamp (write-path verbs). One declaration site
+/// per pm-v3.1; consumed by the caller-owns mutation gate.
+const REASON_UNSTAMPED_TENANT_WRITE: &str =
+    "memory has no agent_id stamp; tenant writes refused (use admin path)";
+/// #1628 — delete-verb sibling of [`REASON_UNSTAMPED_TENANT_WRITE`].
+const REASON_UNSTAMPED_TENANT_DELETE: &str =
+    "memory has no agent_id stamp; tenant deletes refused (use admin path)";
 
 /// v0.8.1 W1 (#1821 / gap G29) + #1844 — postgres parity for the sqlite
 /// `db::insert` / `insert_if_newer` credential REDACT backstop. Returns a
