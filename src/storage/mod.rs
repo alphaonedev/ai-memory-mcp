@@ -4595,6 +4595,44 @@ pub(crate) fn archive_memory_no_tx(
     result
 }
 
+/// #3012 — ARCHIVE-FIRST delete: the targeted single-row destructive verb.
+///
+/// Pre-#3012 the CLI `delete <id>` called [`delete`] directly, so it destroyed
+/// the last copy of the memory's CURRENT text with NO recovery path, while the
+/// BULK `forget` always archived and stayed restorable. That is the inverse of
+/// every operator's expectation (targeted = surgical and recoverable; bulk =
+/// the scary one) and it violated the documented recoverability contract for
+/// the substrate's durable truth.
+///
+/// It was also silently WRONG in the presence of a #1725 `in_place_edit`
+/// snapshot. `delete` is `DELETE FROM memories` only — it does not touch
+/// `archived_memories` (no FK, no trigger) — so a hard delete LEFT the
+/// pre-edit snapshot behind and `archive restore <id>` then resurrected the
+/// STALE content under that id, which reads as a successful restore. Routing
+/// through the archive replaces that snapshot with what was actually live at
+/// delete time (`INSERT OR REPLACE`, the #1725 single-snapshot retention rule),
+/// so a restore now returns the content the operator actually deleted.
+///
+/// This routes the delete through [`archive_memory`] (one `BEGIN IMMEDIATE`:
+/// copy the row + its `memory_links` into the archive, sever namespace
+/// standards, then `DELETE FROM memories`) under
+/// `archive_reason = 'delete'`, so `archive list` / `archive restore` can
+/// bring it back. The TRUE erasure path is still available and still exact —
+/// it is now an explicit `--hard` opt-in that calls [`delete`].
+///
+/// The #1955 R45 record-stop fence is applied here explicitly because
+/// [`archive_memory`] (an ordinary archive verb) does not carry one, and a
+/// delete funnel must not lose the fence by changing which primitive it calls.
+///
+/// # Errors
+///
+/// Propagates the record-stop refusal and any rusqlite failure.
+pub fn delete_archive_first(conn: &Connection, id: &str) -> Result<bool> {
+    // #1955 R45 — record-stop fence for the delete funnel (twin of `delete`).
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    archive_memory(conn, id, Some(field_names::ARCHIVE_REASON_DELETE))
+}
+
 /// #1725 (v0.8.0) — INSERT-only archive of a STILL-LIVE row. Unlike
 /// [`archive_memory_no_tx`] this does NOT delete the live row or its
 /// `namespace_meta` standard: it snapshots the row's CURRENT content

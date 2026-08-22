@@ -169,19 +169,48 @@ Standard CRUD.
 ai-memory list --namespace planning --tier long --limit 50
 ai-memory get abc123
 ai-memory update abc123 --title "Renamed" --priority 8
-ai-memory delete abc123
+ai-memory delete abc123          # archive-first: restorable
+ai-memory delete abc123 --hard   # irreversible
 ```
 
 `get` accepts a UUID or unique prefix. `update` omits any flag you
-don't pass. `delete` archives first when `archive_on_gc=true` (default).
+don't pass.
 
-**`list` filters (`ListArgs`, `src/cli/crud.rs:29-50`) — NOT identical
+**`list` filters (`ListArgs`, `src/cli/crud.rs`) — NOT identical
 to `search`.** `list` accepts `--namespace`/`-n`, `--tier`/`-t`,
 `--since`, `--until`, `--tags`, `--agent-id`, plus `--limit` (default
 `20`), `--offset` (default `0`) and `--valid-at` (#1834 bitemporal
 as-of). It does **not** accept `--as-agent` or `--include-archived` —
 those are `search`/`recall` flags. Conversely `search` has no
 `--offset` and no `--valid-at`.
+
+**`delete` is ARCHIVE-FIRST**
+([#3012](https://github.com/alphaonedev/ai-memory-mcp/issues/3012)). The row
+and its `memory_links` edges are copied into `archived_memories` under
+`archive_reason = "delete"` in the same transaction as the removal, so
+`ai-memory archive restore <id>` brings the memory back. Until v1.0.0 this
+page claimed that behaviour but `cmd_delete` called the raw `db::delete`,
+so the TARGETED verb destroyed the last copy of the memory's current text
+with no recovery, while the BULK `forget` stayed restorable: the inverse of
+what an operator expects. The code now matches the documented contract.
+
+`db::delete` removes the live row only — it never touched
+`archived_memories` (no foreign key, no trigger) — so where a
+[#1725](https://github.com/alphaonedev/ai-memory-mcp/issues/1725)
+`in_place_edit` snapshot existed, a hard delete left it behind and
+`archive restore <id>` resurrected the **stale pre-edit** content under that
+id. The archive-first path replaces that snapshot with what was actually
+live at delete time, so a restore returns the content you deleted.
+`--hard` keeps the old behaviour, stale-snapshot caveat included.
+
+| Flag | Applies to | Notes |
+|---|---|---|
+| `--hard` | `delete` | Skip the archive copy and destroy the row irreversibly (the pre-v1.0.0 behaviour, now an explicit opt-in). There is no recovery afterwards short of a `backup`. |
+| `--capability <TOKEN>` | `delete` | v0.9.0 G10.1 macaroon token; inert unless `[capabilities].enabled`. |
+| `--capability-file <PATH>` | `delete` | Non-argv `cap1:` token file (`0600`); conflicts with `--capability`. |
+
+JSON output carries `archived: true|false` so a scripting caller can tell
+whether the row is still restorable.
 
 #### `update` flags
 

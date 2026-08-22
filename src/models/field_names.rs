@@ -73,6 +73,12 @@ pub const ARCHIVE_REASON_IN_PLACE_EDIT: &str = "in_place_edit";
 /// backends. `"archive"` is the value the sqlite unit test
 /// `archive_memory_default_reason_is_archive` has pinned since v0.6.
 pub const ARCHIVE_REASON_DEFAULT: &str = "archive";
+/// v1.0.0 #3012 — the `archive_reason` VALUE stamped when the targeted CLI
+/// `delete <id>` archives-then-deletes (its recoverable default). Distinct
+/// from the bulk `forget` reason so an operator can tell WHICH destructive
+/// verb produced an archived row. Shared SSOT so the storage layer, the CLI
+/// and the regression tests agree on the marker.
+pub const ARCHIVE_REASON_DELETE: &str = "delete";
 /// `atomisation_archived_at` — wire/row field name.
 pub const ATOMISATION_ARCHIVED_AT: &str = "atomisation_archived_at";
 /// `atom_count` — wire/row field name.

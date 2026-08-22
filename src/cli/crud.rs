@@ -71,6 +71,21 @@ pub struct DeleteArgs {
     /// Conflicts with `--capability`.
     #[arg(long, conflicts_with = "capability")]
     pub capability_file: Option<std::path::PathBuf>,
+    /// v1.0.0 #3012 — IRREVERSIBLY destroy the row instead of archiving it.
+    ///
+    /// The default `delete <id>` is ARCHIVE-FIRST: the memory (and its
+    /// `memory_links` edges) is copied into `archived_memories` under
+    /// `archive_reason = "delete"` and can be brought back with
+    /// `ai-memory archive restore <id>`. `--hard` skips the archive copy and
+    /// destroys the last copy of the memory's CURRENT text — there is NO
+    /// recovery afterwards short of a `backup`. (It removes the live row only;
+    /// an older `in_place_edit` snapshot in `archived_memories` survives, so a
+    /// later `archive restore <id>` may resurrect STALE pre-edit content.)
+    /// Pre-#3012 this was the ONLY behaviour and it was the unflagged default,
+    /// which meant the targeted verb was unrecoverable while the BULK `forget`
+    /// was restorable.
+    #[arg(long, default_value_t = false)]
+    pub hard: bool,
 }
 
 /// `get` handler. Looks up by full id then prefix; prints memory + links.
@@ -251,7 +266,20 @@ pub fn cmd_delete(
         }
     }
 
-    if db::delete(&conn, &target.id)? {
+    // v1.0.0 #3012 — ARCHIVE-FIRST by default. `db::delete_archive_first`
+    // snapshots the row + its edges into `archived_memories`
+    // (`archive_reason = "delete"`) and removes it from the live set in ONE
+    // transaction, so the durable TEXT survives an operator mistake and
+    // `archive restore <id>` brings it back — the same recoverability the
+    // bulk `forget` has always had. `--hard` is the explicit, documented
+    // opt-in to the pre-#3012 destroy-in-place behaviour. Both paths carry
+    // the #1955 R45 record-stop fence.
+    let removed = if args.hard {
+        db::delete(&conn, &target.id)?
+    } else {
+        db::delete_archive_first(&conn, &target.id)?
+    };
+    if removed {
         // v1.0.0 #2446 — queue the erasure for federated fan-out. The CLI
         // never constructs a `FederationConfig` (HTTP `serve` only), so a
         // local delete used to leave every replica holding the row.
@@ -283,10 +311,22 @@ pub fn cmd_delete(
             writeln!(
                 out.stdout,
                 "{}",
-                serde_json::json!({"deleted": true, "id": target.id})
+                // #3012 — `archived` tells a scripting caller whether the row
+                // is still recoverable via `archive restore <id>`.
+                serde_json::json!({
+                    "deleted": true,
+                    "id": target.id,
+                    "archived": !args.hard,
+                })
             )?;
+        } else if args.hard {
+            writeln!(out.stdout, "deleted (hard, unrecoverable): {}", target.id)?;
         } else {
-            writeln!(out.stdout, "deleted: {}", target.id)?;
+            writeln!(
+                out.stdout,
+                "deleted: {} (archived — restore with `ai-memory archive restore {}`)",
+                target.id, target.id
+            )?;
         }
     } else {
         writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
@@ -560,6 +600,7 @@ mod tests {
                     id: id.clone(),
                     capability: None,
                     capability_file: None,
+                    hard: false,
                 },
                 false,
                 Some("test-agent"),
@@ -576,6 +617,173 @@ mod tests {
         assert!(db::get(&conn, &id).unwrap().is_none());
     }
 
+    // ---- #3012 — targeted delete is ARCHIVE-FIRST -----------------------
+
+    /// Pre-#3012 this exact sequence returned `not found in archive`: the
+    /// TARGETED verb destroyed the last copy of the memory's current text
+    /// while the BULK `forget` stayed restorable, and `docs/CLI_REFERENCE.md`
+    /// claimed the opposite. The row must now round-trip through the archive.
+    #[test]
+    fn delete_archives_and_is_restorable_3012() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "keepable", "durable text");
+        {
+            let mut out = env.output();
+            cmd_delete(
+                &db,
+                &DeleteArgs {
+                    id: id.clone(),
+                    capability: None,
+                    hard: false,
+                },
+                true,
+                Some("test-agent"),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["deleted"].as_bool().unwrap(), true);
+        assert_eq!(v["archived"].as_bool().unwrap(), true, "got: {v}");
+
+        let conn = db::open(&db).unwrap();
+        // Gone from the live set...
+        assert!(db::get(&conn, &id).unwrap().is_none());
+        // ...but the durable TEXT survives in the archive, stamped with the
+        // reason that says WHICH destructive verb produced it.
+        let archived = db::list_archived(&conn, Some("ns"), 10, 0).unwrap();
+        assert_eq!(archived.len(), 1, "got: {archived:?}");
+        assert_eq!(archived[0]["id"].as_str().unwrap(), id);
+        assert_eq!(
+            archived[0][crate::models::field_names::ARCHIVE_REASON]
+                .as_str()
+                .unwrap(),
+            crate::models::field_names::ARCHIVE_REASON_DELETE
+        );
+        // And it restores.
+        assert!(db::restore_archived(&conn, &id).unwrap());
+        let back = db::get(&conn, &id).unwrap().expect("restored");
+        assert_eq!(back.content, "durable text");
+    }
+
+    /// #3012 — the stale-snapshot correction. `db::delete` is `DELETE FROM
+    /// memories` only (no FK, no trigger onto `archived_memories`), so where a
+    /// #1725 `in_place_edit` snapshot existed a hard delete LEFT it behind and
+    /// `archive restore <id>` resurrected the STALE pre-edit content under that
+    /// id — a restore that reads as successful and returns the wrong text. The
+    /// archive-first path must replace that snapshot with what was actually
+    /// LIVE at delete time.
+    #[test]
+    fn delete_replaces_a_stale_in_place_edit_snapshot_3012() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "t", "v1 pre-edit");
+
+        // Edit in place: #1725 snapshots the PRE-EDIT content into
+        // `archived_memories` under the SAME id.
+        {
+            let conn = db::open(&db).unwrap();
+            db::update(
+                &conn,
+                &id,
+                None,
+                Some("v2 live at delete"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let archived = db::list_archived(&conn, Some("ns"), 10, 0).unwrap();
+            assert_eq!(
+                archived.len(),
+                1,
+                "the #1725 snapshot must exist: {archived:?}"
+            );
+            assert_eq!(
+                archived[0][crate::models::field_names::ARCHIVE_REASON]
+                    .as_str()
+                    .unwrap(),
+                crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT
+            );
+            assert_eq!(archived[0]["content"].as_str().unwrap(), "v1 pre-edit");
+        }
+
+        {
+            let mut out = env.output();
+            cmd_delete(
+                &db,
+                &DeleteArgs {
+                    id: id.clone(),
+                    capability: None,
+                    hard: false,
+                },
+                true,
+                Some("test-agent"),
+                &mut out,
+            )
+            .unwrap();
+        }
+
+        let conn = db::open(&db).unwrap();
+        let archived = db::list_archived(&conn, Some("ns"), 10, 0).unwrap();
+        assert_eq!(archived.len(), 1, "one archive row per id: {archived:?}");
+        assert_eq!(
+            archived[0][crate::models::field_names::ARCHIVE_REASON]
+                .as_str()
+                .unwrap(),
+            crate::models::field_names::ARCHIVE_REASON_DELETE,
+            "the delete must own the archive slot, not the stale edit snapshot"
+        );
+        assert!(db::restore_archived(&conn, &id).unwrap());
+        assert_eq!(
+            db::get(&conn, &id).unwrap().expect("restored").content,
+            "v2 live at delete",
+            "a restore must return what was LIVE at delete time, not the \
+             pre-edit snapshot"
+        );
+    }
+
+    /// `--hard` is the explicit, documented opt-in to the pre-#3012
+    /// destroy-in-place behaviour: nothing lands in the archive.
+    #[test]
+    fn delete_hard_destroys_without_archiving_3012() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "gone", "unrecoverable");
+        {
+            let mut out = env.output();
+            cmd_delete(
+                &db,
+                &DeleteArgs {
+                    id: id.clone(),
+                    capability: None,
+                    hard: true,
+                },
+                true,
+                Some("test-agent"),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["deleted"].as_bool().unwrap(), true);
+        assert_eq!(v["archived"].as_bool().unwrap(), false, "got: {v}");
+
+        let conn = db::open(&db).unwrap();
+        assert!(db::get(&conn, &id).unwrap().is_none());
+        assert!(
+            db::list_archived(&conn, Some("ns"), 10, 0)
+                .unwrap()
+                .is_empty(),
+            "--hard must NOT archive"
+        );
+    }
+
     #[test]
     fn test_delete_by_prefix() {
         let mut env = TestEnv::fresh();
@@ -590,6 +798,7 @@ mod tests {
                     id: prefix,
                     capability: None,
                     capability_file: None,
+                    hard: false,
                 },
                 true,
                 Some("test-agent"),
@@ -688,6 +897,7 @@ mod tests {
                     id: id.clone(),
                     capability: None,
                     capability_file: None,
+                    hard: false,
                 },
                 true,
                 Some("bob"),
