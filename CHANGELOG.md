@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
+
+Two CLI paths diverged from the guard the MCP/HTTP reference surface already
+enforces. Both are precedent-copies — the fail-closed posture was already
+decided on the reference surface — and neither tightens behaviour beyond that
+precedent.
+
+- **#3036 — CLI `link` edges were permanently unattestable.** `ai-memory link`
+  called the unsigned `db::create_link` while MCP `memory_link` routes through
+  `db::create_link_signed`, so every edge the CLI ever created landed
+  `attest_level=unsigned` and could never be verified under the certified
+  all-signature-lanes posture. The CLI now resolves the active keypair
+  (`--agent-id` selects the signer, else the daemon keypair — mirroring
+  `load_active_keypair_for_mcp_in`) and signs through the same
+  `create_link_signed` funnel, reporting the resulting `attest_level`. With no
+  keypair resolvable the edge still lands `unsigned`, byte-identical to the
+  prior behaviour — this adds attestation where a key exists, it does not
+  refuse anything that previously succeeded.
+- **#2988 — the recall ledger bound a NAMESPACE into the identity column.**
+  Both CLI recall paths wrote `--as-agent` (a namespace) into
+  `recall_observations.agent_id`: `src/cli/recall.rs` passed
+  `args.as_agent`, and the interactive shell passed `None`. The #1705
+  cross-agent replay guard keys on that column (`agent_id IS NULL OR agent_id
+  = ?`), so it was inert on both paths — a namespace cannot gate an identity.
+  Both now bind `resolve_read_visibility_caller()`, the same value the MCP/HTTP
+  writer stamps. `--as-agent` remains the namespace-scope visibility knob.
+
+
 ### Changed
 
 - **Linux CI returns to GitHub-hosted runners except for the Postgres tier.**
