@@ -375,7 +375,7 @@ fn prompt_content(name: &str, params: &Value) -> Result<Value, String> {
         GET: memory_get(id) → single memory with links\n\
         PROMOTE: memory_promote(id) — mid→long, clears expiry\n\
         CONSOLIDATE: memory_consolidate(ids, title) — merge N→1, LLM summary if available\n\
-        LINK: memory_link(source_id, target_id, relation) — related_to|supersedes|contradicts|derived_from|reflects_on\n\
+        LINK: memory_link(source_id, target_id, relation) — related_to|supersedes|contradicts|derived_from|reflects_on|derives_from|decomposes_into|depends_on|advances\n\
         TAG: memory_auto_tag(id) — LLM generates tags (smart+ tier)\n\
         EXPAND: memory_expand_query(query) — LLM broadens search terms (smart+ tier)\n\
         CONTRADICT: memory_detect_contradiction(id_a, id_b) — LLM checks conflict (smart+ tier)"

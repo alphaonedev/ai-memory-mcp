@@ -13,12 +13,26 @@ export type Tier = "short" | "mid" | "long";
 /** Visibility scope (Task 1.5). Controls which agents can see the memory. */
 export type Scope = "private" | "team" | "unit" | "org" | "collective";
 
-/** Link relation kinds (closed set — server validates). */
+/**
+ * Link relation kinds (closed set — server validates).
+ *
+ * All 9 variants of `MemoryLinkRelation` (`src/models/link.rs`), mirrored by
+ * `VALID_RELATIONS` in `src/validate.rs` and the SQL CHECK constraints.
+ *
+ * Note `derived_from` and `derives_from` differ by one character and point in
+ * OPPOSITE directions: `derived_from` is N->1 consolidation-merge provenance,
+ * `derives_from` is 1->N atomisation-split provenance.
+ */
 export type Relation =
   | "related_to"
   | "supersedes"
   | "contradicts"
-  | "derived_from";
+  | "derived_from"
+  | "reflects_on"
+  | "derives_from"
+  | "decomposes_into"
+  | "depends_on"
+  | "advances";
 
 /** Allowed `source` values — see `src/validate.rs` `VALID_SOURCES`. */
 export type Source =

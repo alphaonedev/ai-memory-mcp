@@ -32,8 +32,13 @@
 //! * `HookEvent::PreCompaction` — Allow / Modify / Deny / AskUser before
 //!   the cluster is processed.  Deny aborts the cluster (no summary, no
 //!   persist, no verify).
-//! * `HookEvent::OnCompactionRollback` — notify-only (return value
-//!   ignored beyond logging), fired when the verify step fails. The
+//! * `HookEvent::OnCompactionRollback` — notify-only, and **NOT WIRED at
+//!   v1.0.0**: this module has no fire site for it (claims audit,
+//!   2026-08-22 — the only `HookEvent::OnCompactionRollback` reference here
+//!   is in the `#[cfg(test)]` module). Operators detect a verify failure
+//!   from the `COMPACTION_TRACE_TARGET` WARN line below instead. Wiring or
+//!   removing the event is an OPEN disposition; see
+//!   [`crate::hooks::HookEvent::OnCompactionRollback`]. The
 //!   Stage-6 auto-rollback restores the pre-merge sources and removes the
 //!   unverifiable summary (#664); on the verified happy path an
 //!   operator-reversible `RollbackEntry::Consolidate` is persisted (#1745).
@@ -465,8 +470,10 @@ impl<'a> ConsolidationPass<'a> {
     /// **Real mode (#1746 — the live consolidator):** summarise → persist →
     /// verify → persist operator-reversible rollback (#1745). On a `verify`
     /// failure the Stage-6 auto-rollback (#664) restores the sources, removes
-    /// the unverifiable summary, fires the notify-only `OnCompactionRollback`,
-    /// and the sweep continues (no rollback entry is left for that cluster).
+    /// the unverifiable summary, and the sweep continues (no rollback entry
+    /// is left for that cluster). Note the notify-only
+    /// `OnCompactionRollback` hook event is NOT fired — it has no fire site
+    /// at v1.0.0; the failure is reported via the WARN line only.
     pub(crate) async fn run(&self, candidates: &[Memory]) -> Result<ConsolidationRunReport> {
         let mut report = ConsolidationRunReport::default();
 
@@ -545,7 +552,10 @@ impl<'a> ConsolidationPass<'a> {
                 // Stage-6 rollback (#664): the consolidate already removed the
                 // source rows and wrote an unverifiable summary. Restore the
                 // cluster from the in-memory pre-merge snapshots and remove the
-                // bad summary. Fires the notify-only `OnCompactionRollback`.
+                // bad summary. NOTE: the notify-only `OnCompactionRollback`
+                // hook event is NOT fired here — it has no fire site at
+                // v1.0.0 (claims audit 2026-08-22); the WARN below is the
+                // only signal an operator receives.
                 let restored = match self.rollback_consolidation(&members, &new_id).await {
                     Ok(n) => n,
                     Err(re) => {

@@ -10,7 +10,14 @@ layout: doc
 [![Release](https://img.shields.io/badge/release-v0.9.0-brightgreen?logo=github)](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.9.0)
 [![crates.io](https://img.shields.io/crates/v/ai-memory)](https://crates.io/crates/ai-memory)
 
-**v0.6.3** cleared the a2a-gate certification bar (three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens); **v0.7.0** layers on the attested-cortex epic (Ed25519 attestation, 25-event hook pipeline, postgres+AGE first-class backend, schema v57). Full release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html).
+**v0.6.3** cleared the a2a-gate certification bar (three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens); **v0.7.0** layers on the attested-cortex epic (Ed25519 attestation, 25-event hook pipeline, postgres+AGE as a second storage backend, schema v57). Full release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html).
+
+> **Postgres is not a parity backend.** At v1.0.0 the PostgreSQL + Apache AGE
+> backend serves **59 of the 80** unique production HTTP paths; the other **21
+> return a uniform `501 NOT IMPLEMENTED`** (fail-closed by design — never a
+> silent read/write against the wrong database), and the **stdio MCP path is
+> SQLite-only** (`ai-memory mcp` always opens a local rusqlite connection).
+> Read [Backend parity](../README.md#backend-parity) before choosing Postgres.
 
 **📦 [Latest published release — v0.9.0](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.9.0)** ·
 **🧪 [Evidence Hub (campaigns)](evidence/)** ·

@@ -1863,6 +1863,94 @@ audit (epic #3076), fixed in one cohesive change.
   load-bearing. Comment corrected (`src/handlers/postgres_gate.rs`).
 
 Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
+### Docs (claims audit batch 1 — every published claim made truthful)
+
+- **A claims audit re-verified the README / ROADMAP / capability / compliance
+  claim surface against the code and corrected every statement that overstated
+  what v1.0.0 actually does.** Docs, doc-comments, and two machine-facing
+  advertisement strings only — **zero behaviour change**; each corrected claim
+  was checked against the shipped code, and claims that turned out to be
+  ACCURATE were left alone. Corrections:
+
+  - **Hook pipeline — 11 of the 22 advertised lifecycle events never fire.**
+    The docs presented all 22 as live. Verified at `release/v1.0.0`: every
+    decision-class `pre_*` event IS wired (so hook-based *enforcement* works
+    exactly as documented — a `Deny` really refuses the operation), but
+    `post_store`, `post_recall`, `post_search`, `post_delete`, `post_promote`,
+    `post_link`, `post_consolidate`, `post_governance_decision`,
+    `post_reflect`, `on_index_eviction`, and `on_compaction_rollback` have
+    **zero production fire sites** — they parse from `hooks.toml`, classify,
+    and render in `ai-memory doctor --hooks`, but never execute. This is the
+    same #2444 advertised-but-inert class that #2637 and #2758 addressed for
+    other events, and it remains OPEN for these 11 (wiring or removing them is
+    a code change, tracked separately). Two specific false statements were
+    corrected at the source: the #2758 rationale claimed the retained
+    `post_recall` / `post_search` siblings "fire on real production read
+    paths" (they do not), and `src/curator/compaction.rs` claimed its Stage-6
+    rollback "fires the notify-only `OnCompactionRollback`" (there is no such
+    fire site outside its test module). `on_index_eviction` is the subtlest:
+    producer and observer both exist, but nothing calls `set_eviction_sink`
+    outside `#[cfg(test)]`, so the channel is never connected. Operators must
+    not route SIEM/audit pipelines through an unwired event.
+  - **`memory_link` advertised 5 of its 9 relations.** `LinkTool::docs()` and
+    the always-served `memory-workflow` MCP prompt listed `related_to |
+    supersedes | contradicts | derived_from | reflects_on`, omitting
+    `derives_from`, `decomposes_into`, `depends_on`, and `advances` — all four
+    accepted by the handler and enforced by `MemoryLinkRelation` (`COUNT ==
+    9`), `VALID_RELATIONS`, and the SQL CHECK constraints. Both strings now
+    list all 9 and flag the `derived_from` (N→1 consolidation-merge) vs
+    `derives_from` (1→N atomisation-split) opposite-direction footgun. The
+    byte-pinned `tests/snapshots/tool_definitions_pre_d1_6.json` was amended
+    in lockstep with the rationale recorded in the pinning test's module doc.
+    Same fix applied to the TypeScript SDK's `Relation` union (4 of 9) and the
+    root README's CLI `link` row (4 of 9).
+  - **`ARCHITECTURAL_LIMITS.md` promised two things the Postgres backend does
+    not do.** §5 said the Postgres adapter "removes the daemon-as-bottleneck
+    entirely; agents connect directly to Postgres over its wire protocol" —
+    but every request still terminates at the axum daemon behind
+    `postgres_route_gate`, which serves 59 of 80 unique paths and 501s the
+    other 21, with a scratch SQLite still opened alongside. §7 said the
+    adapter "exposes CDC natively" — there is no logical-replication,
+    `wal2json`, publication, or change-stream code anywhere in `src/`. Both
+    now state the shipped status.
+  - **`docs/README.md` advertised "postgres+AGE first-class backend" with no
+    parity caveat**, while the root README already carried the honest Backend
+    parity section. It now carries the 59/21 split and the SQLite-only stdio
+    MCP limitation.
+  - **`SECURITY.md` M8 overstated `asi-hard`.** It said the profile pins the
+    fail-closed gates "so a compromised host cannot silently weaken them" —
+    but the profile is selected by a host-controlled environment variable and
+    enforced in-process, and with it unset the profile is `standard` with no
+    pins in force, silently. Rescoped to what it actually protects against:
+    operator error and configuration drift, once `asi-hard` IS selected.
+  - **Certification-doc evidence staleness.** The committed four-leg posture
+    proof in `docs/compliance/evidence/cert-54/` is an **18**-check capture,
+    while `ENTERPRISE_FEDERATION_CHECK_COUNT` is now **20** (#2954 added check
+    #19, #2991 added check #20); the doc disclosed only the 19-check step. The
+    evidence note now covers both, and states explicitly that the
+    post-#2954/#2991 tallies are DERIVED, not measured, with the re-capture
+    called out as outstanding. Separately, §5.4(3)'s heading claimed
+    "executed … evidence (at certified versions)" while every cited run ID
+    executed the superseded 18.4 / 1.7.0 / 0.8.5 triple; the heading and a new
+    evidence-status note now say plainly that the current triple is
+    CI-asserted, not yet cited by run ID.
+  - **`src/lib.rs` CLI-subcommand comments were stale.** The block comment
+    still described the v0.7.0-era "82 variants / 80 default", one const's doc
+    said "86 variants … leaving 84" against a value of 90, and both bump
+    trails were missing the #2676 `Features` entry (89→90 default, 91→92 sal).
+    The consts themselves (90 / 92) were correct and machine-pinned; only the
+    surrounding prose was wrong.
+
+  Files: `README.md`, `docs/README.md`, `docs/ARCHITECTURAL_LIMITS.md`,
+  `docs/SECURITY.md`, `docs/hook-pipeline.md`, `docs/ADMIN_GUIDE.md`,
+  `docs/production-deployment.md`,
+  `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`,
+  `src/hooks/events.rs`, `src/curator/compaction.rs`, `src/lib.rs`,
+  `src/mcp/tools/link.rs`, `src/mcp/mod.rs`, `src/mcp/registry.rs`,
+  `tests/snapshots/tool_definitions_pre_d1_6.json`,
+  `sdk/typescript/src/types.ts`.
+
+
 ### Docs (recall write-coupling drift corrected; #3086)
 
 - **SDK docstrings + operator docs still described `memory_recall` as

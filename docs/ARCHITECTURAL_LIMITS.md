@@ -78,8 +78,17 @@ pgvector all have real wire protocols.
 
 **Impact:** the HTTP daemon is the bottleneck at fleet scale, not SQLite's
 write lock.
-**v0.7 SAL:** Postgres adapter removes the daemon-as-bottleneck entirely;
-agents connect directly to Postgres over its wire protocol.
+**v1.0.0 status — NOT removed.** The Postgres backend does **not** let agents
+connect directly to Postgres. Every request still terminates at the axum
+daemon: `serve --store-url postgres://…` routes through
+`postgres_route_gate` (`src/lib.rs` → `src/handlers/postgres_gate.rs`), which
+serves 59 of the 80 unique production HTTP paths from Postgres and returns a
+uniform `501 NOT IMPLEMENTED` on the other 21; the daemon additionally opens a
+scratch SQLite beside Postgres. So the daemon remains the fleet-scale
+bottleneck on both backends — the SAL work moved the *storage* off SQLite, not
+the *access path* off the daemon. A direct-to-Postgres agent wire protocol is
+not implemented and is not planned for v1.0.0. See
+[Backend parity](../README.md#backend-parity).
 
 ### 6. FTS5 does not port — **Structural**
 
@@ -101,7 +110,16 @@ consumer protocol.
 
 **Impact:** event-driven pipelines cannot tap changes without bolt-on
 triggers.
-**v0.7 SAL:** Postgres adapter exposes CDC natively.
+**v1.0.0 status — NOT implemented.** The Postgres backend does **not** expose
+CDC. There is no logical-replication, `wal2json`, publication, or
+change-stream code anywhere in `src/` on either backend, and no external
+consumer protocol ships. Postgres *as a database* has logical replication, so
+an operator can configure it out-of-band against the ai-memory schema, but
+that is operator-supplied plumbing, not a substrate feature. The supported
+in-substrate change-observation surface is the hook pipeline
+([`hook-pipeline.md`](hook-pipeline.md)) — read its firing-status note first:
+at v1.0.0 the decision-class `pre_*` events fire, but most notify-class
+`post_*` events have no production fire site.
 
 ### 8. Schema migration DDL is feature-poor — **Workaround**
 
