@@ -218,6 +218,17 @@ pub struct ImportReport {
     /// to `claimed` (the #1464 invariant; mirrors the federation receive
     /// path's per-row skip disposition).
     pub forged_signature_skipped: usize,
+    /// v1.0.0 #3149/#3151 — bundle rows on a RAW `INSERT OR IGNORE` /
+    /// `ON CONFLICT DO NOTHING` lane whose insert was suppressed because a
+    /// BYTE-IDENTICAL row is already at the destination: a genuine idempotent
+    /// re-import, not a staged write. Counted HERE rather than in the
+    /// per-class `staged` counters, which now count ONLY rows that actually
+    /// landed — the report must never assert a row it did not write (the
+    /// struct's own "a report can only exist for a bundle that fully landed"
+    /// contract). A DIVERGENT surviving row is never counted here: it is
+    /// refused (memory-bearing lanes) or counted + warned
+    /// ([`Self::namespace_meta_skipped_divergent`]).
+    pub idempotent_rows_already_present: usize,
     /// `true` when the imported audit spine re-verified in the transaction.
     pub reverify_chain_ok: bool,
     /// `true` when the staged `memory_revisions` chain replayed cleanly
@@ -253,7 +264,13 @@ pub struct ImportReport {
 ///   into a non-empty destination, or a broken `prev_hash` link);
 /// - the staged `agent_lineage` succession chains verify as FORGED (#2209 —
 ///   a tampered lineage record, or a bundle chain that forks the
-///   destination's existing key-succession history).
+///   destination's existing key-succession history);
+/// - a RAW `INSERT OR IGNORE` lane's insert was suppressed by a DIVERGENT
+///   surviving row at the same key (#3149 — a `forget_tombstones` erasure
+///   receipt or a write-once `model_attestations` TOFU pin whose destination
+///   twin carries different bytes). Silently keeping the destination row while
+///   REPORTING the bundle's as staged would falsify the report, so the import
+///   refuses instead.
 pub fn import_full_envelope(
     conn: &Connection,
     env: &ExportEnvelope,
@@ -435,20 +452,61 @@ fn apply_all_classes(
             );
             continue;
         }
-        conn.execute(
-            "INSERT OR IGNORE INTO forget_tombstones \
+        let signature_bytes = t.signature.as_ref().map(|h| h.0.as_slice());
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO forget_tombstones \
                 (memory_id, namespace, forgotten_at, agent_id, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                t.memory_id,
-                t.namespace,
-                t.forgotten_at,
-                t.agent_id,
-                t.signature.as_ref().map(|h| h.0.as_slice())
-            ],
-        )
-        .with_context(|| format!("import forget_tombstone for memory {}", t.memory_id))?;
-        report.forget_tombstones += 1;
+                params![
+                    t.memory_id,
+                    t.namespace,
+                    t.forgotten_at,
+                    t.agent_id,
+                    signature_bytes
+                ],
+            )
+            .with_context(|| format!("import forget_tombstone for memory {}", t.memory_id))?;
+        // #3149 — the affected-row count was DISCARDED here (`+= 1`
+        // unconditionally), so an `OR IGNORE` suppressed by a DIFFERENT
+        // surviving row at this `memory_id` PK (two nodes forgot the same id
+        // with a different `forgotten_at` / erasure signature) was reported as
+        // STAGED while the destination kept its own bytes — a report that
+        // asserts rows which never landed. Apply the same identical-or-refuse
+        // discipline the signed lanes use: byte-identical ⇒ an honest
+        // idempotent re-import; divergent ⇒ REFUSE (a forget receipt is a
+        // signed erasure attestation, so silently keeping one and claiming the
+        // other landed would falsify proof-of-erasure).
+        if n == 0 {
+            let identical: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM forget_tombstones \
+                     WHERE memory_id = ?1 AND namespace = ?2 AND forgotten_at = ?3 \
+                       AND agent_id IS ?4 AND signature IS ?5)",
+                    params![
+                        t.memory_id,
+                        t.namespace,
+                        t.forgotten_at,
+                        t.agent_id,
+                        signature_bytes
+                    ],
+                    |r| r.get(0),
+                )
+                .with_context(|| {
+                    format!("import: identity probe for forget_tombstone {}", t.memory_id)
+                })?;
+            if !identical {
+                anyhow::bail!(
+                    "import forget_tombstone for memory {}: a DIFFERENT erasure receipt already \
+                     occupies this memory_id at the destination (different forgotten_at / \
+                     agent_id / signature) — refusing rather than silently dropping the \
+                     bundle's receipt while reporting it as staged",
+                    t.memory_id
+                );
+            }
+            report.idempotent_rows_already_present += 1;
+        }
+        report.forget_tombstones += n;
     }
 
     // (2) memories (tombstoned/archived skipped; id-keyed idempotent) + links.
@@ -1205,25 +1263,68 @@ fn apply_all_classes(
     // (6) model_attestations — RAW (write-once TOFU; preserve verbatim).
     for dto in &env.model_attestations {
         let m: crate::storage::model_attest::ModelAttestation = dto.clone().into();
-        conn.execute(
-            "INSERT OR IGNORE INTO model_attestations \
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO model_attestations \
                 (id, provider, model_ref, model_digest, model_family, attest_level, \
                  agent_id, signature, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                m.id,
-                m.provider,
-                m.model_ref,
-                m.model_digest,
-                m.model_family,
-                m.attest_level,
-                m.agent_id,
-                m.signature,
-                m.created_at,
-            ],
-        )
-        .with_context(|| format!("import model_attestation {}", m.id))?;
-        report.model_attestations += 1;
+                params![
+                    m.id,
+                    m.provider,
+                    m.model_ref,
+                    m.model_digest,
+                    m.model_family,
+                    m.attest_level,
+                    m.agent_id,
+                    m.signature,
+                    m.created_at,
+                ],
+            )
+            .with_context(|| format!("import model_attestation {}", m.id))?;
+        // #3149 — same discarded-`n` defect as the tombstone lane, and this
+        // table has TWO suppressing constraints: the `id` PK and
+        // `UNIQUE (provider, model_ref, model_family, agent_id)`. A divergent
+        // TOFU attestation (the same model pinned to a DIFFERENT digest /
+        // attest_level / signature) is exactly what write-once TOFU exists to
+        // surface, so the probe matches on EVERY column: byte-identical ⇒
+        // idempotent; anything else ⇒ REFUSE rather than report a pin that did
+        // not land.
+        if n == 0 {
+            let identical: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM model_attestations \
+                     WHERE id = ?1 AND provider = ?2 AND model_ref = ?3 \
+                       AND model_digest IS ?4 AND model_family = ?5 AND attest_level = ?6 \
+                       AND agent_id = ?7 AND signature IS ?8 AND created_at = ?9)",
+                    params![
+                        m.id,
+                        m.provider,
+                        m.model_ref,
+                        m.model_digest,
+                        m.model_family,
+                        m.attest_level,
+                        m.agent_id,
+                        m.signature,
+                        m.created_at,
+                    ],
+                    |r| r.get(0),
+                )
+                .with_context(|| format!("import: identity probe for model_attestation {}", m.id))?;
+            if !identical {
+                anyhow::bail!(
+                    "import model_attestation {} ({} {}): a DIFFERENT attestation already \
+                     occupies this id — or this (provider, model_ref, model_family, agent_id) \
+                     TOFU pin — at the destination; refusing rather than silently dropping the \
+                     bundle's pin while reporting it as staged",
+                    m.id,
+                    m.provider,
+                    m.model_ref
+                );
+            }
+            report.idempotent_rows_already_present += 1;
+        }
+        report.model_attestations += n;
     }
 
     // (7) governance_rules — verify-or-drop (L3). An operator-signed rule whose
@@ -2694,4 +2795,217 @@ mod tests {
             report.warnings
         );
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // #3149 — the RAW `INSERT OR IGNORE` lanes must never report a row
+    // that did not land. `execute`'s affected-row count was discarded, so
+    // a bundle row suppressed by a DIFFERENT surviving row at the PK was
+    // counted as staged — a report that lies about the imported state.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Seed a `forget_tombstones` row directly (the destination's OWN prior
+    /// erasure receipt, not one that came from this bundle).
+    fn seed_tombstone(
+        conn: &Connection,
+        memory_id: &str,
+        forgotten_at: &str,
+        signature: Option<&[u8]>,
+    ) {
+        conn.execute(
+            "INSERT INTO forget_tombstones \
+                (memory_id, namespace, forgotten_at, agent_id, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![memory_id, "portability", forgotten_at, "dest-eraser", signature],
+        )
+        .expect("seed tombstone");
+    }
+
+    fn tombstone_dto(
+        memory_id: &str,
+        forgotten_at: &str,
+        signature: Option<Vec<u8>>,
+    ) -> crate::portability::dto::ForgetTombstoneDto {
+        crate::portability::dto::ForgetTombstoneDto {
+            memory_id: memory_id.into(),
+            namespace: "portability".into(),
+            forgotten_at: forgotten_at.into(),
+            agent_id: Some("dest-eraser".into()),
+            signature: signature.map(crate::portability::hex_bytes::HexBytes),
+        }
+    }
+
+    /// ★ #3149: a bundle tombstone whose PK is already occupied by a
+    /// DIFFERENT erasure receipt is REFUSED (fail-closed, zero rows), never
+    /// silently dropped-and-counted. Fails on pre-fix code, which returned
+    /// `Ok` with `forget_tombstones == 1` while the destination kept its own
+    /// bytes.
+    #[test]
+    fn divergent_forget_tombstone_is_refused_3149() {
+        let src = fresh_conn("tomb-diverge-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.forget_tombstones.push(tombstone_dto(
+            "mem-diverge-3149",
+            "2026-08-01T00:00:00Z",
+            Some(vec![2u8; 64]),
+        ));
+
+        let dst = fresh_conn("tomb-diverge-dst-");
+        seed_tombstone(
+            &dst,
+            "mem-diverge-3149",
+            "2026-01-01T00:00:00Z",
+            Some(&[1u8; 64]),
+        );
+
+        let err = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect_err("a divergent erasure receipt must REFUSE the import");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mem-diverge-3149") && msg.contains("DIFFERENT erasure receipt"),
+            "the refusal names the row and the reason, got: {msg}"
+        );
+
+        // ALL-OR-NOTHING: the destination's own receipt is untouched.
+        let (kept_at, kept_sig): (String, Option<Vec<u8>>) = dst
+            .query_row(
+                "SELECT forgotten_at, signature FROM forget_tombstones WHERE memory_id = ?1",
+                params!["mem-diverge-3149"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("dest receipt still present");
+        assert_eq!(kept_at, "2026-01-01T00:00:00Z");
+        assert_eq!(kept_sig, Some(vec![1u8; 64]));
+    }
+
+    /// ★ #3149: a BYTE-IDENTICAL tombstone already at the destination is an
+    /// honest idempotent re-import — counted in
+    /// `idempotent_rows_already_present`, NOT in `forget_tombstones` (nothing
+    /// was written).
+    #[test]
+    fn identical_forget_tombstone_counts_idempotent_not_staged_3149() {
+        let src = fresh_conn("tomb-idem-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.forget_tombstones.push(tombstone_dto(
+            "mem-idem-3149",
+            "2026-01-01T00:00:00Z",
+            Some(vec![7u8; 64]),
+        ));
+
+        let dst = fresh_conn("tomb-idem-dst-");
+        // First import stages it for real.
+        let first = import_full_envelope(&dst, &env, &opts_trusted()).expect("first import");
+        assert_eq!(first.forget_tombstones, 1, "the receipt landed");
+        assert_eq!(first.idempotent_rows_already_present, 0);
+
+        // Re-import the SAME bundle: nothing is written, and the report says so.
+        let second = import_full_envelope(&dst, &env, &opts_trusted()).expect("re-import");
+        assert_eq!(
+            second.forget_tombstones, 0,
+            "no row landed, so none is reported as staged"
+        );
+        assert!(
+            second.idempotent_rows_already_present >= 1,
+            "the byte-identical row is reported as an idempotent no-op"
+        );
+    }
+
+    fn attestation_dto(
+        id: &str,
+        digest: &str,
+        signature: Option<Vec<u8>>,
+    ) -> crate::portability::dto::ModelAttestationDto {
+        crate::portability::dto::ModelAttestationDto {
+            id: id.into(),
+            provider: "openrouter".into(),
+            model_ref: "vendor/model-3149".into(),
+            model_digest: Some(digest.into()),
+            model_family: "model-3149".into(),
+            attest_level: "loader_observed".into(),
+            agent_id: "ai:attestor-3149".into(),
+            signature: signature.map(crate::portability::hex_bytes::HexBytes),
+            created_at: "2026-07-14T00:00:00Z".into(),
+        }
+    }
+
+    fn seed_attestation(conn: &Connection, id: &str, digest: &str) {
+        conn.execute(
+            "INSERT INTO model_attestations \
+                (id, provider, model_ref, model_digest, model_family, attest_level, \
+                 agent_id, signature, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                "openrouter",
+                "vendor/model-3149",
+                digest,
+                "model-3149",
+                "loader_observed",
+                "ai:attestor-3149",
+                Option::<Vec<u8>>::None,
+                "2026-07-14T00:00:00Z"
+            ],
+        )
+        .expect("seed attestation");
+    }
+
+    /// ★ #3149: a divergent TOFU model attestation (same id — and the same
+    /// `UNIQUE (provider, model_ref, model_family, agent_id)` pin — but a
+    /// DIFFERENT digest) is REFUSED, never reported as staged. Fails on
+    /// pre-fix code (`Ok`, `model_attestations == 1`, destination digest
+    /// unchanged).
+    #[test]
+    fn divergent_model_attestation_is_refused_3149() {
+        let src = fresh_conn("attest-diverge-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.model_attestations
+            .push(attestation_dto("attest-3149", "sha256:bundle", None));
+
+        let dst = fresh_conn("attest-diverge-dst-");
+        seed_attestation(&dst, "attest-3149", "sha256:destination");
+
+        let err = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect_err("a divergent TOFU pin must REFUSE the import");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("attest-3149") && msg.contains("DIFFERENT attestation"),
+            "the refusal names the pin and the reason, got: {msg}"
+        );
+
+        let kept: String = dst
+            .query_row(
+                "SELECT model_digest FROM model_attestations WHERE id = ?1",
+                params!["attest-3149"],
+                |r| r.get(0),
+            )
+            .expect("dest pin still present");
+        assert_eq!(
+            kept, "sha256:destination",
+            "the destination's write-once TOFU pin is untouched"
+        );
+    }
+
+    /// ★ #3149: a byte-identical attestation re-import is an honest
+    /// idempotent no-op, not a claimed staging.
+    #[test]
+    fn identical_model_attestation_counts_idempotent_not_staged_3149() {
+        let src = fresh_conn("attest-idem-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.model_attestations
+            .push(attestation_dto("attest-idem-3149", "sha256:same", None));
+
+        let dst = fresh_conn("attest-idem-dst-");
+        let first = import_full_envelope(&dst, &env, &opts_trusted()).expect("first import");
+        assert_eq!(first.model_attestations, 1, "the pin landed");
+
+        let second = import_full_envelope(&dst, &env, &opts_trusted()).expect("re-import");
+        assert_eq!(
+            second.model_attestations, 0,
+            "no row landed, so none is reported as staged"
+        );
+        assert!(
+            second.idempotent_rows_already_present >= 1,
+            "the byte-identical pin is reported as an idempotent no-op"
+        );
+    }
+
 }
