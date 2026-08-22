@@ -763,6 +763,17 @@ truthful.
   - **removes the stale `-wal` / `-shm`** from beside the restored file, and
   - **prints the rollback path** (and reports it as a `rollback` field in
     `--json`).
+
+  **CLI contract change for scripts.** `restore` is destructive, so it now
+  prompts `Proceed? [y/N]` and the new `--yes` is REQUIRED with `--json` (a
+  prompt would corrupt the envelope) and whenever stdin is not a terminal
+  (cron, CI, a pipe) — a non-interactive `ai-memory restore` that does not
+  pass `--yes` now exits non-zero instead of restoring. Existing automation
+  must add `--yes`; the shipped runbooks
+  (`docs/production-deployment.md`, `docs/enterprise-deployment.md`,
+  `docs/RUNBOOK-curator-soak.md`) are updated in lockstep. A restore onto a
+  target another process holds open now also exits non-zero rather than
+  corrupting it, so DR automation must stop the daemon first.
 - **An unrecognised `--tier` / `tier` no longer widens the operation — every
   tier-filter surface now FAILS CLOSED**
   ([#3130](https://github.com/alphaonedev/ai-memory-mcp/issues/3130)).
