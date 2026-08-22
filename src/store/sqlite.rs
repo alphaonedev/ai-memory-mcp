@@ -105,8 +105,22 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
 /// (`handlers::parity::require_caller_owns_memory`) and the MCP mutate
 /// tools, so any OTHER SAL caller — CLI, internal surfaces, federation,
 /// any future code path — could rewrite or delete another tenant's row by
-/// id. The gate belongs at the SAL layer so every surface is owner-checked
-/// uniformly, not at handlers each new caller must remember to re-implement.
+/// id. The gate belongs at the SAL layer so every `MemoryStore` trait
+/// caller is owner-checked uniformly, not at handlers each new caller must
+/// remember to re-implement.
+///
+/// SCOPE — this arm covers `MemoryStore` trait callers ONLY, so "every
+/// surface" is not literal: the MCP paths that bypass the trait and mutate
+/// a bare `rusqlite::Connection` never reach it, and their posture is
+/// whatever their own call site applies. `mcp::tools::delete` re-applies
+/// this very same lenient [`crate::visibility::caller_owns_for_mutation`]
+/// predicate before `db::delete`, so it matches this arm exactly; the
+/// `mcp::tools::store::synthesis` merge (`db::update` / `db::delete` over
+/// `db::find_synthesis_candidates`) applies no per-row owner check at all
+/// and is scoped by NAMESPACE alone. That split is recorded here
+/// deliberately — a SAL gate cannot cover a caller that never constructs a
+/// store — so a future reader does not mistake this arm for a whole-crate
+/// chokepoint.
 ///
 /// SEMANTICS — deliberately sqlite's OWN contract, not postgres's.
 /// This delegates to the canonical, shared
