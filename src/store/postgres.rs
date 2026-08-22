@@ -17194,11 +17194,31 @@ impl MemoryStore for PostgresStore {
                 -- #1629 — Form-5 sqlite parity: an explicit non-default
                 -- provenance replaces; the caller_provided default keeps the
                 -- stored (auto-derived / calibrated) signal.
-                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
-                                         THEN EXCLUDED.confidence_source
+                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+                -- merges by GREATEST above, so the calibration record that
+                -- DESCRIBES that number must come from the SAME operand that
+                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+                -- re-store with a LOWER confidence but a non-default source
+                -- kept the stored 0.9 and stamped the incoming label + signals
+                -- over it — durable Form-5 corruption, silent to every reader.
+                -- Selector = the GREATEST winner: > takes the incoming tuple,
+                -- < keeps the stored tuple, and an exact tie keeps the #1629
+                -- rule verbatim (explicit non-`caller_provided` replaces) but
+                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+                -- total order, never a logical float-equality test.
+                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 -- #1608 / #1629 — QW-2 persona-artifact columns stay sticky:
                 -- the sqlite COALESCE order keeps the value the row was
                 -- minted with (old wins), so match it.
@@ -17697,11 +17717,31 @@ impl MemoryStore for PostgresStore {
                                  ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
-                                         THEN EXCLUDED.confidence_source
+                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+                -- merges by GREATEST above, so the calibration record that
+                -- DESCRIBES that number must come from the SAME operand that
+                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+                -- re-store with a LOWER confidence but a non-default source
+                -- kept the stored 0.9 and stamped the incoming label + signals
+                -- over it — durable Form-5 corruption, silent to every reader.
+                -- Selector = the GREATEST winner: > takes the incoming tuple,
+                -- < keeps the stored tuple, and an exact tie keeps the #1629
+                -- rule verbatim (explicit non-`caller_provided` replaces) but
+                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+                -- total order, never a logical float-equality test.
+                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
                 persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
@@ -18080,11 +18120,31 @@ impl MemoryStore for PostgresStore {
                                  ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
-                                         THEN EXCLUDED.confidence_source
+                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+                -- merges by GREATEST above, so the calibration record that
+                -- DESCRIBES that number must come from the SAME operand that
+                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+                -- re-store with a LOWER confidence but a non-default source
+                -- kept the stored 0.9 and stamped the incoming label + signals
+                -- over it — durable Form-5 corruption, silent to every reader.
+                -- Selector = the GREATEST winner: > takes the incoming tuple,
+                -- < keeps the stored tuple, and an exact tie keeps the #1629
+                -- rule verbatim (explicit non-`caller_provided` replaces) but
+                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+                -- total order, never a logical float-equality test.
+                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
@@ -18411,11 +18471,31 @@ impl MemoryStore for PostgresStore {
                                  ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
-                                         THEN EXCLUDED.confidence_source
+                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+                -- merges by GREATEST above, so the calibration record that
+                -- DESCRIBES that number must come from the SAME operand that
+                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+                -- re-store with a LOWER confidence but a non-default source
+                -- kept the stored 0.9 and stamped the incoming label + signals
+                -- over it — durable Form-5 corruption, silent to every reader.
+                -- Selector = the GREATEST winner: > takes the incoming tuple,
+                -- < keeps the stored tuple, and an exact tie keeps the #1629
+                -- rule verbatim (explicit non-`caller_provided` replaces) but
+                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+                -- total order, never a logical float-equality test.
+                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
@@ -20494,24 +20574,45 @@ impl MemoryStore for PostgresStore {
                 END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
+                -- v1.0.0 #2395 (pg mirror of the sqlite `insert_if_newer`
+                -- twin) — the confidence field-set is ATOMIC. `confidence`
+                -- merges by GREATEST (a commutative lattice join) while these
+                -- three merged on the updated_at/id NEWER-WINS tiebreak: a
+                -- DIFFERENT selector, so a peer that LOST the GREATEST but WON
+                -- the timestamp durably relabelled the surviving number with
+                -- its own source / signals / decayed_at. Every replica
+                -- converges on that inconsistent tuple, i.e. permanently.
+                -- The tuple now rides the operand that wins the LEXICOGRAPHIC
+                -- order (confidence, updated_at, id) — whose first component
+                -- IS the GREATEST above, so value and calibration record always
+                -- describe the same write. The order is total and deterministic
+                -- on both sides of a bidirectional sync, so the merge stays
+                -- commutative / idempotent. `=` on the REAL is only the tie
+                -- BRANCH of that order, never a logical float-equality test.
                 confidence_source = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                         OR (EXCLUDED.updated_at = memories.updated_at
-                             AND EXCLUDED.id > memories.id)
+                    WHEN EXCLUDED.confidence > memories.confidence
+                         OR (EXCLUDED.confidence = memories.confidence
+                             AND (EXCLUDED.updated_at > memories.updated_at
+                                  OR (EXCLUDED.updated_at = memories.updated_at
+                                      AND EXCLUDED.id > memories.id)))
                         THEN EXCLUDED.confidence_source
                     ELSE memories.confidence_source
                 END,
                 confidence_signals = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                         OR (EXCLUDED.updated_at = memories.updated_at
-                             AND EXCLUDED.id > memories.id)
+                    WHEN EXCLUDED.confidence > memories.confidence
+                         OR (EXCLUDED.confidence = memories.confidence
+                             AND (EXCLUDED.updated_at > memories.updated_at
+                                  OR (EXCLUDED.updated_at = memories.updated_at
+                                      AND EXCLUDED.id > memories.id)))
                         THEN EXCLUDED.confidence_signals
                     ELSE memories.confidence_signals
                 END,
                 confidence_decayed_at = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                         OR (EXCLUDED.updated_at = memories.updated_at
-                             AND EXCLUDED.id > memories.id)
+                    WHEN EXCLUDED.confidence > memories.confidence
+                         OR (EXCLUDED.confidence = memories.confidence
+                             AND (EXCLUDED.updated_at > memories.updated_at
+                                  OR (EXCLUDED.updated_at = memories.updated_at
+                                      AND EXCLUDED.id > memories.id)))
                         THEN EXCLUDED.confidence_decayed_at
                     ELSE memories.confidence_decayed_at
                 END,
@@ -29023,11 +29124,31 @@ impl PostgresStore {
                                  ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
-                                         THEN EXCLUDED.confidence_source
+                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+                -- merges by GREATEST above, so the calibration record that
+                -- DESCRIBES that number must come from the SAME operand that
+                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+                -- re-store with a LOWER confidence but a non-default source
+                -- kept the stored 0.9 and stamped the incoming label + signals
+                -- over it — durable Form-5 corruption, silent to every reader.
+                -- Selector = the GREATEST winner: > takes the incoming tuple,
+                -- < keeps the stored tuple, and an exact tie keeps the #1629
+                -- rule verbatim (explicit non-`caller_provided` replaces) but
+                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+                -- total order, never a logical float-equality test.
+                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
                 persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
                 embedding = COALESCE(EXCLUDED.embedding, memories.embedding),

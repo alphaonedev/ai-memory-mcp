@@ -2047,16 +2047,47 @@ fn insert_inner(
                                  ELSE excluded.citations END,
                 source_uri = COALESCE(excluded.source_uri, memories.source_uri),
                 source_span = COALESCE(excluded.source_span, memories.source_span),
-                -- v0.7.0 Form 5 — confidence-provenance follows the same
-                -- shape as Form 4 columns: explicit non-default replaces;
-                -- caller_provided + NULL signals keep the existing
-                -- provenance signal so a re-store doesn't blank out an
-                -- auto-derived or calibrated value.
-                confidence_source = CASE WHEN excluded.confidence_source != 'caller_provided'
-                                         THEN excluded.confidence_source
+                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
+                -- ATOMIC. `confidence` merges by MAX (above), so the
+                -- calibration record that DESCRIBES that number —
+                -- `confidence_source`, `confidence_signals`,
+                -- `confidence_decayed_at` — must come from the SAME operand
+                -- that won the MAX. Pre-#2395 the three provenance columns
+                -- used a DIFFERENT selector (explicit-non-default replaces /
+                -- COALESCE), so merging a stored (0.9, auto_derived, S1) with
+                -- an incoming (0.4, calibrated, S2) durably produced
+                -- `confidence = 0.9` labelled `calibrated` carrying S2 — a
+                -- value from one operand wearing another operand's label and
+                -- evidence. That is a self-inconsistent calibration record on
+                -- the durable tier (Form-5 semantics corrupted), and it is
+                -- silent: every downstream consumer of the pair reads it as
+                -- fact.
+                --
+                -- The selector below IS the MAX winner, applied as a unit:
+                --   * excluded.confidence > memories.confidence -> incoming tuple
+                --   * excluded.confidence < memories.confidence -> stored tuple
+                --   * EQUAL -> the pre-#2395 tie rule verbatim (an incoming
+                --     explicit non-`caller_provided` source replaces; a
+                --     default `caller_provided` keeps the stored provenance so
+                --     a plain re-store never blanks an auto-derived or
+                --     calibrated value) — except that it now carries the WHOLE
+                --     tuple rather than one column, which is the fix.
+                -- The `=`/`<`/`>` comparisons form a total order on the pair;
+                -- exact equality is only the tie BRANCH (if the two REALs are
+                -- not bit-identical, one is strictly greater), never a logical
+                -- float-equality test.
+                confidence_source = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_source
+                                         WHEN excluded.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(excluded.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(excluded.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_signals
+                                          WHEN excluded.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_decayed_at
+                                             WHEN excluded.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 -- v0.7.0 polish PERF-8 (#781) — denormalised mention tag.
                 -- COALESCE keeps any pre-existing tag (re-write that
                 -- omits the structured entity_id metadata should NOT
@@ -14532,20 +14563,41 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                                  THEN excluded.citations ELSE memories.citations END,
                 source_uri = COALESCE(excluded.source_uri, memories.source_uri),
                 source_span = COALESCE(excluded.source_span, memories.source_span),
-                -- v0.7.0 Form 5 — confidence-provenance follows the newer-
-                -- wins shape established for the other Form 4 columns.
-                -- A peer pushing an auto-derived/calibrated value wins on
-                -- the timestamp tiebreak; otherwise the local row's
-                -- provenance is preserved so a stale peer cannot blank out
-                -- a fresher local calibration.
-                confidence_source = CASE WHEN excluded.updated_at > memories.updated_at
-                                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
+                -- ATOMIC on the federation lane too. `confidence` merges by
+                -- MAX (a commutative lattice join, above) while the three
+                -- provenance columns merged on the updated_at/id NEWER-WINS
+                -- tiebreak — a DIFFERENT selector, so a peer whose row lost
+                -- the MAX but won the timestamp durably relabelled the local
+                -- row: `confidence` from one replica, `confidence_source` /
+                -- `confidence_signals` / `confidence_decayed_at` from the
+                -- other. A self-inconsistent calibration record, converged to
+                -- identically on every peer, i.e. permanent.
+                --
+                -- The tuple now moves with the operand that wins the
+                -- LEXICOGRAPHIC order (confidence, updated_at, id) — whose
+                -- first component is exactly the MAX above, so the surviving
+                -- number and its calibration record always describe the same
+                -- write. The order is total and deterministic on both sides of
+                -- a bidirectional sync, so the merge stays commutative /
+                -- idempotent (a true CRDT join): both replicas converge on the
+                -- SAME tuple regardless of push order. Exact `=` on the REAL
+                -- is only the tie BRANCH of that total order, never a logical
+                -- float-equality test.
+                confidence_source = CASE WHEN excluded.confidence > memories.confidence
+                                              OR (excluded.confidence = memories.confidence
+                                                  AND (excluded.updated_at > memories.updated_at
+                                                       OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
                                          THEN excluded.confidence_source ELSE memories.confidence_source END,
-                confidence_signals = CASE WHEN excluded.updated_at > memories.updated_at
-                                               OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                confidence_signals = CASE WHEN excluded.confidence > memories.confidence
+                                               OR (excluded.confidence = memories.confidence
+                                                   AND (excluded.updated_at > memories.updated_at
+                                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
                                           THEN excluded.confidence_signals ELSE memories.confidence_signals END,
-                confidence_decayed_at = CASE WHEN excluded.updated_at > memories.updated_at
-                                                  OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence
+                                                  OR (excluded.confidence = memories.confidence
+                                                      AND (excluded.updated_at > memories.updated_at
+                                                           OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
                                              THEN excluded.confidence_decayed_at ELSE memories.confidence_decayed_at END,
                 -- v0.7.0 polish PERF-8 (#781) — newer-wins on the mention
                 -- tag (the winning row's content is the one a future matcher
