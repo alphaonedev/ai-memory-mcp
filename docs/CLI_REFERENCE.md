@@ -1172,8 +1172,24 @@ whose caveat chain and issuer ceiling cover the in-flight
 `(action, namespace)` flips an otherwise-`Deny`/`Ask` coarse-gate
 decision to `Allow` — **attenuation-only widening**, never escalation.
 Tokens are presented via the MCP `capability` param, the
-`X-AI-Memory-Capability` HTTP header, or `--capability` on governed CLI
-verbs. A caller that presents no token is unaffected.
+`X-AI-Memory-Capability` HTTP header, or `--capability` / `--capability-file`
+on governed CLI verbs (`store`, `delete`, `promote`). A caller that presents
+no token is unaffected.
+
+**Present the token off-argv.** `--capability <token>` puts the macaroon in
+`/proc/<pid>/cmdline` (world-readable), `ps auxww`, shell history and any
+systemd unit file, where any local UID can lift and replay it within its
+caveats — the same exposure `--store-url` carries for the DB credential
+(#1927). Prefer `--capability-file <path>`, or `AI_MEMORY_CAPABILITY_FILE`
+naming the same file; the file must be owner-only (`chmod 0600`) or the verb
+refuses fail-closed (opt out with `AI_MEMORY_CAPABILITY_FILE_ALLOW_LAX_PERMS=1`).
+`--capability` still works and emits a WARN; the two flags conflict at parse.
+
+```bash
+printf 'cap1:...' > ~/.ai-memory/cap.tok && chmod 0600 ~/.ai-memory/cap.tok
+ai-memory store --title t --content c --capability-file ~/.ai-memory/cap.tok
+AI_MEMORY_CAPABILITY_FILE=~/.ai-memory/cap.tok ai-memory delete <id>
+```
 
 ```bash
 ai-memory capability init                              # v1.0.0 R9 (#1960) — idempotent zero-config

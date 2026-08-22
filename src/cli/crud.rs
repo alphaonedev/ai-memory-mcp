@@ -57,8 +57,20 @@ pub struct DeleteArgs {
     /// v0.9.0 G10.1 (#1827) — optional macaroon capability token
     /// (`cap1:...`) that may flip a governance Deny/Pending to Allow
     /// within its caveats. Inert unless `[capabilities].enabled`.
+    ///
+    /// SECURITY: a token passed here lands in world-readable
+    /// `/proc/<pid>/cmdline`, `ps auxww` and shell history, where any local
+    /// UID can lift and replay it within its caveats. Prefer
+    /// `--capability-file` (or `AI_MEMORY_CAPABILITY_FILE`); this flag warns
+    /// when used.
     #[arg(long)]
     pub capability: Option<String>,
+    /// Path to a `0600` file whose sole contents are the `cap1:` token — the
+    /// non-argv channel (never in `/proc/<pid>/cmdline`, never in shell
+    /// history), mirroring `--store-url`'s `AI_MEMORY_STORE_URL_FILE` (#1927).
+    /// Conflicts with `--capability`.
+    #[arg(long, conflicts_with = "capability")]
+    pub capability_file: Option<std::path::PathBuf>,
 }
 
 /// `get` handler. Looks up by full id then prefix; prints memory + links.
@@ -201,10 +213,19 @@ pub fn cmd_delete(
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let payload = serde_json::json!({"id": target.id, "title": target.title});
-        // v0.9.0 G10.1 (#1827) — edge-parse the optional `--capability`
-        // token ONCE; inert unless `[capabilities].enabled`.
-        let capability = crate::governance::capability::parse_presented_token(
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional capability token
+        // ONCE; inert unless `[capabilities].enabled`. Resolved through the
+        // NON-argv channels first (`--capability-file` /
+        // `AI_MEMORY_CAPABILITY_FILE`, a 0600 file) so the macaroon need
+        // never sit in `/proc/<pid>/cmdline`; `--capability` still works and
+        // warns. A named-but-unreadable/lax-mode file is a hard error, never
+        // a silent downgrade to "no token".
+        let presented_capability = crate::governance::capability::resolve_capability(
             args.capability.as_deref(),
+            args.capability_file.as_deref(),
+        )?;
+        let capability = crate::governance::capability::parse_presented_token(
+            presented_capability.as_deref(),
             &caller_agent_id,
         )
         .map_err(|rej| anyhow::anyhow!(crate::governance::capability::edge_reject_message(&rej)))?;
@@ -538,6 +559,7 @@ mod tests {
                 &DeleteArgs {
                     id: id.clone(),
                     capability: None,
+                    capability_file: None,
                 },
                 false,
                 Some("test-agent"),
@@ -567,6 +589,7 @@ mod tests {
                 &DeleteArgs {
                     id: prefix,
                     capability: None,
+                    capability_file: None,
                 },
                 true,
                 Some("test-agent"),
@@ -664,6 +687,7 @@ mod tests {
                 &DeleteArgs {
                     id: id.clone(),
                     capability: None,
+                    capability_file: None,
                 },
                 true,
                 Some("bob"),
@@ -677,5 +701,38 @@ mod tests {
         // Memory must NOT be deleted on Pending.
         let conn = db::open(&db).unwrap();
         assert!(db::get(&conn, &id).unwrap().is_some());
+    }
+
+    /// #1927-class — the argv token and the non-argv file channel are
+    /// contradictory ways to present ONE credential, so clap must refuse them
+    /// together at parse rather than silently preferring one.
+    #[test]
+    fn capability_and_capability_file_conflict_at_parse() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: DeleteArgs,
+        }
+        assert!(
+            TestCli::try_parse_from([
+                "x",
+                "some-id",
+                "--capability",
+                "cap1:abc",
+                "--capability-file",
+                "/tmp/cap.tok",
+            ])
+            .is_err(),
+            "--capability + --capability-file must conflict at parse"
+        );
+        let ok = TestCli::try_parse_from(["x", "some-id", "--capability-file", "/tmp/cap.tok"])
+            .expect("--capability-file alone must parse");
+        assert_eq!(
+            ok.args.capability_file.as_deref(),
+            Some(std::path::Path::new("/tmp/cap.tok"))
+        );
+        let plain = TestCli::try_parse_from(["x", "some-id"]).expect("plain parse");
+        assert!(plain.args.capability.is_none() && plain.args.capability_file.is_none());
     }
 }

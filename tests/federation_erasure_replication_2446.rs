@@ -441,6 +441,7 @@ fn cli_delete_queues_an_erasure_outbox_row_2446() {
         &ai_memory::cli::crud::DeleteArgs {
             id: "cli-del-1".to_string(),
             capability: None,
+            capability_file: None,
         },
         true,
         None,
@@ -517,6 +518,7 @@ fn unconfigured_deployment_erasure_succeeds_and_queues_nothing_2446() {
         &ai_memory::cli::crud::DeleteArgs {
             id: "solo-1".to_string(),
             capability: None,
+            capability_file: None,
         },
         true,
         None,
@@ -549,6 +551,7 @@ fn unconfigured_deployment_erasure_succeeds_and_queues_nothing_2446() {
         &ai_memory::cli::crud::DeleteArgs {
             id: "paired-1".to_string(),
             capability: None,
+            capability_file: None,
         },
         true,
         None,
@@ -588,6 +591,7 @@ async fn drain_expands_sentinel_and_delivers_deletion_to_peer_2446() {
             &ai_memory::cli::crud::DeleteArgs {
                 id: "drain-1".to_string(),
                 capability: None,
+                capability_file: None,
             },
             true,
             None,
@@ -660,6 +664,7 @@ async fn peer_down_leaves_the_expanded_row_pending_2446() {
             &ai_memory::cli::crud::DeleteArgs {
                 id: "down-1".to_string(),
                 capability: None,
+                capability_file: None,
             },
             true,
             None,
@@ -719,6 +724,7 @@ async fn restore_after_delete_supersedes_the_queued_erasure_2446() {
             &ai_memory::cli::crud::DeleteArgs {
                 id: "restore-1".to_string(),
                 capability: None,
+                capability_file: None,
             },
             true,
             None,
@@ -800,6 +806,7 @@ fn sentinel_and_real_peer_row_coexist_for_the_same_memory_2446() {
         &ai_memory::cli::crud::DeleteArgs {
             id: "coexist-1".to_string(),
             capability: None,
+            capability_file: None,
         },
         true,
         None,
