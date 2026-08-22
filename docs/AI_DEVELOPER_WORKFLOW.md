@@ -205,6 +205,23 @@ backwards-compatibility shims for code paths that have no caller. If a follow-up
 needed, capture it as an ai-memory entry tagged `followup` and mention it in the PR
 description.
 
+### 5.6 Gate scripts mutate the tree by design — never `git add -A` after one
+
+Several `scripts/check-*.sh` gates REWRITE tracked files on purpose while they run, and
+`scripts/check-cert-removal-proof.sh` rewrites production **security controls** — it
+short-circuits a guard to always-allow, runs the guard's lane test, and asserts the test
+goes RED. So a gate run is a window in which the working tree is deliberately, invisibly
+wrong: nothing in `git status` reads as "a security control is disabled". On 2026-08-22
+(#3118, caught before merge) a harness run killed at a timeout left
+`inbound_write_namespace_authorized` returning always-allow — a cross-tenant inbound
+federated-write authorization bypass — and a subsequent `git add -A` pushed it to a PR
+branch. **Stage explicitly (`git add <path> …`), always, and read the diff you staged.**
+`git add -A` / `git add .` / `git commit -a` are banned after running any gate or harness
+script. The harness now restores under an `EXIT`/`INT`/`TERM`/`HUP` trap, refuses to start
+on a tree that still carries a mutation marker (`--force-restore` is the recovery path),
+and `scripts/check-mutation-marker.sh` blocks the marker anywhere under `src/` in CI — but
+those are the backstops, not the discipline. The discipline is explicit staging.
+
 ---
 
 ## 6. Memory Hygiene (ai-memory usage by AI agents)

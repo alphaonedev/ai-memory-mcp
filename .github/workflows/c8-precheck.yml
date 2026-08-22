@@ -129,6 +129,15 @@ jobs:
     # gate HARD-BLOCKS `rqgm|epoch_manifest|red.?queen` in src/. The
     # ruled public identifiers (SignableEpochManifest, epoch.manifest_applied,
     # EpochAdvance, EPOCH_APPLIED) are gate-clean by construction.
+    #
+    # This job now carries a SECOND perma-banned-string-in-src/ gate (#3119,
+    # below). It rides HERE, as extra steps, rather than in a job of its own
+    # because this job's `name:` is a DECLARED REQUIRED CONTEXT (see
+    # scripts/qc-allowlists/required-contexts-release.txt) — so the new gate is
+    # merge-BLOCKING from the first commit, whereas a fresh job would be an
+    # unrequired context that a merge could ignore. The name is deliberately
+    # NOT changed: it is the exact string branch protection requires, and #2473
+    # is the record of what renaming it costs.
     steps:
       - uses: actions/checkout@v4
       - name: Run L3-boundary perma-ban gate
@@ -137,6 +146,30 @@ jobs:
         # Proves the gate is load-bearing: passes a clean tree, fails on
         # a planted `epoch_manifest` violation in a tmpdir, cleans up.
         run: bash scripts/check-l3-boundary.sh --self-test
+      - name: Run cert removal-proof mutation-marker gate (#3119)
+        # DEFENCE IN DEPTH for the #3118 near-miss.
+        # scripts/check-cert-removal-proof.sh rewrites production security
+        # controls in place to prove they are load-bearing; an aborted run left
+        # `inbound_write_namespace_authorized` short-circuited to always-allow
+        # (a cross-tenant inbound federated-write authorization BYPASS) in the
+        # working tree, and a `git add -A` pushed it to a PR branch. #3119
+        # fixed the harness (EXIT/INT/TERM/HUP trap + start guard + end
+        # assertion); THIS is the independent second line — the marker can
+        # never reach a merged commit under src/, however it got there.
+        run: bash scripts/check-mutation-marker.sh
+      - name: Self-test the mutation-marker gate (regression evidence)
+        # Plants the exact #3118 artefact in a throwaway src/ tree under
+        # .local-runs/ (must FAIL), against a clean near-miss control that
+        # names the harness without carrying the marker (must PASS), and an
+        # empty scan set that must fail CLOSED.
+        run: bash scripts/check-mutation-marker.sh --self-test
+      - name: Prove the harness restores an interrupted run (#3119)
+        # The other half of #3119: the harness's own --self-test drives the
+        # REAL harness against a REAL control under `timeout 2` and under a
+        # re-raised SIGINT, with the cargo step stubbed (no toolchain), and
+        # asserts `git status --porcelain src/` is empty and the marker absent
+        # afterwards. Removing the trap turns these two legs RED.
+        run: bash scripts/check-cert-removal-proof.sh --self-test
 
   hardcoded-literal-gate:
     name: Hardcoded-literal duplication ratchet (pm-v3.1)
