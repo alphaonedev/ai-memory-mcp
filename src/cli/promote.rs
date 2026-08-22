@@ -134,7 +134,43 @@ pub fn cmd_promote(
     }
 
     if let Some(ref to_ns) = args.to_namespace {
-        let clone_id = db::promote_to_namespace(&conn, &resolved_id, to_ns)?;
+        // #3202 — govern the DESTINATION, not just the source. Vertical
+        // promotion is a WRITE into `to_ns`, so the CLI runs the same
+        // STORE-class gate the MCP handler now runs; without it, the CLI
+        // stayed the surface on which the ancestor namespace's `write` policy
+        // could be bypassed. Same shape as the source gate above.
+        let promoter = identity::resolve_agent_id(cli_agent_id, None)?;
+        let dest_payload = serde_json::json!({
+            "id": resolved_id,
+            (crate::models::field_names::TO_NAMESPACE): to_ns,
+            "mode": "vertical",
+        });
+        let dest_capability = crate::governance::capability::parse_presented_token(
+            args.capability.as_deref(),
+            &promoter,
+        );
+        match enforce_governance(
+            &conn,
+            models::GovernedAction::Store,
+            to_ns,
+            &promoter,
+            None,
+            // A new row in `to_ns` has no prior owner there (see the MCP twin).
+            None,
+            &dest_payload,
+            dest_capability.as_ref(),
+            json_out,
+            out,
+        )? {
+            GovernanceOutcome::Allow => {}
+            GovernanceOutcome::Deny => {
+                std::process::exit(1);
+            }
+            GovernanceOutcome::Pending => {
+                return Ok(());
+            }
+        }
+        let clone_id = db::promote_to_namespace(&conn, &resolved_id, to_ns, Some(&promoter))?;
         if json_out {
             writeln!(
                 out.stdout,

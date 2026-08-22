@@ -7696,6 +7696,7 @@ pub fn promote_to_namespace(
     conn: &Connection,
     source_id: &str,
     to_namespace: &str,
+    promoted_by: Option<&str>,
 ) -> Result<String> {
     if to_namespace.is_empty() {
         // #962 typed envelope.
@@ -7733,6 +7734,51 @@ pub fn promote_to_namespace(
     }
 
     let now = Utc::now().to_rfc3339();
+    // #3202 — RE-STAMP the clone's provenance. Pre-fix the clone carried
+    // `source.metadata` verbatim, so the new row in the DESTINATION namespace
+    // was owned by the SOURCE's author rather than by the caller that put it
+    // there, and nothing in the row recorded where it came from (only the
+    // out-of-band `derived_from` edge did). Two consequences: a destination
+    // owner gate compared against a principal who never wrote into that
+    // namespace, and an operator auditing the destination could not tell a
+    // promoted row from a natively-authored one. The acting caller becomes the
+    // clone's `agent_id`; the origin is PRESERVED (never overwritten) under
+    // `promoted_from*` so the original authorship is still recoverable — the
+    // durable truth is added to, not replaced.
+    let clone_metadata = {
+        let mut meta = source.metadata.clone();
+        if let Some(obj) = meta.as_object_mut() {
+            if let Some(actor) = promoted_by.filter(|a| !a.is_empty()) {
+                if let Some(prior) = obj
+                    .get(crate::mcp::param_names::AGENT_ID)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                {
+                    obj.insert(
+                        "promoted_from_agent_id".to_string(),
+                        serde_json::Value::String(prior),
+                    );
+                }
+                obj.insert(
+                    crate::mcp::param_names::AGENT_ID.to_string(),
+                    serde_json::Value::String(actor.to_string()),
+                );
+            }
+            obj.insert(
+                "promoted_from".to_string(),
+                serde_json::Value::String(source_id.to_string()),
+            );
+            obj.insert(
+                "promoted_from_namespace".to_string(),
+                serde_json::Value::String(source.namespace.clone()),
+            );
+            obj.insert(
+                "promoted_at".to_string(),
+                serde_json::Value::String(now.clone()),
+            );
+        }
+        meta
+    };
     let clone = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         valid_from: source.valid_from.clone(),
@@ -7751,7 +7797,7 @@ pub fn promote_to_namespace(
         updated_at: now,
         last_accessed_at: None,
         expires_at: source.expires_at.clone(),
-        metadata: source.metadata.clone(),
+        metadata: clone_metadata,
         reflection_depth: source.reflection_depth,
         memory_kind: source.memory_kind.clone(),
         entity_id: None,
@@ -20067,8 +20113,12 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                     .get(field_names::TO_NAMESPACE)
                     .and_then(|v| v.as_str())
                 {
-                    // Vertical promotion to ancestor.
-                    let clone_id = promote_to_namespace(conn, &mid, to_ns)?;
+                    // Vertical promotion to ancestor. #3202 — the clone is
+                    // attributed to the principal that REQUESTED the promote
+                    // (the governance subject the approval was granted for),
+                    // not to the source row's author.
+                    let clone_id =
+                        promote_to_namespace(conn, &mid, to_ns, Some(pa.requested_by.as_str()))?;
                     Some(clone_id)
                 } else {
                     // Tier bump to long + clear expiry.

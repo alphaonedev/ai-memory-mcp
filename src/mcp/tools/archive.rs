@@ -63,12 +63,33 @@ pub(super) fn handle_archive_purge(
     // the single-operator default is unchanged. Resolved ONCE and reused below
     // (pre-fix the same param was resolved twice with different failure modes —
     // `unwrap_or_else(ANONYMOUS_INVALID)` here and `?` in the K9 block).
-    let caller = crate::identity::resolve_governance_subject(
+    let caller = match crate::identity::resolve_governance_subject(
         params[param_names::AGENT_ID].as_str(),
         None,
         "purge the archive",
-    )
-    .map_err(|e| e.to_string())?;
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            // #3171 — a REFUSED subject is a security event, and #913's remit
+            // is that the forensic chain captures INTENT regardless of the
+            // downstream outcome. Chain a `refuse` row (attributed to the
+            // enforced-read caller, never to the id the request asserted)
+            // before returning, so an attempt to purge another owner's archive
+            // is not the one archive-purge call that leaves no trace.
+            crate::governance::audit::record_decision(
+                &crate::identity::resolve_read_visibility_caller()
+                    .unwrap_or_else(|| crate::identity::sentinels::ANONYMOUS_INVALID.to_string()),
+                "refuse",
+                crate::governance::action_labels::ARCHIVE_PURGE,
+                "",
+                json!({
+                    (field_names::OLDER_THAN_DAYS): older_than_days,
+                    "reason": e.to_string(),
+                }),
+            );
+            return Err(e.to_string());
+        }
+    };
     // #936 (security-critical, 2026-05-20) — MCP-side owner gate.
     // The MCP entry is a second attack surface for the same gap the
     // HTTP `purge_archive` handler had: pre-#936 the dispatch reached
@@ -144,6 +165,109 @@ pub(super) fn handle_archive_stats(conn: &rusqlite::Connection) -> Result<Value,
     db::archive_stats(conn).map_err(|e| e.to_string())
 }
 
+/// #3204 item 7 — the three gates a real `memory_gc` sweep must clear, in the
+/// same order and with the same semantics `handle_archive_purge` uses.
+///
+/// 1. **K9 permission rules.** Evaluated against the resolved caller. The op is
+///    chosen by DISPOSITION: an archiving sweep is `MemoryArchive` (a
+///    recoverable move, same op as the archive family); a non-archiving sweep
+///    is `MemoryDelete`, because that is exactly what it is. Rules are
+///    namespace-scoped and a sweep is substrate-wide, so it is evaluated at the
+///    default namespace and operators scope with `namespace_pattern = "**"` —
+///    the `handle_archive_purge` convention.
+/// 2. **Namespace governance.** A sweep cannot honour a per-namespace `delete`
+///    policy row-by-row, so it applies the #1849 rule for a namespace-less bulk
+///    delete: if ANY namespace holding reapable rows carries a non-`Any`
+///    `delete` level, REFUSE the whole sweep and direct the operator at the
+///    scoped path. Otherwise a `delete: Approve` legal-hold is no defence at all
+///    — the held rows simply expire and vanish on the next tick.
+/// 3. **Forensic capture.** An `allow` decision chained BEFORE the write, so
+///    the trail records intent regardless of the storage outcome (#913).
+///
+/// # Errors
+/// A governance-refusal message when a rule denies, when a reapable namespace
+/// is delete-governed, or the stringified storage error on the namespace probe.
+fn gate_gc_sweep(conn: &rusqlite::Connection, archive: bool) -> Result<(), String> {
+    use crate::permissions::{Op, PermissionContext, Permissions};
+    let caller = crate::identity::resolve_agent_id(None, None)
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    let op = if archive {
+        Op::MemoryArchive
+    } else {
+        Op::MemoryDelete
+    };
+    let ctx = PermissionContext {
+        op,
+        namespace: crate::DEFAULT_NAMESPACE.to_string(),
+        agent_id: caller.clone(),
+        payload: json!({ "archived": archive }),
+    };
+    match Permissions::evaluate(&ctx, &[]) {
+        crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
+        crate::permissions::Decision::Deny(reason) => {
+            return Err(crate::governance::deny_message(
+                "gc",
+                crate::governance::DenyGate::PermissionRule,
+                &reason,
+            ));
+        }
+        crate::permissions::Decision::Ask(prompt) => {
+            return Err(crate::governance::deny_message(
+                "gc",
+                crate::governance::DenyGate::PermissionRule,
+                &prompt,
+            ));
+        }
+    }
+
+    // #1849-shaped governance guard, applied to the reapable set. The predicate
+    // is the SAME one `db::gc` sweeps with (`SQL_GC_EXPIRED_CHUNK_IDS`), so the
+    // governed-namespace probe can never miss a namespace the sweep would reap.
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT namespace FROM memories \
+             WHERE expires_at IS NOT NULL AND expires_at < ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let namespaces: Vec<String> = stmt
+        .query_map(rusqlite::params![now], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .map_err(|e| e.to_string())?;
+    for ns in &namespaces {
+        if db::resolve_governance_policy(conn, ns)
+            .is_some_and(|p| !matches!(p.core.delete, crate::models::GovernanceLevel::Any))
+        {
+            crate::governance::audit::record_decision(
+                &caller,
+                "refuse",
+                crate::mcp::registry::tool_names::MEMORY_GC,
+                ns,
+                json!({ "archived": archive }),
+            );
+            return Err(crate::governance::deny_message(
+                "gc",
+                crate::governance::DenyGate::Governance,
+                &format!(
+                    "namespace '{ns}' holds expired rows and carries a non-permissive \
+                     delete policy; a substrate-wide gc cannot honour it — reap that \
+                     namespace through the governed per-memory delete instead"
+                ),
+            ));
+        }
+    }
+
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        crate::mcp::registry::tool_names::MEMORY_GC,
+        "",
+        json!({ "archived": archive, "governed_namespaces_checked": namespaces.len() }),
+    );
+    Ok(())
+}
+
 pub(super) fn handle_gc(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -166,6 +290,20 @@ pub(super) fn handle_gc(
     // present-but-non-boolean `dry_run` used to run a REAL sweep.
     let dry_run = crate::mcp::param_guard::optional_bool(params, param_names::DRY_RUN)?
         .unwrap_or(false);
+
+    // ── #3204 item 7 — gate the SWEEP ────────────────────────────────────
+    // `memory_gc` was the one destructive MCP tool that reached the substrate
+    // with NO permission gate, NO governance consult and NO forensic row,
+    // while its sibling `handle_archive_purge` (above) carries all three. It
+    // deletes across EVERY namespace and EVERY owner, and with `archive_on_gc`
+    // off that delete is a permanent hard-delete + crypto-erase — strictly
+    // more destructive than the purge that IS gated. The gates below run only
+    // for a real sweep; `dry_run` is a pure count and stays ungated so an
+    // operator can always SEE what would be reaped.
+    if !dry_run {
+        gate_gc_sweep(conn, archive)?;
+    }
+
     if dry_run {
         // Just count expired without deleting
         let now = chrono::Utc::now().to_rfc3339();

@@ -222,16 +222,21 @@ fn resolve_mcp_agent_id(arguments: &Value, mcp_client: Option<&str>) -> String {
     arguments
         .get(param_names::AGENT_ID)
         .and_then(Value::as_str)
-        // #3171 — SHAPE-VALIDATE the wire value before it lands in the
-        // enterprise-audit `actor` field. This is the one site where an
-        // UNVALIDATED, arbitrary caller string reached the SIEM emitter: a
-        // value carrying newlines / control characters is a log-injection
-        // vector into the audit record for every store/update/delete/promote/
-        // forget/link/consolidate/approve/reject call. A shape-invalid value
-        // falls through to the synthesized client id, exactly like an absent
-        // one — the audit row then names an unforgeable id rather than a
-        // forged one.
-        .filter(|id| crate::validate::validate_agent_id_shape(id).is_ok())
+        // #3171 / #3204 item 4 — VALIDATE the wire value before it lands in
+        // the enterprise-audit `actor` field. This is the one site where an
+        // UNVALIDATED, arbitrary caller string reached the SIEM emitter, in
+        // two ways: a value carrying newlines / control characters is a
+        // log-injection vector into the audit record for every
+        // store/update/delete/promote/forget/link/consolidate/approve/reject
+        // call, and — because the shape gate alone does not reject them — a
+        // RESERVED sentinel (`daemon`, `system`, …) let a wire caller stamp
+        // the audit row with the internal principal that downstream gates
+        // carve out as "the internal path is exempt". The full
+        // `validate_agent_id` (#977) closes both: it runs the shape gate AND
+        // rejects every `RESERVED_AGENT_IDS` member. An invalid value falls
+        // through to the synthesized client id exactly like an absent one, so
+        // the audit row names an unforgeable id rather than a forged one.
+        .filter(|id| crate::validate::validate_agent_id(id).is_ok())
         .map(str::to_string)
         .unwrap_or_else(|| {
             mcp_client
@@ -3354,11 +3359,35 @@ fn handle_request(
             let _enter = span.enter();
             let started = Instant::now();
 
+            // #3204 item 4 — a PRESENT but non-object `arguments` is a
+            // protocol violation, not "no arguments". Coercing it to `{}`
+            // meant `{"arguments": "namespace=acme"}` (or an array, or a
+            // number) silently ran the tool with EVERY argument absent: a
+            // destructive tool then took its unscoped defaults, and a
+            // schema-required field took whatever fallback its handler had.
+            // MCP 2025-03-26 puts malformed request STRUCTURE in the
+            // envelope-level error channel, so refuse with -32602. An ABSENT
+            // `arguments` still means "no arguments" (the documented default
+            // for tools whose fields are all optional).
             let empty_obj = json!({});
-            let arguments = if req.params["arguments"].is_object() {
-                &req.params["arguments"]
-            } else {
-                &empty_obj
+            let arguments = match &req.params["arguments"] {
+                v if v.is_object() => v,
+                Value::Null => &empty_obj,
+                other => {
+                    return err_response(
+                        id,
+                        jsonrpc::INVALID_PARAMS,
+                        format!(
+                            "tools/call `arguments` must be a JSON object, got {}",
+                            match other {
+                                Value::Array(_) => "an array",
+                                Value::String(_) => "a string",
+                                Value::Bool(_) => "a boolean",
+                                _ => "a number",
+                            }
+                        ),
+                    );
+                }
             };
 
             // v0.7.0 #1389 / #1398 L1 — observe this call against the

@@ -381,7 +381,20 @@ pub fn handle_pending_approve(
         mcp_client,
         "approve",
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| {
+        // #3171 — an attempt to approve AS SOMEONE ELSE is a separation-of-duties
+        // attack, not an operational error, so it earns a `refuse` verdict row
+        // attributed to the ENFORCED caller (never to the id the request
+        // asserted). Without this it would be the one refused approval that
+        // leaves no trace in the tamper-evident chain.
+        audit_pending_verdict(
+            &crate::identity::resolve_read_visibility_caller()
+                .unwrap_or_else(|| crate::identity::sentinels::ANONYMOUS_INVALID.to_string()),
+            id,
+            "refuse",
+        );
+        e.to_string()
+    })?;
     let remember = parse_remember_param(params);
 
     // #913 + #2634 / CB-24 — admin governance audit. Pre-fix a
@@ -669,6 +682,11 @@ mod tests {
             .expect("row present");
         assert_eq!(row.status, "pending", "a refused decision must not decide");
         assert!(row.decided_by.is_none(), "no decider may be recorded");
+
+        // (The refusal also chains a `refuse` verdict attributed to the
+        // ENFORCED caller — see the `map_err` on the subject resolution. It is
+        // a no-op here because no audit sink is initialised in this hermetic
+        // test; the forensic-chain suites cover the emitter itself.)
 
         unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     }

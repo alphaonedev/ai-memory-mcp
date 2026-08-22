@@ -679,6 +679,56 @@ backend and missing or divergently implemented on its twin). Pinned by
   every link carries one. It now `COALESCE`s to `"unsigned"` — the same
   projection the reflection export already used.
 
+### Security (governance gates that were missing or pointed at the wrong namespace; #3202, #3204 items 4 and 7)
+
+- **`memory_promote` now governs the DESTINATION namespace, not only the source
+  (#3202).** Vertical promotion CLONES the row into `to_namespace`, i.e. it is a
+  WRITE into that namespace — but the Task-1.9 block evaluated
+  `GovernedAction::Promote` against the SOURCE namespace, and the destination
+  received nothing beyond `reject_reserved_write_namespace`. An operator who set
+  `write: Owner` (or `Approve`) on an ancestor namespace still had every row a
+  caller could read from a descendant clonable into it, and the ancestor is
+  normally the MORE protected namespace — so the governance boundary was
+  crossable by construction. A STORE-class `enforce_governance` now runs against
+  `to_namespace` before the clone (Deny refuses, Approve queues exactly as a
+  direct `memory_store` into that namespace would), the forensic row is chained
+  under the DESTINATION, and the clone's provenance is RE-STAMPED: it was
+  carrying `source.metadata` verbatim, so the new row was owned by the source's
+  author rather than the caller that put it there and nothing in the row
+  recorded its origin. The acting caller becomes the clone's `agent_id`; the
+  original authorship is PRESERVED under `promoted_from_agent_id` alongside
+  `promoted_from` / `promoted_from_namespace` / `promoted_at`, so the durable
+  truth is added to, never replaced. `promote_to_namespace` takes the acting
+  caller explicitly, so the MCP, CLI and approved-pending-action lanes each
+  attribute the clone correctly. Surface audit: MCP and CLI both gained the
+  destination gate; HTTP has no exposure (`handlers/memories.rs` hard-codes
+  `to_namespace: None`); postgres has no `promote_to_namespace` twin, so
+  vertical promotion is sqlite-only.
+- **`memory_gc` is no longer the one ungated destructive tool (#3204 item 7).**
+  It reached the substrate with no permission gate, no governance consult and no
+  forensic row, while its sibling `memory_archive_purge` carries all three —
+  even though gc deletes across EVERY namespace and EVERY owner, and with
+  `archive_on_gc` off that delete is a permanent hard-delete + crypto-erase.
+  A real sweep now clears three gates: a K9 `Permissions::evaluate` (op chosen by
+  disposition — `MemoryArchive` for an archiving sweep, `MemoryDelete` for a
+  reaping one) evaluated at the default namespace with `namespace_pattern = "**"`
+  scoping, the #1849 bulk-delete governance rule (REFUSE the sweep if any
+  namespace holding reapable rows carries a non-`Any` `delete` level — otherwise
+  a `delete: Approve` legal-hold is no defence at all, since the held rows simply
+  expire and vanish on the next tick), and an `allow` forensic row chained before
+  the write. `dry_run` stays ungated so an operator can always SEE what would be
+  reaped.
+- **A non-object `tools/call` `arguments` is now `-32602`, not `{}` (#3204
+  item 4).** Coercing it meant `{"arguments": "namespace=acme"}` (or an array, or
+  a number) silently ran the tool with EVERY argument absent — a destructive tool
+  then took its unscoped defaults and a schema-required field took its handler
+  fallback. An ABSENT `arguments` still means "no arguments".
+- **The audit actor rejects RESERVED sentinels (#3204 item 4).** The shape gate
+  alone does not reject them, so a wire caller could stamp the enterprise-audit
+  `actor` with `daemon` / `system` — the internal principals downstream gates
+  carve out as "the internal path is exempt". `resolve_mcp_agent_id` now applies
+  the full `validate_agent_id` (#977).
+
 ### Added (MCP tool-contract SSOT: declared parameters, exception mechanisms, and a handler-reads guard; #3171)
 
 - **26 parameters that handlers already honoured are now DECLARED** on their
