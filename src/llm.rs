@@ -6595,11 +6595,18 @@ mod bridge_budget_tests_3140 {
 
     /// The wall-clock alarm fires on its own budget, with no tokio timer
     /// involved beyond awaiting the `oneshot`.
+    ///
+    /// `t0` MUST be captured before spawn: the alarm thread starts its
+    /// deadline at `Instant::now()` inside the worker, and
+    /// `thread::Builder::spawn` plus the first poll of the oneshot future
+    /// both take wall time. Starting the clock after spawn made CI
+    /// (ubuntu Check + SAL-only, SHA `8aa7ddd6`) report 97-99 ms against a
+    /// 100 ms budget — a measurement artefact, not an early fire.
     #[tokio::test(flavor = "current_thread")]
     async fn wallclock_alarm_fires_after_its_budget() {
         let alarm_budget = Duration::from_millis(100);
-        let (alarm, _guard) = super::spawn_wallclock_alarm(alarm_budget);
         let t0 = Instant::now();
+        let (alarm, _guard) = super::spawn_wallclock_alarm(alarm_budget);
         alarm.await;
         let elapsed = t0.elapsed();
         assert!(
