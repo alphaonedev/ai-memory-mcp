@@ -24,6 +24,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
+  # CARGO_INCREMENTAL=0, and it is now skipped on the self-hosted fleet (see the
+  # rust-cache guards below), so the value must be declared here. Incremental
+  # state is the most fragile thing in a `target/` tree, and the fleet's
+  # `target/` is PERSISTENT and reused across branches — leaving incremental on
+  # there would be a worse version of the very inconsistency the guard closes.
+  # Declaring it at workflow level also means no job depends on the runner
+  # `.env` supplying it.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   lifetime-tests:
@@ -37,9 +46,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - uses: dtolnay/rust-toolchain@stable
 
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
 
       - name: Run lifetime suite
         env:

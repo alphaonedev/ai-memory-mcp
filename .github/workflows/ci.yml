@@ -20,6 +20,53 @@ name: CI
 # superset of the 2026-05-22 dossier baseline; this push refreshes the
 # integrated full-platform CI signal as Tier 1 ship-gate evidence.
 
+# ---------------------------------------------------------------------------
+# RUNNER PLACEMENT — THE RULE (cited by every `# RUNNER PLACEMENT` comment in
+# this repository's workflows; this block is its single statement).
+# ---------------------------------------------------------------------------
+# Self-hosted concurrency is SIX runner instances for the whole repository —
+# four `linux-fed` on one Linux host, two `macos-fed` on one macOS host — shared
+# across every open pull request, and GitHub does not priority-order that queue.
+# GitHub-hosted capacity, at this repository's volume, is not a constraint.
+#
+# So a self-hosted slot is spent ONLY where the node offers something the hosted
+# pool cannot:
+#
+#   pg-tier      the always-up native PG 18.6 + AGE 1.8.0 + pgvector 0.8.6
+#                instance on :5445. A job qualifies if it reads the node-local
+#                tier-URL file, CREATE DATABASEs an ephemeral db on it, or points
+#                AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_AGE_URL at it.
+#   warm-cache   the persistent `target/` tree. A job qualifies if it runs
+#                `cargo build` / `cargo test` / `cargo clippy` over a non-trivial
+#                slice of the crate, where warm-vs-cold is minutes.
+#   script-only  EVERYTHING ELSE — `bash scripts/check-*.sh`, git/grep/python3
+#                over the checked-out tree, container-action steps,
+#                dependency-graph RESOLUTION that never compiles, and Docker
+#                builds whose layer cache is `type=gha` (a container build cannot
+#                see the host's cargo cache). These run on `ubuntu-latest`.
+#
+# WHY THIS IS A RULE AND NOT A PREFERENCE. #3109 put 39 job definitions (43
+# expanded) onto the fleet, `Classify changes` — the root of this workflow's
+# `needs:` graph — among them. With several PRs open, whole runs sat `queued`
+# 40+ minutes because the decider could not get a slot, so the four REQUIRED
+# `Check (…)` legs never started. One absolute follows: A JOB THAT OTHER JOBS
+# `needs:` MUST NEVER BE SELF-HOSTED UNLESS IT IS ITSELF pg-tier OR warm-cache.
+# A queued decider stalls its whole graph.
+#
+# A job moving BACK to the hosted pool must not keep anything the fleet supplied
+# implicitly — a PATH entry for ~/.cargo/bin, CARGO_BUILD_JOBS, a runner-managed
+# RUNNER_TOOL_CACHE, a job-started hook. Where #3109 replaced
+# actions/setup-python / actions/setup-node with a `command -v` presence
+# assertion (the fleet cannot write the hosted RUNNER_TOOL_CACHE default), the
+# setup-* actions are restored with the move back — see `conformance-readers-gate`
+# in c8-precheck.yml. AI_MEMORY_NO_CONFIG=1 is unaffected either way: the runner
+# .env sets it on the fleet and the workflows set it per-step, so hosted jobs
+# behave identically.
+#
+# Adding a job: answer (1) does it need the :5445 tier? (2) does it compile a
+# non-trivial slice of the crate? (3) otherwise hosted — and record the answer as
+# a `# RUNNER PLACEMENT` comment on the job.
+
 on:
   push:
     branches: [main, develop, "release/**"]
@@ -69,6 +116,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
+  # CARGO_INCREMENTAL=0, and it is now skipped on the self-hosted fleet (see the
+  # rust-cache guards below), so the value must be declared here. Incremental
+  # state is the most fragile thing in a `target/` tree, and the fleet's
+  # `target/` is PERSISTENT and reused across branches — leaving incremental on
+  # there would be a worse version of the very inconsistency the guard closes.
+  # Declaring it at workflow level also means no job depends on the runner
+  # `.env` supplying it.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   # Classify the diff so docs-only PRs can short-circuit the heavy Rust
@@ -105,11 +161,25 @@ jobs:
   # correctly reported `docs_only=false` on that same commit.
   classify:
     name: Classify changes
-    # v1.0.0 self-hosted CI — was ubuntu-latest; the classify decider is a
-    # toolchain-free git/bash gate, re-homed onto the enterprise-fed Linux
-    # node. The `- id: cls` two-base body is UNCHANGED (frozen by
+    # RUNNER PLACEMENT — GITHUB-HOSTED, AND THIS ONE IS LOAD-BEARING
+    # (the rule is stated at the head of this file).
+    #
+    # `classify` is the ROOT of this workflow's `needs:` graph: `lint`,
+    # `actionlint`, `msrv`, `check` (×4), `postgres-feature`,
+    # `mobile-cross-compile` (×2), `sal-feature`, `vectorlite-feature` and
+    # `dockerfile-validate` all wait on it, so NOTHING in the pipeline can start
+    # until it finishes. #3109 put it on `[self-hosted, linux-fed]`, where it
+    # queued behind ~37 other self-hosted jobs on a 2-node fleet — with several
+    # PRs open the decider itself sat `queued` for 40+ minutes and the four
+    # REQUIRED `Check (…)` legs never started. Head-of-line blocking on the one
+    # job that must never wait.
+    #
+    # It is a toolchain-free git/bash decider — no cargo, no Postgres — so it
+    # has nothing to gain from a self-hosted node and belongs on the hosted
+    # pool, which has no slot contention. DO NOT re-home this job onto
+    # `self-hosted`. The `- id: cls` two-base body is UNCHANGED (frozen by
     # scripts/test/test-ci-workflow-invariants.sh §A).
-    runs-on: [self-hosted, linux-fed]
+    runs-on: ubuntu-latest
     outputs:
       docs_only: ${{ steps.cls.outputs.docs_only }}
       # v0.7.0 Task #12 (#1399) — test-impact selection output.
@@ -332,14 +402,56 @@ jobs:
     name: Lint (fmt + clippy)
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
+    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of this
+    # file). Two full pedantic clippy passes (default + `--all-targets
+    # --features sal`); the node's warm `target/` turns a multi-minute cold
+    # compile into an incremental one.
     runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
+      # FAIL CLOSED if rustup is missing on a self-hosted node (#3128).
+      # `dtolnay/rust-toolchain` has an "Install rustup if needed" path that
+      # runs `curl https://sh.rustup.rs | sh`. On a GitHub-hosted runner that is
+      # a clean, throwaway image. On the fleet it curl-pipes an installer into a
+      # SHARED $HOME — which is what happened on f2 at 05:40:33Z on 2026-08-22
+      # ("downloading installer … Rust is installed now") when `~/.cargo/bin/rustup`
+      # was momentarily absent during a rustup self-update, and the job then
+      # built against whatever that install produced. A node missing its
+      # toolchain is a BROKEN NODE: it must red the job loudly, not silently
+      # repair itself from the network. Skipped on hosted runners, where
+      # provisioning the toolchain is exactly the action's job.
+      #
+      # The condition is `!= 'github-hosted'`, NOT `== 'self-hosted'`, so that an
+      # unset or unrecognised `runner.environment` STILL RUNS the assertion. An
+      # unknown runner class must not silently switch a fail-closed control off.
+      # The rust-cache guards below use the opposite polarity for the same
+      # reason: unknown => skip the cache action, whose worst case is a cold
+      # build, never a mixed-provenance `target/`.
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — refusing to let the toolchain action curl-pipe an installer into a shared home. Repair the node."
+            exit 1
+          }
+          echo "rustup=$("$HOME/.cargo/bin/rustup" --version 2>&1 | head -1)"
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
@@ -377,7 +489,13 @@ jobs:
   # do not apply, and it always runs — which is the entire point.
   build-script-vetting:
     name: "Build-script custom-build ledger gate (#2635)"
-    runs-on: [self-hosted, linux-fed]
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). This job
+    # RESOLVES the dependency graph (`cargo fetch --locked` +
+    # `cargo metadata --offline`) and then runs a python verifier; it never
+    # COMPILES anything, so the self-hosted nodes' warm `target/` directory buys
+    # it nothing. `Swatinem/rust-cache` restores the registry on hosted exactly
+    # as it did before #3109.
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -419,7 +537,9 @@ jobs:
     name: actionlint (workflow-injection guard)
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    runs-on: [self-hosted, linux-fed]
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). A single
+    # container-action step over `.github/workflows/`: no cargo, no Postgres.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: actionlint
@@ -442,12 +562,35 @@ jobs:
     name: MSRV (Rust 1.96)
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
+    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of this
+    # file). `cargo check --all-targets` over the whole crate.
     runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.96.0 (declared MSRV)
         uses: dtolnay/rust-toolchain@1.96.0
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
       - name: cargo check on MSRV
         run: cargo check --all-targets
 
@@ -548,12 +691,32 @@ jobs:
           command -v node    >/dev/null || { echo "::error::node not on PATH on $RUNNER_NAME"; exit 1; }
           echo "python3=$(python3 --version) node=$(node --version)"
 
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted' && needs.classify.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         if: needs.classify.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@1.96.0
 
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
-        if: needs.classify.outputs.docs_only != 'true'
+        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
         with:
           # CI-speed (#3089) — SAVE the cache only on trunk `push` events
           # (push.branches = main/develop/release/**). `pull_request` and
@@ -951,18 +1114,46 @@ jobs:
     name: Postgres feature gate
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
+    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of this
+    # file). NOTE the reason is the cache, NOT the pg tier: since the #3109
+    # rewrite this job no longer talks to Postgres at all (no `services:`, no
+    # `AI_MEMORY_TEST_POSTGRES_URL`) — the live-tier coverage moved to the
+    # `enterprise-fed` legs of `check`. What is left is a full
+    # `--features sal-postgres --tests` compile for pedantic clippy, which is
+    # exactly the workload the warm `target/` exists for.
     runs-on: [self-hosted, linux-fed]
     # #1487 — bound the job so a wedged compile can't pin the runner.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
         with:
           # CI-speed (#3089) — save the cache only on trunk `push` events;
           # PR + merge_group runs restore-only. See the `check` job for the
@@ -1105,6 +1296,8 @@ jobs:
   # gates (clippy / build / lib tests) at the same feature combo.
   # Skipped on docs-only PRs alongside the rest of the heavy matrix.
   sal-feature:
+    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of this
+    # file): clippy + `cargo build --release --features sal` + `cargo test`.
     name: SAL-only feature gate
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
@@ -1118,12 +1311,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
 
       - name: Clippy (sal feature)
         run: cargo clippy --features sal -- -D warnings -D clippy::all -D clippy::pedantic
@@ -1148,6 +1362,8 @@ jobs:
   # It also runs `config_precedence` under the feature so the #2256
   # feature-gated env-resolution pin is exercised. Skipped on docs-only PRs.
   vectorlite-feature:
+    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of this
+    # file): `--all-targets --features vectorlite` clippy + two test binaries.
     name: vectorlite feature gate
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
@@ -1157,12 +1373,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
 
       - name: Clippy (vectorlite feature, all targets)
         run: cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic
@@ -1195,7 +1432,14 @@ jobs:
   dockerfile-validate:
     name: Dockerfile build (no push)
     needs: classify
-    runs-on: [self-hosted, linux-fed]
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). The
+    # build happens inside a Docker layer cache backed by `type=gha` (the
+    # GitHub Actions cache service), NOT by the self-hosted nodes' `target/`
+    # directory — the container build cannot see the host's cargo cache at all,
+    # so re-homing it onto the fleet in #3109 consumed a scarce slot for zero
+    # cache benefit. It also keeps buildx/BuildKit state off the persistent
+    # hosts.
+    runs-on: ubuntu-latest
     # Skip on tag pushes — the docker job below handles those (with push).
     if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' }}
     steps:

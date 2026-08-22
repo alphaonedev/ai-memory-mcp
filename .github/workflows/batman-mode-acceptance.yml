@@ -80,18 +80,50 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
+  # CARGO_INCREMENTAL=0, and it is now skipped on the self-hosted fleet (see the
+  # rust-cache guards below), so the value must be declared here. Incremental
+  # state is the most fragile thing in a `target/` tree, and the fleet's
+  # `target/` is PERSISTENT and reused across branches — leaving incremental on
+  # there would be a worse version of the very inconsistency the guard closes.
+  # Declaring it at workflow level also means no job depends on the runner
+  # `.env` supplying it.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   rust-integration:
     name: Rust integration (issue_800_batman_mode)
+    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of ci.yml):
+    # `cargo build --release` + two `cargo test --release` binaries.
     runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: batman-mode-acceptance
       - name: Build release binary
@@ -139,13 +171,39 @@ jobs:
 
   bash-integration:
     name: Bash integration (test-batman-mode-suite.sh)
+    # RUNNER PLACEMENT — self-hosted, WARM CACHE (rule at the head of ci.yml):
+    # it rebuilds the release binary against the same
+    # `shared-key: batman-mode-acceptance` cache as `rust-integration` above,
+    # which it `needs:`, so splitting the two across runner classes would throw
+    # that cache away and pay a second cold release build.
     runs-on: [self-hosted, linux-fed]
     needs: rust-integration
     steps:
       - uses: actions/checkout@v4
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
+      # PERSISTENT and already IS the warm cache, so this action has nothing to
+      # add and two ways to do harm: its restore extracts an archive saved by a
+      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
+      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
+      # build died in 18s with `could not parse/generate dep info at:
+      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
+      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
+      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
+      # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: batman-mode-acceptance
       - name: Install sqlite3 + jq (bounded+retry #3090/#2960)
@@ -188,7 +246,9 @@ jobs:
   # before the test fails with a confusing rustc error.
   surface-stability:
     name: Surface stability (load-bearing symbols)
-    runs-on: [self-hosted, linux-fed]
+    # RUNNER PLACEMENT — GitHub-hosted (rule at the head of ci.yml). Pure
+    # `git ls-files` + `grep` over src/: no toolchain, no cargo, no Postgres.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Assert load-bearing symbols are present

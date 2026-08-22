@@ -43,8 +43,28 @@ env:
 
 jobs:
   bench:
+    # RUNNER PLACEMENT — GitHub-hosted, AND THE NAME IS A CLAIM
+    # (the rule is stated at the head of ci.yml).
+    #
+    # `ubuntu-latest` is not a convenience here, it is the REFERENCE HARDWARE
+    # the published budgets are defined against: `PERFORMANCE.md` §"Measurement
+    # methodology" pins CI to "GitHub-hosted Linux x86_64 runners
+    # (`ubuntu-latest`)" and its hardware multiplier table gives that class the
+    # 1.0 multiplier every p95 target in the budget table is expressed in.
+    # `performance/baseline.json` likewise documents itself as a
+    # `regenerate-baseline`-on-`ubuntu-latest` median-of-3 artefact. #3109 moved
+    # the job to `[self-hosted, linux-fed]` WITHOUT moving the budgets, so a
+    # p95 measured on the f2 node was being compared against an
+    # `ubuntu-latest`-calibrated target while the job name, PERFORMANCE.md §7
+    # and the baseline file all still said `ubuntu-latest` — a measurement read
+    # off the wrong machine and a doc-vs-reality drift in the same move.
+    #
+    # Moving it back both makes the job name TRUE again (no rename, so no
+    # required-context churn — this job is advisory, see the `paths-ignore`
+    # note above) and returns an advisory 6-8 min release build to the hosted
+    # pool instead of a scarce self-hosted slot.
     name: ai-memory bench (ubuntu-latest)
-    runs-on: [self-hosted, linux-fed]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -175,9 +195,14 @@ jobs:
   # artifact for the operator to commit as performance/baseline.json with
   # bootstrap:false — the workflow has contents:read and never auto-commits.
   regenerate-baseline:
+    # RUNNER PLACEMENT — GitHub-hosted, same reference-hardware argument as
+    # `bench` above (the rule is stated at the head of ci.yml). This job MINTS the
+    # committed baseline, so it must run on the runner class the baseline
+    # claims: its own name says `ubuntu-latest`, and so does the `_note` field
+    # it writes into `performance/baseline.json`.
     name: Regenerate bench baseline (ubuntu-latest, median-of-3)
     if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, linux-fed]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
