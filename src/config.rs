@@ -2753,8 +2753,90 @@ impl ResolvedScoring {
 // Persistent config file (~/.config/ai-memory/config.toml)
 // ---------------------------------------------------------------------------
 
-const CONFIG_DIR: &str = ".config/ai-memory";
+/// Application sub-directory under the platform config root
+/// ([`dirs::config_dir`]). Kept in lockstep with the identity key dir
+/// (`dirs::config_dir().join("ai-memory/keys")`, `src/identity/keypair.rs`)
+/// and the hooks resolver (`dirs::config_dir().join("ai-memory/hooks.toml")`,
+/// `src/hooks/config.rs`) so `config.toml` never splits off from the keys /
+/// hooks root on a host that sets `XDG_CONFIG_HOME` (#3002).
+const CONFIG_APP_DIR: &str = "ai-memory";
+
+/// The PRE-#3002 config location, relative to `$HOME`:
+/// `~/.config/ai-memory/config.toml`. Retained ONLY as a read-side
+/// compatibility fallback (see [`AppConfig::config_path`]) so the #3002 move
+/// to `dirs::config_dir()` cannot orphan a config an operator already has on
+/// a host that sets `XDG_CONFIG_HOME` to something other than `~/.config`.
+const LEGACY_CONFIG_DIR: &str = ".config/ai-memory";
 const CONFIG_FILE: &str = "config.toml";
+
+/// `sysexits.h` `EX_CONFIG` — the process exit code this binary uses for
+/// "the operator's configuration is unusable; nothing was started".
+///
+/// Single-sourced here (#3166) so the boot-refusal call sites in
+/// `src/main.rs` cannot drift from one another or re-spell the literal.
+pub const EX_CONFIG: i32 = 78;
+
+/// The `AI_MEMORY_NO_CONFIG` escape hatch (#3167).
+///
+/// The documented contract (`docs/ADMIN_GUIDE.md`, `docs/CLI_REFERENCE.md`)
+/// is "set to `1` to skip config file loading". The pre-#3167 sites tested
+/// `std::env::var(..).is_ok()` — mere PRESENCE — so an empty placeholder
+/// export in a compose/unit file (`AI_MEMORY_NO_CONFIG=`) or an explicit
+/// opt-OUT (`=0`) silently reverted every config-backed knob (including
+/// `db`, see #3166) to compiled defaults, while a non-UTF-8 value had the
+/// inverse effect (`var()` returned `Err`, so the config LOADED).
+///
+/// This resolves the var through the substrate-wide truthy grammar
+/// (`1`/`true`/`yes`/`on`, trimmed, case-insensitive) shared by every other
+/// `AI_MEMORY_*` boolean knob, and WARNs ONCE to stderr when the variable is
+/// present but not truthy so an operator who meant to skip the config learns
+/// that they did not.
+#[must_use]
+pub fn skip_config() -> bool {
+    // `var_os` first so a non-UTF-8 value is treated as PRESENT (the
+    // pre-#3167 `var()` path silently classified it as absent).
+    let Some(raw) = std::env::var_os("AI_MEMORY_NO_CONFIG") else {
+        return false;
+    };
+    let as_str = raw.to_str();
+    if as_str.is_some_and(crate::security_profile::is_truthy) {
+        return true;
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "ai-memory: AI_MEMORY_NO_CONFIG is set to {} — that is NOT one of \
+             `1`/`true`/`yes`/`on`, so the config file IS being loaded (#3167). \
+             Set AI_MEMORY_NO_CONFIG=1 to actually skip it, or unset the variable.",
+            as_str.map_or_else(|| "a non-UTF-8 value".to_string(), |v| format!("`{v}`"))
+        );
+    });
+    false
+}
+
+/// One-shot stderr WARN for the #3002 legacy-config-root fallback.
+///
+/// Emitted by [`AppConfig::config_path`] when `XDG_CONFIG_HOME` moves the
+/// platform config root but the operator's `config.toml` is still at the
+/// pre-#3002 `$HOME/.config/ai-memory/config.toml`. `Once`-gated
+/// (CONCURRENCY-16) so a daemon that re-resolves the path on every reload
+/// poll does not spam the log. `eprintln!` rather than `tracing::warn!`
+/// because this fires during boot, BEFORE file logging is initialised.
+fn warn_legacy_config_root_once(legacy: &Path, xdg: &Path) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "ai-memory: using the LEGACY config path {} — the platform config \
+             root is now {} (XDG_CONFIG_HOME is set), which is also where the \
+             identity keys and hooks live (#3002). The legacy file is still \
+             honoured so this upgrade cannot silently drop your configuration \
+             (#3166); move it to {} to consolidate.",
+            legacy.display(),
+            xdg.parent().unwrap_or(xdg).display(),
+            xdg.display()
+        );
+    });
+}
 
 /// Persistent configuration loaded from `~/.config/ai-memory/config.toml`.
 ///
@@ -7311,22 +7393,139 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 impl AppConfig {
-    /// Returns the config file path: `~/.config/ai-memory/config.toml`
+    /// Returns the config file path: `<platform-config-dir>/ai-memory/config.toml`
+    /// (`$XDG_CONFIG_HOME/ai-memory/config.toml` when `XDG_CONFIG_HOME` is set,
+    /// else `$HOME/.config/ai-memory/config.toml` on Linux).
+    ///
+    /// #3002 — resolves through [`dirs::config_dir`], the SAME platform-config
+    /// resolver the identity key dir (`src/identity/keypair.rs`) and the hooks
+    /// resolver (`src/hooks/config.rs`) use. The pre-fix `$HOME/.config`
+    /// hardcode ignored `XDG_CONFIG_HOME`, so on any host that set it (containers
+    /// / Nix / systemd-user / multi-tenant) `config.toml` loaded from one root
+    /// while the identity signing keys were looked for under another — a
+    /// certified daemon could boot "continuing unsigned" because it never found
+    /// the keys the config told it to use.
+    /// # Migration safety (#3002 + #3166)
+    ///
+    /// The #3002 move from the hardcoded `$HOME/.config` to
+    /// [`dirs::config_dir`] CHANGES where an existing deployment's config is
+    /// looked for whenever `XDG_CONFIG_HOME` is set to something other than
+    /// `~/.config`. Left unguarded that is a data-integrity regression, not a
+    /// tidy-up: the XDG path would simply not exist, which is the documented
+    /// "no config file" arm, so the daemon would boot on compiled defaults —
+    /// resolving `db` to the RELATIVE `ai-memory.db` in `$PWD` and reverting
+    /// `[storage].append_only` / `[governance].require_operator_pubkey` /
+    /// `[[permissions.rules]]`. That is the exact corpus split-brain #3166
+    /// exists to prevent, and the #3166 boot refusal would NOT catch it
+    /// (a missing file is not an error).
+    ///
+    /// So the resolution is: prefer the XDG-correct path, but when it does
+    /// NOT exist and the legacy `$HOME/.config/ai-memory/config.toml` DOES,
+    /// keep honouring the legacy file and WARN once telling the operator to
+    /// move it. New installs land at the XDG path (it is what is returned
+    /// when neither exists, so `write_default_if_missing` creates it there).
     pub fn config_path() -> Option<PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        Some(Path::new(&home).join(CONFIG_DIR).join(CONFIG_FILE))
+        let xdg = dirs::config_dir().map(|base| base.join(CONFIG_APP_DIR).join(CONFIG_FILE));
+        let legacy = std::env::var_os("HOME")
+            .map(|home| Path::new(&home).join(LEGACY_CONFIG_DIR).join(CONFIG_FILE));
+        match (xdg, legacy) {
+            // The only divergent arm: XDG root differs from `~/.config`, the
+            // operator's config is still at the legacy path, and nothing was
+            // written at the new one. Honour what they actually have.
+            (Some(xdg_path), Some(legacy_path))
+                if xdg_path != legacy_path && !xdg_path.exists() && legacy_path.exists() =>
+            {
+                warn_legacy_config_root_once(&legacy_path, &xdg_path);
+                Some(legacy_path)
+            }
+            (xdg_path @ Some(_), _) => xdg_path,
+            // No platform config dir resolvable (no `$HOME`, no
+            // `XDG_CONFIG_HOME`): nothing to fall back to either.
+            (None, legacy_path) => legacy_path,
+        }
     }
 
     /// Load config from disk. Returns `AppConfig::default()` if file is missing.
     /// Set `AI_MEMORY_NO_CONFIG=1` to skip config loading (used by integration tests).
+    ///
+    /// LENIENT by construction: a parse / secret-validation failure falls back
+    /// to compiled defaults. #3166 makes that fallback LOUD (an unreadable
+    /// file is no longer indistinguishable from an absent one) but does not
+    /// make it fatal, because this entry point is now reserved for callers
+    /// that must keep working ON a broken config:
+    ///
+    /// * `ai-memory doctor` — the tool an operator reaches for precisely
+    ///   BECAUSE the config is broken; it reports the breakage in its own
+    ///   `Configuration` section rather than refusing to run.
+    /// * the in-process `[llm]` re-resolvers (`cli::curator`,
+    ///   `cli::commands::atomise`), which run only AFTER
+    ///   [`Self::load_for_boot`] has already vetted the same file in `main`.
+    ///
+    /// EVERY boot path MUST use [`Self::load_for_boot`] instead: resolving a
+    /// malformed config to defaults there silently repoints `db` at the
+    /// relative `ai-memory.db` in `$PWD` (corpus split-brain) and reverts
+    /// `append_only` / `require_operator_pubkey` / `[permissions.rules]`.
     pub fn load() -> Self {
-        if std::env::var("AI_MEMORY_NO_CONFIG").is_ok() {
+        if skip_config() {
             return Self::default();
         }
         let Some(path) = Self::config_path() else {
             return Self::default();
         };
         Self::load_from(&path)
+    }
+
+    /// #3166 — FAIL-CLOSED boot resolution of the on-disk config.
+    ///
+    /// The one entry point a daemon / CLI boot may use. It differs from
+    /// [`Self::load`] in exactly one way: anything that would make the
+    /// resolved config DIFFERENT from what the operator wrote is returned as
+    /// an error instead of being flattened into [`Self::default`]. The
+    /// documented "no config file -> compiled defaults" contract is preserved
+    /// verbatim (`ErrorKind::NotFound` only), as is the
+    /// `AI_MEMORY_NO_CONFIG=1` test escape hatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the config file exists but cannot be read
+    /// (`EACCES`, `EIO`, a dangling symlink target, a directory in its
+    /// place), when the TOML fails to parse, or when the secret-handling
+    /// validation rejects it. The caller is expected to refuse the boot and
+    /// exit [`EX_CONFIG`] — never to continue on compiled defaults.
+    pub fn load_for_boot() -> anyhow::Result<Self> {
+        if skip_config() {
+            return Ok(Self::default());
+        }
+        let Some(path) = Self::config_path() else {
+            // No `$HOME` => no config file was ever nominated, so there is
+            // no operator intent to diverge from. Same arm as a missing file.
+            return Ok(Self::default());
+        };
+        Self::try_load_from_optional(&path)
+    }
+
+    /// [`Self::try_load_from`] with the documented "a MISSING file means
+    /// compiled defaults" arm (#3166).
+    ///
+    /// `try_load_from` treats every `read_to_string` failure as an error
+    /// because its #2166 hot-swap callers only ever call it for a file they
+    /// just stat'd. Boot must distinguish the two: `ENOENT` is the ordinary
+    /// "operator has no config.toml" case, while `EACCES`/`EIO`/`EISDIR`
+    /// means a config the operator DOES have is being silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any read failure other than
+    /// [`std::io::ErrorKind::NotFound`], and for any parse / secret-handling
+    /// validation failure.
+    pub fn try_load_from_optional(path: &Path) -> anyhow::Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => Self::from_toml_contents(path, &contents),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => {
+                Err(anyhow::Error::new(e).context(format!("reading config {}", path.display())))
+            }
+        }
     }
 
     /// Load config from a specific path.
@@ -7370,7 +7569,25 @@ impl AppConfig {
                     }
                 }
             }
-            Err(_) => Self::default(),
+            // #3166 — a MISSING config file is the documented "fall back to
+            // compiled defaults" contract. Every OTHER io error (EACCES on a
+            // root-owned config, EIO on a failing disk, EISDIR) means the
+            // operator HAS a config that is being ignored; discarding the
+            // `ErrorKind` made the two indistinguishable and silent. Boot
+            // callers get this as a hard error via `try_load_from_optional`;
+            // the lenient callers at least get told.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => {
+                eprintln!(
+                    "ai-memory: config UNREADABLE ({}): {e}\n\
+                     ai-memory: continuing on COMPILED DEFAULTS — every config-backed \
+                     setting (including `db`) is being ignored. Fix the file permissions \
+                     and restart. See \
+                     https://github.com/alphaonedev/ai-memory-mcp/issues/3166",
+                    path.display()
+                );
+                Self::default()
+            }
         }
     }
 
@@ -7391,7 +7608,7 @@ impl AppConfig {
     /// be read, the TOML fails to parse, or the secret-handling validation
     /// (`[llm].api_key` inline-literal rejection, etc.) fails.
     pub fn try_load() -> anyhow::Result<Self> {
-        if std::env::var("AI_MEMORY_NO_CONFIG").is_ok() {
+        if skip_config() {
             anyhow::bail!("AI_MEMORY_NO_CONFIG is set — config loading disabled");
         }
         let path = Self::config_path()
@@ -7411,13 +7628,27 @@ impl AppConfig {
         use anyhow::Context as _;
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
+        Self::from_toml_contents(path, &contents)
+    }
+
+    /// The shared PROPAGATING parse+validate tail of [`Self::try_load_from`]
+    /// and [`Self::try_load_from_optional`] (#3166): unknown-key WARN, TOML
+    /// parse, secret-handling validation, legacy-drift WARN.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the TOML fails to parse or the secret-handling
+    /// validation rejects the resolved config.
+    fn from_toml_contents(path: &Path, contents: &str) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
         // Mirror `load_from`'s L1 unknown-top-level-key WARN (best-effort;
         // does not fail the load).
-        Self::warn_unknown_top_level_keys(path, &contents);
-        let cfg: Self = toml::from_str(&contents)
+        Self::warn_unknown_top_level_keys(path, contents);
+        let cfg: Self = toml::from_str(contents)
             .with_context(|| format!("parsing config {}", path.display()))?;
         cfg.validate_secret_handling()
             .map_err(|reason| anyhow::anyhow!("config rejected ({}): {reason}", path.display()))?;
+        eprintln!("ai-memory: loaded config from {}", path.display());
         cfg.warn_legacy_schema_drift(path);
         Ok(cfg)
     }
@@ -10375,10 +10606,152 @@ legacy_scoring = false
     fn config_path_returns_some_when_home_set() {
         // M9 — process-wide serialization via env_var_lock.
         let _g = env_var_lock();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         // SAFETY: env mutation serialised by `_g`.
-        unsafe { std::env::set_var("HOME", "/some/home") };
+        unsafe {
+            // Clear XDG_CONFIG_HOME so `dirs::config_dir()` falls back to
+            // `$HOME/.config` for this assertion (#3002 makes config_path
+            // XDG-aware; without this the host's XDG value would win).
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::set_var("HOME", "/some/home");
+        }
         let path = AppConfig::config_path().unwrap();
         assert!(path.starts_with("/some/home"));
+        assert!(path.ends_with("ai-memory/config.toml"), "got: {path:?}");
+        // SAFETY: restore under the same lock.
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    /// #3002 — `config_path()` MUST honor `XDG_CONFIG_HOME` so `config.toml`
+    /// resolves under the SAME platform-config root the identity key dir
+    /// (`src/identity/keypair.rs`) and the hooks resolver
+    /// (`src/hooks/config.rs`) use. Pre-fix it hardcoded `$HOME/.config`, so
+    /// on any host that set `XDG_CONFIG_HOME` the config loaded from one root
+    /// while the signing keys were looked for under another — a certified
+    /// daemon could boot "continuing unsigned" against the wrong root.
+    #[test]
+    fn config_path_honors_xdg_config_home() {
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+        let xdg_root = std::path::Path::new("/nonstandard/xdg-root");
+        // SAFETY: env mutation serialised by `_g`; restored below.
+        unsafe {
+            std::env::set_var("HOME", "/some/home");
+            std::env::set_var("XDG_CONFIG_HOME", xdg_root);
+        }
+        let path = AppConfig::config_path().expect("config_path resolves");
+        assert_eq!(
+            path,
+            xdg_root.join("ai-memory").join("config.toml"),
+            "config.toml must resolve under XDG_CONFIG_HOME, not $HOME/.config"
+        );
+        assert!(
+            !path.starts_with("/some/home"),
+            "config.toml split off from the XDG root: {path:?}"
+        );
+        // SAFETY: restore under the same lock.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    /// #3002 + #3166 — the XDG move must NOT orphan a config an operator
+    /// already has. When `XDG_CONFIG_HOME` points at a root that carries no
+    /// `ai-memory/config.toml` but the legacy `$HOME/.config` one does,
+    /// `config_path()` keeps honouring the legacy file. Without this the
+    /// XDG path is simply ABSENT, which is the documented "compiled
+    /// defaults" arm (the #3166 boot refusal does not fire on a missing
+    /// file), so the daemon would silently repoint `db` at the relative
+    /// `ai-memory.db` — the corpus split-brain #3166 exists to prevent.
+    #[test]
+    fn config_path_falls_back_to_legacy_home_config_3002() {
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let xdg_root = tmp.path().join("xdg");
+        let legacy = home.join(".config").join("ai-memory").join("config.toml");
+        std::fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("mkdir legacy");
+        std::fs::create_dir_all(&xdg_root).expect("mkdir xdg");
+        std::fs::write(&legacy, "db = \"/var/lib/ai-memory/prod.db\"\n").expect("write legacy");
+        // SAFETY: env mutation serialised by `_g`; restored below.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_root);
+        }
+        let path = AppConfig::config_path().expect("config_path resolves");
+        // SAFETY: restore under the same lock, BEFORE asserting so a failure
+        // cannot leak the sandbox env into sibling tests.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert_eq!(
+            path, legacy,
+            "an existing legacy config must keep being honoured after the #3002 XDG move"
+        );
+    }
+
+    /// #3002 — when BOTH roots carry a `config.toml`, the XDG-correct one
+    /// wins (the legacy path is a fallback, never an override).
+    #[test]
+    fn config_path_prefers_xdg_when_both_exist_3002() {
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let xdg_root = tmp.path().join("xdg");
+        let legacy = home.join(".config").join("ai-memory").join("config.toml");
+        let xdg_cfg = xdg_root.join("ai-memory").join("config.toml");
+        for f in [&legacy, &xdg_cfg] {
+            std::fs::create_dir_all(f.parent().expect("parent")).expect("mkdir");
+            std::fs::write(f, "tier = \"keyword\"\n").expect("write");
+        }
+        // SAFETY: env mutation serialised by `_g`; restored below.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_root);
+        }
+        let path = AppConfig::config_path().expect("config_path resolves");
+        // SAFETY: restore under the same lock, before asserting.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert_eq!(
+            path, xdg_cfg,
+            "the XDG root must win when it carries a config"
+        );
     }
 
     #[test]
@@ -10412,6 +10785,71 @@ legacy_scoring = false
         let cfg = AppConfig::load_from(tmp.path());
         assert_eq!(cfg.tier.as_deref(), Some("smart"));
         assert_eq!(cfg.db.as_deref(), Some("/disk.db"));
+    }
+
+    // -----------------------------------------------------------------
+    // #3166 — fail-closed boot resolution. Path-explicit and therefore
+    // env-free: the process-environment half (`AI_MEMORY_NO_CONFIG`, the
+    // exit-78 refusal, the orphan `./ai-memory.db`) is pinned end-to-end
+    // against the real binary by
+    // `tests/boot_fail_closed_config_3166.rs`, never by mutating this
+    // process's environment (the #2905 env-leak precedent).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn try_load_from_optional_returns_default_for_missing_file_3166() {
+        // The documented "no config.toml -> compiled defaults" contract is
+        // the ONE io arm that stays lenient.
+        let cfg = AppConfig::try_load_from_optional(Path::new("/non/existent/path.toml"))
+            .expect("a missing config must resolve to compiled defaults");
+        assert!(cfg.tier.is_none());
+        assert!(cfg.db.is_none());
+    }
+
+    #[test]
+    fn try_load_from_optional_propagates_parse_error_3166() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "db = \"/var/lib/ai-memory/prod.db\"\nnot toml]]]",
+        )
+        .unwrap();
+        let err = AppConfig::try_load_from_optional(tmp.path())
+            .expect_err("a TOML syntax error must NOT resolve to compiled defaults");
+        assert!(
+            format!("{err:#}").contains("parsing config"),
+            "expected the parse error to be surfaced; got {err:#}"
+        );
+    }
+
+    #[test]
+    fn try_load_from_optional_propagates_non_notfound_io_error_3166() {
+        // A DIRECTORY where the config should be: `read_to_string` fails
+        // with `EISDIR`, which is NOT `NotFound`. Deterministic on every
+        // runner (unlike a mode-000 file, which a root runner can read).
+        let tmp = tempfile::tempdir().unwrap();
+        let as_dir = tmp.path().join("config.toml");
+        std::fs::create_dir(&as_dir).unwrap();
+        let err = AppConfig::try_load_from_optional(&as_dir)
+            .expect_err("a non-NotFound io error must be surfaced, not swallowed");
+        assert!(
+            format!("{err:#}").contains("reading config"),
+            "expected the io error to carry its context; got {err:#}"
+        );
+    }
+
+    #[test]
+    fn try_load_from_optional_preserves_the_configured_db_3166() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "db = \"/var/lib/ai-memory/prod.db\"\n").unwrap();
+        let cfg = AppConfig::try_load_from_optional(tmp.path()).expect("valid config");
+        assert_eq!(cfg.db.as_deref(), Some("/var/lib/ai-memory/prod.db"));
+        // The regression this whole issue is about: the resolved db must be
+        // the configured one, never the relative `ai-memory.db` fallback.
+        assert_eq!(
+            cfg.effective_db(Path::new("ai-memory.db")),
+            PathBuf::from("/var/lib/ai-memory/prod.db")
+        );
     }
 
     // -----------------------------------------------------------------

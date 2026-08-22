@@ -27,7 +27,9 @@
 //! |   0  | success — file migrated or already v2 (no-op INFO)       |
 //! |   1  | informational — dry-run mode, no writes performed        |
 //! |   2  | file not found (no `~/.config/ai-memory/config.toml`)    |
-//! |   3  | parse error — file is not valid TOML                     |
+//! |   3  | parse error — input is not valid TOML, OR (#3001) the     |
+//! |      | migrated output does not round-trip through `AppConfig`   |
+//! |      | (refused; no file written, original untouched)           |
 //! |   4  | write error — could not write `.bak` or new file         |
 
 use crate::models::field_names;
@@ -181,6 +183,29 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
             );
         }
         return Ok(1);
+    }
+
+    // #3001 — FAIL LOUD, never fail-open. The migrator is SUPPOSED to
+    // produce a valid v2 file; a malformed legacy value (e.g. a string
+    // where `[reranker].enabled` expects a bool) would otherwise be
+    // laundered verbatim into the v2 output, we would print "OK: migrated"
+    // and exit 0, and the NEXT process would fail to parse it and silently
+    // fall back to `AppConfig::default()` — tier / db / llm / namespace all
+    // discarded. Validate that the migrated text round-trips through the
+    // SAME parser the daemon uses BEFORE writing anything; on failure,
+    // refuse with a non-zero exit and leave the original config untouched.
+    if let Err(e) = toml::from_str::<AppConfig>(&migrated_text) {
+        let _ = writeln!(
+            out.stderr,
+            "ERROR: refusing to write {} — the migrated config does not parse \
+             ({}). No file was written and your original config is untouched. \
+             This usually means a legacy field in {} holds a value of the wrong \
+             type; fix it and re-run.",
+            path.display(),
+            e,
+            path.display()
+        );
+        return Ok(3);
     }
 
     // Write backup.
@@ -476,10 +501,18 @@ mod tests {
             std::fs::write(dir.join("config.toml"), body).unwrap();
         }
         let prev_home = std::env::var("HOME").ok();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         // SAFETY: serialised via `env_lock()`; restored before the lock
         // is released so no other test observes the tempdir HOME.
+        //
+        // #3002 — `AppConfig::config_path()` now resolves through
+        // `dirs::config_dir()`, which honors `XDG_CONFIG_HOME`. Pin it to
+        // the tempdir's `.config` so the migrate command resolves to the
+        // same `<home>/.config/ai-memory/config.toml` this helper writes,
+        // regardless of the ambient host `XDG_CONFIG_HOME`.
         unsafe {
             std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
         }
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
@@ -497,6 +530,10 @@ mod tests {
             match prev_home {
                 Some(h) => std::env::set_var("HOME", h),
                 None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
         (code, String::from_utf8(stderr).unwrap())
@@ -554,6 +591,84 @@ mod tests {
         assert_eq!(code, 0);
         // No ~/.claude.json in the tempdir HOME → INFO no-change line.
         assert!(stderr.contains("no mcpServers env block"), "got: {stderr}");
+    }
+
+    /// #3001 — a malformed legacy value (here `cross_encoder` as a STRING,
+    /// which the migrator folds into `[reranker].enabled` where a bool is
+    /// expected) must NOT be laundered into a v2 file the daemon then fails
+    /// to parse. The migrate command must FAIL LOUD (non-zero exit, no v2
+    /// file written, no `.bak`), leaving the original config byte-identical.
+    #[test]
+    fn run_migrate_malformed_legacy_fails_closed_and_writes_nothing() {
+        let _g = env_lock();
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join(".config/ai-memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        // Valid TOML, but `cross_encoder` is a STRING (should be a bool);
+        // `build_migrated_table` maps it into `[reranker].enabled`.
+        let body = "tier = \"autonomous\"\ncross_encoder = \"ms-marco-MiniLM-L-6-v2\"\n";
+        std::fs::write(&cfg_path, body).unwrap();
+
+        let prev_home = std::env::var("HOME").ok();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        // SAFETY: serialised via `env_lock()`; restored below.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
+        }
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Migrate {
+                    dry_run: false,
+                    also_clean_claude_json: false,
+                },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let stderr = String::from_utf8(stderr).unwrap();
+        // FAIL LOUD: non-zero exit, never "OK: migrated".
+        assert_ne!(
+            code, 0,
+            "expected non-zero refusal, got 0; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("does not parse") && stderr.contains("refusing to write"),
+            "expected a loud parse-refusal, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("OK: migrated"),
+            "must NOT claim success, got: {stderr}"
+        );
+        // The original config is byte-identical (nothing was written).
+        assert_eq!(
+            std::fs::read_to_string(&cfg_path).unwrap(),
+            body,
+            "original config must be untouched"
+        );
+        // No `.bak` file was written alongside it.
+        let bak_present = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".bak."));
+        assert!(
+            !bak_present,
+            "no backup file must be written on a refused migrate"
+        );
     }
 
     #[test]

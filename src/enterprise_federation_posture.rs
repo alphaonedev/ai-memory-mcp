@@ -794,8 +794,11 @@ pub fn enforce_at_boot_pre_runtime(app_config: &AppConfig) -> anyhow::Result<()>
         ));
     }
     msg.push_str(&format!(
-        "Run `ai-memory doctor --posture {POSTURE_ENTERPRISE_FEDERATION}` for the full report, \
-         or unset {ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE} to boot without this cert gate."
+        "Fix the control(s) above, then re-check with \
+         `ai-memory doctor --posture {POSTURE_ENTERPRISE_FEDERATION}` — the diagnostic bypasses \
+         this boot gate (#3003) so it renders the full report even while the gate is armed, \
+         and exits 0 once every control passes (2 while any fails). To boot WITHOUT this cert \
+         gate instead, unset {ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE}."
     ));
     anyhow::bail!(msg);
 }
@@ -1906,6 +1909,18 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("refuses to boot"));
         assert!(msg.contains("AI_MEMORY_SECURITY_PROFILE"));
+        // #3003 — the remediation must point at the `doctor --posture`
+        // diagnostic AND make clear it works while the gate is armed (it
+        // bypasses the boot refusal), so it is not "re-run the command that
+        // just refused" advice.
+        assert!(
+            msg.contains(&format!("doctor --posture {POSTURE_ENTERPRISE_FEDERATION}")),
+            "remediation must name the diagnostic: {msg}"
+        );
+        assert!(
+            msg.contains("bypasses") && msg.contains("armed"),
+            "remediation must state the diagnostic works while the gate is armed: {msg}"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -55,6 +55,9 @@ use std::path::Path;
 use std::time::Duration;
 
 // ── #1558 batch 6 — repeated doctor fact / section labels ──────────────
+/// #3166 — the resolved `config.toml` path, reported by both the `--hooks`
+/// JSON payload and the `Configuration` report section. One name, one spelling.
+const FACT_CONFIG_PATH: &str = "config_path";
 const FACT_DIM_VIOLATIONS: &str = "dim_violations";
 
 /// v1.0.0 (#3113) — `doctor` fact naming the core-relation integrity state
@@ -395,7 +398,7 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
     if args.json {
         let payload = serde_json::json!({
             (field_names::SCHEMA_VERSION): "v0.7-hooks-1",
-            "config_path": path_opt.as_ref().map(|p| p.display().to_string()),
+            (FACT_CONFIG_PATH): path_opt.as_ref().map(|p| p.display().to_string()),
             "hooks_loaded": hooks.len(),
             // #1734 PE-1 — enforcement posture + pre-flight.
             "enforce_mode": enforce_mode.as_str(),
@@ -617,6 +620,12 @@ pub fn run_posture(name: &str, json: bool, out: &mut CliOutput<'_>) -> Result<i3
 fn run_local(db_path: &Path) -> Report {
     let mut sections = Vec::with_capacity(7);
 
+    // #3166 — FIRST, and BEFORE the database open, because the two faults are
+    // causally linked: an unusable `config.toml` resolves `db` to the relative
+    // `ai-memory.db` in `$PWD`, so the very next step ("could not open
+    // database") is a SYMPTOM whose cause would otherwise never be printed.
+    sections.push(section_config_health_3166());
+
     // Open the connection once; failures bubble into a single Critical
     // section and the rest of the report is N/A.
     let conn = match db::open(db_path) {
@@ -700,6 +709,64 @@ fn core_relation_status(
     let stamped = crate::storage::connection::probe_schema_stamp(conn)?.version();
     let missing = crate::storage::schema_integrity::missing_core_tables(conn, stamped)?;
     Ok((stamped, missing))
+}
+
+/// #3166 — config-health section.
+///
+/// `doctor` is one of the few subcommands deliberately allowed to keep running
+/// on compiled defaults when `config.toml` cannot be honoured (see
+/// `config_tolerant_command` in `src/main.rs`) — precisely so that it can NAME
+/// the fault instead of hiding it. This section re-resolves the config through
+/// the same PROPAGATING `AppConfig::load_for_boot` the daemon boot uses and
+/// reports the error verbatim, so an operator staring at an unexpectedly empty
+/// corpus learns that `ai-memory serve` would have refused, and why.
+fn section_config_health_3166() -> ReportSection {
+    const NAME: &str = "Configuration";
+    let config_path = crate::config::AppConfig::config_path().map_or_else(
+        || "(unresolved — $HOME unset)".to_string(),
+        |p| p.display().to_string(),
+    );
+    if crate::config::skip_config() {
+        return ReportSection {
+            name: NAME.into(),
+            severity: Severity::Info,
+            facts: vec![
+                (FACT_CONFIG_PATH.into(), config_path),
+                (
+                    "status".into(),
+                    "skipped (AI_MEMORY_NO_CONFIG is truthy)".into(),
+                ),
+            ],
+            note: None,
+        };
+    }
+    match crate::config::AppConfig::load_for_boot() {
+        Ok(_) => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Info,
+            facts: vec![
+                (FACT_CONFIG_PATH.into(), config_path),
+                ("status".into(), "ok (or absent — compiled defaults)".into()),
+            ],
+            note: None,
+        },
+        Err(e) => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Critical,
+            facts: vec![
+                (FACT_CONFIG_PATH.into(), config_path),
+                ("status".into(), "UNUSABLE".into()),
+                ("error".into(), format!("{e:#}")),
+            ],
+            note: Some(
+                "config.toml exists but cannot be honoured — `ai-memory serve` REFUSES \
+                 to boot on it (exit 78, #3166) rather than silently opening the \
+                 relative `ai-memory.db` in the current directory. Every section below \
+                 reflects COMPILED DEFAULTS, not your configuration."
+                    .into(),
+            ),
+        },
+    }
 }
 
 fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection {
@@ -2429,7 +2496,7 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_thirteen_sections() {
+    fn local_run_on_empty_db_produces_fifteen_sections() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
@@ -2439,12 +2506,14 @@ mod tests {
         // "Recall Index Coverage (#1964)"; #1965 added
         // "Corpus Lifecycle (#1965)"; #2167 added
         // "Embedding Space Census (#2167)"; #2985 added
-        // "Atomisation Curator" — total is now 14.
-        assert_eq!(report.sections.len(), 14);
+        // "Atomisation Curator"; #3166 prepended "Configuration" — total is
+        // now 15.
+        assert_eq!(report.sections.len(), 15);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
+                "Configuration",
                 "Storage",
                 "Index",
                 "Embedding Space Census (#2167)",
@@ -3281,9 +3350,11 @@ mod tests {
         // Write garbage so SQLite refuses to open it.
         std::fs::write(&bad, b"this is not a sqlite database, it's just text").unwrap();
         let report = run_local_collect(&bad);
-        // The error path appends a single Storage section and returns.
-        assert_eq!(report.sections.len(), 1);
-        let storage = &report.sections[0];
+        // #3166 — the error path now carries the always-present
+        // "Configuration" section plus the single Storage section.
+        assert_eq!(report.sections.len(), 2);
+        assert_eq!(report.sections[0].name, "Configuration");
+        let storage = &report.sections[1];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the single section.

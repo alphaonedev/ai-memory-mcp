@@ -33,7 +33,7 @@ supplements `--help` with examples and context.
 | `AI_MEMORY_DB` | Override default database path. |
 | `AI_MEMORY_AGENT_ID` | Default `metadata.agent_id` for memories written by this process. |
 | `AI_MEMORY_DB_PASSPHRASE` | SQLCipher passphrase (set via `--db-passphrase-file` or by operator). |
-| `AI_MEMORY_NO_CONFIG=1` | Skip loading `~/.config/ai-memory/config.toml`. Used by tests. |
+| `AI_MEMORY_NO_CONFIG=1` | Skip loading the platform config file (`$XDG_CONFIG_HOME/ai-memory/config.toml`, else `~/.config/ai-memory/config.toml`). Used by tests. **[#3167]** Only a truthy value (`1`/`true`/`yes`/`on`) skips it; an empty value or `0` loads the config and WARNs. |
 | `AI_MEMORY_ANONYMIZE=1` | Suppress hostname/PID from fallback `agent_id` generation. |
 | `AI_MEMORY_AUTONOMOUS_HOOKS=1` | Enable post-store LLM hooks (v0.6.0.0). Overrides config. |
 | `AI_MEMORY_BOOT_ENABLED` | Enable/disable session-boot context. Set to `0` to disable. Overrides config. |

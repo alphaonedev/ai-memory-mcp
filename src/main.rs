@@ -31,7 +31,8 @@ use ai_memory::tls;
 // (color init, OnceLock-backed permissions/hmac/audit posture) and
 // can call `std::process::exit(78)` on a bad hmac secret, which would
 // abort the test harness. Its individual steps are covered indirectly:
-//   - `config::AppConfig::load` / `write_default_if_missing` — config tests
+//   - `config::AppConfig::load_for_boot` / `write_default_if_missing` — config tests
+//     (+ `tests/boot_fail_closed_config_3166.rs` drives the real binary)
 //   - `daemon_runtime::apply_startup_env` / `apply_anonymize_default` — daemon_runtime tests
 //   - `config::set_active_permissions_mode` / `set_active_hooks_hmac_secret`
 //     / `set_allow_loopback_webhooks` — config tests
@@ -55,11 +56,60 @@ use ai_memory::tls;
 // (multi-thread + all drivers enabled).
 fn main() -> Result<()> {
     color::init();
-    let app_config = config::AppConfig::load();
-    config::AppConfig::write_default_if_missing();
 
-    // Parse argv up front so `apply_startup_env` can read `--db-passphrase-file`.
+    // #3166 — parse argv FIRST. `Cli::parse()` reads only the process argv
+    // (and exits on its own for `--version` / `--help` / a usage error), so it
+    // has no dependency on the config. Doing it before the config load means
+    // (a) a malformed `config.toml` can never make `ai-memory --version`
+    // unusable, and (b) the boot-refusal below knows WHICH subcommand was
+    // asked for. It also still runs up front so `apply_startup_env` can read
+    // `--db-passphrase-file`.
     let cli = Cli::parse();
+
+    // #3166 — FAIL CLOSED on a config that exists but cannot be honoured.
+    //
+    // The pre-#3166 `AppConfig::load()` swallowed a TOML syntax error, a
+    // secret-validation rejection, and every io error (EACCES/EIO were
+    // indistinguishable from the documented ENOENT) and returned
+    // `AppConfig::default()`. `effective_db` then resolved the RELATIVE
+    // `ai-memory.db`, so a one-character typo in a config carrying
+    // `db = "/var/lib/ai-memory/prod.db"` made the daemon open/create a fresh
+    // empty database in `$PWD`, report healthy, and accept writes into that
+    // orphan — corpus split-brain, the prime-directive violation. In the same
+    // stroke `[storage].append_only`, `[governance].require_operator_pubkey`
+    // and `[[permissions.rules]]` silently reverted to their defaults.
+    //
+    // A MISSING config file is still the documented "compiled defaults" case
+    // (`AppConfig::load_for_boot` matches `ErrorKind::NotFound` explicitly),
+    // and `AI_MEMORY_NO_CONFIG=1` still short-circuits to defaults, so CI and
+    // the test suite are byte-identical.
+    let app_config = match config::AppConfig::load_for_boot() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("ai-memory: config is UNUSABLE — {e:#}");
+            if config_tolerant_command(&cli.command) {
+                eprintln!(
+                    "ai-memory: continuing on COMPILED DEFAULTS for this read-only \
+                     diagnostic / config-repair subcommand — every config-backed \
+                     setting (including `db`) is being IGNORED, so treat its output \
+                     as describing the defaults, not your configuration (#3166)."
+                );
+                config::AppConfig::default()
+            } else {
+                eprintln!(
+                    "ai-memory: boot REFUSED (#3166) — nothing was started and no \
+                     database was opened. Continuing on compiled defaults would open \
+                     the relative `ai-memory.db` in the current directory instead of \
+                     the configured `db` (corpus split-brain) and would revert \
+                     [storage].append_only, [governance].require_operator_pubkey and \
+                     [[permissions.rules]]. Fix the file, then re-run. \
+                     `ai-memory doctor` and `ai-memory config` still run."
+                );
+                std::process::exit(config::EX_CONFIG);
+            }
+        }
+    };
+    config::AppConfig::write_default_if_missing();
 
     // #1889 — ALL env mutation (passphrase-file export + anonymize seeding)
     // happens HERE, synchronously, before any thread (tracing appender worker,
@@ -86,7 +136,23 @@ fn main() -> Result<()> {
     // Runs AFTER the asi-hard enforcement above so it observes the
     // already-pinned asi-hard knobs. See
     // `src/enterprise_federation_posture.rs`.
-    ai_memory::enterprise_federation_posture::enforce_at_boot_pre_runtime(&app_config)?;
+    //
+    // #3003 — `ai-memory doctor --posture <name>` is THE read-only diagnostic
+    // for this very gate: it renders the per-control PASS/FAIL report the boot
+    // refusal points the operator at, and it computes the contracted exit
+    // codes itself (`cli::doctor::run_posture` → 0 PASS / 2 FAIL). It MUST NOT
+    // be caught by the boot refusal — otherwise, with the gate armed+failing,
+    // the diagnostic the remediation names exits 1 (a generic anyhow-bail CLI
+    // error) instead of the contracted 2, and the operator is told to re-run
+    // the command that just refused. Bypass the gate for that one subcommand
+    // so the report always renders and the exit code is the contracted 2.
+    let is_posture_doctor = matches!(
+        &cli.command,
+        daemon_runtime::Command::Doctor(a) if a.posture.is_some()
+    );
+    if !is_posture_doctor {
+        ai_memory::enterprise_federation_posture::enforce_at_boot_pre_runtime(&app_config)?;
+    }
 
     // v0.7.0 K3 — pin the process-wide governance gate posture before
     // any subcommand has a chance to call `db::enforce_governance`.
@@ -111,7 +177,7 @@ fn main() -> Result<()> {
         ai_memory::subscriptions::validate_hmac_secret_hex(resolved_hmac_secret.as_deref())
     {
         eprintln!("ai-memory: boot refused — #1048 invalid hmac_secret\n  {msg}");
-        std::process::exit(78); // EX_CONFIG per sysexits.h
+        std::process::exit(config::EX_CONFIG); // sysexits.h EX_CONFIG (#3166)
     }
     config::set_active_hooks_hmac_secret(resolved_hmac_secret);
 
@@ -196,6 +262,34 @@ fn main() -> Result<()> {
         std::process::exit(75);
     }
     result
+}
+
+/// #3166 — the ONLY subcommands allowed to keep running on compiled defaults
+/// when `config.toml` exists but cannot be honoured.
+///
+/// The set is deliberately tiny and justified per member:
+///
+/// * `doctor` — the verb an operator reaches for BECAUSE the config is
+///   broken. Refusing it would hide the very fault it exists to surface; it
+///   instead REPORTS the breakage in its own `Configuration` section
+///   (`cli::doctor::section_config_health_3166`).
+/// * `config` — the repair verb (`config migrate`), which reads and rewrites
+///   the broken file directly and has its own parse-error exit codes.
+/// * `completions` / `man` — pure argv-to-stdout generators. They open no
+///   database and read no config-backed setting.
+///
+/// Everything else — including `boot`, which would otherwise serve an agent
+/// its first-turn context out of the WRONG database — fails closed. Reading
+/// the wrong corpus is a wrong ANSWER, which the data-integrity directive
+/// ranks with corruption, not with degraded function.
+fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
+    matches!(
+        cmd,
+        daemon_runtime::Command::Doctor(_)
+            | daemon_runtime::Command::Config(_)
+            | daemon_runtime::Command::Completions(_)
+            | daemon_runtime::Command::Man
+    )
 }
 
 /// v0.7.0 #697 — best-effort init for the forensic governance log.

@@ -4560,12 +4560,11 @@ pub fn run_mcp_server(
     // `[llm]` client. NO SIGHUP on the stdio child — a HUP would collide
     // with parent-exit orphan semantics. Disabled under
     // `AI_MEMORY_NO_CONFIG` so tests stay hermetic.
-    let reload_config_path: Option<std::path::PathBuf> =
-        if std::env::var("AI_MEMORY_NO_CONFIG").is_ok() {
-            None
-        } else {
-            crate::config::AppConfig::config_path()
-        };
+    let reload_config_path: Option<std::path::PathBuf> = if crate::config::skip_config() {
+        None
+    } else {
+        crate::config::AppConfig::config_path()
+    };
     let mut last_config_mtime: Option<std::time::SystemTime> = reload_config_path
         .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())

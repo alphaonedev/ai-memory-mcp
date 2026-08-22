@@ -512,8 +512,11 @@ The `ResolvedLlm::Debug` impl redacts the resolved `api_key` to
 ## Secret handling discipline
 
 `[llm].api_key = "<literal>"` is **REJECTED at parse time** with a
-clear stderr error. The daemon falls back to `AppConfig::default()`
-on rejection so it still boots, and the operator sees:
+clear stderr error. **[#3166]** The daemon no longer falls back to
+`AppConfig::default()` on rejection — that fail-OPEN behaviour meant a
+rejected (or merely typo'd) config silently repointed `db` at the relative
+`ai-memory.db` in the working directory. Boot now REFUSES with exit `78`
+(`EX_CONFIG`) and nothing is started; the operator sees:
 
 ```
 ai-memory: config rejected (~/.config/ai-memory/config.toml): inline
@@ -717,6 +720,69 @@ dependency-free std-only poll loop when absent or on init failure.
 
 Source: `src/vectorlite.rs::{VECTORLITE_EXTENSION_ENV,from_env}` +
 `src/hnsw.rs`.
+
+## Boot contract — what happens to a config the daemon cannot honour
+
+**[#3166]** Boot FAILS CLOSED. The rule is one sentence: *a boot must never
+silently open a different database than the one configured.*
+
+| Config state | Behaviour |
+|---|---|
+| File ABSENT | Compiled defaults. Documented, unchanged. |
+| `AI_MEMORY_NO_CONFIG` truthy (`1`/`true`/`yes`/`on`) | File skipped, compiled defaults. Unchanged. |
+| File parses and validates | Loaded. `ai-memory: loaded config from <path>` on stderr. |
+| TOML syntax error | **Boot REFUSED.** Error printed, exit `78` (`EX_CONFIG`). No database opened. |
+| Secret-handling rejection (inline `api_key`, `api_key_env`+`api_key_file` both set, lax key-file mode) | **Boot REFUSED.** Exit `78`. |
+| File unreadable (`EACCES`, `EIO`, a directory in its place) | **Boot REFUSED.** The io error is surfaced with its `ErrorKind`, never flattened into the "missing file" arm. Exit `78`. |
+
+### Where `config.toml` is looked for
+
+**[#3002]** The path resolves through the platform config dir — the SAME
+resolver the identity key dir (`<config-dir>/ai-memory/keys`) and the hooks
+file (`<config-dir>/ai-memory/hooks.toml`) use:
+
+| `XDG_CONFIG_HOME` | Resolved path |
+|---|---|
+| unset | `~/.config/ai-memory/config.toml` (unchanged) |
+| set, and it carries `ai-memory/config.toml` | `$XDG_CONFIG_HOME/ai-memory/config.toml` |
+| set, empty, but `~/.config/ai-memory/config.toml` exists | **the legacy `~/.config` file, plus a one-shot stderr WARN** |
+| set, and neither file exists | `$XDG_CONFIG_HOME/ai-memory/config.toml` (where a default is written) |
+
+The third row is a deliberate migration guard, not sloppiness. Before #3002
+the path was hardcoded to `$HOME/.config`; making it XDG-aware without a
+fallback would mean that on any host setting `XDG_CONFIG_HOME` the operator's
+existing config simply stops being found. An ABSENT config is the documented
+"compiled defaults" case, so the #3166 boot refusal does NOT fire — `db` would
+silently revert to the relative `ai-memory.db` in the working directory, which
+is exactly the corpus split-brain #3166 exists to prevent. Honouring the legacy
+file (loudly) keeps the upgrade lossless; move it to the XDG root to
+consolidate with the keys and hooks.
+
+Why refusing is the safe answer: on a fall-back to compiled defaults, `db`
+becomes the RELATIVE `ai-memory.db` resolved against the process working
+directory, so the daemon opens/creates a fresh empty database, serves
+`count=0`, and accepts writes into that orphan — corpus split-brain against
+the real corpus at the configured path. `[storage].append_only`,
+`[governance].require_operator_pubkey` and `[[permissions.rules]]` revert in
+the same stroke.
+
+Four subcommands deliberately keep running on compiled defaults, because
+refusing them would remove the operator's ability to diagnose or repair the
+fault:
+
+- `ai-memory doctor` — reports the breakage in its `Configuration` section
+  (severity `Critical`, with the parse/io error verbatim) and states that every
+  other section reflects compiled defaults.
+- `ai-memory config` — the repair verb; it reads and rewrites the file directly
+  and has its own parse-error exit codes.
+- `ai-memory completions` / `ai-memory man` — pure argv-to-stdout generators.
+
+`--version` and `--help` are unaffected: argv is parsed before the config is
+resolved.
+
+Everything else — including `ai-memory boot` — fails closed. Serving an agent
+its first-turn context out of the wrong database is a WRONG ANSWER, which the
+data-integrity directive ranks with corruption, not with degraded function.
 
 ## Related
 
