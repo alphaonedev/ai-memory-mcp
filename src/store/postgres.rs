@@ -11898,7 +11898,17 @@ impl PostgresStore {
                 -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (the `store()` COALESCE precedent).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON (see the `store()` twin). The CASE
+                -- mirrors THIS funnel's `memory_kind` CASE exactly — which,
+                -- unlike every other pg funnel, carries no `persona` arm; that
+                -- sqlite-parity gap is a separate residual and is deliberately
+                -- NOT widened here.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind = 'reflection'
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
             RETURNING id",
         )
         .bind(&new_id)
@@ -17241,7 +17251,22 @@ impl MemoryStore for PostgresStore {
                 -- v1.0.0 (#1945) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (COALESCE).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance),
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END,
                 -- v1.0.0 #1834 — sqlite `db::insert` parity: valid_from is
                 -- immutable (stored value wins), valid_until is caller-updatable
                 -- (COALESCE takes a fresh upper bound, else keeps existing).
@@ -17767,7 +17792,22 @@ impl MemoryStore for PostgresStore {
                 -- v1.0.0 (#1945 / #2289) — sqlite + `store()` parity: the
                 -- epistemic-typing provenance follows the incoming write when
                 -- present, else keeps the stored marker (COALESCE).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
             -- v1.0.0 #2383 (N1) — the POST-update `metadata.agent_id` (after
             -- the existing-wins provenance overlay above) rides back on the
             -- SAME statement, so the envelope-owner reconcile below costs
@@ -18153,7 +18193,22 @@ impl MemoryStore for PostgresStore {
                 -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (the `store()` COALESCE precedent).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
             RETURNING id",
         )
         .bind(&memory.id)
@@ -18503,7 +18558,22 @@ impl MemoryStore for PostgresStore {
                 -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (the `store()` COALESCE precedent).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
             RETURNING id",
         )
         .bind(&memory.id)
@@ -20667,7 +20737,22 @@ impl MemoryStore for PostgresStore {
                 -- already CLAIMED pg parity that was never wired): COALESCE
                 -- keeps the local value when the peer carries none, so a
                 -- replication hop can never blank an already-typed row.
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: the surviving local row keeps its genesis cid on a
                 -- federation-merge (preserves the local genesis pre-image).
@@ -29181,7 +29266,22 @@ impl PostgresStore {
                 -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (the `store()` COALESCE precedent).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
             RETURNING id";
         // #2771/#2887 — single-source the column list + binds + the whole DO
         // UPDATE SET arm across every disposition; only the ON CONFLICT

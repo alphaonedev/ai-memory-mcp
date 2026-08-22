@@ -2109,11 +2109,36 @@ fn insert_inner(
                 -- sweep remains the only documented non-bumping mutator
                 -- (tests/non_version_bumping_sites_1036.rs).
                 version = memories.version + 1,
-                -- v1.0.0 (#1945) — the epistemic-typing provenance follows the
-                -- incoming write when it carries one, else keeps the stored
-                -- value (a re-store that omits the carrier must not blank an
-                -- existing marker). COALESCE, like the Form-4/5 columns above.
-                kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
+                -- v1.0.0 (#1945) + v1.0.0 #2394 — the epistemic-typing
+                -- provenance FOLLOWS THE KIND THAT ACTUALLY WON. `memory_kind`
+                -- above is STICKY (a stored `reflection` / `persona` is never
+                -- downgraded), but the bare
+                -- `COALESCE(excluded.kind_provenance, memories.kind_provenance)`
+                -- adopted the incoming provenance unconditionally: a row stored
+                -- as `reflection` (kind_provenance = `declared`) that received
+                -- an upsert claiming `observation` via `llm` kept kind
+                -- `reflection` while relabelling its provenance `llm` — the
+                -- stored provenance then described a kind the merge REJECTED.
+                -- Downstream consumers (decorrelation, typed-cognition
+                -- analytics) read that as fact, so it is durable metadata
+                -- corruption, not a cosmetic skew.
+                --
+                -- The CASE mirrors the `memory_kind` CASE above exactly:
+                --   * kind UNCHANGED -> COALESCE (the #1945 rule: an incoming
+                --     carrier wins, an omitted one must not blank the marker);
+                --   * kind changed and the STORED kind survived (sticky
+                --     reflection / persona) -> keep the stored provenance;
+                --   * otherwise the INCOMING kind was adopted -> take its
+                --     provenance verbatim, NULL included (a provenance
+                --     describing the superseded kind would be a lie).
+                -- NULL-safe by construction: a NULL `memory_kind` fails both
+                -- WHENs and lands on the ELSE, which is the same operand the
+                -- `memory_kind` CASE picks.
+                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
+                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE excluded.kind_provenance END,
                 -- v1.0.0 #1834 — claim-bitemporal validity. `valid_from` is
                 -- IMMUTABLE once set (a correction is a supersede, not a mutation),
                 -- so the stored value always wins on upsert. `valid_until` is the
@@ -14623,10 +14648,23 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                 lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
                                             OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                                        THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
-                -- v1.0.0 #2333 (FBL-03) — stamp/merge the v79 denormalized
-                -- kind_provenance on the federation funnel (pg 13949 parity:
-                -- COALESCE keeps the local value when the peer carries none).
-                kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
+                -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
+                -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the
+                -- federation lane too. `memory_kind` above is sticky (a local
+                -- `reflection` / `persona` is never downgraded by a peer that
+                -- does not know the kind), but the bare COALESCE adopted the
+                -- peer's provenance unconditionally — so a stale peer pushing
+                -- `observation`/`llm` relabelled a surviving local `reflection`
+                -- as `llm`-provenanced. The CASE mirrors the `memory_kind`
+                -- CASE exactly (kind unchanged -> COALESCE per FBL-03; stored
+                -- sticky kind survived -> keep the local provenance; incoming
+                -- kind adopted -> take its provenance verbatim), and is
+                -- NULL-safe by construction.
+                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
+                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE excluded.kind_provenance END,
                 -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
                 -- `valid_from` is immutable (local genesis wins, like `cid`);
                 -- `valid_until` follows the newer-wins tiebreak so a peer that
