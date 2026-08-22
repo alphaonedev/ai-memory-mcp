@@ -239,6 +239,8 @@ fn conserve_pass_flag_on_retains_both_and_is_idempotent() {
         &[loser.clone(), winner.clone()],
         false,
         true,
+        usize::MAX,
+        None,
     );
     assert!(report.errors.is_empty(), "pass errors: {:?}", report.errors);
     // (h) mutual contradiction conserved exactly once (winner → Ok(None)).
@@ -320,8 +322,15 @@ fn conserve_pass_flag_on_retains_both_and_is_idempotent() {
     // re-entry gate fires → ZERO new links, ZERO new leaves.
     let loser_fresh = ai_memory::db::get(&conn, "loser").unwrap().unwrap();
     let winner_fresh = ai_memory::db::get(&conn, "winner").unwrap().unwrap();
-    let report2 =
-        autonomy::run_autonomy_passes(&conn, &NoopLlm, &[loser_fresh, winner_fresh], false, true);
+    let report2 = autonomy::run_autonomy_passes(
+        &conn,
+        &NoopLlm,
+        &[loser_fresh, winner_fresh],
+        false,
+        true,
+        usize::MAX,
+        None,
+    );
     assert_eq!(
         report2.memories_forgotten, 0,
         "re-entry gate: nothing re-conserved"

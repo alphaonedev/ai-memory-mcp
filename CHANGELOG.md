@@ -263,6 +263,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   production caller reached the method (the postgres HTTP search path dispatches
   through the SAL trait `search`), so this closes a latent leak and restores
   cross-backend parity rather than fixing an actively exploited route.
+### Fixed (curator/autonomy correctness — namespace config, op cap, silent-error surfacing)
+
+Nine defects found by a rust-1.98-grounded code review of `src/curator/*` and
+`src/autonomy.rs`. Every one is a case of the daemon either ignoring operator
+configuration, exceeding its documented budget, or self-reporting work it did
+not do — all of which make the fleet less manageable and the report less
+truthful.
+
+- **`persona_sweep` ignored the operator's include/exclude namespace
+  configuration (HIGH).** The sweep's scan filtered on the reserved `_`-prefix
+  only, so `PersonaGenerator` ran — and wrote SIGNED persona rows — in
+  namespaces the operator had excluded, or outside a non-empty
+  `include_namespaces`, while `run_size_gc_pass` in the same file filtered
+  correctly. Both lists are now pushed into the scan SQL (so out-of-scope rows
+  cannot consume the `LIMIT` window and starve in-scope entities either) and
+  re-checked per row. All three passes — `needs_curation`, size-GC, and the
+  persona sweep — now route through ONE `namespace_in_scope` predicate so
+  scope can never be honoured by one pass and ignored by another.
+- **Autonomy passes ran outside the documented per-cycle op cap (HIGH).**
+  `max_ops_per_cycle` is documented as a hard cap on LLM-invoking operations
+  per cycle, but `run_autonomy_passes` had no budget check: Pass 1 issued one
+  `summarize_memories` call per cluster over a candidate batch capped at
+  `max_ops_per_cycle * 4`, so a single cycle could make several times the
+  authorised number of LLM invocations. `run_once` now threads its REMAINING
+  budget in; over-budget clusters are deferred to the next cycle and counted in
+  `operations_skipped_cap` (never dropped). Passes 2 and 3 invoke no LLM and
+  stay bounded by the candidate batch, so they are deliberately uncharged.
+- **A destructive action proceeded after its rollback-log write failed.** The
+  corpus was already mutated and the only reversibility record had failed to
+  persist, yet the cycle carried on issuing further irreversible actions with
+  one line in `report.errors` as the sole trace. The passes now HALT for the
+  rest of the cycle and set a new `rollback_log_degraded` flag on the report.
+- **Silent no-op that counted as success in `persist_auto_tags` /
+  `persist_contradiction`.** A row whose `metadata` is non-object JSON made both
+  helpers write the metadata back unchanged, return `Ok(())`, and let `run_once`
+  increment `auto_tagged` / `contradictions_found`. They now refuse with an
+  error naming the row and the offending shape.
+- **A DB failure in `adjacent_memory` silently skipped contradiction
+  detection.** `if let Ok(Some(..))` discarded the `Err` half with no report
+  entry; the failure is now recorded in `report.errors`.
+- **`block_on` reachable from a public API could panic the caller.** The SAL
+  consolidation pass builds its own current-thread runtime; reached from a
+  thread with an ambient tokio runtime that `block_on` panicked ("Cannot start
+  a runtime from within a runtime"), and only a doc comment stood in the way —
+  the `curator --once` CLI path did exactly this. The pass now detects the
+  in-runtime case and degrades to a reported skip, and the CLI runs the sweep
+  under `spawn_blocking`.
+- **The conserved `contradicts` edge was signed with an arbitrary key.**
+  `forget_if_superseded` loaded "the lexicographically-first key under the
+  active key dir" ambiently, so on a multi-key host the edge could be attested
+  to an identity that is not the one the daemon runs as. The authenticated
+  `active_keypair` is now plumbed from `run_once` through
+  `run_autonomy_passes`, and the ambient loader is gone.
+- **Embedding-read failures were indistinguishable from missing embeddings.**
+  `.ok().flatten()` in both clusterers collapsed a failing store into "no
+  embedding", so a database that had started failing reads looked exactly like
+  an un-embedded corpus and consolidation silently did nothing, cycle after
+  cycle. Both now log the error before degrading (the degrade itself is
+  unchanged and still blocks the merge, per #1774).
+- **Dry runs inflated `rollback_entries_written`.** The counter is documented as
+  rows persisted, but a dry run — which persists nothing — incremented it. Dry
+  runs now report `rollback_entries_simulated` instead.
 
 ### Removed
 

@@ -71,7 +71,8 @@ use crate::models::Memory;
 use crate::models::Tier;
 
 use candidates::{
-    CandidateBatch, adjacent_memory, collect_candidates, needs_curation, record_truncation,
+    CandidateBatch, adjacent_memory, collect_candidates, namespace_in_scope, needs_curation,
+    record_truncation,
 };
 use persist::{persist_auto_tags, persist_contradiction};
 
@@ -254,7 +255,8 @@ impl CuratorReport {
 /// the sweep at the end of the cycle scans freshly-tagged reflections
 /// (rows with `mentioned_entity_id` set, in non-reserved namespaces)
 /// and calls [`crate::persona::PersonaGenerator`] for each entity that
-/// lacks a current persona row. When `None`, the sweep skips entirely
+/// lacks a current persona row, within the operator's configured
+/// namespace scope. When `None`, the sweep skips entirely
 /// — the substrate refuses to emit unsigned persona rows from the
 /// curator path, matching the pre-#816 posture for daemons started
 /// without a keypair on disk.
@@ -329,7 +331,20 @@ pub fn run_once(
         // contradict this one. We don't do an N^2 scan — just the nearest
         // sibling by created_at. Broader contradiction analysis remains
         // an explicit `memory_detect_contradiction` call.
-        if let Ok(Some(sibling)) = adjacent_memory(conn, mem) {
+        // ERRORS-19 — a DB failure here must NOT masquerade as "no sibling":
+        // the pre-fix `if let Ok(Some(..))` discarded the `Err` half with no
+        // report entry, so a transient read failure silently skipped
+        // contradiction detection while the cycle report looked clean.
+        let sibling = match adjacent_memory(conn, mem) {
+            Ok(s) => s,
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("adjacent_memory failed for {}: {e}", mem.id));
+                None
+            }
+        };
+        if let Some(sibling) = sibling {
             match llm_client.detect_contradiction(&mem.content, &sibling.content) {
                 Ok(true) => {
                     if !cfg.dry_run
@@ -368,14 +383,34 @@ pub fn run_once(
     // (both run) or zero-consolidation (neither runs). Default false → autonomy
     // Pass-1 runs and the SAL pass is a no-op (production byte-unchanged).
     let compaction_owns_consolidation = cfg.compaction.enabled;
+    // v1.0.0 — `max_ops_per_cycle` is documented as a HARD cap on
+    // LLM-invoking operations per cycle, but the autonomy passes used to
+    // run outside it entirely: Pass 1 issued one `summarize_memories` call
+    // per cluster over a candidate batch capped at `max_ops_per_cycle * 4`,
+    // so a cycle could exceed the operator's authorised LLM budget several
+    // times over. Hand the passes what is LEFT of the cycle budget after
+    // the auto_tag / contradiction loop above, and fold the ops they spend
+    // back into the cycle counters so the persona sweep below sees a true
+    // remaining budget.
+    let remaining_ops = cfg
+        .max_ops_per_cycle
+        .saturating_sub(report.operations_attempted);
     let pass_report = crate::autonomy::run_autonomy_passes(
         conn,
         llm_client,
         &autonomy_candidates,
         cfg.dry_run,
         /* skip_consolidation = */ compaction_owns_consolidation,
+        /* llm_op_budget = */ remaining_ops,
+        active_keypair,
     );
     report.errors.extend(pass_report.errors.clone());
+    report.operations_attempted = report
+        .operations_attempted
+        .saturating_add(pass_report.operations_attempted);
+    report.operations_skipped_cap = report
+        .operations_skipped_cap
+        .saturating_add(pass_report.operations_skipped_cap);
     report.autonomy = pass_report;
 
     // SAL `ConsolidationPass`. When `compaction.enabled` it is the LIVE
@@ -490,13 +525,7 @@ fn run_size_gc_pass(
     let mut namespaces: BTreeSet<&str> = BTreeSet::new();
     for mem in candidates {
         let ns = mem.namespace.as_str();
-        if ns.starts_with('_') {
-            continue;
-        }
-        if !cfg.include_namespaces.is_empty() && !cfg.include_namespaces.iter().any(|n| n == ns) {
-            continue;
-        }
-        if cfg.exclude_namespaces.iter().any(|n| n == ns) {
+        if !namespace_in_scope(ns, cfg) {
             continue;
         }
         namespaces.insert(ns);
@@ -547,6 +576,23 @@ fn run_consolidation_pass(
     report: &mut CuratorReport,
 ) {
     if !cfg.compaction.enabled {
+        return;
+    }
+    // ERRORS-08 / CONCURRENCY-22 — the `rt.block_on` below PANICS
+    // ("Cannot start a runtime from within a runtime") when `run_once` is
+    // reached from a thread that already has an ambient tokio runtime. That
+    // contract used to be documentation-only on a `pub fn`, so an async
+    // caller crashed instead of getting a `Result`. Detect the in-runtime
+    // case and DEGRADE (skip this pass, surface the reason) rather than
+    // unwinding the caller: the corpus is untouched either way, but a
+    // reported skip is recoverable and a panic is not.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        report.errors.push(
+            "consolidation pass: skipped — curator::run_once was called from inside an async \
+             runtime; wrap the call in tokio::task::spawn_blocking so the pass can drive its \
+             own runtime"
+                .to_string(),
+        );
         return;
     }
     let Some(path) = conn.path().map(std::path::PathBuf::from) else {
@@ -621,6 +667,17 @@ fn run_consolidation_pass(
 /// `attest_level='self_signed'` and a 64-byte Ed25519 signature on every
 /// `derived_from` link.
 ///
+/// **Namespace scope (v1.0.0)**: every candidate `(entity_id, namespace)`
+/// pair is filtered through [`namespace_in_scope`] — the same predicate
+/// `needs_curation` and the size-GC pass use — so the operator's
+/// `include_namespaces` / `exclude_namespaces` configuration governs this
+/// sweep exactly as it governs the rest of the cycle. Pre-fix the scan
+/// filtered on the reserved `_`-prefix ONLY, so a namespace the operator
+/// had excluded still grew signed persona rows. The predicate is applied
+/// twice on purpose: once pushed into the scan SQL (so out-of-scope rows
+/// cannot consume the `LIMIT` window and starve in-scope entities) and
+/// once per row in the loop (fail-closed backstop).
+///
 /// **Gating**: skips the entire sweep when `active_keypair` is `None`.
 /// The pre-#816 contract on the curator path was "no auto-generated
 /// persona at all" rather than "unsigned auto-generated persona", so
@@ -661,18 +718,51 @@ fn persona_sweep(
     // existence check inside the loop short-circuit.
     use std::collections::BTreeSet;
     let limit = (cfg.max_ops_per_cycle.saturating_mul(2)).max(64);
+    // PERF-07 — `limit` is a `usize` derived from operator config; a lossy
+    // `as i64` would WRAP NEGATIVE on a pathological `max_ops_per_cycle`
+    // and turn the LIMIT clause into "no rows" (or worse). Clamp instead.
+    let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
+
+    // v1.0.0 — the operator's include / exclude namespace configuration is
+    // pushed into the SCAN, not just applied after it. Filtering only in
+    // the loop would still let out-of-scope rows consume the `LIMIT`
+    // window and starve in-scope entities in a busy corpus, so the
+    // predicate goes into SQL; the loop below re-checks via
+    // `namespace_in_scope` as a fail-closed backstop should this SQL and
+    // the predicate ever drift.
+    let mut sql = String::from(
+        "SELECT mentioned_entity_id, namespace \
+         FROM memories \
+         WHERE memory_kind = 'reflection' \
+           AND mentioned_entity_id IS NOT NULL \
+           AND namespace NOT LIKE '\\_%' ESCAPE '\\'",
+    );
+    let mut binds: Vec<rusqlite::types::Value> =
+        Vec::with_capacity(cfg.include_namespaces.len() + cfg.exclude_namespaces.len() + 1);
+    for (clause, list) in [
+        (" AND namespace IN (", &cfg.include_namespaces),
+        (" AND namespace NOT IN (", &cfg.exclude_namespaces),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        sql.push_str(clause);
+        for (i, ns) in list.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            binds.push(rusqlite::types::Value::Text(ns.clone()));
+        }
+        sql.push(')');
+    }
+    sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+    binds.push(rusqlite::types::Value::Integer(limit_sql));
+
     let mut entity_pairs: BTreeSet<(String, String)> = BTreeSet::new();
     let scan_result = (|| -> Result<()> {
-        let mut stmt = conn.prepare(
-            "SELECT mentioned_entity_id, namespace
-             FROM memories
-             WHERE memory_kind = 'reflection'
-               AND mentioned_entity_id IS NOT NULL
-               AND namespace NOT LIKE '\\_%' ESCAPE '\\'
-             ORDER BY created_at DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -699,6 +789,12 @@ fn persona_sweep(
     let generator = PersonaGenerator::new(conn, _llm_client, Some(keypair), config);
 
     for (entity_id, namespace) in entity_pairs {
+        // Fail-closed backstop for the SQL scope predicate above: a persona
+        // row is a SIGNED artifact, so it must never land in a namespace
+        // the operator put out of scope, even if the scan drifts.
+        if !namespace_in_scope(&namespace, cfg) {
+            continue;
+        }
         if report.operations_attempted >= cfg.max_ops_per_cycle {
             report.operations_skipped_cap += 1;
             continue;
@@ -2355,6 +2451,169 @@ mod tests {
             "dry-run must NOT write a persona row, got: {persona:?}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // v1.0.0 curator correctness regressions (ox-alpha review).
+    // -----------------------------------------------------------------
+
+    /// Insert one reflection carrying `mentioned_entity_id` in `ns` and
+    /// return the entity id. Mirrors the fixture used by the existing
+    /// persona-sweep tests: the column is patched post-insert because the
+    /// public `Memory` struct does not expose it.
+    fn seed_reflection_with_entity(conn: &Connection, ns: &str, entity_id: &str) {
+        let obs = make_eligible_memory(ns, "observation");
+        let obs_id = db::insert(conn, &obs).unwrap();
+        let mut rfl = make_eligible_memory(ns, "reflection-of-obs");
+        rfl.memory_kind = crate::models::MemoryKind::Reflection;
+        rfl.reflection_depth = 1;
+        rfl.content = "This reflection mentions the entity under test.".to_string();
+        let rfl_id = db::insert(conn, &rfl).unwrap();
+        conn.execute(
+            "UPDATE memories SET mentioned_entity_id = ?1 WHERE id = ?2",
+            rusqlite::params![entity_id, &rfl_id],
+        )
+        .unwrap();
+        db::create_link(conn, &rfl_id, &obs_id, "reflects_on").unwrap();
+    }
+
+    /// REGRESSION (ox-alpha #1) — `persona_sweep` must honour the
+    /// operator's `exclude_namespaces`. Pre-fix its scan filtered on the
+    /// reserved `_`-prefix ONLY, so the sweep wrote SIGNED persona rows
+    /// into namespaces the operator had explicitly excluded — while
+    /// `run_size_gc_pass` in the same file filtered correctly. The
+    /// in-scope namespace is asserted too, so a filter that simply
+    /// disabled the sweep could not pass this test.
+    #[test]
+    fn persona_sweep_honours_exclude_namespaces() {
+        let server = FakeOllama::start(FakeOllamaCfg::default());
+        let llm = ollama_for(&server);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+
+        seed_reflection_with_entity(&conn, "persona-kept", "entity-kept");
+        seed_reflection_with_entity(&conn, "persona-dropped", "entity-dropped");
+
+        let kp = crate::identity::keypair::generate("daemon").unwrap();
+        let cfg = CuratorConfig {
+            exclude_namespaces: vec!["persona-dropped".to_string()],
+            ..CuratorConfig::default()
+        };
+        let report = run_once(&conn, Some(&llm), &cfg, Some(&kp)).unwrap();
+
+        assert!(
+            crate::persona::get_latest_persona(&conn, "entity-kept", "persona-kept")
+                .unwrap()
+                .is_some(),
+            "in-scope namespace must still get a persona, report.errors={:?}",
+            report.errors
+        );
+        assert!(
+            crate::persona::get_latest_persona(&conn, "entity-dropped", "persona-dropped")
+                .unwrap()
+                .is_none(),
+            "excluded namespace must NEVER receive a curator-signed persona row"
+        );
+        assert_eq!(
+            report.personas_generated, 1,
+            "exactly one in-scope persona expected, errors={:?}",
+            report.errors
+        );
+    }
+
+    /// REGRESSION (ox-alpha #1, include half) — with a non-empty
+    /// `include_namespaces`, `persona_sweep` must touch ONLY the listed
+    /// namespaces.
+    #[test]
+    fn persona_sweep_honours_include_namespaces() {
+        let server = FakeOllama::start(FakeOllamaCfg::default());
+        let llm = ollama_for(&server);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+
+        seed_reflection_with_entity(&conn, "persona-in", "entity-in");
+        seed_reflection_with_entity(&conn, "persona-out", "entity-out");
+
+        let kp = crate::identity::keypair::generate("daemon").unwrap();
+        let cfg = CuratorConfig {
+            include_namespaces: vec!["persona-in".to_string()],
+            ..CuratorConfig::default()
+        };
+        let report = run_once(&conn, Some(&llm), &cfg, Some(&kp)).unwrap();
+
+        assert!(
+            crate::persona::get_latest_persona(&conn, "entity-in", "persona-in")
+                .unwrap()
+                .is_some(),
+            "included namespace must get a persona, report.errors={:?}",
+            report.errors
+        );
+        assert!(
+            crate::persona::get_latest_persona(&conn, "entity-out", "persona-out")
+                .unwrap()
+                .is_none(),
+            "namespace outside include_namespaces must NEVER receive a persona row"
+        );
+    }
+
+    /// The single-source namespace-scope predicate every curator pass
+    /// routes through.
+    #[test]
+    fn namespace_in_scope_predicate() {
+        let mut cfg = CuratorConfig::default();
+        assert!(namespace_in_scope("app", &cfg));
+        assert!(
+            !namespace_in_scope("_curator/reports", &cfg),
+            "reserved namespaces are always out of scope"
+        );
+
+        cfg.include_namespaces = vec!["app".to_string()];
+        assert!(namespace_in_scope("app", &cfg));
+        assert!(!namespace_in_scope("other", &cfg));
+
+        cfg.include_namespaces.clear();
+        cfg.exclude_namespaces = vec!["noisy".to_string()];
+        assert!(namespace_in_scope("app", &cfg));
+        assert!(!namespace_in_scope("noisy", &cfg));
+
+        // Exclude wins over include for the same namespace (fail closed).
+        cfg.include_namespaces = vec!["noisy".to_string()];
+        assert!(!namespace_in_scope("noisy", &cfg));
+    }
+
+    /// REGRESSION (ox-alpha #4) — a row whose `metadata` column holds
+    /// non-object JSON used to make both persist helpers a SILENT no-op:
+    /// they wrote the metadata back unchanged, returned `Ok(())`, and let
+    /// `run_once` increment `auto_tagged` / `contradictions_found`. A lost
+    /// write must be refused loudly, not self-reported as a success.
+    #[test]
+    fn persist_helpers_refuse_non_object_metadata() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+
+        let mut mem = make_eligible_memory("meta-ns", "non-object-metadata");
+        mem.metadata = serde_json::json!([1, 2, 3]);
+        db::insert(&conn, &mem).unwrap();
+
+        let tag_err = persist_auto_tags(&conn, &mem, &["t".to_string()])
+            .expect_err("non-object metadata must be refused, not silently dropped");
+        assert!(
+            tag_err.to_string().contains("auto_tags"),
+            "error must name the refused write: {tag_err}"
+        );
+
+        let contra_err = persist_contradiction(&conn, &mem, "other-id")
+            .expect_err("non-object metadata must be refused, not silently dropped");
+        assert!(
+            contra_err.to_string().contains("array"),
+            "error must name the offending metadata shape: {contra_err}"
+        );
+
+        // An object-metadata row on the same path still succeeds.
+        let ok_mem = make_eligible_memory("meta-ns", "object-metadata");
+        db::insert(&conn, &ok_mem).unwrap();
+        persist_auto_tags(&conn, &ok_mem, &["t".to_string()])
+            .expect("object metadata must still persist");
+    }
 }
 
 #[test]
@@ -2787,5 +3046,55 @@ mod consolidation_pass_tests_1746 {
             "no errors expected: {:?}",
             report.errors
         );
+    }
+
+    /// REGRESSION (ox-alpha #8) — `run_once` is a `pub fn` whose SAL
+    /// consolidation pass drives its own runtime via `block_on`. Reached
+    /// from a thread that already has an ambient tokio runtime that call
+    /// PANICS ("Cannot start a runtime from within a runtime"), and the
+    /// only thing standing between a caller and that panic used to be a
+    /// doc comment. The in-runtime case is now detected and DEGRADED to a
+    /// reported skip: the caller gets its report back instead of an
+    /// unwind, and the corpus is untouched either way.
+    #[tokio::test]
+    async fn consolidation_pass_degrades_instead_of_panicking_inside_a_runtime() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let cfg = CuratorConfig {
+            compaction: CompactionConfig {
+                enabled: true,
+                ..CompactionConfig::default()
+            },
+            ..CuratorConfig::default()
+        };
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(false);
+
+        // Pre-fix: this line panicked and took the test thread with it.
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("inside an async runtime")),
+            "the in-runtime skip must be surfaced to the operator, got {:?}",
+            report.errors
+        );
+        assert_eq!(
+            *llm.summarize_calls.lock().unwrap(),
+            0,
+            "a skipped pass must invoke no LLM"
+        );
+        assert_eq!(report.autonomy.memories_consolidated, 0);
+        for m in &candidates {
+            assert!(
+                db::get(&conn, &m.id).unwrap().is_some(),
+                "a skipped pass must leave every source row intact"
+            );
+        }
     }
 }
