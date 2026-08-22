@@ -80,11 +80,15 @@ pub const P95_TOLERANCE: f64 = 1.10;
 ///
 /// Apple's `macos-latest` GHA runner pool has substantially higher
 /// I/O scheduling variance and cold-start latency than `ubuntu-latest`.
-/// `tests/integration.rs::test_cli_bench_emits_json_with_seven_results_and_passes_budget`
-/// drives `ai-memory bench --iterations 5` end-to-end and asserts the
-/// process exits 0 — at the small iteration count the macOS tail can
-/// blow the absolute `target_p95_ms` budgets even when the underlying
-/// code is healthy. Per #1193 "Proposed fix" option 1 (preferred):
+/// At a small iteration count the macOS tail can blow the absolute
+/// `target_p95_ms` budgets even when the underlying code is healthy.
+/// (The test that originally surfaced this,
+/// `tests/integration.rs::test_cli_bench_emits_json_with_eight_results_report_only`,
+/// no longer asserts the budget verdict — it runs `--report-only`, because a
+/// required `Check` leg is the wrong place for a perf assertion. The
+/// multiplier stays load-bearing regardless: it still decides the
+/// `Status::Pass`/`Fail` every result reports, on every platform and in every
+/// caller.) Per #1193 "Proposed fix" option 1 (preferred):
 /// apply a centralized multiplier inside the runner-effective budget
 /// path so the pass/fail verdict is platform-aware while the canonical
 /// `target_p95_ms` reported in the JSON envelope still reflects the
@@ -1148,6 +1152,67 @@ pub fn compare_against_baseline(
     out
 }
 
+/// Process-level verdict for a completed latency bench run.
+///
+/// `results` and `regressions` have already been rendered by the caller
+/// (table or JSON), so this decides only whether the process exits zero.
+///
+/// # `report_only`
+///
+/// When `report_only` is `true` BOTH gates are downgraded to advisory: every
+/// per-operation `status` and every regression row is still measured and
+/// printed, but neither can fail the process.
+///
+/// This exists because the absolute p95 budgets are pinned to specific
+/// reference hardware — `PERFORMANCE.md` §"Measurement methodology" defines
+/// them against GitHub-hosted `ubuntu-latest`, the runner class its hardware
+/// multiplier table gives 1.0 — and exactly ONE gate measures them there:
+/// `.github/workflows/bench.yml`, which runs on `ubuntu-latest` and builds
+/// `--release`. A diagnostic or smoke caller anywhere else — a self-hosted
+/// runner sharing the box with the rest of a test suite, a developer laptop, an
+/// unoptimized debug build — is measuring a different machine against
+/// `ubuntu-latest`-calibrated targets, so its latencies say nothing about the
+/// performance contract and letting them fail the process turns machine load
+/// into a red build. `--report-only` lets such a caller prove the subcommand
+/// runs and emits well-formed output while leaving budget enforcement to the
+/// one gate that runs on the calibrated hardware.
+///
+/// # Errors
+///
+/// Without `report_only`, returns an error when any operation's measured p95
+/// exceeded its budget by more than the documented 10% tolerance
+/// ([`Status::Fail`]), and/or when any baseline comparison row is flagged as
+/// regressed. The three message shapes (budget, regression, both) are part of
+/// the CLI contract.
+pub fn verdict(
+    results: &[OperationResult],
+    regressions: Option<&[Regression]>,
+    regression_threshold: f64,
+    report_only: bool,
+) -> Result<()> {
+    let budget_failed = results.iter().any(|r| matches!(r.status, Status::Fail));
+    let regression_failed = regressions.is_some_and(|rows| rows.iter().any(|r| r.regressed));
+
+    if report_only {
+        return Ok(());
+    }
+
+    if budget_failed && regression_failed {
+        anyhow::bail!(
+            "bench: at least one operation exceeded its p95 budget by >10% AND regressed >{regression_threshold:.1}% vs baseline"
+        );
+    }
+    if budget_failed {
+        anyhow::bail!("bench: at least one operation exceeded its p95 budget by >10%");
+    }
+    if regression_failed {
+        anyhow::bail!(
+            "bench: at least one operation regressed >{regression_threshold:.1}% vs baseline"
+        );
+    }
+    Ok(())
+}
+
 /// Render a regression table to a string, mirroring the layout of
 /// [`render_table`].
 #[must_use]
@@ -1735,5 +1800,72 @@ mod tests {
         assert!(table.contains("memory_search (FTS5)"));
         assert!(table.contains("REGRESSION"));
         assert!(table.contains("OK"));
+    }
+
+    /// One synthetic over-budget row, reused by the `verdict` tests below.
+    #[allow(dead_code)]
+    fn failing_result() -> OperationResult {
+        OperationResult {
+            operation: Operation::StoreNoEmbedding,
+            label: Operation::StoreNoEmbedding.label(),
+            target_p95_ms: 10.0,
+            measured_p50_ms: 40.0,
+            measured_p95_ms: 50.0,
+            measured_p99_ms: 60.0,
+            samples: 5,
+            status: Status::Fail,
+        }
+    }
+
+    #[test]
+    fn verdict_fails_on_budget_without_report_only() {
+        // Fatal semantics when the flag is absent stay byte-identical: an
+        // over-budget row is an error carrying the documented message.
+        let err = verdict(&[failing_result()], None, 10.0, false)
+            .expect_err("an over-budget row must fail the run");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exceeded its p95 budget"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn verdict_report_only_downgrades_budget_failure() {
+        // `--report-only` measures and reports the same `Fail` status but
+        // never fails the process, so a CLI smoke on non-reference hardware
+        // is not an undeclared perf gate (CI run 32556214239).
+        verdict(&[failing_result()], None, 10.0, true)
+            .expect("report-only must not fail on an over-budget row");
+    }
+
+    #[test]
+    fn verdict_report_only_downgrades_regression_failure() {
+        let rows = vec![Regression {
+            operation: Operation::StoreNoEmbedding,
+            label: Operation::StoreNoEmbedding.label(),
+            baseline_p95_ms: 10.0,
+            measured_p95_ms: 30.0,
+            delta_pct: 200.0,
+            threshold_pct: 10.0,
+            regressed: true,
+        }];
+        let err = verdict(&[], Some(&rows), 10.0, false)
+            .expect_err("a regressed row must fail the run without report-only");
+        assert!(
+            format!("{err:#}").contains("regressed"),
+            "unexpected message: {err:#}"
+        );
+        verdict(&[], Some(&rows), 10.0, true)
+            .expect("report-only must not fail on a regressed row");
+    }
+
+    #[test]
+    fn verdict_passes_when_nothing_failed() {
+        let ok = OperationResult {
+            status: Status::Pass,
+            ..failing_result()
+        };
+        verdict(&[ok], None, 10.0, false).expect("a passing run exits zero");
     }
 }
