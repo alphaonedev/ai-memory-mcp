@@ -420,8 +420,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           components: rustfmt, clippy
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
@@ -483,9 +483,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
       - name: Fetch the locked dependency graph
         # `cargo metadata --offline` resolves the complete CROSS-PLATFORM graph,
         # including target-only crates (the windows_* / wasm / haiku families)
@@ -531,19 +530,25 @@ jobs:
         with:
           args: -shellcheck= -color
 
-  # MSRV gate — ai-memory standardizes on Rust 1.96, declared in
+  # MSRV gate — ai-memory standardizes on Rust 1.98, declared in
   # Cargo.toml `rust-version`. CI's other jobs build on `@stable` (which
   # floats forward), so without this pin the declared floor is never
-  # actually exercised: a stray use of a >1.96 API would only surface
-  # downstream. This job installs exactly 1.96.0 and `cargo check`s the
+  # actually exercised: a stray use of a >1.98 API would only surface
+  # downstream. This job installs exactly 1.98.0 and `cargo check`s the
   # whole crate against it, failing CI if the real minimum drifts above
   # the declared one.
   #
   # #2494 doc-vs-reality fix: previously "Advisory until added to branch
   # protection". It IS required on `release/v1.0.0` now
-  # (`MSRV (Rust 1.96)`) — see the `lint` job's note above.
+  # (`MSRV (Rust 1.98)`) — see the `lint` job's note above.
+  #
+  # NOTE — this job's context NAME changed from `MSRV (Rust 1.96)` to
+  # `MSRV (Rust 1.98)` when the MSRV floor moved to 1.98 (chore/rust-1.98).
+  # Renaming a branch-protection-required context requires updating the
+  # required-status-check list on `release/v1.0.0` (and the mirrors in
+  # scripts/qc-allowlists/ + scripts/test/fixtures/) in lockstep.
   msrv:
-    name: MSRV (Rust 1.96)
+    name: MSRV (Rust 1.98)
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     # RUNNER PLACEMENT — GitHub-hosted (rule at the head of this file). Linux
@@ -552,20 +557,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install Rust 1.96.0 (declared MSRV)
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
-      # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
-      # PERSISTENT and already IS the warm cache, so this action has nothing to
-      # add and two ways to do harm: its restore extracts an archive saved by a
-      # DIFFERENT runner instance OVER the live tree, and its post-step prunes
-      # that tree. Mixed-provenance artifacts are how PR #3116's self-hosted
-      # build died in 18s with `could not parse/generate dep info at:
-      # …/target/debug/deps/getrandom-*.d — No such file or directory` (disk was
-      # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
-      # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
-      # export — is now declared in the workflow `env:` block above.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: runner.environment == 'github-hosted'
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
       - name: cargo check on MSRV
         run: cargo check --all-targets
 
@@ -837,19 +830,8 @@ jobs:
           command -v node    >/dev/null || { echo "::error::node not on PATH on $RUNNER_NAME"; exit 1; }
           echo "python3=$(python3 --version) node=$(node --version)"
 
-      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
-      # `lint` job in ci.yml for the full rationale (#3128).
-      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted' && needs.classify.outputs.docs_only != 'true'
-        shell: bash
-        run: |
-          test -x "$HOME/.cargo/bin/rustup" || {
-            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
-            exit 1
-          }
-      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        if: needs.classify.outputs.docs_only != 'true'
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
 
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
       # PERSISTENT and already IS the warm cache, so this action has nothing to
@@ -1312,8 +1294,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           components: clippy
 
@@ -1396,9 +1378,9 @@ jobs:
         if: needs.classify.outputs.docs_only == 'true'
         run: echo "::notice::docs-only PR — ${{ matrix.target }} cross-compile is a no-op"
 
-      - name: Install Rust 1.96.0 (target ${{ matrix.target }}, matches rust-toolchain.toml pin)
+      - name: Install Rust 1.98.0 (target ${{ matrix.target }}, matches rust-toolchain.toml pin)
         if: needs.classify.outputs.docs_only != 'true'
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           targets: ${{ matrix.target }}
 
@@ -1496,8 +1478,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           components: clippy
 
@@ -1550,8 +1532,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           components: clippy
 

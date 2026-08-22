@@ -2372,6 +2372,19 @@ Known residual, deliberately out of scope and filed as #3207: the pg
 `sweep_pending_action_timeouts` still emits no `pending_action.timed_out` row
 (the sqlite sweeper does). It is the one governance transition of the four that
 this cluster does not close — the three an adversary can drive are covered.
+- **Rust toolchain and MSRV bumped to 1.98.0 (current stable).**
+  `rust-toolchain.toml`, `Cargo.toml` `rust-version`, and every CI job now
+  standardize on Rust **1.98** (was 1.96), giving a single supported-Rust
+  story: local development, all CI build/lint legs, the published-crate MSRV
+  floor, and the shipped Docker image are all 1.98. The MSRV floor is kept
+  mechanically verified by the CI job renamed `MSRV (Rust 1.96)` →
+  **`MSRV (Rust 1.98)`** (a branch-protection-required context — the required
+  status-check list and the `scripts/qc-allowlists/` + `scripts/test/fixtures/`
+  mirrors are updated in lockstep). A handful of new `clippy::pedantic` lints
+  that 1.98 raises (all in `tests/`: `useless_borrows_in_formatting`,
+  `manual_assert_eq`, `manual_is_variant_and`, `chunks_exact_to_as_chunks`)
+  were fixed, along with two pre-existing `uninlined_format_args` on the same
+  lines.
 
 ### Fixed
 

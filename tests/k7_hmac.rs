@@ -442,7 +442,9 @@ fn hex_decode(s: &str) -> Vec<u8> {
         return s.as_bytes().to_vec();
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    // `bytes.len()` is guaranteed even above, so the remainder is empty.
+    let (pairs, _rest) = bytes.as_chunks::<2>();
+    for pair in pairs {
         let hi = match pair[0] {
             b'0'..=b'9' => pair[0] - b'0',
             b'a'..=b'f' => pair[0] - b'a' + 10,
