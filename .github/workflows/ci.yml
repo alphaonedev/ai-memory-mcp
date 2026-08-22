@@ -105,7 +105,11 @@ jobs:
   # correctly reported `docs_only=false` on that same commit.
   classify:
     name: Classify changes
-    runs-on: ubuntu-latest
+    # v1.0.0 self-hosted CI — was ubuntu-latest; the classify decider is a
+    # toolchain-free git/bash gate, re-homed onto the enterprise-fed Linux
+    # node. The `- id: cls` two-base body is UNCHANGED (frozen by
+    # scripts/test/test-ci-workflow-invariants.sh §A).
+    runs-on: [self-hosted, linux-fed]
     outputs:
       docs_only: ${{ steps.cls.outputs.docs_only }}
       # v0.7.0 Task #12 (#1399) — test-impact selection output.
@@ -328,7 +332,7 @@ jobs:
     name: Lint (fmt + clippy)
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
@@ -373,7 +377,7 @@ jobs:
   # do not apply, and it always runs — which is the entire point.
   build-script-vetting:
     name: "Build-script custom-build ledger gate (#2635)"
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -415,7 +419,7 @@ jobs:
     name: actionlint (workflow-injection guard)
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
       - name: actionlint
@@ -438,7 +442,7 @@ jobs:
     name: MSRV (Rust 1.96)
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.96.0 (declared MSRV)
@@ -452,149 +456,97 @@ jobs:
   # and complete SUCCESS even on docs-only PRs. Per-step `if:` makes the
   # heavy work skip on docs-only diffs while the job still returns green
   # in <30 seconds.
+  # v1.0.0 self-hosted 2x2 correctness matrix. {linux-fed, macos-fed} nodes
+  # × {sqlite (default features), enterprise-fed (sal-postgres against the
+  # always-up native pg18.6+AGE1.8.0+pgvector0.8.6 tier)}. These four
+  # `Check (…)` job names are REQUIRED contexts on release/v1.0.0 — declared
+  # in scripts/qc-allowlists/required-contexts-release.txt — so all four
+  # expansions MUST run and complete SUCCESS even on docs-only PRs; the
+  # per-step docs-only guards keep the heavy work off while the contexts
+  # still report green in <30s.
+  #
+  # ONE matrix variable in the NAME (`matrix.leg`) — a hard requirement of
+  # scripts/check-required-contexts.sh, whose name-expander resolves EXACTLY
+  # one `${{ matrix.<key> }}` per job name (a two-placeholder name is
+  # "unexpandable" and fails rule (a)). `leg` carries the display string;
+  # `node`/`tier`, supplied by the same `include:` entry, drive `runs-on`
+  # and the feature/URL selection without appearing in the name.
+  #
+  # No GitHub-hosted disk-freeing / swap / simulator-purge steps: those
+  # `sudo rm -rf /usr/share/dotnet …` recipes are for the ephemeral hosted
+  # images and would DELETE real files on the persistent self-hosted hosts.
+  # The enterprise-fed tier is always up on each node, so there is no
+  # `services: postgres:` block and no per-PR pg image build.
   check:
-    name: Check (${{ matrix.os }})
+    name: Check (${{ matrix.leg }})
     needs: classify
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted, "${{ matrix.node }}"]
     # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
     # download on the semantic-tier CLI recall path) fails fast instead of
-    # pinning a runner for hours. Normal run is well under this.
-    timeout-minutes: 45
+    # pinning a runner for hours. Sized for the SLOWEST leg: the
+    # `enterprise-fed` tier runs the sal-postgres suite SINGLE-THREADED and
+    # CPU-contended by its sibling `sqlite` leg on the same self-hosted host,
+    # so its compile (~12 min, hoisted OUTSIDE the per-invocation watchdog)
+    # plus the 3300s (55 min) hang-watchdog can legitimately approach ~67
+    # min; this outer cap must sit above that so the watchdog — not the job
+    # cap — is what fires on a genuine hang (a job-level cancel is silent and
+    # nameless, the exact #1492 failure mode). The `sqlite` legs finish far
+    # under this (parallel suite + release build + audit, ~45 min observed),
+    # so the higher ceiling only adds headroom there.
+    timeout-minutes: 80
     env:
-      # #1407/#1405/#1387 — the ubuntu `cargo test` link step OOM'd the
-      # linker (`collect2: ld terminated with signal 7 [Bus error]`).
-      # Downgrade dev-profile debug info from level 2 (full DWARF) to
-      # level 1 (line tables only) to keep peak linker RSS under the
-      # ~7 GB ubuntu ceiling. Cross-OS safe: only narrows debuginfo,
-      # does not affect the `--release` build (debug=0). Mirrors the
-      # postgres-feature / coverage jobs' knob. Keep debug at 1 for the
-      # OOM posture above + readable backtraces.
+      # Keep dev-profile debug at level 1 (line tables) for readable
+      # backtraces without the full-DWARF link cost.
       CARGO_PROFILE_DEV_DEBUG: '1'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # 2x2 via `include:` so the single name variable `leg` co-varies with
+        # `node` (runs-on label) and `tier` (feature/URL selection).
+        include:
+          # `leg` carries NO whitespace: scripts/check-required-contexts.sh's
+          # name-expander word-splits matrix values on IFS, so a space in the
+          # value would fracture the expanded context name. Comma-without-space
+          # keeps both dimensions legible while staying one token.
+          - leg: linux-fed,sqlite
+            node: linux-fed
+            tier: sqlite
+          - leg: linux-fed,enterprise-fed
+            node: linux-fed
+            tier: enterprise-fed
+          - leg: macos-fed,sqlite
+            node: macos-fed
+            tier: sqlite
+          - leg: macos-fed,enterprise-fed
+            node: macos-fed
+            tier: enterprise-fed
     steps:
       - uses: actions/checkout@v4
 
       - name: docs-only short-circuit
         if: needs.classify.outputs.docs_only == 'true'
-        run: echo "::notice::docs-only PR — ${{ matrix.os }} matrix is a no-op"
+        run: echo "::notice::docs-only PR — ${{ matrix.leg }} matrix leg is a no-op"
 
-      # #1407 / #1405 / #1387 — free disk BEFORE Install Rust +
-      # Swatinem/rust-cache + Run tests. The runner image ships with
-      # ~14 GiB free; doctest linking under `cargo test` blows past
-      # the tmpfs ceiling once libai_memory's dep closure grew
-      # (PR #1397 L1-L4 capture work added ~80 files), producing
-      # `collect2: fatal error: ld terminated with signal 7
-      # [Bus error]` deterministically (#1407). Pruning ~35 GiB of
-      # unused runner tooling (.NET / CodeQL / Android SDK / GHC)
-      # here — BEFORE any cargo step — also keeps the partition
-      # where the actions-runner writes its own _diag/Worker_*.log
-      # tracing well clear of ENOSPC (#1405). Same root partition
-      # serves both, so one early cleanup closes both surfaces.
-      # Pure-shell fix per project no-external-code-injection rule
-      # (CLAUDE.md §"Sole-authority operator"). Each `rm -rf` is
-      # best-effort — runner image contents may shift between
-      # versions, and a missing path is benign.
-      - name: Free disk before tests (ubuntu-latest, #1407/#1405/#1387 fix)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
-        run: |
-          set -eu
-          echo "::group::Disk usage before cleanup"
-          df -h /
-          echo "::endgroup::"
-          sudo rm -rf /usr/share/dotnet              || true  # ~17 GiB
-          sudo rm -rf /opt/hostedtoolcache/CodeQL    || true  # ~5 GiB
-          sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
-          sudo rm -rf /opt/ghc                       || true  # ~5 GiB
-          sudo rm -rf /usr/local/.ghcup              || true  # ~6 GiB (#1810)
-          # #2960 — the existing pruning above (dotnet/CodeQL/android/ghc/
-          # ghcup) was no longer enough headroom for the grown ~200k-LOC +
-          # ~600-dep debug test-compile: run 31911087758 died with
-          # `rustc-LLVM ERROR: No space left on device` on this Check
-          # (ubuntu-latest) leg. Bring the Check reclaim up to parity with
-          # the (heavier, already-passing-on-space) Postgres + Coverage
-          # legs and additionally free the whole tool cache
-          # ($AGENT_TOOLSDIRECTORY = /opt/hostedtoolcache, ~10 GiB of
-          # Python/Node/Go/Ruby/PyPy) — safe here because setup-python /
-          # setup-node run AFTER this step and repopulate exactly the
-          # versions the conformance readers (#2452) need. Pure first-party
-          # shell per the no-external-code-injection rule; each rm is
-          # best-effort so a shifting runner image never fails the step.
-          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}"    || true  # ~10 GiB (#2960)
-          sudo rm -rf /usr/local/share/powershell /usr/local/share/chromium \
-                      /usr/local/share/boost /usr/local/lib/node_modules \
-                      /opt/google /usr/lib/jvm /opt/microsoft \
-                      /usr/share/swift /usr/share/miniconda || true  # ~15 GiB (#2960)
-          sudo docker system prune -af --volumes     || true  # ~4 GiB (#1810)
-          sudo apt-get autoremove --purge -y         || true
-          sudo apt-get clean
-          # #1810 — bring the Check job's pre-test disk cleanup up to parity
-          # with the (passing, heavier-llvm-cov) Coverage job, which already
-          # frees `.ghcup` + docker images. The full `cargo test` compile of
-          # all integration bins under DEV_DEBUG=1 (full debug symbols)
-          # exhausted the ubuntu runner disk on c3087e33 with
-          # `rustc-LLVM ERROR: No space left on device`; the extra ~10 GiB
-          # restores headroom. macOS Check + Coverage were unaffected.
-          # #1407 — add 8 GB swap on /mnt (ephemeral data disk) so the
-          # heavy lib-test link step has headroom above the ~7 GB RAM
-          # ceiling and stops dying with `ld ... signal 7 [Bus error]`.
-          # Mirrors the postgres-feature / coverage swap recipe.
-          sudo fallocate -l 8G /mnt/swapfile-1407
-          sudo chmod 600 /mnt/swapfile-1407
-          sudo mkswap /mnt/swapfile-1407
-          sudo swapon /mnt/swapfile-1407
-          echo "::group::Disk + memory after cleanup"
-          df -h /
-          free -h
-          echo "::endgroup::"
-
-      # #2960 — macOS reclaim. The macos-latest image ships a large bundled
-      # iOS/tvOS/watchOS Simulator runtime set (each ~7-13 GiB) that a
-      # pure-Rust host build + test suite never touches, plus their caches.
-      # Freeing them before any cargo/toolchain step gives the grown
-      # ~200k-LOC debug test-compile headroom on the same
-      # `rustc-LLVM ERROR: No space left on device` class the ubuntu leg
-      # hit (run 31911087758). Pure first-party shell (no external action)
-      # per the no-external-code-injection rule; every rm is best-effort so
-      # a shifting runner image never fails the step. The df -h before/after
-      # makes the freed space (or a non-disk root cause) visible in the log.
-      - name: Free disk before tests (macos-latest, #2960)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'macos-latest'
+      # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
+      # python3/node is a test FAILURE, not a silent pass. On the self-hosted
+      # fleet we do NOT use actions/setup-python / actions/setup-node: those
+      # actions try to populate the GitHub-hosted RUNNER_TOOL_CACHE default
+      # (/Users/runner/hostedtoolcache), which the `fate`/`fate_two` runner user
+      # cannot create (`mkdir: /Users/runner: Permission denied`), and
+      # RUNNER_TOOL_CACHE is runner-managed so .env cannot override it. The
+      # runners ship python3 + node pre-installed on PATH (f2 /usr/bin/python3
+      # 3.12 + /usr/bin/node v22; f1 /opt/homebrew/bin python3 3.14 + node v26),
+      # so ASSERT their presence instead of downloading — same fail-closed
+      # guarantee (an absent tool reds the step), no tool-cache write. The
+      # dedicated self-tested proof lives in c8-precheck.yml
+      # (`Non-Rust conformance-reader proof gate (#2452)`).
+      - name: Ensure python3 + node present (self-hosted; #2452 fail-closed)
+        if: needs.classify.outputs.docs_only != 'true'
         shell: bash
         run: |
-          set -u
-          echo "::group::Disk usage before cleanup (macOS)"
-          df -h /
-          echo "::endgroup::"
-          # Simulator runtimes + their caches — the biggest reclaimable set
-          # for a host-only Rust build; the toolchain (Command Line Tools /
-          # selected Xcode) is left untouched so the linker/clang stay intact.
-          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
-          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* || true
-          sudo rm -rf ~/Library/Developer/Xcode/iOS\ DeviceSupport/* || true
-          echo "::group::Disk usage after cleanup (macOS)"
-          df -h /
-          echo "::endgroup::"
-
-      # #2452 — tests/conformance_readers.rs is now FAIL-CLOSED: an absent
-      # python3/node is a test FAILURE, not a silent pass. Provision both
-      # explicitly rather than relying on what each runner image happens to
-      # ship. A controlled proof must
-      # not depend on an image accident: without these steps the fix would
-      # trade a silent pass for an environmental red, which is the pressure
-      # that gets a test deleted. The dedicated, self-tested proof lives in
-      # c8-precheck.yml (`Non-Rust conformance-reader proof gate (#2452)`).
-      - uses: actions/setup-python@v5
-        if: needs.classify.outputs.docs_only != 'true'
-        with:
-          python-version: '3.12'
-
-      - uses: actions/setup-node@v4
-        if: needs.classify.outputs.docs_only != 'true'
-        with:
-          node-version: '22'
+          command -v python3 >/dev/null || { echo "::error::python3 not on PATH on $RUNNER_NAME"; exit 1; }
+          command -v node    >/dev/null || { echo "::error::node not on PATH on $RUNNER_NAME"; exit 1; }
+          echo "python3=$(python3 --version) node=$(node --version)"
 
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         if: needs.classify.outputs.docs_only != 'true'
@@ -627,7 +579,7 @@ jobs:
       # nested build never flaked on ubuntu, and skipping the step there
       # keeps the tool build off the ubuntu critical path.
       - name: Prebuild t0 orchestrator (macOS e1 anti-flake, #1853)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'macos-latest'
+        if: needs.classify.outputs.docs_only != 'true' && matrix.node == 'macos-fed'
         shell: bash
         run: |
           set -euo pipefail
@@ -656,10 +608,86 @@ jobs:
       # cli_subcommand_count_invariant, memory_link_relation_count_invariant,
       # etc.) are always-on in the impact set so cross-cutting drift
       # the heuristic might otherwise miss still fails the build.
+      # v1.0.0 self-hosted 2x2 — enterprise-fed tier wiring. Only the
+      # `enterprise-fed` legs point at the node's always-up native pg tier
+      # (pg18.6 + AGE 1.8.0 + pgvector 0.8.6, TLS verify-full). The URL lives
+      # ONLY on that node's disk ($HOME/.ai-memory-ci-fed-url); reading it into
+      # $GITHUB_ENV switches on the `sal-postgres` integration cells. The
+      # `sqlite` legs deliberately leave AI_MEMORY_TEST_POSTGRES_URL UNSET so
+      # the pg-gated tests self-skip and the default (sqlite-bundled) build is
+      # what is exercised. psql for the native tier lives under a
+      # platform-specific prefix; prepend whichever exists.
+      # v1.0.0 per-job ephemeral database (concurrent-runner safety). With 4
+      # linux-fed + 3 macos-fed runner instances, multiple pg jobs can run on
+      # ONE node at once. Pointing every job at the shared `ai_memory_test`
+      # base db would collide (concurrent CREATE/DROP schema + shared tables ->
+      # flaky). Instead each enterprise-fed leg CREATEs its OWN uniquely-named
+      # db on the native tier, points the tests at it, and DROPs it in the
+      # always() cleanup step below. The base `ai_memory_test` is used ONLY as
+      # a maintenance connection to issue CREATE/DROP DATABASE. Fail-closed:
+      # a missing URL file or a failed CREATE reds the leg.
+      - name: Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        shell: bash
+        env:
+          # matrix.leg via env (never inlined into the script body) so the
+          # actionlint expression-injection guard stays satisfied; sanitised
+          # in-shell below into a pg-identifier-safe suffix.
+          LEG: ${{ matrix.leg }}
+        run: |
+          set -euo pipefail
+          # psql lives under a platform-specific prefix. Prepend it to
+          # GITHUB_PATH (for LATER steps: the test run + the always() cleanup)
+          # AND to THIS step's own PATH (GITHUB_PATH does not affect the current
+          # step) so the CREATE DATABASE below can find psql.
+          for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do
+            if [ -d "$d" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+              PATH="$d:$PATH"
+            fi
+          done
+          export PATH
+          url_file="$HOME/.ai-memory-ci-fed-url"
+          if [ ! -f "$url_file" ]; then
+            echo "::error::enterprise-fed leg on $RUNNER_NAME is missing $url_file — the native pg tier URL is not provisioned on this node"
+            exit 1
+          fi
+          base_url="$(cat "$url_file")"
+          # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=63
+          # chars). run_id+attempt make it unique across concurrent runs; the
+          # sanitised matrix leg keeps the two enterprise-fed legs distinct and
+          # never sharing a name with the cert-postgres-age job.
+          leg_sanitized="$(printf '%s' "$LEG" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '_')"
+          CI_FED_DB="$(printf '%s' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${leg_sanitized}" | cut -c1-63)"
+          # Compute-once, pass to the cleanup step via $GITHUB_ENV so create
+          # and drop use the byte-identical name.
+          echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"
+          # Create the ephemeral db on the base tier (connected to ai_memory_test).
+          if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
+            echo "::error::enterprise-fed leg on $RUNNER_NAME failed to CREATE DATABASE $CI_FED_DB on the native tier"
+            exit 1
+          fi
+          # Rewrite the base URL's db-name path segment (the last path segment,
+          # before any '?') to the ephemeral db, preserving every query param
+          # (sslmode/sslrootcert). The db name is [a-z0-9_] so needs no encoding.
+          case "$base_url" in
+            *\?*) q="?${base_url#*\?}"; head="${base_url%%\?*}" ;;
+            *)    q=""; head="$base_url" ;;
+          esac
+          new_url="${head%/*}/${CI_FED_DB}${q}"
+          # Provision the ephemeral db's extensions (the tier role is SUPERUSER).
+          if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
+            echo "::error::enterprise-fed leg on $RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"
+            exit 1
+          fi
+          echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"
+          echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"
+
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
         env:
           AI_MEMORY_NO_CONFIG: "1"
+          TIER: ${{ matrix.tier }}
           TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}
           TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
           TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
@@ -667,6 +695,53 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # v1.0.0 2x2 — tier-parametrised feature/thread selection. The
+          # `enterprise-fed` legs add `--features sal-postgres` and serialise
+          # DDL with `-- --test-threads=1` (the sal-postgres suite shares one
+          # database); the `sqlite` legs run the default build. $FEAT/$TAIL are
+          # word-split intentionally (no spaces inside their tokens) so the
+          # exact `cargo test --no-fail-fast $FEAT "$@" $TAIL` shape below stays
+          # a single line the #2500 --no-fail-fast invariant gate can see.
+          FEAT=""
+          TAIL=""
+          # #1492 hung-test watchdog cap (seconds), TIER-AWARE. The `sqlite`
+          # legs run the default suite in PARALLEL and finish fast, so 1500s
+          # is ample hang-detection headroom. The `enterprise-fed` legs run
+          # the sal-postgres suite SINGLE-THREADED (`-- --test-threads=1`, to
+          # serialise the shared-database DDL) — the exact discipline the
+          # release `postgres-feature` job uses, which measured a ~1605s
+          # runtime under a 2100s cap on a DEDICATED GitHub-hosted runner.
+          # On the self-hosted 2x2 the enterprise-fed leg runs CPU-CONTENDED
+          # (its sibling `sqlite` leg saturates every core of the same host
+          # while this leg is pinned to one), so the serialised run measured
+          # ~2231s on run 32515454158 (`--lib` 1019s directly timed +
+          # ~1212s integration extrapolated from 250/630 binaries reached
+          # before the old 1500s cap killed it — record_stop_r45_1955, being
+          # alphabetically late, never even started). 1500s therefore killed
+          # a suite that was still actively PASSING — the same class of
+          # regression the postgres-feature job already fixed by raising its
+          # cap. Because BOTH linux legs land on the SAME host (this leg pinned
+          # to one core while its sibling saturates the rest), that ~2231s is
+          # the NORMAL max-contention case, not an outlier, and other f2 jobs
+          # push it higher — so 3300s (~1.48x the measured runtime) buys real
+          # variance headroom rather than a knife-edge margin. The cap must
+          # stay a hang-detector, so the job-level `timeout-minutes` is the
+          # outer bound (see that key on this job).
+          WATCHDOG_SECS=1500
+          if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
+            FEAT="--features sal-postgres"
+            TAIL="-- --test-threads=1"
+            WATCHDOG_SECS=3300
+            echo "::notice::[enterprise-fed] cargo test $FEAT ... $TAIL (watchdog ${WATCHDOG_SECS}s)"
+          else
+            echo "::notice::[sqlite] cargo test (default features) (watchdog ${WATCHDOG_SECS}s)"
+          fi
+          # Durable audit artifact (#4): tee ALL test output to a per-leg log
+          # that the next step uploads. PIPESTATUS[0] preserves the real test
+          # exit code through the tee pipe (pipefail would otherwise mask it).
+          RESULT_LOG="${RUNNER_TEMP:-/tmp}/test-output-${TIER:-sqlite}.log"
+          echo "TEST_RESULT_LOG=$RESULT_LOG" >> "$GITHUB_ENV"
+          run_all() {
           echo "::group::test-impact decision"
           echo "reason: ${TEST_IMPACT_REASON:-unset}"
           echo "count:  ${TEST_IMPACT_COUNT:-unset} / ${TEST_IMPACT_TOTAL:-unset}"
@@ -676,14 +751,14 @@ jobs:
           # #1492 hung-test watchdog. libtest has no built-in per-test
           # timeout, so a single wedged integration test (e.g. an ephemeral
           # TCP port-bind / wait_for_ready race) used to stall this step
-          # silently until the job-level `timeout-minutes: 45` killed it —
-          # ~34 min of wasted budget and ZERO diagnosability (the hung
-          # test's name never printed). Wrap each invocation in GNU
-          # `timeout` so a hang fails the STEP fast (25 min < the 45 min
-          # job cap) with a named ::error:: pointing at the logged impact
-          # set, instead of a silent job-level cancel. SIGTERM lets libtest
-          # flush partial output; --kill-after escalates to SIGKILL for a
-          # truly wedged process.
+          # silently until the job-level `timeout-minutes` killed it —
+          # wasted budget and ZERO diagnosability (the hung test's name never
+          # printed). Wrap each invocation in GNU `timeout` (cap = the
+          # tier-aware $WATCHDOG_SECS set above) so a hang fails the STEP fast
+          # (< the job cap) with a named ::error:: pointing at the logged
+          # impact set, instead of a silent job-level cancel. SIGTERM lets
+          # libtest flush partial output; --kill-after escalates to SIGKILL
+          # for a truly wedged process.
           #
           # The #1492 hang was observed ONLY on the ubuntu runner, and the
           # watchdog is gated to Linux because macOS ships no `timeout`
@@ -692,7 +767,7 @@ jobs:
           # So restrict the watchdog to Linux (reliable GNU `timeout` +
           # POSIX process-group signal semantics over native test binaries)
           # and degrade to a bare `cargo test` everywhere else — the
-          # job-level `timeout-minutes: 45` cap still applies as the
+          # job-level `timeout-minutes` cap still applies as the
           # universal backstop (the pre-#1492 behaviour).
           TIMEOUT_BIN=""
           if [ "${RUNNER_OS:-}" = "Linux" ]; then
@@ -703,7 +778,7 @@ jobs:
             fi
           fi
           if [ -n "$TIMEOUT_BIN" ]; then
-            echo "::notice::[#1492] hung-test watchdog active via '$TIMEOUT_BIN' (1500s per invocation)"
+            echo "::notice::[#1492] hung-test watchdog active via '$TIMEOUT_BIN' (${WATCHDOG_SECS}s per invocation, tier=${TIER:-sqlite})"
           else
             echo "::notice::[#1492] watchdog disabled on ${RUNNER_OS:-unknown} (Linux-only; job-level timeout-minutes still applies)"
           fi
@@ -711,13 +786,14 @@ jobs:
             local label="$1"; shift
             local rc=0
             # #1989: COMPILE the test binaries OUTSIDE the watchdog first, so
-            # the 1500s per-invocation cap times test RUNTIME (the hang-detection
-            # purpose) rather than compile+run wall-time. The __ALL__ tag path
-            # builds ~448 debug integration binaries; that compile legitimately
-            # grew past 1500s during the v1.0.0 epic, which the watchdog was
-            # misreading as a hang (it is not — the full suite runs to
-            # completion). The job-level `timeout-minutes` cap still bounds the
-            # build. A genuine runtime hang still trips the 1500s below.
+            # the $WATCHDOG_SECS per-invocation cap times test RUNTIME (the
+            # hang-detection purpose) rather than compile+run wall-time. The
+            # __ALL__ tag path builds ~448 debug integration binaries; that
+            # compile legitimately grew past the cap during the v1.0.0 epic,
+            # which the watchdog was misreading as a hang (it is not — the full
+            # suite runs to completion). The job-level `timeout-minutes` cap
+            # still bounds the build. A genuine runtime hang still trips the
+            # $WATCHDOG_SECS cap below.
             cargo test --no-run "$@" || return "$?"
             # `--no-fail-fast` (#2500) — see the identical rationale on
             # `pg_test` in the postgres-feature job below. Cargo otherwise
@@ -726,16 +802,19 @@ jobs:
             # every later binary. Probed: the flag does not change the exit
             # code (a failing run stays non-zero), so it cannot mask a real
             # failure — it only stops the run from throwing away evidence.
-            # Runtime stays bounded by the 1500s per-invocation watchdog
-            # below plus the job-level `timeout-minutes`.
+            # Runtime stays bounded by the $WATCHDOG_SECS per-invocation
+            # watchdog below plus the job-level `timeout-minutes`. The tier's feature
+            # flag + `-- --test-threads=1` arrive via "$@" from the call sites
+            # (folded into $FEAT/$TAIL there), so these two cargo lines stay the
+            # exact `... "$@" ...` shape the #2657 / #2500 invariant gates pin.
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 1500 cargo test --no-fail-fast "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --no-fail-fast "$@" || rc=$?
             else
               cargo test --no-fail-fast "$@" || rc=$?
             fi
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-                echo "::error::[#1492 watchdog] '${label}' exceeded the 1500s per-invocation timeout and was terminated (previously a silent ~34min hang until the 45min job cap). Reproduce with the impact set logged above; then file a follow-up for the specific flaky test."
+                echo "::error::[#1492 watchdog] '${label}' exceeded the ${WATCHDOG_SECS}s per-invocation timeout (tier=${TIER:-sqlite}) and was terminated (previously a silent ~34min hang until the job cap). Reproduce with the impact set logged above; then file a follow-up for the specific flaky test."
               fi
               return "$rc"
             fi
@@ -746,423 +825,152 @@ jobs:
               echo "::notice::docs-only diff — test step is a no-op"
               ;;
             __ALL__|"")
-              echo "::notice::running FULL test suite"
-              run_tests "full suite (cargo test)"
+              echo "::notice::running FULL test suite (tier=${TIER:-sqlite})"
+              # $FEAT/$TAIL are UNQUOTED on purpose: on enterprise-fed they
+              # word-split into `--features sal-postgres` before and
+              # `-- --test-threads=1` after "$@"; on sqlite both are empty.
+              run_tests "full suite (cargo test)" $FEAT $TAIL
               ;;
             *)
               # Always run --lib first (catches every inline unit test)
-              echo "::notice::running cargo test --lib + impact-selected integration binaries"
-              run_tests "cargo test --lib" --lib
+              echo "::notice::running cargo test --lib + impact-selected integration binaries (tier=${TIER:-sqlite})"
+              run_tests "cargo test --lib" $FEAT --lib $TAIL
               # Dispatch each impacted tests/*.rs binary
               ARGS=()
               for t in $TEST_IMPACT; do
                 ARGS+=(--test "$t")
               done
-              run_tests "impact-selected integration binaries (${TEST_IMPACT})" "${ARGS[@]}"
+              run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL
               ;;
           esac
+          }
+          # Run the whole dispatch, teeing to the durable per-leg log. errexit +
+          # pipefail (set at the top of this step) stay ON through the pipe: if
+          # any run_tests fails, run_all's subshell aborts at that point and the
+          # pipeline's non-zero status (pipefail — tee itself exits 0) fails the
+          # step. A later passing invocation therefore cannot mask an earlier
+          # failure, and the completed pipe flushes the log before the upload
+          # step reads it. No `set +e`/PIPESTATUS dance — that would have
+          # disabled the fail-fast the invariants depend on.
+          run_all 2>&1 | tee "$RESULT_LOG"
 
+      # Durable audit-history artifact (#4). Uploaded on success AND failure so
+      # a red leg's full output is retrievable long after the log view expires.
+      # A real JUnit XML would require swapping the runner to cargo-nextest —
+      # deliberately avoided here so the #1492 watchdog + #2500 --no-fail-fast +
+      # impact-aware dispatch invariants keep their exact `cargo test` shape;
+      # the captured log is the honest durable record of what ran.
+      - name: Upload test results (durable audit history)
+        if: needs.classify.outputs.docs_only != 'true' && always() && env.TEST_RESULT_LOG != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.node }}-${{ matrix.tier }}
+          path: ${{ env.TEST_RESULT_LOG }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # cargo-audit runs once (the advisory DB is platform-independent) — on
+      # the linux-fed sqlite leg so it does not multiply across the 2x2.
       - name: Security audit
-        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
+        if: needs.classify.outputs.docs_only != 'true' && matrix.node == 'linux-fed' && matrix.tier == 'sqlite'
         run: |
           cargo install cargo-audit --locked
           cargo audit
 
-      # Drop dev-profile artefacts now that the test step is complete
-      # so the subsequent `cargo build --release` link has headroom on
-      # the ubuntu-latest tmpfs. Keeps the dep cache (proc-macros,
-      # build-scripts) so the release build doesn't recompile from
-      # scratch. The big runner-image cleanup ran earlier (see
-      # 'Free disk before tests' step above, #1407/#1405).
-      - name: Trim target/debug before release build (ubuntu-latest)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
-        run: |
-          set -eu
-          echo "::group::Disk usage before cargo clean"
-          df -h /
-          du -sh target 2>/dev/null || true
-          echo "::endgroup::"
-          cargo clean --profile dev || true
-          echo "::group::Disk usage after cargo clean"
-          df -h /
-          du -sh target 2>/dev/null || true
-          echo "::endgroup::"
-
       # CI-speed: the release build here is only a release-PROFILE compile
       # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are
       # produced by release.yml on tag, and a release-profile-only break that
-      # the debug `cargo test` build on ubuntu wouldn't already catch is
-      # vanishingly rare for this pure-Rust + bundled-sqlite crate. Running it
-      # on ubuntu ONLY takes it off the macos critical path (-~400s) — the
-      # prep `cargo clean` step above is already ubuntu-only.
-      - name: Build release (ubuntu — release-profile smoke)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
+      # the debug `cargo test` build wouldn't already catch is vanishingly rare
+      # for this pure-Rust + bundled-sqlite crate. Run it on ONE leg
+      # (linux-fed / sqlite) so it does not multiply across the 2x2. No
+      # target/debug trim step: the self-hosted host has ample disk (the old
+      # `cargo clean --profile dev` was a hosted-runner tmpfs workaround and
+      # would only cold-start the shared cache here).
+      - name: Build release (linux-fed — release-profile smoke)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.node == 'linux-fed' && matrix.tier == 'sqlite'
         run: cargo build --release
 
-  # M16 — Postgres-feature gate. The cross-platform `check` matrix above
-  # exercises the default build only; the `sal-postgres` adapter relies on
-  # sqlx + pgvector + AGE (Apache AGE 1.5 on Postgres 16), which is
-  # Linux-only at build-time. This job adds:
-  #   1. A service container running postgres:16 with pgvector + AGE
-  #      preinstalled (image: pgvector/pgvector:pg16, then `CREATE
-  #      EXTENSION age` inside the SAL test fixture).
-  #   2. `cargo test --features sal-postgres` exercising BOTH the lib
-  #      unit suite AND the 17 postgres integration test binaries
-  #      (`tests/{g1..g5,governance_postgres,postgres_schema_parity,
-  #      s79_postgres,sal_v07_postgres,serve_postgres_*,
-  #      federation_postgres_*}.rs`). Until v0.7.0 cluster-I this job
-  #      ran with `--lib`, which silently excluded the integration
-  #      binaries — ~56 `#[tokio::test]` cases compiled but never ran
-  #      under the feature gate (issue #767, finding COV-1). Tests
-  #      gated by `AI_MEMORY_TEST_POSTGRES_URL` (e.g.
-  #      g3_postgres_verify_link_signature_roundtrip,
-  #      postgres_memory_kind_backfill) self-skip when the URL is
-  #      unset; the AI_MEMORY_TEST_POSTGRES_URL set below switches
-  #      them on against the service container.
-  #   3. Clippy pedantic at the same feature gate so the postgres-only
-  #      code paths inherit the same lint budget as the default build.
-  # The lint advisory job above (`lint`) only runs `cargo clippy` at
-  # default features, so a `clippy::pedantic` lint regression that only
-  # surfaces with `sal-postgres` would otherwise slip through.
-  # Skipped on docs-only PRs alongside the rest of the heavy matrix.
+      # Drop the per-job ephemeral db (created by "Configure enterprise-fed
+      # tier" above). always() so a failed/cancelled test run still reclaims
+      # it. Guarded on CI_FED_DB so it no-ops on the sqlite legs (where it was
+      # never set) and if the configure step failed before creating the db.
+      - name: Cleanup enterprise-fed ephemeral db
+        # always() so a failed/cancelled test run still reclaims the db, but
+        # still docs_only-guarded (rule (b3)): on a docs-only run the configure
+        # step is skipped, no db is created, so there is nothing to drop.
+        if: always() && needs.classify.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CI_FED_DB:-}" ]; then
+            echo "::notice::no ephemeral db to drop (CI_FED_DB unset — sqlite leg or configure never ran)"
+            exit 0
+          fi
+          # Re-derive psql on PATH defensively (GITHUB_PATH from the configure
+          # step normally carries it, but this step must not depend on that).
+          for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do
+            [ -d "$d" ] && PATH="$d:$PATH"
+          done
+          export PATH
+          url_file="$HOME/.ai-memory-ci-fed-url"
+          if [ ! -f "$url_file" ]; then
+            echo "::warning::cannot drop $CI_FED_DB — $url_file missing on $RUNNER_NAME (leaked ephemeral db)"
+            exit 0
+          fi
+          base_url="$(cat "$url_file")"
+          # Connect to the base ai_memory_test to drop the ephemeral db. FORCE
+          # terminates any lingering backend so the drop cannot wedge on a
+          # still-connected test process.
+          if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
+            echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"
+          else
+            echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
+          fi
+
+  # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
+  #
+  # v1.0.0 self-hosted rewrite. Under the old GitHub-hosted topology this job
+  # spun up a `services: pgvector/pgvector:pg16` container and ran the whole
+  # sal-postgres integration suite. That coverage now lives in the 2x2 `check`
+  # matrix's `enterprise-fed` legs, which run the sal-postgres tests against
+  # the node's ALWAYS-UP native pg18.6 + AGE 1.8.0 + pgvector 0.8.6 tier — a
+  # truer target than a throwaway pg16 container. So there is no `services:`
+  # block, no per-PR pg image, no mold/disk/swap hosted-runner hacks here.
+  #
+  # What this job still uniquely owns is the CI-parity CLIPPY leg for the
+  # `sal-postgres` feature: `clippy --features sal-postgres --tests` at
+  # `-D warnings -D clippy::all -D clippy::pedantic`. The `check` matrix
+  # COMPILES + RUNS that feature but does not run pedantic clippy over its
+  # test targets, and the default-features `lint` job cannot see the
+  # postgres-only code paths — so a pedantic regression that only surfaces
+  # under `sal-postgres` would otherwise slip through. Keeping the required
+  # context name `Postgres feature gate` unchanged means branch protection
+  # needs no edit for this job. Retains its job-level `if:` (docs-only skip),
+  # tracked in required-contexts-joblevel-if-allow.txt like the other gates.
   postgres-feature:
     name: Postgres feature gate
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
-    # #1487 — bound the job so a wedged test can't pin the runner.
-    timeout-minutes: 45
-    env:
-      # v0.7.x (#1148) — mold linker + line-only DWARF to keep peak
-      # linker RSS under the 7 GB ubuntu-latest ceiling for the heavy
-      # `--features sal-postgres` build (sqlx + sqlx-postgres + AGE +
-      # pgvector = massive symbol table).
-      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # Drop dev-profile debug info entirely (level 0). The Postgres
-      # feature gate uses the dev profile via `cargo test`, not the
-      # `coverage` profile, so the env-var override is the cleanest knob.
-      # #1744: line-table DWARF on the heavy sal-postgres test binaries
-      # cost GBs of target/ space — enough to exhaust the ~14 GB runner
-      # disk during the test compile ("No space left on device", run
-      # 27818775169). The #1492 hung-test watchdog uses timeout(1), not
-      # symbolized backtraces, so debug info buys nothing here.
-      CARGO_PROFILE_DEV_DEBUG: "0"
-    services:
-      postgres:
-        # pgvector/pgvector:pg16 ships postgres 16 with pgvector already
-        # built; AGE is `CREATE EXTENSION`-installed by the
-        # `serve_postgres_smoke` fixture when AI_MEMORY_TEST_POSTGRES_URL
-        # is set. If a future AGE-as-a-service container appears, swap
-        # this image; the rest of the job stays.
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: ai_memory
-          POSTGRES_PASSWORD: ai_memory_ci
-          POSTGRES_DB: ai_memory_ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U ai_memory -d ai_memory_ci"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+    runs-on: [self-hosted, linux-fed]
+    # #1487 — bound the job so a wedged compile can't pin the runner.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free disk + add swap (#1148 belt-and-suspenders, aggressive)
-        run: |
-          # Aggressive cleanup — the sal+sal-postgres instrumented
-          # coverage build's target/llvm-cov-target/ can exceed 20 GB
-          # under heavy integration-test instrumentation. Free
-          # everything we don't need before building.
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
-                      /usr/local/share/powershell /usr/local/share/chromium \
-                      /usr/local/share/boost /usr/local/lib/node_modules \
-                      /opt/google /usr/lib/jvm /opt/microsoft \
-                      /usr/share/swift /usr/share/miniconda || true
-          # #2960 — also free the whole tool cache ($AGENT_TOOLSDIRECTORY =
-          # /opt/hostedtoolcache, ~10 GiB). Nothing after this step reads it
-          # (Rust comes via rustup, jq/postgresql-client via apt, python3 is
-          # the system /usr/bin/python3), so this is pure additional headroom
-          # for the sal-postgres test-compile that ran out of space on
-          # run 31911087758.
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
-          sudo docker system prune -af --volumes || true
-          sudo apt-get autoremove --purge -y || true
-          sudo apt-get clean
-          # Swap on /mnt (the ephemeral data disk, ~70 GB) so the 8 GB
-          # doesn't eat into the root partition.
-          sudo fallocate -l 8G /mnt/swapfile-1148
-          sudo chmod 600 /mnt/swapfile-1148
-          sudo mkswap /mnt/swapfile-1148
-          sudo swapon /mnt/swapfile-1148
-          echo "::group::memory + disk after"
-          free -h
-          df -h /
-          df -h /mnt
-          echo "::endgroup::"
 
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
-      - name: Install mold linker (#1148, pinned+bounded #3090)
-        timeout-minutes: 6
-        env:
-          MOLD_VERSION: "2.4.1"
-        run: |
-          set -euo pipefail
-          # ------------------------------------------------------------------
-          # #3090 — the old body was a bare `apt-get update && apt-get install
-          # -y mold` with NO step timeout, NO retry, NO pin. When the Azure apt
-          # mirror stalled, the step blocked until the JOB `timeout-minutes`
-          # fired (75 on coverage) — a ~1h15m flake per PR. This step is now
-          # idempotent, PINNED, time-bounded (step `timeout-minutes` above +
-          # per-command GNU `timeout`), retried once, and FAILS LOUD (exit 1)
-          # rather than hanging if mold cannot be fetched. Primary path pulls a
-          # pinned first-party mold release tarball from github.com (the infra
-          # the runner already trusts) into /usr/local/bin, removing the flaky
-          # apt mirror from the happy path; apt is the bounded fallback only. No
-          # external Action is added (repo no-external-code-injection rule).
-          # ------------------------------------------------------------------
-          if command -v mold >/dev/null 2>&1 && mold --version | grep -q "${MOLD_VERSION}"; then
-            echo "mold ${MOLD_VERSION} already present: $(mold --version)"; exit 0
-          fi
-          install_from_tarball() {
-            local arch tgz url dir ok attempt
-            arch="$(uname -m)"
-            tgz="mold-${MOLD_VERSION}-${arch}-linux.tar.gz"
-            url="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${tgz}"
-            dir="$(mktemp -d)"; ok=0
-            for attempt in 1 2; do
-              if timeout 120 curl -fsSL --retry 2 --retry-delay 3 -o "${dir}/${tgz}" "${url}"; then
-                ok=1; break
-              fi
-              echo "mold tarball fetch attempt ${attempt} failed; retrying" >&2; sleep 3
-            done
-            [ "${ok}" = 1 ] || return 1
-            tar -xzf "${dir}/${tgz}" -C "${dir}"
-            sudo install -m0755 "${dir}/mold-${MOLD_VERSION}-${arch}-linux/bin/mold" /usr/local/bin/mold
-            sudo ln -sf /usr/local/bin/mold /usr/local/bin/ld.mold
-          }
-          install_from_apt() {
-            local ok attempt; ok=0
-            for attempt in 1 2; do
-              if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y mold; then
-                ok=1; break
-              fi
-              echo "apt mold install attempt ${attempt} failed; retrying" >&2; sleep 5
-            done
-            [ "${ok}" = 1 ]
-          }
-          if ! install_from_tarball; then
-            echo "::warning::pinned mold tarball unavailable — falling back to apt"
-            install_from_apt || { echo "::error::mold install failed (tarball + apt both failed)"; exit 1; }
-          fi
-          command -v mold >/dev/null 2>&1 || { echo "::error::mold not on PATH after install"; exit 1; }
-          mold --version
-
       - uses: Swatinem/rust-cache@v2
         with:
           # CI-speed (#3089) — save the cache only on trunk `push` events;
-          # PR + merge_group runs restore-only. See the `check` job above for
-          # the full rationale (no cache poison from a failed PR compile; no
-          # LRU eviction of the warm trunk cache). No new Action introduced.
+          # PR + merge_group runs restore-only. See the `check` job for the
+          # full rationale.
           save-if: ${{ github.event_name == 'push' }}
-
-      - name: Wait for postgres readiness
-        run: |
-          set -euo pipefail
-          for i in $(seq 1 30); do
-            if pg_isready -h localhost -p 5432 -U ai_memory -d ai_memory_ci >/dev/null 2>&1; then
-              echo "::notice::postgres is up"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::warning::postgres did not become ready within 60s — postgres-gated tests will soft-skip"
 
       - name: Clippy (sal-postgres feature, lib + tests)
         run: cargo clippy --features sal-postgres --tests -- -D warnings -D clippy::all -D clippy::pedantic
-
-      - name: Reclaim disk before test compile (#1744)
-        run: |
-          # #1744 — the Clippy step above lands a full sal-postgres debug
-          # build in target/. The test step then compiles the test
-          # binaries on top, and the sum overflowed the ~14 GB runner disk
-          # ("No space left on device", run 27818775169). The one-shot
-          # "Free disk" step runs before Clippy, too early to help the
-          # test-compile peak. Drop the Clippy-only incremental + dep
-          # artifacts here so the test compile starts with headroom; the
-          # crate's own fresh objects rebuild cheaply.
-          echo "::group::disk before reclaim"
-          df -h /
-          du -sh target 2>/dev/null || true
-          echo "::endgroup::"
-          rm -rf target/debug/incremental || true
-          cargo clean -p ai-memory 2>/dev/null || true
-          echo "::group::disk after reclaim"
-          df -h /
-          echo "::endgroup::"
-
-      - name: Run lib + integration tests (sal-postgres feature, impact-aware)
-        env:
-          AI_MEMORY_NO_CONFIG: "1"
-          # Soft-skip pattern: postgres-gated integration tests check
-          # this var and self-skip if absent. We set it so the AGE-gated
-          # tests at least attempt the connection; when AGE isn't
-          # available those tests log a skip and exit 0 (see
-          # `tests/age_cte_equivalence.rs` for the gating logic).
-          AI_MEMORY_TEST_POSTGRES_URL: postgres://ai_memory:ai_memory_ci@localhost:5432/ai_memory_ci
-          TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}
-          TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
-          TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
-          TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
-        shell: bash
-        # v0.7.0 Task #12 (#1399) — test-impact-aware dispatch over the
-        # sal-postgres feature gate. Same triage tree as the default
-        # `check` job's test step plus:
-        # 1. The `--features sal-postgres` flag is non-negotiable —
-        #    that's the entire point of this gate (lib + 17 postgres
-        #    integration binaries that the default build doesn't
-        #    compile).
-        # 2. `-- --test-threads=1` serialises postgres-init DDL across
-        #    workers. Cluster-I (COV-1, issue #767): dropping `--lib`
-        #    so integration binaries actually run; pre-#767 only the
-        #    lib unit suite executed under this gate.
-        # 3. The impact-selected branch ALSO passes
-        #    `-- --test-threads=1` for the same per-DDL serialisation
-        #    discipline.
-        run: |
-          set -euo pipefail
-          echo "::group::sal-postgres test-impact decision"
-          echo "reason: ${TEST_IMPACT_REASON:-unset}"
-          echo "count:  ${TEST_IMPACT_COUNT:-unset} / ${TEST_IMPACT_TOTAL:-unset}"
-          echo "impact: ${TEST_IMPACT:-unset}"
-          echo "::endgroup::"
-
-          # #1492 hung-test watchdog (postgres-gate arm). The default
-          # `check` job already wraps its test step in GNU `timeout`; this
-          # gate needs the same guard because run 26998232157 cancelled
-          # here: the `embedding_dim_migration` binary hung ~26 min on a
-          # leaked Postgres advisory lock (a `PublicSchemaLock` Drop bug
-          # released the lock from a cross-runtime sqlx pool, which failed
-          # 100% and leaked the lock; the next test's unbounded
-          # `pg_advisory_lock` then blocked until the 45-min job cap). The
-          # test-side defect is fixed in tests/common/postgres_env.rs, but
-          # the watchdog stays so any future hang fails the STEP fast (25
-          # min < the 45-min job cap) with a named ::error:: instead of a
-          # silent job-level cancel. This job is always Linux (ubuntu + a
-          # postgres service container), so GNU coreutils `timeout` is
-          # reliably present — no per-OS gating needed (unlike the cross-OS
-          # `check` matrix).
-          TIMEOUT_BIN=""
-          if command -v gtimeout >/dev/null 2>&1; then
-            TIMEOUT_BIN=gtimeout
-          elif timeout --version 2>/dev/null | grep -qi coreutils; then
-            TIMEOUT_BIN=timeout
-          fi
-          if [ -n "$TIMEOUT_BIN" ]; then
-            echo "::notice::[#1492] sal-postgres hung-test watchdog active via '$TIMEOUT_BIN' (2100s per invocation; 1500s budget outgrown by the 2026-06-10 GA-drive suite — tests were actively passing at the old cap's kill, run 27251985404)"
-          else
-            echo "::warning::[#1492] sal-postgres watchdog could not find GNU timeout — relying on job-level timeout-minutes"
-          fi
-          pg_test() {
-            local label="$1"; shift
-            local rc=0
-            # #2657: COMPILE the test binaries OUTSIDE the watchdog first, so the
-            # 2100s per-invocation cap times test RUNTIME (the hang-detection
-            # purpose) rather than compile+run wall-time. This is the same fix
-            # #1989 applied to `run_tests` in the `check` job above; that issue
-            # fixed one of the two near-identical runners and left this twin
-            # untouched, so the postgres gate kept timing compile+run.
-            #
-            # MEASURED on run 30718303500 attempt 2: the timed invocation began
-            # 22:16:43 and the first `Running tests/...` line did not appear
-            # until 22:24:41 — 478s (23% of the 2100s cap) spent compiling 316
-            # crates INSIDE the window. Tests then ran 1605s before the kill;
-            # 478 + 1605 = 2083s against the 2100s cap, and the SIGTERM landed
-            # 99% of the way through (547 of 550 binaries had run; only
-            # wire_check_sole_path_pin, wt_1_a_schema_migration, wt1c_mcp_atomise
-            # and zeroize_secret_holders_1258 never started). Nothing hung — the
-            # watchdog was measuring the build.
-            #
-            # The failure mode this closes is a silent, GROWING one: compile time
-            # rises with every test file added, so each new binary shrinks the
-            # runtime budget the cap actually grants. Hoisting the build is the
-            # correct fix rather than raising the cap, which would only reset the
-            # same curve and have to be raised again; the cap must keep timing
-            # hang-detection alone. The job-level `timeout-minutes` still bounds
-            # the build, and a genuine runtime hang still trips the 2100s below.
-            #
-            # `|| return "$?"` is load-bearing: a compile failure must fail the
-            # job here, not fall through into a `timeout` run that would report a
-            # confusing second error. `cargo test --no-run` accepts (and ignores)
-            # the trailing `-- --test-threads=1` that every call site passes —
-            # verified on cargo 1.96.0 for all three arg shapes used below
-            # (bare, `--lib`, and repeated `--test <name>`): exit 0, zero tests
-            # executed.
-            cargo test --no-run "$@" || return "$?"
-            # `--no-fail-fast` (#2500) — DIAGNOSTIC COMPLETENESS. Without it,
-            # cargo exits after the FIRST failing test executable and every
-            # later binary is never run. That is not hypothetical: on PR
-            # #2497's run 30518877707 ATTEMPT 1 (job 90794703373 — the
-            # attempt the default `/runs/{id}/jobs` endpoint hides, since it
-            # returns only the latest attempt), `e2_post_ship_dry_run` failed
-            # on a crates.io `[16] Error in the HTTP2 framing layer` during
-            # its nested `cargo build`, the invocation aborted, and the job
-            # log ENDS there — `tests/federation_delete_ns_scope_2488_pg.rs`,
-            # the binary that proves a CWE-284 GA-blocker closed on postgres,
-            # appears nowhere in it. A network hiccup in an unrelated tool
-            # crate silently withheld the evidence the PR existed to produce.
-            #
-            # SAFE, and probed rather than assumed: `--no-fail-fast` does NOT
-            # change the verdict. Measured on a 2-binary throwaway crate —
-            # default: 2 binaries run, the later one never reached, exit 101;
-            # with the flag: 3 run, the later one reached, exit STILL 101. It
-            # can only ever turn a red run into a red run with more evidence,
-            # never a red run green.
-            #
-            # The usual argument for fail-fast — bounding runtime on a broken
-            # build — is already covered by the #1492 watchdog above, which
-            # caps EACH invocation at 2100s independently of how many binaries
-            # it runs, with `timeout-minutes` as the outer bound. With a
-            # per-invocation cap in place, fail-fast buys early termination at
-            # the cost of diagnostic completeness, and the discarded remainder
-            # is exactly where the proof lives.
-            if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 2100 cargo test --no-fail-fast "$@" || rc=$?
-            else
-              cargo test --no-fail-fast "$@" || rc=$?
-            fi
-            if [ "$rc" -ne 0 ]; then
-              if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-                echo "::error::[#1492 watchdog] sal-postgres '${label}' exceeded the 2100s per-invocation timeout and was terminated (previously a silent hang until the 45min job cap; see run 26998232157 embedding_dim_migration / leaked advisory lock). Reproduce with the impact set logged above."
-              fi
-              return "$rc"
-            fi
-          }
-
-          case "${TEST_IMPACT:-__ALL__}" in
-            __SKIP__)
-              echo "::notice::docs-only diff — sal-postgres test step is a no-op"
-              ;;
-            __ALL__|"")
-              echo "::notice::running FULL sal-postgres test suite"
-              pg_test "full sal-postgres suite" --features sal-postgres -- --test-threads=1
-              ;;
-            *)
-              echo "::notice::running --lib + impact-selected sal-postgres integration binaries"
-              pg_test "sal-postgres --lib" --features sal-postgres --lib -- --test-threads=1
-              ARGS=()
-              for t in $TEST_IMPACT; do
-                ARGS+=(--test "$t")
-              done
-              pg_test "impact-selected sal-postgres binaries (${TEST_IMPACT})" --features sal-postgres "${ARGS[@]}" -- --test-threads=1
-              ;;
-          esac
 
   # v0.7.0 Posture-1a (issue #1068) — mobile cross-compile gate.
   # Verifies that the `--features sqlite-bundled --lib` build cross-compiles
@@ -1300,31 +1108,15 @@ jobs:
     name: SAL-only feature gate
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    # v1.0.0 self-hosted — re-homed onto the enterprise-fed Linux node. The
+    # old GitHub-hosted `Free disk` step (sudo rm -rf /usr/share/dotnet …) is
+    # removed: it targeted the ephemeral hosted image and would delete real
+    # files on the persistent host. The self-hosted host has ample disk.
+    runs-on: [self-hosted, linux-fed]
     # #1487 — bound the job so a wedged test can't pin the runner.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-
-      # #1405 — the sal-feature release build (`cargo build --release
-      # --features sal`) is heavy enough to risk both rust-lld tmpfs
-      # exhaustion and runner _diag-log ENOSPC. Prune unused runner
-      # tooling early so neither surface trips this job. Same recipe as
-      # the `check` and `coverage` jobs.
-      - name: Free disk (ubuntu-latest, #1405 fix)
-        run: |
-          set -eu
-          echo "::group::Disk usage before cleanup"
-          df -h /
-          echo "::endgroup::"
-          sudo rm -rf /usr/share/dotnet              || true  # ~17 GiB
-          sudo rm -rf /opt/hostedtoolcache/CodeQL    || true  # ~5 GiB
-          sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
-          sudo rm -rf /opt/ghc                       || true  # ~5 GiB
-          sudo apt-get clean
-          echo "::group::Disk usage after cleanup"
-          df -h /
-          echo "::endgroup::"
 
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@1.96.0
@@ -1359,7 +1151,7 @@ jobs:
     name: vectorlite feature gate
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     # #1487 — bound the job so a wedged test can't pin the runner.
     timeout-minutes: 30
     steps:
@@ -1403,7 +1195,7 @@ jobs:
   dockerfile-validate:
     name: Dockerfile build (no push)
     needs: classify
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     # Skip on tag pushes — the docker job below handles those (with push).
     if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' }}
     steps:

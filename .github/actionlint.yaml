@@ -8,3 +8,11 @@
 self-hosted-runner:
   labels:
     - ubuntu-24.04-arm
+    # v1.0.0 self-hosted CI (chore/ci-self-hosted-2x2). The enterprise-fed
+    # runner fleet exposes two labels used alongside the built-in
+    # `self-hosted` label: `linux-fed` (host pop-os/f2) and `macos-fed`
+    # (host f1/FROSTYi). Registering them here teaches actionlint 1.7.1 they
+    # are known runner labels; they are real self-hosted runners (unlike
+    # `ubuntu-24.04-arm` above, which is a GitHub-hosted label).
+    - linux-fed
+    - macos-fed

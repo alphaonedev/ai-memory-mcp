@@ -78,7 +78,7 @@ concurrency:
 jobs:
   c8-precheck:
     name: C8 caller-context allowlist check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +87,7 @@ jobs:
 
   vendor-literal-gate:
     name: Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -112,7 +112,7 @@ jobs:
     # scripts/check-required-contexts.sh hard-fails the unquoted form
     # repo-wide, so this cannot silently re-land.
     name: "L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)"
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     # v0.9.0 §25.3 S5 — the epoch-closure lane ships under strictly ruled
     # public identifiers; certain internal design-doc identifiers are
@@ -131,7 +131,7 @@ jobs:
 
   hardcoded-literal-gate:
     name: Hardcoded-literal duplication ratchet (pm-v3.1)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     # Operator directive (~6mo, escalated 2026-06-09): no hardcoded literal
     # values; no literals embedded in variable/constant names. Instructions
@@ -160,7 +160,7 @@ jobs:
     # schema bumps / SSOT-const changes now fail loudly here when
     # narrative isn't updated in lockstep.
     name: Docs vs SSOT drift gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -187,7 +187,7 @@ jobs:
     # from scripts/check-migration-ladder.sh rather than re-derived.
     # Burn-down allowlist, where a STALE entry ALSO FAILS (#2494 style).
     name: Doc symbol/path anchor gate (#2629)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -218,7 +218,7 @@ jobs:
     # membership test passes it (the collection path IS registered) and
     # a parameter-blind test passes it too.
     name: SDK-path vs routes.rs membership gate (#2629)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -255,7 +255,7 @@ jobs:
     # EXISTS." Shipped as a ratchet with a pending-fix ledger because
     # five document-correction lanes are in flight concurrently.
     name: Named-CI-job existence + enforcement-truthfulness gate (#2629)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -290,7 +290,7 @@ jobs:
     # CLOSED. Dependency-free (grep/python3 over src/), matching the
     # toolchain-free posture of the other c8-precheck gates.
     name: Doc surface completeness gate (#2839)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -322,7 +322,7 @@ jobs:
     # it aimed at the defect, and a burn-down allowlist (STALE entry hard-fails)
     # carries the vetted, explicitly-aspirational vision-tier statements.
     name: Capacity-claim ceiling gate (#2869)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -354,7 +354,7 @@ jobs:
     # retired figure are exempt; non-keyword (LLM-expanded / semantic /
     # autonomous) rows use a different canon and are not compared.
     name: Benchmark-claim canon gate (#2879)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -379,7 +379,7 @@ jobs:
     # templates pure ASCII so `terraform apply` renders a cloud-config
     # cloud-init will parse.
     name: Cloud-init ASCII gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -402,7 +402,7 @@ jobs:
     # suite until the 1500s watchdog killed it. This gate keeps a new
     # test from silently re-introducing that class.
     name: Test-reachable stdin-read gate (#1989)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -423,7 +423,7 @@ jobs:
     # fleet-wide. HARD-BLOCKS a duplicate numeric prefix / duplicate schema
     # version / ladder gap / cross-adapter tip disagreement / orphan file.
     name: Migration-ladder-uniqueness gate (guardrail-D)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -446,7 +446,7 @@ jobs:
     # HARD-BLOCKS a reintroduced fail-open branch in `install.sh` and
     # any release artifact published without a sibling `.sha256`.
     name: Installer checksum fail-closed gate (#2449)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -477,19 +477,25 @@ jobs:
     # no-op to green. This job is the environment where the guarantee is
     # actually claimed, so here an absent interpreter is a FAILURE.
     name: Non-Rust conformance-reader proof gate (#2452)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      # The interpreters are PROVISIONED, not assumed. The gate fails closed
-      # when they are missing, so relying on whatever the runner image
-      # happens to ship would make a controlled proof depend on an accident.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+      # On the self-hosted fleet we ASSERT the pre-installed interpreters
+      # instead of actions/setup-python / actions/setup-node: those actions
+      # write the GitHub-hosted RUNNER_TOOL_CACHE default
+      # (/Users/runner/hostedtoolcache), which the `fate`/`fate_two` runner
+      # user cannot create, and RUNNER_TOOL_CACHE is runner-managed (.env
+      # cannot override it). The runners ship python3 + node on PATH. The gate
+      # still fails closed when they are missing — this assertion reds the job
+      # BEFORE the gate runs, so the controlled proof never depends on an
+      # accident, and it downloads nothing.
+      - name: Ensure python3 + node present (self-hosted; #2452 fail-closed)
+        shell: bash
+        run: |
+          command -v python3 >/dev/null || { echo "::error::python3 not on PATH on $RUNNER_NAME"; exit 1; }
+          command -v node    >/dev/null || { echo "::error::node not on PATH on $RUNNER_NAME"; exit 1; }
+          echo "python3=$(python3 --version) node=$(node --version)"
       # Needed only by the gate's R-203 / before-after evidence, which
       # compiles tests/conformance_readers.rs standalone with `rustc --test`
       # (the harness is deliberately crate-dependency-free — no cargo build).
@@ -525,7 +531,7 @@ jobs:
     # module-local lock instead of reusing the shared one. This gate
     # keeps a new module from silently re-introducing that class.
     name: Test-env $HOME-lock gate (#2146)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -572,7 +578,7 @@ jobs:
     # workflow's own `push.branches` lost `local/**` for exactly that reason
     # (#2523); `tool-count-drift.yml` was fixed in #2509.
     name: Required-context + classify-base soundness gate (#2494/#2496/#2508)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -651,7 +657,7 @@ jobs:
     # remotes at PR time would make this repo's CI depend on third-party
     # availability and teach reviewers to ignore a red gate.
     name: Git-dependency-source supply-chain gate (#2050/#2512)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -679,7 +685,7 @@ jobs:
     # it keeps a currently-clean property (zero unallowlisted extension
     # references at HEAD) clean at tag-cut, which is the cheapest moment.
     name: "CREATE EXTENSION allowlist gate (#2648)"
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -745,7 +751,7 @@ jobs:
     # issue-tracked) so rule (f) of `scripts/check-required-contexts.sh`
     # stays green in the interim rather than defaulting to unenforced.
     name: Commit-signing posture gate (#2486)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -801,7 +807,7 @@ jobs:
     # Declared REQUIRED in required-contexts-release.txt (mirror-first;
     # live branch-protection API is the operator-gated follow-up).
     name: Enterprise-federation cert-expiry gate (cert §7 / F7)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux-fed]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4

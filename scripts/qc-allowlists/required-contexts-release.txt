@@ -130,8 +130,20 @@ Dockerfile build (no push)
 # guard on every step — so the EXPANDED names always report. Adding a
 # job-level `if:` to either job re-opens the #2494 branch wedge and rule (b1)
 # hard-fails for it.
-Check (ubuntu-latest)
-Check (macos-latest)
+#
+# v1.0.0 self-hosted 2x2 (chore/ci-self-hosted-2x2): the `check` job is now a
+# {linux-fed, macos-fed} × {sqlite, enterprise-fed} matrix over a single
+# `matrix.leg` display variable (one `${{ matrix.* }}` per name, so the gate's
+# name-expander resolves it; `node`/`tier` drive runs-on + features without
+# appearing in the name). This REPLACES the former GitHub-hosted
+# `Check (ubuntu-latest)` / `Check (macos-latest)` pair. All FOUR expansions
+# are required — rule (f) fails partial matrix coverage — and the companion
+# branch-protection edit (drop the two old, add the four new) is the
+# ADDITION-half / REMOVAL-half swap described in the ORDER doctrine above.
+Check (linux-fed,sqlite)
+Check (linux-fed,enterprise-fed)
+Check (macos-fed,sqlite)
+Check (macos-fed,enterprise-fed)
 Cross-compile (aarch64-apple-ios)
 Cross-compile (aarch64-linux-android)
 #

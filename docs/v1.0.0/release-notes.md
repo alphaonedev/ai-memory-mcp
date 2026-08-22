@@ -331,9 +331,12 @@ The historical `postgres-age` nightly
 once rebuilt the stack from source every night was **deleted on
 2026-07-31 by operator directive** (`2b85ba38`), and is NOT what
 provides this coverage — the new in-PR job above does.
-`.github/workflows/postgres-parity-nightly.yml` retains the
-`postgres-parity` job (four cross-backend parity binaries against a
-`pgvector/pgvector:pg16` service container, no AGE). `coverage.yml`
+The former nightly cross-backend parity workflow (four parity binaries
+against a `pgvector/pgvector:pg16` service container, no AGE) was
+**removed in the v1.0.0 self-hosted CI rewrite**: the enterprise-fed
+Check legs now run the sal-postgres parity suite in-PR on every push/PR
+against the always-up native tier, so a separate nightly is redundant.
+`coverage.yml`
 continues to run the AGE-gated Cypher/KG suites on every PR and push
 against an `apache/age:release_PG16_1.6.0` service container — **PG 16 +
 AGE 1.6.0**, retained as the documented alternate matrix (a line-coverage

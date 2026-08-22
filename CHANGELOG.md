@@ -7,7 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **CI moved to a self-hosted enterprise-fed fleet with a 2x2 `Check` matrix.**
+  All compute/gate jobs re-home from GitHub-hosted `ubuntu-latest`/`macos-latest`
+  onto two self-hosted runner labels — `[self-hosted, linux-fed]` (host pop-os/f2)
+  and `[self-hosted, macos-fed]` (host f1/FROSTYi) — EXCEPT the two mobile
+  cross-compile jobs (`Cross-compile (aarch64-linux-android)` / `(aarch64-apple-ios)`),
+  which stay GitHub-hosted. The `Check` job becomes a **2x2 matrix** over
+  {`linux-fed`, `macos-fed`} × {`sqlite` (default features), `enterprise-fed`
+  (`sal-postgres` against each node's always-up native pg18.6 + AGE 1.8.0 +
+  pgvector 0.8.6 tier, read from `$HOME/.ai-memory-ci-fed-url`)}. This **renames**
+  the two former required contexts `Check (ubuntu-latest)` / `Check (macos-latest)`
+  to the four `Check (linux-fed,sqlite)`, `Check (linux-fed,enterprise-fed)`,
+  `Check (macos-fed,sqlite)`, `Check (macos-fed,enterprise-fed)` — the mirror
+  `scripts/qc-allowlists/required-contexts-release.txt` is updated in lockstep and
+  branch protection must be updated to match. The `enterprise-fed` Check legs
+  absorb the old `Postgres feature gate` test run (now against the real cert tier);
+  that job is slimmed to the `sal-postgres` clippy-parity leg (name unchanged).
+  GitHub-hosted-only disk-freeing / swap / simulator-purge steps and all
+  `services: postgres:` blocks + per-PR pg image builds are removed (they would
+  delete real files on the persistent hosts; the native tier is always up).
+  JUnit-style durable test-result log artifacts are uploaded per leg.
+
+### Fixed
+
+- **Record-stop enforcement no longer silently degrades at the SAL layer when
+  the sqlite DB path resolves through a symlink** (e.g. the macOS
+  `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
+  the shared record-stop registry off the raw path passed to `open`, while the
+  actuator, the `db::` funnel gate, the status read and the open-time seed all
+  key off the connection's OWN resolved path (`conn.path()`, which SQLite's VFS
+  symlink-follows). When the two diverged the SAL gate read a stale RUNNING
+  entry, so a write issued under an engaged stop fell through to the deeper
+  `db::` gate and surfaced `StoreError::Backend` instead of the intended
+  `StoreError::Stopped` — a single-layer, fail-closed-ONLY degradation of the
+  SAL 503 refusal contract. The gate now caches and keys off the connection's
+  resolved path at open, restoring one source of truth across every layer.
+  Surfaced by the macOS `enterprise-fed` CI leg (`record_stop_r45_1955`); a
+  symlinked-open-path regression test pins it.
+- **The self-hosted `enterprise-fed` Check legs no longer kill a still-passing
+  sal-postgres suite at the hung-test watchdog.** The 2x2 `check` job reused the
+  sqlite-oriented 1500s per-invocation watchdog for the `enterprise-fed` legs,
+  which run the sal-postgres suite SINGLE-THREADED (`--test-threads=1`) and
+  CPU-contended by the sibling `sqlite` leg on the same self-hosted host — a
+  ~2231s measured runtime that the 1500s cap terminated mid-run (the same
+  regression the release `postgres-feature` job already fixed by raising its
+  cap to 2100s on its dedicated runner; the self-hosted leg runs both linux
+  legs on ONE host, so its ~2231s is the normal max-contention case). The
+  watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
+  the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
+  the outer job cap — remains what fires on a genuine hang.
+
 ### Removed
+
+- **`postgres-parity-nightly.yml` and `self-hosted-smoke.yml` workflows deleted.**
+  The nightly cross-backend parity job is redundant now that the `enterprise-fed`
+  Check legs run the `sal-postgres` suite in-PR on every push/PR against the native
+  tier; the smoke workflow was a pre-flight superseded by the real self-hosted CI.
+  `cert-postgres-age.yml` is re-homed onto `[self-hosted, linux-fed]` using the
+  always-up native tier (its per-PR docker build/pull of the pg stack is dropped;
+  the SSOT version assertions — pg 18.6 / AGE 1.8.0 / pgvector 0.8.6 — are preserved).
+
 
 - **Windows OS support dropped for v1.0.0 GA.** All Windows OS support is
   removed: the PowerShell installer (`install.ps1`), the

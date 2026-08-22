@@ -212,7 +212,20 @@ static SQLITE_FLAGS: LazyLock<Mutex<HashMap<PathBuf, RecordStopFlag>>> =
 /// Resolve a stable registry key for a `Connection`: the DB file path
 /// when it has one, else a per-`Connection` sentinel (in-memory DBs) so
 /// two in-memory connections in one process do not collide.
-fn conn_key(conn: &rusqlite::Connection) -> PathBuf {
+///
+/// `conn.path()` is the pathname SQLite's VFS actually resolved — which on
+/// some platforms is NOT byte-identical to the path handed to
+/// [`crate::db::open`]. SQLite's `unixFullPathname` follows symlinks, so on
+/// macOS (where the temp dir `/var/folders/…` sits under the `/var ->
+/// /private/var` symlink) the resolved path gains the `/private` prefix. This
+/// is the SINGLE source of the registry key for EVERY sqlite record-stop
+/// touchpoint — the actuator ([`actuate_sqlite`]), the `db::` funnel gate
+/// ([`gate_storage_conn`]), the status read ([`status_sqlite`]), the open-time
+/// seed ([`seed_from_conn`]), AND the SAL adapter's write-funnel gate (which
+/// caches this value at open; see `SqliteStore::open`). Keying any one of them
+/// off the raw open path instead would split the map and let a gate read a
+/// stale RUNNING entry while the stop is engaged under the resolved key.
+pub(crate) fn conn_key(conn: &rusqlite::Connection) -> PathBuf {
     match conn.path() {
         Some(p) if !p.is_empty() && p != ":memory:" => PathBuf::from(p),
         _ => PathBuf::from(format!("mem:{:p}", std::ptr::from_ref(conn))),

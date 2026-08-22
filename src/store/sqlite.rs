@@ -32,6 +32,21 @@ use crate::quotas::{self, QuotaStatus};
 pub struct SqliteStore {
     state: Arc<Mutex<rusqlite::Connection>>,
     path: PathBuf,
+    /// #1955 R45 — the record-stop registry key, derived ONCE at open from
+    /// the live connection's own reported path (`conn.path()` via
+    /// [`crate::storage::record_stop::conn_key`]) rather than the raw open
+    /// path in [`Self::path`]. The actuator, the `db::` funnel gate, the
+    /// status read and the open-time seed all key the shared
+    /// `SQLITE_FLAGS` registry off `conn.path()`; SQLite's VFS resolves
+    /// symlinks, so on macOS (temp dir under the `/var -> /private/var`
+    /// link) the resolved path differs from the open path. Keying the
+    /// SAL-surface gate off [`Self::path`] instead split the registry and
+    /// let the SAL gate read a stale RUNNING entry while a stop was engaged
+    /// under the resolved key — the SAL 503 refusal silently degraded to
+    /// the deeper `db::` `Backend` refusal (fail-closed was preserved only
+    /// by that backstop). Caching the connection's key here restores a
+    /// single source of truth across every layer at zero hot-path cost.
+    record_stop_key: PathBuf,
 }
 
 impl SqliteStore {
@@ -44,9 +59,17 @@ impl SqliteStore {
         // chain so a stop persisted before this open survives a restart.
         // A read hiccup is non-fatal (leaves the plane RUNNING).
         let _ = crate::store::record_stop::seed_from_conn(&conn);
+        // #1955 R45 — capture the connection's OWN resolved path as the
+        // record-stop registry key so the SAL gate keys the SAME entry the
+        // actuator/db-gate/status/seed use (see the `record_stop_key` field
+        // doc). Derived from the connection SQLite actually opened, so it is
+        // always consistent with those touchpoints regardless of any
+        // VFS-level symlink resolution.
+        let record_stop_key = crate::storage::record_stop::conn_key(&conn);
         Ok(Self {
             state: Arc::new(Mutex::new(conn)),
             path,
+            record_stop_key,
         })
     }
 
@@ -62,7 +85,11 @@ impl SqliteStore {
     /// SAL surface refuses with the typed error (503) rather than the
     /// `db::`-layer `Backend`-wrapped one.
     fn gate_record_stop(&self) -> StoreResult<()> {
-        crate::store::record_stop::gate_sqlite_path(&self.path)
+        // Key off `record_stop_key` (the connection's resolved path captured
+        // at open), NOT `self.path` (the raw open path) — see the
+        // `record_stop_key` field doc for why the two can diverge and why
+        // that split silently degraded SAL-layer stop enforcement on macOS.
+        crate::store::record_stop::gate_sqlite_path(&self.record_stop_key)
     }
 }
 
