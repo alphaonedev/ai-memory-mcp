@@ -752,6 +752,15 @@ backend and missing or divergently implemented on its twin). Pinned by
   `test_cli_bench_emits_json_with_eight_results_report_only` (the old name
   claimed seven results while asserting eight, and claimed a budget pass it no
   longer makes). Fatal semantics are unchanged when the flag is absent.
+- **`scripts/check-const-name-literals.sh` no longer HARD-BLOCKs on the
+  unmodified tree.** The name-vs-value matcher is now SEGMENT-AWARE: a value
+  must equal a whole `_`-delimited identifier segment (or be the digit run of
+  an otherwise alphabetic one), never an arbitrary substring — the hex byte
+  `0xad` was matching the "...ad" tail of `payload_hash`. Two-hex-digit byte
+  values are skipped outright, and size/width suffixes on an alphabetic stem
+  (`zero32`, `buf64`, `key256`) are treated as semantic terms rather than
+  embedded values. `--self-test` now probes each true positive individually
+  AND asserts both #3121 false positives are not flagged (#3121).
 - **Record-stop enforcement no longer silently degrades at the SAL layer when
   the sqlite DB path resolves through a symlink** (e.g. the macOS
   `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
