@@ -813,6 +813,39 @@ pub(super) fn signal_author_authorized(
 /// URL-safe-no-pad exactly as the pull lane encodes it;
 /// [`crate::identity::keypair::decode_public_base64`] accepts both that and the
 /// STANDARD form the DB registry stores.
+/// #3145 (v1.0.0, data-integrity) — de-silence the DB-registry lookup on the
+/// federation receive lane.
+///
+/// [`crate::db::agent_pubkey`] now PROPAGATES a real backend fault instead of
+/// flattening it into `Ok(None)`. This lane still has to keep going (the
+/// enclosing `sync_push` loop returns `impl IntoResponse`, not a `Result`, and
+/// a fault here degrades the row to `claimed` / quarantines it rather than
+/// mis-attesting it — a wrong/absent key can only DEGRADE, never forge, because
+/// `apply_inbound_write_attestation` verifies the presented signature against
+/// whichever key resolves and rejects a forged one unconditionally). What it
+/// must NOT do is degrade SILENTLY: an operator seeing rows land `claimed`
+/// under a busy/locked database gets a named WARN naming the agent and the
+/// error, instead of an indistinguishable "author not enrolled".
+///
+/// Hardening this lane further (refusing the inbound batch outright on a
+/// registry fault, rather than degrading it) is deliberately NOT done here —
+/// it changes federation-receive semantics and belongs to its own change.
+fn registry_key_or_warn(
+    lookup: anyhow::Result<Option<String>>,
+    attribute_agent: &str,
+) -> Option<String> {
+    lookup
+        .inspect_err(|e| {
+            tracing::warn!(
+                "sync_push: bound-key registry lookup FAILED for {attribute_agent}: {e:#} \
+                 — treating as unenrolled for this row (it can only land `claimed` / be \
+                 quarantined, never mis-attested). Check database health (#3145)."
+            );
+        })
+        .ok()
+        .flatten()
+}
+
 #[must_use]
 pub fn resolve_author_bound_key(
     registry_key: Option<String>,
@@ -2254,7 +2287,7 @@ pub async fn sync_push(
             // fallback, so a third-party author whose FEDERATION identity key
             // is cross-enrolled in the key-dir (not DB-bound) is HONORED
             // rather than re-attributed to the relay sender.
-            resolve_author_bound_key(db::agent_pubkey(&lock.0, c).ok().flatten(), c)
+            resolve_author_bound_key(registry_key_or_warn(db::agent_pubkey(&lock.0, c), c), c)
         });
         let claim_write_attested = original_claim.as_deref().is_some_and(|c| {
             inbound_claim_is_write_attested(&to_insert, c, claim_bound_key.as_deref())
@@ -2285,7 +2318,10 @@ pub async fn sync_push(
             // identity key verify a propagated write_signature and reach
             // agent_attested out-of-box, with no manual DB-bind step.
             resolve_author_bound_key(
-                db::agent_pubkey(&lock.0, &attribute_agent).ok().flatten(),
+                registry_key_or_warn(
+                    db::agent_pubkey(&lock.0, &attribute_agent),
+                    &attribute_agent,
+                ),
                 &attribute_agent,
             )
         };

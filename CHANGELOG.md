@@ -1809,6 +1809,41 @@ REFUTED and deliberately not changed: `peer_attestation::namespace_allowed`'s
 legacy `AI_MEMORY_FED_SYNC_TRUST_PEER=1`), `/sync/since` resolves scope itself
 with an explicit `None => false`, the write/delete lanes gate through the
 `has_allowlist()` wrappers, and the third call site is WARN-only observability.
+### Security (a DB fault must never silently demote a signed write's provenance; #3145)
+
+`db::agent_pubkey` — the sqlite resolver for an agent's ENROLLED Ed25519
+public key — collapsed its `query_row` with `.ok().flatten()`, so
+`SQLITE_BUSY`, a lock timeout, an I/O error, or a corrupt page all became
+`Ok(None)`: "this agent has no bound key". Its callers
+(`identity::attest::stamp_attestation_sync` on the CLI/direct-connection write
+funnel, and `store::sqlite::SqliteStore::agent_pubkey` on the SAL + sync
+funnels) then stamped a genuinely-signed write as bare `claimed`, or — under
+required attestation — rejected it as `AttestationRequired`. Stamping
+`claimed` on a signed write is not a DEGRADED result but a WRONG one, written
+durably into the row's provenance, and it is unrecoverable after the fact: the
+row does not record that a lookup ever failed.
+
+The postgres twin (`PostgresStore::agent_pubkey`) already used
+`fetch_optional` + `map_err` and propagated, so the same fault produced
+DIFFERENT durable provenance depending on the backend. `agent_pubkey` now uses
+`.optional()` — only the no-row case maps to `None`, every real query error
+propagates with the agent id in its context — closing the asymmetry. This is
+the identical hazard, and the identical fix, applied to `agent_id_for_api_key`
+thirty lines below it in #2095.
+
+The federation receive lane keeps DEGRADING rather than refusing on a registry
+fault (a wrong or absent key there can only land a row `claimed` or quarantine
+it — `apply_inbound_write_attestation` rejects a forged signature
+unconditionally — and `sync_push` has no `Result` to propagate into), but it no
+longer degrades SILENTLY: both lookup sites now emit a WARN naming the agent
+and the error instead of an indistinguishable "author not enrolled".
+
+Regression coverage pins the three-row contract both backends share — bound
+agent -> `Ok(Some(key))`, unregistered agent -> `Ok(None)`, backend fault ->
+`Err(_)` — with a deterministically locked database on sqlite
+(`tests/agent_pubkey_failclosed_3145.rs`, including a signed write over a
+locked DB that must FAIL rather than report `claimed`) and its postgres twin in
+`tests/agent_pubkey_error_parity_3145.rs`.
 
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 
