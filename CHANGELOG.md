@@ -735,6 +735,34 @@ truthful.
 
 ### Fixed
 
+- **`ai-memory restore` no longer publishes with a bare `fs::copy` onto the
+  live database** ([#3131](https://github.com/alphaonedev/ai-memory-mcp/issues/3131)).
+  The publish step was `std::fs::copy(&snapshot, &target_db)` straight onto the
+  target path, after renaming the current database out of the way. Three
+  failure modes followed: a daemon / MCP server holding the database open kept
+  writing into a file being overwritten (mixed pages plus an orphaned WAL); a
+  partial copy (ENOSPC, an interrupt) left a truncated database at the target
+  with **no** database there to fall back to, because the original had already
+  been renamed away; and there was no confirmation of any kind. `restore` now:
+  - **refuses a live target** — a SQLite `locking_mode = EXCLUSIVE` probe
+    (rolled back, so it writes nothing) detects any other open connection and
+    refuses; a corrupt/unreadable target is WARNed and allowed through, because
+    restoring over a database nothing can open is the disaster-recovery case
+    this verb exists for;
+  - **asks first** — a `Proceed? [y/N]` prompt, overridden by the new
+    `restore --yes`, matching `forget --confirm-global` /
+    `governance install-defaults --yes`. `--yes` is REQUIRED with `--json` and
+    whenever stdin is not a terminal;
+  - **keeps the original in place** — the pre-restore safety net is now a
+    COPY to `<db>.pre-restore-<ts>.db` (with its sidecars), not a rename, so
+    the target path never goes empty;
+  - **stages, verifies, then swaps** — the replacement is written to a temp
+    file in the same directory, fsynced, and must pass `PRAGMA integrity_check`
+    before an atomic `rename` publishes it; a failure there deletes the staged
+    file and leaves the live database untouched;
+  - **removes the stale `-wal` / `-shm`** from beside the restored file, and
+  - **prints the rollback path** (and reports it as a `rollback` field in
+    `--json`).
 - **An unrecognised `--tier` / `tier` no longer widens the operation — every
   tier-filter surface now FAILS CLOSED**
   ([#3130](https://github.com/alphaonedev/ai-memory-mcp/issues/3130)).

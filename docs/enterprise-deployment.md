@@ -1778,7 +1778,7 @@ quarterly restore drill is the only mechanical defense against the
 Drill on a scratch host:
 
 ```bash
-ai-memory restore --from /var/backups/ai-memory             # 1. uses newest snapshot
+ai-memory restore --from /var/backups/ai-memory --yes       # 1. uses newest snapshot (--yes: scripted, no prompt)
 ai-memory serve --db /var/lib/ai-memory/restored.db         # 2. boots; schema ladder re-applies idempotently
 ai-memory verify-signed-events-chain --format json | jq .chain_holds   # 3. expected: true
 ai-memory doctor --json                                     # 4. 10-section health pass

@@ -398,6 +398,7 @@ DB; use `--skip-verify` only for forensic recoveries.
 | `--keep <n>` | `backup` | Retain at most `n` snapshots, oldest-first rotation. `0` disables. |
 | `--from <path>` | `restore` | A snapshot file, or a directory (newest snapshot wins). |
 | `--skip-verify` | `restore` | Skip the sha256 check. Not routine. |
+| `--yes` | `restore` | Skip the `Proceed? [y/N]` confirmation. REQUIRED with `--json` and whenever stdin is not a terminal (v1.0.0 #3131). |
 | `--store-url <url>` | both | The store this deployment serves, same grammar as `serve` / `curator`. Also read from `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL`. |
 
 **SQLite only, and it now REFUSES rather than pretending**
@@ -423,9 +424,50 @@ Pass `--store-url` explicitly (or export `AI_MEMORY_STORE_URL`) on any
 host where the daemon is Postgres-backed, so the command can refuse
 instead of guessing. The manifest now records `backend`,
 `schema_version` and `memory_count`; a snapshot with zero memories is
-WARNed on stderr. `restore` also moves the `-wal` / `-shm` sidecars
-aside with the database, so stale WAL frames can never be replayed into
-the restored corpus.
+WARNed on stderr. `restore` also clears the `-wal` / `-shm` sidecars
+from beside the restored database, so stale WAL frames can never be
+replayed into the restored corpus.
+
+### How `restore` publishes (v1.0.0, [#3131](https://github.com/alphaonedev/ai-memory-mcp/issues/3131))
+
+`restore` replaces the live corpus, so it is liveness-gated, staged,
+verified, atomic and reversible — in that order:
+
+1. **Refuse a live target.** A SQLite `locking_mode = EXCLUSIVE` probe
+   (rolled back, so it writes nothing) detects any other open
+   connection. Stop the daemon / MCP server first:
+
+   ```text
+   error: /path/memories.db is open in another process — refusing to
+   restore over a live database … (#3131)
+   ```
+
+   A target that cannot be opened at all (corrupt, unreadable) is
+   WARNed and allowed through — restoring over a database nothing can
+   open is exactly what this verb is for.
+2. **Confirm.** `Proceed? [y/N]` unless `--yes` is passed. `--yes` is
+   **required** with `--json` (a prompt would corrupt the envelope) and
+   whenever stdin is not a terminal (cron, CI, a pipe).
+3. **Copy the current database aside** to `<db>.pre-restore-<ts>.db`
+   (sidecars included). This is a COPY, not a move: the target path
+   never goes empty, so an interrupt cannot leave you with no database.
+4. **Stage and verify.** The replacement is written to a temp file in
+   the same directory, fsynced, and must pass `PRAGMA integrity_check`.
+   A partial copy (ENOSPC, interrupt) or a damaged snapshot fails here,
+   the staged file is deleted, and the live database is untouched.
+5. **Swap atomically** with `rename`, then remove the stale
+   `-wal` / `-shm` left over from the replaced database.
+6. **Print the rollback path.** Human output ends with
+   `Rollback: cp <db>.pre-restore-<ts>.db <db>`; `--json` carries the
+   same path in a `rollback` field (`null` only when no database
+   existed at the target before).
+
+```bash
+ai-memory restore --from /var/backups/ai-memory --yes
+# Previous DB copied to /var/lib/ai-memory/memories.pre-restore-2026-08-22T101500Z.db
+# Restored /var/backups/ai-memory/ai-memory-….db → /var/lib/ai-memory/memories.db
+# Rollback: cp /var/lib/ai-memory/memories.pre-restore-2026-08-22T101500Z.db /var/lib/ai-memory/memories.db
+```
 
 ## Autonomy (v0.6.1)
 
