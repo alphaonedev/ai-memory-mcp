@@ -146,6 +146,38 @@ fn read_stdin_to_string() -> Result<String> {
 /// every emit routes through `out.stdout` / `out.stderr` instead of
 /// `println!` / `eprintln!`.
 #[allow(clippy::too_many_lines)]
+/// #3025 — read back the row `db::insert` just committed, so the response can
+/// report what the DB ACTUALLY stored rather than what the caller requested.
+///
+/// **Fails closed (ERRORS-19).** The guarantee this fix exists to make is
+/// "the response reports the STORED values, not the requested ones". A
+/// verification read that fails and then falls back to echoing the REQUESTED
+/// values breaks exactly that guarantee on the error path, and does it
+/// invisibly: the caller cannot tell a verified echo from an unverified one,
+/// which is the same reports-success-doing-nothing class (#2444) the fix was
+/// written to close. So both failure modes are errors:
+///
+/// * `Err` — the read itself failed (transient / IO).
+/// * `Ok(None)` — an INVARIANT VIOLATION: `db::insert` returned this id, so the
+///   row must be readable. Never a silent fallback.
+///
+/// Both messages state that the WRITE ALREADY HAPPENED and name the id, so an
+/// operator reading the failure knows the row exists and only its verification
+/// failed — the exit code must not be read as "nothing was stored".
+fn read_back_persisted(conn: &rusqlite::Connection, actual_id: &str) -> Result<models::Memory> {
+    match db::get(conn, actual_id) {
+        Ok(Some(persisted)) => Ok(persisted),
+        Ok(None) => anyhow::bail!(
+            "memory {actual_id} WAS STORED, but the read-back that verifies what was persisted \
+             found no such row; refusing to report the requested values as if they were stored"
+        ),
+        Err(e) => anyhow::bail!(
+            "memory {actual_id} WAS STORED, but the read-back that verifies what was persisted \
+             failed: {e}; refusing to report the requested values as if they were stored"
+        ),
+    }
+}
+
 pub fn run(
     db_path: &Path,
     args: StoreArgs,
@@ -434,10 +466,9 @@ pub fn run(
     // stays `long`), `version` bumps, and `expires_at` follows the persisted
     // tier — so echoing `mem` would report a downgrade / expiry / version that
     // never happened (the #2444 reports-success-doing-nothing / honesty class).
-    // An echo-read failure must not turn the already-committed write into an
-    // error; fall back to `mem`. MCP precedent: `src/mcp/tools/store/mod.rs`
-    // `echo_tier`.
-    let persisted = db::get(&conn, &actual_id).ok().flatten();
+    // FAIL CLOSED on a failed read-back — see `read_back_persisted`.
+    // MCP precedent: `src/mcp/tools/store/mod.rs` `echo_tier`.
+    let persisted = read_back_persisted(&conn, &actual_id)?;
 
     // PR-5 (issue #487): security audit trail. No-op when disabled.
     crate::audit::emit(crate::audit::EventBuilder::new(
@@ -463,12 +494,9 @@ pub fn run(
         .map(|c| &c.id)
         .collect();
     if json_out {
-        // #3025 — serialize the PERSISTED row (falling back to `mem` only if
-        // the echo-read failed) so tier/version/expiry are the DB's truth.
-        let mut j = match persisted.as_ref() {
-            Some(p) => serde_json::to_value(p)?,
-            None => serde_json::to_value(&mem)?,
-        };
+        // #3025 — serialize the PERSISTED row so tier/version/expiry are the
+        // DB's truth. Unconditional: an unverified write never reaches here.
+        let mut j = serde_json::to_value(&persisted)?;
         j["id"] = serde_json::json!(actual_id);
         let filtered: Vec<&String> = contradictions
             .iter()
@@ -481,12 +509,8 @@ pub fn run(
         writeln!(out.stdout, "{}", serde_json::to_string(&j)?)?;
     } else {
         // #3025 — echo the PERSISTED tier/namespace, not the requested ones.
-        let tier = persisted
-            .as_ref()
-            .map_or_else(|| mem.tier.clone(), |p| p.tier.clone());
-        let namespace = persisted
-            .as_ref()
-            .map_or(mem.namespace.as_str(), |p| p.namespace.as_str());
+        let tier = &persisted.tier;
+        let namespace = persisted.namespace.as_str();
         writeln!(out.stdout, "stored: {actual_id} [{tier}] (ns={namespace})")?;
         if !filtered.is_empty() {
             writeln!(
@@ -1103,5 +1127,57 @@ mod tests {
             Some(prior.path().as_os_str())
         );
         unsafe { std::env::remove_var("AI_MEMORY_KEY_DIR") };
+    }
+
+    /// #3025 (fail-closed half) — the read-back that verifies what was
+    /// persisted must ERROR when the row cannot be read, never fall back to
+    /// echoing the REQUESTED values. The fallback was the original shape and
+    /// it broke the fix's own contract on the error path: the caller could not
+    /// distinguish a verified echo from an unverified one, which is the very
+    /// reports-success-doing-nothing class (#2444) #3025 exists to close.
+    ///
+    /// `Ok(None)` is the invariant-violation arm: `db::insert` returned the id,
+    /// so the row must be readable. The happy path (this helper returning the
+    /// PERSISTED row) is the positive control in
+    /// `test_store_upsert_json_reports_persisted_not_requested_3025`, which
+    /// drives `run()` end-to-end through this gate — so the two tests below
+    /// cannot pass by rejecting everything.
+    #[test]
+    fn read_back_persisted_errors_when_row_is_missing_3025() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+
+        let err = read_back_persisted(&conn, "no-such-id-3025")
+            .expect_err("a missing row must be an error, never a silent fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no-such-id-3025"),
+            "the error must name the id so the operator can find the row: {msg}"
+        );
+        assert!(
+            msg.contains("WAS STORED"),
+            "the error must say the write already happened, so a non-zero exit \
+             is not misread as 'nothing was stored': {msg}"
+        );
+    }
+
+    /// The `Err` arm of the same gate: a read-back that FAILS (here: the
+    /// `memories` table dropped out from under the reader, standing in for a
+    /// transient/IO failure) is an error too, carrying the same
+    /// write-already-happened wording and the id.
+    #[test]
+    fn read_back_persisted_errors_when_read_fails_3025() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        conn.execute_batch("DROP TABLE memories;")
+            .expect("drop table to force a read failure");
+
+        let err = read_back_persisted(&conn, "id-read-fails-3025")
+            .expect_err("a failed read-back must be an error, never a silent fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("id-read-fails-3025") && msg.contains("WAS STORED"),
+            "the error must name the id and say the write already happened: {msg}"
+        );
     }
 }
