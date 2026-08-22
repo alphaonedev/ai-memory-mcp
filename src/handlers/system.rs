@@ -19,6 +19,21 @@ use super::transport::AppState;
 
 // --- /api/v1/capabilities (GET) -------------------------------------------
 
+/// #3183 — `capabilities.skills` key overlaid on a postgres-backed daemon.
+const CAP_SKILLS: &str = "skills";
+/// #3183 — `capabilities.skills.implemented` key (forced `false` on postgres).
+const CAP_SKILLS_IMPLEMENTED: &str = "implemented";
+/// #3183 — additive postgres-disclosure flag on `capabilities.skills`.
+const CAP_SKILLS_UNSUPPORTED_ON_POSTGRES: &str = "unsupported_on_postgres";
+/// #3183 — additive human-readable reason on `capabilities.skills`.
+const CAP_SKILLS_UNSUPPORTED_REASON: &str = "unsupported_reason";
+/// #3183 — the reason text. Names the tracking issue so an operator reading
+/// the wire can find the port, and states the failure mode (hard 501, not a
+/// degraded mode) rather than implying a partial plane.
+const CAP_SKILLS_POSTGRES_REASON: &str = "the skills plane is sqlite-only: postgres ships no skills table, so every \
+     /api/v1/skill/* path returns 501 NOT IMPLEMENTED and the memory_skill_* MCP \
+     tools are unavailable on a postgres-backed daemon (port tracked by #2804)";
+
 pub async fn get_capabilities(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -208,6 +223,37 @@ pub async fn get_capabilities(
                     "db_schema_version".to_string(),
                     serde_json::Value::Number(serde_json::Number::from(db_schema_version)),
                 );
+                // #3183 — claims-truth on the skills plane. `CapabilitySkills`
+                // is a compile-time constant (`implemented: true`) because the
+                // skills SUBSTRATE is always built in; but that substrate is
+                // typed on a `rusqlite::Connection`, so on a postgres-backed
+                // daemon it can only ever reach the node-local scratch SQLite
+                // file — the 8 `/api/v1/skill/*` paths are fully fail-closed
+                // 501s (absent from `postgres_endpoint_supported`, pinned by
+                // `tests/pg_supported_route_inventory_gate_2799.rs`, refused a
+                // second time inside `handlers::skills`). Advertising
+                // `implemented: true` there told an operator to plan on a plane
+                // that cannot durably hold a single row. Overlay the honest
+                // posture — additively, so a client reading `skills.tools` for
+                // the canonical tool list is unaffected. sqlite is untouched.
+                if matches!(app.storage_backend, super::StorageBackend::Postgres)
+                    && let Some(skills) = obj
+                        .get_mut(CAP_SKILLS)
+                        .and_then(serde_json::Value::as_object_mut)
+                {
+                    skills.insert(
+                        CAP_SKILLS_IMPLEMENTED.to_string(),
+                        serde_json::Value::Bool(false),
+                    );
+                    skills.insert(
+                        CAP_SKILLS_UNSUPPORTED_ON_POSTGRES.to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                    skills.insert(
+                        CAP_SKILLS_UNSUPPORTED_REASON.to_string(),
+                        serde_json::Value::String(CAP_SKILLS_POSTGRES_REASON.to_string()),
+                    );
+                }
             }
             (StatusCode::OK, Json(v)).into_response()
         }

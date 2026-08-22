@@ -155,3 +155,23 @@ ai-memory serve
 A boot under `asi-hard` prints the pin report (which knobs were pinned from
 unset vs already-compliant) and refuses to start if any pinned knob was set
 below its hard floor.
+
+## Storage-backend caveat: no skills plane on Postgres (#3183)
+
+Neither template selects a storage backend — that is `--store-url` (or
+`--db`) at launch. If you point a templated node at Postgres, note that
+the **Agent Skills plane is SQLite-only in v1.0**: all 8
+`/api/v1/skill/*` paths return `501 NOT IMPLEMENTED` and the
+`memory_skill_*` MCP tools are unavailable, because postgres ships no
+`skills` table. `GET /api/v1/capabilities` discloses this as
+`skills.implemented: false` plus `skills.unsupported_on_postgres: true`.
+
+The refusal is deliberate and fail-closed — it is the same posture the
+templates above take everywhere else. Without it the handlers would have
+written the skill row into the node-local scratch SQLite file the daemon
+opens against `--db`, which on a postgres deployment is empty, invisible
+to every peer, and discarded on container restart. Plan skills onto a
+sqlite-backed node; postgres skills storage is tracked by
+[#2804](https://github.com/alphaonedev/ai-memory-mcp/issues/2804). Full
+inventory: [`../postgres-age-guide.md` § What still returns 501 on
+postgres](../postgres-age-guide.md).

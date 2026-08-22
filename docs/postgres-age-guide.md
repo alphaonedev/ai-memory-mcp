@@ -670,6 +670,30 @@ in-memory scratch SQLite database that `bootstrap_serve` opens
 against `--db`. On sqlite-backed daemons the gate is a pure
 pass-through.
 
+#### Defence in depth: the skills plane refuses at the handler too (#3183)
+
+The route gate is the *first* line, not the only one. The 8
+`/api/v1/skill/*` paths are the sharpest case: their substrate
+(`crate::mcp::handle_skill_*`) is typed on a `rusqlite::Connection`, so
+`handlers/skills.rs` takes `app.db.lock()` — which on a postgres daemon is
+the node-local scratch SQLite file, not the operator's store. Before
+#3183 a caller who reached those handlers with the middleware absent,
+reordered, or bypassed (a custom router, an in-process call) would have
+written an executable artefact into a file that is invisible to every peer
+and discarded on container restart. Each of the 9 skill handlers now
+re-checks `StorageBackend::Postgres` **first** — ahead of the #949 admin
+gate, mirroring the middleware's own ordering — and returns the same
+documented 501 envelope. Pinned by
+`tests/skills_fail_closed_on_postgres_3183.rs`, which includes a removal
+proof that calls `skill_register_route` directly with no router at all.
+
+`/api/v1/capabilities` discloses the gap in the same release: on a
+postgres-backed daemon `skills.implemented` is `false` and the block
+carries an additive `unsupported_on_postgres: true` plus an
+`unsupported_reason` naming the hard 501 and the tracking issue. The
+`skills.tools` list is unchanged, so a client reading it for the canonical
+tool names is unaffected. On sqlite nothing changes.
+
 ### What still returns 501 on postgres
 
 Of the **80 unique production URL paths** (over **94 `.route(...)`

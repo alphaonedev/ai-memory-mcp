@@ -1507,6 +1507,44 @@ backend and missing or divergently implemented on its twin). Pinned by
   names the wrong version sends an operator debugging a stuck ladder to the
   wrong arm.
 
+- **Skills on a Postgres-backed daemon now fail closed with the documented 501
+  instead of silently persisting to the node-local scratch SQLite file
+  (#3183).** The skills substrate (`crate::mcp::handle_skill_*`) is typed on a
+  `rusqlite::Connection`, so all nine handlers in `src/handlers/skills.rs` took
+  `app.db.lock()` unconditionally — and on a postgres daemon `app.db` is not the
+  operator's database but the scratch file `bootstrap_serve` opens against
+  `--db` (postgres ships no `skills` table; `migrate_v82` is a version stamp
+  with no DDL). A skill registered against a postgres deployment therefore
+  landed in an empty local file: invisible to every peer, discarded on the next
+  container restart, while `/api/v1/capabilities` reported
+  `skills.implemented: true`. Split-brain plus a false claim, and an
+  unannounced data-loss path for an executable artefact. The router-layer gate
+  already refused these 8 paths (they are absent from
+  `postgres_endpoint_supported` and pinned as fully-501 by
+  `tests/pg_supported_route_inventory_gate_2799.rs`); what was missing was a
+  refusal at the handler itself and an honest capability report. Each handler
+  now re-checks `StorageBackend::Postgres` **first** — ahead of the #949 admin
+  gate, mirroring the middleware's ordering — and returns the same documented
+  envelope via the existing `postgres_not_implemented` helper, so a middleware
+  reorder, a custom router, or an in-process caller can no longer re-open the
+  local-write path. `/api/v1/capabilities` on postgres now reports
+  `skills.implemented: false` plus an additive `unsupported_on_postgres: true`
+  and an `unsupported_reason` naming the hard 501 and the tracking issue;
+  `skills.tools` is unchanged, so clients reading it for the canonical tool
+  names are unaffected. **Sqlite behaviour is untouched.** The postgres 501
+  route inventory is unchanged at 59 supported / 21 fully-501 / 80 unique paths
+  — this release makes the runtime match the partition that was already
+  declared, it does not move it. Consistent with the skills-501 disclosure
+  pending in #3134; documented in `ADMIN_GUIDE`, `agent-skills.md`,
+  `postgres-age-guide.md`, and `docs/deploy/README.md`. Postgres skills storage
+  remains post-GA (#2804). New pin:
+  `tests/skills_fail_closed_on_postgres_3183.rs`, including a removal proof that
+  calls `skill_register_route` directly with no router in the pipeline.
+  Also closes a router-mirror omission found while verifying the above:
+  `path_is_registered_route` matched only `GET` on `/api/v1/skill/{id}`, so
+  `DELETE /api/v1/skill/{id}` — a registered route, and an IRREVERSIBLE
+  lineage purge — was reported UNREGISTERED and fell through the gate to the
+  handler rather than 501-ing. Both controls now agree.
 - **The required `Check` legs are no longer undeclared performance gates:
   `ai-memory bench` gains `--report-only`.** `cmd_bench` bails non-zero
   whenever any operation's measured p95 exceeds its target by more than 10%, so

@@ -741,6 +741,16 @@ ai-memory schema-init --store-url postgres://…
 
 **Acceptance gate:** AGE p95 must beat CTE p95 by ≥30% at depth=5 to ship in a given build — the bench gate (`feat/v0.7-j-8-age-bench-gate`) enforces it. If AGE isn't faster on your Postgres + hardware combination, stay on the CTE path; the substrate is happy with either. See [MIGRATION § Apache AGE acceleration](MIGRATION_v0.7.html#apache-age-acceleration-opt-in) and the [`attested-cortex` RFC § Decision 3](v0.7/rfc-attested-cortex.html#decision-3--why-age-behind-a-feature-flag-vs-hard-dependency) for why AGE ships behind a feature flag instead of as a hard dependency.
 
+### No skills plane on Postgres (#3183)
+
+The Agent Skills surface is **SQLite-only in v1.0**. Postgres ships no `skills` table (the `migrate_v82` step is a version stamp with no DDL), and the skills substrate is typed on a SQLite connection. On a postgres-backed daemon, therefore:
+
+- all 8 `/api/v1/skill/*` paths return **`501 NOT IMPLEMENTED`** with the standard postgres envelope (`error` / `endpoint` / `storage_backend` / `remediation`) — a hard refusal, not a degraded mode;
+- the `memory_skill_*` MCP tools are unavailable for the same reason;
+- `GET /api/v1/capabilities` reports `skills.implemented: false` together with `skills.unsupported_on_postgres: true` and a human-readable `skills.unsupported_reason`.
+
+This is deliberate fail-closed behaviour. The refusal fires both at the route gate and inside each handler, so a skill registered against a postgres deployment can never be silently written to the node-local scratch SQLite file the daemon opens against `--db` — that file is empty, invisible to every peer, and discarded when the container restarts, which would have been an unannounced data-loss path. If you need skills, run a sqlite-backed daemon; postgres skills storage is tracked by [#2804](https://github.com/alphaonedev/ai-memory-mcp/issues/2804). The full postgres 501 inventory lives in [`postgres-age-guide.md` § What still returns 501 on postgres](postgres-age-guide.html).
+
 ## Permissions & Approvals (A2A) (v0.7+)
 
 The v0.6.x `governance` subsystem is refactored into three composable inputs that resolve to a single `Decision`:

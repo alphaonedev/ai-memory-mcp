@@ -59,12 +59,73 @@ use super::AppState;
 /// Tracing target for the skills HTTP handlers (#1558 tracing-target SSOT).
 const SKILLS_TRACE_TARGET: &str = "ai_memory::handlers::skills";
 
+/// #3183 — fail-closed guard for the **SQLite-only** skills plane.
+///
+/// Every handler below reaches the skills substrate through
+/// `crate::mcp::handle_skill_*`, which is typed on a
+/// `rusqlite::Connection`, so each one takes `app.db.lock()`. On a
+/// postgres-backed daemon `app.db` is NOT the operator's database — it is
+/// the node-local scratch SQLite file `bootstrap_serve` opens against
+/// `--db`: empty, invisible to every peer, and discarded when the
+/// container restarts (`src/store/postgres.rs` `migrate_v82`: "postgres
+/// ships no skills table"). Persisting an executable artefact there while
+/// the daemon advertises a skills plane is a split-brain + claims-truth
+/// defect, so the handlers REFUSE instead of writing to the wrong
+/// database (North Star: degrade, never corrupt — the worst case on
+/// postgres is a loud 501, never a silent local write).
+///
+/// Returns `Some(501)` carrying the documented postgres envelope from
+/// [`crate::handlers::postgres_not_implemented`] — byte-identical in shape
+/// to every other un-migrated surface — when the daemon is
+/// postgres-backed, and `None` on sqlite.
+///
+/// This is the defence-in-depth twin of the router-layer gate, not a
+/// replacement for it: the 8 `/api/v1/skill/*` paths are absent from
+/// [`crate::handlers::postgres_endpoint_supported`], so
+/// `postgres_route_gate` already 501s them on the wire, and that
+/// partition is frozen by `tests/pg_supported_route_inventory_gate_2799.rs`
+/// (`expected_fully_501_paths`). Duplicating the refusal at the handler
+/// means a future middleware reorder, a direct in-process call, or a
+/// custom router assembled without the gate can never re-open the
+/// silent-local-write path. The postgres port is tracked by #2804.
+#[cfg(feature = "sal")]
+fn refuse_skills_on_postgres(
+    app: &AppState,
+    endpoint: &'static str,
+) -> Option<axum::response::Response> {
+    if matches!(app.storage_backend, super::StorageBackend::Postgres) {
+        return Some(crate::handlers::postgres_not_implemented(endpoint));
+    }
+    None
+}
+
+/// Non-`sal` builds compile no postgres adapter at all, so
+/// `AppState::storage_backend` is structurally
+/// [`super::StorageBackend::Sqlite`] and `app.db` IS the operator's
+/// database. The guard is a compile-time no-op there (the `sal`-gated
+/// [`crate::handlers::postgres_not_implemented`] helper does not exist in
+/// this build).
+#[cfg(not(feature = "sal"))]
+fn refuse_skills_on_postgres(
+    _app: &AppState,
+    _endpoint: &'static str,
+) -> Option<axum::response::Response> {
+    None
+}
+
 /// `POST /api/v1/skill` — register a new skill from an inline body.
 pub async fn skill_register_route(
     State(app): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // #3183 — the skills substrate is sqlite-only; on a postgres-backed
+    // daemon `app.db` below is the node-local scratch file, not the
+    // operator's store. Refuse BEFORE the admin gate, mirroring the
+    // ordering `postgres_route_gate` already enforces on the wire.
+    if let Some(resp) = refuse_skills_on_postgres(&app, super::routes::SKILL_REGISTER) {
+        return resp;
+    }
     // #949 — admin-only. Skill registration mints an executable
     // artefact; non-admin callers MUST NOT be able to plant a row
     // other agents will subsequently activate.
@@ -96,6 +157,13 @@ pub async fn skill_list_route(
     headers: HeaderMap,
     Query(q): Query<SkillListQuery>,
 ) -> impl IntoResponse {
+    // #3183 — the skills substrate is sqlite-only; on a postgres-backed
+    // daemon `app.db` below is the node-local scratch file, not the
+    // operator's store. Refuse BEFORE the admin gate, mirroring the
+    // ordering `postgres_route_gate` already enforces on the wire.
+    if let Some(resp) = refuse_skills_on_postgres(&app, super::routes::SKILL_LIST) {
+        return resp;
+    }
     // #949 — admin-only. The list payload enumerates every skill in
     // the requested namespace including bodies that may be tagged
     // with another tenant's `signing_agent`. Cross-tenant
@@ -142,6 +210,13 @@ pub async fn skill_get_route(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // #3183 — the skills substrate is sqlite-only; on a postgres-backed
+    // daemon `app.db` below is the node-local scratch file, not the
+    // operator's store. Refuse BEFORE the admin gate, mirroring the
+    // ordering `postgres_route_gate` already enforces on the wire.
+    if let Some(resp) = refuse_skills_on_postgres(&app, super::routes::SKILL_ID) {
+        return resp;
+    }
     // #949 — admin-only. The GET response includes the full
     // (decompressed) skill body — the executable capability bundle.
     if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_get") {
@@ -188,6 +263,13 @@ pub async fn skill_resource_route(
     Path(id): Path<String>,
     Query(q): Query<SkillResourceQuery>,
 ) -> impl IntoResponse {
+    // #3183 — the skills substrate is sqlite-only; on a postgres-backed
+    // daemon `app.db` below is the node-local scratch file, not the
+    // operator's store. Refuse BEFORE the admin gate, mirroring the
+    // ordering `postgres_route_gate` already enforces on the wire.
+    if let Some(resp) = refuse_skills_on_postgres(&app, super::routes::SKILL_ID_RESOURCE) {
+        return resp;
+    }
     // #949 — admin-only. Skill resource blobs are part of the
     // executable bundle (scripts, prompts, fixtures) and inherit
     // the same supply-chain threat surface as the skill body.
@@ -228,6 +310,13 @@ pub async fn skill_export_route(
     Path(id): Path<String>,
     Json(body): Json<SkillExportBody>,
 ) -> impl IntoResponse {
+    // #3183 — the skills substrate is sqlite-only; on a postgres-backed
+    // daemon `app.db` below is the node-local scratch file, not the
+    // operator's store. Refuse BEFORE the admin gate, mirroring the
+    // ordering `postgres_route_gate` already enforces on the wire.
+    if let Some(resp) = refuse_skills_on_postgres(&app, super::routes::SKILL_ID_EXPORT) {
+        return resp;
+    }
     // #949 — admin-only. Export writes `target_folder` on the daemon
     // host (resolved by the daemon, written under the daemon user);
     // any non-admin caller would gain an arbitrary-path write
@@ -273,6 +362,13 @@ pub async fn skill_promote_route(
     Path(id): Path<String>,
     Json(body): Json<SkillPromoteBody>,
 ) -> impl IntoResponse {
+    // #3183 — the skills substrate is sqlite-only; on a postgres-backed
+    // daemon `app.db` below is the node-local scratch file, not the
+    // operator's store. Refuse BEFORE the admin gate, mirroring the
+    // ordering `postgres_route_gate` already enforces on the wire.
+    if let Some(resp) = refuse_skills_on_postgres(&app, super::routes::SKILL_ID_PROMOTE) {
+        return resp;
+    }
     // #949 — admin-only. Promote consumes a reflection memory and
     // mints a new skill row carrying the promoting agent's signing
     // surface. Cross-tenant promote = laundering an executable
@@ -317,6 +413,13 @@ pub async fn skill_compose_route(
     Path(id): Path<String>,
     body: Option<Json<SkillComposeBody>>,
 ) -> impl IntoResponse {
+    // #3183 — the skills substrate is sqlite-only; on a postgres-backed
+    // daemon `app.db` below is the node-local scratch file, not the
+    // operator's store. Refuse BEFORE the admin gate, mirroring the
+    // ordering `postgres_route_gate` already enforces on the wire.
+    if let Some(resp) = refuse_skills_on_postgres(&app, super::routes::SKILL_ID_COMPOSE) {
+        return resp;
+    }
     // #949 — admin-only. Compose reads the skill body PLUS the
     // reflections declared in `composes_with_reflections` — a
     // multi-row read across the caller and other agents' reflection
@@ -376,6 +479,13 @@ pub async fn skill_retire_route(
     Path(id): Path<String>,
     body: Option<Json<SkillRetireBody>>,
 ) -> impl IntoResponse {
+    // #3183 — the skills substrate is sqlite-only; on a postgres-backed
+    // daemon `app.db` below is the node-local scratch file, not the
+    // operator's store. Refuse BEFORE the admin gate, mirroring the
+    // ordering `postgres_route_gate` already enforces on the wire.
+    if let Some(resp) = refuse_skills_on_postgres(&app, super::routes::SKILL_ID_RETIRE) {
+        return resp;
+    }
     // #2024 — admin-only, like every other skill HTTP surface (#949).
     // Retire toggles the discovery + re-register lifecycle of an
     // executable artefact; cross-tenant retire is a supply-chain lever.
@@ -425,6 +535,13 @@ pub async fn skill_delete_route(
     Path(id): Path<String>,
     body: Option<Json<SkillDeleteBody>>,
 ) -> impl IntoResponse {
+    // #3183 — the skills substrate is sqlite-only; on a postgres-backed
+    // daemon `app.db` below is the node-local scratch file, not the
+    // operator's store. Refuse BEFORE the admin gate, mirroring the
+    // ordering `postgres_route_gate` already enforces on the wire.
+    if let Some(resp) = refuse_skills_on_postgres(&app, super::routes::SKILL_ID) {
+        return resp;
+    }
     // #2024 — admin-only (#949). Purge is irreversible; the substrate's
     // retire-first safety gate (or explicit force) still applies underneath.
     if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_delete") {
