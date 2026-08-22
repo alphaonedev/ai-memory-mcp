@@ -12674,14 +12674,14 @@ impl PostgresStore {
 /// Caller-supplied fields for [`pg_append_signed_event_with_chain`].
 /// Bundled in a struct rather than positional args so the helper
 /// doesn't trip `clippy::too_many_arguments`.
-struct PgSignedEventInsert<'a> {
-    id: &'a str,
-    agent_id: &'a str,
-    event_type: &'a str,
-    payload_hash: &'a [u8],
-    signature: Option<&'a [u8]>,
-    attest_level: &'a str,
-    timestamp: chrono::DateTime<chrono::Utc>,
+pub(crate) struct PgSignedEventInsert<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) agent_id: &'a str,
+    pub(crate) event_type: &'a str,
+    pub(crate) payload_hash: &'a [u8],
+    pub(crate) signature: Option<&'a [u8]>,
+    pub(crate) attest_level: &'a str,
+    pub(crate) timestamp: chrono::DateTime<chrono::Utc>,
     /// v73 (#1822, G5a) — audit cause-binding. `Some` when the write
     /// binds a triggering cause (see
     /// [`crate::signed_events::compute_cause_hash`]); `None` for the
@@ -12690,7 +12690,7 @@ struct PgSignedEventInsert<'a> {
     /// append path does not itself Ed25519-sign — the caller supplies
     /// the already-cause-folded `signature` — so this field only feeds
     /// the canonical-bytes fold, not a signing step here.
-    cause_hash: Option<&'a [u8]>,
+    pub(crate) cause_hash: Option<&'a [u8]>,
 }
 
 /// Postgres-side companion to
@@ -12858,7 +12858,7 @@ async fn pg_invalidate_link_relational_in_tx(
 /// `capture_turn_idempotent` path, #1416) can append the audit row in
 /// the SAME transaction as the data rows — the chain never lags the
 /// data, and a rollback discards both. The caller owns BEGIN/COMMIT.
-async fn pg_append_signed_event_with_chain_in_tx(
+pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: PgSignedEventInsert<'_>,
 ) -> Result<(), sqlx::Error> {
@@ -14740,7 +14740,7 @@ const ENVELOPE_OWNER_RECONCILED_MSG: &str = "upsert-merge landed on a row that r
      merged content to the retained identity so the row stays readable";
 
 #[allow(clippy::needless_pass_by_value)]
-fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
+pub(crate) fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
     StoreError::BackendUnavailable {
         backend: "postgres".to_string(),
         // #1585 (SEC) — the #1579 A3 redaction covered the parse-url
@@ -14762,32 +14762,26 @@ const PG_ACTION_SELECT_BY_ID: &str = "SELECT id, namespace, kind, state, title, 
 
 /// #1709 §11.4 Pillar-1 FRONTIER — the UNBLOCKED `WHERE`-tail shared by the
 /// postgres `action_frontier` / `action_next` reads. `$1` is the namespace.
-/// Byte-for-byte the same predicate the sqlite `crate::actions::frontier`
-/// uses (see `crate::actions::frontier_where_tail`): a pending action is
-/// UNBLOCKED iff every `requires` / `gated_by` prerequisite is `done` and no
-/// still-active `blocks` edge targets it.
+///
+/// v1.0.0 #3179 — this is now literally the SAME predicate the sqlite
+/// `crate::actions::frontier` runs, because both are formatted from the one
+/// [`crate::actions::frontier_where_tail_with`] fragment (this call supplies
+/// the postgres `$1` placeholder). It is no longer a hand-copied twin.
+///
+/// The prior hand-copy carried only TWO of the three `NOT EXISTS` clauses —
+/// the #3008 `unlocks` clause was never mirrored — so a pending action whose
+/// ONLY dependency was an `EdgeType::Unlocks` edge was served to agents by
+/// `action_frontier` / `action_next` on postgres while sqlite held it back.
+/// The doc comment here asserted the two were "byte-for-byte the same
+/// predicate", which hid the divergence from every reviewer who read it. The
+/// claim is now true by construction rather than by assertion.
 fn pg_frontier_where_tail() -> String {
-    use crate::models::{ActionState, EdgeType};
-    format!(
-        "a.namespace = $1 AND a.state = '{pending}' \
-           AND NOT EXISTS ( \
-             SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.to_action \
-             WHERE e.from_action = a.id \
-               AND e.edge_type IN ('{requires}', '{gated_by}') \
-               AND b.state <> '{done}') \
-           AND NOT EXISTS ( \
-             SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.from_action \
-             WHERE e.to_action = a.id AND e.edge_type = '{blocks}' \
-               AND b.state NOT IN ('{done}', '{failed}', '{abandoned}'))",
-        pending = ActionState::Pending.as_str(),
-        requires = EdgeType::Requires.as_str(),
-        gated_by = EdgeType::GatedBy.as_str(),
-        done = ActionState::Done.as_str(),
-        blocks = EdgeType::Blocks.as_str(),
-        failed = ActionState::Failed.as_str(),
-        abandoned = ActionState::Abandoned.as_str(),
-    )
+    crate::actions::frontier_where_tail_with(PG_FRONTIER_NS_PLACEHOLDER)
 }
+
+/// The postgres namespace bind placeholder fed to
+/// [`crate::actions::frontier_where_tail_with`].
+const PG_FRONTIER_NS_PLACEHOLDER: &str = "$1";
 
 /// Map a postgres row (the action column order) to an
 /// [`crate::models::Action`]. JSON columns are TEXT (parity with sqlite).
@@ -14822,6 +14816,84 @@ fn pg_row_to_action(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Act
             .try_get("updated_at")
             .map_err(|e| g("action.updated_at", e))?,
     })
+}
+
+/// v1.0.0 #3180 — the `pending_actions` projection shared by `get_pending`
+/// and [`pg_get_pending_in_tx`]. Extracted (not duplicated) so the row that
+/// the governance audit hashes is projected by the SAME code the read
+/// surface returns.
+const PG_PENDING_ACTION_SELECT: &str = "SELECT id, action_type, memory_id, namespace, payload, \
+     requested_by, requested_at, status, decided_by, decided_at, approvals \
+     FROM pending_actions WHERE id = $1";
+
+/// v1.0.0 #3180 — map one `pending_actions` row to a
+/// [`crate::models::PendingAction`]. Lifted out of `get_pending` so the
+/// in-transaction re-read used by the deny-audit path shares the identical
+/// projection.
+///
+/// # Errors
+///
+/// Propagates a column read/decode error.
+fn pg_row_to_pending_action(
+    r: &sqlx::postgres::PgRow,
+) -> StoreResult<crate::models::PendingAction> {
+    let requested_at: DateTime<Utc> = r
+        .try_get(field_names::REQUESTED_AT)
+        .map_err(|e| to_store_err("read requested_at", e))?;
+    let decided_at: Option<DateTime<Utc>> = r
+        .try_get(field_names::DECIDED_AT)
+        .map_err(|e| to_store_err("read decided_at", e))?;
+    let approvals_v: serde_json::Value = r
+        .try_get("approvals")
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    let approvals: Vec<crate::models::Approval> =
+        serde_json::from_value(approvals_v).unwrap_or_default();
+    Ok(crate::models::PendingAction {
+        id: r
+            .try_get::<String, _>("id")
+            .map_err(|e| to_store_err("read id", e))?,
+        action_type: r
+            .try_get::<String, _>(field_names::ACTION_TYPE)
+            .map_err(|e| to_store_err("read action_type", e))?,
+        memory_id: r.try_get::<Option<String>, _>("memory_id").unwrap_or(None),
+        namespace: r
+            .try_get::<String, _>("namespace")
+            .map_err(|e| to_store_err(READ_NAMESPACE, e))?,
+        payload: r
+            .try_get::<serde_json::Value, _>("payload")
+            .unwrap_or(serde_json::Value::Null),
+        requested_by: r
+            .try_get::<String, _>(field_names::REQUESTED_BY)
+            .map_err(|e| to_store_err("read requested_by", e))?,
+        requested_at: requested_at.to_rfc3339(),
+        status: r
+            .try_get::<String, _>("status")
+            .map_err(|e| to_store_err("read status", e))?,
+        decided_by: r
+            .try_get::<Option<String>, _>(field_names::DECIDED_BY)
+            .unwrap_or(None),
+        decided_at: decided_at.map(|d| d.to_rfc3339()),
+        approvals,
+    })
+}
+
+/// v1.0.0 #3180 — read one pending action INSIDE the caller's transaction,
+/// so the deny-audit emit hashes the same snapshot the decision UPDATE just
+/// produced.
+///
+/// # Errors
+///
+/// Propagates the query or projection error.
+async fn pg_get_pending_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> StoreResult<Option<crate::models::PendingAction>> {
+    let row = sqlx::query(PG_PENDING_ACTION_SELECT)
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("get_pending in tx", e))?;
+    row.as_ref().map(pg_row_to_pending_action).transpose()
 }
 
 /// #1709 Pillar 1 — `leases` by-action-id SELECT (canonical order for
@@ -17339,6 +17411,45 @@ impl PostgresStore {
         crate::store::record_stop::gate_flag(&self.record_stop)
     }
 
+    /// v1.0.0 #3180 / #3175 — append ONE `pending_action.<state>` audit row
+    /// in its own transaction.
+    ///
+    /// Used by the governance paths that have no surrounding transaction of
+    /// their own (`execute_pending_action`, which applies its effect through
+    /// the SAL surfaces). The postgres chain append is transactional by
+    /// necessity — it reads `MAX(sequence)` and the head hash and inserts
+    /// atomically — so "no surrounding tx" means "its own tx", not "no tx".
+    /// `pending_decide` deliberately does NOT use this helper: its audit row
+    /// must share the decision's transaction.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the begin / append / commit error. Callers decide the
+    /// disposition (the post-execute `approved` emit warns; the S5-H4 refusal
+    /// emit warns and still refuses).
+    async fn pg_emit_pending_action_event(
+        &self,
+        pa: &crate::models::PendingAction,
+        event_type: &str,
+        decided_by_override: Option<&str>,
+    ) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("pending_action audit begin tx", e))?;
+        crate::store::postgres_parity::emit_pending_action_event_in_tx(
+            &mut tx,
+            pa,
+            event_type,
+            decided_by_override,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("pending_action audit commit", e))
+    }
+
     /// #1955 R45 — derive the record-stop state from the pg
     /// `signed_events` chain and apply it to the cache. Best-effort — a
     /// read error leaves the plane RUNNING (never wedges connect).
@@ -17456,10 +17567,33 @@ impl MemoryStore for PostgresStore {
     }
 
     /// #1955 R45 — current record-stop status on postgres.
+    ///
+    /// v1.0.0 #3175 — re-derives the state from the PERSISTED `signed_events`
+    /// chain before answering, then reports the reconciled cache.
+    ///
+    /// Pre-#3175 this returned `self.record_stop.status()` — the
+    /// PROCESS-LOCAL cache — which is seeded exactly once, at
+    /// `PostgresStore::connect`. On the multi-pool deployment postgres exists
+    /// for, a stop engaged by ANOTHER daemon (or by this one before a restart
+    /// of a peer) left every other pool answering RUNNING while the chain said
+    /// STOPPED: the operator asking "is the record plane stopped?" got a
+    /// confident wrong answer about a safety control. The sqlite twin
+    /// (`record_stop::status_sqlite`) has always derived from the chain,
+    /// seeding via `seed_from_conn` when the flag was never touched.
+    ///
+    /// Reusing `seed_record_stop` (rather than a read-only probe) is
+    /// deliberate: it also RECONCILES this pool's hot-path gate cache, so a
+    /// stop engaged elsewhere starts refusing this pool's writes from the next
+    /// status read onward — self-healing in the fail-closed direction. A chain
+    /// read error is non-fatal there (WARN, cache untouched), so a transient
+    /// DB hiccup degrades to the last known state and never wedges the status
+    /// surface — but it also never silently downgrades a cached STOPPED to
+    /// RUNNING.
     async fn record_stop_status(
         &self,
         _ctx: &CallerContext,
     ) -> StoreResult<crate::store::record_stop::RecordStopStatus> {
+        self.seed_record_stop().await;
         Ok(self.record_stop.status())
     }
 
@@ -18900,6 +19034,16 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         write: &crate::models::RecoverTurnWrite,
     ) -> StoreResult<crate::models::RecoverTurnResult> {
+        // v1.0.0 #3175 [security, BLOCKING] — FIRST statement, mirroring the
+        // sqlite twin (`SqliteStore::recover_turn_idempotent`, which gates
+        // before delegating to `db::recover_turn_idempotent`). Pre-#3175 L2
+        // transcript recovery kept inserting durable memory rows on postgres
+        // while the record plane was STOPPED — the record-stop's whole promise
+        // is that the append boundary freezes, and a recovery walker is one of
+        // the highest-volume appenders there is. Gated BEFORE the dedup read
+        // so a stopped plane refuses uniformly rather than returning a
+        // dedup-hit for some inputs and refusing for others.
+        self.gate_record_stop()?;
         // Step 1 — dual dedup fast-path (no transaction needed for the read).
         if let (Some(sid), Some(tix)) = (write.host_session_id.as_deref(), write.host_turn_index) {
             let hit: Option<String> = sqlx::query_scalar(
@@ -20003,6 +20147,21 @@ impl MemoryStore for PostgresStore {
             .clamp(1, crate::storage::LIST_MAX_LIMIT)
             .try_into()
             .unwrap_or(LIST_FALLBACK_LIMIT_I64);
+        // v1.0.0 #3174 — the clamp above is the tenant page cap and stays, but
+        // it must never be SILENT: pre-#3174 an internal caller that asked for
+        // more than `LIST_MAX_LIMIT` (the admin export asked for 100_000, the
+        // entity-register scan for 10_000) got a truncated result set with no
+        // error, no warning, and no truncation flag, so a partial answer was
+        // indistinguishable from a complete one. A caller that genuinely needs
+        // the whole set must page (see `export_memories_keyset`); this WARN is
+        // how the next such caller finds out before shipping a lossy read.
+        if filter.limit > crate::storage::LIST_MAX_LIMIT {
+            tracing::warn!(
+                requested = filter.limit,
+                cap = crate::storage::LIST_MAX_LIMIT,
+                "list: caller limit clamped to LIST_MAX_LIMIT — result set is TRUNCATED, not complete"
+            );
+        }
         // #910 SAL-level scope=private gate — push the visibility
         // predicate into SQL so the row filter runs server-side and
         // the result-set size scales with what the caller can see,
@@ -21955,9 +22114,84 @@ impl MemoryStore for PostgresStore {
             results.retain(|(m, _)| is_visible_to_caller(m, caller));
         }
         results.truncate(filter.limit.max(1));
+        // v1.0.0 #3180 [data-integrity, BLOCKING] — append the RECALL ACCESS
+        // LEDGER, the postgres twin of the sqlite `SqliteStore::recall_hybrid`
+        // `record_recall_with_identity` call (v0.9.0 P0-1 / #1869).
+        //
+        // Pre-#3180 this method ended `results.truncate(..); Ok(results)`:
+        // `recall_observation_insert`'s ONLY caller was the separate
+        // `record_recall_observation` trait method, so SAL recall on postgres
+        // produced ZERO access observations. The observation ledger is what
+        // the memory LIFECYCLE runs on — TTL extension, mid→long promotion,
+        // priority decay all fold from these rows — so on every pg-backed
+        // fleet the lifecycle was frozen: memories never aged, never promoted,
+        // never decayed, and nothing reported that they weren't. A silent
+        // core-behaviour divergence, not a missing feature.
+        //
+        // Appended on the POST-filter, POST-truncate set so an observation is
+        // recorded for exactly the rows the caller actually received (the
+        // sqlite twin's post-filter placement), ranked from 1 in returned
+        // order. `retriever` is `hybrid`/`keyword` on the same
+        // `query_embedding.is_some()` test sqlite uses.
+        //
+        // Best-effort by DESIGN, matching sqlite: a ledger failure is WARNed
+        // and the recall still returns. Recall is a READ; failing it because a
+        // downstream signal could not be recorded would trade a working read
+        // for a bookkeeping row. The discard is explicit, never a dropped
+        // `Result` (ERRORS-19).
+        let candidates: Vec<(String, String, i64, f64)> = results
+            .iter()
+            .enumerate()
+            .map(|(i, (m, score))| {
+                (
+                    m.id.clone(),
+                    if query_embedding.is_some() {
+                        "hybrid"
+                    } else {
+                        "keyword"
+                    }
+                    .to_string(),
+                    i64::try_from(i + 1).unwrap_or(i64::MAX),
+                    *score,
+                )
+            })
+            .collect();
+        if !candidates.is_empty() {
+            let recall_id = uuid::Uuid::new_v4().to_string();
+            if let Err(e) = self
+                .recall_observation_insert(
+                    &recall_id,
+                    &candidates,
+                    Some(ctx.effective_principal()),
+                    filter.namespace.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "recall_hybrid (SAL-postgres): ledger append failed (non-fatal): {e}"
+                );
+            }
+        }
         Ok(results)
     }
 
+    /// v1.0.0 #3180 (v0.7.0 S5-M2) — the decision write and its
+    /// `pending_action.denied` audit row now land in ONE transaction.
+    ///
+    /// Pre-#3180 `grep -rn 'pending_action.denied' src/` matched
+    /// `storage/mod.rs` ONLY: the postgres twin appended nothing, so on every
+    /// pg-backed fleet a governance REFUSAL left no trace in the signed chain
+    /// — the deny was unprovable after the (mutable) `pending_actions` row was
+    /// swept or edited. Approvals were equally unrecorded (see
+    /// `execute_pending_action`).
+    ///
+    /// The emit is IN-TX rather than best-effort-after, unlike the sqlite twin,
+    /// because the postgres chain append must read `MAX(sequence)` and the
+    /// head's canonical hash atomically with the insert — outside a tx it
+    /// cannot compute a correct `prev_hash`. The resulting disposition is also
+    /// the fail-closed one: if the audit row cannot be written the decision
+    /// rolls back and the action stays `pending`, which is refusable and
+    /// retryable, rather than committing a state change nothing can attest to.
     async fn pending_decide(
         &self,
         _ctx: &CallerContext,
@@ -21966,6 +22200,11 @@ impl MemoryStore for PostgresStore {
         decided_by: &str,
     ) -> StoreResult<bool> {
         let new_status = if approve { "approved" } else { "rejected" };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("pending_decide begin tx", e))?;
         let rows_affected = sqlx::query(
             "UPDATE pending_actions SET status = $1, decided_by = $2, decided_at = NOW()
              WHERE id = $3 AND status = 'pending'",
@@ -21973,10 +22212,32 @@ impl MemoryStore for PostgresStore {
         .bind(new_status)
         .bind(decided_by)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("pending_decide", e))?
         .rows_affected();
+        // S5-M2 parity: emit ONLY on a landed DENY transition. An APPROVE emits
+        // later, from `execute_pending_action`, so its audit row captures the
+        // POST-execute state — the sqlite ordering, preserved exactly.
+        if rows_affected > 0 && !approve {
+            // Re-read INSIDE the tx so the audited row is the POST-update one
+            // (`status = "rejected"`, `decided_by`/`decided_at` populated) —
+            // the sqlite twin's `get_pending_action` after the UPDATE. Reading
+            // the pre-update row would commit a payload hash for a `pending`
+            // status that no longer exists.
+            if let Some(pa) = pg_get_pending_in_tx(&mut tx, id).await? {
+                crate::store::postgres_parity::emit_pending_action_event_in_tx(
+                    &mut tx,
+                    &pa,
+                    "pending_action.denied",
+                    Some(decided_by),
+                )
+                .await?;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("pending_decide commit", e))?;
         Ok(rows_affected > 0)
     }
 
@@ -21985,56 +22246,15 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         id: &str,
     ) -> StoreResult<Option<crate::models::PendingAction>> {
-        let row = sqlx::query(
-            "SELECT id, action_type, memory_id, namespace, payload, requested_by,
-                    requested_at, status, decided_by, decided_at, approvals
-             FROM pending_actions WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| to_store_err("get_pending", e))?;
+        let row = sqlx::query(PG_PENDING_ACTION_SELECT)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("get_pending", e))?;
         let Some(r) = row else {
             return Ok(None);
         };
-        let requested_at: DateTime<Utc> = r
-            .try_get(field_names::REQUESTED_AT)
-            .map_err(|e| to_store_err("read requested_at", e))?;
-        let decided_at: Option<DateTime<Utc>> = r
-            .try_get(field_names::DECIDED_AT)
-            .map_err(|e| to_store_err("read decided_at", e))?;
-        let approvals_v: serde_json::Value = r
-            .try_get("approvals")
-            .unwrap_or(serde_json::Value::Array(vec![]));
-        let approvals: Vec<crate::models::Approval> =
-            serde_json::from_value(approvals_v).unwrap_or_default();
-        Ok(Some(crate::models::PendingAction {
-            id: r
-                .try_get::<String, _>("id")
-                .map_err(|e| to_store_err("read id", e))?,
-            action_type: r
-                .try_get::<String, _>(field_names::ACTION_TYPE)
-                .map_err(|e| to_store_err("read action_type", e))?,
-            memory_id: r.try_get::<Option<String>, _>("memory_id").unwrap_or(None),
-            namespace: r
-                .try_get::<String, _>("namespace")
-                .map_err(|e| to_store_err(READ_NAMESPACE, e))?,
-            payload: r
-                .try_get::<serde_json::Value, _>("payload")
-                .unwrap_or(serde_json::Value::Null),
-            requested_by: r
-                .try_get::<String, _>(field_names::REQUESTED_BY)
-                .map_err(|e| to_store_err("read requested_by", e))?,
-            requested_at: requested_at.to_rfc3339(),
-            status: r
-                .try_get::<String, _>("status")
-                .map_err(|e| to_store_err("read status", e))?,
-            decided_by: r
-                .try_get::<Option<String>, _>(field_names::DECIDED_BY)
-                .unwrap_or(None),
-            decided_at: decided_at.map(|d| d.to_rfc3339()),
-            approvals,
-        }))
+        pg_row_to_pending_action(&r).map(Some)
     }
 
     async fn set_namespace_standard(
@@ -25722,6 +25942,46 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("gc snapshot links", e))?;
         }
 
+        // v1.0.0 #3177 [data-integrity/security, BLOCKING] — MANDATORY
+        // tombstone + crypto-erase on the HARD-DELETE (non-archive) eviction
+        // path, BEFORE the DELETE, in THIS tx.
+        //
+        // `grep -rn evict_tombstone_and_erase src/` matched the sqlite gc /
+        // size_gc callers ONLY: the postgres twins DELETEd outright. Two
+        // consequences, both prime-directive-class:
+        //   * a TTL-evicted ENCRYPTED row left its per-record envelope key
+        //     intact, so the retention/erasure claim held on sqlite and not on
+        //     postgres — a backend-dependent erasure guarantee;
+        //   * the eviction left NO forget-tombstone, so a federated peer's
+        //     copy of the evicted row was accepted straight back by
+        //     `apply_remote_memory` under LWW. On sqlite the tombstone refuses
+        //     it. "Evicted" that silently un-evicts is data the operator
+        //     believes is gone.
+        //
+        // When `archive` is true the row is COPIED to `archived_memories`
+        // first — a recoverable MOVE, not an erasure — so no tombstone/erase
+        // there, exactly as the sqlite twin reasons; the archive reaper is the
+        // erasure point for archived rows.
+        //
+        // The victim set is read `FOR UPDATE` with the IDENTICAL predicate the
+        // DELETE below uses, inside this one transaction, so the erased +
+        // tombstoned set and the deleted set cannot diverge.
+        if !archive {
+            let victims: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT id, namespace, metadata->>'agent_id' FROM memories \
+                 WHERE expires_at IS NOT NULL AND expires_at < $1 \
+                 FOR UPDATE",
+            )
+            .bind(now)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("gc read evict victims", e))?;
+            crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(
+                &mut tx, &victims, now,
+            )
+            .await?;
+        }
+
         // #1783 — RETURNING id so the TTL-evicted set is known for AGE
         // unprojection in THIS tx. gc is the most common delete path; the
         // v70 "don't snapshot auto-eviction" restore-rationale never
@@ -25900,31 +26160,37 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("size_gc archive copy", e))?;
-
-                // #3161 (v1.0.0) — DATA-LOSS CLOSE, third funnel. The SQLite
-                // `storage::size_gc` archive branch routes through
-                // `archive_memory_no_tx`, which has snapshotted the victim's
-                // edges since #1771; this postgres twin open-codes the archive
-                // copy and never did — so a byte-cap-evicted memory restored
-                // here came back with an EMPTY edge graph. Same shape as the
-                // `archive_by_ids` snapshot; idempotent via the PK `ON
-                // CONFLICT DO NOTHING`.
-                sqlx::query(
-                    "INSERT INTO archived_memory_links (
-                         source_id, target_id, relation, created_at, valid_from,
-                         valid_until, observed_by, signature, attest_level, archived_at
-                     )
-                     SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
-                            ml.valid_from, ml.valid_until, ml.observed_by,
-                            ml.signature, ml.attest_level, now()
-                     FROM memory_links ml
-                     WHERE ml.source_id = $1 OR ml.target_id = $1
-                     ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+                // v1.0.0 #3177 / #3161 — snapshot the victim's `memory_links`
+                // into `archived_memory_links` BEFORE the same-tx cascade
+                // DELETE reaps them (FK `ON DELETE CASCADE`). Release already
+                // inlined this SQL (#3161); this cluster routes it through
+                // the `postgres_parity` helper so `forget` / `archive_by_ids`
+                // / `size_gc` share one snapshot funnel.
+                crate::store::postgres_parity::archive_links_for_memory_in_tx(&mut tx, &id)
+                    .await?;
+            } else {
+                // v1.0.0 #3177 [data-integrity/security, BLOCKING] —
+                // MANDATORY tombstone + crypto-erase on the byte-cap
+                // HARD-DELETE eviction, BEFORE the DELETE, in THIS tx. Same
+                // defect and same reasoning as the `run_gc` twin above: the
+                // sqlite `size_gc` has called `evict_tombstone_and_erase`
+                // unconditionally on this branch since #1956, the postgres
+                // twin DELETEd outright — leaving an encrypted row's key
+                // intact and no federation resurrection guard.
+                let evict_agent: Option<String> =
+                    sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
+                        .bind(&id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("size_gc read evict agent", e))?
+                        .flatten();
+                let victim = [(id.clone(), namespace.to_string(), evict_agent)];
+                crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(
+                    &mut tx,
+                    &victim,
+                    chrono::Utc::now(),
                 )
-                .bind(&id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("size_gc snapshot links", e))?;
+                .await?;
             }
 
             // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
@@ -26565,25 +26831,40 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn export_memories(&self) -> StoreResult<Vec<Memory>> {
-        // Reuse the existing list path with an unbounded filter — postgres
-        // adapter's `list` already projects the full Memory shape and the
-        // ATOMIC_MULTI_WRITE-class semantics make a snapshot read safe.
+        // v1.0.0 #3174 [data-loss, BLOCKING] — a DEDICATED uncapped
+        // keyset-paged reader, NOT `list`.
         //
-        // #955 SECURITY-medium (Track A QC sweep, 2026-05-20) — use
-        // `for_admin` instead of `for_agent("export")`. The trait method
-        // does not yet take a caller, and the only HTTP entry
-        // (`handlers::admin::export_memories`) is already admin-gated via
-        // `require_admin`; `for_admin` matches that contract by bypassing
-        // the SAL #910 scope=private visibility filter so the export
-        // returns the FULL corpus rather than silently dropping any row
-        // whose `metadata.agent_id != "export"`. Reserved for operator
-        // surfaces per the `for_admin` docs.
-        let ctx = CallerContext::for_admin(crate::identity::sentinels::EXPORT_INTERNAL);
-        let filter = Filter {
-            limit: 100_000,
-            ..Filter::default()
-        };
-        self.list(&ctx, &filter).await
+        // Pre-#3174 this built `Filter { limit: 100_000, .. }` and delegated
+        // to `self.list`, whose FIRST statement is
+        // `filter.limit.clamp(1, crate::storage::LIST_MAX_LIMIT)` with
+        // `LIST_MAX_LIMIT = 1000`. The oversized limit was silently clamped —
+        // no error, no warning, no truncation flag — so
+        // `GET /api/v1/admin/export` on a postgres corpus of N > 1000 rows
+        // emitted a bundle marked COMPLETE carrying at most 1000 of them,
+        // while `export_links` (uncapped) carried the FULL edge set: the
+        // restored corpus had dangling edges and, far worse, the operator's
+        // backup silently was not a backup. The sqlite reference
+        // (`crate::storage::export_all`) has always been uncapped.
+        //
+        // `LIST_MAX_LIMIT` is deliberately NOT raised — it is the tenant-facing
+        // page cap and raising it would widen every tenant read. Instead the
+        // export gets its own reader that pages by an `(created_at, id)` keyset
+        // cursor until the corpus is exhausted; see
+        // [`crate::store::postgres_parity::export_memories_keyset`] for the
+        // predicate parity (expiry + the #1948 lifecycle allow-list) and why
+        // keyset rather than OFFSET.
+        //
+        // #955 SECURITY-medium (Track A QC sweep, 2026-05-20) — the reader
+        // applies NO scope=private visibility filter, preserving the
+        // `for_admin` contract this path has always held: the only HTTP entry
+        // (`handlers::admin::export_memories`) is admin-gated via
+        // `require_admin`, and the export must return the FULL corpus rather
+        // than silently dropping any row whose `metadata.agent_id` differs.
+        crate::store::postgres_parity::export_memories_keyset(
+            &self.pool,
+            Self::row_to_memory_scan,
+        )
+        .await
     }
 
     async fn export_links(&self) -> StoreResult<Vec<MemoryLink>> {
@@ -26909,6 +27190,15 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         pending_id: &str,
     ) -> StoreResult<Option<String>> {
+        // v1.0.0 #3175 — gate EXPLICITLY, as the sqlite twin does, rather than
+        // relying on the transitive gate the `store` / `delete` / `update`
+        // arms provide. The transitive gate does hold for the mutation itself,
+        // but it fires only AFTER this method has already appended a signed
+        // `pending_action.refused_agent_id_mismatch` / `approved` audit row —
+        // a record-plane write on a STOPPED plane. Gating first makes the
+        // refusal uniform (and keeps this method inside the guard set
+        // `tests/qual_pg_record_stop_gate_parity_3175.rs` pins).
+        self.gate_record_stop()?;
         // Mirror sqlite `db::execute_pending_action`. Loads the row,
         // asserts status='approved', and applies the action via the
         // standard SAL surfaces (`store_with_embedding` for create-
@@ -26927,7 +27217,48 @@ impl MemoryStore for PostgresStore {
                 detail: format!("cannot execute non-approved action (status={})", pa.status),
             });
         }
-        match pa.action_type.as_str() {
+        // v1.0.0 #3175 (v0.7.0 S5-H4) [security, BLOCKING] — refuse
+        // approver-on-behalf LAUNDERING before the side-effecting write.
+        //
+        // The S5 audit closed this on sqlite: a caller queues a pending action
+        // with `requested_by = "alice"` but embeds a payload whose
+        // `metadata.agent_id = "bob"`, and on execute the new memory lands
+        // attributed to bob — the approver, not the requester, attributes the
+        // write. `db::execute_pending_action` has run
+        // `verify_payload_agent_id` before every arm since S5-H4; the postgres
+        // twin never did, so the whole gate was absent on the multi-tenant
+        // HTTP daemon — the ONE surface with a real adversary. Calling the
+        // storage-layer function directly (rather than re-implementing the
+        // payload probe) means the two backends cannot drift again.
+        //
+        // On refusal we FIRST append the
+        // `pending_action.refused_agent_id_mismatch` audit row so the attempt
+        // is captured by the signed chain even though the execute bails, then
+        // return 403. An audit-append failure does NOT convert the refusal
+        // into an allow — it is logged and the refusal still stands
+        // (fail closed).
+        if let Err(e) = crate::storage::verify_payload_agent_id(&pa) {
+            if let Err(audit_err) = self
+                .pg_emit_pending_action_event(
+                    &pa,
+                    "pending_action.refused_agent_id_mismatch",
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                    pending_id = %pending_id,
+                    "failed to append pending_action.refused_agent_id_mismatch audit row: {audit_err}"
+                );
+            }
+            return Err(StoreError::PermissionDenied {
+                action: crate::store::EXECUTE_PENDING_ACTION.to_string(),
+                target: pending_id.to_string(),
+                reason: e.to_string(),
+            });
+        }
+        let memory_id: Option<String> = match pa.action_type.as_str() {
             "store" => {
                 let mut mem: Memory = match serde_json::from_value(pa.payload.clone()) {
                     Ok(m) => m,
@@ -26943,15 +27274,14 @@ impl MemoryStore for PostgresStore {
                 mem.created_at.clone_from(&now);
                 mem.updated_at = now;
                 mem.access_count = 0;
-                let id = self.store(ctx, &mem).await?;
-                Ok(Some(id))
+                Some(self.store(ctx, &mem).await?)
             }
             "delete" => {
                 if let Some(mid) = pa.memory_id.clone() {
                     self.delete(ctx, &mid).await?;
-                    Ok(Some(mid))
+                    Some(mid)
                 } else {
-                    Ok(None)
+                    None
                 }
             }
             "promote" => {
@@ -26961,15 +27291,34 @@ impl MemoryStore for PostgresStore {
                         ..Default::default()
                     };
                     self.update(ctx, &mid, patch).await?;
-                    Ok(Some(mid))
+                    Some(mid)
                 } else {
-                    Ok(None)
+                    None
                 }
             }
-            other => Err(StoreError::InvalidInput {
-                detail: format!("unsupported action_type: {other}"),
-            }),
+            other => {
+                return Err(StoreError::InvalidInput {
+                    detail: format!("unsupported action_type: {other}"),
+                });
+            }
+        };
+        // v1.0.0 #3180 (v0.7.0 S5-M1) — append the `pending_action.approved`
+        // audit row AFTER the side-effecting write succeeded, so the chain
+        // reflects the post-execute state (byte-identical placement to the
+        // sqlite twin's trailing `emit_pending_action_event`). Best-effort:
+        // an audit-side failure must not roll back a governance decision that
+        // already landed (the chain is allowed to gap; the write is not).
+        if let Err(e) = self
+            .pg_emit_pending_action_event(&pa, "pending_action.approved", pa.decided_by.as_deref())
+            .await
+        {
+            tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                pending_id = %pending_id,
+                "failed to append pending_action.approved audit row: {e}"
+            );
         }
+        Ok(memory_id)
     }
 
     async fn is_registered_agent(&self, agent_id: &str) -> StoreResult<bool> {
@@ -28305,18 +28654,40 @@ impl MemoryStore for PostgresStore {
             return Ok(false);
         }
         let now = chrono::Utc::now();
+        let action_kind = "memory.reclassified";
         let ph = crate::signed_events::payload_hash(
-            format!("memory.reclassified|{id}|{old_kind}|{new_kind_str}").as_bytes(),
+            format!("{action_kind}|{id}|{old_kind}|{new_kind_str}").as_bytes(),
+        );
+        // v1.0.0 #3180 [data-integrity] — bind the TRIGGERING CAUSE, closing
+        // the v73 (#1822 G5a) postgres residual. The sqlite twin
+        // (`SqliteStore::reclassify_memory_kind`) has bound
+        // `compute_cause_hash(caller, action, id, "{id}|{old}|{new}")` since
+        // G5a; the pg twin passed `None`, so the SAME reclassify produced a
+        // chain row WITH causal linkage on sqlite and WITHOUT it on postgres
+        // — an auditor walking a pg chain could not tie the reclassification
+        // to the caller and inputs that caused it. The inputs are
+        // secret-screened inside `compute_cause_hash`, so a credential that
+        // ever appeared in an id/kind can never be recovered from the stored
+        // `cause_hash` (K4).
+        //
+        // NOTE the two-place threading this requires on postgres:
+        // `with_daemon_signature` folds the cause into the Ed25519 SIGNING
+        // input, while `PgSignedEventInsert.cause_hash` carries it into the
+        // ROW (and thus the canonical chain bytes). Passing the cause to only
+        // one of them would produce a row whose signature and stored cause
+        // disagree — a self-inflicted verify failure.
+        let cause = crate::signed_events::compute_cause_hash(
+            &ctx.agent_id,
+            action_kind,
+            id,
+            &format!("{id}|{old_kind}|{new_kind_str}"),
         );
         let event = crate::signed_events::SignedEvent::with_daemon_signature(
             ph,
             ctx.agent_id.clone(),
-            "memory.reclassified".to_string(),
+            action_kind.to_string(),
             now.to_rfc3339(),
-            // v73 (#1822, G5a): the postgres reclassify twin does not
-            // thread a cause yet — only the sqlite writer binds one in
-            // G5a (additive; the cause column still round-trips on pg).
-            None,
+            Some(&cause),
         );
         pg_append_signed_event_with_chain_in_tx(
             &mut tx,
@@ -28328,10 +28699,8 @@ impl MemoryStore for PostgresStore {
                 signature: event.signature.as_deref(),
                 attest_level: &event.attest_level,
                 timestamp: now,
-                // v73: postgres reclassify/undo twins do not thread a
-                // cause yet — only the sqlite reclassify writer binds one
-                // in G5a (additive; both backends round-trip the column).
-                cause_hash: None,
+                // v1.0.0 #3180 — the same cause the signature folded above.
+                cause_hash: Some(&cause),
             },
         )
         .await
@@ -28369,6 +28738,19 @@ impl MemoryStore for PostgresStore {
         id: &str,
         dry_run: bool,
     ) -> StoreResult<crate::store::UndoOutcome> {
+        // v1.0.0 #3175 [security, BLOCKING] — FIRST statement, mirroring the
+        // sqlite twin (`SqliteStore::undo_in_place_edit`, `store/sqlite.rs`).
+        // Pre-#3175 this whole body ran with the record plane STOPPED: undo is
+        // a destructive CONTENT RESTORE that overwrites the live row through
+        // `update_with_expected_version` (auto-snapshotting the current content
+        // as a fresh `in_place_edit`) AND appends a signed audit event — the
+        // exact class of mutation the fleet-wide kill switch exists to hold.
+        // A control that must fail CLOSED was failing OPEN on one backend
+        // only. The `dry_run` arm is gated too: refusing uniformly keeps the
+        // stop's contract ("every mutating record-plane operation REFUSES")
+        // one predicate rather than a per-argument exception a future
+        // refactor could lose.
+        self.gate_record_stop()?;
         let caller: Option<&str> = if ctx.bypass_visibility {
             None
         } else {
@@ -29111,19 +29493,39 @@ impl MemoryStore for PostgresStore {
             })?;
         }
 
-        // Look up any prior entity row in this namespace via the
-        // SAL `list` surface (namespace-scoped). We match by
-        // (title == canonical_name) AND (metadata.kind == "entity").
-        let filter = super::Filter {
-            namespace: Some(namespace.to_string()),
-            limit: 10_000,
-            ..Default::default()
-        };
-        let candidates = self.list(ctx, &filter).await?;
-        let prior = candidates.into_iter().find(|m| {
-            m.title == canonical_name
-                && m.metadata.get("kind").and_then(serde_json::Value::as_str) == Some(ENTITY_KIND)
-        });
+        // v1.0.0 #3174 [data-loss, BLOCKING] — DIRECT indexed lookup, NOT a
+        // `list` scan.
+        //
+        // Pre-#3174 this listed up to `limit: 10_000` rows of the namespace
+        // and searched them in-process. `PostgresStore::list` clamps to
+        // `LIST_MAX_LIMIT = 1000`, so in any namespace with more than 1000
+        // rows the prior entity simply fell outside the window: the
+        // registration was reported `created: true` and a DUPLICATE entity row
+        // landed for a name that was already registered — silent corpus
+        // corruption that compounds on every re-register. The `list` path also
+        // applied the #910 scope=private visibility filter, so an entity owned
+        // by ANOTHER agent was invisible here yet visible to the
+        // `find_by_title_namespace` collision probe below, turning an
+        // alias-union re-register into a hard `Conflict` on postgres only.
+        //
+        // The replacement is the exact postgres twin of the sqlite SSOT's
+        // lookup (`db::entity_register`,
+        // `SELECT id FROM memories WHERE namespace = ?1 AND title = ?2
+        //  AND COALESCE(json_extract(metadata,'$.kind'),'') = ?3`): one
+        // index-servable probe, unbounded by any page cap, owner-agnostic
+        // exactly like the reference.
+        let prior: Option<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT id, metadata FROM memories \
+             WHERE namespace = $1 AND title = $2 \
+               AND COALESCE(metadata->>'kind', '') = $3 \
+             LIMIT 1",
+        )
+        .bind(namespace)
+        .bind(canonical_name)
+        .bind(ENTITY_KIND)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("entity_register prior lookup", e))?;
 
         // Detect a colliding non-entity row at (title, namespace).
         // The list-then-filter above only finds entity rows; a
@@ -29142,15 +29544,12 @@ impl MemoryStore for PostgresStore {
         // `db::entity_register`.
         let prior_aliases: Vec<String> = prior
             .as_ref()
-            .and_then(|m| {
-                m.metadata
-                    .get("aliases")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str().map(str::to_string))
-                            .collect()
-                    })
+            .and_then(|(_, meta)| {
+                meta.get("aliases").and_then(|v| v.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
             })
             .unwrap_or_default();
         let mut union: Vec<String> = Vec::new();
@@ -29193,7 +29592,7 @@ impl MemoryStore for PostgresStore {
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_id = prior
             .as_ref()
-            .map(|m| m.id.clone())
+            .map(|(id, _)| id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mem = Memory {
             id: resolved_id.clone(),
@@ -29238,28 +29637,69 @@ impl MemoryStore for PostgresStore {
         // that unions new aliases only adds the missing rows. Mirrors the
         // kg-handler `INSERT INTO entity_aliases` path so the two SAL
         // methods are consistent.
-        for alias in &union {
-            // #2993 — persist the STORAGE form (redact mode masks a credential;
-            // refuse mode already rejected above; off = verbatim) so no raw
-            // secret lands in `entity_aliases`.
-            let stored =
-                crate::secret_screen::redact_for_storage(alias).unwrap_or_else(|| alias.clone());
+        //
+        // v1.0.0 #3174 — the CANONICAL NAME is now inserted as an alias row
+        // FIRST, unconditionally, exactly as the sqlite SSOT does
+        // (`db::entity_register`: "canonical_name is always reachable via
+        // entity_get_by_alias. Without this row, registering an entity with no
+        // aliases makes it unreachable by name (NHI-P3-T2)"). Pre-#3174 the pg
+        // twin built its insert set from `prior_aliases + aliases` ONLY, so
+        // `entity_get_by_alias(canonical_name)` returned `Some` on sqlite and
+        // `None` on postgres for the identical registration — and an entity
+        // registered with NO aliases was name-unreachable on pg entirely.
+        let stored_canonical = crate::secret_screen::redact_for_storage(canonical_name)
+            .unwrap_or_else(|| canonical_name.to_string());
+        let alias_rows: Vec<String> = std::iter::once(stored_canonical)
+            .chain(union.iter().filter_map(|alias| {
+                let trimmed = alias.trim();
+                if trimmed.is_empty() || trimmed == canonical_name {
+                    // Empty aliases carry nothing; the canonical name already
+                    // has its row above (skip mirrors the sqlite loop).
+                    return None;
+                }
+                // #2993 — persist the STORAGE form (redact mode masks a
+                // credential; refuse mode already rejected above; off =
+                // verbatim) so no raw secret lands in `entity_aliases`.
+                Some(
+                    crate::secret_screen::redact_for_storage(trimmed)
+                        .unwrap_or_else(|| trimmed.to_string()),
+                )
+            }))
+            .collect();
+        for stored in &alias_rows {
             sqlx::query(
                 "INSERT INTO entity_aliases (entity_id, alias) VALUES ($1, $2)
                  ON CONFLICT (entity_id, alias) DO NOTHING",
             )
             .bind(&written_id)
-            .bind(&stored)
+            .bind(stored)
             .execute(&self.pool)
             .await
             .map_err(|e| to_store_err("entity_register populate entity_aliases", e))?;
         }
 
+        // v1.0.0 #3174 — return the JOIN TABLE's own rows, the sqlite twin's
+        // `list_entity_aliases(conn, &entity_id)` shape (same
+        // `ORDER BY created_at ASC, alias ASC`). Pre-#3174 pg returned the
+        // in-memory `union`, which (a) omitted the canonical name sqlite
+        // includes and (b) echoed the RAW caller strings — so under
+        // `secret_screen` redact mode the pg response handed back a credential
+        // that sqlite had already masked. Reading the table returns the STORED
+        // (masked) forms on both backends.
+        let aliases_out: Vec<String> = sqlx::query_scalar(
+            "SELECT alias FROM entity_aliases WHERE entity_id = $1 \
+             ORDER BY created_at ASC, alias ASC",
+        )
+        .bind(&written_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("entity_register list aliases", e))?;
+
         Ok(EntityRegistration {
             entity_id: written_id,
             canonical_name: canonical_name.to_string(),
             namespace: namespace.to_string(),
-            aliases: union,
+            aliases: aliases_out,
             created,
         })
     }
