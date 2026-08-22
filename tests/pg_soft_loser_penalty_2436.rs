@@ -233,7 +233,7 @@ mod postgres_side {
             ..Filter::default()
         };
         let ranked = pg
-            .search_with_source_uri(tok, &filter, None)
+            .search_with_source_uri(&ctx, tok, &filter, None)
             .await
             .expect("search_with_source_uri");
 
@@ -269,7 +269,7 @@ mod postgres_side {
         let _ = MemoryStore::store(&pg, &ctx, &hi).await;
         let _ = MemoryStore::store(&pg, &ctx, &lo).await;
         let ranked2 = pg
-            .search_with_source_uri(tok2, &filter, None)
+            .search_with_source_uri(&ctx, tok2, &filter, None)
             .await
             .expect("search_with_source_uri");
         for id in ["pg-cb16-normal-hi", "pg-cb16-normal-lo"] {

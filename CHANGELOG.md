@@ -239,6 +239,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
   the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
   the outer job cap — remains what fires on a genuine hang.
+### Security (#3110 — cross-agent private-row leak on the postgres reciprocal-provenance search)
+
+- **`PostgresStore::search_with_source_uri` now enforces the SAL #910
+  `scope=private` visibility gate.** The postgres reciprocal-provenance FTS
+  surface (the `?source_uri=` compose path, Gap 6 / #889) returned `Memory` rows
+  with NO caller/scope predicate at all, while its sqlite twin
+  (`storage::search_with_source_uri`) has been fail-closed since #1720 A3 and the
+  postgres `search` trait method has carried the gate since #910. A
+  `scope=private` row owned by another agent could therefore surface to any
+  caller through this method. The method now takes a `&CallerContext` and applies
+  the SAME owner-keyed predicate the postgres `search` uses — absent `scope`
+  defaults to `private` (fail-closed), the owner (`metadata.agent_id`) and the
+  addressed inbox recipient (`metadata.target_agent_id`, the #3070 carve-out) stay
+  visible — pushed into SQL and re-applied in-process via `is_visible_to_caller`
+  (belt-and-suspenders, identical to `search`). `bypass_visibility` (admin /
+  migrate / federation catch-up / GC) remains the one sanctioned bypass. No
+  production caller reached the method (the postgres HTTP search path dispatches
+  through the SAL trait `search`), so this closes a latent leak and restores
+  cross-backend parity rather than fixing an actively exploited route.
 
 ### Removed
 

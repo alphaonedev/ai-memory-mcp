@@ -6566,8 +6566,18 @@ impl PostgresStore {
     ///
     /// Returns up to `limit` matches ordered descending by a blended
     /// score (text-rank + priority + recency).
+    ///
+    /// # Visibility (#3110)
+    /// `ctx` drives the SAL #910 scope=private gate: a `scope=private`
+    /// row is returned only when the caller owns it
+    /// (`metadata.agent_id == ctx.effective_principal()`) or is its
+    /// addressed inbox recipient (`metadata.target_agent_id`), exactly
+    /// as the pg `search` trait method and the sqlite twin enforce. A
+    /// context with `bypass_visibility` (admin / migrate / federation
+    /// catch-up / GC only) sees every row.
     pub async fn search_with_source_uri(
         &self,
+        ctx: &CallerContext,
         query: &str,
         filter: &Filter,
         source_uri: Option<&str>,
@@ -6577,6 +6587,24 @@ impl PostgresStore {
             .clamp(1, crate::storage::LIST_MAX_LIMIT)
             .try_into()
             .unwrap_or(LIST_FALLBACK_LIMIT_I64);
+        // #3110 (2026-08) — SAL #910 scope=private visibility gate. The
+        // reciprocal-provenance FTS path returns `Memory` rows and MUST
+        // apply the same owner-keyed private filter as the pg `search`
+        // trait method (postgres.rs `search`) and the fail-closed sqlite
+        // twin (`crate::storage::search_with_source_uri`, bound at ?15).
+        // Without it a `scope=private` row owned by another agent could
+        // surface to any caller through the `?source_uri=` compose path
+        // — the exact cross-agent private-row leak the twin already
+        // blocks. `bypass_visibility` (admin / migrate / federation
+        // catch-up / GC) binds NULL so the SQL arm short-circuits true
+        // (no filtering), IDENTICAL to pg `search`'s `caller_opt`
+        // derivation — the ONE sanctioned bypass, never a tenant path.
+        let caller = ctx.effective_principal();
+        let caller_opt: Option<&str> = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(caller)
+        };
         // #1579 B2 — rank + match read the stored generated `tsv`
         // column (schema v57) instead of recomputing
         // to_tsvector(title||' '||content) per matched row.
@@ -6607,11 +6635,23 @@ impl PostgresStore {
                AND ($4::timestamptz IS NULL OR m.created_at >= $4)
                AND ($5::timestamptz IS NULL OR m.created_at <= $5)
                AND ($6::text IS NULL OR m.source_uri = $6)
+               -- #3110 — SAL #910 owner-keyed scope=private gate (mirrors
+               -- pg `search` at postgres.rs `search`). $7 = caller
+               -- principal; NULL (bypass) short-circuits the arm true.
+               -- Absent `scope` defaults to 'private' (fail-closed);
+               -- `target_agent_id` is the #3070 inbox carve-out so a row
+               -- addressed TO the caller stays visible.
+               AND (
+                   $7::text IS NULL
+                   OR COALESCE(m.metadata->>'scope', 'private') <> 'private'
+                   OR m.metadata->>'agent_id' = $7
+                   OR m.metadata->>'target_agent_id' = $7
+               )
                {lifecycle_vis}
              ORDER BY rank DESC,
                       m.priority DESC,
                       m.updated_at DESC
-             LIMIT $7",
+             LIMIT $8",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
             lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
             soft_loser_factor = crate::storage::SOFT_LOSER_SCORE_FACTOR,
@@ -6622,18 +6662,30 @@ impl PostgresStore {
         .bind(filter.since)
         .bind(filter.until)
         .bind(source_uri)
+        .bind(caller_opt)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("search_with_source_uri", e))?;
 
         // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
-        Ok(rows
+        let mems: Vec<Memory> = rows
             .iter()
             .map(Self::row_to_memory_scan)
             .collect::<StoreResult<Vec<_>>>()?
             .into_iter()
             .flatten()
+            .collect();
+        // #3110 — belt-and-suspenders in-process re-filter, IDENTICAL to
+        // pg `search`: the SQL gate is authoritative, but re-applying
+        // `is_visible_to_caller` in Rust closes any gap between the SQL
+        // predicate and the canonical `crate::visibility` semantics.
+        if ctx.bypass_visibility {
+            return Ok(mems);
+        }
+        Ok(mems
+            .into_iter()
+            .filter(|m| is_visible_to_caller(m, caller))
             .collect())
     }
 
