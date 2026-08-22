@@ -453,7 +453,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // what it now refuses, why the disposition is surface-keyed rather than
     // unconditional (3x3 vote 7-2), and which residual is deliberate.
     // MEASURED post-change: 28_047. Ceiling 27_900 -> 28_120 (+73 headroom).
-    ("src/storage/mod.rs", 30_020), /* 2026-08-24 (#3220 Fable HIGH 2): refuse_unapproved_destination_store on promote execute arm + dest-owner pin. MEASURED 29_936. Ceiling 29_900 -> 30_020 (+84 headroom). PRIOR: 2026-08-24 (#3202 Fable HIGH rebase onto 72e4c100): execute_pending_action store arm dispatches mode=vertical onto promote_to_namespace + test_execute_store_arm_vertical_promote_clones_3202. MEASURED 29_818. Ceiling 29_600 -> 29_900 (+82 headroom). PRIOR: 2026-08-23 (#3216 Fable fail-closed): RE-MEASURED 29_516. Ceiling 29_600 stays then (never lower a floor); +84 headroom. PRIOR: 2026-08-22 (#3171 MCP tool-contract audit): STRICT forget_fts_query. Ceiling was 29_320 on that branch; folded into 29_600 at rebase onto d674047f/#3218. */
+    ("src/storage/mod.rs", 30_220), /* 2026-08-24 (#3221 rebase onto 5cb2dc31): #3161 gc/archive-then-delete link snapshot ON TOP OF #3220 dest-execute refuse. HEAD measured 29_936 at 30_020; incoming #3161 measured +~200 on its base. Ceiling 30_020 -> 30_220 (never lower a floor). Remeasure after gates. */
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
@@ -1088,7 +1088,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // that arrives through a clean auto-merge is UNVERIFIED — always
     // re-measure the merged file), so 33_150 carries the same modest headroom
     // as the neighbouring bumps.
-    ("src/store/postgres.rs", 35_840), /* 2026-08-23 (#3216 Fable fail-closed): live corroboration probe now runs SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL under SET LOCAL search_path in a tx (no restated cousin SQL). MEASURED 35_759; ceiling 35_400 -> 35_840 (+81 headroom, lockstep). Never lower a floor. PRIOR: 2026-08-23 (#3216 rebase onto 8fb6e9eb) pending-remeasure placeholder 35_200 -> 35_400. PRIOR HEAD: 2026-08-23 (#3134) MEASURED 35_166; ceiling 35_200. */
+    ("src/store/postgres.rs", 35_940), /* 2026-08-24 (#3221 rebase onto 5cb2dc31): #3161 pg gc/size_gc/supersede link snapshots ON TOP OF #3216. HEAD 35_840 measured 35_759; incoming #3161 +~180. Ceiling 35_840 -> 35_940 (never lower a floor). Remeasure after gates. */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

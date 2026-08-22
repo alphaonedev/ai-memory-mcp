@@ -1988,8 +1988,10 @@ fn insert_inner(
                 -- incoming row's expiry verbatim, so re-storing the same
                 -- (title, namespace) with an EARLIER expiry silently rolled a
                 -- live row's TTL backwards — a #1596 never-move-expiry-earlier
-                -- violation (premature GC reap / permanent link-edge loss under
-                -- the v70 auto-eviction posture). Mirrors EXACTLY the shipped
+                -- violation (premature GC reap; under the v70 auto-eviction
+                -- posture that ALSO meant permanent link-edge loss — #3161 has
+                -- since closed that half, but a premature reap is still a
+                -- reap). Mirrors EXACTLY the shipped
                 -- #2335 federation extension-FLOOR lattice join (scalar MAX over
                 -- the COALESCE'd pair, both operands funnel-canonical per #2332):
                 -- the merge converges on the LATER expiry regardless of store
@@ -5013,6 +5015,17 @@ pub fn archive_memory_for_caller(
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
+        // #3161 (v1.0.0) — DATA-LOSS CLOSE, fourth funnel. This
+        // OWNERSHIP-SCOPED archive path (the non-admin caller's
+        // `memory_archive`) open-codes the archive copy instead of routing
+        // through `archive_memory_no_tx`, and never snapshotted the row's
+        // edges — so the `ON DELETE CASCADE` at the bottom of this same tx
+        // reaped them and `restore_archived_for_caller` brought the memory
+        // back with an EMPTY edge graph, while the ADMIN funnel next door
+        // preserved it. Whether a memory keeps its links must not depend on
+        // which principal archived it. Snapshot BEFORE the delete, exactly
+        // as `archive_memory_no_tx` does.
+        archive_links_for_memory(conn, id)?;
         // #2503 — mirrors `delete`'s SEVER so an archived row is not still
         // referenced as a namespace standard, WITHOUT destroying the binding
         // row (and its `parent_namespace` inheritance link) of every namespace
@@ -13330,6 +13343,48 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                      WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
                 ))?;
                 archive_stmt.execute(params![now, GC_CHUNK_ROWS])?;
+                // #3161 (v1.0.0) — DATA-LOSS CLOSE. The archive copy above
+                // moves only the memory ROW; `memory_links` carries an
+                // `ON DELETE CASCADE` FK on both endpoints, so the DELETE at
+                // the bottom of this same transaction reaps every edge of every
+                // doomed row. Pre-#3161 the gc archive path never snapshotted
+                // them, so `restore_archived` brought the row back with an EMPTY
+                // edge graph — while `forget(archive=true)` /
+                // `archive_memory_no_tx` / `archive_by_ids` (which DO call
+                // `archive_links_for_memory`) preserved it. Whether a memory
+                // kept its edges across archive→restore therefore depended on
+                // WHICH path archived it, an asymmetry no operator could see.
+                // Snapshot here, BEFORE the cascade, over the SAME
+                // deterministic chunk subquery (`SQL_GC_EXPIRED_CHUNK_IDS`,
+                // `ORDER BY rowid LIMIT ?2`) that the archive copy above and
+                // the `DELETE` below both target — so the three statements
+                // provably pin to the identical row set inside this
+                // `BEGIN IMMEDIATE`, with no materialized id list to drift.
+                // The edge's `archived_at` binds `?1`, the same stamp the
+                // memory row's archive copy takes, so a row and its edges
+                // carry ONE archive timestamp.
+                //
+                // SET-BASED deliberately (North Star: manageable at scale).
+                // The single-row funnels call `archive_links_for_memory`, but
+                // gc reaps up to `GC_CHUNK_ROWS` (500) rows per chunk on a
+                // 30-minute timer across a fleet, and a per-victim call would
+                // put 500 statements inside the eviction transaction — the
+                // same set-based shape `forget` uses and the postgres `run_gc`
+                // twin lands in this change. `INSERT OR IGNORE` on the
+                // `(source_id, target_id, relation)` PK makes it idempotent,
+                // so an edge already snapshotted by another funnel (or by an
+                // earlier chunk that shared an endpoint) is left untouched.
+                let mut links_stmt = conn.prepare_cached(&format!(
+                    "INSERT OR IGNORE INTO archived_memory_links
+                         (source_id, target_id, relation, created_at, valid_from,
+                          valid_until, observed_by, signature, attest_level, archived_at)
+                     SELECT source_id, target_id, relation, created_at, valid_from,
+                            valid_until, observed_by, signature, attest_level, ?1
+                     FROM memory_links
+                     WHERE source_id IN ({SQL_GC_EXPIRED_CHUNK_IDS})
+                        OR target_id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
+                ))?;
+                links_stmt.execute(params![now, GC_CHUNK_ROWS])?;
             }
             // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
             // append ONE identity-only EXPIRE leaf per doomed row IN THIS
@@ -13744,14 +13799,22 @@ pub fn list_archived(
 /// other endpoint is permanently gone is correctly skipped — the FK would
 /// reject it). Idempotent.
 ///
-/// **NOT recovered:** edges lost to the auto-eviction paths (`gc` /
-/// `size_gc`) — those are intentionally NOT snapshotted (nobody restores
-/// an auto-eviction; snapshotting there is a perf regression per the
-/// 5-agent vote 4d3ea1c5), so a memory archived by gc restores with an
-/// empty edge graph. Other `ON DELETE CASCADE` provenance
-/// (`recall_observations`, confidence-calibration rows,
-/// `memory_transcript_links`) is regenerable telemetry and is NOT
-/// preserved by design.
+/// #3161 truth-fix (v1.0.0): this comment read "**NOT recovered:** edges
+/// lost to the auto-eviction paths (`gc` / `size_gc`) — those are
+/// intentionally NOT snapshotted … so a memory archived by gc restores
+/// with an empty edge graph." That carve-out is GONE. `gc(archive = true)`
+/// and `size_gc(archive = true)` now snapshot on BOTH backends, so the
+/// archiving PATH no longer decides whether a restored memory keeps its
+/// edge graph — EVERY archive-then-delete funnel preserves it. The v70
+/// rationale ("nobody restores an auto-eviction") did not survive contact
+/// with the prime directive: `archive = true` is a caller asking for
+/// reversibility, and half-honouring it is unintentional data loss.
+///
+/// **Still NOT recovered (by design):** a HARD (non-archiving) forget or
+/// gc — `archive = false` is an explicit request for irreversibility — and
+/// the other `ON DELETE CASCADE` provenance (`recall_observations`,
+/// confidence-calibration rows, `memory_transcript_links`), which is
+/// regenerable telemetry.
 ///
 /// #2318 truth-fix: this comment long read "POSTGRES edge restore is a
 /// tracked follow-up (this commit wires sqlite only)". That is FALSE and
@@ -14791,8 +14854,9 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                 -- STALE losing peer's expiry verbatim, silently shortening a
                 -- live row's TTL (recall fold-extensions raise expires_at
                 -- WITHOUT bumping updated_at, so routine bidirectional sync
-                -- rolled local extensions back and GC reaped early — with the
-                -- v70 auto-eviction posture that is permanent link-edge loss).
+                -- rolled local extensions back and GC reaped early — under the
+                -- v70 auto-eviction posture that ALSO meant permanent link-edge
+                -- loss, closed by #3161; the premature reap itself remains).
                 -- The merge is now the extension-FLOOR lattice join (scalar
                 -- MAX, both operands funnel-canonicalized per #2332 so byte
                 -- order is chronological): both replicas converge to the LATER
@@ -22220,14 +22284,19 @@ mod tests {
         );
     }
 
-    /// #1771 — DOCUMENTS the current archive->restore edge-loss: a restored
-    /// memory comes back WITHOUT its `memory_links` (cascade-reaped at delete
-    /// time, never copied into the archive). This pins the KNOWN-LOSS behaviour
-    /// as the honesty floor of #1771 (5-agent vote 4d3ea1c5); when the
-    /// `archived_memory_links` structural fix lands, the final assertion flips
-    /// to expect edge SURVIVAL (1), and this test becomes the regression guard.
+    /// #3161 (v1.0.0) — the flipped #1771 pin. This test used to assert the
+    /// DOCUMENTED LOSS ("a gc-archived memory comes back with an empty edge
+    /// graph") and carried the instruction "flip this to expect 1 when
+    /// `archived_memory_links` preservation lands". Preservation landed for
+    /// `forget(archive=true)` / `archive_memory_no_tx` / `archive_by_ids` at
+    /// #1771 and the issue was CLOSED, but `gc(archive=true)` never called
+    /// `archive_links_for_memory` — so the "documented loss" silently became an
+    /// UNDOCUMENTED ASYMMETRY: whether a memory kept its edges across
+    /// archive→restore depended on WHICH path archived it. #3161 wires the
+    /// snapshot into the gc archive path on both backends; this is now the
+    /// regression guard the #1771 comment promised.
     #[test]
-    fn restore_does_not_recover_links_documented_loss_1771() {
+    fn gc_archive_then_restore_preserves_links_3161() {
         let conn = test_db();
         // A is a gc-eligible short-tier row (past expiry); B is permanent.
         let mut a = make_memory("link-loss-A", "ns1771", Tier::Short, 5);
@@ -22253,15 +22322,109 @@ mod tests {
             "A is deleted from live memories"
         );
 
-        // Restore A: the ROW returns, the edge graph does NOT (#1771).
+        // The edge must have been snapshotted BEFORE the cascade delete.
+        let snapshotted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM archived_memory_links \
+                 WHERE source_id = ?1 AND target_id = ?2",
+                params![a_id, b_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            snapshotted, 1,
+            "#3161: gc(archive=true) must snapshot the doomed row's memory_links \
+             into archived_memory_links BEFORE the cascade DELETE reaps them"
+        );
+
+        // Restore A: the ROW returns AND so does the edge graph (#3161).
         assert!(restore_archived(&conn, &a_id).unwrap(), "A row restored");
         assert!(get(&conn, &a_id).unwrap().is_some(), "A is live again");
         assert_eq!(
             get_links(&conn, &a_id).unwrap().len(),
-            0,
-            "#1771 DOCUMENTED LOSS: a restored memory's memory_links are NOT \
-             recovered (cascade-reaped at delete time, not archived). Flip this \
-             to expect 1 when archived_memory_links preservation lands."
+            1,
+            "#3161: a gc-archived memory must come back with its edge graph, \
+             exactly as forget(archive=true) / archive_by_ids already do — the \
+             archiving PATH must not decide whether links survive"
+        );
+    }
+
+    /// #3161 (v1.0.0) — the FUNNEL-PARITY twin of
+    /// `gc_archive_then_restore_preserves_links_3161`. Pins the invariant the
+    /// bug violated: for the SAME memory + edge shape, `gc(archive=true)` and
+    /// `forget(archive=true)` must both preserve the edge across
+    /// archive→restore. A future funnel that archives without snapshotting
+    /// fails HERE with a direct A-vs-B comparison rather than as a lone
+    /// absolute-count assertion someone could "fix" by lowering the expectation.
+    #[test]
+    fn gc_and_forget_archive_paths_agree_on_link_preservation_3161() {
+        /// Build one gc-eligible source row linked to one permanent target,
+        /// archive it via `archive_via`, restore it, and report the restored
+        /// edge count.
+        fn restored_link_count(archive_via: impl Fn(&Connection, &str)) -> usize {
+            let conn = test_db();
+            // A is gc-eligible (past expiry) AND alone in its namespace, so
+            // BOTH funnels can target it; B lives in another namespace so it
+            // survives the namespace-scoped forget and is a live endpoint at
+            // restore time.
+            let mut a = make_memory("parity-A", "ns3161-a", Tier::Short, 5);
+            a.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+            let a_id = insert(&conn, &a).unwrap();
+            let b = make_memory("parity-B", "ns3161-b", Tier::Long, 5);
+            let b_id = insert(&conn, &b).unwrap();
+            create_link(&conn, &a_id, &b_id, "related_to").unwrap();
+            assert_eq!(get_links(&conn, &a_id).unwrap().len(), 1, "precondition");
+
+            archive_via(&conn, &a_id);
+            assert!(
+                get(&conn, &a_id).unwrap().is_none(),
+                "A must be archived out of the live table"
+            );
+            assert!(get(&conn, &b_id).unwrap().is_some(), "B must survive");
+            assert!(restore_archived(&conn, &a_id).unwrap(), "A restored");
+            get_links(&conn, &a_id).unwrap().len()
+        }
+
+        let via_gc = restored_link_count(|conn, _id| {
+            assert!(gc(conn, true).unwrap() >= 1, "gc archived the expired row");
+        });
+        let via_forget = restored_link_count(|conn, _id| {
+            assert_eq!(
+                forget(conn, Some("ns3161-a"), None, None, true).unwrap(),
+                1,
+                "forget(archive=true) archived the row"
+            );
+        });
+        // The ADMIN single-row funnel.
+        let via_archive = restored_link_count(|conn, id| {
+            assert!(
+                archive_memory(conn, id, None).unwrap(),
+                "archive_memory archived the row"
+            );
+        });
+        // The OWNERSHIP-SCOPED funnel (`memory_archive` for a non-admin
+        // caller). It open-codes its archive copy instead of routing through
+        // `archive_memory_no_tx`, and pre-#3161 it lost the edge graph — so
+        // whether a memory kept its links depended on WHICH PRINCIPAL
+        // archived it, not just which funnel.
+        let via_caller = restored_link_count(|conn, id| {
+            assert!(
+                archive_memory_for_caller(conn, id, None, "ai:owner-3161").unwrap(),
+                "archive_memory_for_caller archived the row"
+            );
+        });
+
+        assert_eq!(
+            [via_gc, via_forget, via_archive, via_caller],
+            [1, 1, 1, 1],
+            "#3161 FUNNEL PARITY: restored edge counts were gc={via_gc}, \
+             forget={via_forget}, archive_memory={via_archive}, \
+             archive_memory_for_caller={via_caller}. All four archive→restore \
+             funnels must PRESERVE the edge graph — whether a memory keeps its \
+             links must not depend on which funnel (or which principal) \
+             archived it. Pinning the exact value 1 on every leg is deliberate: \
+             an all-zero row would satisfy a mere equality check while still \
+             losing every edge."
         );
     }
 

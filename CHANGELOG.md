@@ -1416,6 +1416,57 @@ backend and missing or divergently implemented on its twin). Pinned by
   watchdog test's detached sleeper drops from 30 s to 5 s (still
   unconditionally over the assertion's ceiling, so the property is intact).
 
+- **DATA LOSS: `gc(archive = true)` dropped every link of the archived memory;
+  the archiving PATH decided whether a memory kept its edge graph (#3161).**
+  `storage::gc`'s archive branch copied only the memory ROW into
+  `archived_memories` and then ran `DELETE FROM memories` in the same
+  transaction. `memory_links` carries an `ON DELETE CASCADE` FK on BOTH
+  endpoints, so that delete reaped the row's entire edge graph, and
+  `restore_archived` brought the memory back with NO links — while
+  `forget(archive = true)`, `archive_memory_no_tx` and (on postgres)
+  `archive_by_ids` have snapshotted edges into `archived_memory_links` since
+  #1771. The loss was pinned as intended by a test whose message read *"Flip
+  this to expect 1 when `archived_memory_links` preservation lands"* and cited
+  #1771 — but preservation HAD landed and #1771 was CLOSED, so a documented
+  known-loss had silently become an undocumented ASYMMETRY that no operator
+  could see: identical memories, identical edges, different outcome depending
+  on which funnel archived them. `gc` now calls `archive_links_for_memory` over
+  the same deterministic chunk id set the `DELETE` targets, before the cascade.
+  An audit of EVERY archive-then-delete funnel on BOTH backends (8 sqlite +
+  7 postgres `archived_memories` write sites) found the issue's `gc` was one of
+  FIVE, not one: **sqlite** `gc` and `archive_memory_for_caller` (the
+  ownership-scoped `memory_archive` for a non-admin caller, which open-codes its
+  archive copy instead of routing through `archive_memory_no_tx` — so whether a
+  memory kept its links depended on which PRINCIPAL archived it, not just which
+  funnel); **postgres** `run_gc` (a set-based insert over the same TTL-expiry
+  predicate the `DELETE` uses), `size_gc` (byte-cap eviction — the sqlite twin
+  routes through `archive_memory_no_tx` and has snapshotted since #1771, this
+  one never did), and `update_with_archive_on_supersede` (the superseded row was
+  archived and deleted, so restoring the `superseded` snapshot on postgres
+  returned it edgeless while sqlite returned the graph). The remaining sites are
+  `in_place_edit` snapshots that never delete the live row, so no cascade fires
+  and no snapshot is owed. All five snapshots are idempotent (`INSERT OR IGNORE`
+  / `ON CONFLICT DO NOTHING` on the `(source_id, target_id, relation)` PK), so
+  an edge already captured by another funnel is left untouched. The pinning test
+  is flipped to expect preservation and joined by a funnel-PARITY twin that
+  compares gc against forget, `archive_memory` and `archive_memory_for_caller`
+  directly, plus gated postgres twins for `run_gc` and `size_gc`.
+- **Claims-truth sweep for the retired v70 "documented loss" carve-out
+  (#3161).** Five places still told operators the opposite of what the code now
+  does. `storage::restore_archived`'s recovery-scope doc (*"**NOT recovered:**
+  edges lost to the auto-eviction paths (`gc` / `size_gc`)"*),
+  `docs/corpus-lifecycle.md`'s EXPIRE restorability row (*"Link edges are
+  **not** snapshotted on auto-eviction (documented loss)"*) and `CLAUDE.md`'s
+  v70 schema note are corrected to state the new contract and to name what IS
+  still irreversible (a HARD `archive = false` forget/gc — which is what
+  irreversibility means). Two expiry-floor rationale comments in
+  `storage::mod.rs` that cited *"permanent link-edge loss under the v70
+  auto-eviction posture"* now say the reap remains but the edge loss does not.
+  Separately, the postgres `archived_memory_links` v70 doc still read *"the
+  snapshot-before-delete + restore-re-insert wiring is wired on SQLite this
+  commit and is a tracked POSTGRES follow-up"* — stale since v70 shipped; the
+  identical sentence was corrected in the sqlite twin by #2318 but the postgres
+  copy was MISSED, so it advertised a two-release-old gap that did not exist.
 - **The per-migration metadata matrix was guessed, not derived, and its lockstep
   gate could never fail (#3158).** `storage::migration_meta::MIGRATION_LADDER`
   is the operator-facing answer to *"is this migration reversible? does it lose
