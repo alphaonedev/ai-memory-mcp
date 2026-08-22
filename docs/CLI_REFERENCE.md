@@ -425,9 +425,27 @@ ai-memory mine ./claude-export --format claude --min-messages 3
 ```bash
 ai-memory archive list --limit 100
 ai-memory archive restore abc123
-ai-memory archive purge --older-than-days 30
+ai-memory archive purge --namespace scratch --older-than-days 30
+ai-memory archive purge --dry-run                 # preview, destroys nothing
+ai-memory archive purge --confirm-global          # every namespace
 ai-memory archive stats
 ```
+
+**`archive purge` safety rail**
+([#3013](https://github.com/alphaonedev/ai-memory-mcp/issues/3013)). `purge`
+is the most destructive verb in the CLI — it destroys the LAST copy of an
+archived memory's text, including the `in_place_edit` undo snapshots and the
+rows `delete` / `forget` left recoverable. Until v1.0.0 its entire argument
+surface was `--older-than-days` ("all if omitted"): no namespace scope, no
+preview, no confirmation — while the strictly *less* destructive `forget`
+already required `--confirm-global`. It now mirrors that guard.
+
+| Flag | Applies to | Notes |
+|---|---|---|
+| `--namespace <NS>` | `archive purge` | Bound the purge to one namespace. Omit for the cross-namespace wipe, which then requires `--confirm-global`. |
+| `--confirm-global` | `archive purge` | Required when `--namespace` is omitted. Without it the purge refuses and destroys nothing. Not needed for `--dry-run`. |
+| `--dry-run` | `archive purge` | Report the count that WOULD be purged under the same predicate and exit without deleting. Reachable without `--confirm-global`. The preview and the delete are single-sourced on one predicate, so the count cannot understate the blast radius. |
+| `--older-than-days <N>` | `archive purge` | Only entries archived more than `N` days ago. All ages if omitted. |
 
 ## Governance & agents
 

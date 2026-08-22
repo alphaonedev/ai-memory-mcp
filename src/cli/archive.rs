@@ -30,14 +30,50 @@ pub enum ArchiveAction {
     },
     /// Restore an archived memory back to active
     Restore { id: String },
-    /// Permanently delete old archive entries
+    /// Permanently delete old archive entries.
+    ///
+    /// v1.0.0 #3013 — this is the most destructive verb in the CLI: it
+    /// destroys the LAST copy of an archived memory's text, including the
+    /// `in_place_edit` undo snapshots and the rows `forget` / `delete` left
+    /// recoverable. Pre-#3013 its ENTIRE argument surface was
+    /// `--older-than-days` ("all if omitted"), with no namespace scope, no
+    /// preview and no confirmation — while the strictly LESS destructive
+    /// `forget` already required `--confirm-global` for a cross-namespace
+    /// blast radius. It now mirrors `forget`'s guard.
     Purge {
-        /// Delete archive entries older than N days (all if omitted)
+        /// Delete archive entries older than N days (all ages if omitted).
         #[arg(long)]
         older_than_days: Option<i64>,
+        /// #3013 — bound the purge to ONE namespace. Omit for the
+        /// cross-namespace wipe, which then requires `--confirm-global`.
+        #[arg(long, short)]
+        namespace: Option<String>,
+        /// #3013 — required when `--namespace` is omitted, because the purge
+        /// then destroys archived rows across EVERY namespace in the
+        /// database. Mirrors `forget --confirm-global`
+        /// (`cli::forget::requires_global_confirmation`). Not needed for
+        /// `--dry-run`, which destroys nothing.
+        #[arg(long, default_value_t = false)]
+        confirm_global: bool,
+        /// #3013 — report exactly what WOULD be purged, under the same
+        /// predicate, and exit WITHOUT deleting anything. The count and the
+        /// delete are single-sourced on `db::archive_purge_predicate`, so the
+        /// preview cannot understate the blast radius.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     /// Show archive statistics
     Stats,
+}
+
+/// #3013 — the safety-rail error string emitted when `archive purge` is
+/// invoked with no `--namespace` and no `--confirm-global`. Pulled out (the
+/// `cli::forget::global_scope_forget_error_message` precedent) so tests can
+/// assert the exact wording without coupling to handler-internal control flow.
+#[must_use]
+pub fn global_scope_purge_error_message() -> &'static str {
+    "global-scope archive purge requires --confirm-global; restrict with \
+     --namespace=<ns>, or preview with --dry-run, for safety"
 }
 
 /// `archive` handler.
@@ -96,7 +132,59 @@ pub fn run(
                 std::process::exit(1);
             }
         }
-        ArchiveAction::Purge { older_than_days } => {
+        ArchiveAction::Purge {
+            older_than_days,
+            namespace,
+            confirm_global,
+            dry_run,
+        } => {
+            // #3013 — DRY-RUN first: query-only, destroys nothing, and is
+            // therefore reachable WITHOUT `--confirm-global` so an operator
+            // can measure the blast radius before opting into it. It
+            // short-circuits above the audit emit for the same reason the
+            // `forget --show-receipt` query sub-mode does — a preview is not
+            // a destructive decision and must not pollute the forensic chain
+            // with an `allow` for a purge that never happened.
+            if dry_run {
+                let would_purge = db::count_archive_purge_candidates(
+                    &conn,
+                    namespace.as_deref(),
+                    older_than_days,
+                )?;
+                if json_out {
+                    writeln!(
+                        out.stdout,
+                        "{}",
+                        serde_json::json!({
+                            "dry_run": true,
+                            "would_purge": would_purge,
+                            "namespace": namespace,
+                            (field_names::OLDER_THAN_DAYS): older_than_days,
+                        })
+                    )?;
+                } else {
+                    writeln!(
+                        out.stdout,
+                        "dry-run: would purge {would_purge} archived memories ({})",
+                        namespace.as_deref().map_or_else(
+                            || "ALL namespaces".to_string(),
+                            |ns| format!("namespace={ns}")
+                        )
+                    )?;
+                }
+                return Ok(());
+            }
+
+            // #3013 — global-scope safety rail, mirroring `forget`'s F11
+            // contract. `archive purge` with no `--namespace` destroys the
+            // last copy of archived rows across EVERY namespace, so it
+            // refuses without the explicit opt-in. Propagated via `bail!`
+            // (not stderr + `process::exit`) so the message is assertable
+            // in-process — the `cli::forget` discipline.
+            if namespace.is_none() && !confirm_global {
+                anyhow::bail!("{}", global_scope_purge_error_message());
+            }
+
             // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
             // state-change audit. CLI archive purge mirrors the HTTP +
             // MCP fixes; emit the forensic-chain row BEFORE the storage
@@ -109,12 +197,19 @@ pub fn run(
                 "allow",
                 crate::governance::action_labels::ARCHIVE_PURGE,
                 "",
-                serde_json::json!({ (field_names::OLDER_THAN_DAYS): older_than_days }),
+                serde_json::json!({
+                    (field_names::OLDER_THAN_DAYS): older_than_days,
+                    "namespace": namespace,
+                }),
             );
 
-            let purged = db::purge_archive(&conn, older_than_days)?;
+            let purged = db::purge_archive_scoped(&conn, namespace.as_deref(), older_than_days)?;
             if json_out {
-                writeln!(out.stdout, "{}", serde_json::json!({"purged": purged}))?;
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({"purged": purged, "namespace": namespace})
+                )?;
             } else {
                 writeln!(out.stdout, "purged {purged} archived memories")?;
             }
@@ -251,6 +346,9 @@ mod tests {
         let args = ArchiveArgs {
             action: ArchiveAction::Purge {
                 older_than_days: None,
+                namespace: None,
+                confirm_global: true,
+                dry_run: false,
             },
         };
         {
@@ -267,6 +365,9 @@ mod tests {
         let args = ArchiveArgs {
             action: ArchiveAction::Purge {
                 older_than_days: Some(30),
+                namespace: None,
+                confirm_global: true,
+                dry_run: false,
             },
         };
         {
@@ -391,6 +492,119 @@ mod tests {
         );
     }
 
+    // ---- #3013 — archive purge safety rail ------------------------------
+
+    fn purge(
+        older_than_days: Option<i64>,
+        namespace: Option<&str>,
+        confirm_global: bool,
+        dry_run: bool,
+    ) -> ArchiveArgs {
+        ArchiveArgs {
+            action: ArchiveAction::Purge {
+                older_than_days,
+                namespace: namespace.map(ToString::to_string),
+                confirm_global,
+                dry_run,
+            },
+        }
+    }
+
+    fn archived_count(db: &std::path::Path) -> usize {
+        let conn = db::open(db).unwrap();
+        db::list_archived(&conn, None, 1000, 0).unwrap().len()
+    }
+
+    /// Pre-#3013 this exact invocation destroyed EVERY archived row in EVERY
+    /// namespace with no confirmation. It must now refuse, and refuse
+    /// WITHOUT destroying anything.
+    #[test]
+    fn purge_refuses_global_scope_without_confirm_3013() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_and_archive(&db, "ns-a", 2);
+        seed_and_archive(&db, "ns-b", 1);
+        let res = {
+            let mut out = env.output();
+            run(&db, purge(None, None, false, false), false, &mut out)
+        };
+        let err = res.expect_err("global-scope purge must refuse").to_string();
+        assert!(err.contains("--confirm-global"), "got: {err}");
+        assert_eq!(
+            archived_count(&db),
+            3,
+            "a refused purge must destroy nothing"
+        );
+    }
+
+    /// `--namespace` bounds the blast radius: the other namespace survives.
+    #[test]
+    fn purge_namespace_scope_spares_other_namespaces_3013() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_and_archive(&db, "ns-a", 2);
+        seed_and_archive(&db, "ns-b", 1);
+        {
+            let mut out = env.output();
+            run(&db, purge(None, Some("ns-a"), false, false), true, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["purged"].as_u64().unwrap(), 2, "got: {v}");
+        assert_eq!(v["namespace"].as_str().unwrap(), "ns-a");
+        let conn = db::open(&db).unwrap();
+        assert_eq!(
+            db::list_archived(&conn, Some("ns-b"), 1000, 0)
+                .unwrap()
+                .len(),
+            1,
+            "ns-b archive must be untouched"
+        );
+    }
+
+    /// `--dry-run` is reachable WITHOUT `--confirm-global` (it destroys
+    /// nothing) and its count matches what the real purge then destroys.
+    #[test]
+    fn purge_dry_run_previews_without_destroying_3013() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_and_archive(&db, "ns-a", 2);
+        seed_and_archive(&db, "ns-b", 1);
+        {
+            let mut out = env.output();
+            run(&db, purge(None, None, false, true), true, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["dry_run"].as_bool().unwrap(), true, "got: {v}");
+        assert_eq!(v["would_purge"].as_u64().unwrap(), 3, "got: {v}");
+        assert_eq!(archived_count(&db), 3, "dry-run must destroy nothing");
+
+        // The preview is honest: the confirmed purge removes exactly that many.
+        env.stdout.clear();
+        {
+            let mut out = env.output();
+            run(&db, purge(None, None, true, false), true, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["purged"].as_u64().unwrap(), 3, "got: {v}");
+        assert_eq!(archived_count(&db), 0);
+    }
+
+    /// A namespace-scoped dry-run counts only that namespace.
+    #[test]
+    fn purge_dry_run_honours_namespace_scope_3013() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_and_archive(&db, "ns-a", 2);
+        seed_and_archive(&db, "ns-b", 1);
+        {
+            let mut out = env.output();
+            run(&db, purge(None, Some("ns-b"), false, true), true, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["would_purge"].as_u64().unwrap(), 1, "got: {v}");
+        assert_eq!(archived_count(&db), 3);
+    }
+
     #[test]
     fn test_archive_purge_clears_with_filter() {
         // Seed + archive, then purge with older_than_days=0 — sweeps everything.
@@ -400,6 +614,9 @@ mod tests {
         let args = ArchiveArgs {
             action: ArchiveAction::Purge {
                 older_than_days: Some(0),
+                namespace: None,
+                confirm_global: true,
+                dry_run: false,
             },
         };
         {
