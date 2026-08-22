@@ -51,7 +51,7 @@ use crate::models::field_names;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // ── #1558 batch 6 — repeated doctor fact / section labels ──────────────
@@ -158,10 +158,71 @@ impl Report {
 
 /// Args from the CLI clap struct. Kept separate so `cli::doctor::run` can
 /// be called directly from tests without going through clap.
+///
+/// v1.0.0 #2815 — the transport-auth knobs are NOT optional polish. `doctor
+/// --remote` was the disclosed remediation for #2810 ("postgres deployments
+/// already reach doctor via `--remote`"), but on the CERTIFIED enterprise
+/// posture (TLS + mandatory client-cert mTLS + top-level `api_key`) it could
+/// not complete a single request, so a certified Postgres deployment had NO
+/// working first-party `doctor` path at all. These mirror the flag names the
+/// sibling fleet-facing verbs already use (`sync-daemon --client-cert` /
+/// `--client-key` / `--ca-cert` / `--api-key`).
+#[derive(Default)]
 pub struct DoctorArgs {
     pub remote: Option<String>,
     pub json: bool,
     pub fail_on_warn: bool,
+    /// #2815 — PEM CA to trust for the remote daemon's server certificate
+    /// (private-CA / self-signed deployments). Precedent: `sync --ca-cert`,
+    /// `serve --quorum-ca-cert`.
+    pub ca_cert: Option<PathBuf>,
+    /// #2815 — client-cert PEM presented when the remote daemon demands mTLS.
+    /// Pairs with [`Self::client_key`].
+    pub client_cert: Option<PathBuf>,
+    /// #2815 — client-key PEM. Must pair with [`Self::client_cert`].
+    pub client_key: Option<PathBuf>,
+    /// #2815 — `X-API-Key` presented to an api-key-protected daemon. Resolved
+    /// by [`resolve_doctor_api_key`], which prefers the non-argv
+    /// [`Self::api_key_file`] (#1927: a key on argv is world-readable via
+    /// `/proc/<pid>/cmdline`).
+    pub api_key: Option<String>,
+    /// #2815 — path to a file holding the api-key token (the
+    /// `--db-passphrase-file` precedent for keeping a secret off argv).
+    /// Takes precedence over [`Self::api_key`].
+    pub api_key_file: Option<PathBuf>,
+}
+
+/// #2815 — the transport posture `doctor --remote` presents to the daemon.
+/// Built once per run and threaded into every remote section so the three
+/// probes cannot drift into different credentials.
+#[derive(Default, Clone)]
+pub(crate) struct RemoteAuth {
+    ca_cert: Option<PathBuf>,
+    client_cert: Option<PathBuf>,
+    client_key: Option<PathBuf>,
+    api_key: Option<String>,
+}
+
+/// #2815 / #1927 — resolve the api-key WITHOUT putting it on argv when the
+/// operator supplied a file. `--api-key-file` wins over `--api-key`; the file
+/// contents are trimmed (a trailing newline is the common shape).
+///
+/// # Errors
+///
+/// Returns `Err` when `--api-key-file` names an unreadable path — a silent
+/// fallback to "no api key" would surface as an opaque 401 instead of naming
+/// the real fault.
+pub(crate) fn resolve_doctor_api_key(args: &DoctorArgs) -> Result<Option<String>> {
+    if let Some(path) = args.api_key_file.as_deref() {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("read --api-key-file {}", path.display()))?;
+        let token = raw.trim().to_string();
+        if token.is_empty() {
+            anyhow::bail!("--api-key-file {} is empty", path.display());
+        }
+        return Ok(Some(token));
+    }
+    Ok(args.api_key.clone())
 }
 
 /// v0.6.4-004 — Args for `ai-memory doctor --tokens`. Routes to
@@ -535,7 +596,16 @@ fn render_hooks_human_with(
 /// sections so a partial report still renders.
 pub fn run(db_path: &Path, args: &DoctorArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     let mut report = if let Some(url) = &args.remote {
-        run_remote(url, db_path)
+        // #2815 — resolve the transport posture ONCE. A malformed
+        // `--api-key-file` fails LOUD here rather than degrading into an
+        // unauthenticated probe that renders a misleading `critical`.
+        let auth = RemoteAuth {
+            ca_cert: args.ca_cert.clone(),
+            client_cert: args.client_cert.clone(),
+            client_key: args.client_key.clone(),
+            api_key: resolve_doctor_api_key(args)?,
+        };
+        run_remote(url, db_path, &auth)
     } else {
         run_local(db_path)
     };
@@ -2317,16 +2387,16 @@ pub(super) fn severity_max(a: Severity, b: Severity) -> Severity {
 // Remote (--remote) mode
 // ---------------------------------------------------------------------------
 
-fn run_remote(url: &str, db_path: &Path) -> Report {
+fn run_remote(url: &str, db_path: &Path, auth: &RemoteAuth) -> Report {
     let mut sections = Vec::with_capacity(2);
 
     let base = url.trim_end_matches('/');
     let cap_url = format!("{base}{}", crate::handlers::routes::CAPABILITIES);
     let stats_url = format!("{base}{}", crate::handlers::routes::STATS);
 
-    sections.push(section_capabilities_remote(&cap_url));
-    sections.push(section_recall_remote(&cap_url));
-    sections.push(section_storage_remote(&stats_url));
+    sections.push(section_capabilities_remote(&cap_url, auth));
+    sections.push(section_recall_remote(&cap_url, auth));
+    sections.push(section_storage_remote(&stats_url, auth));
     sections.push(ReportSection {
         name: "Index".into(),
         severity: Severity::NotAvailable,
@@ -2361,14 +2431,36 @@ fn run_remote(url: &str, db_path: &Path) -> Report {
     }
 }
 
-/// Fetch a JSON document from `url` with a short timeout. Returns `Err`
-/// on transport failure or non-2xx status.
-fn http_get_json(url: &str) -> Result<Value> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .context("constructing HTTP client")?;
-    let resp = client.get(url).send().context("HTTP GET")?;
+/// Fetch a JSON document from `url` with a short timeout, presenting the
+/// #2815 transport posture (private-CA root, mTLS client identity, api-key
+/// header). Returns `Err` on transport failure or non-2xx status.
+///
+/// The TLS pieces reuse the sync client's builders
+/// (`cli::sync::parse_ca_certificate` / `cli::sync::sync_client_identity`) so
+/// the fleet verbs and the doctor cannot disagree about what a `--ca-cert` or
+/// a `--client-cert` pair means. The secure default is unchanged: with no
+/// flags this is byte-for-byte the pre-#2815 client (public webpki roots, no
+/// client identity, no header) — nothing is loosened, a capability is added.
+fn http_get_json(url: &str, auth: &RemoteAuth) -> Result<Value> {
+    let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(5));
+    if let Some(ca_path) = auth.ca_cert.as_deref() {
+        let ca_pem = std::fs::read(ca_path)
+            .with_context(|| format!("read --ca-cert {}", ca_path.display()))?;
+        builder =
+            builder.add_root_certificate(crate::cli::sync::parse_ca_certificate(&ca_pem, ca_path)?);
+    }
+    if let Some(identity) = crate::cli::sync::sync_client_identity(
+        auth.client_cert.as_deref(),
+        auth.client_key.as_deref(),
+    )? {
+        builder = builder.identity(identity);
+    }
+    let client = builder.build().context("constructing HTTP client")?;
+    let mut req = client.get(url);
+    if let Some(key) = auth.api_key.as_deref() {
+        req = req.header(crate::HEADER_API_KEY, key);
+    }
+    let resp = req.send().context("HTTP GET")?;
     let status = resp.status();
     if !status.is_success() {
         anyhow::bail!("HTTP {status} from {url}");
@@ -2376,12 +2468,12 @@ fn http_get_json(url: &str) -> Result<Value> {
     resp.json::<Value>().context("decoding JSON response")
 }
 
-fn section_capabilities_remote(url: &str) -> ReportSection {
+fn section_capabilities_remote(url: &str, auth: &RemoteAuth) -> ReportSection {
     let mut facts = Vec::new();
     let mut severity = Severity::Info;
     let mut note: Option<String> = None;
 
-    match http_get_json(url) {
+    match http_get_json(url, auth) {
         Ok(v) => {
             // schema_version: "1" (legacy v0.6.3) or "2" (post-P1).
             let schema = v
@@ -2441,11 +2533,11 @@ fn section_capabilities_remote(url: &str) -> ReportSection {
     }
 }
 
-fn section_recall_remote(cap_url: &str) -> ReportSection {
+fn section_recall_remote(cap_url: &str, auth: &RemoteAuth) -> ReportSection {
     let mut facts = Vec::new();
     let severity = Severity::Info;
 
-    if let Ok(v) = http_get_json(cap_url) {
+    if let Ok(v) = http_get_json(cap_url, auth) {
         let recall_mode = v
             .get("features")
             .and_then(|f| f.get(FACT_RECALL_MODE_ACTIVE))
@@ -2474,11 +2566,11 @@ fn section_recall_remote(cap_url: &str) -> ReportSection {
     }
 }
 
-fn section_storage_remote(stats_url: &str) -> ReportSection {
+fn section_storage_remote(stats_url: &str, auth: &RemoteAuth) -> ReportSection {
     let mut facts = Vec::new();
     let severity = Severity::Info;
 
-    match http_get_json(stats_url) {
+    match http_get_json(stats_url, auth) {
         Ok(v) => {
             if let Some(total) = v.get("total").and_then(Value::as_u64) {
                 facts.push((field_names::TOTAL_MEMORIES.into(), total.to_string()));
@@ -3384,6 +3476,7 @@ mod tests {
                 remote: None,
                 json: true,
                 fail_on_warn: false,
+                ..DoctorArgs::default()
             },
             &mut out,
         )
@@ -3415,6 +3508,7 @@ mod tests {
                 remote: None,
                 json: true,
                 fail_on_warn: false,
+                ..DoctorArgs::default()
             },
             &mut out,
         )
@@ -3439,6 +3533,7 @@ mod tests {
                 remote: None,
                 json: false,
                 fail_on_warn: false,
+                ..DoctorArgs::default()
             },
             &mut out,
         )
@@ -3479,6 +3574,7 @@ mod tests {
                 remote: None,
                 json: true,
                 fail_on_warn: false,
+                ..DoctorArgs::default()
             },
             &mut out,
         )
@@ -3511,6 +3607,7 @@ mod tests {
                 remote: None,
                 json: false,
                 fail_on_warn: false,
+                ..DoctorArgs::default()
             },
             &mut out,
         )
@@ -3541,6 +3638,7 @@ mod tests {
                 remote: None,
                 json: false,
                 fail_on_warn: true,
+                ..DoctorArgs::default()
             },
             &mut out,
         )
@@ -3571,6 +3669,7 @@ mod tests {
                 remote: None,
                 json: false,
                 fail_on_warn: false,
+                ..DoctorArgs::default()
             },
             &mut out,
         )
@@ -3634,7 +3733,7 @@ mod tests {
     /// the blocking reqwest call onto the spawn_blocking pool.
     async fn run_remote_in_blocking(url: String, db_path: PathBuf) -> Report {
         tokio::task::spawn_blocking(move || {
-            let mut r = run_remote(&url, &db_path);
+            let mut r = run_remote(&url, &db_path, &RemoteAuth::default());
             r.compute_overall();
             r
         })
@@ -3643,6 +3742,134 @@ mod tests {
     }
 
     use std::path::PathBuf;
+
+    // ---- #2815 — doctor --remote transport auth -------------------------
+
+    /// The certified posture gates on `X-API-Key`. Pre-#2815 `doctor
+    /// --remote` had no way to present one, so the probe 401'd and every
+    /// section rendered `critical` — a certified Postgres deployment had NO
+    /// working first-party doctor path. The mock below only answers a
+    /// request that carries the header, so a regression re-breaks this test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_presents_api_key_header_2815() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/capabilities"))
+            .and(header(crate::HEADER_API_KEY, "s3cret-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": "2",
+                "feature_tier": "keyword",
+                "features": { "recall_mode_active": "keyword_only" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stats"))
+            .and(header(crate::HEADER_API_KEY, "s3cret-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"total": 7})))
+            .mount(&server)
+            .await;
+
+        let env = TestEnv::fresh();
+        let url = server.uri();
+        let db_path = env.db_path.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            let auth = RemoteAuth {
+                api_key: Some("s3cret-token".to_string()),
+                ..RemoteAuth::default()
+            };
+            let mut r = run_remote(&url, &db_path, &auth);
+            r.compute_overall();
+            r
+        })
+        .await
+        .expect("join");
+
+        let cap = find(&report, "Capabilities");
+        assert_ne!(
+            cap.severity,
+            Severity::Critical,
+            "an api-key-gated daemon must be reachable: {cap:?}"
+        );
+        assert_eq!(fact(cap, "schema_version"), "2");
+        assert_eq!(fact(find(&report, "Storage"), "total_memories"), "7");
+    }
+
+    /// Without the key the SAME daemon is unreachable — proving the header,
+    /// not something else, is what made the test above pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_without_api_key_stays_critical_2815() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/capabilities"))
+            .and(header(crate::HEADER_API_KEY, "s3cret-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let env = TestEnv::fresh();
+        let report = run_remote_in_blocking(server.uri(), env.db_path.clone()).await;
+        let cap = find(&report, "Capabilities");
+        assert_eq!(cap.severity, Severity::Critical);
+        assert!(
+            cap.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not reach"),
+            "must fail LOUD, naming the URL: {cap:?}"
+        );
+    }
+
+    #[test]
+    fn api_key_file_wins_over_argv_key_2815() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let key_path = dir.path().join("api.key");
+        // A trailing newline is the common shape of a key file.
+        std::fs::write(&key_path, "from-file\n").expect("write key");
+        let args = DoctorArgs {
+            api_key: Some("from-argv".to_string()),
+            api_key_file: Some(key_path),
+            ..DoctorArgs::default()
+        };
+        assert_eq!(
+            resolve_doctor_api_key(&args).expect("resolve"),
+            Some("from-file".to_string())
+        );
+    }
+
+    #[test]
+    fn api_key_file_missing_or_empty_fails_loud_2815() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let missing = DoctorArgs {
+            api_key_file: Some(dir.path().join("nope.key")),
+            ..DoctorArgs::default()
+        };
+        // A silent fallback to "no api key" would surface as an opaque
+        // unreachable-daemon `critical` instead of naming the real fault.
+        assert!(resolve_doctor_api_key(&missing).is_err());
+
+        let empty_path = dir.path().join("empty.key");
+        std::fs::write(&empty_path, "   \n").expect("write");
+        let empty = DoctorArgs {
+            api_key_file: Some(empty_path),
+            ..DoctorArgs::default()
+        };
+        assert!(resolve_doctor_api_key(&empty).is_err());
+    }
+
+    #[test]
+    fn no_transport_flags_resolves_to_no_api_key_2815() {
+        // The secure default is unchanged: with no flags the client is the
+        // pre-#2815 one.
+        assert_eq!(
+            resolve_doctor_api_key(&DoctorArgs::default()).expect("resolve"),
+            None
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn remote_section_capabilities_parses_v2_fields() {
@@ -3833,6 +4060,7 @@ mod tests {
                     remote: Some(url),
                     json: true,
                     fail_on_warn: false,
+                    ..DoctorArgs::default()
                 },
                 &mut out,
             )

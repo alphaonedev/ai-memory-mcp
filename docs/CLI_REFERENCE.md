@@ -786,6 +786,11 @@ Reachability (#1598)**. Each section is severity-tagged.
 | `--profile <PROFILE>` | string | `core` | With `--tokens`: evaluate cost under this hypothetical profile (same vocabulary as `mcp --profile`). |
 | `--raw-table` | bool | `false` | Dump the full per-tool size table as JSON. Implies `--tokens`. |
 | `--hooks` | bool | `false` | v0.7-G3 — hook-executor backpressure report (loaded `hooks.toml` shape + metric placeholders). |
+| `--ca-cert <PATH>` | path | — | v1.0.0 [#2815](https://github.com/alphaonedev/ai-memory-mcp/issues/2815) — PEM CA to trust for the `--remote` daemon's server certificate (private-CA / self-signed). Without it the daemon is validated against the bundled public webpki roots. |
+| `--client-cert <PATH>` | path | — | v1.0.0 #2815 — client-certificate PEM presented when the `--remote` daemon demands mTLS. Requires `--client-key`. |
+| `--client-key <PATH>` | path | — | v1.0.0 #2815 — client-key PEM. Requires `--client-cert`. |
+| `--api-key <KEY>` | string | — | v1.0.0 #2815 — `X-API-Key` for an api-key-protected `--remote` daemon. Prefer `--api-key-file`: a key on argv is world-readable via `/proc/<pid>/cmdline` ([#1927](https://github.com/alphaonedev/ai-memory-mcp/issues/1927)). Conflicts with `--api-key-file`. |
+| `--api-key-file <PATH>` | path | — | v1.0.0 #2815 — read the api-key token from a file so the secret never reaches argv (the `--db-passphrase-file` precedent; mode 0400 recommended). Contents are trimmed. |
 
 Exit codes: `0` healthy, `1` warning (only when `--fail-on-warn`), `2`
 critical.
@@ -794,7 +799,29 @@ critical.
 ai-memory doctor
 ai-memory doctor --json | jq '.sections[] | select(.severity != "ok")'
 ai-memory doctor --remote https://memory.prod.example.com
+
+# Certified enterprise posture: TLS + mandatory client-cert mTLS + api-key.
+ai-memory doctor --remote https://memory.prod.example.com \
+  --ca-cert /etc/ai-memory/tls/ca.pem \
+  --client-cert /etc/ai-memory/tls/client.crt \
+  --client-key  /etc/ai-memory/tls/client.key \
+  --api-key-file /etc/ai-memory/keys/api.key
 ```
+
+**Reaching a hardened daemon**
+([#2815](https://github.com/alphaonedev/ai-memory-mcp/issues/2815)). `doctor
+--remote` is the disclosed remediation for
+[#2810](https://github.com/alphaonedev/ai-memory-mcp/issues/2810) (no
+`--store-url` Postgres path yet) — but until v1.0.0 it exposed **no**
+transport-auth knobs, so on the certified posture (TLS + mandatory mTLS +
+top-level `api_key`) it could not complete a request and a certified
+Postgres deployment had no working first-party `doctor` path at all. The
+five flags above close that gap, reusing the sibling fleet verbs' flag names
+and TLS builders (`sync --ca-cert`, `sync-daemon --client-cert` /
+`--client-key`). With none of them passed the client is byte-for-byte the
+pre-v1.0.0 one — nothing is loosened. `doctor` still fails LOUD on an
+unreachable daemon (a `critical` section naming the URL it queried); it never
+claims a corpus is healthy it could not read.
 
 **`LLM Reachability (#1146)` section.** Resolves the canonical LLM
 configuration via `AppConfig::resolve_llm` (the same path used by

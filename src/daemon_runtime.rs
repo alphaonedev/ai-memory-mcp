@@ -698,6 +698,31 @@ pub struct DoctorCliArgs {
     /// this flag, warnings keep exit 0; criticals always exit 2.
     #[arg(long)]
     pub fail_on_warn: bool,
+    /// v1.0.0 #2815 — PEM CA certificate to trust when validating the
+    /// `--remote` daemon's server certificate (private-CA / self-signed
+    /// deployments). Precedent: `sync --ca-cert`, `serve --quorum-ca-cert`.
+    /// Without it the daemon is validated against the bundled public webpki
+    /// roots (the secure default, unchanged).
+    #[arg(long, value_name = "PATH")]
+    pub ca_cert: Option<PathBuf>,
+    /// v1.0.0 #2815 — client-certificate PEM presented when the `--remote`
+    /// daemon demands mTLS. Must pair with `--client-key`. Precedent:
+    /// `sync-daemon --client-cert`, `serve --quorum-client-cert`.
+    #[arg(long, requires = "client_key", value_name = "PATH")]
+    pub client_cert: Option<PathBuf>,
+    /// v1.0.0 #2815 — client-key PEM. Must pair with `--client-cert`.
+    #[arg(long, requires = "client_cert", value_name = "PATH")]
+    pub client_key: Option<PathBuf>,
+    /// v1.0.0 #2815 — `X-API-Key` presented to an api-key-protected
+    /// `--remote` daemon. Prefer `--api-key-file`: a key on argv is
+    /// world-readable via `/proc/<pid>/cmdline` (#1927).
+    #[arg(long, value_name = "KEY", conflicts_with = "api_key_file")]
+    pub api_key: Option<String>,
+    /// v1.0.0 #2815 / #1927 — path to a file containing the api-key token,
+    /// so the secret never reaches argv. The `--db-passphrase-file`
+    /// precedent; mode 0400 recommended. Contents are trimmed.
+    #[arg(long, value_name = "PATH")]
+    pub api_key_file: Option<PathBuf>,
     /// v0.6.4-004 — print per-tool, per-family, and per-profile token
     /// costs (`cl100k_base`) instead of the regular health report.
     /// Combined with `--json` returns a structured payload for CI.
@@ -2117,6 +2142,14 @@ pub async fn run(
                 remote: a.remote,
                 json: a.json,
                 fail_on_warn: a.fail_on_warn,
+                // #2815 — transport-auth knobs for the `--remote` fleet path.
+                // Inert (and byte-identical to the pre-#2815 client) when the
+                // operator passes none of them.
+                ca_cert: a.ca_cert,
+                client_cert: a.client_cert,
+                client_key: a.client_key,
+                api_key: a.api_key,
+                api_key_file: a.api_key_file,
             };
             let join = tokio::task::spawn_blocking(move || {
                 let stdout = std::io::stdout();
