@@ -3868,6 +3868,65 @@ enabled = true
         assert!(s.contains("notify-hook.sh"), "got: {s}");
     }
 
+    /// #3113 — a healthy, fully-migrated database reports its core relations
+    /// complete and does NOT raise the Storage section.
+    #[test]
+    fn storage_section_reports_core_relations_complete_on_a_healthy_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doctor-3113-ok.db");
+        let conn = crate::db::open(&path).expect("open");
+        let section = section_storage(&conn, &path);
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == FACT_CORE_RELATIONS && v.starts_with("complete")),
+            "facts: {:?}",
+            section.facts
+        );
+        assert_ne!(
+            section.severity,
+            Severity::Critical,
+            "a healthy database must not raise Storage to Critical"
+        );
+    }
+
+    /// #3113 — the standing operator signal. A database that LOST a
+    /// ladder-only core relation while keeping a high stamp must raise Storage
+    /// to Critical and NAME the relation, so the fail-open migration is
+    /// visible long after the migration that skipped it.
+    #[test]
+    fn storage_section_is_critical_when_a_core_relation_was_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doctor-3113-lost.db");
+        drop(crate::db::open(&path).expect("open"));
+        let raw = rusqlite::Connection::open(&path).expect("reopen");
+        raw.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {};",
+            crate::storage::schema_integrity::TABLE_GOVERNANCE_RULES
+        ))
+        .expect("drop core relation");
+
+        let section = section_storage(&raw, &path);
+        assert_eq!(
+            section.severity,
+            Severity::Critical,
+            "a lost core relation must raise Storage to Critical: {:?}",
+            section.facts
+        );
+        assert!(
+            section.facts.iter().any(|(k, v)| k == FACT_CORE_RELATIONS
+                && v.contains(crate::storage::schema_integrity::TABLE_GOVERNANCE_RULES)),
+            "the fact must NAME the missing relation: {:?}",
+            section.facts
+        );
+        assert!(
+            section.note.as_ref().is_some_and(|n| n.contains("ABSENT")),
+            "note: {:?}",
+            section.note
+        );
+    }
+
     /// A connection with no schema at all: `db::stats` fails, the
     /// Storage section must downgrade to WARN with a `stats_error`
     /// fact, and `dim_violations` renders the pre-P2 `not_observed`
