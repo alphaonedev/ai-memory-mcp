@@ -183,15 +183,24 @@ pub struct ImportReport {
     pub idempotent_skipped: usize,
     /// Memory rows whose `metadata.agent_id` was restamped with the
     /// caller's id (the L1-parity default; `--trust-source` disables).
+    /// Counts BOTH the live `memories[]` lane and — since #3150 — the
+    /// `archived_memories[]` lane (an archived row's author claim is the
+    /// ownership predicate `restore_archived_for_caller` gates on).
     pub restamped: usize,
     /// Memory rows skipped under `--on-conflict error` because their
     /// `(title, namespace)` collided with an existing destination row.
     pub conflicts_skipped: usize,
     /// Memory rows skipped because they failed the L1-parity input
     /// validation ([`crate::validate::validate_memory`]) — size / range /
-    /// RFC3339 (incl. the #1834 `valid_from`/`valid_until`) / refuse-mode
-    /// secret screen (pre-ship 3x7 HIGH-2; the `cli::io` L1 import has run
-    /// this per-row gate since #1780 — the v2 route ran ZERO validation).
+    /// RFC3339 (incl. the #1834 `valid_from`/`valid_until`) (pre-ship 3x7
+    /// HIGH-2; the `cli::io` L1 import has run this per-row gate since #1780
+    /// — the v2 route ran ZERO validation). NOT the credential screen: the
+    /// redact-before-attestation step upstream has already MASKED any
+    /// credential material under every non-`off` screen mode, so
+    /// `validate_memory`'s caller-origin screen never fires on this funnel
+    /// (see the redact call site). Counts BOTH the live `memories[]` lane and
+    /// — since #3150 — the `archived_memories[]` lane; the `warnings` entry
+    /// names which.
     pub invalid_skipped: usize,
     /// Link rows skipped because they failed
     /// [`crate::validate::validate_link`] (id shape / relation / self-link).
@@ -210,13 +219,15 @@ pub struct ImportReport {
     /// signature) but the DESTINATION could not verify it (re-attributed
     /// under restamp, no destination-enrolled author key, or no signature),
     /// so the row landed `attest_level=claimed` (pre-ship 3x7 HIGH-1 — the
-    /// wire `attest_level` is NEVER trusted).
+    /// wire `attest_level` is NEVER trusted). Counts BOTH the live
+    /// `memories[]` lane and — since #3150 — the `archived_memories[]` lane.
     pub attestation_downgraded: usize,
     /// Memory rows SKIPPED because they presented a `write_signature` that
     /// FAILED verification against the destination-enrolled author key — a
     /// presented-but-invalid signature is always rejected, never downgraded
     /// to `claimed` (the #1464 invariant; mirrors the federation receive
-    /// path's per-row skip disposition).
+    /// path's per-row skip disposition). Counts BOTH the live `memories[]`
+    /// lane and — since #3150 — the `archived_memories[]` lane.
     pub forged_signature_skipped: usize,
     /// v1.0.0 #3149/#3151 — bundle rows on a RAW `INSERT OR IGNORE` /
     /// `ON CONFLICT DO NOTHING` lane whose insert was suppressed because a
@@ -225,9 +236,9 @@ pub struct ImportReport {
     /// per-class `staged` counters, which now count ONLY rows that actually
     /// landed — the report must never assert a row it did not write (the
     /// struct's own "a report can only exist for a bundle that fully landed"
-    /// contract). A DIVERGENT surviving row is never counted here: it is
-    /// refused (memory-bearing lanes) or counted + warned
-    /// ([`Self::namespace_meta_skipped_divergent`]).
+    /// contract). A DIVERGENT surviving row is never counted here: on the
+    /// SIGNED write-once lanes (#3149 — `forget_tombstones`,
+    /// `model_attestations`) it REFUSES the bundle.
     pub idempotent_rows_already_present: usize,
     /// `true` when the imported audit spine re-verified in the transaction.
     pub reverify_chain_ok: bool,
@@ -493,7 +504,10 @@ fn apply_all_classes(
                     |r| r.get(0),
                 )
                 .with_context(|| {
-                    format!("import: identity probe for forget_tombstone {}", t.memory_id)
+                    format!(
+                        "import: identity probe for forget_tombstone {}",
+                        t.memory_id
+                    )
                 })?;
             if !identical {
                 anyhow::bail!(
@@ -565,36 +579,9 @@ fn apply_all_classes(
             continue;
         }
         let mut staged = mem.clone();
-        // #2211 — the L1 restamp-by-default provenance hygiene, replicated
-        // (verbatim identity ONLY under the operator's explicit
-        // `--trust-source`; see `ImportOptions::trust_source`). Mirrors the
-        // L1 path byte-for-byte: the caller's id replaces
-        // `metadata.agent_id` and the original claim is preserved under
-        // `imported_from_agent_id`. The ORIGINAL claim is hoisted so the
-        // attestation re-derivation below can apply the federation
-        // re-attribution rule (`apply_inbound_write_attestation`).
-        let original_claim = staged
-            .metadata
-            .get(crate::META_KEY_AGENT_ID)
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string);
-        if !opts.trust_source {
-            if let Some(obj) = staged.metadata.as_object_mut() {
-                obj.insert(
-                    crate::META_KEY_AGENT_ID.to_string(),
-                    serde_json::Value::String(opts.caller_agent_id.clone()),
-                );
-                if let Some(orig) = original_claim.as_ref()
-                    && orig.as_str() != opts.caller_agent_id
-                {
-                    obj.insert(
-                        crate::models::field_names::IMPORTED_FROM_AGENT_ID.to_string(),
-                        serde_json::Value::String(orig.clone()),
-                    );
-                    report.restamped += 1;
-                }
-            }
-        }
+        // #2211 — the L1 restamp-by-default provenance hygiene (shared with
+        // the `archived_memories[]` lane since #3150).
+        let original_claim = restamp_inbound_identity(&mut staged, opts, &mut report);
         // #2353 (sibling of #2340) — redact to the TO-BE-PERSISTED form
         // BEFORE the attestation re-derivation below, so the stamp covers
         // exactly the bytes `storage::insert_imported`'s origin-blind screen
@@ -602,10 +589,14 @@ fn apply_all_classes(
         // covers RAW secret-bearing bytes would otherwise land
         // `agent_attested` with mutated stored bytes (the #2340
         // stamp-then-redact class); the helper drops the now-uncoverable
-        // signature so the row lands honestly `claimed`. (Under the default
-        // `refuse` mode the L1-parity `validate_memory` below refuses
-        // secret-bearing rows outright, so this only changes `redact`-mode
-        // outcomes.)
+        // signature so the row lands honestly `claimed`. This runs under
+        // EVERY non-`off` screen mode (`redact_memory_for_storage` keys off
+        // `mode != Off`), so it — not the `validate_memory` caller screen
+        // below — is what neutralises credential material on this funnel: by
+        // the time validation runs the bytes are already masked. Masking
+        // rather than refusing is deliberate here (capture-first: an import
+        // must not destroy the operator's own archive because a historical
+        // row happens to carry a credential).
         crate::federation::receive_auth::redact_inbound_before_attestation(&mut staged);
         // ── Pre-ship 3x7 HIGH-1 — NEVER trust wire attestation. ──
         // Bundles are UNAUTHENTICATED input (this module's own threat
@@ -633,8 +624,11 @@ fn apply_all_classes(
         // #1780 (`validate::validate_memory` at src/cli/io.rs); the v2
         // route ran ZERO validation, landing rows that violate every write
         // invariant (MAX_CONTENT_SIZE, priority/confidence ranges, RFC3339
-        // timestamps incl. #1834 valid_from/valid_until, refuse-mode secret
-        // screen). Per-row skip + WARN — the bundle continues, matching the
+        // timestamps incl. #1834 valid_from/valid_until). Its caller-origin
+        // credential screen is already satisfied — the redact step above
+        // masked any credential material — so what this gate actually
+        // enforces here is the shape/range/format class. Per-row skip + WARN
+        // — the bundle continues, matching the
         // tombstone/conflict disposition posture; never a silent accept.
         if let Err(e) = crate::validate::validate_memory(&staged) {
             report.invalid_skipped += 1;
@@ -871,21 +865,81 @@ fn apply_all_classes(
     // `in_place_edit` live-snapshot is the deliberate exception and is
     // always admitted.
     for dto in &env.archived_memories {
-        let row: crate::portability::read::ArchivedMemoryRow = dto.clone().into();
-        let mem = &row.memory;
-        let is_live = crate::storage::get(conn, &mem.id)
-            .with_context(|| format!("import: liveness probe for archived memory {}", mem.id))?
+        let mut row: crate::portability::read::ArchivedMemoryRow = dto.clone().into();
+        let is_live = crate::storage::get(conn, &row.memory.id)
+            .with_context(|| {
+                format!(
+                    "import: liveness probe for archived memory {}",
+                    row.memory.id
+                )
+            })?
             .is_some();
-        if is_live && row.archive_reason != "in_place_edit" {
+        if is_live && row.archive_reason != crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT
+        {
             report.archived_memories_skipped_dual_residency += 1;
             report.warnings.push(format!(
                 "archived memory {} skipped: the id is LIVE at the destination and the \
                  archive reason ({}) is not in_place_edit — admitting it would create \
                  illegal dual residency (live + archived under the same id)",
-                mem.id, row.archive_reason
+                row.memory.id, row.archive_reason
             ));
             continue;
         }
+        // ── #3150 — the archived lane runs the SAME three admission gates as
+        // the live `memories[]` lane. ──
+        //
+        // Pre-fix this lane went DTO → liveness probe → seal_content → raw
+        // INSERT, justified only by "an archived row was already vetted when
+        // originally stored" — which trusts the PRODUCER, while this module's
+        // own threat model declares bundles "UNAUTHENTICATED input … earns no
+        // implicit trust (fail-closed, #2211)". A crafted bundle could
+        // therefore land a forged `attest_level=agent_attested` +
+        // `write_signature` and oversized / secret-bearing content through
+        // `archived_memories[]` that the SAME row was refused / downgraded for
+        // through `memories[]` — a gate is not a gate if one lane skips it.
+        //
+        // The three gates, in the live lane's order (`:551` / `:564` / `:581`
+        // pre-fix line numbers):
+        //   1. restamp the identity claim (see `restamp_inbound_identity` — an
+        //      archived row's `metadata.agent_id` is the ownership predicate
+        //      `restore_archived_for_caller` gates on);
+        //   2. redact-before-attestation (#2353) then re-derive the
+        //      attestation from what the DESTINATION can verify (HIGH-1
+        //      "NEVER trust wire attestation"); a presented-but-FORGED
+        //      signature SKIPS the row, exactly like the live lane;
+        //   3. L1-parity `validate_memory` (HIGH-2) — size / range / RFC3339
+        //      shape enforcement. Per-row skip + WARN + counted; the bundle
+        //      continues, matching every other per-row disposition on this
+        //      funnel. (Credential material is already MASKED by step 2's
+        //      redact, exactly as on the live lane — the archive can no
+        //      longer take a raw credential verbatim.)
+        let original_claim = restamp_inbound_identity(&mut row.memory, opts, &mut report);
+        crate::federation::receive_auth::redact_inbound_before_attestation(&mut row.memory);
+        if !apply_import_attestation(
+            &mut row.memory,
+            original_claim.as_deref(),
+            opts.trust_source,
+            enrolled_keys,
+            &mut report,
+        )? {
+            continue;
+        }
+        if let Err(e) = crate::validate::validate_memory(&row.memory) {
+            report.invalid_skipped += 1;
+            report.warnings.push(format!(
+                "archived memory {} skipped: failed input validation: {e}",
+                row.memory.id
+            ));
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                memory_id = %row.memory.id,
+                error = %e,
+                "bundle archived memory skipped: failed L1-parity input validation (#3150)"
+            );
+            continue;
+        }
+        let row = row;
+        let mem = &row.memory;
         let agent_id = crate::storage::memory_agent_id(mem);
         let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
         let content_to_store: &str = sealed.as_ref().map_or(mem.content.as_str(), |(_, ph)| ph);
@@ -1310,7 +1364,9 @@ fn apply_all_classes(
                     ],
                     |r| r.get(0),
                 )
-                .with_context(|| format!("import: identity probe for model_attestation {}", m.id))?;
+                .with_context(|| {
+                    format!("import: identity probe for model_attestation {}", m.id)
+                })?;
             if !identical {
                 anyhow::bail!(
                     "import model_attestation {} ({} {}): a DIFFERENT attestation already \
@@ -1380,6 +1436,57 @@ fn apply_all_classes(
     Ok(report)
 }
 
+/// #2211 / #3150 — the L1-parity restamp-by-default provenance hygiene,
+/// shared by the live `memories[]` lane and the `archived_memories[]` lane.
+///
+/// Verbatim identity is preserved ONLY under the operator's explicit
+/// `--trust-source` (see [`ImportOptions::trust_source`]). Otherwise the
+/// caller's id replaces `metadata.agent_id` and the ORIGINAL claim is
+/// preserved under `imported_from_agent_id`, exactly like the L1 `cli::io`
+/// path.
+///
+/// Returns the row's ORIGINAL `metadata.agent_id` claim, which
+/// [`apply_import_attestation`] needs for the federation re-attribution rule
+/// (`apply_inbound_write_attestation`).
+///
+/// **Why the archived lane needs it too (#3150):** an archived row's
+/// `metadata.agent_id` is the OWNERSHIP predicate
+/// `storage::restore_archived_for_caller` gates on, so a bundle-chosen author
+/// on an archived snapshot decides who may promote that row back to LIVE —
+/// and the restored live row then carries the bundle's author claim verbatim.
+/// Leaving the archived lane unstamped would have left the live lane's
+/// provenance hygiene bypassable by routing the row through
+/// `archived_memories[]` instead of `memories[]`.
+fn restamp_inbound_identity(
+    staged: &mut crate::models::Memory,
+    opts: &ImportOptions,
+    report: &mut ImportReport,
+) -> Option<String> {
+    let original_claim = staged
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    if !opts.trust_source
+        && let Some(obj) = staged.metadata.as_object_mut()
+    {
+        obj.insert(
+            crate::META_KEY_AGENT_ID.to_string(),
+            serde_json::Value::String(opts.caller_agent_id.clone()),
+        );
+        if let Some(orig) = original_claim.as_ref()
+            && orig.as_str() != opts.caller_agent_id
+        {
+            obj.insert(
+                crate::models::field_names::IMPORTED_FROM_AGENT_ID.to_string(),
+                serde_json::Value::String(orig.clone()),
+            );
+            report.restamped += 1;
+        }
+    }
+    original_claim
+}
+
 /// Pre-ship 3x7 F1 — lightweight existence probe for a link endpoint
 /// against the STAGED transaction state. Deliberately NOT
 /// [`crate::storage::get`] (full row read + decrypt path) — one
@@ -1410,6 +1517,8 @@ fn memory_row_exists(conn: &Connection, id: &str) -> Result<bool> {
 ///
 /// Under the default restamp posture the only attributed author is the
 /// caller; under `--trust-source` each memory keeps its own claimed author.
+/// Covers BOTH the live `memories[]` and (since #3150) the
+/// `archived_memories[]` lane.
 ///
 /// # Errors
 ///
@@ -1420,7 +1529,13 @@ fn snapshot_dest_enrolled_keys(
     opts: &ImportOptions,
 ) -> Result<std::collections::HashMap<String, Option<String>>> {
     let mut keys = std::collections::HashMap::new();
-    for mem in &env.memories {
+    // #3150 — the `archived_memories[]` lane now runs the same attestation
+    // re-derivation as `memories[]`, so its authors must be in the SAME
+    // pre-transaction snapshot. Resolving them lazily inside the transaction
+    // would reopen the in-bundle self-enrollment hole this snapshot exists to
+    // close.
+    let archived_authors = env.archived_memories.iter().map(|d| &d.memory);
+    for mem in env.memories.iter().chain(archived_authors) {
         let author: Option<String> = if opts.trust_source {
             mem.metadata
                 .get(crate::META_KEY_AGENT_ID)
@@ -2815,7 +2930,13 @@ mod tests {
             "INSERT INTO forget_tombstones \
                 (memory_id, namespace, forgotten_at, agent_id, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![memory_id, "portability", forgotten_at, "dest-eraser", signature],
+            params![
+                memory_id,
+                "portability",
+                forgotten_at,
+                "dest-eraser",
+                signature
+            ],
         )
         .expect("seed tombstone");
     }
@@ -3007,5 +3128,4 @@ mod tests {
             "the byte-identical pin is reported as an idempotent no-op"
         );
     }
-
 }
