@@ -586,7 +586,7 @@ pub fn reflect_with_hooks(
     // links inside a single BEGIN IMMEDIATE ... COMMIT block. If any
     // link insert fails, ROLLBACK undoes the reflection row too.
     // Matches the `consolidate` pattern earlier in this file.
-    conn.execute_batch(super::connection::SQL_BEGIN_IMMEDIATE)
+    let write_txn = super::connection::WriteTxn::begin(conn)
         .map_err(|e| ReflectError::Database(e.to_string()))?;
 
     let txn_result = (|| -> std::result::Result<String, ReflectError> {
@@ -646,7 +646,8 @@ pub fn reflect_with_hooks(
 
     match txn_result {
         Ok(actual_id) => {
-            conn.execute_batch(super::connection::SQL_COMMIT)
+            write_txn
+                .commit()
                 .map_err(|e| ReflectError::Database(e.to_string()))?;
             let outcome = ReflectOutcome {
                 id: actual_id,
@@ -668,9 +669,7 @@ pub fn reflect_with_hooks(
             Ok(outcome)
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch(super::connection::SQL_ROLLBACK) {
-                tracing::error!("ROLLBACK failed in reflect: {}", rb);
-            }
+            write_txn.rollback();
             Err(e)
         }
     }

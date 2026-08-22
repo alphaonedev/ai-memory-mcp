@@ -1570,7 +1570,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         }
     }
 
-    conn.execute_batch("BEGIN EXCLUSIVE")?;
+    let write_txn = super::connection::WriteTxn::begin_exclusive(conn)?;
     let result = (|| -> Result<()> {
         if version < 2 {
             let mut has_confidence = false;
@@ -3883,11 +3883,11 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 
     match result {
         Ok(()) => {
-            conn.execute_batch(super::connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             Ok(())
         }
         Err(e) => {
-            let _ = conn.execute_batch(super::connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }

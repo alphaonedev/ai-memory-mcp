@@ -76,6 +76,215 @@ pub const SQL_BEGIN_IMMEDIATE: &str = "BEGIN IMMEDIATE";
 pub const SQL_COMMIT: &str = "COMMIT";
 pub const SQL_ROLLBACK: &str = "ROLLBACK";
 
+/// v1.0.0 #3163 — the plain (DEFERRED) BEGIN, used by the CLI `mine` import's
+/// chunked transaction. Hoisted out of `cli/io.rs` as an inline literal so
+/// every transaction verb in the substrate is spelled once, here
+/// (pm-v3.1 no-hardcoded-literals). DEFERRED is correct there because the
+/// importer owns its own process-private connection and takes no lock until
+/// its first write.
+pub const SQL_BEGIN_DEFERRED: &str = "BEGIN";
+
+/// v1.0.0 #3163 — the migration ladder's exclusive-lock BEGIN, hoisted out
+/// of `migrations.rs` as an inline literal so every transaction verb in the
+/// substrate is spelled once, here (pm-v3.1 no-hardcoded-literals).
+/// `BEGIN EXCLUSIVE` additionally blocks READERS for the whole ladder, which
+/// is what keeps a concurrent process from observing a half-migrated schema.
+pub const SQL_BEGIN_EXCLUSIVE: &str = "BEGIN EXCLUSIVE";
+
+/// v1.0.0 #3163 — the RAII drop-guard for the explicit-`BEGIN IMMEDIATE`
+/// write-transaction pattern.
+///
+/// # Why this type exists
+///
+/// The substrate drives write transactions manually — `execute_batch(`
+/// [`SQL_BEGIN_IMMEDIATE`]`)` … `execute_batch(`[`SQL_COMMIT`]`)`, with a
+/// hand-written `execute_batch(`[`SQL_ROLLBACK`]`)` on each `Err` arm.
+/// That shape is correct on the happy path and on the arms someone
+/// remembered to write, but it is NOT unwind-safe: `Cargo.toml` keeps
+/// `panic = "unwind"`, and a panic between the BEGIN and the COMMIT skips
+/// every hand-written ROLLBACK.
+///
+/// That matters because the daemon's writer is a SINGLE
+/// `rusqlite::Connection` shared behind a `tokio::sync::Mutex`, and a
+/// `tokio` mutex does **not** poison. An unwind therefore releases the
+/// mutex with the connection still inside an open write transaction, and
+/// the next writer inherits it: its own `BEGIN IMMEDIATE` fails with
+/// "cannot start a transaction within a transaction", or its statements
+/// silently join the orphaned transaction and become visible on someone
+/// else's COMMIT. Both outcomes are mixed state, which the project's prime
+/// directive forbids outright.
+///
+/// `WriteTxn` closes that hole structurally rather than by discipline: the
+/// transaction is ended by [`Drop`], which runs on an unwind exactly as it
+/// runs on an early `?` return. The worst case after a panic is a
+/// ROLLED-BACK transaction on a usable connection — degrade, never corrupt.
+///
+/// # Contract
+///
+/// - [`WriteTxn::begin`] issues `BEGIN IMMEDIATE` (write lock taken up
+///   front, so contention surfaces at BEGIN and is retryable).
+/// - [`WriteTxn::commit`] is the ONLY way to keep the work. A failed
+///   COMMIT still leaves the guard armed, so the drop rolls back.
+/// - Every other exit — an early `?`, an explicit [`WriteTxn::rollback`],
+///   or a panic unwind — rolls back.
+/// - The guard borrows the connection SHAREDLY (`&'c Connection`), so the
+///   surrounding code keeps using `conn` verbatim; adopting the guard is a
+///   line-for-line swap at the BEGIN/COMMIT/ROLLBACK statements, not a
+///   restructure of the transaction body.
+///
+/// # Panics in `Drop`
+///
+/// Never. A failing ROLLBACK is logged at ERROR and swallowed
+/// (rust-1.98 OWNERSHIP-25: a panic in a destructor during an unwind
+/// aborts the process). The connection is left for the next
+/// [`ensure_autocommit`] sweep, which fails the request closed rather than
+/// writing into a foreign transaction.
+pub struct WriteTxn<'c> {
+    conn: &'c Connection,
+    /// `true` once the transaction has been terminated (committed or
+    /// rolled back), which makes [`Drop`] a no-op.
+    finished: bool,
+}
+
+impl<'c> WriteTxn<'c> {
+    /// Open an immediate write transaction on `conn`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `rusqlite` error from `BEGIN IMMEDIATE` — most
+    /// commonly `SQLITE_BUSY` when another connection holds the write
+    /// lock (retryable), or a nested-transaction error when the caller is
+    /// already inside one. No guard is constructed on failure, so nothing
+    /// is left to roll back.
+    pub fn begin(conn: &'c Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(SQL_BEGIN_IMMEDIATE)?;
+        Ok(Self {
+            conn,
+            finished: false,
+        })
+    }
+
+    /// Open a DEFERRED transaction on `conn` — the chunked-import boundary,
+    /// which takes no write lock until its first write.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `rusqlite` error from `BEGIN`. As with
+    /// [`WriteTxn::begin`], no guard is constructed on failure.
+    pub fn begin_deferred(conn: &'c Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(SQL_BEGIN_DEFERRED)?;
+        Ok(Self {
+            conn,
+            finished: false,
+        })
+    }
+
+    /// Open an EXCLUSIVE write transaction on `conn` — the schema-migration
+    /// ladder's boundary, which must also exclude readers.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `rusqlite` error from `BEGIN EXCLUSIVE`. As with
+    /// [`WriteTxn::begin`], no guard is constructed on failure.
+    pub fn begin_exclusive(conn: &'c Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(SQL_BEGIN_EXCLUSIVE)?;
+        Ok(Self {
+            conn,
+            finished: false,
+        })
+    }
+
+    /// Commit the transaction, consuming the guard.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `rusqlite` error from `COMMIT`. The guard stays
+    /// ARMED on failure, so the drop that follows this call rolls the
+    /// transaction back — a half-committed connection is never handed on.
+    pub fn commit(mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(SQL_COMMIT)?;
+        // Only a SUCCESSFUL commit disarms the guard. On the error path we
+        // fall through with `finished == false` so `Drop` rolls back.
+        self.finished = true;
+        Ok(())
+    }
+
+    /// Roll the transaction back explicitly, consuming the guard.
+    ///
+    /// Equivalent to dropping the guard; provided so call sites that used
+    /// to write `let _ = conn.execute_batch(SQL_ROLLBACK);` keep saying
+    /// what they mean instead of relying on an invisible drop.
+    pub fn rollback(mut self) {
+        self.finish();
+    }
+
+    /// Terminate the transaction with a ROLLBACK unless it is already
+    /// terminated. Infallible by construction — see the type-level
+    /// "Panics in `Drop`" note.
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        // A connection already back in autocommit has nothing open: the
+        // COMMIT landed, or SQLite auto-rolled the transaction back after
+        // a fatal statement error. Issuing ROLLBACK there would only log a
+        // spurious "cannot rollback - no transaction is active".
+        if self.conn.is_autocommit() {
+            return;
+        }
+        if let Err(e) = self.conn.execute_batch(SQL_ROLLBACK) {
+            tracing::error!(
+                target: TXN_GUARD_TRACE_TARGET,
+                error = %e,
+                "#3163 WriteTxn: ROLLBACK failed while unwinding a write \
+                 transaction; the shared writer connection is still inside a \
+                 transaction and the next ensure_autocommit sweep will fail \
+                 the request closed rather than write into it"
+            );
+        }
+    }
+}
+
+impl Drop for WriteTxn<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Tracing target for the #3163 transaction-integrity guards.
+const TXN_GUARD_TRACE_TARGET: &str = "ai_memory::storage::txn_guard";
+
+/// v1.0.0 #3163 — the mutex-boundary integrity sweep for a SHARED writer
+/// connection.
+///
+/// [`WriteTxn`] makes it structurally impossible for an unwind to leave one
+/// of the substrate's OWN write transactions open. This is the
+/// defense-in-depth layer behind it: called on both sides of every closure
+/// that borrows the daemon's shared writer connection
+/// (`crate::handlers::transport::db_op`), it guarantees the connection is in
+/// autocommit before another caller is allowed to touch it — no matter which
+/// code opened the transaction or how it was abandoned.
+///
+/// Returns `Ok(true)` when an orphaned transaction was found and rolled
+/// back (the caller should log that as a defect), `Ok(false)` when the
+/// connection was already clean.
+///
+/// # Errors
+///
+/// Returns the `rusqlite` error when the connection is inside a transaction
+/// that could NOT be rolled back. That is the fail-closed case: the caller
+/// must refuse the operation rather than run new statements inside an
+/// unknown transaction. The check is retried on the next acquisition, so a
+/// transient failure self-heals without any poison flag or reopen.
+pub fn ensure_autocommit(conn: &Connection) -> rusqlite::Result<bool> {
+    if conn.is_autocommit() {
+        return Ok(false);
+    }
+    conn.execute_batch(SQL_ROLLBACK)?;
+    Ok(true)
+}
+
 /// #1579 B7 — default `PRAGMA mmap_size` in bytes (256 MiB).
 ///
 /// The P1 perf-audit PRAGMA A/B on the 100k-row corpus found
@@ -444,7 +653,7 @@ fn apply_check_constraint_triggers(conn: &Connection) -> Result<()> {
         );
     }
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let write_txn = WriteTxn::begin(conn)?;
     let result = (|| -> Result<()> {
         conn.execute_batch(CHECK_CONSTRAINT_TRIGGERS_SQLITE)
             .context("apply CHECK-constraint triggers")?;
@@ -452,11 +661,11 @@ fn apply_check_constraint_triggers(conn: &Connection) -> Result<()> {
     })();
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            write_txn.commit()?;
             Ok(())
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -811,6 +1020,186 @@ mod tests {
         assert!(
             index_present(&conn, "idx_shadow_obs_namespace_source_observed"),
             "v41 compound shadow index must be re-attached"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v1.0.0 #3163 — `WriteTxn` unwind/commit-failure contract
+    // -----------------------------------------------------------------
+
+    /// A bare connection with one table, deliberately NOT the full schema —
+    /// these tests pin the transaction guard, not the substrate.
+    fn txn_test_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create t");
+        conn
+    }
+
+    fn row_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .expect("count")
+    }
+
+    #[test]
+    fn write_txn_commit_persists_and_returns_to_autocommit() {
+        let conn = txn_test_conn();
+        let write_txn = WriteTxn::begin(&conn).expect("begin");
+        assert!(
+            !conn.is_autocommit(),
+            "BEGIN IMMEDIATE must leave the connection inside a transaction"
+        );
+        conn.execute("INSERT INTO t (id) VALUES (1)", [])
+            .expect("insert");
+        write_txn.commit().expect("commit");
+        assert!(conn.is_autocommit(), "COMMIT must restore autocommit");
+        assert_eq!(row_count(&conn), 1, "committed row must survive");
+    }
+
+    #[test]
+    fn write_txn_explicit_rollback_discards_the_partial_write() {
+        let conn = txn_test_conn();
+        let write_txn = WriteTxn::begin(&conn).expect("begin");
+        conn.execute("INSERT INTO t (id) VALUES (1)", [])
+            .expect("insert");
+        write_txn.rollback();
+        assert!(conn.is_autocommit(), "ROLLBACK must restore autocommit");
+        assert_eq!(row_count(&conn), 0, "rolled-back row must not be visible");
+    }
+
+    #[test]
+    fn write_txn_drop_without_commit_rolls_back() {
+        let conn = txn_test_conn();
+        {
+            let _write_txn = WriteTxn::begin(&conn).expect("begin");
+            conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                .expect("insert");
+            // No commit — the guard falls out of scope here.
+        }
+        assert!(conn.is_autocommit(), "drop must end the transaction");
+        assert_eq!(row_count(&conn), 0, "uncommitted row must not be visible");
+    }
+
+    /// THE #3163 regression: a PANIC between BEGIN and COMMIT must leave the
+    /// connection usable and the partial write invisible. Pre-fix the
+    /// hand-written `match result { Err(_) => ROLLBACK }` arms were skipped by
+    /// the unwind and the transaction stayed open forever.
+    #[test]
+    fn write_txn_rolls_back_on_panic_unwind_and_connection_stays_usable() {
+        let conn = txn_test_conn();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _write_txn = WriteTxn::begin(&conn).expect("begin");
+            conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                .expect("partial write");
+            panic!("#3163: injected panic between BEGIN and COMMIT");
+        }));
+        assert!(unwound.is_err(), "the injected panic must have unwound");
+
+        // (c) the connection is back in autocommit …
+        assert!(
+            conn.is_autocommit(),
+            "#3163: an unwind must not leave the shared writer inside a transaction"
+        );
+        // (a) … the partial write is NOT visible …
+        assert_eq!(
+            row_count(&conn),
+            0,
+            "#3163: the partial write must have been rolled back by the guard"
+        );
+        // (b) … and the next write on the SAME connection succeeds.
+        let write_txn = WriteTxn::begin(&conn).expect("#3163: next BEGIN must succeed");
+        conn.execute("INSERT INTO t (id) VALUES (2)", [])
+            .expect("post-unwind write");
+        write_txn.commit().expect("post-unwind commit");
+        assert_eq!(row_count(&conn), 1, "the post-unwind write must persist");
+    }
+
+    /// The #3163 addendum: the house pattern propagated a COMMIT failure with
+    /// `?` and NEVER rolled back, stranding the shared writer mid-transaction
+    /// so the next caller saw `is_autocommit() == false`, skipped its own
+    /// BEGIN, and silently joined the orphaned transaction.
+    ///
+    /// A DEFERRED foreign-key violation is the deterministic injection: SQLite
+    /// reports the violation at COMMIT time with `SQLITE_CONSTRAINT` and
+    /// deliberately leaves the transaction OPEN, which is exactly the shape
+    /// the guard has to survive.
+    #[test]
+    fn write_txn_rolls_back_when_commit_itself_fails() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY);\n\
+             CREATE TABLE t (\n\
+                 id INTEGER PRIMARY KEY,\n\
+                 parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED\n\
+             );",
+        )
+        .expect("create schema");
+        conn.execute_batch("PRAGMA foreign_keys = ON")
+            .expect("enable FK enforcement");
+
+        let write_txn = WriteTxn::begin(&conn).expect("begin");
+        conn.execute("INSERT INTO t (id, parent_id) VALUES (1, 999)", [])
+            .expect("deferred FK violation is accepted until COMMIT");
+        let err = write_txn
+            .commit()
+            .expect_err("COMMIT must fail on the deferred FK violation");
+        assert!(
+            format!("{err}")
+                .to_ascii_lowercase()
+                .contains("foreign key"),
+            "expected a foreign-key COMMIT failure, got: {err}"
+        );
+
+        // The guard's drop ran on the `?`-return out of `commit()`.
+        assert!(
+            conn.is_autocommit(),
+            "#3163 addendum: a FAILED COMMIT must not strand the writer inside \
+             a transaction"
+        );
+        assert_eq!(row_count(&conn), 0, "the violating row must not survive");
+
+        // And the next write on the same connection succeeds — the exact
+        // property the addendum says was broken.
+        conn.execute("INSERT INTO parent (id) VALUES (999)", [])
+            .expect("next write must succeed");
+        let write_txn = WriteTxn::begin(&conn).expect("next BEGIN must succeed");
+        conn.execute("INSERT INTO t (id, parent_id) VALUES (2, 999)", [])
+            .expect("insert");
+        write_txn.commit().expect("second commit must succeed");
+        assert_eq!(row_count(&conn), 1, "the post-failure write must persist");
+    }
+
+    #[test]
+    fn ensure_autocommit_is_a_no_op_on_a_clean_connection() {
+        let conn = txn_test_conn();
+        assert!(
+            !ensure_autocommit(&conn).expect("clean sweep"),
+            "a connection already in autocommit must report nothing to do"
+        );
+        assert!(conn.is_autocommit());
+    }
+
+    /// The mutex-boundary sweep must clear a transaction the substrate did NOT
+    /// open through [`WriteTxn`] — a future call site, or code this crate does
+    /// not own. This is the defense-in-depth half of #3163.
+    #[test]
+    fn ensure_autocommit_rolls_back_an_unguarded_transaction() {
+        let conn = txn_test_conn();
+        conn.execute_batch(SQL_BEGIN_IMMEDIATE)
+            .expect("raw BEGIN, deliberately unguarded");
+        conn.execute("INSERT INTO t (id) VALUES (1)", [])
+            .expect("partial write");
+
+        assert!(
+            ensure_autocommit(&conn).expect("sweep must succeed"),
+            "the sweep must REPORT that it found and rolled back a transaction"
+        );
+        assert!(conn.is_autocommit(), "the connection must be usable again");
+        assert_eq!(
+            row_count(&conn),
+            0,
+            "the unguarded write must be rolled back"
         );
     }
 

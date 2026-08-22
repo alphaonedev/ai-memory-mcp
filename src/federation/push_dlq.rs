@@ -1343,7 +1343,7 @@ impl FederationDlqSink for SqliteDlqSink {
         // BEGIN IMMEDIATE (not DEFERRED): the body both reads and writes,
         // and a deferred read-then-upgrade is the classic SQLITE_BUSY
         // deadlock shape against the HTTP writer on the same file.
-        conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
+        let write_txn = crate::storage::connection::WriteTxn::begin(&conn)
             .map_err(|e| format!("sqlite expand_erasure_sentinel begin: {e}"))?;
         let outcome = (|| -> rusqlite::Result<SentinelExpansion> {
             // Optimistic-concurrency guard, same token as
@@ -1425,12 +1425,13 @@ impl FederationDlqSink for SqliteDlqSink {
         })();
         match outcome {
             Ok(v) => {
-                conn.execute_batch("COMMIT")
+                write_txn
+                    .commit()
                     .map_err(|e| format!("sqlite expand_erasure_sentinel commit: {e}"))?;
                 Ok(v)
             }
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
+                write_txn.rollback();
                 Err(format!("sqlite expand_erasure_sentinel: {e}"))
             }
         }

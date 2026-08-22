@@ -1211,17 +1211,26 @@ impl MemoryStore for SqliteStore {
         // v0.7.0 #1079 — wrap the per-id decay-touch loop in a single
         // BEGIN/COMMIT pair so each id pays only the UPDATE cost.
         if crate::confidence::decay::decay_enabled() {
-            if let Err(e) = conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE) {
-                tracing::warn!("decay-touch BEGIN failed: {e}");
-            } else {
-                for id in ids {
-                    if let Err(e) = crate::confidence::decay::apply_decay_touch(&conn, id) {
-                        tracing::warn!("confidence decay touch failed for memory {id}: {e}");
+            // #3163 — the RAII guard ends this transaction on EVERY exit,
+            // including a panic unwind out of `apply_decay_touch`. Pre-fix an
+            // unwind here stranded an open write transaction on the SAL
+            // store's own long-lived shared writer connection
+            // (`SqliteStore::state`), which is a second non-poisoning
+            // `tokio::sync::Mutex` with exactly the `Db` hazard.
+            match crate::storage::connection::WriteTxn::begin(&conn) {
+                Err(e) => tracing::warn!("decay-touch BEGIN failed: {e}"),
+                Ok(write_txn) => {
+                    for id in ids {
+                        if let Err(e) = crate::confidence::decay::apply_decay_touch(&conn, id) {
+                            tracing::warn!("confidence decay touch failed for memory {id}: {e}");
+                        }
                     }
-                }
-                if let Err(e) = conn.execute_batch(crate::storage::connection::SQL_COMMIT) {
-                    tracing::warn!("decay-touch COMMIT failed: {e}");
-                    let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+                    // A failed COMMIT leaves the guard armed, so the drop that
+                    // follows rolls the partial decay-touch back rather than
+                    // handing the next SAL caller a mid-transaction connection.
+                    if let Err(e) = write_txn.commit() {
+                        tracing::warn!("decay-touch COMMIT failed: {e}");
+                    }
                 }
             }
         }
