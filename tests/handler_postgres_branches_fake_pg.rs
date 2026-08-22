@@ -242,6 +242,17 @@ async fn put_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode,
     (status, v)
 }
 
+/// PUT with an authenticated `X-Agent-Id`, the sibling of `post_json_as` /
+/// `get_uri_as` / `delete_uri_as`.
+///
+/// A mutating handler resolves the caller via `identity::resolve_http_agent_id`,
+/// which — with NO header — synthesizes a FRESH `anonymous:req-<uuid>` per
+/// request (and logs a WARN). Two header-less requests therefore have two
+/// DIFFERENT principals, so the create stamps `metadata.agent_id` with one
+/// identity and a later header-less mutate arrives as another and fails the
+/// caller-owns gate. Any happy-path mutate test must pin ONE stable identity
+/// across the create and the mutate — exactly as the real sqlite smoke test
+/// does (`route_put(.., Some("ai:smoke-agent"))` in tests/integration.rs).
 async fn put_json_as(
     router: &axum::Router,
     uri: &str,
@@ -363,12 +374,20 @@ async fn pg_update_memory_happy() {
         "source": "user",
         "metadata": {},
     });
-    let (_status, v) = post_json(&router, "/api/v1/memories", body).await;
+    // ONE stable identity for BOTH the create and the update: the create
+    // stamps `metadata.agent_id` with the caller, and the pg branch's
+    // caller-owns gate (`assert_caller_owns_for_mutation`, #1412/#1628)
+    // requires the mutating caller to be that owner. Header-less requests
+    // get a FRESH `anonymous:req-<uuid>` each time, so they can never own
+    // what a previous header-less request created.
+    let caller = "ai:pgfake-upd";
+    let (_status, v) = post_json_as(&router, "/api/v1/memories", body, caller).await;
     let id = v["id"].as_str().unwrap().to_string();
-    let (status, got) = put_json(
+    let (status, got) = put_json_as(
         &router,
         &format!("/api/v1/memories/{id}"),
         json!({"content": "updated body"}),
+        caller,
     )
     .await;
     assert!(status == StatusCode::OK, "pg update: {status} body={got}");
@@ -494,9 +513,14 @@ async fn pg_delete_memory_after_create() {
         "source": "user",
         "metadata": {},
     });
-    let (_status, v) = post_json(&router, "/api/v1/memories", body).await;
+    // Same stable-identity requirement as `pg_update_memory_happy`: the pg
+    // delete branch runs the same caller-owns gate, so the deleter must be
+    // the agent that created the row.
+    let caller = "ai:pgfake-del";
+    let (_status, v) = post_json_as(&router, "/api/v1/memories", body, caller).await;
     let id = v["id"].as_str().unwrap().to_string();
-    let (status, got) = delete_uri(&router, &format!("/api/v1/memories/{id}")).await;
+    let (status, got) =
+        delete_uri_as(&router, &format!("/api/v1/memories/{id}"), Some(caller)).await;
     assert_eq!(status, StatusCode::OK, "{got}");
 }
 
