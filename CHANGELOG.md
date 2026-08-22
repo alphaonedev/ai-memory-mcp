@@ -1416,6 +1416,35 @@ backend and missing or divergently implemented on its twin). Pinned by
   watchdog test's detached sleeper drops from 30 s to 5 s (still
   unconditionally over the assertion's ceiling, so the property is intact).
 
+- **The per-migration metadata matrix was guessed, not derived, and its lockstep
+  gate could never fail (#3158).** `storage::migration_meta::MIGRATION_LADDER`
+  is the operator-facing answer to *"is this migration reversible? does it lose
+  data? is it idempotent?"* — the input to every rollback plan — and it was
+  wrong. v43 was recorded as `ADD_RECURSIVE_LEARNING_LEDGER / idempotent /
+  reversible / DataLossRisk::None`; `grep recursive_learning
+  src/storage/migrations.rs` has no match, and the real v43 arm applies
+  `0037_v07_persona_signing_atomicity.sql`, whose first statement
+  (`UPDATE memory_links SET attest_level = 'unsigned' WHERE attest_level IN
+  ('self_signed','peer_attested') AND (signature IS NULL OR length(signature) !=
+  64)`) irreversibly overwrites caller-supplied values. v41/v42/v44/v46/v47 and
+  most of v3–v40 were mislabelled the same way. The tail row was keyed to
+  `current_schema_version()`, so `meta_for(54)` returned `None`, `meta_for(89)`
+  returned v54's semantics, there were NO rows at all for v54–v88 (35 arms,
+  including three full-table rebuilds and the postgres tsv rewrite), and
+  `arch_8_ladder_terminates_at_current_schema_version` — which asserts
+  `last().version == current_schema_version()` — was TRUE BY CONSTRUCTION. All
+  88 rows (v2–v89) are re-derived from the arms' actual SQL by one stated rule,
+  keyed to LITERAL versions, and carry a new `LadderArm` field distinguishing
+  the four postgres-only steps (v57/v69/v88/v89) from the sqlite arms. The gate
+  is rebuilt to fail on a symbolic tail key, to require exactly one row per
+  `if version < N` arm (const-phrased arms resolved from their mandatory
+  `// vNN` comment), to require gap-free coverage of v2..=CURRENT, and to
+  require each row's NAME be grounded in the arm it describes — the check that
+  catches the v43 class. `scripts/check-migration-ladder.sh` gains the same
+  coverage as rule (g), with two self-test cases proving it load-bearing.
+  Two arms are now correctly flagged `DataLossRisk::Column` (v43, v50) and the
+  irreversible set is 21 arms, not the three the old comment in `migrate()`
+  named.
 - **The required `Check` legs are no longer undeclared performance gates:
   `ai-memory bench` gains `--report-only`.** `cmd_bench` bails non-zero
   whenever any operation's measured p95 exceeds its target by more than 10%, so
@@ -1524,6 +1553,7 @@ backend and missing or divergently implemented on its twin). Pinned by
   watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
   the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
   the outer job cap — remains what fires on a genuine hang.
+
 ### Security (#3110 — cross-agent private-row leak on the postgres reciprocal-provenance search)
 
 - **`PostgresStore::search_with_source_uri` now enforces the SAL #910

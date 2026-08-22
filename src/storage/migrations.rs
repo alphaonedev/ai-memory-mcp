@@ -1624,12 +1624,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     // Pre-migration safety snapshot. A `version > 0` stamp means this is a
     // pre-existing, populated DB about to be schema-mutated by the ladder
     // below (a fresh DB stamps 0 and has nothing to lose, so it is
-    // skipped). Several ladder arms are irreversible (see
-    // `migration_meta::MIGRATION_LADDER`: v34/v50/v54) — restore-from-
-    // backup is their only rollback path, so we take that backup HERE,
-    // before any schema mutation, rather than leaving it to an external
-    // step. Runs before `BEGIN EXCLUSIVE` because `VACUUM INTO` cannot
-    // execute inside a transaction.
+    // skipped). Many ladder arms are irreversible — restore-from-backup
+    // is their only rollback path, so we take that backup HERE, before
+    // any schema mutation, rather than leaving it to an external step.
+    //
+    // #3158 (v1.0.0) — the authoritative, ARM-DERIVED list lives in
+    // `migration_meta::MIGRATION_LADDER` (`reversible: false`), which is
+    // pinned one-row-per-arm by the `arch_8_*` tests. Do NOT re-inline a
+    // short list here — read the matrix. Two of those arms destroy
+    // caller-visible data (`DataLossRisk::Column`): v43 (rewrites
+    // pre-existing `memory_links.attest_level` values) and v50 (the
+    // agent_quotas PK widening).
     // v1.0.0 #2564 (a) — the gate is no longer `version > 0` ALONE. A stamp of
     // 0 on a database that holds durable rows now refuses above, but a legacy
     // pre-v2 database legitimately stamps 0 AND holds rows, and it is exactly

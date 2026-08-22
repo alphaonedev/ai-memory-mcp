@@ -69,6 +69,26 @@
 #       enter the ladder at version 0 and execute every arm) — so
 #       `bootstrap(fresh)` and `ladder(v0→tip)` converge on the same schema.
 #       That equivalence is the invariant; this rule is its static enforcement.
+#   (g) a MISSING or SYMBOLICALLY-KEYED per-migration METADATA row (#3158, the
+#       claims-truth class). `src/storage/migration_meta.rs::MIGRATION_LADDER`
+#       is the operator-facing answer to "is this migration reversible? does it
+#       lose data? is it idempotent?" — the input to every rollback plan. It
+#       drifted silently to the point where the tail row was keyed to
+#       `current_schema_version()` (so it re-labelled itself on every bump,
+#       `meta_for(54)` returned None, `meta_for(89)` returned v54's semantics,
+#       and there were NO rows at all for v54–v88 — 35 arms including three
+#       full-table rebuilds), while its own lockstep test asserted
+#       `last().version == current_schema_version()`, TRUE BY CONSTRUCTION.
+#       This rule enforces, from the shell lane: (g1) exactly ONE meta row per
+#       sqlite ladder arm — literal arms AND const-phrased arms, the latter
+#       resolved from the mandatory `// vNN` comment that opens the arm body;
+#       (g2) NO row keyed to `current_schema_version()` (every row is a
+#       LITERAL, the same literalize-on-settle convention the postgres
+#       `record_schema_version(&mut tx, 88)` stamps follow); (g3) the matrix is
+#       gap-free from v2 to CURRENT_SCHEMA_VERSION, since every number in that
+#       range is a real ladder step on at least one adapter. Mirrored by the
+#       `arch_8_*` unit tests in migration_meta.rs, which additionally check
+#       each row's NAME is grounded in the arm it describes.
 #
 # Mirrors the structure + `--self-test` convention of the sibling gates
 # (`scripts/check-vendor-literals.sh`, `scripts/check-l3-boundary.sh`).
@@ -78,8 +98,10 @@
 #   scripts/check-migration-ladder.sh --self-test  — plant the #2036/#2192
 #       same-prefix-different-name shape AND a same-version-two-arms case AND
 #       the #2424 v84 bootstrap-inline-index shape (both backends) in a
-#       throwaway copy UNDER the repo (never system /tmp) and confirm the gate
-#       rejects EACH, plus a clean-tree control — proving it is load-bearing.
+#       throwaway copy UNDER the repo (never system /tmp) AND the #3158
+#       metadata-matrix escapes (a ladder arm with no meta row; a tail row
+#       re-keyed to `current_schema_version()`) and confirm the gate rejects
+#       EACH, plus a clean-tree control — proving it is load-bearing.
 #
 # Path inputs (env-overridable so --self-test can point at planted fixtures):
 #   LADDER_MIGRATIONS_DIR  (default <root>/migrations)
@@ -87,6 +109,7 @@
 #   LADDER_POSTGRES_RS     (default <root>/src/store/postgres.rs)
 #   LADDER_PG_SCHEMA_SQL   (default <root>/src/store/postgres_schema.sql)
 #   LADDER_SRC_DIR         (default <root>/src)  — orphan reference scan root
+#   LADDER_MIGRATION_META_RS (default <root>/src/storage/migration_meta.rs)
 #
 # Requires bash >= 4 (Grok W2-bash3): this gate uses associative arrays
 # (`declare -A`) and negative array indexing (`${arr[-1]}`), both absent
@@ -256,6 +279,44 @@ collect_resolved_arithmetic_arms() {
         [[ -z "$op" || -z "$num" ]] && continue
         if [[ "$op" == "-" ]]; then echo $((csv - num)); else echo $((csv + num)); fi
     done < <(grep -oE "^[[:space:]]*if ${var} < CURRENT_SCHEMA_VERSION *[-+] *[0-9]+ \{" "$f" 2>/dev/null || true)
+}
+
+# --- Rule (g) helpers: per-migration metadata coverage (#3158) ---------------
+
+# collect_const_arm_versions <rust-file> — the schema version of every
+# CONST-PHRASED sqlite arm (`if version < CURRENT_SCHEMA_VERSION {`), resolved
+# from the MANDATORY `// vNN` comment that opens the arm body (the house
+# convention for the tip cohort). Emits `?` for an arm that carries no such
+# comment so rule (g) can FAIL LOUDLY rather than silently skipping an arm —
+# a skipped arm is a missing meta row nobody would ever notice.
+collect_const_arm_versions() {
+    local f="$1"
+    awk '
+        /^[[:space:]]*if version < CURRENT_SCHEMA_VERSION \{/ { inarm = 1; found = 0; next }
+        inarm && !found && /^[[:space:]]*\/\/ v[0-9]+/ {
+            line = $0
+            sub(/^[[:space:]]*\/\/ v/, "", line)
+            n = ""
+            for (i = 1; i <= length(line); i++) {
+                c = substr(line, i, 1)
+                if (c ~ /[0-9]/) { n = n c } else { break }
+            }
+            print n
+            found = 1
+            inarm = 0
+            next
+        }
+        # An arm that opens another arm before yielding a `// vNN` comment.
+        inarm && /^[[:space:]]*if version < / { print "?"; inarm = 0 }
+    ' "$f" 2>/dev/null || true
+}
+
+# collect_meta_versions <migration_meta.rs> — the schema version of every
+# MIGRATION_LADDER row (`meta(<N>, "NAME", …)` table entries).
+collect_meta_versions() {
+    local f="$1"
+    grep -oE '^[[:space:]]*meta\([0-9]+,' "$f" 2>/dev/null \
+        | grep -oE '[0-9]+' || true
 }
 
 # --- Rule (f) helpers: bootstrap↔ladder forward-reference (#2424) ------------
@@ -642,13 +703,76 @@ run_gate() {
         done < <(printf '%s\n' "$fb_bootstrap" | collect_bootstrap_indexes)
     done
 
+    # ---- Rule (g): per-migration METADATA coverage (#3158) ------------------
+    local meta_rs="${LADDER_MIGRATION_META_RS:-$ROOT/src/storage/migration_meta.rs}"
+    if [[ ! -f "$meta_rs" ]]; then
+        echo "❌ migration-ladder: RULE (g) migration-metadata matrix not found: $meta_rs" >&2
+        violations=$((violations + 1))
+    elif [[ -f "$mig_rs" && -n "$cv_sqlite" ]]; then
+        # (g2) NO symbolic key. A row keyed to `current_schema_version()`
+        #      re-labels itself on every bump and makes the matrix's own
+        #      lockstep test a tautology.
+        local meta_table
+        meta_table="$(awk '/^pub const MIGRATION_LADDER:/ { intable = 1 } intable { print } intable && /^\];/ { exit }' "$meta_rs")"
+        if printf '%s' "$meta_table" | grep -q 'current_schema_version()'; then
+            echo "❌ migration-ladder: RULE (g) MIGRATION_LADDER carries a row keyed to \`current_schema_version()\` — a SYMBOLIC tail key silently re-labels the new tip with the OLD arm's semantics and makes the lockstep assertion true by construction (#3158). Key every row to a LITERAL version." >&2
+            violations=$((violations + 1))
+        fi
+
+        # (g1) exactly one meta row per sqlite arm (literal + const-phrased).
+        local -a g_arms=() g_metas=()
+        local gv
+        while IFS= read -r gv; do
+            [[ -z "$gv" ]] && continue
+            g_arms+=("$gv")
+        done < <( { collect_arm_versions "$mig_rs"; collect_const_arm_versions "$mig_rs"; } )
+        while IFS= read -r gv; do
+            [[ -z "$gv" ]] && continue
+            g_metas+=("$gv")
+        done < <(collect_meta_versions "$meta_rs")
+
+        if (( ${#g_metas[@]} == 0 )); then
+            echo "❌ migration-ladder: RULE (g) parsed ZERO MIGRATION_LADDER rows out of $meta_rs — the matrix parser lost its anchor (\`meta(<N>, \"NAME\", …)\`); fix the parser before trusting this gate." >&2
+            violations=$((violations + 1))
+        else
+            local ga
+            for ga in "${g_arms[@]}"; do
+                if [[ "$ga" == "?" ]]; then
+                    echo "❌ migration-ladder [sqlite]: RULE (g) a const-phrased arm (\`if version < CURRENT_SCHEMA_VERSION\`) does not open with the mandatory \`// vNN …\` comment, so its schema version cannot be resolved and its meta row cannot be checked. Add the comment, or LITERALIZE the guard now that the arm has settled." >&2
+                    violations=$((violations + 1))
+                    continue
+                fi
+                if ! printf '%s\n' "${g_metas[@]}" | grep -qx "$ga"; then
+                    echo "❌ migration-ladder: RULE (g) sqlite ladder arm v$ga has NO row in MIGRATION_LADDER (src/storage/migration_meta.rs). Its reversibility / data-loss / idempotency contract is operator-facing truth and is the input to every rollback plan — add the row, DERIVED from the arm's SQL, never guessed." >&2
+                    violations=$((violations + 1))
+                fi
+            done
+            # Duplicate rows.
+            local gdup
+            gdup="$(printf '%s\n' "${g_metas[@]}" | sort -n | uniq -d || true)"
+            if [[ -n "$gdup" ]]; then
+                echo "❌ migration-ladder: RULE (g) DUPLICATE MIGRATION_LADDER row(s) for version(s):" >&2
+                printf '%s\n' "$gdup" | sed -E 's/^/     v/' >&2
+                violations=$((violations + 1))
+            fi
+            # (g3) gap-free v2..CURRENT_SCHEMA_VERSION.
+            local gi
+            for (( gi = 2; gi <= cv_sqlite; gi++ )); do
+                if ! printf '%s\n' "${g_metas[@]}" | grep -qx "$gi"; then
+                    echo "❌ migration-ladder: RULE (g) MIGRATION_LADDER has NO row for v$gi — every number from 2 to CURRENT_SCHEMA_VERSION=$cv_sqlite is a real ladder step on at least one adapter (a postgres-only step still needs a row flagged \`LadderArm::PostgresOnly\`)." >&2
+                    violations=$((violations + 1))
+                fi
+            done
+        fi
+    fi
+
     return "$violations"
 }
 
 # --- Self-test --------------------------------------------------------------
 
 run_self_test() {
-    echo "migration-ladder gate: self-test (clean control -> PASS; #2036/#2192 same-prefix collision -> FAIL; same-version-two-arms -> FAIL; #2198 arm-lane const-phrase escapes D1a/D1b/D2 -> FAIL; #2424 bootstrap-inline index on a ladder-added column, postgres v84 + sqlite cid -> FAIL)"
+    echo "migration-ladder gate: self-test (clean control -> PASS; #2036/#2192 same-prefix collision -> FAIL; same-version-two-arms -> FAIL; #2198 arm-lane const-phrase escapes D1a/D1b/D2 -> FAIL; #2424 bootstrap-inline index on a ladder-added column, postgres v84 + sqlite cid -> FAIL; #3158 metadata-matrix missing row + symbolic tail key -> FAIL)"
     local scratch
     # Project hard rule: scratch UNDER the repo, never system /tmp.
     scratch="$(mktemp -d "$ROOT/.migration-ladder-selftest.XXXXXX")"
@@ -816,8 +940,47 @@ run_self_test() {
         fail=1
     fi
 
+    # ---- #3158 per-migration metadata coverage (rule g) ---------------------
+    #
+    # Both cases re-plant the EXACT shapes that shipped: a ladder arm with no
+    # metadata row, and a tail row keyed to the moving const.
+
+    # (g1) MISSING META ROW — delete the v43 row (the issue's headline row:
+    #      the arm that irreversibly rewrites `memory_links.attest_level`).
+    local meta_g1="$scratch/migration_meta_missing_row.rs"
+    grep -v '^[[:space:]]*meta(43,' "$ROOT/src/storage/migration_meta.rs" > "$meta_g1"
+    local out_g1
+    if out_g1="$(LADDER_MIGRATION_META_RS="$meta_g1" run_gate 2>&1)"; then
+        echo "  [g1] #3158 missing meta row: NOT CAUGHT (gate passed) — FAIL" >&2
+        fail=1
+    elif printf '%s' "$out_g1" | grep -q 'RULE (g) sqlite ladder arm v43 has NO row in MIGRATION_LADDER'; then
+        echo "  [g1] #3158 ladder arm with no metadata row: CAUGHT"
+    else
+        echo "  [g1] #3158 missing meta row: gate failed but without the rule-(g) coverage message — FAIL" >&2
+        printf '%s\n' "$out_g1" >&2
+        fail=1
+    fi
+
+    # (g2) SYMBOLIC TAIL KEY — re-key the tail row to the moving const, the
+    #      exact pre-#3158 shape that made `meta_for(54)` None, `meta_for(89)`
+    #      return v54's semantics, and the lockstep test unfailable.
+    local meta_g2="$scratch/migration_meta_symbolic_tail.rs"
+    sed -E "s/^([[:space:]]*)meta\\(${csv},/\\1meta(crate::storage::migrations::current_schema_version(),/" \
+        "$ROOT/src/storage/migration_meta.rs" > "$meta_g2"
+    local out_g2
+    if out_g2="$(LADDER_MIGRATION_META_RS="$meta_g2" run_gate 2>&1)"; then
+        echo "  [g2] #3158 symbolic tail key: NOT CAUGHT (gate passed) — FAIL" >&2
+        fail=1
+    elif printf '%s' "$out_g2" | grep -q 'RULE (g) MIGRATION_LADDER carries a row keyed to'; then
+        echo "  [g2] #3158 tail row keyed to current_schema_version(): CAUGHT"
+    else
+        echo "  [g2] #3158 symbolic tail key: gate failed but without the rule-(g) symbolic-key message — FAIL" >&2
+        printf '%s\n' "$out_g2" >&2
+        fail=1
+    fi
+
     if (( fail == 0 )); then
-        echo "migration-ladder gate self-test: PASS (load-bearing — catches the prefix collision, the dup-arm shapes, the #2198 const-phrase arm-lane escapes D1a/D1b/D2, AND the #2424 bootstrap↔ladder forward reference on BOTH adapters; spares a clean tree)"
+        echo "migration-ladder gate self-test: PASS (load-bearing — catches the prefix collision, the dup-arm shapes, the #2198 const-phrase arm-lane escapes D1a/D1b/D2, the #2424 bootstrap↔ladder forward reference on BOTH adapters, AND the #3158 metadata-matrix escapes (missing row / symbolic tail key); spares a clean tree)"
         return 0
     fi
     echo "migration-ladder gate self-test: FAIL" >&2
@@ -832,7 +995,7 @@ main() {
         exit $?
     fi
     if run_gate; then
-        echo "✅ migration-ladder-uniqueness gate: PASS (prefixes unique + gap-free, arms strictly monotonic incl. normalized const-phrased tip cohort, cross-adapter tip agrees, no orphans, no bootstrap↔ladder forward references on either adapter)"
+        echo "✅ migration-ladder-uniqueness gate: PASS (prefixes unique + gap-free, arms strictly monotonic incl. normalized const-phrased tip cohort, cross-adapter tip agrees, no orphans, no bootstrap↔ladder forward references on either adapter, every ladder arm carries a literally-keyed migration_meta row)"
         exit 0
     else
         echo "" >&2
