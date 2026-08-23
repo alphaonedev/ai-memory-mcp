@@ -113,6 +113,8 @@ async fn bulk_catchup_attaches_credential_and_chain_headers() {
     outbound::store_intermediates(vec![intermediate]);
 
     let (url, captured) = spawn_capturing_peer().await;
+    let _ = ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION
+        .set(Box::new(|_action| Ok(())));
     let cfg = FederationConfig {
         policy: QuorumPolicy::new(1, 2, Duration::from_secs(2), Duration::from_secs(30))
             .expect("policy"),

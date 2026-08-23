@@ -646,6 +646,10 @@ async fn spawn_mock_peer(status_line: &'static str, body: &'static str) -> Strin
 fn quorum_config_w2(
     peers: Vec<ai_memory::federation::PeerEndpoint>,
 ) -> ai_memory::federation::FederationConfig {
+    // Coverage binaries do not bootstrap_serve. check_governed refuses
+    // outbound POSTs when the hook is unset; install Allow-all once.
+    let _ = ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION
+        .set(Box::new(|_action| Ok(())));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
