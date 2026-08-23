@@ -10979,6 +10979,11 @@ fn federation_cfg_for_test(
     timeout_ms: u64,
 ) -> ai_memory::federation::FederationConfig {
     use std::time::Duration;
+    // Coverage `--tests` does not run `bootstrap_serve`, so
+    // `check_governed` would refuse outbound POSTs (HOOK_NOT_INSTALLED)
+    // and agent-register would return 202 under-replicated instead of 200/201.
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let timeout = Duration::from_millis(timeout_ms);
     let client = reqwest::Client::builder()
         .timeout(timeout)
