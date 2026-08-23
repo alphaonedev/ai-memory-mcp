@@ -27,6 +27,12 @@ const INTEGRATION_TEST_ADMIN: &str = "ai:integration-test-admin";
 fn cmd(binary: &str) -> std::process::Command {
     let mut c = std::process::Command::new(binary);
     c.env("AI_MEMORY_NO_CONFIG", "1");
+    // Spawned CLI `--json` reports must be a single JSON document on
+    // stdout. GitHub-hosted Check runners (and some local shells) inherit
+    // `RUST_LOG=info`; curator then prefixes stdout with a tracing INFO
+    // line and `serde_json::from_str` fails at column 1. Pin error so
+    // `--json` stays parseable. Tests that need log text can override.
+    c.env("RUST_LOG", "error");
     // #1751 — the v0.9 store-path default REQUIRES attestation; this suite's
     // unsigned CLI/daemon stores exercise other subject matter, so pin the
     // explicit documented opt-out on every spawned child. The required
@@ -10894,8 +10900,13 @@ fn test_curator_autonomy_end_to_end_cycle() {
         output.status
     );
 
-    // Parse the JSON report
-    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+    // Parse the JSON report. Skip any tracing prefix if one leaked
+    // past RUST_LOG=error (first `{` is the CuratorReport object).
+    let json_src = stdout
+        .find('{')
+        .map(|i| &stdout[i..])
+        .unwrap_or(stdout.trim());
+    let report: serde_json::Value = serde_json::from_str(json_src.trim()).unwrap_or_else(|e| {
         panic!("curator output should be valid JSON: {e}\nstdout={stdout:?}\nstderr={stderr:?}")
     });
 
