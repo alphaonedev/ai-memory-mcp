@@ -185,8 +185,78 @@ write is permission-evaluated as; see the operator note below.
     fleet-only `rustup` presence assertion is dropped from every job that no
     longer runs there. `CARGO_INCREMENTAL: "0"` stays declared at workflow level.
 
+### Security
+
+- **Federation's S40 bulk catch-up push shipped memory content past the
+  `NetworkRequest` governance egress gate**
+  ([#3148](https://github.com/alphaonedev/ai-memory-mcp/issues/3148)).
+  `post_once` consulted `governance::wire_check` before its outbound POST and
+  attached the FED-P3a credential (`x-memory-cred`) + FED-P4d chain
+  (`x-memory-cred-chain`) headers; `bulk_catchup_push` open-coded its own
+  request and honoured NEITHER. An operator `refuse` rule for a peer host
+  blocked the per-row fanout while the catch-up lane still delivered FULL
+  memory batches to that host — with no `governance.check` `signed_events` row,
+  so the bypass was not even auditable. Both lanes now build their request
+  through one shared `build_governed_peer_post`: the only way to obtain a peer
+  request builder in `federation::sync` is to pass the gate first, so a future
+  lane cannot forget it. A refused catch-up returns the operator-authored
+  reason and ZERO bytes leave the process.
+- **The Portability-v2 `archived_memories[]` import lane skipped the three
+  admission gates the live `memories[]` lane enforces**
+  ([#3150](https://github.com/alphaonedev/ai-memory-mcp/issues/3150)). The
+  archived lane went DTO -> liveness probe -> seal -> raw INSERT, trusting the
+  bundle PRODUCER, while the importer's own threat model treats bundles as
+  UNAUTHENTICATED input. A crafted bundle could therefore land a forged
+  `attest_level=agent_attested` + `write_signature`, an unrestamped author
+  claim, and oversized / credential-bearing content through
+  `archived_memories[]` that the SAME row was refused or downgraded for through
+  `memories[]`. The archived lane now runs identity restamp (#2211),
+  redact-before-attestation (#2353), destination-side attestation
+  re-derivation (a presented-but-forged signature SKIPS the row) and the
+  L1-parity `validate_memory` — and archived authors are resolved in the same
+  pre-transaction enrolled-key snapshot, so the in-bundle self-enrollment hole
+  stays closed. This matters beyond the archive: `metadata.agent_id` on an
+  archived row is the ownership predicate `restore_archived_for_caller` gates
+  on, so a bundle-chosen author decided who could promote that row back to LIVE.
+
 ### Fixed
 
+- **Import reports asserted rows that never landed**
+  ([#3149](https://github.com/alphaonedev/ai-memory-mcp/issues/3149)). The
+  `forget_tombstones` and `model_attestations` import lanes discarded
+  `execute`'s affected-row count and incremented their counter
+  unconditionally, so when the destination already held a DIFFERENT-bytes row
+  at the key (two nodes forgot the same id with a different `forgotten_at` /
+  erasure signature; a divergent TOFU model pin) the bundle row was suppressed
+  while the committed report claimed full staging — falsifying
+  `ImportReport`'s own "a report can only exist for a bundle that fully landed"
+  contract. Both lanes now count only what landed and apply the #2209
+  identical-or-refuse discipline: byte-identical survivor => an honest
+  idempotent no-op (new `ImportReport::idempotent_rows_already_present`);
+  divergent survivor => the import REFUSES and rolls back.
+- **Divergent rows on the #2571 import lanes were dropped with no signal at
+  all** ([#3151](https://github.com/alphaonedev/ai-memory-mcp/issues/3151)).
+  `archived_memories`, `archived_memory_links` and `namespace_meta` used
+  `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` with no identity probe, no
+  warning and no counter, so a restore/merge onto a destination holding an
+  OLDER snapshot kept the stale bytes and discarded the bundle's newer ones
+  silently. All three lanes now PROBE the survivor: byte-identical => an honest
+  idempotent no-op (counted, not reported as staged); DIVERGENT => the
+  destination's row is kept, the bundle's is not applied, and the drop is
+  counted (`archived_memories_skipped_divergent`,
+  `archived_memory_links_skipped_divergent`,
+  `namespace_meta_skipped_divergent`) plus WARNed. Archived content is compared
+  DECRYPTED, since the archived insert re-seals with a fresh per-record DEK.
+  This is the LIVE `memories[]` lane's disposition and deliberately NOT a
+  refusal: two independently-running nodes hold different `in_place_edit`
+  snapshots under the same id as a matter of course (#1725 writes one on every
+  edit), so refusing would pin a repeat restore permanently red on a
+  steady-state merge condition. The write-once SIGNED lanes (#3149) keep their
+  refusal — a conflicting erasure receipt or TOFU pin IS an integrity signal.
+  The probe cannot itself fail an import: a destination row that is
+  crypto-ERASED (#1956 destroys the wrapped DEK on forget) is undecryptable by
+  design, and is treated as divergent rather than propagated — the erased row
+  stays and the bundle's pre-erasure copy is never resurrected.
 - **`cargo audit` and the release-profile smoke build would have silently
   stopped running.** Both were pinned to the singleton leg by
   `matrix.node == 'linux-fed' && matrix.tier == 'sqlite'`, a comparison that
