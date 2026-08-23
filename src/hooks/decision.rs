@@ -91,6 +91,21 @@ pub enum HookDecision {
     /// Rewrite the in-flight payload before the memory operation
     /// runs. Only valid on pre- events; on post- events the
     /// dispatcher logs a warning and degrades to `Allow`.
+    ///
+    /// **v1.0.0 #2427 — NOT every pre-event dispatch site applies the
+    /// delta.** The `hooks.enforce` pre-event gate
+    /// (`crate::mcp::consult_pre_event_gate`, shared by the MCP stdio store
+    /// path and the HTTP `http_pre_event_gate`) and the #1752
+    /// `PreSignalSend` gate both have NO field mapping for the
+    /// memory-shaped [`MemoryDelta`], so they proceed with the ORIGINAL,
+    /// un-rewritten payload. Both now emit a `tracing::warn!` naming the
+    /// event and stating that the delta was not applied, so a redaction /
+    /// normalization / policy-rewrite hook cannot evaporate silently — but
+    /// a hook author MUST NOT treat `Modify` as an enforced control on
+    /// those events. Use an in-process `pre_store` hook to rewrite a
+    /// memory. Honouring the delta on the store path (or withdrawing
+    /// `Modify` from the events whose dispatch sites discard it) is tracked
+    /// as v1.x follow-up work on #2427.
     Modify(ModifyPayload),
     /// Halt the memory operation. `reason` surfaces in the
     /// operator log and (when G7+ wires the executor into the

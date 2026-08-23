@@ -526,7 +526,26 @@ pub async fn create_link(
                             .map(str::to_string);
                         (Some(m.namespace), owner)
                     }
-                    Err(_) => (None, None),
+                    // v1.0.0 #2596 — the link COMMITTED; only the anchor
+                    // lookup failed, so the `memory_link_created` webhook is
+                    // silently skipped below (`link_namespace` is None).
+                    // Under `AI_MEMORY_ENCRYPT_AT_REST` a source row whose
+                    // envelope will not open fails this FailClosed full-row
+                    // read on every attempt, so a subscriber can lose the
+                    // event permanently with no signal anywhere. Name the
+                    // error so the drop is observable rather than inferred
+                    // from a missing webhook.
+                    Err(e) => {
+                        tracing::warn!(
+                            source_id = %source_id,
+                            target_id = %target_id,
+                            relation = %relation,
+                            error = %e,
+                            "link committed but the source-memory anchor lookup failed — \
+                             memory_link_created will NOT be dispatched for this link (#2596)"
+                        );
+                        (None, None)
+                    }
                 };
                 if let Some(ns) = link_namespace {
                     let details =
