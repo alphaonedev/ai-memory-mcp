@@ -1982,10 +1982,11 @@ impl MemoryStore for SqliteStore {
         // a transaction"): open our own tx ONLY when the caller does not
         // already hold one.
         let owns_tx = conn.is_autocommit();
-        if owns_tx {
-            conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
-                .map_err(box_err)?;
-        }
+        let write_txn = if owns_tx {
+            Some(crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?)
+        } else {
+            None
+        };
         let batch = (|| -> anyhow::Result<usize> {
             let mut moved = 0usize;
             for id in ids {
@@ -1997,15 +1998,14 @@ impl MemoryStore for SqliteStore {
         })();
         match batch {
             Ok(moved) => {
-                if owns_tx {
-                    conn.execute_batch(crate::storage::connection::SQL_COMMIT)
-                        .map_err(box_err)?;
+                if let Some(txn) = write_txn {
+                    txn.commit().map_err(box_err)?;
                 }
                 Ok(moved)
             }
             Err(e) => {
-                if owns_tx {
-                    let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+                if let Some(txn) = write_txn {
+                    txn.rollback();
                 }
                 Err(box_err(e))
             }

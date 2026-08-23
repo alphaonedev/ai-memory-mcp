@@ -139,6 +139,7 @@ pub const SQL_BEGIN_EXCLUSIVE: &str = "BEGIN EXCLUSIVE";
 /// aborts the process). The connection is left for the next
 /// [`ensure_autocommit`] sweep, which fails the request closed rather than
 /// writing into a foreign transaction.
+#[must_use = "dropping the guard rolls the transaction back immediately"]
 pub struct WriteTxn<'c> {
     conn: &'c Connection,
     /// `true` once the transaction has been terminated (committed or
@@ -1200,6 +1201,68 @@ mod tests {
             row_count(&conn),
             0,
             "the unguarded write must be rolled back"
+        );
+    }
+
+    /// Structural pin (#3211 Fable gate): after #3115 landed `delete` /
+    /// `archive_by_ids` with raw `execute_batch(SQL_BEGIN_IMMEDIATE)`, the
+    /// "zero raw BEGINs outside connection.rs" claim was already false at
+    /// the tip. Allow-list `connection.rs` (the primitive), `cli/backup.rs`
+    /// (self-terminating exclusive-lock probe), and `handlers/transport.rs`
+    /// (`db_op` sweep tests that *must* open an unguarded BEGIN).
+    #[test]
+    fn no_raw_sql_begin_immediate_outside_allowlisted_sites_3163() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let allow = [
+            "storage/connection.rs",
+            "cli/backup.rs",
+            "handlers/transport.rs",
+        ];
+        let mut hits = Vec::new();
+        fn walk(
+            dir: &std::path::Path,
+            hits: &mut Vec<String>,
+            allow: &[&str],
+            root: &std::path::Path,
+        ) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for ent in rd.flatten() {
+                let path = ent.path();
+                if path.is_dir() {
+                    walk(&path, hits, allow, root);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                if allow.iter().any(|a| rel == *a) {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (i, line) in text.lines().enumerate() {
+                    if line.contains("execute_batch")
+                        && (line.contains("SQL_BEGIN_IMMEDIATE")
+                            || line.contains("SQL_BEGIN_DEFERRED")
+                            || line.contains("SQL_BEGIN_EXCLUSIVE"))
+                    {
+                        hits.push(format!("{rel}:{}:{line}", i + 1));
+                    }
+                }
+            }
+        }
+        walk(&root, &mut hits, &allow, &root);
+        assert!(
+            hits.is_empty(),
+            "raw execute_batch(SQL_BEGIN_*) outside allow-listed sites (#3163):\n{}",
+            hits.join("\n")
         );
     }
 

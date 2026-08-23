@@ -4103,20 +4103,22 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
     // commit/rollback covers atomicity (which is exactly the guarantee the
     // caller already wanted).
     let owns_tx = conn.is_autocommit();
-    if owns_tx {
-        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
-    }
+    let write_txn = if owns_tx {
+        Some(connection::WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
     let txn_result = delete_inner(conn, id);
     match txn_result {
         Ok(changed) => {
-            if owns_tx {
-                conn.execute_batch(connection::SQL_COMMIT)?;
+            if let Some(txn) = write_txn {
+                txn.commit()?;
             }
             Ok(changed)
         }
         Err(e) => {
-            if owns_tx {
-                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            if let Some(txn) = write_txn {
+                txn.rollback();
             }
             Err(e)
         }
