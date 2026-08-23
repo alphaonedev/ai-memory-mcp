@@ -235,7 +235,7 @@ docker run -d \
   -v /var/log/ai-memory-host:/var/log/ai-memory \
   -e AI_MEMORY_LOG_DIR=/var/log/ai-memory/logs \
   -e AI_MEMORY_AUDIT_DIR=/var/log/ai-memory/audit \
-  ghcr.io/alphaonedev/ai-memory:0.6.3
+  ghcr.io/alphaonedev/ai-memory:0.10.0
 ```
 
 **Kubernetes pod with `emptyDir` volume.** Project the volume into
@@ -251,7 +251,7 @@ metadata:
 spec:
   containers:
     - name: ai-memory
-      image: ghcr.io/alphaonedev/ai-memory:0.6.3
+      image: ghcr.io/alphaonedev/ai-memory:0.10.0
       env:
         - name: AI_MEMORY_LOG_DIR
           value: /var/log/ai-memory/logs

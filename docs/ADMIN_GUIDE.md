@@ -339,10 +339,11 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `AI_MEMORY_LLM_API_KEY` | unset | **[#1067, v0.7.0, secret]** Bearer secret for OpenAI-compatible backends. Per-vendor fallback env vars honoured (`OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` or `KIMI_API_KEY`, `DASHSCOPE_API_KEY` or `QWEN_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`). Never echoed in capabilities / banners / audit. |
 | `AI_MEMORY_LLM_MODEL` | tier-/vendor-specific | **[#1067, v0.7.0]** Model identifier (e.g. `grok-4.3` for xAI, `gpt-5` for OpenAI, `deepseek-chat` for DeepSeek, `gemma3:4b` for Ollama). |
 | `OLLAMA_BASE_URL` | unset | Legacy escape hatch honoured ONLY when `AI_MEMORY_LLM_BACKEND` is unset or `ollama`. Pre-#1067 callers using the old env var keep working. |
-| `AI_MEMORY_MAX_MEMORIES_PER_DAY` | `1000` | **[#1156 follow-up, v0.7.x]** Per-agent daily memory-write quota seeded into fresh `agent_quotas` rows. Precedence: env > `[limits].max_memories_per_day` > compiled default. Non-positive / unparseable falls through. |
-| `AI_MEMORY_MAX_STORAGE_BYTES` | `104857600` (100 MiB) | **[#1156 follow-up, v0.7.x]** Per-agent storage-byte quota seeded into fresh `agent_quotas` rows. Same ladder as above (`[limits].max_storage_bytes`). |
-| `AI_MEMORY_MAX_LINKS_PER_DAY` | `5000` | **[#1156 follow-up, v0.7.x]** Per-agent daily link-write quota seeded into fresh `agent_quotas` rows. Same ladder as above (`[limits].max_links_per_day`). |
+| `AI_MEMORY_MAX_MEMORIES_PER_DAY` | `1000` | **[#1156 follow-up, v0.7.x]** Per-**(agent, namespace)** daily memory-write quota seeded into fresh `agent_quotas` rows **(SQLite; the pg DDL divergence is [#3209](https://github.com/alphaonedev/ai-memory-mcp/issues/3209))**. (#1156 / schema v50 extended the `agent_quotas` PRIMARY KEY from `(agent_id)` to `(agent_id, namespace)`; pre-v50 rows backfill to the `_global` sentinel, and a caller that supplies no namespace still lands on `_global`.) Precedence: env > `[limits].max_memories_per_day` > compiled default. Non-positive / unparseable falls through. |
+| `AI_MEMORY_MAX_STORAGE_BYTES` | `104857600` (100 MiB) | **[#1156 follow-up, v0.7.x]** Per-**(agent, namespace)** storage-byte quota seeded into fresh `agent_quotas` rows **(SQLite; the pg DDL divergence is #3209)**. Same ladder as above (`[limits].max_storage_bytes`). |
+| `AI_MEMORY_MAX_LINKS_PER_DAY` | `5000` | **[#1156 follow-up, v0.7.x]** Per-**(agent, namespace)** daily link-write quota seeded into fresh `agent_quotas` rows **(SQLite; the pg DDL divergence is #3209)**. Same ladder as above (`[limits].max_links_per_day`). |
 | `AI_MEMORY_MAX_PAGE_SIZE` | `1000` | **[#1156 follow-up, v0.7.x]** Cap on list / bulk-write / federation-sync page size — bounds per-request in-memory materialization (OOM guard). Precedence: env > `[limits].max_page_size` > compiled `MAX_BULK_SIZE`. Non-positive / unparseable falls through. |
+| `AI_MEMORY_MAX_INFLIGHT_REQUESTS` | unset ⇒ CPU-scaled | **[#1733 Pillar-4 4.A; TRI-STATE since #2032 M3]** Global HTTP admission-control concurrency cap. `0` **disables** it (the layer is not composed at all). When UNSET the daemon computes a CPU-scaled default — `cores × 64`, clamped to a floor of **256** and a ceiling of **4096** (`resolve_default_max_inflight_requests`, `src/config.rs:4368-4375`; constants `MAX_INFLIGHT_PER_CORE`/`MAX_INFLIGHT_FLOOR`/`MAX_INFLIGHT_CEILING` at `src/config.rs:4347,4352,4356`) — it is NOT "unset = disabled". Precedence: env > `[limits].max_inflight_requests` > CPU-scaled default (`src/config.rs:4326` for the env name, `:8938-8942` for the ladder). |
 | `RUST_LOG` | (none) | Logging filter (e.g., `ai_memory=info,tower_http=debug`) |
 | `AI_MEMORY_NO_CONFIG` | (none) | Set to `1` to skip config file loading (useful for testing) |
 
@@ -365,7 +366,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `llm_model` | String | Backend-dependent | `"gemma3:4b"` (Ollama default), `"grok-4.3"` (xai), `"gpt-5"` (openai), `"claude-opus-4.7"` (anthropic), `"deepseek-chat"`, `"qwen-max"`, … | **[LEGACY]** LLM model tag. Canonical v2: `[llm].model`. Default resolution lives in `src/config.rs::backend_default_model`. |
 | `cross_encoder` | **Bool** | `false` (`true` for autonomous tier) | `true`, `false` | **[LEGACY]** Enable neural cross-encoder reranking. Canonical v2: `[reranker].enabled`. |
 | `default_namespace` | String | `"global"` | Any valid namespace (max 512 chars; `/` hierarchy delimiter allowed; no spaces/nulls) | **[LEGACY]** Default namespace applied to new memories. Canonical v2: `[storage].default_namespace`. |
-| `max_memory_mb` | Integer | Tier-dependent | Any positive integer | Maximum memory budget in MB; used for automatic tier selection via `from_memory_budget()` |
+| `max_memory_mb` | Integer | Tier-dependent | Any positive integer | **[LEGACY — PARSED BUT NOT ENFORCED (FBL-13)]** It has **no runtime consumer**: it does not cap memory or storage and is NOT an auto-tier-selection input on any live path. `resolve_storage` emits a one-shot WARN when it is set (`src/config.rs:145-149`). For an actual storage ceiling use `[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES`. |
 | `archive_on_gc` | Bool | `true` | `true`, `false` | **[LEGACY]** Archive expired memories on GC. Canonical v2: `[storage].archive_on_gc`. |
 | `[ttl]` | Section | -- | -- | Per-tier TTL overrides (all sub-fields are integers in seconds) |
 | `ttl.short_ttl_secs` | Integer | `21600` (6 hours) | `0` = never expires, or positive integer | TTL for short-tier memories in seconds |
@@ -590,11 +591,15 @@ Below is a complete example showing every supported field with explanatory comme
 # unparseable. Per-field precedence: AI_MEMORY_MAX_* env > [limits] > default.
 # The three quota fields seed fresh agent_quotas rows (existing rows are not
 # rewritten); max_page_size bounds list/bulk/sync page size as an OOM guard.
+# The quota dimension is (agent_id, namespace) since #1156 / schema v50.
 # [limits]
-# max_memories_per_day = 1000        # per-agent daily memory-write quota
-# max_storage_bytes    = 104857600   # per-agent storage cap (bytes; 100 MiB)
-# max_links_per_day    = 5000        # per-agent daily link-write quota
+# max_memories_per_day = 1000        # per-(agent, namespace) daily memory-write quota
+# max_storage_bytes    = 104857600   # per-(agent, namespace) storage cap (bytes; 100 MiB)
+# max_links_per_day    = 5000        # per-(agent, namespace) daily link-write quota
 # max_page_size        = 1000        # list/bulk/sync page-size cap (OOM guard)
+# max_inflight_requests = 1024       # explicit HTTP admission-control cap. OMIT for the
+#                                    # CPU-scaled default (cores x 64, clamped 256..4096).
+#                                    # Setting it to 0 DISABLES admission control entirely.
 ```
 
 **Precedence:** For per-invocation subcommands (`mcp`, `store`, `recall`, etc.), CLI flags and MCP args take precedence over `config.toml` values. When the MCP server is launched by an AI client, the `--tier` flag in the MCP args is used, not the `config.toml` `tier` setting. The `serve` daemon is a special case: it has no `--tier` flag, so tier is resolved from `config.toml` (`tier = "..."`) with the compiled-in default (`semantic`) as the only fallback. See issue #703.
@@ -605,8 +610,8 @@ These are set in the source code and require recompilation to change:
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `DEFAULT_PORT` | 9077 | `main.rs` |
-| `GC_INTERVAL_SECS` | 1800 (30 min) | `main.rs` |
+| `DEFAULT_PORT` | 9077 | `src/daemon_runtime.rs:97` |
+| `GC_INTERVAL_SECS` | 1800 (30 min) | `src/daemon_runtime.rs:98` |
 | `MAX_CONTENT_SIZE` | 65536 (64 KB) | `models.rs` |
 | `PROMOTION_THRESHOLD` | 5 accesses | `models.rs` |
 | `SHORT_TTL_EXTEND_SECS` | 3600 (1 hour) | `models.rs` |
@@ -1224,7 +1229,7 @@ The HTTP server uses `CorsLayer::new()` (deny-by-default) since v0.5.4-patch.6. 
 
 ### Authentication
 
-The HTTP daemon takes an optional shared API key — the top-level `api_key = "…"` field in `config.toml` (there is no `--api-key` serve flag; the Plan-C container entrypoint injects it via `AI_MEMORY_API_KEY`). When configured, every endpoint except `/api/v1/health` requires it. **The supported credential channel is the `x-api-key` request header**; the `?api_key=` query-parameter form is **deprecated** ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)) — URL-embedded credentials leak into access logs, `Referer` headers, and proxy logs. The query form is still accepted at v0.7.0 for back-compat (once-per-process WARN on first use) and is slated for rejection at v0.8 behind a temporary escape hatch. `AI_MEMORY_REQUIRE_API_KEY=1` hard-refuses keyless daemon start on any bind host ([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)).
+The HTTP daemon takes an optional shared API key — the top-level `api_key = "…"` field in `config.toml` (there is no `--api-key` serve flag, and **`AI_MEMORY_API_KEY` is not read by `src/`**). Container deployments inject it via `AI_MEMORY_API_KEY`, consumed by `entrypoint.plan-c.sh` which renders `api_key = "${AI_MEMORY_API_KEY}"` into the generated `config.toml` (that **is** the HTTP shared key; see also [#3197](https://github.com/alphaonedev/ai-memory-mcp/issues/3197) — the Plan-C entrypoint interpolates the same variable unescaped). The `${AI_MEMORY_API_KEY:-${OPENROUTER_API_KEY}}` fallback reuses one secret for two roles; it does not make the variable "the LLM-vendor key". When configured, every endpoint except `/api/v1/health` requires it. **The supported credential channel is the `x-api-key` request header**; the `?api_key=` query-parameter form is **deprecated** ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)) — URL-embedded credentials leak into access logs, `Referer` headers, and proxy logs. The query form is still accepted at v0.7.0 for back-compat (once-per-process WARN on first use) and is slated for rejection at v0.8 behind a temporary escape hatch. `AI_MEMORY_REQUIRE_API_KEY=1` hard-refuses keyless daemon start on any bind host ([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)).
 
 With no `api_key` configured the standard HTTP surface is unauthenticated — acceptable only for the default localhost-bound, single-user posture. The MCP (stdio) and CLI surfaces have no key mechanism by design; they are local-process interfaces.
 

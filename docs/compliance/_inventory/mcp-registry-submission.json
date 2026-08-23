@@ -1,6 +1,8 @@
 {
   "$schema_comment": "MCP Registry submission metadata for ai-memory v0.7.0. Prepared as part of Task H of audit issue #1153 (NSA CSI MCP Security Audit). Actual submission to the external MCP Registry remains operator-gated — this JSON is the canonical submission payload Jim approves before the external PR is opened.",
   "submission_status": "prepared_pending_operator_authorisation",
+  "superseded_by": "docs/compliance/_inventory/v1.0.0-capabilities.json",
+  "superseded_by_note": "Counts and surface figures in this payload are the frozen v0.7.0 snapshot (verification_commit_sha above) and are NOT current for v1.0.0. The live capability inventory is v1.0.0-capabilities.json; consult it before quoting any number here.",
   "verification_commit_sha": "4add7a8528d4c16d696b391ec6e2890269669a84",
   "verification_branch": "release/v0.7.0",
   "prepared_at_utc": "2026-05-23T16:30:22Z",

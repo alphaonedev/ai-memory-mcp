@@ -45,6 +45,18 @@ Substrates that opt in advertise the following capability and tool:
 
 #### Capability advertisement
 
+> **PROPOSED — not implemented in v1.0.0.** This RFC is `Status: Draft`,
+> and the `capture_layer_4` capability block below is part of the
+> PROPOSAL, not a description of shipped behavior: the identifier
+> `capture_layer_4` appears NOWHERE in `src/` or `tests/` at v1.0.0, so
+> `memory_capabilities` does **not** advertise it and a host that keys
+> off `capture_layer_4.supported` will find it **absent**. The
+> `memory_capture_turn` tool itself IS implemented (v0.7.0 #1389 L4, in
+> the `Lifecycle` family); only the capability-advertisement contract in
+> this section is unshipped. Per the fallback below, an absent block is
+> already the defined "not supported" signal, so no host breaks — it
+> falls back to the agent-volunteers-via-`memory_store` pattern.
+
 ```json
 {
   "capabilities": {
@@ -60,7 +72,7 @@ Substrates that opt in advertise the following capability and tool:
 }
 ```
 
-Hosts read `capture_layer_4.supported = true` to decide whether to volunteer turns. When `false` or absent the host falls back to the legacy "agent volunteers via `memory_store`" pattern with no behavior change.
+Under this PROPOSAL hosts would read `capture_layer_4.supported = true` to decide whether to volunteer turns. When `false` or absent the host falls back to the legacy "agent volunteers via `memory_store`" pattern with no behavior change — and **absent is what ai-memory v1.0.0 actually returns**, since the block is not yet advertised.
 
 #### Tool input schema (JSON Schema draft, `schemars`-flavored)
 
@@ -199,7 +211,7 @@ For procurement-grade deployment (FFIEC / SOX §404 / HIPAA / GDPR §32) the sig
 
 Adoption is incremental and additive:
 
-1. **Discovery.** At session boot the host calls `memory_capabilities` and checks `capture_layer_4.supported`. Hosts that don't perform discovery can hard-code support — the substrate's response shape is stable.
+1. **Discovery (PROPOSED).** At session boot the host would call `memory_capabilities` and check `capture_layer_4.supported`. **Not yet available on ai-memory v1.0.0** — the key is absent, which the fallback above treats as "not supported". Hosts that don't perform discovery can hard-code support against the implemented `memory_capture_turn` tool; the substrate's response shape is stable.
 2. **Per-turn invocation.** After every conversation turn (whether the agent generated it or the user submitted it), the host calls `memory_capture_turn` with the turn payload. Failure to call leaves the substrate without that turn; L1-L3 layers cover the gap.
 3. **Reconnect.** On disconnect + reconnect, the host re-delivers turns since the last `(host_session_id, host_turn_index)` it has acknowledgement for. Substrate dedup makes this safe.
 4. **Signature path.** Hosts that ship a signing keypair add `host_signature_b64` + `host_pubkey_b64` to each call. Enrollment is via existing federation flows.
@@ -210,7 +222,7 @@ A reference host integration for Claude Code lands in `docs/integrations/claude-
 
 A substrate that wants to implement this RFC:
 
-1. Advertises `capture_layer_4.supported = true` in `memory_capabilities`.
+1. Advertises `capture_layer_4.supported = true` in `memory_capabilities`. *(PROPOSED — ai-memory v1.0.0 does not yet do this; the other four points below ARE implemented.)*
 2. Implements the `memory_capture_turn` MCP tool per the schema above.
 3. Maintains a dedup table keyed by `(host_session_id, host_turn_index)`. The canonical reference is the ai-memory `transcript_line_dedup` table (schema v52).
 4. Writes a `signed_events` row per call with `layer = "L4"`.

@@ -450,11 +450,12 @@ list_map() {
   done
 }
 
-# --self-test — prove BOTH mutation grammars rewrite Rust source as intended,
+# --self-test — prove ALL THREE mutation grammars rewrite Rust source as intended,
 # WITHOUT compiling anything. Mirrors the plant-a-violation discipline the repo's
-# other gates carry; the cargo RED/GREEN acceptance run below only exercises the
-# `return` shape (all 5 shipped rows), so this is the mechanical proof that the
-# PR-0 `body` grammar is load-bearing.
+# other gates carry; the cargo RED/GREEN acceptance run below exercises the shipped
+# MAP (all 14 shipped rows across the three shapes — return/body/subst), so this is
+# the mechanical, compile-free proof that each grammar — including the PR-0 `body`
+# grammar and the 2x7 `subst` grammar — rewrites exactly what it claims to.
 self_test() {
   if ! grep -qF "$MUT_MARK" "$SELF"; then
     echo "FAIL: harness no longer carries the mutation MARKER literal" >&2
