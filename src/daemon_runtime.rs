@@ -1232,6 +1232,14 @@ pub async fn run(
         // at router-build time. Idempotent; harmless on the mcp/CLI paths
         // that never build the HTTP router.
         crate::set_max_inflight_requests(limits.max_inflight_requests);
+        // #3040 — seed the process-wide list/bulk page-size cap from the same
+        // resolved `[limits]` config (env `AI_MEMORY_MAX_PAGE_SIZE` >
+        // `[limits].max_page_size` > compiled `MAX_BULK_SIZE`). The HTTP surface
+        // reads `AppState.max_page_size`; the MCP stdio list handler has no
+        // `AppState`, so it consults this seeded global — closing the asymmetry
+        // where MCP `memory_list` ignored the OOM guard HTTP honors. Idempotent;
+        // harmless on every subcommand path.
+        crate::set_max_page_size(limits.max_page_size);
     }
     // #1579 B7 — seed the process-wide sqlite `PRAGMA mmap_size` from
     // the resolved `[storage]` config (env `AI_MEMORY_DB_MMAP_SIZE` >

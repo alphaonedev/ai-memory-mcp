@@ -23089,7 +23089,8 @@ impl MemoryStore for PostgresStore {
         // parameter (no string interpolation of caller input).
         let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
             "SELECT recall_id, memory_id, retriever, rank, score, consumed, \
-                    observed_at, consumed_at, consumed_by_memory_id \
+                    observed_at, consumed_at, consumed_by_memory_id, \
+                    agent_id, namespace, folded \
                FROM recall_observations WHERE TRUE",
         );
         if let Some(rid) = recall_id {
@@ -23151,6 +23152,13 @@ impl MemoryStore for PostgresStore {
                 observed_at: observed_at.to_rfc3339(),
                 consumed_at: consumed_at.map(|t| t.to_rfc3339()),
                 consumed_by_memory_id: r.try_get("consumed_by_memory_id").ok(),
+                // #2989 — surface the v58 identity binding + v77 fold state
+                // (postgres twin of the sqlite `list_observations` mapping).
+                agent_id: r.try_get("agent_id").ok(),
+                namespace: r.try_get("namespace").ok(),
+                folded: r
+                    .try_get("folded")
+                    .map_err(|e| to_store_err("obs.folded", e))?,
             });
         }
         Ok(out)

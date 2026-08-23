@@ -74,6 +74,25 @@ pub(super) fn handle_list(
     params: &Value,
     caller: Option<&str>,
 ) -> Result<Value, String> {
+    // #3040 — honor the same list/bulk page-size cap (`AI_MEMORY_MAX_PAGE_SIZE`,
+    // env #52) the HTTP surface applies via `AppState.max_page_size`. The MCP
+    // stdio loop carries no `AppState`, so the resolved cap is mirrored into a
+    // process-global seeded at boot; consult it here so `memory_list` can never
+    // return more rows than the operator's OOM guard permits. Unseeded
+    // raw-library reads yield the compiled `MAX_BULK_SIZE`, so the historical
+    // 200-row default is unchanged.
+    handle_list_capped(conn, params, caller, crate::max_page_size())
+}
+
+/// #3040 — inner list handler with the operator's page-size cap threaded in
+/// explicitly, so the cap plumbing is unit-testable without mutating the
+/// process-global `MAX_PAGE_SIZE` (which concurrent list tests read).
+fn handle_list_capped(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+    page_cap: usize,
+) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
     // v0.8.0 PE-2 (#1730) — read-action governance gate (zero-config
     // fast-path when no read_action rules exist).
@@ -105,11 +124,16 @@ pub(super) fn handle_list(
         validate::validate_valid_at(v).map_err(|e| e.to_string())?;
     }
 
+    // #3040 — cap the page size at the SMALLER of the historical MCP 200-row
+    // ceiling and the operator-resolved `max_page_size`, so MCP never exceeds
+    // the OOM guard (and never loosens its own tighter default when the cap is
+    // larger than 200).
+    let effective_limit = limit.min(200).min(page_cap);
     let results = db::list(
         conn,
         namespace,
         tier.as_ref(),
-        limit.min(200),
+        effective_limit,
         0,
         None,
         None,
@@ -249,6 +273,27 @@ mod tests {
         db::insert(&conn, &make_mem("a", "ns", MTier::Mid, "ai:a")).expect("ins");
         let out = handle_list(&conn, &json!({"limit": u64::MAX}), None).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(1));
+    }
+
+    // #3040 — the operator's `max_page_size` cap bounds the MCP list page, so
+    // `memory_list` never returns more rows than the OOM guard HTTP applies.
+    #[test]
+    fn page_size_cap_bounds_mcp_list_3040() {
+        let conn = fresh_conn();
+        for i in 0..3 {
+            db::insert(&conn, &make_mem(&format!("m{i}"), "ns", MTier::Mid, "ai:a")).expect("ins");
+        }
+        // Large caller limit + a small operator cap (2) → the page is bounded.
+        let capped = handle_list_capped(&conn, &json!({"limit": 1000}), None, 2).expect("ok");
+        assert_eq!(
+            capped["count"].as_u64(),
+            Some(2),
+            "max_page_size=2 must cap the MCP list page: {capped}"
+        );
+        // A cap larger than the historical MCP 200-row ceiling never LOOSENS it
+        // (all 3 rows are under both bounds, so all 3 return).
+        let generous = handle_list_capped(&conn, &json!({"limit": 1000}), None, 5000).expect("ok");
+        assert_eq!(generous["count"].as_u64(), Some(3));
     }
 
     // E. idempotency

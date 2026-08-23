@@ -971,6 +971,33 @@ pub fn max_inflight_requests() -> usize {
     MAX_INFLIGHT_REQUESTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// #3040 — process-wide list/bulk page-size cap (`AI_MEMORY_MAX_PAGE_SIZE`,
+/// env #52), the OOM guard that bounds per-request in-memory materialization.
+/// The HTTP surface reads it via `AppState.max_page_size`; the MCP stdio loop
+/// carries no `AppState`, so the same resolved cap is mirrored into this atomic
+/// (the `MAX_INFLIGHT_REQUESTS` precedent) and consulted by the MCP list
+/// handler, closing the asymmetry where MCP `memory_list` honored no cap while
+/// HTTP did. Seeded once at daemon/mcp/CLI boot from
+/// `AppConfig::resolve_limits().max_page_size` (env > `[limits].max_page_size`
+/// > compiled `MAX_BULK_SIZE`). The pre-boot / raw-library default is the
+/// compiled `MAX_BULK_SIZE` so the unseeded lib-test read is byte-identical to
+/// the historical behavior.
+static MAX_PAGE_SIZE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(crate::handlers::MAX_BULK_SIZE);
+
+/// Seed the process-wide list/bulk page-size cap (#3040). Called once at boot
+/// from the resolved `[limits]` config, alongside `set_max_inflight_requests`.
+pub fn set_max_page_size(cap: usize) {
+    MAX_PAGE_SIZE.store(cap, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current process-wide list/bulk page-size cap (#3040). Consumed by the MCP
+/// `memory_list` handler so it honors the same OOM guard HTTP applies.
+#[must_use]
+pub fn max_page_size() -> usize {
+    MAX_PAGE_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// #1733 (Pillar-4 4.A) — sample rate for the admission-shed `WARN` log.
 /// The Prometheus `ai_memory_admission_shed_total` counter records every
 /// shed; the log line is sampled (1st, then every Nth) so sustained
