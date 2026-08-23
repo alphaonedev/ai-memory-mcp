@@ -744,15 +744,18 @@ truthful.
   partial copy (ENOSPC, an interrupt) left a truncated database at the target
   with **no** database there to fall back to, because the original had already
   been renamed away; and there was no confirmation of any kind. `restore` now:
-  - **refuses a live target** — a SQLite `locking_mode = EXCLUSIVE` probe
-    (rolled back, so it writes nothing) detects any other open connection and
-    refuses; a corrupt/unreadable target is WARNed and allowed through, because
-    restoring over a database nothing can open is the disaster-recovery case
-    this verb exists for;
   - **asks first** — a `Proceed? [y/N]` prompt, overridden by the new
     `restore --yes`, matching `forget --confirm-global` /
     `governance install-defaults --yes`. `--yes` is REQUIRED with `--json` and
-    whenever stdin is not a terminal;
+    whenever stdin is not a terminal. Consent runs BEFORE the liveness
+    probe: the probe opens READ_WRITE and on close recovers+checkpoints a
+    hot WAL, so an abort after the probe is not a no-op. "Aborted. The
+    database was not modified." is true only because the prompt is first;
+  - **refuses a live target** — a SQLite `locking_mode = EXCLUSIVE` probe
+    (after consent) detects any other open connection and refuses; a
+    corrupt/unreadable target is WARNed and allowed through, because
+    restoring over a database nothing can open is the disaster-recovery case
+    this verb exists for;
   - **keeps the original in place** — the pre-restore safety net is now a
     COPY to `<db>.pre-restore-<ts>.db` (with its sidecars), not a rename, so
     the target path never goes empty;
@@ -760,9 +763,18 @@ truthful.
     file in the same directory, fsynced, and must pass `PRAGMA integrity_check`
     before an atomic `rename` publishes it; a failure there deletes the staged
     file and leaves the live database untouched;
-  - **removes the stale `-wal` / `-shm`** from beside the restored file, and
+  - **removes the stale `-wal` / `-shm`** from beside the restored file as
+    best-effort after the swap (a sidecar unlink failure WARNs with the
+    manual `rm` path and does not fail a restore that already published);
+    the directory is fsynced immediately after the rename. A failed
+    rename deletes the staged `.<db>.restore-tmp-<ts>` rather than
+    leaving it beside the live corpus;
   - **prints the rollback path** (and reports it as a `rollback` field in
     `--json`).
+    **#2565 rider not folded:** writing a manifest for the pre-migration
+    snapshot is a separate backup-writer change; `restore --skip-verify`
+    already refuses a forward-schema file via the #2445 stamp probe.
+    Left as #2565.
 
   **CLI contract change for scripts.** `restore` is destructive, so it now
   prompts `Proceed? [y/N]` and the new `--yes` is REQUIRED with `--json` (a
@@ -792,6 +804,9 @@ truthful.
   store is opened or a single id is collected — non-zero exit, nothing
   deleted, nothing returned. An ABSENT tier still means genuinely
   unconstrained; that is exactly the distinction the old shape collapsed.
+  The reflect payload's `tier` field uses the same `parse_optional` (absent
+  → Mid default for a new row; present-but-unrecognised → InvalidArgument)
+  instead of `.and_then(Tier::from_str).unwrap_or(Tier::Mid)`.
   The HTTP `POST /api/v1/notify` Postgres branch is brought to the same
   posture as its sqlite/MCP siblings (400 instead of a silent
   default-tier write), and the two already-correct sites

@@ -19802,11 +19802,19 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .or_else(|| Some(pa.namespace.clone()));
-    let tier = payload
-        .get("tier")
-        .and_then(|v| v.as_str())
-        .and_then(Tier::from_str)
-        .unwrap_or(Tier::Mid);
+    // #3130 — absent tier stays the unconstrained default (Mid for a new
+    // reflect row); a PRESENT-but-unrecognised value is a refusal, never
+    // a silent Mid. `from_str` + `unwrap_or(Mid)` was the same widening
+    // the rest of this PR closed.
+    let tier = match Tier::parse_optional(payload.get("tier").and_then(|v| v.as_str())) {
+        Ok(Some(t)) => t,
+        Ok(None) => Tier::Mid,
+        Err(e) => {
+            return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: e,
+            }));
+        }
+    };
     let tags: Vec<String> = payload
         .get("tags")
         .and_then(|v| v.as_array())

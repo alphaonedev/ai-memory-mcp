@@ -908,21 +908,19 @@ pub fn run_restore(
         )?;
     }
 
-    // v1.0.0 #3131 — LIVENESS. Everything above this point is read-only; from
-    // here the target path is rewritten. The pre-#3131 code went straight to
-    // `std::fs::copy` onto the live file, so a daemon / MCP server holding the
-    // database open kept writing into a file being overwritten underneath it —
-    // mixed pages plus an orphaned WAL, i.e. corruption of the durable text.
-    // Refuse while anything still holds it open.
-    refuse_if_target_in_use(&target_db, out)?;
-
-    // v1.0.0 #3131 — EXPLICIT INTENT. `restore` REPLACES the operator's live
-    // corpus and had no confirmation at all. It now takes the same posture as
+    // v1.0.0 #3131 — EXPLICIT INTENT before any RW open. `restore` REPLACES
+    // the operator's live corpus. The confirmation takes the same posture as
     // the substrate's other destructive verbs (`forget --confirm-global`,
     // `governance install-defaults --yes`): an interactive `[y/N]`, overridden
     // by `--yes`, REQUIRED under `--json` (a prompt would corrupt the envelope)
     // and whenever stdin is not a terminal (nobody is there to answer, and a
     // destructive verb must not proceed on silence).
+    //
+    // Fable FIX-BEFORE-MERGE: the liveness probe (`refuse_if_target_in_use`)
+    // opens READ_WRITE and on close recovers+checkpoints a hot WAL, so it is
+    // NOT read-only. Consent MUST run first; otherwise an abort still
+    // checkpointed the live WAL and the "The database was not modified"
+    // line was a lie in the crashed-daemon case.
     if restore_requires_confirmation(args) {
         if json_out {
             anyhow::bail!(RESTORE_JSON_REQUIRES_YES);
@@ -946,6 +944,14 @@ pub fn run_restore(
             return Ok(());
         }
     }
+
+    // v1.0.0 #3131 — LIVENESS. The probe opens the target READ_WRITE and
+    // may checkpoint a hot WAL; it therefore runs ONLY after consent.
+    // The pre-#3131 code went straight to `std::fs::copy` onto the live
+    // file, so a daemon / MCP server holding the database open kept
+    // writing into a file being overwritten underneath it — mixed pages
+    // plus an orphaned WAL. Refuse while anything still holds it open.
+    refuse_if_target_in_use(&target_db, out)?;
 
     // v1.0.0 #3131 — REVERSIBILITY FIRST. The pre-restore safety copy is taken
     // by COPY, not by renaming the live file out of the way: a rename leaves NO
@@ -996,22 +1002,38 @@ pub fn run_restore(
         let _ = std::fs::remove_file(&staged);
         return Err(e);
     }
-    std::fs::rename(&staged, &target_db).with_context(|| {
-        format!(
-            "publishing the verified restore over {}",
-            target_db.display()
-        )
-    })?;
+    if let Err(e) = std::fs::rename(&staged, &target_db) {
+        // Fable FIX-BEFORE-MERGE: a failed rename must not leave
+        // `.<db>.restore-tmp-<ts>` beside the live corpus.
+        let _ = std::fs::remove_file(&staged);
+        return Err(e).with_context(|| {
+            format!(
+                "publishing the verified restore over {}",
+                target_db.display()
+            )
+        });
+    }
+    // Durability of the swap itself — do this BEFORE sidecar cleanup so a
+    // later sidecar error cannot skip the directory fsync.
+    fsync_dir_of(&target_db);
     for suffix in SQLITE_SIDECAR_SUFFIXES {
         let live_sidecar = sidecar_path(&target_db, suffix);
         if live_sidecar.exists() {
-            std::fs::remove_file(&live_sidecar).with_context(|| {
-                format!(
-                    "removing the stale SQLite sidecar {} — leaving it beside the \
-                     restored database risks replaying old WAL frames into it (#2444)",
+            // Fable FIX-BEFORE-MERGE: the live DB is already swapped.
+            // A sidecar unlink failure must not roll the restore back
+            // (there is nothing to roll) and must not skip the fsync.
+            // Best-effort + loud WARN with the manual remediation.
+            if let Err(e) = std::fs::remove_file(&live_sidecar) {
+                writeln!(
+                    out.stderr,
+                    "warning: restored {} but could not remove stale SQLite sidecar {} \
+                     ({e}); remove it manually before starting a daemon — leaving it \
+                     beside the restored database risks replaying old WAL frames into \
+                     it (#2444)",
+                    target_db.display(),
                     live_sidecar.display()
-                )
-            })?;
+                )?;
+            }
         }
     }
     fsync_dir_of(&target_db);
