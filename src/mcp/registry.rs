@@ -1453,6 +1453,26 @@ mod d1_6_987_tests {
     //! - Description text changed (must be byte-equal)
     //! - `required` array changed
     //! - Type widening or narrowing beyond Option<T>::None nullable
+    //!
+    //! # Amending the snapshot
+    //!
+    //! The byte-pin exists to force a REVIEWED edit, not to freeze an
+    //! inaccuracy forever. When a pinned string is factually wrong about
+    //! the shipped behaviour, correct BOTH the `docs()`/`description()`
+    //! source and this snapshot in the same commit, and record why here.
+    //!
+    //! Amendments to date:
+    //! - 2026-08-22 (claims audit): `memory_link.docs` advertised a
+    //!   5-value relation vocabulary (`related_to | supersedes |
+    //!   contradicts | derived_from | reflects_on`) while the enforced
+    //!   taxonomy has been 9 since v0.8.0 — `MemoryLinkRelation::COUNT
+    //!   == 9` (`src/models/link.rs`), `VALID_RELATIONS`
+    //!   (`src/validate.rs`), and the SQL CHECK constraints. The four
+    //!   omitted relations (`derives_from`, `decomposes_into`,
+    //!   `depends_on`, `advances`) are accepted by the handler, so the
+    //!   string understated the tool's real surface to every MCP client.
+    //!   Corrected to list all 9 plus the `derived_from` /
+    //!   `derives_from` directionality footgun.
     use super::*;
     use std::collections::BTreeSet;
 

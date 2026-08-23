@@ -535,13 +535,15 @@ pub struct VectorIndex {
     /// drain in `insert()` pushes an [`EvictionEvent`] onto this
     /// channel for each evicted id; a hook-aware observer above this
     /// layer drains the channel and fires the `on_index_eviction`
-    /// chain off the hot path. Wired by the daemon at startup
-    /// (`daemon_runtime`) via [`Self::set_eviction_sink`]. Optional —
-    /// CLI / test builds that never bring up the hooks pipeline leave
-    /// it `None` and the sink-push is a no-op so eviction throughput
-    /// is unaffected. Closes the G2 / G8 "fire site exists but not
-    /// wired" gap that the prior `tracing::warn!`-only implementation
-    /// left open.
+    /// chain off the hot path. Production wiring is the vectorlite
+    /// adapter (`vectorlite.rs` forwards onto the inner index via
+    /// [`Self::set_eviction_sink`]); `spawn_eviction_observer` is
+    /// test-only. `daemon_runtime` does **not** populate this sink —
+    /// a prior comment that claimed it did was the stale other half of
+    /// the "never connected" claims-audit finding. Optional — CLI
+    /// builds that never bring up the hooks pipeline leave it `None`
+    /// and the sink-push is a no-op so eviction throughput is
+    /// unaffected.
     ///
     /// `Mutex` (not `RwLock`) because writes happen exactly twice in
     /// the process lifetime (`set_eviction_sink` at startup and

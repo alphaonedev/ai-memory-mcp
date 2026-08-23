@@ -446,19 +446,23 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 80;
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
 // canonical CLI subcommand counts. The source `pub enum Command` in
-// `src/daemon_runtime.rs` declares 82 variants; two (`Migrate`,
-// `SchemaInit`) are `#[cfg(feature = "sal")]`-gated, so the default
-// build compiles 80 and `--features sal` OR `--features sal-postgres`
-// unlocks the full 82. Pre-sweep, the count was cited in 24+ doc
+// `src/daemon_runtime.rs` declares 92 variants at v1.0.0; two
+// (`Migrate`, `SchemaInit`) are `#[cfg(feature = "sal")]`-gated, so the
+// default build compiles 90 and `--features sal` OR
+// `--features sal-postgres` unlocks the full 92. (The "82 / 80 / 82"
+// figures this block carried were the v0.7.0-era counts and were never
+// re-synced as the enum grew — corrected 2026-08-22 by claims audit
+// against the two consts below, which are the machine-checked SSOT.)
+// Pre-sweep, the count was cited in 24+ doc
 // surfaces with zero machine-checkable anchor — CLAUDE.md alone had 7
 // different historical counts (40, 57, 58, 63, 79, 80, 82). Pinned by
 // `tests/cli_subcommand_count_invariant.rs`.
 // ---------------------------------------------------------------------------
 
 /// Variants in `pub enum Command` (src/daemon_runtime.rs) that
-/// COMPILE under the default build. The source file declares 86
+/// COMPILE under the default build. The source file declares 92
 /// variants; two (`Migrate`, `SchemaInit`) are `#[cfg(feature =
-/// "sal")]`-gated and excluded from default builds, leaving 84.
+/// "sal")]`-gated and excluded from default builds, leaving 90.
 /// (v0.7.0 #1443 added `Expand` for the `ai-memory expand` CLI parity
 /// surface, bumping 78 → 79; #1598 added `Reembed` for the
 /// `ai-memory reembed` vector-space migration, bumping 79 → 80;
@@ -480,7 +484,9 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 80;
 /// the `ai-memory stop [--resume] [--status]` substrate record-stop
 /// actuator, bumping 87 → 88; v1.0.0 #1978 added `Watch` for the
 /// `ai-memory watch [--once|--daemon]` L3 substrate poll-based
-/// filesystem-watcher capture daemon, bumping 88 → 89.)
+/// filesystem-watcher capture daemon, bumping 88 → 89; v1.0.0 #2676
+/// added `Features` for the `ai-memory features` build-feature
+/// self-report, bumping 89 → 90.)
 pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 90;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
@@ -499,7 +505,8 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 90;
 /// `EpochApply`, bumping 88 → 89; v1.0.0 [P1][R45] #1955 added `Stop`
 /// (substrate record-stop actuator), bumping 89 → 90; v1.0.0 #1978
 /// added `Watch` (L3 substrate poll-based filesystem-watcher capture
-/// daemon), bumping 90 → 91.
+/// daemon), bumping 90 → 91; v1.0.0 #2676 added `Features` (build-feature
+/// self-report), bumping 91 → 92.
 pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 92;
 
 // ---------------------------------------------------------------------------

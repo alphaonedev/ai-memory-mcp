@@ -117,24 +117,66 @@ The 15 baseline events (#2758 removed `pre_recall` / `pre_search` and the
 whole transcript hook family `pre_transcript_store` / `post_transcript_store`;
 the `post_recall` / `post_search` notify events are retained):
 
-| Event | Phase | Class | Fires on |
-|---|---|---|---|
-| `pre_store` / `post_store` | write | Write | `memory_store`, `memory_update` (when content changes) |
-| `post_recall` | read | Read | `memory_recall`, family-loader recall |
-| `post_search` | read | Read | `memory_search` |
-| `pre_delete` / `post_delete` | write | Write | `memory_delete` |
-| `pre_promote` / `post_promote` | write | Write | tier promotion (manual + auto) |
-| `pre_link` / `post_link` | write | Write | `memory_link` |
-| `pre_consolidate` / `post_consolidate` | write | Write | `memory_consolidate` |
-| `pre_governance_decision` / `post_governance_decision` | gate | Write | governance pipeline |
-| `on_index_eviction` | maintenance | Index | HNSW eviction |
+| Event | Phase | Class | Fires on | Wired at v1.0.0? |
+|---|---|---|---|---|
+| `pre_store` | write | Write | `memory_store`, `memory_update` (when content changes) | **yes** |
+| `post_store` | write | Write | intended: post-INSERT | **no — never fires** |
+| `post_recall` | read | Read | intended: `memory_recall`, family-loader recall | **no — never fires** |
+| `post_search` | read | Read | intended: `memory_search` | **no — never fires** |
+| `pre_delete` | write | Write | `memory_delete` | **yes** |
+| `post_delete` | write | Write | intended: post-DELETE | **no — never fires** |
+| `pre_promote` | write | Write | tier promotion (manual + auto) | **yes** |
+| `post_promote` | write | Write | intended: post-UPDATE | **no — never fires** |
+| `pre_link` | write | Write | `memory_link` | **yes** |
+| `post_link` | write | Write | intended: post-INSERT | **no — never fires** |
+| `pre_consolidate` | write | Write | `memory_consolidate` | **yes** |
+| `post_consolidate` | write | Write | intended: post-return | **no — never fires** |
+| `pre_governance_decision` | gate | Write | governance pipeline | **yes** |
+| `post_governance_decision` | gate | Write | intended: post-return | **no — never fires** |
+| `on_index_eviction` | maintenance | Index | intended: HNSW eviction | **no — sink never installed** |
+
+> ### ⚠️ Firing status at v1.0.0 — read this before configuring a `post_*` hook
+>
+> **The decision-class `pre_*` events all fire. Most notify-class events do
+> not.** Verified against `release/v1.0.0`:
+>
+> - **Wired (11 of 22)** — every one of the 10 decision-class `pre_*` events
+>   (`pre_store`, `pre_delete`, `pre_promote`, `pre_link`, `pre_consolidate`,
+>   `pre_governance_decision`, `pre_reflect`, `pre_compaction`,
+>   `pre_recall_expand`, `pre_signal_send`) plus the one notify event
+>   `post_signal_ack` (installed only when an operator has configured a
+>   `post_signal_ack` hook). **Hook-based ENFORCEMENT is fully wired** — a
+>   `Deny` from any `pre_*` hook really refuses the operation.
+> - **Advertised but NOT wired (11 of 22)** — `post_store`, `post_recall`,
+>   `post_search`, `post_delete`, `post_promote`, `post_link`,
+>   `post_consolidate`, `post_governance_decision`, `post_reflect`,
+>   `on_index_eviction`, `on_compaction_rollback`. These variants parse from
+>   `hooks.toml`, classify, and appear in `ai-memory doctor --hooks`, but no
+>   production code path fires them, so a hook configured on one of them will
+>   **never execute**. (`on_index_eviction` has a complete producer/observer
+>   bridge in `src/hnsw.rs` + `src/hooks/chain.rs`, but nothing calls
+>   `set_eviction_sink` outside tests, so the channel is never connected.)
+>
+> This contradicts the standard this project states for itself under #2637 /
+> #2758 — "a hook the substrate advertises must actually fire, or it must not
+> be advertised". The disposition for these 11 (wire them, or remove them as
+> `pre_archive` / `pre_recall` / `pre_search` were removed) is **open**, and
+> is a code change, not a docs change. This table records the measured
+> behaviour in the meantime. Do not build observability or audit pipelines on
+> an unwired event.
 
 > **#2758 (v1.0.0):** `pre_recall`, `pre_search`, and the whole transcript
 > hook family (`pre_transcript_store` + `post_transcript_store`) were REMOVED.
 > Recall and search are pure read paths (recall mutates zero rows since
 > #1869/#1953), so a pre-READ governance gate has no destructive op to gate —
-> the `post_recall` / `post_search` notify events, which fire on real
-> production read paths, are retained. `crate::transcripts::store` has NO
+> the `post_recall` / `post_search` notify events were retained. **Correction
+> (claims audit, 2026-08-22):** the #2758 rationale asserted that the retained
+> `post_recall` / `post_search` siblings "fire on real production read paths".
+> They do not — neither has a production fire site at v1.0.0 (see the firing-status
+> note above). The removal decision for `pre_recall` / `pre_search` stands on
+> its own reasoning (a pure read path has no destructive op to gate); only the
+> stated justification for RETAINING the `post_*` pair was wrong.
+> `crate::transcripts::store` has NO
 > production caller (every caller is test-only), so NEITHER transcript event
 > ever fired — the `post_transcript_store` notify was inert for the same
 > reason as its `pre_*` sibling, so the whole family (both events + the
@@ -229,6 +271,9 @@ recall p95 budget is 50 ms; the daemon subprocess keeps the hook
 chain off the synchronous fork/exec path. `mode = "exec"` is
 permitted for these events but requires the explicit setting — the
 default is intentionally biased toward latency-preserving behavior.
+(At v1.0.0 this is a *latent* contract: neither event has a production
+fire site, so neither mode costs anything on the live recall path today
+— see the firing-status note above.)
 
 `pre_recall_expand` defaults to `daemon` for the same reason but is
 classed as `HotPath` rather than `Read` (50 ms whole-chain ceiling vs

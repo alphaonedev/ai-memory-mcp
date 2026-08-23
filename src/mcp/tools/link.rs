@@ -41,7 +41,7 @@ impl McpTool for LinkTool {
         "Create a typed link between two memories."
     }
     fn docs() -> &'static str {
-        "Directional link. Relations: related_to | supersedes | contradicts | derived_from | reflects_on (Task 3/8). H-track signs with active Ed25519 (verify via memory_verify)."
+        "Directional link. 9 relations: related_to | supersedes | contradicts | derived_from | reflects_on | derives_from | decomposes_into | depends_on | advances. Note derived_from (N->1 consolidation-merge) and derives_from (1->N atomisation-split) point in OPPOSITE directions. Unknown values are rejected. H-track signs with active Ed25519 (verify via memory_verify)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<LinkRequest>()

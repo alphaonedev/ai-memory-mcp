@@ -37,15 +37,31 @@
 // `validate_hook`, the existing tests) keep compiling unchanged.
 // The canonical path going forward is `crate::hooks::HookEvent`.
 //
-// # Where each event will fire (G3-G11)
+// # Where each event fires — and which ones do NOT (v1.0.0)
 //
-// Each variant carries a `// TODO(G3-G11): wire here at <file>:<line>`
-// doc-comment naming the source-code location the executor will
-// hook into when later tasks land. The line numbers are
-// *approximate* — pinned against the heads of the relevant
-// functions on `main` at the time of G2 — and are intended as
-// hints for the implementer of G3-G11, not load-bearing
-// invariants.
+// Each variant's doc-comment states its ACTUAL firing status at
+// v1.0.0, verified by claims audit on 2026-08-22. Summary:
+//
+// * WIRED (11 of 22): every decision-class `Pre*` variant —
+//   `PreStore`, `PreDelete`, `PrePromote`, `PreLink`,
+//   `PreConsolidate`, `PreGovernanceDecision`, `PreReflect`,
+//   `PreCompaction`, `PreRecallExpand`, `PreSignalSend` — plus the
+//   notify event `PostSignalAck`. Hook-based ENFORCEMENT is therefore
+//   fully wired: a `Deny` from any `Pre*` hook really refuses the op.
+// * NOT WIRED (11 of 22): `PostStore`, `PostRecall`, `PostSearch`,
+//   `PostDelete`, `PostPromote`, `PostLink`, `PostConsolidate`,
+//   `PostGovernanceDecision`, `PostReflect`, `OnIndexEviction`,
+//   `OnCompactionRollback`. These parse, classify, and render in
+//   `ai-memory doctor --hooks`, but no production code path fires
+//   them — the #2444 false-success class this file condemns below.
+//   Their disposition (wire, or remove as `pre_archive` /
+//   `pre_recall` / `pre_search` were removed) is OPEN.
+//
+// The old `TODO(G3-G11): wire here at <file>:<line>` hints were stale
+// — the wired events landed at the MCP/HTTP dispatch layer, not at the
+// `crate::storage::*` sites those hints named — so they have been
+// replaced by per-variant status statements. Keep those statements
+// true: an advertised-but-inert hook is a false enforcement claim.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,10 +69,10 @@ use serde_json::Value;
 use crate::models::{Memory, MemoryLink, Tier};
 
 // ---------------------------------------------------------------------------
-// HookEvent — the 21 lifecycle event tags
+// HookEvent — the 22 lifecycle event tags
 // ---------------------------------------------------------------------------
 
-/// The 21 lifecycle events the hook pipeline supports.
+/// The 22 lifecycle events the hook pipeline supports.
 ///
 /// `HookEvent` is the *tag* an operator names in `hooks.toml`
 /// (`event = "post_store"`) and the discriminator the executor
@@ -75,7 +91,7 @@ use crate::models::{Memory, MemoryLink, Tier};
 /// and implementation of **NSA recommendation (d) Constrain and
 /// sandbox tool execution** + **(f) Filter and monitor output
 /// pipelines and chained execution** per U/OO/6030316-26 (May 2026
-/// v1.0). 27 lifecycle events (20 baseline + 5 v0.7.0 additions:
+/// v1.0). 22 lifecycle events (15 baseline + 5 v0.7.0 additions:
 /// `PreRecallExpand`, `PreReflect`, `PostReflect`, `PreCompaction`,
 /// `OnCompactionRollback`; + 2 v0.8.0 #1709 signal events:
 /// `PreSignalSend`, `PostSignalAck`) give operators a substrate-side hook for
@@ -92,11 +108,21 @@ use crate::models::{Memory, MemoryLink, Tier};
 pub enum HookEvent {
     /// Fires before a memory is persisted. Payload: [`MemoryDelta`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::insert`.
+    /// WIRED at v1.0.0: `crate::mcp::consult_pre_event_gate` from the MCP
+    /// store tool (`src/mcp/tools/store/mod.rs`) and the HTTP create /
+    /// bulk-create handlers (`src/handlers/create.rs`, `src/handlers/bulk.rs`).
+    /// The old `TODO(G3-G11)` storage-layer wiring plan was superseded by
+    /// dispatch-layer gating.
     PreStore,
     /// Fires after a memory has been persisted. Payload: [`Memory`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::insert` (post-INSERT).
+    /// NOT WIRED at v1.0.0 — ZERO production fire sites (claims audit,
+    /// 2026-08-22). The variant parses from `hooks.toml`, classifies, and
+    /// renders in `ai-memory doctor --hooks`, but nothing in production
+    /// fires it, so a configured `post_store` hook never executes. This is
+    /// the #2444 false-success class condemned further down this file; the
+    /// disposition (wire it, or REMOVE it the way `pre_archive` /
+    /// `pre_recall` / `pre_search` were removed) is OPEN.
     PostStore,
     // #2758 — `PreRecall` REMOVED (v1.0.0). It advertised a fail-closable
     // gate over recall, but never fired in production and — since #1869/#1953
@@ -105,52 +131,66 @@ pub enum HookEvent {
     // gate. A configurable-but-inert gate is worse than none (#2444
     // false-success class), so the variant + advertisement were removed rather
     // than wired onto a read for symmetry. Same disposition as #2637's
-    // `PreArchive`. The `post_recall` NOTIFY event is retained. (Row visibility
+    // `PreArchive`. The `post_recall` NOTIFY event was retained — but see that
+    // variant's doc: it has no production fire site either. (Row visibility
     // + governance are already enforced on the read path — see
     // `is_visible_to_caller` / the SAL scope=private gates.)
     /// Fires after a recall query returns. Payload: [`RecallResult`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::recall` (post-return).
+    /// NOT WIRED at v1.0.0 — ZERO production fire sites (claims audit,
+    /// 2026-08-22). The #2758 comment above justified RETAINING this variant
+    /// on the grounds that it "fires on real production read paths"; that
+    /// was factually wrong. `RecallResult` is constructed nowhere outside
+    /// this module. Same OPEN disposition as [`HookEvent::PostStore`].
     PostRecall,
     // #2758 — `PreSearch` REMOVED (v1.0.0). Same disposition as `PreRecall`
     // above: full-text search is a read path with no destructive op to gate,
     // and the variant never fired in production. Removed rather than wired onto
-    // a read for symmetry. The `post_search` NOTIFY event is retained.
+    // a read for symmetry. The `post_search` NOTIFY event was retained — but see
+    // that variant's doc: it has no production fire site either.
     /// Fires after a full-text search returns. Payload: [`SearchResult`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::search` (post-return).
+    /// NOT WIRED at v1.0.0 — ZERO production fire sites (claims audit,
+    /// 2026-08-22); `SearchResult` is constructed nowhere outside this
+    /// module. Same OPEN disposition as [`HookEvent::PostStore`].
     PostSearch,
     /// Fires before a memory is deleted. Payload: [`MemoryRef`] (writable target id).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::delete`.
+    /// WIRED at v1.0.0: `crate::mcp::consult_pre_event_gate` (MCP dispatch).
     PreDelete,
     /// Fires after a memory has been deleted. Payload: [`MemoryRef`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::delete` (post-DELETE).
+    /// NOT WIRED at v1.0.0 — ZERO production fire sites (claims audit,
+    /// 2026-08-22). Same OPEN disposition as [`HookEvent::PostStore`].
     PostDelete,
     /// Fires before a tier promotion. Payload: [`PromoteDelta`] (writable target tier).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::promote_to_namespace`.
+    /// WIRED at v1.0.0: `crate::mcp::consult_pre_event_gate` (MCP dispatch).
     PrePromote,
     /// Fires after a tier promotion. Payload: [`PromoteResult`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::promote_to_namespace` (post-UPDATE).
+    /// NOT WIRED at v1.0.0 — ZERO production fire sites (claims audit,
+    /// 2026-08-22). Same OPEN disposition as [`HookEvent::PostStore`].
     PostPromote,
     /// Fires before a link is created. Payload: [`LinkDelta`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::create_link`.
+    /// WIRED at v1.0.0: `crate::mcp::consult_pre_event_gate` (MCP dispatch)
+    /// and the HTTP links handler (`src/handlers/links.rs`).
     PreLink,
     /// Fires after a link has been created. Payload: [`Link`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::create_link` (post-INSERT).
+    /// NOT WIRED at v1.0.0 — ZERO production fire sites (claims audit,
+    /// 2026-08-22). Same OPEN disposition as [`HookEvent::PostStore`].
     PostLink,
     /// Fires before a consolidation pass runs. Payload: [`ConsolidationDelta`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::consolidate`.
+    /// WIRED at v1.0.0: `crate::mcp::consult_pre_event_gate` (MCP dispatch)
+    /// and `src/handlers/power_consolidation.rs`.
     PreConsolidate,
     /// Fires after a consolidation pass completes. Payload: [`ConsolidationResult`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::consolidate` (post-return).
+    /// NOT WIRED at v1.0.0 — ZERO production fire sites (claims audit,
+    /// 2026-08-22). Same OPEN disposition as [`HookEvent::PostStore`].
     PostConsolidate,
     /// Fires before a governance gate decision. Payload: [`GovernanceContext`] (writable).
     ///
@@ -167,11 +207,21 @@ pub enum HookEvent {
     PreGovernanceDecision,
     /// Fires after a governance gate decision. Payload: [`GovernanceDecision`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::enforce_governance` (post-return).
+    /// NOT WIRED at v1.0.0 — ZERO production fire sites (claims audit,
+    /// 2026-08-22). The `Pre` sibling IS wired, so governance ENFORCEMENT is
+    /// unaffected; only the post-decision notify is inert. Same OPEN
+    /// disposition as [`HookEvent::PostStore`].
     PostGovernanceDecision,
     /// Fires when the ANN index evicts an entry. Payload: [`EvictionEvent`] (read-only).
     ///
-    /// TODO(G3-G11): wire here at `crate::hnsw` (`hnsw.eviction` log site).
+    /// NOT WIRED at v1.0.0 (claims audit, 2026-08-22) — and this is the
+    /// subtlest of the group: the producer (`crate::hnsw`'s eviction send)
+    /// and the consumer (`crate::hooks::chain::spawn_eviction_observer` ->
+    /// `fire_on_index_eviction`) BOTH exist, but nothing calls
+    /// `set_eviction_sink` outside `#[cfg(test)]`, so the channel is never
+    /// connected and the sink stays `None` (a no-op short-circuit). Reading
+    /// either half alone suggests the event fires; it does not. Same OPEN
+    /// disposition as [`HookEvent::PostStore`].
     OnIndexEviction,
     // #2637 — `PreArchive` REMOVED (v1.0.0). It advertised a fail-closable
     // gate over archiving (a REVERSIBLE op: rows move to `archived_memories`
@@ -195,8 +245,14 @@ pub enum HookEvent {
     // fires is a false claim (the #2637 `PreArchive` disposition), so the whole
     // transcript hook family — both variants, the `TranscriptDelta`/`Transcript`
     // payload structs, and the now-uninhabited `EventClass::Transcript` — was
-    // removed. Unlike recall/search (whose retained `post_*` events fire on real
-    // production read paths), the transcript pair had no live path at all.
+    // removed. CORRECTION (claims audit, 2026-08-22): this sentence originally
+    // read "Unlike recall/search (whose retained `post_*` events fire on real
+    // production read paths), the transcript pair had no live path at all." The
+    // contrast was false — `PostRecall`/`PostSearch` have no production fire
+    // site either. The transcript REMOVAL still stands on its own reasoning
+    // (`crate::transcripts::store` has no production caller at all, so even the
+    // `pre_*` gate guarded nothing); only the stated reason for RETAINING the
+    // recall/search `post_*` pair was wrong. See each variant's doc.
     /// G10: fires *synchronously* on the recall hot path before the
     /// embedder / DB call to allow query expansion (synonyms,
     /// spelling correction, harness-specific normalization). Payload:
@@ -228,10 +284,13 @@ pub enum HookEvent {
     /// post-commit envelope mirrors the `memory_reflect` MCP
     /// response). Classified as [`crate::hooks::EventClass::Write`].
     ///
-    /// Wires here at `crate::storage::reflect` step 7 (after COMMIT
-    /// succeeds, before returning `ReflectOutcome` to the caller).
-    /// Layers on top of the existing `memory_store` webhook event the
-    /// MCP handler dispatches — both fire on a successful reflect.
+    /// NOT WIRED at v1.0.0 — ZERO production fire sites (claims audit,
+    /// 2026-08-22). The original plan ("wires here at
+    /// `crate::storage::reflect` step 7, after COMMIT succeeds") was never
+    /// implemented; the `PreReflect` sibling IS wired (`src/mcp/mod.rs`,
+    /// `src/handlers/route_1111.rs`), so reflect GATING works and only the
+    /// post-commit notify is inert. Same OPEN disposition as
+    /// [`HookEvent::PostStore`].
     PostReflect,
     /// v0.7.0 L1-7 compaction pipeline — fires BEFORE a compaction
     /// pass (consolidation, reflection, …) processes a cluster.
@@ -251,10 +310,17 @@ pub enum HookEvent {
     /// Payload: [`CompactionRollbackEvent`] (read-only — names the
     /// summary id and pass that failed).
     ///
-    /// NOTE: actual rollback (re-inserting source rows, invalidating
-    /// the summary) is deferred to v0.8.0 Pillar 2.5 (issue #664).
-    /// This hook fires NOW so integrations can detect and report
-    /// verify failures; the rollback mechanics ship later.
+    /// NOT WIRED at v1.0.0 — ZERO production fire sites (claims audit,
+    /// 2026-08-22). The rollback MECHANICS did ship (#664: the Stage-6
+    /// auto-rollback in `src/curator/compaction.rs` restores the pre-merge
+    /// sources and removes the unverifiable summary), and that module's
+    /// docs say the rollback "fires the notify-only `OnCompactionRollback`"
+    /// — but no such fire site exists; the only `HookEvent::OnCompactionRollback`
+    /// reference in that file is inside its `#[cfg(test)]` module. The
+    /// earlier note claiming "this hook fires NOW so integrations can detect
+    /// and report verify failures" was, and remains, untrue. Operators must
+    /// detect verify failures from the `COMPACTION_TRACE_TARGET` WARN line
+    /// instead. Same OPEN disposition as [`HookEvent::PostStore`].
     ///
     /// Classified as [`crate::hooks::EventClass::Write`].
     OnCompactionRollback,
@@ -777,13 +843,13 @@ mod tests {
             (HookEvent::PreRecallExpand, "\"pre_recall_expand\""),
             (HookEvent::PreReflect, "\"pre_reflect\""),
             (HookEvent::PostReflect, "\"post_reflect\""),
-            // v0.7.0 L1-7: compaction pipeline events (24th + 25th).
+            // v0.7.0 L1-7: compaction pipeline events.
             (HookEvent::PreCompaction, "\"pre_compaction\""),
             (
                 HookEvent::OnCompactionRollback,
                 "\"on_compaction_rollback\"",
             ),
-            // v0.8.0 Pillar-1 #1709: signed-signal events (26th + 27th).
+            // v0.8.0 Pillar-1 #1709: signed-signal events.
             (HookEvent::PreSignalSend, "\"pre_signal_send\""),
             (HookEvent::PostSignalAck, "\"post_signal_ack\""),
         ];

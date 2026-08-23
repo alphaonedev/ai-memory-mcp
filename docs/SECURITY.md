@@ -115,8 +115,23 @@ with the substrate's current posture against each:
   requires an enrolled pubkey allowlist
   (`AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST`, #1414); and the `asi-hard`
   security profile (`AI_MEMORY_SECURITY_PROFILE=asi-hard`, #1961) pins
-  the fail-closed gates so a compromised host cannot silently weaken
-  them.
+  the fail-closed gates and refuses to boot if any pinned knob is set
+  below its hard floor.
+  **Scope limit — `asi-hard` does not defend against a compromised
+  host.** The profile is selected by an environment variable the host
+  controls (`AI_MEMORY_SECURITY_PROFILE`, resolved by
+  `security_profile::resolve()`) and enforced entirely in-process
+  (`src/main.rs`); with the variable unset the profile is `standard`
+  and **no pins are in force, silently**. A host that can set the
+  process environment can therefore simply not select `asi-hard`.
+  What the profile actually protects against is **operator error and
+  configuration drift** — once `asi-hard` IS selected, a
+  below-floor knob is refused loudly at boot rather than silently
+  honoured. Defending the selection itself requires an out-of-process
+  control (a supervisor/launcher that pins the variable, image or
+  policy attestation), which ai-memory does not ship. Same disposition
+  as the analogous limits recorded in
+  [`compliance/honest-limitations.md`](compliance/honest-limitations.md).
 
 Per the adjudication these carry design-level mitigation for v1.0.0 (no
 dedicated build lane); each is split into its own tracking issue if it

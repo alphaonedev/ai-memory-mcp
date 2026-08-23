@@ -5,9 +5,18 @@ layout: doc
 
 > **Audience.** Operators running `ai-memory` who want PostgreSQL as the
 > live storage backend, with Apache AGE for graph queries and pgvector
-> for semantic recall. **As-of v0.7.0**, postgres+AGE is a first-class
-> backend — `ai-memory serve --store-url postgres://…` is the supported
-> production deployment shape.
+> for semantic recall. Since v0.7.0, postgres+AGE is a supported
+> production storage backend — `ai-memory serve --store-url postgres://…`
+> is the supported deployment shape.
+>
+> **It is not a parity backend, and this guide does not claim it is.** At
+> v1.0.0 postgres serves **59 of the 80** unique production HTTP paths;
+> the other **21 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
+> is SQLite-only** (`ai-memory mcp` always opens a local rusqlite
+> connection, so a postgres deployment serves MCP clients through the
+> HTTP daemon instead). Read "The 21 fully-501 paths" below and
+> [Backend parity](../README.md#backend-parity) before committing to
+> postgres.
 >
 > If you only want sqlite, you don't need any of this — the default
 > `ai-memory serve` continues to work exactly as it did in v0.6.x. The
@@ -39,10 +48,20 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends have **schema parity at v78**
+The two backends are at **schema parity at v89**
 (`CURRENT_SCHEMA_VERSION = 89` on both ladders — the postgres upgrade
-ladder ends at `migrate_v89()`) — every feature that works on sqlite
-works on postgres.
+ladder ends at `migrate_v89()`).
+
+**Schema parity is NOT feature parity.** Some postgres ladder arms are
+version-stamp no-ops rather than real DDL, so a matching version number
+does not mean a matching set of tables: postgres ships no `skills` table
+(`migrate_v82` is a no-op) and no `governance_rules` table. Concretely,
+**59 of the 80 unique production HTTP paths are served on postgres and
+21 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
+silent read/write against the wrong database), and the **stdio MCP path
+is SQLite-only**. See "The 21 fully-501 paths" below for the exact
+inventory, which is frozen against regression by
+`tests/pg_supported_route_inventory_gate_2799.rs`.
 
 ## Prerequisites
 
@@ -758,7 +777,7 @@ endpoint availability:
   the trait. Postgres operators relying on multi-node consistency
   for these subcollections should poll peers or pin sqlite for v0.7.0.
 
-Schema parity at v78 means `ai-memory migrate` sqlite → postgres
+Schema parity at v89 means `ai-memory migrate` sqlite → postgres
 carries every row across cleanly.
 
 The recall **score breakdown** is the same 6-factor formula on both

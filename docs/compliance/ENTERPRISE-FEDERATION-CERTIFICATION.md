@@ -299,17 +299,29 @@ post-remediation tree (the merged cert wave: #2915-#2920, #2925-#2927,
 #2929); raw output in `docs/compliance/evidence/cert-54/` (see that
 directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 
-> **Evidence note (#2954, 2026-08-20):** the `cert-54/` §2 captures below
-> PREDATE #2954 and reflect the **18**-check posture. #2954 added check
-> #19, so a re-capture on the post-#2954 release binary shows **19**
-> checks: the **bare leg** gains one FAIL (append-only spine off + no
-> audit key) → **9 FAIL of 19**; the **certified pass leg** stays
-> `overall: PASS` because the checked-in `enterprise-federation.env`
-> profile now sets `AI_MEMORY_APPEND_ONLY=1` and a certified deployment
-> provisions the daemon audit signing key (→ **19 `[PASS]`, 0 `[FAIL]`**).
-> The PASS/FAIL *verdict per leg* is unchanged for the certified config;
-> only the check count and the bare-leg FAIL tally grew. (Same handling
-> precedent as the #3033 knob-count note below.)
+> **Evidence note (#2954 + #2991, 2026-08-22):** the `cert-54/` §2 captures
+> below PREDATE BOTH #2954 and #2991 and reflect the **18**-check posture.
+> The shipped binary now renders **20** checks — `ENTERPRISE_FEDERATION_CHECK_COUNT
+> = 20` (`src/enterprise_federation_posture.rs`), pinned by that module's own
+> `evaluate() must return exactly …` assertion. #2954 added check **#19**
+> (append-only spine flag + daemon audit signing key); #2991 added check **#20**
+> (escalate-producer approver-key enrollment). On a re-capture at the current
+> release tip: the **bare leg** gains one FAIL per added check → **10 FAIL of
+> 20**; the **certified pass leg** is expected to stay `overall: PASS`
+> (→ **20 `[PASS]`, 0 `[FAIL]`**) because the checked-in
+> `enterprise-federation.env` profile sets `AI_MEMORY_APPEND_ONLY=1` and a
+> certified deployment provisions both the daemon audit signing key and the
+> approver pubkey enrollment.
+>
+> **These post-#2954/#2991 tallies are DERIVED, not measured** — no re-captured
+> evidence bundle is committed for them; the committed `.out` files in
+> `cert-54/` are the 18-check round (`grep -c '[PASS]'
+> posture-sqlcipher-pass.out` = 18). The PASS/FAIL *verdict per leg* is
+> unchanged for the certified config; only the check count and the bare-leg
+> FAIL tally grew. Re-capturing the four legs on a release-built binary at the
+> current tip, committing them under `docs/compliance/evidence/cert-<next>/`,
+> and re-binding §2/§8 to that bundle is tracked as remaining certification
+> hygiene. (Same handling precedent as the #3033 knob-count note below.)
 
 | Environment | Exit | Result |
 |---|---|---|
@@ -434,7 +446,7 @@ release binary is deliberately NOT enterprise-federation-compliant.
 
 ---
 
-## 3. §5.4(3) — executed Postgres + AGE + pgvector evidence (at certified versions)
+## 3. §5.4(3) — Postgres + AGE + pgvector evidence (executed at the PRIOR triple; the current triple is CI-asserted, not yet cited by run ID)
 
 The certified stack is **executed in-PR** by `.github/workflows/cert-postgres-age.yml`
 (#2548), which BUILDS and runs the exact certified triple and hard-fails on any
@@ -465,6 +477,19 @@ stack. (Those specific dated runs executed the historical **18.4 / 1.7.0 /
 0.8.5** round; the CURRENT standard tier — **PG 18.6 / AGE 1.8.0 / pgvector
 0.8.6** — is the tier this same workflow asserts in-PR on `release/**` from
 the SSOT pins, per the STANDARD data-tier note below.)
+
+> **Evidence status, stated plainly (2026-08-22).** **No `actions/runs/<id>`
+> citation for an executed GREEN run at the CURRENT triple (18.6 / 1.8.0 /
+> 0.8.6) appears anywhere in this document.** Every run ID cited above
+> executed the superseded **18.4 / 1.7.0 / 0.8.5** round. The current triple
+> rests on the *prospective* CI semantics described in the STANDARD data-tier
+> note below — the `Assert certified stack versions` step reads the SSOT pins
+> and hard-fails on drift, so a GREEN `cert-postgres-age.yml` run on
+> `release/**` IS build+assert evidence at those versions — but that argument
+> is only as good as a specific green run, and none is cited here. Discharging
+> this means triggering one run at the release tip and citing its run ID +
+> head SHA in the same format as the citations above. Until then, read §5.4(3)
+> as **executed at the prior triple, CI-asserted at the current one**.
 
 > **pgvector pin advance from 0.8.5 to 0.8.6 (2026-08-14, honest evidence
 > status).** The certified pgvector pin was advanced from `0.8.5-1.pgdg13+1`
@@ -894,11 +919,14 @@ amended through the merged 2026-08-13 remediation wave — #2915-#2920,
 #2925-#2927, #2929 — with evidence re-captured at that tree):** the
 seven §5.4 falsifiability requirements are met as follows — §5.4(1)
 canonical doc = this document; §5.4(2) machine-checked posture = CLOSED
-(four-leg localhost proof at 18 checks — PRE-#2954; see the §2 #2954
-evidence note, the post-#2954 count is **19**: bare→exit 2 / **8 FAIL**,
+(four-leg localhost proof **executed and committed at 18 checks** —
+PRE-#2954 and PRE-#2991: bare→exit 2 / **8 FAIL**,
 hardened-non-sqlcipher→exit 2 / 2 FAIL, hardened-with-boot-gate-armed→
 **boot refusal** demonstrated, hardened-sqlcipher-armed→exit 0 /
-18 PASS); §5.4(3) executed pg+AGE+pgvector = green on the cert SHA at
+18 PASS. The shipped binary now renders **20** checks; see the §2
+#2954+#2991 evidence note for the derived post-#2991 tallies and for
+the outstanding re-capture. The gate mechanism and the per-leg
+PASS/FAIL verdicts are unchanged; only the check count grew); §5.4(3) executed pg+AGE+pgvector = green on the cert SHA at
 the pinned triple (single-node CI; see §3 stack-evidence note);
 §5.4(4) adversarial negative lanes = covered (including the five
 previously-omitted in-tree lanes named in §4); §5.4(5) removal proof =
