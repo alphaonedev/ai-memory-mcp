@@ -10902,10 +10902,7 @@ fn test_curator_autonomy_end_to_end_cycle() {
 
     // Parse the JSON report. Skip any tracing prefix if one leaked
     // past RUST_LOG=error (first `{` is the CuratorReport object).
-    let json_src = stdout
-        .find('{')
-        .map(|i| &stdout[i..])
-        .unwrap_or(stdout.trim());
+    let json_src = stdout.find('{').map_or(stdout.trim(), |i| &stdout[i..]);
     let report: serde_json::Value = serde_json::from_str(json_src.trim()).unwrap_or_else(|e| {
         panic!("curator output should be valid JSON: {e}\nstdout={stdout:?}\nstderr={stderr:?}")
     });
