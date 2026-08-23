@@ -740,19 +740,33 @@ mod pg {
         assert!(!report.signature_present);
 
         // PRE-FIX: zero rows — the postgres audit chain had no record at all.
+        // Count by event_type only (same as the sqlite twin): after #3203
+        // `agent_id` is the ACTING principal (`system` here — `invalidate_link`
+        // was passed `None`), not the attester `kp.agent_id`.
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .connect(&url)
             .await
             .expect("pool");
         let events: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM signed_events WHERE event_type = $1 AND agent_id = $2",
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = $1",
         )
         .bind("memory_link.invalidated")
-        .bind(&kp.agent_id)
         .fetch_one(&pool)
         .await
         .expect("count events");
         assert_eq!(events, 1, "supersession must leave exactly one audit leaf");
+        let actor: String = sqlx::query_scalar(
+            "SELECT agent_id FROM signed_events WHERE event_type = $1",
+        )
+        .bind("memory_link.invalidated")
+        .fetch_one(&pool)
+        .await
+        .expect("actor");
+        assert_eq!(
+            actor,
+            ai_memory::identity::sentinels::SYSTEM_PRINCIPAL,
+            "#3203: unattributed pg supersession names the system sentinel, not the attester"
+        );
     }
 }
