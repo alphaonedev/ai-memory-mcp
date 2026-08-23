@@ -159,8 +159,8 @@ fn build_cfg_with_sink(
     sink: Arc<dyn FederationDlqSink>,
     timeout_ms: u64,
 ) -> FederationConfig {
-    let _ = ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION
-        .set(Box::new(|_action| Ok(())));
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()

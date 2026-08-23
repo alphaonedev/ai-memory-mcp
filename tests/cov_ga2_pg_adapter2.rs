@@ -648,8 +648,8 @@ fn quorum_config_w2(
 ) -> ai_memory::federation::FederationConfig {
     // Coverage binaries do not bootstrap_serve. check_governed refuses
     // outbound POSTs when the hook is unset; install Allow-all once.
-    let _ = ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION
-        .set(Box::new(|_action| Ok(())));
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
