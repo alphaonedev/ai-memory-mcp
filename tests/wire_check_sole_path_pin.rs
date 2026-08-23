@@ -17,9 +17,9 @@
 //!   2. `GOVERNANCE_PRE_WRITE: OnceLock<...>` is declared in
 //!      `src/storage/mod.rs`.
 //!   3. `src/hooks/executor.rs` calls `wire_check::check_governed(...)`
-//!      before `Command::new(...).spawn()` (daemon-only ProcessSpawn).
+//!      before `Command::new(...).spawn()` (daemon-only `ProcessSpawn`).
 //!   4. `src/federation/sync.rs` calls `wire_check::check_governed(...)`
-//!      before the outbound peer POST (daemon-only NetworkRequest).
+//!      before the outbound peer POST (daemon-only `NetworkRequest`).
 //!   5. `src/llm.rs` calls `wire_check::check_anyhow(...)` before the
 //!      Ollama HTTP request.
 //!   6. `src/mcp/tools/skill_export.rs` calls `wire_check::check(...)`
