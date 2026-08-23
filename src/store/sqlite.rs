@@ -644,7 +644,12 @@ impl MemoryStore for SqliteStore {
         } else {
             (Some(ctx.effective_principal()), ctx.as_agent.as_deref())
         };
-        let rows = db::search(
+        // #3127 — honour `Filter.source_uri` on the sqlite SAL search
+        // path (HTTP postgres-flagged tests drive this adapter through
+        // the trait). `db::search` is the None-uri wrapper; pass the
+        // Filter axis through the SSOT so a compose `q + source_uri`
+        // cannot silently drop the URI filter.
+        let rows = db::search_with_source_uri(
             &conn,
             query,
             filter.namespace.as_deref(),
@@ -657,6 +662,7 @@ impl MemoryStore for SqliteStore {
             filter.agent_id.as_deref(),
             vis_as_agent,
             false,
+            filter.source_uri.as_deref(),
             vis_caller,
         )
         .map_err(box_err)?;

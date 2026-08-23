@@ -80,6 +80,9 @@ probe (citing #2445) but kept it for the corpus probe.
   commit the sever (and flag-ON tombstone leaf) then return `NotFound`.
   Dropping the tx rolls back. Regression:
   `pg_delete_unknown_id_does_not_commit_sever_or_tombstone_3245`.
+### Fixed
+
+- **#3185 / #3127 — Postgres keyword search dropped `Filter.since`/`until` and `source_uri`.** `PostgresStore::search` (the HTTP/MCP production caller) bound namespace/tier/tags/agent_id/expiry/visibility/lifecycle but had **no `created_at` window and no `source_uri` predicate**, so `GET /api/v1/search?since=&until=` and `?source_uri=` returned rows outside the requested set (wrong results, fail-open widening). The sqlite twin already honoured both via `db::search` → `db::search_with_source_uri`. Postgres had two forked lanes with different subsets; they now collapse onto **one SSOT** (`search_with_source_uri`, carrying since/until, source_uri, G7 soft-loser, #910/#3110 visibility, tags/agent_id, expiry/lifecycle, plus the 6-factor blend the trait method owned). Trait `search` is a thin wrapper; HTTP puts `?source_uri=` on `Filter.source_uri` so the compose path (`q + source_uri + since`) cannot silently drop the URI filter. Unset filters stay `None` (no silent tightening of a documented default). Worst case after the fix = fewer results, never extra. The previously caller-less inherent keyword lane used `plainto_tsquery` (AND); the SSOT uses `to_tsquery(build_or_tsquery(q))` (OR of sanitised tokens, same as the trait lane at base) — named here so the AND→OR change is not silent.
 
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 

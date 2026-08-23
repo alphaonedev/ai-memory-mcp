@@ -6916,6 +6916,20 @@ impl PostgresStore {
     /// narrowing was dropped BEFORE `LIMIT`, a caller asking for
     /// `tags_any = ["x"]` got a page of rows that mostly do not carry the tag
     /// — wrong results, not merely extra ones.
+    ///
+    /// # SSOT (#3185 / #3127)
+    /// This is the ONE postgres keyword-search implementation. Trait
+    /// [`MemoryStore::search`] is a thin wrapper (HTTP / MCP production
+    /// callers land here). `source_uri` is taken from the explicit
+    /// argument, falling back to [`Filter::source_uri`], so a Filter
+    /// built by the HTTP compose path cannot silently drop the URI
+    /// axis. `filter.since` / `filter.until` bind `created_at` (the
+    /// pre-fix trait `search` dropped them — fail-open widening).
+    /// Ranking is the 6-factor blend the trait method used to own,
+    /// multiplied by the G7 soft-loser factor this method already
+    /// applied — union of the two lanes, never a silent default
+    /// change on an unfiltered call (`source_uri`/`since`/`until`
+    /// default `None`).
     pub async fn search_with_source_uri(
         &self,
         ctx: &CallerContext,
@@ -6956,12 +6970,43 @@ impl PostgresStore {
         //   `agent_id`: match when `metadata->>'agent_id'` equals it.
         // Identical shape to `search` above so the two cannot drift again.
         let tags_first: Option<&str> = filter.tags_any.first().map(String::as_str);
+        // #3127 — explicit arg wins (inherent callers + tests); Filter
+        // axis covers the HTTP compose path that only holds a Filter.
+        let uri = source_uri.or(filter.source_uri.as_deref());
+        // Empty query + source_uri: skip FTS (sqlite `list_by_source_uri`
+        // twin — "every memory from this document"). Empty query without
+        // a URI: `build_or_tsquery("")` is the `'_empty_'` sentinel and
+        // matches nothing (fail-closed, never the unfiltered table).
+        let or_tsquery: Option<String> = if query.trim().is_empty() && uri.is_some() {
+            None
+        } else {
+            Some(build_or_tsquery(query))
+        };
         // #1579 B2 — rank + match read the stored generated `tsv`
         // column (schema v57) instead of recomputing
         // to_tsvector(title||' '||content) per matched row.
+        //
+        // #3185 — `to_tsquery` + `build_or_tsquery` is the production
+        // keyword-search matcher (the trait `search` lane). Keep it
+        // here so collapsing the two lanes cannot silently AND-join
+        // multi-token HTTP queries. G7 multiplies the 6-factor blend
+        // (sqlite `db::search_with_source_uri` ranking contract).
         let rows = sqlx::query(&format!(
-            "SELECT m.*,
-                    ts_rank(m.tsv, plainto_tsquery('english', $1))
+            "SELECT {cols},
+                    (CASE WHEN $1::text IS NULL THEN 0.0
+                          ELSE ts_rank(tsv, to_tsquery('english', $1))
+                     END
+                     + (priority * 0.5)
+                     + (LEAST(access_count, 50) * 0.1)
+                     + (confidence * 2.0)
+                     + CASE tier
+                           WHEN 'long' THEN 3.0
+                           WHEN 'mid'  THEN 1.0
+                           ELSE 0.0
+                       END
+                     + (1.0 / (1.0 +
+                         EXTRACT(EPOCH FROM (NOW() - updated_at)) / 86400.0 * 0.1))
+                    )
                     -- v1.0.0 #2338 (FBL-33 pg mirror) — G7 soft-loser
                     -- down-weight: a contradiction-conserved loser is
                     -- multiplicatively penalized so it cannot outrank its
@@ -6976,52 +7021,54 @@ impl PostgresStore {
                     -- An absent marker makes `->>` NULL, so `NULL = 'true'`
                     -- is NULL → the CASE ELSE arm applies factor 1.0 (no
                     -- penalty, no error).
-                    * (CASE WHEN (m.metadata->>'contradiction_soft_loser') = 'true'
+                    * (CASE WHEN (metadata->>'contradiction_soft_loser') = 'true'
                             THEN {soft_loser_factor} ELSE 1.0 END) AS rank
-             FROM memories m
-             WHERE m.tsv @@ plainto_tsquery('english', $1)
-               AND ($2::text IS NULL OR m.namespace = $2)
-               AND ($3::text IS NULL OR m.tier = $3)
-               AND (m.expires_at IS NULL OR m.expires_at > NOW())
-               AND ($4::timestamptz IS NULL OR m.created_at >= $4)
-               AND ($5::timestamptz IS NULL OR m.created_at <= $5)
-               AND ($6::text IS NULL OR m.source_uri = $6)
-               -- #3110 — COARSE private-row PRE-FILTER (mirrors pg `search`
-               -- at postgres.rs `search`), NOT the authoritative gate: it is
-               -- WIDER than `visibility::is_visible_to_caller` for every
-               -- non-private scope (no subtree test for team/unit/org, and an
-               -- unrecognised scope token reads as non-private here). The
-               -- in-process `is_visible_to_caller` re-filter after the fetch
-               -- is what enforces the real semantics. $7 = caller principal;
-               -- NULL (bypass) short-circuits the arm true. Absent `scope`
-               -- defaults to 'private' (fail-closed); `target_agent_id` is the
-               -- #3070 inbox carve-out so a row addressed TO the caller stays
+             FROM memories
+             WHERE ($1::text IS NULL OR tsv @@ to_tsquery('english', $1))
+               AND ($2::text IS NULL OR namespace = $2)
+               AND ($3::text IS NULL OR tier = $3)
+               AND (expires_at IS NULL OR expires_at > NOW())
+               AND ($4::timestamptz IS NULL OR created_at >= $4)
+               AND ($5::timestamptz IS NULL OR created_at <= $5)
+               AND ($6::text IS NULL OR source_uri = $6)
+               -- #3110 — COARSE private-row PRE-FILTER (mirrors the
+               -- former trait `search` SQL arm), NOT the authoritative
+               -- gate: it is WIDER than `visibility::is_visible_to_caller`
+               -- for every non-private scope (no subtree test for
+               -- team/unit/org, and an unrecognised scope token reads as
+               -- non-private here). The in-process `is_visible_to_caller`
+               -- re-filter after the fetch is what enforces the real
+               -- semantics. $7 = caller principal; NULL (bypass)
+               -- short-circuits the arm true. Absent `scope` defaults to
+               -- 'private' (fail-closed); `target_agent_id` is the #3070
+               -- inbox carve-out so a row addressed TO the caller stays
                -- visible.
                AND (
                    $7::text IS NULL
-                   OR COALESCE(m.metadata->>'scope', 'private') <> 'private'
-                   OR m.metadata->>'agent_id' = $7
-                   OR m.metadata->>'target_agent_id' = $7
+                   OR COALESCE(metadata->>'scope', 'private') <> 'private'
+                   OR metadata->>'agent_id' = $7
+                   OR metadata->>'target_agent_id' = $7
                )
                -- v1.0.0 batch-2 — `tags_any` / `agent_id` parity with the
-               -- sqlite twin and the pg `search` trait method (see the fn doc).
-               AND ($8::text IS NULL OR m.tags @> to_jsonb(ARRAY[$8]))
-               AND ($9::text IS NULL OR m.metadata ->> 'agent_id' = $9)
+               -- sqlite twin (see the fn doc).
+               AND ($8::text IS NULL OR tags @> to_jsonb(ARRAY[$8]))
+               AND ($9::text IS NULL OR metadata ->> 'agent_id' = $9)
                {lifecycle_vis}
              ORDER BY rank DESC,
-                      m.priority DESC,
-                      m.updated_at DESC
+                      priority DESC,
+                      updated_at DESC
              LIMIT $10",
+            cols = MEMORY_READ_COLUMNS,
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
-            lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+            lifecycle_vis = crate::models::lifecycle_visible_clause(""),
             soft_loser_factor = crate::storage::SOFT_LOSER_SCORE_FACTOR,
         ))
-        .bind(query)
+        .bind(or_tsquery.as_deref())
         .bind(filter.namespace.as_ref())
         .bind(filter.tier.as_ref().map(Tier::as_str))
         .bind(filter.since)
         .bind(filter.until)
-        .bind(source_uri)
+        .bind(uri)
         .bind(caller_opt)
         .bind(tags_first)
         .bind(filter.agent_id.as_ref())
@@ -19959,135 +20006,15 @@ impl MemoryStore for PostgresStore {
         query: &str,
         filter: &Filter,
     ) -> StoreResult<Vec<Memory>> {
-        let limit: i64 = filter
-            .limit
-            .clamp(1, crate::storage::LIST_MAX_LIMIT)
-            .try_into()
-            .unwrap_or(LIST_FALLBACK_LIMIT_I64);
-        let caller = ctx.effective_principal();
-        // Adapter parity with SQLite (#302 item 3): threads the full
-        // Filter (namespace, tier, tags_any, agent_id) into the query.
-        // Prior implementation ignored `tags_any` and `agent_id` so
-        // identical calls returned different result sets on the two
-        // adapters.
-        //
-        // `tags_any`:  match if any of the requested tags is present in
-        //              memories.tags (JSONB array). Uses @> over a
-        //              single-element JSONB array per requested tag,
-        //              OR'd together via sqlx bind array.
-        // `agent_id`:  match if metadata->>'agent_id' == $agent_id.
-        //
-        // ────────────────────────────────────────────────────────────
-        // v0.7.0 F6 Gap 7 — recall scoring parity with SQLite.
-        //
-        // SQLite's `db::recall` scores each FTS hit with a 6-factor
-        // blend (crate::storage::recall):
-        //
-        //     fts.rank        * (-1)
-        //   + priority        * 0.5
-        //   + min(access_count, 50) * 0.1
-        //   + confidence      * 2.0
-        //   + tier_bonus      (long=3.0, mid=1.0, short=0.0)
-        //   + recency_factor  (1 / (1 + age_days * 0.1))
-        //
-        // Pre-v0.7.0 the Postgres adapter shipped a 2-factor blend
-        // (`ts_rank DESC, priority DESC`) so identical FTS calls
-        // produced different orderings on the two backends. This
-        // brings them to byte-equivalent rank up to a small swap
-        // tolerance (covered in tests/recall_scoring_parity.rs).
-        //
-        // SQLite's `fts.rank` is BM25-style and negative; multiplying
-        // by `-1` makes higher-rank hits score positive. Postgres'
-        // `ts_rank` is already positive so we use it directly without
-        // sign flipping. The relative magnitudes line up well enough
-        // for top-K ordering parity in practice — see the parity test
-        // suite for tolerance bounds.
-        //
-        // The recency_factor uses `EXTRACT(EPOCH FROM (NOW() -
-        // updated_at)) / 86400.0` as the day-age, mirroring SQLite's
-        // `julianday('now') - julianday(m.updated_at)` (also days).
-        let tags_first: Option<&str> = filter.tags_any.first().map(String::as_str);
-        // v0.7.0.1 S79 — build the OR-joined tsquery on the rust side
-        // so multi-token queries surface every row that matches AT
-        // LEAST one token. `plainto_tsquery` is AND-joined and
-        // diverges from sqlite's FTS5 `OR` contract — see
-        // `build_or_tsquery` for the sanitization rules.
-        let or_tsquery = build_or_tsquery(query);
-        // #910 SAL-level scope=private gate — push the visibility
-        // predicate into SQL via `$7` (caller principal). Admin paths
-        // pass NULL to bypass.
-        let caller_opt: Option<&str> = if ctx.bypass_visibility {
-            None
-        } else {
-            Some(caller)
-        };
-        // #1579 B2 — rank + match read the stored generated `tsv`
-        // column (schema v57). Pre-fix, `ts_rank(to_tsvector(...))`
-        // recomputed the tsvector PER MATCHED ROW (~305 of 306 ms at
-        // 8k rows in the P3 fleet audit); the GIN expression index
-        // only ever served the `@@` match, never the rank.
-        let rows = sqlx::query(&format!(
-            "SELECT {cols},
-                    ts_rank(tsv, to_tsquery('english', $1))
-                    + (priority * 0.5)
-                    + (LEAST(access_count, 50) * 0.1)
-                    + (confidence * 2.0)
-                    + CASE tier
-                          WHEN 'long' THEN 3.0
-                          WHEN 'mid'  THEN 1.0
-                          ELSE 0.0
-                      END
-                    + (1.0 / (1.0 +
-                        EXTRACT(EPOCH FROM (NOW() - updated_at)) / 86400.0 * 0.1))
-                      AS rank
-             FROM memories
-             WHERE tsv @@ to_tsquery('english', $1)
-               AND ($2::text IS NULL OR namespace = $2)
-               AND ($3::text IS NULL OR tier = $3)
-               AND ($4::text IS NULL OR tags @> to_jsonb(ARRAY[$4]))
-               AND ($5::text IS NULL OR metadata ->> 'agent_id' = $5)
-               AND (expires_at IS NULL OR expires_at > NOW())
-               AND (
-                   $7::text IS NULL
-                   OR COALESCE(metadata->>'scope', 'private') <> 'private'
-                   OR metadata->>'agent_id' = $7
-                   OR metadata->>'target_agent_id' = $7
-               )
-               {lifecycle_vis}
-             ORDER BY rank DESC, priority DESC
-             LIMIT $6",
-            // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
-            // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS).
-            cols = MEMORY_READ_COLUMNS,
-            lifecycle_vis = crate::models::lifecycle_visible_clause(""),
-        ))
-        .bind(&or_tsquery)
-        .bind(filter.namespace.as_ref())
-        .bind(filter.tier.as_ref().map(Tier::as_str))
-        .bind(tags_first)
-        .bind(filter.agent_id.as_ref())
-        .bind(limit)
-        .bind(caller_opt)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| to_store_err("search", e))?;
-
-        // Belt-and-suspenders: re-apply the predicate in-process.
-        // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
-        let mems: Vec<Memory> = rows
-            .iter()
-            .map(Self::row_to_memory_scan)
-            .collect::<StoreResult<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-        if ctx.bypass_visibility {
-            return Ok(mems);
-        }
-        Ok(mems
-            .into_iter()
-            .filter(|m| is_visible_to_caller(m, caller))
-            .collect())
+        // #3185 / #3127 — ONE postgres keyword-search SSOT. The inherent
+        // `search_with_source_uri` carries the union of sqlite's
+        // predicates (since/until, source_uri, G7, visibility, tags,
+        // agent_id, expiry, lifecycle) plus the 6-factor blend this
+        // trait method used to own. HTTP / MCP production callers land
+        // here; passing `filter.source_uri` (None when unset) keeps the
+        // compose path from silently dropping the URI filter.
+        self.search_with_source_uri(ctx, query, filter, filter.source_uri.as_deref())
+            .await
     }
 
     async fn verify(&self, _ctx: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
