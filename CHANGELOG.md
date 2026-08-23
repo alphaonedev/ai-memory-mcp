@@ -300,7 +300,9 @@ backend and missing or divergently implemented on its twin). Pinned by
     `admin_header_trust_boot_refusal`, `consume_execution_exemption`, spanning
     `src/approvals.rs` and `src/handlers/admin_role.rs`); and the §5.4(2)
     four-leg proof is explicitly labelled a PRE-#2954 / PRE-#2991 **18**-check
-    CAPTURE rather than the live posture.
+    CAPTURE rather than the live posture. Post-#2991 tallies (bare **10 FAIL of
+    20** / certified **20 PASS**) are **derived** from the #19/#20 unit tests,
+    not re-captured — `cert-54/` remains the evidence of record.
   - `scripts/check-cert-removal-proof.sh`: `--self-test` header comment
     corrected from "all 5 shipped rows" / "BOTH mutation grammars" to all **14**
     shipped rows across the **three** shapes (`return` / `body` / `subst`).
@@ -332,10 +334,12 @@ backend and missing or divergently implemented on its twin). Pinned by
     `DEFAULT_PORT` / `GC_INTERVAL_SECS` location corrected `main.rs` ->
     `src/daemon_runtime.rs:97-98`; added the missing
     `AI_MEMORY_MAX_INFLIGHT_REQUESTS` row (`0` disables; unset ⇒ CPU-scaled
-    `cores x 64` clamped 256..4096, #2032 M3); dropped the claim that
-    `AI_MEMORY_API_KEY` configures the HTTP shared key (it is read nowhere in
-    `src/`); and the three quota knobs relabelled per-agent -> **per-(agent,
-    namespace)** (#1156 / schema v50 extended the `agent_quotas` PRIMARY KEY).
+    `cores x 64` clamped 256..4096, #2032 M3); `AI_MEMORY_API_KEY` is not
+    read by `src/` and there is no `--api-key` flag — container deployments
+    still inject the HTTP shared key via `entrypoint.plan-c.sh` rendering it
+    into `config.toml` ([#3197](https://github.com/alphaonedev/ai-memory-mcp/issues/3197));
+    and the three quota knobs relabelled per-agent -> **per-(agent,
+    namespace)** on SQLite (#1156 / schema v50; the pg DDL divergence is #3209).
   - `SECURITY.md`: supported-versions table gains **v0.10.x** and **v1.0.x**
     rows and restates the post-v1.0 support window.
   - `docs/rfc/RFC-0001-mcp-turn-capture.md`: the `capture_layer_4` capability
