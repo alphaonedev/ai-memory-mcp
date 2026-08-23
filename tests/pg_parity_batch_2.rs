@@ -488,7 +488,7 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
 
     // No narrowing: BOTH rows surface (proves the fixture is sound).
     let all = store
-        .search_with_source_uri(&token, &base, Some(&uri))
+        .search_with_source_uri(&ctx, &token, &base, Some(uri.as_str()))
         .await
         .expect("search unfiltered");
     assert_eq!(
@@ -500,12 +500,13 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
     // tags_any narrows.
     let by_tag = store
         .search_with_source_uri(
+            &ctx,
             &token,
             &Filter {
                 tags_any: vec!["parity-keep".to_string()],
                 ..base.clone()
             },
-            Some(&uri),
+            Some(uri.as_str()),
         )
         .await
         .expect("search by tag");
@@ -519,12 +520,13 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
     // agent_id narrows.
     let by_agent = store
         .search_with_source_uri(
+            &ctx,
             &token,
             &Filter {
                 agent_id: Some("ai:owner-keep".to_string()),
                 ..base.clone()
             },
-            Some(&uri),
+            Some(uri.as_str()),
         )
         .await
         .expect("search by agent");
@@ -538,12 +540,13 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
     // A tag nobody carries returns NOTHING (fail-closed, not fail-open).
     let none = store
         .search_with_source_uri(
+            &ctx,
             &token,
             &Filter {
                 tags_any: vec![uid("no-such-tag")],
                 ..base.clone()
             },
-            Some(&uri),
+            Some(uri.as_str()),
         )
         .await
         .expect("search by absent tag");
