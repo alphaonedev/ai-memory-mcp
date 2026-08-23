@@ -10871,27 +10871,33 @@ fn test_curator_autonomy_end_to_end_cycle() {
         );
     }
 
-    // Run curator in dry-run mode (single cycle, no writes)
+    // Run curator in dry-run mode (single cycle, no writes).
+    // `--json` is a CuratorArgs flag (not a global), so it must sit
+    // AFTER `curator`. A leading `--json` is silently ignored and the
+    // human "curator cycle report" then fails JSON parse at column 1.
     let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
-            "--json",
             "curator",
             "--once",
             "--dry-run",
+            "--json",
         ])
         .output()
         .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "curator failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "curator failed: status={:?} stdout={stdout:?} stderr={stderr:?}",
+        output.status
     );
 
     // Parse the JSON report
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("curator output should be valid JSON");
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("curator output should be valid JSON: {e}\nstdout={stdout:?}\nstderr={stderr:?}")
+    });
 
     // Assert that the curator cycle ran
     assert!(report["memories_scanned"].as_u64().is_some());
