@@ -2167,6 +2167,89 @@ pub fn record_dlq_with_conn(
     Ok(())
 }
 
+/// v1.0.0 #2592 — reserved `subscription_dlq.subscription_id` under which a
+/// TRUNCATED subscriber scan is recorded.
+///
+/// It is deliberately not a real subscription id: when the scan is cut at
+/// `SUBSCRIPTION_DISPATCH_LIMIT` the dispatcher does not
+/// know WHICH subscribers it failed to see, so the loss cannot be attributed
+/// to one of them. Filing it under a reserved id keeps the fact that an event
+/// went undelivered DURABLE and inspectable through the existing
+/// `memory_subscription_dlq_list` surface instead of living only in a log
+/// line. The leading `_` matches the `_subscriptions/` reserved-namespace
+/// convention and cannot collide with a UUID subscription id.
+///
+/// The #1253 per-subscription depth cap applies to this id like any other, so
+/// a deployment that truncates on every write cannot fill the operator's disk:
+/// past the cap the inserts are refused with the typed `dlq_overflow` error
+/// and its own counter/WARN.
+pub const DISPATCH_SCAN_TRUNCATED_SUB_ID: &str = "_dispatch_scan_truncated";
+
+/// v1.0.0 #2592 — record one truncated subscriber scan: WARN + metric + a
+/// durable `subscription_dlq` row.
+///
+/// The postgres dispatch path pulls subscription mirror rows with a hard
+/// `LIMIT` and an `ORDER BY namespace`. Past that ceiling, subscribers
+/// sorting after the first `scanned` rows received NO event, with no error,
+/// no metric and no DLQ entry — and because the scan is ordered and
+/// cursor-less, the SAME tail is cut on every subsequent write, so the loss
+/// is permanent rather than transient. This makes it loud on all three
+/// surfaces an operator actually watches.
+///
+/// Best-effort and never panics: a DLQ write failure is itself logged. The
+/// WARN and the counter fire regardless, so the signal survives a DLQ that
+/// is full or unwritable.
+pub fn record_dispatch_scan_truncation(
+    db_path: &std::path::Path,
+    event_type: &str,
+    memory_id: &str,
+    namespace: &str,
+    scanned: usize,
+    limit: usize,
+) {
+    crate::metrics::record_subscription_dispatch_truncated();
+    tracing::warn!(
+        event_type = %event_type,
+        memory_id = %memory_id,
+        namespace = %namespace,
+        scanned = scanned,
+        limit = limit,
+        "subscription dispatch scan TRUNCATED at the {limit}-row ceiling — subscribers \
+         sorting after it received NO event for this write and will not receive one for \
+         any future write either (the scan is ordered and cursor-less). Reduce the \
+         subscription population or split the deployment (#2592)"
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+    let payload = serde_json::json!({
+        "memory_id": memory_id,
+        "namespace": namespace,
+        "scanned": scanned,
+        "limit": limit,
+    })
+    .to_string();
+    if let Err(e) = record_dlq(
+        db_path,
+        DISPATCH_SCAN_TRUNCATED_SUB_ID,
+        &correlation_id,
+        event_type,
+        &payload,
+        0,
+        &format!(
+            "subscriber scan truncated at {limit} rows; subscribers past the ceiling were \
+             never consulted (#2592)"
+        ),
+        &now,
+        &now,
+    ) {
+        tracing::warn!(
+            correlation_id = %correlation_id,
+            error = %e,
+            "could not record the truncated-dispatch DLQ row (the WARN + metric still stand)"
+        );
+    }
+}
+
 /// v0.7.0 K6 — list `subscription_dlq` rows. Used by the K7
 /// inspector tool (not registered in MCP yet) and by the K6
 /// integration test suite.
