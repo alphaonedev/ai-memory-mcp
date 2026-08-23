@@ -1088,7 +1088,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // that arrives through a clean auto-merge is UNVERIFIED — always
     // re-measure the merged file), so 33_150 carries the same modest headroom
     // as the neighbouring bumps.
-    ("src/store/postgres.rs", 35_200), /* 2026-08-23 (#3134 rebase onto 76417e85): BOTH #3110 visibility ($7 caller_opt + is_visible_to_caller) AND batch-2 tags_any/agent_id ($8/$9, LIMIT $10). Ceiling 34_720 (#3110) + batch-2 growth; re-measure after rebase. PRIOR batch-2 35_060 measured 34_997. PRIOR: 2026-08-22 (#3110): visibility-gate comments + caller_opt SQL arm on search_with_source_uri. Measured 34_645; ceiling 34_620 -> 34_720 (+75 headroom). */
+    ("src/store/postgres.rs", 35_200), /* 2026-08-23 (#3134 rebase onto 76417e85): BOTH #3110 visibility ($7 caller_opt + is_visible_to_caller) AND batch-2 tags_any/agent_id ($8/$9, LIMIT $10). Measured 35_166; ceiling 35_200 (+34 headroom). PRIOR batch-2 35_060 measured 34_997. PRIOR: 2026-08-22 (#3110): visibility-gate comments + caller_opt SQL arm on search_with_source_uri. Measured 34_645; ceiling 34_620 -> 34_720 (+75 headroom). */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
