@@ -1,6 +1,14 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "sal")]
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::too_many_lines,
+    clippy::doc_markdown,
+    clippy::uninlined_format_args
+)]
+
 //! v1.0.0 #3179 — the FRONTIER `unlocks` gate must hold on BOTH backends.
 //!
 //! `a --unlocks--> b` documents "`from` unlocks `to` on completion", so while
@@ -14,15 +22,10 @@
 //! The fix formats both backends from one fragment
 //! (`crate::actions::frontier_where_tail_with`). These tests pin the BEHAVIOUR
 //! on both lanes so a future `EdgeType` cannot regress one of them; the
-//! sqlite lane always runs, the pg lane skips cleanly without
-//! `AI_MEMORY_TEST_POSTGRES_URL`.
-
-#![allow(
-    clippy::missing_panics_doc,
-    clippy::too_many_lines,
-    clippy::doc_markdown,
-    clippy::uninlined_format_args
-)]
+//! sqlite lane always runs on a `--features sal` build (`SqliteStore` is
+//! `sal`-gated), the pg lane is `sal-postgres` and skips cleanly without
+//! `AI_MEMORY_TEST_POSTGRES_URL`. Default-features `--all-targets` does not
+//! compile this crate (the `store` module is `#[cfg(feature = "sal")]`).
 
 use ai_memory::models::{Action, ActionState, EdgeType};
 use ai_memory::store::{CallerContext, MemoryStore};

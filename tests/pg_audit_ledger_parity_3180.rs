@@ -1,6 +1,10 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// #1986: crate-level `//!` docs are still linted when `#![cfg(feature =
+// "sal-postgres")]` is false (the allow below that cfg is configured out).
+#![allow(clippy::doc_markdown)]
+
 //! v1.0.0 #3180 — the three audit/signal writes the postgres adapter lost.
 //!
 //! 1. **`pending_action.denied`** — a governance DENY must be provable. Before

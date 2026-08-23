@@ -1,6 +1,10 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// #1986: crate-level `//!` docs are still linted when `#![cfg(feature =
+// "sal-postgres")]` is false (the allow below that cfg is configured out).
+#![allow(clippy::doc_markdown)]
+
 //! v1.0.0 #3175 — the record-stop kill switch must cover the postgres
 //! `undo_in_place_edit` / `recover_turn_idempotent` write paths, and
 //! `record_stop_status` must answer from the PERSISTED chain, not a stale

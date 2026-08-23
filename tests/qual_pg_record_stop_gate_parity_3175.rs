@@ -33,7 +33,7 @@
 //! Text-scanning, not compiled against the adapters, so it runs on every
 //! feature leg and needs no database.
 
-#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::missing_panics_doc, clippy::doc_markdown)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
