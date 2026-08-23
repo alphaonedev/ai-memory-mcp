@@ -46,6 +46,30 @@ fn sidecar_path(base: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
+/// Best-effort unlink of stale `-wal`/`-shm` beside a just-published
+/// restore. The live DB is already swapped: an unlink failure WARNs
+/// with the manual `rm` path and does not fail the restore (Fable
+/// FIX-BEFORE-MERGE).
+fn remove_stale_sidecars(target_db: &Path, out: &mut CliOutput<'_>) -> Result<()> {
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let live_sidecar = sidecar_path(target_db, suffix);
+        if live_sidecar.exists() {
+            if let Err(e) = std::fs::remove_file(&live_sidecar) {
+                writeln!(
+                    out.stderr,
+                    "warning: restored {} but could not remove stale SQLite sidecar {} \
+                     ({e}); remove it manually before starting a daemon — leaving it \
+                     beside the restored database risks replaying old WAL frames into \
+                     it (#2444)",
+                    target_db.display(),
+                    live_sidecar.display()
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// v1.0.0 #3131 — filename infix of the pre-restore rollback copy
 /// (`<db>.pre-restore-<ts>.db`). Named so the operator can find it, and
 /// so the rollback line printed by `restore` and the `--json`
@@ -1024,26 +1048,7 @@ pub fn run_restore(
     // Durability of the swap itself — do this BEFORE sidecar cleanup so a
     // later sidecar error cannot skip the directory fsync.
     fsync_dir_of(&target_db);
-    for suffix in SQLITE_SIDECAR_SUFFIXES {
-        let live_sidecar = sidecar_path(&target_db, suffix);
-        if live_sidecar.exists() {
-            // Fable FIX-BEFORE-MERGE: the live DB is already swapped.
-            // A sidecar unlink failure must not roll the restore back
-            // (there is nothing to roll) and must not skip the fsync.
-            // Best-effort + loud WARN with the manual remediation.
-            if let Err(e) = std::fs::remove_file(&live_sidecar) {
-                writeln!(
-                    out.stderr,
-                    "warning: restored {} but could not remove stale SQLite sidecar {} \
-                     ({e}); remove it manually before starting a daemon — leaving it \
-                     beside the restored database risks replaying old WAL frames into \
-                     it (#2444)",
-                    target_db.display(),
-                    live_sidecar.display()
-                )?;
-            }
-        }
-    }
+    remove_stale_sidecars(&target_db, out)?;
     fsync_dir_of(&target_db);
 
     if json_out {
@@ -2096,34 +2101,22 @@ mod tests {
         assert_eq!(leftovers, 0, "consent refusal must not leave restore-tmp");
     }
 
-    /// A sidecar path that cannot be unlinked (here: a directory where
-    /// `-wal` should be a file) must WARN and still publish. The live DB
-    /// is already swapped; failing the restore over a sidecar unlink
-    /// would leave the operator with a published corpus AND a non-zero
-    /// exit (Fable FIX-BEFORE-MERGE).
+    /// Drive `remove_stale_sidecars` directly: a directory planted as
+    /// `-wal` cannot be `remove_file`'d, so the helper WARNs and returns
+    /// Ok. Planting that directory *before* `run_restore` is wrong — the
+    /// pre-swap sidecar *copy* would fail first (macos-fed sqlite red on
+    /// `b68e0a4f`).
     #[test]
-    fn restore_sidecar_unlink_failure_warns_and_still_publishes_3131() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn remove_stale_sidecars_warns_when_unlink_fails_and_does_not_err_3131() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        seed_memory(&db, "ns", "in-snap", "a");
-        let backup_dir = db.parent().unwrap().join("backups-3131-sidecar");
-        let manifest = take_backup(&mut env, &db, &backup_dir);
-        seed_memory(&db, "ns", "after", "b");
+        seed_memory(&db, "ns", "t", "c");
         let wal = sidecar_path(&db, "-wal");
         std::fs::create_dir(&wal).expect("plant a directory as the -wal sidecar");
-        let args = RestoreArgs {
-            from: backup_dir.join(&manifest.snapshot),
-            skip_verify: false,
-            store_url: None,
-            yes: true,
-        };
         {
             let mut out = env.output();
-            run_restore(&db, &args, false, &mut out)
-                .expect("sidecar unlink failure must not fail a published restore");
+            remove_stale_sidecars(&db, &mut out)
+                .expect("unlink failure must not fail the published restore");
         }
         assert!(
             env.stderr_str()
