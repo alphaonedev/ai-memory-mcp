@@ -29,6 +29,8 @@ use ai_memory::storage::schema_guard::{
     self, BACKEND_SQLITE, SchemaStamp, schema_ahead_of, schema_stamp_zeroed,
 };
 use rusqlite::Connection;
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int, c_void};
 
 /// The v1 `memories` shape — deliberately WITHOUT `confidence` (the column the
 /// v2 ladder arm adds), which is what makes a legitimate stamp-0 database
@@ -67,6 +69,31 @@ fn tmp_db(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         .expect("scratch dir");
     let path = dir.path().join("memories.db");
     (dir, path)
+}
+
+/// Authorizer that denies READ of `memories` so the corroboration
+/// probe can be forced to error while `sqlite_master` still answers.
+///
+/// # Safety
+/// Invoked from `sqlite3_prepare` with `arg1` a NUL-terminated
+/// table name (or null) for `SQLITE_READ`. We only read that C string and
+/// never retain it past the callback.
+unsafe extern "C" fn deny_memories_read(
+    _userdata: *mut c_void,
+    action: c_int,
+    arg1: *const c_char,
+    _arg2: *const c_char,
+    _db: *const c_char,
+    _trigger: *const c_char,
+) -> c_int {
+    if action == rusqlite::ffi::SQLITE_READ && !arg1.is_null() {
+        // SAFETY: SQLite passes a NUL-terminated table name for SQLITE_READ.
+        let table = unsafe { CStr::from_ptr(arg1) };
+        if table.to_bytes() == b"memories" {
+            return rusqlite::ffi::SQLITE_DENY;
+        }
+    }
+    rusqlite::ffi::SQLITE_OK
 }
 
 fn seed_row(conn: &Connection) {
@@ -359,4 +386,62 @@ fn zeroed_has_no_operable_version_2564() {
         .operable_version(BACKEND_SQLITE, "t")
         .expect_err("a zeroed stamp authorises nothing");
     assert_eq!(refusal.observed, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed: a probe that cannot answer is NOT Fresh
+// ---------------------------------------------------------------------------
+
+/// Legitimate no-corroboration (no `memories` table) is structurally Fresh —
+/// that is the ordinary pre-bootstrap state. The next test pins the OTHER
+/// arm: a table that is present but unreadable must not take this path.
+#[test]
+fn missing_memories_table_is_fresh_not_an_error_2564() {
+    let conn = Connection::open_in_memory().expect("mem");
+    conn.execute_batch(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);
+         INSERT INTO schema_version (version) VALUES (0);",
+    )
+    .expect("stamp only");
+    assert_eq!(
+        ai_memory::storage::probe_schema_stamp(&conn).expect("absent memories is Fresh"),
+        SchemaStamp::Fresh
+    );
+}
+
+/// An authorizer-denied READ of `memories` is the stand-in for I/O, lock
+/// and corruption: `sqlite_master` still answers (the table is present) but
+/// the row/column corroboration cannot run. Pre-fix that failure was
+/// `.unwrap_or(false)` → Fresh, which would replay the ladder over live
+/// data. A probe that cannot answer must return Err, never Fresh
+/// (`schema_guard` contract; ERRORS-19).
+#[test]
+fn corroboration_probe_error_is_not_fresh_2564() {
+    let conn = Connection::open_in_memory().expect("mem");
+    conn.execute_batch(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);
+         INSERT INTO schema_version (version) VALUES (0);
+         CREATE TABLE memories (id TEXT, confidence REAL);
+         INSERT INTO memories (id, confidence) VALUES ('x', 0.5);",
+    )
+    .expect("populated stamp-0 fixture");
+
+    // SAFETY: `handle` is valid for the lifetime of `conn`; the authorizer
+    // only reads SQLite-provided C strings and does not retain them.
+    unsafe {
+        let rc = rusqlite::ffi::sqlite3_set_authorizer(
+            conn.handle(),
+            Some(deny_memories_read),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, rusqlite::ffi::SQLITE_OK, "install authorizer");
+    }
+
+    match ai_memory::storage::probe_schema_stamp(&conn) {
+        Err(_) => {}
+        Ok(SchemaStamp::Fresh) => {
+            panic!("a corroboration probe that cannot answer must return Err, never Fresh")
+        }
+        Ok(other) => panic!("expected Err, got {other:?}"),
+    }
 }

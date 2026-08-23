@@ -218,9 +218,11 @@ fn trigger_names(conn: &Connection) -> Vec<String> {
 /// triggers, so a migration test that does not scan them proves nothing.)
 #[test]
 fn v90_migration_is_idempotent_and_preserves_every_trigger_2385() {
-    let dir = std::env::temp_dir().join(format!("ai-memory-2385-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    let path = dir.join("memories.db");
+    let dir = tempfile::Builder::new()
+        .prefix("ai-memory-2385-")
+        .tempdir()
+        .expect("scratch dir");
+    let path = dir.path().join("memories.db");
 
     let triggers_before;
     let cid_before;

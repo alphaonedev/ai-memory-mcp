@@ -867,14 +867,18 @@ backend and missing or divergently implemented on its twin). Pinned by
   `ai-memory backup` still snapshots the database — it re-opens through the
   unmigrated funnel on this refusal exactly as it already did for #2445, so the
   refusal message's "snapshot it before doing anything else" instruction is
-  something the binary actually honours. `ai-memory boot` and `ai-memory doctor`
-  name the refusal instead of flattening it into "could not open database"
-  (`doctor` reports `schema_stamp=invalid` plus the observed and supported
-  versions; `boot` reports it as the BELOW-MIN `warn-schema` status, which
-  #2445 alone could never reach). On the HTTP surface the postgres gate maps
-  `SCHEMA_STAMP_INVALID` to **503**, not 500 — the same disposition as the
-  schema-ahead refusal, so an orchestrator parks the node rather than
-  crash-looping it into the replay.
+  something the binary actually honours. `ai-memory doctor` reports
+  `schema_stamp=invalid` plus the observed and supported versions. `ai-memory
+  boot` reports a distinct `WarnSchemaStampInvalid` status whose copy is
+  backup-first / restore-the-stamp — not the schema-ahead "consider upgrading"
+  remedy, which is the opposite instruction for a database whose binary is
+  already current. The sqlite corroboration probe now distinguishes a missing
+  `memories` table (legitimate Fresh) from a probe that cannot answer (Err,
+  never Fresh): table-presence is asked of `sqlite_master` first, then the
+  row/column test propagates with `?` — the same split as the postgres twin.
+  On the HTTP surface the postgres gate maps `SCHEMA_STAMP_INVALID` to **503**,
+  not 500 — the same disposition as the schema-ahead refusal, so an
+  orchestrator parks the node rather than crash-looping it into the replay.
 
 ### Fixed
 

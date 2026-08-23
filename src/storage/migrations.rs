@@ -905,35 +905,54 @@ fn database_main_file_path(conn: &Connection) -> Option<PathBuf> {
     .map(PathBuf::from)
 }
 
+/// Row-existence half of the pre-migration snapshot gate, named per tier so
+/// SQLite's prepare-time relation resolution cannot turn a missing
+/// `archived_memories` (pre-v4) into a failed probe of `memories`.
+const SQL_MEMORIES_HOLDS_ROWS: &str = "SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)";
+const SQL_ARCHIVED_MEMORIES_HOLDS_ROWS: &str =
+    "SELECT EXISTS(SELECT 1 FROM archived_memories LIMIT 1)";
+
 /// v1.0.0 #2564 — does this database hold any durable rows worth snapshotting?
 ///
-/// Best-effort by construction: a database with no such relation (a genuinely
-/// fresh open, or a partial-schema fixture) errors and reads as `false`, so
-/// the probe can never manufacture a snapshot attempt on a database that has
-/// nothing to lose. Used ONLY to widen the pre-migration snapshot gate, never
-/// to refuse — so every failure mode here costs at most a missing backup on a
-/// database with no data, and never a refused open.
-///
-/// BOTH tiers are probed, and each in its OWN statement. `archived_memories`
+/// Used ONLY to widen the pre-migration snapshot gate, never to refuse an
+/// open. BOTH tiers are probed, each in its OWN statement. `archived_memories`
 /// is durable text too — a corpus that has been fully archived (or restored
 /// from a bundle into cold storage) holds no `memories` rows at all, and the
 /// v86/v87 ladder arms rewrite `archived_memories` renderings — so a
 /// `memories`-only probe would skip the snapshot on exactly that database.
 /// Two statements rather than one `OR` because SQLite resolves relations at
 /// PREPARE time: a single statement naming both would fail outright on a
-/// pre-v4 database that has `memories` but not yet `archived_memories`,
-/// silently turning a populated database back into an unsnapshotted one.
-fn database_holds_durable_rows(conn: &Connection) -> bool {
-    [super::TABLE_MEMORIES, super::TABLE_ARCHIVED_MEMORIES]
-        .iter()
-        .any(|table| {
-            conn.query_row(
-                &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
-                [],
-                |r| r.get::<_, i64>(0).map(|n| n != 0),
-            )
-            .unwrap_or(false)
-        })
+/// pre-v4 database that has `memories` but not yet `archived_memories`.
+///
+/// Table-presence is the legitimate "no rows to snapshot" case (a genuinely
+/// fresh open, or a partial-schema fixture). Distinguish it STRUCTURALLY:
+/// ask `sqlite_master` first, then run the row test with `?`. A catalogue
+/// or row probe that cannot answer is damage — propagate it rather than
+/// `.unwrap_or(false)`, which would skip the snapshot on a populated
+/// database whose pages we failed to read (ERRORS-19).
+///
+/// # Errors
+///
+/// Propagates a genuine `sqlite_master` or row-probe failure.
+fn database_holds_durable_rows(conn: &Connection) -> Result<bool> {
+    for (table, has_rows_sql) in [
+        (super::TABLE_MEMORIES, SQL_MEMORIES_HOLDS_ROWS),
+        (
+            super::TABLE_ARCHIVED_MEMORIES,
+            SQL_ARCHIVED_MEMORIES_HOLDS_ROWS,
+        ),
+    ] {
+        if !super::connection::sqlite_table_present(conn, table)? {
+            continue;
+        }
+        let has_rows: bool = conn
+            .query_row(has_rows_sql, [], |r| r.get::<_, i64>(0).map(|n| n != 0))
+            .with_context(|| format!("probe whether {table} holds durable rows"))?;
+        if has_rows {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Snapshot the live DB file immediately BEFORE a schema-mutating upgrade
@@ -1617,7 +1636,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     // the database with the longest ladder still to replay — precisely the one
     // that most needs a snapshot. Probe for durable rows so the snapshot can
     // never again be suppressed on a populated database.
-    if version > 0 || database_holds_durable_rows(conn) {
+    if version > 0 || database_holds_durable_rows(conn)? {
         if let Some(snapshot) = snapshot_before_migration(conn, version, CURRENT_SCHEMA_VERSION)? {
             tracing::info!(
                 from_version = version,

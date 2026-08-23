@@ -46,9 +46,28 @@ const SQL_SCHEMA_VERSION_TABLE_PRESENT: &str =
 /// `pragma_table_info` is used rather than a `SELECT confidence …` probe so
 /// the check never depends on statement-preparation error text, and the whole
 /// query is one round trip against a table SQLite already has open.
+///
+/// Run ONLY after [`sqlite_table_present`] has proven `memories` exists.
+/// SQLite resolves relation references at PREPARE time, so this statement
+/// errors on a database with no `memories` — which is the ordinary fresh
+/// case, not damage. The table-presence probe is what makes that case
+/// structurally `Fresh`; a failure of THIS statement after the table has
+/// been shown to exist is damage and must propagate (never `unwrap_or`
+/// into [`SchemaStamp::Fresh`]).
 const SQL_SCHEMA_STAMP_ZERO_IS_IMPOSSIBLE: &str = "SELECT EXISTS(SELECT 1 FROM memories LIMIT 1) \
      AND EXISTS(SELECT 1 FROM pragma_table_info('memories') WHERE name = 'confidence')";
 
+/// Catalogue-only presence probe. Parameterised so [`sqlite_table_present`]
+/// and the pre-migration snapshot gate name the same tables as data rather
+/// than baking them into SQL. `sqlite_master` is always readable; a failure
+/// here is I/O / lock / corruption, not "the table is absent".
+const SQL_SQLITE_TABLE_PRESENT: &str =
+    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1";
+
+/// Context label for a failed zeroed-stamp corroboration probe (#2564).
+/// Twin of `store::postgres::MSG_PROBE_SCHEMA_STAMP_CORROBORATION`.
+const MSG_PROBE_SCHEMA_STAMP_CORROBORATION: &str =
+    "probe whether a zero schema stamp is structurally impossible";
 /// #2266 — exact, parse-tolerant RFC3339 instant projection for SQLite KG
 /// predicates. Returning NULL for malformed text makes comparisons fail
 /// closed without modifying the H2-signed source bytes.
@@ -429,20 +448,43 @@ pub fn probe_schema_stamp(conn: &Connection) -> Result<SchemaStamp> {
     if version < 0 {
         return Ok(SchemaStamp::Zeroed(version));
     }
-    // The probe is best-effort by construction: on a database with no
-    // `memories` relation at all (the true fresh case, and the partial-schema
-    // test fixtures) the query errors, which reads as "no corroboration" —
-    // i.e. Fresh. It can therefore never turn a fresh open into a refusal.
+    // Table-presence is the legitimate "no corroboration" case (a truly
+    // fresh database, or a partial-schema fixture). Distinguish it
+    // STRUCTURALLY: ask `sqlite_master` first (that catalogue is always
+    // there), and only then run the row/column test with `?`. A probe
+    // that cannot answer returns Err, never Fresh — see
+    // [`super::schema_guard`] (ERRORS-19). The previous `.unwrap_or(false)`
+    // collapsed I/O, lock and corruption failures into Fresh, which is
+    // exactly the fail-OPEN that would replay the ladder over live data.
+    if !sqlite_table_present(conn, super::TABLE_MEMORIES)? {
+        return Ok(SchemaStamp::Fresh);
+    }
     let impossible: bool = conn
         .query_row(SQL_SCHEMA_STAMP_ZERO_IS_IMPOSSIBLE, [], |r| {
             r.get::<_, i64>(0).map(|n| n != 0)
         })
-        .unwrap_or(false);
+        .context(MSG_PROBE_SCHEMA_STAMP_CORROBORATION)?;
     if impossible {
         Ok(SchemaStamp::Zeroed(version))
     } else {
         Ok(SchemaStamp::Fresh)
     }
+}
+
+/// v1.0.0 #2564 — is `table` present in `sqlite_master`?
+///
+/// `true` / `false` only when the catalogue answered. A catalogue that
+/// cannot be read is damage and must propagate: absence is a legitimate
+/// no-op, unreadability is not.
+///
+/// # Errors
+///
+/// Propagates a genuine query failure. Does not coerce one into "absent".
+pub(crate) fn sqlite_table_present(conn: &Connection, table: &str) -> Result<bool> {
+    let present: i64 = conn
+        .query_row(SQL_SQLITE_TABLE_PRESENT, [table], |r| r.get(0))
+        .with_context(|| format!("probe for the {table} relation"))?;
+    Ok(present != 0)
 }
 
 /// v1.0.0 #2445 — the shared downgrade guard for EVERY sqlite funnel that

@@ -453,7 +453,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // what it now refuses, why the disposition is surface-keyed rather than
     // unconditional (3x3 vote 7-2), and which residual is deliberate.
     // MEASURED post-change: 28_047. Ceiling 27_900 -> 28_120 (+73 headroom).
-    ("src/storage/mod.rs", 29_600), /* 2026-08-23 (#3216 rebase onto 8fb6e9eb / #3215): v90 archive genesis-cid carry + #2394/#2395/#2399 sqlite-integrity cluster on top of the #3133 ungoverned-namespace admission arm. Ceiling 29_400 -> 29_600 pending remeasure. PRIOR HEAD: 2026-08-23 (#3133 rebase onto #3115) MEASURED 29_314; ceiling 29_400. */
+    ("src/storage/mod.rs", 29_600), /* 2026-08-23 (#3216 Fable fail-closed): RE-MEASURED 29_516 after the sqlite corroboration-probe / boot-status follow-up (this file unchanged). Ceiling 29_600 stays (never lower a floor); +84 headroom. PRIOR: 2026-08-23 (#3216 rebase onto 8fb6e9eb / #3215) pending-remeasure placeholder 29_400 -> 29_600. PRIOR HEAD: 2026-08-23 (#3133 rebase onto #3115) MEASURED 29_314; ceiling 29_400. */
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
@@ -1088,7 +1088,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // that arrives through a clean auto-merge is UNVERIFIED — always
     // re-measure the merged file), so 33_150 carries the same modest headroom
     // as the neighbouring bumps.
-    ("src/store/postgres.rs", 35_400), /* 2026-08-23 (#3216 rebase onto 8fb6e9eb): v90 pg twins + #2564 corroboration probe on top of #3134 tags_any/agent_id. Ceiling 35_200 -> 35_400 pending remeasure. PRIOR HEAD: 2026-08-23 (#3134) MEASURED 35_166; ceiling 35_200. */
+    ("src/store/postgres.rs", 35_840), /* 2026-08-23 (#3216 Fable fail-closed): live corroboration probe now runs SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL under SET LOCAL search_path in a tx (no restated cousin SQL). MEASURED 35_759; ceiling 35_400 -> 35_840 (+81 headroom, lockstep). Never lower a floor. PRIOR: 2026-08-23 (#3216 rebase onto 8fb6e9eb) pending-remeasure placeholder 35_200 -> 35_400. PRIOR HEAD: 2026-08-23 (#3134) MEASURED 35_166; ceiling 35_200. */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1519,7 +1519,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
     // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
     // Additive ALTER-ADD-COLUMN migration only.
-    ("src/storage/migrations.rs", 5_910), /* 2026-08-23 (#3216 rebase onto 8fb6e9eb): #2385 v90 archive-cid arm + #2564 snapshot-gate widening. Incoming measured 5_848; ceiling 5_910 (+62). PRIOR HEAD: 2026-08-21 #3113 core-relation integrity gate, measured 5_770; ceiling 5_850. Remeasure after rebase. */
+    ("src/storage/migrations.rs", 5_980), /* 2026-08-23 (#3216 Fable fail-closed): database_holds_durable_rows table-presence then `?` (never unwrap_or false). MEASURED 5_915; ceiling 5_910 -> 5_980 (+65 headroom, lockstep). Never lower a floor. PRIOR: 2026-08-23 (#3216 rebase onto 8fb6e9eb) placeholder 5_910. PRIOR HEAD: 2026-08-21 #3113 core-relation integrity gate, measured 5_770; ceiling 5_850. */
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

@@ -343,3 +343,41 @@ async fn live_archive_restore_preserves_the_genesis_cid_2385() {
         "#2385: a drifted re-mint input must NOT re-address the durable row"
     );
 }
+
+/// #2385 — the v90 arm must actually RUN against a database already at v89,
+/// not only against a fresh install. `connect` short-circuits at the tip, so
+/// a shared test database that is already at v90 would never prepare the
+/// v90 DDL. Rewind the stamp (the DDL is `IF NOT EXISTS`, so the corpus
+/// is not rewritten) and reconnect so the arm is parsed and applied on a
+/// live server.
+#[tokio::test]
+async fn live_v90_arm_runs_on_a_database_already_at_v89_2385() {
+    let Some(pg) = live_pg().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL unset");
+        return;
+    };
+    {
+        let mut tx = pg.pool().begin().await.expect("begin v89 rewind");
+        sqlx::query("DELETE FROM schema_version")
+            .execute(&mut *tx)
+            .await
+            .expect("clear stamp");
+        sqlx::query("INSERT INTO schema_version (version) VALUES (89)")
+            .execute(&mut *tx)
+            .await
+            .expect("rewind to v89");
+        tx.commit().await.expect("commit v89 rewind");
+    }
+    drop(pg);
+    let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("url still set");
+    let pg = PostgresStore::connect(&url)
+        .await
+        .expect("reconnect must apply v90 from v89");
+    let v = pg.schema_version().await.expect("stamp");
+    assert_eq!(
+        v,
+        ai_memory::storage::current_schema_version_for_tests(),
+        "the ladder must land back on the tip after replaying v90 from v89"
+    );
+    eprintln!("RAN: live_v90_arm_runs_on_a_database_already_at_v89_2385 (from v89)");
+}

@@ -31420,23 +31420,60 @@ mod tests {
         // an integrity guard into a total availability outage: no fresh
         // postgres deployment could ever bootstrap.
         //
-        // Prove the catalogue-only step answers `false` — not an error — for a
-        // relation that does not exist, using an empty throwaway schema as the
-        // stand-in for a fresh database.
+        // Pin the PRODUCTION catalogue-only constant — not a restated
+        // `$1 || '.memories'` cousin — under `SET LOCAL search_path` in a
+        // transaction, so `to_regclass('memories')` resolves the same way
+        // `connect_*` does and the pooled connection's GUC is not mutated.
         let scratch = format!("stamp_probe_2564_{}", uuid::Uuid::new_v4().simple());
         sqlx::query(&format!("CREATE SCHEMA \"{scratch}\""))
             .execute(&store.pool)
             .await
             .expect("create scratch schema");
-        let empty_schema_answer: Result<bool, _> = sqlx::query_scalar(
-            "SELECT to_regclass($1 || '.memories') IS NOT NULL \
-             AND EXISTS(SELECT 1 FROM pg_attribute \
-                        WHERE attrelid = to_regclass($1 || '.memories') \
-                          AND attname = 'confidence' AND NOT attisdropped)",
-        )
-        .bind(&scratch)
-        .fetch_one(&store.pool)
-        .await;
+
+        {
+            let mut tx = store
+                .pool
+                .begin()
+                .await
+                .expect("begin public-search_path tx");
+            sqlx::query("SET LOCAL search_path TO public")
+                .execute(&mut *tx)
+                .await
+                .expect("SET LOCAL search_path public");
+            let public_answer: bool =
+                sqlx::query_scalar(SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect(
+                        "#2564: SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL must parse \
+                         under SET LOCAL search_path",
+                    );
+            assert!(
+                public_answer,
+                "#2564: production catalogue-only SQL must see memories.confidence \
+                 on a populated public schema"
+            );
+            tx.rollback().await.expect("rollback public-search_path tx");
+        }
+
+        let empty_schema_answer: Result<bool, sqlx::Error> = {
+            let mut tx = store
+                .pool
+                .begin()
+                .await
+                .expect("begin empty-schema search_path tx");
+            sqlx::query(&format!("SET LOCAL search_path TO \"{scratch}\""))
+                .execute(&mut *tx)
+                .await
+                .expect("SET LOCAL search_path scratch");
+            let answer = sqlx::query_scalar(SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL)
+                .fetch_one(&mut *tx)
+                .await;
+            tx.rollback()
+                .await
+                .expect("rollback empty-schema search_path tx");
+            answer
+        };
         sqlx::query(&format!("DROP SCHEMA \"{scratch}\" CASCADE"))
             .execute(&store.pool)
             .await
