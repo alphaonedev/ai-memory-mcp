@@ -748,21 +748,19 @@ mod pg {
             .connect(&url)
             .await
             .expect("pool");
-        let events: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM signed_events WHERE event_type = $1",
-        )
-        .bind("memory_link.invalidated")
-        .fetch_one(&pool)
-        .await
-        .expect("count events");
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM signed_events WHERE event_type = $1")
+                .bind("memory_link.invalidated")
+                .fetch_one(&pool)
+                .await
+                .expect("count events");
         assert_eq!(events, 1, "supersession must leave exactly one audit leaf");
-        let actor: String = sqlx::query_scalar(
-            "SELECT agent_id FROM signed_events WHERE event_type = $1",
-        )
-        .bind("memory_link.invalidated")
-        .fetch_one(&pool)
-        .await
-        .expect("actor");
+        let actor: String =
+            sqlx::query_scalar("SELECT agent_id FROM signed_events WHERE event_type = $1")
+                .bind("memory_link.invalidated")
+                .fetch_one(&pool)
+                .await
+                .expect("actor");
         assert_eq!(
             actor,
             ai_memory::identity::sentinels::SYSTEM_PRINCIPAL,
