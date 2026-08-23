@@ -28,7 +28,7 @@
 //!
 //! The certified posture is the UNION of:
 //!
-//! 1. The existing 22-knob `asi-hard` hardened set
+//! 1. The existing 27-knob `asi-hard` hardened set
 //!    ([`crate::security_profile::KNOBS`], reused via
 //!    [`crate::security_profile::is_asi_hard`] +
 //!    [`crate::security_profile::asi_hard_below_floor`] — no knob name
@@ -250,7 +250,7 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
         "set AI_MEMORY_SECURITY_PROFILE=asi-hard",
     ));
 
-    // ---- 2. every asi-hard pinned knob (22) at its hard floor ------
+    // ---- 2. every asi-hard pinned knob (27) at its hard floor ------
     // Reuses `security_profile::KNOBS` via the read-only accessor — NO
     // knob name or floor value is re-declared here (see module docs).
     //
@@ -308,6 +308,10 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
     // `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` set made the daemon accept
     // unenrolled-peer attribution on BOTH receive lanes while this check
     // reported PASS. Reuses both real gate functions verbatim.
+    // #3201 now ALSO pins the unenrolled hatch into `security_profile::KNOBS`
+    // (plain `asi-hard` refuses a truthy hatch at boot); this row remains
+    // so a certified doctor run still names the combined live predicate
+    // even when the operator is not on `asi-hard`.
     let peer_enrollment_required =
         crate::handlers::federation_signing_check::require_peer_enrollment_enabled();
     let unenrolled_peers_allowed =
@@ -636,7 +640,7 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
     // unchanged.
 
     // ---- 16. peer URLs https-only ------------------------------------
-    // Same underlying knob as one of the 22 asi-hard pins (#154) —
+    // Same underlying knob as one of the 27 asi-hard pins (#154) —
     // named separately here because §5.3 calls it out as its own
     // enumerated requirement ("peer URLs: https:// only").
     let plaintext_allowed = crate::tls::plaintext_peers_allowed();
@@ -672,17 +676,13 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
     ));
 
     // ---- 18. AI_MEMORY_FED_REQUIRE_POLICY_CURRENT (#2911 item 2) ------
-    // FED-RQ-03 stale-governance-policy refusal (receive_auth.rs:479-494
-    // at 580d8427). Default-ON via `env_flag_default_on`; an explicit
-    // falsy token (`0`/`false`/`no`/`off`) escaped BOTH this posture
-    // table and `security_profile::KNOBS`. A dedicated posture check
-    // (not a KNOBS pin) keeps the certified set off the cert-expiry
-    // watch list: this module is not watched, and the identifier is
-    // already declared in receive_auth. Crossroads: generic `asi-hard`
-    // without this enterprise posture still permits `=0`; that is the
-    // generic-vs-certified-set boundary — operators who want the
-    // certified guarantee arm check #17, which then refuses `=0` at
-    // boot via this row.
+    // FED-RQ-03 stale-governance-policy refusal. Default-ON via
+    // `env_flag_default_on`. #3168 now ALSO pins this into
+    // `security_profile::KNOBS` (plain `asi-hard` refuses `=0` at boot);
+    // this row remains so a certified doctor run still names the live
+    // reader even when the operator is not on `asi-hard` (check #17
+    // then refuses `=0` independently). The identifier is the live
+    // `REQUIRE_POLICY_CURRENT_ENV` (`AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`).
     out.push(check(
         crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
         "not explicitly disabled (detected-stale inbound policy_version refused)",
@@ -937,7 +937,7 @@ mod tests {
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard");
         }
-        // Pins the 22 asi-hard knobs via the REAL enforcement fn — the
+        // Pins the 27 asi-hard knobs via the REAL enforcement fn — the
         // single source of truth for what "compliant" means for that set.
         crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly from a clean env");
 
@@ -1210,7 +1210,7 @@ mod tests {
         }
         let _cleanup = EnvGuard;
         let _fp_file = set_fully_hardened_env();
-        // Loosen ONE of the 22 pinned knobs after the fact.
+        // Loosen ONE of the 27 pinned knobs after the fact.
         unsafe {
             std::env::set_var("AI_MEMORY_SECRET_SCREEN_MODE", "off");
         }

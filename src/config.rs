@@ -7928,6 +7928,20 @@ impl AppConfig {
     /// hardcoded-literal-duplication gate).
     pub const ENV_PERMISSIONS_MODE: &str = "AI_MEMORY_PERMISSIONS_MODE";
 
+    /// Value-level half of [`Self::effective_permissions_mode`]'s env arm.
+    /// Lowercases WITHOUT trimming (the live reader never trims), then
+    /// exact-matches `enforce` / `advisory` / `off`. Shared with the
+    /// `asi-hard` KNOBS `meets_floor` (#3168) so a token the live reader
+    /// would not resolve as Enforce cannot pass the floor (NB1).
+    pub(crate) fn permissions_mode_from_env_token(raw: &str) -> Option<PermissionsMode> {
+        match raw.to_ascii_lowercase().as_str() {
+            "enforce" => Some(PermissionsMode::Enforce),
+            "advisory" => Some(PermissionsMode::Advisory),
+            "off" => Some(PermissionsMode::Off),
+            _ => None,
+        }
+    }
+
     /// v0.7.0 K3 — resolve the effective [`PermissionsMode`] consulted
     /// by [`crate::db::enforce_governance`].
     ///
@@ -7951,17 +7965,14 @@ impl AppConfig {
     #[must_use]
     pub fn effective_permissions_mode(&self) -> PermissionsMode {
         if let Ok(raw) = std::env::var(Self::ENV_PERMISSIONS_MODE) {
-            match raw.to_ascii_lowercase().as_str() {
-                "enforce" => return PermissionsMode::Enforce,
-                "advisory" => return PermissionsMode::Advisory,
-                "off" => return PermissionsMode::Off,
-                other => {
-                    eprintln!(
-                        "ai-memory: AI_MEMORY_PERMISSIONS_MODE={other:?} is not a valid mode \
-                         (expected enforce / advisory / off); falling back to config.toml"
-                    );
-                }
+            if let Some(mode) = Self::permissions_mode_from_env_token(&raw) {
+                return mode;
             }
+            let other = raw.to_ascii_lowercase();
+            eprintln!(
+                "ai-memory: AI_MEMORY_PERMISSIONS_MODE={other:?} is not a valid mode \
+                 (expected enforce / advisory / off); falling back to config.toml"
+            );
         }
         // B4 (S5-M3) — both "block absent entirely" and "block present
         // but `mode =` omitted" must reach the secure default. The

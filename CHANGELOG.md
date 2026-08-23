@@ -671,6 +671,32 @@ write is permission-evaluated as; see the operator note below.
 ### Security
 
 - **#3192 — single-row `delete` wrote no `forget_tombstone` and did not crypto-erase, so every MCP `memory_delete` / HTTP DELETE / inbound federation `deletions[]` was LWW-resurrectable.** `db::delete` (`delete_inner`) now reuses the existing `tombstone_and_erase` primitive (the same helper `gc` / `size_gc` already call via `evict_tombstone_and_erase`) *inside* the caller's transaction: forget-tombstone INSERT, envelope crypto-erase + attestation, `cid_genesis` scrub, DLQ/dedup remanence purge, then DELETE. `insert_if_newer`'s G30 resurrection guard therefore sees the tombstone and drops a fresher peer re-push. Postgres `PostgresStore::delete` and `apply_remote_deletion` share one `pg_hard_delete_in_tx` so the two funnels cannot drift. A delete of a never-seen id stays a no-op with no tombstone and no `namespace_meta` sever (probe-then-write). Delete also discards undelivered federation DLQ pushes for that memory. Tombstone `signature` is NULL when no daemon keypair is present (unsigned resurrection guard); refuse-under-enforced-posture is the shared rule with #3240 and must not fork here. The MCP/CLI erasure-outbox remains best-effort + infallible (documented contract; an outbox failure still WARNs and does not fail the local delete). Distinct from #3177 (pg gc).
+- **`asi-hard` now pins the three residual #3033 governance knobs** (#3168).
+  Certified deployments already refused `AI_MEMORY_PERMISSIONS_MODE=off`,
+  `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1` and a disabled
+  `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` via
+  `enterprise_federation_posture` when
+  `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` was set; plain
+  `asi-hard` booted with the K3/K9 governance gate OFF. Each new
+  `KNOBS` row delegates `meets_floor` to the live reader (NB1):
+  permissions-mode is the exact `enforce` token (not a naive truthy
+  invert); the fail-OPEN hatch is the live `"1"` / case-insensitive
+  `"true"` grammar (not house `is_truthy` — `yes`/`on` do not arm it);
+  policy-current uses `flag_value_default_on` (the live name is
+  `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`; the unprefixed
+  `REQUIRE_POLICY_CURRENT` does not exist). Count 22 → 25. `standard`
+  posture defaults are unchanged.
+- **`asi-hard` now pins the two federation escape hatches, and a typo no
+  longer fail-opens cert↔peer-id binding** (#3201).
+  `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` still opened the
+  `(None,None)` receive arm even with `REQUIRE_PEER_ENROLLMENT` pinned
+  ON; `AI_MEMORY_FED_CERT_PEER_BINDING` parsed unknown tokens
+  (`=enforc`) as Warn and defaulted to Warn against its own "one
+  release, then enforce" comment. The unenrolled hatch now pins CLOSED
+  (live truthy grammar). Cert-peer-binding pins to `enforce` under
+  `asi-hard` only. `CertPeerBindingMode::parse` fail-closes unknown
+  tokens to Enforce; the documented `standard` UNSET default stays
+  Warn (not silently flipped). Count 25 → 27.
 
 - **The cert removal-proof harness can no longer leave a DISABLED security control
   in the working tree** (#3119, closing the #3118 near-miss).

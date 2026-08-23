@@ -401,7 +401,7 @@ contract). Under the default `standard` posture every knob keeps its
 own default (byte-identical legacy). SSOT: `src/security_profile.rs`.
 
 Pinned knobs (unset → pinned to the hard value; already-compliant →
-accepted; set-below-floor → boot REFUSED). All **22** of them, in `KNOBS`
+accepted; set-below-floor → boot REFUSED). All **27** of them, in `KNOBS`
 order — this table is mechanically pinned to the SSOT by SET equality in
 `src/security_profile.rs::tests::performance_md_pinned_knobs_table_matches_the_knobs_ssot_exactly`,
 so a knob can no longer be added to `KNOBS` without a row here, and a row
@@ -432,6 +432,11 @@ here cannot claim a hardening guarantee the binary does not enforce
 | `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` | *(unset)* — PERMISSIVE-shaped: the plaintext-peer hatch must be non-truthy; a truthy value REFUSES boot (#154/#2477) |
 | `AI_MEMORY_DB_SYNCHRONOUS` | `FULL` (power-loss durability, above) |
 | `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES` | `1` (a migration REFUSES to stamp a schema version whose ladder-created core relations were lost, rather than warning — #3113) |
+| `AI_MEMORY_PERMISSIONS_MODE` | `enforce` (K3/K9 governance gate ON — `off`/`advisory` refuse boot — #3168) |
+| `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` | *(unset)* — PERMISSIVE-shaped: the fail-OPEN hatch must be disarmed; a truthy live-grammar token (`1`/`true`) REFUSES boot (#3168) |
+| `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` | `1` (inbound federated push with a DETECTED-stale `policy_version` is refused — #3168; live name, not the unprefixed `REQUIRE_POLICY_CURRENT`) |
+| `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` | *(unset)* — PERMISSIVE-shaped: the unenrolled-peer hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT` must be CLOSED; a truthy value REFUSES boot (#3201) |
+| `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` (mTLS cert↔`X-Peer-Id` cross-check ENFORCES; `off`/`warn` refuse boot. Documented `standard` unset default stays `warn` — #3201) |
 
 In addition, `asi-hard` forces the config-backed governance knob
 `[governance].require_operator_pubkey` to `true` at the governance boot

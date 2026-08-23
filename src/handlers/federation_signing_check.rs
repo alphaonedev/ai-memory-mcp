@@ -1725,14 +1725,22 @@ pub(crate) const ALLOW_UNENROLLED_PEERS_ENV: &str = "AI_MEMORY_FED_ALLOW_UNENROL
 /// gate uses, instead of checking only half of it.
 pub(crate) fn allow_unenrolled_peers_enabled() -> bool {
     std::env::var(ALLOW_UNENROLLED_PEERS_ENV)
-        .map(|v| {
-            let t = v.trim();
-            t == "1"
-                || t.eq_ignore_ascii_case("true")
-                || t.eq_ignore_ascii_case("yes")
-                || t.eq_ignore_ascii_case("on")
-        })
+        .map(|v| allow_unenrolled_peers_value_enabled(&v))
         .unwrap_or(false)
+}
+
+/// Value-level half of [`allow_unenrolled_peers_enabled`]. Trimmed `1` /
+/// case-insensitive `true`/`yes`/`on` arms the hatch; every other token
+/// (including empty) keeps it CLOSED. Shared with the `asi-hard` KNOBS
+/// `meets_floor` (#3201) so a value the live receive gate would not honour
+/// cannot refuse boot (NB1).
+#[must_use]
+pub(crate) fn allow_unenrolled_peers_value_enabled(v: &str) -> bool {
+    let t = v.trim();
+    t == "1"
+        || t.eq_ignore_ascii_case("true")
+        || t.eq_ignore_ascii_case("yes")
+        || t.eq_ignore_ascii_case("on")
 }
 
 // ---------------------------------------------------------------------------
