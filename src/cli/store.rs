@@ -146,38 +146,6 @@ fn read_stdin_to_string() -> Result<String> {
 /// every emit routes through `out.stdout` / `out.stderr` instead of
 /// `println!` / `eprintln!`.
 #[allow(clippy::too_many_lines)]
-/// #3025 — read back the row `db::insert` just committed, so the response can
-/// report what the DB ACTUALLY stored rather than what the caller requested.
-///
-/// **Fails closed (ERRORS-19).** The guarantee this fix exists to make is
-/// "the response reports the STORED values, not the requested ones". A
-/// verification read that fails and then falls back to echoing the REQUESTED
-/// values breaks exactly that guarantee on the error path, and does it
-/// invisibly: the caller cannot tell a verified echo from an unverified one,
-/// which is the same reports-success-doing-nothing class (#2444) the fix was
-/// written to close. So both failure modes are errors:
-///
-/// * `Err` — the read itself failed (transient / IO).
-/// * `Ok(None)` — an INVARIANT VIOLATION: `db::insert` returned this id, so the
-///   row must be readable. Never a silent fallback.
-///
-/// Both messages state that the WRITE ALREADY HAPPENED and name the id, so an
-/// operator reading the failure knows the row exists and only its verification
-/// failed — the exit code must not be read as "nothing was stored".
-fn read_back_persisted(conn: &rusqlite::Connection, actual_id: &str) -> Result<models::Memory> {
-    match db::get(conn, actual_id) {
-        Ok(Some(persisted)) => Ok(persisted),
-        Ok(None) => anyhow::bail!(
-            "memory {actual_id} WAS STORED, but the read-back that verifies what was persisted \
-             found no such row; refusing to report the requested values as if they were stored"
-        ),
-        Err(e) => anyhow::bail!(
-            "memory {actual_id} WAS STORED, but the read-back that verifies what was persisted \
-             failed: {e}; refusing to report the requested values as if they were stored"
-        ),
-    }
-}
-
 pub fn run(
     db_path: &Path,
     args: StoreArgs,
@@ -459,35 +427,66 @@ pub fn run(
         db::find_contradictions(&conn, &mem.title, &mem.namespace).unwrap_or_default();
     let actual_id = db::insert(&conn, &mem)?;
 
-    // #3025 — re-read the persisted row so the response reflects what the DB
-    // ACTUALLY stored, never the requested-but-not-persisted values. On a
-    // `(title, namespace)` upsert `db::insert` merges onto the existing row:
-    // tier stays monotonic-max (a `--tier short` upsert over a `long` row
-    // stays `long`), `version` bumps, and `expires_at` follows the persisted
-    // tier — so echoing `mem` would report a downgrade / expiry / version that
-    // never happened (the #2444 reports-success-doing-nothing / honesty class).
-    // FAIL CLOSED on a failed read-back — see `read_back_persisted`.
-    // MCP precedent: `src/mcp/tools/store/mod.rs` `echo_tier`.
-    let persisted = read_back_persisted(&conn, &actual_id)?;
-
     // PR-5 (issue #487): security audit trail. No-op when disabled.
-    crate::audit::emit(crate::audit::EventBuilder::new(
-        crate::audit::AuditAction::Store,
-        crate::audit::actor(
-            agent_id.clone(),
-            cli_agent_id.map_or(crate::audit::synthesis_sources::DEFAULT_FALLBACK, |_| {
-                crate::audit::synthesis_sources::EXPLICIT
-            }),
-            args.scope.clone(),
-        ),
-        crate::audit::target_memory(
-            actual_id.clone(),
-            mem.namespace.clone(),
-            Some(mem.title.clone()),
-            Some(mem.tier.to_string()),
-            args.scope.clone(),
-        ),
-    ));
+    // Built once so both arms share the same actor (the write already
+    // happened; the trail must not go silent on a failed read-back).
+    let store_actor = crate::audit::actor(
+        agent_id.clone(),
+        cli_agent_id.map_or(crate::audit::synthesis_sources::DEFAULT_FALLBACK, |_| {
+            crate::audit::synthesis_sources::EXPLICIT
+        }),
+        args.scope.clone(),
+    );
+
+    // #3025 — re-read the persisted row so the response (AND the audit
+    // target) reflects what the DB ACTUALLY stored, never the
+    // requested-but-not-persisted values. On a `(title, namespace)`
+    // upsert `db::insert` merges onto the existing row: tier stays
+    // monotonic-max (a `--tier short` upsert over a `long` row stays
+    // `long`), `version` bumps, and `expires_at` follows the persisted
+    // tier — so echoing `mem` would report a downgrade / expiry /
+    // version that never happened (the #2444 reports-success-doing-
+    // nothing / honesty class). FAIL CLOSED on a failed read-back —
+    // see `read_back_persisted`. MCP precedent:
+    // `src/mcp/tools/store/mod.rs` `echo_tier`.
+    //
+    // Audit is emitted in BOTH arms: Allow + persisted target on
+    // success; Error + `verification_failed` + requested target on
+    // the fail-closed path (the row is already committed; PR-5
+    // forbids a silent write).
+    let persisted = match read_back_persisted(&conn, &actual_id) {
+        Ok(p) => {
+            crate::audit::emit(crate::audit::EventBuilder::new(
+                crate::audit::AuditAction::Store,
+                store_actor,
+                crate::audit::target_memory(
+                    actual_id.clone(),
+                    p.namespace.clone(),
+                    Some(p.title.clone()),
+                    Some(p.tier.to_string()),
+                    args.scope.clone(),
+                ),
+            ));
+            p
+        }
+        Err(e) => {
+            crate::audit::emit(
+                crate::audit::EventBuilder::new(
+                    crate::audit::AuditAction::Store,
+                    store_actor,
+                    crate::audit::target_memory(
+                        actual_id.clone(),
+                        mem.namespace.clone(),
+                        Some(mem.title.clone()),
+                        Some(mem.tier.to_string()),
+                        args.scope.clone(),
+                    ),
+                )
+                .error(format!("verification_failed: {e}")),
+            );
+            return Err(e);
+        }
+    };
     let filtered: Vec<&String> = contradictions
         .iter()
         .filter(|c| c.id != mem.id && c.id != actual_id)
@@ -521,6 +520,41 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+/// #3025 — read back the row `db::insert` just committed, so the response can
+/// report what the DB ACTUALLY stored rather than what the caller requested.
+///
+/// Lives BELOW `run` so `#[allow(clippy::too_many_lines)]` and `run`'s
+/// doc-comment attach to `run` (not this helper).
+///
+/// **Fails closed (ERRORS-19).** The guarantee this fix exists to make is
+/// "the response reports the STORED values, not the requested ones". A
+/// verification read that fails and then falls back to echoing the REQUESTED
+/// values breaks exactly that guarantee on the error path, and does it
+/// invisibly: the caller cannot tell a verified echo from an unverified one,
+/// which is the same reports-success-doing-nothing class (#2444) the fix was
+/// written to close. So both failure modes are errors:
+///
+/// * `Err` — the read itself failed (transient / IO).
+/// * `Ok(None)` — an INVARIANT VIOLATION: `db::insert` returned this id, so the
+///   row must be readable. Never a silent fallback.
+///
+/// Both messages state that the WRITE ALREADY HAPPENED and name the id, so an
+/// operator reading the failure knows the row exists and only its verification
+/// failed — the exit code must not be read as "nothing was stored".
+fn read_back_persisted(conn: &rusqlite::Connection, actual_id: &str) -> Result<models::Memory> {
+    match db::get(conn, actual_id) {
+        Ok(Some(persisted)) => Ok(persisted),
+        Ok(None) => anyhow::bail!(
+            "memory {actual_id} WAS STORED, but the read-back that verifies what was persisted \
+             found no such row; refusing to report the requested values as if they were stored"
+        ),
+        Err(e) => anyhow::bail!(
+            "memory {actual_id} WAS STORED, but the read-back that verifies what was persisted \
+             failed: {e}; refusing to report the requested values as if they were stored"
+        ),
+    }
 }
 
 #[cfg(test)]

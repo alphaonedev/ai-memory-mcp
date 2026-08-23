@@ -113,7 +113,11 @@ write is permission-evaluated as; see the operator note below.
   guarantee on the error path and left the caller unable to tell a verified
   echo from an unverified one. Both messages state that the WRITE ALREADY
   HAPPENED and name the id, so a non-zero exit is not misread as "nothing was
-  stored". Source: `src/cli/store.rs`.
+  stored". The PR-5/#487 Store audit now emits AFTER the read-back using the
+  persisted title/namespace/tier (never the requested ones), and also emits
+  on the fail-closed path as `outcome=error` / `error=verification_failed: …`
+  so a committed row is never silent on the trail (ERRORS-19). Source:
+  `src/cli/store.rs`.
 - **#3040 — MCP `memory_list` ignored `AI_MEMORY_MAX_PAGE_SIZE` while HTTP
   honored it (asymmetric OOM guard).** The MCP stdio loop carries no `AppState`,
   so the resolved `[limits].max_page_size` cap is now mirrored into a
