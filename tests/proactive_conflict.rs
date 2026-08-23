@@ -400,8 +400,12 @@ fn a5_1579_candidates_path_applies_namespace_and_liveness_filters() {
     let foreign = make_mem("shared-fact", "the answer is 42", "ns-other");
     let foreign_id = insert_with_embedding(&conn, &foreign, &emb);
 
-    // Expired in-namespace near-duplicate.
+    // Expired in-namespace near-duplicate. `make_mem` defaults to Long;
+    // #2399 makes long-tier writes permanent, so a past `expires_at` on
+    // Long is stripped and the liveness filter would never see it. Mid
+    // keeps TTL load-bearing, which is what this pin is about.
     let mut expired = make_mem("shared-fact-x", "the answer is 41", "ns-mine");
+    expired.tier = Tier::Mid;
     expired.expires_at = Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
     let expired_id = insert_with_embedding(&conn, &expired, &emb);
 

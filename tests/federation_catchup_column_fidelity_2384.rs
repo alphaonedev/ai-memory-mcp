@@ -87,8 +87,11 @@ fn fresh_conn() -> rusqlite::Connection {
 fn maximal_memory() -> Memory {
     Memory {
         id: uuid::Uuid::new_v4().to_string(),
-        // Default reconstruction would be `Tier::Mid`.
-        tier: Tier::Long,
+        // Default reconstruction would be `Tier::Mid`. Must NOT be
+        // `Tier::Long`: #2399 makes a fresh long-tier write permanent, so
+        // a caller-supplied `expires_at` is stripped and this fixture
+        // could not pin that column on the catch-up projection.
+        tier: Tier::Short,
         namespace: "team/fed-2384".to_string(),
         title: "federation catch-up column fidelity — #2384".to_string(),
         content: "a Decision-kind claim with a bounded validity window".to_string(),

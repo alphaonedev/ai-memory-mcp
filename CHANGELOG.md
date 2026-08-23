@@ -774,7 +774,11 @@ backend and missing or divergently implemented on its twin). Pinned by
   survived forever. The long gate now runs FIRST in both the handler SSOT (so
   the create response is truthful) and in `Memory::effective_expires_at`, which
   is the shared store funnel every sqlite insert path and ~10 postgres write
-  sites bind `expires_at` through.
+  sites bind `expires_at` through. Tests that used `Tier::Long` only as a
+  non-default label while also asserting a live `expires_at` (catch-up
+  column fidelity #2384; proactive-conflict liveness filter) now pin TTL
+  on Short/Mid so they still prove the column / filter, not the permanence
+  contract.
 - **A merged row's `confidence` and its calibration record could come from
   different operands (#2395).** `confidence` merged by `MAX` / `GREATEST` while
   `confidence_source`, `confidence_signals` and `confidence_decayed_at` merged
