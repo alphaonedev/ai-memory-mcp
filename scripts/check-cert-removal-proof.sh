@@ -146,7 +146,9 @@ restore_mutations() {
 # an unscannable tree is never reported as clean).
 marked_src_files() {
   local files rc=0
-  files="$(git grep -l -e "$MUT_MARK" -- src 2>/dev/null)" || rc=$?
+  # --untracked: an aborted run that never `git add`ed the rewrite is still
+  # a live disabled control (#3119 Fable gate). rc>1 → could not scan.
+  files="$(git grep -l --untracked -e "$MUT_MARK" -- src tests conformance examples sdk 2>/dev/null)" || rc=$?
   if (( rc > 1 )); then
     return 2
   fi
@@ -182,7 +184,7 @@ assert_no_mutation_in_src() {
 # downgrades a failure.
 on_exit() {
   local rc=$?
-  trap - EXIT INT TERM HUP
+  trap - EXIT INT TERM HUP QUIT PIPE
   kill_guard_child
   restore_mutations
   if ! assert_no_mutation_in_src; then
@@ -200,7 +202,7 @@ on_exit() {
 # "cancelled" from "failed" (or a `timeout --preserve-status`) would be lied to.
 on_signal() {
   local sig="$1"
-  trap - EXIT INT TERM HUP
+  trap - EXIT INT TERM HUP QUIT PIPE
   echo "" >&2
   echo "[$sig] interrupted — restoring ${#MUTATED[@]} mutated file(s) before dying…" >&2
   kill_guard_child
@@ -215,6 +217,8 @@ trap on_exit EXIT
 trap 'on_signal INT' INT
 trap 'on_signal TERM' TERM
 trap 'on_signal HUP' HUP
+trap 'on_signal QUIT' QUIT
+trap 'on_signal PIPE' PIPE
 
 # control-name | shape | mutation-payload | target-file | lane-test-crate | lane-test-fn
 # shape ∈ {return, body} — see the header for the two grammars. The payload is the
@@ -452,6 +456,10 @@ list_map() {
 # `return` shape (all 5 shipped rows), so this is the mechanical proof that the
 # PR-0 `body` grammar is load-bearing.
 self_test() {
+  if ! grep -qF "$MUT_MARK" "$SELF"; then
+    echo "FAIL: harness no longer carries the mutation MARKER literal" >&2
+    return 1
+  fi
   local dir="$EVIDENCE_DIR/self-test"
   rm -rf "$dir"; mkdir -p "$dir"
   local fx="$dir/fixture.rs"
@@ -655,10 +663,17 @@ run_one() {
   # 3. revert
   restore_mutations
   if grep -q "$MUT_MARK" "$tf"; then
-    # Re-register so the EXIT trap gets another attempt and, failing that,
-    # SHOUTS. A file the revert could not clean must never fall off the ledger.
     MUTATED+=("$tf")
     echo "  [ERR] revert FAILED — mutation still present!"
+    echo "  dump: git diff HEAD -- $tf" >&2
+    git diff HEAD -- "$tf" >&2 || true
+    restore_mutations
+    return 3
+  fi
+  if ! git diff --quiet HEAD -- "$tf"; then
+    echo "  [ERR] post-restore $tf still differs from HEAD" >&2
+    git diff HEAD -- "$tf" >&2 || true
+    restore_mutations
     return 3
   fi
 
@@ -757,7 +772,15 @@ overall=0
 for row in "${MAP[@]}"; do
   IFS='|' read -r ctl shape mut tf crate fn <<<"$row"
   [[ "$sel" != "ALL" && "$sel" != "$ctl" ]] && continue
-  run_one "$ctl" "$shape" "$mut" "$tf" "$crate" "$fn" || overall=1
+  local_rc=0
+  run_one "$ctl" "$shape" "$mut" "$tf" "$crate" "$fn" || local_rc=$?
+  if [[ $local_rc -eq 3 ]]; then
+    echo "❌ revert failed on $ctl — refusing to continue the MAP (tree may still be mutated)" >&2
+    restore_mutations
+    assert_no_mutation_in_src || true
+    exit 3
+  fi
+  [[ $local_rc -ne 0 ]] && overall=1
 done
 
 echo
