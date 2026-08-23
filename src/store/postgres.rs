@@ -19523,80 +19523,73 @@ impl MemoryStore for PostgresStore {
         self.assert_caller_owns_for_mutation(ctx, id, "delete", REASON_UNSTAMPED_TENANT_DELETE)
             .await?;
 
-        // #1642 / #2503 — parity with sqlite `storage::delete`: if this memory
-        // is registered as a namespace standard, SEVER the `namespace_meta`
-        // binding(s) pointing at it BEFORE deleting the memory, mirroring the
-        // sqlite ordering. Pre-#1642 the postgres delete left a dangling
-        // `standard_id`; pre-#2503 both backends DELETED the binding rows,
-        // destroying the governance configuration (and `parent_namespace`
-        // inheritance link) of every namespace that pointed here — including
-        // namespaces the deleting principal has no authority over.
+        // #1642 / #2503 / #3245 — SEVER `namespace_meta` bindings pointing
+        // here BEFORE the row DELETE, matching sqlite `storage::delete`
+        // (`delete_inner`: sever, optional TOMBSTONE leaf, DELETE). Pre-#1642
+        // postgres left a dangling `standard_id`; pre-#2503 both backends
+        // DELETED the binding rows (destroying `parent_namespace` inheritance
+        // of namespaces the deleting principal has no authority over).
+        // Pre-#3245 the sever ran pool-direct on `&self.pool` BEFORE
+        // `begin()`, so a failing delete committed an unrecoverable policy
+        // downgrade while the memory stayed live; flag-OFF was two autocommit
+        // statements with the same window. One tx now covers sever + leaf +
+        // delete: either the memory is gone WITH its sever (and leaf), or
+        // nothing changed.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("delete begin tx", e))?;
         sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("delete: namespace_meta sever", e))?;
 
-        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact TOMBSTONE:
-        // under the flag, run the leaf + the memory delete in ONE tx so they
-        // commit atomically. Flag-OFF falls through to the byte-identical
-        // pool-direct delete below.
-        if crate::config::append_only_enabled() {
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|e| to_store_err("delete begin tx", e))?;
-            if let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact TOMBSTONE
+        // leaf in THIS tx, before the delete. Flag-OFF skips the leaf and
+        // still runs the delete in the same tx (not a second autocommit).
+        if crate::config::append_only_enabled()
+            && let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("delete read row for tombstone leaf", e))?
-            {
-                pg_emit_revision_leaf_if_enabled(
-                    &mut tx,
-                    id,
-                    crate::revisions::RecordKind::Tombstone,
-                    Some(ver),
-                    &ns,
-                    None,
-                    &chrono::Utc::now().to_rfc3339(),
-                )
-                .await
-                .map_err(|e| to_store_err("append tombstone revision leaf", e))?;
-            }
-            let rows = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("delete", e))?
-                .rows_affected();
-            tx.commit()
-                .await
-                .map_err(|e| to_store_err("delete commit tx", e))?;
-            if rows == 0 {
-                return Err(StoreError::NotFound { id: id.to_string() });
-            }
-            self.unproject_memory_ids_best_effort(&[id]).await;
-            return Ok(());
+        {
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                id,
+                crate::revisions::RecordKind::Tombstone,
+                Some(ver),
+                &ns,
+                None,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+            .map_err(|e| to_store_err("append tombstone revision leaf", e))?;
         }
-
-        let rows_affected = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
+        let rows = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("delete", e))?
             .rows_affected();
-        if rows_affected == 0 {
-            Err(StoreError::NotFound { id: id.to_string() })
-        } else {
-            // #1783 — the relational row + its cascade-deleted memory_links
-            // are gone; remove the now-orphaned AGE :Memory node + edges so
-            // kg_query/find_paths don't return ghost edges. Best-effort,
-            // own-tx (this path is pool-direct, no surrounding tx).
-            self.unproject_memory_ids_best_effort(&[id]).await;
-            Ok(())
+        // #3245 Fable gate — a 0-row DELETE is NotFound. Commit-then-NotFound
+        // would land the namespace_meta sever (and any flag-ON tombstone leaf)
+        // for a row that was never deleted. Dropping `tx` rolls back. Mirrors
+        // sqlite `delete_inner`. ERRORS-09 / fail-closed.
+        if rows == 0 {
+            return Err(StoreError::NotFound { id: id.to_string() });
         }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("delete commit tx", e))?;
+        // #1783 — the relational row + its cascade-deleted memory_links
+        // are gone; remove the now-orphaned AGE :Memory node + edges so
+        // kg_query/find_paths don't return ghost edges. Best-effort,
+        // own-tx (after the delete tx commits).
+        self.unproject_memory_ids_best_effort(&[id]).await;
+        Ok(())
     }
 
     async fn list(&self, ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>> {
