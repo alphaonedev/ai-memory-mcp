@@ -28,6 +28,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multi-thread `spawn_blocking` positive-control test asserts the pass
   ran; the existing `#[tokio::test]` panic-avoidance skip is kept.
 
+### Security (migration core-relation gate: an unreadable `memories` COUNT is not "no corpus"; #3246)
+
+Closes a remaining fail-OPEN in the #3113 sqlite ladder gate. The populated-corpus
+discriminator refused only on `Some(n > 0)`; `corpus_row_count` used `.ok()` so
+any `COUNT(*) FROM memories` fault became `None`, and `None` was treated as the
+same no-brick path as `Some(0)`. `memories` ships in the bootstrap `SCHEMA` and
+is replayed by `db::open` before `migrate`, so `None` never means "fixture
+without a corpus" — it means the count FAILED (corruption / I/O / `BUSY`).
+Under `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1` (pinned ON by `asi-hard`) a
+database with missing core relations AND an unreadable corpus stamped the tip
+with only a WARN. The same PR already removed `.ok()` on the `sqlite_master`
+probe (citing #2445) but kept it for the corpus probe.
+
+- **`Some(0)` stays the documented no-brick path.** An empty fixture / archive-less
+  deployment still opens under enforcement; `asi-hard` does not become more
+  fragile than `standard`.
+- **`None` / a failed COUNT refuses under enforcement** and, under the
+  DEFAULT (non-enforced) posture, **fails the migration** (`Err`) instead of
+  warning-and-stamping — the named change, not a silent tightening of the
+  documented `Some(0)` no-brick path. Either way the tail cannot stamp
+  integrity as intact on the strength of a failed read. The check is still
+  inside the migrate transaction BEFORE the stamp: a refusal rolls the
+  ladder back and leaves the database UNCHANGED.
+- **Truthy grammar SSOT.** `config::migration_require_core_tables` now delegates
+  to `governance::audit::env_flag_enabled` (`1` / `true` / `yes` / `on`); the
+  documented tokens are unchanged.
+
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 
 Two CLI paths diverged from the guard the MCP/HTTP reference surface already
