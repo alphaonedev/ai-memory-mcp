@@ -232,6 +232,37 @@ pub fn default_key_dir() -> Result<PathBuf> {
 /// `ensure_keypair` pointed at the same file across restarts.
 pub const DAEMON_KEYPAIR_LABEL: &str = "daemon";
 
+/// Substrings that mark a [`load`] / [`load_public`] failure as the
+/// ordinary "this key is simply not enrolled here" rung-miss rather than
+/// a real fault.
+///
+/// v1.0.0 #3051 — ONE named home for the discrimination that every
+/// keypair-resolution rung (MCP `load_active_keypair_for_mcp_in`, CLI
+/// `cli::link::resolve_active_link_keypair`) has to make, so the markers
+/// cannot drift apart between surfaces and the operator directive against
+/// scattered magic literals holds.
+const KEY_ABSENT_ERROR_MARKERS: [&str; 2] = ["No such file", "not found"];
+
+/// Is this keypair-load error just "the key does not exist"?
+///
+/// Resolution walks a ladder of candidate keys (per-agent, then the
+/// substrate `daemon` label) and a miss on a rung is expected and silent.
+/// Every OTHER failure — a mode-refused `.priv` (S4-LOW1), a truncated or
+/// corrupt key file, an unreadable directory — is operator-actionable and
+/// must be surfaced before the caller degrades to an unsigned write, or
+/// the degrade is indistinguishable from "no key configured".
+///
+/// Matches on the rendered `{err:#}` chain because [`load`] composes its
+/// causes with `anyhow::Context`; the concrete `io::ErrorKind` is not
+/// preserved through that chain.
+#[must_use]
+pub fn is_key_absent_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    KEY_ABSENT_ERROR_MARKERS
+        .iter()
+        .any(|marker| msg.contains(marker))
+}
+
 pub fn generate(agent_id: &str) -> Result<AgentKeypair> {
     validate::validate_agent_id_shape(agent_id)?;
     // ed25519-dalek 2.x consumes a `CryptoRngCore` (rand_core 0.6).
@@ -876,6 +907,39 @@ mod tests {
 
     fn tmp_dir() -> TempDir {
         TempDir::new().expect("tempdir")
+    }
+
+    /// v1.0.0 #3051 — the shared rung-miss predicate both keypair-resolution
+    /// ladders (MCP `load_active_keypair_for_mcp_in`, CLI
+    /// `cli::link::resolve_active_link_keypair`) branch on. It must classify
+    /// a genuinely absent key as silent, and EVERY other fault — notably the
+    /// S4-LOW1 mode refusal — as operator-visible, or a degraded-to-unsigned
+    /// write becomes indistinguishable from "no key configured".
+    #[test]
+    fn is_key_absent_error_only_swallows_a_missing_key_3051() {
+        let dir = tmp_dir();
+
+        // Absent key: expected rung-miss, silent.
+        let absent = load("nobody", dir.path()).expect_err("no such key");
+        assert!(
+            is_key_absent_error(&absent),
+            "a missing key must be classified absent; got: {absent:#}"
+        );
+
+        // Mode-refused `.priv` (S4-LOW1): a real fault, must NOT be swallowed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let kp = generate("alice").expect("generate");
+            save(&kp, dir.path()).expect("save");
+            let priv_path = dir.path().join(format!("alice{PRIV_SUFFIX}"));
+            fs::set_permissions(&priv_path, fs::Permissions::from_mode(0o644)).expect("widen mode");
+            let refused = load("alice", dir.path()).expect_err("insecure mode");
+            assert!(
+                !is_key_absent_error(&refused),
+                "a mode-refused .priv must stay operator-visible; got: {refused:#}"
+            );
+        }
     }
 
     #[test]

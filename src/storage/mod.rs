@@ -8098,8 +8098,12 @@ pub fn create_link(
 /// `memory_verify` will surface the signing identity from the keypair
 /// + signature, not from this column.
 ///
-/// Returns the chosen attest level so callers (HTTP/MCP wrappers) can
-/// surface it in the wire response without re-querying the row.
+/// Returns the attest level the row ACTUALLY carries, so callers
+/// (HTTP/MCP wrappers) can surface it in the wire response. On the
+/// normal insert path that is the level just computed and written; on
+/// the `INSERT OR IGNORE` no-op path (the `(source_id, target_id,
+/// relation)` edge already existed) it is the level read back off the
+/// stored row — see `stored_link_attest_level` (v1.0.0 #3051).
 pub fn create_link_signed(
     conn: &Connection,
     source_id: &str,
@@ -8309,7 +8313,50 @@ pub fn create_link_signed(
         }
     }
 
+    // v1.0.0 #3051 (R-405) — `INSERT OR IGNORE` wrote NOTHING when the
+    // `(source_id, target_id, relation)` edge already existed, yet we were
+    // still returning the freshly COMPUTED `attest_level`. That describes a
+    // signature the substrate never persisted: re-running `ai-memory link`
+    // over a pre-existing legacy `unsigned` edge left the row untouched and
+    // told the operator `(self_signed)`. An attestation label the durable row
+    // does not carry is an integrity overclaim, so on the no-op branch report
+    // what is ACTUALLY STORED instead. Fail closed: an unreadable, missing, or
+    // unrecognised column reports `unsigned` — the weakest honest claim — and
+    // never the stronger computed one.
+    if inserted == 0 {
+        return Ok(stored_link_attest_level(
+            conn, source_id, target_id, relation,
+        ));
+    }
     Ok(attest_level)
+}
+
+/// v1.0.0 #3051 — read the `attest_level` PERSISTED on an existing
+/// `memory_links` row, for the `INSERT OR IGNORE` no-op branch of
+/// [`create_link_signed`].
+///
+/// Fail-closed by construction: a query error, an absent row, a NULL column,
+/// or a value outside [`crate::models::AttestLevel`]'s known set all collapse
+/// to `"unsigned"`. Reporting a weaker level than the row holds costs a caller
+/// nothing; reporting a stronger one would be an unbacked attestation claim.
+fn stored_link_attest_level(
+    conn: &Connection,
+    source_id: &str,
+    target_id: &str,
+    relation: &str,
+) -> &'static str {
+    conn.query_row(
+        "SELECT attest_level FROM memory_links \
+         WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
+        params![source_id, target_id, relation],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .and_then(|level| crate::models::AttestLevel::from_str(&level))
+    .map_or(crate::models::AttestLevel::Unsigned.as_str(), |lvl| {
+        lvl.as_str()
+    })
 }
 
 /// v0.7.0 issue #812 / #813 — return the strongest `attest_level`

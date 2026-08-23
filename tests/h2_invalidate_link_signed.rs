@@ -252,3 +252,63 @@ fn unsigned_link_invalidation_does_not_create_audit_row() {
          got: {listed:?}"
     );
 }
+
+/// v1.0.0 #3051 (R-405) — `create_link_signed` uses `INSERT OR IGNORE`, so a
+/// second call over an already-existing `(source, target, relation)` edge
+/// writes NOTHING. Before the fix it still returned the freshly COMPUTED
+/// `self_signed` level, so re-running `ai-memory link` over a legacy unsigned
+/// edge printed `(self_signed)` for a row that was, and remained, unsigned —
+/// an attestation claim the durable state does not back.
+///
+/// Post-fix: the no-op branch reports the STORED level and the row is byte-
+/// unchanged (no signature, no attest upgrade, no duplicate audit row).
+#[test]
+fn resigning_existing_unsigned_edge_reports_stored_level_3051() {
+    let _g = ENV_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let f = setup();
+
+    // 1. Legacy unsigned edge.
+    let first = db::create_link_signed(&f.conn, &f.src_id, &f.dst_id, "related_to", None)
+        .expect("create unsigned");
+    assert_eq!(first, "unsigned");
+    let before = read_signature_and_attest(&f.conn, &f.src_id, &f.dst_id);
+    assert_eq!(before, (None, Some("unsigned".to_string())));
+    let audit_rows_after_first = created_audit_rows(&f.conn);
+
+    // 2. Re-run WITH a signing keypair over the same triple.
+    let alice = kp_mod::generate("alice").expect("generate");
+    kp_mod::save(&alice, f.keys_tmp.path()).expect("save");
+    let second = db::create_link_signed(&f.conn, &f.src_id, &f.dst_id, "related_to", Some(&alice))
+        .expect("re-create over existing edge");
+
+    // 3. The reported level must be the STORED one, not the computed one.
+    assert_eq!(
+        second, "unsigned",
+        "an INSERT OR IGNORE no-op must report the stored attest_level (#3051), \
+         not the signature it computed but never persisted"
+    );
+
+    // 4. The row itself is untouched — no silent signature/attest upgrade.
+    let after = read_signature_and_attest(&f.conn, &f.src_id, &f.dst_id);
+    assert_eq!(after, before, "the pre-existing row must not be mutated");
+
+    // 5. And no DUPLICATE `memory_link.created` audit row was appended for
+    // the replay — the count is whatever step 1 produced, unchanged.
+    assert_eq!(
+        created_audit_rows(&f.conn),
+        audit_rows_after_first,
+        "an INSERT OR IGNORE no-op must not append a second \
+         memory_link.created audit row (#3051)"
+    );
+}
+
+/// Count of `memory_link.created` rows currently in the audit ledger.
+fn created_audit_rows(conn: &rusqlite::Connection) -> usize {
+    signed_events::list_signed_events(conn, None, 1000, 0)
+        .expect("list")
+        .iter()
+        .filter(|e| e.event_type == "memory_link.created")
+        .count()
+}
