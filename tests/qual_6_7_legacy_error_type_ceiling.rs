@@ -248,7 +248,15 @@ const QUAL_6_CEILING: usize = 124;
 // (operator-facing write-time validator, rendered verbatim by `rules add`).
 // Floors never fall: #3204's `gate_gc_sweep` and #3031's matcher validator
 // are independent adds. Measured after rebase.
-const QUAL_7_CEILING: usize = 45;
+// 2026-08-26 (#3239 rebase onto e9bf9dea) — raised 45 → 47 for the two
+// #3173 mutate-site helpers `assert_caller_may_mutate` /
+// `assert_caller_may_mutate_all` in `src/mcp/tools/store/synthesis.rs`.
+// They return `Result<(), String>` so a cross-owner refusal flows verbatim
+// into the MCP `handle_store` `Result<Value, String>` envelope
+// (`CALLER_DOES_NOT_OWN_MEMORY`) — the same String-refusal contract as
+// the rest of the store handler, not a new error type. Independent of
+// #3204/#3223; never lower. Re-measure after this rebase.
+const QUAL_7_CEILING: usize = 47;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {

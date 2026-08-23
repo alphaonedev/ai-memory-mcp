@@ -18,7 +18,7 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::similar_names)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use ai_memory::config::ResolvedTtl;
@@ -98,10 +98,10 @@ fn seed_owned(
     id
 }
 
-fn run_store(conn: &Connection, db_path: &PathBuf, params: Value) -> Result<Value, String> {
+fn run_store(conn: &Connection, db_path: &Path, params: &Value) -> Result<Value, String> {
     let ttl = ResolvedTtl::default();
     ai_memory::mcp::tools::handle_store_for_tests(
-        conn, db_path, &params, None, None, None, &ttl,
+        conn, db_path, params, None, None, None, &ttl,
         false, // autonomous_hooks off — exact-dup path is LLM-independent
         None, None,
     )
@@ -149,7 +149,7 @@ fn exact_dup_cross_owner_merge_refuses_and_preserves_3173() {
     let err = run_store(
         &conn,
         &path,
-        json!({
+        &json!({
             "title": title,
             "content": "bob overwrite attempt — must never land",
             "namespace": ns,
@@ -197,7 +197,7 @@ fn similar_title_does_not_mutate_other_owner_3173() {
     let resp = run_store(
         &conn,
         &path,
-        json!({
+        &json!({
             "title": "kubernetes rolling deploy strategy",
             "content": "bob's own similar-title row — must insert, never touch alice",
             "namespace": ns,
@@ -238,7 +238,7 @@ fn exact_dup_single_operator_default_still_merges_3173() {
     let resp = run_store(
         &conn,
         &path,
-        json!({
+        &json!({
             "title": title,
             "content": "merged content from trust-all default",
             "namespace": ns,
