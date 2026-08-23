@@ -10627,13 +10627,16 @@ legacy_scoring = false
         }
     }
 
-    /// #3002 — `config_path()` MUST honor `XDG_CONFIG_HOME` so `config.toml`
-    /// resolves under the SAME platform-config root the identity key dir
-    /// (`src/identity/keypair.rs`) and the hooks resolver
-    /// (`src/hooks/config.rs`) use. Pre-fix it hardcoded `$HOME/.config`, so
-    /// on any host that set `XDG_CONFIG_HOME` the config loaded from one root
-    /// while the signing keys were looked for under another — a certified
-    /// daemon could boot "continuing unsigned" against the wrong root.
+    /// #3002 — `config_path()` MUST resolve under `dirs::config_dir()` so
+    /// `config.toml` lives at the SAME platform-config root the identity key
+    /// dir (`src/identity/keypair.rs`) and the hooks resolver
+    /// (`src/hooks/config.rs`) use. Pre-fix it hardcoded `$HOME/.config`.
+    ///
+    /// `dirs::config_dir()` is `$XDG_CONFIG_HOME` (else `$HOME/.config`) on
+    /// Linux and `$HOME/Library/Application Support` on macOS — it does
+    /// **not** honor `XDG_CONFIG_HOME` on macOS. Pinning the expected path
+    /// against `dirs::config_dir()` (rather than the env var) is what keeps
+    /// this test true on both Check legs (#3215 macos-fed,sqlite RED).
     #[test]
     fn config_path_honors_xdg_config_home() {
         // M9 — process-wide serialization via env_var_lock.
@@ -10647,16 +10650,16 @@ legacy_scoring = false
             std::env::set_var("XDG_CONFIG_HOME", xdg_root);
         }
         let path = AppConfig::config_path().expect("config_path resolves");
-        assert_eq!(
-            path,
-            xdg_root.join("ai-memory").join("config.toml"),
-            "config.toml must resolve under XDG_CONFIG_HOME, not $HOME/.config"
-        );
-        assert!(
-            !path.starts_with("/some/home"),
-            "config.toml split off from the XDG root: {path:?}"
-        );
-        // SAFETY: restore under the same lock.
+        let platform = dirs::config_dir()
+            .expect("dirs::config_dir resolves under the sandbox env")
+            .join("ai-memory")
+            .join("config.toml");
+        let hardcoded_legacy = std::path::Path::new("/some/home")
+            .join(".config")
+            .join("ai-memory")
+            .join("config.toml");
+        // SAFETY: restore under the same lock, BEFORE asserting so a failure
+        // cannot leak the sandbox env into sibling tests.
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("HOME", v),
@@ -10667,6 +10670,15 @@ legacy_scoring = false
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+        assert_eq!(
+            path, platform,
+            "config.toml must resolve under dirs::config_dir() (keys/hooks root), \
+             not a hardcoded $HOME/.config"
+        );
+        assert_ne!(
+            path, hardcoded_legacy,
+            "pre-#3002 hardcoded $HOME/.config must not win when dirs::config_dir() differs: {path:?}"
+        );
     }
 
     /// #3002 + #3166 — the XDG move must NOT orphan a config an operator
@@ -10714,8 +10726,11 @@ legacy_scoring = false
         );
     }
 
-    /// #3002 — when BOTH roots carry a `config.toml`, the XDG-correct one
-    /// wins (the legacy path is a fallback, never an override).
+    /// #3002 — when BOTH roots carry a `config.toml`, the `dirs::config_dir()`
+    /// one wins (the `$HOME/.config` path is a fallback, never an override).
+    /// The platform root is `XDG_CONFIG_HOME` on Linux and
+    /// `$HOME/Library/Application Support` on macOS — write the "XDG" file
+    /// at `dirs::config_dir()`, not at the env-var path, so macOS is covered.
     #[test]
     fn config_path_prefers_xdg_when_both_exist_3002() {
         // M9 — process-wide serialization via env_var_lock.
@@ -10726,15 +10741,20 @@ legacy_scoring = false
         let home = tmp.path().join("home");
         let xdg_root = tmp.path().join("xdg");
         let legacy = home.join(".config").join("ai-memory").join("config.toml");
-        let xdg_cfg = xdg_root.join("ai-memory").join("config.toml");
-        for f in [&legacy, &xdg_cfg] {
-            std::fs::create_dir_all(f.parent().expect("parent")).expect("mkdir");
-            std::fs::write(f, "tier = \"keyword\"\n").expect("write");
-        }
-        // SAFETY: env mutation serialised by `_g`; restored below.
+        // SAFETY: env mutation serialised by `_g`; restored below. Must be
+        // set BEFORE `dirs::config_dir()` so the platform path we write is
+        // the one production will actually prefer.
         unsafe {
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_CONFIG_HOME", &xdg_root);
+        }
+        let platform = dirs::config_dir()
+            .expect("dirs::config_dir resolves under the sandbox env")
+            .join("ai-memory")
+            .join("config.toml");
+        for f in [&legacy, &platform] {
+            std::fs::create_dir_all(f.parent().expect("parent")).expect("mkdir");
+            std::fs::write(f, "tier = \"keyword\"\n").expect("write");
         }
         let path = AppConfig::config_path().expect("config_path resolves");
         // SAFETY: restore under the same lock, before asserting.
@@ -10749,8 +10769,8 @@ legacy_scoring = false
             }
         }
         assert_eq!(
-            path, xdg_cfg,
-            "the XDG root must win when it carries a config"
+            path, platform,
+            "the dirs::config_dir() root must win when it carries a config"
         );
     }
 
