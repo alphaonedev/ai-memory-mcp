@@ -28091,14 +28091,33 @@ impl MemoryStore for PostgresStore {
         }))
     }
 
+    /// v1.0.0 #2617 — O(1) liveness probe, per the trait MUST ("keep this
+    /// method O(1) in corpus size and MUST NOT take a write lock").
+    ///
+    /// This used to run `SELECT COUNT(*)::BIGINT FROM memories` first and
+    /// DISCARD the result (`let _`), described in-comment as "a cheap SELECT
+    /// against the memories table". Postgres plans it as an Index Only Scan
+    /// over EVERY row — measured 1.135 ms vs 0.152 ms for `SELECT 1` on a
+    /// 10,724-row corpus, i.e. ~88% of the probe's database time, growing
+    /// linearly. `/health` is scraped on a fixed orchestrator interval and is
+    /// exempt from admission control, so at corpus scale the probe crosses
+    /// the Kubernetes default `timeoutSeconds: 1` and kills HEALTHY pods —
+    /// the exact failure mode #2579 closed on the sqlite twin. The count
+    /// proved nothing the `SELECT 1` round-trip does not already prove
+    /// (connection-pool + network liveness); its entire contribution was
+    /// cost.
+    ///
+    /// The `EXISTS` probe keeps a real touch of the `memories` relation
+    /// (so a dropped / unreadable table still fails the probe) while
+    /// remaining O(1): the planner short-circuits on the first row.
     async fn health_check(&self) -> StoreResult<bool> {
-        // Postgres equivalent of SQLite's FTS integrity probe: a cheap
-        // SELECT against the memories table plus a SELECT 1 round-trip
-        // so connection-pool / network-layer failures surface.
-        let _: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM memories")
+        // Touches the memories relation without scanning it: `LIMIT 1`
+        // inside EXISTS stops at the first row (and answers `false`
+        // immediately on an empty corpus), so cost is constant in rows.
+        let _: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memories LIMIT 1)")
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| to_store_err("health_check count", e))?;
+            .map_err(|e| to_store_err("health_check probe", e))?;
         let one: i32 = sqlx::query_scalar("SELECT 1")
             .fetch_one(&self.pool)
             .await
