@@ -854,7 +854,7 @@ async fn via_store_dispatchers_round_trip() {
     assert!(pend.is_empty());
 
     // kg_invalidate_via_store marks the edge.
-    let inv = kg_invalidate_via_store(&store, &a, &b, "related_to", None)
+    let inv = kg_invalidate_via_store(&store, &a, &b, "related_to", None, None)
         .await
         .expect("kg_invalidate_via_store");
     assert!(inv.found);
