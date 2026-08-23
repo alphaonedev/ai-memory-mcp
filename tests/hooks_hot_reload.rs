@@ -34,6 +34,8 @@ use tokio::sync::RwLock;
 /// see the comment there on the explicit fsync + drop dance that
 /// avoids ETXTBSY on fast Linux runners.
 fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let path = dir.path().join(name);

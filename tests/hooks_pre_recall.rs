@@ -36,6 +36,8 @@ use tempfile::TempDir;
 // ---------------------------------------------------------------------------
 
 fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let path = dir.path().join(name);
@@ -51,6 +53,8 @@ fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
 }
 
 fn cfg_for(command: PathBuf, mode: HookMode, timeout_ms: u32) -> HookConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     HookConfig {
         event: HookEvent::PreRecallExpand,
         command,
@@ -344,6 +348,8 @@ async fn empty_chain_skips_marshal_and_returns_allow() {
 /// Build a `HookConfig` for a subprocess hook targeting `event`. The
 /// command path is filled in by the caller after writing the script.
 fn make_hook_cfg(command: PathBuf, event: HookEvent, mode: HookMode) -> HookConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     HookConfig {
         event,
         command,
