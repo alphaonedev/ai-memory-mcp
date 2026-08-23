@@ -167,12 +167,23 @@ fn read_raw_link(path: &std::path::Path, src: &str, dst: &str) -> RawLink {
 }
 
 async fn seeded_pair(store: &SqliteStore, ctx: &CallerContext) -> (String, String) {
+    // Unique titles per call: `(title, namespace)` is the upsert key, so a
+    // second pair with the same titles would reuse the first pair's ids and
+    // the subsequent `link_signed` would `INSERT OR IGNORE` onto an already-
+    // invalidated edge (no second audit leaf).
+    let tag = uuid::Uuid::new_v4();
     let a = store
-        .store(ctx, &memory("parity/3178", "link-src", "alice"))
+        .store(
+            ctx,
+            &memory("parity/3178", &format!("link-src-{tag}"), "alice"),
+        )
         .await
         .expect("store src");
     let b = store
-        .store(ctx, &memory("parity/3178", "link-dst", "alice"))
+        .store(
+            ctx,
+            &memory("parity/3178", &format!("link-dst-{tag}"), "alice"),
+        )
         .await
         .expect("store dst");
     (a, b)
