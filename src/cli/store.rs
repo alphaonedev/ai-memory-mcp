@@ -160,8 +160,9 @@ pub fn run(
     let conn = db::open(db_path)?;
     let resolved_ttl = app_config.effective_ttl();
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
-    let tier = Tier::from_str(&args.tier)
-        .ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", args.tier))?;
+    // v1.0.0 #3130 — already fail-closed; routed through the shared
+    // `Tier::parse_strict` so the refusal wording is single-sourced.
+    let tier = Tier::parse_strict(&args.tier).map_err(|e| anyhow::anyhow!(e))?;
     // #1590 — explicit --namespace > configured [storage].default_namespace
     // > git remote > cwd basename > "global" (see `cli::helpers`).
     let namespace = crate::cli::helpers::resolve_namespace(args.namespace);

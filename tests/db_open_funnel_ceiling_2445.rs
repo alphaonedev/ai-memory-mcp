@@ -94,6 +94,17 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
          and it runs only after `migrate::open_store` has already opened and \
          guarded the same file in-process.",
     ),
+    (
+        "src/cli/backup.rs",
+        1,
+        "LIVENESS probe for `restore` (#3131). Opens READ_WRITE so \
+         `PRAGMA locking_mode=exclusive` + `BEGIN EXCLUSIVE` can detect a \
+         live daemon; it is NOT `db::open` because a probe must not run the \
+         bootstrap/ladder against the operator's live file. Schema-downgrade \
+         and rollback-evidence are applied immediately after the exclusive \
+         lock via `assert_schema_not_ahead` (#2445). The probe still \
+         checkpoints a hot WAL on close — that is why consent runs first.",
+    ),
 ];
 
 fn repo_root() -> PathBuf {

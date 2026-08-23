@@ -322,16 +322,27 @@ mod tests {
         ))
     }
 
+    /// These three tests mutate the same process-global env var. CI
+    /// `cargo test --lib` is parallel; without a lock, `honours_explicit`
+    /// can observe DEFAULT (256) when `default_when_unset` races it
+    /// (ubuntu-latest sqlite, #3136).
+    fn atomise_capacity_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn resolve_queue_capacity_default_when_unset() {
-        // SAFETY: test-local env mutation of a var no concurrent reader
-        // in this process observes (the house pattern for env resolvers).
+        let _g = atomise_capacity_env_lock();
+        // SAFETY: exclusive lock held; no concurrent reader of this var.
         unsafe { std::env::remove_var(ENV_ATOMISE_QUEUE_CAPACITY) };
         assert_eq!(resolve_queue_capacity(), ATOMISE_QUEUE_CAPACITY_DEFAULT);
     }
 
     #[test]
     fn resolve_queue_capacity_honours_explicit_positive_value() {
+        let _g = atomise_capacity_env_lock();
         unsafe { std::env::set_var(ENV_ATOMISE_QUEUE_CAPACITY, "19") };
         assert_eq!(resolve_queue_capacity(), 19);
         unsafe { std::env::remove_var(ENV_ATOMISE_QUEUE_CAPACITY) };
@@ -339,6 +350,7 @@ mod tests {
 
     #[test]
     fn resolve_queue_capacity_falls_through_on_zero_and_garbage() {
+        let _g = atomise_capacity_env_lock();
         unsafe { std::env::set_var(ENV_ATOMISE_QUEUE_CAPACITY, "0") };
         assert_eq!(resolve_queue_capacity(), ATOMISE_QUEUE_CAPACITY_DEFAULT);
         unsafe { std::env::set_var(ENV_ATOMISE_QUEUE_CAPACITY, "not-a-number") };

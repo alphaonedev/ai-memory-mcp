@@ -11022,17 +11022,22 @@ mod tests {
     }
 
     #[test]
-    fn handle_list_invalid_tier_treated_as_none() {
-        // tier::from_str returns None for an invalid value, which the
-        // handler tolerates (no validation error) — drives the
-        // and_then-None branch.
+    fn handle_list_invalid_tier_is_refused_3130() {
+        // v1.0.0 #3130 — an unrecognised tier is REFUSED. Pre-fix
+        // `Tier::from_str` answered None, the handler read that as "no
+        // tier constraint", and `memory_list` returned EVERY tier as if
+        // the caller had asked for no filter at all.
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let req = make_tools_call(
             "memory_list",
             json!({"namespace": "w12-list-bad-tier", "tier": "ULTRAMID", "format": "json"}),
         );
         let resp = invoke_handle_request(&conn, &req);
-        assert!(resp.error.is_none());
+        let rendered = format!("{:?}{:?}", resp.error, resp.result);
+        assert!(
+            rendered.contains("invalid tier"),
+            "an unrecognised tier must be refused: {rendered}"
+        );
     }
 
     #[test]
@@ -15844,13 +15849,15 @@ mod tests {
         assert!(transcripts[0].get("content").is_none());
     }
 
-    /// forget — invalid tier string is silently dropped (parse failure
-    /// falls through `Tier::from_str` to None). Exercises the `tier`
-    /// extraction branch.
+    /// v1.0.0 #3130 — forget REFUSES an invalid tier string instead of
+    /// silently dropping the filter. Pre-fix this test asserted the
+    /// opposite (`would_delete >= 1` with the tier filter dropped),
+    /// which is exactly the data-loss defect: on a live run the same
+    /// `None` erased every tier and answered success.
     #[test]
-    fn chunkc_forget_invalid_tier_string_silently_dropped() {
+    fn chunkc_forget_invalid_tier_string_is_refused_3130() {
         // #1772 — env lock: serialize against the AI_MEMORY_AGENT_ID-mutating
-        // forget tests so this env-unset would_delete assertion is stable.
+        // forget tests so this env-unset assertion is stable.
         let _envg = crate::identity::agent_id_env_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let _ = chunkc_seed_memory(&conn, "chunkc-forget-tier", "v1", Tier::Mid);
@@ -15863,11 +15870,15 @@ mod tests {
             }),
         );
         let resp = invoke_handle_request(&conn, &req);
-        assert!(resp.error.is_none());
-        let payload = i4_decode_response_payload(&resp);
-        assert_eq!(payload["dry_run"], true);
-        // Tier filter is dropped → would-delete count includes the row.
-        assert!(payload["would_delete"].as_u64().unwrap() >= 1);
+        let rendered = format!("{:?}{:?}", resp.error, resp.result);
+        assert!(
+            rendered.contains("invalid tier"),
+            "an unrecognised tier must be refused, not dropped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("would_delete"),
+            "a refused forget must not report a delete preview: {rendered}"
+        );
     }
 
     /// archive — restore returns `restored=true` for an id that was

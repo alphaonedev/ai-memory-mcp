@@ -735,6 +735,98 @@ truthful.
 
 ### Fixed
 
+- **`ai-memory restore` no longer publishes with a bare `fs::copy` onto the
+  live database** ([#3131](https://github.com/alphaonedev/ai-memory-mcp/issues/3131)).
+  The publish step was `std::fs::copy(&snapshot, &target_db)` straight onto the
+  target path, after renaming the current database out of the way. Three
+  failure modes followed: a daemon / MCP server holding the database open kept
+  writing into a file being overwritten (mixed pages plus an orphaned WAL); a
+  partial copy (ENOSPC, an interrupt) left a truncated database at the target
+  with **no** database there to fall back to, because the original had already
+  been renamed away; and there was no confirmation of any kind. `restore` now:
+  - **asks first** — a `Proceed? [y/N]` prompt, overridden by the new
+    `restore --yes`, matching `forget --confirm-global` /
+    `governance install-defaults --yes`. `--yes` is REQUIRED with `--json` and
+    whenever stdin is not a terminal. Consent runs BEFORE the liveness
+    probe: the probe opens READ_WRITE and on close recovers+checkpoints a
+    hot WAL, so an abort after the probe is not a no-op. "Aborted. The
+    database was not modified." is true only because the prompt is first;
+  - **refuses a live target** — a SQLite `locking_mode = EXCLUSIVE` probe
+    (after consent) detects any other open connection and refuses; a
+    corrupt/unreadable target is WARNed and allowed through, because
+    restoring over a database nothing can open is the disaster-recovery case
+    this verb exists for;
+  - **keeps the original in place** — the pre-restore safety net is now a
+    COPY to `<db>.pre-restore-<ts>.db` (with its sidecars), not a rename, so
+    the target path never goes empty;
+  - **stages, verifies, then swaps** — the replacement is written to a temp
+    file in the same directory, fsynced, and must pass `PRAGMA integrity_check`
+    before an atomic `rename` publishes it; a failure there deletes the staged
+    file and leaves the live database untouched;
+  - **removes the stale `-wal` / `-shm`** from beside the restored file as
+    best-effort after the swap (a sidecar unlink failure WARNs with the
+    manual `rm` path and does not fail a restore that already published);
+    the directory is fsynced immediately after the rename. A failed
+    rename deletes the staged `.<db>.restore-tmp-<ts>` rather than
+    leaving it beside the live corpus;
+  - **prints the rollback path** (and reports it as a `rollback` field in
+    `--json`).
+    **#2565 rider not folded:** writing a manifest for the pre-migration
+    snapshot is a separate backup-writer change; `restore --skip-verify`
+    already refuses a forward-schema file via the #2445 stamp probe.
+    Left as #2565.
+
+  **CLI contract change for scripts.** `restore` is destructive, so it now
+  prompts `Proceed? [y/N]` and the new `--yes` is REQUIRED with `--json` (a
+  prompt would corrupt the envelope) and whenever stdin is not a terminal
+  (cron, CI, a pipe) — a non-interactive `ai-memory restore` that does not
+  pass `--yes` now exits non-zero instead of restoring. Existing automation
+  must add `--yes`; the shipped runbooks
+  (`docs/production-deployment.md`, `docs/enterprise-deployment.md`,
+  `docs/RUNBOOK-curator-soak.md`) are updated in lockstep. A restore onto a
+  target another process holds open now also exits non-zero rather than
+  corrupting it, so DR automation must stop the daemon first.
+- **An unrecognised `--tier` / `tier` no longer widens the operation — every
+  tier-filter surface now FAILS CLOSED**
+  ([#3130](https://github.com/alphaonedev/ai-memory-mcp/issues/3130)).
+  `Tier::from_str` answers `None` for anything outside `short` / `mid` /
+  `long`, and the storage layer reads `None` as *"no tier constraint"*.
+  Six surfaces chained the two (`.and_then(Tier::from_str)`), so a typo did
+  not narrow the request, it WIDENED it: `ai-memory forget --tier Long`
+  matched **every** tier, erased the whole scope and printed
+  `forgot N memories` (silent, unintentional data loss), while
+  `search` / `list` (CLI and the MCP `memory_search` / `memory_list` tools)
+  returned **unfiltered** rows — wrong results, not fewer. The retier paths
+  (`ai-memory update --tier`, MCP `memory_update`) silently NO-OPed the
+  requested tier change and still reported success. All six now route through
+  the new fail-closed `Tier::parse_strict` / `Tier::parse_optional`, which
+  refuse with `invalid tier: <value> (use short, mid, long)` **before** the
+  store is opened or a single id is collected — non-zero exit, nothing
+  deleted, nothing returned. An ABSENT tier still means genuinely
+  unconstrained; that is exactly the distinction the old shape collapsed.
+  The reflect payload's `tier` field uses the same `parse_optional` (absent
+  → Mid default for a new row; present-but-unrecognised → InvalidArgument)
+  instead of `.and_then(Tier::from_str).unwrap_or(Tier::Mid)`.
+  The HTTP `POST /api/v1/notify` Postgres branch is brought to the same
+  posture as its sqlite/MCP siblings (400 instead of a silent
+  default-tier write), and the two already-correct sites
+  (`ai-memory store`, `ai-memory mine`) now single-source the refusal wording.
+
+  **Operator-visible behaviour change.** An unrecognised `--tier` / `tier`
+  value is now REFUSED with `invalid tier: <value> (use short, mid, long)` and
+  a non-zero exit on `forget` / `search` / `list` / `update` across the CLI,
+  the MCP tools and the HTTP notify Postgres branch. Previously the same value
+  was silently treated as *"no tier constraint"* and the command exited 0 — on
+  `forget`, after erasing EVERY tier in scope. A script that relied on the old
+  leniency must now pass a canonical tier.
+
+  Four in-tree tests had PINNED the lenient behaviour and are rewritten to
+  assert the refusal:
+  `mcp::tools::forget::tests::forget_with_invalid_tier_string_treated_as_none`,
+  `mcp::tests::handle_list_invalid_tier_treated_as_none`,
+  `mcp::tests::chunkc_forget_invalid_tier_string_silently_dropped`, and the
+  "silently falls through" arm of
+  `mcp::tools::list::tests::filters_by_tier`.
 - **Record-stop enforcement no longer silently degrades at the SAL layer when
   the sqlite DB path resolves through a symlink** (e.g. the macOS
   `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed

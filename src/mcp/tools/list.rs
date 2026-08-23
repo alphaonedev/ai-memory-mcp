@@ -109,7 +109,10 @@ fn handle_list_capped(
                 )
             })?;
     }
-    let tier = params["tier"].as_str().and_then(Tier::from_str);
+    // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `tier` (was
+    // `.and_then(Tier::from_str)`, which listed EVERY tier as if the
+    // caller had asked for it).
+    let tier = Tier::parse_optional(params["tier"].as_str())?;
     // Ultrareview #339: saturate instead of panic (see handle_search).
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(20)).unwrap_or(usize::MAX);
     let agent_id = params["agent_id"].as_str();
@@ -235,7 +238,7 @@ mod tests {
         assert_eq!(out["count"].as_u64(), Some(1));
     }
 
-    // A. tier filter exercises Tier::from_str branch
+    // A. tier filter exercises the Tier::parse_optional branch
     #[test]
     fn filters_by_tier() {
         let conn = fresh_conn();
@@ -243,9 +246,34 @@ mod tests {
         db::insert(&conn, &make_mem("b", "ns", MTier::Long, "ai:b")).expect("ins");
         let out = handle_list(&conn, &json!({"tier": MTier::Long.as_str()}), None).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(1));
-        // invalid tier silently falls through (and_then None) — listed all.
-        let out_bad = handle_list(&conn, &json!({"tier": "nonsense"}), None).expect("ok");
-        assert_eq!(out_bad["count"].as_u64(), Some(2));
+    }
+
+    // B. validation — v1.0.0 #3130: an unrecognised tier is REFUSED, not
+    // silently dropped. Pre-fix this asserted `count == 2` (every row
+    // listed as if the caller had asked for no tier filter at all).
+    #[test]
+    fn unknown_tier_is_refused_not_unfiltered_3130() {
+        let conn = fresh_conn();
+        db::insert(&conn, &make_mem("a", "ns", MTier::Short, "ai:a")).expect("ins");
+        db::insert(&conn, &make_mem("b", "ns", MTier::Long, "ai:b")).expect("ins");
+        let err = handle_list(&conn, &json!({"tier": "nonsense"}), None)
+            .expect_err("an unrecognised tier must be refused");
+        assert!(err.contains("invalid tier"), "got: {err}");
+        assert!(
+            err.contains(MTier::VALUES_HINT),
+            "must name the valid tiers: {err}"
+        );
+    }
+
+    // An ABSENT tier stays genuinely unconstrained — the distinction the
+    // `.and_then(Tier::from_str)` shape collapsed (#3130).
+    #[test]
+    fn absent_tier_still_lists_every_tier_3130() {
+        let conn = fresh_conn();
+        db::insert(&conn, &make_mem("a", "ns", MTier::Short, "ai:a")).expect("ins");
+        db::insert(&conn, &make_mem("b", "ns", MTier::Long, "ai:b")).expect("ins");
+        let out = handle_list(&conn, &json!({}), None).expect("ok");
+        assert_eq!(out["count"].as_u64(), Some(2));
     }
 
     // A. agent_id filter (validated path)

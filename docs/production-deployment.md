@@ -84,10 +84,12 @@ SQLite deployments use `ai-memory backup` (a `VACUUM INTO` wrapper that emits a 
 
 ```bash
 ai-memory backup --to /var/backups/ai-memory --keep 48
-ai-memory restore --from /var/backups/ai-memory   # uses newest snapshot
+ai-memory restore --from /var/backups/ai-memory   # uses newest snapshot; prompts before replacing
 ```
 
 `--keep` rotates oldest-first. The manifest pins the snapshot's sha256, byte size, source-DB path, and binary version that produced it. `restore` verifies the sha256 before swapping the target file in. Pass `--skip-verify` only if you have already verified out-of-band — the flag exists for restoring from cold storage that has been re-hashed by a separate tool, not as a routine bypass.
+
+Since v1.0.0 `restore` also **refuses a live target** and **stages the replacement before publishing it** ([#3131](https://github.com/alphaonedev/ai-memory-mcp/issues/3131)): stop the daemon first (an exclusive-lock probe detects any other open connection and refuses), the current database is COPIED to `<db>.pre-restore-<ts>.db`, the replacement is fsynced and must pass `PRAGMA integrity_check`, and only then is it swapped in with an atomic `rename` — so a partial copy or a damaged snapshot leaves the live corpus untouched. It asks `Proceed? [y/N]` first; pass `--yes` in scripts and cron (it is **required** with `--json` and whenever stdin is not a terminal). The rollback path is printed, and reported as a `rollback` field under `--json`. See [`CLI_REFERENCE.md §"How restore publishes"`](CLI_REFERENCE.html).
 
 PostgreSQL deployments use the standard tooling:
 

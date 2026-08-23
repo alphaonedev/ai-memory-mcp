@@ -42,7 +42,7 @@ autonomous" with a measured activity + reversal + cost profile.
 
 ```sh
 # 1. Restore the corpus snapshot.
-ai-memory restore --from ./corpus-snapshot.db --skip-verify  # verify yourself first
+ai-memory restore --from ./corpus-snapshot.db --skip-verify --yes  # verify yourself first; --yes: scripted, no prompt
 
 # 2. Start the HTTP daemon (optional but useful for observability).
 ai-memory serve --host 127.0.0.1 --port 9077 --tls-cert … &

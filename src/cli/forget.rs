@@ -99,7 +99,13 @@ pub fn cmd_forget(
         bail!(global_scope_forget_error_message());
     }
 
-    let tier = args.tier.as_deref().and_then(Tier::from_str);
+    // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `--tier`. This was
+    // `.and_then(Tier::from_str)`: a typo (`--tier Long`, `--tier
+    // longterm`) parsed to `None`, `db::forget` reads `None` as "no tier
+    // constraint", and the command therefore erased EVERY tier and
+    // printed success. Parsed here, before the store is resolved or a
+    // single id is collected, so a refusal deletes nothing.
+    let tier = Tier::parse_optional(args.tier.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
     // v1.0.0 #2572 — REFUSE this erasure on a Postgres store (see `refuse_pg_store`).
     // The query-only receipt sub-modes above short-circuit before this and carry
     // their own guard.

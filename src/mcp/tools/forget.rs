@@ -131,7 +131,13 @@ pub(super) fn handle_forget(
 ) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
     let pattern = params["pattern"].as_str();
-    let tier = params["tier"].as_str().and_then(Tier::from_str);
+    // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `tier`. This was
+    // `.and_then(Tier::from_str)`: an unparseable value became `None`,
+    // which `db::forget` reads as "no tier constraint", so a typo'd
+    // `memory_forget` erased EVERY tier in scope and answered success.
+    // Refused before the governance gate, before the dry-run preview and
+    // before any delete, so nothing is touched.
+    let tier = Tier::parse_optional(params["tier"].as_str())?;
     let dry_run = params["dry_run"].as_bool().unwrap_or(false);
 
     // #1772 — owner gate: when the multi-tenant opt-in is on
@@ -558,20 +564,44 @@ mod tests {
         assert_eq!(resp["deleted"].as_u64(), Some(1));
     }
 
-    // Invalid tier string falls back to None (tier not applied).
+    // v1.0.0 #3130 — an invalid tier string is REFUSED, and the refusal
+    // names the valid values. Pre-fix it fell back to `None`, which
+    // `db::forget` reads as "no tier constraint": this very test asserted
+    // `would_delete == 1` for a row the caller's filter excluded, and a
+    // non-dry-run of the same call erased every tier in the namespace.
     #[test]
-    fn forget_with_invalid_tier_string_treated_as_none() {
+    fn forget_with_invalid_tier_string_is_refused_3130() {
         let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let _ = insert_one(&conn, "bad-tier-ns", "x", Tier::Mid);
-        let resp = handle_forget(
+        let err = handle_forget(
             &conn,
             &json!({"namespace": "bad-tier-ns", "tier": "not-a-tier", "dry_run": true}),
             false,
             None,
         )
-        .expect("ok");
-        assert_eq!(resp["would_delete"].as_u64(), Some(1));
+        .expect_err("an unrecognised tier must be refused");
+        assert!(err.contains("invalid tier"), "got: {err}");
+        assert!(
+            err.contains(Tier::VALUES_HINT),
+            "must name the valid tiers: {err}"
+        );
+        // And nothing was erased: the row is still there.
+        let still = crate::storage::list(
+            &conn,
+            Some("bad-tier-ns"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("list");
+        assert_eq!(still.len(), 1, "a refused forget must erase nothing");
     }
 
     // Substrate error path: no namespace, no pattern, no tier → error.

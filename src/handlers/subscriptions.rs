@@ -135,7 +135,18 @@ pub async fn notify(
         // `Tier::from_str` SSOT at `src/models/memory.rs:395`. The prior
         // inline parser duplicated the match body; routing through the
         // const SSOT means future Tier variants land in one place.
-        let resolved_tier = body.tier.as_deref().and_then(Tier::from_str);
+        // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `tier`, matching
+        // the sqlite branch below (which forwards the raw string to
+        // `handle_notify`, whose parse has been strict since #1432) and
+        // the MCP `memory_notify` surface. Silently dropping it wrote the
+        // notify at the backend default tier while reporting the caller's
+        // requested one.
+        let resolved_tier = match Tier::parse_optional(body.tier.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+            }
+        };
         let ctx = crate::store::CallerContext::for_agent(&sender);
         let new_id = match app
             .store

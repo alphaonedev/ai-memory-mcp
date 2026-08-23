@@ -92,7 +92,12 @@ pub fn run(
         writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     };
-    let tier = args.tier.as_deref().and_then(Tier::from_str);
+    // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `--tier`. `None`
+    // means "leave the tier alone" on this path, so a typo silently
+    // NO-OPed the retier the operator asked for and still reported
+    // success (a short-tier row the operator believed was promoted to
+    // long is then GC'd on schedule — the same data-loss class).
+    let tier = Tier::parse_optional(args.tier.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
     let tags: Option<Vec<String>> = args.tags.as_ref().map(|t| {
         t.split(',')
             .map(|s| s.trim().to_string())

@@ -118,13 +118,16 @@ pub fn cmd_list(
     if let Some(ref v) = args.valid_at {
         validate::validate_valid_at(v)?;
     }
+    // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `--tier` (was
+    // `.and_then(Tier::from_str)`, which dropped the filter and listed
+    // EVERY tier as if the operator had asked for it).
+    let tier = Tier::parse_optional(args.tier.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
     // v1.0.0 #2572 — REFUSE on a Postgres store (a phantom SQLite read returns
     // an empty conjured database; see `refuse_pg_store`).
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "list", out)?;
     let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
-    let tier = args.tier.as_deref().and_then(Tier::from_str);
     let results = db::list(
         &conn,
         args.namespace.as_deref(),

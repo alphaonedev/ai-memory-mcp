@@ -98,7 +98,10 @@ pub(super) fn handle_search(
                 )
             })?;
     }
-    let tier = params["tier"].as_str().and_then(Tier::from_str);
+    // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `tier` (was
+    // `.and_then(Tier::from_str)`, which silently dropped the filter and
+    // returned UNFILTERED results — wrong results, not fewer).
+    let tier = Tier::parse_optional(params["tier"].as_str())?;
     // Ultrareview #339: saturate instead of panic on 32-bit targets
     // where u64 may exceed usize::MAX. A malicious client passing
     // limit=2^63 would otherwise take down the daemon.
@@ -185,6 +188,35 @@ fn filter_visible(
             .filter(|m| crate::visibility::is_visible_to_caller(m, c))
             .collect(),
         None => results,
+    }
+}
+
+#[cfg(test)]
+mod tier_fail_closed_3130_tests {
+    //! v1.0.0 #3130 — `memory_search` REFUSES an unrecognised `tier`
+    //! instead of dropping the filter and answering with unfiltered
+    //! results (wrong results, not fewer).
+    use super::*;
+    use crate::models::Tier as MTier;
+    use crate::storage as db;
+
+    #[test]
+    fn unknown_tier_is_refused_not_unfiltered_3130() {
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let err = handle_search(&conn, &json!({"query": "anything", "tier": "Long"}), None)
+            .expect_err("an unrecognised tier must be refused");
+        assert!(err.contains("invalid tier"), "got: {err}");
+        assert!(
+            err.contains(MTier::VALUES_HINT),
+            "must name the valid tiers: {err}"
+        );
+    }
+
+    #[test]
+    fn absent_tier_is_still_unconstrained_3130() {
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        handle_search(&conn, &json!({"query": "anything"}), None)
+            .expect("an absent tier stays genuinely unconstrained");
     }
 }
 
