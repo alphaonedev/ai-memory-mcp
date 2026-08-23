@@ -255,20 +255,111 @@ pub(crate) fn capability_from_headers(
 #[cfg(test)]
 mod capability_from_headers_tests {
     use super::capability_from_headers;
+    use crate::governance::capability::{CapabilityConfig, HTTP_CAPABILITY_HEADER};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use std::collections::BTreeMap;
+
+    fn headers_with(value: HeaderValue) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(HTTP_CAPABILITY_HEADER, value);
+        headers
+    }
+
+    fn enabled_cfg() -> CapabilityConfig {
+        CapabilityConfig {
+            enabled: true,
+            issuers: BTreeMap::new(),
+        }
+    }
+
+    fn disabled_cfg() -> CapabilityConfig {
+        CapabilityConfig {
+            enabled: false,
+            issuers: BTreeMap::new(),
+        }
+    }
 
     /// Fable HIGH (#3133): a PRESENTED non-UTF-8 capability header must
     /// 403, never collapse to "absent = bare ACL".
     #[test]
     fn presented_non_utf8_capability_header_is_403() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            crate::governance::capability::HTTP_CAPABILITY_HEADER,
-            HeaderValue::from_bytes(&[0x80, 0x81]).expect("raw header bytes"),
-        );
+        let headers =
+            headers_with(HeaderValue::from_bytes(&[0x80, 0x81]).expect("raw header bytes"));
         let err = capability_from_headers(&headers, "test-actor")
             .expect_err("non-UTF-8 presented credential must FAIL CLOSED");
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Omitted header is the documented inert path (`Ok(None)`), even when
+    /// the master switch is on — a capability-LESS caller stays on the
+    /// bare ACL (R9 #1960 additive-only).
+    #[test]
+    fn absent_header_is_ok_none() {
+        let _cap = crate::config::lock_capability_config_for_test();
+        crate::config::set_active_capability_config(enabled_cfg());
+        let got = capability_from_headers(&HeaderMap::new(), "test-actor")
+            .expect("omitted header must not refuse");
+        assert!(got.is_none(), "absent header must stay Ok(None)");
+        crate::config::clear_capability_config_for_test();
+    }
+
+    /// Whitespace-only UTF-8 is equivalent to omitted (trim+empty filter
+    /// in `parse_presented_token`); never a 403.
+    #[test]
+    fn blank_utf8_header_is_ok_none() {
+        let _cap = crate::config::lock_capability_config_for_test();
+        crate::config::set_active_capability_config(enabled_cfg());
+        let got =
+            capability_from_headers(&headers_with(HeaderValue::from_static("   ")), "test-actor")
+                .expect("whitespace-only header is equivalent to omitted");
+        assert!(got.is_none());
+        crate::config::clear_capability_config_for_test();
+    }
+
+    /// `[capabilities].enabled = false` short-circuits BEFORE parse, so a
+    /// presented-but-garbage UTF-8 token stays `Ok(None)` (zero behavioural
+    /// delta while the feature is off).
+    #[test]
+    fn presented_utf8_garbage_is_inert_when_capabilities_disabled() {
+        let _cap = crate::config::lock_capability_config_for_test();
+        crate::config::set_active_capability_config(disabled_cfg());
+        let got = capability_from_headers(
+            &headers_with(HeaderValue::from_static("cap1:!!!garbage")),
+            "test-actor",
+        )
+        .expect("disabled master switch must not parse");
+        assert!(got.is_none());
+        crate::config::clear_capability_config_for_test();
+    }
+
+    /// Enabled + PRESENTED UTF-8 that `from_wire` rejects must 403 via
+    /// the `map_err` arm — never downgrade to anonymous/bare ACL.
+    #[test]
+    fn presented_utf8_garbage_is_403_when_capabilities_enabled() {
+        let _cap = crate::config::lock_capability_config_for_test();
+        crate::config::set_active_capability_config(enabled_cfg());
+        let err = capability_from_headers(
+            &headers_with(HeaderValue::from_static("cap1:!!!garbage")),
+            "test-actor",
+        )
+        .expect_err("presented-but-unparseable credential must FAIL CLOSED");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        crate::config::clear_capability_config_for_test();
+    }
+
+    /// A well-formed-looking but wrong-version envelope is also a
+    /// presented-but-unusable credential (not "omitted").
+    #[test]
+    fn presented_wrong_version_envelope_is_403_when_enabled() {
+        let _cap = crate::config::lock_capability_config_for_test();
+        crate::config::set_active_capability_config(enabled_cfg());
+        let err = capability_from_headers(
+            &headers_with(HeaderValue::from_static("cap9:aGk=")),
+            "test-actor",
+        )
+        .expect_err("wrong-version envelope must FAIL CLOSED");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        crate::config::clear_capability_config_for_test();
     }
 }
 
