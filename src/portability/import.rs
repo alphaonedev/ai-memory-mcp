@@ -3670,9 +3670,10 @@ mod tests {
             "an UNREADABLE survivor is never miscounted as byte-identical"
         );
         assert!(
-            report.warnings.iter().any(|w| {
-                w.contains("mem-arch-erased-3151") && w.contains("could not be read")
-            }),
+            report
+                .warnings
+                .iter()
+                .any(|w| { w.contains("mem-arch-erased-3151") && w.contains("could not be read") }),
             "a WARN names the unreadable row, got: {:?}",
             report.warnings
         );
