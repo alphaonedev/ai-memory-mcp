@@ -44,10 +44,10 @@ use tempfile::TempDir;
 /// integration-tests harness compiles each `tests/*.rs` as its
 /// own binary).
 fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
-    let _ =
-        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let path = dir.path().join(name);
     {
         let mut f = std::fs::File::create(&path).expect("create script");

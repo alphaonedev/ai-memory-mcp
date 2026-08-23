@@ -31,10 +31,10 @@ use tempfile::TempDir;
 /// Tests rely on /bin/sh being available — true on every supported
 /// deployment target (Linux containers, macOS dev hosts).
 fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
-    let _ =
-        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let path = dir.path().join(name);
     // Explicit File::create + write_all + sync_all + drop so the file is
     // fully flushed and the writer fd is released BEFORE exec. Linux
