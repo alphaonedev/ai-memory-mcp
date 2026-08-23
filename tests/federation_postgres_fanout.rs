@@ -111,6 +111,8 @@ async fn spawn_inproc_mock_peer() -> MockPeer {
 }
 
 fn federation_cfg_for_test(peer_urls: &[String], quorum_writes: usize) -> FederationConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let timeout = Duration::from_secs(2);
     let client = reqwest::Client::builder()
         .timeout(timeout)

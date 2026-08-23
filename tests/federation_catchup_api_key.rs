@@ -111,6 +111,8 @@ async fn spawn_since_peer(expected_api_key: Option<&str>) -> (String, HeaderCapt
 }
 
 fn build_cfg(peer_url: &str, api_key: Option<String>) -> FederationConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
