@@ -2044,6 +2044,97 @@ mod tests {
         assert!(!restore_requires_confirmation(&confirmed));
     }
 
+    /// The exclusive liveness probe is a production raw open (#2445). On an
+    /// idle current-schema database it must succeed AND run
+    /// `assert_schema_not_ahead` (the Ok arm added with the funnel
+    /// allowlist). A schema-ahead target would refuse here rather than
+    /// proceeding to rewrite the live file.
+    #[test]
+    fn refuse_if_target_in_use_idle_current_schema_is_ok_3131() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "idle", "row");
+        {
+            let mut out = env.output();
+            refuse_if_target_in_use(&db, &mut out)
+                .expect("an idle current-schema database must pass the liveness probe");
+        }
+        assert!(
+            !env.stderr_str().contains("warning:"),
+            "idle probe must not warn; stderr was: {}",
+            env.stderr_str()
+        );
+    }
+
+    /// `--json` without `--yes` is refused BEFORE the RW probe, so it must
+    /// not leave a restore-tmp artefact (consent-first, Fable gate).
+    #[test]
+    fn restore_json_without_yes_leaves_no_restore_tmp_3131() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "t", "c");
+        let backup_dir = db.parent().unwrap().join("backups-3131-noyes-tmp");
+        let manifest = take_backup(&mut env, &db, &backup_dir);
+        let args = RestoreArgs {
+            from: backup_dir.join(&manifest.snapshot),
+            skip_verify: false,
+            store_url: None,
+            yes: false,
+        };
+        {
+            let mut out = env.output();
+            let _ = run_restore(&db, &args, true, &mut out);
+        }
+        let leftovers = std::fs::read_dir(db.parent().unwrap())
+            .expect("read dir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(RESTORE_TMP_INFIX))
+            .count();
+        assert_eq!(leftovers, 0, "consent refusal must not leave restore-tmp");
+    }
+
+    /// A sidecar path that cannot be unlinked (here: a directory where
+    /// `-wal` should be a file) must WARN and still publish. The live DB
+    /// is already swapped; failing the restore over a sidecar unlink
+    /// would leave the operator with a published corpus AND a non-zero
+    /// exit (Fable FIX-BEFORE-MERGE).
+    #[test]
+    fn restore_sidecar_unlink_failure_warns_and_still_publishes_3131() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "in-snap", "a");
+        let backup_dir = db.parent().unwrap().join("backups-3131-sidecar");
+        let manifest = take_backup(&mut env, &db, &backup_dir);
+        seed_memory(&db, "ns", "after", "b");
+        let wal = sidecar_path(&db, "-wal");
+        std::fs::create_dir(&wal).expect("plant a directory as the -wal sidecar");
+        let args = RestoreArgs {
+            from: backup_dir.join(&manifest.snapshot),
+            skip_verify: false,
+            store_url: None,
+            yes: true,
+        };
+        {
+            let mut out = env.output();
+            run_restore(&db, &args, false, &mut out)
+                .expect("sidecar unlink failure must not fail a published restore");
+        }
+        assert!(
+            env.stderr_str()
+                .contains("could not remove stale SQLite sidecar"),
+            "must WARN with the manual rm path; stderr was: {}",
+            env.stderr_str()
+        );
+        assert!(wal.is_dir(), "the planted directory must still be there");
+        let _ = std::fs::remove_dir(&wal);
+    }
+
     /// `stage_and_verify` never touches the target: that is the whole point
     /// of staging. Pinned directly so a future refactor cannot quietly move
     /// the verification after the swap.
