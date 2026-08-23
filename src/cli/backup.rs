@@ -126,7 +126,15 @@ fn refuse_if_target_in_use(target_db: &Path, out: &mut CliOutput<'_>) -> Result<
         .pragma_update(None, "locking_mode", "exclusive")
         .and_then(|()| conn.execute_batch("BEGIN EXCLUSIVE; ROLLBACK;"));
     match probe {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // #2445 — this raw open is off `db::open` on purpose (a
+            // liveness probe must not run the bootstrap/ladder against
+            // the live file). Guard the schema-downgrade / rollback-
+            // evidence checks immediately after the exclusive lock is
+            // held so the bypass is not a silent #2488.
+            crate::storage::assert_schema_not_ahead(&conn, &target_db.display().to_string())?;
+            Ok(())
+        }
         Err(e) if is_busy(&e) => anyhow::bail!(
             "{} is open in another process — refusing to restore over a live \
              database (a daemon / MCP server writing into the file being replaced \
