@@ -8557,6 +8557,11 @@ impl<'a> LinkClaimWindow<'a> {
 /// * A malformed timestamp is a hard error, never a silent substitution of
 ///   `now` — silently re-writing an attested claim is the defect this closes.
 ///
+/// Returns the attest level the row ACTUALLY carries (v1.0.0 #3051). On the
+/// insert path that is the level just computed and written; on the
+/// `INSERT OR IGNORE` no-op path it is the level read back off the stored
+/// row via `stored_link_attest_level` — never the stronger computed one.
+///
 /// # Errors
 ///
 /// Every error [`create_link_signed`] returns, plus an

@@ -203,6 +203,163 @@ had silently dropped.
   (parse-only; never echoes the file, never fail-opens) before
   `exec`. Does **not** bump `EXPECTED_CLI_SUBCOMMANDS_*` — `Check` is
   a sub-verb of the existing `Config` command.
+### Security (sqlite SAL adapter enforced LESS than the postgres twin; #3176)
+
+Four result-changing authorization divergences where the **same** SAL call was
+permitted on sqlite and refused on postgres. All four are closed by moving the
+decision to a place both adapters share, not by adding a second copy of it.
+
+- **`clear_namespace_standard` had NO owner gate and no #2545 severed-standard
+  refusal on sqlite.** The adapter discarded `ctx` and ran a bare `DELETE FROM
+  namespace_meta`, so a trait-routed tenant could DISARM the governance
+  standard protecting every memory in another tenant's namespace — reverting it
+  to permissive allow-on-silence. postgres has enforced both arms since #1777 /
+  #2545, and the sqlite MCP + HTTP surfaces have their own copies, but the SAL
+  layer (CLI, internal surfaces, federation, any future caller) had none. The
+  #1777 owner predicate, the #2545 unresolvable-standard refusal and BOTH
+  wire-pinned refusal strings now live once in
+  `crate::store::authorize_clear_namespace_standard`; each adapter only reads
+  the three-state binding (`NoMetaRow` / `Resolved(owner)` / `Unresolvable`),
+  so the refusals are byte-identical whichever backend serves the request. The
+  #2704-F2 unowned-PASS is preserved explicitly by keeping row-presence and
+  owner-nullness separable.
+- **`verify` discarded `ctx` on sqlite** and read the row through the raw
+  `db::get`, so a caller could confirm the EXISTENCE of another agent's
+  `scope=private` memory and read its integrity findings and CID verdict. It
+  now folds an invisible row to `NotFound`, matching the postgres twin (which
+  routes through the #910-gated `self.get(ctx, id)`).
+- **`reflect` read its SOURCES unscoped on sqlite**, so a tenant could pull
+  another agent's `scope=private` content into its own reflection. The new
+  `storage::reflect::reflect_with_hooks_for_caller` threads the caller's
+  principal into the source load and folds an invisible source to
+  `SourceNotFound` — byte-identical to a genuinely missing id, so the gate
+  leaks no existence signal. `None` (admin / migrate / curator, and the
+  surfaces that gate upstream) keeps the previous unscoped read.
+- **Owner-level governance resolved a different owner per backend.**
+  `storage::evaluate_level` used `memory_owner.or(namespace_owner)` for every
+  action; the postgres twin keys on the action (`Store => ns_owner`). A `Store`
+  with `memory_owner == agent != ns_owner` was therefore ALLOW on sqlite and
+  DENY on postgres. sqlite now uses the action-keyed selection, which is what
+  the function's own docblock has always documented ("`namespace_owner` … used
+  as the 'owner' for store operations") and is the fail-closed direction.
+
+### Fixed (link claim windows discarded on sqlite; postgres supersession left a stale signature and no audit leaf; #3178)
+
+- **`link()` / `link_signed()` discarded the caller's temporal claim on sqlite
+  — and signed a window the caller never supplied (#3178).** The adapter passed
+  only `(source_id, target_id, relation)`; `db::create_link_signed` had no
+  `valid_until` in its INSERT at all and bound `created_at` and `valid_from`
+  through one shared parameter, while the Ed25519 pre-image committed to
+  `valid_from = now, valid_until = None`. The same
+  `MemoryStore::link_signed(link)` therefore produced DIFFERENT durable rows
+  AND different signature pre-images per backend, so a link minted on one
+  backend could not verify on the other. The new
+  `db::create_link_signed_with_window` honours all three fields, adds
+  `valid_until` to the INSERT, signs the window it actually persists, and
+  truncates every stamp to microseconds before both signing and writing (the
+  precision postgres `TIMESTAMPTZ` round-trips) so the CBOR pre-image survives
+  the storage boundary. A malformed timestamp is now a hard error instead of a
+  silent substitution of `now`. `create_link_signed` is retained as a
+  no-window shim (same signature), so existing call sites are untouched.
+  After #3051 the `INSERT OR IGNORE` stored-level replay-return lives in
+  the windowed core, so both entry points report the attest level the
+  durable row actually carries (R-405: `src/storage/mod.rs` `create_link_signed`
+  docstring + `create_link_signed_with_window` no-op branch).
+- **postgres supersession left a stale signature and no audit leaf (#3178).**
+  `kg_invalidate_cte` stamped `valid_until` only, so a superseded row kept an
+  Ed25519 signature over bytes that had changed — `memory_verify` then reported
+  a misleading "signature mismatch" instead of an honest "unsigned" — and the
+  postgres audit chain carried no `memory_link.invalidated` event at all. The
+  prior-row read (`FOR UPDATE`), the stamp, the signing-surface clear and the
+  audit append now run in ONE transaction, matching the sqlite twin's v0.7.0
+  #628 H5 contract (including its refusal to commit the update when the audit
+  row cannot be appended).
+
+### Fixed (link supersession audit named the wrong actor and had no record-stop fence; #3203, #3204 item 3)
+
+- **The `memory_link.invalidated` audit leaf was attributed to the edge's
+  ORIGINAL ATTESTER (#3203).** Both backends stamped `signed_events.agent_id`
+  from the row's `observed_by` — the agent that signed the edge — so an audit
+  replay showed the original attesting peer as the actor of an invalidation it
+  never performed, on a chain whose whole purpose is establishing who did what.
+  `MemoryStore::invalidate_link` / `db::invalidate_link` /
+  `PostgresStore::kg_invalidate{,_cte,_cypher}` now take the ACTING principal
+  and stamp that; the HTTP handler passes its authenticated caller and the MCP
+  handler passes the ENFORCED read-visibility caller (deliberately not the
+  self-asserted `arguments["agent_id"]` — an audit actor must not be forgeable
+  from the wire), while an unattributed substrate path records the `system`
+  sentinel rather than borrowing an identity. The superseded signer is not
+  lost: its Ed25519 proof stays in the leaf's `signature` column and its
+  identity travels as `observed_by` inside the canonical CBOR that
+  `payload_hash` commits to.
+- **`invalidate_link` had no record-stop fence (#3203).** It mutates
+  `memory_links` and appends to `signed_events`, but unlike its create twin it
+  sat outside the #1955 R45 fence, so a supersession landed while the record
+  plane was STOPPED. `record_stop::gate_storage_conn` now guards it, before the
+  transaction opens so a refusal leaves nothing half-done.
+- **`create_link_inbound` substituted an untruncated receiver-clock stamp
+  (#3204 item 3).** When a peer sent no `valid_from` (or no `created_at`) the
+  receiver wrote `Utc::now().to_rfc3339()` verbatim — nanosecond precision —
+  while every outbound signer truncates to microseconds because postgres
+  `TIMESTAMPTZ` quantises there. A genuinely `peer_attested` edge could
+  therefore never re-verify locally: `memory_verify` re-derives the pre-image
+  from the stored row and reported `Tampered` (fail-closed, but false). The
+  substitute is now truncated. A peer-SUPPLIED value is still stored
+  byte-identical — a receiver must never rewrite an attested claim.
+
+### Fixed (sqlite silently inherited trait defaults that do not meet their documented contracts; #3181)
+
+- **`store_batch` was not atomic on sqlite, despite the trait doc saying it is
+  (#3181).** The docblock states the batch "is atomic (all rows commit or none
+  do)" and that "SQLite inherits it unchanged"; sqlite had no override, so it
+  inherited the per-row `store()` loop in autocommit and a mid-batch failure
+  left a COMMITTED PREFIX durable while returning only `Err`. `SqliteStore` now
+  wraps the loop in one `BEGIN IMMEDIATE`, transaction-aware in the
+  `db::delete` / `archive_by_ids` style so a caller that already holds a
+  transaction is unaffected. The per-row funnel and input order are unchanged,
+  so the #2551 returned-id contract (ids never rewritten by the conflict arm;
+  in-batch duplicates collapse LAST-WINS) holds as before.
+- **`set_embeddings_batch` counted GHOST writes on sqlite (#3181).** The trait
+  default incremented `written` once per ENTRY regardless of whether a row was
+  updated, so an id deleted between the scan and the write was reported as
+  embedded — a number the backfill logs and the caller's progress accounting
+  both consumed. sqlite now delegates to the SSOT `db::set_embeddings_batch`
+  (one transaction per chunk, `changes()`-derived counts, per-namespace dim
+  validation), which the trait doc already named as the shape to mirror.
+- **`check_memory_quota` was a silent no-op on sqlite (#3181).** The trait
+  default returns `Ok(())`, documented as safe because sqlite "enforces at the
+  handler layer" — true of the HTTP/MCP handlers, false of any trait-routed
+  caller, which got no quota gate while the postgres twin enforced one. The new
+  read-only `quotas::check_memory_quota` mirrors the postgres arithmetic
+  (day-rolled daily counter, cumulative storage bytes, compiled defaults when
+  no row exists) and the adapter maps a breach onto the same
+  `StoreError::QuotaExceeded` envelope, so the 429 wire shape is identical
+  across backends. It creates no quota row as a side effect.
+
+### Fixed (sqlite fail-open reads turned substrate faults into benign answers; #3182)
+
+- **Four sqlite reads turned substrate faults into benign answers.**
+  `is_registered_agent` ended in `.is_ok()`, `agent_max_created_at` in
+  `.unwrap_or(None)`, `schema_version` in `.unwrap_or(0)` and
+  `storage::get_embedding` in `.ok()` — each collapsing a dropped table, a lock
+  failure or corruption into a plausible value their postgres twins report as
+  an error. `schema_version` was the most dangerous: `0` is a migration-ladder
+  INPUT, so a populated-but-damaged database presented itself as fresh. All
+  four now propagate. The one remaining best-effort consumer — the recovery
+  fast-path watermark in `recover::run` — keeps its discard EXPLICIT and
+  records the fault on the report, because the watermark is a pure optimisation
+  over idempotent writes. `agent_max_created_at` additionally normalises its
+  RFC3339 string to microsecond precision so the sqlite and postgres watermarks
+  are byte-identical for the same instant (postgres re-renders through a
+  microsecond-quantised `TIMESTAMPTZ`; sqlite returned a nanosecond string).
+- **`db::find_by_title_namespace` swallowed faults on the deduplication
+  probe.** Its `.ok()` answered "no row with this (title, namespace)" for any
+  rusqlite failure, while its own docblock promised it "returns the underlying
+  SQLite error". Every `on_conflict` caller (`db::upsert`, the create and bulk
+  handlers, `cli::io`, `portability::import`) reads `None` as "safe to insert a
+  new row", so a transient fault forked a duplicate lineage instead of updating
+  the existing memory, and `next_versioned_title` handed back a title that was
+  already taken. A genuine miss is still `Ok(None)`; a fault is now an error.
 
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 

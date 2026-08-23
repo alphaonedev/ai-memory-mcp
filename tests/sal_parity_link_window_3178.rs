@@ -420,19 +420,21 @@ async fn sqlite_invalidate_audit_names_the_actor_not_the_attester_3203() {
         .await
         .expect("invalidate_link");
 
-    let conn = ai_memory::db::open(&path).expect("reopen");
-    let actor: String = conn
-        .query_row(
-            "SELECT agent_id FROM signed_events WHERE event_type = ?1",
-            rusqlite::params!["memory_link.invalidated"],
-            |r| r.get(0),
-        )
-        .expect("invalidated audit row");
-    // PRE-FIX: "bob" — the attester, credited with an act he never performed.
-    assert_eq!(
-        actor, "alice",
-        "the supersession audit leaf must name the ACTING principal"
-    );
+    {
+        let conn = ai_memory::db::open(&path).expect("reopen after first invalidate");
+        let actor: String = conn
+            .query_row(
+                "SELECT agent_id FROM signed_events WHERE event_type = ?1",
+                rusqlite::params!["memory_link.invalidated"],
+                |r| r.get(0),
+            )
+            .expect("invalidated audit row");
+        // PRE-FIX: "bob" — the attester, credited with an act he never performed.
+        assert_eq!(
+            actor, "alice",
+            "the supersession audit leaf must name the ACTING principal"
+        );
+    }
 
     // An unattributed substrate path records the `system` sentinel rather than
     // borrowing anyone's identity.
@@ -451,6 +453,9 @@ async fn sqlite_invalidate_audit_names_the_actor_not_the_attester_3203() {
         )
         .await
         .expect("invalidate_link 2");
+    // Re-open AFTER the second write so this reader is not sitting on a WAL
+    // snapshot taken before the substrate committed the `system` leaf.
+    let conn = ai_memory::db::open(&path).expect("reopen after second invalidate");
     let actors: Vec<String> = conn
         .prepare("SELECT agent_id FROM signed_events WHERE event_type = ?1 ORDER BY sequence")
         .expect("prepare")
@@ -535,11 +540,16 @@ fn sqlite_inbound_link_substitute_stamp_is_microsecond_truncated_3204() {
     ai_memory::db::insert(&conn, &dst).expect("insert dst");
 
     // A peer that sent NO temporal claim at all — the receiver substitutes its
-    // own clock for both stamps.
+    // own clock for both stamps. `peer_attested` is the inbound federation
+    // rung this cell is about; the CHECK requires a 64-byte signature blob
+    // (length only — this cell pins stamp truncation, not cryptographic
+    // verification of the peer sig).
     let mut link = windowed_link(&src.id, &dst.id);
     link.created_at = String::new();
     link.valid_from = None;
     link.valid_until = None;
+    link.signature = Some(vec![0u8; 64]);
+    link.observed_by = Some("peer".to_string());
     ai_memory::db::create_link_inbound(&conn, &link, "peer_attested").expect("inbound link");
 
     let raw = read_raw_link(&path, &src.id, &dst.id);
