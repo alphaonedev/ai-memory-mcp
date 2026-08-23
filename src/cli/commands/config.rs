@@ -3,10 +3,10 @@
 
 //! v0.7.x (#1146) — `ai-memory config <subcommand>` CLI surface.
 //!
-//! Today exposes a single action: `migrate`. Rewrites a legacy v1
-//! (flat-field) `config.toml` to the canonical v2 sectioned shape
-//! (`[llm]`, `[embeddings]`, `[reranker]`, `[storage]`) defined in
-//! issue #1146.
+//! Exposes `migrate` (rewrite a legacy v1 flat-field `config.toml` to
+//! the canonical v2 sectioned shape) and `check` (#3197 — parse-only
+//! TOML validation that never echoes the file, so a secret-bearing
+//! config cannot leak into logs).
 //!
 //! ## Wire shape
 //!
@@ -18,6 +18,8 @@
 //!                                       # mcpServers.<*>.env block from
 //!                                       # ~/.claude.json after verifying
 //!                                       # the new config.toml works
+//! ai-memory config check                # validate resolved config.toml
+//! ai-memory config check --file PATH    # validate a specific file
 //! ```
 //!
 //! ## Exit codes
@@ -71,6 +73,24 @@ pub enum ConfigAction {
         #[arg(long)]
         also_clean_claude_json: bool,
     },
+
+    /// Validate that a config file is parseable TOML without printing
+    /// its contents (#3197). Used by `entrypoint.plan-c.sh` after
+    /// rendering so a malformed secret cannot leak into container
+    /// logs via `config migrate --dry-run`'s diff, and so a parse
+    /// failure refuses `exec` (EX_CONFIG) instead of
+    /// `AppConfig::load_from` fail-opening to a keyless daemon.
+    ///
+    /// Exit 0 = valid TOML; 2 = file missing; 3 = not valid TOML;
+    /// 4 = unreadable. The toml crate's `Display` is deliberately
+    /// omitted from the error line — it can echo the offending
+    /// source, which may carry `api_key`.
+    Check {
+        /// Config file to validate. Defaults to the resolved
+        /// `~/.config/ai-memory/config.toml`.
+        #[arg(long, value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
 }
 
 /// Entry point dispatched by `daemon_runtime::run`.
@@ -84,6 +104,60 @@ pub fn run(_db: &Path, args: ConfigCliArgs, out: &mut CliOutput) -> Result<i32> 
             dry_run,
             also_clean_claude_json,
         } => migrate(dry_run, also_clean_claude_json, out),
+        ConfigAction::Check { file } => check_toml(file.as_deref(), out),
+    }
+}
+
+/// #3197 — parse-only TOML check. Does not migrate, does not print the
+/// file, does not run `AppConfig::load_from` (which fail-opens).
+fn check_toml(file: Option<&Path>, out: &mut CliOutput) -> Result<i32> {
+    use crate::config::AppConfig;
+
+    let resolved;
+    let path: &Path = if let Some(p) = file {
+        p
+    } else {
+        let Some(p) = AppConfig::config_path() else {
+            let _ = writeln!(
+                out.stderr,
+                "ERROR: $HOME is not set; cannot resolve config path."
+            );
+            return Ok(2);
+        };
+        resolved = p;
+        &resolved
+    };
+    if !path.exists() {
+        let _ = writeln!(
+            out.stderr,
+            "ERROR: no config file at {} — nothing to check.",
+            path.display()
+        );
+        return Ok(2);
+    }
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(
+                out.stderr,
+                "ERROR: could not read {}: {}",
+                path.display(),
+                e
+            );
+            return Ok(4);
+        }
+    };
+    match toml::from_str::<toml::Value>(&contents) {
+        Ok(_) => {
+            let _ = writeln!(out.stderr, "OK: {} is valid TOML", path.display());
+            Ok(0)
+        }
+        Err(_) => {
+            // Do not interpolate the toml error: it can echo the
+            // offending line, which may carry `api_key`.
+            let _ = writeln!(out.stderr, "ERROR: {} is not valid TOML", path.display());
+            Ok(3)
+        }
     }
 }
 
@@ -860,5 +934,62 @@ model = "grok-4.3"
             llm.get("model").and_then(toml::Value::as_str),
             Some("grok-4.3")
         );
+    }
+
+    #[test]
+    fn check_valid_toml_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.toml");
+        std::fs::write(&path, "tier = \"keyword\"\n").unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Check { file: Some(path) },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        assert_eq!(code, 0);
+        let err = String::from_utf8(stderr).unwrap();
+        assert!(err.contains("valid TOML"), "got: {err}");
+    }
+
+    #[test]
+    fn check_invalid_toml_returns_three_without_echoing_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "api_key = \"sekrit-must-not-leak\"unclosed\n").unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Check { file: Some(path) },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        assert_eq!(code, 3);
+        let err = String::from_utf8(stderr).unwrap();
+        assert!(err.contains("not valid TOML"), "got: {err}");
+        assert!(
+            !err.contains("sekrit-must-not-leak"),
+            "toml error Display must not leak the secret, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_missing_file_returns_two() {
+        let path = std::path::PathBuf::from("/no/such/config-3197.toml");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Check { file: Some(path) },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        assert_eq!(code, 2);
     }
 }

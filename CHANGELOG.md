@@ -83,6 +83,57 @@ probe (citing #2445) but kept it for the corpus probe.
 ### Fixed
 
 - **#3185 / #3127 — Postgres keyword search dropped `Filter.since`/`until` and `source_uri`.** `PostgresStore::search` (the HTTP/MCP production caller) bound namespace/tier/tags/agent_id/expiry/visibility/lifecycle but had **no `created_at` window and no `source_uri` predicate**, so `GET /api/v1/search?since=&until=` and `?source_uri=` returned rows outside the requested set (wrong results, fail-open widening). The sqlite twin already honoured both via `db::search` → `db::search_with_source_uri`. Postgres had two forked lanes with different subsets; they now collapse onto **one SSOT** (`search_with_source_uri`, carrying since/until, source_uri, G7 soft-loser, #910/#3110 visibility, tags/agent_id, expiry/lifecycle, plus the 6-factor blend the trait method owned). Trait `search` is a thin wrapper; HTTP puts `?source_uri=` on `Filter.source_uri` so the compose path (`q + source_uri + since`) cannot silently drop the URI filter. Unset filters stay `None` (no silent tightening of a documented default). Worst case after the fix = fewer results, never extra. The previously caller-less inherent keyword lane used `plainto_tsquery` (AND); the SSOT uses `to_tsquery(build_or_tsquery(q))` (OR of sanitised tokens, same as the trait lane at base) — named here so the AND→OR change is not silent.
+### Security (postgres authz catch-up: #3193 #3194 #3195 #3197)
+
+Four fail-closed restorations. None of them tightens a documented default:
+each copies a sqlite/push-lane precedent the postgres or catch-up path
+had silently dropped.
+
+- **#3193 — `PostgresStore::archive_by_ids` discarded `CallerContext`.**
+  Any authenticated tenant on a postgres-backed daemon could
+  bulk-soft-delete another tenant's live rows through
+  `POST /api/v1/archive` (links cascaded). The sqlite HTTP branch has
+  refused since #940. The SAL method now runs
+  `assert_caller_owns_for_mutation_on` **inside the batch transaction**
+  (closes a re-own TOCTOU against a pool-borrowed probe). Unstamped
+  rows REFUSE on postgres (#3124 policy; the row stays live). The
+  handler maps per-id `PermissionDenied`/`NotFound` to `missing` so
+  the response is not an existence oracle over other tenants' ids.
+  The sqlite SAL adapter now also routes through
+  `archive_memory_for_caller` (latent: HTTP sqlite already gated).
+- **#3194 — `PostgresStore::link` / `link_signed` discarded ctx and
+  evaluated K9 as the daemon keypair.** `validate_link_pre_create_pg`
+  now folds source `agent_id` / `target_agent_id` into the existing
+  namespace SELECT and applies the sqlite #941 four-way predicate
+  (owner / inbox-target / empty-legacy / daemon). K9
+  `evaluate_link_permission` uses `ctx.effective_principal()` for
+  tenant writes; `bypass_visibility` keeps the prior
+  keypair-or-`"system"` fallback so federation inbound
+  (`apply_remote_link`) and operator lanes stay byte-identical. A
+  missing source skips the owner gate so the FK pre-flight still
+  names the missing memory (no 403 existence oracle).
+- **#3195 — catch-up/PULL hardcoded `existing_namespace: None`.**
+  Layer-1 stored-namespace probe the push lane runs fail-closed
+  (#2447) was structurally absent on PULL, so a `public/*`-scoped
+  peer could relocate/clobber an out-of-scope `secure/ops` row by
+  serving its id under an in-scope claimed namespace. All three
+  apply branches (SAL `store.namespace_by_id`, sqlite
+  `db::namespace_by_id`, no-sal legacy) now pass the stored
+  namespace when `inbound_write_needs_existing_namespace` is true.
+  Probe **error** skips AND halts the watermark (transient →
+  re-pull); a scope **refusal** skips without halt (permanent).
+  Zero-config stays at ZERO extra reads.
+- **#3197 — `entrypoint.plan-c.sh` interpolated `AI_MEMORY_API_KEY`
+  raw into TOML.** A `"`, `\`, or trailing newline (docker-secret
+  artefact) produced invalid TOML; `AppConfig::load_from` fail-opened
+  to defaults (`api_key` absent, `append_only=false`,
+  `require_operator_pubkey=false`, fresh `./ai-memory.db`). Render
+  now goes through `infra/plan-c/config-emit.sh` (TOML basic-string
+  escape, trailing-newline strip with WARN, EX_CONFIG 78 on any
+  other control character) and `ai-memory config check --file`
+  (parse-only; never echoes the file, never fail-opens) before
+  `exec`. Does **not** bump `EXPECTED_CLI_SUBCOMMANDS_*` — `Check` is
+  a sub-verb of the existing `Config` command.
 
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 

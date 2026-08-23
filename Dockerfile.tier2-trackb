@@ -41,7 +41,10 @@ RUN mkdir -p /var/lib/ai-memory /var/log/ai-memory/audit /etc/ai-memory \
 
 COPY entrypoint.plan-c.sh /usr/local/bin/entrypoint.sh
 COPY infra/plan-c/peer-preflight.sh /usr/local/lib/ai-memory/peer-preflight.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/lib/ai-memory/peer-preflight.sh
+COPY infra/plan-c/config-emit.sh /usr/local/lib/ai-memory/config-emit.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh \
+             /usr/local/lib/ai-memory/peer-preflight.sh \
+             /usr/local/lib/ai-memory/config-emit.sh
 
 EXPOSE 19077
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
