@@ -2478,6 +2478,13 @@ Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
   does not exist and the legacy `$HOME/.config/ai-memory/config.toml` does,
   the legacy file is still honoured and a one-shot stderr WARN tells the
   operator to move it. New installs land at the XDG path.
+- **#3215 CI follow-up — `serve_api_key_required_when_configured` now pins
+  `XDG_CONFIG_HOME` to the sandbox.** After #3002, `config_path()` prefers
+  `dirs::config_dir()`. The spawn-and-poke test wrote `config.toml` under
+  `$HOME` only, so an ambient XDG root won, the daemon booted without the
+  test `api_key`, `api_key_auth` became a pass-through, and GET
+  `/api/v1/stats` returned the admin-gate 403 instead of the api-key 401.
+  Same pin as `tests/boot_fail_closed_config_3166.rs`.
 - **#3003 — `doctor --posture` returned exit 1 (not the contracted 2) when the
   enterprise-federation boot gate was armed+failing, and the boot remediation
   told the operator to re-run the command that just refused.** The read-only

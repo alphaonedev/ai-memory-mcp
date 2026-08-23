@@ -421,7 +421,8 @@ fn serve_api_key_required_when_configured() {
     // and DO NOT set `AI_MEMORY_NO_CONFIG=1` for this test alone.
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
-    let cfg_dir = tmp.path().join(".config").join("ai-memory");
+    let xdg_root = tmp.path().join(".config");
+    let cfg_dir = xdg_root.join("ai-memory");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let api_key = "test-i7-secret";
     std::fs::write(
@@ -436,6 +437,17 @@ fn serve_api_key_required_when_configured() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env_remove("AI_MEMORY_NO_CONFIG")
         .env("HOME", tmp.path().to_str().unwrap())
+        // #3002 / #3215 — `config_path()` resolves through `dirs::config_dir()`,
+        // which honors `XDG_CONFIG_HOME`. Without this pin an ambient host
+        // XDG root (or a leftover `config.toml` there) wins, the daemon boots
+        // without the test `api_key`, `api_key_auth` becomes a pass-through,
+        // and GET `/api/v1/stats` returns the admin-gate 403 instead of the
+        // api-key 401 this test is pinning. Same pin as
+        // `tests/boot_fail_closed_config_3166.rs`.
+        .env("XDG_CONFIG_HOME", &xdg_root)
+        // `--db` carries `env = "AI_MEMORY_DB"`, which would pre-empt the
+        // path this test is pinning if the parent job exported it.
+        .env_remove("AI_MEMORY_DB")
         // #976 (2026-05-20) — `/api/v1/stats` is admin-gated post-#955;
         // the test exercises the api_key auth happy path, not the
         // admin-rejection contract, so seed a concrete admin id and
@@ -459,8 +471,16 @@ fn serve_api_key_required_when_configured() {
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || for _ in BufReader::new(stdout).lines() {});
     }
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
+        let sink = std::sync::Arc::clone(&stderr_buf);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut guard = sink.lock().unwrap();
+                guard.push_str(&line);
+                guard.push('\n');
+            }
+        });
     }
 
     let client = http_client();
@@ -472,13 +492,24 @@ fn serve_api_key_required_when_configured() {
         child: Some(child),
         port,
     };
-    assert!(ready, "auth-protected daemon never came up");
+    assert!(
+        ready,
+        "auth-protected daemon never came up; stderr:\n{}",
+        stderr_buf.lock().unwrap()
+    );
 
     // No header → 401. Retried on a connection-level error (not the
     // assertion below) — see [`send_first_request`] for why this is
     // needed even after the readiness gate above (#1994).
     let resp = send_first_request(|| client.get(format!("{}/api/v1/stats", &url)));
-    assert_eq!(resp.status().as_u16(), 401);
+    let status = resp.status().as_u16();
+    let body = resp.text().unwrap_or_default();
+    assert_eq!(
+        status,
+        401,
+        "missing x-api-key must 401 (got {status}); body={body}; stderr:\n{}",
+        stderr_buf.lock().unwrap()
+    );
 
     // With header → 200 (admin id threaded via X-Agent-Id per #1001).
     let resp = client
@@ -489,8 +520,9 @@ fn serve_api_key_required_when_configured() {
         .unwrap();
     assert!(
         resp.status().is_success(),
-        "auth header rejected: {}",
-        resp.status()
+        "auth header rejected: {}; stderr:\n{}",
+        resp.status(),
+        stderr_buf.lock().unwrap()
     );
     drop(guard);
 }
