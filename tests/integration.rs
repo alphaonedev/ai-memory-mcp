@@ -13147,7 +13147,7 @@ async fn test_daemon_cmd_serve_responds_to_health_then_terminates() {
     // assertion the prior subprocess test made, but against the in-process
     // daemon — coverage attribution lands on `handlers::health`).
     let resp = bounded_test_client()
-        .get(&format!("http://127.0.0.1:{port}/api/v1/health"))
+        .get(format!("http://127.0.0.1:{port}/api/v1/health"))
         .send()
         .await
         .expect("health request must succeed");
