@@ -291,10 +291,12 @@ impl MemoryStore for SqliteStore {
     /// upsert-merging. A collision surfaces as the legacy
     /// `crate::storage::ConflictError`, mapped here to the typed
     /// [`StoreError::Conflict`] carrying the existing row's id. The `embedding`
-    /// is written separately by the HTTP create handler after this returns
-    /// (the sqlite backend keeps embeddings in a side-table), so it is
-    /// deliberately ignored here — mirroring the trait-default
-    /// `store_with_embedding` sqlite behaviour.
+    /// is written separately by the HTTP create handler after this returns,
+    /// so it is deliberately ignored here. v1.0.0 #2638 — that out-of-band
+    /// write is exactly why this adapter does NOT implement
+    /// [`MemoryStore::store_with_embedding`]: a method whose contract is
+    /// "persist the row AND its vector" must refuse rather than accept the
+    /// vector and drop it.
     async fn store_with_embedding_no_overwrite(
         &self,
         ctx: &CallerContext,
@@ -2669,6 +2671,48 @@ impl MemoryStore for SqliteStore {
         }
     }
 
+    /// v1.0.0 #2639 — bounded scan of rows whose `memories.embedding`
+    /// column is NULL, so the `serve`-boot embedding-backfill sweep
+    /// ([`crate::store::run_embedding_backfill_on_store`]) actually covers
+    /// an HTTP-only sqlite daemon.
+    ///
+    /// **Why this override exists.** The trait method used to default to
+    /// `Ok(Vec::new())` and ONLY `PostgresStore` implemented it, on the
+    /// stated assumption that "sqlite side-table embeddings are backfilled
+    /// by the MCP boot path". Sqlite embeddings are NOT in a side table
+    /// (`memories.embedding` is a real column, written by
+    /// [`Self::update_embedding`] → `db::set_embedding`), and the MCP boot
+    /// backfill runs only in the stdio process — so `ai-memory serve --db
+    /// x.db` ran no sweep whatsoever and any row that reached storage
+    /// without a vector was permanently unreachable by semantic / hybrid
+    /// recall while still answering keyword search. Degraded-but-repairable
+    /// became permanent purely because the repair path was a silent default.
+    ///
+    /// Delegates to `db::get_unembedded_ids_batch`, which is the SAME
+    /// bounded scan the MCP-boot backfill drains and which already applies
+    /// the #1779 decrypt-or-skip resolver, so an at-rest-encrypted row whose
+    /// envelope will not open is SKIPPED rather than embedded as its empty
+    /// seal placeholder (embedding the placeholder would overwrite a good
+    /// store-time vector under the replace-semantics writer).
+    async fn list_unembedded(
+        &self,
+        ctx: &CallerContext,
+        limit: usize,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        // #1586 (SEC) — this returns id+title+content of EVERY unembedded row
+        // regardless of namespace/scope, so it is an admin-only sweep
+        // primitive. Mirrors the `PostgresStore` gate verbatim: a non-admin
+        // context gets an empty result, never cross-tenant private content.
+        // The sole production caller is the serve-boot sweep under
+        // `CallerContext::for_admin`. The `ctx` is load-bearing, not
+        // decorative.
+        if !ctx.bypass_visibility {
+            return Ok(Vec::new());
+        }
+        let conn = self.state.lock().await;
+        db::get_unembedded_ids_batch(&conn, limit).map_err(box_err)
+    }
+
     async fn find_by_title_namespace(
         &self,
         title: &str,
@@ -3062,40 +3106,69 @@ mod tests {
 
     #[tokio::test]
     async fn inherited_trait_defaults_roundtrip_cov() {
-        // Coverage: SqliteStore inherits the trait DEFAULT impls for
-        // store_with_embedding (forwards to store), store_batch (loops
-        // store), list_unembedded (empty), set_embeddings_batch (loops
-        // update_embedding — a no-op on the inline-vector-less sqlite
-        // adapter). Exercise each so the SAL default arms are covered.
+        // Coverage: the SAL default arms SqliteStore inherits.
+        //
+        // v1.0.0 #2638 — `store_with_embedding` and `store_batch` no longer
+        // have permissive defaults. The old bodies silently DISCARDED the
+        // embedding vector and silently downgraded batch atomicity to
+        // partially-applied; both now REFUSE, and sqlite deliberately does
+        // not implement them (its create funnel writes the vector
+        // out-of-band and its bulk ingest is the transactional
+        // `bulk_create_sqlite` path, neither of which routes here).
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
 
-        let m = test_memory("def-emb", "store_with_embedding default forwards to store");
-        let id = store
+        let m = test_memory("def-emb", "store_with_embedding must not drop the vector");
+        match store
             .store_with_embedding(&ctx, &m, Some(&[0.1f32, 0.2, 0.3]), Some("test#none"))
             .await
-            .expect("store_with_embedding default");
-        assert_eq!(id, m.id);
-        assert!(store.get(&ctx, &m.id).await.expect("get").id == m.id);
+        {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "STORE_WITH_EMBEDDING");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(_) => {
+                panic!("store_with_embedding must never report SUCCESS while dropping the vector")
+            }
+        }
+        assert!(
+            store.get(&ctx, &m.id).await.is_err(),
+            "a refused write must not have persisted the row"
+        );
 
         let batch = vec![
             test_memory("def-batch-1", "batch row one body"),
             test_memory("def-batch-2", "batch row two body"),
         ];
-        let ids = store
-            .store_batch(&ctx, &batch)
-            .await
-            .expect("store_batch default");
-        assert_eq!(ids.len(), 2);
+        match store.store_batch(&ctx, &batch).await {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "STORE_BATCH");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(_) => {
+                panic!("store_batch must never approximate the all-or-nothing contract silently")
+            }
+        }
 
-        // list_unembedded default = empty; update_embedding default =
-        // no-op Ok; set_embeddings_batch default loops it and counts.
+        // A row the remaining assertions can key on.
+        store.store(&ctx, &m).await.expect("store");
+
+        // v1.0.0 #2639 — `list_unembedded` is now IMPLEMENTED on this
+        // adapter, but it is admin-only: a tenant context still gets an
+        // empty result (the #1586 cross-tenant-content gate), never the
+        // corpus. The real scan is covered by
+        // `list_unembedded_scans_null_embedding_rows_for_admin_2639`.
         let unembedded = store
             .list_unembedded(&ctx, 10)
             .await
-            .expect("list_unembedded default");
-        assert!(unembedded.is_empty(), "default list_unembedded is empty");
+            .expect("list_unembedded (tenant ctx)");
+        assert!(
+            unembedded.is_empty(),
+            "a non-admin caller must never receive unembedded corpus rows"
+        );
+        // update_embedding writes `memories.embedding`;
+        // set_embeddings_batch default loops it and counts.
         let written = store
             .set_embeddings_batch(
                 &ctx,
@@ -3107,6 +3180,64 @@ mod tests {
         assert_eq!(
             written, 1,
             "default set_embeddings_batch counts the no-op writes"
+        );
+    }
+
+    /// v1.0.0 #2639 — `SqliteStore::list_unembedded` REALLY enumerates
+    /// `memories.embedding IS NULL` rows for an admin sweep context, so the
+    /// `serve`-boot backfill covers an HTTP-only sqlite daemon. Pre-#2639
+    /// the adapter inherited the `Ok(Vec::new())` trait default, so the
+    /// sweep read "nothing to embed" on EVERY boot and unembedded rows were
+    /// permanently invisible to semantic + hybrid recall.
+    #[tokio::test]
+    async fn list_unembedded_scans_null_embedding_rows_for_admin_2639() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let store = SqliteStore::open(tmp.path()).expect("open");
+        let tenant = CallerContext::for_agent("alice");
+        let admin = CallerContext::for_admin("test-backfill");
+
+        let a = test_memory("unembedded-a", "alpha body text");
+        let b = test_memory("unembedded-b", "beta body text");
+        store.store(&tenant, &a).await.expect("store a");
+        store.store(&tenant, &b).await.expect("store b");
+
+        let rows = store
+            .list_unembedded(&admin, 10)
+            .await
+            .expect("admin list_unembedded");
+        let ids: Vec<&str> = rows.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert!(
+            ids.contains(&a.id.as_str()) && ids.contains(&b.id.as_str()),
+            "both NULL-embedding rows must be enumerated, got {ids:?}"
+        );
+
+        // The `limit` is honoured so the boot sweep stays bounded.
+        let one = store
+            .list_unembedded(&admin, 1)
+            .await
+            .expect("bounded scan");
+        assert_eq!(one.len(), 1, "limit must bound the scan");
+
+        // A row that gains a vector leaves the scan set — the sweep is
+        // monotone and terminates.
+        store
+            .update_embedding(
+                &admin,
+                &a.id,
+                Some(&[0.1f32, 0.2, 0.3]),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
+            )
+            .await
+            .expect("update_embedding");
+        let after = store.list_unembedded(&admin, 10).await.expect("rescan");
+        let after_ids: Vec<&str> = after.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert!(
+            !after_ids.contains(&a.id.as_str()),
+            "an embedded row must drop out of the unembedded scan, got {after_ids:?}"
+        );
+        assert!(
+            after_ids.contains(&b.id.as_str()),
+            "the still-unembedded row must remain enumerable"
         );
     }
 

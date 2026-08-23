@@ -917,12 +917,8 @@ pub trait MemoryStore: Send + Sync {
     /// Store a memory together with its pre-computed embedding vector.
     /// v0.7.0 Wave-3 Continuation 5 — semantic recall on postgres-
     /// backed daemons relies on `memories.embedding` being populated
-    /// at write time; the SQLite path does the same via
-    /// `db::insert_with_embedding`. Adapters that don't have a vector
-    /// column (sqlite — embeddings live in a separate side-table)
-    /// fall back to plain `store` and ignore the vector; the
-    /// PostgresStore overrides this to bind the vector into the
-    /// INSERT. Default implementation forwards to `store`.
+    /// at write time, so `PostgresStore` overrides this to bind the vector
+    /// into the INSERT.
     /// #2167 — `space` is the fingerprint of the embedding space the
     /// supplied `_embedding` lives in (the LIVE embedder's
     /// [`crate::embeddings::Embed::space_fingerprint`]). It travels in the
@@ -931,14 +927,31 @@ pub trait MemoryStore: Send + Sync {
     /// stale / absent stamp (the §2 same-statement rule; the write-side twin
     /// of the recall `AND embedding_space = $fp` gate). `space` MUST be
     /// `Some` whenever `_embedding` is `Some`; `None` clears both.
+    ///
+    /// # Errors
+    ///
+    /// v1.0.0 #2638 — the default is [`StoreError::UnsupportedCapability`],
+    /// matching the convention every other optional method on this trait
+    /// already follows. It used to forward to [`Self::store`], SILENTLY
+    /// DISCARDING `embedding` + `space` — a drop of a DATA-BEARING argument
+    /// that returned SUCCESS, i.e. the #2444 false-success class
+    /// pre-installed and waiting for its first caller. `SqliteStore`
+    /// deliberately does NOT implement it: the sqlite create funnel writes
+    /// the vector out-of-band after the row lands (see
+    /// `SqliteStore::store_with_embedding_no_overwrite`), and the sqlite
+    /// bulk path is `handlers::bulk::bulk_create_sqlite`, which never routes
+    /// here. A caller that reaches this on sqlite is misrouted, and a loud
+    /// refusal is the only answer that cannot lose a vector.
     async fn store_with_embedding(
         &self,
-        ctx: &CallerContext,
-        memory: &Memory,
+        _ctx: &CallerContext,
+        _memory: &Memory,
         _embedding: Option<&[f32]>,
         _space: Option<&str>,
     ) -> StoreResult<String> {
-        self.store(ctx, memory).await
+        Err(StoreError::UnsupportedCapability {
+            capability: "STORE_WITH_EMBEDDING".to_string(),
+        })
     }
 
     /// v1.0.0 #2771 — FAIL-CLOSED create twin of [`Self::store_with_embedding`]:
@@ -1010,12 +1023,13 @@ pub trait MemoryStore: Send + Sync {
     /// it is atomic (all rows commit or none do), so a single row that
     /// fails to persist rolls the whole batch back.
     ///
-    /// The default implementation loops [`store`](Self::store) so every
-    /// adapter is correct without an override; SQLite inherits it
-    /// unchanged because its writes are in-process (no per-row network
-    /// round-trip to amortise). `PostgresStore` overrides this with one
-    /// multi-row `INSERT ... ON CONFLICT` so an N-row bulk ingest costs a
-    /// single round-trip instead of N.
+    /// v1.0.0 #2638 — the default is [`StoreError::UnsupportedCapability`],
+    /// not a per-row [`store`](Self::store) loop: looping would silently
+    /// downgrade the ALL-OR-NOTHING contract to PARTIALLY-APPLIED. An
+    /// adapter that cannot honour atomicity must refuse. `PostgresStore`
+    /// overrides with one multi-row `INSERT ... ON CONFLICT`. `SqliteStore`
+    /// does not: sqlite bulk ingest is `handlers::bulk::bulk_create_sqlite`
+    /// over the transactional `crate::storage` funnel.
     ///
     /// # Returned-id contract (#2551 — LOAD-BEARING, do not weaken)
     ///
@@ -1040,16 +1054,29 @@ pub trait MemoryStore: Send + Sync {
     ///
     /// Both properties are pinned cross-backend by
     /// `tests/bulk_write_truthfulness_2551.rs`.
+    ///
+    /// # Errors
+    ///
+    /// v1.0.0 #2638 — the default is [`StoreError::UnsupportedCapability`].
+    /// It used to loop [`Self::store`], which silently downgraded the
+    /// batch-failure contract from the documented ALL-OR-NOTHING to
+    /// PARTIALLY-APPLIED while leaving the caller's response shape
+    /// identical — so a future routing of `POST /api/v1/memories/bulk` at a
+    /// non-overriding adapter would have reported a batch outcome that did
+    /// not describe what durably landed (the #2551/#2588 write-truthfulness
+    /// class, one layer down). An adapter that cannot honour the atomicity
+    /// contract must say so, not approximate it. `SqliteStore` deliberately
+    /// does NOT implement it: sqlite's bulk ingest is
+    /// `handlers::bulk::bulk_create_sqlite` over the transactional
+    /// `crate::storage` funnel, which never routes through the SAL batch.
     async fn store_batch(
         &self,
-        ctx: &CallerContext,
-        memories: &[Memory],
+        _ctx: &CallerContext,
+        _memories: &[Memory],
     ) -> StoreResult<Vec<String>> {
-        let mut ids = Vec::with_capacity(memories.len());
-        for memory in memories {
-            ids.push(self.store(ctx, memory).await?);
-        }
-        Ok(ids)
+        Err(StoreError::UnsupportedCapability {
+            capability: "STORE_BATCH".to_string(),
+        })
     }
 
     /// Set or clear the embedding column for an existing memory.
@@ -1087,17 +1114,33 @@ pub trait MemoryStore: Send + Sync {
     /// on postgres fleets (P3 audit: 37/7,994 rows embedded). This
     /// trait method is the SAL-level enumerator that closes that gap.
     ///
-    /// Default returns an empty vec: adapters that don't store
-    /// embeddings inline (sqlite — embeddings live in a side table and
-    /// are backfilled by the MCP-boot path / the `src/storage` sweep)
-    /// make the serve-boot sweep a structural no-op, preserving their
-    /// existing behaviour exactly.
+    /// # Errors
+    ///
+    /// v1.0.0 #2639 — the default is [`StoreError::UnsupportedCapability`],
+    /// NOT `Ok(Vec::new())`. The pre-#2639 empty-vec default asserted
+    /// "nothing to embed" for every adapter that simply had not implemented
+    /// the scan, and [`run_embedding_backfill_on_store`] reads an empty chunk
+    /// as END OF CORPUS — so the sweep completed successfully having done
+    /// nothing. Its in-code justification (sqlite is covered by the MCP boot
+    /// path) does not hold for an HTTP-only sqlite daemon
+    /// (`ai-memory serve --db x.db`, no MCP stdio): that process runs NO
+    /// backfill at all, so rows written without a vector stayed permanently
+    /// invisible to semantic + hybrid recall while still answering keyword
+    /// search. "Nothing to do" and "I cannot answer" must never be the same
+    /// value; an adapter that cannot enumerate now REFUSES loudly and the
+    /// sweep logs the refusal instead of reporting a clean pass.
+    ///
+    /// Both production adapters implement it: `PostgresStore` scans the
+    /// inline `embedding` column and `SqliteStore` scans its own
+    /// `memories.embedding` column via `db::get_unembedded_ids_batch`.
     async fn list_unembedded(
         &self,
         _ctx: &CallerContext,
         _limit: usize,
     ) -> StoreResult<Vec<(String, String, String)>> {
-        Ok(Vec::new())
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_UNEMBEDDED".to_string(),
+        })
     }
 
     /// #1579 A4 — write a batch of freshly-computed embeddings in as
@@ -4403,10 +4446,11 @@ pub struct VerifyLinkReport {
 /// This is the serve-daemon twin of the MCP-boot
 /// [`crate::mcp::run_embedding_backfill_with_batch_size`] (which is
 /// rusqlite-`Connection`-bound and therefore never ran on
-/// postgres-backed daemons — the #1579 A4 root cause). Adapters whose
-/// `list_unembedded` default to empty (sqlite) make this a true no-op,
-/// so spawning it unconditionally on `serve` boot changes nothing for
-/// sqlite deployments.
+/// postgres-backed daemons — the #1579 A4 root cause). v1.0.0 #2639:
+/// both production adapters implement the scan (`PostgresStore` and
+/// `SqliteStore`); the trait default REFUSES (`UnsupportedCapability`)
+/// rather than answering empty. Spawning this on `serve` boot is the
+/// HTTP-sqlite backfill path that the MCP-stdio sweep never covered.
 ///
 /// **Failure semantics** mirror the MCP twin: a per-chunk embedder or
 /// writer fault is logged and the sweep STOPS (rather than skipping —
@@ -4753,17 +4797,46 @@ mod tests {
         assert_eq!(s.schema_version().await.expect("schema_version"), 0);
     }
 
+    /// v1.0.0 #2638 (was: `default_store_with_embedding_falls_through_to_store`)
+    /// — the default no longer forwards to `store` while DROPPING `embedding`
+    /// + `space`. Reporting SUCCESS for a write that discarded a data-bearing
+    /// argument is the #2444 false-success class; an adapter that cannot
+    /// persist the vector must refuse so the vector cannot be lost.
     #[tokio::test]
-    async fn default_store_with_embedding_falls_through_to_store() {
+    async fn default_store_with_embedding_refuses_rather_than_dropping_the_vector_2638() {
         let s = MinimalStore;
         let ctx = CallerContext::for_agent("alice");
         let mem = dummy_memory("with-emb");
-        // The default body forwards to `store` (ignoring the vector).
-        let id = s
+        match s
             .store_with_embedding(&ctx, &mem, Some(&[0.1_f32, 0.2, 0.3]), Some("test#none"))
             .await
-            .expect("store_with_embedding default");
-        assert_eq!(id, "with-emb");
+        {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "STORE_WITH_EMBEDDING");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(id) => panic!("returned success ({id}) while discarding the embedding"),
+        }
+    }
+
+    /// v1.0.0 #2638 — the batch default no longer loops `store`, which
+    /// silently downgraded the documented ALL-OR-NOTHING contract to
+    /// PARTIALLY-APPLIED under an unchanged response shape.
+    #[tokio::test]
+    async fn default_store_batch_refuses_rather_than_approximating_atomicity_2638() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let batch = [dummy_memory("batch-a"), dummy_memory("batch-b")];
+        match s.store_batch(&ctx, &batch).await {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "STORE_BATCH");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(ids) => panic!(
+                "returned success ({} id(s)) for a contract it cannot honour",
+                ids.len()
+            ),
+        }
     }
 
     #[tokio::test]
@@ -5673,19 +5746,33 @@ mod tests {
         }
     }
 
-    /// #1579 A4 — adapters that inherit the `list_unembedded` default
-    /// (sqlite) make the serve-boot sweep a structural no-op: the
-    /// first scan is empty, the loop exits immediately, zero rows are
-    /// written. This is the "sqlite serve surface unchanged" pin.
+    /// v1.0.0 #2639 (was: #1579 A4 "sqlite serve surface unchanged") — an
+    /// adapter that does NOT implement `list_unembedded` no longer answers
+    /// `Ok(vec![])`. The sweep therefore stops on the ERROR arm (WARN,
+    /// zero rows written) instead of reading an empty first scan as
+    /// end-of-corpus and reporting a clean pass over a corpus it never
+    /// looked at. `SqliteStore` now implements the scan, so the real sqlite
+    /// `serve` surface gains the backfill rather than losing anything.
     #[tokio::test]
-    async fn backfill_sweep_is_noop_on_default_list_unembedded() {
+    async fn backfill_sweep_stops_loudly_on_unsupported_list_unembedded_2639() {
         let s = MinimalStore;
         let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+        // The scan refuses before the embedder is consulted.
+        match s.list_unembedded(&ctx, 8).await {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "LIST_UNEMBEDDED");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(rows) => panic!(
+                "an adapter with no scan must refuse, not report {} row(s)",
+                rows.len()
+            ),
+        }
         let emb = crate::embeddings::test_support::MockEmbedder::new_ollama();
         let written = run_embedding_backfill_on_store(&s, &ctx, &emb, 8).await;
         assert_eq!(
             written, 0,
-            "default (sqlite-shape) adapters must make the sweep a no-op"
+            "an unsupported scan writes nothing (and logs the refusal)"
         );
     }
 
@@ -6499,14 +6586,36 @@ mod tests {
             ),
             "#1625: default surfaces UnsupportedCapability"
         );
-        // store_with_embedding default forwards to store (Err here).
+        // v1.0.0 #2638 — the store_with_embedding / store_batch defaults now
+        // REFUSE with UnsupportedCapability instead of silently dropping the
+        // vector / approximating the all-or-nothing batch contract.
         assert!(
-            dp.store_with_embedding(&ctx, &mem, Some(&[0.1]), Some("test#none"))
-                .await
-                .is_err()
+            matches!(
+                dp.store_with_embedding(&ctx, &mem, Some(&[0.1]), Some("test#none"))
+                    .await,
+                Err(StoreError::UnsupportedCapability { .. })
+            ),
+            "#2638: the default must refuse, not drop the vector"
         );
-        // list_unembedded default = empty; update_embedding default = Ok.
-        assert!(dp.list_unembedded(&ctx, 8).await.unwrap().is_empty());
+        assert!(
+            matches!(
+                dp.store_batch(&ctx, std::slice::from_ref(&mem)).await,
+                Err(StoreError::UnsupportedCapability { .. })
+            ),
+            "#2638: the default must refuse, not approximate atomicity"
+        );
+        // v1.0.0 #2639 — the list_unembedded default REFUSES rather than
+        // answering `Ok(vec![])`: "nothing to embed" and "I never looked" must
+        // not be the same value, or the backfill sweep reads an unimplemented
+        // scan as end-of-corpus and reports a clean pass.
+        assert!(
+            matches!(
+                dp.list_unembedded(&ctx, 8).await,
+                Err(StoreError::UnsupportedCapability { .. })
+            ),
+            "#2639: the default must refuse, not claim an empty corpus"
+        );
+        // update_embedding default = Ok.
         dp.update_embedding(
             &ctx,
             "x",
