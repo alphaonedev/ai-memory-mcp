@@ -1194,4 +1194,118 @@ mod tests {
             );
         }
     }
+
+    // ── #3049 — federation-receive coordination-plane folds ──────────
+    //
+    // These drive the PURE cores (`fold_screened_signal` /
+    // `fold_screened_checkpoint`) so they do not touch the process-global
+    // `SCREEN_MODE` OnceLock. The integration binary
+    // `tests/federation_receive_coord_screen_3049.rs` is the load-bearing
+    // `/sync/push` proof.
+
+    fn sample_signal(subject: &str) -> crate::models::Signal {
+        crate::models::Signal {
+            id: "sig-3049-unit".to_string(),
+            namespace: "coord/screen".to_string(),
+            from_agent: "ai:peer".to_string(),
+            to_agent: None,
+            subject: subject.to_string(),
+            body: serde_json::json!({"hello": "world"}),
+            signal_type: crate::models::SignalType::Notify,
+            in_reply_to: None,
+            correlation_id: None,
+            reference_ids: serde_json::json!([]),
+            created_at: 1_700_000_000,
+            expires_at: None,
+            delivered_at: None,
+            read_at: None,
+            acknowledged_at: None,
+            signature: vec![0xAB; 64],
+            sender_pubkey: vec![0xCD; 32],
+        }
+    }
+
+    fn sample_checkpoint() -> crate::models::Checkpoint {
+        crate::models::Checkpoint {
+            id: "cp-3049-unit".to_string(),
+            namespace: "coord/screen".to_string(),
+            title: "needs approval".to_string(),
+            condition_type: crate::models::ConditionType::Approval,
+            condition: serde_json::json!({}),
+            state: crate::models::CheckpointState::Resolved,
+            created_by: "ai:peer".to_string(),
+            resolved_by: Some("ai:peer".to_string()),
+            resolution: Some("approved".to_string()),
+            resolution_note: None,
+            signature: vec![0xAB; 64],
+            resolver_pubkey: vec![0xCD; 32],
+            created_at: 1_700_000_000,
+            deadline_at: None,
+            resolved_at: Some(1_700_000_900),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn fold_screened_signal_redacted_subject_clears_attestation_3049() {
+        let sig = sample_signal("clean subject");
+        let out = fold_screened_signal(&sig, Some(REDACTION_PLACEHOLDER.to_string()), None)
+            .expect("hit must clone");
+        assert_eq!(out.subject, REDACTION_PLACEHOLDER);
+        assert!(
+            out.signature.is_empty() && out.sender_pubkey.is_empty(),
+            "signed surface mutation MUST drop the presented attestation (#2340)"
+        );
+        assert_eq!(out.body, sig.body, "un-hit body is preserved");
+    }
+
+    #[test]
+    fn fold_screened_signal_clean_is_none_3049() {
+        let sig = sample_signal("clean subject");
+        assert!(
+            fold_screened_signal(&sig, None, None).is_none(),
+            "clean signal is a zero-copy None so the receive loop binds the original"
+        );
+        assert!(!sig.signature.is_empty(), "fixture itself stays signed");
+    }
+
+    #[test]
+    fn fold_screened_checkpoint_resolution_hit_clears_attestation_3049() {
+        let cp = sample_checkpoint();
+        let out = fold_screened_checkpoint(
+            &cp,
+            None,
+            None,
+            Some(REDACTION_PLACEHOLDER.to_string()),
+            None,
+            None,
+        )
+        .expect("hit must clone");
+        assert_eq!(out.resolution.as_deref(), Some(REDACTION_PLACEHOLDER));
+        assert!(
+            out.signature.is_empty() && out.resolver_pubkey.is_empty(),
+            "redacting the SIGNED `resolution` MUST drop the presented attestation"
+        );
+    }
+
+    #[test]
+    fn fold_screened_checkpoint_title_hit_preserves_attestation_3049() {
+        let cp = sample_checkpoint();
+        let out = fold_screened_checkpoint(
+            &cp,
+            Some(REDACTION_PLACEHOLDER.to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("hit must clone");
+        assert_eq!(out.title, REDACTION_PLACEHOLDER);
+        assert_eq!(
+            out.signature, cp.signature,
+            "a hit confined to unsigned fields (title) MUST keep the resolution attestation"
+        );
+        assert_eq!(out.resolver_pubkey, cp.resolver_pubkey);
+        assert_eq!(out.resolution, cp.resolution);
+    }
 }

@@ -589,6 +589,47 @@ Known residual, deliberately out of scope and filed as #3207: the pg
 `sweep_pending_action_timeouts` still emits no `pending_action.timed_out` row
 (the sqlite sweeper does). It is the one governance transition of the four that
 this cluster does not close — the three an adversary can drive are covered.
+### Security
+
+- **#3049 — federation-receive secret screen for inbound coordination rows.**
+  Follow-up from #2994: the CALLER-origin screen on signal/checkpoint create
+  was live, but `POST /api/v1/sync/push` `signals[]` / `checkpoints[]` had
+  ZERO screening — a peer running `AI_MEMORY_SECRET_SCREEN_MODE=off` (or a
+  hostile peer) could land a credential in this node's `signals` /
+  `checkpoints` tables, where it is queryable, forensic-exported, and
+  re-egressed. The receive arm now runs `secret_screen::redact_signal_for_storage`
+  / `redact_checkpoint_for_storage` AFTER the lane's authorization gates
+  (so forged-signature / authorship / namespace-scope still see the bytes
+  the peer signed) and BEFORE persist. Disposition is REDACT-only, never
+  refuse — a refused inbound row would diverge replicas (the #1821 lesson);
+  this restores the documented federation-receive contract, it does not
+  tighten it. When the redaction touches the SIGNED surface (`Signal.subject`
+  / `sha256(body)`; checkpoint `resolution`) the presented attestation is
+  dropped with a loud WARN so the row lands honestly unsigned rather than
+  carrying a signature that cannot cover its own stored bytes (#2340).
+  Source: `src/secret_screen.rs`, `src/handlers/federation_receive.rs`
+  (signals apply loop + checkpoint Accept arm only).
+- **#3173 — synthesis merge plane ownership gate.**
+  `db::find_synthesis_candidates` is namespace-scoped only, and the
+  Form-1 `db::update` / `db::delete` sites plus the exact-dup merge
+  detour ran on a bare `rusqlite::Connection` with none of the #1786
+  `visibility::caller_owns_for_mutation` gates the explicit MCP mutation
+  handlers apply. Under `AI_MEMORY_AGENT_ID` multi-tenancy in a shared
+  namespace, an autonomous synthesis verdict (or an exact-dup
+  `on_conflict=merge`) could overwrite or hard-delete another agent's
+  row. The candidate pool is now filtered to rows the caller may mutate
+  BEFORE the curator sees them; every mutate site re-checks and REFUSES
+  (`caller does not own this memory`) rather than silently skipping; the
+  update+delete queue is vetted BEFORE `BEGIN IMMEDIATE` so a refusal
+  cannot leave a half-applied merge. The exact-dup detour searches the
+  FULL pool so a cross-owner collision refuses loudly instead of
+  falling through to an opaque `(title, namespace)` UNIQUE violation.
+  Keyed on `resolve_read_visibility_caller` (env-only) so the
+  single-operator trust-all default is byte-unchanged. Inbox recipients
+  are NOT owners here (`allow_inbox = false` — a synthesis verdict is
+  an autonomous mutation the caller never named). No postgres synthesis
+  lane exists (`memory_store` is sqlite-native). Source:
+  `src/mcp/tools/store/{mod,synthesis}.rs`.
 
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 

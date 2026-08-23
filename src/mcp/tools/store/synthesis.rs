@@ -705,3 +705,92 @@ pub(super) fn synthesis_eligible(
         && !namespace.starts_with('_')
         && !ns_policy.effective_legacy_per_pair_classifier()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn owned_by(owner: &str) -> Memory {
+        Memory {
+            id: "mem-3173-alice".to_string(),
+            namespace: "shared/ns".to_string(),
+            title: "shared title".to_string(),
+            metadata: json!({ crate::META_KEY_AGENT_ID: owner }),
+            ..Memory::default()
+        }
+    }
+
+    fn inbox_for(owner: &str, target: &str) -> Memory {
+        Memory {
+            metadata: json!({
+                crate::META_KEY_AGENT_ID: owner,
+                crate::META_KEY_TARGET_AGENT_ID: target,
+            }),
+            ..owned_by(owner)
+        }
+    }
+
+    #[test]
+    fn caller_may_mutate_owner_yes_cross_owner_no_3173() {
+        let alice = owned_by("ai:alice");
+        assert!(caller_may_mutate(&alice, "ai:alice"));
+        assert!(
+            !caller_may_mutate(&alice, "ai:bob"),
+            "cross-owner MUST fail the synthesis-plane gate"
+        );
+    }
+
+    #[test]
+    fn caller_may_mutate_inbox_recipient_is_not_owner_3173() {
+        // SYNTHESIS_ALLOW_INBOX = false: an inbox recipient never asked
+        // for the row to be merged away, so they must not count as owner.
+        let inbox = inbox_for("ai:alice", "ai:bob");
+        assert!(
+            !caller_may_mutate(&inbox, "ai:bob"),
+            "inbox recipient must NOT own a synthesis mutation"
+        );
+        assert!(caller_may_mutate(&inbox, "ai:alice"));
+    }
+
+    #[test]
+    fn assert_caller_may_mutate_refuses_cross_owner_and_unvetted_3173() {
+        let alice = owned_by("ai:alice");
+        let pool = [alice];
+        assert!(
+            assert_caller_may_mutate(
+                &pool,
+                Some("ai:alice"),
+                crate::audit::AuditAction::Update,
+                "mem-3173-alice",
+            )
+            .is_ok()
+        );
+        let err = assert_caller_may_mutate(
+            &pool,
+            Some("ai:bob"),
+            crate::audit::AuditAction::Update,
+            "mem-3173-alice",
+        )
+        .expect_err("cross-owner MUST refuse, never skip");
+        assert_eq!(err, crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY);
+        let missing = assert_caller_may_mutate(
+            &pool,
+            Some("ai:alice"),
+            crate::audit::AuditAction::Delete,
+            "not-in-pool",
+        )
+        .expect_err("unvetted target MUST refuse");
+        assert_eq!(missing, crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY);
+        assert!(
+            assert_caller_may_mutate(
+                &pool,
+                None,
+                crate::audit::AuditAction::Update,
+                "mem-3173-alice",
+            )
+            .is_ok(),
+            "None caller is the single-operator trust-all default"
+        );
+    }
+}
