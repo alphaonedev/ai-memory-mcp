@@ -1084,6 +1084,42 @@ still fail ("poison rows") are skipped with a WARN naming the row id,
 and the run continues — a single un-embeddable row never aborts the
 migration. The run ends with a summary (JSON under `--json`).
 
+**Exit codes (v1.0.0 #2607).**
+
+| Exit | Meaning |
+|---|---|
+| `0` | The sweep completed with FULL coverage of its scan target. |
+| `2` | Keyword-only tier — no embedding model configured. |
+| `3` | Embedder construction failed (dead endpoint, bad key, unknown dim). |
+| `4` | `--stamp-only` refused a mixed-dim NULL-space population. |
+| `5` | **Partial coverage** — the sweep ran and wrote, but rows were skipped and/or the corpus still holds unembedded rows. |
+
+Every live run now prints `rows still unembedded: N`, **read back from
+storage after the sweep** rather than inferred from the loop's own
+counters (`rows_still_unembedded` + `complete` in the `--json`
+envelope). Pre-#2607 a run exited `0` regardless: a measured sweep at
+the DEFAULT batch size left 1,155 of 7,855 rows (14.7%) unembedded and
+reported success, so an operator who ran the documented vector-space
+migration once ended up with an 85 %-embedded corpus and no signal that
+the rest was keyword-only. The boot census cannot flag those rows
+either — they carry NULL embeddings, not a foreign space.
+
+On a `5`, re-run: a smaller `--batch` frequently clears rows a provider
+refused inside a large request (the same corpus that left 14.7 %
+unembedded at the default batch embedded 100 % at `--batch 50`). A
+`--max-rows` run that consumed its budget is **not** partial — its scan
+target is the budget — but skipped rows still report `5` in that mode,
+because a skip is a row the sweep looked at and could not embed.
+
+`--expect-skipped <N>` (default `0`) is the **ratchet** for a corpus that
+holds a genuinely un-embeddable population: an operator attestation that
+up to `N` rows cannot be embedded, so a stable poison set does not leave
+a scheduled sweep forever-red, while a poison set that GROWS past `N`
+still exits `5`. It suppresses the exit code only — the summary prints
+the real `skipped` and `rows still unembedded` counts either way (and
+`expect_skipped` is echoed in the `--json` envelope), so the ratchet
+never hides the evidence.
+
 Pair with `ai-memory doctor` (section "Embeddings Reachability
 (#1598)") to verify the target backend is reachable and authenticated
 *before* a long re-embed run.
