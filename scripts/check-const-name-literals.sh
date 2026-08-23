@@ -28,8 +28,12 @@
 #     tiny counts in names are domain terms, not tuned values);
 #   - hex literals of fewer than 3 hex digits: a byte value (0xde, 0xad)
 #     is far too short to be a value-encoding name;
-#   - semantic size/width suffixes on an alphabetic stem — `zero32`,
-#     `buf64`, `key256`: the number is the width TERM, not a tuned value;
+#   - hex values that span consecutive `_` segments (`MAGIC_DEAD_BEEF` =
+#     `0xdeadbeef`) ARE flagged (concatenated whole segments); a substring
+#     inside one word still is not;
+#   - semantic width names (`zero32`, `buf64`, `key256`) live in the
+#     allowlist as exact identifier regexes — not a fused `<alpha><width>`
+#     matcher, which would also exempt `POOL_SIZE256 = 256` (#3122);
 #   - domain-number tokens where the number IS the term, not the value
 #     (SHA256, ED25519, FTS5, BASE64, HTTP2, CL100K, ...) — allowlisted
 #     in scripts/qc-allowlists/const-name-literals-allow.txt as regexes
@@ -100,9 +104,6 @@ numlit = re.compile(r'\b(?:0x[0-9a-fA-F_]+|\d[\d_]*(?:\.\d[\d_]*)?)\b')
 # A `_`-delimited name segment split into optional alphabetic stem, digit
 # run, optional alphabetic tail: `8000`, `chunk500`, `500ms`.
 seg_split = re.compile(r'([A-Za-z]*)([0-9]+)([A-Za-z]*)')
-# Semantic size/width suffix on an alphabetic stem (`zero32`, `buf64`,
-# `key256`): the number is the byte/bit-width TERM, not a tuned value.
-size_suffix = re.compile(r'[A-Za-z]+(?:8|16|32|64|128|256|512)')
 
 
 def encodes_value(name, digits, is_hex):
@@ -113,23 +114,27 @@ def encodes_value(name, digits, is_hex):
     alphabetic segment — never an arbitrary substring. The previous
     `digits in name.replace("_", "")` test matched the hex byte `0xad`
     inside `paylo{ad}_hash`.
+
+    Hex (#3122 follow-up): also match a span of consecutive whole
+    segments whose concatenation equals the digits (`MAGIC_DEAD_BEEF`
+    vs `0xdeadbeef`). A substring inside one word still does not match.
     """
     want = digits.lower()
-    for seg in name.split("_"):
-        if not seg:
-            continue
-        seg = seg.lower()
+    segs = [s.lower() for s in name.split("_") if s]
+    for i, seg in enumerate(segs):
         if seg == want:
             return True
         if is_hex:
-            # A hex digit run only ever names a value as a whole segment
-            # (`MAGIC_DEADBEEF`); it must never match inside a word.
+            acc = seg
+            for nxt in segs[i + 1 :]:
+                acc += nxt
+                if acc == want:
+                    return True
+                if len(acc) > len(want):
+                    break
             continue
         m = seg_split.fullmatch(seg)
         if m is None or m.group(2) != want:
-            continue
-        if m.group(1) and not m.group(3) and size_suffix.fullmatch(seg):
-            # `zero32` / `buf64` / `key256`: semantic width, not a value
             continue
         return True
     return False
@@ -220,6 +225,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
 pub const SELFTEST_TIMEOUT_8000_MS: u64 = 8_000;
 pub const SELFTEST_CHUNK500: usize = 500;
 pub const SELFTEST_MAGIC_DEADBEEF: u32 = 0xdead_beef;
+pub const SELFTEST_MAGIC_DEAD_BEEF: u32 = 0xdeadbeef;
+pub const SELFTEST_POOL_SIZE256: usize = 256;
+let selftest_chunk_500 = 500;
 SELFTEST_POSITIVE
 
     # (b) FALSE POSITIVES from #3121 — the gate must NOT flag any of these.

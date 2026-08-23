@@ -24,3 +24,8 @@ P256
 P384
 [Bb]64
 ^V[0-9]+_
+# Semantic width identifiers (exact). Do NOT use a fused <alpha><width>
+# matcher — that would also exempt POOL_SIZE256 = 256 (#3122 follow-up).
+^zero32$
+^buf64$
+^key256$
