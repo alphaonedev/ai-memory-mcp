@@ -2452,15 +2452,18 @@ Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
   `/home/fate_two/...`, or a `.local-runs/` worktree) `recover` / `watch`
   computed a directory that does not exist, captured NOTHING, and reported
   success — the exact #1388 data-loss the backstops exist to prevent. The
-  encoder now matches the real on-disk layout, and `list_jsonl_in` is a
-  bounded RECURSIVE walk (some project dirs nest the transcript under a
-  per-session subdir; the depth-1 read missed it).
+  encoder now matches the real on-disk layout. Claude Code candidates are
+  **top-level only** (`<project>/<session-uuid>.jsonl`); a nested
+  `<session>/subagents/agent-*.jsonl` must not beat the operator session
+  (#3215 Fable HIGH). Recursive `list_jsonl_in` remains for Codex/Gemini
+  (`~/.codex/sessions/YYYY/MM/DD/*.jsonl`).
 - **#3001 (fail-open honesty) — `config migrate` laundered malformed legacy
   input into an unparseable v2 file, printed `OK: migrated`, and exited 0**;
   the next process then failed to parse it and silently fell back to
   `AppConfig::default()`. The migrator now validates the migrated output
-  round-trips through the real `AppConfig` parser BEFORE writing; on failure it
-  FAILS LOUD (non-zero exit, no file written, original config untouched).
+  through the SAME daemon tail (`toml::from_str::<AppConfig>` +
+  `validate_secret_handling`) BEFORE writing; on failure it FAILS LOUD
+  (non-zero exit, no file written, original config untouched).
 - **#3002 — `config.toml` was hardcoded to `$HOME/.config` while the identity
   key dir + hooks resolver honor `XDG_CONFIG_HOME`.** On any host that set
   `XDG_CONFIG_HOME`, a certified daemon loaded config from one root and looked

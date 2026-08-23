@@ -81,9 +81,35 @@ pub fn resolve_transcript(host: HostKind, cwd: &Path) -> Result<Option<PathBuf>,
 /// `$HOME/.claude/projects/-<cwd-encoded>/*.jsonl`. The cwd
 /// encoding replaces `/` with `-` and prefixes a leading `-`.
 fn claude_code_candidates(cwd: &Path) -> Vec<PathBuf> {
+    // Fable HIGH (#3215 / #2999): main transcripts are ALWAYS top-level
+    // `<project>/<session-uuid>.jsonl`. Recursing into
+    // `<session>/subagents/agent-*.jsonl` lets a worker fork beat the
+    // operator session by mtime — the same "reports success doing
+    // something other than asked" class #2999 was filed under. Recursive
+    // walk stays on Codex/Gemini (`list_jsonl_in`), where the real layout
+    // is nested (`~/.codex/sessions/YYYY/MM/DD/*.jsonl`).
     claude_code_dir(cwd)
-        .map(|d| list_jsonl_in(&d))
+        .map(|d| list_jsonl_top_level(&d))
         .unwrap_or_default()
+}
+
+/// Non-recursive `*.jsonl` / `*.json` listing — Claude Code main
+/// transcripts only. Does not descend into `subagents/` (or any subdir).
+fn list_jsonl_top_level(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                return None;
+            }
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str())?;
+            (ext == "jsonl" || ext == "json").then_some(path)
+        })
+        .collect()
 }
 
 /// The Claude Code transcript directory for `cwd` — the parent that the
@@ -161,13 +187,10 @@ pub fn watch_dirs(host: HostKind, cwd: &Path) -> Vec<PathBuf> {
 /// swallowing I/O errors (a non-existent directory is a legitimate
 /// empty-candidate state, not an error).
 ///
-/// #2999 — the walk is RECURSIVE (bounded depth) because the real host
-/// layout is NOT uniformly flat: some project dirs hold
-/// `<session-uuid>.jsonl` directly, while others nest the transcript one
-/// level down under a per-session subdirectory. A depth-1 `read_dir`
-/// missed the nested layout, so even a correctly-encoded dir could capture
-/// nothing. The depth bound keeps the L2 fast-path within budget on a deep
-/// tree, and symlinked entries are not followed (no walk-loop risk).
+/// Used for Codex (`~/.codex/sessions/YYYY/MM/DD/*.jsonl`) and Gemini.
+/// Claude Code does **not** use this walker — see [`list_jsonl_top_level`].
+/// The depth bound keeps the L2 fast-path within budget; symlinked entries
+/// are not followed (no walk-loop risk).
 fn list_jsonl_in(dir: &Path) -> Vec<PathBuf> {
     // Session subdirs sit one level under the project dir; a small bound
     // covers every observed layout while capping the walk on a deep tree.
@@ -287,15 +310,13 @@ mod tests {
         }
     }
 
-    /// #2999 (end-to-end) — with the correct encoding AND a recursive walk,
-    /// `resolve_transcript` finds a NESTED `*.jsonl` under the correctly
-    /// encoded project dir for a cwd containing `_` and `.`. Pre-fix, the
-    /// mis-encoded dir did not exist so this returned `None` (silent
-    /// no-capture); the depth-1 walk would also have missed the nested file.
+    /// #2999 / #3215 Fable HIGH — Claude Code main transcripts are
+    /// top-level `<project>/<session-uuid>.jsonl`. A NEWER nested
+    /// `<session>/subagents/agent-x.jsonl` must NOT beat the top-level
+    /// session file (that was a worker fork, not the operator session).
     #[test]
     fn resolve_finds_nested_transcript_for_underscore_dot_cwd() {
         let _g = crate::config::test_env_lock();
-        // Scratch HOME under the repo's gitignored .local-runs (no-/tmp rule).
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join(".local-runs")
             .join("transcript-paths-2999");
@@ -303,33 +324,33 @@ mod tests {
         let home = tempfile::tempdir_in(&root).expect("tempdir under .local-runs");
 
         let cwd = Path::new("/srv/team_alpha/proj.v2");
-        // Encoded name: each of '/', '_', '.' -> '-'.
         let encoded = "-srv-team-alpha-proj-v2";
-        // Transcript nested one level down in a per-session subdir.
-        let session_dir = home
-            .path()
-            .join(".claude")
-            .join("projects")
-            .join(encoded)
-            .join("session-abc");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        let transcript = session_dir.join("turns.jsonl");
-        std::fs::write(&transcript, b"{}\n").unwrap();
+        let proj = home.path().join(".claude").join("projects").join(encoded);
+        std::fs::create_dir_all(&proj).unwrap();
+        let main = proj.join("a7dca41e-session.jsonl");
+        std::fs::write(&main, b"{}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let subagents = proj.join("a7dca41e-session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let worker = subagents.join("agent-x.jsonl");
+        std::fs::write(&worker, b"{}\n").unwrap();
 
         let prev_home = std::env::var("HOME").ok();
-        // SAFETY: env mutation serialised by the lock; restored below.
         unsafe { std::env::set_var("HOME", home.path()) }
         let resolved = resolve_transcript(HostKind::ClaudeCode, cwd)
             .expect("resolve ok")
-            .expect("nested transcript located");
-        // SAFETY: restore under the same lock.
+            .expect("top-level session transcript located");
         unsafe {
             match prev_home {
                 Some(h) => std::env::set_var("HOME", h),
                 None => std::env::remove_var("HOME"),
             }
         }
-        assert_eq!(resolved, transcript, "must locate the nested .jsonl");
+        assert_eq!(
+            resolved, main,
+            "a newer subagents/*.jsonl must not beat the top-level session jsonl"
+        );
+        assert_ne!(resolved, worker);
     }
 
     #[test]

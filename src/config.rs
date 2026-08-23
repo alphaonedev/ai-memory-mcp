@@ -7761,7 +7761,7 @@ impl AppConfig {
     /// stderr and falls back to [`Self::default`] so the daemon boots
     /// without the misconfigured secret rather than refusing to start
     /// entirely.
-    fn validate_secret_handling(&self) -> Result<(), String> {
+    pub(crate) fn validate_secret_handling(&self) -> Result<(), String> {
         if let Some(llm) = &self.llm {
             // Rejection 1 — inline api_key literal.
             if llm.api_key.is_some() {

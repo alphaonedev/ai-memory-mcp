@@ -194,18 +194,36 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
     // discarded. Validate that the migrated text round-trips through the
     // SAME parser the daemon uses BEFORE writing anything; on failure,
     // refuse with a non-zero exit and leave the original config untouched.
-    if let Err(e) = toml::from_str::<AppConfig>(&migrated_text) {
-        let _ = writeln!(
-            out.stderr,
-            "ERROR: refusing to write {} — the migrated config does not parse \
-             ({}). No file was written and your original config is untouched. \
-             This usually means a legacy field in {} holds a value of the wrong \
-             type; fix it and re-run.",
-            path.display(),
-            e,
-            path.display()
-        );
-        return Ok(3);
+    // #3001 / #3215 Fable MED — same validating tail the daemon uses
+    // (`from_toml_contents` = parse + `validate_secret_handling`). A
+    // migrated file that parses but carries an inline secret must not
+    // print "OK: migrated" and then 78 on the next boot.
+    match toml::from_str::<AppConfig>(&migrated_text) {
+        Err(e) => {
+            let _ = writeln!(
+                out.stderr,
+                "ERROR: refusing to write {} — the migrated config does not parse \
+                 ({}). No file was written and your original config is untouched. \
+                 This usually means a legacy field in {} holds a value of the wrong \
+                 type; fix it and re-run.",
+                path.display(),
+                e,
+                path.display()
+            );
+            return Ok(3);
+        }
+        Ok(cfg) => {
+            if let Err(reason) = cfg.validate_secret_handling() {
+                let _ = writeln!(
+                    out.stderr,
+                    "ERROR: refusing to write {} — the migrated config is rejected \
+                     by the daemon's secret-handling validator ({reason}). No file \
+                     was written and your original config is untouched.",
+                    path.display()
+                );
+                return Ok(3);
+            }
+        }
     }
 
     // Write backup.
