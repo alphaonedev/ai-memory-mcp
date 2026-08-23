@@ -397,10 +397,11 @@ tier via `cert-postgres-age.yml` and honestly labels the PG 16 alternate.
   mount no longer cross-refuse each other's opens under require-mode;
   legacy id-less v1/v2 anchor lines stay counted CONSERVATIVELY for one
   release, and the operator sanction record binds the database it clears.
-  The open-time check + per-DB verdict filter are sqlite-side; the postgres
-  `verify-audit-trail` check side keeps the conservative count-every-anchor
-  posture pending [#2373](https://github.com/alphaonedev/ai-memory-mcp/issues/2373)
-  (postgres EMISSION already stamps v3 `db_id` anchors).
+  The open-time check + per-DB verdict filter shipped sqlite-first; the
+  postgres `verify-audit-trail` CHECK side now scopes by the same
+  genesis-derived `db_id` ([#2373](https://github.com/alphaonedev/ai-memory-mcp/issues/2373)
+  closed by #3134 — `PostgresStore::verify_audit_trail` passes
+  `watermark_db_id.as_deref()` into `compute_rollback_verdict_for_report`).
 - **Federated commit-checkpoint resolution signatures ([#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936), FED-RQ-01).**
   `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` (env-table row #125, default
   `1`) gates the inner per-resolution signature on inbound federated

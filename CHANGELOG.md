@@ -1872,6 +1872,12 @@ Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
   was checked against the shipped code, and claims that turned out to be
   ACCURATE were left alone. Corrections:
 
+  - **`docs/v1.0.0/release-notes.md` no longer claims the postgres
+    `verify-audit-trail` CHECK side is "pending #2373".** #3134
+    (`3983025d`) closed it: `PostgresStore::verify_audit_trail` now
+    passes `watermark_db_id.as_deref()` into
+    `compute_rollback_verdict_for_report`.
+
   - **Hook pipeline — 11 of the 22 advertised lifecycle events never fire.**
     The docs presented all 22 as live. Verified at `release/v1.0.0`: every
     decision-class `pre_*` event IS wired (so hook-based *enforcement* works
