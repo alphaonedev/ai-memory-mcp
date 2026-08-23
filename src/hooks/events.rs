@@ -69,10 +69,10 @@ use serde_json::Value;
 use crate::models::{Memory, MemoryLink, Tier};
 
 // ---------------------------------------------------------------------------
-// HookEvent — the 21 lifecycle event tags
+// HookEvent — the 22 lifecycle event tags
 // ---------------------------------------------------------------------------
 
-/// The 21 lifecycle events the hook pipeline supports.
+/// The 22 lifecycle events the hook pipeline supports.
 ///
 /// `HookEvent` is the *tag* an operator names in `hooks.toml`
 /// (`event = "post_store"`) and the discriminator the executor
@@ -91,7 +91,7 @@ use crate::models::{Memory, MemoryLink, Tier};
 /// and implementation of **NSA recommendation (d) Constrain and
 /// sandbox tool execution** + **(f) Filter and monitor output
 /// pipelines and chained execution** per U/OO/6030316-26 (May 2026
-/// v1.0). 27 lifecycle events (20 baseline + 5 v0.7.0 additions:
+/// v1.0). 22 lifecycle events (15 baseline + 5 v0.7.0 additions:
 /// `PreRecallExpand`, `PreReflect`, `PostReflect`, `PreCompaction`,
 /// `OnCompactionRollback`; + 2 v0.8.0 #1709 signal events:
 /// `PreSignalSend`, `PostSignalAck`) give operators a substrate-side hook for
@@ -843,13 +843,13 @@ mod tests {
             (HookEvent::PreRecallExpand, "\"pre_recall_expand\""),
             (HookEvent::PreReflect, "\"pre_reflect\""),
             (HookEvent::PostReflect, "\"post_reflect\""),
-            // v0.7.0 L1-7: compaction pipeline events (24th + 25th).
+            // v0.7.0 L1-7: compaction pipeline events.
             (HookEvent::PreCompaction, "\"pre_compaction\""),
             (
                 HookEvent::OnCompactionRollback,
                 "\"on_compaction_rollback\"",
             ),
-            // v0.8.0 Pillar-1 #1709: signed-signal events (26th + 27th).
+            // v0.8.0 Pillar-1 #1709: signed-signal events.
             (HookEvent::PreSignalSend, "\"pre_signal_send\""),
             (HookEvent::PostSignalAck, "\"post_signal_ack\""),
         ];

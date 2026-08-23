@@ -554,8 +554,9 @@ impl<'a> ConsolidationPass<'a> {
                 // cluster from the in-memory pre-merge snapshots and remove the
                 // bad summary. NOTE: the notify-only `OnCompactionRollback`
                 // hook event is NOT fired here — it has no fire site at
-                // v1.0.0 (claims audit 2026-08-22); the WARN below is the
-                // only signal an operator receives.
+                // v1.0.0 (claims audit 2026-08-22). The operator-visible
+                // signals are the WARN below AND `report.errors` (the
+                // verify-failed string is pushed onto the pass report).
                 let restored = match self.rollback_consolidation(&members, &new_id).await {
                     Ok(n) => n,
                     Err(re) => {
