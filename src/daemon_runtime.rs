@@ -6228,17 +6228,27 @@ pub async fn bootstrap_serve(
         }
     }
 
-    // #1735 (Pillar-4 4.C) — spawn the cold-path AGE-projection drainer when
-    // deferred mode is active on a postgres+AGE backend. Independent of
-    // federation: deferred link writes enqueue to `kg_projection_outbox` in
-    // the same tx as the relational row, and this worker projects them into
-    // `memory_graph` out-of-band (drain-once boot-recovery + periodic tick,
-    // supervised). Default `sync` mode never enqueues, so this is not spawned.
+    // #1735 (Pillar-4 4.C) — spawn the cold-path AGE-projection drainer on a
+    // postgres backend. Independent of federation: deferred link writes enqueue
+    // to `kg_projection_outbox` in the same tx as the relational row, and this
+    // worker projects them into `memory_graph` out-of-band (drain-once
+    // boot-recovery + periodic tick, supervised).
+    //
+    // v1.0.0 batch-2 (cross-backend parity) — spawned in SYNC mode too. Sync
+    // mode used to enqueue nothing, so the drainer was pointless there; it now
+    // RECORDS an unreconciled item whenever an AGE runtime failure prevents the
+    // inline projection (link insert) or unprojection (hard delete), instead of
+    // swallowing the failure and leaving the graph permanently divergent from
+    // the relational source of truth. Those records need the same self-heal.
+    // On a healthy sync deployment the queue is empty and each tick is one
+    // indexed no-op count — the cost of the always-on drainer is negligible
+    // against a silent, permanent relational-vs-graph divergence.
     #[cfg(feature = "sal-postgres")]
-    if matches!(
-        crate::config::age_projection_mode(),
-        crate::config::AgeProjectionMode::Deferred
-    ) {
+    {
+        let deferred = matches!(
+            crate::config::age_projection_mode(),
+            crate::config::AgeProjectionMode::Deferred
+        );
         if let Some(pg) = store_handle
             .as_any()
             .downcast_ref::<crate::store::postgres::PostgresStore>()
@@ -6250,11 +6260,12 @@ pub async fn bootstrap_serve(
             });
             task_handles.push(std::sync::Arc::new(pg.clone()).spawn_drainer(interval));
             tracing::info!(
-                "kg_projection drainer enabled (AI_MEMORY_AGE_PROJECTION_MODE=deferred): \
-                 draining kg_projection_outbox every {}s",
+                "kg_projection drainer enabled (age_projection_mode={}): draining \
+                 kg_projection_outbox every {}s",
+                if deferred { "deferred" } else { "sync" },
                 interval.as_secs()
             );
-        } else {
+        } else if deferred {
             tracing::warn!(
                 "AI_MEMORY_AGE_PROJECTION_MODE=deferred but store is not PostgresStore; \
                  deferred AGE projection has no drainer — falling back to inline-equivalent \

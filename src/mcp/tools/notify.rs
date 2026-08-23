@@ -22,13 +22,17 @@ pub fn handle_notify(
         .as_str()
         .ok_or(crate::errors::msg::TITLE_REQUIRED)?;
     let payload = params["payload"].as_str().ok_or("payload is required")?;
-    // B4 (R2-LOW) — clamp instead of panic on out-of-range JSON; the
-    // `.clamp(1, 10)` below enforces the semantic priority range, but
-    // an i64 like `9_999_999_999` would have aborted the stdio MCP
-    // server before the clamp ran.
-    let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5))
-        .unwrap_or(i32::MAX)
-        .clamp(1, 10);
+    // B4 (R2-LOW) — clamp instead of panic on out-of-range JSON; an i64 like
+    // `9_999_999_999` would have aborted the stdio MCP server before the clamp
+    // ran. v1.0.0 batch-2: routed through the shared
+    // `crate::models::normalize_priority` SSOT so the MCP, HTTP-sqlite and
+    // HTTP-postgres surfaces cannot drift on this normalization (they had).
+    // Behaviour is byte-identical to the inline expression this replaces.
+    let priority = crate::models::normalize_priority(
+        params["priority"]
+            .as_i64()
+            .unwrap_or(i64::from(crate::models::DEFAULT_PRIORITY)),
+    );
     let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
     let tier =
         Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;

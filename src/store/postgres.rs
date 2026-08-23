@@ -149,6 +149,54 @@ const SQL_HEAL_DANGLING_NAMESPACE_META: &str = "UPDATE namespace_meta \
        AND NOT EXISTS (SELECT 1 FROM memories WHERE memories.id = namespace_meta.standard_id)";
 const SQL_SELECT_MEMORY_ID_BY_ID: &str = "SELECT id FROM memories WHERE id = $1";
 
+/// #3011 parity (v1.0.0 batch-2) — postgres twin of the sqlite retention reap
+/// [`crate::signals::prune_expired`]. Deletes every signal whose
+/// caller-declared `expires_at` has passed. Only caller-declared-ephemeral
+/// signals are reaped (`expires_at IS NOT NULL`), so this is intended TTL
+/// expiry, NEVER unintentional loss of a durable coordination record — the
+/// same guarantee the sqlite SSOT makes.
+/// v1.0.0 batch-2 (cross-backend parity, AGE projection fail-open) — the
+/// reserved `kg_projection_outbox.relation` value that marks an
+/// UNPROJECTION (detach) reconciliation item rather than a pending edge
+/// projection.
+///
+/// SAFETY OF THE DISCRIMINATOR: `memory_links.relation` is a CLOSED typed set
+/// ([`crate::models::MemoryLinkRelation`], additionally enforced by a SQL CHECK
+/// constraint), so no caller — however hostile — can ever produce a link whose
+/// relation equals this marker. Pinned by
+/// `kg_unproject_marker_is_not_a_valid_link_relation`, which fails the build's
+/// test gate if a future `MemoryLinkRelation` variant ever collides.
+///
+/// The row shape is `(source_id = target_id = <deleted memory id>, relation =
+/// marker)`, so the existing pending/quarantine/attempt machinery, the
+/// take-query and the pending-depth gauge all apply unchanged — no schema
+/// change, no new drainer.
+const KG_UNPROJECT_MARKER_RELATION: &str = "__ai_memory_unproject__";
+
+/// v1.0.0 batch-2 — durable record of an AGE unprojection that could not be
+/// applied at hard-delete time. Idempotent: a second failure for the same id
+/// while one is still pending is a no-op rather than a duplicate row.
+const SQL_ENQUEUE_KG_UNPROJECTION: &str = "INSERT INTO kg_projection_outbox      (source_id, target_id, relation)      SELECT $1, $1, $2      WHERE NOT EXISTS (SELECT 1 FROM kg_projection_outbox                         WHERE source_id = $1 AND relation = $2 AND projected_at IS NULL)";
+
+/// v1.0.0 batch-2 (pm-v3.1 literal de-dup) — stamp an outbox row reconciled.
+const SQL_MARK_KG_OUTBOX_PROJECTED: &str =
+    "UPDATE kg_projection_outbox SET projected_at = now() WHERE id = $1";
+
+/// v1.0.0 batch-2 (pm-v3.1 literal de-dup) — enqueue a pending AGE edge
+/// projection. Used by BOTH the deferred-mode link path and the sync-mode
+/// projection-failure recovery arm.
+const SQL_ENQUEUE_KG_PROJECTION: &str =
+    "INSERT INTO kg_projection_outbox      (source_id, target_id, relation) VALUES ($1, $2, $3)";
+
+/// #3008 parity (v1.0.0 batch-2) — the single advisory-lock key that
+/// serializes every `action_edges` write, so the cycle probe and the INSERT
+/// are atomic with respect to each other. See
+/// [`pg_advisory_lock_action_edges`].
+const PG_ACTION_EDGES_LOCK_KEY: &str = "ai_memory.action_edges";
+
+const SQL_PRUNE_EXPIRED_SIGNALS: &str =
+    "DELETE FROM signals WHERE expires_at IS NOT NULL AND expires_at <= $1";
+
 /// #2542 (pm-v3.1 literal de-dup) — a namespace's bound `standard_id` (NULLABLE:
 /// a severed row holds NULL). Reused by the pool- and tx-side governance chain
 /// walks, the `-`-prefix inferred-parent detector, and the governance resolver.
@@ -6586,6 +6634,18 @@ impl PostgresStore {
     /// [`crate::visibility::is_visible_to_caller`] re-filter, NOT the SQL
     /// predicate — the SQL arm is a coarse private-row pre-filter and is
     /// wider than the predicate for non-private scopes.
+    ///
+    /// # Filter parity (v1.0.0 batch-2)
+    /// `filter.tags_any` and `filter.agent_id` are honoured, exactly as the
+    /// sqlite twin (`crate::storage::search_with_source_uri`) and the pg
+    /// `search` trait method honour them. Pre-fix this method bound only
+    /// `namespace/tier/since/until/source_uri/limit` and SILENTLY IGNORED both
+    /// — the same defect class `search` records as fixed there only ("Prior
+    /// implementation ignored `tags_any` and `agent_id` so identical calls
+    /// returned different result sets on the two adapters"). Because the
+    /// narrowing was dropped BEFORE `LIMIT`, a caller asking for
+    /// `tags_any = ["x"]` got a page of rows that mostly do not carry the tag
+    /// — wrong results, not merely extra ones.
     pub async fn search_with_source_uri(
         &self,
         ctx: &CallerContext,
@@ -6619,6 +6679,13 @@ impl PostgresStore {
         } else {
             Some(caller)
         };
+        // v1.0.0 batch-2 adapter parity (#302 item 3) — thread the FULL filter
+        // into the query, mirroring the pg `search` trait method verbatim:
+        //   `tags_any`: match when the FIRST requested tag is present in the
+        //               `memories.tags` JSONB array (`@> to_jsonb(ARRAY[$n])`);
+        //   `agent_id`: match when `metadata->>'agent_id'` equals it.
+        // Identical shape to `search` above so the two cannot drift again.
+        let tags_first: Option<&str> = filter.tags_any.first().map(String::as_str);
         // #1579 B2 — rank + match read the stored generated `tsv`
         // column (schema v57) instead of recomputing
         // to_tsvector(title||' '||content) per matched row.
@@ -6666,11 +6733,15 @@ impl PostgresStore {
                    OR m.metadata->>'agent_id' = $7
                    OR m.metadata->>'target_agent_id' = $7
                )
+               -- v1.0.0 batch-2 — `tags_any` / `agent_id` parity with the
+               -- sqlite twin and the pg `search` trait method (see the fn doc).
+               AND ($8::text IS NULL OR m.tags @> to_jsonb(ARRAY[$8]))
+               AND ($9::text IS NULL OR m.metadata ->> 'agent_id' = $9)
                {lifecycle_vis}
              ORDER BY rank DESC,
                       m.priority DESC,
                       m.updated_at DESC
-             LIMIT $8",
+             LIMIT $10",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
             lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
             soft_loser_factor = crate::storage::SOFT_LOSER_SCORE_FACTOR,
@@ -6682,6 +6753,8 @@ impl PostgresStore {
         .bind(filter.until)
         .bind(source_uri)
         .bind(caller_opt)
+        .bind(tags_first)
+        .bind(filter.agent_id.as_ref())
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -8718,6 +8791,17 @@ impl PostgresStore {
             .into_iter()
             .collect();
         decoded.retain(|r| visible.contains(&r.target_id));
+        // v1.0.0 batch-2 parity — mirror the CTE branch's deterministic order
+        // and row cap so the two postgres branches (and the sqlite SSOT) return
+        // the SAME bounded page for the same traversal. Sorting BEFORE
+        // truncating is what makes the cap a stable prefix rather than an
+        // arbitrary subset: DEGRADE (fewer rows), never WRONG rows.
+        decoded.sort_by(|a, b| {
+            a.depth
+                .cmp(&b.depth)
+                .then_with(|| a.target_id.cmp(&b.target_id))
+        });
+        decoded.truncate(kg_query_row_cap(None));
         Ok(decoded)
     }
 
@@ -8795,7 +8879,8 @@ impl PostgresStore {
                    array_to_string(nodes, '->') AS path
             FROM traversal
             WHERE EXISTS (SELECT 1 FROM memories m WHERE m.id = traversal.target_id {lifecycle_vis})
-            ORDER BY depth ASC, target_id ASC",
+            ORDER BY depth ASC, target_id ASC
+            LIMIT $3",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
             // general KG graph traversal, matching the SQLite `kg_query`
             // memories-JOIN. The EXISTS also converges postgres to SQLite's
@@ -8805,9 +8890,17 @@ impl PostgresStore {
             lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
         );
 
+        // v1.0.0 batch-2 parity — bound the result set exactly as the sqlite
+        // SSOT does (`crate::storage::kg_query` clamps to
+        // KG_QUERY_DEFAULT_LIMIT/KG_QUERY_MAX_LIMIT). Applied AFTER the
+        // deterministic `ORDER BY depth ASC, target_id ASC`, so the capped page
+        // is a stable prefix, never a random subset. PERF-07 — `TryFrom`,
+        // never `as`.
+        let row_cap = i64::try_from(kg_query_row_cap(None)).unwrap_or(i64::MAX);
         let rows = sqlx::query(&sql)
             .bind(source_id)
             .bind(depth_cap)
+            .bind(row_cap)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("cte kg_query", e))?;
@@ -10422,16 +10515,13 @@ impl PostgresStore {
                 crate::config::age_projection_mode(),
                 crate::config::AgeProjectionMode::Deferred
             ) {
-                sqlx::query(
-                    "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
-                     VALUES ($1, $2, $3)",
-                )
-                .bind(&link.source_id)
-                .bind(&link.target_id)
-                .bind(link.relation.as_str())
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("enqueue kg_projection_outbox", e))?;
+                sqlx::query(SQL_ENQUEUE_KG_PROJECTION)
+                    .bind(&link.source_id)
+                    .bind(&link.target_id)
+                    .bind(link.relation.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("enqueue kg_projection_outbox", e))?;
             } else {
                 // v0.7.0 fold-A2A1.3 (#700) extended to the link path
                 // (#858 follow-up, 2026-05-18): AGE projection is
@@ -10500,18 +10590,47 @@ impl PostgresStore {
                             .map_err(|e2| {
                                 to_store_err("rollback savepoint age_link_projection", e2)
                             })?;
+                        // v1.0.0 batch-2 (cross-backend parity) — RECORD the
+                        // unreconciled projection instead of only logging it.
+                        // Pre-fix this arm swallowed the failure: nothing
+                        // durable remembered that the committed relational edge
+                        // never reached AGE, so once AGE recovered the stale
+                        // graph was PERMANENT in sync mode (no retry, no
+                        // reconcile, no operator-visible pending depth) — a
+                        // query result silently contradicting the durable store.
+                        //
+                        // The enqueue rides THIS SAME tx as the relational
+                        // `memory_links` INSERT, so the record and the row it
+                        // describes commit together or not at all. It reuses the
+                        // deferred-mode table/drainer verbatim, including the
+                        // #1783 existence guard (a since-deleted link is dropped
+                        // without resurrecting a ghost) and the #2377 validity
+                        // re-read — no schema change, no new machinery.
+                        //
+                        // ERRORS-19 — a failure to RECORD the drift is NOT
+                        // swallowed: it propagates, because at that point we
+                        // could neither project nor remember, and committing the
+                        // relational row would leave undetectable drift.
+                        sqlx::query(SQL_ENQUEUE_KG_PROJECTION)
+                            .bind(&link.source_id)
+                            .bind(&link.target_id)
+                            .bind(link.relation.as_str())
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e2| to_store_err("record unreconciled kg projection", e2))?;
+                        crate::metrics::registry().age_projection_failed_total.inc();
                         tracing::warn!(
                             target: TRACE_TARGET_KG,
                             source_id = %link.source_id,
                             target_id = %link.target_id,
                             relation = link.relation.as_str(),
                             err = %e,
-                            "AGE projection skipped on link insert — \
-                             relational memory_links row still committed. \
-                             kg_query/kg_timeline over this edge may see a \
-                             stale AGE projection until it is rebuilt; \
-                             find_paths reads memory_links via the CTE and \
-                             stays correct."
+                            "AGE projection deferred on link insert (runtime failure) — \
+                             relational memory_links row committed and the pending \
+                             projection was RECORDED in kg_projection_outbox for \
+                             reconciliation by the drainer. kg_query/kg_timeline over \
+                             this edge may lag until it drains; find_paths reads \
+                             memory_links via the CTE and stays correct."
                         );
                     }
                     Err(e) => return Err(e),
@@ -10538,9 +10657,21 @@ impl PostgresStore {
     pub const AGE_PROJECTION_DRAIN_BATCH: i64 = 64;
 
     /// #1735 (Pillar-4 4.C) — cold-path drainer for `kg_projection_outbox`.
-    /// Projects up to `batch` pending rows (oldest first, under the attempt
-    /// ceiling) into the AGE `memory_graph` out-of-band of the link-write hot
-    /// path. Each row is projected in its OWN tx: on success the AGE MERGE +
+    /// Reconciles up to `batch` pending rows (oldest first, under the attempt
+    /// ceiling) against the AGE `memory_graph` out-of-band of the link-write
+    /// hot path.
+    ///
+    /// Two item kinds share the queue (v1.0.0 batch-2):
+    /// - a pending EDGE PROJECTION (`relation` is a real
+    ///   [`crate::models::MemoryLinkRelation`]) — MERGEd into the graph, guarded
+    ///   by the #1783 relational-existence re-check and the #2377 validity
+    ///   re-read;
+    /// - an UNPROJECTION marker ([`KG_UNPROJECT_MARKER_RELATION`]) — a
+    ///   hard-deleted memory whose ghost `:Memory` node still needs detaching,
+    ///   guarded by the mirror-image liveness re-check so a re-created id is
+    ///   never detached.
+    ///
+    /// Each row is reconciled in its OWN tx: on success the AGE write +
     /// the `projected_at = now()` stamp commit atomically; on failure the tx
     /// rolls back and `attempt_count` is bumped (with `last_error`) in a
     /// separate statement, so a poison row is retried up to
@@ -10588,47 +10719,90 @@ impl PostgresStore {
             // `memory_links`) land in AGE ALREADY-carrying its validity —
             // instead of a bare `{relation}` edge the current-view filter
             // serves as VALID forever. No `kg_projection_outbox` schema change.
-            let existing: Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
-                "SELECT valid_from, valid_until FROM memory_links \
+            // v1.0.0 batch-2 — UNPROJECTION marker (see
+            // [`KG_UNPROJECT_MARKER_RELATION`]): the relational memory was
+            // hard-deleted but its AGE `:Memory` node could not be detached at
+            // delete time. Reconcile it through the SAME per-row tx, attempt
+            // ceiling and quarantine ladder as an edge projection.
+            let outcome = if relation == KG_UNPROJECT_MARKER_RELATION {
+                // Mirror image of the #1783 existence guard. The marker asserts
+                // "no `memories` row with this id should have a graph node". If
+                // a row with this id EXISTS again — the id was re-created after
+                // the delete — detaching now would destroy a LIVE projection,
+                // so DROP the marker instead of acting on it. Fail-safe by
+                // construction: the reconciler can only ever remove a node
+                // whose relational row is confirmed absent inside this tx.
+                let live: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
+                    .bind(&source_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("kg unprojection marker liveness check", e))?;
+                if live.is_some() {
+                    sqlx::query(SQL_MARK_KG_OUTBOX_PROJECTED)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("drop re-created kg unprojection marker", e))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| to_store_err("commit drop kg unprojection marker", e))?;
+                    continue;
+                }
+                // Call the INNER (propagating) detach, NOT the
+                // `unproject_memory_from_age` wrapper: that wrapper deliberately
+                // SWALLOWS an AGE runtime failure and returns `Ok(())` for the
+                // hot delete path, which here would stamp the marker
+                // `projected_at` while the ghost node is still attached — the
+                // reconciler reporting work it did not do. Propagating instead
+                // routes an AGE failure into this drainer's own retry /
+                // attempt-bump / quarantine ladder, exactly as the projection
+                // arm below does with `project_link_into_age`. The `Err` arm
+                // rolls this tx back, so an aborted tx is not a problem.
+                unproject_memory_from_age_inner(&mut tx, &source_id).await
+            } else {
+                let existing: Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> =
+                    sqlx::query_as(
+                        "SELECT valid_from, valid_until FROM memory_links \
                      WHERE source_id = $1 AND target_id = $2 AND relation = $3",
-            )
-            .bind(&source_id)
-            .bind(&target_id)
-            .bind(&relation)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("kg_projection_outbox existence check", e))?;
-            let Some((valid_from, valid_until)) = existing else {
-                sqlx::query("UPDATE kg_projection_outbox SET projected_at = now() WHERE id = $1")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("drop deleted-link kg_projection_outbox row", e))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| to_store_err("commit drop deleted-link outbox row", e))?;
-                continue;
-            };
-            let valid_from_str = valid_from.map(|t| t.to_rfc3339());
-            let valid_until_str = valid_until.map(|t| t.to_rfc3339());
-            match project_link_into_age(
-                &mut tx,
-                &source_id,
-                &target_id,
-                &relation,
-                valid_from_str.as_deref(),
-                valid_until_str.as_deref(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    sqlx::query(
-                        "UPDATE kg_projection_outbox SET projected_at = now() WHERE id = $1",
                     )
-                    .bind(id)
-                    .execute(&mut *tx)
+                    .bind(&source_id)
+                    .bind(&target_id)
+                    .bind(&relation)
+                    .fetch_optional(&mut *tx)
                     .await
-                    .map_err(|e| to_store_err("mark kg_projection_outbox projected", e))?;
+                    .map_err(|e| to_store_err("kg_projection_outbox existence check", e))?;
+                let Some((valid_from, valid_until)) = existing else {
+                    sqlx::query(SQL_MARK_KG_OUTBOX_PROJECTED)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            to_store_err("drop deleted-link kg_projection_outbox row", e)
+                        })?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| to_store_err("commit drop deleted-link outbox row", e))?;
+                    continue;
+                };
+                let valid_from_str = valid_from.map(|t| t.to_rfc3339());
+                let valid_until_str = valid_until.map(|t| t.to_rfc3339());
+                project_link_into_age(
+                    &mut tx,
+                    &source_id,
+                    &target_id,
+                    &relation,
+                    valid_from_str.as_deref(),
+                    valid_until_str.as_deref(),
+                )
+                .await
+            };
+            match outcome {
+                Ok(()) => {
+                    sqlx::query(SQL_MARK_KG_OUTBOX_PROJECTED)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("mark kg_projection_outbox projected", e))?;
                     tx.commit()
                         .await
                         .map_err(|e| to_store_err("commit kg_projection drain tx", e))?;
@@ -10670,9 +10844,12 @@ impl PostgresStore {
                             target_id = %target_id,
                             relation = %relation,
                             attempts = attempt_count + 1,
-                            "kg_projection_outbox: row QUARANTINED after {} failed AGE-projection \
-                             attempts — relational edge exists but will not reach the AGE graph \
-                             until repaired/re-enqueued. Operator action required.",
+                            "kg_projection_outbox: row QUARANTINED after {} failed AGE \
+                             reconciliation attempts — the relational store and the AGE graph \
+                             remain divergent for this item (a pending edge projection, or an \
+                             `__ai_memory_unproject__` marker whose ghost node is still \
+                             attached) until repaired/re-enqueued. Readers fall back to the \
+                             relational CTE while AGE is unhealthy. Operator action required.",
                             Self::MAX_AGE_PROJECTION_ATTEMPTS
                         );
                     } else {
@@ -10683,7 +10860,7 @@ impl PostgresStore {
                             target_id = %target_id,
                             relation = %relation,
                             err = %err_text,
-                            "kg_projection_outbox: deferred AGE projection attempt failed; \
+                            "kg_projection_outbox: AGE reconciliation attempt failed; \
                              will retry until quarantine"
                         );
                     }
@@ -10729,27 +10906,116 @@ impl PostgresStore {
                 tracing::warn!(
                     target: TRACE_TARGET_KG,
                     err = %to_store_err("begin unproject tx", e),
-                    "AGE unprojection skipped (begin tx failed) on hard-delete"
+                    "AGE unprojection deferred (begin tx failed) on hard-delete — \
+                     recording every id for reconciliation"
                 );
+                self.record_unreconciled_unprojections(ids).await;
                 return;
             }
         };
+        let mut failed: Vec<&str> = Vec::new();
         for id in ids {
             if let Err(e) = unproject_memory_from_age(&mut tx, id).await {
                 tracing::warn!(
                     target: TRACE_TARGET_KG,
                     memory_id = %id,
                     err = %e,
-                    "AGE unprojection error on hard-delete (continuing)"
+                    "AGE unprojection error on hard-delete (recording for reconciliation)"
                 );
+                failed.push(id);
             }
         }
         if let Err(e) = tx.commit().await {
             tracing::warn!(
                 target: TRACE_TARGET_KG,
                 err = %to_store_err("commit unproject tx", e),
-                "AGE unprojection commit failed on hard-delete"
+                "AGE unprojection commit failed on hard-delete — \
+                 recording every id for reconciliation"
             );
+            // The commit failed, so NOTHING in this tx applied — every id is
+            // still unreconciled, not only the ones that errored inline.
+            self.record_unreconciled_unprojections(ids).await;
+            return;
+        }
+        if !failed.is_empty() {
+            self.record_unreconciled_unprojections(&failed).await;
+        }
+    }
+
+    /// v1.0.0 batch-2 TEST SEAM — drive
+    /// [`Self::record_unreconciled_unprojections`] from the live-tier parity
+    /// suite (`tests/pg_parity_batch_2.rs`).
+    ///
+    /// In production the recording path is reached ONLY when an AGE runtime
+    /// failure prevents an unprojection. A test cannot induce that on a SHARED
+    /// live tier without revoking the role's AGE access, which would break
+    /// every concurrent test on that tier. This wrapper lets the suite
+    /// reproduce the exact post-failure state — relational row deleted, ghost
+    /// `:Memory` node still attached — and then assert the real recording and
+    /// drain-reconciliation behaviour end to end.
+    ///
+    /// `#[doc(hidden)]` + the `_for_test` suffix follow the crate's established
+    /// test-seam convention (see
+    /// `crate::config::override_active_permissions_mode_for_test`): production
+    /// code must NEVER call this; it only forwards.
+    #[doc(hidden)]
+    pub async fn record_unreconciled_unprojections_for_test(&self, ids: &[&str]) {
+        self.record_unreconciled_unprojections(ids).await;
+    }
+
+    /// v1.0.0 batch-2 (cross-backend parity, AGE projection fail-open) —
+    /// durably RECORD memory ids whose AGE `:Memory` node could not be detached
+    /// after the relational row was hard-deleted, so the drift is reconcilable
+    /// instead of a log line that scrolls away.
+    ///
+    /// Pre-fix every failure arm of [`Self::unproject_memory_ids_best_effort`]
+    /// swallowed the error: the relational delete had already committed, so the
+    /// orphaned AGE node became a PERMANENT ghost in sync mode — `kg_query` /
+    /// `kg_timeline` would serve an edge to a memory that no longer exists once
+    /// AGE recovered, with zero client-visible signal and no self-heal.
+    ///
+    /// Recording reuses `kg_projection_outbox` with the reserved
+    /// [`KG_UNPROJECT_MARKER_RELATION`] (no schema change), so the existing
+    /// drainer, attempt/quarantine ceiling and pending-depth gauge cover it.
+    /// The write is pool-direct (the caller's tx may already be gone or
+    /// unusable) and idempotent.
+    ///
+    /// This is the terminal cleanup path, so it CANNOT propagate (OWNERSHIP-25:
+    /// best-effort cleanup never panics and never undoes the committed delete).
+    /// If even the record fails we escalate to `error!` and bump
+    /// `age_projection_failed_total` — the loudest signal available here.
+    async fn record_unreconciled_unprojections(&self, ids: &[&str]) {
+        for id in ids {
+            match sqlx::query(SQL_ENQUEUE_KG_UNPROJECTION)
+                .bind(id)
+                .bind(KG_UNPROJECT_MARKER_RELATION)
+                .execute(&self.pool)
+                .await
+            {
+                Ok(_) => {
+                    crate::metrics::registry().age_projection_failed_total.inc();
+                    tracing::warn!(
+                        target: TRACE_TARGET_KG,
+                        memory_id = %id,
+                        "AGE unprojection RECORDED as unreconciled in kg_projection_outbox — \
+                         the relational row is deleted; its graph node is detached on the \
+                         next drain pass"
+                    );
+                }
+                Err(e) => {
+                    crate::metrics::registry().age_projection_failed_total.inc();
+                    tracing::error!(
+                        target: TRACE_TARGET_KG,
+                        memory_id = %id,
+                        err = %to_store_err("record unreconciled kg unprojection", e),
+                        "AGE unprojection could NOT be applied OR recorded — the relational \
+                         row is deleted but a ghost :Memory node may remain in the AGE \
+                         graph. kg_query/kg_timeline readers fall back to the relational \
+                         CTE while AGE is unhealthy, but a recovered AGE will serve the \
+                         ghost until the graph is rebuilt. Operator action required."
+                    );
+                }
+            }
         }
     }
 
@@ -10759,9 +11025,14 @@ impl PostgresStore {
     /// the relational commit and the projection), then drains every
     /// `interval`. Supervised by construction: every drain step returns a
     /// `Result` that is logged and swallowed, so a transient AGE/DB error
-    /// never panics the task or aborts the loop. Only spawned by `serve`
-    /// when `AI_MEMORY_AGE_PROJECTION_MODE=deferred` on a postgres+AGE
-    /// backend.
+    /// never panics the task or aborts the loop.
+    ///
+    /// v1.0.0 batch-2 — spawned by `serve` on ANY postgres+AGE backend, not
+    /// only under `AI_MEMORY_AGE_PROJECTION_MODE=deferred`: sync mode now also
+    /// RECORDS unreconciled projections/unprojections here when an AGE runtime
+    /// failure prevents the inline write, so a sync deployment needs the same
+    /// self-heal. On a healthy sync deployment the queue is empty and every
+    /// tick is a single indexed no-op count.
     pub fn spawn_drainer(
         self: std::sync::Arc<Self>,
         interval: std::time::Duration,
@@ -12490,11 +12761,11 @@ impl PostgresStore {
         // the sink can never bleed its head into THIS db's verdict. Derived from
         // the SAME stable stored columns as the sqlite twin + the pg witness
         // emission (id/agent_id/payload_hash, never a TIMESTAMPTZ readback), so
-        // both backends resolve the identical db_id (K3 parity). Unlike the
-        // #2373-deferred rollback lane (which threads into a SYNC verdict fn),
-        // the watermark reader is called directly in this async fn, so the pg
-        // CHECK side can + does scope it. `None` on an empty chain = the
-        // conservative count-every-watermark posture.
+        // both backends resolve the identical db_id (K3 parity). Resolved once
+        // here and reused by BOTH check-side lanes — the forensic watermark
+        // reader below AND the #1946 D rollback-evidence verdict (#2373 closed
+        // in v1.0.0 batch-2; see that call site). `None` on an empty chain =
+        // the conservative count-every-watermark posture.
         let watermark_db_id: Option<String> = {
             let genesis: Option<(String, String, Vec<u8>)> =
                 sqlx::query_as(crate::signed_events::GENESIS_ROW_SQL)
@@ -12806,15 +13077,30 @@ impl PostgresStore {
 
         // v1.0.0 #1946 D — rollback-evidence verdict from the SHARED off-table
         // anchor reader (backend-agnostic file logic), so the pg twin surfaces
-        // an IDENTICAL verdict to sqlite (K3 parity). #2370: the pg CHECK side
-        // deliberately passes `db_id = None` this release — the conservative
-        // count-every-anchor posture, byte-identical to the pre-#2370 verdict
-        // (over-detect toward Evidence, never suppression). Postgres
-        // check-side db-id parity (threading an async genesis fetch into this
-        // sync-shared verdict fn) is tracked as the #2373 follow-up; the pg
-        // EMISSION side already stamps v3 db_id anchors above.
-        let rollback =
-            crate::governance::audit::compute_rollback_verdict_for_report(head_sequence, None);
+        // an IDENTICAL verdict to sqlite (K3 parity).
+        //
+        // #2373 CLOSED (v1.0.0 batch-2, cross-backend parity): the pg CHECK
+        // side now scopes the verdict by THIS database's genesis-derived id,
+        // exactly as the sqlite twin does (`crate::signed_events::
+        // verify_audit_trail`, which passes `genesis_db_id(conn)`). The
+        // deferral rationale ("threading an async genesis fetch into this SYNC
+        // verdict fn") never actually applied: `watermark_db_id` is resolved by
+        // an async fetch EARLIER IN THIS SAME async fn (see the #2955 block
+        // above) and the verdict fn itself is a pure `Option<&str>` consumer.
+        //
+        // Passing `None` was NOT the conservative posture it claimed: with an
+        // unscoped read, (a) `scan_head_anchor_log` can never apply its
+        // foreign-line filter, so ANY sibling database sharing the witness
+        // mount convicts THIS store (the exact #2370 false-positive class,
+        // which sqlite fixed and pg did not), and (b) `restore_sanction_clears`
+        // short-circuits on every db-bound sanction, so a legitimately restored
+        // pg store could NEVER be exonerated. Scoping suppresses no evidence
+        // about THIS store — a foreign anchor carries a different db_id by
+        // construction — it only stops counting other databases' lines.
+        let rollback = crate::governance::audit::compute_rollback_verdict_for_report(
+            head_sequence,
+            watermark_db_id.as_deref(),
+        );
 
         // v1.0.0 #1873 (CWE-354) — audit-head HASH-anchor check (postgres twin of
         // the sqlite `head_hash`, #2202). For every anchor that records a head hash
@@ -13177,6 +13463,39 @@ async fn pg_advisory_lock_title_namespace(
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
         .bind(title)
         .bind(namespace)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+}
+
+/// #3008 parity (v1.0.0 batch-2) — transaction-scoped advisory lock that
+/// serializes `action_edges` writes on a postgres backend.
+///
+/// The sqlite twin runs the self-edge check, the reachability (cycle) probe and
+/// the INSERT under ONE held `state.lock().await` connection mutex, so the
+/// gate and the write are atomic. The postgres adapter ran the probe and the
+/// INSERT as two INDEPENDENT pool statements: under READ COMMITTED two
+/// concurrent adds of opposing arcs (`A -> B` and `B -> A`) can each probe a
+/// cycle-free graph and then both commit, closing exactly the ordering cycle
+/// #3008 exists to prevent — a CORRUPTED ordering DAG that wedges
+/// `action_frontier` forever.
+///
+/// One global key (rather than per-endpoint row locks) is required for
+/// correctness: two DISJOINT new edges can co-close a cycle, so locking only
+/// the endpoints of one edge cannot see the other writer. Action edges are a
+/// low-volume coordination surface, so full serialization is the cheap,
+/// obviously-correct choice — and it exactly reproduces the sqlite posture.
+/// The lock is `_xact_` scoped, so it is released by COMMIT/ROLLBACK and can
+/// never leak on an error path. Single-key, so it is trivially deadlock-free
+/// (CONCURRENCY-04).
+///
+/// # Errors
+/// Propagates the lock query error.
+async fn pg_advisory_lock_action_edges(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(PG_ACTION_EDGES_LOCK_KEY)
         .execute(&mut **tx)
         .await
         .map(|_| ())
@@ -14234,7 +14553,13 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
     let mut bytes = prefix.as_bytes().to_vec();
     while let Some(&last) = bytes.last() {
         if last < 0xFF {
-            *bytes.last_mut().unwrap() = last + 1;
+            // ERRORS-07 — provably infallible: the `while let Some(&last) =
+            // bytes.last()` guard two lines above proves the vec is non-empty,
+            // so `last_mut()` is `Some`. The message records the invariant so a
+            // future refactor that breaks it is self-diagnosing.
+            *bytes
+                .last_mut()
+                .expect("bytes.last() matched Some in the while-let guard above") = last + 1;
             // Bytes before the incremented one stay valid UTF-8; the
             // incremented tail byte keeps any multi-byte sequence's lead
             // bytes intact for ASCII prefixes (our namespaces are ASCII).
@@ -14820,6 +15145,33 @@ const KG_TIMELINE_DEFAULT_LIMIT_SAL: usize = 200;
 ///
 /// Mirrors `crate::db::KG_TIMELINE_MAX_LIMIT`.
 const KG_TIMELINE_MAX_LIMIT_SAL: usize = 1000;
+
+/// v1.0.0 batch-2 cross-backend parity — postgres mirror of the sqlite
+/// `kg_query` default row cap (`crate::storage::KG_QUERY_DEFAULT_LIMIT`). The
+/// sqlite SAL adapter always passes `limit = None`, so 200 is the row count
+/// BOTH backends return for the same traversal.
+const KG_QUERY_DEFAULT_LIMIT_SAL: usize = 200;
+
+/// v1.0.0 batch-2 cross-backend parity — postgres mirror of the sqlite
+/// `kg_query` hard ceiling (`crate::storage::KG_QUERY_MAX_LIMIT`).
+const KG_QUERY_MAX_LIMIT_SAL: usize = 1000;
+
+/// v1.0.0 batch-2 cross-backend parity — resolve the `kg_query` result-row cap.
+///
+/// The sqlite SSOT (`crate::storage::kg_query`) defaults an absent limit to
+/// [`KG_QUERY_DEFAULT_LIMIT_SAL`] and clamps to
+/// `[1, KG_QUERY_MAX_LIMIT_SAL]`; both postgres traversal branches carried NO
+/// row cap at all, so a dense graph could materialize every simple path up to
+/// depth 5 (combinatorial) into memory and onto the wire, AND returned a
+/// different result set than sqlite for an identical call. DEGRADE (fewer
+/// rows, deterministic order), never CORRUPT: both branches order by
+/// `(depth ASC, target_id ASC)` before truncating, so the capped page is a
+/// stable prefix of the full result — identical to what sqlite returns.
+fn kg_query_row_cap(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(KG_QUERY_DEFAULT_LIMIT_SAL)
+        .clamp(1, KG_QUERY_MAX_LIMIT_SAL)
+}
 
 /// Hard ceiling on rows returned by a single store-level list scan
 /// ([`PostgresStore::list_by_namespace_prefix`],
@@ -19018,7 +19370,15 @@ impl MemoryStore for PostgresStore {
         prefix: &str,
         limit: usize,
     ) -> StoreResult<Vec<Memory>> {
-        let limit: i64 = (limit as i64).clamp(1, STORE_LIST_MAX_LIMIT_SAL);
+        // PERF-07 — narrowing/widening conversions go through `TryFrom`,
+        // never `as` (the file's own dominant idiom). A `usize` that cannot
+        // be represented as `i64` saturates to the SAL page cap, which is
+        // exactly what the old `.clamp(1, STORE_LIST_MAX_LIMIT_SAL)` produced
+        // for any such value — semantics identical, silent-truncation class
+        // removed.
+        let limit: i64 = i64::try_from(limit)
+            .unwrap_or(STORE_LIST_MAX_LIMIT_SAL)
+            .clamp(1, STORE_LIST_MAX_LIMIT_SAL);
         // Sargable BYTE-range prefix scan on the `namespace`
         // text_pattern_ops btree (`idx_memories_namespace_path`).
         //
@@ -19635,7 +19995,10 @@ impl MemoryStore for PostgresStore {
         since: Option<&str>,
         limit: usize,
     ) -> StoreResult<(Vec<Memory>, usize)> {
-        let limit_i: i64 = (limit as i64).clamp(1, STORE_LIST_MAX_LIMIT_SAL);
+        // PERF-07 — `TryFrom`, never `as` (see `list_by_namespace_prefix`).
+        let limit_i: i64 = i64::try_from(limit)
+            .unwrap_or(STORE_LIST_MAX_LIMIT_SAL)
+            .clamp(1, STORE_LIST_MAX_LIMIT_SAL);
         let since_dt = match since {
             None => None,
             Some(s) => Some(parse_rfc3339_required(s)?),
@@ -23603,6 +23966,24 @@ impl MemoryStore for PostgresStore {
                 detail: format!("refused self-edge on action {from_action}"),
             });
         }
+        // #3008 parity (v1.0.0 batch-2) — the cycle probe and the INSERT MUST
+        // be ATOMIC with respect to each other. Pre-fix they were two
+        // independent pool statements, so under READ COMMITTED two concurrent
+        // adds of opposing arcs (`A -> B` and `B -> A`) could each probe a
+        // cycle-free graph and both commit — closing the very ordering cycle
+        // this gate refuses and wedging `action_frontier` permanently. The
+        // sqlite twin holds ONE connection mutex across gate+insert
+        // (`SqliteStore::action_add_edge` -> `crate::actions::add_edge`); the
+        // postgres twin now reproduces that serialization with a tx-scoped
+        // advisory lock (auto-released on COMMIT/ROLLBACK).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("action_add_edge begin tx", e))?;
+        pg_advisory_lock_action_edges(&mut tx)
+            .await
+            .map_err(|e| to_store_err("action_add_edge advisory lock", e))?;
         if edge_type != crate::models::EdgeType::Sibling {
             // Does `to_action` already reach `from_action` via non-sibling arcs?
             // If so, `from_action -> to_action` would close a cycle.
@@ -23617,10 +23998,12 @@ impl MemoryStore for PostgresStore {
             .bind(to_action)
             .bind(from_action)
             .bind(crate::models::EdgeType::Sibling.as_str())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| to_store_err("action_add_edge cycle-check", e))?;
             if cycle.is_some() {
+                // Byte-equal wire error with the sqlite twin. The tx is dropped
+                // (ROLLBACK) on this early return, releasing the advisory lock.
                 return Err(StoreError::IntegrityFailed {
                     detail: format!(
                         "refused edge {from_action} -> {to_action}: would close an ordering cycle"
@@ -23636,9 +24019,12 @@ impl MemoryStore for PostgresStore {
         .bind(to_action)
         .bind(edge_type.as_str())
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("action_add_edge", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("action_add_edge commit", e))?;
         Ok(())
     }
 
@@ -24083,6 +24469,16 @@ impl MemoryStore for PostgresStore {
                FROM signals WHERE namespace = ",
         );
         qb.push_bind(namespace.to_string());
+        // #3011 parity (v1.0.0 batch-2) — EXCLUDE acknowledged signals, exactly
+        // as the sqlite SSOT `crate::signals::list_inbox` does
+        // (`WHERE namespace = ? AND acknowledged_at IS NULL`). Pre-fix the pg
+        // adapter carried NO `acknowledged_at` predicate while `signal_ack`
+        // STAMPS-and-KEEPS the row, so a postgres inbox kept re-serving already
+        // acked signals forever — the same work re-dispatched on every poll,
+        // and a different result set than sqlite for an identical call.
+        // `signal_thread` / `signal_get` remain the read paths for an
+        // already-acked signal (unchanged on both backends).
+        qb.push(" AND acknowledged_at IS NULL");
         if let Some(agent) = to_agent {
             qb.push(" AND (to_agent = ")
                 .push_bind(agent.to_string())
@@ -24666,6 +25062,33 @@ impl MemoryStore for PostgresStore {
         let _ = sqlx::query(SQL_HEAL_DANGLING_NAMESPACE_META)
             .execute(&self.pool)
             .await;
+
+        // #3011 parity (v1.0.0 batch-2) — reap caller-declared-ephemeral
+        // (expired) coordination signals, the postgres twin of the sqlite gc
+        // chokepoint's `crate::signals::prune_expired` call
+        // (`crate::storage::gc`). Without it a postgres deployment honored
+        // `signals.expires_at` on the WRITE side (the column is persisted by
+        // `signal_send`) but never reaped, so ephemeral signals accumulated
+        // unbounded and kept surfacing in `signal_inbox` — the documented TTL
+        // contract was false on postgres.
+        //
+        // Deliberately OUTSIDE the #1026 transaction and best-effort
+        // (WARN-only), mirroring both the sqlite posture (best-effort from the
+        // gc chokepoint) and the `SQL_HEAL_DANGLING_NAMESPACE_META` sweep
+        // immediately above: a failed reap degrades to "signals live one more
+        // sweep", never to a rolled-back memory eviction. ERRORS-19 — the
+        // discard is explicit and the failure is observed, not dropped.
+        if let Err(e) = sqlx::query(SQL_PRUNE_EXPIRED_SIGNALS)
+            .bind(chrono::Utc::now().timestamp())
+            .execute(&self.pool)
+            .await
+        {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                err = %to_store_err("prune expired signals", e),
+                "expired-signal prune failed (in gc); will retry next sweep"
+            );
+        }
 
         Ok(evicted.len())
     }
@@ -29052,6 +29475,49 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v1.0.0 batch-2 — the AGE UNPROJECTION marker discriminator MUST be
+    /// unforgeable. The drainer treats a `kg_projection_outbox` row whose
+    /// `relation` equals [`KG_UNPROJECT_MARKER_RELATION`] as "detach this
+    /// memory's graph node", so if a caller could ever mint a `memory_links`
+    /// row carrying that relation, the marker would become a caller-triggerable
+    /// node-deletion primitive. It cannot: `memory_links.relation` is the
+    /// CLOSED [`crate::models::MemoryLinkRelation`] set (plus a SQL CHECK
+    /// constraint), and this test fails the build if a future variant ever
+    /// collides with the reserved value.
+    #[test]
+    fn kg_unproject_marker_is_not_a_valid_link_relation() {
+        assert!(
+            crate::models::MemoryLinkRelation::from_str(KG_UNPROJECT_MARKER_RELATION).is_none(),
+            "the reserved unprojection marker {KG_UNPROJECT_MARKER_RELATION:?} must NEVER parse              as a real MemoryLinkRelation — otherwise a caller-minted link could impersonate a              detach instruction to the AGE reconciler"
+        );
+        // Belt-and-suspenders: the marker keeps its `__`-fenced shape, which no
+        // relation vocabulary word can take.
+        assert!(
+            KG_UNPROJECT_MARKER_RELATION.starts_with("__")
+                && KG_UNPROJECT_MARKER_RELATION.ends_with("__"),
+            "the marker must stay visibly reserved so it reads as non-vocabulary in a table dump"
+        );
+    }
+
+    /// v1.0.0 batch-2 — the postgres `kg_query` row cap must reproduce the
+    /// sqlite SSOT policy exactly: default 200 when the caller passes no limit,
+    /// clamped into `[1, 1000]`.
+    #[test]
+    fn kg_query_row_cap_mirrors_the_sqlite_policy() {
+        assert_eq!(kg_query_row_cap(None), KG_QUERY_DEFAULT_LIMIT_SAL);
+        assert_eq!(kg_query_row_cap(Some(0)), 1, "0 clamps up to the floor");
+        assert_eq!(
+            kg_query_row_cap(Some(50)),
+            50,
+            "an in-band limit passes through"
+        );
+        assert_eq!(
+            kg_query_row_cap(Some(usize::MAX)),
+            KG_QUERY_MAX_LIMIT_SAL,
+            "an absurd limit clamps to the hard ceiling, never unbounded"
+        );
+    }
 
     // prefix_upper_bound underpins the sargable namespace-prefix range
     // used by `list_by_namespace_prefix` (the per-write dispatch hot

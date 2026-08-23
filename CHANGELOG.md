@@ -143,6 +143,135 @@ write is permission-evaluated as; see the operator note below.
   backends' `list_recall_observations` SELECT (sqlite + postgres), and the doc
   now truthfully mirrors the columns. Output-only (no input-schema / tool-count
   change). Source: `src/observations/mod.rs`, `src/store/postgres.rs`.
+### Fixed (cross-backend PARITY, batch 2 — pg/sqlite divergences)
+
+Every item below is one invariant the sqlite SSOT already held and the postgres
+adapter did not — the #3110 defect class (a gate/check/cap present on one
+backend and missing or divergently implemented on its twin). Pinned by
+`tests/pg_parity_batch_2.rs`, which drives each assertion through BOTH adapters.
+
+- **`signal_inbox` re-served ACKNOWLEDGED signals on postgres (#3011 parity).**
+  The sqlite SSOT (`signals::list_inbox`) filters `acknowledged_at IS NULL`; the
+  postgres adapter carried no such predicate while `signal_ack`
+  stamps-and-KEEPS the row, so a postgres inbox returned finished work on every
+  poll — the same task re-dispatched forever, and a different result set than
+  sqlite for an identical call. `signal_thread` / `signal_get` remain the read
+  paths for an acked signal on both backends.
+
+- **Expired signals were never reaped on postgres (#3011 parity).** `expires_at`
+  was persisted by `signal_send` but no postgres path ever deleted an expired
+  row (`run_gc` touched only memories/AGE/revisions/namespace_meta; the
+  maintenance loop swept memories/archives/leases/pending_actions), so the
+  documented TTL contract was false on postgres and ephemeral signals
+  accumulated unbounded. `PostgresStore::run_gc` now performs the twin of the
+  sqlite gc chokepoint's `signals::prune_expired` — best-effort, WARN-only, and
+  deliberately OUTSIDE the #1026 transaction, mirroring the sqlite failure
+  domain. Only caller-declared-ephemeral rows are reaped; a signal with no
+  `expires_at` is a durable record and always survives.
+
+- **`action_add_edge` lost its cycle-gate atomicity on postgres (#3008
+  parity).** The sqlite twin runs the self-edge check, the reachability probe
+  and the INSERT under ONE held connection mutex. The postgres adapter ran the
+  probe and the `ON CONFLICT DO NOTHING` insert as two INDEPENDENT pool
+  statements, so under READ COMMITTED two concurrent adds of opposing arcs
+  (`A -> B` and `B -> A`) could each observe a cycle-free graph and both commit
+  — closing the exact ordering cycle the gate exists to refuse and wedging
+  `action_frontier` permanently (a corrupted coordination DAG). Gate and write
+  now share one transaction under a tx-scoped advisory lock. One global key is
+  required for correctness: two DISJOINT new edges can co-close a cycle, so
+  endpoint-row locking cannot see the other writer. Wire errors stay byte-equal
+  with the sqlite twin.
+
+- **AGE projection failures were SWALLOWED on the sync-mode link and
+  hard-delete paths.** An AGE runtime failure on a link insert logged a warning
+  and committed the relational row; a failed unprojection after a hard delete
+  logged and returned. Nothing durable remembered either, so once AGE recovered
+  the divergence was PERMANENT in sync mode — `kg_query`/`kg_timeline` serving
+  an edge whose relational row is gone (or missing one that exists), with no
+  retry, no reconcile and no operator-visible signal. Both paths now RECORD the
+  unreconciled item in the existing `kg_projection_outbox` (no schema change):
+  the link path enqueues in the SAME transaction as the relational row, and the
+  delete path enqueues an unprojection marker under a reserved relation value
+  that no caller can forge (`memory_links.relation` is a closed typed set with a
+  SQL CHECK constraint; pinned by a unit test). The existing drainer reconciles
+  both kinds with mirror-image existence guards — a since-deleted link is never
+  resurrected, a re-created id is never detached — under the same
+  attempt/quarantine ceiling and pending-depth gauge. The drainer's marker arm
+  calls the PROPAGATING inner detach, never the swallow-wrapper the hot delete
+  path uses — otherwise an AGE failure during reconciliation would stamp the
+  marker reconciled while the ghost node stayed attached, i.e. the reconciler
+  reporting work it did not do. The drainer is now spawned on ANY postgres+AGE
+  backend, not only `age_projection_mode=deferred`, so sync deployments
+  self-heal; on a healthy sync deployment the queue is empty and each tick is
+  one indexed no-op count.
+
+- **`PostgresStore::search_with_source_uri` silently ignored `tags_any` and
+  `agent_id`.** The reciprocal-provenance FTS surface bound only
+  `namespace/tier/since/until/source_uri/limit`, while its sqlite twin and the
+  postgres `search` trait method both narrow on tags and owner. Because the
+  narrowing was dropped BEFORE `LIMIT`, callers got a page of rows that mostly
+  do not carry the requested tag/owner — wrong results, not merely extra ones.
+  (`search` records this exact defect class as fixed there only.)
+
+- **`kg_query` was UNCAPPED on postgres.** sqlite clamps the result rows to
+  `[1, 1000]` with a 200 default; both postgres branches (recursive CTE and AGE
+  cypher) had no row cap at all, so a dense graph materialized every simple path
+  up to depth 5 into memory and onto the wire, and returned a different result
+  set than sqlite for an identical call. Both branches now apply the sqlite page
+  policy AFTER a deterministic `(depth, target_id)` ordering, so the capped page
+  is a stable prefix — DEGRADE (fewer rows), never wrong rows. The HTTP
+  `body.limit` is still not threaded to the postgres branch (the SAL trait
+  carries no limit parameter); that remains a documented follow-up.
+
+- **`POST /api/v1/notify` stored a DIFFERENT priority depending on the
+  backend.** The sqlite branch clamped into `[1, 10]` via `mcp::handle_notify`
+  while the postgres branch used `i32::try_from(p).ok()`, which silently DROPPED
+  an out-of-`i32` priority to the SAL default 5 (sqlite stored 10) and never
+  clamped an in-`i32` but out-of-band value like 50 (sqlite stored 10, postgres
+  stored 50 — outside the documented domain). All three surfaces (MCP,
+  HTTP-sqlite, HTTP-postgres) now normalize through one SSOT,
+  `models::normalize_priority`, applied ABOVE the backend branch. sqlite
+  behaviour is unchanged for every in-`i32` input (its own clamp is idempotent
+  over the value); postgres is brought onto the documented domain. The SSOT also
+  corrects a latent INVERSION the old inline expression carried on all
+  surfaces: `i32::try_from(raw).unwrap_or(i32::MAX).clamp(1, 10)` saturated a
+  value BELOW `i32::MIN` upward, so `priority = i64::MIN` was stored as the
+  MAXIMUM priority 10. Saturation is now directional — below the band lands on
+  the floor, above it lands on the ceiling, at any magnitude.
+
+- **#2373 CLOSED — the postgres `verify_audit_trail` CHECK side now scopes the
+  #1946 D rollback-evidence verdict by this database's genesis-derived
+  `db_id`,** exactly as the sqlite twin does. Passing `None` was not the
+  conservative posture it claimed: the anchor-lane reader counts EVERY pinned
+  line for an id-less caller, so any sibling database sharing the witness mount
+  convicted this store (the #2370 false-positive class, fixed on sqlite and left
+  live on postgres), and a db-bound operator sanction could never clear, so a
+  legitimately restored postgres store could never be exonerated. The
+  genesis-derived id was already resolved by an async fetch earlier in the same
+  function for the watermark lane, so the stated deferral blocker never applied.
+
+- **PERF-07 / ERRORS-07 hygiene on the postgres store:** the two remaining
+  `usize as i64` limit casts (`list_by_namespace_prefix`,
+  `list_memories_updated_since_counted`) go through `TryFrom` with a saturating
+  fallback (semantics identical), and the provably-guarded `unwrap()` in
+  `prefix_upper_bound` becomes an `expect()` that records the invariant.
+
+### Documentation
+
+- **`docs/postgres-age-guide.md` now discloses the EXACT postgres-unsupported
+  surface,** per the #3064 minimum. The Agent Skills 501 entry is expanded into
+  a path/method/MCP-tool table naming all 8 routes and the 9 `memory_skill_*`
+  tools, with an explicit "this is a hard 501, not a degraded mode" warning. A
+  new *SQLite-only substrate planes* section discloses two capability gaps that
+  are NOT route-gated and were therefore invisible to an operator reading the
+  501 inventory: the **persona** mint/read surface (schema parity exists on
+  postgres, the executor and reader do not) and the **erasure cold tier**
+  (bundle / quarantine / reconcile), including the two concrete consequences on
+  postgres — `archive_restore` cannot self-heal a missing `archived_memories`
+  row from a verified bundle, and the purge-intent refusal has no postgres
+  counterpart. The crypto-erase invariant itself is explicitly noted as present
+  on postgres, so the disclosure neither overstates nor understates the gap.
+
 ### Changed
 
 - **Linux CI returns to GitHub-hosted runners except for the Postgres tier.**
