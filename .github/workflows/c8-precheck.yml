@@ -191,6 +191,21 @@ jobs:
         # confirms the gate exits non-zero + names the offender, cleans up.
         run: bash scripts/check-hardcoded-literals.sh --self-test
 
+  const-name-literal-gate:
+    # #3122 follow-up: the companion name-literal gate was script-only
+    # and unwired. Mirror hardcoded-literals (run + --self-test). NOT
+    # required at introduction (mirror-first; see
+    # required-contexts-not-required.txt).
+    name: Const-name-literal identifier gate (#3121)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run const-name-literal gate
+        run: bash scripts/check-const-name-literals.sh
+      - name: Self-test the gate (regression evidence)
+        run: bash scripts/check-const-name-literals.sh --self-test
+
   docs-vs-ssot-drift:
     # v0.7.0 (operator directive 2026-05-31: "can we use variables in
     # documentation for versions instead of literals?") — Markdown has
