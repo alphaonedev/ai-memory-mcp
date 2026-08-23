@@ -213,7 +213,8 @@ async fn default_collision_is_rejected_2743() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
     let suffix = uuid::Uuid::new_v4();
     let agent = format!("c2743-err-{suffix}");
     let ns = format!("c2743-err-ns-{suffix}");
@@ -282,7 +283,8 @@ async fn explicit_merge_upserts_2743() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
     let suffix = uuid::Uuid::new_v4();
     let agent = format!("c2743-merge-{suffix}");
     let ns = format!("c2743-merge-ns-{suffix}");
@@ -333,7 +335,8 @@ async fn explicit_version_renames_2743() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
     let suffix = uuid::Uuid::new_v4();
     let agent = format!("c2743-ver-{suffix}");
     let ns = format!("c2743-ver-ns-{suffix}");

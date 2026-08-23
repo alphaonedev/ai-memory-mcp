@@ -287,7 +287,8 @@ async fn create_memory_postgres_fans_out_to_peers() {
     let cfg = federation_cfg_for_test(&peer_urls, 2);
 
     let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
 
     let suffix = uuid::Uuid::new_v4();
     let ns = format!("fold-a2a1-6-s18-{suffix}");
@@ -389,7 +390,8 @@ async fn promote_postgres_fans_out_to_peers() {
     // doesn't fan out. This isolates the test's signal — we want
     // every peer counter to start at 0 and only bump on the promote.
     let (base, shutdown, handle) = spawn_daemon_with_federation(&url, None).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
 
     let suffix = uuid::Uuid::new_v4();
     let ns = format!("fold-a2a1-6-s16-{suffix}");
@@ -509,7 +511,8 @@ async fn promote_postgres_succeeds_against_freshly_stored_memory() {
     };
 
     let (base, shutdown, handle) = spawn_daemon_with_federation(&url, None).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
 
     let suffix = uuid::Uuid::new_v4();
     let ns = format!("fold-a2a1-6-s16-vis-{suffix}");

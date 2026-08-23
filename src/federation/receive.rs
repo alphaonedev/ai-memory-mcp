@@ -1006,6 +1006,19 @@ mod issue_1928_tests {
     use super::{MAX_SYNC_RESPONSE_BYTES, read_capped_sync_json_inner};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// v1.0.0 #3140 — a bounded client for the hostile-peer probes.
+    ///
+    /// `reqwest::Client::new()` has NO request timeout. A HOSTILE peer that
+    /// accepts the connection and then stalls would park the test forever —
+    /// the very posture these tests exist to prove we survive.
+    fn bounded_test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("bounded test client builds")
+    }
+
     /// Spawn a one-shot TCP "peer" that returns `body` under a crafted
     /// `Content-Length: content_length_hdr` and returns its address.
     async fn hostile_peer(content_length_hdr: u64, body: &'static [u8]) -> std::net::SocketAddr {
@@ -1031,7 +1044,7 @@ mod issue_1928_tests {
         // Advertise 100 MiB — the exact multi-gigabyte-class OOM vector.
         let advertised = 100 * 1024 * 1024u64;
         let addr = hostile_peer(advertised, b"{").await;
-        let client = reqwest::Client::new();
+        let client = bounded_test_client();
         let resp = client
             .get(format!("http://{addr}/sync/since"))
             .send()
@@ -1050,7 +1063,7 @@ mod issue_1928_tests {
     async fn legitimate_small_sync_body_still_parses() {
         let body = br#"{"memories":[]}"#;
         let addr = hostile_peer(body.len() as u64, body).await;
-        let client = reqwest::Client::new();
+        let client = bounded_test_client();
         let resp = client
             .get(format!("http://{addr}/sync/since"))
             .send()

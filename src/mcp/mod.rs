@@ -1587,7 +1587,7 @@ pub(crate) fn set_post_signal_ack_sink(tx: tokio::sync::mpsc::UnboundedSender<se
 // PRE/deny-capable event: its decision MUST be honored synchronously, before
 // the signal is signed + inserted. The MCP stdio dispatch is synchronous (a
 // `spawn_blocking` thread), so the gate fires the async `HookChain` inline via
-// `crate::llm::block_on_local` (the multi-thread arm reuses the outer runtime
+// `crate::llm::block_on_local_bounded` (the multi-thread arm reuses the outer runtime
 // via `block_in_place`; never a panicking `Handle::current().block_on`).
 //
 // INERT BY DEFAULT: installed by `run_mcp_server` ONLY when an operator
@@ -1604,6 +1604,25 @@ struct PreSignalSendGate {
     chain: std::sync::Arc<crate::hooks::HookChain>,
     registry: std::sync::Mutex<crate::hooks::ExecutorRegistry>,
 }
+
+/// v1.0.0 #3140 — wall-clock budget for driving an async hook chain from the
+/// synchronous MCP stdio dispatch.
+///
+/// The chain enforces its own per-event class deadline (max 5 s, see
+/// `crate::hooks::timeouts`), so this is a bridge-level backstop with >10x
+/// headroom: it can only fire when the bridge itself failed to advance the
+/// future, never when a chain is merely slow.
+const HOOK_BRIDGE_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// v1.0.0 #3140 — HTTP-style code reported when a deny-capable gate could not
+/// be EVALUATED (bridge budget exceeded, ephemeral runtime unbuildable under
+/// fd/memory exhaustion, hook task panicked).
+///
+/// 503 matches what `hooks::chain` already reports for an executor-level
+/// failure under `fail_mode=closed`. An enforcement gate that cannot run must
+/// refuse, never wave the operation through: an unevaluated gate is not an
+/// allow.
+const HOOK_BRIDGE_UNAVAILABLE_CODE: i32 = 503;
 
 static PRE_SIGNAL_SEND_GATE: std::sync::OnceLock<PreSignalSendGate> = std::sync::OnceLock::new();
 
@@ -1658,7 +1677,7 @@ fn map_chain_result_to_signal_decision(
 }
 
 /// #1752 — evaluate the installed PreSignalSend gate for one in-flight signal.
-/// Fires the configured async `HookChain` synchronously (via `block_on_local`)
+/// Fires the configured async `HookChain` synchronously (via `block_on_local_bounded`)
 /// and maps the outcome. The registry `Mutex` is uncontended (single-threaded
 /// stdio loop); a poisoned lock recovers its inner value.
 fn pre_signal_send_decision(
@@ -1666,7 +1685,7 @@ fn pre_signal_send_decision(
     delta: &crate::hooks::events::SignalDelta,
 ) -> signal::SignalHookDecision {
     let payload = serde_json::to_value(delta).unwrap_or(serde_json::Value::Null);
-    let cr = crate::llm::block_on_local(move || async move {
+    let fired = crate::llm::block_on_local_bounded(HOOK_BRIDGE_BUDGET, move || async move {
         let mut reg = gate
             .registry
             .lock()
@@ -1675,7 +1694,25 @@ fn pre_signal_send_decision(
             .fire(crate::hooks::HookEvent::PreSignalSend, payload, &mut reg)
             .await
     });
-    map_chain_result_to_signal_decision(cr)
+    match fired {
+        Ok(cr) => map_chain_result_to_signal_decision(cr),
+        // #3140 — FAIL CLOSED. This is a deny-capable PRE gate: if the bridge
+        // could not evaluate it, the operator's policy is UNKNOWN, and an
+        // unknown policy on an enforcement gate is a refusal, not an allow.
+        // Pre-#3140 this path could not even be reached — the bridge panicked
+        // (killing the stdio worker) or hung forever.
+        Err(e) => {
+            tracing::error!(
+                target: "hooks",
+                error = %e,
+                "PreSignalSend gate could not be evaluated; refusing the signal (fail-closed, #3140)"
+            );
+            signal::SignalHookDecision::Deny {
+                reason: format!("pre_signal_send gate could not be evaluated: {e}"),
+                code: HOOK_BRIDGE_UNAVAILABLE_CODE,
+            }
+        }
+    }
 }
 
 /// #1714 — build the [`signal::SignalHooks`] bundle for an MCP signal-ack
@@ -1746,7 +1783,7 @@ fn dispatch_memory_signal_send(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Strin
 // enforce is active AND a required event is declared — default off = never
 // installed = inert), and every eligible pre-event handler consults it BEFORE
 // the op commits, returning the 503 Deny on short-circuit. The async chain fires
-// synchronously via `block_on_local` (the sync stdio dispatch cannot `.await`).
+// synchronously via `block_on_local_bounded` (the sync stdio dispatch cannot `.await`).
 // ---------------------------------------------------------------------------
 
 /// #1885 — the process-global pre-event enforcement gate: the full loaded hook
@@ -1798,7 +1835,7 @@ pub(crate) fn consult_pre_event_gate(
     let Some(gate) = PRE_EVENT_ENFORCE_GATE.get() else {
         return Ok(());
     };
-    let cr = crate::llm::block_on_local(move || async move {
+    let fired = crate::llm::block_on_local_bounded(HOOK_BRIDGE_BUDGET, move || async move {
         let mut reg = gate
             .registry
             .lock()
@@ -1814,6 +1851,22 @@ pub(crate) fn consult_pre_event_gate(
         )
         .await
     });
+    // #3140 — FAIL CLOSED: a gate that could not be EVALUATED refuses. Pre-fix
+    // the bridge panicked (killing the request task mid-write) or hung.
+    let cr = match fired {
+        Ok(cr) => cr,
+        Err(e) => {
+            tracing::error!(
+                target: "hooks",
+                error = %e,
+                "pre-event enforcement gate could not be evaluated; refusing (fail-closed, #3140)"
+            );
+            return Err(format!(
+                "refused by hooks.enforce gate (code {HOOK_BRIDGE_UNAVAILABLE_CODE}): \
+                 gate could not be evaluated: {e}"
+            ));
+        }
+    };
     use crate::hooks::chain::ChainResult;
     match cr {
         // Allow / ModifiedAllow (the memory-shaped delta has no MCP-store
@@ -4017,7 +4070,7 @@ pub fn run_mcp_server(
 
     // #1752 — MCP PreSignalSend ENFORCEMENT gate. Same inert-by-default load as
     // the #1714 PostSignalAck bridge, but PRE/deny-capable: the dispatch fires
-    // the chain synchronously before sign+insert (via `block_on_local`), so a
+    // the chain synchronously before sign+insert (via `block_on_local_bounded`), so a
     // `Deny` actually refuses the send. Installed only when an operator
     // `pre_signal_send` `[[hook]]` is configured; otherwise byte-identical to
     // pre-#1752. Design: 5-agent vote (memory `4d3ea1c5`).

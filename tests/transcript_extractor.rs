@@ -24,6 +24,25 @@ use std::sync::OnceLock;
 use ai_memory::config::{TranscriptNamespaceConfig, TranscriptsConfig};
 use serde_json::{Value, json};
 
+/// v1.0.0 #3140 — ceiling on the nested `cargo build` for the sibling crate.
+///
+/// Generous: on a cold CI runner this compiles a small crate plus its
+/// dependencies, and it may first have to wait out the outer cargo's
+/// package-cache lock. The point is that a bound EXISTS.
+const EXTRACTOR_BUILD_BUDGET: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// v1.0.0 #3140 — ceiling on ONE extractor invocation. The binary reads one
+/// envelope from stdin and writes one decision line; a healthy run is
+/// milliseconds.
+const EXTRACTOR_RUN_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// v1.0.0 #3140 — poll cadence while waiting on a child.
+const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// v1.0.0 #3140 — disambiguates the per-invocation capture files when several
+/// test threads run the extractor concurrently.
+static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Build the reference extractor binary and return the absolute
 /// path to it.
 ///
@@ -59,23 +78,29 @@ fn build_extractor_once() -> PathBuf {
         manifest_path.display()
     );
 
-    // Build into a per-test target dir so a parallel `cargo test`
-    // invocation against the main crate doesn't race the
-    // sibling-crate build cache. Scope the temp dir by current
-    // PID so two concurrent `cargo test` driver processes (e.g.
-    // CI sharding) cannot stomp each other's target/.
+    // Build into a dedicated target dir, separate from the main crate's so a
+    // parallel `cargo test` against `ai-memory` doesn't race the sibling-crate
+    // build cache.
     // #1721 — project-local scratch (no /tmp writes; CLAUDE.md hard rule).
+    //
+    // v1.0.0 #3140 — this used to be scoped by PID. Cargo already takes an
+    // exclusive lock on a target dir, so two concurrent driver processes were
+    // never at risk of stomping each other; all the PID suffix bought was a
+    // COLD full rebuild per test-runner process, each leaving its own multi-
+    // gigabyte tree behind under `.local-runs/`. One shared dir is both
+    // correct and an order of magnitude cheaper on disk and time.
     let scratch_root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join(".local-runs")
         .join("transcript-extractor");
     std::fs::create_dir_all(&scratch_root).ok();
-    let target_dir = scratch_root.join(format!(
-        "ai-memory-transcript-extractor-target-{}",
-        std::process::id()
-    ));
+    let target_dir = scratch_root.join("ai-memory-transcript-extractor-target");
 
-    let status = Command::new("cargo")
+    // v1.0.0 #3140 — bounded. A nested `cargo build` blocks on the OUTER
+    // cargo's package-cache lock, so an unbounded `.status()` here can park
+    // the whole test binary indefinitely — indistinguishable from a hang, and
+    // charged to the CI job cap.
+    let mut child = Command::new("cargo")
         .args([
             "build",
             "--quiet",
@@ -84,8 +109,24 @@ fn build_extractor_once() -> PathBuf {
             "--target-dir",
             target_dir.to_str().expect("utf-8 target dir"),
         ])
-        .status()
+        .spawn()
         .expect("invoke cargo build");
+    let deadline = std::time::Instant::now() + EXTRACTOR_BUILD_BUDGET;
+    let status = loop {
+        match child.try_wait().expect("try_wait on cargo build") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "`cargo build` for the transcript extractor did not finish within \
+                     {EXTRACTOR_BUILD_BUDGET:?} — most likely blocked on the outer cargo's \
+                     package-cache lock (#3140)"
+                );
+            }
+            None => std::thread::sleep(CHILD_POLL_INTERVAL),
+        }
+    };
     assert!(status.success(), "cargo build for extractor failed");
 
     let bin = target_dir.join("debug").join("transcript-extractor");
@@ -101,10 +142,31 @@ fn build_extractor_once() -> PathBuf {
 /// the parsed decision JSON.
 fn run_once(bin: &Path, envelope: &Value) -> Value {
     use std::io::Write;
+    // v1.0.0 #3140 — stdout/stderr go to FILES, not pipes. `wait_with_output`
+    // reads both pipes to EOF with no deadline, so an extractor that never
+    // exits (or one that fills a pipe nobody drains) parks the test forever.
+    // With files the child can always make progress, which makes `try_wait` a
+    // truthful liveness signal and the deadline below real.
+    let capture_root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".local-runs")
+        .join("transcript-extractor");
+    std::fs::create_dir_all(&capture_root).ok();
+    let stem = capture_root.join(format!(
+        "run-{}-{}",
+        std::process::id(),
+        RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let out_path = stem.with_extension("stdout");
+    let err_path = stem.with_extension("stderr");
     let mut child = Command::new(bin)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(
+            std::fs::File::create(&out_path).expect("create stdout capture"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(&err_path).expect("create stderr capture"),
+        ))
         .spawn()
         .expect("spawn extractor");
     {
@@ -113,13 +175,31 @@ fn run_once(bin: &Path, envelope: &Value) -> Value {
             .write_all(envelope.to_string().as_bytes())
             .expect("write envelope");
     }
-    let output = child.wait_with_output().expect("wait extractor");
+    // Close stdin so the extractor sees EOF and can exit.
+    drop(child.stdin.take());
+
+    let deadline = std::time::Instant::now() + EXTRACTOR_RUN_BUDGET;
+    let status = loop {
+        match child.try_wait().expect("try_wait on extractor") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("extractor still running after {EXTRACTOR_RUN_BUDGET:?} (#3140)");
+            }
+            None => std::thread::sleep(CHILD_POLL_INTERVAL),
+        }
+    };
+    let stdout_bytes = std::fs::read(&out_path).unwrap_or_default();
+    let stderr_bytes = std::fs::read(&err_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&err_path);
     assert!(
-        output.status.success(),
+        status.success(),
         "extractor exited non-zero: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&stderr_bytes)
     );
-    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    let stdout = String::from_utf8(stdout_bytes).expect("utf-8 stdout");
     let line = stdout
         .lines()
         .rfind(|l| !l.trim().is_empty())

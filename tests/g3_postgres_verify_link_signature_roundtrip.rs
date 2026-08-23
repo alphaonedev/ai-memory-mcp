@@ -286,7 +286,8 @@ async fn g3_postgres_verify_link_signed_returns_verified_true() {
     let _env_g = env_var_lock();
     let (kp, _keys_keep) = ephemeral_keypair();
     let (base, shutdown, handle) = spawn_daemon(&url, kp.clone()).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
 
     let suffix = uuid::Uuid::new_v4();
     let ns = format!("g3-verify-{suffix}");

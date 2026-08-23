@@ -79,6 +79,14 @@ use rand_core::OsRng;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
+/// v1.0.0 #3140 — per-request ceiling for [`pg_test_client`].
+///
+/// Generous: these requests hit a Postgres-backed daemon on a shared CI
+/// runner and may legitimately take seconds. The point is that a bound
+/// EXISTS — an unbounded client turns a stalled daemon into a hung job.
+#[allow(dead_code)]
+pub const PG_TEST_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Build a `reqwest::Client` that sends a stable `X-Agent-Id` header
 /// on every request to the test daemon.
 ///
@@ -115,6 +123,11 @@ pub fn pg_test_client(agent_id: &str) -> reqwest::Client {
     );
     reqwest::Client::builder()
         .default_headers(headers)
+        // v1.0.0 #3140 — a client with NO request timeout parks the calling
+        // test forever if the daemon accepts the connection and then stalls.
+        // Six postgres suites share this constructor, so one bound covers all
+        // of them.
+        .timeout(PG_TEST_CLIENT_TIMEOUT)
         .build()
         .expect("build reqwest client with default X-Agent-Id header")
 }
@@ -684,6 +697,56 @@ pub const DAEMON_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_
 // fast enough to not meaningfully dent the CI job's time budget.
 pub const FANOUT_OBSERVED_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
+/// v1.0.0 #3140 — readiness budget for an IN-PROCESS daemon task.
+///
+/// [`DAEMON_READY_TIMEOUT`]'s 5 minutes is sized for a cold Postgres container;
+/// an in-process `serve_http_with_shutdown` task binds in milliseconds, so a
+/// failure there should surface in seconds, not minutes.
+pub const IN_PROCESS_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// v1.0.0 #3140 — how long to wait for an in-process daemon task to exit after
+/// `shutdown.notify_one()`.
+///
+/// A bare `let _ = handle.await;` is unbounded: a daemon that never observes
+/// the notify parks the test for the whole job cap. Mirrors the bounded join
+/// `tests/serve_postgres_smoke.rs` already uses.
+pub const DAEMON_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// v1.0.0 #3140 — a plain `reqwest::Client` WITH a request timeout.
+///
+/// `reqwest::Client::new()` has none, so a daemon that accepts the connection
+/// and then stalls parks the calling test forever.
+pub fn bounded_test_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(PG_TEST_CLIENT_TIMEOUT)
+        .build()
+        .expect("bounded test client builds")
+}
+
+/// v1.0.0 #3140 — per-probe ceiling inside [`wait_for_http_ready`].
+///
+/// The readiness loop checks `elapsed >= timeout` only at the TOP of each
+/// iteration, so a single probe that connects and then never answers defeats
+/// the whole [`DAEMON_READY_TIMEOUT`]: the loop never comes back around to
+/// notice it is out of time. Bounding the probe itself is what makes the
+/// loop's own budget real. A health check that takes longer than this is
+/// already a failed probe.
+const READY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// v1.0.0 #3140 — the bounded client used by [`wait_for_http_ready`].
+///
+/// Built once: a fresh `reqwest::Client` per probe would discard the
+/// connection pool and leak a resolver thread pool on every iteration.
+fn ready_probe_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(READY_PROBE_TIMEOUT)
+            .build()
+            .expect("readiness probe client builds")
+    })
+}
+
 /// Probe the in-process HTTP daemon's `/api/v1/health` endpoint until
 /// it returns 200 OK or the overall `timeout` elapses.
 ///
@@ -737,7 +800,7 @@ pub async fn wait_for_http_ready(
                     .unwrap_or_else(|| "no successful health probe before timeout".to_string()),
             });
         }
-        match reqwest::get(&url).await {
+        match ready_probe_client().get(&url).send().await {
             Ok(resp) if resp.status() == reqwest::StatusCode::OK => {
                 return Ok(elapsed);
             }

@@ -52,7 +52,7 @@ use super::{AppState, JsonOrBadRequest};
 ///
 /// Shared by every HTTP write handler (`create`, `delete`, `promote`, `link`,
 /// `consolidate`, `reflect`) so the enforcement surface is uniform. The
-/// underlying consult drives the async hook chain via `block_on_local`, which
+/// underlying consult drives the async hook chain via `block_on_local_bounded`, which
 /// uses `block_in_place` on the daemon's multi-thread runtime — safe to call
 /// from an async handler.
 /// #2390 (N9) — `namespaces` is the SUBSTRATE-resolved namespace set the

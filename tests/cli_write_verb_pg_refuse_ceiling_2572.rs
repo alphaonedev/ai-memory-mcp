@@ -333,7 +333,17 @@ use std::process::Command;
 use assert_cmd::cargo::cargo_bin;
 use tempfile::TempDir;
 
-const PG_STORE_URL: &str = "postgres://ai_memory:hunter2@127.0.0.1:5432/ai_memory";
+/// v1.0.0 #3140 — the port is `1`, an address nothing ever listens on.
+///
+/// This is a REFUSAL probe: the guard must fire on the URL scheme, before
+/// any connection. Aiming it at the real Postgres port (5432) made the
+/// assertion VACUOUS on any host running Postgres — a regression that moved
+/// the refusal after connect would still pass, and a regression that removed
+/// it could WRITE to that live database. Pointing at a dead address means a
+/// refusal can never be manufactured by a live server; the reason-text
+/// assertions below keep it from being manufactured by a connection error
+/// either.
+const PG_STORE_URL: &str = "postgres://ai_memory:hunter2@127.0.0.1:1/ai_memory";
 const PG_PASSWORD: &str = "hunter2";
 
 /// Run a fast (non-daemon) CLI verb once and capture its output. `store_url`,

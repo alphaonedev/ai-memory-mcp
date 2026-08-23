@@ -363,7 +363,8 @@ async fn g4_unsigned_http_link_projects_into_age() {
         .await
         .expect("in-process HTTP daemon never bound");
 
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
     let base = format!("http://{addr}");
     let suffix = uuid::Uuid::new_v4();
     let ns = format!("g4-unsigned-http-{suffix}");

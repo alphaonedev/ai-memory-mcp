@@ -934,13 +934,27 @@ fn fold_flips_inbox_unread_marker() {
     );
 }
 
+/// v1.0.0 #3140 — TTL given to the two racing rows in
+/// `fold_before_gc_retains_recalled_expiring_row`.
+const RACE_EXPIRY_MS: i64 = 900;
+
+/// v1.0.0 #3140 — how long the test sleeps before running gc.
+///
+/// Was 1200 ms against a 900 ms TTL: a 1.33x margin, thin enough that a
+/// scheduler stall or a backwards system-clock step (the TTL comparison is
+/// wall-clock `chrono`, the sleep is monotonic) could leave the control row
+/// un-expired and fail a test with no defect behind it. 5x keeps the exact
+/// property under test — un-recalled rows expire, folded ones survive — and
+/// removes the timing knife-edge.
+const RACE_EXPIRY_MARGIN: u32 = 5;
+
 #[test]
 fn fold_before_gc_retains_recalled_expiring_row() {
     let _g = env_lock();
     clear_flags();
     let (conn, _dir) = fresh_db();
     let created = chrono::Utc::now().to_rfc3339();
-    let soon = (chrono::Utc::now() + chrono::Duration::milliseconds(900)).to_rfc3339();
+    let soon = (chrono::Utc::now() + chrono::Duration::milliseconds(RACE_EXPIRY_MS)).to_rfc3339();
     // Two identical short rows expiring in <1s; only one is recalled.
     for id in ["race-recalled", "race-control"] {
         conn.execute(
@@ -964,7 +978,9 @@ fn fold_before_gc_retains_recalled_expiring_row() {
     .unwrap();
     // Fold BEFORE gc (the load-bearing ordering).
     assert_eq!(db::fold_recall_accesses(&conn, 3600, 86_400).unwrap(), 1);
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    std::thread::sleep(std::time::Duration::from_millis(
+        RACE_EXPIRY_MS.unsigned_abs() * u64::from(RACE_EXPIRY_MARGIN),
+    ));
     db::gc(&conn, false).expect("gc");
     let exists = |id: &str| -> i64 {
         conn.query_row("SELECT COUNT(*) FROM memories WHERE id = ?1", [id], |r| {

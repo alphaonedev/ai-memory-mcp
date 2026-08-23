@@ -15,7 +15,7 @@
 // degrades to keyword-only instead of hanging the test process.
 
 mod common;
-use common::free_port;
+use common::{DAEMON_READY_TIMEOUT, bounded_test_client, free_port, wait_for_http_ready};
 
 /// #998 (2026-05-21) — concrete admin id seeded into
 /// `AI_MEMORY_ADMIN_AGENT_IDS` for every spawned integration daemon.
@@ -1991,7 +1991,16 @@ fn test_health_endpoint() {
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if let Ok(output) = std::process::Command::new("curl")
-            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &url])
+            .args([
+                "-s",
+                "-m",
+                CURL_PROBE_MAX_SECS,
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                &url,
+            ])
             .output()
         {
             let code = String::from_utf8_lossy(&output.stdout);
@@ -8252,6 +8261,8 @@ fn wait_for_health(port: u16) -> bool {
         if let Ok(out) = std::process::Command::new("curl")
             .args([
                 "-s",
+                "-m",
+                CURL_PROBE_MAX_SECS,
                 "-o",
                 "/dev/null",
                 "-w",
@@ -8330,6 +8341,8 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     let seed_out = std::process::Command::new("curl")
         .args([
             "-s",
+            "-m",
+            CURL_REQUEST_MAX_SECS,
             "-X",
             "POST",
             "-H",
@@ -8479,6 +8492,8 @@ fn test_serve_native_tls_health_probe() {
         if let Ok(out) = std::process::Command::new("curl")
             .args([
                 "-sk",
+                "-m",
+                CURL_PROBE_MAX_SECS,
                 "-o",
                 "/dev/null",
                 "-w",
@@ -8891,10 +8906,29 @@ fn test_serve_rejects_half_tls_config() {
 // blocking client to the test harness.
 // ---------------------------------------------------------------------------
 
+/// v1.0.0 #3140 — `curl --max-time` (`-m`) rider, in seconds, for a
+/// READINESS PROBE issued inside a bounded retry loop.
+///
+/// Without it a probe that connects and then stalls parks the whole test
+/// binary: the surrounding `for _ in 0..N` loop counts iterations, not
+/// wall-clock, so one wedged probe defeats the loop's own bound.
+const CURL_PROBE_MAX_SECS: &str = "2";
+
+/// v1.0.0 #3140 — `curl --max-time` (`-m`) rider, in seconds, for a real
+/// API call (not a probe).
+///
+/// Deliberately far larger than [`CURL_PROBE_MAX_SECS`]: these carry bodies
+/// and run against an instrumented daemon under `cargo-llvm-cov` (3-5x
+/// slower), so a probe-tight cap would convert a slow runner into a red
+/// test. The point is a bound that exists, not a tight one.
+const CURL_REQUEST_MAX_SECS: &str = "30";
+
 fn curl_get(port: u16, path: &str) -> (String, serde_json::Value) {
     let out = std::process::Command::new("curl")
         .args([
             "-s",
+            "-m",
+            CURL_REQUEST_MAX_SECS,
             "-w",
             "\n%{http_code}",
             &format!("http://127.0.0.1:{port}{path}"),
@@ -8916,6 +8950,8 @@ fn curl_get_as(port: u16, path: &str, agent_id: &str) -> (String, serde_json::Va
     let out = std::process::Command::new("curl")
         .args([
             "-s",
+            "-m",
+            CURL_REQUEST_MAX_SECS,
             "-w",
             "\n%{http_code}",
             "-H",
@@ -8962,6 +8998,8 @@ fn curl_post(
 ) -> (String, serde_json::Value) {
     let mut args: Vec<String> = vec![
         "-s".into(),
+        "-m".into(),
+        CURL_REQUEST_MAX_SECS.into(),
         "-w".into(),
         "\n%{http_code}".into(),
         "-X".into(),
@@ -8995,6 +9033,8 @@ fn curl_post(
 fn curl_delete(port: u16, path: &str, agent_id: Option<&str>) -> String {
     let mut args: Vec<String> = vec![
         "-s".into(),
+        "-m".into(),
+        CURL_REQUEST_MAX_SECS.into(),
         "-o".into(),
         "/dev/null".into(),
         "-w".into(),
@@ -9486,6 +9526,8 @@ fn http_inbox_cross_source_agent_id_body_vs_query_vs_header() {
     let out = std::process::Command::new("curl")
         .args([
             "-s",
+            "-m",
+            CURL_REQUEST_MAX_SECS,
             "-H",
             "x-agent-id: ai:bob",
             &format!("http://127.0.0.1:{}/api/v1/inbox?limit=5", d.port),
@@ -11334,6 +11376,8 @@ fn curl_put(
 ) -> (String, serde_json::Value) {
     let mut args: Vec<String> = vec![
         "-s".into(),
+        "-m".into(),
+        CURL_REQUEST_MAX_SECS.into(),
         "-w".into(),
         "\n%{http_code}".into(),
         "-X".into(),
@@ -13093,28 +13137,18 @@ async fn test_daemon_cmd_serve_responds_to_health_then_terminates() {
         .await
     });
 
-    // Wait for the listener to come up. ~5s budget with 100ms backoff —
-    // identical wait_for_health semantics as the prior subprocess test,
-    // but talking to the in-process daemon over the loopback socket.
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{port}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(
-        ready,
-        "serve health probe never returned 200 — in-process HTTP daemon failed to bind"
-    );
+    // Wait for the listener — bounded probe (#3140 Fable FOLLOW-UP (a);
+    // the previous `reqwest::get` default client had no request timeout).
+    wait_for_http_ready(&addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect("serve health probe never returned 200 — in-process HTTP daemon failed to bind");
 
     // Hit /api/v1/health a second time to exercise the handler path (same
     // assertion the prior subprocess test made, but against the in-process
     // daemon — coverage attribution lands on `handlers::health`).
-    let resp = reqwest::get(&format!("http://127.0.0.1:{port}/api/v1/health"))
+    let resp = bounded_test_client()
+        .get(format!("http://127.0.0.1:{port}/api/v1/health"))
+        .send()
         .await
         .expect("health request must succeed");
     assert_eq!(
@@ -13175,18 +13209,9 @@ async fn test_daemon_cmd_sync_daemon_pulls_then_terminates() {
         .await
     });
 
-    // Wait for peer readiness.
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{peer_port}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "peer serve never became ready");
+    wait_for_http_ready(&peer_addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect("peer serve never became ready");
 
     // 2. Run the sync-daemon loop in-process with interval=1 so at least
     //    one full cycle (pull + push) executes before we trigger shutdown.
@@ -13339,22 +13364,9 @@ async fn test_daemon_serve_http_with_shutdown_future_runs_with_custom_cleanup() 
         .await
     });
 
-    // Wait for readiness via the same health-probe pattern as the Wave 2
-    // serve test.
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{port}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(
-        ready,
-        "serve_http_with_shutdown_future health probe never returned 200"
-    );
+    wait_for_http_ready(&addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect("serve_http_with_shutdown_future never became ready");
 
     // Trigger shutdown — the user-supplied future's notified().await wakes,
     // it does the cleanup work, then resolves; axum::serve drains; the
@@ -13414,17 +13426,9 @@ async fn test_daemon_sync_with_shutdown_using_client_accepts_custom_client() {
         .await
     });
 
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{peer_port}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "peer serve never became ready");
+    wait_for_http_ready(&peer_addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect("peer serve never became ready");
 
     // 2. Build a custom reqwest::Client that differs from the default the
     //    plain run_sync_daemon_with_shutdown wrapper builds — non-default

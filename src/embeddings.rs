@@ -3547,15 +3547,44 @@ mod c5_ollama_variant_tests {
         assert_eq!(batch[1], vec![1.0_f32, 2.0_f32, 3.0_f32]);
     }
 
+    /// v1.0.0 #3140 — the watchdog budget this test proves is enforced, in
+    /// milliseconds, so every derived bound below is a plain multiple of it
+    /// rather than a bare wall-clock number.
+    const STALL_TEST_BUDGET_MS: u64 = 50;
+
+    /// v1.0.0 #3140 — the watchdog budget this test proves is enforced.
+    const STALL_TEST_BUDGET: std::time::Duration =
+        std::time::Duration::from_millis(STALL_TEST_BUDGET_MS);
+
+    /// v1.0.0 #3140 — how long the ABANDONED closure sleeps: 100x the budget.
+    ///
+    /// Was a flat 30 s. The closure is deliberately abandoned, so the test
+    /// process carried a detached 30-second sleeper for the rest of the run.
+    /// It only has to outlast [`STALL_TEST_RETURN_CEILING`] to keep the test
+    /// discriminating — a watchdog that wrongly JOINED the closure would take
+    /// at least this long, which is unconditionally over the ceiling — so 5 s
+    /// preserves the property at a sixth of the residue.
+    const STALL_TEST_SLEEP: std::time::Duration =
+        std::time::Duration::from_millis(STALL_TEST_BUDGET_MS * 100);
+
+    /// v1.0.0 #3140 — ceiling on how long the watchdog itself may take to
+    /// return after the budget elapses: 40x the budget.
+    ///
+    /// Must stay strictly below [`STALL_TEST_SLEEP`] (that separation is what
+    /// makes a joining watchdog fail) while leaving a correct watchdog ample
+    /// scheduling slack on a loaded runner.
+    const STALL_TEST_RETURN_CEILING: std::time::Duration =
+        std::time::Duration::from_millis(STALL_TEST_BUDGET_MS * 40);
+
     // #1487 — the download watchdog must surface an error instead of
     // blocking forever when the underlying download closure stalls.
     #[test]
     fn download_within_times_out_on_stalled_closure() {
         let start = std::time::Instant::now();
-        let res = Embedder::download_within(std::time::Duration::from_millis(50), || {
+        let res = Embedder::download_within(STALL_TEST_BUDGET, || {
             // Simulate a wedged hf-hub `.get()` that never returns within
             // the budget. The watchdog must abandon it, not join it.
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::thread::sleep(STALL_TEST_SLEEP);
             Ok((
                 std::path::PathBuf::new(),
                 std::path::PathBuf::new(),
@@ -3569,8 +3598,9 @@ mod c5_ollama_variant_tests {
             "error should explain the timeout budget"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "watchdog must return promptly after the budget, not wait for the closure: {elapsed:?}"
+            elapsed < STALL_TEST_RETURN_CEILING,
+            "watchdog must return promptly after the {STALL_TEST_BUDGET:?} budget, \
+             not wait for the closure: {elapsed:?}"
         );
     }
 

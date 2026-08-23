@@ -224,7 +224,8 @@ async fn g5_find_paths_cte_served_on_age() {
     drop(store);
 
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = reqwest::Client::new();
+    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
+    let client = common::bounded_test_client();
 
     // Per-test namespace so concurrent runs against a shared scratch DB
     // don't reuse memory ids.

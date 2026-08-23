@@ -507,6 +507,19 @@ fn crate_mid_extend() -> i64 {
 // C — fold-before-gc race (postgres eviction path)
 // =====================================================================
 
+/// v1.0.0 #3140 — TTL given to the two racing rows below.
+const RACE_EXPIRY_MS: i64 = 900;
+
+/// v1.0.0 #3140 — how long the test sleeps before running gc, as a multiple
+/// of [`RACE_EXPIRY_MS`].
+///
+/// Was a flat 1200 ms against a 900 ms TTL: a 1.33x margin, thin enough that a
+/// scheduler stall or a backwards system-clock step (the TTL comparison is
+/// wall-clock, the sleep is monotonic) could leave the control row un-expired
+/// and fail a test with no defect behind it. 5x keeps the exact property under
+/// test and removes the timing knife-edge.
+const RACE_EXPIRY_MARGIN: u32 = 5;
+
 #[tokio::test]
 #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL (live postgres); run with --include-ignored"]
 // M-LINT-OVERRIDE-EXPECT — the env-serialization guard MUST span the
@@ -541,7 +554,7 @@ async fn postgres_fold_before_gc_retains_recalled_expiring_row() {
         .await
         .expect("store control");
     // Both expire in <1s.
-    let soon = chrono::Utc::now() + chrono::Duration::milliseconds(900);
+    let soon = chrono::Utc::now() + chrono::Duration::milliseconds(RACE_EXPIRY_MS);
     for id in [&recalled, &control] {
         sqlx::query("UPDATE memories SET expires_at = $2 WHERE id = $1")
             .bind(id)
@@ -561,7 +574,10 @@ async fn postgres_fold_before_gc_retains_recalled_expiring_row() {
         .await
         .expect("ledger row");
     assert_eq!(store.fold_recall_accesses().await.expect("fold"), 1);
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(
+        RACE_EXPIRY_MS.unsigned_abs() * u64::from(RACE_EXPIRY_MARGIN),
+    ))
+    .await;
     store.run_gc(false).await.expect("run_gc");
 
     let count = |id: &str| {
