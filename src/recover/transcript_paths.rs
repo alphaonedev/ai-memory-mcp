@@ -81,18 +81,57 @@ pub fn resolve_transcript(host: HostKind, cwd: &Path) -> Result<Option<PathBuf>,
 /// `$HOME/.claude/projects/-<cwd-encoded>/*.jsonl`. The cwd
 /// encoding replaces `/` with `-` and prefixes a leading `-`.
 fn claude_code_candidates(cwd: &Path) -> Vec<PathBuf> {
+    // Fable HIGH (#3215 / #2999): main transcripts are ALWAYS top-level
+    // `<project>/<session-uuid>.jsonl`. Recursing into
+    // `<session>/subagents/agent-*.jsonl` lets a worker fork beat the
+    // operator session by mtime — the same "reports success doing
+    // something other than asked" class #2999 was filed under. Recursive
+    // walk stays on Codex/Gemini (`list_jsonl_in`), where the real layout
+    // is nested (`~/.codex/sessions/YYYY/MM/DD/*.jsonl`).
     claude_code_dir(cwd)
-        .map(|d| list_jsonl_in(&d))
+        .map(|d| list_jsonl_top_level(&d))
         .unwrap_or_default()
+}
+
+/// Non-recursive `*.jsonl` / `*.json` listing — Claude Code main
+/// transcripts only. Does not descend into `subagents/` (or any subdir).
+fn list_jsonl_top_level(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                return None;
+            }
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str())?;
+            (ext == "jsonl" || ext == "json").then_some(path)
+        })
+        .collect()
 }
 
 /// The Claude Code transcript directory for `cwd` — the parent that the
 /// [`watch_dirs`] fs-notify watch subscribes to. `None` when `$HOME` is
 /// unset.
+///
+/// #2999 — Claude Code derives the project-dir name by replacing EACH of
+/// `/`, `_` and `.` with `-` (the leading `/` of an absolute cwd becomes
+/// the single leading `-`). The pre-fix encoder replaced ONLY `/` and also
+/// prepended a spurious extra leading `-`, so on ANY host whose cwd
+/// contains `_` or `.` (e.g. `/home/fate_two/...`, or a `.local-runs/`
+/// worktree) it computed a directory that does not exist: `list_jsonl_in`
+/// read nothing, and `recover` / `watch` reported success while capturing
+/// NOTHING — the exact #1388 data-loss the L2/L3 backstops exist to
+/// prevent. Verified against the real on-disk layout, e.g. cwd
+/// `/home/fate_two/v07/v09-dev` → `-home-fate-two-v07-v09-dev` and
+/// `/home/fate_two/v07/v09-dev/.local-runs/wt-x` →
+/// `-home-fate-two-v07-v09-dev--local-runs-wt-x`.
 fn claude_code_dir(cwd: &Path) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let cwd_str = cwd.to_string_lossy();
-    let encoded = format!("-{}", cwd_str.replace('/', "-"));
+    let encoded = cwd_str.replace(['/', '_', '.'], "-");
     Some(home.join(".claude").join("projects").join(&encoded))
 }
 
@@ -144,22 +183,48 @@ pub fn watch_dirs(host: HostKind, cwd: &Path) -> Vec<PathBuf> {
     }
 }
 
-/// List every `*.jsonl` (or `*.json`) file in a directory, swallowing
-/// I/O errors (a non-existent directory is a legitimate empty-candidate
-/// state, not an error).
+/// Recursively list every `*.jsonl` (or `*.json`) file under `dir`,
+/// swallowing I/O errors (a non-existent directory is a legitimate
+/// empty-candidate state, not an error).
+///
+/// Used for Codex (`~/.codex/sessions/YYYY/MM/DD/*.jsonl`) and Gemini.
+/// Claude Code does **not** use this walker — see [`list_jsonl_top_level`].
+/// The depth bound keeps the L2 fast-path within budget; symlinked entries
+/// are not followed (no walk-loop risk).
 fn list_jsonl_in(dir: &Path) -> Vec<PathBuf> {
+    // Session subdirs sit one level under the project dir; a small bound
+    // covers every observed layout while capping the walk on a deep tree.
+    const MAX_DEPTH: usize = 4;
+    let mut out = Vec::new();
+    collect_jsonl_recursive(dir, MAX_DEPTH, &mut out);
+    out
+}
+
+/// Depth-bounded recursive collector backing [`list_jsonl_in`]. Files
+/// directly in `dir` are collected at `depth_budget`; subdirectories are
+/// descended only while `depth_budget > 0`.
+fn collect_jsonl_recursive(dir: &Path, depth_budget: usize, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return;
     };
-    entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|ext| ext == "jsonl" || ext == "json")
-        })
-        .collect()
+    for entry in entries.filter_map(Result::ok) {
+        // `file_type()` reflects the entry itself (a symlink reports
+        // `is_dir() == false`), so we never recurse through a symlink.
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if depth_budget > 0 {
+                collect_jsonl_recursive(&entry.path(), depth_budget - 1, out);
+            }
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext == "jsonl" || ext == "json")
+        {
+            out.push(path);
+        }
+    }
 }
 
 /// Pick the most-recently-modified path from a candidate list.
@@ -216,6 +281,76 @@ mod tests {
         let res = resolve_transcript(HostKind::ClaudeCode, &tmp);
         assert!(res.is_ok());
         assert!(res.unwrap().is_none());
+    }
+
+    /// #2999 — a cwd containing `_` and `.` MUST encode to the real Claude
+    /// Code project-dir name (each of `/`, `_`, `.` → `-`, the leading `/`
+    /// giving the single leading `-`), NOT the pre-fix `/`-only + spurious
+    /// extra-`-` encoding. Verified directly on `claude_code_dir`.
+    #[test]
+    fn claude_code_dir_encodes_underscore_and_dot() {
+        let _g = crate::config::test_env_lock();
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: env mutation serialised by the lock; restored below.
+        unsafe { std::env::set_var("HOME", "/root/home") }
+        let cwd = Path::new("/home/fate_two/v07/v09-dev/.local-runs/wt-x");
+        let dir = claude_code_dir(cwd).expect("HOME is set");
+        assert_eq!(
+            dir,
+            Path::new("/root/home/.claude/projects")
+                .join("-home-fate-two-v07-v09-dev--local-runs-wt-x"),
+            "cwd with '_'/'.' must map to the real Claude Code dir name"
+        );
+        // SAFETY: restore under the same lock.
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// #2999 / #3215 Fable HIGH — Claude Code main transcripts are
+    /// top-level `<project>/<session-uuid>.jsonl`. A NEWER nested
+    /// `<session>/subagents/agent-x.jsonl` must NOT beat the top-level
+    /// session file (that was a worker fork, not the operator session).
+    #[test]
+    fn resolve_finds_nested_transcript_for_underscore_dot_cwd() {
+        let _g = crate::config::test_env_lock();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join("transcript-paths-2999");
+        std::fs::create_dir_all(&root).expect("scratch root");
+        let home = tempfile::tempdir_in(&root).expect("tempdir under .local-runs");
+
+        let cwd = Path::new("/srv/team_alpha/proj.v2");
+        let encoded = "-srv-team-alpha-proj-v2";
+        let proj = home.path().join(".claude").join("projects").join(encoded);
+        std::fs::create_dir_all(&proj).unwrap();
+        let main = proj.join("a7dca41e-session.jsonl");
+        std::fs::write(&main, b"{}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let subagents = proj.join("a7dca41e-session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let worker = subagents.join("agent-x.jsonl");
+        std::fs::write(&worker, b"{}\n").unwrap();
+
+        let prev_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", home.path()) }
+        let resolved = resolve_transcript(HostKind::ClaudeCode, cwd)
+            .expect("resolve ok")
+            .expect("top-level session transcript located");
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(
+            resolved, main,
+            "a newer subagents/*.jsonl must not beat the top-level session jsonl"
+        );
+        assert_ne!(resolved, worker);
     }
 
     #[test]
@@ -294,8 +429,9 @@ mod tests {
 
         // Build the encoded project dir for a synthetic cwd.
         let cwd = std::path::Path::new("/work/proj");
-        let encoded = format!("-{}", cwd.to_string_lossy().replace('/', "-"));
-        let proj = home.join(".claude").join("projects").join(&encoded);
+        // Use the production encoder so this fixture can never drift from
+        // the resolver's cwd → project-dir mapping (#2999).
+        let proj = claude_code_dir(cwd).expect("HOME is set");
         std::fs::create_dir_all(&proj).unwrap();
 
         // Two jsonl files + one non-jsonl that must be ignored. Write

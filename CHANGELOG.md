@@ -458,6 +458,48 @@ backend and missing or divergently implemented on its twin). Pinned by
   both call sites is byte-identical; the split exists so no caller can mistake
   a permissive accept for an authenticated one.
 
+### Security (boot fails CLOSED on an unusable config; `AI_MEMORY_NO_CONFIG` honours its documented contract — #3166 #3167)
+
+- **#3166 (data-integrity, GA-blocking) — boot was fail-OPEN on a malformed
+  config: a TOML typo (or a silent `EACCES`/`EIO`) made the daemon open a NEW
+  empty `./ai-memory.db` in the current directory, report healthy, and accept
+  writes into that orphan.** `src/main.rs` called the non-propagating
+  `AppConfig::load()`, which swallowed parse errors, the secret-validation
+  rejection, and EVERY io error (`ErrorKind` was discarded, so `EACCES`/`EIO`
+  were indistinguishable from the documented `ENOENT`) and returned
+  `AppConfig::default()`. `effective_db` then resolved the RELATIVE
+  `ai-memory.db`, so a one-character typo in a config carrying
+  `db = "/var/lib/ai-memory/prod.db"` produced corpus split-brain — and
+  `[storage].append_only`, `[governance].require_operator_pubkey` and
+  `[[permissions.rules]]` silently reverted to their defaults in the same
+  stroke. `main` now resolves the config through the PROPAGATING
+  `AppConfig::load_for_boot()` and REFUSES the boot with the error printed to
+  stderr and exit `78` (`EX_CONFIG`, single-sourced as `config::EX_CONFIG`),
+  before any database is opened. `load_for_boot` matches
+  `ErrorKind::NotFound` explicitly, so the documented "no `config.toml` ->
+  compiled defaults" contract and the `AI_MEMORY_NO_CONFIG=1` test escape
+  hatch are byte-identical; every OTHER io error is surfaced. Argv is now
+  parsed BEFORE the config is resolved, so `--version` / `--help` cannot be
+  taken down by a broken config. Four subcommands deliberately keep running on
+  compiled defaults — `doctor` (which now REPORTS the fault in a new
+  `Configuration` report section rather than hiding it), `config` (the repair
+  verb), `completions` and `man`; everything else, including `boot`, fails
+  closed, because serving an agent its context out of the WRONG database is a
+  wrong ANSWER, not degraded function. The lenient `AppConfig::load_from` no
+  longer swallows a non-`NotFound` io error silently either — it prints a loud
+  "config UNREADABLE" line before falling back.
+- **#3167 — `AI_MEMORY_NO_CONFIG=` (empty) and `=0` silently disabled the
+  ENTIRE config file, while a non-UTF-8 value had the inverse effect.** The
+  three production sites tested `std::env::var(..).is_ok()` — mere PRESENCE —
+  against a documented "set to `1`" contract, so an empty placeholder export in
+  a compose / unit file reverted every config-backed knob (including `db`, see
+  #3166) to compiled defaults with no stderr line, and a non-UTF-8 value made
+  `var()` return `Err` so the config LOADED. All three sites now route through
+  one shared `config::skip_config()` that resolves the variable through the
+  substrate-wide truthy grammar (`1`/`true`/`yes`/`on`, trimmed,
+  case-insensitive) already used by every other `AI_MEMORY_*` boolean knob, and
+  WARN once when the variable is present but not truthy. `AI_MEMORY_NO_CONFIG=1`
+  behaviour is unchanged.
 
 ### Changed
 
@@ -2399,6 +2441,61 @@ Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
   backends' `list_recall_observations` SELECT (sqlite + postgres), and the doc
   now truthfully mirrors the columns. Output-only (no input-schema / tool-count
   change). Source: `src/observations/mod.rs`, `src/store/postgres.rs`.
+
+### Fixed (Wave-D2 OPS / config honesty — #2999 #3001 #3002 #3003)
+
+- **#2999 (data-integrity) — L2/L3 transcript capture was INERT on any cwd
+  containing `_` or `.`.** `claude_code_dir` (`src/recover/transcript_paths.rs`)
+  encoded the cwd into the Claude Code project-dir name by replacing only `/`
+  (plus a spurious extra leading `-`), but Claude Code sanitizes each of `/`,
+  `_` AND `.` to `-`. On any host whose cwd contained `_`/`.` (e.g.
+  `/home/fate_two/...`, or a `.local-runs/` worktree) `recover` / `watch`
+  computed a directory that does not exist, captured NOTHING, and reported
+  success — the exact #1388 data-loss the backstops exist to prevent. The
+  encoder now matches the real on-disk layout. Claude Code candidates are
+  **top-level only** (`<project>/<session-uuid>.jsonl`); a nested
+  `<session>/subagents/agent-*.jsonl` must not beat the operator session
+  (#3215 Fable HIGH). Recursive `list_jsonl_in` remains for Codex/Gemini
+  (`~/.codex/sessions/YYYY/MM/DD/*.jsonl`).
+- **#3001 (fail-open honesty) — `config migrate` laundered malformed legacy
+  input into an unparseable v2 file, printed `OK: migrated`, and exited 0**;
+  the next process then failed to parse it and silently fell back to
+  `AppConfig::default()`. The migrator now validates the migrated output
+  through the SAME daemon tail (`toml::from_str::<AppConfig>` +
+  `validate_secret_handling`) BEFORE writing; on failure it FAILS LOUD
+  (non-zero exit, no file written, original config untouched).
+- **#3002 — `config.toml` was hardcoded to `$HOME/.config` while the identity
+  key dir + hooks resolver honor `XDG_CONFIG_HOME`.** On any host that set
+  `XDG_CONFIG_HOME`, a certified daemon loaded config from one root and looked
+  for its signing keys under another — booting "continuing unsigned".
+  `config_path()` now resolves through `dirs::config_dir()`, the same
+  platform-config resolver the key/hook dirs use. **Migration safety:** the
+  move is guarded, because on its own it would CHANGE where an existing
+  deployment's config is looked for — and a config that is merely ABSENT is
+  the documented "compiled defaults" arm, so the #3166 boot refusal would not
+  fire and `db` would silently revert to the relative `./ai-memory.db`
+  (the very corpus split-brain #3166 exists to prevent). When the XDG path
+  does not exist and the legacy `$HOME/.config/ai-memory/config.toml` does,
+  the legacy file is still honoured and a one-shot stderr WARN tells the
+  operator to move it. New installs land at the XDG path.
+- **#3215 CI follow-up — `serve_api_key_required_when_configured` now pins
+  `XDG_CONFIG_HOME` to the sandbox.** After #3002, `config_path()` prefers
+  `dirs::config_dir()`. The spawn-and-poke test wrote `config.toml` under
+  `$HOME` only, so an ambient XDG root won, the daemon booted without the
+  test `api_key`, `api_key_auth` became a pass-through, and GET
+  `/api/v1/stats` returned the admin-gate 403 instead of the api-key 401.
+  Same pin as `tests/boot_fail_closed_config_3166.rs`. The #3002 unit tests
+  that assumed `XDG_CONFIG_HOME` *is* `dirs::config_dir()` were Linux-only
+  (`dirs` on macOS is `$HOME/Library/Application Support` and ignores
+  `XDG_CONFIG_HOME`) — they now pin the expected path against
+  `dirs::config_dir()` so `Check (macos-fed,sqlite)` matches production.
+- **#3003 — `doctor --posture` returned exit 1 (not the contracted 2) when the
+  enterprise-federation boot gate was armed+failing, and the boot remediation
+  told the operator to re-run the command that just refused.** The read-only
+  `doctor --posture` diagnostic now BYPASSES the boot gate (it IS the
+  diagnostic for it), so it always renders the report and exits 2 on FAIL; the
+  boot-refusal remediation is corrected to state the diagnostic works while the
+  gate is armed.
 
 ### Fixed (Batman auto-atomisation was structurally inert product-wide; #2983 #2984 #2985 #2986 #2987)
 

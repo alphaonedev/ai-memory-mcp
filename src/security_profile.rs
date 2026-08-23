@@ -183,7 +183,11 @@ struct KnobSpec {
 
 /// A truthy env token (the affirmative half of the substrate-wide
 /// `1`/`true`/`yes`/`on` convention).
-fn is_truthy(v: &str) -> bool {
+///
+/// #3167 — exposed crate-wide so `config::skip_config` resolves
+/// `AI_MEMORY_NO_CONFIG` through the SAME grammar as every other
+/// `AI_MEMORY_*` boolean knob instead of a bare presence check.
+pub(crate) fn is_truthy(v: &str) -> bool {
     matches!(
         v.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
