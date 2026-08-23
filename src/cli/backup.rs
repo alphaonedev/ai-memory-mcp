@@ -2055,6 +2055,21 @@ mod tests {
     /// allowlist). A schema-ahead target would refuse here rather than
     /// proceeding to rewrite the live file.
     #[test]
+    fn refuse_if_target_in_use_missing_path_is_ok_3131() {
+        let mut env = TestEnv::fresh();
+        let missing = env
+            .db_path
+            .parent()
+            .unwrap()
+            .join("no-such-restore-target.db");
+        {
+            let mut out = env.output();
+            refuse_if_target_in_use(&missing, &mut out)
+                .expect("a missing target is the empty-corpus restore case");
+        }
+    }
+
+    #[test]
     fn refuse_if_target_in_use_idle_current_schema_is_ok_3131() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
@@ -2126,6 +2141,25 @@ mod tests {
         );
         assert!(wal.is_dir(), "the planted directory must still be there");
         let _ = std::fs::remove_dir(&wal);
+    }
+
+    #[test]
+    fn remove_stale_sidecars_unlinks_a_regular_file_3131() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "t", "c");
+        let wal = sidecar_path(&db, "-wal");
+        std::fs::write(&wal, b"stale-wal").expect("plant a regular -wal file");
+        {
+            let mut out = env.output();
+            remove_stale_sidecars(&db, &mut out).expect("regular file must unlink");
+        }
+        assert!(!wal.exists(), "stale -wal file must be gone");
+        assert!(
+            !env.stderr_str().contains("could not remove"),
+            "successful unlink must not WARN; stderr was: {}",
+            env.stderr_str()
+        );
     }
 
     /// `stage_and_verify` never touches the target: that is the whole point
