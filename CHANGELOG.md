@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3244 — SAL ConsolidationPass skipped under `spawn_blocking`)
+
+- **#3116's nested-runtime guard used `Handle::try_current()` as the panic
+  probe, which skipped the SAL `ConsolidationPass` on every production
+  cycle.** Quoted at `src/curator/mod.rs` (pre-fix):
+  `if tokio::runtime::Handle::try_current().is_ok() { report.errors.push("consolidation pass: skipped — … wrap the call in spawn_blocking …"); return; }`.
+  A tokio 1.52 `spawn_blocking` thread **has** a current Handle
+  (`runtime/blocking/pool.rs` calls `rt.enter()`) but does **not** call
+  `enter_runtime` — the only condition for "Cannot start a runtime from
+  within a runtime". `Runtime::block_on` inside `spawn_blocking` is
+  therefore legal (that is why the pre-#3116 daemon path worked). Both
+  production entrypoints already wrap the curator in `spawn_blocking`
+  (`daemon_runtime.rs` two sites + CLI `--once`) on a **multi-thread**
+  runtime, so with `compaction.enabled = true` every cycle pushed the
+  skip error and the pass never ran. The skip is now only the
+  current-thread Handle (`#[tokio::test]` default, where `block_in_place`
+  panics); production `spawn_blocking` drives via `block_in_place` + a
+  nested current-thread `block_on` (CONCURRENCY-22 / ERRORS-08). A
+  multi-thread `spawn_blocking` positive-control test asserts the pass
+  ran; the existing `#[tokio::test]` panic-avoidance skip is kept.
+
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 
 Two CLI paths diverged from the guard the MCP/HTTP reference surface already
