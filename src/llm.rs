@@ -1530,7 +1530,15 @@ impl OllamaClient {
     pub fn is_available(&self) -> bool {
         // #3140 — a health probe that outlives its bridge budget IS
         // "not available"; degrade to false rather than park the caller.
-        block_on_local_bounded(BRIDGE_HEALTH_BUDGET, || self.is_available_async()).unwrap_or(false)
+        block_on_local_bounded(BRIDGE_HEALTH_BUDGET, || self.is_available_async()).unwrap_or_else(
+            |e| {
+                tracing::warn!(
+                    error = %e,
+                    "LLM health probe failed at the sync↔async bridge; treating as unavailable"
+                );
+                false
+            },
+        )
     }
 
     /// PERF-9 (v0.7.0 FX-C1) — async variant of [`Self::is_available`].

@@ -15,7 +15,7 @@
 // degrades to keyword-only instead of hanging the test process.
 
 mod common;
-use common::free_port;
+use common::{DAEMON_READY_TIMEOUT, bounded_test_client, free_port, wait_for_http_ready};
 
 /// #998 (2026-05-21) — concrete admin id seeded into
 /// `AI_MEMORY_ADMIN_AGENT_IDS` for every spawned integration daemon.
@@ -13137,28 +13137,18 @@ async fn test_daemon_cmd_serve_responds_to_health_then_terminates() {
         .await
     });
 
-    // Wait for the listener to come up. ~5s budget with 100ms backoff —
-    // identical wait_for_health semantics as the prior subprocess test,
-    // but talking to the in-process daemon over the loopback socket.
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{port}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(
-        ready,
-        "serve health probe never returned 200 — in-process HTTP daemon failed to bind"
-    );
+    // Wait for the listener — bounded probe (#3140 Fable FOLLOW-UP (a);
+    // the previous `reqwest::get` default client had no request timeout).
+    wait_for_http_ready(&addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect("serve health probe never returned 200 — in-process HTTP daemon failed to bind");
 
     // Hit /api/v1/health a second time to exercise the handler path (same
     // assertion the prior subprocess test made, but against the in-process
     // daemon — coverage attribution lands on `handlers::health`).
-    let resp = reqwest::get(&format!("http://127.0.0.1:{port}/api/v1/health"))
+    let resp = bounded_test_client()
+        .get(&format!("http://127.0.0.1:{port}/api/v1/health"))
+        .send()
         .await
         .expect("health request must succeed");
     assert_eq!(
@@ -13219,18 +13209,9 @@ async fn test_daemon_cmd_sync_daemon_pulls_then_terminates() {
         .await
     });
 
-    // Wait for peer readiness.
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{peer_port}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "peer serve never became ready");
+    wait_for_http_ready(&peer_addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect("peer serve never became ready");
 
     // 2. Run the sync-daemon loop in-process with interval=1 so at least
     //    one full cycle (pull + push) executes before we trigger shutdown.
@@ -13383,22 +13364,9 @@ async fn test_daemon_serve_http_with_shutdown_future_runs_with_custom_cleanup() 
         .await
     });
 
-    // Wait for readiness via the same health-probe pattern as the Wave 2
-    // serve test.
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{port}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(
-        ready,
-        "serve_http_with_shutdown_future health probe never returned 200"
-    );
+    wait_for_http_ready(&addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect("serve_http_with_shutdown_future never became ready");
 
     // Trigger shutdown — the user-supplied future's notified().await wakes,
     // it does the cleanup work, then resolves; axum::serve drains; the
@@ -13458,17 +13426,9 @@ async fn test_daemon_sync_with_shutdown_using_client_accepts_custom_client() {
         .await
     });
 
-    let mut ready = false;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(resp) = reqwest::get(&format!("http://127.0.0.1:{peer_port}/api/v1/health")).await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "peer serve never became ready");
+    wait_for_http_ready(&peer_addr, DAEMON_READY_TIMEOUT)
+        .await
+        .expect("peer serve never became ready");
 
     // 2. Build a custom reqwest::Client that differs from the default the
     //    plain run_sync_daemon_with_shutdown wrapper builds — non-default
