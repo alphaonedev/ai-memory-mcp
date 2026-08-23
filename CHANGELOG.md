@@ -44,6 +44,58 @@ write is permission-evaluated as; see the operator note below.
   Both now bind `resolve_read_visibility_caller()`, the same value the MCP/HTTP
   writer stamps. `--as-agent` remains the namespace-scope visibility knob.
 
+### Security
+
+- **The cert removal-proof harness can no longer leave a DISABLED security control
+  in the working tree** (#3119, closing the #3118 near-miss).
+  `scripts/check-cert-removal-proof.sh` is a mutation-testing harness: for each cited
+  control it rewrites the production source to an always-allow disposition, runs the
+  control's lane test, and asserts the test goes RED. Restoration previously happened
+  only on the happy and handled paths — there was **no `trap`** — so a SIGINT, a
+  `timeout` kill or a crash inside the cargo run left the control off, with nothing in
+  `git status` that reads as "a security control is disabled". On 2026-08-22 an aborted
+  run left `inbound_write_namespace_authorized` short-circuited to always-allow (a
+  cross-tenant inbound federated-write authorization **bypass**) and a `git add -A`
+  swept it onto a pushed PR branch for ~25 minutes (#3118 — never merged, no commit
+  ever contained it, base never affected). Four layers now stand between a mutation
+  and a commit:
+  - **Trap.** Every target is registered in a `MUTATED` array *before* it is rewritten
+    (so a crash between "mutate" and "run" is still covered), and an `EXIT`/`INT`/
+    `TERM`/`HUP` trap restores all of them with `git checkout HEAD --` — index *and*
+    worktree, which is what unwinds the staged `git add -A` variant that an index-only
+    `git checkout --` would have written straight back. Restoration is idempotent. The
+    `EXIT` trap carries the run's real status through unchanged (upgrading only a
+    success that failed to restore); the signal traps clear their handler and
+    **re-raise** (`kill -s "$sig" $$`) so the process dies of the original signal and
+    every parent observes `WIFSIGNALED` / 128+N exactly as with no trap installed.
+    The guard test now runs backgrounded under `wait` rather than in the foreground,
+    because bash defers a trap until the foreground command returns — the whole length
+    of a `cargo test` run was previously an un-interruptible window.
+  - **Start guard.** A marker already present in `src/` (an aborted earlier run) makes
+    the harness refuse to start, loudly and non-zero, instead of stacking a second
+    mutation on a disabled control. `--force-restore` is the deliberate recovery path:
+    it backs the mutated files up under `.local-runs/cert-54-evidence/` first, then
+    resets them to `HEAD` and exits 0.
+  - **End assertion.** The end of the run and the trap both assert the marker is absent
+    from `src/`, printing `SECURITY: mutation still present in <files>` and exiting
+    non-zero otherwise.
+  - **Repo-wide gate.** New `scripts/check-mutation-marker.sh` fails on the marker
+    anywhere under `src/`, however it got there — a crash the trap could not catch, a
+    `git add -A`, a rebase that resurrects a dropped hunk. It runs (with its own
+    `--self-test`, which plants the exact #3118 artefact) in the existing
+    `L3-boundary perma-ban gate` job of `.github/workflows/c8-precheck.yml` — a
+    required context, so the new gate is merge-blocking from the first commit. The
+    marker string lives only outside `src/`, so the gate cannot trip itself.
+
+  The harness `--self-test` gains two interrupt-safety legs that need no cargo: it
+  drives the **real** harness against a **real** control under `timeout 2` and under a
+  re-raised `SIGINT` (with the cargo step stubbed to a sentinel-touch + sleep, so the
+  mutation is provably live when the signal lands) and asserts `git status --porcelain
+  src/` is empty and the marker absent afterwards. Removing the trap turns both legs
+  RED. A `subst` payload whose replacement omits the marker — invisible to the trap,
+  the guard, the assertion and the gate — is now rejected outright. Agent SOP recorded
+  in `docs/AI_DEVELOPER_WORKFLOW.md` §5.6 and `CLAUDE.md`: gate scripts mutate the tree
+  by design; never `git add -A` after running one, stage explicitly.
 
 ### Changed
 

@@ -206,6 +206,15 @@ cargo bench --bench recall
 
 `AI_MEMORY_NO_CONFIG=1` prevents loading user config which may trigger embedder/LLM initialization during tests.
 
+**Never `git add -A` after running a gate/harness script.** Several `scripts/check-*.sh`
+gates rewrite tracked files by design, and `scripts/check-cert-removal-proof.sh` rewrites
+production **security controls** (it short-circuits a guard to always-allow to prove the
+guard is load-bearing). An interrupted run once left a cross-tenant federated-write
+authorization bypass in the tree and a `git add -A` pushed it to a PR branch (#3118,
+caught before merge). Stage explicitly, read the staged diff, and recover a mutated tree
+with `scripts/check-cert-removal-proof.sh --force-restore`. Full SOP:
+[`AI_DEVELOPER_WORKFLOW.md` §5.6](docs/AI_DEVELOPER_WORKFLOW.md).
+
 ### Local coverage (matching CI's `coverage.yml`)
 
 ```bash
