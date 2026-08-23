@@ -65,6 +65,8 @@ async fn spawn_mock_peer() -> (String, Cap) {
 
 /// W-of-N config over the single mock peer. `w = 2` means local + peer.
 fn federation_config(push_url: &str) -> ai_memory::federation::FederationConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     ai_memory::federation::FederationConfig {
         policy: ai_memory::replication::QuorumPolicy::new(
             2,

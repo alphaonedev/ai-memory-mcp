@@ -883,9 +883,12 @@ pub async fn delete_memory(
         // v0.9.0 G10.1 (#1827) — edge-parse the optional
         // `X-AI-Memory-Capability` header ONCE into the caller context;
         // inert unless `[capabilities].enabled`.
-        let ctx = crate::store::CallerContext::for_agent(agent_id.clone()).with_capability(
-            crate::handlers::capability_from_headers(&headers, &agent_id),
-        );
+        let capability = match crate::handlers::capability_from_headers(&headers, &agent_id) {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
+        let ctx =
+            crate::store::CallerContext::for_agent(agent_id.clone()).with_capability(capability);
         let target = app.store.get(&ctx, &id).await.ok();
 
         // F-A2A1.2 (#700) — governance enforcement on the postgres delete
@@ -1078,7 +1081,10 @@ pub async fn delete_memory(
         // v0.9.0 G10.1 (#1827) — edge-parse the optional
         // `X-AI-Memory-Capability` header ONCE; inert unless
         // `[capabilities].enabled`.
-        let capability = crate::handlers::capability_from_headers(&headers, &agent_id);
+        let capability = match crate::handlers::capability_from_headers(&headers, &agent_id) {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
         // #2356 (W1A6-03) — `pre_governance_decision` presence consult
         // BEFORE the governance decision dispatches (sqlite branch).
         if let Some(resp) = super::create::http_pre_governance_decision_gate(
@@ -1326,9 +1332,11 @@ pub async fn promote_memory(
         // v0.9.0 G10.1 (#1827) — edge-parse the optional
         // `X-AI-Memory-Capability` header ONCE into the caller context;
         // inert unless `[capabilities].enabled`.
-        let ctx = crate::store::CallerContext::for_agent(&agent_id).with_capability(
-            crate::handlers::capability_from_headers(&headers, &agent_id),
-        );
+        let capability = match crate::handlers::capability_from_headers(&headers, &agent_id) {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
+        let ctx = crate::store::CallerContext::for_agent(&agent_id).with_capability(capability);
         // F-A2A1.4 (#700, S16/S49) — bounded retry on NotFound. A
         // freshly-stored row that travelled through a read replica or
         // is still settling in WAL flush can briefly return
@@ -1566,7 +1574,10 @@ pub async fn promote_memory(
         // v0.9.0 G10.1 (#1827) — edge-parse the optional
         // `X-AI-Memory-Capability` header ONCE; inert unless
         // `[capabilities].enabled`.
-        let capability = crate::handlers::capability_from_headers(&headers, &agent_id);
+        let capability = match crate::handlers::capability_from_headers(&headers, &agent_id) {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
         // #2356 (W1A6-03) — `pre_governance_decision` presence consult
         // BEFORE the governance decision dispatches (sqlite branch).
         if let Some(resp) = super::create::http_pre_governance_decision_gate(

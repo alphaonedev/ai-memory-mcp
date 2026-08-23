@@ -42,6 +42,7 @@ use ed25519_dalek::SigningKey;
 
 use ai_memory::federation::push_dlq::{FederationDlqSink, FederationPushDlqRow};
 use ai_memory::federation::{FederationConfig, PeerEndpoint, ShippedEmbedding, sync};
+use ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION;
 use ai_memory::models::{Memory, MemoryKind, MemoryLinkRelation, Tier};
 use ai_memory::replication::QuorumPolicy;
 
@@ -126,7 +127,17 @@ fn dead_peer(id: &str) -> PeerEndpoint {
 
 const SENDER: &str = "ai:cov-sync-arms-sender";
 
+/// Coverage tests drive fanout against loopback mock peers without
+/// `bootstrap_serve`. `check_governed` (daemon-only) refuses when the
+/// hook is unset, so the HTTP fail/ack arms never run. Install an
+/// Allow-all hook once per process — first-writer-wins, same shape as
+/// `tests/governance_wire_points.rs`.
+fn install_allow_pre_action_hook() {
+    let _ = GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
+}
+
 fn config(peers: Vec<PeerEndpoint>, w: usize, ack_timeout_ms: u64) -> FederationConfig {
+    install_allow_pre_action_hook();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

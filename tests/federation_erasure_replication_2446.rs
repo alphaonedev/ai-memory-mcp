@@ -329,6 +329,8 @@ fn build_cfg(
     peer_url: &str,
     sink: Arc<dyn ai_memory::federation::FederationDlqSink>,
 ) -> FederationConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()

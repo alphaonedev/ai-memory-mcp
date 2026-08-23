@@ -33,6 +33,8 @@ use tempfile::TempDir;
 fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let path = dir.path().join(name);
     // Explicit File::create + write_all + sync_all + drop so the file is
     // fully flushed and the writer fd is released BEFORE exec. Linux
@@ -52,6 +54,8 @@ fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
 }
 
 fn cfg_for(command: PathBuf, mode: HookMode, timeout_ms: u32) -> HookConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     HookConfig {
         event: HookEvent::PostStore,
         command,
@@ -654,6 +658,8 @@ done
 /// must trip `DaemonExecutor::connect_with_backoff` exhaustion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_mode_unavailable_after_spawn_failures() {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let exec = DaemonExecutor::new(HookConfig {
         event: HookEvent::PostStore,
         command: PathBuf::from("/nonexistent/binary/that/cannot/be/spawned"),

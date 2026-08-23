@@ -334,6 +334,12 @@ mod replay {
     }
 
     fn config_for(urls: &[String], sink: Arc<dyn FederationDlqSink>) -> FederationConfig {
+        // Daemon-mode wire-check is required for outbound POST. Coverage
+        // (`--tests`, no `serve` bootstrap) leaves the OnceLock empty, so
+        // `check_governed` would refuse with HOOK_NOT_INSTALLED and the
+        // positive-control delivery would never land. First-writer-wins.
+        let _ = ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION
+            .set(Box::new(|_action| Ok(())));
         let mut cfg = FederationConfig::build(
             1,
             urls,

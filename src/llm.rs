@@ -2016,7 +2016,16 @@ impl OllamaClient {
     /// v0.7.0 (issue #691 fold-1) — consult the governance wire-point
     /// hook before issuing an outbound HTTP request to the Ollama
     /// endpoint. Returns `Err` (with a typed anyhow context) when a
-    /// `refuse` rule matches the Ollama host. The caller surfaces the
+    /// `refuse` rule matches the Ollama host.
+    ///
+    /// Deliberately uses [`crate::governance::wire_check::check`] (the
+    /// CLI-exempt entry point) rather than the fail-closed
+    /// `check_governed`: this sink is reachable from CLI one-shots
+    /// (`ai-memory curator`, `atomise`, `expand`), which by documented
+    /// design do NOT install `GOVERNANCE_PRE_ACTION` — the operator's own
+    /// hands-on ops stay unimpeded. The daemon/MCP-only sinks
+    /// (skill-export filesystem writes, federation egress, hook
+    /// process-spawns) use `check_governed` instead. The caller surfaces the
     /// error verbatim — the LLM-absent fallback path (auto_tag, etc.)
     /// already handles `Err` gracefully so a governance refusal
     /// degrades to "no LLM tags this call" rather than crashing the

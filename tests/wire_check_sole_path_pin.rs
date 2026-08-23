@@ -16,10 +16,10 @@
 //!      in `src/governance/wire_check.rs`.
 //!   2. `GOVERNANCE_PRE_WRITE: OnceLock<...>` is declared in
 //!      `src/storage/mod.rs`.
-//!   3. `src/hooks/executor.rs` calls `wire_check::check(...)` before
-//!      `Command::new(...).spawn()`.
-//!   4. `src/federation/sync.rs` calls `wire_check::check(...)` before
-//!      the outbound peer POST.
+//!   3. `src/hooks/executor.rs` calls `wire_check::check_governed(...)`
+//!      before `Command::new(...).spawn()` (daemon-only `ProcessSpawn`).
+//!   4. `src/federation/sync.rs` calls `wire_check::check_governed(...)`
+//!      before the outbound peer POST (daemon-only `NetworkRequest`).
 //!   5. `src/llm.rs` calls `wire_check::check_anyhow(...)` before the
 //!      Ollama HTTP request.
 //!   6. `src/mcp/tools/skill_export.rs` calls `wire_check::check(...)`
@@ -84,16 +84,17 @@ fn governance_pre_write_oncelock_present_in_storage() {
 #[test]
 fn hooks_executor_invokes_wire_check_before_command_spawn() {
     let body = src("src/hooks/executor.rs");
-    // wire_check::check call present, with the ProcessSpawn action shape
+    // Daemon-only ProcessSpawn: check_governed (fail-closed if the hook
+    // is unset). CLI-reachable sinks keep `check`.
     assert!(
-        body.contains("wire_check::check(&spawn_action)"),
-        "src/hooks/executor.rs must call wire_check::check(&spawn_action) before Command::spawn"
+        body.contains("wire_check::check_governed(&spawn_action)"),
+        "src/hooks/executor.rs must call wire_check::check_governed(&spawn_action) before Command::spawn"
     );
-    // Validate textual ordering: wire_check::check appears before the
+    // Validate textual ordering: the gate appears before the
     // subsequent Command::new(&self.config.command).spawn().
     let wire_idx = body
-        .find("wire_check::check(&spawn_action)")
-        .expect("wire_check::check call must exist");
+        .find("wire_check::check_governed(&spawn_action)")
+        .expect("wire_check::check_governed call must exist");
     // The CODE spawn() (vs. the doc-comment mention) is a multi-line
     // chain ending in `.spawn()\n` at the indentation of the chain. We
     // match `.kill_on_drop(true)\n` `.spawn()` shape that's stable
@@ -103,7 +104,7 @@ fn hooks_executor_invokes_wire_check_before_command_spawn() {
         .expect("Command::spawn (code) must exist");
     assert!(
         wire_idx < spawn_idx,
-        "wire_check::check must precede Command::spawn in src/hooks/executor.rs"
+        "wire_check::check_governed must precede Command::spawn in src/hooks/executor.rs"
     );
 }
 
@@ -111,17 +112,17 @@ fn hooks_executor_invokes_wire_check_before_command_spawn() {
 fn federation_sync_invokes_wire_check_before_peer_post() {
     let body = src("src/federation/sync.rs");
     assert!(
-        body.contains("wire_check::check(&net_action)"),
-        "src/federation/sync.rs must call wire_check::check(&net_action) before peer POST"
+        body.contains("wire_check::check_governed(&net_action)"),
+        "src/federation/sync.rs must call wire_check::check_governed(&net_action) before peer POST"
     );
-    // wire_check::check appears before the req.send() that drives the POST
+    // check_governed appears before the req.send() that drives the POST
     let wire_idx = body
-        .find("wire_check::check(&net_action)")
-        .expect("wire_check::check call must exist");
+        .find("wire_check::check_governed(&net_action)")
+        .expect("wire_check::check_governed call must exist");
     let post_idx = body.find("req.send()").expect("req.send() must exist");
     assert!(
         wire_idx < post_idx,
-        "wire_check::check must precede req.send() in src/federation/sync.rs"
+        "wire_check::check_governed must precede req.send() in src/federation/sync.rs"
     );
 }
 

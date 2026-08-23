@@ -88,7 +88,8 @@ pub fn cmd_promote(
         let capability = crate::governance::capability::parse_presented_token(
             args.capability.as_deref(),
             &caller_agent_id,
-        );
+        )
+        .map_err(|rej| anyhow::anyhow!(crate::governance::capability::edge_reject_message(&rej)))?;
         match enforce_governance(
             &conn,
             GovernedAction::Promote,

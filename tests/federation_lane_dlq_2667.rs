@@ -146,6 +146,8 @@ fn fresh_dlq_db() -> (tempfile::TempDir, ai_memory::handlers::Db) {
 /// required — the fanout can never early-exit before the failing peer is
 /// observed.
 fn build_cfg(peer_url: &str, sink: Arc<dyn FederationDlqSink>) -> FederationConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
         .build()

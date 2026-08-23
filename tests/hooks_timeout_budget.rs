@@ -46,6 +46,8 @@ use tempfile::TempDir;
 fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let path = dir.path().join(name);
     {
         let mut f = std::fs::File::create(&path).expect("create script");
@@ -59,6 +61,8 @@ fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
 }
 
 fn cfg_for(command: PathBuf, event: HookEvent, timeout_ms: u32) -> HookConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     HookConfig {
         event,
         command,

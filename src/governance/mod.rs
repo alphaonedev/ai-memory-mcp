@@ -42,6 +42,14 @@ use crate::hooks::events::MemoryDelta;
 /// `metadata.governance` key (`crate::META_KEY_GOVERNANCE`).
 pub(crate) const GOVERNANCE_TRACE_TARGET: &str = "governance";
 
+/// Tracing target for the substrate ADMISSION gate
+/// ([`crate::storage::enforce_governance`] and its postgres
+/// `enforce_governance_action` twin). Distinct from
+/// [`GOVERNANCE_TRACE_TARGET`] (the rules-engine / wire-point target);
+/// named here as ONE const so the two backends cannot drift and the
+/// string is not scattered (pm-v3.1 no-scattered-literals discipline).
+pub const GOVERNANCE_GATE_TRACE_TARGET: &str = "ai_memory::governance";
+
 // v0.7.0 (issue #691) — substrate-level agent-action rules engine.
 // The K9 pipeline below gates substrate-INTERNAL ops (memory_store,
 // memory_link, ...). `agent_action` adds the parallel engine for
@@ -90,16 +98,19 @@ pub mod rules_store;
 //
 // The daemon `bootstrap_serve` installs ONE shared closure that
 // consults the same `governance_rules` table the storage hook reads,
-// then every wire-point in the daemon-side code paths (skill_export,
-// federation::sync, hooks::executor, llm) calls
-// `wire_check::check(&action)?` to consult it.
+// then every wire-point (skill_export + llm use `check` because they
+// are CLI-reachable; federation::sync + hooks::executor use
+// `check_governed` because they are daemon/MCP-only) consults it.
 pub mod wire_check;
 // #963 — typed governance refusal envelope. Currently exposed as a
 // self-contained module + unit-tested in isolation; the wire-in to
 // `GovernanceDecision::Deny` lands in the follow-up commit per the
 // per-issue end-to-end protocol (see issue #963 body).
 pub mod refusal;
-pub use refusal::{GovernanceRefusal, required_scope_refusal};
+pub use refusal::{
+    ENV_REQUIRE_GOVERNED_NAMESPACE, GovernanceRefusal, UNGOVERNED_NAMESPACE_REASON,
+    require_governed_namespace, required_scope_refusal, ungoverned_namespace_refusal,
+};
 
 // v0.9.0 G10.1 (#1827) — stateless macaroon capability tokens. The opt-in,
 // attenuation-only Deny/Pending→Allow grant primitive; inert unless

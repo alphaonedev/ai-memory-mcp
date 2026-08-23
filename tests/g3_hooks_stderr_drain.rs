@@ -68,6 +68,11 @@ fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
 }
 
 fn cfg_for(command: PathBuf, mode: HookMode, timeout_ms: u32) -> HookConfig {
+    // Coverage `--tests` does not run `bootstrap_serve`, so
+    // `check_governed` would refuse ProcessSpawn with HOOK_NOT_INSTALLED.
+    // First-writer-wins Allow-all; production daemon still installs for real.
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     HookConfig {
         event: HookEvent::PostStore,
         command,

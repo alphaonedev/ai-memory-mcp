@@ -15,24 +15,39 @@
 //!
 //! # Wire shape
 //!
-//! Every daemon-side wire-point — the skill exporter's filesystem
+//! Every production wire-point — the skill exporter's filesystem
 //! writes, the federation client's outbound HTTPS POST, the hooks
 //! executor's child-process spawn, and the LLM client's Ollama HTTP
-//! — calls a single uniform helper:
+//! — calls a single uniform helper (`check` or `check_governed`):
 //!
 //! ```ignore
 //! use crate::governance::wire_check;
-//! wire_check::check(&action)?;
+//! wire_check::check(&action)?;            // CLI-reachable sinks
+//! wire_check::check_governed(&action)?;   // daemon/MCP-only sinks
 //! ```
 //!
 //! The helper consults the process-wide [`GOVERNANCE_PRE_ACTION`]
-//! `OnceLock`. When unset (CLI one-shot mode, pre-hook-install daemon
-//! path), the call is a zero-cost no-op `Ok(())`. When set, the
-//! closure runs and an `Err(reason)` wraps into a
-//! [`crate::storage::GovernanceRefusal`] propagated up the `anyhow`
-//! chain — the same typed error the storage hook produces, so the
-//! existing `MemoryError::from(anyhow::Error)` impl in `errors.rs`
+//! `OnceLock`. When set, the closure runs and an `Err(reason)` wraps
+//! into a [`crate::storage::GovernanceRefusal`] propagated up the
+//! `anyhow` chain — the same typed error the storage hook produces, so
+//! the existing `MemoryError::from(anyhow::Error)` impl in `errors.rs`
 //! handles the 403 / `GOVERNANCE_REFUSED` mapping uniformly.
+//!
+//! # Two entry points: `check` (CLI-exempt) vs `check_governed` (fail-closed)
+//!
+//! [`check`] keeps the documented CLI exemption: when the hook is unset
+//! (CLI one-shot mode) the call is a zero-cost no-op `Ok(())`. That is a
+//! deliberate operator-facing design (rationale 3 below) and applies ONLY
+//! to sinks a CLI one-shot can actually reach.
+//!
+//! [`check_governed`] is the FAIL-CLOSED variant for wire-points that are
+//! structurally daemon/MCP-only — every production caller of those sinks
+//! reaches them after `serve` / `run_mcp_server` has installed the hook.
+//! There, "hook unset" is not the CLI exemption, it is a broken bootstrap,
+//! and a security gate that cannot consult its policy must REFUSE rather
+//! than wave the action through (ERRORS-01/ERRORS-09; the same direction
+//! the installed hook itself already takes for an unavailable consultation
+//! connection, #1455).
 //!
 //! # Layering rationale (mirrors `storage::GOVERNANCE_PRE_WRITE`)
 //!
@@ -95,6 +110,55 @@ pub fn check(action: &AgentAction) -> std::result::Result<(), GovernanceRefusal>
         if let Err(reason) = hook(action) {
             return Err(GovernanceRefusal { reason });
         }
+    }
+    Ok(())
+}
+
+/// Refusal reason emitted by [`check_governed`] when the wire-action hook
+/// is not installed. One const (pm-v3.1 no-scattered-literals discipline)
+/// shared by every daemon-side wire-point.
+pub const HOOK_NOT_INSTALLED_REASON: &str = "governance wire-action hook is not installed — refusing this daemon-side action \
+     (fail-closed). This sink is reachable only from `ai-memory serve` / `ai-memory mcp`, \
+     both of which install the hook during bootstrap, so an uninstalled hook means the \
+     governance bootstrap did not complete: check the daemon start-up log for the \
+     pre-action hook install line and restart the daemon";
+
+/// FAIL-CLOSED variant of [`check`] for wire-points that are structurally
+/// daemon/MCP-only.
+///
+/// Identical to [`check`] when the hook IS installed. The difference is the
+/// unset-hook leg: [`check`] returns `Ok(())` (the documented CLI
+/// exemption), whereas this refuses.
+///
+/// # When to use which
+///
+/// Use `check_governed` when EVERY production caller of the sink runs
+/// inside `ai-memory serve` or `ai-memory mcp` (both install the hook
+/// during bootstrap, before any request is dispatched), so an unset hook
+/// can only mean a broken bootstrap — never the operator's own hands-on
+/// CLI ops. Use [`check`] for sinks a CLI one-shot can reach (e.g. the
+/// LLM egress in `llm.rs`, reached by `ai-memory curator` / `atomise` /
+/// `expand`), where refusing would break the documented exemption.
+///
+/// # Errors
+///
+/// Returns [`GovernanceRefusal`] when the installed hook refuses `action`,
+/// OR when no hook is installed at all ([`HOOK_NOT_INSTALLED_REASON`]).
+#[inline]
+pub fn check_governed(action: &AgentAction) -> std::result::Result<(), GovernanceRefusal> {
+    let Some(hook) = GOVERNANCE_PRE_ACTION.get() else {
+        tracing::error!(
+            target: crate::governance::GOVERNANCE_TRACE_TARGET,
+            action = action.kind(),
+            "wire_check: REFUSING a daemon-side action because the GOVERNANCE_PRE_ACTION \
+             hook is not installed (fail-closed)"
+        );
+        return Err(GovernanceRefusal {
+            reason: HOOK_NOT_INSTALLED_REASON.to_string(),
+        });
+    };
+    if let Err(reason) = hook(action) {
+        return Err(GovernanceRefusal { reason });
     }
     Ok(())
 }

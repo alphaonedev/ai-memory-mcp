@@ -885,7 +885,10 @@ pub async fn bulk_create(
 
     // v0.9.0 G10.1 (#1827) — edge-parse the optional `X-AI-Memory-Capability`
     // header ONCE; the same token gates every row in the batch.
-    let capability = super::capability_from_headers(&headers, &caller);
+    let capability = match super::capability_from_headers(&headers, &caller) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
 
     // ---- Stage 1 (NO DB LOCK) — validate + project every row. --------------
     //

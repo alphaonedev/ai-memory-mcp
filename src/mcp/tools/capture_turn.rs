@@ -379,7 +379,8 @@ pub fn handle_capture_turn(
         // v0.9.0 G10.1 (#1827) — edge-parse the optional `capability`
         // param ONCE; inert unless `[capabilities].enabled`.
         let capability =
-            crate::governance::capability::parse_presented_token(req.capability.as_deref(), caller);
+            crate::governance::capability::parse_presented_token(req.capability.as_deref(), caller)
+                .map_err(|rej| crate::governance::capability::edge_reject_message(&rej))?;
         // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
         // consult BEFORE the governance decision dispatches.
         crate::mcp::consult_pre_governance_decision_gate(

@@ -865,8 +865,12 @@ pub async fn import_memories(
         // `X-AI-Memory-Capability` header ONCE into the caller context;
         // inert unless `[capabilities].enabled`. The same token gates
         // every row in the batch.
-        let ctx = crate::store::CallerContext::for_agent(caller.clone())
-            .with_capability(crate::handlers::capability_from_headers(&headers, &caller));
+        let capability = match crate::handlers::capability_from_headers(&headers, &caller) {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
+        let ctx =
+            crate::store::CallerContext::for_agent(caller.clone()).with_capability(capability);
         let mut imported = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();

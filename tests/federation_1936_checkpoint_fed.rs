@@ -452,6 +452,8 @@ async fn broadcast_includes_checkpoint_in_push_body() {
         axum::serve(listener, app).await.ok();
     });
 
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let cfg = ai_memory::federation::FederationConfig {
         policy: ai_memory::replication::QuorumPolicy::new(
             2,

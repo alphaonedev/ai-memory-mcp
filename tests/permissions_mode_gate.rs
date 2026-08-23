@@ -152,6 +152,164 @@ fn k3_enforce_mode_blocks_with_pending() {
     clear_permissions_mode_override_for_test();
 }
 
+/// REGRESSION (fail-open fix) — with the OPT-IN strict admission posture
+/// engaged, a namespace whose chain resolves NO policy must be REFUSED under
+/// `enforce`, not silently allowed.
+///
+/// `enforce_governance` returns `Allow` from the
+/// `resolve_governance_policy == None` arm unconditionally, so a namespace
+/// the operator BELIEVED was covered (a typo, or a sibling of a governed
+/// tree) skips the approval / owner / `required_scope` gates entirely. That
+/// remains the DEFAULT (see `ungoverned_namespace_allows_by_default_under_enforce`
+/// below — it is a cutline-protected ship-gate contract); this knob is how an
+/// operator who means "govern everything" gets the fail-closed posture.
+#[test]
+fn enforce_mode_ungoverned_namespace_is_deny_under_strict_posture() {
+    let _guard = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    // SAFETY-of-scope: single-threaded within the mode lock; removed below.
+    unsafe { std::env::set_var(ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE, "1") };
+
+    let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+    // NOTHING seeded for this namespace — that IS the reproduction.
+    let payload = serde_json::json!({"title": "ungoverned"});
+    let decision = db::enforce_governance(
+        &conn,
+        GovernedAction::Store,
+        "brand-new-tenant/scratch",
+        "mallory",
+        None,
+        None,
+        &payload,
+        None,
+    )
+    .expect("gate must not error");
+
+    unsafe { std::env::remove_var(ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE) };
+
+    match decision {
+        GovernanceDecision::Deny(refusal) => {
+            assert_eq!(
+                refusal.reason,
+                ai_memory::governance::UNGOVERNED_NAMESPACE_REASON
+            );
+            assert_eq!(
+                refusal.namespace.as_deref(),
+                Some("brand-new-tenant/scratch")
+            );
+            // The message must be ACTIONABLE — every remedy named.
+            assert!(refusal.reason.contains("memory_namespace_set_standard"));
+            assert!(refusal.reason.contains("advisory"));
+            assert!(
+                refusal
+                    .reason
+                    .contains(ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE)
+            );
+        }
+        other => panic!("enforce + strict posture + no policy must REFUSE, got {other:?}"),
+    }
+
+    clear_permissions_mode_override_for_test();
+}
+
+/// THE DEFAULT MUST NOT CHANGE — with the knob unset, an ungoverned namespace
+/// still ALLOWS under `enforce`.
+///
+/// This is load-bearing, not a nicety. `AppConfig::effective_permissions_mode`
+/// resolves an unconfigured `[permissions]` block to `Enforce`
+/// (`governance::default_v07_secure_mode`), so `enforce` + no policy IS the
+/// out-of-the-box posture; and `tests/ship_gate_governance_inheritance.rs` is
+/// CUTLINE-PROTECTED on "ungoverned subtrees remain opt-in (compatibility
+/// preserved)" even while a sibling subtree IS governed. Flipping this default
+/// is a product-semantics decision, not remediation.
+#[test]
+fn ungoverned_namespace_allows_by_default_under_enforce() {
+    let _guard = lock_permissions_mode_for_test();
+    unsafe { std::env::remove_var(ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE) };
+    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+
+    let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+    // A GOVERNED sibling subtree — the multi-tenant shape the ship gate pins.
+    seed_policy(&conn, "alphaone/secure", &approve_write_policy(), "alice");
+    let payload = serde_json::json!({"title": "ungoverned-default"});
+    let decision = db::enforce_governance(
+        &conn,
+        GovernedAction::Store,
+        "betatwo/free",
+        "mallory",
+        None,
+        None,
+        &payload,
+        None,
+    )
+    .expect("gate must not error");
+    assert!(
+        matches!(decision, GovernanceDecision::Allow),
+        "opt-in enforcement is preserved verbatim by default, even with a governed \
+         sibling subtree present; got {decision:?}"
+    );
+
+    clear_permissions_mode_override_for_test();
+}
+
+/// `advisory` is UNCHANGED even with the strict posture engaged: it logs
+/// rather than blocks, by contract.
+#[test]
+fn advisory_mode_no_policy_still_allows_under_strict_posture() {
+    let _guard = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    // SAFETY-of-scope: single-threaded within the mode lock; removed below.
+    unsafe { std::env::set_var(ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE, "1") };
+
+    let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+    let payload = serde_json::json!({"title": "ungoverned-advisory"});
+    let decision = db::enforce_governance(
+        &conn,
+        GovernedAction::Store,
+        "brand-new-tenant/scratch",
+        "mallory",
+        None,
+        None,
+        &payload,
+        None,
+    )
+    .expect("gate must not error");
+
+    unsafe { std::env::remove_var(ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE) };
+    assert!(matches!(decision, GovernanceDecision::Allow));
+
+    clear_permissions_mode_override_for_test();
+}
+
+/// Fable HIGH (#3133): the strict-admission resolver must accept the house
+/// truthy grammar (`1`/`true`/`yes`/`on`), not only `1`/`true`. A `=yes`
+/// that silently stays FAIL-OPEN is the defect.
+#[test]
+fn require_governed_namespace_uses_shared_truthy_grammar() {
+    let _guard = lock_permissions_mode_for_test();
+    let env = ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE;
+    unsafe { std::env::remove_var(env) };
+    assert!(
+        !ai_memory::governance::require_governed_namespace(),
+        "unset must stay the legacy Allow posture"
+    );
+    for truthy in ["1", "true", "TRUE", "yes", "on", "Yes", "ON"] {
+        unsafe { std::env::set_var(env, truthy) };
+        assert!(
+            ai_memory::governance::require_governed_namespace(),
+            "truthy token {truthy:?} must engage the strict posture"
+        );
+    }
+    for falsy in ["0", "false", "enable", "enabled", "", "2"] {
+        unsafe { std::env::set_var(env, falsy) };
+        assert!(
+            !ai_memory::governance::require_governed_namespace(),
+            "non-truthy token {falsy:?} must NOT engage the strict posture"
+        );
+    }
+    unsafe { std::env::remove_var(env) };
+}
+
 /// `advisory` mode is the v0.7.0 default for upgrading operators —
 /// governance metadata is recorded but the gate logs and allows. The
 /// would-be `Pending` is suppressed: no `pending_actions` row is

@@ -180,7 +180,8 @@ pub(super) fn handle_forget(
     let capability = crate::governance::capability::parse_presented_token(
         params[crate::mcp::param_names::CAPABILITY].as_str(),
         owner.as_deref().unwrap_or_default(),
-    );
+    )
+    .map_err(|rej| crate::governance::capability::edge_reject_message(&rej))?;
     match (namespace, owner.as_deref()) {
         (Some(ns), Some(caller)) => {
             forget_governance_gate_one_ns(

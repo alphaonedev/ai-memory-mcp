@@ -372,6 +372,56 @@ FED-RQ-03 policy-current, check #18).
   the armed gate actually refusing boot on a below-floor control.
   Check #18 pins FED-RQ-03 (`AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`
   not explicitly falsy) into the posture.
+- **STRENGTHENED (v1.0.0 fail-open remediation):** three gates a
+  certified deployment runs through now fail closed where they
+  previously degraded to accept (the first as an opt-in posture, the
+  other two by default). None weakens the posture; all three change
+  behaviour a certified operator will observe, so they are recorded
+  here rather than only in the CHANGELOG:
+  1. A new OPT-IN strict admission posture,
+     `AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE=1`, makes a write
+     into a namespace whose governance chain resolves **no policy** a
+     403 `GOVERNANCE_REFUSED` instead of an allow-on-silence. It is
+     **off by default** (flipping the default would break the
+     cutline-protected "ungoverned subtrees remain opt-in" ship gate and
+     would refuse every write on a fresh install, since an unconfigured
+     `[permissions]` block already resolves to `enforce`). A certified
+     deployment — which by construction runs
+     `AI_MEMORY_PERMISSIONS_MODE=enforce` (check #7) and genuinely means
+     "govern everything" — **SHOULD engage it**, paired with a
+     substrate-wide default policy on the `*` namespace
+     (`memory_namespace_set_standard`) so no legitimate write is
+     stranded. It is **not** pinned by `asi-hard` today, deliberately:
+     every entry in that KNOBS table already defaults fail-closed, so
+     pinning is a no-op for a compliant deployment, whereas pinning a
+     default-OFF knob would change behaviour for existing `asi-hard`
+     deployments and pre-empt the default-flip decision. That decision
+     is tracked as **#3125**; if it lands ON, the `asi-hard` pin
+     (21 → 22) becomes a no-op and should follow in lockstep.
+     `ai-memory doctor` reports the posture as `require_governed_namespace`
+     next to `namespaces_without_policy`.
+  2. `AI_MEMORY_FED_CERT_PEER_BINDING=enforce` now refuses an mTLS
+     client cert that carries **no operator binding**, and a bound cert
+     presented with **no `X-Peer-Id`** (`401 peer_id_cert_unbound`).
+     Both previously proceeded, which made the documented compensating
+     control for the `FED_REQUIRE_SIG=0` window skippable by any holder
+     of an unmapped-but-TLS-accepted cert. `warn` — the default and the
+     documented rollout posture — is unchanged; populate
+     `AI_MEMORY_FED_CERT_PEER_BINDING_MAP` for every peer before moving
+     to `enforce`. **Precondition (not closed here):** a request that
+     arrives with **no client-cert extension at all** still proceeds
+     under `enforce` (`federation_receive.rs` no-extension arm) — that
+     path is "the request did not land on the peer-binding mTLS
+     acceptor" (plain HTTP / no binding map). This control is therefore
+     only as strong as the operator's **single mTLS listener**
+     precondition: do not expose a cleartext (or non-mTLS) fallback
+     listener on the same mesh, or an unauthenticated client can skip
+     the binding check by never presenting a cert.
+  3. FED-RQ-03 no longer converts a failed local governance-policy read
+     into ACCEPT. The read is retried three times (linear 10/20 ms
+     backoff) and, if the gate is enabled, a persistent failure refuses
+     `503 policy_read_unavailable` (retryable) instead of applying the
+     push under an undeterminable policy.
 - Check #10 (`AI_MEMORY_FED_PEER_FINGERPRINTS`) verifies the pin file
   *exists*; it does not parse pin lines. A garbage pin file passes
   posture. Filed as #2911 item 3 (TLS failure mode on unparseable pins

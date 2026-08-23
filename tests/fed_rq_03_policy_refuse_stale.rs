@@ -229,6 +229,122 @@ async fn stale_policy_version_is_refused_before_apply() {
     );
 }
 
+/// Break the local governance policy read so `current_policy_version`
+/// returns `Err` on every attempt.
+///
+/// `policy_advance_count` short-circuits to `Ok(0)` when `signed_events` is
+/// ABSENT, so dropping the table would exercise the (legitimate) `seq=0`
+/// sentinel, not the fault path. Renaming the column the count query filters
+/// on keeps the table present and makes the SELECT itself fail — the shape a
+/// transient `SQLITE_BUSY` / corrupted-read fault takes at this call site.
+async fn break_policy_read(db: &ai_memory::handlers::Db) {
+    let lock = db.lock().await;
+    lock.0
+        .execute_batch("ALTER TABLE signed_events RENAME COLUMN event_type TO event_type_broken;")
+        .expect("break the policy-version read");
+    assert!(
+        ai_memory::governance::policy_version::current_policy_version(&lock.0).is_err(),
+        "the fault must actually make the policy read fail — otherwise this test is vacuous"
+    );
+}
+
+/// REGRESSION (fail-open fix) — a local governance policy-read fault must
+/// REFUSE the push, not accept it.
+///
+/// Pre-fix `refuse_if_stale_policy` swallowed the `Err` and returned `None`
+/// (accept), so a peer could ride out FED-RQ-03 by inducing a transient
+/// governance-read fault it can generate itself with parallel pushes, and
+/// apply under a stale policy. `503` (not `409`) because the condition is
+/// transient and the peer SHOULD retry.
+#[tokio::test]
+async fn policy_read_fault_refuses_503_and_does_not_apply() {
+    let guard = ENV_LOCK.lock().await;
+    reset_env();
+    let (router, db) = build_router_with_db();
+    advance_policy(&db, 5).await;
+    break_policy_read(&db).await;
+
+    // A push that would otherwise be ACCEPTED (fresh seq) — proving the
+    // refusal comes from the read fault, not from staleness.
+    let (status, body) = post_push(
+        &router,
+        &push_body("44444444-4444-4444-8444-444444444444", Some(5)),
+    )
+    .await;
+    drop(guard);
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a policy-read fault must FAIL CLOSED with a retryable 503; body={body}"
+    );
+    assert_eq!(
+        body["error"], "policy_read_unavailable",
+        "typed policy-read-fault tag (distinct from the stale tag); body={body}"
+    );
+    assert!(
+        body.get("detail").is_none(),
+        "Fable HIGH (#3133): raw rusqlite/IO error must not ride the peer wire; body={body}"
+    );
+    let note = body["note"].as_str().unwrap_or("");
+    assert!(
+        note.contains("retryable"),
+        "note must say it is retryable: {note}"
+    );
+    assert!(
+        note.contains(ai_memory::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV),
+        "note must name the documented opt-out: {note}"
+    );
+    assert_eq!(
+        count_ns(&db, NS).await,
+        0,
+        "no memory may land when staleness is undeterminable (reject-before-apply)"
+    );
+}
+
+/// The documented rollout opt-out is UNCHANGED by the fail-closed fix: with
+/// the gate disabled, a policy-read fault still ACCEPTS exactly as before.
+#[tokio::test]
+async fn policy_read_fault_still_accepts_when_gate_disabled() {
+    let guard = ENV_LOCK.lock().await;
+    reset_env();
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+            "0",
+        );
+    }
+    let (router, db) = build_router_with_db();
+    advance_policy(&db, 5).await;
+    break_policy_read(&db).await;
+
+    let (status, body) = post_push(
+        &router,
+        &push_body("55555555-5555-4555-8555-555555555555", Some(3)),
+    )
+    .await;
+    unsafe {
+        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV);
+    }
+    drop(guard);
+
+    assert_ne!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0 keeps the legacy accept-on-fault; body={body}"
+    );
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "the gate is disabled, so nothing may be refused as stale either; body={body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "non-vacuous: the push must actually be ACCEPTED under the opt-out; body={body}"
+    );
+}
+
 #[tokio::test]
 async fn fresh_policy_version_is_accepted() {
     let guard = ENV_LOCK.lock().await;

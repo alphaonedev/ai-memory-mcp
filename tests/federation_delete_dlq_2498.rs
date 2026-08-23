@@ -164,6 +164,8 @@ fn build_cfg(
     ack_timeout_ms: u64,
     client_timeout_ms: u64,
 ) -> FederationConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(client_timeout_ms))
         .build()

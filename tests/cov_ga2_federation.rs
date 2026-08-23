@@ -1126,6 +1126,8 @@ fn ga2_link() -> ai_memory::models::MemoryLink {
 fn quorum_config(
     peers: Vec<ai_memory::federation::PeerEndpoint>,
 ) -> ai_memory::federation::FederationConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(300))
         .build()

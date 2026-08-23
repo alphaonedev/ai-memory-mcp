@@ -159,6 +159,8 @@ fn fed_cfg(
     timeout_ms: u64,
     api_key: Option<String>,
 ) -> FederationConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let timeout = Duration::from_millis(timeout_ms);
     let client = reqwest::Client::builder()
         .timeout(timeout)

@@ -27,6 +27,12 @@ const INTEGRATION_TEST_ADMIN: &str = "ai:integration-test-admin";
 fn cmd(binary: &str) -> std::process::Command {
     let mut c = std::process::Command::new(binary);
     c.env("AI_MEMORY_NO_CONFIG", "1");
+    // Spawned CLI `--json` reports must be a single JSON document on
+    // stdout. GitHub-hosted Check runners (and some local shells) inherit
+    // `RUST_LOG=info`; curator then prefixes stdout with a tracing INFO
+    // line and `serde_json::from_str` fails at column 1. Pin error so
+    // `--json` stays parseable. Tests that need log text can override.
+    c.env("RUST_LOG", "error");
     // #1751 — the v0.9 store-path default REQUIRES attestation; this suite's
     // unsigned CLI/daemon stores exercise other subject matter, so pin the
     // explicit documented opt-out on every spawned child. The required
@@ -10871,27 +10877,35 @@ fn test_curator_autonomy_end_to_end_cycle() {
         );
     }
 
-    // Run curator in dry-run mode (single cycle, no writes)
+    // Run curator in dry-run mode (single cycle, no writes).
+    // `--json` is a CuratorArgs flag (not a global), so it must sit
+    // AFTER `curator`. A leading `--json` is silently ignored and the
+    // human "curator cycle report" then fails JSON parse at column 1.
     let output = cmd(binary)
         .args([
             "--db",
             db_path.to_str().unwrap(),
-            "--json",
             "curator",
             "--once",
             "--dry-run",
+            "--json",
         ])
         .output()
         .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "curator failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "curator failed: status={:?} stdout={stdout:?} stderr={stderr:?}",
+        output.status
     );
 
-    // Parse the JSON report
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("curator output should be valid JSON");
+    // Parse the JSON report. Skip any tracing prefix if one leaked
+    // past RUST_LOG=error (first `{` is the CuratorReport object).
+    let json_src = stdout.find('{').map_or(stdout.trim(), |i| &stdout[i..]);
+    let report: serde_json::Value = serde_json::from_str(json_src.trim()).unwrap_or_else(|e| {
+        panic!("curator output should be valid JSON: {e}\nstdout={stdout:?}\nstderr={stderr:?}")
+    });
 
     // Assert that the curator cycle ran
     assert!(report["memories_scanned"].as_u64().is_some());
@@ -10979,6 +10993,11 @@ fn federation_cfg_for_test(
     timeout_ms: u64,
 ) -> ai_memory::federation::FederationConfig {
     use std::time::Duration;
+    // Coverage `--tests` does not run `bootstrap_serve`, so
+    // `check_governed` would refuse outbound POSTs (HOOK_NOT_INSTALLED)
+    // and agent-register would return 202 under-replicated instead of 200/201.
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let timeout = Duration::from_millis(timeout_ms);
     let client = reqwest::Client::builder()
         .timeout(timeout)
