@@ -5855,14 +5855,8 @@ impl PostgresStore {
         action: &str,
         unstamped_reason: &str,
     ) -> StoreResult<()> {
-        Self::assert_caller_owns_for_mutation_on(
-            &self.pool,
-            ctx,
-            id,
-            action,
-            unstamped_reason,
-        )
-        .await
+        Self::assert_caller_owns_for_mutation_on(&self.pool, ctx, id, action, unstamped_reason)
+            .await
     }
 
     /// #3193 — executor-parameterised core of
@@ -10548,25 +10542,74 @@ impl PostgresStore {
     /// peer-attested posture, tracked separately.
     async fn validate_link_pre_create_pg(
         &self,
+        ctx: &CallerContext,
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<()> {
-        // Same identity fallback as sqlite's `create_link_signed`: the
-        // signing keypair's claim when present (the writer is by
-        // definition the actor), else "system".
-        let agent_id_for_eval = keypair.map_or("system", |kp| kp.agent_id.as_str());
+        // #3194 — K9 is evaluated for the CALLER principal, not the
+        // daemon keypair the handler threads in for signing. Pre-fix
+        // this used `keypair.map_or("system", |kp| kp.agent_id)`, so
+        // every tenant HTTP link was judged as the daemon identity.
+        // Federation/admin (`ctx.bypass_visibility`) keeps the prior
+        // keypair-or-"system" fallback so inbound apply and operator
+        // lanes stay byte-identical. Tenant writes use
+        // `ctx.effective_principal()`.
+        let caller_principal = ctx.effective_principal();
+        let keypair_or_system = keypair.map_or("system", |kp| kp.agent_id.as_str());
+        let agent_id_for_eval = if ctx.bypass_visibility {
+            keypair_or_system
+        } else {
+            caller_principal
+        };
 
         // The source memory's namespace scopes both gates (matches the
         // sqlite/MCP choice). A missing source falls back to the
         // default namespace — the FK pre-flight in `link_internal`
         // surfaces the missing-memory error after this returns.
-        let link_ns: Option<String> =
-            sqlx::query_scalar("SELECT namespace FROM memories WHERE id = $1")
-                .bind(&link.source_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| to_store_err("resolve link source namespace", e))?;
-        let link_ns = link_ns.unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
+        //
+        // #3194 — fold the source-owner columns into this ONE query
+        // rather than a second round-trip. The sqlite #941 four-way
+        // predicate (owner / inbox-target / empty-legacy / daemon
+        // sentinel) runs below; a missing source skips the owner gate
+        // so the later FK pre-flight still names the missing memory
+        // (an owner-gate 403 on a missing id would be an existence
+        // oracle).
+        let source_row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT namespace, metadata->>'agent_id', metadata->>'target_agent_id' \
+             FROM memories WHERE id = $1",
+        )
+        .bind(&link.source_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("resolve link source namespace", e))?;
+        if !ctx.bypass_visibility
+            && let Some((_, ref owner, ref inbox)) = source_row
+        {
+            let source_owner = owner.as_deref().unwrap_or("");
+            let source_inbox = inbox.as_deref().unwrap_or("");
+            let is_unowned_legacy = source_owner.is_empty();
+            if !is_unowned_legacy
+                && source_owner != caller_principal
+                && source_inbox != caller_principal
+                && caller_principal != crate::identity::sentinels::DAEMON_PRINCIPAL
+            {
+                tracing::warn!(
+                    target: crate::handlers::AUTHZ_TRACE_TARGET,
+                    "postgres link 403: caller {caller_principal} != source owner \
+                     {source_owner} (source_id={})",
+                    link.source_id
+                );
+                return Err(StoreError::PermissionDenied {
+                    action: "memory_link".to_string(),
+                    target: link.source_id.clone(),
+                    reason: crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string(),
+                });
+            }
+        }
+        let link_ns = source_row
+            .as_ref()
+            .map(|(ns, _, _)| ns.clone())
+            .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
 
         // Pass 0: v0.9.0 G13-mem (#1859) — lineage-DAG acyclicity guard
         // (postgres twin of the sqlite `validate_link_pre_create` Pass 0).
@@ -10680,13 +10723,16 @@ impl PostgresStore {
 
     async fn link_internal(
         &self,
+        ctx: &CallerContext,
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
         // #1568 (H1 residual) — run the same pre-link gates the sqlite
         // `db::create_link_signed` path runs (reflects_on cycle
         // invariant + K9 governance) BEFORE any FK pre-flight or write.
-        self.validate_link_pre_create_pg(link, keypair).await?;
+        // #3194 threads `ctx` so the source-owner gate + K9 principal
+        // are the CALLER, not the discarded `_ctx` / daemon keypair.
+        self.validate_link_pre_create_pg(ctx, link, keypair).await?;
 
         // FK pre-flight — mirror SQLite's explicit existence check so
         // the error message names the missing memory rather than
@@ -20093,23 +20139,24 @@ impl MemoryStore for PostgresStore {
         })
     }
 
-    async fn link(&self, _ctx: &CallerContext, link: &MemoryLink) -> StoreResult<()> {
+    async fn link(&self, ctx: &CallerContext, link: &MemoryLink) -> StoreResult<()> {
         self.gate_record_stop()?;
         // F6 Gap 3 (v0.7.0) — unsigned link write. The trait method
         // does not surface a keypair so we always land the row with
         // `attest_level = "unsigned"`. Callers that want signing route
         // through [`MemoryStore::link_signed`].
-        self.link_internal(link, None).await.map(|_| ())
+        // #3194 — pass the real ctx; `link_internal` now gates on it.
+        self.link_internal(ctx, link, None).await.map(|_| ())
     }
 
     async fn link_signed(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
         self.gate_record_stop()?;
-        self.link_internal(link, keypair).await
+        self.link_internal(ctx, link, keypair).await
     }
 
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {

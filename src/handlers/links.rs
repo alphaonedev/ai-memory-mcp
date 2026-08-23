@@ -566,9 +566,14 @@ pub async fn create_link(
     // any caller could create a link rooted at any source_id
     // regardless of ownership — a forge primitive against the v0.7
     // typed link graph (`:supersedes` / `:contradicts` / `:reflects_on`
-    // pollution). The postgres SAL branch above is correct because
-    // `app.store.link_signed` uses the ctx the handler threaded
-    // through. The sqlite path needs the explicit gate.
+    // pollution). The postgres SAL branch above used to CLAIM it was
+    // already gated because `app.store.link_signed` took a ctx — that
+    // was FALSE: `PostgresStore::link_signed` discarded `_ctx` until
+    // #3194, which now runs this same four-way predicate (owner /
+    // inbox-target / empty-legacy / daemon sentinel) inside
+    // `validate_link_pre_create_pg`. The sqlite path still needs the
+    // explicit handler gate because `db::create_link_signed` has no
+    // caller ctx.
     let caller = match crate::handlers::parity::resolve_caller_agent_id(None, &headers, None) {
         Ok(c) => c,
         Err(err) => {
