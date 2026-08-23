@@ -106,8 +106,28 @@ pub fn authorize_remote_transition(
 /// a hard error that drops the rest of the push.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointResolutionAuthz {
-    /// Authenticated (or permissively accepted) — apply the resolution.
-    Accept,
+    /// **Authenticated** — the resolution's Ed25519 signature verified against
+    /// the resolver's locally-ENROLLED key, which is carried here.
+    ///
+    /// v1.0.0 #3164 (ERRORS-09, make illegal states unrepresentable): the key
+    /// is a payload of the variant rather than something the caller re-derives
+    /// from a separate `Option<&VerifyingKey>`. Before this, `Accept` was also
+    /// returned by the two PERMISSIVE branches below with `enrolled_key ==
+    /// None`, so "Accept implies an enrolled key" was true only for callers
+    /// that hardcoded `require_sig = true` — and one such caller
+    /// (`mcp::tools::checkpoint`) turned that assumption into an
+    /// `.expect(…)`. Wiring the runtime flag into that call site would have
+    /// made a REMOTE peer able to panic an MCP tool. Splitting the variant
+    /// makes the unsound pairing impossible to construct.
+    Accept(VerifyingKey),
+    /// **Permissively accepted with NO verified signature** — `require_sig`
+    /// is off (an operator opt-in for a heterogeneous-rollout window) and the
+    /// resolution was either unsigned or attributed to a resolver with no
+    /// locally-enrolled key. The resolution is applied, but NOTHING about the
+    /// resolver's identity has been authenticated, so a caller that needs a
+    /// verified attestation (rather than merely "may apply") MUST treat this
+    /// as a non-attested outcome.
+    AcceptUnverified,
     /// Unsigned resolution while signatures are required (fail-closed default).
     RejectUnsigned,
     /// Signed, but the attested resolver has no enrolled public key locally.
@@ -131,10 +151,13 @@ pub enum CheckpointResolutionAuthz {
 /// verdict:
 ///
 /// 1. **Unsigned →** fail-closed ([`CheckpointResolutionAuthz::RejectUnsigned`])
-///    under `require_sig`, else [`CheckpointResolutionAuthz::Accept`] (operator
-///    opt-out for a heterogeneous-rollout window).
+///    under `require_sig`, else [`CheckpointResolutionAuthz::AcceptUnverified`]
+///    (operator opt-out for a heterogeneous-rollout window — applied, but NOT
+///    authenticated).
 /// 2. **Signed →** the resolver MUST have an enrolled key and the signature MUST
-///    verify against *that* key. A present-but-invalid signature is
+///    verify against *that* key. Only that path yields
+///    [`CheckpointResolutionAuthz::Accept`], which carries the verifying key.
+///    A present-but-invalid signature is
 ///    [`CheckpointResolutionAuthz::RejectForged`] **unconditionally** (even under
 ///    permissive `require_sig == false`).
 #[must_use]
@@ -148,18 +171,20 @@ pub fn authorize_remote_checkpoint_resolution(
         return if require_sig {
             CheckpointResolutionAuthz::RejectUnsigned
         } else {
-            CheckpointResolutionAuthz::Accept
+            CheckpointResolutionAuthz::AcceptUnverified
         };
     }
     let Some(key) = enrolled_key else {
         return if require_sig {
             CheckpointResolutionAuthz::RejectNotEnrolled
         } else {
-            CheckpointResolutionAuthz::Accept
+            CheckpointResolutionAuthz::AcceptUnverified
         };
     };
     if verify_checkpoint_resolution(signable, signature, key.as_bytes()) {
-        CheckpointResolutionAuthz::Accept
+        // #3164 — the verifying key travels WITH the verdict, so no call site
+        // can pair an `Accept` with a missing key.
+        CheckpointResolutionAuthz::Accept(*key)
     } else {
         CheckpointResolutionAuthz::RejectForged
     }
@@ -2198,7 +2223,7 @@ mod tests {
         let sig = sign::sign_checkpoint_resolution(&kp, &r).unwrap();
         assert_eq!(
             authorize_remote_checkpoint_resolution(&r, &sig, Some(&kp.public), true),
-            CheckpointResolutionAuthz::Accept
+            CheckpointResolutionAuthz::Accept(kp.public)
         );
     }
 
@@ -2211,7 +2236,7 @@ mod tests {
         );
         assert_eq!(
             authorize_remote_checkpoint_resolution(&r, &[], None, false),
-            CheckpointResolutionAuthz::Accept
+            CheckpointResolutionAuthz::AcceptUnverified
         );
     }
 
@@ -2226,8 +2251,43 @@ mod tests {
         );
         assert_eq!(
             authorize_remote_checkpoint_resolution(&r, &sig, None, false),
-            CheckpointResolutionAuthz::Accept
+            CheckpointResolutionAuthz::AcceptUnverified
         );
+    }
+
+    /// v1.0.0 #3164 (ERRORS-09) — `Accept` CARRIES the key that verified the
+    /// resolution, and the permissive branches can no longer produce it. The
+    /// old shape returned a bare `Accept` from three different branches, only
+    /// one of which had actually authenticated anything — which is what made
+    /// `mcp::tools::checkpoint`'s `.expect("Accept implies an enrolled
+    /// verifying key")` one config flag away from a remote-triggerable panic.
+    #[test]
+    fn checkpoint_accept_carries_the_verifying_key_and_permissive_cannot_produce_it_3164() {
+        let kp = kp_mod::generate("alice").unwrap();
+        let r = cp_fixture("approved");
+        let sig = sign::sign_checkpoint_resolution(&kp, &r).unwrap();
+
+        match authorize_remote_checkpoint_resolution(&r, &sig, Some(&kp.public), true) {
+            CheckpointResolutionAuthz::Accept(verified) => assert_eq!(
+                verified, kp.public,
+                "Accept must carry the ENROLLED key the signature verified against"
+            ),
+            other => panic!("expected an authenticated Accept, got {other:?}"),
+        }
+
+        // Both permissive branches: applied, but NOT authenticated. Neither can
+        // be pattern-matched as `Accept(_)`, so no caller can extract a key
+        // that was never verified.
+        for verdict in [
+            authorize_remote_checkpoint_resolution(&r, &[], None, false),
+            authorize_remote_checkpoint_resolution(&r, &sig, None, false),
+        ] {
+            assert_eq!(verdict, CheckpointResolutionAuthz::AcceptUnverified);
+            assert!(
+                !matches!(verdict, CheckpointResolutionAuthz::Accept(_)),
+                "#3164: an unauthenticated permissive accept must be unrepresentable as Accept"
+            );
+        }
     }
 
     #[test]

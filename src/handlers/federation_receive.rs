@@ -3702,7 +3702,14 @@ pub async fn sync_push(
             enrolled.as_ref(),
             require_checkpoint_sig,
         ) {
-            crate::federation::receive_auth::CheckpointResolutionAuthz::Accept => {
+            // #3164 — `Accept(key)` is the authenticated verdict (the key that
+            // verified the resolution); `AcceptUnverified` is the permissive
+            // `require_checkpoint_sig = false` rollout window. Both apply the
+            // resolution, which is byte-identical to the pre-split behaviour of
+            // the single `Accept` arm — the split exists so no caller can
+            // mistake the permissive outcome for an authenticated one.
+            crate::federation::receive_auth::CheckpointResolutionAuthz::Accept(_)
+            | crate::federation::receive_auth::CheckpointResolutionAuthz::AcceptUnverified => {
                 if body.dry_run {
                     noop += 1;
                     continue;

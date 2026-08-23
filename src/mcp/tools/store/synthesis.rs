@@ -281,12 +281,14 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     // the entire merge back instead of leaving a half-synthesised store.
     // Vector-index mutations are in-memory and DEFERRED until after COMMIT so a
     // rollback can never leave the index out of sync with the DB.
-    if conn
-        .execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
-        .is_err()
-    {
+    // #3163 — RAII guard. The early `return None` arms below keep their
+    // explicit ROLLBACK so the write lock is released at the exact bail-out
+    // point; the guard is what covers a PANIC unwind out of any of the
+    // update/link/delete calls, and it no-ops once the connection is back in
+    // autocommit, so the two are idempotent with each other.
+    let Ok(write_txn) = crate::storage::connection::WriteTxn::begin(conn) else {
         return None;
-    }
+    };
     let mut deferred_index_ops: Vec<(String, Vec<f32>)> = Vec::new();
 
     // Issue #1239 — counter into `outcome.updates` so subsequent
@@ -435,11 +437,10 @@ pub(super) fn apply_synthesis_updates_and_deletes(
 
     // #1700 — all core writes succeeded; commit the merge as one unit, then
     // apply the deferred in-memory vector-index swaps (the DB is now durable).
-    if conn
-        .execute_batch(crate::storage::connection::SQL_COMMIT)
-        .is_err()
-    {
-        let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+    // A failed COMMIT leaves the guard armed: dropping it here rolls the
+    // whole merge back, so the deferred vector-index swaps below are never
+    // applied against a store that did not durably change.
+    if write_txn.commit().is_err() {
         return None;
     }
     if let Some(idx) = vector_index {

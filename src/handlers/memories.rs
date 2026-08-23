@@ -123,22 +123,24 @@ pub async fn get_memory(
     let lookup: Result<
         Option<(crate::models::Memory, Vec<crate::models::MemoryLink>)>,
         anyhow::Error,
-    > = super::read_pool::db_read_op(app.db.clone(), move |conn| {
-        match db::resolve_id(conn, &id_clone) {
-            Ok(Some(mem)) => {
-                // #869 audit (Category B — safe default): a substrate
-                // failure on `get_links` is non-fatal — the memory
-                // body itself was retrieved cleanly. Empty `links`
-                // array degrades graph navigation rather than
-                // failing the GET.
-                let links = db::get_links(conn, &mem.id).unwrap_or_default();
-                Ok(Some((mem, links)))
+    > = super::transport::flatten_db_op(
+        super::read_pool::db_read_op(app.db.clone(), move |conn| {
+            match db::resolve_id(conn, &id_clone) {
+                Ok(Some(mem)) => {
+                    // #869 audit (Category B — safe default): a substrate
+                    // failure on `get_links` is non-fatal — the memory
+                    // body itself was retrieved cleanly. Empty `links`
+                    // array degrades graph navigation rather than
+                    // failing the GET.
+                    let links = db::get_links(conn, &mem.id).unwrap_or_default();
+                    Ok(Some((mem, links)))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
             }
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        }
-    })
-    .await;
+        })
+        .await,
+    );
     match lookup {
         Ok(Some((mem, links))) => {
             // #927 — 404 (not 403) on a private-row read by a non-owner

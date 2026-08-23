@@ -351,6 +351,113 @@ backend and missing or divergently implemented on its twin). Pinned by
   - This file: the #3129 "unchanged on the fleet" list and the nine-job
     `rust-cache` enumeration are marked SUPERSEDED by #3141 — the current total
     is **5 self-hosted legs**.
+### Security (data integrity: RAII write transactions — an unwind can no longer strand the shared sqlite writer mid-transaction; #3163)
+
+- **Every explicit `BEGIN IMMEDIATE` in the substrate is now closed by a
+  destructor, not by discipline.** `Cargo.toml` keeps `panic = "unwind"` and
+  there is no `CatchPanicLayer`, so a panic inside a write path unwound past
+  the hand-written `match result { Err(_) => ROLLBACK }` arm at all **34**
+  manual `BEGIN … COMMIT` sites (`rg -n 'WriteTxn::begin' src/` outside
+  `#[cfg(test)]`). Because the daemon's writer is a SINGLE
+  `rusqlite::Connection` behind a `tokio::sync::Mutex` — which, unlike
+  `std::sync::Mutex`, does **not** poison — the unwind released the mutex with
+  the connection still inside an open write transaction and the next caller
+  inherited it. The nested-`BEGIN` outcome is loud and recoverable; the
+  dangerous one is silent: the three `owns_tx = … && conn.is_autocommit()`
+  write funnels (`insert_inner`, `update_with_expected_version`,
+  `insert_if_newer`) see `is_autocommit() == false`, conclude "the caller owns
+  the transaction", skip their own BEGIN/COMMIT, and let their writes JOIN the
+  orphaned transaction — whose durability is then decided by whoever eventually
+  errors or restarts. That is mixed state and unintentional data loss, which
+  the project ranks above every other concern. New
+  `storage::connection::WriteTxn` issues `ROLLBACK` from `Drop`, which runs on
+  an unwind exactly as it runs on an early `?` return, so the worst case after
+  a panic is a ROLLED-BACK transaction on a usable connection. Converted at all
+  34 sites across `storage/mod.rs` (23), `storage/reflect.rs`,
+  `storage/migrations.rs` (`BEGIN EXCLUSIVE`), `storage/connection.rs`,
+  `store/sqlite.rs` (the SAL store's separate shared writer), `quotas.rs` (2),
+  `atomisation/mod.rs`, `federation/push_dlq.rs`,
+  `mcp/tools/store/synthesis.rs`, and `cli/io.rs` (2 — the `mine` importer's
+  chunked `BEGIN`/`COMMIT` loop, via `WriteTxn::begin_deferred`).
+  `mcp/tools/skill_register.rs` and `mcp/tools/skill_retire.rs` already used
+  RAII `rusqlite::Transaction` and are unchanged.
+- **A failed `COMMIT` no longer strands the connection either.** The house
+  pattern propagated a COMMIT failure with `?` and never rolled back, so the
+  writer was left mid-transaction for the next caller to silently join.
+  `WriteTxn::commit` stays ARMED on failure: the drop that follows the `?`
+  rolls the transaction back and the commit error is still returned. Pinned by
+  a deterministic regression test that forces a real COMMIT failure through a
+  DEFERRED foreign-key violation (SQLite reports it at COMMIT time and
+  deliberately leaves the transaction OPEN).
+- **Defense in depth at the mutex boundary.** `handlers::transport::db_op` now
+  runs a `storage::connection::ensure_autocommit` sweep on BOTH sides of the
+  closure and contains the unwind with `catch_unwind`. A connection that is
+  inside a transaction on acquisition, or left inside one on release, is rolled
+  back; if it cannot be rolled back the request is REFUSED rather than writing
+  into an unknown transaction, and the next acquisition retries the sweep — so
+  a transient failure self-heals with no poison flag, no reopen, and no extra
+  state on the `Db` tuple. A closure that returns `Ok` while leaving a
+  transaction open now fails CLOSED (`DbOpError::OrphanedTransaction`) instead
+  of reporting a write that the sweep just erased.
+- **Postgres lane audited, no change required.** Every Postgres transaction goes
+  through `pool.begin()` → `sqlx::Transaction`, whose `Drop` calls
+  `start_rollback` (sqlx-core 0.8.6); the only `BEGIN` literals in
+  `store/postgres.rs` are inside PL/pgSQL `DO $$ BEGIN … END $$` migration
+  blocks, which are not transaction control. Postgres also takes a connection
+  from a POOL rather than sharing one behind a mutex, so an unwind cannot hand a
+  dirty connection to the next caller.
+
+### Fixed (availability: production-reachable panics — JoinError re-panic, boot-time thread spawn, silent dead audit drainer, checkpoint authz; #3164)
+
+- **`db_op` / `db_read_op` return `Result` instead of re-panicking the request
+  task.** Both helpers ended in `.expect("… spawn_blocking worker panicked or
+  runtime shut down")`, so a panic in any handler closure — or a
+  `spawn_blocking` cancelled during graceful shutdown — propagated into the
+  connection task instead of producing a 500. Panics are now contained, logged
+  with their payload, and surfaced as a typed `DbOpError`. The PERF-1 (#982)
+  and #1580 dispatch fast paths are unchanged: the same `spawn_blocking` hop,
+  the same pooled read-only connection, and `catch_unwind` costs nothing when
+  nothing panics.
+- **The forensic-audit writer thread spawn no longer aborts boot.**
+  `governance::audit::writer()` `.expect()`ed the `thread::Builder::spawn`
+  result on the MAIN thread during `init_forensic_audit`, so a `clone(2)`
+  refusal (`EAGAIN` from a pids-cgroup cap or `RLIMIT_NPROC` on a dense host) —
+  a resource condition, not a programmer bug — killed the process with exit
+  101 before it served a request. It now returns `Result` (ERRORS-01/02) and
+  every caller degrades: the boot path applies its existing "continuing
+  unsigned" policy, `flush_blocking` logs and returns, and emission surfaces a
+  typed error. A failure does not poison the `OnceLock`, so a later call
+  retries the spawn.
+- **A dead deferred-audit drainer is now visible while the daemon is still
+  running.** The supervisor `panic!`ed when a sink exhausted `max_restarts`.
+  That was deliberately fail-loud, but a panic in a `tokio::spawn`ed task kills
+  only THAT task: the daemon kept serving with the audit drainer permanently
+  dead, and nothing observed it until shutdown finally awaited the
+  `JoinHandle`. `spawn_supervised_drainer` now returns
+  `JoinHandle<Result<(), DrainError>>` with a typed `DrainTerminalState`
+  (`sink_unresolved` / `sink_panicked`) published on the shared
+  `DeferredAuditMetrics` and on a new Prometheus gauge
+  `ai_memory_deferred_audit_drainer_terminal_state` (0 = running/graceful,
+  1 = unresolved, 2 = panicked) that a fleet can alert on. Fail-loud semantics
+  are unchanged — the supervisor still refuses to advance past an unresolved
+  occurrence, and `close_and_flush` still refuses to report a clean drain,
+  now with a machine-readable cause (`DrainFlushError`) instead of a panic
+  payload.
+- **`CheckpointResolutionAuthz::Accept` now CARRIES the verifying key
+  (ERRORS-09).** `authorize_remote_checkpoint_resolution` returned a bare
+  `Accept` from three branches, only one of which had authenticated anything:
+  the two permissive (`require_sig == false`) branches returned `Accept` with
+  `enrolled_key == None`. `mcp::tools::checkpoint` turned that into
+  `enrolled.expect("Accept implies an enrolled verifying key")`, sound ONLY
+  because that one call site hardcodes `require_sig = true` — while its HTTP
+  sibling in `handlers::federation_receive` already passes the RUNTIME flag.
+  Wiring the same flag into the MCP tool would have made a remote peer's
+  unsigned resolution panic an MCP tool. The unsound pairing is now
+  unrepresentable: `Accept(VerifyingKey)` for the authenticated verdict, a
+  distinct `AcceptUnverified` for the permissive rollout window. Behaviour at
+  both call sites is byte-identical; the split exists so no caller can mistake
+  a permissive accept for an authenticated one.
+
 
 ### Changed
 

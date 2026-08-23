@@ -155,15 +155,34 @@ static WRITER: OnceLock<Sender<WriteOp>> = OnceLock::new();
 /// Lazily spawn (once per process) the background writer and return its
 /// FIFO sender. Subsequent `init`/`shutdown` cycles reuse the same
 /// thread, so repeated test setup never leaks threads.
-fn writer() -> &'static Sender<WriteOp> {
-    WRITER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<WriteOp>();
-        std::thread::Builder::new()
-            .name(WRITER_THREAD_NAME.to_string())
-            .spawn(move || run_writer(rx))
-            .expect("spawning the forensic audit writer thread");
-        tx
-    })
+///
+/// v1.0.0 #3164 — this used to `.expect()` on the spawn. It runs on the MAIN
+/// thread during boot (`main::init_forensic_audit` → [`init`]), so a
+/// `clone(2)` refusal — `EAGAIN` from a pids-cgroup cap or `RLIMIT_NPROC` on
+/// a dense host, which is a RESOURCE condition and not a programmer bug —
+/// aborted the whole process with exit 101 before it ever served a request.
+/// Returning `Result` (ERRORS-01/ERRORS-02) lets the boot path apply its
+/// existing degraded-audit policy instead of dying, and lets every emission
+/// site surface a typed error rather than inherit a panic.
+///
+/// # Errors
+///
+/// Returns the OS error when the writer thread cannot be spawned. The
+/// `OnceLock` is NOT poisoned by a failure: a later call retries the spawn,
+/// so a transient resource exhaustion self-heals.
+fn writer() -> anyhow::Result<&'static Sender<WriteOp>> {
+    if let Some(tx) = WRITER.get() {
+        return Ok(tx);
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<WriteOp>();
+    std::thread::Builder::new()
+        .name(WRITER_THREAD_NAME.to_string())
+        .spawn(move || run_writer(rx))
+        .with_context(|| format!("spawning the {WRITER_THREAD_NAME} thread"))?;
+    // A concurrent first-caller may have won the race. `get_or_init` then
+    // drops OUR sender, whose receiver-side loop ends on the next `recv()`
+    // and the freshly-spawned thread exits — no leak, no double writer.
+    Ok(WRITER.get_or_init(|| tx))
 }
 
 /// Drain loop for the background writer. Keeps the destination file open
@@ -237,8 +256,19 @@ fn run_writer(rx: Receiver<WriteOp>) {
 /// been spawned (it will be spawned, drain nothing, and return).
 pub fn flush_blocking() {
     let (ack, done) = std::sync::mpsc::channel();
-    if writer().send(WriteOp::Barrier(ack)).is_ok() {
-        let _ = done.recv();
+    // #3164 — a writer that could not be spawned has nothing to drain, so a
+    // failure here is equivalent to an empty queue: log it and return rather
+    // than block forever or abort the caller.
+    match writer() {
+        Ok(w) => {
+            if w.send(WriteOp::Barrier(ack)).is_ok() {
+                let _ = done.recv();
+            }
+        }
+        Err(e) => tracing::error!(
+            target: AUDIT_TRACE_TARGET,
+            "forensic: flush skipped, writer unavailable: {e:#}"
+        ),
     }
 }
 
@@ -247,7 +277,9 @@ pub fn flush_blocking() {
 /// open/append branches (including the error arm) with arbitrary paths.
 #[cfg(test)]
 pub(crate) fn enqueue_append_for_test(path: PathBuf, line: String) {
-    let _ = writer().send(WriteOp::Append { path, line });
+    if let Ok(w) = writer() {
+        let _ = w.send(WriteOp::Append { path, line });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +399,10 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     // before any row for the freshly-initialised sink is enqueued —
     // without this, a re-init over a removed/rotated same-named file
     // would keep writing to the unlinked inode.
-    let _ = writer().send(WriteOp::Reset);
+    // #3164 — a spawn failure surfaces as an `init` error (the boot path
+    // already downgrades to "continuing unsigned" rather than aborting);
+    // it no longer kills the process from the main thread.
+    let _ = writer()?.send(WriteOp::Reset);
     *guard = Some(new_sink);
     Ok(())
 }
@@ -442,7 +477,7 @@ pub fn try_record_decision(
     // request thread, removing per-write file I/O from this serialized
     // critical section (#1472).
     s.last_hash = self_hash;
-    writer()
+    writer()?
         .send(WriteOp::Append {
             path: file_path,
             line,
@@ -3284,6 +3319,45 @@ pub fn apply_rollback_disposition_at_open(
 pub(crate) fn forensic_sink_test_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+mod writer_spawn_tests_3164 {
+    use super::*;
+
+    /// v1.0.0 #3164 — the forensic-audit writer spawn is FALLIBLE, not a
+    /// boot-time `.expect()`.
+    ///
+    /// The panic this replaced ran on the MAIN thread during
+    /// `main::init_forensic_audit`, so a `clone(2)` refusal (`EAGAIN` from a
+    /// pids-cgroup cap or `RLIMIT_NPROC` on a dense host) aborted the whole
+    /// process with exit 101 before it served a request. A resource condition
+    /// must be a `Result` (ERRORS-01), and the boot path's existing
+    /// "continuing unsigned" policy then decides.
+    ///
+    /// LIMITATION, stated honestly: forcing a real `clone(2)` EAGAIN inside a
+    /// test process is not portable, so this pins the CONTRACT — the fallible
+    /// signature, the idempotent spawn, and the fact that every caller now
+    /// degrades instead of unwinding — rather than the exhausted-host branch
+    /// itself.
+    #[test]
+    fn writer_is_fallible_and_idempotent() {
+        let first: Result<&'static Sender<WriteOp>> = writer();
+        let first = first.expect("writer spawn must succeed on a healthy host");
+        let second = writer().expect("second call must reuse the same writer");
+        assert!(
+            std::ptr::eq(first, second),
+            "#3164: the OnceLock must hand back ONE sender, never re-spawn"
+        );
+    }
+
+    /// Every `writer()` caller must degrade rather than unwind. `flush_blocking`
+    /// is the one that used to inherit the panic on a spawn failure; it is now
+    /// a no-op-on-failure path and is safe to call before any `init`.
+    #[test]
+    fn flush_blocking_never_panics_without_an_initialised_sink() {
+        flush_blocking();
+    }
 }
 
 #[cfg(test)]

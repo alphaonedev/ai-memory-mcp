@@ -1887,9 +1887,11 @@ fn insert_inner(
     let owns_tx = (crate::encryption::encryption_enabled(None)
         || crate::config::append_only_enabled())
         && conn.is_autocommit();
-    if owns_tx {
-        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
-    }
+    let write_txn = if owns_tx {
+        Some(connection::WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
     let sealed_insert = (|| -> Result<String> {
         // #2948 — armed-only version pre-probe. `None` when the spine is OFF
         // (default → no extra read → byte-identical) or when no row currently
@@ -2196,12 +2198,12 @@ fn insert_inner(
         emit_upsert_supersede_leaf_if_enabled(conn, prior_version_on_conflict, &actual_id, mem)?;
         Ok(actual_id)
     })();
-    if owns_tx {
+    if let Some(write_txn) = write_txn {
         match &sealed_insert {
-            Ok(_) => conn.execute_batch(connection::SQL_COMMIT)?,
-            Err(_) => {
-                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
-            }
+            Ok(_) => write_txn.commit()?,
+            // #3163 — the guard would roll back on drop anyway; saying it
+            // explicitly keeps the intent readable at the call site.
+            Err(_) => write_txn.rollback(),
         }
     }
     sealed_insert
@@ -2342,8 +2344,8 @@ pub fn capture_turn_idempotent(
         });
     }
 
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)
-        .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+    let write_txn =
+        connection::WriteTxn::begin(conn).map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
         // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
@@ -2386,7 +2388,8 @@ pub fn capture_turn_idempotent(
 
     match tx_result {
         Ok(memory_id) => {
-            conn.execute_batch(connection::SQL_COMMIT)
+            write_txn
+                .commit()
                 .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
             Ok(crate::models::CaptureTurnResult {
                 memory_id,
@@ -2394,7 +2397,7 @@ pub fn capture_turn_idempotent(
             })
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -2473,8 +2476,8 @@ pub fn recover_turn_idempotent(
         });
     }
 
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)
-        .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+    let write_txn =
+        connection::WriteTxn::begin(conn).map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
         // #2121 (supersedes the #2110/#2113 unconditional stamp) — stamp the
@@ -2509,7 +2512,8 @@ pub fn recover_turn_idempotent(
 
     match tx_result {
         Ok(memory_id) => {
-            conn.execute_batch(connection::SQL_COMMIT)
+            write_txn
+                .commit()
                 .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
             Ok(crate::models::RecoverTurnResult {
                 memory_id,
@@ -2517,7 +2521,7 @@ pub fn recover_turn_idempotent(
             })
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -2816,7 +2820,7 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
     let mid_expires =
         crate::validate::render_canonical_utc(now + chrono::Duration::seconds(mid_extend));
 
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
 
     let result = (|| -> Result<()> {
         // #1596 — the per-access TTL window is an extension FLOOR, not a
@@ -2860,13 +2864,11 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
 
     match result {
         Ok(()) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             Ok(())
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
-                tracing::error!("ROLLBACK failed in touch: {}", rb);
-            }
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -2930,7 +2932,7 @@ pub fn touch_many(
     let mid_expires =
         crate::validate::render_canonical_utc(now + chrono::Duration::seconds(mid_extend));
 
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
 
     let result = (|| -> Result<()> {
         // Cache the three prepared statements once for the whole
@@ -2972,13 +2974,11 @@ pub fn touch_many(
 
     match result {
         Ok(()) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             Ok(ids.len())
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
-                tracing::error!("ROLLBACK failed in touch_many: {}", rb);
-            }
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -3059,7 +3059,7 @@ pub fn fold_recall_accesses(
     let decay = crate::confidence::decay::decay_enabled();
     let mut total = 0_usize;
     loop {
-        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+        let write_txn = connection::WriteTxn::begin(conn)?;
         let chunk = (|| -> Result<usize> {
             // ≤ FOLD_CHUNK_MEMORIES distinct memories per transaction.
             let agg: Vec<(String, i64, String)> = conn
@@ -3149,20 +3149,18 @@ pub fn fold_recall_accesses(
         })();
         match chunk {
             Ok(0) => {
-                conn.execute_batch(connection::SQL_COMMIT)?;
+                write_txn.commit()?;
                 break;
             }
             Ok(n) => {
-                conn.execute_batch(connection::SQL_COMMIT)?;
+                write_txn.commit()?;
                 total += n;
                 if n < FOLD_CHUNK_MEMORIES {
                     break; // drained
                 }
             }
             Err(e) => {
-                if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
-                    tracing::error!("ROLLBACK failed in fold_recall_accesses: {rb}");
-                }
+                write_txn.rollback();
                 return Err(e);
             }
         }
@@ -3566,9 +3564,11 @@ pub fn update_with_expected_version(
     // caller owns the tx, the archive + UPDATE run inside it and the
     // caller's commit/rollback covers atomicity.
     let owns_tx = conn.is_autocommit();
-    if owns_tx {
-        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
-    }
+    let write_txn = if owns_tx {
+        Some(connection::WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
     let txn_result = (|| -> Result<(bool, bool)> {
         if content_changed {
             archive_memory_insert_only(
@@ -3678,16 +3678,16 @@ pub fn update_with_expected_version(
     })();
     match txn_result {
         Ok(r) => {
-            if owns_tx {
-                conn.execute_batch(connection::SQL_COMMIT)?;
+            if let Some(write_txn) = write_txn {
+                write_txn.commit()?;
             }
             Ok(r)
         }
         Err(e) => {
             // Only roll back a tx we opened. When the caller owns the tx,
             // propagating the Err lets THEIR rollback revert the archive.
-            if owns_tx {
-                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            if let Some(write_txn) = write_txn {
+                write_txn.rollback();
             }
             Err(e)
         }
@@ -3910,7 +3910,7 @@ pub fn update_with_archive_on_supersede(
     consult_governance_pre_write(&new_mem)?;
 
     // Steps 1+2 (#1638): one transaction around archive + insert.
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
     let tx_result = (|| -> Result<()> {
         // Step 1: archive the OLD row with reason='superseded'.
         let moved = archive_memory_no_tx(conn, &archived_id, Some("superseded"))?;
@@ -3927,9 +3927,9 @@ pub fn update_with_archive_on_supersede(
         Ok(())
     })();
     match tx_result {
-        Ok(()) => conn.execute_batch(connection::SQL_COMMIT)?,
+        Ok(()) => write_txn.commit()?,
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             return Err(e);
         }
     }
@@ -4103,20 +4103,22 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
     // commit/rollback covers atomicity (which is exactly the guarantee the
     // caller already wanted).
     let owns_tx = conn.is_autocommit();
-    if owns_tx {
-        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
-    }
+    let write_txn = if owns_tx {
+        Some(connection::WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
     let txn_result = delete_inner(conn, id);
     match txn_result {
         Ok(changed) => {
-            if owns_tx {
-                conn.execute_batch(connection::SQL_COMMIT)?;
+            if let Some(txn) = write_txn {
+                txn.commit()?;
             }
             Ok(changed)
         }
         Err(e) => {
-            if owns_tx {
-                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            if let Some(txn) = write_txn {
+                txn.rollback();
             }
             Err(e)
         }
@@ -4204,7 +4206,7 @@ pub fn conserve_contradiction(
     winner_id: &str,
     curator_keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> Result<()> {
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
     let tx_result = (|| -> Result<()> {
         // (1) Resurrection-race guard: re-read under the write lock.
         let Some(current) = get(conn, &loser.id)? else {
@@ -4268,9 +4270,9 @@ pub fn conserve_contradiction(
         Ok(())
     })();
     match tx_result {
-        Ok(()) => conn.execute_batch(connection::SQL_COMMIT)?,
+        Ok(()) => write_txn.commit()?,
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             return Err(e);
         }
     }
@@ -4299,7 +4301,7 @@ pub fn reverse_conserve_contradiction(
     canonical_src: &str,
     canonical_tgt: &str,
 ) -> Result<()> {
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
     let tx_result = (|| -> Result<()> {
         // Remove ONLY the canonical `contradicts` edge for this pair
         // (relation-scoped so we never disturb another relation the pair
@@ -4331,9 +4333,9 @@ pub fn reverse_conserve_contradiction(
         Ok(())
     })();
     match tx_result {
-        Ok(()) => conn.execute_batch(connection::SQL_COMMIT)?,
+        Ok(()) => write_txn.commit()?,
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             return Err(e);
         }
     }
@@ -4356,15 +4358,15 @@ pub fn reverse_conserve_contradiction(
 ///
 /// Returns an error if the INSERT-SELECT or DELETE fails.
 pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Result<bool> {
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
     let result = archive_memory_no_tx(conn, id, reason);
     match result {
         Ok(moved) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             Ok(moved)
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -4884,7 +4886,7 @@ pub fn archive_memory_for_caller(
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let reason = reason.unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT);
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
     let result = (|| -> Result<bool> {
         // Owner gate: row must exist AND match the caller (or be an
         // inbox-target row whose recipient is the caller).
@@ -4958,11 +4960,11 @@ pub fn archive_memory_for_caller(
     })();
     match result {
         Ok(moved) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             Ok(moved)
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -5747,7 +5749,7 @@ pub fn forget(
     // atomic AND pins them to the identical row set: the write lock is held for
     // the whole transaction, so no concurrent writer can change the match set
     // between the archive and the delete.
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
     let result = (|| -> Result<usize> {
         if archive {
             // Archive matching memories before deletion.
@@ -5923,11 +5925,11 @@ pub fn forget(
 
     match result {
         Ok(deleted) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             Ok(deleted)
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -6213,7 +6215,7 @@ pub fn forget_for_caller(
     // for the full rationale). The owner clause (#1772) is pinned to the
     // identical row set across the archive SELECT and the DELETE because the
     // `BEGIN IMMEDIATE` write lock is held for the whole transaction.
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
     let result = (|| -> Result<usize> {
         if archive {
             // Archive matching memories before deletion.
@@ -6399,11 +6401,11 @@ pub fn forget_for_caller(
 
     match result {
         Ok(deleted) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             Ok(deleted)
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -8783,7 +8785,7 @@ pub fn consolidate(
     let now = Utc::now().to_rfc3339();
     let new_id = uuid::Uuid::new_v4().to_string();
 
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
 
     let result = (|| -> Result<String> {
         // Verify all IDs exist and collect metadata in one pass
@@ -9123,13 +9125,11 @@ pub fn consolidate(
 
     match result {
         Ok(id) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             Ok(id)
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
-                tracing::error!("ROLLBACK failed in consolidate: {}", rb);
-            }
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -10775,8 +10775,14 @@ pub fn invalidate_link(
     // signature) and the audit INSERT leaves H5's silent-supersession
     // state — the exact thing H5 was added to prevent. RESERVED-lock
     // semantics also serialise concurrent writers across processes.
-    conn.execute(connection::SQL_BEGIN_IMMEDIATE, [])?;
-    // From here on, every early return MUST `ROLLBACK` first.
+    let write_txn = connection::WriteTxn::begin(conn)?;
+    // #3163 — `write_txn` now rolls back on EVERY non-commit exit, unwind
+    // included, so correctness no longer depends on remembering this call.
+    // The explicit `rollback()` is kept because it ends the write transaction
+    // at the exact early-return point instead of at end-of-scope, which keeps
+    // the RESERVED lock hold as short as it was before; it is idempotent
+    // against the guard (the guard no-ops once the connection is back in
+    // autocommit).
     let rollback = || {
         let _ = conn.execute(connection::SQL_ROLLBACK, []);
     };
@@ -10911,7 +10917,7 @@ pub fn invalidate_link(
         }
     }
 
-    conn.execute(connection::SQL_COMMIT, [])?;
+    write_txn.commit()?;
     Ok(Some(InvalidateResult {
         valid_until: stamp,
         previous_valid_until: prior,
@@ -12186,8 +12192,7 @@ pub fn append_lineage_record(
 
     // C4 — one IMMEDIATE transaction for body + pubkey sync + witness
     // (clone of the capture_turn_idempotent single-tx contract).
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)
-        .context("append_lineage_record: begin tx")?;
+    let write_txn = connection::WriteTxn::begin(conn).context("append_lineage_record: begin tx")?;
     let tx_result = (|| -> Result<()> {
         conn.execute(
             "INSERT INTO agent_lineage \
@@ -12245,12 +12250,13 @@ pub fn append_lineage_record(
 
     match tx_result {
         Ok(()) => {
-            conn.execute_batch(connection::SQL_COMMIT)
+            write_txn
+                .commit()
                 .context("append_lineage_record: commit")?;
             Ok(())
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -13020,7 +13026,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     // smaller gc calls).
     let mut total = 0usize;
     loop {
-        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+        let write_txn = connection::WriteTxn::begin(conn)?;
         let result = (|| -> Result<usize> {
             if archive {
                 // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on GC archive.
@@ -13102,14 +13108,14 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
         })();
         match result {
             Ok(n) => {
-                conn.execute_batch(connection::SQL_COMMIT)?;
+                write_txn.commit()?;
                 total += n;
                 if n < GC_CHUNK_ROWS {
                     break;
                 }
             }
             Err(e) => {
-                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+                write_txn.rollback();
                 return Err(e);
             }
         }
@@ -13221,7 +13227,7 @@ pub fn size_gc(
         // autocommit statements → a crash between them left that victim both
         // archived AND live (duplicate). Per-victim tx bounds the lock-hold
         // (mirrors `gc`'s chunked sweep) while making each eviction atomic.
-        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+        let write_txn = connection::WriteTxn::begin(conn)?;
         let victim_result = (|| -> Result<()> {
             if archive {
                 // Restorable eviction: archive-before-delete in one step,
@@ -13280,9 +13286,9 @@ pub fn size_gc(
             Ok(())
         })();
         match victim_result {
-            Ok(()) => conn.execute_batch(connection::SQL_COMMIT)?,
+            Ok(()) => write_txn.commit()?,
             Err(e) => {
-                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+                write_txn.rollback();
                 return Err(e);
             }
         }
@@ -13503,7 +13509,7 @@ fn canonical_archived_expiry(conn: &Connection, id: &str) -> Result<Option<Strin
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let _erasure_guard = crate::erasure::archive_sync::coordination_lock_if_enabled(conn)?;
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
     let result = (|| -> Result<bool> {
         let exists: bool = conn
             .query_row(
@@ -13681,7 +13687,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     })();
     match result {
         Ok(v) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             // #2064 F1 — the archived row is now live; its cold-tier bundle is
             // a STALE snapshot. Remove it in the same flow so a later
             // non-archiving delete of the live row cannot resurrect the old
@@ -13696,7 +13702,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
             Ok(v)
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -13721,7 +13727,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
 pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let _erasure_guard = crate::erasure::archive_sync::coordination_lock_if_enabled(conn)?;
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
     let result = (|| -> Result<bool> {
         // Owner gate: row must exist AND match the caller (or be an
         // inbox-target row whose recipient is the caller, or be a
@@ -13906,7 +13912,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
     })();
     match result {
         Ok(v) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             // #2064 F1 — remove the now-stale bundle after a successful
             // restore (see [`restore_archived`] for the rationale).
             if v {
@@ -13918,7 +13924,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
             Ok(v)
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -14389,9 +14395,11 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     let owns_tx = (crate::encryption::encryption_enabled(None)
         || crate::config::append_only_enabled())
         && conn.is_autocommit();
-    if owns_tx {
-        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
-    }
+    let write_txn = if owns_tx {
+        Some(connection::WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
     let sealed_merge = (|| -> Result<String> {
         // #2954 — armed-only pre-image of the `(title, namespace)` row this
         // upsert may overwrite. `None` when the spine is OFF (byte-identical) or
@@ -14633,12 +14641,12 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         )?;
         Ok(actual_id)
     })();
-    if owns_tx {
+    if let Some(write_txn) = write_txn {
         match &sealed_merge {
-            Ok(_) => conn.execute_batch(connection::SQL_COMMIT)?,
-            Err(_) => {
-                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
-            }
+            Ok(_) => write_txn.commit()?,
+            // #3163 — the guard would roll back on drop anyway; saying it
+            // explicitly keeps the intent readable at the call site.
+            Err(_) => write_txn.rollback(),
         }
     }
     sealed_merge
@@ -14733,7 +14741,7 @@ pub fn merge_inbound(
     // Take the write lock up front so the read-merge-write is atomic
     // against a concurrent peer push (BEGIN IMMEDIATE — same idiom as
     // `consolidate` / `size_gc`).
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
     let tx_result = (|| -> Result<Option<String>> {
         match get(conn, &inbound.id)? {
             Some(existing) => {
@@ -14799,18 +14807,18 @@ pub fn merge_inbound(
 
     match tx_result {
         Ok(Some(id)) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             Ok(id)
         }
         Ok(None) => {
             // Nothing was written in the merge transaction; close it
             // cleanly and fall through to the unchanged LWW path
             // (handles fresh insert + (title, namespace) dedup-upsert).
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            write_txn.commit()?;
             insert_if_newer(conn, inbound)
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }

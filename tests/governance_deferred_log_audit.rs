@@ -35,9 +35,9 @@ use std::time::{Duration, Instant};
 use ai_memory::db;
 use ai_memory::governance::agent_action::{AgentAction, Decision, check_agent_action_deferred};
 use ai_memory::governance::deferred_audit::{
-    AppendOutcome, DeferredAuditEvent, DeferredAuditQueue, DeferredAuditSink,
-    GOVERNANCE_REFUSAL_EVENT_TYPE, SqliteSignedEventsSink, close_and_flush,
-    install_deferred_audit_drainer, spawn_drainer_task, spawn_supervised_drainer,
+    AppendOutcome, DeferredAuditEvent, DeferredAuditQueue, DeferredAuditSink, DrainError,
+    DrainFlushError, DrainTerminalState, GOVERNANCE_REFUSAL_EVENT_TYPE, SqliteSignedEventsSink,
+    close_and_flush, install_deferred_audit_drainer, spawn_drainer_task, spawn_supervised_drainer,
 };
 use ai_memory::governance::rules_store::{self, Rule};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
@@ -236,6 +236,110 @@ impl DeferredAuditSink for PanicOnceSink {
         );
         Ok(AppendOutcome::Appended)
     }
+}
+
+/// v1.0.0 #3164 — a sink that panics on EVERY call, so the supervisor's
+/// restart budget is exhausted rather than recovered from.
+struct AlwaysPanicSink;
+
+impl DeferredAuditSink for AlwaysPanicSink {
+    fn append(&mut self, _event: &DeferredAuditEvent) -> anyhow::Result<AppendOutcome> {
+        panic!("AlwaysPanicSink: unrecoverable sink");
+    }
+}
+
+/// v1.0.0 #3164 — a sink that always returns `Err`, exhausting the budget
+/// through the UNRESOLVED arm rather than the panic arm.
+struct AlwaysErrSink;
+
+impl DeferredAuditSink for AlwaysErrSink {
+    fn append(&mut self, _event: &DeferredAuditEvent) -> anyhow::Result<AppendOutcome> {
+        Err(anyhow::anyhow!("AlwaysErrSink: chain write refused"))
+    }
+}
+
+/// v1.0.0 #3164 — exhausting the restart budget on a PANICKING sink must
+/// produce a TYPED terminal state that is observable while the process is
+/// still running, not a `panic!` that silently kills only the supervisor task
+/// and leaves the daemon serving with a dead audit drainer.
+#[tokio::test]
+async fn supervisor_exhaustion_returns_typed_terminal_state_sink_panicked_3164() {
+    let (queue, rx) = DeferredAuditQueue::new();
+    let metrics = queue.metrics();
+    assert_eq!(
+        metrics.terminal_state(),
+        None,
+        "a fresh drainer has no terminal state"
+    );
+
+    let supervisor = spawn_supervised_drainer(rx, || AlwaysPanicSink, metrics.clone(), 0);
+    let event = DeferredAuditEvent::from_refusal(
+        "agent:terminal",
+        &refusal_action(),
+        &refusal_decision("R-terminal", "terminal panic test"),
+    )
+    .unwrap();
+    assert!(queue.submit(event));
+
+    let err = close_and_flush(queue, supervisor)
+        .await
+        .expect_err("#3164: an exhausted budget must NOT report a clean drain");
+    match err {
+        DrainFlushError::Drain(DrainError::SinkPanicked { max_restarts }) => {
+            assert_eq!(max_restarts, 0);
+        }
+        other => panic!("expected a typed SinkPanicked terminal state, got {other:?}"),
+    }
+
+    // The state is published on the SHARED metrics, so a fleet can see a dead
+    // drainer without awaiting the supervisor.
+    assert_eq!(
+        metrics.terminal_state(),
+        Some(DrainTerminalState::SinkPanicked),
+        "#3164: the terminal state must be observable on the metrics handle"
+    );
+    assert_eq!(
+        metrics.terminal_state().map(DrainTerminalState::as_str),
+        Some("sink_panicked")
+    );
+}
+
+/// Sibling of the above for the UNRESOLVED (`Err`-returning sink) arm, whose
+/// `panic!` had the same invisibility problem.
+#[tokio::test]
+async fn supervisor_exhaustion_returns_typed_terminal_state_sink_unresolved_3164() {
+    let (queue, rx) = DeferredAuditQueue::new();
+    let metrics = queue.metrics();
+
+    let supervisor = spawn_supervised_drainer(rx, || AlwaysErrSink, metrics.clone(), 0);
+    let event = DeferredAuditEvent::from_refusal(
+        "agent:unresolved",
+        &refusal_action(),
+        &refusal_decision("R-unresolved", "terminal unresolved test"),
+    )
+    .unwrap();
+    assert!(queue.submit(event));
+
+    let err = close_and_flush(queue, supervisor)
+        .await
+        .expect_err("#3164: an exhausted budget must NOT report a clean drain");
+    match err {
+        DrainFlushError::Drain(DrainError::SinkUnresolved {
+            max_restarts,
+            ref detail,
+        }) => {
+            assert_eq!(max_restarts, 0);
+            assert!(
+                detail.contains("chain write refused"),
+                "the typed error must carry the underlying cause, got {detail:?}"
+            );
+        }
+        ref other => panic!("expected a typed SinkUnresolved terminal state, got {other:?}"),
+    }
+    assert_eq!(
+        metrics.terminal_state(),
+        Some(DrainTerminalState::SinkUnresolved)
+    );
 }
 
 #[tokio::test]

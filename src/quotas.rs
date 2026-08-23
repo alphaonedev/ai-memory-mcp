@@ -493,7 +493,7 @@ pub fn check_and_record(
     // can begin a write transaction until we COMMIT or ROLLBACK. The
     // window between SELECT and UPDATE inside the transaction is
     // therefore safe from another writer's UPDATE racing past us.
-    conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
+    let write_txn = crate::storage::connection::WriteTxn::begin(conn)
         .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("BEGIN IMMEDIATE failed: {e}")))?;
 
     let result: std::result::Result<(), QuotaCheckError> = (|| {
@@ -606,14 +606,15 @@ pub fn check_and_record(
 
     match result {
         Ok(()) => {
-            conn.execute_batch(crate::storage::connection::SQL_COMMIT)
+            write_txn
+                .commit()
                 .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("quota commit failed: {e}")))?;
             Ok(())
         }
         Err(e) => {
-            // Rollback is best-effort — even if it fails, the
-            // transaction is implicitly aborted on connection drop.
-            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+            // #3163 — the guard rolls back here and, unlike the old
+            // hand-written arm, on an unwind too.
+            write_txn.rollback();
             Err(e)
         }
     }
@@ -692,7 +693,7 @@ pub fn check_and_record_storage_only(
     bytes: i64,
 ) -> std::result::Result<(), QuotaCheckError> {
     let _ = ensure_row(conn, agent_id, namespace).map_err(QuotaCheckError::Sql)?;
-    conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
+    let write_txn = crate::storage::connection::WriteTxn::begin(conn)
         .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("BEGIN IMMEDIATE failed: {e}")))?;
     let result: std::result::Result<(), QuotaCheckError> = (|| {
         let row = load_row(conn, agent_id, namespace)
@@ -726,12 +727,13 @@ pub fn check_and_record_storage_only(
     })();
     match result {
         Ok(()) => {
-            conn.execute_batch(crate::storage::connection::SQL_COMMIT)
+            write_txn
+                .commit()
                 .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("quota commit failed: {e}")))?;
             Ok(())
         }
         Err(e) => {
-            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+            write_txn.rollback();
             Err(e)
         }
     }

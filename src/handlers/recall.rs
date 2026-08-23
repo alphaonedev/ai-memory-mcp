@@ -749,11 +749,12 @@ async fn recall_response(
     let ns_allowlist: Option<Vec<String>> = match namespace {
         Some(ns) if query_emb.is_some() && crate::hnsw::vector_ns_allowlist_enabled() => {
             let ns_owned = ns.to_string();
-            match super::read_pool::db_read_op(app.db.clone(), move |conn| {
-                db::vector_recall_allowlist_ids(conn, &ns_owned)
-            })
-            .await
-            {
+            match super::transport::flatten_db_op(
+                super::read_pool::db_read_op(app.db.clone(), move |conn| {
+                    db::vector_recall_allowlist_ids(conn, &ns_owned)
+                })
+                .await,
+            ) {
                 Ok(ids) => Some(ids),
                 Err(e) => {
                     tracing::warn!(
@@ -847,7 +848,11 @@ async fn recall_response(
             .as_ref()
             .map(|e| e.space_fingerprint())
     });
-    let (result, mode) = super::read_pool::db_read_op(app.db.clone(), move |conn| {
+    // #3164 — a dispatch failure (a panicking read closure, or a shutting-down
+    // runtime) surfaces as an `Err` recall result on the SAME path the
+    // substrate's own errors take, so the handler renders one 500 rather than
+    // re-panicking the connection task.
+    let (result, mode) = match super::read_pool::db_read_op(app.db.clone(), move |conn| {
         if let Some(qe) = qe_owned.as_deref() {
             // SAFETY: `precomputed_hits` is Some when `query_emb` is
             // Some, by construction of the if-let above. The empty
@@ -916,7 +921,13 @@ async fn recall_response(
             (r, crate::models::RECALL_MODE_KEYWORD)
         }
     })
-    .await;
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            return crate::handlers::errors::handler_error_500(&e);
+        }
+    };
 
     // PHASE 2 (writer) — authoritative touch + recall_observations
     // ledger, batched under one brief writer lock. Mirrors the postgres
@@ -935,7 +946,7 @@ async fn recall_response(
         // + `namespace` stamping.
         let agent_for_ledger = as_agent.or(caller_principal).map(str::to_string);
         let ns_for_ledger = namespace.map(str::to_string);
-        super::db_op(app.db.clone(), move |guard| {
+        if let Err(e) = super::db_op(app.db.clone(), move |guard| {
             // #1710 — record the recalled set into the ledger on the
             // writer connection (no second lock; mirrors the MCP free-fn).
             if crate::observations::table_exists(&guard.0) {
@@ -959,7 +970,18 @@ async fn recall_response(
                 }
             }
         })
-        .await;
+        .await
+        {
+            // #3164 — the ledger write is best-effort telemetry (its own
+            // internal failure already only WARNs), so a dispatch failure is
+            // logged and the recall response still returns the rows the read
+            // phase truthfully produced.
+            tracing::warn!(
+                target: crate::handlers::transport::DB_OP_TRACE_TARGET,
+                error = %e,
+                "recall (sqlite-http): observation-ledger write could not be dispatched"
+            );
+        }
     }
 
     match result {

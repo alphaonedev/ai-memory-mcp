@@ -1023,7 +1023,10 @@ pub fn mine(
     let mut skipped = 0usize;
     let mut errors = 0usize;
 
-    conn.execute_batch("BEGIN")?;
+    // #3163 — RAII: an early `?` return (or a panic) inside the import loop
+    // below now rolls the in-flight chunk back instead of leaving an open
+    // transaction on the connection.
+    let mut write_txn = crate::storage::connection::WriteTxn::begin_deferred(&conn)?;
 
     for conv in &filtered {
         let Some(mined) = mine::conversation_to_memory(conv, format) else {
@@ -1104,12 +1107,14 @@ pub fn mine(
         }
 
         if imported.is_multiple_of(100) && imported > 0 {
-            conn.execute_batch(crate::storage::connection::SQL_COMMIT)?;
-            conn.execute_batch("BEGIN")?;
+            // Close the chunk and open the next one. `commit` consumes the
+            // guard, so the reassignment is what keeps the loop guarded.
+            write_txn.commit()?;
+            write_txn = crate::storage::connection::WriteTxn::begin_deferred(&conn)?;
         }
     }
 
-    conn.execute_batch(crate::storage::connection::SQL_COMMIT)?;
+    write_txn.commit()?;
 
     if json_out {
         writeln!(

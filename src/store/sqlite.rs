@@ -1211,17 +1211,26 @@ impl MemoryStore for SqliteStore {
         // v0.7.0 #1079 — wrap the per-id decay-touch loop in a single
         // BEGIN/COMMIT pair so each id pays only the UPDATE cost.
         if crate::confidence::decay::decay_enabled() {
-            if let Err(e) = conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE) {
-                tracing::warn!("decay-touch BEGIN failed: {e}");
-            } else {
-                for id in ids {
-                    if let Err(e) = crate::confidence::decay::apply_decay_touch(&conn, id) {
-                        tracing::warn!("confidence decay touch failed for memory {id}: {e}");
+            // #3163 — the RAII guard ends this transaction on EVERY exit,
+            // including a panic unwind out of `apply_decay_touch`. Pre-fix an
+            // unwind here stranded an open write transaction on the SAL
+            // store's own long-lived shared writer connection
+            // (`SqliteStore::state`), which is a second non-poisoning
+            // `tokio::sync::Mutex` with exactly the `Db` hazard.
+            match crate::storage::connection::WriteTxn::begin(&conn) {
+                Err(e) => tracing::warn!("decay-touch BEGIN failed: {e}"),
+                Ok(write_txn) => {
+                    for id in ids {
+                        if let Err(e) = crate::confidence::decay::apply_decay_touch(&conn, id) {
+                            tracing::warn!("confidence decay touch failed for memory {id}: {e}");
+                        }
                     }
-                }
-                if let Err(e) = conn.execute_batch(crate::storage::connection::SQL_COMMIT) {
-                    tracing::warn!("decay-touch COMMIT failed: {e}");
-                    let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+                    // A failed COMMIT leaves the guard armed, so the drop that
+                    // follows rolls the partial decay-touch back rather than
+                    // handing the next SAL caller a mid-transaction connection.
+                    if let Err(e) = write_txn.commit() {
+                        tracing::warn!("decay-touch COMMIT failed: {e}");
+                    }
                 }
             }
         }
@@ -1973,10 +1982,11 @@ impl MemoryStore for SqliteStore {
         // a transaction"): open our own tx ONLY when the caller does not
         // already hold one.
         let owns_tx = conn.is_autocommit();
-        if owns_tx {
-            conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
-                .map_err(box_err)?;
-        }
+        let write_txn = if owns_tx {
+            Some(crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?)
+        } else {
+            None
+        };
         let batch = (|| -> anyhow::Result<usize> {
             let mut moved = 0usize;
             for id in ids {
@@ -1988,15 +1998,14 @@ impl MemoryStore for SqliteStore {
         })();
         match batch {
             Ok(moved) => {
-                if owns_tx {
-                    conn.execute_batch(crate::storage::connection::SQL_COMMIT)
-                        .map_err(box_err)?;
+                if let Some(txn) = write_txn {
+                    txn.commit().map_err(box_err)?;
                 }
                 Ok(moved)
             }
             Err(e) => {
-                if owns_tx {
-                    let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+                if let Some(txn) = write_txn {
+                    txn.rollback();
                 }
                 Err(box_err(e))
             }
