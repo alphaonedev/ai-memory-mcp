@@ -1278,13 +1278,16 @@ pub fn capability_from_file(path: &std::path::Path) -> Result<String> {
 /// # Errors
 ///
 /// Propagates [`capability_from_file`]'s fail-closed permission/empty-file
-/// refusals; a caller that names a file channel is never silently downgraded
-/// to "no token".
+/// refusals; a caller that names a file channel (including a set-but-non-UTF-8
+/// [`CAPABILITY_FILE_ENV`]) is never silently downgraded to "no token".
 pub fn resolve_capability(
     argv: Option<&str>,
     file: Option<&std::path::Path>,
 ) -> Result<Option<String>> {
-    let from_env = std::env::var(CAPABILITY_FILE_ENV).ok();
+    // ERRORS-19: `env::var` returns `Err(NotUnicode)` for a set-but-non-UTF-8
+    // value; `.ok()` would treat that NAMED channel as unset and fall through
+    // to argv/anonymous. `var_os` + `PathBuf::from` needs no UTF-8.
+    let from_env = std::env::var_os(CAPABILITY_FILE_ENV).map(std::path::PathBuf::from);
     resolve_capability_from(argv, file, from_env.as_deref())
 }
 
@@ -1305,13 +1308,20 @@ pub fn resolve_capability(
 fn resolve_capability_from(
     argv: Option<&str>,
     file: Option<&std::path::Path>,
-    env_file: Option<&str>,
+    env_file: Option<&std::path::Path>,
 ) -> Result<Option<String>> {
     if let Some(p) = file {
         return capability_from_file(p).map(Some);
     }
-    if let Some(p) = env_file.map(str::trim).filter(|s| !s.is_empty()) {
-        return capability_from_file(std::path::Path::new(p)).map(Some);
+    if let Some(p) = env_file {
+        // UTF-8 empty/whitespace is "not named" (an exported-but-empty
+        // variable must not brick the verb). Non-UTF-8 cannot be
+        // empty-whitespace — it is a NAMED channel and must fail closed
+        // (ERRORS-19). `Path` needs no UTF-8.
+        let unnamed = p.to_str().is_some_and(|s| s.trim().is_empty());
+        if !unnamed {
+            return capability_from_file(p).map(Some);
+        }
     }
     let Some(token) = argv.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -2233,27 +2243,30 @@ mod tests {
     fn resolve_capability_prefers_file_channels_over_argv() {
         let tmp = tempfile::tempdir().unwrap();
         let p = write_token_file(tmp.path(), "cap.tok", "cap1:from-file", 0o600);
-        let env_path = p.to_string_lossy().to_string();
 
         // 1. explicit --capability-file wins over BOTH the env channel and argv.
         assert_eq!(
             resolve_capability_from(
                 Some("cap1:from-argv"),
                 Some(p.as_path()),
-                Some("/does/not/exist.tok"),
+                Some(std::path::Path::new("/does/not/exist.tok")),
             )
             .unwrap(),
             Some("cap1:from-file".to_string())
         );
         // 2. the env file channel wins over argv.
         assert_eq!(
-            resolve_capability_from(Some("cap1:from-argv"), None, Some(&env_path)).unwrap(),
+            resolve_capability_from(Some("cap1:from-argv"), None, Some(p.as_path())).unwrap(),
             Some("cap1:from-file".to_string())
         );
         // 3. argv still works when no file channel is named — and a blank or
         //    whitespace-only env value is treated as "not named", not as a
         //    path (so an exported-but-empty variable cannot brick the verb).
-        for env in [None, Some(""), Some("   ")] {
+        for env in [
+            None,
+            Some(std::path::Path::new("")),
+            Some(std::path::Path::new("   ")),
+        ] {
             assert_eq!(
                 resolve_capability_from(Some("cap1:from-argv"), None, env).unwrap(),
                 Some("cap1:from-argv".to_string()),
@@ -2274,22 +2287,35 @@ mod tests {
     fn resolve_capability_named_file_failure_is_not_downgraded() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist.tok");
-        let missing_str = missing.to_string_lossy().to_string();
         // via the flag
         assert!(resolve_capability_from(None, Some(missing.as_path()), None).is_err());
         // via the env channel — and NOT quietly demoted to the argv token.
         assert!(
-            resolve_capability_from(Some("cap1:from-argv"), None, Some(&missing_str)).is_err(),
+            resolve_capability_from(Some("cap1:from-argv"), None, Some(missing.as_path())).is_err(),
             "a named-but-unreadable env file must refuse, not fall through to argv"
         );
         // a lax-mode file named through either channel is equally fatal.
         #[cfg(unix)]
         {
             let lax = write_token_file(tmp.path(), "lax.tok", "cap1:abc", 0o644);
-            let lax_str = lax.to_string_lossy().to_string();
             assert!(resolve_capability_from(None, Some(lax.as_path()), None).is_err());
-            assert!(resolve_capability_from(Some("cap1:x"), None, Some(&lax_str)).is_err());
+            assert!(resolve_capability_from(Some("cap1:x"), None, Some(lax.as_path())).is_err());
         }
+    }
+
+    /// ERRORS-19: a set-but-non-UTF-8 named env channel is still a NAMED
+    /// channel (`Path` needs no UTF-8) and must refuse, never fall through
+    /// to argv/anonymous.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_capability_non_utf8_named_env_is_not_downgraded() {
+        use std::os::unix::ffi::OsStrExt;
+        let non_utf8 = std::ffi::OsStr::from_bytes(b"\xff\xfe/nope.tok");
+        let path = std::path::Path::new(non_utf8);
+        assert!(
+            resolve_capability_from(Some("cap1:from-argv"), None, Some(path)).is_err(),
+            "a set-but-non-UTF-8 named env channel must refuse, not fall through to argv"
+        );
     }
 
     /// The env knob's NAME is part of the operator contract (it is pinned in

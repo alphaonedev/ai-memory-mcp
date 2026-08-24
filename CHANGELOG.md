@@ -500,7 +500,6 @@ backend and missing or divergently implemented on its twin). Pinned by
   case-insensitive) already used by every other `AI_MEMORY_*` boolean knob, and
   WARN once when the variable is present but not truthy. `AI_MEMORY_NO_CONFIG=1`
   behaviour is unchanged.
-### Security (secret-file handling: close the TOCTOU re-open window; give the capability token a non-argv channel; stop re-publishing the SQLCipher passphrase)
 ### Security (secret-file handling: close the TOCTOU re-open window; give the capability token a non-argv channel; stop re-publishing the SQLCipher passphrase; caproot directory posture)
 
 - **Four secret-file loaders still did stat-then-reopen (TOCTOU).** #3205. #1790
@@ -536,7 +535,9 @@ backend and missing or divergently implemented on its twin). Pinned by
   `--capability-file` > `AI_MEMORY_CAPABILITY_FILE` > `--capability`; the two
   flags conflict at clap parse; `--capability` still works and now emits a WARN
   naming the exposure and the alternatives. A NAMED-but-unusable file channel
-  is a hard error, never a silent downgrade to "no token presented". No default
+  (missing / unreadable / lax-mode / empty / set-but-non-UTF-8) is a hard
+  error, never a silent downgrade to argv or "no token presented"
+  (`var_os` + `PathBuf`; `Path` needs no UTF-8). No default
   behaviour changes: a caller that presents nothing is unaffected, and a caller
   that presents `--capability` gets the same decision it did before.
 - **`--db-passphrase-file` no longer re-publishes the SQLCipher passphrase into

@@ -2793,9 +2793,9 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
     let passphrase = raw.trim_end_matches(['\n', '\r']).to_string();
     // #1258 — zeroize the intermediate `raw` buffer so the secret bytes
     // do not linger on the heap after we hand the trimmed copy to the
-    // caller. The caller is responsible for zeroizing the returned
-    // `passphrase` when it falls out of scope (typically passed
-    // straight into [`crate::storage::set_db_passphrase`]).
+    // caller. The returned String is moved into process-private `OnceLock`
+    // state (`storage::set_db_passphrase`) and is not zeroized — it lives
+    // for the process lifetime by design (#3213).
     {
         use zeroize::Zeroize;
         raw.zeroize();

@@ -80,6 +80,23 @@ fn capability_file_env_is_read_and_fails_closed() {
         "expected a contextualised refusal, got: {err}"
     );
 
+    // FAIL-CLOSED (ERRORS-19): a set-but-non-UTF-8 named env channel must
+    // never silently become None → argv/anonymous. `var_os` + PathBuf
+    // needs no UTF-8.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let non_utf8 = std::ffi::OsString::from_vec(vec![0xff, 0xfe, 0x2f, b'x']);
+        // SAFETY: as above.
+        unsafe { std::env::set_var(CAPABILITY_FILE_ENV, &non_utf8) };
+        let err = resolve_capability(Some("cap1:from-argv"), None)
+            .expect_err("a set-but-non-UTF-8 named env channel must refuse");
+        assert!(
+            err.to_string().contains("capability file"),
+            "expected a contextualised refusal, got: {err}"
+        );
+    }
+
     // Clearing the variable restores the argv-only behaviour.
     // SAFETY: as above.
     unsafe { std::env::remove_var(CAPABILITY_FILE_ENV) };
