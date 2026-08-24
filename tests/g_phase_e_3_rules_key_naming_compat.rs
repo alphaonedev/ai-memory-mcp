@@ -34,6 +34,9 @@ use ed25519_dalek::SigningKey;
 use std::fs;
 use std::path::Path;
 
+#[path = "key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -168,7 +171,7 @@ fn enable_accepts_legacy_priv_pub_layout() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-priv-pub");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let _signing = stage_layout_priv_pub(&key_dir);
 
     run_enable(&db_path, &key_dir, "R-PHASE-E-3").expect("enable with operator.priv layout");
@@ -184,7 +187,7 @@ fn enable_accepts_keygen_key_keypub_layout() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-keygen");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let _signing = stage_layout_key_keypub(&key_dir);
 
     run_enable(&db_path, &key_dir, "R-PHASE-E-3").expect("enable with operator.key layout");
@@ -200,7 +203,7 @@ fn enable_with_neither_layout_present_errors_mentions_both_options() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-empty");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
     // No staged files.
 
     let err = run_enable(&db_path, &key_dir, "R-PHASE-E-3").unwrap_err();
@@ -233,7 +236,7 @@ fn keygen_then_enable_roundtrip_works() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-roundtrip");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let key_path = key_dir.join("operator.key");
 
     // 1. Run keygen via the CLI dispatch.
@@ -286,7 +289,7 @@ fn keygen_honors_key_dir_override_then_enable_sign_succeeds_1610() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("relocated-keys");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
 
     // 1. keygen with the key-dir override and no --out.
     {
@@ -338,7 +341,7 @@ fn enable_rejects_mismatched_key_keypub_pair() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-mismatch");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let _signing = stage_layout_key_keypub(&key_dir);
 
     // Overwrite operator.key.pub with the verifier from a DIFFERENT keypair.
@@ -371,7 +374,7 @@ fn enable_accepts_keygen_layout_without_pub_sidecar() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-keygen-priv-only");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
 
     // Write ONLY operator.key (raw 32B seed) — deliberately omit
     // operator.key.pub. The function should still load + sign.
@@ -402,7 +405,7 @@ fn enable_rejects_keygen_layout_with_invalid_base64_pub() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-bad-b64");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let _signing = stage_layout_key_keypub(&key_dir);
 
     // Overwrite the public sidecar with content that cannot be base64url
@@ -426,7 +429,7 @@ fn enable_rejects_keygen_layout_with_wrong_pub_byte_length() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-wrong-len");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let _signing = stage_layout_key_keypub(&key_dir);
 
     // Write a base64url-valid encoding of a 16-byte payload (not 32).
@@ -453,7 +456,7 @@ fn enable_rejects_keygen_layout_with_corrupt_seed() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-bad-seed");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
 
     // Write a too-short seed (must be 32B). No pub sidecar needed —
     // load_operator_signing_key fails on length before we'd reach it.
@@ -488,7 +491,7 @@ fn enable_rejects_legacy_layout_when_kp_load_fails() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-legacy-bad-pub");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
 
     // Stage a normal priv, then overwrite .pub with a too-short blob so
     // `kp::load` fails its `pub_bytes.len() != PUBLIC_KEY_LEN` check.
@@ -515,7 +518,7 @@ fn enable_falls_through_when_only_operator_priv_exists() {
     let db_path = tdir.path().join("rules.db");
     init_governance_db(&db_path);
     let key_dir = tdir.path().join("keys-priv-only");
-    fs::create_dir_all(&key_dir).unwrap();
+    key_dir_sandbox::mkdir_0700(&key_dir);
 
     // Stage a normal pair, then DELETE the pub. The function should
     // not load layout 1 (guard fails) and should not find layout 2

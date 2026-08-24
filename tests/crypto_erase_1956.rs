@@ -28,7 +28,11 @@ use ai_memory::storage as db;
 use ai_memory::storage::ErasureKind;
 use rusqlite::{OptionalExtension, params};
 
+#[path = "key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 fn fresh_conn() -> rusqlite::Connection {
+    let _ = key_dir_sandbox::pin();
     db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
 }
 
@@ -75,6 +79,7 @@ fn insert_encrypted(
     plaintext: &str,
     ns: &str,
 ) -> String {
+    let _ = key_dir_sandbox::pin();
     let kp = get_or_create_keypair(agent).expect("keypair");
     let sealed = seal_content_per_record(plaintext, &kp.public).expect("seal per-record");
     assert!(

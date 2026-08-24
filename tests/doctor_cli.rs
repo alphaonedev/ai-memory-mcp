@@ -80,7 +80,22 @@ enum SpawnFailure {
 /// `AI_MEMORY_NO_CONFIG=1` set.
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
+    // #3198 — the doctor Identity section stats the default key dir. Pin a
+    // 0700 sibling of the test DB so the child never sees the host 0o775
+    // `~/.config/ai-memory/keys` (self-hosted umask 0002).
+    let keys = db
+        .parent()
+        .expect("db lives in a tempdir")
+        .join("keys-3198");
+    std::fs::create_dir_all(&keys).expect("mkdir doctor key sandbox");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700 doctor key sandbox");
+    }
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_KEY_DIR", &keys)
         .args(["--db", db.to_str().unwrap()]);
     cmd
 }
@@ -334,7 +349,18 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
     let port = free_port();
     let port_s = port.to_string();
     let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_ai-memory"));
+    let keys = db
+        .parent()
+        .expect("db lives in a tempdir")
+        .join("keys-3198");
+    std::fs::create_dir_all(&keys).ok();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700));
+    }
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_KEY_DIR", &keys)
         .args([
             "--db",
             db.to_str().unwrap(),

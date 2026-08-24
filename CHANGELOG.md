@@ -1955,6 +1955,14 @@ the merged #3217 helpers (`create_caproot_dir_secure` /
 `enforce_caproot_dir_secure`, #3214) — this change does not re-implement
 that keystore.
 
+CI on a host whose `~/.config/ai-memory/keys` already exists at `0o775`
+(self-hosted umask 0002) is isolated: doctor/`TestEnv` and encryption
+integration tests pin `AI_MEMORY_KEY_DIR` at a 0700 sandbox rather than
+chmod'ing the operator store. `rules list` / `rules check` stay
+documented no-key verbs and no longer resolve the default key dir;
+`rules keygen --out PATH` writes PATH without consulting the unused
+default dir.
+
 The gate is the group/other WRITE bits (`0o022`), deliberately NOT `0o077`.
 Refusing a merely group/other-READABLE `0o755` directory would brick every
 deployment created under the default `umask 022` — a silent tightening of a

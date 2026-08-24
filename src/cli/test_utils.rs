@@ -79,6 +79,7 @@ use std::path::{Path, PathBuf};
 /// `unsafe` env-var write happens exactly once per test binary.
 pub fn ensure_no_config_env() {
     static INIT: std::sync::Once = std::sync::Once::new();
+    static KEYS: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     INIT.call_once(|| {
         // SAFETY: `std::env::set_var` is `unsafe` on the 2024 edition
         // because env mutation is process-global. We gate it through
@@ -86,8 +87,23 @@ pub fn ensure_no_config_env() {
         // test thread can read `AI_MEMORY_NO_CONFIG`, which removes
         // the data-race window the unsafety contract is guarding
         // against.
+        // #3198 — doctor Identity (and any other TestEnv consumer) must not
+        // inspect the host `~/.config/ai-memory/keys` (0o775 on umask-0002
+        // self-hosted runners). A missing sandbox would make Identity
+        // CRITICAL and flip doctor exit codes. Never chmod the real store.
+        let keys = KEYS.get_or_init(|| {
+            let tmp = tempfile::tempdir().expect("#3198 TestEnv key-dir sandbox");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+                    .expect("#3198 chmod 0700 TestEnv key dir");
+            }
+            tmp
+        });
         unsafe {
             std::env::set_var("AI_MEMORY_NO_CONFIG", "1");
+            std::env::set_var(crate::identity::keypair::KEY_DIR_ENV, keys.path());
         }
     });
 }
