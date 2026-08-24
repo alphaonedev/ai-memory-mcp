@@ -129,7 +129,10 @@ else
   # bare exit code. stderr is echoed too: a NON-doctor exit (e.g. a boot
   # refusal) writes there and leaves this file empty, and that distinction is
   # the whole diagnosis.
-  grep -A 5 '"pass": false' "$OUT_A" 2>/dev/null | grep '"control"' \
+  # PostureCheck pretty-prints control, required, actual, pass, remediation
+  # in that order. `-A 5` after `"pass": false` lands on the NEXT row's
+  # control (or nothing for a failing last row). `-B 4` is this row.
+  grep -B 4 '"pass": false' "$OUT_A" 2>/dev/null | grep '"control"' \
     | sed 's/^/    FAIL-ROW /' || true
   sed 's/^/    STDERR /' "$ERR_A" 2>/dev/null | head -20 || true
 fi

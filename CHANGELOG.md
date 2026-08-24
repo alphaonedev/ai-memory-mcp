@@ -1199,8 +1199,10 @@ backend and missing or divergently implemented on its twin). Pinned by
   `/dev/null`; and the "#15 is the pg compensating control, not the sqlcipher
   predicate" assertion's NEGATIVE half used that same compact spelling, making
   it **vacuously true**. All three are fixed: the assertion now matches the
-  `control` FIELD in either spelling, failing rows are dumped line-wise, and
-  stderr is captured to `pg-posture-pass.err` and echoed.
+  `control` FIELD in either spelling, failing rows are dumped line-wise
+  (`grep -B 4 '"pass": false'` so the dump names THIS row's control, not
+  the successor — Fable gate on #3219), and stderr is captured to
+  `pg-posture-pass.err` and echoed.
 - **In-tree regression guard for control #15's backend-aware resolution**
   (`tests/posture_control15_pg_resolution_3106.rs`). Through the real binary:
   #15 is the pg compensating control on a `postgres://` DSN (PASSing on
