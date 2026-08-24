@@ -925,7 +925,11 @@ fn section_identity_3147(conn: Option<&rusqlite::Connection>) -> ReportSection {
     let (mut facts, mut severity, mut notes) = identity_keystore_facts();
     let mode = crate::config::http_attested_identity_mode();
     facts.push(("http_identity_mode".into(), mode.as_str().into()));
-    let enrolled = conn.map_or(0, |c| db::list_agent_api_keys(c).map(Vec::len).unwrap_or(0));
+    let enrolled = conn.map_or(0, |c| {
+        db::list_agent_api_keys(c)
+            .map(|rows| rows.len())
+            .unwrap_or(0)
+    });
     facts.push(("enrolled_api_keys".into(), enrolled.to_string()));
     if let Some(reason) =
         crate::handlers::identity_binding::inert_enforce_boot_reason(mode, enrolled)
