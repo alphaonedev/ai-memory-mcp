@@ -545,17 +545,24 @@ pub(super) async fn catchup_once_with_store(
                     &mem,
                     existing_ns.as_deref(),
                 ) {
+                    // #3233 — a delivered row we refused to apply must halt
+                    // the watermark. Consuming `next_since` would leap past
+                    // it; an allowlist/key-enrollment change can make a later
+                    // re-pull succeed. Distinct from #2441 (empty window:
+                    // the peer never delivered the row).
+                    catchup_halted = true;
                     continue;
                 }
                 // #2715 (CB-11 / B-4) — per-write CONTENT attestation, the pull
                 // sibling of the `/sync/push` gate. Verify a presented
                 // `metadata.write_signature` against the author's enrolled key:
                 // forged → refuse (skip), valid → agent_attested, absent →
-                // claimed. A refused row is a deliberate, permanent refusal (not
-                // transient), so `continue` WITHOUT halting the watermark — the
-                // `next_since` advance may pass it, as re-pull cannot fix a forged
-                // signature (same disposition as a namespace-scope refusal).
+                // claimed.
+                // #3233 — skip of a *delivered* attest refusal also halts:
+                // missing-author-key is recoverable after enrollment, and
+                // leaping `next_since` is silent inbound data loss.
                 if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut mem) {
+                    catchup_halted = true;
                     continue;
                 }
                 // #1687/#2714 — advance the catchup watermark ONLY for rows that
@@ -623,12 +630,14 @@ pub(super) async fn catchup_once_with_store(
                     &mem,
                     existing_ns.as_deref(),
                 ) {
+                    // #3233 — delivered ns-skip halts the watermark (see SAL).
+                    catchup_halted = true;
                     continue;
                 }
                 // #2715 (CB-11 / B-4) — per-write content attestation (see the
-                // SAL branch). Forged → refuse (skip, no halt); valid →
-                // agent_attested; absent → claimed.
+                // SAL branch). #3233 — delivered attest-skip also halts.
                 if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut mem) {
+                    catchup_halted = true;
                     continue;
                 }
                 // #1687/#2714 — advance the catchup watermark only on a successful
@@ -794,11 +803,14 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                     &mem,
                     existing_ns.as_deref(),
                 ) {
+                    // #3233 — delivered ns-skip halts the watermark (see SAL).
+                    catchup_halted = true;
                     continue;
                 }
                 // #2715 (CB-11 / B-4) — per-write content attestation (see the
-                // SAL branch). Forged → refuse (skip); valid → agent_attested.
+                // SAL branch). #3233 — delivered attest-skip also halts.
                 if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut mem) {
+                    catchup_halted = true;
                     continue;
                 }
                 // #1687/#2714 — advance the catchup watermark only on a successful
@@ -1083,6 +1095,28 @@ mod issue_2714_2441_tests {
     const T1: &str = "2026-06-15T00:00:01Z";
     const T2: &str = "2026-06-15T00:00:02Z";
     const T3: &str = "2026-06-15T00:00:03Z";
+
+    #[test]
+    #[test]
+    fn catchup_does_not_leap_skipped_ns() {
+        // #3233 — a receiver-side skip of a *delivered* row (ns-scope or
+        // attest) is the same cursor disposition as an apply halt: do NOT
+        // consume the peer's examined-watermark `next_since` (T3) past the
+        // skipped high-water. Empty/all-peer-filtered windows still
+        // advance via `next_since` (#2441) because nothing was delivered.
+        let skipped = true;
+        let advance = resolve_catchup_advance(skipped, Some(T1), Some(T3), Some(T1), "peer-x");
+        assert_eq!(
+            advance.as_deref(),
+            Some(T1),
+            "row-loss guard: a skipped delivered row must not leap to next_since"
+        );
+        let skipped_no_apply = resolve_catchup_advance(skipped, None, Some(T3), Some(T1), "peer-x");
+        assert_eq!(
+            skipped_no_apply, None,
+            "all-skipped delivered window holds the cursor so the rows re-pull"
+        );
+    }
 
     #[test]
     fn halted_never_advances_to_next_since_2714() {

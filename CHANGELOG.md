@@ -1326,6 +1326,13 @@ write is permission-evaluated as; see the operator note below.
   tokens to Enforce; the documented `standard` UNSET default stays
   Warn (not silently flipped). Count 25 → 27.
 
+- **#3233 — catchup cursor no longer leaps past skipped (ns/attest) delivered rows.**
+  `#1687/#2714` halted the watermark only on apply `Err`. A receiver-side
+  `continue` on namespace-scope or content-attestation skip still consumed the
+  peer's `next_since`, so skipped rows were never retried (silent inbound lag
+  / data loss). Distinct from #2441: an *empty* window (peer filtered; nothing
+  delivered) still advances via `next_since`. A skip of a *delivered* row now
+  sets `catchup_halted` (serve puller + sync-daemon attest skip).
 - **#3232 — pg `entity_get_by_alias` no longer treats an invisible row as visible.**
   The postgres handler used `store.get(...).ok().as_ref().is_none_or(...)`.
   Under a non-admin `CallerContext`, a `scope=private` row owned by someone else
