@@ -1206,6 +1206,17 @@ this cluster does not close — the three an adversary can drive are covered.
   an autonomous mutation the caller never named). No postgres synthesis
   lane exists (`memory_store` is sqlite-native). Source:
   `src/mcp/tools/store/{mod,synthesis}.rs`.
+### Security (HTTP/pg governance skip cluster: #3225 capture_turn K9)
+
+- **#3225 — HTTP `POST /api/v1/capture_turn` skipped the K9 permission gate
+  and namespace governance that MCP `memory_capture_turn` enforces.** The
+  HTTP route ran `prepare_capture_turn` then `capture_turn_idempotent` only
+  (`src/handlers/capture_turn.rs`), so an HTTP client could write a turn into
+  a namespace a Deny rule / `delete`/`write` standard would refuse on MCP.
+  HTTP now mirrors MCP: `Permissions::evaluate` (Deny → 403, Ask → 202) then
+  `enforce_governance` / `enforce_governance_action` (Deny → 403, Pending →
+  202) before the durable write. A dedup-hit is a no-op, so gating first is
+  safe. Pinned by `http_capture_turn_respects_namespace_deny`.
 
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 

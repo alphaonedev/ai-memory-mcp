@@ -66,6 +66,7 @@ fn capture_turn_ok(result: &crate::models::CaptureTurnResult, attest_level: &str
 /// header authenticates the caller (same precedence as every other
 /// HTTP write); a `metadata.agent_id` in the body MUST agree with it
 /// (enforced inside `prepare_capture_turn`, #1413).
+#[allow(clippy::too_many_lines)]
 pub async fn capture_turn(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -97,11 +98,37 @@ pub async fn capture_turn(
     };
     let attest_level = write.signed_event.attest_level.clone();
 
+    // #3225 — MCP `handle_capture_turn` runs K9 `Permissions::evaluate` +
+    // K3 `enforce_governance` before the idempotent write. HTTP used to
+    // skip both (prepare + `capture_turn_idempotent` only), so a Deny
+    // rule / namespace standard that MCP would refuse was an ungated
+    // HTTP write. Mirror MCP: Deny → 403, Ask/Pending → 202, before
+    // any durable write. A dedup-hit is a no-op, so gating first is
+    // safe (a denied namespace refuses uniformly whether or not the
+    // turn was already captured).
+    if let Some(resp) = http_capture_turn_k9_gate(&write, &agent_id) {
+        return resp;
+    }
+
     #[cfg(feature = "sal")]
     let response = {
+        let capability = match crate::handlers::capability_from_headers(&headers, &agent_id) {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
+        if let Some(resp) = http_capture_turn_governance_via_store(
+            &app,
+            &write,
+            &agent_id,
+            capability.as_ref(),
+        )
+        .await
+        {
+            return resp;
+        }
         // Single SAL path: `app.store` wraps the sqlite OR postgres
         // adapter, so this serves both backends through the trait method.
-        let ctx = crate::store::CallerContext::for_agent(agent_id);
+        let ctx = crate::store::CallerContext::for_agent(agent_id).with_capability(capability);
         match app.store.capture_turn_idempotent(&ctx, &write).await {
             Ok(result) => capture_turn_ok(&result, &attest_level),
             Err(e) => store_err_to_response(e),
@@ -114,6 +141,9 @@ pub async fn capture_turn(
         // directly under the shared connection lock.
         let state = app.db.clone();
         let lock = state.lock().await;
+        if let Some(resp) = http_capture_turn_governance_via_db(&lock.0, &write, &agent_id) {
+            return resp;
+        }
         // #2121 — tenant HTTP surface: never substrate-authored (parity with
         // the SAL branch above, whose `for_agent` ctx has
         // `bypass_visibility = false`).
@@ -128,4 +158,182 @@ pub async fn capture_turn(
     };
 
     response
+}
+
+/// Action label for the L4 capture-turn write gate. Matches the MCP
+/// `ACTION_CAPTURE_TURN` spelling so Deny/Ask/Pending envelopes stay
+/// cross-surface identical (#3225).
+const ACTION_CAPTURE_TURN: &str = "capture_turn";
+
+/// #3225 — K9 permission gate (backend-blind). Deny → 403; Ask → 202.
+fn http_capture_turn_k9_gate(
+    write: &crate::models::CaptureTurnWrite,
+    agent_id: &str,
+) -> Option<Response> {
+    use crate::permissions::{Op, PermissionContext, Permissions};
+    let gate_namespace = write.memory.namespace.clone();
+    let payload = json!({
+        "id": write.memory.id,
+        "title": write.memory.title,
+        "namespace": gate_namespace,
+    });
+    let ctx = PermissionContext {
+        op: Op::MemoryStore,
+        namespace: gate_namespace.clone(),
+        agent_id: agent_id.to_string(),
+        payload,
+    };
+    match Permissions::evaluate(&ctx, &[]) {
+        crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => None,
+        crate::permissions::Decision::Deny(reason) => Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": crate::governance::deny_message(
+                        ACTION_CAPTURE_TURN,
+                        crate::governance::DenyGate::PermissionRule,
+                        &reason,
+                    ),
+                })),
+            )
+                .into_response(),
+        ),
+        crate::permissions::Decision::Ask(prompt) => Some(
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "status": "ask",
+                    "reason": prompt,
+                    "action": ACTION_CAPTURE_TURN,
+                    "namespace": gate_namespace,
+                })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// #3225 — namespace-governance gate on the SAL path (sqlite-SAL + postgres).
+/// Deny → 403; Pending → 202. Probe error → the typed store-error envelope.
+#[cfg(feature = "sal")]
+async fn http_capture_turn_governance_via_store(
+    app: &AppState,
+    write: &crate::models::CaptureTurnWrite,
+    agent_id: &str,
+    capability: Option<&crate::governance::capability::CapabilityToken>,
+) -> Option<Response> {
+    use crate::models::GovernanceDecision;
+    let ns = &write.memory.namespace;
+    let payload = json!({
+        "id": write.memory.id,
+        "title": write.memory.title,
+        "namespace": ns,
+    });
+    if let Some(resp) =
+        super::create::http_pre_governance_decision_gate(ns, "store", agent_id, Some(&write.memory.id))
+    {
+        return Some(resp);
+    }
+    match app
+        .store
+        .enforce_governance_action(
+            crate::store::GovernedAction::Store,
+            ns,
+            agent_id,
+            Some(&write.memory.id),
+            Some(agent_id),
+            &payload,
+            capability,
+        )
+        .await
+    {
+        Ok(GovernanceDecision::Allow) => None,
+        Ok(GovernanceDecision::Deny(refusal)) => Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": crate::governance::deny_message(
+                        ACTION_CAPTURE_TURN,
+                        crate::governance::DenyGate::Governance,
+                        &refusal.reason,
+                    ),
+                })),
+            )
+                .into_response(),
+        ),
+        Ok(GovernanceDecision::Pending(pending_id)) => Some(
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "status": "pending",
+                    (field_names::PENDING_ID): pending_id,
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
+                    "action": ACTION_CAPTURE_TURN,
+                    "namespace": ns,
+                })),
+            )
+                .into_response(),
+        ),
+        Err(e) => Some(store_err_to_response(e)),
+    }
+}
+
+/// #3225 — namespace-governance gate on the non-SAL sqlite path.
+#[cfg(not(feature = "sal"))]
+fn http_capture_turn_governance_via_db(
+    conn: &rusqlite::Connection,
+    write: &crate::models::CaptureTurnWrite,
+    agent_id: &str,
+) -> Option<Response> {
+    use crate::models::{GovernanceDecision, GovernedAction};
+    let ns = &write.memory.namespace;
+    let payload = json!({
+        "id": write.memory.id,
+        "title": write.memory.title,
+        "namespace": ns,
+    });
+    if let Some(resp) =
+        super::create::http_pre_governance_decision_gate(ns, "store", agent_id, Some(&write.memory.id))
+    {
+        return Some(resp);
+    }
+    match crate::db::enforce_governance(
+        conn,
+        GovernedAction::Store,
+        ns,
+        agent_id,
+        Some(&write.memory.id),
+        Some(agent_id),
+        &payload,
+        None,
+    ) {
+        Ok(GovernanceDecision::Allow) => None,
+        Ok(GovernanceDecision::Deny(refusal)) => Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": crate::governance::deny_message(
+                        ACTION_CAPTURE_TURN,
+                        crate::governance::DenyGate::Governance,
+                        &refusal.reason,
+                    ),
+                })),
+            )
+                .into_response(),
+        ),
+        Ok(GovernanceDecision::Pending(pending_id)) => Some(
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "status": "pending",
+                    (field_names::PENDING_ID): pending_id,
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
+                    "action": ACTION_CAPTURE_TURN,
+                    "namespace": ns,
+                })),
+            )
+                .into_response(),
+        ),
+        Err(e) => Some(crate::handlers::errors::governance_error_500(&e)),
+    }
 }

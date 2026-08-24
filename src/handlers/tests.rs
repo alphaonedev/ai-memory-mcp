@@ -15822,6 +15822,59 @@ async fn http_capture_turn_rejects_agent_id_mismatch_1413() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// #3225 — HTTP `POST /capture_turn` must honour a K9 namespace Deny the
+/// same way MCP `memory_capture_turn` does. Pre-fix the HTTP route skipped
+/// `Permissions::evaluate`, so a rule that MCP would refuse was an ungated
+/// write. Deny → 403; the turn is not stored.
+#[tokio::test]
+async fn http_capture_turn_respects_namespace_deny() {
+    use crate::governance::{
+        PermissionRule, RuleDecision, clear_active_permission_rules_for_test,
+        set_active_permission_rules,
+    };
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    clear_active_permission_rules_for_test();
+    crate::config::override_active_permissions_mode_for_test(
+        crate::config::PermissionsMode::Enforce,
+    );
+    set_active_permission_rules(vec![PermissionRule {
+        namespace_pattern: "secrets/*".to_string(),
+        op: crate::governance::Op::MemoryStore.as_str().to_string(),
+        agent_pattern: "*".to_string(),
+        decision: RuleDecision::Deny,
+        reason: Some("no HTTP capture into secrets".to_string()),
+    }]);
+
+    let state = test_state();
+    let app = capture_turn_test_router(state);
+    let (status, payload) = post_capture_turn(
+        &app,
+        "alice",
+        &json!({
+            "host_session_id": "sess-3225",
+            "host_turn_index": 0,
+            "role": "user",
+            "content": "secret operator directive",
+            "namespace": "secrets/ops"
+        }),
+    )
+    .await;
+    clear_active_permission_rules_for_test();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#3225: K9 Deny on capture_turn namespace must be 403, got {status} {payload}"
+    );
+    let err = payload["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("denied") || err.contains("no HTTP capture into secrets"),
+        "#3225: denial must surface the rule reason, got {payload}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #1579 B4 — gzip response compression + TOON format negotiation
 // ---------------------------------------------------------------------------
