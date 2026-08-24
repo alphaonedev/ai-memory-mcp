@@ -139,7 +139,11 @@ async fn postgres_update_without_expires_at_patch_leaves_stored_value_untouched(
     let ctx = CallerContext::for_agent(owner);
     let mut mem = seed_mem(owner, "ns-1423-coalesce", "expires-at-coalesce");
     // Seed with a pre-existing expires_at so we can prove the no-touch
-    // semantics of the COALESCE behaviour.
+    // semantics of the COALESCE behaviour. `seed_mem` defaults to Long;
+    // #2399 makes a fresh long-tier write permanent, so a caller-supplied
+    // expires_at would be stripped on insert and this pin would prove
+    // nothing. Mid keeps TTL load-bearing.
+    mem.tier = Tier::Mid;
     let pre_existing = "2029-06-01T12:00:00+00:00";
     mem.expires_at = Some(pre_existing.to_string());
     let inserted_id = store.store(&ctx, &mem).await.expect("seed insert");
