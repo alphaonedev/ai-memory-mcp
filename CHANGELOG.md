@@ -1206,6 +1206,11 @@ this cluster does not close — the three an adversary can drive are covered.
   an autonomous mutation the caller never named). No postgres synthesis
   lane exists (`memory_store` is sqlite-native). Source:
   `src/mcp/tools/store/{mod,synthesis}.rs`.
+### Security (HTTP/pg governance skip cluster: #3225 capture_turn K9; #3227 forget probe; #3228 pg delete pre-get)
+
+- **#3227 — namespace-less bulk forget treated a `resolve_governance_policy` Err as ungoverned.** `#1849` refuses a cross-namespace forget when any matched ns carries a non-`Any` delete level, but the probe used `.ok().flatten()` so a DB fault skipped the gate and the forget proceeded (ERRORS-19). Probe `Err` is now 503; the forget does not run.
+- **#3228 — postgres HTTP DELETE skipped governance when `get()` failed.** `app.store.get(&ctx, &id).await.ok()` collapsed a transport/DB error to `None`, the `if let Some(mem)` consult was skipped, and `delete` still ran. Non-`NotFound` get errors are now 503; the delete does not run. `NotFound` still 404s at delete.
+
 ### Security (HTTP/pg governance skip cluster: #3225 capture_turn K9)
 
 - **#3225 — HTTP `POST /api/v1/capture_turn` skipped the K9 permission gate
