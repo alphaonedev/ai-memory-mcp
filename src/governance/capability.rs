@@ -1185,6 +1185,156 @@ pub fn parse_presented_token(
     }
 }
 
+/// #1927-class (CWE-214) — env var naming a `0600` file whose sole contents
+/// are the `cap1:` capability token. A macaroon presented on `--capability`
+/// lands in world-readable `/proc/<pid>/cmdline`, `ps auxww`, shell history
+/// and systemd unit files, readable by ANY co-tenant local UID — and the
+/// token can then be replayed within its caveats to flip a governance
+/// `Deny`/`Ask` to `Allow`. This is the same non-argv channel `store_url`
+/// already provides for the DB credential ([`crate::store_url::STORE_URL_FILE_ENV`]).
+pub const CAPABILITY_FILE_ENV: &str = "AI_MEMORY_CAPABILITY_FILE";
+
+/// Opt-out for the [`CAPABILITY_FILE_ENV`] owner-only permission gate, for
+/// orchestrators that already gate the secret upstream. Mirrors
+/// `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS` (#1927).
+pub const CAPABILITY_FILE_ALLOW_LAX_PERMS_ENV: &str = "AI_MEMORY_CAPABILITY_FILE_ALLOW_LAX_PERMS";
+
+/// Read a `cap1:` capability token from a `0600` file, enforcing owner-only
+/// permissions fail-closed.
+///
+/// Opens ONCE and `fstat`s that same handle (no TOCTOU re-open window —
+/// #1790 finding 2), exactly like [`read_root_secret`] above.
+///
+/// # Errors
+///
+/// - the file cannot be opened or read;
+/// - (unix) its mode grants group/world access and
+///   [`CAPABILITY_FILE_ALLOW_LAX_PERMS_ENV`] is not set;
+/// - the file is empty after trimming.
+pub fn capability_from_file(path: &std::path::Path) -> Result<String> {
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("reading capability file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = f.metadata().with_context(|| {
+            format!(
+                "stat capability file {} for permission check",
+                path.display()
+            )
+        })?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            let fail_open = std::env::var(CAPABILITY_FILE_ALLOW_LAX_PERMS_ENV)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if fail_open {
+                tracing::warn!(
+                    target: crate::governance::GOVERNANCE_TRACE_TARGET,
+                    path = %path.display(),
+                    mode = format!("{mode:o}"),
+                    "capability_from_file: file is group/world-readable; \
+                     {CAPABILITY_FILE_ALLOW_LAX_PERMS_ENV}=1 — accepting (UNSAFE)."
+                );
+            } else {
+                anyhow::bail!(
+                    "capability file {} has lax permissions (mode {:o}, group/world bits set); \
+                     tighten with `chmod 0600 {}` OR set {}=1 to opt out",
+                    path.display(),
+                    mode,
+                    path.display(),
+                    CAPABILITY_FILE_ALLOW_LAX_PERMS_ENV,
+                );
+            }
+        }
+    }
+    let mut raw = String::new();
+    {
+        use std::io::Read as _;
+        f.read_to_string(&mut raw)
+            .with_context(|| format!("reading capability file {}", path.display()))?;
+    }
+    let token = raw.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("capability file {} is empty", path.display());
+    }
+    Ok(token)
+}
+
+/// Resolve the capability token a CLI verb should present, preferring the
+/// NON-argv channels so the macaroon need never appear on the command line.
+///
+/// Resolution order (first hit wins):
+///   1. `--capability-file <path>` — a `0600` file (clap already refuses it
+///      together with `--capability`);
+///   2. [`CAPABILITY_FILE_ENV`] — the same file channel via the owner-only
+///      environment block;
+///   3. `--capability <token>` — unchanged, plus a WARN naming the
+///      `/proc/<pid>/cmdline` exposure and the alternatives (#1927 grammar).
+///
+/// Returns `Ok(None)` when no channel supplies a token (the request then
+/// proceeds on the bare ACL, exactly as before).
+///
+/// # Errors
+///
+/// Propagates [`capability_from_file`]'s fail-closed permission/empty-file
+/// refusals; a caller that names a file channel (including a set-but-non-UTF-8
+/// [`CAPABILITY_FILE_ENV`]) is never silently downgraded to "no token".
+pub fn resolve_capability(
+    argv: Option<&str>,
+    file: Option<&std::path::Path>,
+) -> Result<Option<String>> {
+    // ERRORS-19: `env::var` returns `Err(NotUnicode)` for a set-but-non-UTF-8
+    // value; `.ok()` would treat that NAMED channel as unset and fall through
+    // to argv/anonymous. `var_os` + `PathBuf::from` needs no UTF-8.
+    let from_env = std::env::var_os(CAPABILITY_FILE_ENV).map(std::path::PathBuf::from);
+    resolve_capability_from(argv, file, from_env.as_deref())
+}
+
+/// [`resolve_capability`] with the [`CAPABILITY_FILE_ENV`] value supplied
+/// explicitly instead of read from the process environment.
+///
+/// This split exists so the resolution order can be unit-tested WITHOUT
+/// `set_var`: mutating the environment is process-global, and a sibling test
+/// that ran `cmd_delete` / `cmd_promote` / `store::run` concurrently would then
+/// pick up this test's capability file and change its governance outcome (the
+/// #2905 env-leak class; it would also add a ninth env mutex to the #3144
+/// pile). The end-to-end env wiring is covered instead by the single-test,
+/// own-process integration binary `tests/capability_file_channel_3206.rs`.
+///
+/// # Errors
+///
+/// Same as [`resolve_capability`].
+fn resolve_capability_from(
+    argv: Option<&str>,
+    file: Option<&std::path::Path>,
+    env_file: Option<&std::path::Path>,
+) -> Result<Option<String>> {
+    if let Some(p) = file {
+        return capability_from_file(p).map(Some);
+    }
+    if let Some(p) = env_file {
+        // UTF-8 empty/whitespace is "not named" (an exported-but-empty
+        // variable must not brick the verb). Non-UTF-8 cannot be
+        // empty-whitespace — it is a NAMED channel and must fail closed
+        // (ERRORS-19). `Path` needs no UTF-8.
+        let unnamed = p.to_str().is_some_and(|s| s.trim().is_empty());
+        if !unnamed {
+            return capability_from_file(p).map(Some);
+        }
+    }
+    let Some(token) = argv.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    tracing::warn!(
+        target: crate::governance::GOVERNANCE_TRACE_TARGET,
+        "--capability carries a macaroon token in argv, exposed via world-readable \
+         /proc/<pid>/cmdline and `ps auxww` to any local UID; prefer \
+         --capability-file / {CAPABILITY_FILE_ENV} (a 0600 file)"
+    );
+    Ok(Some(token.to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // root_secret key-file helpers (T5/T9) — 0o600 discipline, keypair-style
 // ---------------------------------------------------------------------------
@@ -1200,6 +1350,73 @@ pub fn caproot_path(dir: &std::path::Path, issuer: &str) -> Result<std::path::Pa
     Ok(dir.join(format!("{issuer}{CAPROOT_SUFFIX}")))
 }
 
+/// Unix mode applied at `mkdir(2)` for a freshly-created caproot directory.
+#[cfg(unix)]
+const CAPROOT_DIR_MODE: u32 = 0o700;
+
+/// Group/other WRITE bits (#3214 / the #3198 class). Directory *read*
+/// does not enable a swap; write does. Refusing `0o077` would brick
+/// every default-`umask 022` (`0o755`) deployment — a silent tightening
+/// of a shipped default this fix must not do.
+#[cfg(unix)]
+const CAPROOT_DIR_FORBIDDEN_BITS: u32 = 0o022;
+
+/// `create_dir_all` that gives every directory it CREATES mode
+/// [`CAPROOT_DIR_MODE`]. `DirBuilder::mode` applies at `mkdir(2)` time,
+/// so the window in which a freshly-created directory is group-writable
+/// does not exist — unlike a `create_dir_all` followed by a `chmod`.
+/// Pre-existing directories are left exactly as they are (checked,
+/// never rewritten).
+fn create_caproot_dir_secure(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(CAPROOT_DIR_MODE);
+    }
+    builder.create(dir)
+}
+
+/// #3214 — refuse to read or write `.caproot` material under a directory
+/// another local UID can write to. A missing directory passes (there is
+/// nothing to attack yet, and [`write_root_secret`] creates it `0o700`).
+/// On non-Unix this is a no-op: there are no POSIX mode bits to enforce.
+///
+/// # Errors
+///
+/// The directory exists and is group- or world-WRITABLE, or it cannot be
+/// `stat`ed.
+fn enforce_caproot_dir_secure(dir: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !dir.exists() {
+            return Ok(());
+        }
+        let md = std::fs::metadata(dir)
+            .with_context(|| format!("stat caproot directory {}", dir.display()))?;
+        let mode = md.permissions().mode() & 0o7777;
+        if mode & CAPROOT_DIR_FORBIDDEN_BITS != 0 {
+            anyhow::bail!(
+                "caproot directory {} is group- or world-writable (mode {mode:o}); refusing to \
+                 use it. Another local user can replace {}/<issuer>.caproot with a secret they \
+                 control — the per-file 0600 check then PASSES on the planted file, so mint \
+                 produces tokens that verify under the attacker's HMAC. Restore with: chmod \
+                 0700 {} (#3214)",
+                dir.display(),
+                dir.display(),
+                dir.display(),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 /// Generate and persist a fresh 32-byte `root_secret` for `issuer` at
 /// `<dir>/<issuer>.caproot`, mode `0o600`. Refuses to overwrite an
 /// existing secret (rotation is an explicit delete-then-keygen so the
@@ -1207,11 +1424,15 @@ pub fn caproot_path(dir: &std::path::Path, issuer: &str) -> Result<std::path::Pa
 ///
 /// # Errors
 /// - the path already exists;
+/// - the caproot directory is group- or world-writable (#3214);
 /// - directory creation or the exclusive create/write fails.
 pub fn write_root_secret(dir: &std::path::Path, issuer: &str) -> Result<std::path::PathBuf> {
     use rand_core::RngCore;
     let path = caproot_path(dir, issuer)?;
-    std::fs::create_dir_all(dir).with_context(|| format!("creating key dir {}", dir.display()))?;
+    enforce_caproot_dir_secure(dir)?;
+    create_caproot_dir_secure(dir)
+        .with_context(|| format!("creating key dir {}", dir.display()))?;
+    enforce_caproot_dir_secure(dir)?;
     let mut secret = [0u8; ROOT_SECRET_LEN];
     rand_core::OsRng.fill_bytes(&mut secret);
     let mut opts = std::fs::OpenOptions::new();
@@ -1242,10 +1463,12 @@ pub fn write_root_secret(dir: &std::path::Path, issuer: &str) -> Result<std::pat
 ///
 /// # Errors
 /// - missing/unreadable file;
+/// - the caproot directory is group- or world-writable (#3214);
 /// - insecure mode bits;
 /// - wrong length (must be exactly [`ROOT_SECRET_LEN`] bytes).
 pub fn read_root_secret(dir: &std::path::Path, issuer: &str) -> Result<Vec<u8>> {
     let path = caproot_path(dir, issuer)?;
+    enforce_caproot_dir_secure(dir)?;
     let mut f = std::fs::File::open(&path)
         .with_context(|| format!("reading root secret {}", path.display()))?;
     #[cfg(unix)]
@@ -1899,6 +2122,27 @@ mod tests {
             let err = read_root_secret(dir, "ai:iss").unwrap_err();
             assert!(err.to_string().contains("insecure mode"), "{err:#}");
         }
+        // #3214 — a group/world-WRITABLE caproot directory is refused
+        // (the #3198 class). A merely group-readable `0o755` directory
+        // (default `umask 022`) still works — directory read does not
+        // enable the swap.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let writable = dir.join("writable");
+            std::fs::create_dir(&writable).unwrap();
+            std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o775)).unwrap();
+            let err = write_root_secret(&writable, "ai:iss2").unwrap_err();
+            assert!(
+                err.to_string().contains("group- or world-writable"),
+                "{err:#}"
+            );
+            let readable = dir.join("readable");
+            std::fs::create_dir(&readable).unwrap();
+            std::fs::set_permissions(&readable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(write_root_secret(&readable, "ai:iss3").is_ok());
+            assert!(read_root_secret(&readable, "ai:iss3").is_ok());
+        }
     }
 
     #[test]
@@ -1933,5 +2177,157 @@ mod tests {
             },
         );
         audit_grant_outcome(&r, "pending", &GrantOutcome::Rejected(CapReject::Expired));
+    }
+
+    // -----------------------------------------------------------------
+    // #1927-class non-argv capability channel (`--capability-file` /
+    // `AI_MEMORY_CAPABILITY_FILE`).
+    // -----------------------------------------------------------------
+
+    // These tests deliberately do NOT touch the process environment: they
+    // drive `resolve_capability_from` with an explicit env value. `set_var` is
+    // process-global, so a `cmd_delete` / `cmd_promote` / `store::run` test
+    // running concurrently in this same binary would otherwise pick up this
+    // test's capability file and get a different governance outcome (the
+    // #2905 env-leak class), and a serialising mutex here would be a ninth
+    // env lock on the #3144 pile. The real `AI_MEMORY_CAPABILITY_FILE` read is
+    // covered end to end by the single-test, own-process integration binary
+    // `tests/capability_file_channel_3206.rs`.
+
+    fn write_token_file(
+        dir: &std::path::Path,
+        name: &str,
+        body: &str,
+        mode: u32,
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn capability_from_file_reads_0600_and_trims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write_token_file(tmp.path(), "cap.tok", "cap1:abc\n", 0o600);
+        assert_eq!(capability_from_file(&p).unwrap(), "cap1:abc");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capability_from_file_refuses_group_or_world_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write_token_file(tmp.path(), "cap.tok", "cap1:abc", 0o644);
+        let err = capability_from_file(&p).expect_err("lax mode must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("lax permissions"), "got: {msg}");
+        assert!(
+            msg.contains(CAPABILITY_FILE_ALLOW_LAX_PERMS_ENV),
+            "the refusal must name its opt-out: {msg}"
+        );
+    }
+
+    #[test]
+    fn capability_from_file_refuses_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write_token_file(tmp.path(), "cap.tok", "   \n", 0o600);
+        let err = capability_from_file(&p).expect_err("empty file must fail closed");
+        assert!(err.to_string().contains("is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_capability_prefers_file_channels_over_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write_token_file(tmp.path(), "cap.tok", "cap1:from-file", 0o600);
+
+        // 1. explicit --capability-file wins over BOTH the env channel and argv.
+        assert_eq!(
+            resolve_capability_from(
+                Some("cap1:from-argv"),
+                Some(p.as_path()),
+                Some(std::path::Path::new("/does/not/exist.tok")),
+            )
+            .unwrap(),
+            Some("cap1:from-file".to_string())
+        );
+        // 2. the env file channel wins over argv.
+        assert_eq!(
+            resolve_capability_from(Some("cap1:from-argv"), None, Some(p.as_path())).unwrap(),
+            Some("cap1:from-file".to_string())
+        );
+        // 3. argv still works when no file channel is named — and a blank or
+        //    whitespace-only env value is treated as "not named", not as a
+        //    path (so an exported-but-empty variable cannot brick the verb).
+        for env in [
+            None,
+            Some(std::path::Path::new("")),
+            Some(std::path::Path::new("   ")),
+        ] {
+            assert_eq!(
+                resolve_capability_from(Some("cap1:from-argv"), None, env).unwrap(),
+                Some("cap1:from-argv".to_string()),
+                "env={env:?}"
+            );
+        }
+        // 4. nothing presented ⇒ no token (bare ACL decides) — unchanged.
+        assert_eq!(resolve_capability_from(None, None, None).unwrap(), None);
+        assert_eq!(
+            resolve_capability_from(Some("   "), None, None).unwrap(),
+            None
+        );
+    }
+
+    /// A NAMED-but-unusable file channel must be a hard error, never a
+    /// silent downgrade to "no token presented" (ERRORS-19).
+    #[test]
+    fn resolve_capability_named_file_failure_is_not_downgraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.tok");
+        // via the flag
+        assert!(resolve_capability_from(None, Some(missing.as_path()), None).is_err());
+        // via the env channel — and NOT quietly demoted to the argv token.
+        assert!(
+            resolve_capability_from(Some("cap1:from-argv"), None, Some(missing.as_path())).is_err(),
+            "a named-but-unreadable env file must refuse, not fall through to argv"
+        );
+        // a lax-mode file named through either channel is equally fatal.
+        #[cfg(unix)]
+        {
+            let lax = write_token_file(tmp.path(), "lax.tok", "cap1:abc", 0o644);
+            assert!(resolve_capability_from(None, Some(lax.as_path()), None).is_err());
+            assert!(resolve_capability_from(Some("cap1:x"), None, Some(lax.as_path())).is_err());
+        }
+    }
+
+    /// ERRORS-19: a set-but-non-UTF-8 named env channel is still a NAMED
+    /// channel (`Path` needs no UTF-8) and must refuse, never fall through
+    /// to argv/anonymous.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_capability_non_utf8_named_env_is_not_downgraded() {
+        use std::os::unix::ffi::OsStrExt;
+        let non_utf8 = std::ffi::OsStr::from_bytes(b"\xff\xfe/nope.tok");
+        let path = std::path::Path::new(non_utf8);
+        assert!(
+            resolve_capability_from(Some("cap1:from-argv"), None, Some(path)).is_err(),
+            "a set-but-non-UTF-8 named env channel must refuse, not fall through to argv"
+        );
+    }
+
+    /// The env knob's NAME is part of the operator contract (it is pinned in
+    /// the CLAUDE.md env ledger, which `scripts/check-docs-vs-ssot.sh`
+    /// enforces) — renaming it silently would strand every deployment that
+    /// exports it.
+    #[test]
+    fn capability_file_env_names_are_stable() {
+        assert_eq!(CAPABILITY_FILE_ENV, "AI_MEMORY_CAPABILITY_FILE");
+        assert_eq!(
+            CAPABILITY_FILE_ALLOW_LAX_PERMS_ENV,
+            "AI_MEMORY_CAPABILITY_FILE_ALLOW_LAX_PERMS"
+        );
     }
 }

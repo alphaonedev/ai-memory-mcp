@@ -156,10 +156,12 @@ pub struct Cli {
     /// Only meaningful when the binary was built with
     /// `--features sqlcipher` (standard builds ignore this flag). File
     /// must be root-readable (mode 0400 recommended). The passphrase is
-    /// read once at startup and exported as `AI_MEMORY_DB_PASSPHRASE`
-    /// for the duration of the process — passing the passphrase
-    /// directly as an env var or as a flag value leaks to the process
-    /// list (`ps -E`) and shell history.
+    /// read once at startup into process-private state — it is **not**
+    /// exported as `AI_MEMORY_DB_PASSPHRASE` (#3213 / the #2905
+    /// env-leak class), so it cannot leak via `ps -E`,
+    /// `/proc/<pid>/environ`, or spawned children. Operators who need
+    /// the env channel may still set `AI_MEMORY_DB_PASSPHRASE`
+    /// themselves.
     #[arg(long, global = true, value_name = "PATH")]
     pub db_passphrase_file: Option<PathBuf>,
 }
@@ -1109,11 +1111,12 @@ pub(crate) async fn enforce_admin_header_trust_boot_gate(
 /// - `is_write_command` → conditional post-run WAL checkpoint.
 /// - The match arm for every `Command` variant.
 ///
-/// #1889: the `--db-passphrase-file` → `AI_MEMORY_DB_PASSPHRASE` export and the
+/// #1889 / #3213: the `--db-passphrase-file` seed and the
 /// `anonymize_default` seeding NO LONGER happen here (this body runs on the
 /// multi-threaded tokio runtime, where `std::env::set_var` is a data race).
 /// They now run synchronously in [`apply_startup_env`], called from the binary
-/// entry point BEFORE the runtime is built.
+/// entry point BEFORE the runtime is built. The passphrase is process-private
+/// ([`crate::storage::set_db_passphrase`]); it is never re-published to env.
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     cli: Cli,
@@ -2727,6 +2730,18 @@ pub fn is_write_command(cmd: &Command) -> bool {
 /// - (Unix only, post-#1055) the file's mode allows group or world
 ///   access without the env-var escape hatch.
 pub fn passphrase_from_file(path: &Path) -> Result<String> {
+    // #1790 finding 2 (parity) — open the file ONCE and perform the #1055
+    // permission check on THAT handle (`f.metadata()` = fstat), then read the
+    // bytes from the SAME handle. The pre-fix form did `fs::metadata(path)`
+    // then `fs::read_to_string(path)` — two path lookups, so a local attacker
+    // could swap a 0400 decoy past the gate and have the real, lax-mode
+    // passphrase file read instead (TOCTOU): the fail-closed gate no longer
+    // bound the bytes actually read. `identity::keypair::load_keypair_from_disk`
+    // (.priv), `encryption` (master KEK) and `governance::capability`
+    // (.caproot) were all fixed to the single-handle form by #1790; this
+    // secret-file loader was the one that was missed.
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("reading passphrase file {}", path.display()))?;
     // v0.7.0 #1055 — Unix permission check. We use the `mode & 0o077`
     // bitmask which fires on any group or world rwx bit. Windows
     // has no equivalent file-mode ACL primitive; the check is
@@ -2735,7 +2750,7 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path).with_context(|| {
+        let meta = f.metadata().with_context(|| {
             format!(
                 "stat passphrase file {} for permission check (#1055)",
                 path.display()
@@ -2769,14 +2784,18 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
             }
         }
     }
-    let mut raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading passphrase file {}", path.display()))?;
+    let mut raw = String::new();
+    {
+        use std::io::Read as _;
+        f.read_to_string(&mut raw)
+            .with_context(|| format!("reading passphrase file {}", path.display()))?;
+    }
     let passphrase = raw.trim_end_matches(['\n', '\r']).to_string();
     // #1258 — zeroize the intermediate `raw` buffer so the secret bytes
     // do not linger on the heap after we hand the trimmed copy to the
-    // caller. The caller is responsible for zeroizing the returned
-    // `passphrase` when it falls out of scope (typically passed
-    // straight into `AI_MEMORY_DB_PASSPHRASE`).
+    // caller. The returned String is moved into process-private `OnceLock`
+    // state (`storage::set_db_passphrase`) and is not zeroized — it lives
+    // for the process lifetime by design (#3213).
     {
         use zeroize::Zeroize;
         raw.zeroize();
@@ -2831,24 +2850,24 @@ pub fn apply_anonymize_default(app_config: &AppConfig) {
 /// SAFETY invariant. Hoisting it into this synchronous pre-runtime shim makes
 /// that invariant actually hold.
 ///
-/// Covers: (1) the `--db-passphrase-file` → `AI_MEMORY_DB_PASSPHRASE` export
-/// (no-op on standard SQLite builds; honoured only under `--features
-/// sqlcipher`), and (2) the `anonymize_default` → `AI_MEMORY_ANONYMIZE` seeding.
+/// Covers: (1) the `--db-passphrase-file` seed into process-private
+/// [`crate::storage::set_db_passphrase`] (honoured by `apply_sqlcipher_key`
+/// under `--features sqlcipher`; never re-published to the environment —
+/// #3213), and (2) the `anonymize_default` → `AI_MEMORY_ANONYMIZE` seeding.
 ///
 /// # Errors
 ///
 /// Propagates a passphrase-file read / permission / empty-content error from
-/// [`passphrase_from_file`].
+/// [`passphrase_from_file`], or a double-seed of the process-private
+/// passphrase.
 pub fn apply_startup_env(cli: &Cli, app_config: &AppConfig) -> Result<()> {
-    // v0.6.0.0: read the SQLCipher passphrase from a file and export it as
-    // AI_MEMORY_DB_PASSPHRASE for the duration of the process.
+    // v0.6.0.0 / #3213: read the SQLCipher passphrase from a file into
+    // process-private state. Do NOT `set_var` — that is the #2905 env-leak
+    // class (`audit_pubkey` is threaded as an explicit parameter for the
+    // same reason) and every subsequently spawned child would inherit it.
     if let Some(path) = &cli.db_passphrase_file {
         let passphrase = passphrase_from_file(path)?;
-        // SAFETY: #1889 — synchronous pre-runtime region (before
-        // `Runtime::block_on`), so no other thread can concurrently read the
-        // environment. This is the invariant the prior in-`run` call site
-        // (under `#[tokio::main]`) falsely claimed.
-        unsafe { std::env::set_var("AI_MEMORY_DB_PASSPHRASE", passphrase) };
+        crate::storage::set_db_passphrase(passphrase)?;
     }
     apply_anonymize_default(app_config);
     Ok(())
@@ -9710,6 +9729,19 @@ mod tests {
         assert_eq!(passphrase_from_file(&p).unwrap(), "secret");
     }
 
+    /// #1790 parity — the loader now opens the file ONCE and fstats that
+    /// handle, so a missing path fails at the open with the read context
+    /// (previously it failed at the separate `fs::metadata` stat call).
+    #[test]
+    fn test_passphrase_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = passphrase_from_file(&dir.path().join("nope")).unwrap_err();
+        assert!(
+            err.to_string().contains("passphrase file"),
+            "expected a contextualised error, got: {err}"
+        );
+    }
+
     #[test]
     fn test_passphrase_empty_file_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -11014,15 +11046,14 @@ mod tests {
     // ----- run() with passphrase file (covers lines 372-374) ------------
 
     #[test]
-    fn test_apply_startup_env_with_db_passphrase_file_exports_env() {
-        // #1889 — the `--db-passphrase-file` → AI_MEMORY_DB_PASSPHRASE export
-        // moved OUT of the async `run()` (unsound env mutation under the
-        // multi-threaded tokio runtime) into the synchronous pre-runtime shim
-        // `apply_startup_env`. This covers that canonical export site: given the
-        // flag, it reads the passphrase file and sets the env var.
+    fn test_apply_startup_env_with_db_passphrase_file_does_not_export_env() {
+        // #3213 — the `--db-passphrase-file` channel seeds process-private
+        // state (`storage::set_db_passphrase`) and MUST NOT re-publish into
+        // `AI_MEMORY_DB_PASSPHRASE` (the #2905 env-leak class; children
+        // spawned afterwards would inherit it).
         let _g = env_var_lock();
         // SAFETY: serialized via env_var_lock.
-        unsafe { std::env::remove_var("AI_MEMORY_DB_PASSPHRASE") };
+        unsafe { std::env::remove_var(crate::storage::ENV_DB_PASSPHRASE) };
         let env = TestEnv::fresh();
         let pass_path = env.db_path.with_file_name("pass");
         std::fs::write(&pass_path, "test-passphrase\n").unwrap();
@@ -11045,13 +11076,20 @@ mod tests {
         ])
         .unwrap();
         apply_startup_env(&cli, &cfg).unwrap();
-        // Env var is now set.
-        assert_eq!(
-            std::env::var("AI_MEMORY_DB_PASSPHRASE").unwrap(),
-            "test-passphrase"
+        assert!(
+            std::env::var(crate::storage::ENV_DB_PASSPHRASE).is_err(),
+            "--db-passphrase-file must not export {ENV}",
+            ENV = crate::storage::ENV_DB_PASSPHRASE
         );
+        assert_eq!(
+            crate::storage::connection::db_passphrase(),
+            Some("test-passphrase"),
+            "file-derived passphrase must land in process-private state"
+        );
+        // First-writer-wins: a second seed is refused, not swapped.
+        assert!(crate::storage::set_db_passphrase("other".into()).is_err());
         // SAFETY: serialized via env_var_lock.
-        unsafe { std::env::remove_var("AI_MEMORY_DB_PASSPHRASE") };
+        unsafe { std::env::remove_var(crate::storage::ENV_DB_PASSPHRASE) };
     }
 
     // ----- init_tracing idempotence ------------------------------------

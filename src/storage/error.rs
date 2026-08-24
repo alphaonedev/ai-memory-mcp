@@ -115,8 +115,10 @@ pub enum StorageError {
     /// DB is corrupt.
     ArchiveSupersedeFailed { archived_id: String },
 
-    /// SQLCipher build started without `AI_MEMORY_DB_PASSPHRASE`.
-    /// Fatal at boot; surfaces as an `apply_sqlcipher_key` refusal.
+    /// SQLCipher build started without a passphrase (neither
+    /// `--db-passphrase-file` process-private state nor
+    /// `AI_MEMORY_DB_PASSPHRASE`). Fatal at boot; surfaces as an
+    /// `apply_sqlcipher_key` refusal.
     SqlcipherMissingPassphrase,
 
     /// #1955 [P1][R45] — a mutating `db::` write refused because the
@@ -181,8 +183,8 @@ impl std::fmt::Display for StorageError {
             }
             Self::SqlcipherMissingPassphrase => write!(
                 f,
-                "sqlcipher build requires AI_MEMORY_DB_PASSPHRASE \
-                 (set via --db-passphrase-file <path>)",
+                "sqlcipher build requires a passphrase \
+                 (--db-passphrase-file or AI_MEMORY_DB_PASSPHRASE)",
             ),
             Self::RecordStopped { issued_by, scope } => write!(
                 f,

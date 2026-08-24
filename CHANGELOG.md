@@ -500,6 +500,69 @@ backend and missing or divergently implemented on its twin). Pinned by
   case-insensitive) already used by every other `AI_MEMORY_*` boolean knob, and
   WARN once when the variable is present but not truthy. `AI_MEMORY_NO_CONFIG=1`
   behaviour is unchanged.
+### Security (secret-file handling: close the TOCTOU re-open window; give the capability token a non-argv channel; stop re-publishing the SQLCipher passphrase; caproot directory posture)
+
+- **Four secret-file loaders still did stat-then-reopen (TOCTOU).** #3205. #1790
+  finding 2 established the rule for this codebase — open the file ONCE and run
+  the permission check on THAT handle (`f.metadata()` = fstat), then read the
+  bytes from the SAME handle — and fixed `identity::keypair` (`.priv`), the
+  encryption master KEK and `governance::capability` (`.caproot`) accordingly.
+  Four loaders were missed: `daemon_runtime::passphrase_from_file` (the
+  SQLCipher DB passphrase, #1055 gate), `store_url::store_url_from_file` (the
+  Postgres DSN, which carries a password, #1927 gate),
+  `cli::rules::load_operator_signing_key` (the Ed25519 OPERATOR SIGNING SEED
+  that authenticates every `governance_rules` row, 0600 gate) and the
+  `[llm]` / `[embeddings]` `api_key_file` reader in `config.rs` (the vendor API
+  key, #1146 0400 gate). Each did `fs::metadata(path)` followed by a separate
+  `fs::read*(path)` — two path lookups, so a local attacker able to write the
+  directory could satisfy the 0400/0600 gate with a decoy and have a different
+  file read in its place: the fail-closed gate did not bind the bytes actually
+  read. All four now use the single-handle form; the permission logic, the
+  opt-out env vars, the refusal text and the trimming behaviour are unchanged.
+  The one observable delta is that a MISSING path now fails at the open (with
+  the read context) instead of at the separate stat — pinned by a regression
+  test on each loader.
+- **The macaroon capability token had no channel other than argv.** #3206.
+  `--capability <cap1:…>` on `store` / `delete` / `promote` puts a bearer
+  credential that can flip a governance `Deny`/`Ask` to `Allow` into
+  world-readable `/proc/<pid>/cmdline`, `ps auxww`, shell history and systemd
+  unit files, where any co-tenant local UID can lift and replay it within its
+  caveats — the exact exposure class #1927 closed for the Postgres DSN, which
+  the capability path never got. Adds `--capability-file <path>` and
+  `AI_MEMORY_CAPABILITY_FILE`: a `0600` file (owner-only enforced fail-closed,
+  opt out with `AI_MEMORY_CAPABILITY_FILE_ALLOW_LAX_PERMS=1`), read through the
+  same single-handle open+fstat discipline. Resolution order is
+  `--capability-file` > `AI_MEMORY_CAPABILITY_FILE` > `--capability`; the two
+  flags conflict at clap parse; `--capability` still works and now emits a WARN
+  naming the exposure and the alternatives. A NAMED-but-unusable file channel
+  (missing / unreadable / lax-mode / empty / set-but-non-UTF-8) is a hard
+  error, never a silent downgrade to argv or "no token presented"
+  (`var_os` + `PathBuf`; `Path` needs no UTF-8). No default
+  behaviour changes: a caller that presents nothing is unaffected, and a caller
+  that presents `--capability` gets the same decision it did before.
+- **`--db-passphrase-file` no longer re-publishes the SQLCipher passphrase into
+  the process environment.** #3213. The flag exists because "passing the
+  passphrase directly as an env var or as a flag value leaks to the process
+  list (`ps -E`) and shell history"; `apply_startup_env` then voided that
+  mitigation with `unsafe { set_var("AI_MEMORY_DB_PASSPHRASE", …) }`, so every
+  subsequently spawned child (`hooks/executor`, `cli/wrap`) inherited it — the
+  #2905 env-leak class, which `audit_pubkey` already refused. The file channel
+  now seeds process-private `OnceLock` state (`storage::set_db_passphrase`);
+  `apply_sqlcipher_key` prefers that and keeps `AI_MEMORY_DB_PASSPHRASE` as
+  the documented operator-set fallback. A second seed in the same process is
+  refused, not swapped. No default change for operators who set the env
+  themselves.
+- **`write_root_secret` used a bare `create_dir_all` for the `.caproot`
+  keystore.** #3214. The identity cluster (#3198) closed this class for
+  Ed25519 `.priv`/`.pub` and left the capability HMAC secret as an
+  out-of-scope residual. A group/world-writable directory lets another local
+  UID replace `<issuer>.caproot`; the per-file 0600 check then PASSES on the
+  planted bearer secret, so `mint` produces tokens that `verify` under the
+  attacker's HMAC (there is no private-derives-public cross-check here). Both
+  `write_root_secret` and `read_root_secret` now create at `0o700`
+  (`mkdir(2)`-time) and refuse an existing directory whose `mode & 0o022 !=
+  0`. A merely group-readable `0o755` directory (default `umask 022`) is
+  still accepted — directory read does not enable the swap.
 
 ### Changed
 

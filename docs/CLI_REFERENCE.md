@@ -24,7 +24,7 @@ supplements `--help` with examples and context.
 | `--db <PATH>` | path | `ai-memory.db` | SQLite database path. Honours `AI_MEMORY_DB` env var. |
 | `--json` | bool | `false` | Emit machine-parseable JSON on stdout. |
 | `--agent-id <ID>` | string | synthesized NHI default | Stamps `metadata.agent_id`. Honours `AI_MEMORY_AGENT_ID` env var. |
-| `--db-passphrase-file <PATH>` | path | — | v0.6.0.0+. Root-readable file holding the SQLCipher passphrase. Only meaningful on `--features sqlcipher` builds. Exports `AI_MEMORY_DB_PASSPHRASE` for the process. |
+| `--db-passphrase-file <PATH>` | path | — | v0.6.0.0+. Root-readable file holding the SQLCipher passphrase. Only meaningful on `--features sqlcipher` builds. Seeds process-private state; does **not** export `AI_MEMORY_DB_PASSPHRASE` (#3213). |
 
 ## Environment variables
 
@@ -32,7 +32,7 @@ supplements `--help` with examples and context.
 |----------|---------|
 | `AI_MEMORY_DB` | Override default database path. |
 | `AI_MEMORY_AGENT_ID` | Default `metadata.agent_id` for memories written by this process. |
-| `AI_MEMORY_DB_PASSPHRASE` | SQLCipher passphrase (set via `--db-passphrase-file` or by operator). |
+| `AI_MEMORY_DB_PASSPHRASE` | SQLCipher passphrase (operator-set; `--db-passphrase-file` does not populate this — #3213). |
 | `AI_MEMORY_NO_CONFIG=1` | Skip loading the platform config file (`$XDG_CONFIG_HOME/ai-memory/config.toml`, else `~/.config/ai-memory/config.toml`). Used by tests. **[#3167]** Only a truthy value (`1`/`true`/`yes`/`on`) skips it; an empty value or `0` loads the config and WARNs. |
 | `AI_MEMORY_ANONYMIZE=1` | Suppress hostname/PID from fallback `agent_id` generation. |
 | `AI_MEMORY_AUTONOMOUS_HOOKS=1` | Enable post-store LLM hooks (v0.6.0.0). Overrides config. |
@@ -1172,8 +1172,24 @@ whose caveat chain and issuer ceiling cover the in-flight
 `(action, namespace)` flips an otherwise-`Deny`/`Ask` coarse-gate
 decision to `Allow` — **attenuation-only widening**, never escalation.
 Tokens are presented via the MCP `capability` param, the
-`X-AI-Memory-Capability` HTTP header, or `--capability` on governed CLI
-verbs. A caller that presents no token is unaffected.
+`X-AI-Memory-Capability` HTTP header, or `--capability` / `--capability-file`
+on governed CLI verbs (`store`, `delete`, `promote`). A caller that presents
+no token is unaffected.
+
+**Present the token off-argv.** `--capability <token>` puts the macaroon in
+`/proc/<pid>/cmdline` (world-readable), `ps auxww`, shell history and any
+systemd unit file, where any local UID can lift and replay it within its
+caveats — the same exposure `--store-url` carries for the DB credential
+(#1927). Prefer `--capability-file <path>`, or `AI_MEMORY_CAPABILITY_FILE`
+naming the same file; the file must be owner-only (`chmod 0600`) or the verb
+refuses fail-closed (opt out with `AI_MEMORY_CAPABILITY_FILE_ALLOW_LAX_PERMS=1`).
+`--capability` still works and emits a WARN; the two flags conflict at parse.
+
+```bash
+printf 'cap1:...' > ~/.ai-memory/cap.tok && chmod 0600 ~/.ai-memory/cap.tok
+ai-memory store --title t --content c --capability-file ~/.ai-memory/cap.tok
+AI_MEMORY_CAPABILITY_FILE=~/.ai-memory/cap.tok ai-memory delete <id>
+```
 
 ```bash
 ai-memory capability init                              # v1.0.0 R9 (#1960) — idempotent zero-config

@@ -286,6 +286,7 @@ fn cli_store_args(title: &str, ns: &str) -> ai_memory::cli::store::StoreArgs {
         sign: false,
         write_v2: None,
         capability: None,
+        capability_file: None,
     }
 }
 

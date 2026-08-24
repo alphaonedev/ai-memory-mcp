@@ -37,8 +37,20 @@ pub struct PromoteArgs {
     /// v0.9.0 G10.1 (#1827) — optional macaroon capability token
     /// (`cap1:...`) that may flip a governance Deny/Pending to Allow
     /// within its caveats. Inert unless `[capabilities].enabled`.
+    ///
+    /// SECURITY: a token passed here lands in world-readable
+    /// `/proc/<pid>/cmdline`, `ps auxww` and shell history, where any local
+    /// UID can lift and replay it within its caveats. Prefer
+    /// `--capability-file` (or `AI_MEMORY_CAPABILITY_FILE`); this flag warns
+    /// when used.
     #[arg(long)]
     pub capability: Option<String>,
+    /// Path to a `0600` file whose sole contents are the `cap1:` token — the
+    /// non-argv channel (never in `/proc/<pid>/cmdline`, never in shell
+    /// history), mirroring `--store-url`'s `AI_MEMORY_STORE_URL_FILE` (#1927).
+    /// Conflicts with `--capability`.
+    #[arg(long, conflicts_with = "capability")]
+    pub capability_file: Option<std::path::PathBuf>,
 }
 
 /// `promote` handler.
@@ -83,10 +95,19 @@ pub fn cmd_promote(
             "id": resolved_id,
             (crate::models::field_names::TO_NAMESPACE): args.to_namespace,
         });
-        // v0.9.0 G10.1 (#1827) — edge-parse the optional `--capability`
-        // token ONCE; inert unless `[capabilities].enabled`.
-        let capability = crate::governance::capability::parse_presented_token(
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional capability token
+        // ONCE; inert unless `[capabilities].enabled`. Resolved through the
+        // NON-argv channels first (`--capability-file` /
+        // `AI_MEMORY_CAPABILITY_FILE`, a 0600 file) so the macaroon need
+        // never sit in `/proc/<pid>/cmdline`; `--capability` still works and
+        // warns. A named-but-unreadable/lax-mode file is a hard error, never
+        // a silent downgrade to "no token".
+        let presented_capability = crate::governance::capability::resolve_capability(
             args.capability.as_deref(),
+            args.capability_file.as_deref(),
+        )?;
+        let capability = crate::governance::capability::parse_presented_token(
+            presented_capability.as_deref(),
             &caller_agent_id,
         )
         .map_err(|rej| anyhow::anyhow!(crate::governance::capability::edge_reject_message(&rej)))?;
@@ -212,6 +233,7 @@ mod tests {
             to_namespace: None,
             target_tier: None,
             capability: None,
+            capability_file: None,
         }
     }
 

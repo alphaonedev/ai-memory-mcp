@@ -409,8 +409,9 @@ stringData:
 
 Mount it at `/run/secrets/ai-memory-passphrase` and point the binary
 at it via the `--db-passphrase-file` flag (a global CLI flag — there
-is no env-var form; the flag reads the file once at startup and
-exports `AI_MEMORY_DB_PASSPHRASE` internally):
+is no env-var form of the *file path*; the flag reads the file once
+at startup into process-private state and does **not** export
+`AI_MEMORY_DB_PASSPHRASE` (#3213)):
 
 ```yaml
 volumeMounts:
