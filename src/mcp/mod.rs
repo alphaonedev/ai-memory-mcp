@@ -12507,16 +12507,22 @@ mod tests {
     fn handle_quota_status_without_agent_id_returns_list_envelope() {
         // Exercises the `else` arm — bulk-list over all quota rows.
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        // Seed two distinct agent rows by asking for them first; the
-        // substrate auto-inserts zero-usage on lookup, populating the list.
-        let _ = invoke_handle_request(
+        // #3171 — peek is read-only; seed via a real write so the list
+        // envelope is non-empty.
+        crate::quotas::record_op(
             &conn,
-            &make_tools_call("memory_quota_status", json!({"agent_id": "agent-a"})),
-        );
-        let _ = invoke_handle_request(
+            "agent-a",
+            crate::quotas::GLOBAL_NAMESPACE,
+            crate::quotas::QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        crate::quotas::record_op(
             &conn,
-            &make_tools_call("memory_quota_status", json!({"agent_id": "agent-b"})),
-        );
+            "agent-b",
+            crate::quotas::GLOBAL_NAMESPACE,
+            crate::quotas::QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
         let req = make_tools_call("memory_quota_status", json!({}));
         let resp = invoke_handle_request(&conn, &req);
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);

@@ -684,7 +684,9 @@ backend and missing or divergently implemented on its twin). Pinned by
   are schema-REQUIRED; they were still `unwrap_or_default()`, so a blank
   resolver was persisted as attribution. They now go through
   `param_guard::require_str`. The handler-reads⊆schema guard now matches
-  `param_guard::*(params, KEY)` and scans `src/mcp/mod.rs`.
+  `param_guard::*(params, KEY)` and scans `src/mcp/mod.rs`. Quota list
+  tests now seed via `record_op` (peek no longer INSERT-on-read). C5
+  trimmed full-profile ceiling 6750 → 7650 (measured 7567).
 
 ### Security (governance gates that were missing or pointed at the wrong namespace; #3202, #3204 items 4 and 7)
 

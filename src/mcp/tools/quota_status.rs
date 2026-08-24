@@ -182,6 +182,18 @@ mod tests {
         db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
     }
 
+    /// #3171 — `peek_*` no longer INSERT-on-read. List tests must seed
+    /// via a real write (`record_op` → `ensure_row`).
+    fn seed_quota_row(conn: &rusqlite::Connection, agent_id: &str, namespace: &str) {
+        crate::quotas::record_op(
+            conn,
+            agent_id,
+            namespace,
+            crate::quotas::QuotaOp::Memory { bytes: 1 },
+        )
+        .expect("seed quota row");
+    }
+
     #[test]
     fn per_agent_returns_aggregate_for_unknown_id() {
         let conn = fresh_conn();
@@ -213,8 +225,8 @@ mod tests {
     #[test]
     fn list_path_returns_count_and_rows() {
         let conn = fresh_conn();
-        let _ = handle_quota_status(&conn, &json!({"agent_id": "ai:bob"})).expect("seed bob");
-        let _ = handle_quota_status(&conn, &json!({"agent_id": "ai:carol"})).expect("seed carol");
+        seed_quota_row(&conn, "ai:bob", crate::quotas::GLOBAL_NAMESPACE);
+        seed_quota_row(&conn, "ai:carol", crate::quotas::GLOBAL_NAMESPACE);
         let resp = handle_quota_status(&conn, &json!({})).expect("ok");
         assert!(resp["count"].as_u64().unwrap() >= 2);
         let quotas = resp["quotas"].as_array().expect("quotas array");
@@ -224,24 +236,13 @@ mod tests {
     #[test]
     fn list_path_namespace_filter_only_returns_matching_rows() {
         let conn = fresh_conn();
-        let _ = handle_quota_status(
-            &conn,
-            &json!({"agent_id": "ai:bob", "namespace": "team/policies"}),
-        )
-        .expect("seed");
-        let _ = handle_quota_status(
-            &conn,
-            &json!({"agent_id": "ai:carol", "namespace": "team/policies"}),
-        )
-        .expect("seed");
-        let _ = handle_quota_status(
-            &conn,
-            &json!({"agent_id": "ai:bob", "namespace": "alice/scratch"}),
-        )
-        .expect("seed");
+        seed_quota_row(&conn, "ai:bob", "team/policies");
+        seed_quota_row(&conn, "ai:carol", "team/policies");
+        seed_quota_row(&conn, "ai:bob", "alice/scratch");
         let resp = handle_quota_status(&conn, &json!({"namespace": "team/policies"})).expect("ok");
         assert_eq!(resp["namespace"].as_str(), Some("team/policies"));
         let quotas = resp["quotas"].as_array().expect("quotas array");
+        assert_eq!(quotas.len(), 2, "peek must not have been the seed");
         for q in quotas {
             assert_eq!(q["namespace"].as_str(), Some("team/policies"));
         }

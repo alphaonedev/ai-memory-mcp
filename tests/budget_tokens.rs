@@ -107,7 +107,12 @@ use serde_json::json;
 // the tool-definition + per-profile snapshots but missed this ceiling.
 // 6750 = 6692 + 58 margin; still 4250 below the 11000 structural
 // backstop.
-const FULL_PROFILE_TOKEN_CEILING: usize = 6_750;
+// 2026-08-24 — raised 6750 -> 7650: #3171 declared previously-undeclared
+// MCP params on the wire (handler-reads ⊆ schema). CI measured 7567
+// cl100k_base on the trimmed full-profile tools/list. Structural keys,
+// not prose (trim already strips per-property descriptions). 7650 =
+// 7567 + 83 margin; still 3350 below the 11000 structural backstop.
+const FULL_PROFILE_TOKEN_CEILING: usize = 7_650;
 
 fn mem_with_content(id: &str, content: &str) -> Memory {
     Memory {

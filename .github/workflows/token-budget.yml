@@ -112,7 +112,10 @@ jobs:
       # memory_update) — STRUCTURAL, not prose (the trimmer already
       # strips per-property descriptions) — measured 6692, so the ceiling
       # moved to 6750 (58 margin).
-      - name: full-profile <= 6750 tokens (v0.7 C5 hard ceiling, post-D1.6 + #1067 + #1709 + #2037 + #2059 + #2204)
+      # 2026-08-24 — raised 6750 -> 7650: #3171 declared previously-hidden
+      # MCP params (handler-reads ⊆ schema). CI measured 7567; 7650 =
+      # 7567 + 83 margin.
+      - name: full-profile <= 7650 tokens (v0.7 C5 hard ceiling, post-D1.6 + #1067 + #1709 + #2037 + #2059 + #2204 + #3171)
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
@@ -124,11 +127,11 @@ jobs:
       # JSON shape (renamed field, dropped key) trips the gate too. We
       # parse the documented `trimmed_full_profile_total_tokens` field
       # — the bare `tools/list` wire payload after C2/C3/C4 trims —
-      # and fail with a pointer to the C2-C4 audit if it exceeds 6750.
+      # and fail with a pointer to the C2-C4 audit if it exceeds 7650.
       # The verbose sibling `full_profile_total_tokens` is only reachable
       # via the opt-in `memory_capabilities { verbose: true, … }` path
       # and is not gated here (see tests/budget_tokens.rs rationale).
-      - name: doctor --tokens --json reports trimmed total <= 6750 (v0.7 C5 post-D1.6 + #1709 + #2037 + #2059 + #2204)
+      - name: doctor --tokens --json reports trimmed total <= 7650 (v0.7 C5 post-D1.6 + #1709 + #2037 + #2059 + #2204 + #3171)
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
@@ -137,10 +140,10 @@ jobs:
           PAYLOAD="$(./target/release/ai-memory doctor --tokens --json)"
           TOTAL="$(printf '%s' "$PAYLOAD" \
             | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["trimmed_full_profile_total_tokens"])')"
-          echo "doctor --tokens --json: trimmed_full_profile_total_tokens=$TOTAL (ceiling 6750, post-D1.6 + #1067 + #1709 + #2037 skill tools + #2059 covenant params + #2204 claim-bitemporal params)"
-          if [ "$TOTAL" -gt 6750 ]; then
-            echo "::error::v0.7 C5 CI gate FAILED: trimmed full-profile tools/list payload is $TOTAL cl100k_base tokens (ceiling: 6750, post-D1.6 + #1067 + #1709 + #2037 + #2059 + #2204)."
-            echo "::error::C2 (split docs field), C3 (collapse schema boilerplate) and C4 (hide rare optional params) drove the wire form from ~7.4K to ~3.5K tokens at v0.6.4; D1.6 schemars metadata + #1067 LLM provider docs took it back to ~5.5K; v0.8.0 #1709 grew the surface 74→100 tools (structural) to ~6.2K; #2204 added 3 optional claim-bitemporal wire params (structural) to ~6.69K. The 6750-token ceiling is the operator-accepted floor (raised from 6650 per the #2204 growth)."
+          echo "doctor --tokens --json: trimmed_full_profile_total_tokens=$TOTAL (ceiling 7650, post-D1.6 + #1067 + #1709 + #2037 skill tools + #2059 covenant params + #2204 claim-bitemporal params + #3171 schema-vs-handler)"
+          if [ "$TOTAL" -gt 7650 ]; then
+            echo "::error::v0.7 C5 CI gate FAILED: trimmed full-profile tools/list payload is $TOTAL cl100k_base tokens (ceiling: 7650, post-D1.6 + #1067 + #1709 + #2037 + #2059 + #2204 + #3171)."
+            echo "::error::C2 (split docs field), C3 (collapse schema boilerplate) and C4 (hide rare optional params) drove the wire form from ~7.4K to ~3.5K tokens at v0.6.4; D1.6 schemars metadata + #1067 LLM provider docs took it back to ~5.5K; v0.8.0 #1709 grew the surface 74→100 tools (structural) to ~6.2K; #2204 added 3 optional claim-bitemporal wire params (structural) to ~6.69K; #3171 declared previously-hidden MCP params (structural) to ~7.57K. The 7650-token ceiling is the operator-accepted floor (raised from 6750 per the #3171 growth)."
             echo "::error::Inspect 'cargo run --release -- doctor --tokens --raw-table' to find the offending tool (the per-tool 'tokens' column already reflects the trim). See docs/v0.7/schema-compaction-audit.md."
             exit 1
           fi
