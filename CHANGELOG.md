@@ -1172,6 +1172,48 @@ backend and missing or divergently implemented on its twin). Pinned by
   binding and `SELFTEST_POOL_SIZE256`) AND asserts the #3121 false positives
   are not flagged. Wired into `c8-precheck.yml` (run + `--self-test`);
   not-required at introduction (#3122 follow-up / #3121).
+- **The certified pg cert gate is green again: `scripts/check-bootstrap-cert-gate.sh`
+  LEG A now encodes the CURRENT certified config**
+  ([#3061](https://github.com/alphaonedev/ai-memory-mcp/issues/3061),
+  regressed by [#3106](https://github.com/alphaonedev/ai-memory-mcp/pull/3106)).
+  #3106 raised the enterprise-federation posture to 20 controls (check #20 —
+  an enrolled R40 approver key, so the wired L1-6 escalate producer routes to
+  a satisfiable signed-approval gate) and updated THREE of the four places
+  that encode "the certified config": the posture module's test helper,
+  `doctor.rs`'s test helper, and `docs/deploy/enterprise-federation.env`. The
+  fourth — the cert gate's LEG A env — was missed, so its node was keyless.
+  Because LEG A also exports
+  `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1`, the boot gate in
+  `fn main()` refused BEFORE `doctor --posture` could run: exit **1** (not
+  `run_posture`'s documented 2) with an EMPTY stdout. LEG A now mints a real
+  Ed25519 approver key with the same binary and enrolls it, and gains a THIRD
+  negative control proving that enrollment is load-bearing. Control #15 was
+  never the defect — its JSON row was simply never emitted; **no product
+  behaviour changed.**
+- **The cert gate's own failure diagnostics no longer misdirect.** Three
+  defects in `check-bootstrap-cert-gate.sh` turned the above into a red
+  naming an unrelated control: the failing-row dump grepped COMPACT JSON
+  (`"control":"…"`) while `run_posture --json` emits `to_string_pretty`, so it
+  could never match; stderr — which is where a boot refusal (as opposed to a
+  doctor verdict) writes, and the whole diagnosis — was discarded to
+  `/dev/null`; and the "#15 is the pg compensating control, not the sqlcipher
+  predicate" assertion's NEGATIVE half used that same compact spelling, making
+  it **vacuously true**. All three are fixed: the assertion now matches the
+  `control` FIELD in either spelling, failing rows are dumped line-wise
+  (`grep -B 4 '"pass": false'` so the dump names THIS row's control, not
+  the successor — Fable gate on #3219), and stderr is captured to
+  `pg-posture-pass.err` and echoed.
+- **In-tree regression guard for control #15's backend-aware resolution**
+  (`tests/posture_control15_pg_resolution_3106.rs`). Through the real binary:
+  #15 is the pg compensating control on a `postgres://` DSN (PASSing on
+  `sslmode=verify-full` + attested, FAILing below it) and the byte-identical
+  sqlcipher predicate on sqlite — each asserted INDEPENDENTLY of the overall
+  verdict, so a future control addition can never again masquerade as a #15
+  failure — plus an end-to-end leg pinning that the complete certified pg
+  config reaches `exit 0` with all `ENTERPRISE_FEDERATION_CHECK_COUNT`
+  controls green. Unlike the cert job (not a required context), these run on
+  every CI leg, so a control added without extending the certified env goes
+  red in the ADDING PR.
 - **Record-stop enforcement no longer silently degrades at the SAL layer when
   the sqlite DB path resolves through a symlink** (e.g. the macOS
   `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
