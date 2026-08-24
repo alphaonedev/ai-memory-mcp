@@ -54,7 +54,7 @@
 
 use ai_memory::encryption::{get_or_create_keypair, seal_content_per_record};
 
-#[path = "key_dir_sandbox.rs"]
+#[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::storage as db;

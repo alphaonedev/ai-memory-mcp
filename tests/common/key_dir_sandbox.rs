@@ -9,11 +9,13 @@
 //! against the host keystore. Pin `AI_MEMORY_KEY_DIR` at a 0700 tempdir
 //! instead. Never chmod the operator's real keys.
 //!
-//! Include with `#[path = "key_dir_sandbox.rs"] mod key_dir_sandbox;` and
-//! call [`pin`] once per binary (OnceLock). For `assert_cmd` children, also
-//! `.env("AI_MEMORY_KEY_DIR", key_dir_sandbox::pin())`.
+//! Include with `#[path = "common/key_dir_sandbox.rs"] mod key_dir_sandbox;`
+//! (a subdirectory so cargo does not treat this file as its own test crate)
+//! and call [`pin`] once per binary (`OnceLock`). For `assert_cmd` children,
+//! also `.env("AI_MEMORY_KEY_DIR", key_dir_sandbox::pin())`.
 
 #![allow(dead_code)]
+#![allow(clippy::missing_panics_doc, clippy::doc_markdown)]
 
 use std::sync::OnceLock;
 

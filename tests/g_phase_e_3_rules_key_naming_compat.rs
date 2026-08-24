@@ -34,7 +34,7 @@ use ed25519_dalek::SigningKey;
 use std::fs;
 use std::path::Path;
 
-#[path = "key_dir_sandbox.rs"]
+#[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
 // ---------------------------------------------------------------------------

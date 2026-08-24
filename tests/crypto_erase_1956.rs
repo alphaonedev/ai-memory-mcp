@@ -28,7 +28,7 @@ use ai_memory::storage as db;
 use ai_memory::storage::ErasureKind;
 use rusqlite::{OptionalExtension, params};
 
-#[path = "key_dir_sandbox.rs"]
+#[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
 fn fresh_conn() -> rusqlite::Connection {

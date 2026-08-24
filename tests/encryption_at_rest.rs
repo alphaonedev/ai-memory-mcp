@@ -40,7 +40,7 @@ use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::storage as db;
 use rusqlite::params;
 
-#[path = "key_dir_sandbox.rs"]
+#[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
 fn fresh_conn() -> rusqlite::Connection {
