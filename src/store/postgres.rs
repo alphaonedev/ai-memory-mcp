@@ -32762,8 +32762,11 @@ mod tests {
 
         // #3171 Fable MED (4) — NULL attest_level must surface as unsigned,
         // matching sqlite COALESCE. A missing trust field is worse than
-        // unsigned.
-        let (c_id, d_id) = fxc2_seed_two_memories(&store, &ns).await;
+        // unsigned. Fresh namespace: `store` keys on (title, namespace),
+        // so reusing `ns` would upsert the first pair and the new ids
+        // would not exist (FK 23503 on coverage's live PG).
+        let ns_null = format!("fxc2-null-attest-{}", uuid::Uuid::new_v4());
+        let (c_id, d_id) = fxc2_seed_two_memories(&store, &ns_null).await;
         sqlx::query(
             "INSERT INTO memory_links
                 (source_id, target_id, relation, created_at, attest_level)
