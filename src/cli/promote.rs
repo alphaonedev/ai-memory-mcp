@@ -83,9 +83,56 @@ pub fn cmd_promote(
     };
     let resolved_id = target.id.clone();
 
+    let caller_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
+    // v0.9.0 G10.1 (#1827) — edge-parse the optional capability token
+    // ONCE; inert unless `[capabilities].enabled`. Resolved through the
+    // NON-argv channels first (`--capability-file` /
+    // `AI_MEMORY_CAPABILITY_FILE`, a 0600 file) so the macaroon need
+    // never sit in `/proc/<pid>/cmdline`; `--capability` still works and
+    // warns. A named-but-unreadable/lax-mode file is a hard error, never
+    // a silent downgrade to "no token".
+    let presented_capability = crate::governance::capability::resolve_capability(
+        args.capability.as_deref(),
+        args.capability_file.as_deref(),
+    )?;
+    let capability = crate::governance::capability::parse_presented_token(
+        presented_capability.as_deref(),
+        &caller_agent_id,
+    )
+    .map_err(|rej| anyhow::anyhow!(crate::governance::capability::edge_reject_message(&rej)))?;
+
+    // #3202 Fable HIGH (2) — dest Store gate FIRST so SOURCE promote:Approve
+    // cannot queue a clone into a dest whose write policy Denies.
+    if let Some(ref to_ns) = args.to_namespace {
+        let dest_payload = serde_json::json!({
+            "id": resolved_id,
+            (crate::models::field_names::TO_NAMESPACE): to_ns,
+            "mode": "vertical",
+        });
+        match enforce_governance(
+            &conn,
+            models::GovernedAction::Store,
+            to_ns,
+            &caller_agent_id,
+            None,
+            None,
+            &dest_payload,
+            capability.as_ref(),
+            json_out,
+            out,
+        )? {
+            GovernanceOutcome::Allow => {}
+            GovernanceOutcome::Deny => {
+                std::process::exit(1);
+            }
+            GovernanceOutcome::Pending => {
+                return Ok(());
+            }
+        }
+    }
+
     {
         use models::GovernedAction;
-        let caller_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
         let mem_owner = target
             .metadata
             .get("agent_id")
@@ -95,22 +142,6 @@ pub fn cmd_promote(
             "id": resolved_id,
             (crate::models::field_names::TO_NAMESPACE): args.to_namespace,
         });
-        // v0.9.0 G10.1 (#1827) — edge-parse the optional capability token
-        // ONCE; inert unless `[capabilities].enabled`. Resolved through the
-        // NON-argv channels first (`--capability-file` /
-        // `AI_MEMORY_CAPABILITY_FILE`, a 0600 file) so the macaroon need
-        // never sit in `/proc/<pid>/cmdline`; `--capability` still works and
-        // warns. A named-but-unreadable/lax-mode file is a hard error, never
-        // a silent downgrade to "no token".
-        let presented_capability = crate::governance::capability::resolve_capability(
-            args.capability.as_deref(),
-            args.capability_file.as_deref(),
-        )?;
-        let capability = crate::governance::capability::parse_presented_token(
-            presented_capability.as_deref(),
-            &caller_agent_id,
-        )
-        .map_err(|rej| anyhow::anyhow!(crate::governance::capability::edge_reject_message(&rej)))?;
         match enforce_governance(
             &conn,
             GovernedAction::Promote,
@@ -134,44 +165,8 @@ pub fn cmd_promote(
     }
 
     if let Some(ref to_ns) = args.to_namespace {
-        // #3202 — govern the DESTINATION, not just the source. Vertical
-        // promotion is a WRITE into `to_ns`, so the CLI runs the same
-        // STORE-class gate the MCP handler now runs; without it, the CLI
-        // stayed the surface on which the ancestor namespace's `write` policy
-        // could be bypassed. Same shape as the source gate above.
-        let promoter = identity::resolve_agent_id(cli_agent_id, None)?;
-        let dest_payload = serde_json::json!({
-            "id": resolved_id,
-            (crate::models::field_names::TO_NAMESPACE): to_ns,
-            "mode": "vertical",
-        });
-        let dest_capability = crate::governance::capability::parse_presented_token(
-            args.capability.as_deref(),
-            &promoter,
-        )
-        .map_err(|rej| anyhow::anyhow!(crate::governance::capability::edge_reject_message(&rej)))?;
-        match enforce_governance(
-            &conn,
-            models::GovernedAction::Store,
-            to_ns,
-            &promoter,
-            None,
-            // A new row in `to_ns` has no prior owner there (see the MCP twin).
-            None,
-            &dest_payload,
-            dest_capability.as_ref(),
-            json_out,
-            out,
-        )? {
-            GovernanceOutcome::Allow => {}
-            GovernanceOutcome::Deny => {
-                std::process::exit(1);
-            }
-            GovernanceOutcome::Pending => {
-                return Ok(());
-            }
-        }
-        let clone_id = db::promote_to_namespace(&conn, &resolved_id, to_ns, Some(&promoter))?;
+        let clone_id =
+            db::promote_to_namespace(&conn, &resolved_id, to_ns, Some(&caller_agent_id))?;
         if json_out {
             writeln!(
                 out.stdout,

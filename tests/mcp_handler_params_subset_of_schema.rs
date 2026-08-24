@@ -81,6 +81,11 @@ const ALLOWED_READS: &[(&str, &str, &str)] = &[
         "from_agent",
         "forward_signal_send_to_http in store/transport.rs; `from_agent` is memory_signal_send's input",
     ),
+    (
+        "dispatcher",
+        "clientInfo",
+        "JSON-RPC initialize handshake field on the session, not a tool inputSchema property",
+    ),
 ];
 
 /// Resolve `pub const NAME: &str = "value";` declarations from a SSOT
@@ -170,6 +175,9 @@ fn strip_comments(src: &str) -> String {
 /// `params.get(param_names::K)` — with any amount of whitespace, and with
 /// an arbitrary receiver prefix (`ctx.arguments.get(..)`) as long as the
 /// last path segment is `params` or `arguments`.
+///
+/// Also matches `param_guard::{require_str,optional_*}(params, KEY)` so
+/// the 23 #3171 fail-closed readers are visible to this guard (Fable MED 5).
 fn read_keys(src: &str, params: &BTreeMap<String, String>) -> BTreeSet<String> {
     let cleaned = strip_comments(src);
     let mut out = BTreeSet::new();
@@ -204,6 +212,40 @@ fn read_keys(src: &str, params: &BTreeMap<String, String>) -> BTreeSet<String> {
         {
             out.insert(v.clone());
         } else if let Some(cname) = inner.rsplit("::").next()
+            && let Some(v) = params.get(cname.trim())
+        {
+            out.insert(v.clone());
+        }
+    }
+    // #3171 Fable MED (5) — `param_guard::require_str(params, KEY)` and
+    // `optional_*` were invisible to the index/get shapes above.
+    for (idx, _) in cleaned.match_indices("param_guard::") {
+        let after = &cleaned[idx + "param_guard::".len()..];
+        let Some(paren) = after.find('(') else {
+            continue;
+        };
+        let args = after[paren + 1..].trim_start();
+        let Some((recv, rest)) = args.split_once(',') else {
+            continue;
+        };
+        let recv = recv.trim();
+        let recv_tail = recv.rsplit('.').next().unwrap_or(recv);
+        if recv_tail != "params" && recv_tail != "arguments" {
+            continue;
+        }
+        let key = rest
+            .trim_start()
+            .split([',', ')'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if let Some(lit) = key.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            out.insert(lit.to_string());
+        } else if let Some(cname) = key.strip_prefix("param_names::")
+            && let Some(v) = params.get(cname.trim())
+        {
+            out.insert(v.clone());
+        } else if let Some(cname) = key.rsplit("::").next()
             && let Some(v) = params.get(cname.trim())
         {
             out.insert(v.clone());
@@ -317,6 +359,24 @@ fn handler_param_reads_are_declared_in_the_tool_schema_3171() {
             {
                 declared.extend(keys.iter().cloned());
             }
+        }
+    }
+
+    // #3171 Fable MED (5) — dispatcher-owned handlers live in src/mcp/mod.rs
+    // (`memory_offload` / `memory_deref` `arguments.get(AGENT_ID)`).
+    let dispatcher = manifest.join("src/mcp/mod.rs");
+    let dispatcher_src = std::fs::read_to_string(&dispatcher).expect("mcp/mod.rs readable");
+    let dispatcher_cleaned = strip_comments(&dispatcher_src);
+    unit_reads
+        .entry("dispatcher".into())
+        .or_default()
+        .extend(read_keys(&dispatcher_src, &param_names));
+    let dispatcher_declared = unit_declared.entry("dispatcher".into()).or_default();
+    for (cname, tname) in &tool_names {
+        if dispatcher_cleaned.contains(&format!("tool_names::{cname}"))
+            && let Some(keys) = props.get(tname)
+        {
+            dispatcher_declared.extend(keys.iter().cloned());
         }
     }
 

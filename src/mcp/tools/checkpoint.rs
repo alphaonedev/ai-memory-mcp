@@ -188,12 +188,9 @@ pub fn handle_checkpoint_resolve(
     params: &Value,
     keypair: Option<&AgentKeypair>,
 ) -> Result<Value, String> {
-    let id = params
-        .get(param_names::ID)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
+    // #3171 Fable MED (3) — schema-REQUIRED `id` and `resolved_by` must
+    // refuse missing/blank rather than persist empty attribution.
+    let id = crate::mcp::param_guard::require_str(params, param_names::ID)?;
     let state = params
         .get(param_names::STATE)
         .and_then(Value::as_str)
@@ -205,10 +202,7 @@ pub fn handle_checkpoint_resolve(
             )
         })
         .ok_or_else(|| "state must be one of: resolved, rejected".to_string())?;
-    let resolved_by = params
-        .get(param_names::RESOLVED_BY)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let resolved_by = crate::mcp::param_guard::require_str(params, param_names::RESOLVED_BY)?;
     let resolution = params.get(param_names::RESOLUTION).and_then(Value::as_str);
     let resolution_note = params
         .get(param_names::RESOLUTION_NOTE)
@@ -795,6 +789,39 @@ mod handler_tests {
         )
         .expect_err("missing id must error");
         assert!(err.contains("not found"), "error reports absence: {err}");
+    }
+
+    /// #3171 Fable MED (3) — blank/absent schema-REQUIRED strings refuse.
+    #[test]
+    fn resolve_refuses_blank_id_and_resolved_by_3171() {
+        let conn = fresh();
+        let created = handle_checkpoint_create(&conn, &json!({ "namespace": "_cp", "title": "t" }))
+            .expect("create ok");
+        let id = created[param_names::ID].as_str().expect("id present");
+        let err = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "state": "resolved", "resolved_by": "x" }),
+            None,
+        )
+        .expect_err("absent id must refuse");
+        assert!(err.contains("id is required"), "got: {err}");
+        let err = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": "  ", "state": "resolved", "resolved_by": "x" }),
+            None,
+        )
+        .expect_err("blank id must refuse");
+        assert!(err.contains("id is required"), "got: {err}");
+        let err = handle_checkpoint_resolve(&conn, &json!({ "id": id, "state": "resolved" }), None)
+            .expect_err("absent resolved_by must refuse");
+        assert!(err.contains("resolved_by is required"), "got: {err}");
+        let err = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "" }),
+            None,
+        )
+        .expect_err("blank resolved_by must refuse");
+        assert!(err.contains("resolved_by is required"), "got: {err}");
     }
 
     /// PR-1 / L5 (#2708-sibling, CWE-284) — a caller must NOT be able to CREATE a

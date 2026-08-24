@@ -677,7 +677,14 @@ backend and missing or divergently implemented on its twin). Pinned by
   nullable and the field is `skip_serializing_if = "Option::is_none"`, so a NULL
   row made the trust field VANISH from the response while the tool docs promised
   every link carries one. It now `COALESCE`s to `"unsigned"` — the same
-  projection the reflection export already used.
+  projection the reflection export already used. The postgres `get_links`
+  / `get_links_for_anchor` twins now use the same COALESCE; a NULL column
+  on a pg-backed daemon no longer drops the trust field.
+- **`memory_checkpoint_resolve` refuses blank `id` / `resolved_by`.** Both
+  are schema-REQUIRED; they were still `unwrap_or_default()`, so a blank
+  resolver was persisted as attribution. They now go through
+  `param_guard::require_str`. The handler-reads⊆schema guard now matches
+  `param_guard::*(params, KEY)` and scans `src/mcp/mod.rs`.
 
 ### Security (governance gates that were missing or pointed at the wrong namespace; #3202, #3204 items 4 and 7)
 
@@ -696,6 +703,11 @@ backend and missing or divergently implemented on its twin). Pinned by
   mode:"vertical"}`, and `execute_pending_action`'s store arm
   `from_value::<Memory>`'d it — Approve never cloned. The store arm now
   dispatches a `mode=vertical` payload onto `promote_to_namespace`. The
+  SOURCE Promote gate used to run FIRST, so `promote: Approve` queued a
+  `"promote"` pending whose execute arm cloned with no dest evaluation
+  (source Approve + dest write:Owner/Deny landed the clone). Dest Store
+  now runs first on MCP and CLI; the promote execute arm re-evaluates dest
+  write without queueing and refuses Deny/still-Pending. The
   forensic row is chained
   under the DESTINATION, and the clone's provenance is RE-STAMPED: it was
   carrying `source.metadata` verbatim, so the new row was owned by the source's

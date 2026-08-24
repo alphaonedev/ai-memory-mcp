@@ -7306,7 +7306,8 @@ impl PostgresStore {
     pub async fn get_links(&self, id: &str) -> StoreResult<Vec<MemoryLink>> {
         let rows = sqlx::query(
             "SELECT source_id, target_id, relation, created_at,
-                    valid_from, valid_until, observed_by, attest_level
+                    valid_from, valid_until, observed_by,
+                    COALESCE(attest_level, 'unsigned') AS attest_level
              FROM memory_links
              WHERE source_id = $1 OR target_id = $1
              ORDER BY source_id, target_id, relation",
@@ -7330,7 +7331,7 @@ impl PostgresStore {
                 let observed_by: Option<String> = r
                     .try_get(field_names::OBSERVED_BY)
                     .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
-                let attest_level: Option<String> = r
+                let attest_level: String = r
                     .try_get(field_names::ATTEST_LEVEL)
                     .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
                 let relation_str: String = r
@@ -7356,7 +7357,7 @@ impl PostgresStore {
                     valid_from: valid_from.map(|t| t.to_rfc3339()),
                     valid_until: valid_until.map(|t| t.to_rfc3339()),
                     observed_by,
-                    attest_level,
+                    attest_level: Some(attest_level),
                     source_cid: None,
                     target_cid: None,
                 })
@@ -20167,7 +20168,8 @@ impl MemoryStore for PostgresStore {
     async fn get_links_for_anchor(&self, anchor_id: &str) -> StoreResult<Vec<MemoryLink>> {
         let rows = sqlx::query(
             "SELECT source_id, target_id, relation, created_at,
-                    valid_from, valid_until, observed_by, attest_level
+                    valid_from, valid_until, observed_by,
+                    COALESCE(attest_level, 'unsigned') AS attest_level
              FROM memory_links
              WHERE source_id = $1 OR target_id = $1
              ORDER BY created_at DESC",
@@ -20194,8 +20196,8 @@ impl MemoryStore for PostgresStore {
                 let relation_str: String = r
                     .try_get::<String, _>("relation")
                     .map_err(|e| to_store_err(READ_RELATION, e))?;
-                let attest_level: Option<String> = r
-                    .try_get::<Option<String>, _>(field_names::ATTEST_LEVEL)
+                let attest_level: String = r
+                    .try_get::<String, _>(field_names::ATTEST_LEVEL)
                     .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
                 Ok(MemoryLink {
                     source_id: r
@@ -20217,7 +20219,7 @@ impl MemoryStore for PostgresStore {
                     observed_by,
                     valid_from: valid_from.map(|t| t.to_rfc3339()),
                     valid_until: valid_until.map(|t| t.to_rfc3339()),
-                    attest_level,
+                    attest_level: Some(attest_level),
                     source_cid: None,
                     target_cid: None,
                 })
@@ -32757,6 +32759,35 @@ mod tests {
         );
         assert_eq!(row.observed_by.as_deref(), Some("ai:tester@host"));
         assert_eq!(row.attest_level.as_deref(), Some("unsigned"));
+
+        // #3171 Fable MED (4) — NULL attest_level must surface as unsigned,
+        // matching sqlite COALESCE. A missing trust field is worse than
+        // unsigned.
+        let (c_id, d_id) = fxc2_seed_two_memories(&store, &ns).await;
+        sqlx::query(
+            "INSERT INTO memory_links
+                (source_id, target_id, relation, created_at, attest_level)
+             VALUES ($1, $2, $3, NOW(), NULL)",
+        )
+        .bind(&c_id)
+        .bind(&d_id)
+        .bind("related_to")
+        .execute(&store.pool)
+        .await
+        .expect("raw insert NULL attest_level");
+        let null_edges = store
+            .get_links_for_anchor(&c_id)
+            .await
+            .expect("get_links_for_anchor NULL attest");
+        let null_row = null_edges
+            .iter()
+            .find(|l| l.source_id == c_id && l.target_id == d_id)
+            .expect("NULL-attest edge");
+        assert_eq!(
+            null_row.attest_level.as_deref(),
+            Some("unsigned"),
+            "NULL attest_level must COALESCE to unsigned"
+        );
     }
 
     // ============================================================

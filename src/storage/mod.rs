@@ -20062,6 +20062,57 @@ pub fn approve_with_approver_type(
 /// emits live in `decide_pending_action` and
 /// `sweep_pending_action_timeouts` respectively, so the three governance
 /// transitions are audit-complete together).
+/// #3202 Fable HIGH (2) — evaluate destination `write` at execute time
+/// WITHOUT queueing. `enforce_governance` would insert a second pending
+/// on `Approve`; this consults the same policy/level/ungoverned path and
+/// treats Deny or still-Pending as a refuse.
+fn refuse_unapproved_destination_store(
+    conn: &Connection,
+    pa: &PendingAction,
+    to_ns: &str,
+) -> Result<()> {
+    use crate::config::{PermissionsMode, active_permissions_mode};
+    let mode = active_permissions_mode();
+    if mode == PermissionsMode::Off {
+        return Ok(());
+    }
+    let decision = match resolve_governance_policy(conn, to_ns) {
+        Some(policy) => {
+            let ns_owner = namespace_owner(conn, to_ns);
+            evaluate_level(
+                conn,
+                GovernedAction::Store,
+                to_ns,
+                &policy.core.write,
+                &pa.requested_by,
+                None,
+                ns_owner.as_deref(),
+            )
+        }
+        None => ungoverned_namespace_decision(mode, GovernedAction::Store, to_ns, &pa.requested_by),
+    };
+    if mode == PermissionsMode::Advisory {
+        return Ok(());
+    }
+    match decision {
+        GovernanceDecision::Allow => Ok(()),
+        GovernanceDecision::Deny(refusal) => {
+            emit_pending_action_event(conn, pa, "pending_action.refused_destination_deny", None);
+            Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: format!("destination write into {to_ns} denied: {}", refusal.reason),
+            }))
+        }
+        GovernanceDecision::Pending(_) => {
+            emit_pending_action_event(conn, pa, "pending_action.refused_destination_pending", None);
+            Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: format!(
+                    "destination write into {to_ns} requires approval that was not granted"
+                ),
+            }))
+        }
+    }
+}
+
 pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Option<String>> {
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #962 typed envelope — 404 NOT_FOUND.
@@ -20160,10 +20211,12 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                     .get(field_names::TO_NAMESPACE)
                     .and_then(|v| v.as_str())
                 {
-                    // Vertical promotion to ancestor. #3202 — the clone is
-                    // attributed to the principal that REQUESTED the promote
-                    // (the governance subject the approval was granted for),
-                    // not to the source row's author.
+                    // #3202 Fable HIGH (2) — SOURCE Promote:Approve queues
+                    // this arm BEFORE the destination Store gate ran, so
+                    // execute must re-evaluate dest write (no queue: an
+                    // Approve here would insert a second pending). Deny or
+                    // still-Pending ⇒ refuse; do not clone into a forbidden ns.
+                    refuse_unapproved_destination_store(conn, &pa, to_ns)?;
                     let clone_id =
                         promote_to_namespace(conn, &mid, to_ns, Some(pa.requested_by.as_str()))?;
                     Some(clone_id)
@@ -28053,6 +28106,71 @@ mod tests {
         assert_eq!(clone.title, "src-vert");
         let source = get(&conn, &src_id).unwrap().expect("source untouched");
         assert_eq!(source.namespace, "parent/child");
+    }
+
+    /// #3202 Fable HIGH (2) — an already-approved SOURCE `promote` pending
+    /// must not clone into a destination whose `write` policy refuses the
+    /// requester. Pre-fix this arm called `promote_to_namespace` with no
+    /// dest evaluation.
+    #[test]
+    fn test_execute_promote_arm_destination_owner_refuses_3202() {
+        use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
+        let _modeg = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
+        let conn = test_db();
+        let mut dest_std = make_memory("dest-std", "parent", Tier::Mid, 5);
+        dest_std.metadata = serde_json::json!({"agent_id": "alice"});
+        let dest_std_id = insert(&conn, &dest_std).unwrap();
+        let dest_policy = serde_json::to_value(GovernancePolicy {
+            core: CorePolicy {
+                write: GovernanceLevel::Owner,
+                ..CorePolicy::default()
+            },
+            ..GovernancePolicy::default()
+        })
+        .unwrap();
+        set_row_metadata(
+            &conn,
+            &dest_std_id,
+            &serde_json::json!({"agent_id": "alice", "governance": dest_policy}).to_string(),
+        )
+        .unwrap();
+        set_namespace_standard(&conn, "parent", &dest_std_id, None).unwrap();
+
+        let mut src = make_memory("src-vert-deny", "parent/child", Tier::Mid, 5);
+        src.metadata = serde_json::json!({"agent_id": "bob"});
+        let src_id = insert(&conn, &src).unwrap();
+        let payload = serde_json::json!({
+            "id": src_id,
+            (field_names::TO_NAMESPACE): "parent",
+        });
+        let pending_id = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Promote,
+            "parent/child",
+            Some(&src_id),
+            "bob",
+            &payload,
+        )
+        .unwrap();
+        assert!(decide_pending_action(&conn, &pending_id, true, "approver").unwrap());
+        let err = execute_pending_action(&conn, &pending_id)
+            .expect_err("dest write:Owner must refuse bob's clone");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not the owner") || msg.contains("denied"),
+            "expected dest-deny message, got: {msg}"
+        );
+        let dest_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = 'parent' AND title = 'src-vert-deny'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dest_count, 0, "refused execute must not land the clone");
     }
 
     /// S5-H4 — a queued payload whose `agent_id` does NOT match
