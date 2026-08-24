@@ -272,3 +272,21 @@ fn public_only_refusal_is_scoped_to_the_degraded_outcome_3147() {
         );
     }
 }
+
+/// #3147 Fable item 3 — the other no-signing arms (unusable key dir,
+/// ensure/load error) refuse under `asi-hard` and degrade otherwise.
+/// Pure so the daemon wiring cannot disagree with this pin.
+#[test]
+fn no_signing_identity_refusal_is_asi_hard_only_3147() {
+    use ai_memory::identity::keypair::no_signing_identity_refusal;
+    assert!(
+        no_signing_identity_refusal(false, "key directory is group-writable").is_none(),
+        "default posture must still degrade, never refuse"
+    );
+    let refusal = no_signing_identity_refusal(true, "key directory is group-writable")
+        .expect("asi-hard must refuse every no-signing arm");
+    assert!(
+        refusal.contains("asi-hard") && refusal.contains("group-writable"),
+        "refusal must name the posture and the cause, got: {refusal}"
+    );
+}

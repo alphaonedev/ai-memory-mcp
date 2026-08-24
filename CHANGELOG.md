@@ -1899,7 +1899,12 @@ without `.priv` is reported as degraded and WARNed, never auto-repaired
 (regenerating would mint a different identity behind the operator's back); and
 neither present generates. The daemon's own "public key only" line is WARN, and
 under `asi-hard` — the posture whose contract is that no security control may
-be silently disabled — a daemon that can never sign refuses to boot.
+be silently disabled — a daemon that can never sign refuses to boot: not only
+the public-only half-state, but every no-signing arm (`default_key_dir`
+refusal, `ensure_keypair` error, `load` error). `ai-memory doctor` now
+renders an Identity section (daemon pub/priv presence, key-dir posture,
+HTTP attested-identity mode, inert-`enforce` fact) so the daemon WARN
+"See `ai-memory doctor` -> Identity" is true.
 
 **#3155 — `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` was silently inert
 with zero enrolled keys.** `enforce_for_request` returns `None` on an empty
@@ -1937,14 +1942,18 @@ every read (`load_public`, and so `load`), at every write (`ensure_parent`, and
 so `save` / `save_public_only` / the rotation archive), and in the existence gate
 (`ensure_keypair` — which decides from file existence, an answer an attacker with
 directory write controls). The same gate is applied to every ancestor between a
-nested (#1514 slashed) key file and the caller-supplied key dir — write access
-to ANY link in that chain is enough to replace the subtree, so a leaf-only
-check would have left that layout half-guarded. The X25519 keystore
-(`encryption::{load,save}_keypair_from/to_disk`) and the capability-token
-keystore (`governance::capability::{write,read}_root_secret`) take the same
-gate: the latter previously did a bare `create_dir_all` for the directory
-holding a `0o600` bearer secret, so a directory-writable swap minted tokens
-that VERIFY.
+nested (#1514 slashed) key file and the caller-supplied key dir, stopping at
+`base` (ancestors above the caller-supplied key directory — `~/.config`,
+`$HOME`, sticky `/tmp` parents — are out of contract). Write access to ANY
+link in that chain is enough to replace the subtree, so a leaf-only check
+would have left that layout half-guarded. The gate also requires the
+directory be owned by this process or by root (OpenSSH `secure_filename`
+precedent): a 0755 directory owned by another uid still lets that owner swap
+the pair. The X25519 keystore (`encryption::{load,save}_keypair_from/to_disk`)
+takes the same gate. The capability-token `.caproot` directory is gated by
+the merged #3217 helpers (`create_caproot_dir_secure` /
+`enforce_caproot_dir_secure`, #3214) — this change does not re-implement
+that keystore.
 
 The gate is the group/other WRITE bits (`0o022`), deliberately NOT `0o077`.
 Refusing a merely group/other-READABLE `0o755` directory would brick every
@@ -1952,6 +1961,15 @@ deployment created under the default `umask 022` — a silent tightening of a
 shipped default. Directory read access does not enable the swap; directory write
 access does. The remediation text still names `chmod 0700`, and pre-existing
 directories are checked, never silently rewritten.
+
+**Upgrade:** pre-existing `~/.config/ai-memory/keys` trees created by earlier
+releases under `umask 0002` (Ubuntu UPG default) are `0o775` and will now
+REFUSE every CLI key op and the daemon's signing until
+`chmod 0700 ~/.config/ai-memory/keys`. Symptom: `key directory … is group- or
+world-writable` on `identity generate` / daemon boot. Under the default
+posture the daemon still boots (degraded, unsigned); under `asi-hard` it
+refuses to boot. `ai-memory doctor` now has an Identity section that names
+this state.
 
 Regression coverage: `tests/keypair_write_crash_injection_3146.rs` re-execs the
 test binary under `RLIMIT_FSIZE=0` so the key write fails mid-`save` exactly as

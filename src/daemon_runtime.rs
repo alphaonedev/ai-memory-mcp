@@ -3443,11 +3443,12 @@ use crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
 ///   3. Load the keypair from disk and return it.
 ///
 /// Failure at any step degrades the daemon to unsigned-link mode (the
-/// pre-v0.7 posture) without aborting startup. Log lines describe
+/// pre-v0.7 posture) without aborting startup — except under `asi-hard`,
+/// which refuses every no-signing-identity arm. Log lines describe
 /// which path was taken so an operator inspecting daemon logs sees
 /// the cause.
 ///
-/// # #3147 — the ONE case that aborts instead of degrading
+/// # #3147 — the cases that abort instead of degrading
 ///
 /// A key directory holding `daemon.pub` with NO `daemon.priv` is not a
 /// transient failure: the daemon can verify but can never sign, it cannot
@@ -3455,15 +3456,19 @@ use crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
 /// regenerating would mint a different identity), and before #3147 it was
 /// reported at INFO and re-entered silently on every restart. Under
 /// `asi-hard` — whose entire contract is that no security control may be
-/// silently disabled — that is a disabled control, so boot REFUSES. Under
-/// every other posture it stays a degraded-but-running WARN, unchanged.
-/// The decision itself lives in the pure
-/// [`crate::identity::keypair::public_only_refusal`].
+/// silently disabled — that is a disabled control, so boot REFUSES via
+/// [`crate::identity::keypair::public_only_refusal`]. The same posture
+/// also refuses when the key directory is unusable (#3198), when
+/// `ensure_keypair` errors, or when `load` fails — every arm that would
+/// otherwise leave the daemon signing nothing
+/// ([`crate::identity::keypair::no_signing_identity_refusal`]). Under
+/// every other posture those arms stay a degraded-but-running WARN,
+/// unchanged.
 ///
 /// # Errors
 ///
-/// Only the `asi-hard` public-only refusal above. Every other failure still
-/// degrades to unsigned-link mode and returns `Ok`.
+/// The `asi-hard` no-signing-identity refusals above. Every other failure
+/// still degrades to unsigned-link mode and returns `Ok`.
 fn ensure_and_load_daemon_keypair() -> Result<(
     Option<crate::identity::keypair::AgentKeypair>,
     Option<crate::identity::keypair::EnsureOutcome>,
@@ -3478,10 +3483,18 @@ fn ensure_and_load_daemon_keypair() -> Result<(
             // local UID can swap is the correct fail-closed outcome, but at
             // INFO it was indistinguishable from an absent HOME and sat below
             // the default log filter — the exact silence #3147 exists to end.
+            // #3147 Fable item 3: under `asi-hard` a daemon that cannot sign
+            // must refuse to boot, not degrade to unsigned-link mode.
             tracing::warn!(
                 "identity: no usable key directory, link/persona/witness signing is \
                  DISABLED: {e:#}"
             );
+            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
+                crate::security_profile::is_asi_hard(),
+                &format!("{e:#}"),
+            ) {
+                anyhow::bail!(reason);
+            }
             return Ok((None, None));
         }
     };
@@ -3494,6 +3507,12 @@ fn ensure_and_load_daemon_keypair() -> Result<(
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("identity: keypair auto-gen failed: {e:#}");
+            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
+                crate::security_profile::is_asi_hard(),
+                &format!("{e:#}"),
+            ) {
+                anyhow::bail!(reason);
+            }
             return Ok((None, None));
         }
     };
@@ -3530,12 +3549,24 @@ fn ensure_and_load_daemon_keypair() -> Result<(
                  restarts. See `ai-memory doctor` -> Identity (#3147).",
                 dir.display()
             );
+            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
+                crate::security_profile::is_asi_hard(),
+                "only the public key is on disk",
+            ) {
+                anyhow::bail!(reason);
+            }
             None
         }
         Err(e) => {
             tracing::warn!(
                 "identity: keypair load failed for {DAEMON_KEYPAIR_LABEL}: {e:#}; link signing disabled"
             );
+            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
+                crate::security_profile::is_asi_hard(),
+                &format!("{e:#}"),
+            ) {
+                anyhow::bail!(reason);
+            }
             None
         }
     };

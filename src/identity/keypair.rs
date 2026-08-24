@@ -198,13 +198,24 @@ pub fn key_dir_env_override() -> Option<PathBuf> {
 /// tests stand up an isolated key dir per test without shelling out to
 /// the operator's real `~/.config/ai-memory/keys/`. Operators who want
 /// to relocate the key store in production can use the same override.
+pub fn default_key_dir() -> Result<PathBuf> {
+    let resolved = resolved_default_key_dir_path()?;
+    // #3198 — refuse at RESOLUTION, so a group-writable key store is named once
+    // at boot rather than surfacing later as a confusing per-operation failure.
+    // A path that does not exist yet passes; `ensure_parent` creates it `0700`.
+    // Mirrors `log_paths::resolve_dir`'s `enforce_not_world_writable` call.
+    enforce_key_dir_secure(&resolved)?;
+    Ok(resolved)
+}
+
 /// Path of the default key directory, WITHOUT the #3198 posture gate.
-/// `default_key_dir` is the production funnel and always gates; this is
-/// the shape-only half so tests can assert the fallback path without
-/// requiring the operator's live `~/.config/ai-memory/keys` to already
-/// be `0o700` (this fleet's `umask 0002` leaves it `0o775` — the
-/// defect #3198 exists to refuse).
-fn resolved_default_key_dir_path() -> Result<PathBuf> {
+///
+/// [`default_key_dir`] is the production funnel and always gates; this is
+/// the shape-only half so `ai-memory doctor` (and tests) can NAME a refused
+/// directory instead of being unable to resolve it. This fleet's `umask 0002`
+/// leaves live `~/.config/ai-memory/keys` at `0o775` — the defect #3198
+/// exists to refuse.
+pub(crate) fn resolved_default_key_dir_path() -> Result<PathBuf> {
     if let Some(p) = key_dir_env_override() {
         return Ok(p);
     }
@@ -217,29 +228,6 @@ fn resolved_default_key_dir_path() -> Result<PathBuf> {
     Ok(base.join("ai-memory").join("keys"))
 }
 
-pub fn default_key_dir() -> Result<PathBuf> {
-    let resolved = resolved_default_key_dir_path()?;
-    // #3198 — refuse at RESOLUTION, so a group-writable key store is named once
-    // at boot rather than surfacing later as a confusing per-operation failure.
-    // A path that does not exist yet passes; `ensure_parent` creates it `0700`.
-    // Mirrors `log_paths::resolve_dir`'s `enforce_not_world_writable` call.
-    enforce_key_dir_secure(&resolved)?;
-    Ok(resolved)
-}
-
-/// Generate a fresh Ed25519 keypair for `agent_id` using `OsRng`.
-///
-/// `agent_id` is validated against
-/// [`crate::validate::validate_agent_id_shape`] (shape-only — char
-/// class + length) so callers cannot smuggle invalid characters into
-/// the on-disk filename. The reserved-name reject lives at the WIRE
-/// boundary ([`crate::validate::validate_agent_id`]) so internal
-/// callers using reserved sentinels (e.g. the daemon's own
-/// [`DAEMON_KEYPAIR_LABEL`] self-signing keypair) can still
-/// load/generate cleanly. Wire
-/// entry points that route caller-supplied agent_ids into this
-/// function must validate FIRST via `validate_agent_id` before
-/// reaching here.
 /// The well-known stable label used by the daemon when auto-generating
 /// and loading its outbound link-signing keypair (`<label>.priv` /
 /// `<label>.pub` under the key directory).
@@ -284,6 +272,18 @@ pub fn is_key_absent_error(err: &anyhow::Error) -> bool {
         .any(|marker| msg.contains(marker))
 }
 
+/// Generate a fresh Ed25519 keypair for `agent_id` using `OsRng`.
+///
+/// `agent_id` is validated against
+/// [`crate::validate::validate_agent_id_shape`] (shape-only — char
+/// class + length) so callers cannot smuggle invalid characters into
+/// the on-disk filename. The reserved-name reject lives at the WIRE
+/// boundary ([`crate::validate::validate_agent_id`]) so internal
+/// callers using reserved sentinels (e.g. the daemon's own
+/// [`DAEMON_KEYPAIR_LABEL`] self-signing keypair) can still
+/// load/generate cleanly. Wire entry points that route caller-supplied
+/// agent_ids into this function must validate FIRST via
+/// `validate_agent_id` before reaching here.
 pub fn generate(agent_id: &str) -> Result<AgentKeypair> {
     validate::validate_agent_id_shape(agent_id)?;
     // ed25519-dalek 2.x consumes a `CryptoRngCore` (rand_core 0.6).
@@ -943,6 +943,30 @@ pub fn public_only_refusal(outcome: &EnsureOutcome, asi_hard: bool) -> Option<St
     ))
 }
 
+/// #3147 — `asi-hard` refusal for every other "this daemon cannot sign"
+/// boot arm, or `None` when boot may proceed.
+///
+/// [`public_only_refusal`] covers the four-way gate's `.pub`-without-`.priv`
+/// outcome. The remaining no-signing arms — `default_key_dir` refusal
+/// (#3198), `ensure_keypair` error, `load` error — used to `Ok((None, None))`
+/// + WARN even under `asi-hard`, so the posture whose contract is "no
+/// security control may be silently disabled" still booted signing nothing.
+/// Pure, so the daemon wiring and its tests share one decision. Default
+/// posture is unchanged: WARN and degrade.
+#[must_use]
+pub fn no_signing_identity_refusal(asi_hard: bool, cause: &str) -> Option<String> {
+    if !asi_hard {
+        return None;
+    }
+    Some(format!(
+        "{} refuses to boot without a signing identity ({cause}). Under this \
+         posture a daemon that can never sign is a silently disabled control — \
+         restore the key directory (`chmod 0700`) and `daemon.priv`, or generate \
+         a fresh keypair (#3147).",
+        crate::security_profile::ASI_HARD_REFUSAL_PREFIX,
+    ))
+}
+
 /// Round-2 F12 — auto-generate a signing keypair for `agent_id` under
 /// `dir` if one does not already exist.
 ///
@@ -1142,13 +1166,14 @@ fn create_dir_all_secure(dir: &Path) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// The directory exists and is group- or world-WRITABLE, or it cannot be
-/// `stat`ed. The message names the path, the offending mode, and the exact
-/// `chmod` that fixes it.
+/// The directory exists and is group- or world-WRITABLE, is owned by
+/// neither this process nor root, or it cannot be `stat`ed. The message
+/// names the path, the offending mode, and the exact `chmod`/`chown`
+/// that fixes it.
 pub(crate) fn enforce_key_dir_secure(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         if !dir.exists() {
             return Ok(());
         }
@@ -1168,6 +1193,26 @@ pub(crate) fn enforce_key_dir_secure(dir: &Path) -> Result<()> {
                 dir.display(),
             );
         }
+        // OpenSSH `secure_filename` precedent: mode bits alone are not enough
+        // when another uid owns a 0755 directory — that owner can swap the
+        // pair without needing group/other WRITE. Root-owned is accepted
+        // (the daemon is then a guest of a root-provisioned tree).
+        // SAFETY: `geteuid` has no preconditions and only reads process
+        // credentials (UNSAFE-01).
+        let euid = unsafe { libc::geteuid() };
+        if !key_dir_owner_ok(md.uid(), euid) {
+            bail!(
+                "key directory {} is owned by uid {}, not this process (euid {euid}) or \
+                 root; refusing to use it. The owner of a 0755 directory can replace \
+                 {}/<agent>.priv and <agent>.pub even without group/other write bits. \
+                 Restore with: chown {euid} {} && chmod 0700 {} (#3198)",
+                dir.display(),
+                md.uid(),
+                dir.display(),
+                dir.display(),
+                dir.display(),
+            );
+        }
     }
     #[cfg(not(unix))]
     {
@@ -1175,6 +1220,14 @@ pub(crate) fn enforce_key_dir_secure(dir: &Path) -> Result<()> {
         let _ = dir;
     }
     Ok(())
+}
+
+/// #3198 — a key directory is trustworthy only when owned by this process
+/// or by root. Pure so the gate and its tests cannot disagree (ERRORS-09).
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn key_dir_owner_ok(dir_uid: u32, euid: u32) -> bool {
+    dir_uid == euid || dir_uid == 0
 }
 
 /// #3198 — apply [`enforce_key_dir_secure`] to the directory `file` lives in
@@ -1186,6 +1239,13 @@ pub(crate) fn enforce_key_dir_secure(dir: &Path) -> Result<()> {
 /// key files sit several directories below `base`, and write access to ANY link
 /// in that chain is enough to replace the subtree holding the key — checking
 /// only the leaf would leave the nested layout half-guarded.
+///
+/// The walk STOPS at `base`. Ancestors above the caller-supplied key directory
+/// (`~/.config`, `$HOME`, sticky `/tmp` parents) are out of contract: a sticky
+/// world-writable parent of `base` is a host-layout concern, and refusing it
+/// would brick `/tmp`-style deployments. Write access to a link *inside* the
+/// keystore tree is enough to replace the subtree; write access *above* `base`
+/// is not this gate's job.
 ///
 /// Owned [`PathBuf`] walk via [`PathBuf::pop`], not a `&Path` reborrow of
 /// `.parent()`, so the loop cannot trip a 1.96 borrow-checker stall on
@@ -1513,6 +1573,34 @@ mod tests {
 
     fn tmp_dir() -> TempDir {
         TempDir::new().expect("tempdir")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_dir_owner_ok_accepts_self_or_root_3198() {
+        assert!(
+            key_dir_owner_ok(1000, 1000),
+            "a directory this process owns must pass"
+        );
+        assert!(
+            key_dir_owner_ok(0, 1000),
+            "a root-owned directory is the OpenSSH secure_filename exception"
+        );
+        assert!(
+            !key_dir_owner_ok(1001, 1000),
+            "another uid must be refused even at 0755"
+        );
+    }
+
+    #[test]
+    fn no_signing_identity_refusal_is_asi_hard_only() {
+        assert!(no_signing_identity_refusal(false, "cause").is_none());
+        let refusal = no_signing_identity_refusal(true, "cause").expect("asi-hard refuses");
+        assert!(
+            refusal.contains(crate::security_profile::ASI_HARD_REFUSAL_PREFIX)
+                && refusal.contains("cause"),
+            "got: {refusal}"
+        );
     }
 
     /// v1.0.0 #3051 — the shared rung-miss predicate both keypair-resolution
