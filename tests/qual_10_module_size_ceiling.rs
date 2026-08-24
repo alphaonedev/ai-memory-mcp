@@ -453,7 +453,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // what it now refuses, why the disposition is surface-keyed rather than
     // unconditional (3x3 vote 7-2), and which residual is deliberate.
     // MEASURED post-change: 28_047. Ceiling 27_900 -> 28_120 (+73 headroom).
-    ("src/storage/mod.rs", 29_900), /* 2026-08-24 (#3202 Fable HIGH rebase onto 72e4c100): execute_pending_action store arm dispatches mode=vertical onto promote_to_namespace + test_execute_store_arm_vertical_promote_clones_3202. MEASURED 29_818. Ceiling 29_600 -> 29_900 (+82 headroom). PRIOR: 2026-08-23 (#3216 Fable fail-closed): RE-MEASURED 29_516. Ceiling 29_600 stays then (never lower a floor); +84 headroom. PRIOR: 2026-08-22 (#3171 MCP tool-contract audit): STRICT forget_fts_query. Ceiling was 29_320 on that branch; folded into 29_600 at rebase onto d674047f/#3218. */
+    ("src/storage/mod.rs", 30_020), /* 2026-08-24 (#3220 Fable HIGH 2): refuse_unapproved_destination_store on promote execute arm + dest-owner pin. MEASURED 29_936. Ceiling 29_900 -> 30_020 (+84 headroom). PRIOR: 2026-08-24 (#3202 Fable HIGH rebase onto 72e4c100): execute_pending_action store arm dispatches mode=vertical onto promote_to_namespace + test_execute_store_arm_vertical_promote_clones_3202. MEASURED 29_818. Ceiling 29_600 -> 29_900 (+82 headroom). PRIOR: 2026-08-23 (#3216 Fable fail-closed): RE-MEASURED 29_516. Ceiling 29_600 stays then (never lower a floor); +84 headroom. PRIOR: 2026-08-22 (#3171 MCP tool-contract audit): STRICT forget_fts_query. Ceiling was 29_320 on that branch; folded into 29_600 at rebase onto d674047f/#3218. */
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
