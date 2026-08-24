@@ -27,6 +27,47 @@ const MSG_REGISTER_VALID_TIME_FNS: &str = "register valid-time SQL functions";
 const SQL_SCHEMA_VERSION_TABLE_PRESENT: &str =
     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'";
 
+/// v1.0.0 #2564 — STRUCTURAL corroboration that a database claiming version 0
+/// is not actually fresh.
+///
+/// Reads as `1` only when `memories` holds at least one row AND carries the
+/// `confidence` column, which the **v2** ladder arm adds
+/// (`ALTER TABLE memories ADD COLUMN confidence …`). Both halves are load
+/// bearing and neither can be dropped:
+///
+/// * the ROW test rules out a fresh install — `db::open` runs the bootstrap
+///   DDL *before* `migrate` writes the first stamp, so between those two steps
+///   a brand-new database legitimately has every table and a stamp of 0. What
+///   it does not have is data;
+/// * the COLUMN test rules out a legacy pre-v2 database mid-upgrade — that one
+///   legitimately has rows AND a stamp of 0, and must keep migrating. It
+///   cannot have `confidence`, because acquiring it IS the v2 step.
+///
+/// `pragma_table_info` is used rather than a `SELECT confidence …` probe so
+/// the check never depends on statement-preparation error text, and the whole
+/// query is one round trip against a table SQLite already has open.
+///
+/// Run ONLY after [`sqlite_table_present`] has proven `memories` exists.
+/// SQLite resolves relation references at PREPARE time, so this statement
+/// errors on a database with no `memories` — which is the ordinary fresh
+/// case, not damage. The table-presence probe is what makes that case
+/// structurally `Fresh`; a failure of THIS statement after the table has
+/// been shown to exist is damage and must propagate (never `unwrap_or`
+/// into [`SchemaStamp::Fresh`]).
+const SQL_SCHEMA_STAMP_ZERO_IS_IMPOSSIBLE: &str = "SELECT EXISTS(SELECT 1 FROM memories LIMIT 1) \
+     AND EXISTS(SELECT 1 FROM pragma_table_info('memories') WHERE name = 'confidence')";
+
+/// Catalogue-only presence probe. Parameterised so [`sqlite_table_present`]
+/// and the pre-migration snapshot gate name the same tables as data rather
+/// than baking them into SQL. `sqlite_master` is always readable; a failure
+/// here is I/O / lock / corruption, not "the table is absent".
+const SQL_SQLITE_TABLE_PRESENT: &str =
+    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1";
+
+/// Context label for a failed zeroed-stamp corroboration probe (#2564).
+/// Twin of `store::postgres::MSG_PROBE_SCHEMA_STAMP_CORROBORATION`.
+const MSG_PROBE_SCHEMA_STAMP_CORROBORATION: &str =
+    "probe whether a zero schema stamp is structurally impossible";
 /// #2266 — exact, parse-tolerant RFC3339 instant projection for SQLite KG
 /// predicates. Returning NULL for malformed text makes comparisons fail
 /// closed without modifying the H2-signed source bytes.
@@ -380,15 +421,70 @@ pub fn probe_schema_stamp(conn: &Connection) -> Result<SchemaStamp> {
     let present: i64 = conn
         .query_row(SQL_SCHEMA_VERSION_TABLE_PRESENT, [], |r| r.get(0))
         .context("probe for the schema_version relation")?;
-    if present == 0 {
-        return Ok(SchemaStamp::Fresh);
-    }
-    let version: i64 = conn
-        .query_row(super::migrations::SELECT_SCHEMA_VERSION_SQL, [], |r| {
+    let version: i64 = if present == 0 {
+        // The relation is absent. That is the ORDINARY fresh-database case —
+        // but #2564 makes it the same question as an empty/zeroed relation,
+        // because `DROP TABLE schema_version` and `DELETE FROM schema_version`
+        // land the guard in exactly the same place. Fall through to the
+        // structural corroboration below rather than short-circuiting.
+        0
+    } else {
+        conn.query_row(super::migrations::SELECT_SCHEMA_VERSION_SQL, [], |r| {
             r.get(0)
         })
-        .context("read the recorded schema version")?;
-    Ok(SchemaStamp::Known(version))
+        .context("read the recorded schema version")?
+    };
+    if version >= 1 {
+        return Ok(SchemaStamp::Known(version));
+    }
+    // v1.0.0 #2564 — a stamp of 0 (absent relation, empty relation, or an
+    // inserted `0`) or a NEGATIVE stamp. Distinguish a genuinely FRESH
+    // database from a POPULATED one whose stamp was destroyed; the latter is
+    // the strictly-better-than-#2445 attack (silent full-ladder replay with the
+    // pre-migration snapshot suppressed) and must fail closed.
+    //
+    // A negative stamp is illegal outright — no ladder writes one, so there is
+    // no legitimate database to protect and no corroboration to seek.
+    if version < 0 {
+        return Ok(SchemaStamp::Zeroed(version));
+    }
+    // Table-presence is the legitimate "no corroboration" case (a truly
+    // fresh database, or a partial-schema fixture). Distinguish it
+    // STRUCTURALLY: ask `sqlite_master` first (that catalogue is always
+    // there), and only then run the row/column test with `?`. A probe
+    // that cannot answer returns Err, never Fresh — see
+    // [`super::schema_guard`] (ERRORS-19). The previous `.unwrap_or(false)`
+    // collapsed I/O, lock and corruption failures into Fresh, which is
+    // exactly the fail-OPEN that would replay the ladder over live data.
+    if !sqlite_table_present(conn, super::TABLE_MEMORIES)? {
+        return Ok(SchemaStamp::Fresh);
+    }
+    let impossible: bool = conn
+        .query_row(SQL_SCHEMA_STAMP_ZERO_IS_IMPOSSIBLE, [], |r| {
+            r.get::<_, i64>(0).map(|n| n != 0)
+        })
+        .context(MSG_PROBE_SCHEMA_STAMP_CORROBORATION)?;
+    if impossible {
+        Ok(SchemaStamp::Zeroed(version))
+    } else {
+        Ok(SchemaStamp::Fresh)
+    }
+}
+
+/// v1.0.0 #2564 — is `table` present in `sqlite_master`?
+///
+/// `true` / `false` only when the catalogue answered. A catalogue that
+/// cannot be read is damage and must propagate: absence is a legitimate
+/// no-op, unreadability is not.
+///
+/// # Errors
+///
+/// Propagates a genuine query failure. Does not coerce one into "absent".
+pub(crate) fn sqlite_table_present(conn: &Connection, table: &str) -> Result<bool> {
+    let present: i64 = conn
+        .query_row(SQL_SQLITE_TABLE_PRESENT, [table], |r| r.get(0))
+        .with_context(|| format!("probe for the {table} relation"))?;
+    Ok(present != 0)
 }
 
 /// v1.0.0 #2445 — the shared downgrade guard for EVERY sqlite funnel that
@@ -405,8 +501,10 @@ pub fn probe_schema_stamp(conn: &Connection) -> Result<SchemaStamp> {
 /// # Errors
 ///
 /// [`super::schema_guard::SchemaAheadOfBinary`] when the database is newer
-/// than this binary's ladder produces, or the probe failure when the recorded
-/// version cannot be read.
+/// than this binary's ladder produces; v1.0.0 #2564
+/// [`super::schema_guard::SchemaStampZeroed`] when the recorded version is
+/// zero / negative / deleted on a database that provably holds durable rows;
+/// or the probe failure when the recorded version cannot be read.
 pub fn assert_schema_not_ahead(conn: &Connection, target: &str) -> Result<()> {
     resolve_schema_posture(conn, target).map(|_| ())
 }
@@ -434,10 +532,18 @@ pub enum SchemaPosture {
 /// # Errors
 ///
 /// [`super::schema_guard::SchemaAheadOfBinary`] when the database is newer than
-/// this binary's ladder produces and no matching hatch is in force, or the
-/// probe failure when the recorded version cannot be read.
+/// this binary's ladder produces and no matching hatch is in force; v1.0.0
+/// #2564 [`super::schema_guard::SchemaStampZeroed`] when the recorded version
+/// is zero / negative / deleted on a database that provably holds durable rows
+/// (the LOW-end twin — the hatch cannot authorise it); or the probe failure
+/// when the recorded version cannot be read.
 pub fn resolve_schema_posture(conn: &Connection, target: &str) -> Result<SchemaPosture> {
-    let observed = probe_schema_stamp(conn)?.version();
+    // v1.0.0 #2564 — `operable_version`, never `version()`: a ZEROED stamp has
+    // no operable version, and reading it as `0` is exactly the defect (a
+    // populated database replaying the whole ladder with the safety snapshot
+    // suppressed). The refusal is typed and propagates through `anyhow` to the
+    // diagnostic verbs, the same shape as the #2445 schema-ahead refusal.
+    let observed = probe_schema_stamp(conn)?.operable_version(BACKEND_SQLITE, target)?;
     let supported = super::migrations::current_schema_version();
     super::schema_guard::evaluate(observed, supported, BACKEND_SQLITE, target)?;
     Ok(if observed > supported {

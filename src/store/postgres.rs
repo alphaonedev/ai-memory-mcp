@@ -122,7 +122,8 @@ const SQL_ARCHIVE_ON_CONFLICT_LAST_WINS: &str = "ON CONFLICT (id) DO UPDATE SET 
      mentioned_entity_id = EXCLUDED.mentioned_entity_id, version = EXCLUDED.version, \
      lifecycle_state = EXCLUDED.lifecycle_state, \
      encrypted_envelope = EXCLUDED.encrypted_envelope, valid_from = EXCLUDED.valid_from, \
-     valid_until = EXCLUDED.valid_until";
+     valid_until = EXCLUDED.valid_until, \
+     cid = EXCLUDED.cid, cid_genesis = EXCLUDED.cid_genesis";
 /// #1642 / #2503 — postgres twin of
 /// `storage::SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID` (`src/storage/mod.rs`).
 ///
@@ -533,6 +534,93 @@ const SELECT_SCHEMA_VERSION_BIGINT_SQL: &str =
 /// Context label for a failed `schema_version` relation probe (#2445).
 const MSG_PROBE_SCHEMA_VERSION_RELATION: &str = "probe for the schema_version relation";
 
+/// v1.0.0 #2564, step 1 of 2 — CATALOGUE-ONLY half of the POSTGRES twin of
+/// `storage::connection::SQL_SCHEMA_STAMP_ZERO_IS_IMPOSSIBLE`.
+///
+/// True when `memories` exists AND carries the `confidence` column that the
+/// **v2** ladder arm adds. The column half is what rules out a legacy pre-v2
+/// database mid-upgrade, which legitimately stamps 0 with rows present and
+/// must keep migrating.
+///
+/// This query touches ONLY `to_regclass` and `pg_attribute`, so it can be run
+/// against a database with no application tables at all and still answer —
+/// which is the whole reason the probe is split in two. **A single statement
+/// cannot do this job.** PostgreSQL resolves every relation reference at
+/// PARSE time, so `to_regclass('memories') IS NOT NULL AND EXISTS(SELECT 1
+/// FROM memories …)` does NOT short-circuit: on a fresh database the whole
+/// statement fails with `relation "memories" does not exist` before the guard
+/// is ever evaluated (verified against a live server, not assumed). Since
+/// `connect_*` runs this gate PRE-BOOTSTRAP, a one-statement probe would fail
+/// EVERY fresh postgres install — turning an integrity guard into a total
+/// availability outage. Step 2 below is only ever reached once this one has
+/// proven the relation exists.
+///
+/// `pg_attribute` is used rather than `information_schema.columns` because the
+/// latter matches on a bare `table_name` and would answer for a `memories` in
+/// ANY schema the role can see; `attrelid = to_regclass('memories')` resolves
+/// through `search_path` to exactly the relation the rest of this adapter
+/// reads and writes. When `to_regclass` returns NULL the join matches nothing
+/// and the answer is `false` — no error, no false corroboration.
+const SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL: &str = "SELECT to_regclass('memories') IS NOT NULL \
+     AND EXISTS(SELECT 1 FROM pg_attribute \
+                WHERE attrelid = to_regclass('memories') \
+                  AND attname = 'confidence' AND NOT attisdropped)";
+
+/// v1.0.0 #2564, step 2 of 2 — the DURABLE-ROW half.
+///
+/// Run ONLY after [`SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL`] has proven
+/// the relation exists (see the parse-time note there). The row test is what
+/// rules out a genuinely fresh database: the bootstrap DDL creates every table
+/// BEFORE the first stamp is written, so between those two steps a brand-new
+/// database legitimately has the whole schema and a stamp of 0. What it does
+/// not have is data.
+const SELECT_SCHEMA_STAMP_MEMORIES_HAS_ROWS_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)";
+
+/// Context label for a failed zeroed-stamp corroboration probe (#2564).
+const MSG_PROBE_SCHEMA_STAMP_CORROBORATION: &str =
+    "probe whether a zero schema stamp is structurally impossible";
+
+/// v1.0.0 #2564 — is a recorded schema stamp of ZERO structurally impossible
+/// for this database?
+///
+/// `true` only when `memories` carries the v2 `confidence` column AND holds at
+/// least one row — i.e. the database is provably neither a fresh bootstrap nor
+/// a legacy pre-v2 upgrade, the only two states that legitimately stamp 0. The
+/// caller uses it to WIDEN a refusal, never to grant anything, so a `false`
+/// answer is always the permissive one.
+///
+/// Two round trips by necessity, not by preference: PostgreSQL resolves
+/// relation references at PARSE time, so a single statement guarding
+/// `EXISTS(SELECT 1 FROM memories …)` behind `to_regclass('memories') IS NOT
+/// NULL` still fails outright on a database that has no `memories` — and this
+/// probe runs PRE-BOOTSTRAP in `connect_*`, where exactly that is the normal
+/// case. The catalogue-only step answers safely there and short-circuits in
+/// Rust before the row test is ever prepared.
+///
+/// # Errors
+///
+/// Propagates a genuine connection / query failure. It does NOT swallow one:
+/// an unreachable server is not evidence that a zero stamp is legitimate, and
+/// the surrounding `connect_*` / `migrate_locked` paths cannot proceed on a
+/// dead pool anyway.
+async fn schema_stamp_zero_is_impossible(pool: &PgPool) -> StoreResult<bool> {
+    let post_v2: bool = sqlx::query_scalar(SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| to_store_err(MSG_PROBE_SCHEMA_STAMP_CORROBORATION, e))?;
+    if !post_v2 {
+        // No `memories` relation at all (a fresh database), or a pre-v2 shape
+        // that has not yet acquired `confidence`. Either way a stamp of 0 is
+        // legitimate and there is nothing to corroborate.
+        return Ok(false);
+    }
+    sqlx::query_scalar(SELECT_SCHEMA_STAMP_MEMORIES_HAS_ROWS_SQL)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| to_store_err(MSG_PROBE_SCHEMA_STAMP_CORROBORATION, e))
+}
+
 /// v1.0.0 #2445 — store label used by `migrate_locked`'s defense-in-depth
 /// guard, which has no DSN in scope. The `connect_*` gate that fires FIRST on
 /// every real open carries the redacted URL; this arm is only reachable by a
@@ -754,6 +842,17 @@ const MIGRATION_V88_LIST_COMPOSITE_INDEXES: &str =
 /// `memories_tsv_gin`. See [`PostgresStore::migrate_v89`] for the arm.
 const MIGRATION_V89_TSV_INCLUDE_TAGS: &str =
     include_str!("../../migrations/postgres/0046_v89_tsv_include_tags.sql");
+
+/// v1.0.0 #2385 — schema v90 canonical DDL, executed via `raw_sql` (the v87
+/// pattern). Mirrors the v74 (#1825) genesis content-id pair (`cid` TEXT /
+/// `cid_genesis` BYTEA) onto `archived_memories` so the archive funnels CARRY
+/// the address instead of dropping it and [`PostgresStore::archive_restore`]
+/// stops RE-MINTING it from six reconstructed inputs. Additive + `IF NOT
+/// EXISTS` (idempotent), no rewrite, no reindex. The sqlite twin is the
+/// probe-guarded arm in `storage::migrations` (`migrations/sqlite/
+/// 0074_v90_archived_cid.sql`). See [`PostgresStore::migrate_v90`].
+const MIGRATION_V90_ARCHIVED_CID: &str =
+    include_str!("../../migrations/postgres/0047_v90_archived_cid.sql");
 
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
@@ -1145,7 +1244,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 89;
+const CURRENT_SCHEMA_VERSION: i32 = 90;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1517,11 +1616,38 @@ impl PostgresStore {
                     .await
                     .map_err(|e| to_store_err(MSG_PROBE_SCHEMA_VERSION_RELATION, e))?;
             let mut schema_ahead = false;
-            if relation.is_some() {
-                let observed: i64 = sqlx::query_scalar(SELECT_SCHEMA_VERSION_BIGINT_SQL)
+            // v1.0.0 #2564 — an ABSENT relation is no longer a free pass: on
+            // postgres the schema is SHARED by every daemon on the cluster, so
+            // `DROP TABLE schema_version` / `DELETE FROM schema_version` moves
+            // every node into a full v1 -> tip ladder replay over live data at
+            // once. Read the stamp as 0 when the relation is missing and let
+            // the SAME structural corroboration decide, exactly as the sqlite
+            // `probe_schema_stamp` twin does.
+            let observed: i64 = if relation.is_some() {
+                sqlx::query_scalar(SELECT_SCHEMA_VERSION_BIGINT_SQL)
                     .fetch_one(&pool)
                     .await
-                    .map_err(|e| to_store_err(crate::errors::msg::READ_SCHEMA_VERSION, e))?;
+                    .map_err(|e| to_store_err(crate::errors::msg::READ_SCHEMA_VERSION, e))?
+            } else {
+                0
+            };
+            if observed < 1 {
+                // A negative stamp is illegal outright; a zero stamp is illegal
+                // only when the database is provably not fresh.
+                let impossible: bool = if observed < 0 {
+                    true
+                } else {
+                    schema_stamp_zero_is_impossible(&pool).await?
+                };
+                if impossible {
+                    crate::storage::schema_guard::SchemaStamp::Zeroed(observed)
+                        .operable_version(
+                            crate::storage::schema_guard::BACKEND_POSTGRES,
+                            &store_label,
+                        )?;
+                }
+            }
+            if relation.is_some() {
                 crate::storage::schema_guard::evaluate(
                     observed,
                     i64::from(CURRENT_SCHEMA_VERSION),
@@ -2221,6 +2347,27 @@ impl PostgresStore {
 
         let current_version = current_version.unwrap_or(0);
 
+        // v1.0.0 #2564 — LOW-end guard, defense-in-depth behind the
+        // pre-bootstrap gate in `connect_*` (the #2445 twin, one rung down).
+        // `unwrap_or(0)` above is exactly the coercion the issue names: a
+        // deleted / zeroed / negative stamp lands here as 0 and would replay
+        // the whole ladder over live data. Refuse when the database is provably
+        // not fresh; a negative stamp is illegal outright.
+        if current_version < 1 {
+            let impossible: bool = if current_version < 0 {
+                true
+            } else {
+                schema_stamp_zero_is_impossible(&self.pool).await?
+            };
+            if impossible {
+                crate::storage::schema_guard::SchemaStamp::Zeroed(i64::from(current_version))
+                    .operable_version(
+                        crate::storage::schema_guard::BACKEND_POSTGRES,
+                        POSTGRES_STORE_LABEL,
+                    )?;
+            }
+        }
+
         // v1.0.0 #2445 — DOWNGRADE guard, defense-in-depth behind the
         // pre-bootstrap gate in `connect_*`. `>` refuses (an older binary
         // writing a newer schema drops columns it does not know); `==` keeps
@@ -2479,8 +2626,11 @@ impl PostgresStore {
         if current_version < 88 {
             self.migrate_v88().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 89 {
             self.migrate_v89().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v90().await?;
         }
 
         Ok(())
@@ -5247,8 +5397,9 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v89 tsv-include-tags ddl", e))?;
 
-        // Tip arm — stamp the symbolic const (the current-tip convention).
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // SETTLED arm — v90 (#2385) took the tip, so v89 is LITERALIZED into
+        // the monotonic literal lane (the #2218 convention).
+        record_schema_version(&mut tx, 89).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v89 migration", e))?;
@@ -5258,6 +5409,64 @@ impl PostgresStore {
             "schema migration v89 applied (#2392: fold tags into the stored \
              generated tsv tsvector + reindex memories_tsv_gin; cross-backend \
              FTS parity with sqlite memories_fts(title, content, tags))"
+        );
+        Ok(())
+    }
+
+    /// v1.0.0 #2385 — schema v90: ARCHIVE CID PARITY.
+    ///
+    /// Adds the v74 (#1825) genesis content-id pair (`cid` TEXT,
+    /// `cid_genesis` BYTEA) to `archived_memories`. Pre-v90 the archive
+    /// mirror had no cid columns, so all seven archive `INSERT ... SELECT`
+    /// funnels DROPPED the address and [`Self::archive_restore`] RE-MINTED it
+    /// from six reconstructed inputs (`agent_id` / `namespace` / `title` /
+    /// `memory_kind` / `created_at` / decrypted plaintext). A re-mint
+    /// reproduces the original address only if ALL SIX are byte-identical at
+    /// restore time; a rewritten `metadata.agent_id`, or a decrypt failure
+    /// whose `unwrap_or` falls back to the ciphertext placeholder, silently
+    /// re-addressed the durable row and dangled every `memory_links.source_cid`
+    /// / `target_cid` mirror resolving to it — the v74 genesis-identity
+    /// contract violated with no write intent and no error.
+    ///
+    /// Purely additive and `IF NOT EXISTS`-guarded, so it is idempotent and
+    /// takes no more than a catalogue-update lock (no table rewrite, unlike
+    /// the v57/v89 STORED-generated adds). It BACKFILLS NOTHING: a pre-v90
+    /// archived row's genesis address cannot be proven from the archive alone,
+    /// so those rows keep NULL and the restore path keeps the legacy re-mint
+    /// fallback for exactly them. Inventing an address we cannot prove would
+    /// be the corruption this arm exists to stop.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the transaction / DDL / version-stamp failure; the caller
+    /// stays at v89 and retries on the next boot (fail closed).
+    async fn migrate_v90(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V90_ARCHIVED_CID.contains(TABLE_ARCHIVED_MEMORIES),
+            "#2385: the v90 DDL doc twin must ship with the binary"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v90 archived-cid ddl tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V90_ARCHIVED_CID)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v90 archived-cid ddl", e))?;
+
+        // Tip arm — stamp the symbolic const (the current-tip convention).
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v90 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v90 applied (#2385: archived_memories.cid / \
+             cid_genesis — archive->restore now CARRIES the v74 genesis \
+             content-id instead of re-minting it)"
         );
         Ok(())
     }
@@ -5999,7 +6208,7 @@ impl PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -6007,7 +6216,7 @@ impl PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -6425,7 +6634,7 @@ impl PostgresStore {
                  reflection_depth, atomised_into, atom_of, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
@@ -6433,7 +6642,7 @@ impl PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
              FROM memories WHERE id = $1
              {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
         ))
@@ -11763,7 +11972,17 @@ impl PostgresStore {
                 -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (the `store()` COALESCE precedent).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON (see the `store()` twin). The CASE
+                -- mirrors THIS funnel's `memory_kind` CASE exactly — which,
+                -- unlike every other pg funnel, carries no `persona` arm; that
+                -- sqlite-parity gap is a separate residual and is deliberately
+                -- NOT widened here.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind = 'reflection'
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
             RETURNING id",
         )
         .bind(&new_id)
@@ -17059,11 +17278,31 @@ impl MemoryStore for PostgresStore {
                 -- #1629 — Form-5 sqlite parity: an explicit non-default
                 -- provenance replaces; the caller_provided default keeps the
                 -- stored (auto-derived / calibrated) signal.
-                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
-                                         THEN EXCLUDED.confidence_source
+                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+                -- merges by GREATEST above, so the calibration record that
+                -- DESCRIBES that number must come from the SAME operand that
+                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+                -- re-store with a LOWER confidence but a non-default source
+                -- kept the stored 0.9 and stamped the incoming label + signals
+                -- over it — durable Form-5 corruption, silent to every reader.
+                -- Selector = the GREATEST winner: > takes the incoming tuple,
+                -- < keeps the stored tuple, and an exact tie keeps the #1629
+                -- rule verbatim (explicit non-`caller_provided` replaces) but
+                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+                -- total order, never a logical float-equality test.
+                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 -- #1608 / #1629 — QW-2 persona-artifact columns stay sticky:
                 -- the sqlite COALESCE order keeps the value the row was
                 -- minted with (old wins), so match it.
@@ -17086,7 +17325,22 @@ impl MemoryStore for PostgresStore {
                 -- v1.0.0 (#1945) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (COALESCE).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance),
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END,
                 -- v1.0.0 #1834 — sqlite `db::insert` parity: valid_from is
                 -- immutable (stored value wins), valid_until is caller-updatable
                 -- (COALESCE takes a fresh upper bound, else keeps existing).
@@ -17562,11 +17816,31 @@ impl MemoryStore for PostgresStore {
                                  ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
-                                         THEN EXCLUDED.confidence_source
+                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+                -- merges by GREATEST above, so the calibration record that
+                -- DESCRIBES that number must come from the SAME operand that
+                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+                -- re-store with a LOWER confidence but a non-default source
+                -- kept the stored 0.9 and stamped the incoming label + signals
+                -- over it — durable Form-5 corruption, silent to every reader.
+                -- Selector = the GREATEST winner: > takes the incoming tuple,
+                -- < keeps the stored tuple, and an exact tie keeps the #1629
+                -- rule verbatim (explicit non-`caller_provided` replaces) but
+                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+                -- total order, never a logical float-equality test.
+                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
                 persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
@@ -17592,7 +17866,22 @@ impl MemoryStore for PostgresStore {
                 -- v1.0.0 (#1945 / #2289) — sqlite + `store()` parity: the
                 -- epistemic-typing provenance follows the incoming write when
                 -- present, else keeps the stored marker (COALESCE).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
             -- v1.0.0 #2383 (N1) — the POST-update `metadata.agent_id` (after
             -- the existing-wins provenance overlay above) rides back on the
             -- SAME statement, so the envelope-owner reconcile below costs
@@ -17945,11 +18234,31 @@ impl MemoryStore for PostgresStore {
                                  ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
-                                         THEN EXCLUDED.confidence_source
+                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+                -- merges by GREATEST above, so the calibration record that
+                -- DESCRIBES that number must come from the SAME operand that
+                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+                -- re-store with a LOWER confidence but a non-default source
+                -- kept the stored 0.9 and stamped the incoming label + signals
+                -- over it — durable Form-5 corruption, silent to every reader.
+                -- Selector = the GREATEST winner: > takes the incoming tuple,
+                -- < keeps the stored tuple, and an exact tie keeps the #1629
+                -- rule verbatim (explicit non-`caller_provided` replaces) but
+                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+                -- total order, never a logical float-equality test.
+                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
@@ -17958,7 +18267,22 @@ impl MemoryStore for PostgresStore {
                 -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (the `store()` COALESCE precedent).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
             RETURNING id",
         )
         .bind(&memory.id)
@@ -18276,11 +18600,31 @@ impl MemoryStore for PostgresStore {
                                  ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
-                                         THEN EXCLUDED.confidence_source
+                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+                -- merges by GREATEST above, so the calibration record that
+                -- DESCRIBES that number must come from the SAME operand that
+                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+                -- re-store with a LOWER confidence but a non-default source
+                -- kept the stored 0.9 and stamped the incoming label + signals
+                -- over it — durable Form-5 corruption, silent to every reader.
+                -- Selector = the GREATEST winner: > takes the incoming tuple,
+                -- < keeps the stored tuple, and an exact tie keeps the #1629
+                -- rule verbatim (explicit non-`caller_provided` replaces) but
+                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+                -- total order, never a logical float-equality test.
+                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
@@ -18288,7 +18632,22 @@ impl MemoryStore for PostgresStore {
                 -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (the `store()` COALESCE precedent).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
             RETURNING id",
         )
         .bind(&memory.id)
@@ -18869,7 +19228,7 @@ impl MemoryStore for PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -18877,7 +19236,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -20359,24 +20718,45 @@ impl MemoryStore for PostgresStore {
                 END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
+                -- v1.0.0 #2395 (pg mirror of the sqlite `insert_if_newer`
+                -- twin) — the confidence field-set is ATOMIC. `confidence`
+                -- merges by GREATEST (a commutative lattice join) while these
+                -- three merged on the updated_at/id NEWER-WINS tiebreak: a
+                -- DIFFERENT selector, so a peer that LOST the GREATEST but WON
+                -- the timestamp durably relabelled the surviving number with
+                -- its own source / signals / decayed_at. Every replica
+                -- converges on that inconsistent tuple, i.e. permanently.
+                -- The tuple now rides the operand that wins the LEXICOGRAPHIC
+                -- order (confidence, updated_at, id) — whose first component
+                -- IS the GREATEST above, so value and calibration record always
+                -- describe the same write. The order is total and deterministic
+                -- on both sides of a bidirectional sync, so the merge stays
+                -- commutative / idempotent. `=` on the REAL is only the tie
+                -- BRANCH of that order, never a logical float-equality test.
                 confidence_source = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                         OR (EXCLUDED.updated_at = memories.updated_at
-                             AND EXCLUDED.id > memories.id)
+                    WHEN EXCLUDED.confidence > memories.confidence
+                         OR (EXCLUDED.confidence = memories.confidence
+                             AND (EXCLUDED.updated_at > memories.updated_at
+                                  OR (EXCLUDED.updated_at = memories.updated_at
+                                      AND EXCLUDED.id > memories.id)))
                         THEN EXCLUDED.confidence_source
                     ELSE memories.confidence_source
                 END,
                 confidence_signals = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                         OR (EXCLUDED.updated_at = memories.updated_at
-                             AND EXCLUDED.id > memories.id)
+                    WHEN EXCLUDED.confidence > memories.confidence
+                         OR (EXCLUDED.confidence = memories.confidence
+                             AND (EXCLUDED.updated_at > memories.updated_at
+                                  OR (EXCLUDED.updated_at = memories.updated_at
+                                      AND EXCLUDED.id > memories.id)))
                         THEN EXCLUDED.confidence_signals
                     ELSE memories.confidence_signals
                 END,
                 confidence_decayed_at = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                         OR (EXCLUDED.updated_at = memories.updated_at
-                             AND EXCLUDED.id > memories.id)
+                    WHEN EXCLUDED.confidence > memories.confidence
+                         OR (EXCLUDED.confidence = memories.confidence
+                             AND (EXCLUDED.updated_at > memories.updated_at
+                                  OR (EXCLUDED.updated_at = memories.updated_at
+                                      AND EXCLUDED.id > memories.id)))
                         THEN EXCLUDED.confidence_decayed_at
                     ELSE memories.confidence_decayed_at
                 END,
@@ -20431,7 +20811,22 @@ impl MemoryStore for PostgresStore {
                 -- already CLAIMED pg parity that was never wired): COALESCE
                 -- keeps the local value when the peer carries none, so a
                 -- replication hop can never blank an already-typed row.
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: the surviving local row keeps its genesis cid on a
                 -- federation-merge (preserves the local genesis pre-image).
@@ -22433,7 +22828,7 @@ impl MemoryStore for PostgresStore {
                     -- #2196 - carry lifecycle_state so a non-open archived state
                     -- survives the archive->restore round-trip (restore no longer
                     -- COALESCEs a NULL to 'open'); mirrors the sqlite archive.
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -22442,7 +22837,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 FROM memories
                 WHERE ($1::text IS NULL OR namespace = $1)
                   AND ($2::text IS NULL OR tier = $2)
@@ -24987,7 +25382,7 @@ impl MemoryStore for PostgresStore {
                     confidence_source, confidence_signals, confidence_decayed_at,
                     -- #2196 - carry lifecycle_state through the TTL archive so a
                     -- non-open state survives archive->restore (postgres parity).
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -24996,7 +25391,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 FROM memories
                 WHERE expires_at IS NOT NULL AND expires_at < $1
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
@@ -25165,7 +25560,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                     )
                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
                            source, access_count, created_at, updated_at, last_accessed_at,
@@ -25174,7 +25569,7 @@ impl MemoryStore for PostgresStore {
                            reflection_depth, atomised_into, atom_of, memory_kind,
                            entity_id, persona_version, citations, source_uri, source_span,
                            confidence_source, confidence_signals, confidence_decayed_at,
-                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                     FROM memories
                     WHERE id = $1
                     -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
@@ -25371,7 +25766,22 @@ impl MemoryStore for PostgresStore {
                    COALESCE(version, 1),
                    COALESCE(lifecycle_state, 'open'),
                    encrypted_envelope,
-                   $3::text, $4::bytea,
+                   -- v1.0.0 #2385 — the STORED genesis identity WINS. Pre-#2385
+                   -- `archived_memories` had no cid columns, so restore
+                   -- unconditionally bound the re-mint ($3/$4) recomputed from six
+                   -- reconstructed inputs (agent_id / namespace / title / kind /
+                   -- created_at / decrypted plaintext) — and a decrypt failure
+                   -- there falls back to the CIPHERTEXT placeholder. Any drift
+                   -- silently re-addressed the durable row and dangled every
+                   -- `memory_links.source_cid` / `target_cid` mirror. The v90
+                   -- columns make the identity a CARRIED fact; the re-mint is now
+                   -- the legacy fallback for pre-v90 archive rows only.
+                   -- The PAIR is selected atomically (the #2395 lesson applied
+                   -- here): `cid_genesis` is the canonical PRE-IMAGE of `cid`, so
+                   -- mixing a carried address with a re-derived pre-image would
+                   -- produce a row whose own verify disagrees with itself.
+                   CASE WHEN cid IS NOT NULL THEN cid ELSE $3::text END,
+                   CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE $4::bytea END,
                    -- v1.0.0 #2333 (FBL-03 pg mirror) — carry kind_provenance
                    -- back on restore; legacy pre-v87 archive rows re-derive
                    -- it from the metadata carrier, vocab-guarded (sqlite twin).
@@ -25656,7 +26066,7 @@ impl MemoryStore for PostgresStore {
                     confidence_source, confidence_signals, confidence_decayed_at,
                     -- #2196 - carry lifecycle_state through the manual archive so a
                     -- non-open state survives archive->restore (postgres parity).
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -25665,7 +26075,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 FROM memories WHERE id = $3
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
                 {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
@@ -28888,11 +29298,31 @@ impl PostgresStore {
                                  ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
-                                         THEN EXCLUDED.confidence_source
+                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+                -- merges by GREATEST above, so the calibration record that
+                -- DESCRIBES that number must come from the SAME operand that
+                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+                -- re-store with a LOWER confidence but a non-default source
+                -- kept the stored 0.9 and stamped the incoming label + signals
+                -- over it — durable Form-5 corruption, silent to every reader.
+                -- Selector = the GREATEST winner: > takes the incoming tuple,
+                -- < keeps the stored tuple, and an exact tie keeps the #1629
+                -- rule verbatim (explicit non-`caller_provided` replaces) but
+                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+                -- total order, never a logical float-equality test.
+                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
                 persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
                 embedding = COALESCE(EXCLUDED.embedding, memories.embedding),
@@ -28925,7 +29355,22 @@ impl PostgresStore {
                 -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (the `store()` COALESCE precedent).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+                -- stored `reflection` / `persona` is never downgraded), but the
+                -- bare COALESCE adopted the incoming provenance unconditionally,
+                -- so a row that KEPT its stored kind was relabelled with the
+                -- REJECTED write's provenance — durable metadata attesting a
+                -- kind the merge threw away. The CASE mirrors the `memory_kind`
+                -- CASE above exactly (kind unchanged -> the #1945/#2393
+                -- COALESCE; stored sticky kind survived -> keep the stored
+                -- provenance; incoming kind adopted -> its provenance verbatim,
+                -- NULL included) and is NULL-safe by construction.
+                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE EXCLUDED.kind_provenance END
             RETURNING id";
         // #2771/#2887 — single-source the column list + binds + the whole DO
         // UPDATE SET arm across every disposition; only the ON CONFLICT
@@ -30919,6 +31364,129 @@ mod tests {
             valid_from: None,
             valid_until: None,
         }
+    }
+
+    /// v1.0.0 #2564 — the zeroed-stamp corroboration probe must be VALID and
+    /// CORRECT against a real PostgreSQL server, not merely plausible.
+    ///
+    /// This is the one arm of the low-end guard that cannot be exercised by
+    /// simply connecting: `connect_*` and `migrate_locked` run the probe only
+    /// when the observed stamp is `< 1`, and a healthy test database is at the
+    /// tip. So the SQL would otherwise ship never having been parsed by
+    /// postgres — a fail-CLOSED guard whose refusal path errors on a syntax or
+    /// catalogue mistake is a guard that converts a repairable incident into an
+    /// opaque one. Run it directly instead.
+    ///
+    /// It must answer `true` here: this database holds `memories` rows AND
+    /// carries `memories.confidence`, which is exactly the structural
+    /// corroboration that a stamp of 0 would be impossible. (The negative
+    /// cases — no relation, no rows, pre-v2 shape — are covered backend-
+    /// agnostically in `tests/schema_stamp_zeroed_guard_2564.rs`.)
+    #[tokio::test]
+    async fn live_schema_stamp_zero_corroboration_probe_is_valid_sql_2564() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        // Guarantee at least one durable row so the EXISTS half is true
+        // regardless of what else ran against this shared database.
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("stamp-probe-2564-{}", uuid::Uuid::new_v4());
+        let mem = sample_memory(
+            &format!("test-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "stamp probe row",
+            "durable row so the corroboration probe has something to see",
+        );
+        store.store(&ctx, &mem).await.expect("store");
+
+        let impossible = schema_stamp_zero_is_impossible(&store.pool)
+            .await
+            .expect("#2564: the corroboration probe must be valid postgres SQL");
+        assert!(
+            impossible,
+            "#2564: a populated, post-v2 database must corroborate that a zero \
+             schema stamp is structurally impossible"
+        );
+
+        // The half that a one-statement probe got WRONG. PostgreSQL resolves
+        // relation references at PARSE time, so guarding
+        // `EXISTS(SELECT 1 FROM memories …)` behind `to_regclass('memories')
+        // IS NOT NULL` in ONE statement still fails with
+        // `relation "memories" does not exist` on a database that has none —
+        // and `connect_*` runs this gate PRE-BOOTSTRAP, where that is the
+        // NORMAL state of every fresh install. A probe that errors there turns
+        // an integrity guard into a total availability outage: no fresh
+        // postgres deployment could ever bootstrap.
+        //
+        // Pin the PRODUCTION catalogue-only constant — not a restated
+        // `$1 || '.memories'` cousin — under `SET LOCAL search_path` in a
+        // transaction, so `to_regclass('memories')` resolves the same way
+        // `connect_*` does and the pooled connection's GUC is not mutated.
+        let scratch = format!("stamp_probe_2564_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA \"{scratch}\""))
+            .execute(&store.pool)
+            .await
+            .expect("create scratch schema");
+
+        {
+            let mut tx = store
+                .pool
+                .begin()
+                .await
+                .expect("begin public-search_path tx");
+            sqlx::query("SET LOCAL search_path TO public")
+                .execute(&mut *tx)
+                .await
+                .expect("SET LOCAL search_path public");
+            let public_answer: bool =
+                sqlx::query_scalar(SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect(
+                        "#2564: SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL must parse \
+                         under SET LOCAL search_path",
+                    );
+            assert!(
+                public_answer,
+                "#2564: production catalogue-only SQL must see memories.confidence \
+                 on a populated public schema"
+            );
+            tx.rollback().await.expect("rollback public-search_path tx");
+        }
+
+        let empty_schema_answer: Result<bool, sqlx::Error> = {
+            let mut tx = store
+                .pool
+                .begin()
+                .await
+                .expect("begin empty-schema search_path tx");
+            sqlx::query(&format!("SET LOCAL search_path TO \"{scratch}\""))
+                .execute(&mut *tx)
+                .await
+                .expect("SET LOCAL search_path scratch");
+            let answer = sqlx::query_scalar(SELECT_SCHEMA_STAMP_MEMORIES_IS_POST_V2_SQL)
+                .fetch_one(&mut *tx)
+                .await;
+            tx.rollback()
+                .await
+                .expect("rollback empty-schema search_path tx");
+            answer
+        };
+        sqlx::query(&format!("DROP SCHEMA \"{scratch}\" CASCADE"))
+            .execute(&store.pool)
+            .await
+            .expect("drop scratch schema");
+        let answered = empty_schema_answer.expect(
+            "#2564: the catalogue-only step must ANSWER for a missing relation, \
+             never error — every fresh install depends on it",
+        );
+        assert!(
+            !answered,
+            "#2564: a database with no `memories` relation offers no \
+             corroboration, so a zero stamp there is legitimate"
+        );
     }
 
     #[tokio::test]

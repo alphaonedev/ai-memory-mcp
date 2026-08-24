@@ -636,11 +636,25 @@ fn run_local(db_path: &Path) -> Report {
             // downgraded node will not start, so the one diagnosis it must not
             // flatten into "could not open database" is the one that says
             // exactly which binary version to install.
+            //
+            // v1.0.0 #2564 — the LOW-end refusal gets the SAME treatment for
+            // the same reason. It is the harder incident to diagnose of the
+            // two: a destroyed `schema_version` row leaves a database that
+            // looks perfectly healthy from the outside, so flattening it into
+            // "could not open database" would hide the single fact the
+            // operator needs (the stamp, not the data, is what is wrong) at
+            // the exact moment it is needed.
             let ahead = crate::storage::schema_guard::schema_ahead_of(&e);
+            let zeroed = crate::storage::schema_guard::schema_stamp_zeroed(&e);
             let mut facts = vec![("error".into(), e.to_string())];
             if let Some(a) = ahead {
                 facts.push(("db_schema".into(), a.observed.to_string()));
                 facts.push(("binary_supports_schema".into(), a.supported.to_string()));
+            }
+            if let Some(z) = zeroed {
+                facts.push(("db_schema".into(), z.observed.to_string()));
+                facts.push(("binary_supports_schema".into(), z.supported.to_string()));
+                facts.push(("schema_stamp".into(), "invalid".into()));
             }
             sections.push(ReportSection {
                 name: "Storage".into(),
@@ -651,6 +665,17 @@ fn run_local(db_path: &Path) -> Report {
                         "database at {} is on a schema NEWER than this binary — refusing \
                          to operate it. Every other section is N/A. `ai-memory backup` \
                          still works against this database.",
+                        db_path.display()
+                    )
+                } else if zeroed.is_some() {
+                    format!(
+                        "database at {} records an INVALID schema version (zero, negative \
+                         or deleted) while holding durable rows — refusing to operate it, \
+                         because migrating from a zero stamp would replay the entire \
+                         migration ladder over live data with the pre-migration safety \
+                         snapshot suppressed. Every other section is N/A. `ai-memory \
+                         backup` still works against this database: snapshot it BEFORE \
+                         repairing the `schema_version` row.",
                         db_path.display()
                     )
                 } else {

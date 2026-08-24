@@ -104,7 +104,7 @@ pub const INVENTORY_REFRESH_SECS: u64 = crate::SECS_PER_HOUR as u64;
 /// The live memories table — the second existence lane the orphan reconciler
 /// consults so a bundle whose row was restored back to `memories` is left
 /// alone (never a caller input; a fixed const alongside [`ARCHIVED_TABLE`]).
-const MEMORIES_TABLE: &str = "memories";
+const MEMORIES_TABLE: &str = crate::storage::TABLE_MEMORIES;
 
 /// Payload JSON: top-level key naming the source table.
 const PAYLOAD_KEY_TABLE: &str = "table";
@@ -115,7 +115,7 @@ const PAYLOAD_KEY_COLUMNS: &str = "columns";
 /// Payload JSON: blob wrapper key (`{"$b64": "..."}`).
 const PAYLOAD_KEY_B64: &str = "$b64";
 /// The protected table.
-const ARCHIVED_TABLE: &str = "archived_memories";
+const ARCHIVED_TABLE: &str = crate::storage::TABLE_ARCHIVED_MEMORIES;
 const SWEEP_FRONTIER_STATE_FILE: &str = ".sweep-frontier.json";
 const RECONCILE_CURSOR_STATE_FILE: &str = ".reconcile-cursor";
 const POISON_RETRY_STATE_FILE: &str = ".sweep-poison-retry.json";

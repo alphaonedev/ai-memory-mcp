@@ -624,17 +624,31 @@ pub fn run_backup(
     // no trigger install) and proceed. Every other open failure still
     // propagates. `open_read_only` cannot serve this path — `PRAGMA
     // query_only = ON` refuses `VACUUM INTO` (verified, not assumed).
+    //
+    // v1.0.0 #2564 — the ZEROED-stamp refusal takes the SAME fallback, and it
+    // needs it even more urgently. That refusal's operator message states
+    // "`ai-memory backup` continues to operate against this database, so
+    // snapshot it before doing anything else"; without this arm that sentence
+    // would be a lie and the one instruction we give the operator in a
+    // destroyed-stamp incident would fail. The two refusals share the exact
+    // property that makes the fallback sound: neither says the BYTES are
+    // untrustworthy, only that this binary must not MIGRATE them, and
+    // `VACUUM INTO` copies bytes it does not have to understand.
     let conn = match db::open(&source_db) {
         Ok(conn) => conn,
-        Err(e) if crate::storage::schema_guard::schema_ahead_of(&e).is_some() => {
+        Err(e)
+            if crate::storage::schema_guard::schema_ahead_of(&e).is_some()
+                || crate::storage::schema_guard::schema_stamp_zeroed(&e).is_some() =>
+        {
             tracing::warn!(
                 target: crate::storage::schema_guard::TRACE_TARGET,
                 error = %e,
-                "database schema is ahead of this binary — taking the snapshot anyway \
+                "this binary refuses to MIGRATE this database (schema ahead of the \
+                 binary, or a destroyed version stamp) — taking the snapshot anyway \
                  through the read-oriented funnel so the durable text is preserved"
             );
             db::open_unmigrated(&source_db)
-                .context("opening source DB for backup (schema-ahead fallback)")?
+                .context("opening source DB for backup (schema-refusal fallback)")?
         }
         Err(e) => return Err(e.context("opening source DB for backup")),
     };
@@ -932,8 +946,17 @@ pub fn run_restore(
                 snapshot_path.display()
             )
         })?;
+        // v1.0.0 #2564 — `operable_version`, never `version()`. A snapshot
+        // whose `schema_version` row was deleted / zeroed / set negative reads
+        // as 0 and would sail through the ceiling check below, then be PLANTED
+        // over the live corpus — where the next open replays the entire ladder
+        // with the pre-migration snapshot suppressed. Refuse the plant.
+        let observed = stamp.operable_version(
+            crate::storage::schema_guard::BACKEND_SQLITE,
+            &snapshot_path.display().to_string(),
+        )?;
         crate::storage::schema_guard::evaluate(
-            stamp.version(),
+            observed,
             crate::storage::migrations::current_schema_version(),
             crate::storage::schema_guard::BACKEND_SQLITE,
             &snapshot_path.display().to_string(),

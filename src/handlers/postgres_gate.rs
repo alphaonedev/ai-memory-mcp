@@ -762,6 +762,17 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         // The message carries two integers and a version string (no URL, no
         // path, no adapter internals), so it is emitted unsanitised.
         StoreError::SchemaAheadOfBinary { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        // v1.0.0 #2564 — the LOW-end twin: this database's `schema_version`
+        // stamp is zero / negative / deleted while the database provably holds
+        // durable rows, so operating it would replay the ENTIRE v1 -> tip
+        // ladder over live data with the pre-migration safety snapshot
+        // suppressed. Same disposition as the schema-ahead arm above and for
+        // the same reason: not our fault, not transient, persists until an
+        // operator repairs the stamp — 503 so an orchestrator PARKS the node
+        // rather than crash-looping it into the replay. The message carries
+        // two integers and a store label (no DSN, no credentials), so it is
+        // emitted unsanitised like its twin.
+        StoreError::SchemaStampInvalid { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
         // #1795 — UNREACHABLE in practice: the `if let` above returns the full
         // 429 QUOTA_EXCEEDED envelope before this match runs. Named here only
         // because #2445 replaced the `_` wildcard with an exhaustive terminal

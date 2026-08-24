@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 89).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 90).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -864,7 +864,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 89;
+const CURRENT_SCHEMA_VERSION: i64 = 90;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -903,6 +903,56 @@ fn database_main_file_path(conn: &Connection) -> Option<PathBuf> {
     .ok()
     .filter(|file| !file.is_empty())
     .map(PathBuf::from)
+}
+
+/// Row-existence half of the pre-migration snapshot gate, named per tier so
+/// SQLite's prepare-time relation resolution cannot turn a missing
+/// `archived_memories` (pre-v4) into a failed probe of `memories`.
+const SQL_MEMORIES_HOLDS_ROWS: &str = "SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)";
+const SQL_ARCHIVED_MEMORIES_HOLDS_ROWS: &str =
+    "SELECT EXISTS(SELECT 1 FROM archived_memories LIMIT 1)";
+
+/// v1.0.0 #2564 — does this database hold any durable rows worth snapshotting?
+///
+/// Used ONLY to widen the pre-migration snapshot gate, never to refuse an
+/// open. BOTH tiers are probed, each in its OWN statement. `archived_memories`
+/// is durable text too — a corpus that has been fully archived (or restored
+/// from a bundle into cold storage) holds no `memories` rows at all, and the
+/// v86/v87 ladder arms rewrite `archived_memories` renderings — so a
+/// `memories`-only probe would skip the snapshot on exactly that database.
+/// Two statements rather than one `OR` because SQLite resolves relations at
+/// PREPARE time: a single statement naming both would fail outright on a
+/// pre-v4 database that has `memories` but not yet `archived_memories`.
+///
+/// Table-presence is the legitimate "no rows to snapshot" case (a genuinely
+/// fresh open, or a partial-schema fixture). Distinguish it STRUCTURALLY:
+/// ask `sqlite_master` first, then run the row test with `?`. A catalogue
+/// or row probe that cannot answer is damage — propagate it rather than
+/// `.unwrap_or(false)`, which would skip the snapshot on a populated
+/// database whose pages we failed to read (ERRORS-19).
+///
+/// # Errors
+///
+/// Propagates a genuine `sqlite_master` or row-probe failure.
+fn database_holds_durable_rows(conn: &Connection) -> Result<bool> {
+    for (table, has_rows_sql) in [
+        (super::TABLE_MEMORIES, SQL_MEMORIES_HOLDS_ROWS),
+        (
+            super::TABLE_ARCHIVED_MEMORIES,
+            SQL_ARCHIVED_MEMORIES_HOLDS_ROWS,
+        ),
+    ] {
+        if !super::connection::sqlite_table_present(conn, table)? {
+            continue;
+        }
+        let has_rows: bool = conn
+            .query_row(has_rows_sql, [], |r| r.get::<_, i64>(0).map(|n| n != 0))
+            .with_context(|| format!("probe whether {table} holds durable rows"))?;
+        if has_rows {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Snapshot the live DB file immediately BEFORE a schema-mutating upgrade
@@ -1506,6 +1556,17 @@ const MIGRATION_V82_SQLITE: &str =
 const MIGRATION_V83_SQLITE: &str =
     include_str!("../../migrations/sqlite/0067_v83_agent_api_keys.sql");
 
+// v90 (#2385, v1.0.0) — ARCHIVE CID PARITY. Two additive nullable
+// `archived_memories` columns (`cid TEXT`, `cid_genesis BLOB`) mirroring the
+// v74 (#1825) genesis-identity pair on `memories`, so the archive funnels
+// CARRY the content address instead of dropping it and both restore paths
+// stop RE-MINTING it. Probe-guarded ALTER (SQLite has no `ADD COLUMN IF NOT
+// EXISTS` — the v79/v82/v87 precedent). Purely additive, no full-table
+// rebuild → no trigger recreation (the v63/v65 lesson does not arise). The
+// postgres twin is `PostgresStore::migrate_v90`.
+const MIGRATION_V90_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0074_v90_archived_cid.sql");
+
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
 // markers. When the canonical SCHEMA constant already ships a target
@@ -1530,7 +1591,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     // replayed the whole v1 -> tip ladder over a POPULATED database WITH THE
     // SNAPSHOT SUPPRESSED. An absent `schema_version` relation still reads as
     // 0 (a genuinely fresh database); a failed READ now propagates.
-    let version = super::connection::probe_schema_stamp(conn)?.version();
+    // v1.0.0 #2564 — `operable_version`, never `version()`. #2445 closed the
+    // "stamp too HIGH" hole; a stamp too LOW was the strictly better attack and
+    // was undefended: `DELETE FROM schema_version` reads as 0 through
+    // `COALESCE(MAX(version), 0)`, which replays the ENTIRE v1 -> tip ladder
+    // over a POPULATED database with the pre-migration safety snapshot below
+    // SUPPRESSED (it was gated on `version > 0`). A ZEROED stamp now refuses
+    // here with a typed error instead of resolving to a permissive `0`.
+    let version = super::connection::probe_schema_stamp(conn)?.operable_version(
+        super::schema_guard::BACKEND_SQLITE,
+        conn.path().unwrap_or(""),
+    )?;
 
     // v1.0.0 #2445 — DOWNGRADE guard, defense-in-depth behind the pre-bootstrap
     // gate in `db::open`. `>` refuses (this binary would write a schema it does
@@ -1559,7 +1630,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     // before any schema mutation, rather than leaving it to an external
     // step. Runs before `BEGIN EXCLUSIVE` because `VACUUM INTO` cannot
     // execute inside a transaction.
-    if version > 0 {
+    // v1.0.0 #2564 (a) — the gate is no longer `version > 0` ALONE. A stamp of
+    // 0 on a database that holds durable rows now refuses above, but a legacy
+    // pre-v2 database legitimately stamps 0 AND holds rows, and it is exactly
+    // the database with the longest ladder still to replay — precisely the one
+    // that most needs a snapshot. Probe for durable rows so the snapshot can
+    // never again be suppressed on a populated database.
+    if version > 0 || database_holds_durable_rows(conn)? {
         if let Some(snapshot) = snapshot_before_migration(conn, version, CURRENT_SCHEMA_VERSION)? {
             tracing::info!(
                 from_version = version,
@@ -3809,6 +3886,67 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                          WHERE original_expires_at IS NOT NULL",
                         "UPDATE archived_memories SET original_expires_at = ?1 \
                          WHERE rowid = ?2",
+                    )?;
+                }
+            }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v90 (#2385, v1.0.0) — ARCHIVE CID PARITY: mirror the v74
+            // (#1825) genesis content-id pair (`cid` TEXT / `cid_genesis`
+            // BLOB) onto `archived_memories`, closing the archive→restore
+            // IDENTITY re-mint.
+            //
+            // Pre-v90 the archive mirror had no cid columns, so every archive
+            // INSERT...SELECT dropped the address and both `restore_archived*`
+            // paths recomputed it from six reconstructed inputs (agent_id /
+            // namespace / title / memory_kind / created_at / decrypted
+            // plaintext). A re-mint reproduces the original address ONLY if all
+            // six are byte-identical at restore time — a rewritten
+            // `metadata.agent_id`, or a decrypt failure whose `unwrap_or` falls
+            // back to the ciphertext placeholder, silently re-addressed the
+            // durable row and dangled every `memory_links.source_cid` /
+            // `target_cid` mirror resolving to it. No write intent, no error:
+            // the v74 genesis-identity contract violated in silence.
+            //
+            // Purely additive and probe-guarded (SQLite has no `ADD COLUMN IF
+            // NOT EXISTS`), table-presence-guarded for partial-schema fixtures,
+            // and idempotent — a second pass finds both columns and does
+            // nothing. NO full-table rebuild, so every `memories` /
+            // `memory_links` trigger survives (the v63/v65 lesson).
+            //
+            // The migration deliberately BACKFILLS NOTHING: a pre-v90 archived
+            // row's genesis address cannot be proven from the archive alone, so
+            // its columns stay NULL and the restore path keeps the legacy
+            // re-mint fallback for exactly those rows. Inventing an address we
+            // cannot prove would be the corruption this arm exists to stop.
+            // Canonical DDL: migrations/sqlite/0074_v90_archived_cid.sql.
+            debug_assert!(
+                MIGRATION_V90_SQLITE.contains(super::TABLE_ARCHIVED_MEMORIES),
+                "v90 doc twin must ship the archived_memories DDL"
+            );
+            let has_archive_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'archived_memories')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_archive_table {
+                if conn
+                    .prepare("SELECT cid FROM archived_memories LIMIT 0")
+                    .is_err()
+                {
+                    conn.execute("ALTER TABLE archived_memories ADD COLUMN cid TEXT", [])?;
+                }
+                if conn
+                    .prepare("SELECT cid_genesis FROM archived_memories LIMIT 0")
+                    .is_err()
+                {
+                    conn.execute(
+                        "ALTER TABLE archived_memories ADD COLUMN cid_genesis BLOB",
+                        [],
                     )?;
                 }
             }

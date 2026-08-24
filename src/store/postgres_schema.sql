@@ -538,7 +538,15 @@ CREATE TABLE IF NOT EXISTS archived_memories (
     -- memory and later restoring it no longer DROPS the claim-validity
     -- interval. Nullable on legacy archived rows (archived pre-v85).
     valid_from            TEXT,
-    valid_until           TEXT
+    valid_until           TEXT,
+    -- v1.0.0 (#2385, schema v90) — the v74/#1825 GENESIS content-id pair
+    -- mirrored onto the archive so archive->restore CARRIES the row's BLAKE3
+    -- address instead of RE-MINTING it from six reconstructed inputs (a
+    -- re-mint that drifts silently re-addresses the durable row and dangles
+    -- every memory_links.source_cid / target_cid mirror). Nullable on legacy
+    -- rows archived pre-v90, which keep the re-mint fallback.
+    cid                   TEXT,
+    cid_genesis           BYTEA
 );
 
 CREATE INDEX IF NOT EXISTS archived_memories_namespace_idx  ON archived_memories (namespace);

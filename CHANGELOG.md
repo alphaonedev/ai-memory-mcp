@@ -759,6 +759,131 @@ backend and missing or divergently implemented on its twin). Pinned by
   delete real files on the persistent hosts; the native tier is always up).
   JUnit-style durable test-result log artifacts are uploaded per leg.
 
+### Fixed (data integrity: merge field-set coherence, long-tier permanence, archive identity, low-end schema guard; #2399 #2395 #2394 #2385 #2564)
+
+- **A fresh `long`-tier write that carried an `expires_at` was GC-reapable
+  (#2399).** `handlers::parity::resolve_create_expires_at` and
+  `Memory::effective_expires_at` were both TIER-BLIND, so `POST /api/v1/memories`
+  (and the bulk lane) with `tier=long` + `expires_at`/`ttl_secs` stored a
+  "permanent" row carrying a live expiry — while EVERY other lane forces NULL
+  for long (the insert `ON CONFLICT` arms, both update funnels per #2331/FBL-01,
+  the supersede funnel). Because the GC reap predicate is tier-blind
+  (`expires_at IS NOT NULL AND expires_at < now`), that row was archived — or
+  hard-deleted **and crypto-erased** under `archive_on_gc=false` — at the
+  caller's deadline, while the identical logical write through the upsert lane
+  survived forever. The long gate now runs FIRST in both the handler SSOT (so
+  the create response is truthful) and in `Memory::effective_expires_at`, which
+  is the shared store funnel every sqlite insert path and ~10 postgres write
+  sites bind `expires_at` through. Tests that used `Tier::Long` only as a
+  non-default label while also asserting a live `expires_at` (catch-up
+  column fidelity #2384; proactive-conflict liveness filter; postgres
+  #1423 COALESCE leave-untouched pin) now pin TTL on Short/Mid so they
+  still prove the column / filter, not the permanence contract.
+- **A merged row's `confidence` and its calibration record could come from
+  different operands (#2395).** `confidence` merged by `MAX` / `GREATEST` while
+  `confidence_source`, `confidence_signals` and `confidence_decayed_at` merged
+  by a DIFFERENT rule — "explicit non-default replaces / COALESCE" on the local
+  upsert funnels, the `updated_at`/`id` newer-wins tiebreak on the federation
+  funnels. Merging a stored `(0.9, auto_derived, S1)` with an incoming
+  `(0.4, calibrated, S2)` durably produced `confidence = 0.9` labelled
+  `calibrated` carrying `S2`: a self-inconsistent Form-5 calibration record that
+  every downstream consumer reads as fact, and — on the federation lane — one
+  that every replica CONVERGES on, making it permanent. The field-set is now
+  ATOMIC: one selector picks the winning operand's whole tuple. Local funnels
+  key on the `MAX` winner with the pre-existing #1629 rule preserved verbatim as
+  the exact-tie branch; federation funnels key on the lexicographic
+  `(confidence, updated_at, id)` order, whose first component IS the `MAX`, so
+  the join stays commutative and idempotent. Fixed on **both** backends: the two
+  sqlite funnels in `storage::mod` and six postgres funnels (`store`,
+  `store_batch`, `capture_turn_idempotent`, `recover_turn_idempotent`,
+  `store_with_embedding_inner`, `apply_remote_memory`).
+- **Upsert kept a sticky `memory_kind` but adopted the rejected write's
+  `kind_provenance` (#2394).** `memory_kind` is sticky — a stored `reflection` /
+  `persona` is never downgraded — but `kind_provenance` merged by a bare
+  `COALESCE(excluded, memories)`, so a row that KEPT its stored kind was
+  relabelled with the provenance of the kind the merge had just thrown away
+  (stored `reflection`/`declared` + an incoming `observation`/`llm` left
+  `reflection` labelled `llm`). Symmetrically, when the incoming kind WAS
+  adopted and carried no provenance, the COALESCE inherited a marker minted for
+  the SUPERSEDED kind. The `kind_provenance` CASE now mirrors the `memory_kind`
+  CASE exactly at all nine sites (two sqlite, seven postgres) and is NULL-safe
+  by construction; the #1945/#2393 COALESCE rule is preserved verbatim for the
+  kind-unchanged case.
+- **Archive→restore RE-MINTED the genesis content-id — schema v90 (#2385).**
+  `archived_memories` never gained the v74 (#1825) `cid` / `cid_genesis`
+  columns, so every archive `INSERT ... SELECT` dropped the BLAKE3 address and
+  both restore paths recomputed it from six reconstructed inputs (`agent_id` /
+  `namespace` / `title` / `memory_kind` / `created_at` / decrypted plaintext).
+  A re-mint reproduces the original address only if all six are byte-identical
+  at restore time; when one drifts — a rewritten `metadata.agent_id`, or a
+  decrypt failure whose `unwrap_or` fallback hashes the CIPHERTEXT placeholder —
+  the restored row silently acquires a DIFFERENT address and every
+  `memory_links.source_cid` / `target_cid` mirror resolving to the old one
+  dangles, with no write intent and no error raised. **Schema v90** (both
+  backends: `migrations/sqlite/0074_v90_archived_cid.sql`,
+  `migrations/postgres/0047_v90_archived_cid.sql`) adds the pair to the archive
+  mirror; all 15 archive funnels (8 sqlite, 7 postgres) now CARRY it and both
+  restore paths bind `CASE WHEN cid IS NOT NULL THEN cid ELSE <re-mint> END` —
+  selecting the address and its pre-image ATOMICALLY from one operand. The
+  migration is additive, probe-guarded, idempotent and performs NO full-table
+  rebuild, so every trigger survives (the v63/v65 lesson), and it BACKFILLS
+  NOTHING: a pre-v90 archived row's address cannot be proven from the archive,
+  so those rows keep NULL and keep the legacy re-mint. The Portability-v2
+  archive importer deliberately does NOT bind the columns — a bundle's address
+  is remote-asserted, and the live-import funnel already recomputes it locally
+  rather than trusting the bundle.
+
+### Security (data integrity: the LOW end of the schema-version guard; #2564)
+
+- **Zeroing the `schema_version` stamp was the strictly better attack, and it
+  was undefended (#2564).** #2445 refuses a stamp that is too HIGH. A stamp that
+  is too LOW did nothing: `SELECT COALESCE(MAX(version), 0)` means
+  `DELETE FROM schema_version` (or an inserted `0`, or a negative value) reads
+  as version 0, which replays the ENTIRE v1 → tip ladder over a POPULATED
+  database under `BEGIN EXCLUSIVE` — **with the pre-migration safety snapshot
+  suppressed**, because that snapshot was gated on `version > 0`. Offered `999`
+  (a loud refusal) or `0` (a silent full-ladder replay with the backup
+  disabled), an adversary picks `0` every time. A NEGATIVE stamp was worse
+  still: `cli::boot::read_schema_version`'s `u32::try_from(v).ok()` mapped it to
+  "unsupported" with **no warning emitted**, and `observed > CURRENT` is false
+  for it, so it too sailed into the replay.
+  The illegal state is now unrepresentable. `SchemaStamp` gains a `Zeroed`
+  variant, and every WRITE funnel reads it through `operable_version()` — which
+  has no path from `Zeroed` to an `i64` — instead of `version()`, which coerced
+  it to a permissive `0`. The refusal is a new typed error
+  (`StoreError::SchemaStampInvalid` / `SCHEMA_STAMP_INVALID`), distinct from the
+  #2445 one because the operator action is the opposite. `evaluate` is now a
+  RANGE check that refuses `observed < 0`, and the `AI_MEMORY_ALLOW_SCHEMA_AHEAD`
+  hatch can never authorise a negative stamp. Wired on both backends: `db::open`
+  / `migrate` / `backup restore --skip-verify` (which could otherwise PLANT a
+  zeroed snapshot over the live corpus) on sqlite, and both the pre-bootstrap
+  `connect_*` gate and `migrate_locked` on postgres — where the schema is SHARED
+  by every daemon on the cluster.
+  The discriminator is STRUCTURAL, not heuristic, so neither legitimate stamp-0
+  database is affected: a fresh install has the tables but no rows (the
+  bootstrap DDL runs before the first stamp is written), and a legacy pre-v2
+  database has rows but cannot have `memories.confidence` — acquiring it IS the
+  v2 step. Independently, the pre-migration snapshot gate is no longer
+  `version > 0` alone: it now also fires whenever the database holds durable
+  rows, so the one database that still legitimately replays the whole ladder
+  over live data is exactly the one that gets a backup first.
+  The refusal is DIAGNOSABLE and does not cost the operator their data.
+  `ai-memory backup` still snapshots the database — it re-opens through the
+  unmigrated funnel on this refusal exactly as it already did for #2445, so the
+  refusal message's "snapshot it before doing anything else" instruction is
+  something the binary actually honours. `ai-memory doctor` reports
+  `schema_stamp=invalid` plus the observed and supported versions. `ai-memory
+  boot` reports a distinct `WarnSchemaStampInvalid` status whose copy is
+  backup-first / restore-the-stamp — not the schema-ahead "consider upgrading"
+  remedy, which is the opposite instruction for a database whose binary is
+  already current. The sqlite corroboration probe now distinguishes a missing
+  `memories` table (legitimate Fresh) from a probe that cannot answer (Err,
+  never Fresh): table-presence is asked of `sqlite_master` first, then the
+  row/column test propagates with `?` — the same split as the postgres twin.
+  On the HTTP surface the postgres gate maps `SCHEMA_STAMP_INVALID` to **503**,
+  not 500 — the same disposition as the schema-ahead refusal, so an
+  orchestrator parks the node rather than crash-looping it into the replay.
+
 ### Fixed
 
 - **Claims-audit batch 2: eleven operator-facing claims corrected against their

@@ -16,6 +16,19 @@ use std::collections::HashMap;
 use std::path::Path;
 
 // ── #1558 batch 6 — file-local SQL SSOT (pm-v3.1 hardcoded-literal gate) ──
+/// v1.0.0 #2564 — the two DURABLE row tiers, named ONCE.
+///
+/// The memory TEXT is the source of truth and it lives in exactly these two
+/// relations: the live tier and its cold mirror. Several probes have to name
+/// them as data rather than bake them into a SQL string — the pre-migration
+/// snapshot gate, the erasure orphan reconciler — and a table name retyped at
+/// each such site is precisely the hardcoded-literal class the operator
+/// directive forbids. Single-sourced here, in the module that owns the sqlite
+/// schema, so `erasure::archive_sync` and `storage::migrations` cannot drift.
+pub(crate) const TABLE_MEMORIES: &str = "memories";
+/// Cold mirror of [`TABLE_MEMORIES`]; see its docs.
+pub(crate) const TABLE_ARCHIVED_MEMORIES: &str = "archived_memories";
+
 const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = ?1";
 /// Reused dynamic-query namespace-filter fragment (pm-v3.1 no-scattered-literals
 /// gate — one named const referenced by the `list` + `reembed` keyset builders).
@@ -2034,16 +2047,47 @@ fn insert_inner(
                                  ELSE excluded.citations END,
                 source_uri = COALESCE(excluded.source_uri, memories.source_uri),
                 source_span = COALESCE(excluded.source_span, memories.source_span),
-                -- v0.7.0 Form 5 — confidence-provenance follows the same
-                -- shape as Form 4 columns: explicit non-default replaces;
-                -- caller_provided + NULL signals keep the existing
-                -- provenance signal so a re-store doesn't blank out an
-                -- auto-derived or calibrated value.
-                confidence_source = CASE WHEN excluded.confidence_source != 'caller_provided'
-                                         THEN excluded.confidence_source
+                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
+                -- ATOMIC. `confidence` merges by MAX (above), so the
+                -- calibration record that DESCRIBES that number —
+                -- `confidence_source`, `confidence_signals`,
+                -- `confidence_decayed_at` — must come from the SAME operand
+                -- that won the MAX. Pre-#2395 the three provenance columns
+                -- used a DIFFERENT selector (explicit-non-default replaces /
+                -- COALESCE), so merging a stored (0.9, auto_derived, S1) with
+                -- an incoming (0.4, calibrated, S2) durably produced
+                -- `confidence = 0.9` labelled `calibrated` carrying S2 — a
+                -- value from one operand wearing another operand's label and
+                -- evidence. That is a self-inconsistent calibration record on
+                -- the durable tier (Form-5 semantics corrupted), and it is
+                -- silent: every downstream consumer of the pair reads it as
+                -- fact.
+                --
+                -- The selector below IS the MAX winner, applied as a unit:
+                --   * excluded.confidence > memories.confidence -> incoming tuple
+                --   * excluded.confidence < memories.confidence -> stored tuple
+                --   * EQUAL -> the pre-#2395 tie rule verbatim (an incoming
+                --     explicit non-`caller_provided` source replaces; a
+                --     default `caller_provided` keeps the stored provenance so
+                --     a plain re-store never blanks an auto-derived or
+                --     calibrated value) — except that it now carries the WHOLE
+                --     tuple rather than one column, which is the fix.
+                -- The `=`/`<`/`>` comparisons form a total order on the pair;
+                -- exact equality is only the tie BRANCH (if the two REALs are
+                -- not bit-identical, one is strictly greater), never a logical
+                -- float-equality test.
+                confidence_source = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_source
+                                         WHEN excluded.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_source
                                          ELSE memories.confidence_source END,
-                confidence_signals = COALESCE(excluded.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(excluded.confidence_decayed_at, memories.confidence_decayed_at),
+                confidence_signals = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_signals
+                                          WHEN excluded.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_decayed_at
+                                             WHEN excluded.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
                 -- v0.7.0 polish PERF-8 (#781) — denormalised mention tag.
                 -- COALESCE keeps any pre-existing tag (re-write that
                 -- omits the structured entity_id metadata should NOT
@@ -2065,11 +2109,36 @@ fn insert_inner(
                 -- sweep remains the only documented non-bumping mutator
                 -- (tests/non_version_bumping_sites_1036.rs).
                 version = memories.version + 1,
-                -- v1.0.0 (#1945) — the epistemic-typing provenance follows the
-                -- incoming write when it carries one, else keeps the stored
-                -- value (a re-store that omits the carrier must not blank an
-                -- existing marker). COALESCE, like the Form-4/5 columns above.
-                kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
+                -- v1.0.0 (#1945) + v1.0.0 #2394 — the epistemic-typing
+                -- provenance FOLLOWS THE KIND THAT ACTUALLY WON. `memory_kind`
+                -- above is STICKY (a stored `reflection` / `persona` is never
+                -- downgraded), but the bare
+                -- `COALESCE(excluded.kind_provenance, memories.kind_provenance)`
+                -- adopted the incoming provenance unconditionally: a row stored
+                -- as `reflection` (kind_provenance = `declared`) that received
+                -- an upsert claiming `observation` via `llm` kept kind
+                -- `reflection` while relabelling its provenance `llm` — the
+                -- stored provenance then described a kind the merge REJECTED.
+                -- Downstream consumers (decorrelation, typed-cognition
+                -- analytics) read that as fact, so it is durable metadata
+                -- corruption, not a cosmetic skew.
+                --
+                -- The CASE mirrors the `memory_kind` CASE above exactly:
+                --   * kind UNCHANGED -> COALESCE (the #1945 rule: an incoming
+                --     carrier wins, an omitted one must not blank the marker);
+                --   * kind changed and the STORED kind survived (sticky
+                --     reflection / persona) -> keep the stored provenance;
+                --   * otherwise the INCOMING kind was adopted -> take its
+                --     provenance verbatim, NULL included (a provenance
+                --     describing the superseded kind would be a lie).
+                -- NULL-safe by construction: a NULL `memory_kind` fails both
+                -- WHENs and lands on the ELSE, which is the same operand the
+                -- `memory_kind` CASE picks.
+                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
+                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE excluded.kind_provenance END,
                 -- v1.0.0 #1834 — claim-bitemporal validity. `valid_from` is
                 -- IMMUTABLE once set (a correction is a supersede, not a mutation),
                 -- so the stored value always wins on upsert. `valid_until` is the
@@ -4469,7 +4538,11 @@ pub(crate) fn archive_memory_no_tx(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+              -- v1.0.0 #2385 — the v74 GENESIS content-id travels WITH the row
+              -- into cold storage so archive→restore CARRIES the address instead
+              -- of re-minting it (see `restore_archived` / the v90 ladder arm).
+              cid, cid_genesis)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -4477,7 +4550,8 @@ pub(crate) fn archive_memory_no_tx(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+                    cid, cid_genesis
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -4558,7 +4632,10 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
           reflection_depth, atomised_into, atom_of, memory_kind,
           entity_id, persona_version, citations, source_uri, source_span,
           confidence_source, confidence_signals, confidence_decayed_at,
-          mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+          mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+          -- v1.0.0 #2385 — the GENESIS content-id travels WITH the row (see the
+          -- `archive_memory_no_tx` twin): archive→restore must not re-mint it.
+          cid, cid_genesis)
          SELECT id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
                 expires_at, ?1, ?2, metadata,
@@ -4566,7 +4643,8 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+                cid, cid_genesis
          FROM memories WHERE id = ?3",
         params![now, reason, id],
     )?;
@@ -4916,7 +4994,11 @@ pub fn archive_memory_for_caller(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+              -- v1.0.0 #2385 — the v74 GENESIS content-id travels WITH the row
+              -- into cold storage so archive→restore CARRIES the address instead
+              -- of re-minting it (see `restore_archived` / the v90 ladder arm).
+              cid, cid_genesis)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -4924,7 +5006,8 @@ pub fn archive_memory_for_caller(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+                    cid, cid_genesis
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -5770,7 +5853,11 @@ pub fn forget(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+              -- v1.0.0 #2385 — the v74 GENESIS content-id travels WITH the row
+              -- into cold storage so archive→restore CARRIES the address instead
+              -- of re-minting it (see `restore_archived` / the v90 ladder arm).
+              cid, cid_genesis)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?4, 'forget', metadata,
@@ -5778,7 +5865,8 @@ pub fn forget(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+                    cid, cid_genesis
                      FROM memories WHERE rowid IN (
                         SELECT m.rowid FROM memories_fts fts
                         JOIN memories m ON m.rowid = fts.rowid
@@ -5799,7 +5887,11 @@ pub fn forget(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+              -- v1.0.0 #2385 — the v74 GENESIS content-id travels WITH the row
+              -- into cold storage so archive→restore CARRIES the address instead
+              -- of re-minting it (see `restore_archived` / the v90 ladder arm).
+              cid, cid_genesis)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?3, 'forget', metadata,
@@ -5807,7 +5899,8 @@ pub fn forget(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+                    cid, cid_genesis
                      FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
                     params![namespace, tier_str, now],
                 )?;
@@ -6232,7 +6325,11 @@ pub fn forget_for_caller(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+              -- v1.0.0 #2385 — the v74 GENESIS content-id travels WITH the row
+              -- into cold storage so archive→restore CARRIES the address instead
+              -- of re-minting it (see `restore_archived` / the v90 ladder arm).
+              cid, cid_genesis)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?4, 'forget', metadata,
@@ -6240,7 +6337,8 @@ pub fn forget_for_caller(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+                    cid, cid_genesis
                      FROM memories WHERE rowid IN (
                         SELECT m.rowid FROM memories_fts fts
                         JOIN memories m ON m.rowid = fts.rowid
@@ -6264,7 +6362,11 @@ pub fn forget_for_caller(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+              -- v1.0.0 #2385 — the v74 GENESIS content-id travels WITH the row
+              -- into cold storage so archive→restore CARRIES the address instead
+              -- of re-minting it (see `restore_archived` / the v90 ladder arm).
+              cid, cid_genesis)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?3, 'forget', metadata,
@@ -6272,7 +6374,8 @@ pub fn forget_for_caller(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+                    cid, cid_genesis
                      FROM memories WHERE (?1 IS NULL OR namespace = ?1)
                        AND (?2 IS NULL OR tier = ?2)
                        AND (json_extract(metadata,'$.agent_id') = ?4
@@ -13039,7 +13142,11 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+              -- v1.0.0 #2385 — the v74 GENESIS content-id travels WITH the row
+              -- into cold storage so archive→restore CARRIES the address instead
+              -- of re-minting it (see `restore_archived` / the v90 ladder arm).
+              cid, cid_genesis)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?1, 'ttl_expired', metadata,
@@ -13047,7 +13154,8 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
+                    cid, cid_genesis
                      FROM memories
                      WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
                 ))?;
@@ -13663,7 +13771,25 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                                        THEN json_extract(metadata, '$.kind_provenance')
                                   END
                              END),
-                    ?3, ?4,
+                    -- v1.0.0 #2385 — the STORED genesis identity WINS. Pre-#2385
+                    -- `archived_memories` carried no cid columns, so restore
+                    -- unconditionally bound the re-mint (?3/?4) recomputed from six
+                    -- reconstructed inputs (agent_id / namespace / title / kind /
+                    -- created_at / decrypted plaintext). Any drift in ANY of them —
+                    -- a rewritten `metadata.agent_id`, or a decrypt failure whose
+                    -- `unwrap_or` falls back to the CIPHERTEXT placeholder — silently
+                    -- re-addressed the durable row and dangled every
+                    -- `memory_links.source_cid`/`target_cid` mirror pointing at it.
+                    -- The v90 columns make the identity a CARRIED fact, so the
+                    -- re-mint is now only the legacy fallback for pre-v90 archive
+                    -- rows (cid NULL) — degrade, never corrupt.
+                    -- The PAIR is selected atomically (the #2395 lesson applied
+                    -- here): `cid_genesis` is the canonical PRE-IMAGE of `cid`, so
+                    -- mixing a carried address with a re-derived pre-image would
+                    -- produce a row whose own verify disagrees with itself. One
+                    -- predicate picks BOTH from the same operand.
+                    CASE WHEN cid IS NOT NULL THEN cid ELSE ?3 END,
+                    CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE ?4 END,
                     valid_from, valid_until
              FROM archived_memories WHERE id = ?2",
             params![
@@ -13889,7 +14015,25 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                                        THEN json_extract(metadata, '$.kind_provenance')
                                   END
                              END),
-                    ?3, ?4,
+                    -- v1.0.0 #2385 — the STORED genesis identity WINS. Pre-#2385
+                    -- `archived_memories` carried no cid columns, so restore
+                    -- unconditionally bound the re-mint (?3/?4) recomputed from six
+                    -- reconstructed inputs (agent_id / namespace / title / kind /
+                    -- created_at / decrypted plaintext). Any drift in ANY of them —
+                    -- a rewritten `metadata.agent_id`, or a decrypt failure whose
+                    -- `unwrap_or` falls back to the CIPHERTEXT placeholder — silently
+                    -- re-addressed the durable row and dangled every
+                    -- `memory_links.source_cid`/`target_cid` mirror pointing at it.
+                    -- The v90 columns make the identity a CARRIED fact, so the
+                    -- re-mint is now only the legacy fallback for pre-v90 archive
+                    -- rows (cid NULL) — degrade, never corrupt.
+                    -- The PAIR is selected atomically (the #2395 lesson applied
+                    -- here): `cid_genesis` is the canonical PRE-IMAGE of `cid`, so
+                    -- mixing a carried address with a re-derived pre-image would
+                    -- produce a row whose own verify disagrees with itself. One
+                    -- predicate picks BOTH from the same operand.
+                    CASE WHEN cid IS NOT NULL THEN cid ELSE ?3 END,
+                    CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE ?4 END,
                     valid_from, valid_until
              FROM archived_memories WHERE id = ?2",
             params![
@@ -13941,7 +14085,18 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
 /// at the tier it will land at post-restore (matches the SQL the
 /// caller is about to execute).
 /// v0.9.0 G8 (#1825) — re-mint the genesis content-id for an archived
-/// row about to be restored. The `candidate` (loaded via
+/// row about to be restored.
+///
+/// v1.0.0 #2385 — this is now the LEGACY FALLBACK ONLY. Since schema v90
+/// `archived_memories` carries `cid` / `cid_genesis`, and both restore paths
+/// bind `CASE WHEN cid IS NOT NULL THEN cid ELSE <this re-mint> END`, so a row
+/// archived at v90+ restores with its ORIGINAL address byte-for-byte. The
+/// re-mint is reached only by rows archived BEFORE v90 (both columns NULL),
+/// whose genesis address cannot be proven from the archive — a re-mint is the
+/// best available answer there, never a substitute for a carried one. See the
+/// v90 arm in `storage::migrations` for why the drift this closes is silent.
+///
+/// The `candidate` (loaded via
 /// [`load_archived_as_memory`]) carries the ORIGINAL genesis identity
 /// (namespace / title / created_at / memory_kind / agent_id); the
 /// archived `content` may be an encryption placeholder, so the PLAINTEXT
@@ -13996,7 +14151,12 @@ fn load_archived_as_memory(conn: &Connection, id: &str) -> Result<Memory> {
                 source_uri, source_span,
                 COALESCE(confidence_source, 'caller_provided') AS confidence_source,
                 confidence_signals, confidence_decayed_at,
-                COALESCE(version, 1) AS version
+                COALESCE(version, 1) AS version,
+                -- v1.0.0 #2385 — the carried genesis content-id (NULL on
+                -- pre-v90 archive rows), so the GOVERNANCE_PRE_WRITE hook and
+                -- `restored_cid_stamp`'s legacy fallback both see the row's
+                -- true identity rather than an unconditional re-mint.
+                cid
          FROM archived_memories WHERE id = ?1",
     )?;
     // #228 Commit B — DELIBERATELY does NOT select `encrypted_envelope`.
@@ -14519,20 +14679,41 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                                  THEN excluded.citations ELSE memories.citations END,
                 source_uri = COALESCE(excluded.source_uri, memories.source_uri),
                 source_span = COALESCE(excluded.source_span, memories.source_span),
-                -- v0.7.0 Form 5 — confidence-provenance follows the newer-
-                -- wins shape established for the other Form 4 columns.
-                -- A peer pushing an auto-derived/calibrated value wins on
-                -- the timestamp tiebreak; otherwise the local row's
-                -- provenance is preserved so a stale peer cannot blank out
-                -- a fresher local calibration.
-                confidence_source = CASE WHEN excluded.updated_at > memories.updated_at
-                                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
+                -- ATOMIC on the federation lane too. `confidence` merges by
+                -- MAX (a commutative lattice join, above) while the three
+                -- provenance columns merged on the updated_at/id NEWER-WINS
+                -- tiebreak — a DIFFERENT selector, so a peer whose row lost
+                -- the MAX but won the timestamp durably relabelled the local
+                -- row: `confidence` from one replica, `confidence_source` /
+                -- `confidence_signals` / `confidence_decayed_at` from the
+                -- other. A self-inconsistent calibration record, converged to
+                -- identically on every peer, i.e. permanent.
+                --
+                -- The tuple now moves with the operand that wins the
+                -- LEXICOGRAPHIC order (confidence, updated_at, id) — whose
+                -- first component is exactly the MAX above, so the surviving
+                -- number and its calibration record always describe the same
+                -- write. The order is total and deterministic on both sides of
+                -- a bidirectional sync, so the merge stays commutative /
+                -- idempotent (a true CRDT join): both replicas converge on the
+                -- SAME tuple regardless of push order. Exact `=` on the REAL
+                -- is only the tie BRANCH of that total order, never a logical
+                -- float-equality test.
+                confidence_source = CASE WHEN excluded.confidence > memories.confidence
+                                              OR (excluded.confidence = memories.confidence
+                                                  AND (excluded.updated_at > memories.updated_at
+                                                       OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
                                          THEN excluded.confidence_source ELSE memories.confidence_source END,
-                confidence_signals = CASE WHEN excluded.updated_at > memories.updated_at
-                                               OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                confidence_signals = CASE WHEN excluded.confidence > memories.confidence
+                                               OR (excluded.confidence = memories.confidence
+                                                   AND (excluded.updated_at > memories.updated_at
+                                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
                                           THEN excluded.confidence_signals ELSE memories.confidence_signals END,
-                confidence_decayed_at = CASE WHEN excluded.updated_at > memories.updated_at
-                                                  OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence
+                                                  OR (excluded.confidence = memories.confidence
+                                                      AND (excluded.updated_at > memories.updated_at
+                                                           OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
                                              THEN excluded.confidence_decayed_at ELSE memories.confidence_decayed_at END,
                 -- v0.7.0 polish PERF-8 (#781) — newer-wins on the mention
                 -- tag (the winning row's content is the one a future matcher
@@ -14558,10 +14739,23 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                 lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
                                             OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                                        THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
-                -- v1.0.0 #2333 (FBL-03) — stamp/merge the v79 denormalized
-                -- kind_provenance on the federation funnel (pg 13949 parity:
-                -- COALESCE keeps the local value when the peer carries none).
-                kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
+                -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
+                -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the
+                -- federation lane too. `memory_kind` above is sticky (a local
+                -- `reflection` / `persona` is never downgraded by a peer that
+                -- does not know the kind), but the bare COALESCE adopted the
+                -- peer's provenance unconditionally — so a stale peer pushing
+                -- `observation`/`llm` relabelled a surviving local `reflection`
+                -- as `llm`-provenanced. The CASE mirrors the `memory_kind`
+                -- CASE exactly (kind unchanged -> COALESCE per FBL-03; stored
+                -- sticky kind survived -> keep the local provenance; incoming
+                -- kind adopted -> take its provenance verbatim), and is
+                -- NULL-safe by construction.
+                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
+                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE excluded.kind_provenance END,
                 -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
                 -- `valid_from` is immutable (local genesis wins, like `cid`);
                 -- `valid_until` follows the newer-wins tiebreak so a peer that

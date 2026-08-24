@@ -348,6 +348,15 @@ pub enum StoreError {
     #[error("{detail}")]
     SchemaAheadOfBinary { detail: String },
 
+    /// v1.0.0 #2564 — this database's recorded `schema_version` is zero,
+    /// negative or absent while the database provably holds durable rows from
+    /// a post-v2 schema, so operating it would replay the ENTIRE v1 -> tip
+    /// ladder over live data with the pre-migration safety snapshot suppressed.
+    /// The low-end twin of [`Self::SchemaAheadOfBinary`]; a separate variant
+    /// because the operator action is the opposite one.
+    #[error("{detail}")]
+    SchemaStampInvalid { detail: String },
+
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
 }
@@ -358,6 +367,14 @@ pub enum StoreError {
 impl From<crate::storage::schema_guard::SchemaAheadOfBinary> for StoreError {
     fn from(e: crate::storage::schema_guard::SchemaAheadOfBinary) -> Self {
         Self::SchemaAheadOfBinary { detail: e.detail }
+    }
+}
+
+/// v1.0.0 #2564 — the low-end twin, lifted the same way so `?` works verbatim
+/// in the postgres funnels and both backends emit a byte-identical message.
+impl From<crate::storage::schema_guard::SchemaStampZeroed> for StoreError {
+    fn from(e: crate::storage::schema_guard::SchemaStampZeroed) -> Self {
+        Self::SchemaStampInvalid { detail: e.detail }
     }
 }
 
@@ -399,6 +416,11 @@ impl StoreError {
             // adapter can do this; the BINARY is too old), so it carries its
             // own slug rather than being folded into either.
             Self::SchemaAheadOfBinary { .. } => error_codes::SCHEMA_AHEAD_OF_BINARY,
+            // #2564 — the low-end refusal carries its own slug for the same
+            // reason: the backend is healthy and the adapter is capable; the
+            // DATABASE's version stamp is the thing that is wrong, and the
+            // operator action differs from the schema-ahead one.
+            Self::SchemaStampInvalid { .. } => error_codes::SCHEMA_STAMP_INVALID,
             Self::Backend(_) => error_codes::DATABASE_ERROR,
         }
     }

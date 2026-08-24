@@ -292,6 +292,15 @@ enum BootStatus {
     /// `ai-memory doctor` and consider upgrading. v0.6.3.1 (PR-9h /
     /// issue #487 PR #497 req #72).
     WarnSchemaUnsupported { db_schema: u32 },
+    /// v1.0.0 #2564 — `db::open` refused because the recorded schema
+    /// stamp is zero / negative / deleted on a database that holds
+    /// durable rows. Distinct from [`Self::WarnSchemaUnsupported`]:
+    /// that one says "install a newer (or older) binary"; this one
+    /// says "your stamp row was destroyed — snapshot first, then
+    /// restore the stamp". Mapping the two together printed the
+    /// opposite remedy (`consider upgrading`) for a database whose
+    /// binary is already the right one.
+    WarnSchemaStampInvalid { observed: i64 },
 }
 
 impl BootStatus {
@@ -299,7 +308,9 @@ impl BootStatus {
         match self {
             Self::OkLoaded => "ok",
             Self::InfoFallback | Self::InfoEmpty => "info",
-            Self::WarnDbUnavailable | Self::WarnSchemaUnsupported { .. } => "warn",
+            Self::WarnDbUnavailable
+            | Self::WarnSchemaUnsupported { .. }
+            | Self::WarnSchemaStampInvalid { .. } => "warn",
         }
     }
 }
@@ -469,6 +480,16 @@ impl BootManifest {
                 min = MIN_SUPPORTED_SCHEMA,
                 max = MAX_SUPPORTED_SCHEMA,
             ),
+            BootStatus::WarnSchemaStampInvalid { observed } => format!(
+                "db schema stamp invalid (observed {observed}) — the version \
+                 row is zero, negative or deleted while the database holds \
+                 durable rows. Migrating from a zero stamp would replay the \
+                 entire ladder over live data with the pre-migration safety \
+                 snapshot suppressed. Snapshot first with `ai-memory backup`, \
+                 then restore the `schema_version` row (the version this \
+                 database was last migrated to). Run `ai-memory doctor` for \
+                 the full diagnosis."
+            ),
         };
 
         Self {
@@ -536,16 +557,28 @@ pub fn run(
                 // `boot` is one of the two verbs an operator reaches for to
                 // find out WHY a downgraded node will not start; degrading it
                 // to an opaque unavailability message would take the answer
-                // away at the exact moment it is needed. ABOVE-MAX is the only
-                // reachable `WarnSchemaUnsupported` (see
-                // `boot_warns_on_schema_below_min`), so without this arm the
-                // status becomes structurally dead code.
-                let status = crate::storage::schema_guard::schema_ahead_of(&e).map_or(
-                    BootStatus::WarnDbUnavailable,
-                    |ahead| BootStatus::WarnSchemaUnsupported {
+                // away at the exact moment it is needed.
+                //
+                // v1.0.0 #2564 — the LOW-end twin is a DISTINCT status.
+                // `WarnSchemaUnsupported` tells the operator to upgrade
+                // (or roll back) the binary; a destroyed stamp needs the
+                // opposite action (backup first, then restore the stamp).
+                // Mapping the two together printed "consider upgrading"
+                // for a database whose binary is already the right one.
+                // `observed` is the raw i64 so a negative stamp cannot
+                // be reported as schema v0-of-a-too-new-binary.
+                let status = crate::storage::schema_guard::schema_ahead_of(&e)
+                    .map(|ahead| BootStatus::WarnSchemaUnsupported {
                         db_schema: u32::try_from(ahead.observed).unwrap_or(u32::MAX),
-                    },
-                );
+                    })
+                    .or_else(|| {
+                        crate::storage::schema_guard::schema_stamp_zeroed(&e).map(|zeroed| {
+                            BootStatus::WarnSchemaStampInvalid {
+                                observed: zeroed.observed,
+                            }
+                        })
+                    })
+                    .unwrap_or(BootStatus::WarnDbUnavailable);
                 let manifest = BootManifest::build(
                     status,
                     &namespace,
@@ -857,6 +890,16 @@ fn emit_status_header(
                         manifest.version,
                         MIN_SUPPORTED_SCHEMA,
                         MAX_SUPPORTED_SCHEMA,
+                    )?;
+                }
+                BootStatus::WarnSchemaStampInvalid { observed } => {
+                    writeln!(
+                        out.stdout,
+                        "#   namespace:  {} (db schema stamp invalid \
+                         (observed {}); snapshot first with `ai-memory backup`, \
+                         then restore the `schema_version` row. \
+                         Run `ai-memory doctor` for the full diagnosis.)",
+                        manifest.namespace, observed,
                     )?;
                 }
             }
@@ -1498,6 +1541,101 @@ mod tests {
                 MIN_SUPPORTED_SCHEMA, MAX_SUPPORTED_SCHEMA
             )),
             "expected supported range in message: {stdout}"
+        );
+    }
+
+    /// v1.0.0 #2564 — a destroyed stamp must NOT reuse the
+    /// `WarnSchemaUnsupported` "consider upgrading" copy. The binary is
+    /// already the right one; the operator needs backup-first / restore-the-
+    /// stamp. Pins both the text header and the JSON `note` so a regression
+    /// that remaps `schema_stamp_zeroed` onto `WarnSchemaUnsupported` cannot
+    /// pass by matching `status=warn` alone (`WarnDbUnavailable` is also warn).
+    #[test]
+    fn boot_warns_on_schema_stamp_invalid() {
+        let _g = test_lock();
+        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // SAFETY: process-wide env mutation, serialised by `_guard_env`.
+        unsafe {
+            std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
+        }
+        let mut env = TestEnv::fresh();
+        seed_memory(&env.db_path, "ns-stamp", "row", "x");
+        {
+            let conn = rusqlite::Connection::open(&env.db_path).expect("rusqlite::open");
+            conn.execute("DELETE FROM schema_version", [])
+                .expect("zero the stamp");
+        }
+        let db_path = env.db_path.clone();
+        let cfg = default_config();
+        let mut args = default_args();
+        args.namespace = Some("ns-stamp".to_string());
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        assert!(
+            stdout.contains("# ai-memory boot: warn"),
+            "expected warn header for an invalid stamp: {stdout}"
+        );
+        assert!(
+            stdout.contains("schema stamp invalid"),
+            "expected the invalid-stamp diagnosis, not generic unavailability: {stdout}"
+        );
+        assert!(
+            stdout.contains("ai-memory backup"),
+            "expected backup-first remedy: {stdout}"
+        );
+        assert!(
+            stdout.contains("schema_version"),
+            "expected restore-the-stamp remedy: {stdout}"
+        );
+        assert!(
+            !stdout.contains("unsupported by binary"),
+            "must not print the schema-ahead upgrade remedy for a destroyed stamp: {stdout}"
+        );
+        assert!(
+            !stdout.contains("consider upgrading"),
+            "must not tell the operator to upgrade a binary that is already current: {stdout}"
+        );
+    }
+
+    #[test]
+    fn boot_json_schema_stamp_invalid_does_not_recommend_upgrade() {
+        let _g = test_lock();
+        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // SAFETY: process-wide env mutation, serialised by `_guard_env`.
+        unsafe {
+            std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
+        }
+        let mut env = TestEnv::fresh();
+        seed_memory(&env.db_path, "ns-stamp-json", "row", "x");
+        {
+            let conn = rusqlite::Connection::open(&env.db_path).expect("rusqlite::open");
+            conn.execute("DELETE FROM schema_version", [])
+                .expect("zero the stamp");
+        }
+        let db_path = env.db_path.clone();
+        let cfg = default_config();
+        let mut args = default_args();
+        args.namespace = Some("ns-stamp-json".to_string());
+        args.format = "json".to_string();
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(parsed["status"], "warn");
+        assert_eq!(parsed["schema_supported"], false);
+        let note = parsed["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("schema stamp invalid"),
+            "JSON note must name the invalid stamp, got: {note}"
+        );
+        assert!(
+            note.contains("ai-memory backup"),
+            "JSON note must lead with backup, got: {note}"
+        );
+        assert!(
+            !note.contains("unsupported by binary") && !note.contains("consider upgrading"),
+            "JSON note must not print the schema-ahead upgrade remedy: {note}"
         );
     }
 

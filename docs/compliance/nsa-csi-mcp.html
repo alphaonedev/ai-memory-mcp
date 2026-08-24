@@ -28,7 +28,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory — NSA CSI MCP Security Compliance</title>
-<meta name="description" content="ai-memory v1.0.0 (schema v89) substrate-level coverage of the National Security Agency Cybersecurity Information document on Model Context Protocol security (U/OO/6030316-26, May 2026). 9 of 10 NSA security concerns structurally addressed as shipped; concern (a) access control structurally addressed under the enforce identity-binding posture with per-agent keys enrolled. 7 of 7 NSA recommendations implemented. Every claim cites a named symbol, not a file:line anchor.">
+<meta name="description" content="ai-memory v1.0.0 (schema v90) substrate-level coverage of the National Security Agency Cybersecurity Information document on Model Context Protocol security (U/OO/6030316-26, May 2026). 9 of 10 NSA security concerns structurally addressed as shipped; concern (a) access control structurally addressed under the enforce identity-binding posture with per-agent keys enrolled. 7 of 7 NSA recommendations implemented. Every claim cites a named symbol, not a file:line anchor.">
 <meta name="theme-color" content="#0d1117">
 <meta property="og:title" content="ai-memory — NSA CSI MCP Security Compliance">
 <meta property="og:description" content="Procurement-grade mapping of NSA-issued MCP security guidance to ai-memory v1.0.0 substrate primitives. 9 of 10 concerns structurally addressed as shipped, concern (a) under the enforce identity-binding posture; 7 of 7 recommendations implemented. Symbol-cited, zero marketing language.">
@@ -155,7 +155,7 @@ footer a{color:var(--text-muted)}
         <span class="hero-pill good">7/7 recommendations implemented</span>
         <span class="hero-pill good">47 dedicated tests pinning the #1154 contract</span>
         <span class="hero-pill">46 primitives catalogued (v1.0.0 inventory @ 580d8427)</span>
-        <span class="hero-pill">Schema v89 · 103 MCP entries · 94 route registrations / 80 paths</span>
+        <span class="hero-pill">Schema v90 · 103 MCP entries · 94 route registrations / 80 paths</span>
       </div>
     </div>
   </div>
@@ -775,10 +775,10 @@ git checkout release/v1.0.0
 
     <h3>2. Verify the schema version (both adapters, lockstep)</h3>
 <pre class="codeblock">grep -n 'CURRENT_SCHEMA_VERSION: i64' src/storage/migrations.rs
-<span class="com"># Expected: const CURRENT_SCHEMA_VERSION: i64 = 89;   (sqlite)</span>
+<span class="com"># Expected: const CURRENT_SCHEMA_VERSION: i64 = 90;   (sqlite)</span>
 
 grep -n 'CURRENT_SCHEMA_VERSION: i32' src/store/postgres.rs
-<span class="com"># Expected: const CURRENT_SCHEMA_VERSION: i32 = 89;   (postgres, lockstep)</span></pre>
+<span class="com"># Expected: const CURRENT_SCHEMA_VERSION: i32 = 90;   (postgres, lockstep)</span></pre>
 
     <h3>3. Verify the MCP tool count anchors</h3>
 <pre class="codeblock">cargo test --lib profile::tests::profile_full_matches_registry_all
@@ -880,7 +880,7 @@ rg -n 'attested_identity_required' src/handlers/</pre>
 
 <footer>
   <div class="container">
-    <p style="margin-bottom:.5rem"><strong>ai-memory v1.0.0</strong> (sqlite + postgres schema <strong>v89</strong>, lockstep) · NSA CSI MCP Security Compliance · public-facing procurement-grade evidence · maintained by AlphaOne LLC under Apache 2.0.</p>
+    <p style="margin-bottom:.5rem"><strong>ai-memory v1.0.0</strong> (sqlite + postgres schema <strong>v90</strong>, lockstep) · NSA CSI MCP Security Compliance · public-facing procurement-grade evidence · maintained by AlphaOne LLC under Apache 2.0.</p>
     <p style="margin-bottom:.5rem">This page's prose, version stamp, coverage postures and symbol citations re-verified against <code>release/v1.0.0</code> HEAD on 2026-08-01. Inventory: <a href="_inventory/v1.0.0-capabilities.json">v1.0.0-capabilities.json</a> — re-derived at <code>580d8427bb4da887f7a25731792c55c4e49d56d6</code> on 2026-08-13 (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>) · Summary: <a href="_inventory/v1.0.0-summary.html">v1.0.0-summary.md</a> · Historical artefact: <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-capabilities.json</a> · Companion: <a href="honest-limitations.html">honest-limitations.md</a></p>
 
     <p style="margin-bottom:.5rem"><strong>Mapping authority.</strong> Every claim on this page traces to a <strong>named symbol</strong> in the source tree (module / type / function / test name), plus — where applicable — an issue or PR reference. It deliberately publishes <strong>no <code>file:line</code> anchors</strong>: line numbers drift with every commit, and a reviewer who follows a stale anchor to unrelated code loses trust that a later correction cannot restore, whereas a symbol either resolves (<code>rg '&lt;symbol&gt;' src/ tests/</code>) or is provably gone. Where a previously-cited symbol has been renamed or removed, this page now says so at the point of citation. Claims additionally carry a <code>capability_id</code> in the v1.0.0 inventory, whose own <code>file:line</code> fields are pin-verified at <code>580d8427</code>.</p>

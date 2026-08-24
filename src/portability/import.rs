@@ -981,6 +981,15 @@ fn apply_all_classes(
         let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
         let content_to_store: &str = sealed.as_ref().map_or(mem.content.as_str(), |(_, ph)| ph);
         let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
+        // v1.0.0 #2385 — the v90 `archived_memories.cid` / `cid_genesis`
+        // columns are DELIBERATELY not bound on this lane. An imported
+        // bundle's content address is REMOTE-ASSERTED, and the live-import
+        // funnel (`storage::insert_imported` -> `insert_inner`) already
+        // RECOMPUTES the address locally rather than trusting the bundle's.
+        // Admitting a caller-supplied cid on an archived row would launder it
+        // onto a LIVE row via archive->restore. The columns stay NULL here, so
+        // restore takes the legacy re-mint — byte-identical to the pre-#2385
+        // behaviour for this lane.
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO archived_memories \

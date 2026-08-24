@@ -87,10 +87,11 @@ The "defaults stop lying" lane (Gate 1′) is the centerpiece: six knobs
 that shipped OFF (or non-functional) through v0.10.0 now resolve to their
 secure posture by default, each riding the one-cycle deprecation-WARN
 discipline the v0.10.0 `warn-carrier` release delivered. The release also
-advances the schema **v78 → v89** — additive `ADD COLUMN` through v85,
+advances the schema **v78 → v90** — additive `ADD COLUMN` through v85,
 then **two DATA-MUTATING rungs (v86, v87) that rewrite stored rows**, one
-index-only rung (v88) and one derived-column-rebuild rung (v89, the
-postgres FTS `tags` fold); see §"Schema ladder v78 → v89" — adds an M-of-N
+index-only rung (v88), one derived-column-rebuild rung (v89, the
+postgres FTS `tags` fold) and one additive rung (v90, the archive
+genesis-cid parity); see §"Schema ladder v78 → v90" — adds an M-of-N
 threshold key-recovery lane, human-key-signed m-of-n approvals, an
 open-time rollback-evidence check, an inference-plane egress gate, and a
 named `asi-hard` no-disable security posture.
@@ -109,7 +110,7 @@ CLI subcommands):
 | HTTP routes | **94 production `.route(...)` registrations** / 80 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v89** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite). Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v89" |
+| Schema | **v90** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and **v90 is additive again**. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v90" |
 
 ## Secure-default flips (breaking)
 
@@ -537,9 +538,9 @@ program:
    live data), functional green, and a sound `verify-audit-trail` (the
    witness / cause-binding / role-separation / identity-lineage /
    rollback-evidence readouts resolve cleanly on both backends). **That
-   dogfood covers v78 → v86 and nothing above it** — v87, v88 and v89
+   dogfood covers v78 → v86 and nothing above it** — v87, v88, v89 and v90
    landed afterwards on `release/v1.0.0` and are NOT covered by it. See
-   §"Schema ladder v78 → v89".
+   §"Schema ladder v78 → v90".
 
 ### Scope of this attestation
 
@@ -603,12 +604,12 @@ those two review lanes raised, and no tag has been cut.
 > summarized here for completeness and to record that both review lanes
 > closed with zero GA-blockers among the findings they raised.
 
-## Schema ladder v78 → v89
+## Schema ladder v78 → v90
 
-`CURRENT_SCHEMA_VERSION = 89` on both adapters
+`CURRENT_SCHEMA_VERSION = 90` on both adapters
 (`src/storage/migrations.rs:867`, `src/store/postgres.rs`); CLAUDE.md
 §Database is the SSOT. Both adapters mirror via
-`src/store/postgres.rs::{migrate_v79 … migrate_v89}`.
+`src/store/postgres.rs::{migrate_v79 … migrate_v90}`.
 
 **The ladder is not uniformly additive, and this document previously
 said it was.** v79–v85 are pure additive `ADD COLUMN` / `CREATE TABLE`
@@ -617,7 +618,10 @@ statements against `memories` and `archived_memories`, rewriting the
 stored rendering of existing rows. v88 is index-only (postgres-side
 DDL; no row is touched). v89 redefines the postgres FTS `tsv` GENERATED
 column (a `DROP COLUMN` + `ADD COLUMN` on a derived, regenerated column;
-the durable `title`/`content`/`tags` TEXT is never touched). Both
+the durable `title`/`content`/`tags` TEXT is never touched). v90 is
+additive again — two nullable `archived_memories` columns on both
+backends, no full-table rebuild and therefore no trigger recreation
+(the v63/v65 lesson), and it deliberately backfills nothing. Both
 mutating rungs are
 instant/value-preserving, idempotent, and fail-safe on an unparseable
 value (left byte-untouched rather than destroyed), but they are row
@@ -625,16 +629,20 @@ rewrites and are labelled as such below.
 
 **Migration evidence, at its true bound.** The Gate-3 dogfood
 (§"Gate-3 evidence" step 5) attested a lossless **v78 → v86**
-round-trip on a real corpus. **v87, v88 and v89 are outside that
+round-trip on a real corpus. **v87, v88, v89 and v90 are outside that
 attestation** — all landed on `release/v1.0.0` after the dogfood ran.
 They are covered by their own regression tests, not by a
 real-corpus dogfood. Per the North Star, data-integrity evidence is
 under-claimed rather than stretched: if you are upgrading a populated
-database across v86 → v89, take a backup first (`ai-memory backup`).
+database across v86 → v90, take a backup first (`ai-memory backup`).
 The sqlite ladder additionally writes its own pre-migration
-`VACUUM INTO` snapshot beside the database file on any `version > 0`
-upgrade, before any schema mutation
-(`src/storage/migrations.rs:1562`).
+`VACUUM INTO` snapshot beside the database file before any schema
+mutation. v1.0.0 [#2564](https://github.com/alphaonedev/ai-memory-mcp/issues/2564)
+widened that gate: it was `version > 0` alone, which meant a database
+whose `schema_version` row had been deleted or zeroed replayed the whole
+ladder with the snapshot SUPPRESSED. It is now `version > 0` **OR** a
+durable-row probe, so a populated database can never migrate unsnapshotted
+(`src/storage/migrations.rs`).
 
 | Schema | Change |
 |---|---|
@@ -649,6 +657,7 @@ upgrade, before any schema mutation
 | v87 | archived `kind_provenance` parity + expiry-rendering heal — **DATA-MUTATING** (the second such rung; the first is v86). Additive half: `archived_memories.kind_provenance` on BOTH backends, the third v79/#1945 column finally mirrored onto the archive (its two siblings landed at v85), carried through every sqlite archive `INSERT…SELECT` + both `restore_archived*` lists, with legacy pre-v87 archive rows re-deriving it vocab-guarded from the metadata carrier ([#2333](https://github.com/alphaonedev/ai-memory-mcp/issues/2333), FBL-03). **Row-rewriting half (sqlite only):** `normalize_expiry_rows` applies the v86 canonicalization recipe to the expiry columns, whose predicates also compare lexicographically — `UPDATE memories SET expires_at = ?1 WHERE rowid = ?2` over every non-NULL `memories.expires_at`, plus the same over `archived_memories.expires_at` and, when the column is present, `archived_memories.original_expires_at` ([#2332](https://github.com/alphaonedev/ai-memory-mcp/issues/2332), FBL-02; `src/storage/migrations.rs`, the `if version < 87` arm). Postgres needs no heal — its `expires_at` is `TIMESTAMPTZ`, not TEXT — so `migrate_v87` is the additive half only. Same guarantees as v86: instant-preserving, idempotent, fail-safe on an unparseable value |
 | v88 | postgres composite list/archive ordering indexes — **index-only, no row is read or rewritten** ([#2578](https://github.com/alphaonedev/ai-memory-mcp/issues/2578)). `migrate_v56()` had been recorded as a postgres version-stamp no-op, so the three composite ordering indexes SQLite has carried since v56 were never built on postgres and a namespace-scoped `list` read the whole namespace and sorted it. v88 is postgres catching up; the SQLite v88 arm is a version-stamp no-op so both adapters keep ONE logical schema number. The DDL runs `CREATE INDEX CONCURRENTLY` on a dedicated connection outside any transaction with `lock_timeout` cleared and a bounded `statement_timeout` — a plain in-transaction `CREATE INDEX` is a fleet-wide boot brick (reproduced live: `canceling statement due to lock timeout` at 5.002 s against a table with one ordinary uncommitted writer, on a small table as readily as a large one). It is **FAIL-OPEN**: these indexes are derived, disposable, non-UNIQUE artifacts regenerable from the durable text, so a build failure DEGRADES to today's query plan and the version stamps regardless — refusing to boot a fleet over a missing performance index would trade total availability for zero integrity. Because the stamp means the arm never re-runs, `connect_*` re-probes `indisvalid` on EVERY connect and rebuilds anything missing or left INVALID, so a node that lost one build self-heals instead of staying silently un-indexed |
 | v89 | postgres FTS `tags` fold — cross-backend determinism fix ([#2392](https://github.com/alphaonedev/ai-memory-mcp/issues/2392); 5-agent vote `4d3ea1c5`). SQLite's `memories_fts` FTS5 table has always indexed `(title, content, tags)`, but the postgres stored generated `tsv` tsvector (v57) folded only `title + content`, so a tag-only-hit search / recall / contradiction returned the row on SQLite but ZERO rows on the enterprise (postgres) tier. `migrate_v89` redefines the generated column to fold `coalesce(tags::text, '')` — the generated-column-LEGAL fold (a GENERATED column bars `jsonb_array_elements_text`; the immutable `jsonb -> text` cast's JSON punctuation tokenizes away, leaving the array elements as lexemes under the same `'english'` config already applied to title + content) — and every `tsv`-reading path (search / recall / contradiction / list) is fixed uniformly. PG16 has no `ALTER COLUMN ... SET EXPRESSION`, so the arm is `DROP COLUMN IF EXISTS tsv` (cascades away `memories_tsv_gin`) + `ADD COLUMN tsv ... GENERATED ... STORED` + recreate the GIN, one transaction on the pooled connection retaining `lock_timeout` (the ACCESS EXCLUSIVE STORED-generated rewrite cannot be `CONCURRENTLY`, so it fails CLOSED under contention — DEGRADE to fewer tag results, never a wrong result). The SQLite v89 arm is a version-stamp no-op (FTS5 already indexes tags), so both adapters keep ONE logical schema number. `tsv` is derived data regenerated from the durable text |
+| v90 | archive genesis-cid parity — **purely additive on both backends**, no full-table rebuild and therefore no trigger recreation (the v63/v65 lesson) ([#2385](https://github.com/alphaonedev/ai-memory-mcp/issues/2385)). `archived_memories` never gained the v74/#1825 genesis content-id pair, so every archive `INSERT…SELECT` DROPPED the row's BLAKE3 address on the way into cold storage and both `restore_archived*` paths RE-MINTED it on the way back out, recomputing `stamp_cid(agent_id, namespace, title, memory_kind, created_at, plaintext)` from six reconstructed inputs. A re-mint reproduces the original address only if all six are byte-identical at restore time; a rewritten `metadata.agent_id`, or a decrypt failure whose `unwrap_or` hashes the CIPHERTEXT placeholder instead of the plaintext, silently re-addressed the durable row and dangled every `memory_links.source_cid` / `target_cid` mirror resolving to it — the v74 genesis-identity contract violated with no write intent and no error. v90 adds `cid` (TEXT) + `cid_genesis` (BLOB / BYTEA) to `archived_memories`, carries them through all seven archive funnels on each backend, and makes both restore paths bind the CARRIED pair atomically (`CASE WHEN cid IS NOT NULL THEN cid ELSE <re-mint> END`, and the same predicate for `cid_genesis` — mixing a carried address with a re-derived pre-image would produce a row whose own verify disagrees with itself). It **backfills nothing**: a pre-v90 archived row's genesis address cannot be proven from the archive alone, so those rows keep NULL and keep the legacy re-mint fallback — degrade, never corrupt; inventing an address we cannot prove would be the corruption the rung exists to stop. SQLite applies it as a probe-guarded `ALTER` (no `ADD COLUMN IF NOT EXISTS`); postgres uses `ADD COLUMN IF NOT EXISTS`. Idempotent on both |
 
 ## Honest limits
 

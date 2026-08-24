@@ -104,6 +104,17 @@ pub mod error_codes {
     /// so a `STORE_`-prefixed constant with a different wire value would be
     /// misleading.
     pub const SCHEMA_AHEAD_OF_BINARY: &str = "SCHEMA_AHEAD_OF_BINARY";
+
+    /// v1.0.0 #2564 — this database's recorded `schema_version` is zero,
+    /// negative or absent while the database provably holds durable rows from a
+    /// post-v2 schema, so the substrate refuses to operate it rather than
+    /// replay the ENTIRE migration ladder over live data with the
+    /// pre-migration safety snapshot suppressed. Un-prefixed for the same
+    /// reason as [`SCHEMA_AHEAD_OF_BINARY`]: a deliberate refusal STATE shared
+    /// across surfaces, not a backend fault. It is a SEPARATE slug because the
+    /// operator action is the opposite one ("your stamp row was destroyed",
+    /// not "run a newer binary").
+    pub const SCHEMA_STAMP_INVALID: &str = "SCHEMA_STAMP_INVALID";
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +336,9 @@ mod arch_9_slug_tests {
         // #2445 — un-prefixed, like RECORD_STOPPED: a deliberate refusal state
         // shared across surfaces, not a backend fault.
         assert_eq!(SCHEMA_AHEAD_OF_BINARY, "SCHEMA_AHEAD_OF_BINARY");
+        // #2564 — the low-end twin of the #2445 refusal, same un-prefixed
+        // convention.
+        assert_eq!(SCHEMA_STAMP_INVALID, "SCHEMA_STAMP_INVALID");
     }
 
     // FX-E1 (2026-05-27) — `crate::store` is gated behind
@@ -365,6 +379,7 @@ mod arch_9_slug_tests {
                 scope: "record-plane".into(),
             },
             StoreError::SchemaAheadOfBinary { detail: "d".into() },
+            StoreError::SchemaStampInvalid { detail: "d".into() },
             StoreError::Backend(BoxBackendError::new("boom")),
         ];
         let expected = [
@@ -379,6 +394,7 @@ mod arch_9_slug_tests {
             CONFLICT,
             RECORD_STOPPED,
             SCHEMA_AHEAD_OF_BINARY,
+            SCHEMA_STAMP_INVALID,
             DATABASE_ERROR,
         ];
         // #2445 — `zip` TRUNCATES to the shorter side, so a variant added to

@@ -457,11 +457,28 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // expiry rows match; a second pass updates nothing). NOT reversible:
     // the original NULL set is unrecoverable once stamped, but no column
     // or table is dropped, so the data-loss class is `None`.
+    //
+    // Pinned at 54 (2026-08-22, #2385): this row used to follow
+    // `current_schema_version()` so `arch_8_ladder_terminates_at_current_schema_version`
+    // stayed green as the tip advanced. That made `meta_for(54)` return
+    // None and labelled every later tip `BACKFILL_NULL_EXPIRY_TIER_DEFAULT`.
+    // v90 takes the declared-tail slot below.
     MigrationMeta {
-        version: crate::storage::migrations::current_schema_version(),
+        version: 54,
         name: "BACKFILL_NULL_EXPIRY_TIER_DEFAULT",
         idempotent: true,
         reversible: false,
+        data_loss_risk: DataLossRisk::None,
+    },
+    // v90 (#2385, v1.0.0) — ARCHIVE CID PARITY. Additive `cid` TEXT +
+    // `cid_genesis` BLOB/BYTEA on `archived_memories`, probe-guarded,
+    // no backfill, no full-table rebuild (v63/v65 trigger-drop lesson).
+    // Declared tail: MUST equal CURRENT_SCHEMA_VERSION.
+    MigrationMeta {
+        version: crate::storage::migrations::current_schema_version(),
+        name: "ARCHIVED_CID_PARITY",
+        idempotent: true,
+        reversible: true,
         data_loss_risk: DataLossRisk::None,
     },
 ];
