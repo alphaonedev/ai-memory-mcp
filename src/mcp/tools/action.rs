@@ -228,15 +228,8 @@ pub fn handle_action_transition(
     // (leases are the ownership primitive), so this never blocks the
     // lease-free flow.
     if let Some(cb) = claimed_by.as_deref() {
-        crate::validate::validate_agent_id(cb).map_err(|e| e.to_string())?;
-        if let Some(lease) = crate::actions::lease_get(conn, id).map_err(|e| e.to_string())? {
-            if lease.expires_at > now && lease.holder != cb {
-                return Err(format!(
-                    "claimed_by '{cb}' is not the live lease holder '{}' on action {id}",
-                    lease.holder
-                ));
-            }
-        }
+        let lease = crate::actions::lease_get(conn, id).map_err(|e| e.to_string())?;
+        crate::actions::authorize_claimed_by(cb, lease.as_ref(), now, id)?;
     }
 
     match crate::actions::transition(conn, id, to, claimed_by.as_deref(), now)
