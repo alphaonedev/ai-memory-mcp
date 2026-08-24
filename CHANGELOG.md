@@ -1326,6 +1326,14 @@ write is permission-evaluated as; see the operator note below.
   tokens to Enforce; the documented `standard` UNSET default stays
   Warn (not silently flipped). Count 25 → 27.
 
+- **#3229 — `lookup_peer_public_key` no longer treats an unloadable `.priv` as unenrolled.**
+  Federation inbound link verify used `keypair::load(...).ok()`, and `load` refuses a
+  group/world-readable private file (S4-LOW1). That collapse made a *forged* signed
+  link from a peer whose key material was present-but-unloadable land
+  `attest_level=unsigned` instead of being signature-rejected. Lookup now reads only
+  `<id>.pub` via `load_public` (verify never needs the private key). A missing `.pub`
+  is still unenrolled (unsigned, the documented back-compat posture); any other load
+  fault is logged so it is not indistinguishable from "no key enrolled" (#3051).
 - **The cert removal-proof harness can no longer leave a DISABLED security control
   in the working tree** (#3119, closing the #3118 near-miss).
   `scripts/check-cert-removal-proof.sh` is a mutation-testing harness: for each cited

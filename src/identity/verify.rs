@@ -525,6 +525,12 @@ pub fn verify_routine_freeze(
 ///
 /// In every `None` case the caller should fall back to the
 /// accept-and-flag-as-unsigned posture rather than rejecting the link.
+///
+/// #3229 — this lookup is verify-only: it must never open the sibling
+/// `.priv`. [`keypair::load`] refuses a loose-mode private file (S4-LOW1),
+/// and the previous `.ok()` collapse treated that as *unenrolled*, so a
+/// forged inbound link from that peer landed `unsigned` instead of being
+/// signature-rejected. [`keypair::load_public`] reads only `<id>.pub`.
 #[must_use]
 pub fn lookup_peer_public_key(observed_by: &str) -> Option<VerifyingKey> {
     if observed_by.is_empty() {
@@ -545,7 +551,21 @@ pub fn lookup_peer_public_key_in(observed_by: &str, dir: &Path) -> Option<Verify
     if observed_by.is_empty() {
         return None;
     }
-    keypair::load(observed_by, dir).ok().map(|kp| kp.public)
+    // #3229 — `load_public` never opens `.priv`. A missing `.pub` is the
+    // only silent `None` (unenrolled). Any other load fault is logged so
+    // it is not indistinguishable from "no key enrolled" (#3051).
+    match keypair::load_public(observed_by, dir) {
+        Ok(vk) => Some(vk),
+        Err(e) if keypair::is_key_absent_error(&e) => None,
+        Err(e) => {
+            tracing::warn!(
+                observed_by = %observed_by,
+                error = %e,
+                "peer public key is present but unloadable — not treating as unenrolled (#3229)"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -692,11 +712,41 @@ mod tests {
 
     #[test]
     fn lookup_peer_public_key_in_skips_invalid_agent_id() {
-        // `keypair::load` validates the agent_id; lookup should not
+        // `keypair::load_public` validates the agent_id; lookup should not
         // panic and should report `None` for invalid input.
         let dir = TempDir::new().unwrap();
         assert!(lookup_peer_public_key_in("has space", dir.path()).is_none());
         assert!(lookup_peer_public_key_in("has\0null", dir.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forged_link_skipped_when_peer_priv_mode_loose() {
+        // #3229 — a peer whose `.priv` was chmod-loosened after `save`
+        // must still be *enrolled* for verify. Pre-fix `keypair::load`
+        // refused the loose `.priv` and `.ok()` made lookup return None,
+        // so a forged signature landed unsigned instead of Tampered.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let alice = kp_mod::generate("alice").unwrap();
+        kp_mod::save(&alice, dir.path()).unwrap();
+        let priv_path = dir.path().join("alice.priv");
+        std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o644))
+            .expect("widen priv mode");
+
+        let found = lookup_peer_public_key_in("alice", dir.path())
+            .expect("loose .priv must not unenroll the .pub");
+        assert_eq!(found.to_bytes(), alice.public.to_bytes());
+
+        let link = link_fixture();
+        let mut sig = sign::sign(&alice, &link).unwrap();
+        sig[0] ^= 0x01;
+        let err = verify(&found, &link, &sig).unwrap_err();
+        assert_eq!(
+            err,
+            VerifyError::Tampered,
+            "forged signature against an enrolled (pub-only-loadable) peer must reject, not land unsigned"
+        );
     }
 
     #[test]
