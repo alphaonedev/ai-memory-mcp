@@ -222,6 +222,70 @@ pg_test!(pg_entity_register_and_by_alias, url, {
     assert_eq!(s2, StatusCode::OK);
 });
 
+pg_test!(entity_get_by_alias_hides_private_on_pg, url, {
+    // #3232 — pg by_alias treated SAL `get` NotFound (invisible) as
+    // visible via `.ok().is_none_or(...)`. A private entity owned by
+    // another tenant must return found:false, never disclose id/name.
+    let r = pg_router(&url).await;
+    let ns = uniq_ns();
+    let run = &uuid::Uuid::new_v4().to_string()[..8];
+    let alias = format!("priv-alias-{run}");
+    let owner = "ai:owner-3232";
+    let stranger = "ai:stranger-3232";
+    let register = Request::builder()
+        .method("POST")
+        .uri("/api/v1/entities")
+        .header("content-type", "application/json")
+        .header("x-agent-id", owner)
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "canonical_name": format!("Private Entity {run}"),
+                "namespace": ns,
+                "aliases": [alias.clone()],
+                "agent_id": owner,
+                "metadata": {"scope": "private", "agent_id": owner},
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, body) = decode(&r, register).await;
+    assert!(
+        status.is_success(),
+        "register private entity status={status} body={body}"
+    );
+
+    let uri = format!("/api/v1/entities/by_alias?alias={alias}&namespace={ns}");
+    let stranger_req = Request::builder()
+        .method("GET")
+        .uri(&uri)
+        .header("x-agent-id", stranger)
+        .body(Body::empty())
+        .unwrap();
+    let (s_stranger, b_stranger) = decode(&r, stranger_req).await;
+    assert_eq!(s_stranger, StatusCode::OK, "body={b_stranger}");
+    assert_eq!(
+        b_stranger["found"], false,
+        "stranger must not see private entity; body={b_stranger}"
+    );
+    assert!(
+        b_stranger["entity_id"].is_null(),
+        "entity_id must be masked; body={b_stranger}"
+    );
+
+    let owner_req = Request::builder()
+        .method("GET")
+        .uri(&uri)
+        .header("x-agent-id", owner)
+        .body(Body::empty())
+        .unwrap();
+    let (s_owner, b_owner) = decode(&r, owner_req).await;
+    assert_eq!(s_owner, StatusCode::OK, "body={b_owner}");
+    assert_eq!(
+        b_owner["found"], true,
+        "owner must still resolve the alias; body={b_owner}"
+    );
+});
+
 pg_test!(pg_entity_register_invalid_name_is_400, url, {
     let r = pg_router(&url).await;
     let (status, _b) = post_json(

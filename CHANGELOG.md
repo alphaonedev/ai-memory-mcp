@@ -1326,6 +1326,13 @@ write is permission-evaluated as; see the operator note below.
   tokens to Enforce; the documented `standard` UNSET default stays
   Warn (not silently flipped). Count 25 → 27.
 
+- **#3232 — pg `entity_get_by_alias` no longer treats an invisible row as visible.**
+  The postgres handler used `store.get(...).ok().as_ref().is_none_or(...)`.
+  Under a non-admin `CallerContext`, a `scope=private` row owned by someone else
+  maps to `Err(NotFound)`; `.ok()` made that look like "no backing memory"
+  which the sqlite path treats as visible — disclosing the private entity
+  id/name. Disposition now matches `kg_timeline`: `Ok(m)` → `is_visible_to_caller`,
+  `Err(_)` → hidden (`found: false`).
 - **#3229 — `lookup_peer_public_key` no longer treats an unloadable `.priv` as unenrolled.**
   Federation inbound link verify used `keypair::load(...).ok()`, and `load` refuses a
   group/world-readable private file (S4-LOW1). That collapse made a *forged* signed

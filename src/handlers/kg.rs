@@ -381,14 +381,17 @@ pub async fn entity_get_by_alias(
                     crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
                 let ctx_admin =
                     crate::store::CallerContext::for_admin_checked(caller.clone(), caller_is_admin);
+                // #3232 — `get` under a non-admin ctx maps an invisible
+                // (`scope=private`, other owner) row to `Err(NotFound)`.
+                // Pre-fix `.ok().is_none_or(...)` treated that Err as
+                // visible, disclosing the private entity id/name. Match
+                // the kg_timeline disposition: Ok → visibility predicate,
+                // Err → hidden (`found: false`).
                 let visible = caller_is_admin
-                    || app
-                        .store
-                        .get(&ctx_admin, &rec.entity_id)
-                        .await
-                        .ok()
-                        .as_ref()
-                        .is_none_or(|m| crate::visibility::is_visible_to_caller(m, &caller));
+                    || match app.store.get(&ctx_admin, &rec.entity_id).await {
+                        Ok(m) => crate::visibility::is_visible_to_caller(&m, &caller),
+                        Err(_) => false,
+                    };
                 if visible {
                     return Json(json!({
                         "found": true,
