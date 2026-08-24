@@ -53,6 +53,9 @@
 //! Runs under `AI_MEMORY_NO_CONFIG=1` — no embedder, no LLM, no network.
 
 use ai_memory::encryption::{get_or_create_keypair, seal_content_per_record};
+
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::storage as db;
 use rusqlite::params;
@@ -143,6 +146,7 @@ impl Drop for EncryptGate {
 }
 
 fn fresh_conn() -> rusqlite::Connection {
+    let _ = key_dir_sandbox::pin();
     db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
 }
 
@@ -194,6 +198,7 @@ fn persisted_agent_id(conn: &rusqlite::Connection, id: &str) -> Option<String> {
 /// produce — but by direct SQL, so the read-posture assertions do not depend
 /// on the write-side fix at all.
 fn poison_row(conn: &rusqlite::Connection, id: &str, foreign_agent: &str, plaintext: &str) {
+    let _ = key_dir_sandbox::pin();
     let foreign_kp = get_or_create_keypair(foreign_agent).expect("foreign keypair");
     let foreign_envelope =
         seal_content_per_record(plaintext, &foreign_kp.public).expect("seal to foreign key");

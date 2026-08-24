@@ -68,6 +68,9 @@ const FACT_RECALL_MODE_ACTIVE: &str = "recall_mode_active";
 const FACT_RERANKER_ACTIVE: &str = "reranker_active";
 const SECTION_LLM_REACHABILITY: &str = "LLM Reachability (#1146)";
 const SECTION_EMBEDDINGS_REACHABILITY: &str = "Embeddings Reachability (#1598)";
+/// #3147 / #3155 — operator-visible identity health. Named to match the
+/// daemon WARN "See `ai-memory doctor` -> Identity".
+const SECTION_IDENTITY: &str = "Identity";
 const MSG_RAW_SQL_DB_MODE: &str = "raw SQL section — only available in --db mode";
 /// #1598 literal-dedup — shared probe-client failure fact prefix for
 /// the LLM + Embeddings reachability sections.
@@ -627,7 +630,8 @@ fn run_local(db_path: &Path) -> Report {
     sections.push(section_config_health_3166());
 
     // Open the connection once; failures bubble into a single Critical
-    // section and the rest of the report is N/A.
+    // section and the rest of the report is N/A. Identity still renders
+    // (the keystore is independent of the database).
     let conn = match db::open(db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -656,6 +660,7 @@ fn run_local(db_path: &Path) -> Report {
                 facts.push(("binary_supports_schema".into(), z.supported.to_string()));
                 facts.push(("schema_stamp".into(), "invalid".into()));
             }
+            sections.push(section_identity_3147(None));
             sections.push(ReportSection {
                 name: "Storage".into(),
                 severity: Severity::Critical,
@@ -695,6 +700,7 @@ fn run_local(db_path: &Path) -> Report {
         }
     };
 
+    sections.push(section_identity_3147(Some(&conn)));
     sections.push(section_storage(&conn, db_path));
     sections.push(section_index(&conn));
     sections.push(section_embedding_space_census_2167(&conn));
@@ -790,6 +796,158 @@ fn section_config_health_3166() -> ReportSection {
                  reflects COMPILED DEFAULTS, not your configuration."
                     .into(),
             ),
+        },
+    }
+}
+
+/// Accumulator for the Identity doctor section.
+type IdentityAcc = (Vec<(String, String)>, Severity, Vec<String>);
+
+/// Filesystem half of [`section_identity_3147`]: key-dir posture + daemon
+/// pub/priv presence. Never generates a key and never rewrites modes.
+fn identity_keystore_facts() -> IdentityAcc {
+    let mut facts = Vec::new();
+    let mut severity = Severity::Info;
+    let mut notes = Vec::new();
+    match crate::identity::keypair::resolved_default_key_dir_path() {
+        Ok(dir) => {
+            facts.push(("key_dir".into(), dir.display().to_string()));
+            identity_dir_mode_facts(&dir, &mut facts, &mut severity, &mut notes);
+            identity_signing_facts(&dir, &mut facts, &mut severity, &mut notes);
+        }
+        Err(e) => {
+            severity = severity_max(severity, Severity::Warning);
+            facts.push(("key_dir".into(), format!("unresolved: {e:#}")));
+        }
+    }
+    (facts, severity, notes)
+}
+
+fn identity_dir_mode_facts(
+    dir: &Path,
+    facts: &mut Vec<(String, String)>,
+    severity: &mut Severity,
+    notes: &mut Vec<String>,
+) {
+    if !dir.exists() {
+        facts.push((
+            "key_dir_mode".into(),
+            "missing (will be created 0700)".into(),
+        ));
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        match std::fs::metadata(dir) {
+            Ok(md) => {
+                let mode = md.permissions().mode() & 0o7777;
+                facts.push(("key_dir_mode".into(), format!("{mode:o}")));
+                // SAFETY: geteuid has no preconditions (UNSAFE-01).
+                let euid = unsafe { libc::geteuid() };
+                let uid = md.uid();
+                let owner = if uid == euid {
+                    "self"
+                } else if uid == 0 {
+                    "root"
+                } else {
+                    "other"
+                };
+                facts.push(("key_dir_owner".into(), format!("{owner} (uid {uid})")));
+                if mode & 0o022 != 0 {
+                    *severity = severity_max(*severity, Severity::Critical);
+                    notes.push(format!(
+                        "key directory is group- or world-writable (mode {mode:o}); \
+                         another local UID can swap daemon.priv. Restore with: \
+                         chmod 0700 {} (#3198)",
+                        dir.display()
+                    ));
+                }
+                if !crate::identity::keypair::key_dir_owner_ok(uid, euid) {
+                    *severity = severity_max(*severity, Severity::Critical);
+                    notes.push(format!(
+                        "key directory is owned by uid {uid}, not this process \
+                         (euid {euid}) or root. Restore with: chown {euid} {} \
+                         && chmod 0700 {} (#3198)",
+                        dir.display(),
+                        dir.display()
+                    ));
+                }
+            }
+            Err(e) => {
+                *severity = severity_max(*severity, Severity::Warning);
+                facts.push(("key_dir_stat".into(), format!("failed: {e}")));
+            }
+        }
+    }
+}
+
+fn identity_signing_facts(
+    dir: &Path,
+    facts: &mut Vec<(String, String)>,
+    severity: &mut Severity,
+    notes: &mut Vec<String>,
+) {
+    let label = crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
+    let pub_exists = dir.join(format!("{label}.pub")).exists();
+    let priv_exists = dir.join(format!("{label}.priv")).exists();
+    facts.push((
+        "daemon_pub".into(),
+        if pub_exists { "present" } else { "absent" }.into(),
+    ));
+    facts.push((
+        "daemon_priv".into(),
+        if priv_exists { "present" } else { "absent" }.into(),
+    ));
+    let signing = match (pub_exists, priv_exists) {
+        (true, true) => "ready",
+        (false, true) => "priv-only (public half re-derivable on next boot)",
+        (true, false) => {
+            *severity = severity_max(*severity, Severity::Warning);
+            notes.push(
+                "daemon.pub exists but daemon.priv does not — this process can \
+                 verify but can NEVER sign. Restore daemon.priv from backup, or \
+                 remove daemon.pub to accept a fresh identity (#3147)."
+                    .into(),
+            );
+            "public-only (cannot sign)"
+        }
+        (false, false) => "none (first boot will generate)",
+    };
+    facts.push(("signing".into(), signing.into()));
+}
+
+/// #3147 / #3155 — Identity section. Read-only: never generates a key,
+/// never rewrites modes. Surfaces the daemon keypair half-state, the
+/// #3198 key-dir posture, and whether `HTTP_REQUIRE_ATTESTED_IDENTITY=enforce`
+/// is inert with zero enrolled keys.
+fn section_identity_3147(conn: Option<&rusqlite::Connection>) -> ReportSection {
+    let (mut facts, mut severity, mut notes) = identity_keystore_facts();
+    let mode = crate::config::http_attested_identity_mode();
+    facts.push(("http_identity_mode".into(), mode.as_str().into()));
+    let enrolled = conn.map_or(0, |c| {
+        db::list_agent_api_keys(c)
+            .map(|rows| rows.len())
+            .unwrap_or(0)
+    });
+    facts.push(("enrolled_api_keys".into(), enrolled.to_string()));
+    if let Some(reason) =
+        crate::handlers::identity_binding::inert_enforce_boot_reason(mode, enrolled)
+    {
+        severity = severity_max(severity, Severity::Warning);
+        facts.push(("inert_enforce".into(), "yes".into()));
+        notes.push(reason);
+    } else {
+        facts.push(("inert_enforce".into(), "no".into()));
+    }
+    ReportSection {
+        name: SECTION_IDENTITY.into(),
+        severity,
+        facts,
+        note: if notes.is_empty() {
+            None
+        } else {
+            Some(notes.join("; "))
         },
     }
 }
@@ -2521,7 +2679,7 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_fifteen_sections() {
+    fn local_run_on_empty_db_produces_sixteen_sections() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
@@ -2531,14 +2689,16 @@ mod tests {
         // "Recall Index Coverage (#1964)"; #1965 added
         // "Corpus Lifecycle (#1965)"; #2167 added
         // "Embedding Space Census (#2167)"; #2985 added
-        // "Atomisation Curator"; #3166 prepended "Configuration" — total is
-        // now 15.
-        assert_eq!(report.sections.len(), 15);
+        // "Atomisation Curator"; #3166 prepended "Configuration";
+        // #3147/#3155 inserted "Identity" after Configuration — total is
+        // now 16.
+        assert_eq!(report.sections.len(), 16);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "Configuration",
+                "Identity",
                 "Storage",
                 "Index",
                 "Embedding Space Census (#2167)",
@@ -2554,6 +2714,20 @@ mod tests {
                 "LLM Reachability (#1146)",
                 "Embeddings Reachability (#1598)",
             ]
+        );
+        let identity = find(&report, SECTION_IDENTITY);
+        assert!(
+            identity.facts.iter().any(|(k, _)| k == "signing"),
+            "Identity section must report daemon signing state: {:?}",
+            identity.facts
+        );
+        assert!(
+            identity
+                .facts
+                .iter()
+                .any(|(k, _)| k == "http_identity_mode"),
+            "Identity section must report HTTP identity mode: {:?}",
+            identity.facts
         );
     }
 
@@ -3375,14 +3549,16 @@ mod tests {
         // Write garbage so SQLite refuses to open it.
         std::fs::write(&bad, b"this is not a sqlite database, it's just text").unwrap();
         let report = run_local_collect(&bad);
-        // #3166 — the error path now carries the always-present
-        // "Configuration" section plus the single Storage section.
-        assert_eq!(report.sections.len(), 2);
+        // #3166 — Configuration always renders; #3147 — Identity still
+        // renders (the keystore is independent of the database); Storage
+        // is the Critical open-failure section.
+        assert_eq!(report.sections.len(), 3);
         assert_eq!(report.sections[0].name, "Configuration");
-        let storage = &report.sections[1];
+        assert_eq!(report.sections[1].name, SECTION_IDENTITY);
+        let storage = &report.sections[2];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
-        // overall is computed from the single section.
+        // overall is computed from the sections; Storage is Critical.
         assert_eq!(report.overall, Severity::Critical);
         assert!(storage.note.as_ref().unwrap().contains("could not open"));
     }

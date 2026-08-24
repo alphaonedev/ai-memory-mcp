@@ -238,7 +238,19 @@ pub fn run(
     // local sqlite — has not yet started. Surfaced by the do-1461 A2A run.
     let conn = crate::db::open(db_path)
         .with_context(|| format!("rules: open db at {}", db_path.display()))?;
-    let key_dir = resolve_key_dir(args.key_dir.as_deref())?;
+    // `List` and `Check` are documented read-only / no-key. Resolving the
+    // default key dir here made `rules list` refuse on a 0o775 host
+    // keystore (#3198) — a silent tightening of "no key required".
+    // `Keygen --out PATH` writes PATH, not the default dir.
+    let key_dir = match &args.action {
+        RulesAction::List | RulesAction::Check { .. } => std::path::PathBuf::new(),
+        RulesAction::Keygen { out: Some(_), .. }
+            if args.key_dir.is_none() && kp::key_dir_env_override().is_none() =>
+        {
+            std::path::PathBuf::new()
+        }
+        _ => resolve_key_dir(args.key_dir.as_deref())?,
+    };
 
     match args.action {
         RulesAction::Add {

@@ -101,6 +101,13 @@ use anyhow::{Result, bail};
 /// Env var selecting the process-wide security posture.
 pub const ENV_SECURITY_PROFILE: &str = "AI_MEMORY_SECURITY_PROFILE";
 
+/// #3146/#3147 (pm-v3.1 hardcoded-literal gate) — the ONE spelling of the
+/// `asi-hard` refusal preamble. Every boot refusal attributed to this posture
+/// (here, and [`crate::identity::keypair::public_only_refusal`]) opens with it,
+/// so operators can grep one phrase for "the posture stopped my boot" and a
+/// rename can never leave half the fleet's messages behind.
+pub const ASI_HARD_REFUSAL_PREFIX: &str = "security posture \"asi-hard\"";
+
 /// The named security posture. `Standard` is the compiled default (every
 /// knob keeps its own default); `AsiHard` engages the pin-and-refuse set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,7 +528,7 @@ pub fn enforce_at_boot() -> Result<(SecurityPosture, Vec<PinReport>)> {
 /// refusal text cannot drift between the two paths (#2386).
 fn loosening_refusal(knob: &KnobSpec, current: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "security posture \"asi-hard\" refuses to disable {knob}: \
+        "{ASI_HARD_REFUSAL_PREFIX} refuses to disable {knob}: \
          it is set to {current:?} which is below the required hard \
          floor {hard:?}. Remove the {knob} override (asi-hard pins \
          it) or raise it to {hard:?}.",
@@ -590,7 +597,7 @@ pub fn runtime_boot_report() -> Result<(SecurityPosture, Vec<PinReport>)> {
             }),
             Ok(current) => return Err(loosening_refusal(knob, &current)),
             Err(_) => bail!(
-                "security posture \"asi-hard\" requires {knob} to be pinned before \
+                "{ASI_HARD_REFUSAL_PREFIX} requires {knob} to be pinned before \
                  the async runtime starts, but the pre-runtime enforcement never ran \
                  (direct `daemon_runtime::run` caller?). Boot through the ai-memory \
                  binary, or set {knob}={hard:?} explicitly before starting (#2386).",

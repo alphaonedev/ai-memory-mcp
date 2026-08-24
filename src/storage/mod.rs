@@ -11896,9 +11896,24 @@ pub fn bind_agent_pubkey(conn: &Connection, agent_id: &str, pubkey_b64: &str) ->
 ///
 /// # Errors
 ///
-/// Surfaces only underlying query failures.
+/// Surfaces `SELECT` failures other than "no row" (#3145). A transient
+/// backend fault must NEVER be flattened into `Ok(None)`: "no bound key"
+/// is a durable provenance claim, so a swallowed error would stamp a
+/// genuinely-signed write as bare `claimed`.
 pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>> {
     let title = crate::models::agent_registration_title(agent_id);
+    // #3145 (v1.0.0, data-integrity) — `.optional()` maps ONLY the no-row case
+    // to `None`; a REAL query error (SQLITE_BUSY / lock timeout / I/O error /
+    // corrupt page) propagates, aligning with the Postgres `fetch_optional` +
+    // `map_err` twin (`crate::store::postgres::PostgresStore::agent_pubkey`).
+    //
+    // The prior `.ok().flatten()` swallowed EVERY error into `Ok(None)` = "no
+    // bound key", so a transient DB fault silently demoted a genuinely-signed
+    // write to bare `claimed` (durable provenance corruption — a WRONG result,
+    // not a degraded one), or under required attestation flipped it to
+    // `AttestationRequired`. Same hazard, same fix, as `agent_id_for_api_key`
+    // 30 lines below (#2095). rust-1.98 ERRORS-15 / ERRORS-19.
+    use rusqlite::OptionalExtension as _;
     let pubkey = conn
         .query_row(
             "SELECT json_extract(metadata, '$.agent_pubkey') FROM memories
@@ -11906,7 +11921,8 @@ pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>>
             params![AGENTS_NAMESPACE, &title],
             |row| row.get::<_, Option<String>>(0),
         )
-        .ok()
+        .optional()
+        .with_context(|| format!("resolving bound agent pubkey for {agent_id}"))?
         .flatten();
     Ok(pubkey)
 }
