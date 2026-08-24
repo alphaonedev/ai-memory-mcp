@@ -20088,20 +20088,62 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
     }
     let memory_id = match pa.action_type.as_str() {
         "store" => {
-            let mut mem: Memory = serde_json::from_value(pa.payload.clone()).map_err(|e| {
-                // #962 typed envelope.
-                anyhow::Error::new(StorageError::InvalidArgument {
-                    reason: format!("invalid store payload: {e}"),
-                })
-            })?;
-            // Stamp fresh id + timestamps so the execution is idempotent on replay.
-            mem.id = uuid::Uuid::new_v4().to_string();
-            let now = Utc::now().to_rfc3339();
-            mem.created_at.clone_from(&now);
-            mem.updated_at = now;
-            mem.access_count = 0;
-            let actual_id = insert(conn, &mem)?;
-            Some(actual_id)
+            // #3202 Fable HIGH — destination-namespace Approve on vertical
+            // promote evaluates the STORE-class write gate (correct: a clone
+            // is a write into `to_ns`) so `queue_pending_action` records
+            // action_type="store" with payload `{id, to_namespace, mode:
+            // "vertical"}`. That is NOT a `Memory`. Pre-fix this arm
+            // `from_value::<Memory>`'d it, the Approve path never cloned,
+            // and the queued row was a dead letter. Dispatch vertical
+            // payloads onto `promote_to_namespace`; leave a real store
+            // payload on the Memory-insert path.
+            let is_vertical_promote =
+                pa.payload.get("mode").and_then(|v| v.as_str()) == Some("vertical");
+            if is_vertical_promote {
+                let mid = pa.memory_id.clone().or_else(|| {
+                    pa.payload
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                });
+                let to_ns = pa
+                    .payload
+                    .get(field_names::TO_NAMESPACE)
+                    .and_then(|v| v.as_str());
+                match (mid, to_ns) {
+                    (Some(mid), Some(to_ns)) => {
+                        let clone_id = promote_to_namespace(
+                            conn,
+                            &mid,
+                            to_ns,
+                            Some(pa.requested_by.as_str()),
+                        )?;
+                        Some(clone_id)
+                    }
+                    _ => {
+                        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                            reason:
+                                "vertical promote pending-store payload missing id or to_namespace"
+                                    .into(),
+                        }));
+                    }
+                }
+            } else {
+                let mut mem: Memory = serde_json::from_value(pa.payload.clone()).map_err(|e| {
+                    // #962 typed envelope.
+                    anyhow::Error::new(StorageError::InvalidArgument {
+                        reason: format!("invalid store payload: {e}"),
+                    })
+                })?;
+                // Stamp fresh id + timestamps so the execution is idempotent on replay.
+                mem.id = uuid::Uuid::new_v4().to_string();
+                let now = Utc::now().to_rfc3339();
+                mem.created_at.clone_from(&now);
+                mem.updated_at = now;
+                mem.access_count = 0;
+                let actual_id = insert(conn, &mem)?;
+                Some(actual_id)
+            }
         }
         "delete" => {
             if let Some(mid) = pa.memory_id.clone() {
@@ -27976,6 +28018,41 @@ mod tests {
         assert_eq!(mem.reflection_depth, 1, "depth = max(source depths) + 1");
         // The substrate stamps `metadata.agent_id` from the input.agent_id field.
         assert_eq!(mem.metadata["agent_id"], "alice");
+    }
+
+    /// #3202 Fable HIGH — a STORE-class destination Approve on vertical
+    /// promote must clone via `promote_to_namespace`, not
+    /// `from_value::<Memory>` the `{id, to_namespace, mode:"vertical"}`
+    /// payload.
+    #[test]
+    fn test_execute_store_arm_vertical_promote_clones_3202() {
+        let conn = test_db();
+        let src = make_memory("src-vert", "parent/child", Tier::Mid, 5);
+        let src_id = insert(&conn, &src).unwrap();
+        let payload = serde_json::json!({
+            "id": src_id,
+            (field_names::TO_NAMESPACE): "parent",
+            "mode": "vertical",
+        });
+        let pending_id = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            "parent",
+            None,
+            "alice",
+            &payload,
+        )
+        .unwrap();
+        assert!(decide_pending_action(&conn, &pending_id, true, "approver").unwrap());
+        let result =
+            execute_pending_action(&conn, &pending_id).expect("vertical store-arm execute ok");
+        let clone_id = result.expect("vertical promote must return the clone id");
+        assert_ne!(clone_id, src_id, "clone is a new row");
+        let clone = get(&conn, &clone_id).unwrap().expect("clone landed");
+        assert_eq!(clone.namespace, "parent");
+        assert_eq!(clone.title, "src-vert");
+        let source = get(&conn, &src_id).unwrap().expect("source untouched");
+        assert_eq!(source.namespace, "parent/child");
     }
 
     /// S5-H4 — a queued payload whose `agent_id` does NOT match

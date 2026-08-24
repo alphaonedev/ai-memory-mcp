@@ -691,7 +691,12 @@ backend and missing or divergently implemented on its twin). Pinned by
   normally the MORE protected namespace — so the governance boundary was
   crossable by construction. A STORE-class `enforce_governance` now runs against
   `to_namespace` before the clone (Deny refuses, Approve queues exactly as a
-  direct `memory_store` into that namespace would), the forensic row is chained
+  direct `memory_store` into that namespace would). Fable HIGH on #3220: that
+  queue recorded `action_type="store"` with payload `{id, to_namespace,
+  mode:"vertical"}`, and `execute_pending_action`'s store arm
+  `from_value::<Memory>`'d it — Approve never cloned. The store arm now
+  dispatches a `mode=vertical` payload onto `promote_to_namespace`. The
+  forensic row is chained
   under the DESTINATION, and the clone's provenance is RE-STAMPED: it was
   carrying `source.metadata` verbatim, so the new row was owned by the source's
   author rather than the caller that put it there and nothing in the row

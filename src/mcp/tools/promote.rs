@@ -236,7 +236,8 @@ pub(super) fn handle_promote(
             let dest_capability = crate::governance::capability::parse_presented_token(
                 params[param_names::CAPABILITY].as_str(),
                 &dest_agent_id,
-            );
+            )
+            .map_err(|rej| crate::governance::capability::edge_reject_message(&rej))?;
             let dest_payload = json!({
                 "id": resolved_id,
                 (crate::models::field_names::TO_NAMESPACE): to_ns,
