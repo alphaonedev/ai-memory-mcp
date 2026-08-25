@@ -3000,6 +3000,17 @@ pub(crate) fn resolve_boot_embedder_model(
         };
     }
     let (model, unhonoured_config_model) = resolve_embedder_model_reported(tier_config, app_config);
+    if let Some(ref raw) = unhonoured_config_model {
+        tracing::warn!(
+            configured_model = %raw,
+            preset = ?model,
+            "#2972: [embeddings].model is not constructible in this binary; \
+             substituting the tier preset. daemon/mcp will not honour the \
+             configured id (doctor and reembed already surface this; this \
+             WARN is the boot-path copy so a silent substitution cannot \
+             hide behind those CLIs)"
+        );
+    }
     BootEmbedderModel {
         model,
         unhonoured_config_model,

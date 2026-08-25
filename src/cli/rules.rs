@@ -368,6 +368,31 @@ pub fn run(
                 bail!("governance.no_operator_key: `rules enable` requires --sign");
             }
             let signing_key = load_operator_signing_key_from_dir(&key_dir)?;
+            // v1.0.0 #3031 — `rules add` refuses an inert matcher, but a
+            // pre-#3031 row can still be sitting disabled. Enabling it
+            // would restore the exact inert-enabled-refuse hole (every
+            // action of that kind fail-closes). Validate before flip;
+            // tell the operator to re-mint via `rules add`.
+            let existing = rules_store::get(&conn, &id)?
+                .with_context(|| format!("rules.enable: no rule with id={id}"))?;
+            let matcher_json: serde_json::Value =
+                serde_json::from_str(&existing.matcher).map_err(|e| {
+                    anyhow::anyhow!(
+                        "rules.enable: stored matcher is not valid JSON ({e}); \
+                         re-mint with `rules add`"
+                    )
+                })?;
+            crate::governance::agent_action::validate_matcher_for_kind(
+                &existing.kind,
+                &matcher_json,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "rules.enable: {e}. Re-mint with `rules add` — enabling an \
+                     inert matcher would fail-close every '{}' action (#3031)",
+                    existing.kind
+                )
+            })?;
             // v0.9.0 §25.3 S3 (F-40, #1853) — route through the audited,
             // atomic signed path. `set_enabled_signed` flips `enabled`,
             // re-signs the canonical (post-state) bytes, appends the
@@ -1627,6 +1652,14 @@ mod tests {
         let kp = kp::generate(OPERATOR_KEY_ID).expect("generate");
         let key_dir = dir.path().join("keys");
         std::fs::create_dir_all(&key_dir).expect("mkdir keys");
+        // #3198 — kp::save refuses a group/world-writable key dir. Host
+        // umask 0002 makes mkdir 0775; pin the sandbox to 0700.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700 test key dir");
+        }
         kp::save(&kp, &key_dir).expect("save kp");
         (dir, db_path, key_dir)
     }
@@ -1887,6 +1920,50 @@ mod tests {
         };
         let err = run(&db_path, args, false, &mut out).expect_err("must error");
         assert!(format!("{err:#}").contains("no rule with id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_rules_enable_refuses_inert_matcher_3031() {
+        let (_dir, db_path, key_dir) = fresh_env_with_operator_key();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        rules_store::insert(
+            &conn,
+            &Rule {
+                id: "R-inert-enable".into(),
+                kind: "bash".into(),
+                matcher: r#"{"totally_bogus_key":123}"#.into(),
+                severity: "refuse".into(),
+                reason: "legacy inert".into(),
+                namespace: "_global".into(),
+                created_by: "test".into(),
+                created_at: 1,
+                enabled: false,
+                signature: None,
+                attest_level: "unsigned".into(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+        let args = RulesArgs {
+            key_dir: Some(key_dir),
+            action: RulesAction::Enable {
+                id: "R-inert-enable".into(),
+                sign: true,
+            },
+        };
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let err = run(&db_path, args, false, &mut out).expect_err("must refuse inert enable");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rules.enable") && msg.contains("rules add"),
+            "enable of an inert matcher must point at `rules add`, got: {msg}"
+        );
     }
 
     #[cfg(unix)]
