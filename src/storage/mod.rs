@@ -4216,17 +4216,9 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
 /// `archive_memory_no_tx`, kept private because every external caller wants
 /// the atomic wrapper.
 fn delete_inner(conn: &Connection, id: &str) -> Result<bool> {
-    // #2503 — SEVER (never DELETE) any namespace_meta binding pointing here.
-    sever_namespace_standards(conn, id)?;
-    // #3192 — tombstone + crypto-erase BEFORE the DELETE, inside the
-    // already-open transaction (`delete` opens one when autocommit;
-    // callers such as consolidate join theirs — never a nested BEGIN).
-    // Reuses [`evict_tombstone_and_erase`] so we do not fork a third
-    // hard-delete primitive. A missing row skips the tombstone (no
-    // namespace to bind) and the DELETE below returns false — same as
-    // pre-#3192. MCP `memory_delete`, HTTP DELETE, CLI delete, and the
-    // inbound federation `deletions[]` lane (`federation_receive.rs` +
-    // `SqliteStore::apply_remote_deletion`) all land here.
+    // #3192 / #3253 Fable item 2 — probe the row FIRST. A missing id must
+    // not sever `namespace_meta` or write a forget-tombstone for a delete
+    // that never happened (sqlite twin of `pg_hard_delete_in_tx`).
     use rusqlite::OptionalExtension;
     let now = Utc::now().to_rfc3339();
     if let Some((ns, ver, agent_id)) = conn
@@ -4239,6 +4231,8 @@ fn delete_inner(conn: &Connection, id: &str) -> Result<bool> {
         })
         .optional()?
     {
+        // #2503 — SEVER (never DELETE) any namespace_meta binding pointing here.
+        sever_namespace_standards(conn, id)?;
         tombstone_and_erase(
             conn,
             id,
