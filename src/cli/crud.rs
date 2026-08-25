@@ -635,6 +635,7 @@ mod tests {
                 &DeleteArgs {
                     id: id.clone(),
                     capability: None,
+                    capability_file: None,
                     hard: false,
                 },
                 true,
@@ -720,6 +721,7 @@ mod tests {
                 &DeleteArgs {
                     id: id.clone(),
                     capability: None,
+                    capability_file: None,
                     hard: false,
                 },
                 true,
@@ -762,6 +764,7 @@ mod tests {
                 &DeleteArgs {
                     id: id.clone(),
                     capability: None,
+                    capability_file: None,
                     hard: true,
                 },
                 true,
