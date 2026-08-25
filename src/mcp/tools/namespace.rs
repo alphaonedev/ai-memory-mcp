@@ -1073,6 +1073,10 @@ mod tests {
         // a cross-owner caller is refused; the owner may clear. (#3171 made the
         // gate unconditional — an UNCLAIMED caller no longer skips it; see
         // `clear_standard_omitted_agent_id_still_gates_owned_row_3171`.)
+        // Single-operator posture: a sibling `_3171` test that sets
+        // `AI_MEMORY_AGENT_ID=ai:bob` must not leak a multi-tenant mismatch
+        // into this assertion (macos-fed flake on #3221).
+        let _g = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = insert_owned(&conn, "ns-clear-1777", "standard", "ai:alice");
         handle_namespace_set_standard(
@@ -1112,6 +1116,7 @@ mod tests {
     /// #2545 — claimed non-owner must not clear a SEVERED/dangling binding.
     #[test]
     fn clear_standard_refuses_unresolvable_binding_2545() {
+        let _g = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = insert_owned(&conn, "ns-clear-2545", "standard", "ai:alice");
         handle_namespace_set_standard(
@@ -1208,6 +1213,7 @@ mod tests {
     /// #2541 hole 1 — omitting agent_id must NOT skip ownership gate.
     #[test]
     fn set_standard_omitted_agent_id_still_gates_owned_row_2541() {
+        let _g = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = insert_owned(&conn, "ns-opt-in", "std", "ai:alice");
         let err =
@@ -1278,6 +1284,14 @@ mod tests {
     /// trusted entry, which the internal producers (CLI operator surface) use.
     #[test]
     fn set_standard_wire_reserved_sentinel_is_not_honored_2721() {
+        // Single-operator posture: `resolve_namespace_standard_caller` takes
+        // the #3171 multi-tenant mismatch arm when `AI_MEMORY_AGENT_ID` is
+        // set. A sibling test (`*_3171`) sets `ai:bob` under the crate-wide
+        // env lock; without this guard we race that window and get
+        // "agent_id mismatch: caller 'ai:bob' … (requested 'daemon')"
+        // instead of the #2721 anonymous:invalid ownership refusal
+        // (required Check macos-fed,sqlite on b537e274).
+        let _g = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = insert_owned(&conn, "ns-2721", "std", "ai:alice");
 

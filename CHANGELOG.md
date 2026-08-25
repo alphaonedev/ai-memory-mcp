@@ -1416,6 +1416,97 @@ backend and missing or divergently implemented on its twin). Pinned by
   watchdog test's detached sleeper drops from 30 s to 5 s (still
   unconditionally over the assertion's ceiling, so the property is intact).
 
+- **DATA LOSS: `gc(archive = true)` dropped every link of the archived memory;
+  the archiving PATH decided whether a memory kept its edge graph (#3161).**
+  `storage::gc`'s archive branch copied only the memory ROW into
+  `archived_memories` and then ran `DELETE FROM memories` in the same
+  transaction. `memory_links` carries an `ON DELETE CASCADE` FK on BOTH
+  endpoints, so that delete reaped the row's entire edge graph, and
+  `restore_archived` brought the memory back with NO links — while
+  `forget(archive = true)`, `archive_memory_no_tx` and (on postgres)
+  `archive_by_ids` have snapshotted edges into `archived_memory_links` since
+  #1771. The loss was pinned as intended by a test whose message read *"Flip
+  this to expect 1 when `archived_memory_links` preservation lands"* and cited
+  #1771 — but preservation HAD landed and #1771 was CLOSED, so a documented
+  known-loss had silently become an undocumented ASYMMETRY that no operator
+  could see: identical memories, identical edges, different outcome depending
+  on which funnel archived them. `gc` now calls `archive_links_for_memory` over
+  the same deterministic chunk id set the `DELETE` targets, before the cascade.
+  An audit of EVERY archive-then-delete funnel on BOTH backends (8 sqlite +
+  7 postgres `archived_memories` write sites) found the issue's `gc` was one of
+  FIVE, not one: **sqlite** `gc` and `archive_memory_for_caller` (the
+  ownership-scoped `memory_archive` for a non-admin caller, which open-codes its
+  archive copy instead of routing through `archive_memory_no_tx` — so whether a
+  memory kept its links depended on which PRINCIPAL archived it, not just which
+  funnel); **postgres** `run_gc` (a set-based insert over the same TTL-expiry
+  predicate the `DELETE` uses), `size_gc` (byte-cap eviction — the sqlite twin
+  routes through `archive_memory_no_tx` and has snapshotted since #1771, this
+  one never did), and `update_with_archive_on_supersede` (the superseded row was
+  archived and deleted, so restoring the `superseded` snapshot on postgres
+  returned it edgeless while sqlite returned the graph). The remaining sites are
+  `in_place_edit` snapshots that never delete the live row, so no cascade fires
+  and no snapshot is owed. All five snapshots are idempotent (`INSERT OR IGNORE`
+  / `ON CONFLICT DO NOTHING` on the `(source_id, target_id, relation)` PK), so
+  an edge already captured by another funnel is left untouched. The pinning test
+  is flipped to expect preservation and joined by a funnel-PARITY twin that
+  compares gc against forget, `archive_memory` and `archive_memory_for_caller`
+  directly, plus gated postgres twins for `run_gc` and `size_gc`.
+- **Claims-truth sweep for the retired v70 "documented loss" carve-out
+  (#3161).** Five places still told operators the opposite of what the code now
+  does. `storage::restore_archived`'s recovery-scope doc (*"**NOT recovered:**
+  edges lost to the auto-eviction paths (`gc` / `size_gc`)"*),
+  `docs/corpus-lifecycle.md`'s EXPIRE restorability row (*"Link edges are
+  **not** snapshotted on auto-eviction (documented loss)"*) and `CLAUDE.md`'s
+  v70 schema note are corrected to state the new contract and to name what IS
+  still irreversible (a HARD `archive = false` forget/gc — which is what
+  irreversibility means). Restored edges still re-insert with NULL
+  `source_cid`/`target_cid` (#3250): `archived_memory_links` has no v75
+  lineage-pin columns, so cid-stable identity across a tombstoned endpoint
+  is lost until a post-v90 schema arm carries them through snapshot/restore.
+  Two expiry-floor rationale comments in
+  `storage::mod.rs` that cited *"permanent link-edge loss under the v70
+  auto-eviction posture"* now say the reap remains but the edge loss does not.
+  Separately, the postgres `archived_memory_links` v70 doc still read *"the
+  snapshot-before-delete + restore-re-insert wiring is wired on SQLite this
+  commit and is a tracked POSTGRES follow-up"* — stale since v70 shipped; the
+  identical sentence was corrected in the sqlite twin by #2318 but the postgres
+  copy was MISSED, so it advertised a two-release-old gap that did not exist.
+- **The per-migration metadata matrix was guessed, not derived, and its lockstep
+  gate could never fail (#3158).** `storage::migration_meta::MIGRATION_LADDER`
+  is the operator-facing answer to *"is this migration reversible? does it lose
+  data? is it idempotent?"* — the input to every rollback plan — and it was
+  wrong. v43 was recorded as `ADD_RECURSIVE_LEARNING_LEDGER / idempotent /
+  reversible / DataLossRisk::None`; `grep recursive_learning
+  src/storage/migrations.rs` has no match, and the real v43 arm applies
+  `0037_v07_persona_signing_atomicity.sql`, whose first statement
+  (`UPDATE memory_links SET attest_level = 'unsigned' WHERE attest_level IN
+  ('self_signed','peer_attested') AND (signature IS NULL OR length(signature) !=
+  64)`) irreversibly overwrites caller-supplied values. v41/v42/v44/v46/v47 and
+  most of v3–v40 were mislabelled the same way. The tail row was keyed to
+  `current_schema_version()`, so `meta_for(54)` returned `None`, `meta_for(89)`
+  returned v54's semantics, there were NO rows at all for v54–v88 (35 arms,
+  including three full-table rebuilds and the postgres tsv rewrite), and
+  `arch_8_ladder_terminates_at_current_schema_version` — which asserts
+  `last().version == current_schema_version()` — was TRUE BY CONSTRUCTION. All
+  88 rows (v2–v89) are re-derived from the arms' actual SQL by one stated rule,
+  keyed to LITERAL versions, and carry a new `LadderArm` field distinguishing
+  the four postgres-only steps (v57/v69/v88/v89) from the sqlite arms. The gate
+  is rebuilt to fail on a symbolic tail key, to require exactly one row per
+  `if version < N` arm (const-phrased arms resolved from their mandatory
+  `// vNN` comment), to require gap-free coverage of v2..=CURRENT, and to
+  require each row's NAME be grounded in the arm it describes — the check that
+  catches the v43 class. `scripts/check-migration-ladder.sh` gains the same
+  coverage as rule (g), with two self-test cases proving it load-bearing.
+  Two arms are now correctly flagged `DataLossRisk::Column` (v43, v50) and the
+  irreversible set is 21 arms, not the three the old comment in `migrate()`
+  named.
+- **Migration-file header drift: `0030_v07_atomisation.sql` named the wrong arm
+  (#3160).** Its idempotency header said the `memory_links` rebuild is gated by
+  `if version < 35` and builds `memory_links_v35`; the arm has been
+  `if version < 36` / `memory_links_v36` since the file landed. A header that
+  names the wrong version sends an operator debugging a stuck ladder to the
+  wrong arm.
+
 - **The required `Check` legs are no longer undeclared performance gates:
   `ai-memory bench` gains `--report-only`.** `cmd_bench` bails non-zero
   whenever any operation's measured p95 exceeds its target by more than 10%, so
@@ -1524,6 +1615,7 @@ backend and missing or divergently implemented on its twin). Pinned by
   watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
   the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
   the outer job cap — remains what fires on a genuine hang.
+
 ### Security (#3110 — cross-agent private-row leak on the postgres reciprocal-provenance search)
 
 - **`PostgresStore::search_with_source_uri` now enforces the SAL #910
@@ -2473,6 +2565,33 @@ requirement was unenforced on the wire + CLI surfaces and never fired in product
   new `doctor --posture` check #20 asserting the escalate producer routes to a
   SATISFIABLE gate (approver keys enrolled). `ENTERPRISE_FEDERATION_CHECK_COUNT`
   19 → 20.
+
+### Tests (full-table-rebuild regression coverage; #3160)
+
+- **The two unexercised sqlite full-table rebuilds now have per-arm tests, and
+  the v63 rebuild test no longer passes without its triggers.** A SQLite
+  rebuild (`CREATE <shadow>` / `INSERT … SELECT` / `DROP TABLE` / `RENAME`)
+  silently drops EVERY trigger and secondary index on the table — the v63 → v65
+  lesson. The ladder carries six rebuilds; v50 (`agent_quotas` PK widening) and
+  v80 (`agent_lineage` custody/revocation) had NO regression test at all, and
+  `v63_rebuild_preserves_links_and_accepts_typed_cognition_relations` asserted
+  ONE of four indexes and ZERO of four triggers — so deleting
+  `CREATE TRIGGER memory_links_ck_attest_signature_ins` from
+  `0054_v65_*.sql` left `cargo test --lib storage::migrations` green, i.e. the
+  test would not have caught the defect it was written for. Added: per-arm v50
+  and v80 tests that seed the legacy shape WITH rows, stamp N-1, migrate, and
+  assert every row (and every BLOB — lineage `signature` / `prev_record_hash` /
+  `record_bytes`) survives verbatim plus the recreated PK, indexes and trigger
+  set read from `sqlite_master`; the full four-trigger / four-index tip-shape
+  assertion on the v63 test, on a new v62→tip replay test that also proves the
+  restored trigger REFUSES a phantom-signed edge, and on
+  `historical_replay_from_v1_reaches_current_schema`; and a generic
+  `rebuilt_tables_reach_the_same_trigger_and_index_set_on_both_paths_3160` gate
+  asserting that for every rebuilt table the UPGRADE path and the FRESH-INSTALL
+  path converge on the identical trigger + index set — the
+  `bootstrap(fresh) ≡ ladder(v0→tip)` invariant applied to triggers, which is
+  exactly the shape of the v63 → v65 defect. With the trigger pair deleted, four
+  tests now fail.
 
 ### Tests (deterministic atomise-worker drain; fix #2986 coverage-instrumentation flake)
 

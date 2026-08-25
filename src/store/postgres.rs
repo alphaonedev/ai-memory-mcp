@@ -4530,12 +4530,19 @@ impl PostgresStore {
     /// `ON DELETE CASCADE`), so `restore_archived` brought the row back
     /// with an empty edge graph. This table is the snapshot destination.
     ///
-    /// **Postgres scope this commit:** the table + schema bump only — the
-    /// snapshot-before-delete + restore-re-insert wiring is wired on
-    /// SQLite this commit and is a tracked POSTGRES follow-up. The table
-    /// is created on both backends now so the two adapters share the
-    /// logical schema number and a future postgres wiring commit has the
-    /// destination already present.
+    /// **Postgres scope at v70:** the table + schema bump only — the
+    /// snapshot-before-delete + restore-re-insert wiring landed on SQLite
+    /// first, with postgres a tracked follow-up. #2318 truth-fix: that
+    /// follow-up SHIPPED — `PostgresStore::forget` and `archive_by_ids`
+    /// snapshot, and `archive_restore` re-inserts every preserved edge
+    /// whose endpoints still exist (pinned by
+    /// `archive_restore_preserves_links_pg_1771`). The identical stale
+    /// "tracked POSTGRES follow-up" sentence was corrected in the sqlite
+    /// twin at #2318 but MISSED here, so this doc kept claiming a gap that
+    /// had been closed for two releases. #3161 completes the set: the
+    /// `update_with_archive_on_supersede`, `run_gc` and `size_gc` funnels
+    /// snapshot too, so EVERY postgres archive-then-delete path preserves
+    /// the edge graph.
     ///
     /// Additive `CREATE TABLE IF NOT EXISTS` (the v59/v60/v69 precedent) —
     /// no rewrite of an existing table, replay-safe. Mirrors `memory_links`
@@ -6666,6 +6673,32 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("rollback supersede", e))?;
             return Err(StoreError::NotFound { id: id.to_string() });
         }
+
+        // #3161 (v1.0.0) — DATA-LOSS CLOSE, cross-backend DIVERGENCE. The
+        // SQLite twin of this funnel routes through `archive_memory_no_tx`,
+        // which has snapshotted the archived row's `memory_links` into
+        // `archived_memory_links` since #1771; this postgres path open-codes
+        // the archive copy and never did, so the Step-2 delete below cascaded
+        // the OLD row's entire edge graph away and restoring the superseded
+        // snapshot on postgres returned it EMPTY — a silent backend-dependent
+        // difference in what an operator gets back. Snapshot BEFORE the
+        // delete; idempotent via the PK `ON CONFLICT DO NOTHING`.
+        sqlx::query(
+            "INSERT INTO archived_memory_links (
+                 source_id, target_id, relation, created_at, valid_from,
+                 valid_until, observed_by, signature, attest_level, archived_at
+             )
+             SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                    ml.valid_from, ml.valid_until, ml.observed_by,
+                    ml.signature, ml.attest_level, now()
+             FROM memory_links ml
+             WHERE ml.source_id = $1 OR ml.target_id = $1
+             ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("supersede snapshot links", e))?;
 
         // Step 2: DELETE the OLD row from the live `memories` table so
         // the (title, namespace) UNIQUE index doesn't collide with the
@@ -25414,13 +25447,48 @@ impl MemoryStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("gc archive copy", e))?;
+
+            // #3161 (v1.0.0) — DATA-LOSS CLOSE, postgres twin of the SQLite
+            // `storage::gc` snapshot. The archive copy above moves only the
+            // memory ROW; `memory_links` carries an `ON DELETE CASCADE` FK on
+            // both endpoints, so the RETURNING DELETE below reaps every edge of
+            // every TTL-evicted row and `archive_restore` used to bring the row
+            // back with an EMPTY edge graph — while `archive_by_ids` (the
+            // manual/forget funnel) has snapshotted them since #1771. Set-based
+            // over the SAME expiry predicate the DELETE uses, inside the SAME
+            // tx, BEFORE the delete. Idempotent via the PK `ON CONFLICT DO
+            // NOTHING`, so an edge already snapshotted by another funnel is
+            // left untouched.
+            sqlx::query(
+                "INSERT INTO archived_memory_links (
+                     source_id, target_id, relation, created_at, valid_from,
+                     valid_until, observed_by, signature, attest_level, archived_at
+                 )
+                 SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                        ml.valid_from, ml.valid_until, ml.observed_by,
+                        ml.signature, ml.attest_level, $1::timestamptz
+                 FROM memory_links ml
+                 WHERE ml.source_id IN (
+                           SELECT id FROM memories
+                           WHERE expires_at IS NOT NULL AND expires_at < $1)
+                    OR ml.target_id IN (
+                           SELECT id FROM memories
+                           WHERE expires_at IS NOT NULL AND expires_at < $1)
+                 ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+            )
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("gc snapshot links", e))?;
         }
 
         // #1783 — RETURNING id so the TTL-evicted set is known for AGE
         // unprojection in THIS tx. gc is the most common delete path; the
-        // v70 "don't snapshot auto-eviction" restore-rationale does NOT
-        // transfer to a SECONDARY query index — a gc-evicted memory still
-        // leaves a ghost :Memory node/edges that kg_query would return.
+        // v70 "don't snapshot auto-eviction" restore-rationale never
+        // transferred to a SECONDARY query index — a gc-evicted memory still
+        // leaves a ghost :Memory node/edges that kg_query would return. (That
+        // rationale is now retired outright: #3161 snapshots the edge graph
+        // on this funnel too, immediately above.)
         let evicted: Vec<(String, String)> = sqlx::query_as(
             "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1 \
              RETURNING id, namespace",
@@ -25592,6 +25660,31 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("size_gc archive copy", e))?;
+
+                // #3161 (v1.0.0) — DATA-LOSS CLOSE, third funnel. The SQLite
+                // `storage::size_gc` archive branch routes through
+                // `archive_memory_no_tx`, which has snapshotted the victim's
+                // edges since #1771; this postgres twin open-codes the archive
+                // copy and never did — so a byte-cap-evicted memory restored
+                // here came back with an EMPTY edge graph. Same shape as the
+                // `archive_by_ids` snapshot; idempotent via the PK `ON
+                // CONFLICT DO NOTHING`.
+                sqlx::query(
+                    "INSERT INTO archived_memory_links (
+                         source_id, target_id, relation, created_at, valid_from,
+                         valid_until, observed_by, signature, attest_level, archived_at
+                     )
+                     SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                            ml.valid_from, ml.valid_until, ml.observed_by,
+                            ml.signature, ml.attest_level, now()
+                     FROM memory_links ml
+                     WHERE ml.source_id = $1 OR ml.target_id = $1
+                     ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+                )
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("size_gc snapshot links", e))?;
             }
 
             // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
@@ -34259,6 +34352,206 @@ mod tests {
                 .iter()
                 .any(|l| l.source_id == a_id && l.target_id == b_id),
             "A->B edge must be preserved across archive_by_ids + archive_restore"
+        );
+    }
+
+    /// #3161 (v1.0.0) — postgres parity for the SQLite
+    /// `gc_archive_then_restore_preserves_links_3161` test, and the pg-lane
+    /// evidence for the data-loss close. `run_gc(archive = true)` archives the
+    /// memory ROW and then DELETEs it; `memory_links` carries an
+    /// `ON DELETE CASCADE` FK on both endpoints, so pre-#3161 the TTL-evicted
+    /// row's whole edge graph was reaped with no snapshot and `archive_restore`
+    /// brought it back EMPTY — while `archive_by_ids` (asserted directly above)
+    /// preserved it. The two funnels must agree. Gated on
+    /// `AI_MEMORY_TEST_POSTGRES_URL`; skips cleanly when unset.
+    #[tokio::test]
+    async fn run_gc_archive_then_restore_preserves_links_pg_3161() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("gclinks-3161-{unique}");
+        let a_id = format!("gcl-a-{unique}");
+        let b_id = format!("gcl-b-{unique}");
+        let a = sample_memory(&a_id, &ns, "gcl-a", "gc edge endpoint a");
+        let b = sample_memory(&b_id, &ns, "gcl-b", "gc edge endpoint b");
+        store.store(&ctx, &a).await.expect("store a");
+        store.store(&ctx, &b).await.expect("store b");
+
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+
+        // Make ONLY A gc-eligible. B keeps a NULL expiry so it survives the
+        // sweep and is a live endpoint at restore time.
+        sqlx::query("UPDATE memories SET expires_at = now() - interval '1 day' WHERE id = $1")
+            .bind(&a_id)
+            .execute(&store.pool)
+            .await
+            .expect("expire a");
+
+        let reaped = store.run_gc(true).await.expect("run_gc");
+        assert!(reaped >= 1, "run_gc must archive+delete the expired A");
+        assert!(
+            matches!(
+                store.get(&ctx, &a_id).await,
+                Err(StoreError::NotFound { .. })
+            ),
+            "A is deleted from live memories"
+        );
+
+        // The edge must have been snapshotted BEFORE the cascade delete.
+        let snapshotted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM archived_memory_links \
+             WHERE source_id = $1 AND target_id = $2",
+        )
+        .bind(&a_id)
+        .bind(&b_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("count archived_memory_links");
+        assert_eq!(
+            snapshotted, 1,
+            "#3161: run_gc(archive=true) must snapshot the doomed row's \
+             memory_links into archived_memory_links BEFORE the cascade DELETE"
+        );
+
+        assert!(
+            store
+                .archive_restore(&ctx, &a_id)
+                .await
+                .expect("archive_restore"),
+            "A row restored"
+        );
+        let after = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor after");
+        assert!(
+            after
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "#3161: a run_gc-archived memory must come back with its edge graph, \
+             exactly as archive_by_ids already does"
+        );
+    }
+
+    /// #3161 (v1.0.0) — the THIRD archive funnel. The SQLite `storage::size_gc`
+    /// archive branch routes through `archive_memory_no_tx` (snapshotting since
+    /// #1771); this postgres twin open-codes its archive copy and never
+    /// snapshotted, so a byte-cap-evicted memory restored EMPTY. Skips cleanly
+    /// when `AI_MEMORY_TEST_POSTGRES_URL` is unset.
+    #[tokio::test]
+    async fn size_gc_archive_then_restore_preserves_links_pg_3161() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("szlinks-3161-{unique}");
+        let a_id = format!("szl-a-{unique}");
+        let b_id = format!("szl-b-{unique}");
+        // A is short-tier so it is the lowest-value victim; B is long-tier and
+        // survives the eviction, keeping the edge's other endpoint live.
+        let mut a = sample_memory(&a_id, &ns, "szl-a", "size gc endpoint a");
+        a.tier = Tier::Short;
+        let mut b = sample_memory(&b_id, &ns, "szl-b", "size gc endpoint b");
+        b.tier = Tier::Long;
+        store.store(&ctx, &a).await.expect("store a");
+        store.store(&ctx, &b).await.expect("store b");
+
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+
+        // Cap the namespace corpus just under its current size so exactly the
+        // lowest-value victim (A) is evicted.
+        let corpus: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(\
+                 length(title) + length(content) + length(metadata::text)), 0)::bigint \
+             FROM memories WHERE namespace = $1",
+        )
+        .bind(&ns)
+        .fetch_one(&store.pool)
+        .await
+        .expect("corpus sum");
+        assert!(corpus > 0, "precondition: the namespace has a corpus");
+
+        let evicted = store
+            .size_gc(&ns, corpus - 1, true)
+            .await
+            .expect("size_gc archive");
+        assert!(evicted >= 1, "size_gc must evict at least the short-tier A");
+        assert!(
+            matches!(
+                store.get(&ctx, &a_id).await,
+                Err(StoreError::NotFound { .. })
+            ),
+            "A is evicted from live memories"
+        );
+        assert!(
+            store.get(&ctx, &b_id).await.is_ok(),
+            "B survives the byte-cap eviction"
+        );
+
+        let snapshotted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM archived_memory_links \
+             WHERE source_id = $1 AND target_id = $2",
+        )
+        .bind(&a_id)
+        .bind(&b_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("count archived_memory_links");
+        assert_eq!(
+            snapshotted, 1,
+            "#3161: size_gc(archive=true) must snapshot the victim's \
+             memory_links BEFORE the cascade DELETE"
+        );
+
+        assert!(
+            store
+                .archive_restore(&ctx, &a_id)
+                .await
+                .expect("archive_restore"),
+            "A row restored"
+        );
+        let after = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor after");
+        assert!(
+            after
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "#3161: a size_gc-archived memory must come back with its edge graph"
         );
     }
 

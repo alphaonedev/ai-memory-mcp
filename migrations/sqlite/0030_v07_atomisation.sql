@@ -53,8 +53,13 @@
 -- both new columns before emitting the ALTERs (SQLite has no
 -- `ADD COLUMN IF NOT EXISTS`). The full-table-rebuild for
 -- `memory_links` runs only when this migration step is active
--- (gated by `if version < 35`) and is replay-safe because the new
--- table is created as `memory_links_v35` and renamed into place.
+-- (gated by `if version < 36`) and is replay-safe because the new
+-- table is created as `memory_links_v36` and renamed into place.
+-- (#3160, 2026-08-22 — this header said `< 35` / `memory_links_v35`;
+-- the arm has been `if version < 36` and the shadow table
+-- `memory_links_v36` since the file landed. A header that names the
+-- wrong arm sends an operator debugging a stuck ladder to the wrong
+-- version.)
 --
 -- This SQL file holds the supporting indexes only; the ALTERs +
 -- rebuild dance live in Rust so the column-existence + table-name

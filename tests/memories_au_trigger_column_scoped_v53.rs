@@ -329,8 +329,12 @@ fn v53_migration_is_part_of_the_live_ladder() {
     // The constant-vs-helper equality invariant is pinned by
     // `current_schema_version_for_tests_matches_constant` in
     // `src/storage/migrations.rs::tests`; the constant-vs-ladder
-    // invariant by `arch_8_ladder_terminates_at_current_schema_version`
-    // in `src/storage/migration_meta.rs::tests`. This binary's pin
+    // invariant by `arch_8_ladder_tail_is_a_literal_at_current_schema_version`
+    // in `src/storage/migration_meta.rs::tests` (renamed at #3158, which
+    // also made it capable of FAILING: the pre-#3158 tail row was keyed to
+    // `current_schema_version()`, so the old
+    // `arch_8_ladder_terminates_at_current_schema_version` compared the
+    // const against itself). This binary's pin
     // is the per-migration regression complement.
     let live = ai_memory::storage::current_schema_version_for_tests();
     assert!(
