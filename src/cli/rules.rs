@@ -271,6 +271,16 @@ pub fn run(
             // input time than on the next check call.
             let matcher_json: serde_json::Value = serde_json::from_str(&matcher)
                 .with_context(|| format!("rules add: matcher is not valid JSON: {matcher}"))?;
+            // v1.0.0 #3031 — per-kind matcher SCHEMA validation. JSON syntax
+            // alone was never enough: `--kind bash --matcher
+            // '{"totally_bogus_key":123}' --severity refuse --sign` parsed
+            // fine and minted an ENABLED, operator-signed rule that enforced
+            // NOTHING (`matcher_applies` returns false for an unrecognised
+            // shape, so `rules check` answered `allow`). Refuse at write time
+            // so an inert rule is structurally unminting-able through the
+            // supported path.
+            crate::governance::agent_action::validate_matcher_for_kind(&kind, &matcher_json)
+                .map_err(|e| anyhow::anyhow!("rules add: {e}"))?;
             // SEC-12 / COR-10 (Cluster D, issue #767) — the bash
             // matcher field is a LITERAL substring (despite the
             // legacy `command_regex` field name). Reject regex
@@ -358,6 +368,31 @@ pub fn run(
                 bail!("governance.no_operator_key: `rules enable` requires --sign");
             }
             let signing_key = load_operator_signing_key_from_dir(&key_dir)?;
+            // v1.0.0 #3031 — `rules add` refuses an inert matcher, but a
+            // pre-#3031 row can still be sitting disabled. Enabling it
+            // would restore the exact inert-enabled-refuse hole (every
+            // action of that kind fail-closes). Validate before flip;
+            // tell the operator to re-mint via `rules add`.
+            let existing = rules_store::get(&conn, &id)?
+                .with_context(|| format!("rules.enable: no rule with id={id}"))?;
+            let matcher_json: serde_json::Value =
+                serde_json::from_str(&existing.matcher).map_err(|e| {
+                    anyhow::anyhow!(
+                        "rules.enable: stored matcher is not valid JSON ({e}); \
+                         re-mint with `rules add`"
+                    )
+                })?;
+            crate::governance::agent_action::validate_matcher_for_kind(
+                &existing.kind,
+                &matcher_json,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "rules.enable: {e}. Re-mint with `rules add` — enabling an \
+                     inert matcher would fail-close every '{}' action (#3031)",
+                    existing.kind
+                )
+            })?;
             // v0.9.0 §25.3 S3 (F-40, #1853) — route through the audited,
             // atomic signed path. `set_enabled_signed` flips `enabled`,
             // re-signs the canonical (post-state) bytes, appends the
@@ -1153,6 +1188,13 @@ fn rule_to_json(rule: &Rule) -> serde_json::Value {
         "enabled": rule.enabled,
         "signature_b64": sig_b64,
         (field_names::ATTEST_LEVEL): rule.attest_level,
+        // v1.0.0 #3031 — `true` when this rule's matcher can never fire for
+        // ANY action of its kind (malformed JSON, or no field the kind
+        // recognises). Such a rule enforces NOTHING; pre-#3031 that was
+        // invisible here and indistinguishable from a rule that simply did
+        // not match. `rules add` now refuses to mint one, so a `true` here
+        // means a legacy row or an out-of-band DB edit.
+        "inert": crate::governance::agent_action::rule_matcher_is_inert(rule),
     })
 }
 
@@ -1610,6 +1652,14 @@ mod tests {
         let kp = kp::generate(OPERATOR_KEY_ID).expect("generate");
         let key_dir = dir.path().join("keys");
         std::fs::create_dir_all(&key_dir).expect("mkdir keys");
+        // #3198 — kp::save refuses a group/world-writable key dir. Host
+        // umask 0002 makes mkdir 0775; pin the sandbox to 0700.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700 test key dir");
+        }
         kp::save(&kp, &key_dir).expect("save kp");
         (dir, db_path, key_dir)
     }
@@ -1870,6 +1920,50 @@ mod tests {
         };
         let err = run(&db_path, args, false, &mut out).expect_err("must error");
         assert!(format!("{err:#}").contains("no rule with id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_rules_enable_refuses_inert_matcher_3031() {
+        let (_dir, db_path, key_dir) = fresh_env_with_operator_key();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        rules_store::insert(
+            &conn,
+            &Rule {
+                id: "R-inert-enable".into(),
+                kind: "bash".into(),
+                matcher: r#"{"totally_bogus_key":123}"#.into(),
+                severity: "refuse".into(),
+                reason: "legacy inert".into(),
+                namespace: "_global".into(),
+                created_by: "test".into(),
+                created_at: 1,
+                enabled: false,
+                signature: None,
+                attest_level: "unsigned".into(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+        let args = RulesArgs {
+            key_dir: Some(key_dir),
+            action: RulesAction::Enable {
+                id: "R-inert-enable".into(),
+                sign: true,
+            },
+        };
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let err = run(&db_path, args, false, &mut out).expect_err("must refuse inert enable");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rules.enable") && msg.contains("rules add"),
+            "enable of an inert matcher must point at `rules add`, got: {msg}"
+        );
     }
 
     #[cfg(unix)]
@@ -2595,6 +2689,131 @@ mod tests {
             "rules add --sign must store a signature"
         );
         assert_eq!(rule.namespace, crate::quotas::GLOBAL_NAMESPACE);
+    }
+
+    /// v1.0.0 #3031 — `rules add` must REFUSE a kind-wrong / typo'd matcher
+    /// instead of signing an ENABLED `refuse` rule that enforces NOTHING.
+    ///
+    /// The reported reproduction: `rules add --kind bash --matcher
+    /// '{"totally_bogus_key":123}' --severity refuse --sign` landed a signed,
+    /// enabled, operator-attested rule whose `rules check` answered `allow`
+    /// for every bash command, with nothing in `rules list` to flag it.
+    #[cfg(unix)]
+    #[test]
+    fn rules_add_refuses_a_kind_wrong_matcher_3031() {
+        let _g = forensic_lock();
+        let tdir = tempfile::tempdir().unwrap();
+        let key_path = tdir.path().join("operator.key");
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        keygen_operator(&key_path, false, &mut out).unwrap();
+        let db_path = tdir.path().join("rules.db");
+        drop(crate::storage::open(&db_path).expect("init schema"));
+
+        let bogus = RulesArgs {
+            key_dir: Some(tdir.path().to_path_buf()),
+            action: RulesAction::Add {
+                id: "R3031-inert".into(),
+                kind: "bash".into(),
+                matcher: r#"{"totally_bogus_key":123}"#.into(),
+                severity: "refuse".into(),
+                reason: "#3031 repro".into(),
+                namespace: crate::quotas::GLOBAL_NAMESPACE.into(),
+                disabled: false,
+                sign: true,
+            },
+        };
+        let err = run(&db_path, bogus, false, &mut out)
+            .expect_err("#3031: an inert matcher must be REFUSED at write time");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unrecognised key"),
+            "the refusal must name the offending key; got {msg}"
+        );
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert!(
+            rules_store::get(&conn, "R3031-inert").unwrap().is_none(),
+            "#3031: no inert rule may be persisted"
+        );
+        drop(conn);
+
+        // A matcher with only OPTIONAL keys is equally inert (it can never
+        // fire without the required `binary`).
+        let optional_only = RulesArgs {
+            key_dir: Some(tdir.path().to_path_buf()),
+            action: RulesAction::Add {
+                id: "R3031-optional-only".into(),
+                kind: "process_spawn".into(),
+                matcher: r#"{"args_contain":"--release"}"#.into(),
+                severity: "refuse".into(),
+                reason: "#3031 optional-only".into(),
+                namespace: crate::quotas::GLOBAL_NAMESPACE.into(),
+                disabled: false,
+                sign: true,
+            },
+        };
+        let err = run(&db_path, optional_only, false, &mut out)
+            .expect_err("#3031: a matcher with no required key must be REFUSED");
+        assert!(
+            format!("{err:#}").contains("required key"),
+            "the refusal must say which required key set is missing"
+        );
+
+        // The well-formed twin still lands (the validator is not a blanket
+        // refusal).
+        let good = RulesArgs {
+            key_dir: Some(tdir.path().to_path_buf()),
+            action: RulesAction::Add {
+                id: "R3031-good".into(),
+                kind: "bash".into(),
+                matcher: r#"{"command_substring":"rm -rf"}"#.into(),
+                severity: "refuse".into(),
+                reason: "#3031 well-formed".into(),
+                namespace: crate::quotas::GLOBAL_NAMESPACE.into(),
+                disabled: false,
+                sign: true,
+            },
+        };
+        run(&db_path, good, false, &mut out).expect("a well-formed matcher must still land");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let landed = rules_store::get(&conn, "R3031-good")
+            .unwrap()
+            .expect("landed");
+        assert!(!crate::governance::agent_action::rule_matcher_is_inert(
+            &landed
+        ));
+    }
+
+    /// v1.0.0 #3031 — `rules list` must SHOW that a legacy rule is inert.
+    #[test]
+    fn rules_list_json_flags_an_inert_rule_3031() {
+        let inert = Rule {
+            id: "R-legacy-inert".into(),
+            kind: "bash".into(),
+            matcher: r#"{"totally_bogus_key":123}"#.into(),
+            severity: "refuse".into(),
+            reason: "legacy".into(),
+            namespace: crate::quotas::GLOBAL_NAMESPACE.into(),
+            created_by: "test".into(),
+            created_at: 0,
+            enabled: true,
+            signature: None,
+            attest_level: "operator_signed".into(),
+        };
+        let mut healthy = inert.clone();
+        healthy.id = "R-healthy".into();
+        healthy.matcher = r#"{"command_substring":"rm -rf"}"#.into();
+
+        assert_eq!(rule_to_json(&inert)["inert"], serde_json::Value::Bool(true));
+        assert_eq!(
+            rule_to_json(&healthy)["inert"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     /// Coverage restoration: the clap `default_value =

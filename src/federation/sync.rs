@@ -42,8 +42,15 @@ pub(super) enum AckOutcome {
 /// Canonical `AckOutcome` reason for a non-2xx peer response. One named
 /// helper so the `"http {status}"` shape lives in exactly one place
 /// (pm-v3.1 no-scattered-literals discipline).
+///
+/// v1.0.0 #2672 — the string is now prefixed with the TYPED
+/// [`DlqErrorClass`](super::dlq_class::DlqErrorClass) tag derived from the
+/// REAL status line, so the push-DLQ retry/label logic reads a structural
+/// discriminant instead of grepping this prose for `429`/`400`/`401`. The
+/// human text is unchanged and follows the tag verbatim.
 fn http_status_reason(status: reqwest::StatusCode) -> String {
-    format!("http {status}")
+    super::dlq_class::DlqErrorClass::from_http_status(status.as_u16())
+        .stamp(&format!("http {status}"))
 }
 
 /// #3148 — the wire header marking a batched S40 catch-up POST, so the
@@ -295,7 +302,13 @@ pub(super) async fn post_once(
                 AckOutcome::Fail(reason)
             }
         }
-        Err(e) => AckOutcome::Fail(crate::errors::msg::network(e)),
+        // #2672 — a transport failure carries no HTTP status; class it
+        // structurally as `network` rather than letting the reqwest error's
+        // text (which can embed a port number like `:4001`) be substring-read
+        // as a `400`-class permanent failure.
+        Err(e) => AckOutcome::Fail(
+            super::dlq_class::DlqErrorClass::Network.stamp(&crate::errors::msg::network(e)),
+        ),
     }
 }
 
@@ -321,16 +334,27 @@ pub(super) fn success_report_non_ack_reason(v: &serde_json::Value) -> Option<Str
     let count = |key: &str| v.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
     let unsupported = count(crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD);
     let skipped = count(crate::handlers::SKIPPED_FIELD);
+    // v1.0.0 #2672 — `unsupported` and `skipped` are integers the PEER
+    // chooses, read verbatim out of its own response body. Pre-fix they were
+    // interpolated into a bare prose string that `reset_throttled_quarantine`
+    // (`LIKE '%429%'`) and `classify_quarantine_cause` (`contains("429")`)
+    // then read as CONTROL SIGNALS — so `{"skipped": 429}` on an HTTP 200
+    // reset the row's attempt budget forever and defeated the #1544
+    // quarantine ceiling. The counts stay in the DIAGNOSTIC text (they are
+    // genuinely useful), but the retry/label decision now comes from the
+    // typed class tag written FIRST, which no peer byte can reach.
     if unsupported > 0 {
-        return Some(format!(
-            "peer 2xx but {unsupported} item(s) {} (not applied on this peer)",
-            crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD
-        ));
+        return Some(
+            super::dlq_class::DlqErrorClass::PeerUnsupported.stamp(&format!(
+                "peer 2xx but {unsupported} item(s) {} (not applied on this peer)",
+                crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD
+            )),
+        );
     }
     if skipped > 0 {
-        return Some(format!(
+        return Some(super::dlq_class::DlqErrorClass::PeerRefused.stamp(&format!(
             "peer 2xx but {skipped} item(s) skipped (refused/not applied by receiver)"
-        ));
+        )));
     }
     None
 }
@@ -424,7 +448,21 @@ pub(super) async fn post_and_classify(
                         .federation_fanout_retry_total
                         .with_label_values(&["fail"])
                         .inc();
-                    AckOutcome::Fail(format!("first: {first_reason}; retry: {retry_reason}"))
+                    // v1.0.0 #2672 — RE-STAMP so the typed class tag stays
+                    // LEADING. Concatenating two already-stamped reasons
+                    // buried both tags mid-string, which would have made the
+                    // combined row read as UNTAGGED and fall through to the
+                    // legacy substring classifier — re-opening the exact
+                    // peer-steering surface this fix closes (a 2xx non-ack
+                    // reason carries the peer's own count). The RETRY's class
+                    // is the most recent observation and therefore the row's
+                    // class; both human details are preserved verbatim.
+                    let class = super::dlq_class::class_of(&retry_reason);
+                    AckOutcome::Fail(class.stamp(&format!(
+                        "first: {}; retry: {}",
+                        super::dlq_class::detail_of(&first_reason),
+                        super::dlq_class::detail_of(&retry_reason)
+                    )))
                 }
                 // #1544 — the retry surfaced a throttle (429); propagate it
                 // as `Throttled` so the DLQ replayer applies back-off rather
@@ -503,6 +541,16 @@ pub(super) async fn land_push_failures(
         if acked.contains(peer_id) {
             continue;
         }
+        // #2672 — DELIBERATELY left untagged. A deadline eviction is a fixed
+        // LOCAL literal with no peer-derived bytes and no digits, so it can
+        // never satisfy the legacy `LIKE '%429%'` arm nor any digit-keyed
+        // classifier token. What the class tag must cover is every reason that
+        // can EMBED peer-supplied data (the HTTP status line, the 2xx
+        // non-ack counts, the transport error) — those are stamped at the
+        // point they are minted, in `post_once` /
+        // `success_report_non_ack_reason`. Keeping this literal verbatim also
+        // preserves the exact-match `last_error == "deadline_exceeded"`
+        // contract the #2498 / #2667 lane suites pin.
         let reason = explicit_map
             .get(peer_id)
             .cloned()

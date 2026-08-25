@@ -485,7 +485,9 @@ const LEGACY_PEER_ID_MARKER: &str = "[#2442 legacy positional peer_id]";
 /// write was undelivered in the first place — verbatim and permanent inside
 /// the string.
 fn already_marked_legacy(last_error: &str) -> bool {
-    last_error.starts_with(LEGACY_PEER_ID_MARKER)
+    // #2672 — the marker leads the DIAGNOSTIC half; the typed class tag (when
+    // present) leads the whole string and must stay in front of it.
+    super::dlq_class::detail_of(last_error).starts_with(LEGACY_PEER_ID_MARKER)
 }
 
 /// #2442 — fires the operator-facing WARN once per process rather than once
@@ -501,8 +503,47 @@ static LEGACY_PEER_ID_WARNED: std::sync::atomic::AtomicBool =
 /// (raise `AI_MEMORY_MAX_MEMORIES_PER_DAY` / wait for the daily reset);
 /// `permanent` is a broken row needing a manual drain.
 fn classify_quarantine_cause(last_error: &str) -> &'static str {
+    // v1.0.0 #2672 — a row minted by THIS binary carries a typed, leading
+    // class tag decided from the real HTTP status / the local call site, so
+    // its label comes from a DISCRIMINANT, never from grepping prose for
+    // digits a peer chose. The two receiver-cause tokens below are ALPHABETIC
+    // and can therefore never be produced by the only peer-supplied inputs
+    // (`skipped` / `unsupported_on_postgres`, both parsed with `as_u64`), so
+    // they remain a safe refinement of the class label. Should a future
+    // receiver wire change echo a cause in its 200 body, it MUST arrive as a
+    // typed field — never as text folded into this string.
+    if let Some((class, detail)) = super::dlq_class::parse(last_error) {
+        if detail.contains(CAUSE_UNENROLLED_AUTHOR_STRICT) {
+            return CAUSE_UNENROLLED_AUTHOR_STRICT;
+        }
+        if detail.contains(CAUSE_NAMESPACE_PROBE_UNRESOLVABLE) {
+            return CAUSE_NAMESPACE_PROBE_UNRESOLVABLE;
+        }
+        return class.quarantine_cause();
+    }
+    classify_quarantine_cause_legacy(last_error)
+}
+
+/// #2672 — the PRE-#2672 substring classifier, retained ONLY for rows written
+/// by an older binary (no class tag).
+///
+/// Kept verbatim so an in-flight upgrade backlog keeps its historical labels
+/// rather than all collapsing to `other`.
+///
+/// It cannot launder peer input: EVERY reason that can carry peer-derived
+/// bytes (the HTTP status line, the 2xx non-ack counts, the transport error,
+/// and the retry concatenation of any two of those) is class-stamped at the
+/// point it is minted, so a peer-chosen count always lands in a TAGGED row.
+/// The only untagged reasons this binary still writes are fixed LOCAL literals
+/// with no digits (`deadline_exceeded`, the erasure-outbox queue markers),
+/// which no digit-keyed arm here can match.
+fn classify_quarantine_cause_legacy(last_error: &str) -> &'static str {
+    use super::dlq_class::{
+        CAUSE_ID_DRIFT, CAUSE_OTHER, CAUSE_PEER_REMOVED, CAUSE_PERMANENT, CAUSE_QUOTA,
+        CAUSE_UNENROLLED_PEER,
+    };
     if last_error.contains("429") {
-        "quota"
+        CAUSE_QUOTA
     } else if last_error.contains(CAUSE_UNENROLLED_AUTHOR_STRICT) {
         // #1801→#1954 item 7 — a honored third-party relayed write refused
         // under the v1.0.0 write-sig flip because the ORIGIN author has no
@@ -538,11 +579,11 @@ fn classify_quarantine_cause(last_error: &str) -> &'static str {
         // The replay last_error is the `http {status}` shape, so 401/403
         // is the enrolment/auth signal (the peer's JSON `peer_not_enrolled`
         // body is not carried in last_error).
-        "unenrolled_peer"
-    } else if last_error.contains("id_drift") {
-        "id_drift"
+        CAUSE_UNENROLLED_PEER
+    } else if last_error.contains(CAUSE_ID_DRIFT) {
+        CAUSE_ID_DRIFT
     } else if last_error.contains("no longer in FederationConfig") {
-        "peer_removed"
+        CAUSE_PEER_REMOVED
     } else if last_error.contains("400")
         || last_error.contains("422")
         || last_error.contains("signature")
@@ -552,9 +593,9 @@ fn classify_quarantine_cause(last_error: &str) -> &'static str {
         // peer (FED-RQ-01 subcollection gap), not a transient flap.
         || last_error.contains(crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD)
     {
-        "permanent"
+        CAUSE_PERMANENT
     } else {
-        "other"
+        CAUSE_OTHER
     }
 }
 
@@ -736,10 +777,14 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                 let reason = if already_marked_legacy(&row.last_error) {
                     row.last_error.clone()
                 } else {
-                    format!(
+                    // #2672 — re-stamp the row's ORIGINAL class so the tag
+                    // stays leading (the anchored SQL predicates and the
+                    // classifier both read a PREFIX) while the forensic
+                    // enqueue reason is preserved verbatim after the marker.
+                    super::dlq_class::class_of(&row.last_error).stamp(&format!(
                         "{LEGACY_PEER_ID_MARKER} original enqueue reason: {}",
-                        row.last_error
-                    )
+                        super::dlq_class::detail_of(&row.last_error)
+                    ))
                 };
                 let _ = sink.bump_dlq_attempt(row.id, &reason).await;
                 if !LEGACY_PEER_ID_WARNED.swap(true, Ordering::Relaxed) {
@@ -781,7 +826,14 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                 }
             } else {
                 let _ = sink
-                    .bump_dlq_attempt(row.id, "peer no longer in FederationConfig")
+                    .bump_dlq_attempt(
+                        row.id,
+                        // #2672 — typed class (the peer set is LOCAL config,
+                        // so this classification was never steerable, but the
+                        // tag keeps every row this binary writes tagged).
+                        &super::dlq_class::DlqErrorClass::PeerRemoved
+                            .stamp("peer no longer in FederationConfig"),
+                    )
                     .await;
                 tracing::warn!(
                     target: PUSH_DLQ_TRACE_TARGET,
@@ -925,7 +977,13 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                 // operator-visible divergence. Bump and keep row so
                 // the audit trail captures the drift.
                 let _ = sink
-                    .bump_dlq_attempt(row.id, "replay observed id_drift on peer ack")
+                    .bump_dlq_attempt(
+                        row.id,
+                        // #2672 — typed class, not a token the classifier
+                        // greps out of the sentence.
+                        &super::dlq_class::DlqErrorClass::IdDrift
+                            .stamp("replay observed id_drift on peer ack"),
+                    )
                     .await;
                 tracing::warn!(
                     target: PUSH_DLQ_TRACE_TARGET,
@@ -1077,7 +1135,15 @@ async fn expand_erasure_sentinel_row(
         ),
         Err(e) => {
             let _ = sink
-                .bump_dlq_attempt(row.id, &format!("erasure sentinel expansion failed: {e}"))
+                .bump_dlq_attempt(
+                    row.id,
+                    // #2672 — a LOCAL store error, but its text is not ours to
+                    // predict. Class it structurally so no digit sequence
+                    // inside a backend error message can ever be read as a
+                    // `429` throttle by the legacy untagged arm.
+                    &super::dlq_class::DlqErrorClass::Other
+                        .stamp(&format!("erasure sentinel expansion failed: {e}")),
+                )
                 .await;
             tracing::warn!(
                 target: PUSH_DLQ_TRACE_TARGET,
@@ -1313,16 +1379,34 @@ impl FederationDlqSink for SqliteDlqSink {
 
     async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
         // #1544 — un-quarantine rows quarantined SOLELY by a 429 throttle.
-        // Scoped to throttle rows (last_error names a 429) so genuinely
-        // systematic failures stay quarantined.
+        // Scoped to throttle rows so genuinely systematic failures stay
+        // quarantined.
+        //
+        // v1.0.0 #2672 — the scope is now the ANCHORED typed class tag
+        // (`[ai-memory:class=throttle]%`) this binary writes from the REAL
+        // HTTP status, not the steerable `LIKE '%429%'` substring. Under the
+        // old predicate a peer answering 200 with `{"skipped": 429}` had its
+        // rows' attempt budget reset on EVERY sweep, so they could never
+        // quarantine — the unbounded no-op POST amplification #1544 exists to
+        // stop. The second arm keeps pre-#2672 (UNTAGGED) rows healing on the
+        // historical substring rule. It cannot launder a peer-steered row:
+        // every reason that can carry peer bytes is class-stamped at mint
+        // time, so such a row is always TAGGED and excluded from this arm by
+        // the `NOT LIKE` guard; the only untagged reasons this binary still
+        // writes are fixed local literals with no digits.
         let conn = self.conn.lock().await;
         let n = conn
             .execute(
                 "UPDATE federation_push_dlq SET attempt_count = 0 \
                  WHERE replayed_at IS NULL \
                    AND attempt_count >= ?1 \
-                   AND last_error LIKE '%429%'",
-                rusqlite::params![MAX_REPLAY_ATTEMPTS],
+                   AND ( last_error LIKE ?2 \
+                         OR ( last_error NOT LIKE ?3 AND last_error LIKE '%429%' ) )",
+                rusqlite::params![
+                    MAX_REPLAY_ATTEMPTS,
+                    super::dlq_class::SQL_LIKE_CLASS_THROTTLE,
+                    super::dlq_class::SQL_LIKE_ANY_CLASS_TAG
+                ],
             )
             .map_err(|e| format!("sqlite reset_throttled_quarantine: {e}"))?;
         Ok(n as u64)
@@ -1624,14 +1708,21 @@ impl FederationDlqSink for PostgresDlqSink {
 
     async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
         // #1544 — un-quarantine 429-throttled rows only (see trait doc).
+        // #2672 — byte-for-byte the sqlite predicate: anchored typed class
+        // tag, plus an UNTAGGED-only legacy arm. The two adapters MUST stay
+        // identical here (#2488/#2491 precedent: the same intent failing in
+        // inverse directions on the two backends).
         let pool = self.store.pool();
         let res = sqlx::query(
             "UPDATE federation_push_dlq SET attempt_count = 0 \
              WHERE replayed_at IS NULL \
                AND attempt_count >= $1 \
-               AND last_error LIKE '%429%'",
+               AND ( last_error LIKE $2 \
+                     OR ( last_error NOT LIKE $3 AND last_error LIKE '%429%' ) )",
         )
         .bind(MAX_REPLAY_ATTEMPTS)
+        .bind(super::dlq_class::SQL_LIKE_CLASS_THROTTLE)
+        .bind(super::dlq_class::SQL_LIKE_ANY_CLASS_TAG)
         .execute(pool)
         .await
         .map_err(|e| format!("postgres reset_throttled_quarantine: {e}"))?;

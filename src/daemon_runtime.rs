@@ -1123,6 +1123,27 @@ pub async fn run(
     app_config: &AppConfig,
     audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
 ) -> Result<()> {
+    // v1.0.0 #2908 — install the console tracing subscriber BEFORE the boot
+    // posture reports below.
+    //
+    // On a stock deployment `[logging].enabled` is OFF, so `main`'s
+    // `init_file_logging` installs NOTHING, and the console subscriber was
+    // installed only inside `serve()` — which runs AFTER this function's
+    // common boot-report block. The asi-hard #1961 pin report and the §5.3
+    // `security.posture.enterprise_federation` banner (#2905) were therefore
+    // emitted into a VOID on a stock `ai-memory serve` console: 0 banner lines
+    // with `RUST_LOG=info` and no config. The §5.3 cutline ruling mandates "a
+    // boot banner echoing the effective posture" and its cited precedent is
+    // "verify the banner, never infer from env" — a banner nobody can see
+    // cannot be cert evidence.
+    //
+    // Scoped to the commands that install this SAME subscriber later anyway
+    // (see `command_installs_console_subscriber`), so every other subcommand's
+    // stdout/stderr stays byte-identical — `init_tracing` is `try_init`, so
+    // the later call is a no-op, and a `[logging].enabled` deployment keeps
+    // its file/syslog subscriber because that one was installed first, in
+    // `main`.
+    install_boot_console_subscriber(&cli.command);
     let db_path = app_config.effective_db(&cli.db);
     // #1937 V08-PE-3 — seed the process-wide audit DB path for the best-effort
     // spawn-audit chokepoint (`crate::spawn_audit`). Every serve / mcp / CLI
@@ -2933,6 +2954,68 @@ pub fn resolve_admin_agent_ids(admin_cfg: Option<&crate::config::AdminConfig>) -
 // ---------------------------------------------------------------------------
 // Embedder / vector-index canonical builders
 // ---------------------------------------------------------------------------
+/// v1.0.0 #2972 — the outcome of the boot embedder-model resolution: the
+/// model to thread into [`crate::embeddings::Embedder::from_resolved`], plus
+/// the raw operator-configured id when one was set and could NOT be honoured.
+///
+/// Splitting the two out is what lets the CORPUS-REWRITING `ai-memory reembed`
+/// verb fail closed on a silent fallback while the daemon keeps its
+/// warn-and-degrade boot posture (a daemon that refuses to boot on an
+/// unsupported model id would be a far worse failure mode than degrading to
+/// the tier preset).
+pub(crate) struct BootEmbedderModel {
+    /// The tier model argument for `Embedder::from_resolved`.
+    pub(crate) model: Option<crate::config::EmbeddingModel>,
+    /// `Some(raw)` when `[embeddings].model` (or the legacy flat
+    /// `embedding_model`) named a model this binary cannot construct, so the
+    /// tier preset was substituted. `None` when the configured model was
+    /// honoured, none was configured, or the backend is an API backend (where
+    /// the operator's id is wired VERBATIM by `Embedder::from_resolved` and
+    /// the tier preset only gates Some-vs-None).
+    pub(crate) unhonoured_config_model: Option<String>,
+}
+
+/// v1.0.0 #2972 — the SINGLE resolver of the `tier_model` argument threaded
+/// into [`crate::embeddings::Embedder::from_resolved`].
+///
+/// Pre-#2972 this two-branch decision (`tier_config.embedding_model` for API
+/// backends, [`resolve_embedder_model_reported`] otherwise) was DUPLICATED in
+/// [`build_embedder`] and in `cli::commands::reembed::cmd_reembed`. Two copies
+/// of the rule that decides which vector space a write lands in is exactly the
+/// drift #322 was: if they ever disagree, `reembed` REPLACES the whole corpus
+/// with vectors of a model/dim the daemon will not score. One resolver, one
+/// SSOT, structurally un-driftable.
+pub(crate) fn resolve_boot_embedder_model(
+    tier_config: &crate::config::TierConfig,
+    app_config: &AppConfig,
+) -> BootEmbedderModel {
+    let resolved = app_config.resolve_embeddings();
+    if crate::config::is_api_embed_backend(&resolved.backend) {
+        // API backends: `Embedder::from_resolved` wires `resolved.model` (and
+        // `resolved.embedding_dim`) verbatim and IGNORES this value beyond its
+        // Some-vs-None gate, so there is nothing to un-honour here.
+        return BootEmbedderModel {
+            model: tier_config.embedding_model,
+            unhonoured_config_model: None,
+        };
+    }
+    let (model, unhonoured_config_model) = resolve_embedder_model_reported(tier_config, app_config);
+    if let Some(ref raw) = unhonoured_config_model {
+        tracing::warn!(
+            configured_model = %raw,
+            preset = ?model,
+            "#2972: [embeddings].model is not constructible in this binary; \
+             substituting the tier preset. daemon/mcp will not honour the \
+             configured id (doctor and reembed already surface this; this \
+             WARN is the boot-path copy so a silent substitution cannot \
+             hide behind those CLIs)"
+        );
+    }
+    BootEmbedderModel {
+        model,
+        unhonoured_config_model,
+    }
+}
 
 /// #1521 — resolve the daemon embedder model under the canonical
 /// precedence ladder, mirroring the [`AppConfig::resolve_embeddings`]
@@ -2951,11 +3034,16 @@ pub fn resolve_admin_agent_ids(admin_cfg: Option<&crate::config::AdminConfig>) -
 /// degrades to the tier preset — the operator picked a pin, not
 /// keyword-only. Pure: no network I/O, so the precedence is unit-testable
 /// without an HF-Hub fetch (`build_embedder` does the construction).
+///
+/// #2972 — returns the resolved model PLUS the raw operator-configured id
+/// it could not honour, so a corpus-rewriting caller can refuse. The
+/// boot-facing entry point is [`resolve_boot_embedder_model`], which adds the
+/// API-backend branch on top of this precedence ladder.
 #[allow(deprecated)]
-pub(crate) fn resolve_embedder_model(
+pub(crate) fn resolve_embedder_model_reported(
     tier_config: &crate::config::TierConfig,
     app_config: &AppConfig,
-) -> Option<crate::config::EmbeddingModel> {
+) -> (Option<crate::config::EmbeddingModel>, Option<String>) {
     let preset = tier_config.embedding_model;
     let preset_label = preset
         .map(|m| m.hf_model_id().to_string())
@@ -2976,7 +3064,7 @@ pub(crate) fn resolve_embedder_model(
         });
 
     let Some((raw, origin)) = configured else {
-        return preset;
+        return (preset, None);
     };
     match crate::config::EmbeddingModel::from_canonical_id(&raw) {
         Some(model) => {
@@ -2985,7 +3073,7 @@ pub(crate) fn resolve_embedder_model(
                 model.hf_model_id(),
                 preset_label
             );
-            Some(model)
+            (Some(model), None)
         }
         None => {
             tracing::warn!(
@@ -2993,7 +3081,10 @@ pub(crate) fn resolve_embedder_model(
                  daemon embedder (supported: nomic-embed-text-v1.5, all-MiniLM-L6-v2); \
                  falling back to tier-preset {preset_label}"
             );
-            preset
+            // #2972 — report the un-honoured id so a CORPUS-REWRITING caller
+            // can refuse rather than replacing every vector under a model the
+            // operator never asked for.
+            (preset, Some(raw))
         }
     }
 }
@@ -3021,17 +3112,15 @@ pub async fn build_embedder(
     // #1598 — construction is delegated to the single shared boot
     // entry `Embedder::from_resolved` (also used by the MCP stdio
     // init). For the local/ollama backend the model is resolved by
-    // the pure `resolve_embedder_model` helper (precedence:
+    // the pure `resolve_embedder_model_reported` helper (precedence:
     // `[embeddings].model` section > legacy flat `embedding_model` >
     // tier preset); for API backends the operator's `model` id is
     // wired verbatim by the resolver and the tier preset only gates
     // whether embeddings are enabled at all (Some vs None).
     let resolved_embeddings = app_config.resolve_embeddings();
-    let tier_model = if crate::config::is_api_embed_backend(&resolved_embeddings.backend) {
-        tier_config.embedding_model
-    } else {
-        resolve_embedder_model(&tier_config, app_config)
-    };
+    // #2972 — ONE resolver, shared with `ai-memory reembed`, so the CLI can
+    // never land vectors in a different space than this daemon scores.
+    let tier_model = resolve_boot_embedder_model(&tier_config, app_config).model;
     let Some(emb_model) = tier_model else {
         tracing::info!(
             "embedder disabled — tier={} keyword-only (FTS5); semantic recall not wired",
@@ -4315,7 +4404,7 @@ pub struct ServeBootstrap {
 ///   constructs from the resolved [`crate::config::EmbeddingModel`] enum
 ///   ONLY — the `resolved.model` id is not honored beyond the two
 ///   compiled families — so the produced dim is exactly what
-///   [`resolve_embedder_model`] resolves (precedence: `[embeddings].model`
+///   [`resolve_boot_embedder_model`] resolves (precedence: `[embeddings].model`
 ///   > legacy flat `embedding_model` > tier preset). Keyword tier (no
 ///   preset, no constructible model) → `None`.
 ///
@@ -4352,9 +4441,11 @@ fn resolve_configured_embedding_dim(
         // resolver (explicit override or canonical lookup).
         return tier_config.embedding_model.and(resolved.embedding_dim);
     }
-    // Ollama backend: the produced dim is whatever `resolve_embedder_model`
+    // Ollama backend: the produced dim is whatever `resolve_boot_embedder_model`
     // — the SAME precedence `build_embedder` loads — resolves to.
-    resolve_embedder_model(tier_config, app_config).map(|m| u32::try_from(m.dim()).unwrap_or(384))
+    resolve_boot_embedder_model(tier_config, app_config)
+        .model
+        .map(|m| u32::try_from(m.dim()).unwrap_or(384))
 }
 
 /// v0.7.0 #1548 — resolve the curator's SAL store handle from the same
@@ -6943,6 +7034,34 @@ pub async fn bootstrap_serve(
     })
 }
 
+/// v1.0.0 #2908 — does `cmd` dispatch to a body that installs the console
+/// tracing subscriber ([`init_tracing`])?
+///
+/// These are exactly the long-running console commands whose `tracing` output
+/// is the operator's primary channel. Every other subcommand renders through
+/// `CliOutput` and deliberately installs NO subscriber (see the COVERAGE NOTE
+/// in `src/main.rs`), so arming one for them would change their captured
+/// stdout/stderr — which is why the boot-time install is scoped rather than
+/// unconditional.
+#[must_use]
+fn command_installs_console_subscriber(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Serve(_) | Command::Curator(_) | Command::Watch(_)
+    )
+}
+
+/// v1.0.0 #2908 — arm the console subscriber for the boot posture reports.
+///
+/// Idempotent by construction: [`init_tracing`] uses `try_init`, so this is a
+/// no-op when `main`'s `init_file_logging` already installed a subscriber, and
+/// the later in-body `init_tracing()` call is a no-op after this one.
+fn install_boot_console_subscriber(cmd: &Command) {
+    if command_installs_console_subscriber(cmd) {
+        init_tracing();
+    }
+}
+
 /// Init the tracing subscriber for the HTTP daemon. Idempotent at the
 /// `tracing-subscriber` level — repeated calls log a warning and no-op
 /// rather than panic. Split out from `serve()` so test code can opt out.
@@ -7612,6 +7731,11 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
             "memories_read": report.memories_read,
             "memories_written": report.memories_written,
             "embeddings_copied": report.embeddings_copied,
+            // v1.0.0 #3085 — vectors whose source `embedding_space` was
+            // unattributed (SQL NULL / empty) and were therefore NOT copied;
+            // the destination re-derives them from the durable text on its
+            // own backfill sweep.
+            "embeddings_unattributed": report.embeddings_unattributed,
             "batches": report.batches,
             "errors": report.errors,
             "dry_run": report.dry_run,
@@ -7624,6 +7748,10 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
         println!("  memories_read:     {}", report.memories_read);
         println!("  memories_written:  {}", report.memories_written);
         println!("  embeddings_copied: {}", report.embeddings_copied);
+        println!(
+            "  embeddings_unattributed: {}",
+            report.embeddings_unattributed
+        );
         println!("  batches:           {}", report.batches);
         println!("  dry_run:           {}", report.dry_run);
         println!("  errors:            {}", report.errors.len());
@@ -9344,7 +9472,7 @@ mod tests {
         );
     }
 
-    // ----- resolve_embedder_model (#1521 precedence) --------------------
+    // ----- resolve_embedder_model_reported (#1521 precedence) -----------
 
     /// #1521 — the sectioned `[embeddings].model` block must beat the
     /// tier preset. Semantic tier presets MiniLM; a section pinning nomic
@@ -9359,9 +9487,75 @@ mod tests {
         });
         let tier = FeatureTier::Semantic.config();
         assert_eq!(
-            resolve_embedder_model(&tier, &cfg),
+            resolve_embedder_model_reported(&tier, &cfg).0,
             Some(crate::config::EmbeddingModel::NomicEmbedV15),
             "[embeddings].model must override the Semantic tier MiniLM preset"
+        );
+    }
+
+    /// v1.0.0 #2972 — ONE resolver decides the `tier_model` argument for
+    /// BOTH the daemon boot (`build_embedder`) and `ai-memory reembed`.
+    ///
+    /// `reembed` REPLACES every vector in the corpus, so a drifted second
+    /// copy of this rule would rewrite the whole corpus into a space the
+    /// daemon refuses to score (the #2167 gate). The reporter's case is the
+    /// third assertion: a `[embeddings].model` this binary cannot construct
+    /// used to be swapped for the tier preset with only a `tracing::warn!`,
+    /// which a CLI one-shot renders nowhere.
+    #[test]
+    fn resolve_boot_embedder_model_is_the_shared_ssot_2972() {
+        let tier = FeatureTier::Semantic.config();
+
+        // Local/ollama backend + a SUPPORTED model id → honoured, nothing to
+        // report.
+        let mut cfg = AppConfig::default();
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            backend: Some(crate::llm::BACKEND_OLLAMA.to_string()),
+            model: Some("nomic_embed_v15".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let got = resolve_boot_embedder_model(&tier, &cfg);
+        assert_eq!(
+            got.model,
+            Some(crate::config::EmbeddingModel::NomicEmbedV15)
+        );
+        assert!(got.unhonoured_config_model.is_none());
+
+        // No configured model → the tier preset, nothing to report.
+        let mut cfg = AppConfig::default();
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            backend: Some(crate::llm::BACKEND_OLLAMA.to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let got = resolve_boot_embedder_model(&tier, &cfg);
+        assert_eq!(got.model, tier.embedding_model);
+        assert!(got.unhonoured_config_model.is_none());
+
+        // #2972 repro — an UNCONSTRUCTIBLE configured id must be REPORTED,
+        // not silently swapped for the preset.
+        let mut cfg = AppConfig::default();
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            backend: Some(crate::llm::BACKEND_OLLAMA.to_string()),
+            model: Some("qwen3-embedding:4b".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let got = resolve_boot_embedder_model(&tier, &cfg);
+        assert_eq!(
+            got.model, tier.embedding_model,
+            "the daemon still degrades to the tier preset (refusing to BOOT would be worse)"
+        );
+        assert_eq!(
+            got.unhonoured_config_model.as_deref(),
+            Some("qwen3-embedding:4b"),
+            "#2972: the un-honoured id must be REPORTED so `reembed` can refuse before \
+             replacing every vector under a model the operator never asked for"
+        );
+
+        // The pure precedence ladder underneath keeps its historical result
+        // (the #1521 contract) — only the un-honoured id is NEW information.
+        assert_eq!(
+            resolve_embedder_model_reported(&tier, &cfg).0,
+            tier.embedding_model
         );
     }
 
@@ -9373,7 +9567,7 @@ mod tests {
         cfg.embedding_model = Some("nomic_embed_v15".to_string());
         let tier = FeatureTier::Semantic.config();
         assert_eq!(
-            resolve_embedder_model(&tier, &cfg),
+            resolve_embedder_model_reported(&tier, &cfg).0,
             Some(crate::config::EmbeddingModel::NomicEmbedV15),
             "legacy flat embedding_model must still override the preset"
         );
@@ -9391,7 +9585,7 @@ mod tests {
         });
         let tier = FeatureTier::Semantic.config();
         assert_eq!(
-            resolve_embedder_model(&tier, &cfg),
+            resolve_embedder_model_reported(&tier, &cfg).0,
             Some(crate::config::EmbeddingModel::MiniLmL6V2),
             "[embeddings].model must win over legacy flat embedding_model"
         );
@@ -9410,7 +9604,7 @@ mod tests {
         });
         let tier = FeatureTier::Semantic.config();
         assert_eq!(
-            resolve_embedder_model(&tier, &cfg),
+            resolve_embedder_model_reported(&tier, &cfg).0,
             Some(crate::config::EmbeddingModel::MiniLmL6V2),
             "url-only section must keep the Semantic MiniLM preset"
         );
@@ -9427,7 +9621,7 @@ mod tests {
         });
         let tier = FeatureTier::Semantic.config();
         assert_eq!(
-            resolve_embedder_model(&tier, &cfg),
+            resolve_embedder_model_reported(&tier, &cfg).0,
             Some(crate::config::EmbeddingModel::MiniLmL6V2),
             "unsupported model id must fall back to the tier preset"
         );
@@ -9439,12 +9633,12 @@ mod tests {
     fn resolve_embedder_model_unconfigured_uses_tier_preset() {
         let cfg = AppConfig::default();
         assert_eq!(
-            resolve_embedder_model(&FeatureTier::Keyword.config(), &cfg),
+            resolve_embedder_model_reported(&FeatureTier::Keyword.config(), &cfg).0,
             None,
             "keyword tier has no preset → None"
         );
         assert_eq!(
-            resolve_embedder_model(&FeatureTier::Semantic.config(), &cfg),
+            resolve_embedder_model_reported(&FeatureTier::Semantic.config(), &cfg).0,
             Some(crate::config::EmbeddingModel::MiniLmL6V2),
             "semantic tier preset is MiniLM"
         );
@@ -11982,7 +12176,7 @@ decision = "allow"
     /// ollama backend [`crate::embeddings::Embedder::from_resolved`] only
     /// constructs from the 2-variant [`crate::config::EmbeddingModel`]
     /// enum (MiniLM/Nomic) — `bge-large-en` falls through
-    /// [`resolve_embedder_model`] to the Autonomous preset (Nomic, 768),
+    /// [`resolve_boot_embedder_model`] to the Autonomous preset (Nomic, 768),
     /// which is what the daemon ACTUALLY loads and writes. Provisioning
     /// the column at the table's 1024 (the pre-#1882 behaviour) would
     /// mismatch every write. Pins that the schema dim tracks the live

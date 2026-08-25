@@ -103,20 +103,23 @@ pub async fn get_inbox(
         };
         return match app.store.list(&ctx, &filter).await {
             Ok(rows) => {
+                let unread_only = q.unread_only.unwrap_or(false);
                 let messages: Vec<serde_json::Value> = rows
                     .into_iter()
                     .filter(|m| {
-                        // Honour `unread_only` when set: any row whose
-                        // metadata explicitly carries `read=true` is
-                        // filtered out. The default state (no key) is
-                        // treated as unread, mirroring the SQLite
-                        // contract.
-                        if q.unread_only.unwrap_or(false) {
-                            m.metadata.get("read").and_then(serde_json::Value::as_bool)
-                                != Some(true)
-                        } else {
-                            true
-                        }
+                        // v1.0.0 #3027 — the unread marker is `access_count`,
+                        // exactly as the sqlite/MCP twin derives it
+                        // (`src/mcp/tools/notify.rs`: `!unread_only ||
+                        // m.access_count == 0`). The pre-fix pg arm filtered on
+                        // `metadata.read == true`, a key NO production writer
+                        // ever sets — so `unread_only=true` filtered NOTHING and
+                        // `unread_count` equalled `messages.len()` forever, while
+                        // the in-code comment claimed sqlite parity. Reading a
+                        // message bumps `access_count`, which is a real column on
+                        // BOTH backends (`memories.access_count`, populated by
+                        // the postgres row mapper), so the two arms now derive the
+                        // SAME fact from the SAME durable field.
+                        !unread_only || m.access_count == 0
                     })
                     .map(|m| {
                         json!({
@@ -130,6 +133,12 @@ pub async fn get_inbox(
                             "metadata": m.metadata,
                             (field_names::CREATED_AT): m.created_at,
                             (field_names::UPDATED_AT): m.updated_at,
+                            // #3027 — surface the same read-state pair the
+                            // sqlite/MCP inbox projects, so a client cannot be
+                            // told a message is unread by one backend and read
+                            // by the other.
+                            "read": m.access_count > 0,
+                            (field_names::ACCESS_COUNT): m.access_count,
                             "agent_id": m.metadata
                                 .get("agent_id")
                                 .and_then(|v| v.as_str())
@@ -145,14 +154,10 @@ pub async fn get_inbox(
                         })
                     })
                     .collect();
+                // #3027 — count from the SAME derived marker the filter uses.
                 let unread_count = messages
                     .iter()
-                    .filter(|m| {
-                        m.get("metadata")
-                            .and_then(|v| v.get("read"))
-                            .and_then(serde_json::Value::as_bool)
-                            != Some(true)
-                    })
+                    .filter(|m| m.get("read").and_then(serde_json::Value::as_bool) != Some(true))
                     .count();
                 (
                     StatusCode::OK,

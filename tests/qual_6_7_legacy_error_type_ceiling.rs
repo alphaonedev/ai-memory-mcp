@@ -242,7 +242,13 @@ const QUAL_6_CEILING: usize = 124;
 // flows verbatim into the enclosing `handle_gc`'s `Result<Value, String>` via
 // `?`, exactly like the sibling gates in `handle_archive_purge`. No new error
 // contract. Measured 44.
-const QUAL_7_CEILING: usize = 44;
+// 2026-08-25 (#3223 rebase onto ecce0a86) — raised 44 -> 45 for
+// `governance::agent_action::validate_matcher_for_kind` (#3031 fail-closed
+// matchers). Same `Result<(), String>` contract as `validate_command_substring`
+// (operator-facing write-time validator, rendered verbatim by `rules add`).
+// Floors never fall: #3204's `gate_gc_sweep` and #3031's matcher validator
+// are independent adds. Measured after rebase.
+const QUAL_7_CEILING: usize = 45;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {

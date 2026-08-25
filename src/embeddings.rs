@@ -1241,7 +1241,7 @@ impl Embedder {
     /// nomic-768 tier preset while boot falls back to the local
     /// MiniLM-384 embedder (e.g. `AI_MEMORY_NO_CONFIG=1`, or a configured
     /// model the daemon cannot construct — see
-    /// [`crate::daemon_runtime::resolve_embedder_model`]). The local
+    /// [`crate::daemon_runtime::resolve_boot_embedder_model`]). The local
     /// variant is ALWAYS `MiniLM` (the sole in-process model), so it
     /// reports the [`crate::config::EmbeddingModel::MiniLmL6V2`] HF id;
     /// the remote variant reports its operator-picked model id verbatim.

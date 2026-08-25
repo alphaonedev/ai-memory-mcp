@@ -71,6 +71,9 @@ const SECTION_EMBEDDINGS_REACHABILITY: &str = "Embeddings Reachability (#1598)";
 /// #3147 / #3155 — operator-visible identity health. Named to match the
 /// daemon WARN "See `ai-memory doctor` -> Identity".
 const SECTION_IDENTITY: &str = "Identity";
+/// v1.0.0 #2972 — doctor fact naming the model this binary will ACTUALLY
+/// load, emitted only when it differs from the configured `model` fact.
+const EFFECTIVE_MODEL_FACT: &str = "effective_model";
 const MSG_RAW_SQL_DB_MODE: &str = "raw SQL section — only available in --db mode";
 /// #1598 literal-dedup — shared probe-client failure fact prefix for
 /// the LLM + Embeddings reachability sections.
@@ -2048,6 +2051,43 @@ fn section_embeddings_reachability_1598() -> ReportSection {
             )
         }
     };
+
+    // v1.0.0 #2972 — the `model` fact above is the CONFIGURED id, not
+    // necessarily the one this binary will LOAD. On a non-API backend
+    // `Embedder::from_resolved` constructs only from the compiled
+    // `EmbeddingModel` families, so any other id is silently swapped for the
+    // tier preset behind a `tracing::warn!` a CLI one-shot renders nowhere.
+    // That is exactly how the #2972 reporter came to believe `doctor` and
+    // `reembed` disagreed: `doctor` echoed `qwen3-embedding:4b` while the
+    // daemon (and `reembed`) used `all-MiniLM-L6-v2`. Report the EFFECTIVE
+    // model whenever it differs from the configured one — a doctor that
+    // states a model the binary will not load is a false claim, not a
+    // cosmetic gap.
+    let boot_model = crate::daemon_runtime::resolve_boot_embedder_model(
+        &app_config.effective_tier(None).config(),
+        &app_config,
+    );
+    if let Some(raw) = boot_model.unhonoured_config_model.as_deref() {
+        let effective = boot_model.model.map_or_else(
+            || "(none — keyword-only tier)".to_string(),
+            |m| m.hf_model_id().to_string(),
+        );
+        severity = severity_max(severity, Severity::Warning);
+        let model_note = format!(
+            "configured [embeddings].model {raw:?} is NOT constructible by this binary \
+             (backend '{}' builds only the compiled families); the EFFECTIVE model is \
+             {effective}. `ai-memory reembed` REFUSES rather than rewriting every vector \
+             under the substitute (#2972) — set a supported model id, or use an API \
+             backend, whose model id is wired verbatim",
+            resolved.backend
+        );
+        facts.push((EFFECTIVE_MODEL_FACT.into(), effective));
+        facts.push(("model_honoured".into(), "false".into()));
+        note = Some(match note {
+            Some(existing) => format!("{existing}; {model_note}"),
+            None => model_note,
+        });
+    }
 
     // Operator GPU-policy WARN (#1598): local-Ollama embeddings on a
     // CPU-only host — operator policy prefers API embeddings there.

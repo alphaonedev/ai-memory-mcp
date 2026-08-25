@@ -129,6 +129,20 @@ nothing written to the destination:
   enumerated from the source.
 - `links_read` / `links_written` / `links_skipped` — `memory_links`
   rows (F6 Gap 2: links migrate alongside memories).
+- `embeddings_copied` — stored embedding VECTORS copied VERBATIM with their
+  `embedding_space` fingerprint (#3060). Never re-embedded, never re-stamped.
+- `embeddings_unattributed` (#3085) — source vectors whose `embedding_space`
+  is SQL NULL (unverified/legacy provenance) and which are therefore **not**
+  copied. Such a vector has no provenance to preserve, and the SAL write
+  surface cannot express a NULL stamp: copying it as the empty string would
+  land a NON-NULL `''` on postgres, which is excluded from BOTH semantic
+  recall and every NULL-space heal scan (permanently non-recallable AND
+  unhealable). Leaving the destination row unembedded is self-healing — the
+  destination's own embedding backfill re-derives the vector from the durable
+  memory TEXT under the live embedder and stamps the ACTIVE space. A non-zero
+  count is expected on a legacy corpus and is **not** an error; it tells you
+  how many rows will regain semantic recall on the destination's first
+  backfill sweep (which needs an embedder configured there).
 - `batches`, `dry_run: true`, and an `errors` array.
 
 Pass `--json` for the machine-parseable shape. Read the report and

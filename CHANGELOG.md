@@ -847,6 +847,118 @@ backend and missing or divergently implemented on its twin). Pinned by
     `isError: true`, so a client switching on the error code would never see
     them. `docs/USER_GUIDE.md`'s `memory_get_links` example showed a `signed_at`
     field that exists nowhere and a `signature` key that is never emitted.
+### Fixed (silent permanent recall loss: `migrate` copied NULL-space vectors as `embedding_space=''`; #3085)
+
+- **`migrate` no longer mints an UNATTRIBUTED embedding stamp, and an
+  already-poisoned corpus now heals.** The #3060 Phase-3 embedding copy bucketed
+  a source row whose `embedding_space` was SQL NULL under
+  `space.unwrap_or_default()` — the EMPTY STRING — and wrote it with
+  `set_embeddings_batch(&ctx, chunk, "")`. On postgres that lands NON-NULL
+  `embedding_space = ''`, which is excluded from the #2167 recall gate (`AND
+  embedding_space = <active_fp>` never matches `''`) **and** from
+  `PostgresStore::list_unembedded`'s NULL-space heal arm (`'' IS NULL` is
+  false). The row was therefore PERMANENTLY non-recallable and unhealable while
+  `migrate` reported `errors: []` — strictly worse than pre-#3060, where such a
+  row landed unembedded and the serve-boot backfill self-healed it. Three
+  changes: (1) a NULL/empty-space source vector is **not copied** (it has no
+  provenance to preserve; the destination re-derives it from the DURABLE TEXT
+  under the live embedder and stamps the ACTIVE space) and is **counted** in the
+  new `MigrationReport.embeddings_unattributed`, surfaced in both the `migrate`
+  text and `--json` reports plus a `tracing::warn!`; (2) every embedding write
+  funnel on both backends (`db::set_embedding`, `db::set_embeddings_batch`,
+  `db::set_embeddings_batch_reembed`, the `MemoryStore::set_embeddings_batch`
+  default, and both adapters' `update_embedding` / `set_embeddings_batch`) now
+  **refuses** an empty or whitespace-only space stamp for a real vector, so the
+  state is structurally un-mintable; (3) every provenance-READ predicate on both
+  backends (the pg boot-backfill heal scan, both `adopt_legacy_embedding_space`
+  [G2] probes and UPDATEs, and `stamp_embedding_space_attested`) now treats `''`
+  as NULL-equivalent, so a corpus an older binary already poisoned heals through
+  the same paths a legacy NULL corpus does. Recall is deliberately **not**
+  widened: an unattributed row stays excluded from scoring until it is healed
+  (degrade, never wrong results).
+
+### Security (fail-closed: inert governance rules, peer-steerable DLQ classification; #3031 #2672)
+
+- **An ENABLED, operator-signed `refuse` rule whose matcher cannot be EVALUATED
+  now REFUSES instead of silently allowing (#3031).** `matcher_applies`
+  collapsed "malformed matcher JSON", "no field this kind recognises", and "was
+  evaluated and did not match" into a single `false`, so `rules add --kind bash
+  --matcher '{"totally_bogus_key":123}' --severity refuse --sign` minted a
+  signed, enabled, operator-attested rule that enforced NOTHING — `rules check`
+  answered `allow` for every command and `rules list` showed nothing amiss. Two
+  halves: `ai-memory rules add` now validates the **per-kind matcher schema**
+  (required keys present, no unrecognised keys, and every recognised key's VALUE
+  TYPE readable by the engine's typed accessor — both a `command_substrng` typo
+  and a `{"glob": 123}` are refused at write time, because the engine reads
+  `glob` with `as_str` and a number is just as inert as a misspelling), and
+  `RuleEngine::evaluate` fails closed on an inert
+  enabled rule whose severity BLOCKS, emitting a loud `tracing::error!` naming
+  the rule. Both `ai-memory rules list` and the MCP `memory_rule_list` gain an
+  `inert` flag, from the same predicate, so a legacy row is visible to the
+  operator and to an agent alike.
+  **Documented-semantics note:** `match_read`'s doc states that for
+  `read_action` "an empty / unrecognized matcher matches nothing, so an operator
+  can't accidentally deny every read with a typo". That property is PRESERVED
+  for the non-blocking severities (`warn` / `log` inert rules stay non-blocking)
+  and DELIBERATELY INVERTED for `refuse` / `escalate`: a typo that disables an
+  intended refusal is a silent security hole, and the typo is now also
+  unmintable through `rules add`.
+- **A federation peer can no longer defeat the push-DLQ quarantine ceiling by
+  returning a count containing `429` (#2672).** `sync::success_report_non_ack_
+  reason` interpolated a `skipped` count read VERBATIM from the peer's own JSON
+  body into a prose `last_error`, which `reset_throttled_quarantine` then
+  matched with `last_error LIKE '%429%'` on BOTH backends and reset
+  `attempt_count = 0`. A peer answering **HTTP 200** with `{"skipped": 429}` had
+  its rows un-quarantined on every sweep, so they could never reach
+  `MAX_REPLAY_ATTEMPTS` — the unbounded no-op POST amplification #1544 exists to
+  stop — and `classify_quarantine_cause`'s `contains("429") => "quota"` arm
+  misdirected the operator to raise a quota. The retry/label signal is now a
+  typed `DlqErrorClass` decided from the REAL HTTP status line or the local call
+  site, persisted as a reserved leading tag (`[ai-memory:class=throttle] …`) that
+  peer-derived text can only ever follow; the SQL is an anchored `LIKE
+  '[ai-memory:class=throttle]%'` on both adapters. Pre-#2672 UNTAGGED rows keep
+  healing on the historical substring rule, scoped by `NOT LIKE
+  '[ai-memory:class=%'` so no in-flight upgrade backlog is stranded. The
+  diagnostic counts stay in `last_error`; only their role as a control signal is
+  removed.
+
+### Fixed (cross-backend parity + observability; #3027 #2908 #2972)
+
+- **The postgres inbox's UNREAD marker is now `access_count`, matching its
+  sqlite/MCP twin (#3027).** The pg arm filtered `metadata['read'] == true`, a
+  key NO production writer sets, so `unread_only=true` filtered nothing and
+  `unread_count` equalled the total forever — while the in-code comment claimed
+  sqlite parity. Both arms now derive read-state from the same durable
+  `access_count` column, and the pg projection surfaces the same `read` /
+  `access_count` pair the sqlite inbox does.
+- **The boot security-posture banner is no longer emitted into a void on a stock
+  `ai-memory serve` console (#2908).** On a default config `[logging].enabled` is
+  off, so no subscriber is installed at `main`, and the console subscriber was
+  installed inside `serve()` — AFTER `run()`'s common boot-report block. Both the
+  asi-hard #1961 pin report and the §5.3 `security.posture.enterprise_federation`
+  banner (#2905) produced 0 lines with `RUST_LOG=info` and no config, so the
+  §5.3 certification could not cite the banner it mandates. The console
+  subscriber is now installed BEFORE the boot-report block, scoped to the
+  commands that install it anyway (`serve` / `curator` / `watch`) so every other
+  subcommand's stdout/stderr stays byte-identical.
+- **`ai-memory reembed` and the daemon now share ONE embedder-model resolver
+  (#2972).** The two-branch rule that decides which vector space a write lands in
+  (`tier_config.embedding_model` for API backends, `resolve_embedder_model`
+  otherwise) was duplicated in `daemon_runtime::build_embedder` and
+  `cmd_reembed`; a drift between the two would have `reembed` REPLACE the whole
+  corpus into a space the daemon refuses to score. Both now call
+  `daemon_runtime::resolve_boot_embedder_model`. That resolver additionally
+  REPORTS a configured `[embeddings].model` it could not construct (the reported
+  case: `backend = "ollama"`, `model = "qwen3-embedding:4b"`, silently swapped
+  for the `all-MiniLM-L6-v2` tier preset behind a `tracing::warn!` a CLI one-shot
+  renders nowhere), and `reembed` now REFUSES rather than rewriting every vector
+  under a substitute model. The daemon keeps its warn-and-degrade boot posture.
+  `ai-memory doctor` no longer states a model the binary will not load: when a
+  configured non-API `[embeddings].model` is unconstructible, the Embeddings
+  Reachability section now WARNs and adds `effective_model` /
+  `model_honoured: false` facts. (The reporter's confusion started there —
+  `doctor` echoed `qwen3-embedding:4b` while both the daemon and `reembed`
+  actually used `all-MiniLM-L6-v2`.)
 
 ### Changed
 

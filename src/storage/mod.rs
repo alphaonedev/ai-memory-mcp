@@ -15518,6 +15518,62 @@ const SQL_UPDATE_EMBEDDING_WITH_DIM: &str =
 /// space stamp is NULLed too — no vector, no provenance).
 const SQL_UPDATE_EMBEDDING_NULL_DIM: &str = "UPDATE memories SET embedding = ?1, embedding_dim = NULL, embedding_space = NULL WHERE id = ?2";
 
+/// v1.0.0 #3085 — SQL fragment that selects a row carrying a vector with NO
+/// provenance.
+///
+/// The canonical no-provenance stamp is SQL `NULL`. The EMPTY STRING is its
+/// corrupt twin: `''` is not a fingerprint any embedder can mint (a
+/// fingerprint is a non-empty hash token), yet it is NON-NULL, so it silently
+/// slipped past every `embedding_space IS NULL` heal predicate while the #2167
+/// recall gate (`AND embedding_space = <active_fp>`) still excluded the row —
+/// permanently non-recallable AND unhealable. `migrate`'s Phase-3 embedding
+/// copy could mint exactly that state before #3085 (`space.unwrap_or_default()`
+/// mapped a NULL-space source vector to `""`).
+///
+/// Two halves of the fix:
+/// 1. [`reject_unattributed_embedding_space`] makes a NEW `''` stamp
+///    structurally impossible on every write funnel (fail closed).
+/// 2. Every provenance-read predicate treats `''` as NULL-equivalent (this
+///    fragment), so an ALREADY-poisoned corpus heals through the SAME
+///    adoption / stamp-only / backfill paths that heal a legacy NULL corpus.
+///
+/// Recall is deliberately NOT widened: an unattributed row stays excluded
+/// from semantic scoring until it is healed (degrade, never wrong results).
+pub const SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED: &str =
+    "(embedding_space IS NULL OR embedding_space = '')";
+
+/// v1.0.0 #3085 — refuse an EMPTY `embedding_space` stamp on a write that
+/// carries a vector.
+///
+/// A vector's space stamp is load-bearing provenance: the #2167 recall gate
+/// scores a row ONLY when its stamp equals the live embedder's fingerprint.
+/// An empty stamp is neither a real fingerprint nor the NULL that every heal
+/// path recognises, so persisting one strands the row outside BOTH — the
+/// silent, permanent recall loss #3085 documents. There is no legitimate
+/// caller: every production writer stamps `Embed::space_fingerprint()`, which
+/// is never empty. Fail CLOSED at the funnel rather than letting a future
+/// caller re-mint the corrupt state.
+///
+/// A caller that genuinely has no provenance to record must CLEAR the vector
+/// (which NULLs the stamp with it) or leave the row unembedded so the backfill
+/// sweep re-derives it from the durable text — never write `''`.
+///
+/// # Errors
+///
+/// Returns an error naming `op` when `space` is empty or whitespace-only.
+pub fn reject_unattributed_embedding_space(op: &str, space: &str) -> Result<()> {
+    if space.trim().is_empty() {
+        anyhow::bail!(
+            "{op}: refusing to stamp an EMPTY embedding_space on a vector (#3085). \
+             An empty stamp is not a fingerprint and is not NULL, so the row would be \
+             excluded from recall AND from every re-embed/heal scan — permanent, silent \
+             semantic-recall loss. Pass the live embedder's space fingerprint, or leave \
+             the row unembedded so the backfill re-derives it from the durable text."
+        );
+    }
+    Ok(())
+}
+
 /// Store an embedding vector for a memory.
 ///
 /// v0.6.3.1 P2 — writes are now headed with the magic byte (`encode_embedding_blob`)
@@ -15549,6 +15605,9 @@ pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32], space: &str
         conn.execute(SQL_UPDATE_EMBEDDING_NULL_DIM, params![bytes, id])?;
         return Ok(());
     }
+    // #3085 — a REAL vector must carry a REAL space stamp. Fail closed before
+    // the write rather than persisting the unattributed `''` state.
+    reject_unattributed_embedding_space("set_embedding", space)?;
     if let Some(ref ns) = namespace
         && let Some(established) = namespace_embedding_dim(conn, ns)?
         && established != attempted
@@ -15612,6 +15671,13 @@ pub fn set_embeddings_batch(
 ) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
+    }
+    // #3085 — fail closed on an unattributed stamp before ANY row is written
+    // (the whole batch shares one space per #2167 M-PARAMETER-CONSISTENCY).
+    // Degenerate all-empty batches NULL the stamp with the vector and are
+    // exempt, matching `set_embedding`'s legacy empty-vector arm.
+    if entries.iter().any(|(_, v)| !v.is_empty()) {
+        reject_unattributed_embedding_space("set_embeddings_batch", space)?;
     }
 
     // Lookup table: id -> namespace. Needed up-front because we want
@@ -16110,7 +16176,8 @@ pub fn stamp_embedding_space_attested(
     // embedded row is itself a mismatch → treated as refusal via COALESCE(-1)).
     let mut census = conn.prepare(&format!(
         "SELECT DISTINCT COALESCE(embedding_dim, -1) FROM memories \
-         WHERE embedding IS NOT NULL AND embedding_space IS NULL{}",
+         WHERE embedding IS NOT NULL AND {}{}",
+        SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED,
         if namespace.is_some() {
             " AND namespace = ?1"
         } else {
@@ -16134,15 +16201,19 @@ pub fn stamp_embedding_space_attested(
     }
     let stamped = match namespace {
         Some(ns) => conn.execute(
-            "UPDATE memories SET embedding_space = ?1 \
-             WHERE embedding IS NOT NULL AND embedding_space IS NULL \
-               AND embedding_dim = ?2 AND namespace = ?3",
+            &format!(
+                "UPDATE memories SET embedding_space = ?1 \
+                 WHERE embedding IS NOT NULL AND {SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED} \
+                   AND embedding_dim = ?2 AND namespace = ?3"
+            ),
             params![active_fp, active_dim_i64, ns],
         )?,
         None => conn.execute(
-            "UPDATE memories SET embedding_space = ?1 \
-             WHERE embedding IS NOT NULL AND embedding_space IS NULL \
-               AND embedding_dim = ?2",
+            &format!(
+                "UPDATE memories SET embedding_space = ?1 \
+                 WHERE embedding IS NOT NULL AND {SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED} \
+                   AND embedding_dim = ?2"
+            ),
             params![active_fp, active_dim_i64],
         )?,
     };
@@ -16178,6 +16249,11 @@ pub fn set_embeddings_batch_reembed(
 ) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
+    }
+    // #3085 — the G4-bypass replace writer is still a REAL vector write; an
+    // unattributed stamp here would strand the whole re-embedded corpus.
+    if entries.iter().any(|(_, v)| !v.is_empty()) {
+        reject_unattributed_embedding_space("set_embeddings_batch_reembed", space)?;
     }
     let tx = conn.transaction()?;
     let mut rows_updated = 0usize;
@@ -16471,7 +16547,8 @@ pub fn adopt_legacy_embedding_space(
     // attestation).
     let mismatched: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM memories \
-         WHERE embedding_space IS NOT NULL AND embedding_space != ?1)",
+         WHERE embedding_space IS NOT NULL AND embedding_space != '' \
+           AND embedding_space != ?1)",
         params![active_fp],
         |r| r.get(0),
     )?;
@@ -16488,13 +16565,19 @@ pub fn adopt_legacy_embedding_space(
     // Stamp NULL→fp for dim-matching embedded rows on BOTH tables. The
     // archived twin keeps archive→restore round-trips in-space lossless.
     let stamped = conn.execute(
-        "UPDATE memories SET embedding_space = ?1 \
-         WHERE embedding IS NOT NULL AND embedding_space IS NULL AND embedding_dim = ?2",
+        &format!(
+            "UPDATE memories SET embedding_space = ?1 \
+             WHERE embedding IS NOT NULL AND {SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED} \
+               AND embedding_dim = ?2"
+        ),
         params![active_fp, dim_i64],
     )?;
     let _archived = conn.execute(
-        "UPDATE archived_memories SET embedding_space = ?1 \
-         WHERE embedding IS NOT NULL AND embedding_space IS NULL AND embedding_dim = ?2",
+        &format!(
+            "UPDATE archived_memories SET embedding_space = ?1 \
+             WHERE embedding IS NOT NULL AND {SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED} \
+               AND embedding_dim = ?2"
+        ),
         params![active_fp, dim_i64],
     )?;
     if stamped > 0 {

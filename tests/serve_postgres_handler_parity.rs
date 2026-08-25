@@ -395,6 +395,111 @@ async fn bucket_b_notify_delivers_to_inbox() {
     let _ = handle.await;
 }
 
+/// v1.0.0 #3027 — the pg inbox's UNREAD marker must be `access_count`, the
+/// same durable field the sqlite/MCP twin derives it from.
+///
+/// Pre-fix the postgres arm filtered `metadata['read'] == true` — a key NO
+/// production writer ever sets (an exhaustive grep found only read sites). So
+/// on postgres `unread_only=true` filtered NOTHING and `unread_count` equalled
+/// the total forever, while the in-code comment claimed sqlite parity. The
+/// sqlite twin has always used `access_count == 0`
+/// (`src/mcp/tools/notify.rs`), and reading a message bumps `access_count` on
+/// BOTH backends.
+#[tokio::test(flavor = "multi_thread")]
+async fn bucket_b_inbox_unread_marker_is_access_count_3027() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping bucket_b_inbox_unread_marker_is_access_count_3027");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = pg_test_client("ai:parity-test");
+    let bob = format!("b3027-bob-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let alice = format!("b3027-alice-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    for n in 0..2 {
+        let resp = client
+            .post(format!("{base}/api/v1/notify"))
+            .header("x-agent-id", &alice)
+            .json(&json!({
+                "target_agent_id": bob,
+                "title": format!("msg {n}"),
+                "payload": format!("payload-{n}-{}", uuid::Uuid::new_v4()),
+            }))
+            .send()
+            .await
+            .expect("notify POST");
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    }
+
+    let inbox = |unread_only: bool| {
+        let client = client.clone();
+        let base = base.clone();
+        let bob = bob.clone();
+        async move {
+            let mut req = client.get(format!("{base}/api/v1/inbox"));
+            if unread_only {
+                req = req.query(&[("unread_only", "true")]);
+            }
+            let resp = req
+                .header("x-agent-id", &bob)
+                .send()
+                .await
+                .expect("inbox GET");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            resp.json::<Value>().await.expect("inbox body")
+        }
+    };
+
+    let before = inbox(true).await;
+    let msgs = before["messages"].as_array().expect("messages array");
+    assert_eq!(msgs.len(), 2, "both notifies land unread; got {msgs:?}");
+    assert_eq!(before["unread_count"].as_u64(), Some(2));
+    let first_id = msgs[0]["id"].as_str().expect("message id").to_string();
+
+    // Mark exactly ONE message read the way a real read does: bump
+    // `access_count` (the sqlite twin's `read` marker, and a real column on
+    // both backends).
+    let probe = PostgresStore::connect(&url)
+        .await
+        .expect("connect probe pool");
+    let updated = sqlx::query("UPDATE memories SET access_count = access_count + 1 WHERE id = $1")
+        .bind(&first_id)
+        .execute(probe.pool())
+        .await
+        .expect("bump access_count")
+        .rows_affected();
+    assert_eq!(updated, 1, "fixture must touch exactly one row");
+
+    let after = inbox(true).await;
+    let remaining = after["messages"].as_array().expect("messages array");
+    assert_eq!(
+        remaining.len(),
+        1,
+        "#3027: unread_only must now EXCLUDE the read message. Pre-fix the pg arm filtered \
+         on metadata.read — a key no writer sets — so unread_only filtered nothing and \
+         every message stayed 'unread' forever. got={remaining:?}"
+    );
+    assert_ne!(remaining[0]["id"].as_str(), Some(first_id.as_str()));
+    assert_eq!(after["unread_count"].as_u64(), Some(1));
+
+    // The unfiltered projection must expose the SAME derived pair the
+    // sqlite/MCP inbox does, so a client cannot be told a message is unread by
+    // one backend and read by the other.
+    let all = inbox(false).await;
+    let all_msgs = all["messages"].as_array().expect("messages array");
+    assert_eq!(all_msgs.len(), 2);
+    let read_row = all_msgs
+        .iter()
+        .find(|m| m["id"].as_str() == Some(first_id.as_str()))
+        .expect("the touched message is still listed");
+    assert_eq!(read_row["read"].as_bool(), Some(true));
+    assert_eq!(read_row["access_count"].as_u64(), Some(1));
+    assert_eq!(all["unread_count"].as_u64(), Some(1));
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
 /// S33: bob subscribes to a namespace; list_subscriptions surfaces it.
 #[tokio::test(flavor = "multi_thread")]
 async fn bucket_b_subscriptions_persist() {

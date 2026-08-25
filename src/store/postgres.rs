@@ -2090,7 +2090,8 @@ impl PostgresStore {
         // attestation). Byte-for-byte the sqlite [G2] EXISTS probe.
         let mismatched: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM memories \
-             WHERE embedding_space IS NOT NULL AND embedding_space != $1)",
+             WHERE embedding_space IS NOT NULL AND embedding_space != '' \
+               AND embedding_space != $1)",
         )
         .bind(active_fp)
         .fetch_one(&self.pool)
@@ -2109,22 +2110,26 @@ impl PostgresStore {
         let dim_i32 = i32::try_from(active_dim).unwrap_or(i32::MAX);
         // Stamp NULL→fp for dim-matching embedded rows on BOTH tables. The
         // archived twin keeps archive→restore round-trips in-space lossless.
-        let stamped = sqlx::query(
+        let stamped = sqlx::query(&format!(
             "UPDATE memories SET embedding_space = $1 \
-             WHERE embedding IS NOT NULL AND embedding_space IS NULL \
-               AND vector_dims(embedding) = $2",
-        )
+                 WHERE embedding IS NOT NULL \
+                   AND {} \
+                   AND vector_dims(embedding) = $2",
+            crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
+        ))
         .bind(active_fp)
         .bind(dim_i32)
         .execute(&self.pool)
         .await
         .map_err(|e| to_store_err("adopt_legacy_embedding_space memories", e))?
         .rows_affected();
-        let _archived = sqlx::query(
+        let _archived = sqlx::query(&format!(
             "UPDATE archived_memories SET embedding_space = $1 \
-             WHERE embedding IS NOT NULL AND embedding_space IS NULL \
-               AND vector_dims(embedding) = $2",
-        )
+                 WHERE embedding IS NOT NULL \
+                   AND {} \
+                   AND vector_dims(embedding) = $2",
+            crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
+        ))
         .bind(active_fp)
         .bind(dim_i32)
         .execute(&self.pool)
@@ -18874,6 +18879,11 @@ impl MemoryStore for PostgresStore {
         embedding: Option<&[f32]>,
         space: &str,
     ) -> StoreResult<()> {
+        // #3085 — a REAL vector must carry a REAL space stamp; refuse an
+        // empty (unattributed) stamp before the write.
+        if embedding.is_some_and(|v| !v.is_empty()) {
+            crate::store::reject_unattributed_space("update_embedding", space)?;
+        }
         let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
         // #2167 — vector + space travel together; a None (cleared) embedding
         // NULLs the space stamp too (no vector, no provenance).
@@ -18960,32 +18970,34 @@ impl MemoryStore for PostgresStore {
         let rows = if let (true, Some(active_fp)) =
             (pg_heal_foreign_space_enabled(), active_space.as_deref())
         {
-            sqlx::query(
+            sqlx::query(&format!(
                 "SELECT id, title, content, encrypted_envelope, \
                         metadata::text AS metadata_json \
                    FROM memories \
                   WHERE embedding IS NULL \
-                     OR (embedding IS NOT NULL AND embedding_space IS NULL) \
+                     OR (embedding IS NOT NULL AND {unattributed}) \
                      OR (embedding IS NOT NULL AND embedding_space IS NOT NULL \
                          AND embedding_space <> $2) \
                   ORDER BY created_at ASC \
                   LIMIT $1",
-            )
+                unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
+            ))
             .bind(cap)
             .bind(active_fp)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("list_unembedded", e))?
         } else {
-            sqlx::query(
+            sqlx::query(&format!(
                 "SELECT id, title, content, encrypted_envelope, \
                         metadata::text AS metadata_json \
                    FROM memories \
                   WHERE embedding IS NULL \
-                     OR (embedding IS NOT NULL AND embedding_space IS NULL) \
+                     OR (embedding IS NOT NULL AND {unattributed}) \
                   ORDER BY created_at ASC \
                   LIMIT $1",
-            )
+                unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
+            ))
             .bind(cap)
             .fetch_all(&self.pool)
             .await
@@ -19045,6 +19057,12 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<usize> {
         if entries.is_empty() {
             return Ok(0);
+        }
+        // #3085 — fail closed on an unattributed (empty) space stamp before
+        // the transaction opens: an `''` stamp on postgres is excluded from
+        // the #2167 recall gate AND from the serve-boot heal scan.
+        if entries.iter().any(|(_, v)| !v.is_empty()) {
+            crate::store::reject_unattributed_space("set_embeddings_batch", space)?;
         }
         let mut tx = self
             .pool
