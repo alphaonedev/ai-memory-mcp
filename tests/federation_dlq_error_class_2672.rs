@@ -153,6 +153,12 @@ async fn drive_one_replay(
     Arc<dyn FederationDlqSink>,
     std::path::PathBuf,
 ) {
+    // `build_governed_peer_post` uses `check_governed`, which fail-closes
+    // when `GOVERNANCE_PRE_ACTION` is unset. This binary is not a daemon
+    // bootstrap — install the same allow-all hook the other in-process
+    // federation tests use (`federation_bulk_catchup_identity_headers_3148`).
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let state = PeerState {
         mode: Arc::new(AtomicUsize::new(mode)),
     };
