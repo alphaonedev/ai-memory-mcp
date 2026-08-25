@@ -1088,7 +1088,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // that arrives through a clean auto-merge is UNVERIFIED — always
     // re-measure the merged file), so 33_150 carries the same modest headroom
     // as the neighbouring bumps.
-    ("src/store/postgres.rs", 35_940), /* 2026-08-24 (#3221 rebase onto 5cb2dc31): #3161 pg gc/size_gc/supersede link snapshots ON TOP OF #3216. HEAD 35_840 measured 35_759; incoming #3161 +~180. Ceiling 35_840 -> 35_940 (never lower a floor). Remeasure after gates. */
+    ("src/store/postgres.rs", 36_200), /* 2026-08-25 (#3221 rebase onto 5cb2dc31): MEASURED 36_119. Ceiling 35_840 -> 36_200 (+81 headroom). Never lower a floor. */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1519,7 +1519,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
     // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
     // Additive ALTER-ADD-COLUMN migration only.
-    ("src/storage/migrations.rs", 6_400), /* 2026-08-24 (#3221 rebase onto 5cb2dc31): #3160 full-table-rebuild coverage. Incoming measured 6_301; ceiling 6_400 (+99). HEAD was 5_980 after #3216; floor never falls. PRIOR: 2026-08-23 (#3216 Fable fail-closed) 5_915 measured, ceiling 5_980. PRIOR: 2026-08-22 (#3160 GA) rebuild tests. */
+    ("src/storage/migrations.rs", 6_540), /* 2026-08-25 (#3221 rebase onto 5cb2dc31): MEASURED 6_463. Ceiling 6_400 -> 6_540 (+77 headroom). Never lower a floor. */
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.
