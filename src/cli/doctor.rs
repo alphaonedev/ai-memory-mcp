@@ -214,8 +214,37 @@ pub(crate) struct RemoteAuth {
 /// the real fault.
 pub(crate) fn resolve_doctor_api_key(args: &DoctorArgs) -> Result<Option<String>> {
     if let Some(path) = args.api_key_file.as_deref() {
-        let raw = std::fs::read_to_string(path)
+        // #1790 / #3205 — open ONCE, fstat that handle, read the same
+        // handle. A path-then-read pair lets a decoy pass the mode gate
+        // and a lax-mode secret be read in its place.
+        let mut f = std::fs::File::open(path)
             .with_context(|| format!("read --api-key-file {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = f.metadata().with_context(|| {
+                format!(
+                    "stat --api-key-file {} for permission check (#1790)",
+                    path.display()
+                )
+            })?;
+            let mode = meta.permissions().mode();
+            if mode & 0o077 != 0 {
+                anyhow::bail!(
+                    "--api-key-file {} has lax permissions (mode {:o}, group/world bits set); \
+                     tighten with `chmod 0600 {}`",
+                    path.display(),
+                    mode & 0o777,
+                    path.display()
+                );
+            }
+        }
+        let mut raw = String::new();
+        {
+            use std::io::Read as _;
+            f.read_to_string(&mut raw)
+                .with_context(|| format!("read --api-key-file {}", path.display()))?;
+        }
         let token = raw.trim().to_string();
         if token.is_empty() {
             anyhow::bail!("--api-key-file {} is empty", path.display());
@@ -3830,6 +3859,12 @@ mod tests {
         let key_path = dir.path().join("api.key");
         // A trailing newline is the common shape of a key file.
         std::fs::write(&key_path, "from-file\n").expect("write key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 test api-key file");
+        }
         let args = DoctorArgs {
             api_key: Some("from-argv".to_string()),
             api_key_file: Some(key_path),
@@ -3854,6 +3889,12 @@ mod tests {
 
         let empty_path = dir.path().join("empty.key");
         std::fs::write(&empty_path, "   \n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&empty_path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 empty api-key file");
+        }
         let empty = DoctorArgs {
             api_key_file: Some(empty_path),
             ..DoctorArgs::default()

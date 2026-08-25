@@ -47,7 +47,10 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
             );
             let _ = writeln!(out.stdout, "  stats               — show statistics");
             let _ = writeln!(out.stdout, "  namespaces          — list namespaces");
-            let _ = writeln!(out.stdout, "  delete <id>         — delete a memory");
+            let _ = writeln!(
+                out.stdout,
+                "  delete [--hard] <id> — archive-first delete (restore via `archive restore`); --hard is irreversible"
+            );
             let _ = writeln!(out.stdout, "  quit                — exit shell");
         }
         "recall" | "r" => {
@@ -396,18 +399,59 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
             }
         },
         "delete" | "del" | "rm" => {
-            let id = parts.get(1).copied().unwrap_or("");
+            // #3012 — same archive-first contract as `ai-memory delete`.
+            // `--hard` is the explicit opt-in to destroy-in-place.
+            let (hard, id) = if parts.get(1).copied() == Some("--hard") {
+                (true, parts.get(2).copied().unwrap_or(""))
+            } else {
+                (false, parts.get(1).copied().unwrap_or(""))
+            };
             if id.is_empty() {
-                let _ = writeln!(out.stderr, "usage: delete <id>");
+                let _ = writeln!(out.stderr, "usage: delete [--hard] <id>");
                 return ShellAction::Continue;
             }
             if let Err(e) = validate::validate_id(id) {
                 let _ = writeln!(out.stderr, "{}", crate::errors::msg::invalid("id", e));
                 return ShellAction::Continue;
             }
-            match db::delete(conn, id) {
+            let snapshot = db::resolve_id(conn, id).ok().flatten();
+            let result = if hard {
+                db::delete(conn, id)
+            } else {
+                db::delete_archive_first(conn, id)
+            };
+            match result {
                 Ok(true) => {
-                    let _ = writeln!(out.stdout, "  deleted");
+                    if let Some(target) = snapshot {
+                        crate::federation::erasure_outbox::enqueue_erasure(
+                            conn,
+                            &target.id,
+                            crate::federation::erasure_outbox::surfaces::CLI_DELETE,
+                        );
+                        crate::audit::emit(crate::audit::EventBuilder::new(
+                            crate::audit::AuditAction::Delete,
+                            crate::audit::actor(
+                                crate::identity::resolve_agent_id(None, None).unwrap_or_default(),
+                                crate::audit::synthesis_sources::DEFAULT_FALLBACK,
+                                None,
+                            ),
+                            crate::audit::target_memory(
+                                target.id.clone(),
+                                target.namespace.clone(),
+                                Some(target.title.clone()),
+                                Some(target.tier.to_string()),
+                                None,
+                            ),
+                        ));
+                    }
+                    if hard {
+                        let _ = writeln!(out.stdout, "  deleted (hard, unrecoverable)");
+                    } else {
+                        let _ = writeln!(
+                            out.stdout,
+                            "  deleted (archived — restore with `ai-memory archive restore {id}`)"
+                        );
+                    }
                 }
                 Ok(false) => {
                     let _ = writeln!(out.stderr, "  not found");

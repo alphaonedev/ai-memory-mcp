@@ -210,7 +210,9 @@ live at delete time, so a restore returns the content you deleted.
 | `--capability-file <PATH>` | `delete` | Non-argv `cap1:` token file (`0600`); conflicts with `--capability`. |
 
 JSON output carries `archived: true|false` so a scripting caller can tell
-whether the row is still restorable.
+whether the row is still restorable. HTTP `DELETE` and MCP `memory_delete`
+remain hard-destroy; federated erasure still propagates from every surface
+(cross-link #3192/#3253).
 
 #### `update` flags
 
