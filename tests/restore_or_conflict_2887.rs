@@ -138,12 +138,25 @@ fn restore_same_id_against_tombstoned_row_merges_2887() {
     let id = ai_memory::db::insert_restore_same_id(&conn, &restore)
         .expect("same-id restore against a tombstoned row must succeed, not refuse");
     assert_eq!(id, "id-orig");
-    let row = ai_memory::db::get(&conn, "id-orig")
-        .expect("get")
-        .expect("row present");
+    // Restore CAS preserves lifecycle_state (insert_inner DO UPDATE keeps
+    // memories.lifecycle_state), so the row stays tombstoned and #2402
+    // hides it from db::get. Merged content + residency are proven on
+    // the unfiltered SQL the update path uses.
+    assert!(
+        ai_memory::db::get(&conn, "id-orig").expect("get").is_none(),
+        "#2402: restored-but-still-tombstoned row is hidden from get"
+    );
+    let (content, state): (String, String) = conn
+        .query_row(
+            "SELECT content, lifecycle_state FROM memories WHERE id = ?1",
+            rusqlite::params!["id-orig"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("row still resident after same-id restore");
+    assert_eq!(content, "restored content", "tombstoned same-id restored");
     assert_eq!(
-        row.content, "restored content",
-        "tombstoned same-id restored"
+        state, "tombstoned",
+        "restore CAS must not un-tombstone; lifecycle advances go through the typed gate"
     );
 }
 
