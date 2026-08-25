@@ -431,100 +431,102 @@ fn serve_api_key_required_when_configured() {
     )
     .unwrap();
 
-    // Spawn without AI_MEMORY_NO_CONFIG so the config.toml is honoured.
-    let port = free_port();
-    let port_s = port.to_string();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
-        .env_remove("AI_MEMORY_NO_CONFIG")
-        .env("HOME", tmp.path().to_str().unwrap())
-        // #3002 / #3215 — `config_path()` resolves through `dirs::config_dir()`,
-        // which honors `XDG_CONFIG_HOME`. Without this pin an ambient host
-        // XDG root (or a leftover `config.toml` there) wins, the daemon boots
-        // without the test `api_key`, `api_key_auth` becomes a pass-through,
-        // and GET `/api/v1/stats` returns the admin-gate 403 instead of the
-        // api-key 401 this test is pinning. Same pin as
-        // `tests/boot_fail_closed_config_3166.rs`.
-        .env("XDG_CONFIG_HOME", &xdg_root)
-        // `--db` carries `env = "AI_MEMORY_DB"`, which would pre-empt the
-        // path this test is pinning if the parent job exported it.
-        .env_remove("AI_MEMORY_DB")
-        // #976 (2026-05-20) — `/api/v1/stats` is admin-gated post-#955;
-        // the test exercises the api_key auth happy path, not the
-        // admin-rejection contract, so seed a concrete admin id and
-        // thread it as `X-Agent-Id` on the GET below. #1001: pre-#980
-        // this used the `"*"` wildcard which is now rejected by
-        // `validate_agent_id`.
-        .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port_s,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || for _ in BufReader::new(stdout).lines() {});
-    }
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    if let Some(stderr) = child.stderr.take() {
-        let sink = std::sync::Arc::clone(&stderr_buf);
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let mut guard = sink.lock().unwrap();
-                guard.push_str(&line);
-                guard.push('\n');
-            }
-        });
-    }
-
+    // Spawn without AI_MEMORY_NO_CONFIG=1 so the config.toml is honoured.
+    // Hosted-ubuntu `Check (ubuntu-latest,sqlite)` has hit a leftover
+    // daemon on the ephemeral port (health 200, /stats 403 admin-gate
+    // because THAT process had no api_key). Health is api-key-exempt, so
+    // `wait_for_health` cannot tell our child from the leftover — retry
+    // the whole spawn on a fresh port when /stats is not 401. Same
+    // attempt budget as `spawn_serve`'s bind-race loop.
     let client = http_client();
-    let url = format!("http://127.0.0.1:{port}");
-    // Wait for /health (exempt from auth) to come up — shared readiness
-    // gate (#1994); see `wait_for_health` doc-comment.
-    let ready = wait_for_health(&client, &url, SPAWN_TIMEOUT);
-    let guard = ServeChild {
-        child: Some(child),
-        port,
-    };
-    assert!(
-        ready,
-        "auth-protected daemon never came up; stderr:\n{}",
-        stderr_buf.lock().unwrap()
-    );
+    let mut last_err = String::new();
+    for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
+        let port = free_port();
+        let port_s = port.to_string();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+            .env_remove("AI_MEMORY_NO_CONFIG")
+            .env("AI_MEMORY_NO_CONFIG", "0")
+            .env("HOME", tmp.path().to_str().unwrap())
+            // #3002 / #3215 — `config_path()` resolves through `dirs::config_dir()`,
+            // which honors `XDG_CONFIG_HOME`. Without this pin an ambient host
+            // XDG root (or a leftover `config.toml` there) wins, the daemon boots
+            // without the test `api_key`, `api_key_auth` becomes a pass-through,
+            // and GET `/api/v1/stats` returns the admin-gate 403 instead of the
+            // api-key 401 this test is pinning.
+            .env("XDG_CONFIG_HOME", &xdg_root)
+            .env_remove("AI_MEMORY_DB")
+            .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
+            .args([
+                "--db",
+                db.to_str().unwrap(),
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port_s,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Some(stdout) = child.stdout.take() {
+            std::thread::spawn(move || for _ in BufReader::new(stdout).lines() {});
+        }
+        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let sink = std::sync::Arc::clone(&stderr_buf);
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let mut guard = sink.lock().unwrap();
+                    guard.push_str(&line);
+                    guard.push('\n');
+                }
+            });
+        }
 
-    // No header → 401. Retried on a connection-level error (not the
-    // assertion below) — see [`send_first_request`] for why this is
-    // needed even after the readiness gate above (#1994).
-    let resp = send_first_request(|| client.get(format!("{}/api/v1/stats", &url)));
-    let status = resp.status().as_u16();
-    let body = resp.text().unwrap_or_default();
-    assert_eq!(
-        status,
-        401,
-        "missing x-api-key must 401 (got {status}); body={body}; stderr:\n{}",
-        stderr_buf.lock().unwrap()
-    );
+        let url = format!("http://127.0.0.1:{port}");
+        let ready = wait_for_health(&client, &url, SPAWN_TIMEOUT);
+        let guard = ServeChild {
+            child: Some(child),
+            port,
+        };
+        if !ready {
+            last_err = format!(
+                "attempt {attempt}: auth-protected daemon never came up; stderr:\n{}",
+                stderr_buf.lock().unwrap()
+            );
+            drop(guard);
+            continue;
+        }
 
-    // With header → 200 (admin id threaded via X-Agent-Id per #1001).
-    let resp = client
-        .get(format!("{}/api/v1/stats", &url))
-        .header("x-api-key", api_key)
-        .header("x-agent-id", "ai:serve-test-admin")
-        .send()
-        .unwrap();
-    assert!(
-        resp.status().is_success(),
-        "auth header rejected: {}; stderr:\n{}",
-        resp.status(),
-        stderr_buf.lock().unwrap()
-    );
-    drop(guard);
+        let resp = send_first_request(|| client.get(format!("{}/api/v1/stats", &url)));
+        let status = resp.status().as_u16();
+        let body = resp.text().unwrap_or_default();
+        if status != 401 {
+            last_err = format!(
+                "attempt {attempt}: missing x-api-key must 401 (got {status}); body={body}; stderr:\n{}",
+                stderr_buf.lock().unwrap()
+            );
+            drop(guard);
+            continue;
+        }
+
+        let resp = client
+            .get(format!("{}/api/v1/stats", &url))
+            .header("x-api-key", api_key)
+            .header("x-agent-id", "ai:serve-test-admin")
+            .send()
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "auth header rejected: {}; stderr:\n{}",
+            resp.status(),
+            stderr_buf.lock().unwrap()
+        );
+        drop(guard);
+        return;
+    }
+    panic!("{last_err}");
 }
 
 #[cfg(unix)]

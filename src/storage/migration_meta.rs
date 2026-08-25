@@ -731,12 +731,12 @@ mod tests {
     /// edit cannot quietly downgrade the claim.
     #[test]
     fn arch_8_destructive_arms_are_flagged_irreversible() {
-        let v43 = meta_for(43).expect("v43 row");
+        let persona_signing = meta_for(43).expect("persona-signing arm must have a row");
         assert!(
-            !v43.reversible,
-            "#3158: v43 rewrites pre-existing `memory_links.attest_level` values"
+            !persona_signing.reversible,
+            "#3158: persona-signing arm rewrites pre-existing `memory_links.attest_level` values"
         );
-        assert_eq!(v43.data_loss_risk, DataLossRisk::Column);
+        assert_eq!(persona_signing.data_loss_risk, DataLossRisk::Column);
         for v in [33, 36, 50, 63, 66, 80] {
             let row = meta_for(v).unwrap_or_else(|| panic!("v{v} row"));
             assert!(
