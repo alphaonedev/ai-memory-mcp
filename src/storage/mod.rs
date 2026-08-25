@@ -13816,6 +13816,12 @@ pub fn list_archived(
 /// confidence-calibration rows, `memory_transcript_links`), which is
 /// regenerable telemetry.
 ///
+/// **NOT recovered (#3250):** `archived_memory_links` carries no
+/// `source_cid`/`target_cid` columns, so every restored edge re-inserts
+/// with NULL v75 lineage pins — cid-stable identity across a tombstoned
+/// endpoint is lost until the post-v90 schema arm tracked in #3250 adds
+/// the columns and the snapshot/restore carry.
+///
 /// #2318 truth-fix: this comment long read "POSTGRES edge restore is a
 /// tracked follow-up (this commit wires sqlite only)". That is FALSE and
 /// has been since v70 shipped — `PostgresStore::forget` and

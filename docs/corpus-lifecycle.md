@@ -67,7 +67,7 @@ ever *removes* a row under a named pressure, never speculatively.
 
 | Transition | Recoverable? |
 |------------|--------------|
-| EXPIRE | Archived before delete when `archive_on_gc = true` (default); restorable from `archived_memories`, **with its `memory_links` edge graph** (#3161 — pre-v1.0.0 the auto-eviction paths were the one archive funnel that did NOT snapshot edges, so a gc-archived memory restored with an empty graph while an operator-driven `forget`/archive of the same row kept it). A **hard** (`archive = false`) expiry is still an explicit, irreversible delete. |
+| EXPIRE | Archived before delete when `archive_on_gc = true` (default); restorable from `archived_memories`, **with its `memory_links` edge graph** (#3161 — pre-v1.0.0 the auto-eviction paths were the one archive funnel that did NOT snapshot edges, so a gc-archived memory restored with an empty graph while an operator-driven `forget`/archive of the same row kept it). Restored edges re-insert with NULL `source_cid`/`target_cid` — `archived_memory_links` has no lineage-pin columns until #3250. A **hard** (`archive = false`) expiry is still an explicit, irreversible delete. |
 | EVICT | Archived before delete when the caller passes `archive = true` (the curator does); restorable. |
 | DISTILL | The merged sources are consolidated into the survivor. With `AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES` the sources are tombstoned (id + cid retained, navigable `derived_from` edges) rather than hard-deleted. |
 

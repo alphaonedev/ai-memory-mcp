@@ -1459,7 +1459,11 @@ backend and missing or divergently implemented on its twin). Pinned by
   **not** snapshotted on auto-eviction (documented loss)"*) and `CLAUDE.md`'s
   v70 schema note are corrected to state the new contract and to name what IS
   still irreversible (a HARD `archive = false` forget/gc — which is what
-  irreversibility means). Two expiry-floor rationale comments in
+  irreversibility means). Restored edges still re-insert with NULL
+  `source_cid`/`target_cid` (#3250): `archived_memory_links` has no v75
+  lineage-pin columns, so cid-stable identity across a tombstoned endpoint
+  is lost until a post-v90 schema arm carries them through snapshot/restore.
+  Two expiry-floor rationale comments in
   `storage::mod.rs` that cited *"permanent link-edge loss under the v70
   auto-eviction posture"* now say the reap remains but the edge loss does not.
   Separately, the postgres `archived_memory_links` v70 doc still read *"the
