@@ -63,6 +63,23 @@ probe (citing #2445) but kept it for the corpus probe.
   hook evaluation. Both process-global registries are now `tokio::sync::Mutex`;
   the guard is acquired with `.lock().await` inside the already-bridged future.
   Fail-closed bridge-budget behaviour is unchanged.
+### Fixed (pg delete atomicity — `namespace_meta` sever inside the delete tx; #3245)
+
+- **`PostgresStore::delete` severs `namespace_meta` inside the same
+  transaction as the tombstone leaf + row DELETE.** The sqlite twin
+  (`storage::delete` / `delete_inner`, #3115) already ran SEVER + TOMBSTONE +
+  DELETE under one `BEGIN IMMEDIATE`. Postgres ran
+  `SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID` pool-direct on `&self.pool`
+  *before* `begin()`, so a failing (or rolled-back) delete left the
+  governance binding severed with the memory still live — an unrecoverable
+  policy downgrade from a delete that never happened. Flag-OFF was two
+  autocommit statements with the same window. One tx now covers all three
+  writes on both flag states. Regression:
+  `pg_delete_failure_leaves_namespace_meta_intact_3245`.
+- **NotFound is decided before `tx.commit()`.** A 0-row DELETE used to
+  commit the sever (and flag-ON tombstone leaf) then return `NotFound`.
+  Dropping the tx rolls back. Regression:
+  `pg_delete_unknown_id_does_not_commit_sever_or_tombstone_3245`.
 
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 
