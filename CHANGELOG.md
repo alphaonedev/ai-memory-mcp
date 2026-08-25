@@ -54,6 +54,15 @@ probe (citing #2445) but kept it for the corpus probe.
 - **Truthy grammar SSOT.** `config::migration_require_core_tables` now delegates
   to `governance::audit::env_flag_enabled` (`1` / `true` / `yes` / `on`); the
   documented tokens are unchanged.
+### Security (`consult_pre_event_gate` no longer holds a `std::sync::Mutex` across `.await` — #3256)
+
+- **#3256 (CONCURRENCY-20) — `consult_pre_event_gate` (and the sibling
+  PreSignalSend gate) held `std::sync::Mutex<ExecutorRegistry>` across
+  `chain.fire(..).await`.** HTTP create consults that gate on the multi-thread
+  runtime, so concurrent writes serialized on an OS-level lock for the whole
+  hook evaluation. Both process-global registries are now `tokio::sync::Mutex`;
+  the guard is acquired with `.lock().await` inside the already-bridged future.
+  Fail-closed bridge-budget behaviour is unchanged.
 
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 

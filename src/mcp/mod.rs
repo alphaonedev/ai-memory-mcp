@@ -1621,11 +1621,13 @@ pub(crate) fn set_post_signal_ack_sink(tx: tokio::sync::mpsc::UnboundedSender<se
 
 /// #1752 — the process-global PreSignalSend enforcement gate: the configured
 /// chain + its executor registry. `fire` needs `&mut` the registry, so it is
-/// held behind a `Mutex` (the sync stdio loop is single-threaded, so the lock
-/// is uncontended). `None` until [`run_mcp_server`] installs it.
+/// held behind a `tokio::sync::Mutex` (#3256 / CONCURRENCY-20: a `std::sync`
+/// guard must never be held across `.await`. The HTTP create path also
+/// consults the sibling pre-event gate on the multi-thread runtime).
+/// `None` until [`run_mcp_server`] installs it.
 struct PreSignalSendGate {
     chain: std::sync::Arc<crate::hooks::HookChain>,
-    registry: std::sync::Mutex<crate::hooks::ExecutorRegistry>,
+    registry: tokio::sync::Mutex<crate::hooks::ExecutorRegistry>,
 }
 
 /// v1.0.0 #3140 — wall-clock budget for driving an async hook chain from the
@@ -1657,7 +1659,7 @@ fn set_pre_signal_send_gate(
 ) {
     let _ = PRE_SIGNAL_SEND_GATE.set(PreSignalSendGate {
         chain,
-        registry: std::sync::Mutex::new(registry),
+        registry: tokio::sync::Mutex::new(registry),
     });
 }
 
@@ -1701,18 +1703,17 @@ fn map_chain_result_to_signal_decision(
 
 /// #1752 — evaluate the installed PreSignalSend gate for one in-flight signal.
 /// Fires the configured async `HookChain` synchronously (via `block_on_local_bounded`)
-/// and maps the outcome. The registry `Mutex` is uncontended (single-threaded
-/// stdio loop); a poisoned lock recovers its inner value.
+/// and maps the outcome. The registry is a `tokio::sync::Mutex` (#3256 /
+/// CONCURRENCY-20): the guard is acquired with `.lock().await` inside the
+/// bridged future so a `std::sync` lock is never held across `.await`.
+#[deny(clippy::await_holding_lock)]
 fn pre_signal_send_decision(
     gate: &'static PreSignalSendGate,
     delta: &crate::hooks::events::SignalDelta,
 ) -> signal::SignalHookDecision {
     let payload = serde_json::to_value(delta).unwrap_or(serde_json::Value::Null);
     let fired = crate::llm::block_on_local_bounded(HOOK_BRIDGE_BUDGET, move || async move {
-        let mut reg = gate
-            .registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reg = gate.registry.lock().await;
         gate.chain
             .fire(crate::hooks::HookEvent::PreSignalSend, payload, &mut reg)
             .await
@@ -1811,14 +1812,16 @@ fn dispatch_memory_signal_send(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Strin
 
 /// #1885 — the process-global pre-event enforcement gate: the full loaded hook
 /// set + resolved `[hooks].enforce_mode` / `required_events`, plus an
-/// `ExecutorRegistry` (behind a `Mutex`; the sync stdio loop is single-threaded
-/// so it is uncontended) for firing any hook that IS present. `None` until
+/// `ExecutorRegistry` behind a `tokio::sync::Mutex` (#3256 / CONCURRENCY-20:
+/// `consult_pre_event_gate` is reached from HTTP handlers on the multi-thread
+/// runtime, so a `std::sync` guard held across `chain.fire(..).await` would
+/// block other workers for the whole evaluation). `None` until
 /// [`run_mcp_server`] installs it.
 struct PreEventEnforceGate {
     all_hooks: Vec<crate::hooks::config::HookConfig>,
     mode: crate::hooks::HookEnforceMode,
     required: Vec<crate::hooks::HookEvent>,
-    registry: std::sync::Mutex<crate::hooks::ExecutorRegistry>,
+    registry: tokio::sync::Mutex<crate::hooks::ExecutorRegistry>,
 }
 
 static PRE_EVENT_ENFORCE_GATE: std::sync::OnceLock<PreEventEnforceGate> =
@@ -1837,7 +1840,7 @@ fn set_pre_event_enforce_gate(
         all_hooks,
         mode,
         required,
-        registry: std::sync::Mutex::new(registry),
+        registry: tokio::sync::Mutex::new(registry),
     });
 }
 
@@ -1850,6 +1853,7 @@ fn set_pre_event_enforce_gate(
 /// required hook fails closed. `Ok(())` means proceed. INERT (`Ok`) when no gate
 /// is installed (the default enforce-off deployment), so callers consult
 /// unconditionally at zero added cost beyond one `OnceLock` load.
+#[deny(clippy::await_holding_lock)]
 pub(crate) fn consult_pre_event_gate(
     event: crate::hooks::HookEvent,
     namespaces: Vec<String>,
@@ -1859,10 +1863,7 @@ pub(crate) fn consult_pre_event_gate(
         return Ok(());
     };
     let fired = crate::llm::block_on_local_bounded(HOOK_BRIDGE_BUDGET, move || async move {
-        let mut reg = gate
-            .registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reg = gate.registry.lock().await;
         crate::hooks::dispatch_pre_event_enforced(
             event,
             payload,
