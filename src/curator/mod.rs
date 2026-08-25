@@ -628,12 +628,17 @@ fn run_size_gc_pass(
 /// `clusters_formed`) for parity: autonomy's `clusters_formed` is already
 /// post-reserved-namespace-filter, which is what `eligible_clusters` measures.
 ///
-/// Sync↔async bridge: the curator daemon runs on a `spawn_blocking` OS thread
-/// (no ambient runtime), so a scoped current-thread runtime `block_on` is safe
-/// here — never call this from inside the async `serve` runtime. Best-effort:
-/// store/runtime/sweep errors land in `report.errors`, never aborting the
-/// cycle. In-memory (`:memory:`) connections have no path to re-open and are
-/// skipped. Decision provenance: 5-agent vote `4d3ea1c5` (#1746).
+/// Sync↔async bridge: the curator daemon and CLI `--once` both run
+/// `run_once` on a `spawn_blocking` thread. That thread HAS a tokio
+/// [`Handle`](tokio::runtime::Handle) (1.52 blocking pool `rt.enter()`)
+/// but is NOT driving the runtime (`enter_runtime`), so a nested
+/// current-thread `block_on` is legal — see [`tokio_current_thread_handle_present`]
+/// and #3244. A current-thread worker still degrades to a reported skip
+/// (ERRORS-08) instead of panicking. Best-effort: store/runtime/sweep
+/// errors land in `report.errors`, never aborting the cycle. In-memory
+/// (`:memory:`) connections have no path to re-open and are skipped.
+/// Decision provenance: 5-agent vote `4d3ea1c5` (#1746); skip-probe
+/// correction #3244.
 #[cfg(feature = "sal")]
 fn run_consolidation_pass(
     conn: &Connection,
@@ -645,21 +650,20 @@ fn run_consolidation_pass(
     if !cfg.compaction.enabled {
         return;
     }
-    // ERRORS-08 / CONCURRENCY-22 — the `rt.block_on` below PANICS
-    // ("Cannot start a runtime from within a runtime") when `run_once` is
-    // reached from a thread that already has an ambient tokio runtime. That
-    // contract used to be documentation-only on a `pub fn`, so an async
-    // caller crashed instead of getting a `Result`. Detect the in-runtime
-    // case and DEGRADE (skip this pass, surface the reason) rather than
-    // unwinding the caller: the corpus is untouched either way, but a
-    // reported skip is recoverable and a panic is not.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        report.errors.push(
-            "consolidation pass: skipped — curator::run_once was called from inside an async \
-             runtime; wrap the call in tokio::task::spawn_blocking so the pass can drive its \
-             own runtime"
-                .to_string(),
-        );
+    // ERRORS-08 / CONCURRENCY-22 / #3244 — nested `Runtime::block_on`
+    // panics on a *current-thread* worker (`#[tokio::test]` default).
+    // `Handle::try_current()` is the wrong probe: a `spawn_blocking`
+    // thread also has a Handle (tokio 1.52 `rt.enter()`) and that is
+    // the production shape (daemon + CLI `--once`), so the #3116 guard
+    // skipped every `compaction.enabled` cycle. Skip only the
+    // current-thread Handle (where `block_in_place` itself panics);
+    // multi-thread (production) drives via `block_in_place` so a
+    // worker is parked rather than nested-block_on'd, and a
+    // `spawn_blocking` thread is a no-op then legal `block_on`.
+    if tokio_current_thread_handle_present() {
+        report
+            .errors
+            .push(CONSOLIDATION_PASS_SKIPPED_NESTED_RUNTIME.to_string());
         return;
     }
     let Some(path) = conn.path().map(std::path::PathBuf::from) else {
@@ -681,19 +685,20 @@ fn run_consolidation_pass(
     )
     // #1750 — thread the operator-resolved cosine gate into the clusterer.
     .with_cosine_threshold(cfg.compaction.cosine_threshold);
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            report
-                .errors
-                .push(format!("consolidation pass: runtime build failed: {e}"));
-            return;
-        }
+    let drive_pass = || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("consolidation pass: runtime build failed: {e}"))?;
+        rt.block_on(pass.run(candidates))
+            .map_err(|e| format!("consolidation pass: {e}"))
     };
-    match rt.block_on(pass.run(candidates)) {
+    // Current-thread Handle already skipped. Remaining cases (multi-thread
+    // worker, spawn_blocking, no runtime): `block_in_place` is a no-op
+    // when not entered and parks a multi-thread worker so nested block_on
+    // is legal. CONCURRENCY-22.
+    let outcome = tokio::task::block_in_place(drive_pass);
+    match outcome {
         Ok(out) => {
             // Fold the SAL consolidator's outcome into the autonomy report so
             // the self-report (keyed on AutonomyPassReport fields) is accurate
@@ -706,7 +711,41 @@ fn run_consolidation_pass(
             report.compaction_pass_rolled_back += out.rolled_back;
             report.errors.extend(out.errors);
         }
-        Err(e) => report.errors.push(format!("consolidation pass: {e}")),
+        Err(e) => report.errors.push(e),
+    }
+}
+
+/// Operator-visible skip when `run_once` is on a thread that is *driving*
+/// a tokio runtime (`enter_runtime`). `spawn_blocking` is NOT this case
+/// (#3244). Kept as one named const so the production skip and the
+/// `#[tokio::test]` assertion share a single spelling.
+#[cfg(feature = "sal")]
+const CONSOLIDATION_PASS_SKIPPED_NESTED_RUNTIME: &str = "consolidation pass: skipped — curator::run_once was called from inside an async \
+     runtime; wrap the call in tokio::task::spawn_blocking so the pass can drive its \
+     own runtime";
+
+/// True iff this thread currently holds a **current-thread** tokio Handle.
+///
+/// Tokio 1.52 `spawn_blocking` threads inherit the outer runtime's Handle
+/// via `rt.enter()` (so [`Handle::try_current`] is `Ok`) but are not
+/// driving (`enter_runtime`). Nested `Runtime::block_on` is legal there
+/// on a **multi-thread** runtime — the production daemon / CLI `--once`
+/// shape (#3244). A current-thread Handle is the `#[tokio::test]` default
+/// worker, where both nested `block_on` and `block_in_place` panic.
+/// Probing `enter_runtime` by building a nested runtime and
+/// `catch_unwind` is not viable: dropping that runtime on a worker
+/// panics a second time ("Cannot drop a runtime in a context where
+/// blocking is not allowed"). Fail closed (ERRORS-08): any non-multi-thread
+/// Handle is treated as would-panic.
+#[cfg(feature = "sal")]
+#[must_use]
+fn tokio_current_thread_handle_present() -> bool {
+    match tokio::runtime::Handle::try_current() {
+        Err(_) => false,
+        Ok(handle) => !matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ),
     }
 }
 
@@ -3334,5 +3373,83 @@ mod consolidation_pass_tests_1746 {
                 "a skipped pass must leave every source row intact"
             );
         }
+    }
+
+    /// #3244 — `Handle::try_current()` is true on a `spawn_blocking` thread
+    /// (tokio 1.52 blocking pool `rt.enter()`) even though that thread is
+    /// not driving the runtime. Both production entrypoints already wrap
+    /// `run_once` in `spawn_blocking` on a **multi-thread** runtime; this
+    /// positive control asserts the SAL pass RAN rather than skipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consolidation_pass_runs_under_spawn_blocking() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let cfg = CuratorConfig {
+            compaction: CompactionConfig {
+                enabled: true,
+                ..CompactionConfig::default()
+            },
+            ..CuratorConfig::default()
+        };
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+
+        let (report, llm) = tokio::task::spawn_blocking(move || {
+            let mut report = CuratorReport::new(false);
+            run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+            (report, llm)
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|e| !e.contains("inside an async runtime")),
+            "must not skip under spawn_blocking, got {:?}",
+            report.errors
+        );
+        assert!(
+            report.compaction_pass_clusters_eligible >= 1,
+            "the dup cluster should be eligible, report: {report:?}"
+        );
+        assert_eq!(
+            report.autonomy.memories_consolidated, 2,
+            "both sources folded into report.autonomy"
+        );
+        assert!(
+            *llm.summarize_calls.lock().unwrap() >= 1,
+            "the pass must invoke the LLM, not skip"
+        );
+    }
+
+    #[test]
+    fn tokio_current_thread_handle_absent_without_a_runtime() {
+        assert!(
+            !tokio_current_thread_handle_present(),
+            "a plain #[test] thread has no tokio Handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn tokio_current_thread_handle_present_on_an_async_worker() {
+        assert!(
+            tokio_current_thread_handle_present(),
+            "#[tokio::test] default flavor is current-thread"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tokio_current_thread_handle_absent_under_spawn_blocking() {
+        let current_thread = tokio::task::spawn_blocking(tokio_current_thread_handle_present)
+            .await
+            .expect("spawn_blocking join");
+        assert!(
+            !current_thread,
+            "spawn_blocking on a multi-thread runtime inherits a MultiThread Handle"
+        );
     }
 }
