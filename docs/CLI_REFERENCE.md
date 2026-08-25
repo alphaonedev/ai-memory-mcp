@@ -127,8 +127,14 @@ replacement contract), auto-promote mid→long at 5 accesses.
 | `--valid-at` | RFC3339 | — | #1834 claim-bitemporal as-of: return only claims asserted to hold at this instant (`valid_from`/`valid_until` window). |
 | `--confidence-tier` | enum | — | v0.7.0 (#1098) — restrict to `high`/`medium`/`low`. Closes the CLI side of the three-surface parity gap. |
 | `--verbose-provenance` | bool | `false` | v0.7.0 (#1098, Gap-7 #890) — request the per-row provenance decoration (`citations`, `source_uri`, `source_span`, `confidence_source`, `confidence_signals`). |
-| `--format` | enum | `human` | v0.7.0 (#1098) — `human` / `json` / `toon`. `toon` is the compact TOON envelope. Same vocabulary as the MCP/HTTP `format` param. |
+| `--format` | enum | `human` | `human` / `json` / `toon`. v1.0.0 [#3005](https://github.com/alphaonedev/ai-memory-mcp/issues/3005) — this selector now actually selects the renderer. `json` emits the same envelope the global `--json` produces; `toon` emits TOON (~79% smaller; the same encoder MCP / HTTP use). The global `--json` still takes precedence, so existing `--json` scripts are unchanged. |
 | `--session-id` | string | — | v0.7.0 (#1257) — in-session ring boost (+0.05 rerank under #518); MCP/HTTP parity flag. |
+
+Until v1.0.0 `--format` was declared, validated and marshalled into the
+recall DTO but never read by the CLI render path: all three values produced
+byte-identical **human** output, so `--format json` silently lied and TOON was
+unreachable from the CLI even though the MCP and HTTP surfaces had honoured it
+since v0.6.x ([#3005](https://github.com/alphaonedev/ai-memory-mcp/issues/3005)).
 
 ```bash
 ai-memory recall "what deployment pattern did we agree on" \
@@ -163,19 +169,50 @@ Standard CRUD.
 ai-memory list --namespace planning --tier long --limit 50
 ai-memory get abc123
 ai-memory update abc123 --title "Renamed" --priority 8
-ai-memory delete abc123
+ai-memory delete abc123          # archive-first: restorable
+ai-memory delete abc123 --hard   # irreversible
 ```
 
 `get` accepts a UUID or unique prefix. `update` omits any flag you
-don't pass. `delete` archives first when `archive_on_gc=true` (default).
+don't pass.
 
-**`list` filters (`ListArgs`, `src/cli/crud.rs:29-50`) — NOT identical
+**`list` filters (`ListArgs`, `src/cli/crud.rs`) — NOT identical
 to `search`.** `list` accepts `--namespace`/`-n`, `--tier`/`-t`,
 `--since`, `--until`, `--tags`, `--agent-id`, plus `--limit` (default
 `20`), `--offset` (default `0`) and `--valid-at` (#1834 bitemporal
 as-of). It does **not** accept `--as-agent` or `--include-archived` —
 those are `search`/`recall` flags. Conversely `search` has no
 `--offset` and no `--valid-at`.
+
+**`delete` is ARCHIVE-FIRST**
+([#3012](https://github.com/alphaonedev/ai-memory-mcp/issues/3012)). The row
+and its `memory_links` edges are copied into `archived_memories` under
+`archive_reason = "delete"` in the same transaction as the removal, so
+`ai-memory archive restore <id>` brings the memory back. Until v1.0.0 this
+page claimed that behaviour but `cmd_delete` called the raw `db::delete`,
+so the TARGETED verb destroyed the last copy of the memory's current text
+with no recovery, while the BULK `forget` stayed restorable: the inverse of
+what an operator expects. The code now matches the documented contract.
+
+`db::delete` removes the live row only — it never touched
+`archived_memories` (no foreign key, no trigger) — so where a
+[#1725](https://github.com/alphaonedev/ai-memory-mcp/issues/1725)
+`in_place_edit` snapshot existed, a hard delete left it behind and
+`archive restore <id>` resurrected the **stale pre-edit** content under that
+id. The archive-first path replaces that snapshot with what was actually
+live at delete time, so a restore returns the content you deleted.
+`--hard` keeps the old behaviour, stale-snapshot caveat included.
+
+| Flag | Applies to | Notes |
+|---|---|---|
+| `--hard` | `delete` | Skip the archive copy and destroy the row irreversibly (the pre-v1.0.0 behaviour, now an explicit opt-in). There is no recovery afterwards short of a `backup`. |
+| `--capability <TOKEN>` | `delete` | v0.9.0 G10.1 macaroon token; inert unless `[capabilities].enabled`. |
+| `--capability-file <PATH>` | `delete` | Non-argv `cap1:` token file (`0600`); conflicts with `--capability`. |
+
+JSON output carries `archived: true|false` so a scripting caller can tell
+whether the row is still restorable. HTTP `DELETE` and MCP `memory_delete`
+remain hard-destroy; federated erasure still propagates from every surface
+(cross-link #3192/#3253).
 
 #### `update` flags
 
@@ -419,9 +456,27 @@ ai-memory mine ./claude-export --format claude --min-messages 3
 ```bash
 ai-memory archive list --limit 100
 ai-memory archive restore abc123
-ai-memory archive purge --older-than-days 30
+ai-memory archive purge --namespace scratch --older-than-days 30
+ai-memory archive purge --dry-run                 # preview, destroys nothing
+ai-memory archive purge --confirm-global          # every namespace
 ai-memory archive stats
 ```
+
+**`archive purge` safety rail**
+([#3013](https://github.com/alphaonedev/ai-memory-mcp/issues/3013)). `purge`
+is the most destructive verb in the CLI — it destroys the LAST copy of an
+archived memory's text, including the `in_place_edit` undo snapshots and the
+rows `delete` / `forget` left recoverable. Until v1.0.0 its entire argument
+surface was `--older-than-days` ("all if omitted"): no namespace scope, no
+preview, no confirmation — while the strictly *less* destructive `forget`
+already required `--confirm-global`. It now mirrors that guard.
+
+| Flag | Applies to | Notes |
+|---|---|---|
+| `--namespace <NS>` | `archive purge` | Bound the purge to one namespace. Omit for the cross-namespace wipe, which then requires `--confirm-global`. |
+| `--confirm-global` | `archive purge` | Required when `--namespace` is omitted. Without it the purge refuses and destroys nothing. Not needed for `--dry-run`. |
+| `--dry-run` | `archive purge` | Report the count that WOULD be purged under the same predicate and exit without deleting. Reachable without `--confirm-global`. The preview and the delete are single-sourced on one predicate, so the count cannot understate the blast radius. |
+| `--older-than-days <N>` | `archive purge` | Only entries archived more than `N` days ago. All ages if omitted. |
 
 ## Governance & agents
 
@@ -444,6 +499,11 @@ ai-memory pending reject pending-id
 `agents` also exposes `bind-key` / `revoke-key` — bind (or revoke) an
 agent's Ed25519 public key for #626 Layer-3 store-path attestation
 (pairs with `ai-memory store --sign`).
+
+| Flag | Applies to | Notes |
+|---|---|---|
+| `--pubkey <KEY>` | `agents bind-key` | Base64 Ed25519 public key (URL-safe-no-pad or standard padding). Accepts a value whose first character is `-` / `_` verbatim ([#3019](https://github.com/alphaonedev/ai-memory-mcp/issues/3019) — `allow_hyphen_values`); before that fix ~1 key in 40 was parsed as a flag and the enrollment died with a usage error. Both `--pubkey <KEY>` and `--pubkey=<KEY>` work. |
+| `--principal <AGENT_ID>` | `agents subkey-certs` | Filter the sub-key certificate inventory to one principal. Omit for the **node-wide** list. Deliberately **not** named `--agent-id` and **not** env-backed ([#3017](https://github.com/alphaonedev/ai-memory-mcp/issues/3017)): the root `--agent-id` is `global` + `env = AI_MEMORY_AGENT_ID`, and clap propagates a matched global over a same-named subcommand-local flag, so the certified posture (which always exports `AI_MEMORY_AGENT_ID`) silently filtered the node-wide inventory to one id and reported `{"count":0}` over a populated table. |
 
 ## Backup & restore (v0.6.0.0)
 
@@ -775,6 +835,11 @@ Reachability (#1598)**. Each section is severity-tagged.
 | `--profile <PROFILE>` | string | `core` | With `--tokens`: evaluate cost under this hypothetical profile (same vocabulary as `mcp --profile`). |
 | `--raw-table` | bool | `false` | Dump the full per-tool size table as JSON. Implies `--tokens`. |
 | `--hooks` | bool | `false` | v0.7-G3 — hook-executor backpressure report (loaded `hooks.toml` shape + metric placeholders). |
+| `--ca-cert <PATH>` | path | — | v1.0.0 [#2815](https://github.com/alphaonedev/ai-memory-mcp/issues/2815) — PEM CA to trust for the `--remote` daemon's server certificate (private-CA / self-signed). Without it the daemon is validated against the bundled public webpki roots. |
+| `--client-cert <PATH>` | path | — | v1.0.0 #2815 — client-certificate PEM presented when the `--remote` daemon demands mTLS. Requires `--client-key`. |
+| `--client-key <PATH>` | path | — | v1.0.0 #2815 — client-key PEM. Requires `--client-cert`. |
+| `--api-key <KEY>` | string | — | v1.0.0 #2815 — `X-API-Key` for an api-key-protected `--remote` daemon. Prefer `--api-key-file`: a key on argv is world-readable via `/proc/<pid>/cmdline` ([#1927](https://github.com/alphaonedev/ai-memory-mcp/issues/1927)). Conflicts with `--api-key-file`. |
+| `--api-key-file <PATH>` | path | — | v1.0.0 #2815 — read the api-key token from a file so the secret never reaches argv (the `--db-passphrase-file` precedent; mode 0400 recommended). Contents are trimmed. |
 
 Exit codes: `0` healthy, `1` warning (only when `--fail-on-warn`), `2`
 critical.
@@ -783,7 +848,29 @@ critical.
 ai-memory doctor
 ai-memory doctor --json | jq '.sections[] | select(.severity != "ok")'
 ai-memory doctor --remote https://memory.prod.example.com
+
+# Certified enterprise posture: TLS + mandatory client-cert mTLS + api-key.
+ai-memory doctor --remote https://memory.prod.example.com \
+  --ca-cert /etc/ai-memory/tls/ca.pem \
+  --client-cert /etc/ai-memory/tls/client.crt \
+  --client-key  /etc/ai-memory/tls/client.key \
+  --api-key-file /etc/ai-memory/keys/api.key
 ```
+
+**Reaching a hardened daemon**
+([#2815](https://github.com/alphaonedev/ai-memory-mcp/issues/2815)). `doctor
+--remote` is the disclosed remediation for
+[#2810](https://github.com/alphaonedev/ai-memory-mcp/issues/2810) (no
+`--store-url` Postgres path yet) — but until v1.0.0 it exposed **no**
+transport-auth knobs, so on the certified posture (TLS + mandatory mTLS +
+top-level `api_key`) it could not complete a request and a certified
+Postgres deployment had no working first-party `doctor` path at all. The
+five flags above close that gap, reusing the sibling fleet verbs' flag names
+and TLS builders (`sync --ca-cert`, `sync-daemon --client-cert` /
+`--client-key`). With none of them passed the client is byte-for-byte the
+pre-v1.0.0 one — nothing is loosened. `doctor` still fails LOUD on an
+unreachable daemon (a `critical` section naming the URL it queried); it never
+claims a corpus is healthy it could not read.
 
 **`LLM Reachability (#1146)` section.** Resolves the canonical LLM
 configuration via `AppConfig::resolve_llm` (the same path used by

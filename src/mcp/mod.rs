@@ -13573,11 +13573,13 @@ mod tests {
 
     /// verify.rs:118-119 + 136-137 — sig present, observed_by present,
     /// pubkey enrolled → verify FAILS (e.g. tampered signature byte).
-    /// Drives the `ok=false` arm: `signature_verified=false`,
-    /// `attest_level="unsigned"` (the explicit downgrade on a failed
-    /// re-verify regardless of stored column).
+    /// Drives the `ok=false` arm: `signature_verified=false` with the
+    /// STORED `attest_level` PRESERVED (#3021 — the pre-fix explicit
+    /// downgrade to `"unsigned"` erased the tamper evidence, so an
+    /// auditor sweeping `attest_level != 'unsigned'` skipped exactly the
+    /// forged edges).
     #[test]
-    fn handle_verify_tampered_signature_returns_false_and_unsigned() {
+    fn handle_verify_tampered_signature_returns_false_and_keeps_stored_level_3021() {
         let _g = verify_key_env_guard()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13667,7 +13669,9 @@ mod tests {
             .to_string();
         let val: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(val["signature_verified"], false, "got {val}");
-        assert_eq!(val["attest_level"], "unsigned");
+        // #3021 — a FORGED signature keeps the level the substrate recorded
+        // (`self_signed` here); the verdict rides on `signature_verified`.
+        assert_eq!(val["attest_level"], "self_signed", "got {val}");
         assert!(val["signed_by"].is_null());
         assert!(val["signed_at"].is_null());
 

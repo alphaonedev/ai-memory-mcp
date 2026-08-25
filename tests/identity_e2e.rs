@@ -487,10 +487,17 @@ fn memory_verify_tampered_content_returns_false() {
         json!(false),
         "tampered link content must reject"
     );
+    // #3021 — TAMPERED CONTENT is the same failed-verify arm as a tampered
+    // signature byte: the row is "signed and INVALID", not "never signed", so
+    // the STORED level is preserved and the verdict rides on
+    // `signature_verified=false` + the null `signed_by`/`signed_at`. Pre-#3021
+    // this pinned `"unsigned"`, which erased the tamper evidence for exactly
+    // the rows an auditor sweeping `attest_level != 'unsigned'` would re-check.
     assert_eq!(
         post["attest_level"],
-        json!("unsigned"),
-        "on-demand verify reports unsigned regardless of stored column"
+        json!("self_signed"),
+        "tampered content → verify preserves the stored attest_level (tamper \
+         evidence) and reports the failure via signature_verified=false"
     );
     assert_eq!(post["signed_by"], json!(null));
     assert_eq!(post["signed_at"], json!(null));
@@ -701,7 +708,10 @@ fn tampered_signature_byte_does_not_verify() {
     .expect("handle_verify Ok (tampered → false, not Err)");
 
     assert_eq!(body["signature_verified"], json!(false));
-    assert_eq!(body["attest_level"], json!("unsigned"));
+    // #3021 — the FORGED arm PRESERVES the stored level (`self_signed`);
+    // relabelling it `unsigned` erased the tamper evidence. The verdict is
+    // `signature_verified=false` + the null `signed_by`/`signed_at`.
+    assert_eq!(body["attest_level"], json!("self_signed"));
     assert_eq!(body["signed_by"], json!(null));
     assert_eq!(body["signed_at"], json!(null));
 }

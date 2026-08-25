@@ -453,7 +453,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // what it now refuses, why the disposition is surface-keyed rather than
     // unconditional (3x3 vote 7-2), and which residual is deliberate.
     // MEASURED post-change: 28_047. Ceiling 27_900 -> 28_120 (+73 headroom).
-    ("src/storage/mod.rs", 30_220), /* 2026-08-25 (#3223 rebase onto ecce0a86): #3085 unattributed embedding_space fragments stacked on #3221's 30_220 floor (never lower). Incoming stale 29_340 discarded. Remeasure after gates. PRIOR: 2026-08-24 (#3221 rebase onto 5cb2dc31): #3161 gc/archive-then-delete link snapshot ON TOP OF #3220 dest-execute refuse. HEAD measured 29_936 at 30_020; incoming #3161 measured +~200 on its base. Ceiling 30_020 -> 30_220. */
+    ("src/storage/mod.rs", 30_380), /* 2026-08-25 (#3224 rebase onto 9f9e1605): measured 30_300 after #3013/#3012 archive-first delete + purge rails stacked on #3223's 30_220 floor; never lower. Ceiling 30_220 -> 30_380 (+80 headroom). PRIOR: 2026-08-25 (#3223 rebase onto ecce0a86): #3085 unattributed embedding_space fragments stacked on #3221's 30_220 floor. PRIOR: 2026-08-24 (#3221): #3161 gc/archive-then-delete link snapshot. */
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).

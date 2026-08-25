@@ -4595,6 +4595,44 @@ pub(crate) fn archive_memory_no_tx(
     result
 }
 
+/// #3012 — ARCHIVE-FIRST delete: the targeted single-row destructive verb.
+///
+/// Pre-#3012 the CLI `delete <id>` called [`delete`] directly, so it destroyed
+/// the last copy of the memory's CURRENT text with NO recovery path, while the
+/// BULK `forget` always archived and stayed restorable. That is the inverse of
+/// every operator's expectation (targeted = surgical and recoverable; bulk =
+/// the scary one) and it violated the documented recoverability contract for
+/// the substrate's durable truth.
+///
+/// It was also silently WRONG in the presence of a #1725 `in_place_edit`
+/// snapshot. `delete` is `DELETE FROM memories` only — it does not touch
+/// `archived_memories` (no FK, no trigger) — so a hard delete LEFT the
+/// pre-edit snapshot behind and `archive restore <id>` then resurrected the
+/// STALE content under that id, which reads as a successful restore. Routing
+/// through the archive replaces that snapshot with what was actually live at
+/// delete time (`INSERT OR REPLACE`, the #1725 single-snapshot retention rule),
+/// so a restore now returns the content the operator actually deleted.
+///
+/// This routes the delete through [`archive_memory`] (one `BEGIN IMMEDIATE`:
+/// copy the row + its `memory_links` into the archive, sever namespace
+/// standards, then `DELETE FROM memories`) under
+/// `archive_reason = 'delete'`, so `archive list` / `archive restore` can
+/// bring it back. The TRUE erasure path is still available and still exact —
+/// it is now an explicit `--hard` opt-in that calls [`delete`].
+///
+/// The #1955 R45 record-stop fence is applied here explicitly because
+/// [`archive_memory`] (an ordinary archive verb) does not carry one, and a
+/// delete funnel must not lose the fence by changing which primitive it calls.
+///
+/// # Errors
+///
+/// Propagates the record-stop refusal and any rusqlite failure.
+pub fn delete_archive_first(conn: &Connection, id: &str) -> Result<bool> {
+    // #1955 R45 — record-stop fence for the delete funnel (twin of `delete`).
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    archive_memory(conn, id, Some(field_names::ARCHIVE_REASON_DELETE))
+}
+
 /// #1725 (v0.8.0) — INSERT-only archive of a STILL-LIVE row. Unlike
 /// [`archive_memory_no_tx`] this does NOT delete the live row or its
 /// `namespace_meta` standard: it snapshots the row's CURRENT content
@@ -14472,20 +14510,94 @@ fn purge_archive_matching(
     Ok(deleted)
 }
 
-pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<usize> {
-    match older_than_days {
-        Some(days) if days < 0 => {
-            // #962 typed envelope.
-            return Err(anyhow::Error::new(StorageError::InvalidArgument {
-                reason: crate::errors::msg::older_than_days_negative(days),
-            }));
-        }
-        Some(days) => {
-            let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-            purge_archive_matching(conn, "archived_at < ?1", &[&cutoff])
-        }
-        None => purge_archive_matching(conn, "1=1", &[]),
+/// #3013 — the ONE predicate that scopes an archive purge, shared by the
+/// dry-run counter ([`count_archive_purge_candidates`]) and the destructive
+/// purge ([`purge_archive_scoped`]). Single-sourcing it is what makes
+/// `--dry-run` a HONEST preview: the count and the delete cannot drift apart
+/// into "we showed you 3 and destroyed 3000".
+///
+/// Returns the `WHERE` body plus its positional binds (all `TEXT`).
+///
+/// # Errors
+///
+/// Returns the #962 typed `InvalidArgument` envelope when `older_than_days`
+/// is negative (a negative cutoff would select rows archived in the FUTURE,
+/// i.e. effectively everything).
+fn archive_purge_predicate(
+    namespace: Option<&str>,
+    older_than_days: Option<i64>,
+) -> Result<(String, Vec<String>)> {
+    if let Some(days) = older_than_days
+        && days < 0
+    {
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: crate::errors::msg::older_than_days_negative(days),
+        }));
     }
+    let mut clauses: Vec<String> = Vec::with_capacity(2);
+    let mut binds: Vec<String> = Vec::with_capacity(2);
+    if let Some(days) = older_than_days {
+        binds.push((Utc::now() - chrono::Duration::days(days)).to_rfc3339());
+        clauses.push(format!("archived_at < ?{}", binds.len()));
+    }
+    if let Some(ns) = namespace {
+        binds.push(ns.to_string());
+        clauses.push(format!("namespace = ?{}", binds.len()));
+    }
+    let where_clause = if clauses.is_empty() {
+        "1=1".to_string()
+    } else {
+        clauses.join(" AND ")
+    };
+    Ok((where_clause, binds))
+}
+
+/// #3013 — how many archived rows the SAME predicate would destroy. Read-only;
+/// backs `ai-memory archive purge --dry-run`.
+///
+/// # Errors
+///
+/// Propagates the [`archive_purge_predicate`] argument error and any rusqlite
+/// failure.
+pub fn count_archive_purge_candidates(
+    conn: &Connection,
+    namespace: Option<&str>,
+    older_than_days: Option<i64>,
+) -> Result<usize> {
+    let (where_clause, binds) = archive_purge_predicate(namespace, older_than_days)?;
+    let sql = format!("SELECT COUNT(*) FROM archived_memories WHERE {where_clause}");
+    let sql_params: Vec<&dyn rusqlite::types::ToSql> = binds
+        .iter()
+        .map(|b| b as &dyn rusqlite::types::ToSql)
+        .collect();
+    let n: i64 = conn.query_row(&sql, sql_params.as_slice(), |r| r.get(0))?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
+/// #3013 — namespace-scopable archive purge. `namespace = None` is the
+/// historical cross-namespace wipe; `Some(ns)` bounds the blast radius to one
+/// namespace. [`purge_archive`] is the `None` case and delegates here, so the
+/// scoped and unscoped paths can never diverge.
+///
+/// # Errors
+///
+/// Propagates the [`archive_purge_predicate`] argument error and any rusqlite
+/// / erasure-coordination failure.
+pub fn purge_archive_scoped(
+    conn: &Connection,
+    namespace: Option<&str>,
+    older_than_days: Option<i64>,
+) -> Result<usize> {
+    let (where_clause, binds) = archive_purge_predicate(namespace, older_than_days)?;
+    let sql_params: Vec<&dyn rusqlite::types::ToSql> = binds
+        .iter()
+        .map(|b| b as &dyn rusqlite::types::ToSql)
+        .collect();
+    purge_archive_matching(conn, &where_clause, sql_params.as_slice())
+}
+
+pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<usize> {
+    purge_archive_scoped(conn, None, older_than_days)
 }
 
 /// #936 (security-critical, 2026-05-20) — caller-scoped purge variant.

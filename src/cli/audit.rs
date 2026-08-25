@@ -97,9 +97,12 @@ pub struct ShowArgs {
     /// event types).
     #[arg(long)]
     pub capability_expansions: bool,
-    /// Filter by exact agent_id match.
-    #[arg(long, value_name = "AGENT_ID")]
-    pub agent_id: Option<String>,
+    /// Filter by exact principal (agent id). Deliberately NOT named
+    /// `--agent-id` and NOT env-backed (#3017): clap's global
+    /// `--agent-id` (`env = AI_MEMORY_AGENT_ID`) would otherwise
+    /// overwrite this filter under the certified posture.
+    #[arg(long = "principal", value_name = "AGENT_ID")]
+    pub principal: Option<String>,
     /// Maximum rows to return (default 50, max 10000).
     #[arg(long, default_value_t = 50)]
     pub limit: usize,
@@ -994,7 +997,7 @@ fn run_restore_attest(
 fn run_show(args: &ShowArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> Result<i32> {
     let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
     let conn = crate::db::open(&db_path)?;
-    let rows = crate::db::list_capability_expansions(&conn, args.limit, args.agent_id.as_deref())?;
+    let rows = crate::db::list_capability_expansions(&conn, args.limit, args.principal.as_deref())?;
     if args.json {
         let payload: Vec<serde_json::Value> = rows
             .iter()
@@ -1918,7 +1921,7 @@ mod tests {
     fn show_args(json: bool, agent_id: Option<&str>) -> ShowArgs {
         ShowArgs {
             capability_expansions: false,
-            agent_id: agent_id.map(str::to_string),
+            principal: agent_id.map(str::to_string),
             limit: 50,
             json,
         }

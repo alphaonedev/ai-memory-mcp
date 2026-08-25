@@ -20,9 +20,10 @@ use crate::storage as db;
 /// CLI args for `ai-memory quota-status`.
 #[derive(Args, Debug, Clone)]
 pub struct QuotaStatusArgs {
-    /// Restrict to one agent.
-    #[arg(long = "agent-id", value_name = "AGENT_ID")]
-    pub agent_id: Option<String>,
+    /// Restrict to one principal (agent id). Deliberately NOT named
+    /// `--agent-id` and NOT env-backed (#3017 clap global shadow).
+    #[arg(long = "principal", value_name = "AGENT_ID")]
+    pub principal: Option<String>,
 
     /// Restrict to one namespace (v0.7.0 #1156).
     #[arg(long, value_name = "NS")]
@@ -48,7 +49,7 @@ pub fn cmd_quota_status(
     let conn = db::open(db_path)?;
 
     let mut params = json!({});
-    if let Some(a) = &args.agent_id {
+    if let Some(a) = &args.principal {
         params["agent_id"] = json!(a);
     }
     if let Some(ns) = &args.namespace {
@@ -92,7 +93,7 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = QuotaStatusArgs {
-            agent_id: None,
+            principal: None,
             namespace: None,
             json: true,
         };
@@ -110,7 +111,7 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = QuotaStatusArgs {
-            agent_id: Some("ai:alice".into()),
+            principal: Some("ai:alice".into()),
             namespace: None,
             json: true,
         };
@@ -130,7 +131,7 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = QuotaStatusArgs {
-            agent_id: None,
+            principal: None,
             namespace: None,
             json: false,
         };
@@ -146,7 +147,7 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = QuotaStatusArgs {
-            agent_id: Some("ai:bob".into()),
+            principal: Some("ai:bob".into()),
             namespace: Some("proj".into()),
             json: false,
         };

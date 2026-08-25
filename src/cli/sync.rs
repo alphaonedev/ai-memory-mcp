@@ -91,11 +91,36 @@ fn restamp_agent_id(mem: &mut models::Memory, caller_id: &str) {
     }
 }
 
+/// #1794 — parse a PEM CA certificate that was already read into memory.
+///
+/// `reqwest::Certificate::from_pem` accepts a marker-less file as an EMPTY
+/// chain, so a non-PEM path would silently add no roots and the operator would
+/// see a generic TLS failure instead of "that file is not a PEM". Pre-flighting
+/// the `-----BEGIN ` marker makes it fail loud (mirrors the strict
+/// `--quorum-ca-cert` check).
+///
+/// #2815 — extracted from the async sync arm so the BLOCKING `doctor --remote`
+/// client (`std::fs::read`) and the async sync client share ONE parser rather
+/// than forking the marker check.
+///
+/// # Errors
+///
+/// Returns `Err` when the bytes carry no PEM marker, or reqwest rejects them.
+pub(crate) fn parse_ca_certificate(ca_pem: &[u8], source: &Path) -> Result<reqwest::Certificate> {
+    if !ca_pem.windows(11).any(|w| w == b"-----BEGIN ") {
+        anyhow::bail!(
+            "parse --ca-cert: input at {} contains no PEM `-----BEGIN ` marker",
+            source.display()
+        );
+    }
+    reqwest::Certificate::from_pem(ca_pem).map_err(|e| anyhow::anyhow!("parse --ca-cert: {e}"))
+}
+
 /// #1794 — build the optional reqwest mTLS client identity from the
 /// `--client-cert` / `--client-key` PEM pair (both-or-neither). Shared by the
 /// CA-validated and accept-any sync TLS arms (the pinning arm threads the cert
 /// through `build_rustls_pinning_client_config` instead).
-fn sync_client_identity(
+pub(crate) fn sync_client_identity(
     client_cert: Option<&Path>,
     client_key: Option<&Path>,
 ) -> Result<Option<reqwest::Identity>> {
@@ -552,18 +577,7 @@ pub async fn build_sync_client(args: &SyncDaemonArgs) -> Result<reqwest::Client>
                 let ca_pem = tokio::fs::read(ca_path)
                     .await
                     .map_err(|e| anyhow::anyhow!("read --ca-cert: {e}"))?;
-                // reqwest::Certificate::from_pem accepts a marker-less file as
-                // an empty chain — pre-flight the PEM marker so a non-PEM path
-                // errors loudly (mirrors the --quorum-ca-cert strict check).
-                if !ca_pem.windows(11).any(|w| w == b"-----BEGIN ") {
-                    anyhow::bail!(
-                        "parse --ca-cert: input at {} contains no PEM `-----BEGIN ` marker",
-                        ca_path.display()
-                    );
-                }
-                let ca = reqwest::Certificate::from_pem(&ca_pem)
-                    .map_err(|e| anyhow::anyhow!("parse --ca-cert: {e}"))?;
-                b = b.add_root_certificate(ca);
+                b = b.add_root_certificate(parse_ca_certificate(&ca_pem, ca_path)?);
             }
             if let Some(id) =
                 sync_client_identity(args.client_cert.as_deref(), args.client_key.as_deref())?

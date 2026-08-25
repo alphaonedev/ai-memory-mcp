@@ -153,14 +153,21 @@ ai-memory agents register --agent-id my-agent --agent-type ai:claude-opus-4.8
 
 ### Step 3 — Bind the public key
 
-Paste the `pub_b64` from step 1 — use the `--pubkey=<key>` form (with the `=`):
+Paste the `pub_b64` from step 1:
 
 ```bash
 ai-memory agents bind-key --agent-id my-agent \
-  --pubkey=cuOFCoGj1UCDK9H52vsoRJKbKlcktsyMVaAaHg52_3U
+  --pubkey cuOFCoGj1UCDK9H52vsoRJKbKlcktsyMVaAaHg52_3U
 ```
 
-> **Tip — keys starting with `-`.** Public keys are URL-safe base64, so they can begin with `-` (e.g. `-nLCEF…`). Always use the `--pubkey=<key>` form (with the `=`); `--pubkey -nLCEF…` makes the shell read `-n` as a flag and errors.
+> **Keys starting with `-` or `_`.** Public keys are URL-safe base64, so
+> ~1 key in 40 begins with `-` or `_` (e.g. `-nLCEF…`). Since
+> [#3019](https://github.com/alphaonedev/ai-memory-mcp/issues/3019) the
+> `--pubkey` argument takes such a value verbatim, so **both** the spaced
+> (`--pubkey -nLCEF…`) and the `=` (`--pubkey=-nLCEF…`) form work. Before
+> that fix the spaced form was parsed as a flag and the enrollment failed
+> with a usage error (exit 2) — a documented recipe that failed on ~3% of
+> generated keys.
 
 Now the daemon can verify signatures from `my-agent`. Re-binding
 overwrites in place (that's how you rotate — see below).
@@ -523,12 +530,22 @@ future revocation. An operator may also **pre-enroll** a cert:
 ```bash
 # The JSON file carries the same fields as write_v2.cert + cert_signature.
 ai-memory agents enroll-subkey-cert --file subkey-cert.json
-ai-memory agents subkey-certs [--agent-id <id>]      # inspect
+ai-memory agents subkey-certs [--principal <agent-id>]   # inspect
 ```
 
 The enrolled principal root (`ai-memory agents bind-key`) is the only trust
 input; the principal-root pubkey is deliberately **not** stored in the cert
 table.
+
+> **The filter flag is `--principal`, not `--agent-id`**
+> ([#3017](https://github.com/alphaonedev/ai-memory-mcp/issues/3017)). The
+> root `--agent-id` is `global = true, env = "AI_MEMORY_AGENT_ID"`, and clap
+> propagates a matched global into every subcommand, overwriting a
+> same-named subcommand-local flag. The certified posture always exports
+> `AI_MEMORY_AGENT_ID`, so `agents subkey-certs` silently filtered the
+> node-wide inventory to that one principal and reported `{"count":0}` over a
+> populated `agent_subkey_certs` table — a security-inventory false negative.
+> `--principal` cannot be shadowed; omit it for the full node-wide list.
 
 ## Epistemic-typing provenance (`kind_provenance`, #1945)
 

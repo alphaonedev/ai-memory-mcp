@@ -118,10 +118,18 @@ pub struct RecallArgs {
     pub verbose_provenance: bool,
     /// v0.7.0 #1098 — response format selector: `human` (default
     /// pretty text), `json` (the same envelope `--json` produces),
-    /// or `toon` (TOON compact format, ~79% smaller than JSON; see
-    /// [`crate::toon`]). The MCP / HTTP surfaces accept the same
-    /// vocabulary via `RecallRequest::format`. Default `human`
-    /// preserves v0.6.x CLI semantics.
+    /// or `toon` (TOON, ~79% smaller than JSON; see [`crate::toon`]).
+    /// The MCP / HTTP surfaces accept the same vocabulary via
+    /// `RecallRequest::format`. Default `human` preserves v0.6.x CLI
+    /// semantics.
+    ///
+    /// v1.0.0 #3005 — this selector is now actually READ by the render
+    /// path. Pre-fix it was declared, `value_parser`-validated and
+    /// marshalled into the DTO, but the only renderer branch was the
+    /// global `--json`, so all three values produced byte-identical
+    /// HUMAN output: `--format json` silently lied and TOON was
+    /// unreachable from the CLI. The global `--json` still takes
+    /// precedence (existing scripts keep their exact envelope).
     #[arg(long = "format", value_name = "FORMAT", value_parser = ["human", "json", "toon"], default_value = "human")]
     pub format: String,
     /// v0.7.0 #1257 — session-id parity flag (DTO C2 #967, +0.05
@@ -595,7 +603,19 @@ pub(crate) fn run_with_embedder(
         }
     }
 
-    if json_out {
+    // #3005 — `--format {human,json,toon}` now SELECTS the renderer. Pre-fix
+    // `args.format` was declared (with a `value_parser`), marshalled into the
+    // `RecallRequest` DTO and pinned by a parity test — but nothing in this
+    // handler ever read it, so all three values rendered byte-identical HUMAN
+    // output: `--format json` silently LIED and TOON was unreachable from the
+    // CLI even though the MCP + HTTP surfaces have honoured it since v0.6.x.
+    //
+    // Precedence: the GLOBAL `--json` still wins, so every existing
+    // `--json`-driven script keeps its exact envelope regardless of `--format`.
+    // Otherwise the value chosen on `--format` decides.
+    let want_toon = !json_out && args.format == crate::toon::FORMAT_TOON;
+    let want_json = json_out || args.format == crate::toon::FORMAT_JSON;
+    if want_json || want_toon {
         let scored: Vec<serde_json::Value> = results
             .iter()
             .map(|(m, s)| {
@@ -640,7 +660,19 @@ pub(crate) fn run_with_embedder(
         if let Some(obj) = meta.as_object_mut() {
             obj.insert("semantic_withheld".to_string(), sw_value);
         }
-        writeln!(out.stdout, "{}", serde_json::to_string(&body)?)?;
+        if want_toon {
+            // Non-compact TOON: the full column set, via the SAME encoder the
+            // MCP + HTTP surfaces use (`crate::toon`), fed the identical
+            // envelope the JSON arm emits — so a `--format toon` reader and a
+            // `--json` reader can never disagree about the result set.
+            writeln!(
+                out.stdout,
+                "{}",
+                crate::toon::memories_to_toon(&body, false)
+            )?;
+        } else {
+            writeln!(out.stdout, "{}", serde_json::to_string(&body)?)?;
+        }
         return Ok(());
     }
     // F-L8a — human-readable path: a concise stderr note when rows were
@@ -785,6 +817,78 @@ mod tests {
         assert_eq!(sw["space_mismatch"], serde_json::json!(0));
         assert_eq!(sw["unverified_space"], serde_json::json!(0));
         assert_eq!(sw["dim_mismatch"], serde_json::json!(0));
+    }
+
+    // ---- #3005 — `--format {human,json,toon}` selects the renderer -------
+
+    /// Pre-#3005 all three `--format` values rendered byte-identical HUMAN
+    /// output. The three assertions below are exactly the measurement the
+    /// issue reported (identical bytes for all three) inverted into a pin.
+    #[test]
+    fn recall_format_selects_the_renderer_3005() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let cfg = AppConfig::default();
+
+        // OWNERSHIP-12 — return the captured bytes by value; `env` is local to
+        // the closure, so handing back its `&str` view would dangle (E0515).
+        let render = |format: &str| -> String {
+            let mut env = TestEnv::fresh();
+            let db = env.db_path.clone();
+            seed_memory(&db, "test", "needle title", "haystack content");
+            let mut args = default_args();
+            args.format = format.to_string();
+            {
+                let mut out = env.output();
+                run(&db, &args, false, &cfg, &mut out).unwrap();
+            }
+            env.stdout_str().to_string()
+        };
+
+        let human = render("human");
+        let json = render(crate::toon::FORMAT_JSON);
+        let toon = render(crate::toon::FORMAT_TOON);
+
+        // human — the v0.6.x pretty renderer, unchanged.
+        assert!(human.contains("needle title"), "got: {human}");
+        assert!(human.contains("memory(ies) recalled"), "got: {human}");
+
+        // json — parses as the same envelope `--json` produces.
+        let v: serde_json::Value =
+            serde_json::from_str(json.trim()).unwrap_or_else(|e| panic!("{e}: {json}"));
+        assert_eq!(v["count"], serde_json::json!(1), "got: {v}");
+        assert_eq!(v["memories"][0]["title"], serde_json::json!("needle title"));
+
+        // toon — the TOON encoder's header+rows shape, NOT JSON, NOT human.
+        assert!(toon.contains("memories["), "got: {toon}");
+        assert!(toon.contains("needle title"), "got: {toon}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(toon.trim()).is_err(),
+            "toon output must not be JSON: {toon}"
+        );
+
+        // The defect was that these were byte-identical.
+        assert_ne!(human, json);
+        assert_ne!(human, toon);
+        assert_ne!(json, toon);
+    }
+
+    /// The GLOBAL `--json` keeps precedence over `--format`, so every
+    /// pre-#3005 `--json` script keeps its exact envelope.
+    #[test]
+    fn recall_global_json_flag_wins_over_format_toon_3005() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "test", "needle title", "haystack content");
+        let mut args = default_args();
+        args.format = crate::toon::FORMAT_TOON.to_string();
+        let cfg = AppConfig::default();
+        {
+            let mut out = env.output();
+            run(&db, &args, true, &cfg, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["count"], serde_json::json!(1), "got: {v}");
     }
 
     #[test]
