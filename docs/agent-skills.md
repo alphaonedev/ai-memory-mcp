@@ -45,6 +45,28 @@ makes a skill portable, audit-trail-attested, content-addressed,
 and round-trip-stable across registration, export, and
 re-registration on a different node.
 
+## Storage-backend support: SQLite only (#3183)
+
+> **The skills plane requires a SQLite-backed daemon.** Postgres ships
+> no `skills` table (`migrate_v82` is a version stamp with no DDL) and the
+> substrate below is typed on a `rusqlite::Connection`, so on a daemon
+> started with `--store-url postgres://…` every one of the 8
+> `/api/v1/skill/*` paths returns `501 NOT IMPLEMENTED` and the
+> `memory_skill_*` MCP tools are unavailable. `/api/v1/capabilities`
+> reports `skills.implemented: false` there, with an explicit
+> `unsupported_on_postgres` / `unsupported_reason` disclosure.
+>
+> This is a hard, fail-closed refusal rather than a degraded mode, and
+> deliberately so: the handlers would otherwise have written the skill row
+> to the node-local scratch SQLite file the daemon opens against `--db` —
+> empty, invisible to every peer, and discarded on container restart.
+> Refusing loudly is the data-integrity posture; silently persisting an
+> executable artefact somewhere it will vanish is not. Postgres skills
+> storage is tracked by
+> [#2804](https://github.com/alphaonedev/ai-memory-mcp/issues/2804); see
+> [`postgres-age-guide.md` § What still returns 501 on postgres](postgres-age-guide.html)
+> for the whole postgres 501 inventory.
+
 ## Substrate vs runtime relationship
 
 | Layer | What ai-memory does | What the host agent does |

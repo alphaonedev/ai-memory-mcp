@@ -545,8 +545,18 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         ("POST", p) if checkpoints_resolve_path(p) => true,
         // /api/v1/approvals/{pending_id}
         ("POST", p) if approvals_decide_path(p) => true,
-        // /api/v1/skill/{id} (GET)
-        ("GET", p) if skill_id_path(p) => true,
+        // /api/v1/skill/{id} (GET + DELETE).
+        //
+        // #3183 — DELETE was missing from this router mirror even though
+        // `skill_delete_route` IS registered in `build_router_with_timeout`.
+        // Same omission class as the #1718 finding above, but with teeth: a
+        // pg-unsupported path that this mirror reports as UNREGISTERED falls
+        // through `postgres_route_gate` to Axum instead of 501-ing, so on a
+        // postgres daemon `DELETE /api/v1/skill/{id}` reached the handler and
+        // hard-purged a skill lineage out of the node-local scratch sqlite
+        // file. (`handlers::skills` now also refuses independently, so the
+        // two controls agree instead of relying on either alone.)
+        ("GET" | "DELETE", p) if skill_id_path(p) => true,
         // /api/v1/skill/{id}/resource (GET)
         ("GET", p) if skill_id_sub_path(p, "resource") => true,
         // /api/v1/skill/{id}/export | /promote | /compose | /retire (POST)
@@ -1630,6 +1640,16 @@ mod transport_postgres_gate_tests {
             &Method::GET,
             "/api/v1/skill/skill-1"
         ));
+        // #3183 — DELETE rides the SAME `.route(...)` registration as GET
+        // (`src/lib.rs`: `get(skill_get_route).delete(skill_delete_route)`)
+        // but was absent from this mirror, so `postgres_route_gate` reported
+        // the path UNREGISTERED and passed an IRREVERSIBLE lineage purge
+        // through to the handler instead of emitting the 501 envelope.
+        // Pinned per this function's maintenance contract.
+        assert!(path_is_registered_route(
+            &Method::DELETE,
+            "/api/v1/skill/skill-1"
+        ));
         // /api/v1/skill/{id}/<sub>
         assert!(path_is_registered_route(
             &Method::GET,
@@ -1646,6 +1666,12 @@ mod transport_postgres_gate_tests {
         assert!(path_is_registered_route(
             &Method::POST,
             "/api/v1/skill/skill-1/compose"
+        ));
+        // #3183 — `/retire` is matched by the same arm as the four above
+        // but was the one sub-path with no pin; cover the whole arm.
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/skill/skill-1/retire"
         ));
 
         // `/api/v1/skill/list` IS a real registered route (fixed
