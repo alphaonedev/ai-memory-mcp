@@ -2656,8 +2656,19 @@ mod tests {
             command: "anything".into(),
             cwd: None,
         };
+        // Must not panic. #3031 inverted the pre-fix Allow: an ENABLED
+        // refuse rule whose matcher cannot be evaluated fail-closes.
         let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
-        assert_eq!(decision, Decision::Allow);
+        match decision {
+            Decision::Refuse { rule_id, reason } => {
+                assert_eq!(rule_id, "R-bad");
+                assert!(
+                    reason.contains("#3031"),
+                    "malformed matcher must cite #3031 fail-closed, got: {reason}"
+                );
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3398,9 +3409,10 @@ mod tests {
 
     #[test]
     fn gate_read_empty_matcher_does_not_blanket_deny_1730() {
-        // Safety: an empty `{}` matcher must NOT lock out every read — only
-        // an explicit {"all":true} is a blanket. Guards against an operator
-        // typo denying all reads.
+        // #1730: empty `{}` must not be a silent blanket. #3031 keeps that
+        // for NON-blocking severities and INVERTS it for blocking ones: an
+        // enabled refuse rule that cannot be evaluated REFUSES rather than
+        // silently allowing (North Star: degrade-loudly).
         let _g = forensic_lock();
         let _np = no_operator_pubkey();
         let conn = full_conn();
@@ -3412,8 +3424,9 @@ mod tests {
             "refuse",
             true,
         );
-        gate_read(&conn, "ai:t", &read_act("recall", Some("ns"), None))
-            .expect("an empty matcher must not blanket-deny reads");
+        let err = gate_read(&conn, "ai:t", &read_act("recall", Some("ns"), None))
+            .expect_err("enabled refuse + unevaluable `{}` matcher fail-closes (#3031)");
+        assert!(err.reason.contains("#3031"), "got: {err:?}");
     }
 
     #[test]
