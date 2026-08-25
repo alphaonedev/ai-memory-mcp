@@ -826,6 +826,17 @@ pub struct Filter {
     /// exact semantics and the MANDATORY caller-side fail-closed
     /// re-check.
     pub metadata_eq: Option<MetadataEq>,
+    /// v1.0.0 #3185 / #3127 — exact `memories.source_uri` narrowing on
+    /// the keyword-search path (sqlite `db::search_with_source_uri`,
+    /// postgres `PostgresStore::search_with_source_uri`). `None` = no
+    /// narrowing (byte-identical to every pre-fix `search` call site,
+    /// which construct `Filter` with `..Default::default()`).
+    ///
+    /// Honoured by `search` on both adapters. Ignored by `list` /
+    /// `recall_hybrid` — those surfaces do not expose a source_uri
+    /// filter. Empty string is treated as `None` by the HTTP parser
+    /// before it reaches this field.
+    pub source_uri: Option<String>,
 }
 
 /// The core trait. Every backend implements this; ai-memory's HTTP /

@@ -166,6 +166,8 @@ pub async fn list_memories(
             active_embedding_space: None,
             // #2580 — metadata-equality pushdown axis unused on this path.
             metadata_eq: None,
+            // #3185/#3127 — keyword-search-only axis; list ignores it.
+            source_uri: None,
         };
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.list(&ctx, &filter).await {
@@ -327,10 +329,10 @@ pub async fn search_memories(
     }
 
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
-    // SAL trait. The Postgres adapter's `search` runs the same
-    // text-search projection as SQLite's FTS5 path with the trait's
-    // `Filter` carried verbatim; result wire-shape matches the
-    // legacy `db::search` envelope.
+    // SAL trait. #3185/#3127: `PostgresStore::search` is a thin wrapper
+    // over `search_with_source_uri`, so `Filter.since`/`until`/`source_uri`
+    // actually bind (the pre-fix trait method dropped them — fail-open
+    // widening). Result wire-shape matches the legacy `db::search` envelope.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let limit = p.limit.unwrap_or(20).min(app.max_page_size);
@@ -344,6 +346,26 @@ pub async fn search_memories(
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.with_timezone(&chrono::Utc));
+        // #3127 — `?source_uri=` was parsed only on the sqlite branch
+        // (below); the postgres early-return dispatched `app.store.search`
+        // and DROPPED the filter, returning rows from every source.
+        // Validate here so a bad scheme is 400 on both backends, then
+        // thread the URI through `Filter.source_uri` into the SSOT
+        // (`PostgresStore::search` → `search_with_source_uri`).
+        let source_uri = p
+            .source_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(uri) = source_uri
+            && let Err(e) = validate::validate_source_uri(uri)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid source_uri filter: {e}")})),
+            )
+                .into_response();
+        }
         let filter = crate::store::Filter {
             namespace: p.namespace.clone(),
             tier: p.tier.clone(),
@@ -369,6 +391,9 @@ pub async fn search_memories(
             active_embedding_space: None,
             // #2580 — metadata-equality pushdown axis unused on this path.
             metadata_eq: None,
+            // #3185/#3127 — compose `q + source_uri + since` lands on
+            // the keyword-search SSOT. None = no URI narrowing.
+            source_uri: source_uri.map(str::to_string),
         };
         // #942 SECURITY-high (Track A QC sweep, 2026-05-20) — replace
         // the hardcoded `"ai:http"` principal with the header-resolved

@@ -636,6 +636,86 @@ async fn pg_search_memories_happy() {
     assert_eq!(status, StatusCode::OK, "{v}");
 }
 
+/// #3185 / #3127 — the postgres HTTP branch must thread `?source_uri=`
+/// and `?since=` into `Filter` (pre-fix it early-returned through trait
+/// `search` and dropped both). This suite claims `StorageBackend::Postgres`
+/// while backing the SAL with `SqliteStore`, so the assertion is the
+/// handler compose path, not the pg SQL. Live pg SQL is pinned in
+/// `tests/pg_search_filter_ssot_3185.rs`.
+#[tokio::test]
+async fn pg_search_compose_q_source_uri_since_on_postgres_branch() {
+    let (router, f) = build_fake_pg_router();
+    let ns = "pgfake-compose";
+    let token = "uniquefaketoken3185";
+    let keep_uri = "doc:fake-keep";
+    let other_uri = "doc:fake-other";
+    let conn = ai_memory::db::open(f.path()).expect("reopen");
+    let now = chrono::Utc::now();
+    let seed = |title: &str, uri: &str, created: chrono::DateTime<chrono::Utc>| {
+        let ts = created.to_rfc3339();
+        let mem = ai_memory::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.to_string(),
+            content: format!("{token} body"),
+            namespace: ns.to_string(),
+            tier: ai_memory::models::Tier::Long,
+            created_at: ts.clone(),
+            updated_at: ts,
+            source_uri: Some(uri.to_string()),
+            metadata: serde_json::json!({"agent_id": ns, "scope": "collective"}),
+            ..Default::default()
+        };
+        ai_memory::db::insert(&conn, &mem).expect("insert");
+    };
+    seed("keep-in-window", keep_uri, now - chrono::Duration::days(1));
+    seed("keep-too-old", keep_uri, now - chrono::Duration::days(10));
+    seed(
+        "other-in-window",
+        other_uri,
+        now - chrono::Duration::days(1),
+    );
+    drop(conn);
+
+    // Use `Z` (not `+00:00`): a `+` in a query string is form-decoded as
+    // space, which would make RFC3339 parse fail and silently drop `since`.
+    let since = (now - chrono::Duration::days(2))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let qs = format!(
+        "q={token}&namespace={ns}&source_uri={}&since={since}",
+        keep_uri.replace(':', "%3A"),
+    );
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/search?{qs}"))
+        .header(ai_memory::HEADER_AGENT_ID, ns)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let results = v["results"].as_array().expect("results");
+    assert_eq!(
+        results.len(),
+        1,
+        "postgres-branch compose must return only the in-window matching-URI row; got {v}"
+    );
+    assert_eq!(
+        results[0]["source_uri"].as_str(),
+        Some(keep_uri),
+        "returned row must carry the filtered URI; got {v}"
+    );
+    assert_eq!(
+        results[0]["title"].as_str(),
+        Some("keep-in-window"),
+        "old + other-URI rows must be excluded; got {v}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // /api/v1/recall — PG keyword fallback envelope
 // ---------------------------------------------------------------------------
