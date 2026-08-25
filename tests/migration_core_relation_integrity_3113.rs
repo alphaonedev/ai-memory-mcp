@@ -112,7 +112,7 @@ fn a_lost_relation_on_a_populated_database_is_detected() {
         schema_integrity::describe(&missing),
     );
     // And the populated-vs-fixture discriminator must be readable.
-    assert_eq!(schema_integrity::corpus_row_count(&conn), Some(1));
+    assert_eq!(schema_integrity::corpus_row_count(&conn).unwrap(), 1);
 }
 
 #[test]
@@ -140,8 +140,9 @@ fn report_only_posture_preserves_legacy_behaviour_exactly() {
 /// once per hand-written copy. Table-driven so a relation added later is
 /// covered the moment it lands in `CORE_TABLES`, with no test to remember to
 /// write: drop it, restamp the tip, and the loss must be detected, must
-/// warrant refusal under enforcement on a POPULATED corpus, must NOT refuse
-/// under the default posture, and must NEVER refuse on an empty corpus.
+/// warrant refusal under enforcement on a POPULATED or UNREADABLE corpus,
+/// must NOT refuse under the default posture, and must NEVER refuse on an
+/// empty (`Some(0)`) corpus.
 #[test]
 fn every_core_relation_when_lost_is_detected_and_obeys_the_refusal_contract() {
     for entry in schema_integrity::CORE_TABLES {
@@ -156,7 +157,7 @@ fn every_core_relation_when_lost_is_detected_and_obeys_the_refusal_contract() {
             entry.name,
         );
 
-        let rows = schema_integrity::corpus_row_count(&conn);
+        let rows = schema_integrity::corpus_row_count(&conn).ok();
         assert_eq!(
             rows,
             Some(1),
@@ -177,6 +178,12 @@ fn every_core_relation_when_lost_is_detected_and_obeys_the_refusal_contract() {
             !schema_integrity::refusal_required_with(&missing, true, Some(0)),
             "an EMPTY corpus missing {} must never be refused (asi-hard pins \
              enforcement ON, so this is the anti-brick invariant)",
+            entry.name,
+        );
+        assert!(
+            schema_integrity::refusal_required_with(&missing, true, None),
+            "an UNREADABLE corpus missing {} must refuse under enforcement \
+             (#3246: None is a failed COUNT, not no-corpus)",
             entry.name,
         );
     }

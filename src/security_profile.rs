@@ -381,11 +381,11 @@ const KNOBS: &[KnobSpec] = &[
     // CERTIFIED deployment REFUSE the stamp rather than warn — the #3033
     // "asi-hard no-disable" contract applied to schema integrity.
     //
-    // Safe to pin ON: refusal additionally requires a POSITIVELY OBSERVED
-    // populated corpus (`storage::schema_integrity::refusal_required`), so a
-    // fresh or archive-less hardened deployment with an empty corpus is never
-    // bricked, and the refusal itself mutates nothing — it rolls the ladder
-    // back and leaves the database readable at its old version.
+    // Safe to pin ON: refusal treats `Some(0)` (empty corpus) as no-brick, so
+    // a fresh or archive-less hardened deployment is never refused, and the
+    // refusal itself mutates nothing — it rolls the ladder back and leaves
+    // the database readable at its old version. An *unreadable* corpus
+    // (`None` / failed COUNT) does refuse under this pin (#3246).
     KnobSpec {
         env: crate::config::ENV_MIGRATION_REQUIRE_CORE_TABLES,
         hard_value: "1",

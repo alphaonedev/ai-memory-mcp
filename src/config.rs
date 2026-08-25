@@ -4627,19 +4627,16 @@ pub fn cid_enforce_enabled() -> bool {
 pub const ENV_MIGRATION_REQUIRE_CORE_TABLES: &str = "AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES";
 
 /// v1.0.0 (#3113) — whether a missing core relation REFUSES the schema stamp
-/// (see [`ENV_MIGRATION_REQUIRE_CORE_TABLES`]). Reads the env var directly,
-/// mirroring [`cid_enforce_enabled`]: the migration ladder runs before the
-/// boot-seeded config globals exist, so a boot-seeded atomic would always
-/// read its compile-time default here.
+/// (see [`ENV_MIGRATION_REQUIRE_CORE_TABLES`]). Reads the env var directly
+/// through the shared [`crate::governance::audit::env_flag_enabled`] truthy
+/// grammar (`1` / `true` / `yes` / `on`, case-insensitive for the words):
+/// the migration ladder runs before the boot-seeded config globals exist, so
+/// a boot-seeded atomic would always read its compile-time default here.
+/// Issue #3246: this used to re-implement the same grammar inline; the SSOT
+/// does not change the documented tokens.
 #[must_use]
 pub fn migration_require_core_tables() -> bool {
-    std::env::var(ENV_MIGRATION_REQUIRE_CORE_TABLES)
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+    crate::governance::audit::env_flag_enabled(ENV_MIGRATION_REQUIRE_CORE_TABLES)
 }
 
 /// v0.8.1 W1 (#1821 / gap G29) — the `[security]` config block.

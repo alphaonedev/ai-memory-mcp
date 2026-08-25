@@ -51,11 +51,14 @@
 //!   against the stored stamp and raises the Storage section to `Critical`.
 //! * OPT-IN: [`crate::config::migration_require_core_tables`]
 //!   (`AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1`) turns the report into a
-//!   REFUSAL. The check runs inside the migrate transaction and BEFORE the
-//!   `schema_version` stamp, so a refusal rolls the whole ladder back and
-//!   leaves the database exactly as found, still stamped at its old version
-//!   and still fully readable — the stamp is never written over a database
-//!   whose integrity controls could not be applied.
+//!   REFUSAL when a core relation is missing AND the corpus is not the
+//!   documented empty fixture (`COUNT(*) = 0`). An unreadable corpus
+//!   (failed `COUNT(*)`) also refuses under enforcement — unreadability is
+//!   not emptiness (#3246). The check runs inside the migrate transaction
+//!   and BEFORE the `schema_version` stamp, so a refusal rolls the whole
+//!   ladder back and leaves the database exactly as found, still stamped at
+//!   its old version and still fully readable — the stamp is never written
+//!   over a database whose integrity controls could not be applied.
 //!
 //! The refusal is opt-in rather than the default deliberately. Defaulting to
 //! refuse would convert every pre-existing high-stamp fixture and every
@@ -77,8 +80,9 @@ pub const TRACE_TARGET: &str = "ai_memory::storage::schema_integrity";
 const SQL_TABLE_PRESENT: &str =
     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)";
 
-/// Live-corpus size, used ONLY to colour the diagnostic (populated database
-/// vs empty fixture). Never a gate.
+/// Live-corpus size. `Ok(0)` is the documented no-brick empty-fixture path;
+/// `Err` is unreadability (corruption / I/O / BUSY / missing relation) and
+/// is an input to the refusal predicate — never coerced to "no corpus".
 const SQL_MEMORIES_COUNT: &str = "SELECT COUNT(*) FROM memories";
 
 /// Storage-layer SSOT for the ladder-created core relation NAMES.
@@ -207,16 +211,23 @@ pub fn missing_core_tables(conn: &Connection, effective_version: i64) -> Result<
     Ok(missing)
 }
 
-/// Live-corpus row count, for colouring the diagnostic only.
+/// Live-corpus row count.
 ///
-/// Returns `None` when the count cannot be read — a bare fixture connection
-/// with no `memories` relation is the ordinary case. DELIBERATE discard: this
-/// value never gates anything, and a diagnostic that fails to render must not
-/// convert a warning into an error.
-#[must_use]
-pub fn corpus_row_count(conn: &Connection) -> Option<i64> {
+/// `Ok(0)` is the documented no-brick empty-fixture path (no lost data,
+/// because there is no data). `Err` is a failed `COUNT(*)` — corruption,
+/// I/O, `BUSY`, or a missing `memories` relation. `memories` ships in the
+/// bootstrap `SCHEMA` and is replayed by `db::open` before `migrate`, so a
+/// failed count is never "a fixture without a corpus"; collapsing `Err` to
+/// "no corpus" is the same unknown-as-a-value mistake #2445 fixed on the
+/// `sqlite_master` probe and #3246 closes here (ERRORS-19).
+///
+/// # Errors
+///
+/// Propagates the `COUNT(*)` failure. Callers that only colour a diagnostic
+/// (see [`report`]) may discard with `.ok()`; the refusal predicate must not.
+pub fn corpus_row_count(conn: &Connection) -> Result<i64> {
     conn.query_row(SQL_MEMORIES_COUNT, [], |r| r.get::<_, i64>(0))
-        .ok()
+        .context("count memories rows for the core-relation integrity gate")
 }
 
 /// Render the missing-relation list into the one-line operator diagnostic.
@@ -244,7 +255,10 @@ pub fn describe(missing: &[CoreTable]) -> String {
 pub fn report(conn: &Connection, effective_version: i64) -> Result<Vec<CoreTable>> {
     let missing = missing_core_tables(conn, effective_version)?;
     if !missing.is_empty() {
-        let rows = corpus_row_count(conn);
+        // Diagnostic only: a failed count must not promote this WARN into an
+        // error. The refusal predicate ([`refusal_required`]) is what fails
+        // closed on unreadability (#3246).
+        let rows = corpus_row_count(conn).ok();
         tracing::warn!(
             target: TRACE_TARGET,
             effective_version,
@@ -279,34 +293,41 @@ pub fn report(conn: &Connection, effective_version: i64) -> Result<Vec<CoreTable
 /// 1. at least one core relation is missing;
 /// 2. enforcement is engaged (`AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1`, or
 ///    the `asi-hard` pin); and
-/// 3. the corpus is POSITIVELY OBSERVED to hold rows.
+/// 3. the corpus is NOT the documented no-brick empty fixture (`Some(0)`).
 ///
-/// Condition 3 is the load-bearing one. The whole reason the ladder's
-/// existence probes skip rather than fail is that an EMPTY database with a
-/// high stamp is the ordinary fixture / archive-less shape — there is no lost
-/// data there, because there is no data. Refusing it would brick a fresh
-/// deployment for nothing, and since `asi-hard` PINS enforcement on, that
-/// would make the hardened posture strictly more fragile than the standard one
-/// with no integrity gain. Loss is only DEMONSTRABLE when rows exist alongside
-/// a relation that should have been created before them.
+/// Condition 3 is the load-bearing anti-brick invariant. An EMPTY database
+/// with a high stamp is the ordinary fixture / archive-less shape — there is
+/// no lost data there, because there is no data. Refusing it would brick a
+/// fresh deployment for nothing, and since `asi-hard` PINS enforcement on,
+/// that would make the hardened posture strictly more fragile than the
+/// standard one with no integrity gain.
 ///
-/// `corpus_rows == None` (the count could not be read) also does NOT refuse:
-/// the check refuses only on a fact it positively established, never on an
-/// absence of information. An unreadable corpus surfaces through the WARN and
-/// the `doctor` signal instead.
+/// `corpus_rows == None` (the count could not be read) DOES refuse under
+/// enforcement. `memories` ships in the bootstrap `SCHEMA`, so `None` is
+/// never "a fixture without a corpus" — it is a failed `COUNT(*)`
+/// (corruption / I/O / `BUSY`). Coercing that to "no refusal" was the #3246
+/// fail-open: a database with missing core relations AND an unreadable
+/// corpus stamped the tip with only a WARN. Unreadable is not empty.
 #[must_use]
 pub fn refusal_required_with(
     missing: &[CoreTable],
     enforced: bool,
     corpus_rows: Option<i64>,
 ) -> bool {
-    enforced && !missing.is_empty() && matches!(corpus_rows, Some(n) if n > 0)
+    // `Some(0)` is the sole no-brick observation. `None` (unreadability) and
+    // `Some(n > 0)` (demonstrable loss) both refuse under enforcement.
+    enforced && !missing.is_empty() && corpus_rows != Some(0)
 }
 
 /// [`refusal_required_with`] resolved against this process's enforcement flag
 /// and this database's corpus size.
-#[must_use]
-pub fn refusal_required(conn: &Connection, missing: &[CoreTable]) -> bool {
+///
+/// # Errors
+///
+/// Propagates a failed `COUNT(*)` (see [`corpus_row_count`]). A failed count
+/// is unreadability, not emptiness: `migrate` must not stamp integrity as
+/// intact on the strength of a failed read (#2445 / #3246 / ERRORS-19).
+pub fn refusal_required(conn: &Connection, missing: &[CoreTable]) -> Result<bool> {
     // Short-circuit BEFORE the corpus count. `refusal_required_with` would
     // return false for an empty `missing` anyway, but Rust evaluates call
     // arguments EAGERLY — so without this guard every migration pays a full
@@ -317,13 +338,35 @@ pub fn refusal_required(conn: &Connection, missing: &[CoreTable]) -> bool {
     // exactly where it is least affordable. Mirrors `report`'s own emptiness
     // guard; semantics are identical.
     if missing.is_empty() {
-        return false;
+        return Ok(false);
     }
-    refusal_required_with(
+    let corpus_rows = match corpus_row_count(conn) {
+        Ok(n) => Some(n),
+        Err(e) => {
+            // Fail closed always: unreadability is not "no corpus". Under
+            // enforcement this is a refusal (`Ok(true)` → `refusal_message`);
+            // without enforcement it still aborts the stamp (`Err`) rather
+            // than letting the tail write a version whose integrity we could
+            // not even measure. `Some(0)` is the only no-brick path.
+            if crate::config::migration_require_core_tables() {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    error = %e,
+                    "memories COUNT(*) failed — unreadable is not empty; refusing the stamp under enforcement"
+                );
+                return Ok(true);
+            }
+            return Err(e).context(
+                "memories COUNT(*) unreadable — refusing to stamp schema integrity as intact. \
+                 The database is UNCHANGED (the migration rolled back)",
+            );
+        }
+    };
+    Ok(refusal_required_with(
         missing,
         crate::config::migration_require_core_tables(),
-        corpus_row_count(conn),
-    )
+        corpus_rows,
+    ))
 }
 
 /// The typed refusal raised when enforcement is enabled and relations are
@@ -449,11 +492,15 @@ mod tests {
     }
 
     #[test]
-    fn corpus_row_count_is_none_without_a_memories_relation() {
-        // Diagnostic-only: a bare fixture connection must not turn the WARN
-        // path into an error.
+    fn corpus_row_count_errors_without_a_memories_relation() {
+        // #3246: a missing `memories` relation is a failed COUNT, not "no
+        // corpus". `report` may still discard this for the WARN colouring;
+        // the refusal predicate must not.
         let conn = conn_with(&[]);
-        assert_eq!(corpus_row_count(&conn), None);
+        assert!(
+            corpus_row_count(&conn).is_err(),
+            "COUNT(*) against a missing memories relation must be Err, not Ok(0)/None"
+        );
     }
 
     #[test]
@@ -461,7 +508,17 @@ mod tests {
         let conn = conn_with(&["memories"]);
         conn.execute("INSERT INTO memories (id) VALUES ('m1')", [])
             .expect("seed");
-        assert_eq!(corpus_row_count(&conn), Some(1));
+        assert_eq!(corpus_row_count(&conn).expect("count"), 1);
+    }
+
+    #[test]
+    fn corpus_row_count_reads_an_empty_corpus() {
+        let conn = conn_with(&["memories"]);
+        assert_eq!(
+            corpus_row_count(&conn).expect("count"),
+            0,
+            "an empty memories table is Ok(0), the documented no-brick path"
+        );
     }
 
     #[test]
@@ -506,10 +563,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_corpus_never_refuses_even_when_enforced() {
-        // Refuse only on a positively established fact, never on an absence of
-        // information. An unreadable corpus surfaces via the WARN + doctor.
-        assert!(!refusal_required_with(&one_missing(), true, None));
+    fn an_unreadable_corpus_refuses_when_enforced() {
+        // #3246: `None` is a failed COUNT, not "no corpus". Under enforcement
+        // (asi-hard pins this ON) an unreadable corpus MUST refuse — the same
+        // fail-closed the sqlite_master probe already has (#2445).
+        assert!(refusal_required_with(&one_missing(), true, None));
+    }
+
+    #[test]
+    fn an_unreadable_corpus_does_not_refuse_when_enforcement_is_off() {
+        // Default posture stays report-only at the predicate: the live
+        // `refusal_required` still propagates the COUNT error so migrate
+        // does not stamp, but the pure predicate itself does not refuse.
+        assert!(!refusal_required_with(&one_missing(), false, None));
     }
 
     #[test]
@@ -530,6 +596,30 @@ mod tests {
     #[test]
     fn a_complete_schema_never_refuses() {
         assert!(!refusal_required_with(&[], true, Some(1_000_000)));
+    }
+
+    #[test]
+    fn refusal_required_propagates_a_failed_count_when_unenforced() {
+        // Default posture: a failed COUNT must not be coerced to "no corpus"
+        // and then stamped. Propagating the error rolls the ladder back.
+        let conn = conn_with(&[]);
+        let missing = one_missing();
+        let err = refusal_required(&conn, &missing).expect_err("failed COUNT must propagate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("UNCHANGED"),
+            "the operator-facing guarantee must survive a failed COUNT: {msg}"
+        );
+    }
+
+    #[test]
+    fn refusal_required_is_false_on_an_empty_readable_corpus() {
+        let conn = conn_with(&["memories"]);
+        let missing = one_missing();
+        assert!(
+            !refusal_required(&conn, &missing).expect("readable empty corpus"),
+            "Ok(0) stays the documented no-brick path even with relations missing"
+        );
     }
 
     #[test]
