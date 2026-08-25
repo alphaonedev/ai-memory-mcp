@@ -66,6 +66,18 @@ const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = ?1"
 /// #1823 G6 — prior-version (namespace, version) read for the COW leaf,
 /// shared across the append-only revision sites (single SQL SSOT).
 const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memories WHERE id = ?1";
+/// #3192 — prior-row (namespace, version, owner) read for the single-row
+/// delete funnel so tombstone + crypto-erase + the optional G6 TOMBSTONE
+/// leaf share one probe (single SQL SSOT).
+const SQL_SELECT_NS_VERSION_AGENT_BY_ID: &str =
+    "SELECT namespace, version, json_extract(metadata,'$.agent_id') FROM memories WHERE id = ?1";
+/// #3192 — purge the non-cascaded DLQ cleartext leak for a single deleted
+/// id (same tables [`purge_and_tombstone_forget`] reaps for a forget set).
+const SQL_DELETE_DLQ_BY_MEMORY_ID: &str = "DELETE FROM federation_push_dlq WHERE memory_id = ?1";
+/// #3192 — purge the transcript-line content-hash oracle for a single
+/// deleted id.
+const SQL_DELETE_DEDUP_BY_MEMORY_ID: &str =
+    "DELETE FROM transcript_line_dedup WHERE memory_id = ?1";
 /// #2447 — scalar namespace-by-id read for the federation receive-side
 /// namespace-scope gates (single SQL SSOT; see [`namespace_by_id`]).
 const SQL_SELECT_NAMESPACE_BY_ID: &str = "SELECT namespace FROM memories WHERE id = ?1";
@@ -4204,19 +4216,38 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
 /// `archive_memory_no_tx`, kept private because every external caller wants
 /// the atomic wrapper.
 fn delete_inner(conn: &Connection, id: &str) -> Result<bool> {
-    // #2503 — SEVER (never DELETE) any namespace_meta binding pointing here.
-    sever_namespace_standards(conn, id)?;
-    // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append ONE
-    // identity-only TOMBSTONE leaf BEFORE the delete. The ns/version lookup
-    // runs only under the flag, so flag-OFF is byte-identical.
-    if crate::config::append_only_enabled() {
-        use rusqlite::OptionalExtension;
-        if let Some((ns, ver)) = conn
-            .query_row(SQL_SELECT_NS_VERSION_BY_ID, params![id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })
-            .optional()?
-        {
+    // #3192 / #3253 Fable item 2 — probe the row FIRST. A missing id must
+    // not sever `namespace_meta` or write a forget-tombstone for a delete
+    // that never happened (sqlite twin of `pg_hard_delete_in_tx`).
+    use rusqlite::OptionalExtension;
+    let now = Utc::now().to_rfc3339();
+    if let Some((ns, ver, agent_id)) = conn
+        .query_row(SQL_SELECT_NS_VERSION_AGENT_BY_ID, params![id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .optional()?
+    {
+        // #2503 — SEVER (never DELETE) any namespace_meta binding pointing here.
+        sever_namespace_standards(conn, id)?;
+        tombstone_and_erase(
+            conn,
+            id,
+            &ns,
+            agent_id.as_deref(),
+            &now,
+            CRYPTO_ERASE_ACTOR_DELETE,
+        )?;
+        conn.execute(SQL_DELETE_DLQ_BY_MEMORY_ID, params![id])?;
+        conn.execute(SQL_DELETE_DEDUP_BY_MEMORY_ID, params![id])?;
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
+        // ONE identity-only TOMBSTONE leaf BEFORE the delete. The
+        // ns/version lookup now shares the tombstone probe above, so
+        // flag-OFF still skips the leaf.
+        if crate::config::append_only_enabled() {
             crate::revisions::emit_revision_leaf_if_enabled(
                 conn,
                 id,
@@ -4224,7 +4255,7 @@ fn delete_inner(conn: &Connection, id: &str) -> Result<bool> {
                 Some(ver),
                 &ns,
                 None,
-                &Utc::now().to_rfc3339(),
+                &now,
             )?;
         }
     }
@@ -5786,6 +5817,11 @@ const CRYPTO_ERASE_ACTOR_SUBSTRATE: &str = "substrate:eviction";
 /// no identifiable caller/owner (both backends share this fallback).
 pub const CRYPTO_ERASE_ACTOR_FORGET: &str = "substrate:forget";
 
+/// #3192 — actor recorded on an erasure attestation for a single-row
+/// `delete` (MCP / HTTP / CLI / inbound `deletions[]`) when the victim
+/// row has no owner `agent_id`. Postgres twin uses the same string.
+pub const CRYPTO_ERASE_ACTOR_DELETE: &str = "substrate:delete";
+
 /// #1956 [R56] — canonical signable bytes for a `substrate.crypto_erase`
 /// erasure attestation. Identity + erasure-kind + actor + time ONLY (NEVER
 /// content — a content fingerprint would re-leak the erased row). Versioned
@@ -5906,13 +5942,13 @@ pub fn crypto_erase_and_attest(
     Ok(kind)
 }
 
-/// #1956 [R56] — record a mandatory tombstone for an EVICTED row (TTL / byte-cap
-/// hard-delete via [`gc`] / [`size_gc`]) and emit its crypto-erase attestation,
-/// inside the caller's transaction, BEFORE the `DELETE`. Reuses the v71
-/// `forget_tombstones` machinery so an evicted row cannot be resurrected via
-/// federation LWW, closing the "a delete that leaves no tombstone" defect on
-/// the eviction paths (the forget paths already tombstone via
-/// [`purge_and_tombstone_forget`]).
+/// #1956 [R56] / #3192 — record a mandatory tombstone for a HARD-DELETED row
+/// (TTL / byte-cap eviction via [`gc`] / [`size_gc`], AND the single-row
+/// [`delete`] funnel) and emit its crypto-erase attestation, inside the
+/// caller's transaction, BEFORE the `DELETE`. Reuses the v71
+/// `forget_tombstones` machinery so an erased row cannot be resurrected via
+/// federation LWW. Forget paths already tombstone via
+/// [`purge_and_tombstone_forget`]; `delete` previously did not (#3192).
 ///
 /// `INSERT OR IGNORE` keeps it idempotent. The tombstone carries identity +
 /// time + owner ONLY (never content). The erasure attestation records whether
@@ -5928,10 +5964,30 @@ pub fn evict_tombstone_and_erase(
     agent_id: Option<&str>,
     now: &str,
 ) -> Result<()> {
+    tombstone_and_erase(
+        conn,
+        id,
+        namespace,
+        agent_id,
+        now,
+        CRYPTO_ERASE_ACTOR_SUBSTRATE,
+    )
+}
+
+/// Shared hard-delete tombstone + crypto-erase (ERRORS-09: one primitive,
+/// not a forked copy per funnel). [`evict_tombstone_and_erase`] and
+/// [`delete_inner`] both land here so a future change cannot make one
+/// path skip the resurrection guard.
+fn tombstone_and_erase(
+    conn: &Connection,
+    id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    now: &str,
+    fallback_actor: &str,
+) -> Result<()> {
     // Crypto-erase the per-record key (if encrypted) + classify + attest.
-    let actor = agent_id
-        .filter(|s| !s.is_empty())
-        .unwrap_or(CRYPTO_ERASE_ACTOR_SUBSTRATE);
+    let actor = agent_id.filter(|s| !s.is_empty()).unwrap_or(fallback_actor);
     crypto_erase_and_attest(conn, id, actor, now)?;
     // Mandatory signed tombstone (federation resurrection guard).
     let signable = forget_tombstone_signable_bytes(id, namespace, now);

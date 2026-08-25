@@ -1660,11 +1660,13 @@ pub struct SyncPushBody {
     #[serde(default)]
     pub embeddings: Vec<crate::federation::ShippedEmbedding>,
     /// Memory IDs the sender has deleted and wants propagated. Applied
-    /// via `db::delete`. v0.6.0.1: simple remove (no tombstone row); a
-    /// concurrent newer `insert_if_newer` from another peer could revive
-    /// the row — a Last-Writer-Wins quirk we live with until v0.7's
-    /// CRDT-lite tombstone table lands. In the common 4-node mesh, the
-    /// same delete reaches every peer well before any revival window.
+    /// via `db::delete` (sqlite) / `apply_remote_deletion` (postgres).
+    /// #3192: `db::delete` now writes a `forget_tombstones` row +
+    /// crypto-erases BEFORE the DELETE, so a later `insert_if_newer`
+    /// from a peer that still holds the row is dropped (tombstone-wins).
+    /// A deletion of an id this node never held is still a no-op (no
+    /// local row, no namespace to bind a tombstone); that is a
+    /// first-arrival, not a resurrection of a locally-erased row.
     #[serde(default)]
     pub deletions: Vec<String>,
     /// v0.6.2 (S29): memory IDs the sender has explicitly archived and

@@ -120,6 +120,8 @@ write is permission-evaluated as; see the operator note below.
 
 ### Security
 
+- **#3192 — single-row `delete` wrote no `forget_tombstone` and did not crypto-erase, so every MCP `memory_delete` / HTTP DELETE / inbound federation `deletions[]` was LWW-resurrectable.** `db::delete` (`delete_inner`) now reuses the existing `tombstone_and_erase` primitive (the same helper `gc` / `size_gc` already call via `evict_tombstone_and_erase`) *inside* the caller's transaction: forget-tombstone INSERT, envelope crypto-erase + attestation, `cid_genesis` scrub, DLQ/dedup remanence purge, then DELETE. `insert_if_newer`'s G30 resurrection guard therefore sees the tombstone and drops a fresher peer re-push. Postgres `PostgresStore::delete` and `apply_remote_deletion` share one `pg_hard_delete_in_tx` so the two funnels cannot drift. A delete of a never-seen id stays a no-op with no tombstone and no `namespace_meta` sever (probe-then-write). Delete also discards undelivered federation DLQ pushes for that memory. Tombstone `signature` is NULL when no daemon keypair is present (unsigned resurrection guard); refuse-under-enforced-posture is the shared rule with #3240 and must not fork here. The MCP/CLI erasure-outbox remains best-effort + infallible (documented contract; an outbox failure still WARNs and does not fail the local delete). Distinct from #3177 (pg gc).
+
 - **The cert removal-proof harness can no longer leave a DISABLED security control
   in the working tree** (#3119, closing the #3118 near-miss).
   `scripts/check-cert-removal-proof.sh` is a mutation-testing harness: for each cited

@@ -336,6 +336,99 @@ fn federation_restore_gate_primitive_blocks_tombstoned_1848() {
     assert_eq!(mem_count(&conn, &id), 0, "the row stays forgotten");
 }
 
+/// #3192 — single-row `db::delete` records a forget tombstone, and a
+/// simulated peer re-push via `insert_if_newer` with a *fresher*
+/// `updated_at` is REJECTED (tombstone-wins). Pre-fix the G30
+/// resurrection guard found no tombstone and the row came back.
+///
+/// This is the production funnel for MCP `memory_delete`, HTTP DELETE,
+/// CLI `delete`, `SqliteStore::delete`, `SqliteStore::apply_remote_deletion`,
+/// and the inbound federation `deletions[]` lane
+/// (`src/handlers/federation_receive.rs` → `db::delete`).
+#[test]
+fn delete_tombstone_blocks_insert_if_newer_3192() {
+    let (_dir, path) = fresh_db();
+    let conn = db::open(&path).expect("open");
+
+    let id = seed_memory(&conn, "g30-delete", "dnote", "original secret content");
+    assert!(
+        db::delete(&conn, &id).expect("delete"),
+        "#3192: delete of a live row must report true"
+    );
+
+    assert_eq!(
+        tombstone_count(&conn, &id),
+        1,
+        "#3192: db::delete must record a forget_tombstones row"
+    );
+    assert!(
+        db::memory_is_tombstoned(&conn, &id).expect("tombstone check"),
+        "#3192: memory_is_tombstoned must see the deleted id"
+    );
+    assert_eq!(mem_count(&conn, &id), 0, "the row is gone");
+
+    let revived = Memory {
+        id: id.clone(),
+        tier: Tier::Long,
+        namespace: "g30-delete".to_string(),
+        title: "dnote".to_string(),
+        content: "original secret content".to_string(),
+        updated_at: "2999-01-01T00:00:00Z".to_string(),
+        memory_kind: MemoryKind::Observation,
+        ..Memory::default()
+    };
+    let returned = db::insert_if_newer(&conn, &revived).expect("insert_if_newer");
+    assert_eq!(
+        returned, id,
+        "tombstone-wins: the id is returned without an insert"
+    );
+    assert_eq!(
+        mem_count(&conn, &id),
+        0,
+        "#3192: a deleted row must NOT be resurrected by a fresher peer re-push"
+    );
+}
+
+/// #3192 — inbound federation `deletions[]` is `db::delete` on sqlite
+/// (`federation_receive.rs` + `SqliteStore::apply_remote_deletion`). Pin
+/// that the same primitive leaves a tombstone the G30 restore-gate
+/// consults, so a peer-pushed restore cannot undo a federated deletion.
+#[test]
+fn federation_inbound_deletion_leaves_tombstone_3192() {
+    let (_dir, path) = fresh_db();
+    let conn = db::open(&path).expect("open");
+
+    let id = seed_memory(&conn, "g30-feddel", "dnote", "peer-delete target");
+    // The inbound lane calls db::delete with the id from deletions[].
+    assert!(
+        db::delete(&conn, &id).expect("inbound deletions[] apply"),
+        "existing row is removed"
+    );
+    assert!(
+        db::memory_is_tombstoned(&conn, &id).expect("tombstone check"),
+        "#3192: inbound deletions[] of a locally-held id must leave a tombstone"
+    );
+    assert_eq!(mem_count(&conn, &id), 0, "the row stays deleted");
+}
+
+/// #3192 — a delete of a never-seen id stays a no-op and does NOT mint
+/// a tombstone (no namespace to bind). First-arrival of that id later
+/// is a fresh write, not a resurrection.
+#[test]
+fn delete_missing_does_not_tombstone_3192() {
+    let (_dir, path) = fresh_db();
+    let conn = db::open(&path).expect("open");
+    let missing = uuid::Uuid::new_v4().to_string();
+    assert!(
+        !db::delete(&conn, &missing).expect("delete missing"),
+        "missing id returns false"
+    );
+    assert!(
+        !db::memory_is_tombstoned(&conn, &missing).expect("tombstone check"),
+        "#3192: a never-seen id must not grow a forget_tombstones row"
+    );
+}
+
 /// The FORGET tombstone signable bytes are deterministic + domain-separated.
 #[test]
 fn forget_tombstone_signable_bytes_deterministic_g30() {

@@ -438,6 +438,29 @@ const SQL_SELECT_ID_BY_NS_TITLE: &str =
 /// #1823 G6 — prior-version (namespace, version) read for the COW leaf,
 /// shared across every append-only revision site (single SQL SSOT).
 const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memories WHERE id = $1";
+/// #3192 — prior-row (namespace, version, owner) read for the single-row
+/// delete / apply_remote_deletion funnels so tombstone + crypto-erase +
+/// the optional G6 TOMBSTONE leaf share one probe (single SQL SSOT).
+const SQL_SELECT_NS_VERSION_AGENT_BY_ID: &str =
+    "SELECT namespace, version, metadata->>'agent_id' FROM memories WHERE id = $1";
+/// #3192 — destroy the per-record envelope key for one encrypted (0x03) row.
+const SQL_CRYPTO_ERASE_ENVELOPE_BY_ID: &str = "UPDATE memories SET encrypted_envelope = $2 \
+     WHERE id = $1 AND encrypted_envelope IS NOT NULL \
+       AND get_byte(encrypted_envelope, 0) = 3 \
+     RETURNING id";
+/// #3192 — erasure invariant: NULL `cid_genesis` for one victim.
+const SQL_SCRUB_CID_GENESIS_BY_ID: &str =
+    "UPDATE memories SET cid_genesis = NULL WHERE id = $1 AND cid_genesis IS NOT NULL";
+/// #3192 — signed FORGET tombstone insert (identity + time + owner only).
+const SQL_INSERT_FORGET_TOMBSTONE: &str = "INSERT INTO forget_tombstones \
+     (memory_id, namespace, forgotten_at, agent_id, signature) \
+     VALUES ($1, $2, $3, $4, $5) \
+     ON CONFLICT (memory_id) DO NOTHING";
+/// #3192 — purge the non-cascaded DLQ cleartext leak for one deleted id.
+const SQL_DELETE_DLQ_BY_MEMORY_ID: &str = "DELETE FROM federation_push_dlq WHERE memory_id = $1";
+/// #3192 — purge the transcript-line content-hash oracle for one deleted id.
+const SQL_DELETE_DEDUP_BY_MEMORY_ID: &str =
+    "DELETE FROM transcript_line_dedup WHERE memory_id = $1";
 
 /// v0.9.0 G13-mem (#1859) — endpoint content-id read for the lineage-DAG
 /// `memory_links.source_cid`/`target_cid` mirror stamp.
@@ -13636,6 +13659,131 @@ async fn pg_append_revision_leaf_in_tx(
     Ok(())
 }
 
+/// #3192 — sqlite [`crate::storage::evict_tombstone_and_erase`] /
+/// `delete_inner` parity: namespace-meta SEVER + forget-tombstone +
+/// crypto-erase + optional G6 TOMBSTONE leaf + DELETE, inside the
+/// caller's transaction. Shared by [`PostgresStore::delete`] and
+/// [`PostgresStore::apply_remote_deletion`] so the two funnels cannot
+/// drift (the #2493 class). Returns `rows_affected` of the DELETE.
+async fn pg_hard_delete_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<u64, sqlx::Error> {
+    // Probe via tombstone/erase first: if the row is already gone, do not
+    // sever `namespace_meta` or emit a forget-tombstone for a delete that
+    // never happened (#3253 Fable item 2 / #3245).
+    let leaf = pg_tombstone_and_erase_in_tx(tx, id).await?;
+    let Some((ref ns, ver)) = leaf else {
+        return Ok(0);
+    };
+    sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    // No-op when the append-only spine is OFF (the helper itself gates).
+    pg_emit_revision_leaf_if_enabled(
+        tx,
+        id,
+        crate::revisions::RecordKind::Tombstone,
+        Some(ver),
+        ns,
+        None,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .await?;
+    let rows = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    Ok(rows)
+}
+
+/// #3192 — sqlite `tombstone_and_erase` parity for one live row: crypto-erase
+/// the per-record envelope (when 0x03), INSERT the forget tombstone, scrub
+/// `cid_genesis`, purge DLQ/dedup remanence, emit the signed erasure
+/// attestation. Returns `Some((namespace, version))` when the row existed
+/// (so the caller can emit the G6 leaf); `None` when already gone.
+async fn pg_tombstone_and_erase_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<Option<(String, i64)>, sqlx::Error> {
+    let row: Option<(String, i64, Option<String>)> =
+        sqlx::query_as(SQL_SELECT_NS_VERSION_AGENT_BY_ID)
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some((ns, ver, agent_id)) = row else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+
+    let erased: Option<(String,)> = sqlx::query_as(SQL_CRYPTO_ERASE_ENVELOPE_BY_ID)
+        .bind(id)
+        .bind(crate::encryption::crypto_erase_marker())
+        .fetch_optional(&mut **tx)
+        .await?;
+    sqlx::query(SQL_SCRUB_CID_GENESIS_BY_ID)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(SQL_DELETE_DLQ_BY_MEMORY_ID)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(SQL_DELETE_DEDUP_BY_MEMORY_ID)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+
+    let signable = crate::storage::forget_tombstone_signable_bytes(id, &ns, &now_str);
+    let signature: Option<Vec<u8>> =
+        crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s);
+    sqlx::query(SQL_INSERT_FORGET_TOMBSTONE)
+        .bind(id)
+        .bind(&ns)
+        .bind(&now_str)
+        .bind(&agent_id)
+        .bind(&signature)
+        .execute(&mut **tx)
+        .await?;
+
+    let kind = if erased.is_some() {
+        crate::storage::ErasureKind::KeyDestroyed
+    } else {
+        crate::storage::ErasureKind::RowDeletedTombstoned
+    };
+    let actor = agent_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(crate::storage::CRYPTO_ERASE_ACTOR_DELETE);
+    let erase_signable = crate::storage::crypto_erase_signable_bytes(id, kind, actor, &now_str);
+    let ph = crate::signed_events::payload_hash(&erase_signable);
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        ph,
+        actor.to_string(),
+        crate::signed_events::event_types::SUBSTRATE_CRYPTO_ERASE.to_string(),
+        now_str.clone(),
+        None,
+    );
+    pg_append_signed_event_with_chain_in_tx(
+        tx,
+        PgSignedEventInsert {
+            id: &event.id,
+            agent_id: &event.agent_id,
+            event_type: &event.event_type,
+            payload_hash: &event.payload_hash,
+            signature: event.signature.as_deref(),
+            attest_level: &event.attest_level,
+            timestamp: now,
+            cause_hash: None,
+        },
+    )
+    .await?;
+    Ok(Some((ns, ver)))
+}
+
 /// v0.9.0 G6 (#1823) STEP 2 — the gated postgres convenience used by every
 /// sanctioned mutation primitive (the async twin of
 /// [`crate::revisions::emit_revision_leaf_if_enabled`]). When the
@@ -19523,71 +19671,26 @@ impl MemoryStore for PostgresStore {
         self.assert_caller_owns_for_mutation(ctx, id, "delete", REASON_UNSTAMPED_TENANT_DELETE)
             .await?;
 
-        // #1642 / #2503 / #3245 — SEVER `namespace_meta` bindings pointing
-        // here BEFORE the row DELETE, matching sqlite `storage::delete`
-        // (`delete_inner`: sever, optional TOMBSTONE leaf, DELETE). Pre-#1642
-        // postgres left a dangling `standard_id`; pre-#2503 both backends
-        // DELETED the binding rows (destroying `parent_namespace` inheritance
-        // of namespaces the deleting principal has no authority over).
-        // Pre-#3245 the sever ran pool-direct on `&self.pool` BEFORE
-        // `begin()`, so a failing delete committed an unrecoverable policy
-        // downgrade while the memory stayed live; flag-OFF was two autocommit
-        // statements with the same window. One tx now covers sever + leaf +
-        // delete: either the memory is gone WITH its sever (and leaf), or
-        // nothing changed.
+        // #3192 + #3245 — one tx: namespace-meta SEVER + forget-tombstone +
+        // crypto-erase + optional G6 leaf + DELETE. `pg_hard_delete_in_tx`
+        // is a no-op (returns 0) when the row is already gone, so a NotFound
+        // path does not commit a sever/tombstone for a memory that was never
+        // deleted. AGE unprojection stays best-effort after a successful
+        // commit (#1783).
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| to_store_err("delete begin tx", e))?;
-        sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
-            .bind(id)
-            .execute(&mut *tx)
+        let rows = pg_hard_delete_in_tx(&mut tx, id)
             .await
-            .map_err(|e| to_store_err("delete: namespace_meta sever", e))?;
-
-        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact TOMBSTONE
-        // leaf in THIS tx, before the delete. Flag-OFF skips the leaf and
-        // still runs the delete in the same tx (not a second autocommit).
-        if crate::config::append_only_enabled()
-            && let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("delete read row for tombstone leaf", e))?
-        {
-            pg_emit_revision_leaf_if_enabled(
-                &mut tx,
-                id,
-                crate::revisions::RecordKind::Tombstone,
-                Some(ver),
-                &ns,
-                None,
-                &chrono::Utc::now().to_rfc3339(),
-            )
-            .await
-            .map_err(|e| to_store_err("append tombstone revision leaf", e))?;
-        }
-        let rows = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("delete", e))?
-            .rows_affected();
-        // #3245 Fable gate — a 0-row DELETE is NotFound. Commit-then-NotFound
-        // would land the namespace_meta sever (and any flag-ON tombstone leaf)
-        // for a row that was never deleted. Dropping `tx` rolls back. Mirrors
-        // sqlite `delete_inner`. ERRORS-09 / fail-closed.
+            .map_err(|e| to_store_err("delete", e))?;
         if rows == 0 {
             return Err(StoreError::NotFound { id: id.to_string() });
         }
         tx.commit()
             .await
             .map_err(|e| to_store_err("delete commit tx", e))?;
-        // #1783 — the relational row + its cascade-deleted memory_links
-        // are gone; remove the now-orphaned AGE :Memory node + edges so
-        // kg_query/find_paths don't return ghost edges. Best-effort,
-        // own-tx (after the delete tx commits).
         self.unproject_memory_ids_best_effort(&[id]).await;
         Ok(())
     }
@@ -21344,81 +21447,35 @@ impl MemoryStore for PostgresStore {
     /// [`MemoryStore::apply_remote_deletion`] (#2488).
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop()?;
-        // #2493 / #2503 — this override reimplements the delete rather than
-        // composing `self.delete`, and it OMITTED the `namespace_meta`
-        // maintenance its own `delete` performs. So the IDENTICAL federated
-        // `deletions[]` push cleaned the binding on sqlite and left it
-        // DANGLING on postgres — reinstating the #1642 bug on the one lane
-        // with an attacker-reachable trigger, and diverging the two backends
-        // on the lane #2497 exists to converge. Severing here restores parity
-        // in the SAME direction as every other reap funnel.
+        // #2493 / #2503 / #3192 — this override still does NOT compose
+        // `self.delete` (that path carries the caller-owns gate this
+        // inbound lane must not apply — `_ctx` is discarded). It DOES
+        // share `pg_hard_delete_in_tx` with `delete` so the federated
+        // `deletions[]` lane cannot again omit namespace-meta SEVER
+        // (#2493) or the forget-tombstone + crypto-erase (#3192).
         //
-        // Deliberately BEFORE the existence check: the federated pending-execute
-        // arm discards `db::delete`'s boolean, so a push naming an id with no
-        // local row must still leave `namespace_meta` in a coherent state
-        // rather than depending on whether the row happened to be present.
-        sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
-            .bind(id)
-            .execute(&self.pool)
+        // Namespace-meta SEVER runs inside the tx even when the row is
+        // already gone: a push naming an id with no local row must still
+        // leave `namespace_meta` coherent rather than depending on
+        // presence. A missing row writes no forget-tombstone (no
+        // namespace to bind); that is a first-arrival hole, not a
+        // resurrection of a locally-erased row — documented on the
+        // sqlite twin.
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| to_store_err("apply_remote_deletion: namespace_meta sever", e))?;
-        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact TOMBSTONE
-        // (origin=remote). This is the headline data-loss fix: the legacy
-        // path hard-deletes the row pool-direct (no tx, no audit trail).
-        // Under the flag we append the identity-only TOMBSTONE leaf and run
-        // the delete in ONE tx so the remote erasure is atomic + auditable.
-        // Flag-OFF falls through to the byte-identical pool-direct delete.
-        if crate::config::append_only_enabled() {
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|e| to_store_err("apply_remote_deletion begin tx", e))?;
-            if let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("apply_remote_deletion read row for leaf", e))?
-            {
-                pg_emit_revision_leaf_if_enabled(
-                    &mut tx,
-                    id,
-                    crate::revisions::RecordKind::Tombstone,
-                    Some(ver),
-                    &ns,
-                    None,
-                    &chrono::Utc::now().to_rfc3339(),
-                )
-                .await
-                .map_err(|e| to_store_err("append remote tombstone revision leaf", e))?;
-            }
-            let rows = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("apply_remote_deletion", e))?
-                .rows_affected();
-            tx.commit()
-                .await
-                .map_err(|e| to_store_err("apply_remote_deletion commit tx", e))?;
-            if rows > 0 {
-                self.unproject_memory_ids_best_effort(&[id]).await;
-            }
-            return Ok(rows > 0);
-        }
-
-        let rows_affected = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
-            .bind(id)
-            .execute(&self.pool)
+            .map_err(|e| to_store_err("apply_remote_deletion begin tx", e))?;
+        let rows = pg_hard_delete_in_tx(&mut tx, id)
             .await
-            .map_err(|e| to_store_err("apply_remote_deletion", e))?
-            .rows_affected();
-        if rows_affected > 0 {
-            // #1783 — federation tombstone-apply hard-deletes the row;
-            // clean its AGE projection too (best-effort, own-tx — pool-direct).
+            .map_err(|e| to_store_err("apply_remote_deletion", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("apply_remote_deletion commit tx", e))?;
+        if rows > 0 {
             self.unproject_memory_ids_best_effort(&[id]).await;
         }
-        Ok(rows_affected > 0)
+        Ok(rows > 0)
     }
 
     // ----- v0.7.0 Wave-3 Continuation 2 — full hybrid recall ---------
@@ -35303,6 +35360,112 @@ mod tests {
         );
 
         // Cleanup.
+        let _ = sqlx::query("DELETE FROM forget_tombstones WHERE memory_id = $1")
+            .bind(&vid)
+            .execute(&store.pool)
+            .await;
+    }
+
+    /// #3192 — postgres `delete` writes a forget_tombstone, so a stale
+    /// peer re-push via `apply_remote_memory` with a fresher `updated_at`
+    /// is DROPPED (tombstone-wins). Pre-fix `PostgresStore::delete` was
+    /// a pool-direct DELETE with no tombstone.
+    #[tokio::test]
+    async fn delete_tombstone_blocks_apply_remote_memory_3192() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("tombstone-3192-del-{unique}");
+        let vid = format!("ts3192-del-{unique}");
+        let victim = sample_memory(&vid, &ns, "deleted row", "delete me and stay gone");
+        store.store(&ctx, &victim).await.expect("store victim");
+        store.delete(&ctx, &vid).await.expect("delete");
+        let (has_tomb,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)")
+                .bind(&vid)
+                .fetch_one(&store.pool)
+                .await
+                .expect("tombstone probe");
+        assert!(has_tomb, "#3192: delete must have written the tombstone");
+
+        let mut replay = sample_memory(&vid, &ns, "deleted row", "resurrection attempt");
+        replay.updated_at = "2999-01-01T00:00:00Z".to_string();
+        let id = store
+            .apply_remote_memory(&ctx, &replay)
+            .await
+            .expect("apply_remote_memory is an idempotent no-op on a tombstoned id");
+        assert_eq!(id, vid);
+        let (alive,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
+                .bind(&vid)
+                .fetch_one(&store.pool)
+                .await
+                .expect("resurrection probe");
+        assert!(
+            !alive,
+            "#3192: a deleted id must NOT be resurrected via apply_remote_memory"
+        );
+
+        let _ = sqlx::query("DELETE FROM forget_tombstones WHERE memory_id = $1")
+            .bind(&vid)
+            .execute(&store.pool)
+            .await;
+    }
+
+    /// #3192 — inbound `deletions[]` on postgres is `apply_remote_deletion`.
+    /// It must leave a forget_tombstone so a later `apply_remote_memory`
+    /// cannot LWW-resurrect the row.
+    #[tokio::test]
+    async fn apply_remote_deletion_writes_forget_tombstone_3192() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("tombstone-3192-ard-{unique}");
+        let vid = format!("ts3192-ard-{unique}");
+        let victim = sample_memory(&vid, &ns, "fed-deleted row", "inbound deletion target");
+        store.store(&ctx, &victim).await.expect("store victim");
+        let deleted = store
+            .apply_remote_deletion(&ctx, &vid)
+            .await
+            .expect("apply_remote_deletion");
+        assert!(deleted, "#3192: existing row is removed");
+        let (has_tomb,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)")
+                .bind(&vid)
+                .fetch_one(&store.pool)
+                .await
+                .expect("tombstone probe");
+        assert!(
+            has_tomb,
+            "#3192: apply_remote_deletion must write a forget_tombstones row"
+        );
+
+        let mut replay = sample_memory(&vid, &ns, "fed-deleted row", "resurrection attempt");
+        replay.updated_at = "2999-01-01T00:00:00Z".to_string();
+        let id = store
+            .apply_remote_memory(&ctx, &replay)
+            .await
+            .expect("apply_remote_memory no-op");
+        assert_eq!(id, vid);
+        let (alive,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
+                .bind(&vid)
+                .fetch_one(&store.pool)
+                .await
+                .expect("resurrection probe");
+        assert!(
+            !alive,
+            "#3192: inbound deletions[] must not be LWW-resurrectable"
+        );
+
         let _ = sqlx::query("DELETE FROM forget_tombstones WHERE memory_id = $1")
             .bind(&vid)
             .execute(&store.pool)
