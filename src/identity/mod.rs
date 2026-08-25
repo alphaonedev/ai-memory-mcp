@@ -344,6 +344,59 @@ pub fn resolve_read_visibility_caller() -> Option<String> {
     Some(v)
 }
 
+/// #3171 — resolve the SUBJECT of a governance / permission / quota /
+/// ownership decision from a SELF-ASSERTED wire `agent_id`, BOUND to the
+/// enforced-read caller whenever the multi-tenant posture is engaged.
+///
+/// [`resolve_agent_id`] gives the EXPLICIT argument precedence (step 1) over
+/// the `AI_MEMORY_AGENT_ID` env identity (step 2). That is correct for an
+/// operator-as-actor ATTRIBUTION field, and wrong for an authz SUBJECT: a
+/// handler that feeds a wire `params.agent_id` into
+/// `Permissions::evaluate` / `enforce_governance` / a capability-token
+/// binding / a quota key lets the caller CHOOSE the principal its own request
+/// is judged as. The #3171 audit found that shape on fourteen tools, where the
+/// ownership predicate is keyed on the ENV caller but the governance subject is
+/// keyed on the WIRE value — two controls that can never agree by construction:
+/// `memory_promote`, `memory_kg_invalidate`, `memory_archive_purge`,
+/// `memory_pending_approve`, `memory_pending_reject`, `memory_delete`,
+/// `memory_update`, `memory_store` (local and forward-to-HTTP),
+/// `memory_consolidate`, `memory_link`, `memory_atomise`, `memory_reflect`,
+/// `memory_offload` and `memory_deref`. The namespace-standard pair applies the
+/// same rule inline (`resolve_namespace_standard_caller`), because its
+/// single-operator fallback must degrade to a sentinel rather than error.
+///
+/// Semantics (the shipped `handle_inbox` #1557 / `handle_replay` #1571
+/// pattern, generalised):
+/// - **Multi-tenant posture** ([`resolve_read_visibility_caller`] is `Some`):
+///   the subject IS the caller. A wire `agent_id` that disagrees is REFUSED
+///   rather than honoured.
+/// - **Single-operator default** (env unset): unchanged — the legacy
+///   [`resolve_agent_id`] ladder runs, so zero-config deployments are
+///   byte-identical.
+///
+/// `op` names the operation in the refusal (e.g. `"promote"`).
+///
+/// # Errors
+/// A mismatch refusal, or the [`resolve_agent_id`] resolution error.
+pub fn resolve_governance_subject(
+    explicit: Option<&str>,
+    mcp_client: Option<&str>,
+    op: &str,
+) -> Result<String> {
+    if let Some(caller) = resolve_read_visibility_caller() {
+        if let Some(requested) = explicit.filter(|s| !s.is_empty())
+            && requested != caller
+        {
+            anyhow::bail!(
+                "agent_id mismatch: caller '{caller}' may only {op} as itself \
+                 (requested '{requested}')"
+            );
+        }
+        return Ok(caller);
+    }
+    resolve_agent_id(explicit, mcp_client)
+}
+
 /// #1772 — crate-wide, test-only process serialization guard for any test
 /// that mutates `AI_MEMORY_AGENT_ID` (`ENV_AGENT_ID`). `cargo test` runs
 /// test fns in parallel, so a `set_var`/`remove_var` in one test can leak

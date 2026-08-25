@@ -5069,8 +5069,97 @@ pub fn archive_memory_for_caller(
 /// sites (`forget_count`, the `forget` delete arm, and the
 /// archive-before-delete arm) route through this single builder so
 /// their match sets can never drift apart.
-fn forget_fts_query(pat: &str) -> String {
-    sanitize_fts_query(pat, false)
+/// #3171 — the STRICT builder. `sanitize_fts_query` is a CLAMPING sanitizer:
+/// it silently drops a token that sanitizes to empty (`"***"`), silently drops
+/// a standalone `AND`/`OR`/`NOT`/`NEAR`, and silently `.take(MAX_FTS_OR_TERMS)`s
+/// the rest. On a RANKED READ that is the right trade (fewer/broader hits).
+/// On the forget path every dropped token is a dropped AND-conjunct, and the
+/// FTS5 implicit-AND join means a dropped conjunct makes the match set —
+/// i.e. the DELETE — STRICTLY WIDER than the pattern the caller wrote and the
+/// schema promised ("every whitespace-separated token must match"). Silently
+/// deleting rows the caller did not name is unrecoverable data loss, so the
+/// destructive path REFUSES instead of widening.
+///
+/// # Errors
+/// [`StorageError::InvalidArgument`] when a token sanitizes to empty, when the
+/// pattern yields more than [`MAX_FTS_OR_TERMS`] tokens (the clamp would drop
+/// narrowing conjuncts), or when the whole pattern sanitizes to nothing.
+fn forget_fts_query(pat: &str) -> Result<String> {
+    let tokens = strict_forget_tokens(pat)
+        .map_err(|reason| anyhow::Error::new(StorageError::InvalidArgument { reason }))?;
+    // Space-joined phrase tokens = FTS5 implicit AND (the #1601 contract).
+    Ok(tokens
+        .into_iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+/// #3171 — BACKEND-AGNOSTIC strict tokeniser for a DESTRUCTIVE forget pattern.
+///
+/// Returns the literal search terms, or the reason the pattern must be
+/// REFUSED. Split out of [`forget_fts_query`] so the postgres lane gets the
+/// identical contract: sqlite reaches it through the FTS5 query builder, and
+/// the HTTP forget funnel calls it at the request boundary BEFORE dispatching
+/// to either backend. Without that, the same destructive wire call would be
+/// refused on sqlite and silently widened on postgres — a cross-backend
+/// divergence on an irreversible operation, which is exactly the class #2312
+/// closed for token-vs-substring semantics.
+///
+/// # Errors
+/// A human-readable reason when the pattern is empty after sanitisation, has
+/// more than [`MAX_FTS_OR_TERMS`] tokens, contains a standalone FTS5 boolean
+/// operator, or contains a token that sanitises to nothing — each of which the
+/// CLAMPING read sanitiser would silently DROP, and each dropped token is a
+/// dropped narrowing AND-conjunct.
+pub fn strict_forget_tokens(pat: &str) -> std::result::Result<Vec<String>, String> {
+    let cleaned = strip_invisible(pat);
+    let raw: Vec<&str> = cleaned
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .collect();
+    if raw.is_empty() {
+        return Err(
+            "forget pattern is empty after sanitisation; refusing rather than \
+                    widening the delete"
+                .to_string(),
+        );
+    }
+    if raw.len() > MAX_FTS_OR_TERMS {
+        return Err(format!(
+            "forget pattern has {} terms, over the {MAX_FTS_OR_TERMS}-term cap; \
+             the clamp would DROP narrowing AND-conjuncts and widen the delete — \
+             narrow the pattern instead",
+            raw.len()
+        ));
+    }
+    let mut tokens: Vec<String> = Vec::with_capacity(raw.len());
+    for token in raw {
+        let upper = token.to_uppercase();
+        if upper == "AND" || upper == "OR" || upper == "NOT" || upper == "NEAR" {
+            return Err(format!(
+                "forget pattern token {token:?} is an FTS5 boolean operator, which \
+                 the sanitiser strips; every token must be a literal search term"
+            ));
+        }
+        let clean: String = token
+            .chars()
+            .filter(|c| {
+                !matches!(
+                    *c,
+                    '"' | '*' | '^' | '{' | '}' | '(' | ')' | ':' | '|' | '+'
+                )
+            })
+            .collect();
+        if clean.is_empty() {
+            return Err(format!(
+                "forget pattern token {token:?} sanitises to nothing; dropping it \
+                 would widen the delete to rows that do not match it"
+            ));
+        }
+        tokens.push(clean);
+    }
+    Ok(tokens)
 }
 
 /// Count memories that would be deleted by forget (for `dry_run`).
@@ -5087,7 +5176,7 @@ pub fn forget_count(
         }));
     }
     if let Some(pat) = pattern {
-        let fts_query = forget_fts_query(pat);
+        let fts_query = forget_fts_query(pat)?;
         let tier_str = tier.map(|t| t.as_str().to_string());
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memories WHERE rowid IN (
@@ -5128,7 +5217,7 @@ pub fn forget_distinct_namespaces(
 ) -> Result<Vec<String>> {
     let tier_str = tier.map(|t| t.as_str().to_string());
     if let Some(pat) = pattern {
-        let fts_query = forget_fts_query(pat);
+        let fts_query = forget_fts_query(pat)?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT m.namespace
              FROM memories_fts fts
@@ -5177,7 +5266,7 @@ fn purge_and_tombstone_forget(
     let tier_str = tier.map(|t| t.as_str().to_string());
     let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     let victims = if let Some(pat) = pattern {
-        bound.push(Box::new(forget_fts_query(pat)));
+        bound.push(Box::new(forget_fts_query(pat)?));
         bound.push(Box::new(namespace.map(str::to_string)));
         bound.push(Box::new(tier_str));
         let mut q = String::from(
@@ -5840,7 +5929,7 @@ pub fn forget(
             // Archive matching memories before deletion.
             let now = Utc::now().to_rfc3339();
             if let Some(pat) = pattern {
-                let fts_query = forget_fts_query(pat);
+                let fts_query = forget_fts_query(pat)?;
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on
                 // forget-archive. v0.7.0 issue #861 — also project `metadata`
@@ -5919,7 +6008,7 @@ pub fn forget(
         if archive {
             let now = Utc::now().to_rfc3339();
             if let Some(pat) = pattern {
-                let fts_query = forget_fts_query(pat);
+                let fts_query = forget_fts_query(pat)?;
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
                     "INSERT OR IGNORE INTO archived_memory_links
@@ -5996,7 +6085,7 @@ pub fn forget(
         // FORGET leaf for every victim id was appended IN THIS tx by the
         // purge_and_tombstone_forget call above (before this DELETE).
         if let Some(pat) = pattern {
-            let fts_query = forget_fts_query(pat);
+            let fts_query = forget_fts_query(pat)?;
             let tier_str = tier.map(|t| t.as_str().to_string());
             conn.execute(
                 "DELETE FROM memories WHERE rowid IN (
@@ -6075,7 +6164,7 @@ pub fn forget_matches(
         })
     };
     if let Some(pat) = pattern {
-        let fts_query = forget_fts_query(pat);
+        let fts_query = forget_fts_query(pat)?;
         let mut stmt = conn.prepare(
             "SELECT m.id, m.title, m.namespace, m.tier
              FROM memories_fts fts
@@ -6129,7 +6218,7 @@ pub fn forget_count_for_caller(
         }));
     }
     if let Some(pat) = pattern {
-        let fts_query = forget_fts_query(pat);
+        let fts_query = forget_fts_query(pat)?;
         let tier_str = tier.map(|t| t.as_str().to_string());
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memories WHERE rowid IN (
@@ -6181,7 +6270,7 @@ pub fn forget_distinct_namespaces_for_caller(
 ) -> Result<Vec<String>> {
     let tier_str = tier.map(|t| t.as_str().to_string());
     if let Some(pat) = pattern {
-        let fts_query = forget_fts_query(pat);
+        let fts_query = forget_fts_query(pat)?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT m.namespace
              FROM memories_fts fts
@@ -6243,7 +6332,7 @@ pub fn forget_matches_for_caller(
         })
     };
     if let Some(pat) = pattern {
-        let fts_query = forget_fts_query(pat);
+        let fts_query = forget_fts_query(pat)?;
         let mut stmt = conn.prepare(
             "SELECT m.id, m.title, m.namespace, m.tier
              FROM memories_fts fts
@@ -6316,7 +6405,7 @@ pub fn forget_for_caller(
             // Archive matching memories before deletion.
             let now = Utc::now().to_rfc3339();
             if let Some(pat) = pattern {
-                let fts_query = forget_fts_query(pat);
+                let fts_query = forget_fts_query(pat)?;
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
                     "INSERT OR REPLACE INTO archived_memories
@@ -6396,7 +6485,7 @@ pub fn forget_for_caller(
         if archive {
             let now = Utc::now().to_rfc3339();
             if let Some(pat) = pattern {
-                let fts_query = forget_fts_query(pat);
+                let fts_query = forget_fts_query(pat)?;
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
                     "INSERT OR IGNORE INTO archived_memory_links
@@ -6475,7 +6564,7 @@ pub fn forget_for_caller(
         // FORGET leaf for every owner-scoped victim id was appended IN THIS
         // tx by the purge_and_tombstone_forget call above (before DELETE).
         if let Some(pat) = pattern {
-            let fts_query = forget_fts_query(pat);
+            let fts_query = forget_fts_query(pat)?;
             let tier_str = tier.map(|t| t.as_str().to_string());
             conn.execute(
                 "DELETE FROM memories WHERE rowid IN (
@@ -7612,6 +7701,7 @@ pub fn promote_to_namespace(
     conn: &Connection,
     source_id: &str,
     to_namespace: &str,
+    promoted_by: Option<&str>,
 ) -> Result<String> {
     if to_namespace.is_empty() {
         // #962 typed envelope.
@@ -7649,6 +7739,51 @@ pub fn promote_to_namespace(
     }
 
     let now = Utc::now().to_rfc3339();
+    // #3202 — RE-STAMP the clone's provenance. Pre-fix the clone carried
+    // `source.metadata` verbatim, so the new row in the DESTINATION namespace
+    // was owned by the SOURCE's author rather than by the caller that put it
+    // there, and nothing in the row recorded where it came from (only the
+    // out-of-band `derived_from` edge did). Two consequences: a destination
+    // owner gate compared against a principal who never wrote into that
+    // namespace, and an operator auditing the destination could not tell a
+    // promoted row from a natively-authored one. The acting caller becomes the
+    // clone's `agent_id`; the origin is PRESERVED (never overwritten) under
+    // `promoted_from*` so the original authorship is still recoverable — the
+    // durable truth is added to, not replaced.
+    let clone_metadata = {
+        let mut meta = source.metadata.clone();
+        if let Some(obj) = meta.as_object_mut() {
+            if let Some(actor) = promoted_by.filter(|a| !a.is_empty()) {
+                if let Some(prior) = obj
+                    .get(crate::mcp::param_names::AGENT_ID)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                {
+                    obj.insert(
+                        "promoted_from_agent_id".to_string(),
+                        serde_json::Value::String(prior),
+                    );
+                }
+                obj.insert(
+                    crate::mcp::param_names::AGENT_ID.to_string(),
+                    serde_json::Value::String(actor.to_string()),
+                );
+            }
+            obj.insert(
+                "promoted_from".to_string(),
+                serde_json::Value::String(source_id.to_string()),
+            );
+            obj.insert(
+                "promoted_from_namespace".to_string(),
+                serde_json::Value::String(source.namespace.clone()),
+            );
+            obj.insert(
+                "promoted_at".to_string(),
+                serde_json::Value::String(now.clone()),
+            );
+        }
+        meta
+    };
     let clone = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         valid_from: source.valid_from.clone(),
@@ -7667,7 +7802,7 @@ pub fn promote_to_namespace(
         updated_at: now,
         last_accessed_at: None,
         expires_at: source.expires_at.clone(),
-        metadata: source.metadata.clone(),
+        metadata: clone_metadata,
         reflection_depth: source.reflection_depth,
         memory_kind: source.memory_kind.clone(),
         entity_id: None,
@@ -8708,7 +8843,8 @@ pub fn get_links(conn: &Connection, id: &str) -> Result<Vec<MemoryLink>> {
     // (`LinkVerifyRecord` below), not the read-only graph view.
     let mut stmt = conn.prepare(
         "SELECT source_id, target_id, relation, created_at, \
-                valid_from, valid_until, observed_by, attest_level \
+                valid_from, valid_until, observed_by, \
+                COALESCE(attest_level, 'unsigned') \
          FROM memory_links \
          WHERE source_id = ?1 OR target_id = ?1",
     )?;
@@ -8736,6 +8872,14 @@ pub fn get_links(conn: &Connection, id: &str) -> Result<Vec<MemoryLink>> {
             valid_from: row.get::<_, Option<String>>(4)?,
             valid_until: row.get::<_, Option<String>>(5)?,
             observed_by: row.get::<_, Option<String>>(6)?,
+            // #3171 — COALESCE to `unsigned` in the SQL above. `attest_level`
+            // is nullable (`memory_links.attest_level TEXT`, no NOT NULL / no
+            // DEFAULT) and the field is `skip_serializing_if = "Option::is_none"`,
+            // so a NULL row made the key VANISH from the response — while the
+            // tool docs promise every link carries an attest_level. A missing
+            // trust field is the worst possible ambiguity on a provenance
+            // surface, so report the fail-closed value the row actually
+            // deserves. Same COALESCE the reflection-export projection uses.
             attest_level: row.get::<_, Option<String>>(7)?,
             // #2215 — the `memory_get_links` graph view is a selective
             // projection (it also leaves `signature` `None`); the lineage
@@ -10544,10 +10688,18 @@ pub fn entity_register(
             "kind".to_string(),
             serde_json::Value::String(ENTITY_KIND.to_string()),
         );
+        // #3171 — the RESOLVED id WINS. `or_insert` let a caller-supplied
+        // inline `metadata.agent_id` take precedence over the id the MCP
+        // handler had just put through `validate_agent_id`, so the owner stamp
+        // could carry a value that never crossed the RESERVED_AGENT_IDS check
+        // (#977) or the caller binding — the same undeclared-second-identity-
+        // channel #3171 removed from `memory_offload`/`memory_deref`. When no
+        // id is resolved, an inline value is still honoured unchanged.
         if let Some(a) = agent_id {
-            meta_map
-                .entry("agent_id".to_string())
-                .or_insert(serde_json::Value::String(a.to_string()));
+            meta_map.insert(
+                "agent_id".to_string(),
+                serde_json::Value::String(a.to_string()),
+            );
         }
         // #3014 — the entity row is a memory-creating TENANT write; cross the
         // attestation posture like `store`. entity_register presents no caller
@@ -19910,6 +20062,57 @@ pub fn approve_with_approver_type(
 /// emits live in `decide_pending_action` and
 /// `sweep_pending_action_timeouts` respectively, so the three governance
 /// transitions are audit-complete together).
+/// #3202 Fable HIGH (2) — evaluate destination `write` at execute time
+/// WITHOUT queueing. `enforce_governance` would insert a second pending
+/// on `Approve`; this consults the same policy/level/ungoverned path and
+/// treats Deny or still-Pending as a refuse.
+fn refuse_unapproved_destination_store(
+    conn: &Connection,
+    pa: &PendingAction,
+    to_ns: &str,
+) -> Result<()> {
+    use crate::config::{PermissionsMode, active_permissions_mode};
+    let mode = active_permissions_mode();
+    if mode == PermissionsMode::Off {
+        return Ok(());
+    }
+    let decision = match resolve_governance_policy(conn, to_ns) {
+        Some(policy) => {
+            let ns_owner = namespace_owner(conn, to_ns);
+            evaluate_level(
+                conn,
+                GovernedAction::Store,
+                to_ns,
+                &policy.core.write,
+                &pa.requested_by,
+                None,
+                ns_owner.as_deref(),
+            )
+        }
+        None => ungoverned_namespace_decision(mode, GovernedAction::Store, to_ns, &pa.requested_by),
+    };
+    if mode == PermissionsMode::Advisory {
+        return Ok(());
+    }
+    match decision {
+        GovernanceDecision::Allow => Ok(()),
+        GovernanceDecision::Deny(refusal) => {
+            emit_pending_action_event(conn, pa, "pending_action.refused_destination_deny", None);
+            Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: format!("destination write into {to_ns} denied: {}", refusal.reason),
+            }))
+        }
+        GovernanceDecision::Pending(_) => {
+            emit_pending_action_event(conn, pa, "pending_action.refused_destination_pending", None);
+            Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: format!(
+                    "destination write into {to_ns} requires approval that was not granted"
+                ),
+            }))
+        }
+    }
+}
+
 pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Option<String>> {
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #962 typed envelope — 404 NOT_FOUND.
@@ -19936,20 +20139,62 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
     }
     let memory_id = match pa.action_type.as_str() {
         "store" => {
-            let mut mem: Memory = serde_json::from_value(pa.payload.clone()).map_err(|e| {
-                // #962 typed envelope.
-                anyhow::Error::new(StorageError::InvalidArgument {
-                    reason: format!("invalid store payload: {e}"),
-                })
-            })?;
-            // Stamp fresh id + timestamps so the execution is idempotent on replay.
-            mem.id = uuid::Uuid::new_v4().to_string();
-            let now = Utc::now().to_rfc3339();
-            mem.created_at.clone_from(&now);
-            mem.updated_at = now;
-            mem.access_count = 0;
-            let actual_id = insert(conn, &mem)?;
-            Some(actual_id)
+            // #3202 Fable HIGH — destination-namespace Approve on vertical
+            // promote evaluates the STORE-class write gate (correct: a clone
+            // is a write into `to_ns`) so `queue_pending_action` records
+            // action_type="store" with payload `{id, to_namespace, mode:
+            // "vertical"}`. That is NOT a `Memory`. Pre-fix this arm
+            // `from_value::<Memory>`'d it, the Approve path never cloned,
+            // and the queued row was a dead letter. Dispatch vertical
+            // payloads onto `promote_to_namespace`; leave a real store
+            // payload on the Memory-insert path.
+            let is_vertical_promote =
+                pa.payload.get("mode").and_then(|v| v.as_str()) == Some("vertical");
+            if is_vertical_promote {
+                let mid = pa.memory_id.clone().or_else(|| {
+                    pa.payload
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                });
+                let to_ns = pa
+                    .payload
+                    .get(field_names::TO_NAMESPACE)
+                    .and_then(|v| v.as_str());
+                match (mid, to_ns) {
+                    (Some(mid), Some(to_ns)) => {
+                        let clone_id = promote_to_namespace(
+                            conn,
+                            &mid,
+                            to_ns,
+                            Some(pa.requested_by.as_str()),
+                        )?;
+                        Some(clone_id)
+                    }
+                    _ => {
+                        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                            reason:
+                                "vertical promote pending-store payload missing id or to_namespace"
+                                    .into(),
+                        }));
+                    }
+                }
+            } else {
+                let mut mem: Memory = serde_json::from_value(pa.payload.clone()).map_err(|e| {
+                    // #962 typed envelope.
+                    anyhow::Error::new(StorageError::InvalidArgument {
+                        reason: format!("invalid store payload: {e}"),
+                    })
+                })?;
+                // Stamp fresh id + timestamps so the execution is idempotent on replay.
+                mem.id = uuid::Uuid::new_v4().to_string();
+                let now = Utc::now().to_rfc3339();
+                mem.created_at.clone_from(&now);
+                mem.updated_at = now;
+                mem.access_count = 0;
+                let actual_id = insert(conn, &mem)?;
+                Some(actual_id)
+            }
         }
         "delete" => {
             if let Some(mid) = pa.memory_id.clone() {
@@ -19966,8 +20211,14 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                     .get(field_names::TO_NAMESPACE)
                     .and_then(|v| v.as_str())
                 {
-                    // Vertical promotion to ancestor.
-                    let clone_id = promote_to_namespace(conn, &mid, to_ns)?;
+                    // #3202 Fable HIGH (2) — SOURCE Promote:Approve queues
+                    // this arm BEFORE the destination Store gate ran, so
+                    // execute must re-evaluate dest write (no queue: an
+                    // Approve here would insert a second pending). Deny or
+                    // still-Pending ⇒ refuse; do not clone into a forbidden ns.
+                    refuse_unapproved_destination_store(conn, &pa, to_ns)?;
+                    let clone_id =
+                        promote_to_namespace(conn, &mid, to_ns, Some(pa.requested_by.as_str()))?;
                     Some(clone_id)
                 } else {
                     // Tier bump to long + clear expiry.
@@ -23466,6 +23717,57 @@ mod tests {
             term_count <= MAX_FTS_OR_TERMS,
             "OR-tree must be clamped to MAX_FTS_OR_TERMS ({MAX_FTS_OR_TERMS}), got {term_count}"
         );
+    }
+
+    /// #3171 — the DESTRUCTIVE forget path REFUSES a pattern the clamping
+    /// sanitiser would have silently WIDENED, instead of deleting rows the
+    /// caller never named.
+    ///
+    /// `sanitize_fts_query` is a clamping sanitiser: it drops a token that
+    /// sanitises to empty, drops a standalone FTS5 boolean operator, and
+    /// `.take(MAX_FTS_OR_TERMS)`s the rest. On a ranked READ that is the right
+    /// trade — fewer, broader hits. On forget, FTS5 implicit-AND means every
+    /// dropped token is a dropped NARROWING conjunct, so the match set (and
+    /// therefore the DELETE) becomes strictly wider than the pattern the
+    /// caller wrote and the schema promised. Silently deleting unnamed rows is
+    /// unrecoverable data loss, so the destructive builder fails closed.
+    #[test]
+    fn forget_fts_query_refuses_instead_of_widening_3171() {
+        // A token that sanitises to nothing would have been dropped, turning
+        // `alpha "*" beta` into `"alpha" "beta"` — a wider match set.
+        let err = forget_fts_query("alpha *** beta").expect_err("refused");
+        assert!(
+            err.to_string().contains("sanitises to nothing"),
+            "got: {err}"
+        );
+        // A standalone FTS5 boolean operator is stripped by the read
+        // sanitiser; on forget that silently drops a conjunct.
+        for op in ["AND", "or", "NoT", "near"] {
+            let err = forget_fts_query(&format!("alpha {op} beta")).expect_err("refused");
+            assert!(err.to_string().contains("boolean operator"), "{op}: {err}");
+        }
+        // Over the term cap, the clamp would drop the tail conjuncts.
+        let huge = (0..MAX_FTS_OR_TERMS + 1)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let err = forget_fts_query(&huge).expect_err("refused");
+        assert!(err.to_string().contains("over the"), "got: {err}");
+        // A pattern that is empty after sanitisation would have matched
+        // EVERYTHING rather than nothing.
+        for empty in ["", "   ", "\u{200b}"] {
+            assert!(
+                forget_fts_query(empty).is_err(),
+                "an empty-after-sanitisation pattern must refuse, not widen"
+            );
+        }
+        // CONTROL: a well-formed multi-token pattern still builds the #1601
+        // implicit-AND phrase query, unchanged.
+        assert_eq!(
+            forget_fts_query("alpha beta").expect("ok"),
+            "\"alpha\" \"beta\""
+        );
+        assert_eq!(forget_fts_query("al-pha").expect("ok"), "\"al-pha\"");
     }
 
     #[test]
@@ -27769,6 +28071,106 @@ mod tests {
         assert_eq!(mem.reflection_depth, 1, "depth = max(source depths) + 1");
         // The substrate stamps `metadata.agent_id` from the input.agent_id field.
         assert_eq!(mem.metadata["agent_id"], "alice");
+    }
+
+    /// #3202 Fable HIGH — a STORE-class destination Approve on vertical
+    /// promote must clone via `promote_to_namespace`, not
+    /// `from_value::<Memory>` the `{id, to_namespace, mode:"vertical"}`
+    /// payload.
+    #[test]
+    fn test_execute_store_arm_vertical_promote_clones_3202() {
+        let conn = test_db();
+        let src = make_memory("src-vert", "parent/child", Tier::Mid, 5);
+        let src_id = insert(&conn, &src).unwrap();
+        let payload = serde_json::json!({
+            "id": src_id,
+            (field_names::TO_NAMESPACE): "parent",
+            "mode": "vertical",
+        });
+        let pending_id = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            "parent",
+            None,
+            "alice",
+            &payload,
+        )
+        .unwrap();
+        assert!(decide_pending_action(&conn, &pending_id, true, "approver").unwrap());
+        let result =
+            execute_pending_action(&conn, &pending_id).expect("vertical store-arm execute ok");
+        let clone_id = result.expect("vertical promote must return the clone id");
+        assert_ne!(clone_id, src_id, "clone is a new row");
+        let clone = get(&conn, &clone_id).unwrap().expect("clone landed");
+        assert_eq!(clone.namespace, "parent");
+        assert_eq!(clone.title, "src-vert");
+        let source = get(&conn, &src_id).unwrap().expect("source untouched");
+        assert_eq!(source.namespace, "parent/child");
+    }
+
+    /// #3202 Fable HIGH (2) — an already-approved SOURCE `promote` pending
+    /// must not clone into a destination whose `write` policy refuses the
+    /// requester. Pre-fix this arm called `promote_to_namespace` with no
+    /// dest evaluation.
+    #[test]
+    fn test_execute_promote_arm_destination_owner_refuses_3202() {
+        use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
+        let _modeg = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
+        let conn = test_db();
+        let mut dest_std = make_memory("dest-std", "parent", Tier::Mid, 5);
+        dest_std.metadata = serde_json::json!({"agent_id": "alice"});
+        let dest_std_id = insert(&conn, &dest_std).unwrap();
+        let dest_policy = serde_json::to_value(GovernancePolicy {
+            core: CorePolicy {
+                write: GovernanceLevel::Owner,
+                ..CorePolicy::default()
+            },
+            ..GovernancePolicy::default()
+        })
+        .unwrap();
+        set_row_metadata(
+            &conn,
+            &dest_std_id,
+            &serde_json::json!({"agent_id": "alice", "governance": dest_policy}).to_string(),
+        )
+        .unwrap();
+        set_namespace_standard(&conn, "parent", &dest_std_id, None).unwrap();
+
+        let mut src = make_memory("src-vert-deny", "parent/child", Tier::Mid, 5);
+        src.metadata = serde_json::json!({"agent_id": "bob"});
+        let src_id = insert(&conn, &src).unwrap();
+        let payload = serde_json::json!({
+            "id": src_id,
+            (field_names::TO_NAMESPACE): "parent",
+        });
+        let pending_id = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Promote,
+            "parent/child",
+            Some(&src_id),
+            "bob",
+            &payload,
+        )
+        .unwrap();
+        assert!(decide_pending_action(&conn, &pending_id, true, "approver").unwrap());
+        let err = execute_pending_action(&conn, &pending_id)
+            .expect_err("dest write:Owner must refuse bob's clone");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not the owner") || msg.contains("denied"),
+            "expected dest-deny message, got: {msg}"
+        );
+        let dest_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = 'parent' AND title = 'src-vert-deny'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dest_count, 0, "refused execute must not land the clone");
     }
 
     /// S5-H4 — a queued payload whose `agent_id` does NOT match

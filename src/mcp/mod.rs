@@ -47,6 +47,13 @@ pub mod server_identity;
 // `src/mcp/` is allowlist-pinned by `tests/mcp_param_names_invariant.rs`.
 pub mod param_names;
 
+// #3171 — fail-closed boundary guards for `tools/call` argument
+// extraction. There is NO runtime JSON-Schema validation on the MCP
+// path, so a value contradicting the advertised schema silently takes
+// the handler's fallback branch (empty-success / filter dropped /
+// negative-as-absent / stringy-bool). These helpers refuse instead.
+pub mod param_guard;
+
 // #1558 batch 3 — JSON-RPC 2.0 wire-layer SSOT: version tag, reserved
 // error codes, method names, MCP protocol revision.
 pub mod jsonrpc;
@@ -213,8 +220,23 @@ fn audit_emit_for_mcp_dispatch(
 /// L1 capture-nag observer so both key on the same identity.
 fn resolve_mcp_agent_id(arguments: &Value, mcp_client: Option<&str>) -> String {
     arguments
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(Value::as_str)
+        // #3171 / #3204 item 4 — VALIDATE the wire value before it lands in
+        // the enterprise-audit `actor` field. This is the one site where an
+        // UNVALIDATED, arbitrary caller string reached the SIEM emitter, in
+        // two ways: a value carrying newlines / control characters is a
+        // log-injection vector into the audit record for every
+        // store/update/delete/promote/forget/link/consolidate/approve/reject
+        // call, and — because the shape gate alone does not reject them — a
+        // RESERVED sentinel (`daemon`, `system`, …) let a wire caller stamp
+        // the audit row with the internal principal that downstream gates
+        // carve out as "the internal path is exempt". The full
+        // `validate_agent_id` (#977) closes both: it runs the shape gate AND
+        // rejects every `RESERVED_AGENT_IDS` member. An invalid value falls
+        // through to the synthesized client id exactly like an absent one, so
+        // the audit row names an unforgeable id rather than a forged one.
+        .filter(|id| crate::validate::validate_agent_id(id).is_ok())
         .map(str::to_string)
         .unwrap_or_else(|| {
             mcp_client
@@ -619,7 +641,8 @@ pub(crate) use namespace::authorize_namespace_standard_parent;
 // regression at `tests/issue_1326_*.rs` can pin the surface without
 // stdio JSON-RPC scaffolding.
 pub use namespace::{
-    handle_namespace_clear_standard, handle_namespace_get_standard, handle_namespace_set_standard,
+    handle_namespace_clear_standard, handle_namespace_clear_standard_trusted,
+    handle_namespace_get_standard, handle_namespace_set_standard,
     handle_namespace_set_standard_trusted,
 };
 pub use notify::{handle_inbox, handle_notify};
@@ -2732,17 +2755,21 @@ fn dispatch_memory_skill_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 /// (explicit > metadata.agent_id > `mcp_client` > host fallback) so
 /// the substrate row is correctly attributed.
 fn dispatch_memory_offload(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #3171 — `metadata.agent_id` was a SECOND, undeclared identity channel
+    // for the same value on a tool that has no `metadata` input at all, so no
+    // schema-conformant caller could ever reach it. Dropped; `agent_id` is now
+    // a declared field.
     let explicit_agent_id = ctx
         .arguments
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            ctx.arguments
-                .get("metadata")
-                .and_then(|m| m.get("agent_id"))
-                .and_then(Value::as_str)
-        });
-    match crate::identity::resolve_agent_id(explicit_agent_id, ctx.mcp_client) {
+        .get(param_names::AGENT_ID)
+        .and_then(Value::as_str);
+    // #3171 — this id is the OWNER STAMP on `offloaded_blobs.agent_id`, and its
+    // read twin (`memory_deref`) gates on `caller == agent_id`. Both being
+    // caller-chosen makes the SEC-4 gate inert in BOTH directions, so bind the
+    // stamp to the enforced-read caller under the multi-tenant posture
+    // (single-operator default unchanged).
+    match crate::identity::resolve_governance_subject(explicit_agent_id, ctx.mcp_client, "offload")
+    {
         Ok(agent_id) => offload::handle_offload(ctx.conn, ctx.arguments, &agent_id),
         Err(e) => Err(e.to_string()),
     }
@@ -2753,17 +2780,22 @@ fn dispatch_memory_offload(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 /// refuse cross-agent leaks (NotFound, leak-resistant). Mirrors the
 /// `memory_offload` shape.
 fn dispatch_memory_deref(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #3171 — `metadata.agent_id` was a SECOND, undeclared identity channel
+    // for the same value on a tool that has no `metadata` input at all, so no
+    // schema-conformant caller could ever reach it. Dropped; `agent_id` is now
+    // a declared field.
     let explicit_agent_id = ctx
         .arguments
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            ctx.arguments
-                .get("metadata")
-                .and_then(|m| m.get("agent_id"))
-                .and_then(Value::as_str)
-        });
-    match crate::identity::resolve_agent_id(explicit_agent_id, ctx.mcp_client) {
+        .get(param_names::AGENT_ID)
+        .and_then(Value::as_str);
+    // #3171 — `ContextOffloader::deref`'s SEC-4 IDOR gate is literally
+    // `if caller_agent_id != blob.agent_id { NotFound }`, and its source note
+    // asserts "the MCP `handle_deref` handler always passes an AUTHENTICATED
+    // `caller_agent_id`" — which was false: the value came verbatim from the
+    // request body (or `metadata.agent_id`), so the gate compared the blob's
+    // owner against a string the caller supplied. Bind it to the enforced-read
+    // caller under the multi-tenant posture; single-operator default unchanged.
+    match crate::identity::resolve_governance_subject(explicit_agent_id, ctx.mcp_client, "deref") {
         Ok(agent_id) => offload::handle_deref(ctx.conn, ctx.arguments, &agent_id),
         Err(e) => Err(e.to_string()),
     }
@@ -3324,11 +3356,35 @@ fn handle_request(
             let _enter = span.enter();
             let started = Instant::now();
 
+            // #3204 item 4 — a PRESENT but non-object `arguments` is a
+            // protocol violation, not "no arguments". Coercing it to `{}`
+            // meant `{"arguments": "namespace=acme"}` (or an array, or a
+            // number) silently ran the tool with EVERY argument absent: a
+            // destructive tool then took its unscoped defaults, and a
+            // schema-required field took whatever fallback its handler had.
+            // MCP 2025-03-26 puts malformed request STRUCTURE in the
+            // envelope-level error channel, so refuse with -32602. An ABSENT
+            // `arguments` still means "no arguments" (the documented default
+            // for tools whose fields are all optional).
             let empty_obj = json!({});
-            let arguments = if req.params["arguments"].is_object() {
-                &req.params["arguments"]
-            } else {
-                &empty_obj
+            let arguments = match &req.params["arguments"] {
+                v if v.is_object() => v,
+                Value::Null => &empty_obj,
+                other => {
+                    return err_response(
+                        id,
+                        jsonrpc::INVALID_PARAMS,
+                        format!(
+                            "tools/call `arguments` must be a JSON object, got {}",
+                            match other {
+                                Value::Array(_) => "an array",
+                                Value::String(_) => "a string",
+                                Value::Bool(_) => "a boolean",
+                                _ => "a number",
+                            }
+                        ),
+                    );
+                }
             };
 
             // v0.7.0 #1389 / #1398 L1 — observe this call against the
@@ -7880,6 +7936,63 @@ mod tests {
         assert_eq!(err.code, -32602);
     }
 
+    /// #3204 item 4 — a PRESENT-but-non-object `arguments` is a protocol
+    /// violation, not "no arguments". Coercing it to `{}` ran the tool with
+    /// every argument absent (a destructive tool took its unscoped defaults).
+    #[test]
+    fn tools_call_non_object_arguments_is_minus_32602_3204() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        for arguments in [
+            json!("namespace=acme"),
+            json!(["namespace", "acme"]),
+            json!(1),
+            json!(true),
+        ] {
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(1)),
+                method: "tools/call".into(),
+                params: json!({ "name": "memory_list", "arguments": arguments }),
+            };
+            let resp = invoke_handle_request(&conn, &req);
+            let err = resp.error.expect("non-object arguments must be -32602");
+            assert_eq!(err.code, jsonrpc::INVALID_PARAMS, "{arguments}");
+            assert!(err.message.contains("JSON object"), "got: {}", err.message);
+        }
+    }
+
+    /// #3204 item 4 — an ABSENT `arguments` still means "no arguments".
+    #[test]
+    fn tools_call_absent_arguments_means_empty_object_3204() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({ "name": "memory_list" }),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        assert!(
+            resp.error.is_none(),
+            "absent arguments must still dispatch; got {:?}",
+            resp.error
+        );
+    }
+
+    /// #3204 item 4 — a reserved sentinel must not stamp the audit actor.
+    #[test]
+    fn resolve_mcp_agent_id_rejects_reserved_sentinel_3204() {
+        let forged = resolve_mcp_agent_id(&json!({"agent_id": "daemon"}), Some("claude"));
+        assert_eq!(
+            forged, "ai:claude",
+            "reserved sentinel must fall through to the synthesized client id"
+        );
+        let ok = resolve_mcp_agent_id(&json!({"agent_id": "alice"}), None);
+        assert_eq!(ok, "alice");
+        let newline = resolve_mcp_agent_id(&json!({"agent_id": "a\nb"}), Some("claude"));
+        assert_eq!(newline, "ai:claude");
+    }
+
     #[test]
     fn test_jsonrpc_handles_unknown_tool_returns_minus_32601() {
         // Ultrareview #349: unknown tool = method-not-found, not isError.
@@ -12394,16 +12507,22 @@ mod tests {
     fn handle_quota_status_without_agent_id_returns_list_envelope() {
         // Exercises the `else` arm — bulk-list over all quota rows.
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        // Seed two distinct agent rows by asking for them first; the
-        // substrate auto-inserts zero-usage on lookup, populating the list.
-        let _ = invoke_handle_request(
+        // #3171 — peek is read-only; seed via a real write so the list
+        // envelope is non-empty.
+        crate::quotas::record_op(
             &conn,
-            &make_tools_call("memory_quota_status", json!({"agent_id": "agent-a"})),
-        );
-        let _ = invoke_handle_request(
+            "agent-a",
+            crate::quotas::GLOBAL_NAMESPACE,
+            crate::quotas::QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        crate::quotas::record_op(
             &conn,
-            &make_tools_call("memory_quota_status", json!({"agent_id": "agent-b"})),
-        );
+            "agent-b",
+            crate::quotas::GLOBAL_NAMESPACE,
+            crate::quotas::QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
         let req = make_tools_call("memory_quota_status", json!({}));
         let resp = invoke_handle_request(&conn, &req);
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);

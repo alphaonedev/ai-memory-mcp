@@ -504,19 +504,16 @@ pub fn handle_routine_status(conn: &rusqlite::Connection, params: &Value) -> Res
 /// newest-first, optionally narrowed by `state`, capped at `limit` (default 50).
 ///
 /// # Errors
-/// Returns an error string when `namespace` is missing, or the stringified
-/// `rusqlite` error on query failure.
+/// Returns `"namespace is required"` when `namespace` is missing/blank,
+/// `"invalid state: .."` when the `state` filter names no known variant
+/// (#3171), or the stringified `rusqlite` error on query failure.
 pub fn handle_routine_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let namespace = params
-        .get(param_names::NAMESPACE)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "namespace is required".to_string())?;
-    let state = params
-        .get(param_names::STATE)
-        .and_then(Value::as_str)
-        .and_then(RoutineState::from_str);
+    let namespace = crate::mcp::param_guard::require_str(params, param_names::NAMESPACE)?;
+    // #3171 — an UNKNOWN `state` used to DROP the filter and return every
+    // routine, including FROZEN ones a caller filtering for `draft` must not
+    // treat as editable. Reject the unknown discriminant instead.
+    let state =
+        crate::mcp::param_guard::optional_enum(params, param_names::STATE, RoutineState::from_str)?;
     let limit = params
         .get(param_names::LIMIT)
         .and_then(Value::as_i64)
@@ -577,6 +574,11 @@ pub struct RoutineRunRequest {
 
     /// Concrete `{{param}} -> value` bindings substituted into the template.
     pub arguments: Value,
+
+    /// #3171 — legacy alias for `routine_id`. Honoured but undeclared until
+    /// the tool-contract audit; prefer `routine_id`.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// v0.8.0 Pillar 1 (#1709) — request body for `memory_routine_status`.
@@ -584,6 +586,11 @@ pub struct RoutineRunRequest {
 #[allow(dead_code)]
 pub struct RoutineStatusRequest {
     pub run_id: String,
+
+    /// #3171 — legacy alias for `run_id`. Honoured but undeclared until the
+    /// tool-contract audit; prefer `run_id`.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// v0.8.0 Pillar 1 (#1709) — request body for `memory_routine_list`.
@@ -1044,5 +1051,26 @@ mod handler_tests {
         let drafts = handle_routine_list(&conn, &json!({ "namespace": "_rt", "state": "draft" }))
             .expect("list drafts");
         assert_eq!(drafts["routines"].as_array().expect("array").len(), 1);
+    }
+
+    /// #3171 — an UNKNOWN `state` filter is REFUSED. Pre-fix it dropped
+    /// the filter and returned FROZEN routines to a caller that asked
+    /// for `draft` only — routines it must not treat as editable.
+    #[test]
+    fn routine_list_refuses_unknown_state_3171() {
+        let conn = fresh();
+        handle_routine_create(&conn, &json!({ "namespace": "_rt", "name": "a" }))
+            .expect("create a");
+        let e = handle_routine_list(&conn, &json!({ "namespace": "_rt", "state": "frozenn" }))
+            .expect_err("unknown state refused");
+        assert_eq!(e, "invalid state: frozenn");
+        let e = handle_routine_list(&conn, &json!({ "namespace": "_rt", "state": true }))
+            .expect_err("non-string state refused");
+        assert_eq!(e, "invalid state: expected a string");
+        let e = handle_routine_list(&conn, &json!({})).expect_err("ns required");
+        assert_eq!(e, "namespace is required");
+        // CONTROL: absent filter still lists everything.
+        let all = handle_routine_list(&conn, &json!({ "namespace": "_rt" })).expect("all");
+        assert_eq!(all["routines"].as_array().expect("array").len(), 1);
     }
 }

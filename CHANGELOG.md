@@ -563,6 +563,290 @@ backend and missing or divergently implemented on its twin). Pinned by
   (`mkdir(2)`-time) and refuse an existing directory whose `mode & 0o022 !=
   0`. A merely group-readable `0o755` directory (default `umask 022`) is
   still accepted — directory read does not enable the swap.
+### Security (MCP tool-contract audit: schema-vs-handler drift — fail-open shapes, caller-chosen authz subjects, overclaimed docs; #3171)
+
+- **Every MCP tool's advertised contract now matches its enforced one, and a CI
+  guard keeps it that way.** Tool input schemas are `schemars`-derived from the
+  per-tool `*Request` structs, but no handler deserializes that struct — each
+  reads the raw `arguments` bag directly, and **there is no runtime JSON-Schema
+  validation on the MCP path**. Nothing coupled the two, so a value that
+  contradicted the advertised schema did not fail: it silently took the
+  handler's fallback branch. The audit of all 103 tools found four repeating
+  fail-open shapes plus a class of undeclared-but-honoured parameters.
+  - **Schema-REQUIRED string read with `unwrap_or_default()` → plausible EMPTY
+    SUCCESS.** `memory_action_frontier` / `memory_action_next` queried the `""`
+    namespace and answered "no work" (a worker fleet would idle on a typo);
+    `memory_signal_thread` threaded on `""` and answered "this thread has no
+    messages"; all four `memory_lease_*` handlers defaulted `action_id` /
+    `holder` to `""`. The lease case was the worst: `lease_acquire`'s upsert
+    guard is `expires_at <= now OR holder = ?`, so **two distinct agents that
+    each omitted `holder` both resolved to `""` and the second was treated as a
+    same-holder re-acquire — a DOUBLE GRANT of a single-holder coordination
+    lease**, defeating the invariant `crate::actions::lease_acquire` documents
+    as "never two winners". All now refuse (ERRORS-08).
+  - **Unknown enum discriminant DROPPED the filter → strictly MORE rows.**
+    `memory_checkpoint_query` (`state`, `condition_type`) and
+    `memory_routine_list` (`state`) turned a typo into "no filter", so a caller
+    asking for the still-open coordination gates got the resolved ones back too,
+    and one filtering for `draft` routines got FROZEN ones it must not treat as
+    editable. Unknown discriminants are now refused, mirroring the #3007
+    `handle_checkpoint_create` gate.
+  - **`i64`-declared integer read via `as_u64` → a schema-valid NEGATIVE read as
+    ABSENT** and silently took a server default: `memory_offload.ttl_seconds`
+    (retention-integrity — caller data kept alive longer than asked),
+    `memory_check_agent_action.byte_estimate` (write-size policy evaluated as if
+    no size had been declared), `memory_find_paths.max_depth`/`max_results` (a
+    caller asking for a NARROWER traversal got a wider one),
+    `memory_pending_list.limit`. All refuse the negative.
+  - **Boolean SAFETY flag read with `.as_bool().unwrap_or(false)`.**
+    `memory_forget` and `memory_gc` ran a REAL, irreversible delete when
+    `dry_run: "true"` / `dry_run: 1` (the shapes a hand-rolled or weakly-typed
+    client emits) requested a PREVIEW. `memory_archive_purge.as_admin` had the
+    same shape on a cross-tenant escalation switch. Present-but-non-boolean is
+    now refused; ABSENT still defaults.
+- **`memory_forget`: a bulk DELETE can no longer be silently WIDER than the
+  pattern the caller wrote.** The forget path shared `sanitize_fts_query` with
+  the ranked-read paths, which CLAMPS: it silently drops a token that sanitises
+  to empty, drops a standalone `AND`/`OR`/`NOT`/`NEAR`, and `.take(128)`s the
+  rest. Under FTS5 implicit-AND every dropped token is a dropped narrowing
+  conjunct, so the delete matched rows the caller never named — unrecoverable
+  data loss from a silent sanitiser. The destructive path now has its own
+  STRICT builder that REFUSES those inputs; read paths keep the clamp.
+- **A caller can no longer choose the principal its own request is judged as.**
+  `identity::resolve_agent_id` gives the EXPLICIT wire argument precedence over
+  the `AI_MEMORY_AGENT_ID` env identity — correct for an attribution field,
+  wrong for an authz SUBJECT. Handlers that fed a wire `params.agent_id` into
+  `Permissions::evaluate` / `enforce_governance` / a capability-token binding /
+  a quota key / an ownership predicate let the caller pick that subject, while
+  the sibling owner gate stayed keyed on the ENV caller — two controls that can
+  never agree by construction. New `identity::resolve_governance_subject`
+  generalises the shipped `handle_inbox` (#1557) / `handle_replay` (#1571)
+  pattern: under the multi-tenant posture the subject IS the enforced-read
+  caller and a disagreeing wire `agent_id` is REFUSED; the single-operator
+  default (env unset) is byte-identical. Applied to `memory_promote`,
+  `memory_kg_invalidate`, `memory_archive_purge`, `memory_pending_approve`,
+  `memory_pending_reject`, `memory_delete`, `memory_update`, `memory_store`
+  (local and forward-to-HTTP), `memory_consolidate`, `memory_link`,
+  `memory_atomise`, `memory_reflect`, `memory_offload` and `memory_deref`.
+  - `memory_pending_approve` was the sharpest: the approver id is the SUBJECT of
+    the separation-of-duties gate itself — it is compared against `requested_by`
+    to refuse self-approval, matched against the named approver, and counted as
+    the DISTINCT-vote key for `ApproverType::Consensus(n)`. Reading it from the
+    wire let one caller defeat self-approval refusal and forge a full human
+    quorum by varying the parameter across N calls.
+  - `memory_namespace_clear_standard` had TWO holes: the #1777 owner gate ran
+    only when the caller CLAIMED an identity (`params.agent_id` present), so
+    omitting an UNDECLARED optional parameter disarmed authz on the one
+    operation that disarms every other gate in the namespace — the exact
+    caller-opt-in shape #2541 had already removed from the SET twin. The gate is
+    now unconditional (the CLI keeps its out-of-band trusted entry,
+    `handle_namespace_clear_standard_trusted`). And the caller string was the
+    LEFT-HAND SIDE of the ownership predicate itself, so a caller could satisfy
+    the gate for any owned standard by naming that owner; it is now bound to the
+    enforced-read caller.
+  - `memory_deref`'s SEC-4 IDOR gate (`caller != blob.agent_id → NotFound`)
+    asserted in its own source note that the MCP handler "always passes an
+    AUTHENTICATED `caller_agent_id`". It did not — the value came verbatim from
+    the request body, so the gate compared the blob's owner against a string the
+    caller supplied. Both `memory_offload` and `memory_deref` also honoured an
+    UNDECLARED second identity channel (`metadata.agent_id`) on tools that have
+    no `metadata` input at all; it is removed. `memory_entity_register` had the
+    same second channel inside `entity_register`, where an inline
+    `metadata.agent_id` WON over the id the handler had just validated and so
+    never crossed the `RESERVED_AGENT_IDS` check (#977) — the resolved id now
+    wins.
+  - The enterprise-audit `actor` field is shape-validated before it reaches the
+    SIEM emitter. It was the one site where an arbitrary, unvalidated caller
+    string reached the audit record — a log-injection vector on every
+    store/update/delete/promote/forget/link/consolidate/approve/reject call.
+- **`memory_quota_status`: an ungated READ no longer WRITES.** It called
+  `quotas::get_status`, which `ensure_row`s, so any MCP caller could
+  `INSERT OR IGNORE` an `agent_quotas` row for an arbitrary
+  `(agent_id, namespace)` pair — an unbounded row-injection primitive that fills
+  an operator's quota census with principals that never existed. New
+  non-materialising `peek_status` / `peek_aggregate_status` twins return the
+  identical wire shape from a synthesised default; the real write paths still
+  materialise on first write, so no accounting is lost. Both parameters are now
+  validated at the boundary. `memory_ingest_multistep` gained the same missing
+  `validate_namespace`.
+- **`memory_skill_get` decompresses BOUNDED.** It was the lone skill decode site
+  still using unbounded `zstd::decode_all` while its three siblings used the
+  #1933 `decode_all_bounded` ceiling, so a hostile `skills.body_blob` row that
+  decodes to gigabytes would OOM the daemon on an activation fetch.
+- **`memory_get_links` reports `attest_level` fail-closed.** The column is
+  nullable and the field is `skip_serializing_if = "Option::is_none"`, so a NULL
+  row made the trust field VANISH from the response while the tool docs promised
+  every link carries one. It now `COALESCE`s to `"unsigned"` — the same
+  projection the reflection export already used. The postgres `get_links`
+  / `get_links_for_anchor` twins now use the same COALESCE; a NULL column
+  on a pg-backed daemon no longer drops the trust field.
+- **`memory_checkpoint_resolve` refuses blank `id` / `resolved_by`.** Both
+  are schema-REQUIRED; they were still `unwrap_or_default()`, so a blank
+  resolver was persisted as attribution. They now go through
+  `param_guard::require_str`. The handler-reads⊆schema guard now matches
+  `param_guard::*(params, KEY)` and scans `src/mcp/mod.rs`. Quota list
+  tests now seed via `record_op` (peek no longer INSERT-on-read). C5
+  trimmed full-profile ceiling 6750 → 7650 (measured 7567).
+
+### Security (governance gates that were missing or pointed at the wrong namespace; #3202, #3204 items 4 and 7)
+
+- **`memory_promote` now governs the DESTINATION namespace, not only the source
+  (#3202).** Vertical promotion CLONES the row into `to_namespace`, i.e. it is a
+  WRITE into that namespace — but the Task-1.9 block evaluated
+  `GovernedAction::Promote` against the SOURCE namespace, and the destination
+  received nothing beyond `reject_reserved_write_namespace`. An operator who set
+  `write: Owner` (or `Approve`) on an ancestor namespace still had every row a
+  caller could read from a descendant clonable into it, and the ancestor is
+  normally the MORE protected namespace — so the governance boundary was
+  crossable by construction. A STORE-class `enforce_governance` now runs against
+  `to_namespace` before the clone (Deny refuses, Approve queues exactly as a
+  direct `memory_store` into that namespace would). Fable HIGH on #3220: that
+  queue recorded `action_type="store"` with payload `{id, to_namespace,
+  mode:"vertical"}`, and `execute_pending_action`'s store arm
+  `from_value::<Memory>`'d it — Approve never cloned. The store arm now
+  dispatches a `mode=vertical` payload onto `promote_to_namespace`. The
+  SOURCE Promote gate used to run FIRST, so `promote: Approve` queued a
+  `"promote"` pending whose execute arm cloned with no dest evaluation
+  (source Approve + dest write:Owner/Deny landed the clone). Dest Store
+  now runs first on MCP and CLI; the promote execute arm re-evaluates dest
+  write without queueing and refuses Deny/still-Pending. The
+  forensic row is chained
+  under the DESTINATION, and the clone's provenance is RE-STAMPED: it was
+  carrying `source.metadata` verbatim, so the new row was owned by the source's
+  author rather than the caller that put it there and nothing in the row
+  recorded its origin. The acting caller becomes the clone's `agent_id`; the
+  original authorship is PRESERVED under `promoted_from_agent_id` alongside
+  `promoted_from` / `promoted_from_namespace` / `promoted_at`, so the durable
+  truth is added to, never replaced. `promote_to_namespace` takes the acting
+  caller explicitly, so the MCP, CLI and approved-pending-action lanes each
+  attribute the clone correctly. Surface audit: MCP and CLI both gained the
+  destination gate; HTTP has no exposure (`handlers/memories.rs` hard-codes
+  `to_namespace: None`); postgres has no `promote_to_namespace` twin, so
+  vertical promotion is sqlite-only.
+- **`memory_gc` is no longer the one ungated destructive tool (#3204 item 7).**
+  It reached the substrate with no permission gate, no governance consult and no
+  forensic row, while its sibling `memory_archive_purge` carries all three —
+  even though gc deletes across EVERY namespace and EVERY owner, and with
+  `archive_on_gc` off that delete is a permanent hard-delete + crypto-erase.
+  A real sweep now clears three gates: a K9 `Permissions::evaluate` (op chosen by
+  disposition — `MemoryArchive` for an archiving sweep, `MemoryDelete` for a
+  reaping one) evaluated at the default namespace with `namespace_pattern = "**"`
+  scoping, the #1849 bulk-delete governance rule on the DESTRUCTIVE disposition
+  (refuse the sweep if any namespace holding reapable rows carries a non-`Any`
+  `delete` level — otherwise a `delete: Approve` legal-hold is no defence at all,
+  since the held rows simply expire and vanish on the next tick, with no approval
+  and no trace), and an `allow` forensic row chained before the write. The
+  governance refusal deliberately does NOT apply to an ARCHIVING sweep: the row
+  moves to `archived_memories` and `memory_archive_restore` recovers it, so the
+  hold is not defeated, and refusing there would strand expired rows in every
+  deployment with any delete-governed namespace — a reliability cost with no
+  integrity benefit. `dry_run` stays ungated so an operator can always SEE what
+  would be reaped. A `Decision::Ask` REFUSES here rather than returning the
+  success-shaped `{status:"ask"}` envelope its sibling returns; a success-shaped
+  body on an unperformed destructive op is itself one of the findings above.
+- **A non-object `tools/call` `arguments` is now `-32602`, not `{}` (#3204
+  item 4).** Coercing it meant `{"arguments": "namespace=acme"}` (or an array, or
+  a number) silently ran the tool with EVERY argument absent — a destructive tool
+  then took its unscoped defaults and a schema-required field took its handler
+  fallback. An ABSENT `arguments` still means "no arguments".
+- **The audit actor rejects RESERVED sentinels (#3204 item 4).** The shape gate
+  alone does not reject them, so a wire caller could stamp the enterprise-audit
+  `actor` with `daemon` / `system` — the internal principals downstream gates
+  carve out as "the internal path is exempt". `resolve_mcp_agent_id` now applies
+  the full `validate_agent_id` (#977).
+
+### Added (MCP tool-contract SSOT: declared parameters, exception mechanisms, and a handler-reads guard; #3171)
+
+- **26 parameters that handlers already honoured are now DECLARED** on their
+  `*Request` structs, so a schema-conformant client can discover them instead of
+  needing to read the source: `agent_id` on `memory_delete`, `memory_update`,
+  `memory_link`, `memory_atomise`, `memory_get`, `memory_recall`,
+  `memory_session_start`, `memory_promote`, `memory_kg_invalidate`,
+  `memory_archive_purge`, `memory_offload`, `memory_deref`,
+  `memory_pending_approve`, `memory_pending_reject`, `memory_skill_get`,
+  `memory_skill_register`, `memory_skill_promote_from_reflection` and the two
+  namespace-standard tools; `as_admin` on `memory_archive_purge`;
+  `caller_agent_id` on `memory_agent_register`; `source_uri` on `memory_search`;
+  `as_agent` on `memory_kg_query`; `citations` / `source_span` on `memory_store`
+  (parsed, validated and persisted since #1421, never advertised); `signature` /
+  `resolved_at` on `memory_checkpoint_resolve`; and the legacy `id` /
+  `kind_inner` aliases on `memory_routine_run`, `memory_routine_status` and
+  `memory_check_agent_action`.
+- **New CI guard `tests/mcp_handler_params_subset_of_schema.rs` closes the class
+  permanently.** It parses every `params["k"]` / `params.get(param_names::K)`
+  read in `src/mcp/tools/`, resolves the constants against the `param_names`
+  SSOT, and asserts the read set is a SUBSET of the properties declared by the
+  tools implemented in the same module unit. The pre-existing pins compared
+  schema against its own past SNAPSHOT and were structurally unable to see any
+  of these defects.
+- **The D1.6 (#987) registry pin gained explicit, documented exception tables**
+  — `PROPERTY_ADDITIONS`, `PROPERTY_REMOVALS`, `DOCS_CORRECTIONS`,
+  `DESCRIPTION_CORRECTIONS` — replacing two inline `if name == …` special cases.
+  The pin previously forbade property REMOVALS outright with no escape hatch,
+  which meant a property the audit proved to be a lie could not be retired even
+  when leaving it advertised was itself the defect; `PROPERTY_REMOVALS` carries
+  the three-condition safety contract such a removal must satisfy and is
+  deliberately EMPTY at #3171 (every ignored parameter was corrected by
+  documenting the truth rather than by breaking the wire contract). The
+  property-key pin now reports EVERY drifting tool in one run instead of
+  fail-fast on the alphabetically-first, and each correction table asserts the
+  text actually changed so a stale entry fails the build rather than silently
+  unpinning a tool.
+- `param_names` SSOT census 133 -> 135: `AS_ADMIN` and `PIPELINE_VARIANT`, both
+  honoured but read as bare literals until the audit.
+- **Verbose tool-catalog token ceiling 25_000 → 28_000**, hoisted to the SSOT
+  `crate::sizes::VERBOSE_FULL_PROFILE_CEILING_TOKENS` (was five duplicated
+  `25_000` pins). The honest-docs rewrite + 26 newly declared properties
+  measured 26_691 cl100k on the verbose drill-down; the trimmed `tools/list`
+  wire is unchanged and still under 11_000. rust-1.98: one named const.
+
+### Fixed (MCP tool descriptions that overclaimed or omitted destructive behaviour; #3171)
+
+- Long-form `docs()` is stripped from the wire `tools/list` payload, so these
+  corrections cost zero tokens — but an agent that trusts "archives first" and
+  gets a crypto-erase has lost data on the strength of our documentation.
+  - `memory_gc` claimed "archives first" unconditionally; archiving is
+    conditional on `archive_on_gc`, and with it OFF the sweep is a permanent
+    hard-delete + crypto-erase. The response now carries `archived` so a caller
+    can tell a recoverable move from an unrecoverable erase (previously it could
+    not), and the docs disclose that the sweep is substrate-wide and ungated,
+    also prunes the `recall_observations` ledger and expired signals, and — per
+    #3161 — does not archive link edges.
+  - `memory_signal_inbox` returns UNACKED signals only; `memory_stats` has no
+    archive counts at all (the docs claimed them); `memory_skill_get`'s
+    "<5000 tok" was never enforced and every fetch APPENDS a `skill.invoked`
+    signed-events row (this "read" is audited and not side-effect free);
+    `memory_pending_list`'s "status filter (default pending)" was false —
+    omitting `status` returns EVERY status; `memory_recall` silently clamps
+    `limit` to 50; `memory_list` defaults to `toon_compact`, not JSON;
+    `memory_kg_invalidate` is NOT idempotent when `valid_until` is omitted and
+    PERMANENTLY clears a signed link's signature and attest level;
+    `memory_archive_purge` defaults to CALLER-ONLY scope and returns a
+    success-shaped `{status:"ask"}` envelope with nothing purged under an Ask
+    rule; `memory_delete` and `memory_promote` accept a unique ID PREFIX;
+    `memory_forget` is silently owner-scoped under `AI_MEMORY_AGENT_ID` and its
+    owner predicate also matches UNOWNED rows; `memory_entity_register` merges
+    aliases only — `metadata` and `agent_id` are discarded on the idempotent
+    path; `memory_ingest_multistep` never populates `ingested_memory_ids` and
+    stores nothing.
+  - Two asymmetries are now DISCLOSED rather than silently carried:
+    `memory_skill_delete` has NO admin gate on the MCP path while its HTTP twin
+    requires the admin role, and the `memory_lease_*` tools decide ownership
+    entirely from a self-asserted `holder` string (they receive no caller
+    identity), so "an owned lease … held by the caller" was not enforced.
+  - Three declared-but-never-read parameters are marked **IGNORED** rather than
+    removed (removing a field a client already sends is itself an unannounced
+    contract change): `memory_signal_send.from_agent` (discarded since #2996 —
+    authorship binds to the signing keypair), `memory_capture_turn.tool_calls`
+    ("preserved verbatim" was false; nothing persists it) and
+    `memory_calibrate_confidence.output_format` (read by no handler on any
+    surface).
+  - The `# Errors` rustdoc on `memory_verify` and `memory_reflection_origin`
+    claimed the dispatcher returns JSON-RPC `-32602`; per the MCP 2025-03-26
+    tool-result convention a handler error is a SUCCESSFUL result carrying
+    `isError: true`, so a client switching on the error code would never see
+    them. `docs/USER_GUIDE.md`'s `memory_get_links` example showed a `signed_at`
+    field that exists nowhere and a `signature` key that is never emitted.
 
 ### Changed
 

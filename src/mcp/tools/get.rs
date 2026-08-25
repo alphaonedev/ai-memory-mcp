@@ -17,6 +17,12 @@ use serde_json::{Value, json};
 pub struct GetRequest {
     /// Memory ID.
     pub id: String,
+
+    /// #3171 — read-governance actor (single-tenant fallback; the resolved
+    /// caller wins when present). Honoured but undeclared until the
+    /// tool-contract audit.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_get`.

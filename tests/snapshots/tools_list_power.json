@@ -16,6 +16,7 @@
               "null"
             ]
           },
+          "citations": {},
           "confidence": {
             "format": "double",
             "type": [
@@ -94,6 +95,7 @@
               "null"
             ]
           },
+          "source_span": {},
           "source_uri": {
             "type": [
               "string",
@@ -158,6 +160,13 @@
           }
         },
         "properties": {
+          "agent_id": {
+            "title": "3171 — read-governance actor (single-tenant fallback; the resolved",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "as_agent": {
             "type": [
               "string",
@@ -331,6 +340,13 @@
           "query": {
             "type": "string"
           },
+          "source_uri": {
+            "title": "3171 — exact `source_uri` filter (honoured but undeclared until the",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "tier": {
             "type": [
               "string",
@@ -484,6 +500,13 @@
       "description": "Get a specific memory by ID,",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — read-governance actor (single-tenant fallback; the resolved",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           }
@@ -743,6 +766,13 @@
       "description": "Decompose a memory into 2-10",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — the id stamped as the owner/actor on every minted atom and",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "force_re_atomise": {
             "type": [
               "boolean",
@@ -1135,7 +1165,7 @@
       "name": "memory_signal_read"
     },
     {
-      "description": "List signals for a",
+      "description": "List UNACKED signals for a",
       "inputSchema": {
         "properties": {
           "limit": {
@@ -1251,8 +1281,23 @@
               "null"
             ]
           },
+          "resolved_at": {
+            "format": "int64",
+            "title": "3171 / #3007 — the exact `resolved_at` (epoch seconds) the",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "resolved_by": {
             "type": "string"
+          },
+          "signature": {
+            "title": "3171 / #3007 — the resolver's DETACHED Ed25519 signature over the",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "state": {
             "type": "string"
@@ -1364,6 +1409,13 @@
       "inputSchema": {
         "properties": {
           "arguments": {},
+          "id": {
+            "title": "3171 — legacy alias for `routine_id`. Honoured but undeclared until",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "routine_id": {
             "type": "string"
           }
@@ -1380,6 +1432,13 @@
       "description": "Fetch a routine run by id, with",
       "inputSchema": {
         "properties": {
+          "id": {
+            "title": "3171 — legacy alias for `run_id`. Honoured but undeclared until the",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "run_id": {
             "type": "string"
           }
@@ -1670,6 +1729,13 @@
           "kind": {
             "type": "string"
           },
+          "kind_inner": {
+            "title": "3171 — legacy alias for `custom_kind` (kind=custom). Honoured but",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "path": {
             "type": [
               "string",
@@ -1715,6 +1781,13 @@
       "description": "Offload verbatim content",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — the id stamped as the blob's owner. Bound to the caller under",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "content": {
             "type": "string"
           },
@@ -1743,6 +1816,13 @@
       "description": "Dereference a memory_offload",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — the principal the blob's ownership gate (SEC-4) compares",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ref_id": {
             "type": "string"
           }

@@ -34,10 +34,27 @@ pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Resul
     let agent_id = params.get(param_names::AGENT_ID).and_then(Value::as_str);
     let namespace = params.get(param_names::NAMESPACE).and_then(Value::as_str);
 
+    // #3171 — VALIDATE at the boundary. Pre-fix both were passed straight into
+    // the quota lookup unvalidated, so an arbitrary string (control chars,
+    // 100 KB, path-traversal) became a durable `agent_quotas` key.
+    if let Some(aid) = agent_id {
+        crate::validate::validate_agent_id_shape(aid).map_err(|e| e.to_string())?;
+    }
+    if let Some(ns) = namespace {
+        crate::validate::validate_namespace(ns).map_err(|e| e.to_string())?;
+    }
+
     match (agent_id, namespace) {
         // Single (agent, namespace) row.
         (Some(aid), Some(ns)) => {
-            let row = crate::quotas::get_status(conn, aid, ns).map_err(|e| e.to_string())?;
+            // #3171 — a REPORTING read must not WRITE. `get_status` calls
+            // `ensure_row`, which `INSERT OR IGNORE`s a row for whatever
+            // `(agent_id, namespace)` the caller names — an ungated
+            // row-injection primitive on an unauthenticated MCP surface. The
+            // `peek_*` twins return the identical wire shape from a
+            // synthesised default; the real write paths still materialise the
+            // row on the first actual write, so no accounting is lost.
+            let row = crate::quotas::peek_status(conn, aid, ns).map_err(|e| e.to_string())?;
             Ok(json!({
                 "agent_id": aid,
                 "namespace": ns,
@@ -46,7 +63,7 @@ pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Resul
         }
         // Per-agent aggregate (rolled-up across every namespace).
         (Some(aid), None) => {
-            let row = crate::quotas::get_aggregate_status(conn, aid).map_err(|e| e.to_string())?;
+            let row = crate::quotas::peek_aggregate_status(conn, aid).map_err(|e| e.to_string())?;
             Ok(json!({
                 "agent_id": aid,
                 "namespace": crate::quotas::GLOBAL_NAMESPACE,
@@ -105,13 +122,16 @@ impl McpTool for QuotaStatusTool {
         crate::mcp::registry::tool_names::MEMORY_QUOTA_STATUS
     }
     fn description() -> &'static str {
-        "Report per-agent + per-namespace quota usage. Operator-facing."
+        "Report per-agent + per-namespace quota usage (read-only)."
     }
     fn docs() -> &'static str {
         "K8/#1156: per-agent + per-namespace quota usage (memories/day, \
          storage bytes, links/day). Omit agent_id for all. Omit namespace \
          for the aggregate view (sum across namespaces). Supply both for \
-         the single row."
+         the single row. #3171: a pure READ — it materialises no quota row for an \
+         (agent_id, namespace) pair that has never been written to; an unwritten pair \
+         reports the configured defaults with zero usage. Not access-gated on the MCP \
+         path: any caller may read any agent's usage."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<QuotaStatusRequest>()
@@ -162,6 +182,18 @@ mod tests {
         db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
     }
 
+    /// #3171 — `peek_*` no longer INSERT-on-read. List tests must seed
+    /// via a real write (`record_op` → `ensure_row`).
+    fn seed_quota_row(conn: &rusqlite::Connection, agent_id: &str, namespace: &str) {
+        crate::quotas::record_op(
+            conn,
+            agent_id,
+            namespace,
+            crate::quotas::QuotaOp::Memory { bytes: 1 },
+        )
+        .expect("seed quota row");
+    }
+
     #[test]
     fn per_agent_returns_aggregate_for_unknown_id() {
         let conn = fresh_conn();
@@ -193,8 +225,8 @@ mod tests {
     #[test]
     fn list_path_returns_count_and_rows() {
         let conn = fresh_conn();
-        let _ = handle_quota_status(&conn, &json!({"agent_id": "ai:bob"})).expect("seed bob");
-        let _ = handle_quota_status(&conn, &json!({"agent_id": "ai:carol"})).expect("seed carol");
+        seed_quota_row(&conn, "ai:bob", crate::quotas::GLOBAL_NAMESPACE);
+        seed_quota_row(&conn, "ai:carol", crate::quotas::GLOBAL_NAMESPACE);
         let resp = handle_quota_status(&conn, &json!({})).expect("ok");
         assert!(resp["count"].as_u64().unwrap() >= 2);
         let quotas = resp["quotas"].as_array().expect("quotas array");
@@ -204,24 +236,13 @@ mod tests {
     #[test]
     fn list_path_namespace_filter_only_returns_matching_rows() {
         let conn = fresh_conn();
-        let _ = handle_quota_status(
-            &conn,
-            &json!({"agent_id": "ai:bob", "namespace": "team/policies"}),
-        )
-        .expect("seed");
-        let _ = handle_quota_status(
-            &conn,
-            &json!({"agent_id": "ai:carol", "namespace": "team/policies"}),
-        )
-        .expect("seed");
-        let _ = handle_quota_status(
-            &conn,
-            &json!({"agent_id": "ai:bob", "namespace": "alice/scratch"}),
-        )
-        .expect("seed");
+        seed_quota_row(&conn, "ai:bob", "team/policies");
+        seed_quota_row(&conn, "ai:carol", "team/policies");
+        seed_quota_row(&conn, "ai:bob", "alice/scratch");
         let resp = handle_quota_status(&conn, &json!({"namespace": "team/policies"})).expect("ok");
         assert_eq!(resp["namespace"].as_str(), Some("team/policies"));
         let quotas = resp["quotas"].as_array().expect("quotas array");
+        assert_eq!(quotas.len(), 2, "peek must not have been the seed");
         for q in quotas {
             assert_eq!(q["namespace"].as_str(), Some("team/policies"));
         }

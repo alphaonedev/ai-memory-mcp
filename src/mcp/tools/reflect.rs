@@ -213,8 +213,14 @@ pub(crate) fn parse_reflect_input(
             .get(param_names::AGENT_ID)
             .and_then(serde_json::Value::as_str)
     });
-    let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
-        .map_err(|e| e.to_string())?;
+    // #3171 — this id becomes the reflection row's `metadata.agent_id`, i.e.
+    // the OWNER every later owner gate compares against. Bind it to the
+    // enforced-read caller so a self-asserted value (top-level or inline
+    // `metadata.agent_id`) cannot mint a row owned by another principal;
+    // single-operator default unchanged. Mirrors the `memory_store` binding.
+    let agent_id =
+        crate::identity::resolve_governance_subject(explicit_agent_id, mcp_client, "reflect")
+            .map_err(|e| e.to_string())?;
     // v0.7.1 #1665 — desugar the top-level `entity_id` convenience param
     // into `metadata.entity_id` before building the input, so the binding
     // is identical across both reflect parsers and the L1-8 round-trip.
@@ -328,8 +334,14 @@ pub fn handle_reflect(
             .get(param_names::AGENT_ID)
             .and_then(serde_json::Value::as_str)
     });
-    let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
-        .map_err(|e| e.to_string())?;
+    // #3171 — this id becomes the reflection row's `metadata.agent_id`, i.e.
+    // the OWNER every later owner gate compares against. Bind it to the
+    // enforced-read caller so a self-asserted value (top-level or inline
+    // `metadata.agent_id`) cannot mint a row owned by another principal;
+    // single-operator default unchanged. Mirrors the `memory_store` binding.
+    let agent_id =
+        crate::identity::resolve_governance_subject(explicit_agent_id, mcp_client, "reflect")
+            .map_err(|e| e.to_string())?;
 
     // v0.7.1 #1665 — desugar the top-level `entity_id` convenience param
     // into `metadata.entity_id` before building the input, so the binding

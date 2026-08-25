@@ -43,6 +43,11 @@ pub struct SearchRequest {
     /// Response format. toon_compact saves 79%.
     #[serde(default)]
     pub format: Option<String>,
+
+    /// #3171 — exact `source_uri` filter (honoured but undeclared until the
+    /// tool-contract audit).
+    #[serde(default)]
+    pub source_uri: Option<String>,
 }
 
 /// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_search`.

@@ -30,8 +30,11 @@ use serde_json::{Value, json};
 /// }
 /// ```
 ///
-/// On unknown id → returns an error string the MCP layer surfaces as
-/// `-32602 "memory not found: <id>"`. Non-reflection ids return a
+/// On unknown id → returns the error string `"memory not found: <id>"`,
+/// which the MCP layer surfaces as a SUCCESSFUL JSON-RPC result with
+/// `isError: true` and that text body — NOT as a JSON-RPC `-32602`
+/// (#3171: the old `-32602` claim here was false; see the error-envelope
+/// convention on `crate::mcp::tools::atomise`). Non-reflection ids return a
 /// well-formed envelope with `is_reflection = false` so callers can
 /// branch without parsing the error path.
 pub fn handle_reflection_origin(

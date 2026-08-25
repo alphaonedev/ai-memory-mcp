@@ -138,7 +138,14 @@ pub(super) fn handle_forget(
     // Refused before the governance gate, before the dry-run preview and
     // before any delete, so nothing is touched.
     let tier = Tier::parse_optional(params["tier"].as_str())?;
-    let dry_run = params["dry_run"].as_bool().unwrap_or(false);
+    // #3171 — `dry_run` is the SAFETY flag on a bulk DELETE, and there is no
+    // runtime JSON-Schema validation on the MCP path: pre-fix
+    // `.as_bool().unwrap_or(false)` turned `dry_run: "true"` / `dry_run: 1`
+    // (the shapes a hand-rolled or weakly-typed client emits) into a REAL,
+    // irreversible delete when a PREVIEW was requested. Refuse a
+    // present-but-non-boolean value; ABSENT still defaults to `false`.
+    let dry_run = crate::mcp::param_guard::optional_bool(params, crate::mcp::param_names::DRY_RUN)?
+        .unwrap_or(false);
 
     // #1772 — owner gate: when the multi-tenant opt-in is on
     // (`AI_MEMORY_AGENT_ID` set), bulk forget only ever touches the CALLER's
@@ -359,7 +366,13 @@ impl McpTool for ForgetTool {
          permanent hard-delete with no recoverable copy (the response's `archived` \
          field reports which happened). dry_run previews the matched rows \
          (id/title/namespace/tier, capped + truncated flag); live runs return \
-         deleted_ids (same cap)."
+         deleted_ids (same cap of 50 — a live run that deleted more reports only the \
+         first 50 ids). #3171: when AI_MEMORY_AGENT_ID is set the delete is silently \
+         OWNER-SCOPED, and the owner predicate ALSO matches UNOWNED rows \
+         (legacy/unstamped memories are erasable by any caller). Pattern tokens must be \
+         literal search terms: an FTS5 boolean operator (AND/OR/NOT/NEAR), a token that \
+         sanitises to nothing, or more than 128 tokens is REFUSED rather than dropped, \
+         because dropping a token would widen the DELETE beyond the pattern you wrote."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ForgetRequest>()
@@ -387,7 +400,10 @@ impl McpTool for StatsTool {
         "Get memory store statistics (counts, tier breakdown, sizes)."
     }
     fn docs() -> &'static str {
-        "Totals, per-tier + namespace tallies, archive + DB size."
+        "Totals (physical `total` vs live `live` vs `expired_pending_gc`), per-tier + \
+         per-namespace tallies, `expiring_soon`, `links_count`, `db_size_bytes`, \
+         `dim_violations`, `index_evictions_total`. #3171: NO archive counts — use \
+         memory_archive_stats for those."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<StatsRequest>()

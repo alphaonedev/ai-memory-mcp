@@ -548,6 +548,19 @@ pub async fn forget_memories(
     {
         return resp;
     }
+    // #3171 — REFUSE a destructive pattern the sanitiser would silently WIDEN,
+    // at the request boundary so BOTH backends get the identical contract. The
+    // sqlite lane reaches the same check through `forget_fts_query`; postgres
+    // builds a `plainto_tsquery` and would otherwise accept an over-cap /
+    // operator-bearing / empty-after-sanitisation pattern that drops narrowing
+    // AND-conjuncts. A bulk DELETE that is wider than the pattern the caller
+    // wrote is unrecoverable data loss, and a refusal that depends on which
+    // backend is configured is the #2312 cross-backend-divergence class.
+    if let Some(pattern) = body.pattern.as_deref()
+        && let Err(reason) = crate::storage::strict_forget_tokens(pattern)
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": reason }))).into_response();
+    }
     // #1849 (CWE-862) — admin bulk forget with the namespace OMITTED spans
     // EVERY namespace, so the per-namespace delete-governance gate (the
     // per-memory `DELETE` gate + the #1772 MCP forget gate) would be silently

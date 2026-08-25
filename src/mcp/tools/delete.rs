@@ -27,6 +27,13 @@ pub struct DeleteRequest {
         description = "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this delete to Allow within its caveats."
     )]
     pub capability: Option<String>,
+
+    /// #3171 — operator-as-actor: the id recorded as the ACTOR of this
+    /// operation (audit / provenance). Honoured since before v1.0.0 but
+    /// undeclared until the tool-contract audit. Under the multi-tenant
+    /// posture (`AI_MEMORY_AGENT_ID` set) it is BOUND to the caller.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_delete`.
@@ -41,7 +48,9 @@ impl McpTool for DeleteTool {
         "Delete a memory by ID."
     }
     fn docs() -> &'static str {
-        "Hard-delete by id (removes row, embedding, FTS, links). Use memory_forget for bulk pattern delete (archives first)."
+        "Hard-delete by id (removes row, embedding, FTS, links). Use memory_forget for bulk \
+         pattern delete (archives first). #3171: `id` also accepts a UNIQUE ID PREFIX on this \
+         IRREVERSIBLE delete — pass the full id unless you intend prefix resolution."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<DeleteRequest>()
@@ -129,8 +138,18 @@ pub(super) fn handle_delete(
     // v0.7.0 K9 — unified permission pipeline (delete-side).
     {
         use crate::permissions::{Op, PermissionContext, Permissions};
-        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .map_err(|e| e.to_string())?;
+        // #3171 — bind the permission/governance/capability SUBJECT to the
+        // enforced-read caller. `resolve_agent_id` gives the WIRE value
+        // precedence over the env identity, while the #1772 owner gate below
+        // (`caller_owns_for_mutation`) is keyed on the ENV caller — two
+        // controls that can never agree by construction. Single-operator
+        // default (env unset) unchanged.
+        let agent_id = crate::identity::resolve_governance_subject(
+            params[param_names::AGENT_ID].as_str(),
+            mcp_client,
+            "delete",
+        )
+        .map_err(|e| e.to_string())?;
         let payload = json!({"id": target.id, "title": target.title});
         let ctx = PermissionContext {
             op: Op::MemoryDelete,
@@ -161,8 +180,18 @@ pub(super) fn handle_delete(
     // Task 1.9: governance enforcement (delete-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
-        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .map_err(|e| e.to_string())?;
+        // #3171 — bind the permission/governance/capability SUBJECT to the
+        // enforced-read caller. `resolve_agent_id` gives the WIRE value
+        // precedence over the env identity, while the #1772 owner gate below
+        // (`caller_owns_for_mutation`) is keyed on the ENV caller — two
+        // controls that can never agree by construction. Single-operator
+        // default (env unset) unchanged.
+        let agent_id = crate::identity::resolve_governance_subject(
+            params[param_names::AGENT_ID].as_str(),
+            mcp_client,
+            "delete",
+        )
+        .map_err(|e| e.to_string())?;
         let mem_owner = target
             .metadata
             .get(param_names::AGENT_ID)

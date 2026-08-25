@@ -154,9 +154,15 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         return Err(crate::errors::msg::skill_not_found(skill_id));
     };
 
-    // Decompress body.
-    let body_bytes = zstd::decode_all(body_blob.as_slice())
-        .map_err(|e| crate::errors::msg::zstd_decompress_body(e))?;
+    // Decompress body. #3171/#1933 — BOUNDED streaming decode, the same
+    // anti-decompression-bomb ceiling the three sibling skill decode sites
+    // (`memory_skill_resource`, `memory_skill_export`,
+    // `memory_skill_compositional_context`) already use. Pre-fix this lone
+    // site used the unbounded `zstd::decode_all`, so a hostile `skills.
+    // body_blob` row that decodes to gigabytes would OOM the daemon on
+    // activation fetch.
+    let body_bytes = crate::mcp::skill_zstd::decode_all_bounded(body_blob.as_slice())
+        .map_err(crate::errors::msg::zstd_decompress_body)?;
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
     let digest_hex: String = digest_bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -254,6 +260,11 @@ use serde::Deserialize;
 pub struct SkillGetRequest {
     /// Skill UUID.
     pub skill_id: String,
+
+    /// #3171 — the actor recorded on the `skill.invoked` audit row this
+    /// fetch appends (see the tool docs: every activation fetch writes one).
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_skill_get`.
@@ -268,7 +279,11 @@ impl McpTool for SkillGetTool {
         "Get full skill activation payload (metadata + body)."
     }
     fn docs() -> &'static str {
-        "L1-5: metadata + decompressed body (<5000 tok). Old version ids stay addressable."
+        "L1-5: metadata + decompressed body. Old version ids stay addressable. #3171: the \
+         <5000-token body size is an authoring GUIDELINE, not an enforced ceiling — the only \
+         hard limit is the anti-decompression-bomb cap on the stored blob. Every fetch \
+         APPENDS a `skill.invoked` signed_events row (returned as `invocation_record`): this \
+         read is audited and is not side-effect free."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SkillGetRequest>()
@@ -611,5 +626,37 @@ mod tests {
         let v = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
         // metadata key should NOT be present in response (parse failure).
         assert!(v.get("metadata").is_none());
+    }
+
+    /// #3171 / #1933 — the skill BODY decode is bounded, matching the
+    /// three sibling skill decode sites. A tiny compressed blob that
+    /// decodes past `MAX_DECOMPRESSED_BYTES` is REFUSED instead of
+    /// materialised (decompression-bomb defence); pre-fix this lone site
+    /// used the unbounded `zstd::decode_all` and would OOM the daemon on
+    /// an activation fetch.
+    #[test]
+    fn refuses_body_decompression_bomb_3171() {
+        let conn = open_db();
+        let id = "bbbbbbbb-0000-0000-0000-00000000bomb";
+        let cap = crate::transcripts::storage::MAX_DECOMPRESSED_BYTES;
+        let bomb_plain = vec![0u8; cap + 1024];
+        let blob = zstd::encode_all(bomb_plain.as_slice(), 19).unwrap();
+        assert!(
+            blob.len() < cap,
+            "precondition: the blob is tiny compressed"
+        );
+        let digest = vec![0u8; 32];
+        conn.execute(
+            "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, created_at) \
+             VALUES (?1, 'ns', 'sk', 'D', '{}', ?2, ?3, 0)",
+            params![id, blob, digest],
+        )
+        .unwrap();
+        let err = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap_err();
+        assert!(err.contains("zstd decompress body"), "got: {err}");
+        assert!(
+            err.contains("decompression-bomb defence"),
+            "the bomb must be refused by the bounded decoder, got: {err}"
+        );
     }
 }

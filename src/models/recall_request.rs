@@ -134,6 +134,9 @@ pub struct RecallRequest {
     #[serde(default)]
     pub namespace: Option<String>,
 
+    /// Max results. #3171 — the recall engine CLAMPS this to 50
+    /// (`limit.min(50)` on both the hybrid and keyword-only paths); a
+    /// larger value returns 50, it is not an error.
     #[serde(default)]
     pub limit: Option<i64>,
 
@@ -206,6 +209,11 @@ pub struct RecallRequest {
     /// Response format. toon_compact saves 79% vs json.
     #[serde(default)]
     pub format: Option<String>,
+    /// #3171 — read-governance actor (single-tenant fallback; the resolved
+    /// caller wins when present). Honoured by the `memory_recall` read gate
+    /// but undeclared until the tool-contract audit.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 impl RecallRequest {
@@ -311,6 +319,9 @@ impl RecallRequest {
             confidence_tier: q.confidence_tier.clone(),
             verbose_provenance: q.verbose_provenance,
             format: q.format.clone(),
+            // #3171 — MCP-only read-governance actor; the HTTP surface
+            // resolves its caller from `X-Agent-Id`, never from the query.
+            agent_id: None,
         }
     }
 
@@ -357,6 +368,9 @@ impl RecallRequest {
             confidence_tier: body.confidence_tier.clone(),
             verbose_provenance: body.verbose_provenance,
             format: body.format.clone(),
+            // #3171 — MCP-only read-governance actor; the HTTP surface
+            // resolves its caller from `X-Agent-Id`, never from the body.
+            agent_id: None,
         }
     }
 
@@ -401,6 +415,9 @@ impl RecallRequest {
             // marshal it through unchanged so the downstream DTO
             // honours an explicit `--format json` / `--format toon`.
             format: Some(args.format.clone()),
+            // #3171 — MCP-only read-governance actor; the CLI resolves its
+            // caller from the environment, never from an argument.
+            agent_id: None,
         }
     }
 

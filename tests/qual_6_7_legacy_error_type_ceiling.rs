@@ -147,7 +147,15 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // mutating the process-global. The helper MUST mirror the existing
 // `Result<Value, String>` MCP-dispatch envelope of `handle_list`, so it is that
 // type by construction — no new error contract. Net acknowledged: +1.
-const QUAL_6_CEILING: usize = 121;
+// 2026-08-22 (#3171 MCP tool-contract audit, rebased onto #3040) — raised
+// 121 -> 124 for the reserved-principal wire-hardening split of
+// `handle_namespace_clear_standard` into the wire handler + the trusted
+// in-process entry `handle_namespace_clear_standard_trusted` + the shared
+// `handle_namespace_clear_standard_inner` (+ `resolve_namespace_standard_caller`
+// `Result<String, String>`). Exact #2721/CB-19 split the SET twin already
+// carries. Measured 123 on the pre-#3040 branch; +1 for handle_list_capped
+// already in 121. Net acknowledged: +3.
+const QUAL_6_CEILING: usize = 124;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
@@ -227,7 +235,14 @@ const QUAL_6_CEILING: usize = 121;
 // escalate PRODUCER helper `daemon_runtime::route_or_block_escalated_write`
 // (`Result<(), String>`: the String refusal flows into the fail-closed block).
 // Measured 43.
-const QUAL_7_CEILING: usize = 43;
+// 2026-08-22 (#3204 item 7) — raised 43 -> 44 for `gate_gc_sweep` in
+// `src/mcp/tools/archive.rs`, the three-gate guard (K9 permission rules +
+// the #1849 bulk-delete governance rule + the forensic `allow` row) that
+// `memory_gc` was missing entirely. `Result<(), String>` because its refusal
+// flows verbatim into the enclosing `handle_gc`'s `Result<Value, String>` via
+// `?`, exactly like the sibling gates in `handle_archive_purge`. No new error
+// contract. Measured 44.
+const QUAL_7_CEILING: usize = 44;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {

@@ -415,12 +415,15 @@ pub fn handle_signal_inbox(conn: &rusqlite::Connection, params: &Value) -> Resul
 /// `correlation_id`, oldest-first (thread order).
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on query failure.
+/// Returns `"correlation_id is required"` when the schema-required
+/// `correlation_id` is missing/blank (#3171), or the stringified `rusqlite`
+/// error on query failure.
 pub fn handle_signal_thread(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let correlation_id = params
-        .get(param_names::CORRELATION_ID)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    // #3171 — `correlation_id` is schema-REQUIRED. Pre-fix it was read with
+    // `unwrap_or_default()`, so a malformed call threaded on `""` and got an
+    // empty `signals` array back: a plausible "this thread has no messages"
+    // answer to a question that was never actually asked. Refuse instead.
+    let correlation_id = crate::mcp::param_guard::require_str(params, param_names::CORRELATION_ID)?;
     let signals = crate::signals::thread(conn, correlation_id).map_err(|e| e.to_string())?;
     Ok(json!({
         "signals": serde_json::to_value(&signals).map_err(|e| e.to_string())?,
@@ -511,6 +514,13 @@ use serde::Deserialize;
 pub struct SignalSendRequest {
     pub namespace: String,
 
+    /// **IGNORED** (#3171 / #2996). Still schema-required for wire
+    /// compatibility, but the value you send is DISCARDED: authorship is
+    /// bound to the signing keypair's own `agent_id` (or the durable process
+    /// identity when no keypair is loaded), because a caller-asserted
+    /// `from_agent` combined with a shared daemon key would let a co-located
+    /// agent forge `self_signed` authorship for anyone. Send your own id or a
+    /// placeholder — either way the stored signal names the signer.
     pub from_agent: String,
 
     pub subject: String,
@@ -642,10 +652,12 @@ impl McpTool for SignalInboxTool {
         crate::mcp::registry::tool_names::MEMORY_SIGNAL_INBOX
     }
     fn description() -> &'static str {
-        "List signals for a namespace/recipient — direct + broadcast (#1709)."
+        "List UNACKED signals for a namespace/recipient — direct + broadcast (#1709)."
     }
     fn docs() -> &'static str {
-        "Pillar 1 (#1709): the recipient inbox — direct messages plus namespace broadcasts, newest-first."
+        "Pillar 1 (#1709): the recipient inbox — direct messages plus namespace broadcasts, \
+         newest-first. #3171: UNACKED ONLY (`acknowledged_at IS NULL`); an acked signal never \
+         reappears here — read it back with memory_signal_thread or memory_signal_read."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SignalInboxRequest>()
@@ -1175,5 +1187,26 @@ mod handler_tests {
             1,
             "a no-op re-ack must not re-fire post_signal_ack"
         );
+    }
+
+    /// #3171 — schema-REQUIRED `correlation_id` is refused when
+    /// missing/blank. Pre-fix an `unwrap_or_default()` read threaded on
+    /// `""` and returned an empty `signals` array: a plausible "this
+    /// thread has no messages" answer to a question never asked.
+    #[test]
+    fn signal_thread_refuses_missing_or_blank_correlation_id_3171() {
+        let conn = fresh();
+        for bad in [
+            json!({}),
+            json!({ "correlation_id": "" }),
+            json!({ "correlation_id": "  " }),
+            json!({ "correlation_id": 1 }),
+        ] {
+            let e = handle_signal_thread(&conn, &bad).expect_err("refused");
+            assert_eq!(e, "correlation_id is required", "{bad}");
+        }
+        // CONTROL: a well-formed call still succeeds.
+        let ok = handle_signal_thread(&conn, &json!({ "correlation_id": "corr-x" })).expect("ok");
+        assert_eq!(ok["signals"].as_array().expect("array").len(), 0);
     }
 }

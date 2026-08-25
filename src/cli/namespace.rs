@@ -28,7 +28,7 @@
 use crate::cli::CliOutput;
 use crate::db;
 use crate::mcp::{
-    handle_namespace_clear_standard, handle_namespace_get_standard,
+    handle_namespace_clear_standard_trusted, handle_namespace_get_standard,
     handle_namespace_set_standard_trusted,
 };
 use crate::models::field_names;
@@ -300,8 +300,19 @@ fn clear_standard(
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "namespace clear-standard", out)?;
     let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
+    // #3171 — the CLEAR owner gate is now unconditional (it was caller-opt-in
+    // via an UNDECLARED `agent_id`), so the CLI takes the same out-of-band
+    // trusted entry `set-standard` already uses: the local CLI is an
+    // operator/admin surface acting as the daemon principal, and a
+    // self-asserted wire `agent_id="daemon"` is rejected at the resolution
+    // boundary (#977, CB-19) so this authority stays in-process-only.
     let params = json!({ "namespace": namespace });
-    let resp = handle_namespace_clear_standard(&conn, &params).map_err(|e| anyhow::anyhow!(e))?;
+    let resp = handle_namespace_clear_standard_trusted(
+        &conn,
+        &params,
+        crate::identity::sentinels::DAEMON_PRINCIPAL,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     emit(out, json_out, &resp, |o, r| {
         writeln!(
             o.stdout,

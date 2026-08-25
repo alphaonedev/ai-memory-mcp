@@ -66,7 +66,10 @@ pub struct CalibrateConfidenceRequest {
     #[serde(default)]
     pub days: Option<i64>,
 
-    /// json envelope or ASCII table.
+    /// **IGNORED** (#3171). Declared since D1.5 and read by NO handler on
+    /// any surface — the response is always the JSON envelope. Left declared
+    /// rather than removed so a client already sending it is not refused;
+    /// do not rely on it to select a format.
     #[serde(default)]
     pub output_format: Option<String>,
 }

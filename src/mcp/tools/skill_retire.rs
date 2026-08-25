@@ -506,7 +506,10 @@ impl McpTool for SkillDeleteTool {
     fn docs() -> &'static str {
         "#2024: IRREVERSIBLE purge of the whole (namespace,name) lineage (all versions + resources). \
          Refused unless the lineage is already retired OR force=true. Emits a signed skill.purged audit row \
-         that survives the erasure."
+         that survives the erasure. #3171: this MCP entry has NO ADMIN GATE — unlike the HTTP \
+         twin (which requires the admin role), any MCP caller may purge any lineage, and \
+         force=true also skips the retire-first requirement. Restrict access to the MCP \
+         surface itself, or split profiles, if that is not acceptable."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SkillDeleteRequest>()

@@ -141,12 +141,13 @@ pub struct MemoryCaptureTurnRequest {
     #[serde(default)]
     pub host_version: Option<String>,
 
-    /// Optional summary of tool invocations within this assistant
-    /// turn. Each entry is `{tool: string, brief: string}`. The
-    /// substrate preserves the list verbatim but does not (at v0.7.0)
-    /// classify or index per-tool-call. Reserved for v0.7.x atom-
-    /// per-tool indexing; the field is wire-stable today so hosts
-    /// can already populate it without breakage.
+    /// **IGNORED** (#3171). Each entry is `{tool: string, brief: string}`.
+    /// The field is parsed and wire-stable so hosts can populate it without
+    /// breakage, but it is NOT persisted anywhere — the earlier claim that
+    /// "the substrate preserves the list verbatim" was false; nothing reads
+    /// it after deserialization. Reserved for the atom-per-tool indexing
+    /// that will give it meaning; until then, anything you send here is
+    /// dropped.
     #[serde(default)]
     #[allow(dead_code)]
     pub tool_calls: Vec<ToolCallSummary>,

@@ -97,6 +97,13 @@ pub struct AgentRegisterRequest {
     /// Capability tags.
     #[serde(default)]
     pub capabilities: Vec<String>,
+
+    /// #3171 — the id recorded as the ACTOR that registered this agent
+    /// (governance audit subject). Honoured since #913, undeclared until the
+    /// tool-contract audit. Distinct from `agent_id`, which is the principal
+    /// BEING registered.
+    #[serde(default)]
+    pub caller_agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_agent_register`.

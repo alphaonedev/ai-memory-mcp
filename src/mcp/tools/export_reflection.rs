@@ -22,6 +22,7 @@
 //!    must stay structurally aligned so the operator's mental model
 //!    transfers.
 
+use crate::mcp::param_names;
 use serde_json::{Value, json};
 
 use crate::cli::commands::export_reflections::{self, ExportFormat};
@@ -54,7 +55,16 @@ pub fn handle_export_reflection(
     if memory_id.is_empty() {
         return Err(crate::errors::msg::MEMORY_ID_EMPTY.to_string());
     }
-    let format_str = params["format"].as_str().unwrap_or("md");
+    // #3171 — an unknown STRING already fails closed (`parse_format_for_mcp`),
+    // but a present-but-non-string `format` (`5`, `true`, `{}`) silently
+    // rendered markdown. Refuse the contradictory value the same way; ABSENT
+    // still takes the documented `md` default.
+    let format_str = match params.get(param_names::FORMAT) {
+        None | Some(Value::Null) => "md",
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| "format must be a string ('md', 'markdown' or 'json')".to_string())?,
+    };
     let format = parse_format_for_mcp(format_str)?;
 
     let mem = db::get(conn, memory_id)
@@ -154,7 +164,7 @@ impl McpTool for ExportReflectionTool {
         "Render a single reflection memory as markdown or JSON (no filesystem write)."
     }
     fn docs() -> &'static str {
-        "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write — harness owns disk I/O."
+        "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write — harness owns disk I/O. #3171: `format` accepts `md` (or the alias `markdown`) and `json`, case-insensitively; any other value is REFUSED."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ExportReflectionRequest>()

@@ -16,6 +16,7 @@
               "null"
             ]
           },
+          "citations": {},
           "confidence": {
             "format": "double",
             "type": [
@@ -94,6 +95,7 @@
               "null"
             ]
           },
+          "source_span": {},
           "source_uri": {
             "type": [
               "string",
@@ -158,6 +160,13 @@
           }
         },
         "properties": {
+          "agent_id": {
+            "title": "3171 — read-governance actor (single-tenant fallback; the resolved",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "as_agent": {
             "type": [
               "string",
@@ -331,6 +340,13 @@
           "query": {
             "type": "string"
           },
+          "source_uri": {
+            "title": "3171 — exact `source_uri` filter (honoured but undeclared until the",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "tier": {
             "type": [
               "string",
@@ -452,6 +468,13 @@
       "description": "Delete a memory by ID.",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — operator-as-actor: the id recorded as the ACTOR of this",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "capability": {
             "type": [
               "string",
@@ -473,6 +496,13 @@
       "description": "Promote a memory to long (or",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — the governance / capability-binding subject for this promote.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "capability": {
             "type": [
               "string",
@@ -545,6 +575,13 @@
       "description": "Update an existing memory by ID",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — operator-as-actor: the id recorded as the ACTOR of this",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "capability": {
             "type": [
               "string",
@@ -675,6 +712,13 @@
       "description": "Get a specific memory by ID,",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — read-governance actor (single-tenant fallback; the resolved",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           }
@@ -832,6 +876,13 @@
       "description": "Set a memory as the",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — the principal the #929/#2541 ownership gate compares against",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "governance": {},
           "id": {
             "type": "string"
@@ -879,6 +930,13 @@
       "description": "Clear the standard/policy for a",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — the principal the #1777 ownership gate compares against the",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "namespace": {
             "type": "string"
           }
@@ -931,6 +989,13 @@
           }
         },
         "properties": {
+          "agent_id": {
+            "title": "3171 — the APPROVER identity: the subject of the self-approval",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "approvals": {
             "items": {
               "$ref": "#/definitions/ApproverSignatureArg"
@@ -961,6 +1026,13 @@
       "description": "Reject a pending action",
       "inputSchema": {
         "properties": {
+          "agent_id": {
+            "title": "3171 — the id written as `decided_by` on the governance-ledger row.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },

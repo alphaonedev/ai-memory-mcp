@@ -94,8 +94,14 @@ pub(super) fn forward_store_to_http(
     let explicit_agent_id = params["agent_id"]
         .as_str()
         .or_else(|| params["metadata"]["agent_id"].as_str());
-    let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
-        .map_err(|e| e.to_string())?;
+    // #3171 — this value becomes the `X-Agent-Id` the HTTP handler treats as
+    // its authenticated principal, so a self-asserted wire `agent_id` (or
+    // `metadata.agent_id`) would forge the forwarded identity. Bind it to the
+    // enforced-read caller exactly as the local store path now does;
+    // single-operator default unchanged.
+    let agent_id =
+        crate::identity::resolve_governance_subject(explicit_agent_id, mcp_client, "store")
+            .map_err(|e| e.to_string())?;
 
     // The HTTP request body mirrors the MCP params; pass them through
     // and let the HTTP handler do all validation, governance, quota,

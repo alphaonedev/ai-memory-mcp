@@ -55,8 +55,41 @@ pub(super) fn handle_archive_purge(
     // so the audit trail captures intent regardless of downstream
     // permission-gate / storage outcome. Mirrors the #911 HTTP
     // `purge_archive` fix.
-    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    // #3171 — `agent_id` selects WHOSE archive is purged
+    // (`purge_archive_for_caller`) and `as_admin` escalates to EVERY owner's,
+    // both from UNDECLARED wire params on an IRREVERSIBLE bulk delete. Bind the
+    // caller-scoped subject to the enforced-read caller under the multi-tenant
+    // posture so a caller cannot purge another owner's archive by naming them;
+    // the single-operator default is unchanged. Resolved ONCE and reused below
+    // (pre-fix the same param was resolved twice with different failure modes —
+    // `unwrap_or_else(ANONYMOUS_INVALID)` here and `?` in the K9 block).
+    let caller = match crate::identity::resolve_governance_subject(
+        params[param_names::AGENT_ID].as_str(),
+        None,
+        "purge the archive",
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            // #3171 — a REFUSED subject is a security event, and #913's remit
+            // is that the forensic chain captures INTENT regardless of the
+            // downstream outcome. Chain a `refuse` row (attributed to the
+            // enforced-read caller, never to the id the request asserted)
+            // before returning, so an attempt to purge another owner's archive
+            // is not the one archive-purge call that leaves no trace.
+            crate::governance::audit::record_decision(
+                &crate::identity::resolve_read_visibility_caller()
+                    .unwrap_or_else(|| crate::identity::sentinels::ANONYMOUS_INVALID.to_string()),
+                "refuse",
+                crate::governance::action_labels::ARCHIVE_PURGE,
+                "",
+                json!({
+                    (field_names::OLDER_THAN_DAYS): older_than_days,
+                    "reason": e.to_string(),
+                }),
+            );
+            return Err(e.to_string());
+        }
+    };
     // #936 (security-critical, 2026-05-20) — MCP-side owner gate.
     // The MCP entry is a second attack surface for the same gap the
     // HTTP `purge_archive` handler had: pre-#936 the dispatch reached
@@ -66,10 +99,11 @@ pub(super) fn handle_archive_purge(
     // requires the explicit `as_admin: true` parameter (no separate
     // MCP-side admin-config block today — operators use either the
     // CLI or the HTTP admin allowlist for cross-tenant deletes).
-    let as_admin = params
-        .get("as_admin")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // #3171 — `as_admin` is the cross-tenant escalation switch on an
+    // irreversible purge, so a present-but-non-boolean value must not silently
+    // take the caller-scoped branch either (fail loudly, the `dry_run` rule).
+    let as_admin =
+        crate::mcp::param_guard::optional_bool(params, param_names::AS_ADMIN)?.unwrap_or(false);
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -87,8 +121,7 @@ pub(super) fn handle_archive_purge(
     // Operators can still scope rules via `namespace_pattern = "**"`.
     {
         use crate::permissions::{Op, PermissionContext, Permissions};
-        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-            .map_err(|e| e.to_string())?;
+        let agent_id = caller.clone();
         let ctx = PermissionContext {
             op: Op::MemoryArchive,
             namespace: crate::DEFAULT_NAMESPACE.to_string(),
@@ -132,6 +165,135 @@ pub(super) fn handle_archive_stats(conn: &rusqlite::Connection) -> Result<Value,
     db::archive_stats(conn).map_err(|e| e.to_string())
 }
 
+/// #3204 item 7 — the three gates a real `memory_gc` sweep must clear, in the
+/// same order and with the same semantics `handle_archive_purge` uses.
+///
+/// 1. **K9 permission rules.** Evaluated against the resolved caller. The op is
+///    chosen by DISPOSITION: an archiving sweep is `MemoryArchive` (a
+///    recoverable move, same op as the archive family); a non-archiving sweep
+///    is `MemoryDelete`, because that is exactly what it is. Rules are
+///    namespace-scoped and a sweep is substrate-wide, so it is evaluated at the
+///    default namespace and operators scope with `namespace_pattern = "**"` —
+///    the `handle_archive_purge` convention.
+/// 2. **Namespace governance — DESTRUCTIVE sweeps only.** A sweep cannot honour
+///    a per-namespace `delete` policy row-by-row, so it applies the #1849 rule
+///    for a namespace-less bulk delete: if ANY namespace holding reapable rows
+///    carries a non-`Any` `delete` level, REFUSE the whole sweep and direct the
+///    operator at the scoped path. Otherwise a `delete: Approve` legal-hold is
+///    no defence at all — the held rows simply expire and vanish on the next
+///    tick, with no approval and no trace.
+///
+///    This applies ONLY when `archive` is false. An archiving sweep MOVES the
+///    row to `archived_memories`, where `memory_archive_restore` recovers it,
+///    so the governed content still exists and the hold is not defeated;
+///    refusing there would strand expired rows in every deployment that has any
+///    delete-governed namespace, which is a reliability cost with no integrity
+///    benefit. (The archive path's link-cascade loss is #3161 — the memory TEXT
+///    survives, which is the durable truth; the edges are derived.)
+/// 3. **Forensic capture.** An `allow` decision chained BEFORE the write, so
+///    the trail records intent regardless of the storage outcome (#913).
+///
+/// Deliberate deviation from the sibling: a `Decision::Ask` REFUSES here rather
+/// than returning the success-shaped `{status:"ask"}` envelope
+/// `handle_archive_purge` returns. A success-shaped body on an unperformed
+/// destructive op is itself a #3171 finding; on a sweep with no per-call
+/// approval channel, refusing is the only fail-closed answer.
+///
+/// # Errors
+/// A governance-refusal message when a rule denies, when a reapable namespace
+/// is delete-governed, or the stringified storage error on the namespace probe.
+fn gate_gc_sweep(conn: &rusqlite::Connection, archive: bool) -> Result<(), String> {
+    use crate::permissions::{Op, PermissionContext, Permissions};
+    let caller = crate::identity::resolve_agent_id(None, None)
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    let op = if archive {
+        Op::MemoryArchive
+    } else {
+        Op::MemoryDelete
+    };
+    let ctx = PermissionContext {
+        op,
+        namespace: crate::DEFAULT_NAMESPACE.to_string(),
+        agent_id: caller.clone(),
+        payload: json!({ "archived": archive }),
+    };
+    match Permissions::evaluate(&ctx, &[]) {
+        crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
+        crate::permissions::Decision::Deny(reason) => {
+            return Err(crate::governance::deny_message(
+                "gc",
+                crate::governance::DenyGate::PermissionRule,
+                &reason,
+            ));
+        }
+        crate::permissions::Decision::Ask(prompt) => {
+            return Err(crate::governance::deny_message(
+                "gc",
+                crate::governance::DenyGate::PermissionRule,
+                &prompt,
+            ));
+        }
+    }
+
+    // #1849-shaped governance guard on the DESTRUCTIVE disposition only (see
+    // the doc comment). The predicate is the SAME one `db::gc` sweeps with
+    // (`SQL_GC_EXPIRED_CHUNK_IDS`), so the governed-namespace probe can never
+    // miss a namespace the sweep would reap.
+    if archive {
+        crate::governance::audit::record_decision(
+            &caller,
+            "allow",
+            crate::mcp::registry::tool_names::MEMORY_GC,
+            "",
+            json!({ "archived": true }),
+        );
+        return Ok(());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT namespace FROM memories \
+             WHERE expires_at IS NOT NULL AND expires_at < ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let namespaces: Vec<String> = stmt
+        .query_map(rusqlite::params![now], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .map_err(|e| e.to_string())?;
+    for ns in &namespaces {
+        if db::resolve_governance_policy(conn, ns)
+            .is_some_and(|p| !matches!(p.core.delete, crate::models::GovernanceLevel::Any))
+        {
+            crate::governance::audit::record_decision(
+                &caller,
+                "refuse",
+                crate::mcp::registry::tool_names::MEMORY_GC,
+                ns,
+                json!({ "archived": archive }),
+            );
+            return Err(crate::governance::deny_message(
+                "gc",
+                crate::governance::DenyGate::Governance,
+                &format!(
+                    "namespace '{ns}' holds expired rows and carries a non-permissive \
+                     delete policy; a substrate-wide gc cannot honour it — reap that \
+                     namespace through the governed per-memory delete instead"
+                ),
+            ));
+        }
+    }
+
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        crate::mcp::registry::tool_names::MEMORY_GC,
+        "",
+        json!({ "archived": archive, "governed_namespaces_checked": namespaces.len() }),
+    );
+    Ok(())
+}
+
 pub(super) fn handle_gc(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -150,7 +312,24 @@ pub(super) fn handle_gc(
     if let Err(e) = db::fold_recall_accesses(conn, crate::SECS_PER_HOUR, crate::SECS_PER_DAY) {
         tracing::warn!("recall-access fold failed (pre-gc, memory_gc): {e}");
     }
-    let dry_run = params["dry_run"].as_bool().unwrap_or(false);
+    // #3171 — same SAFETY-flag shape as `memory_forget` (see there): a
+    // present-but-non-boolean `dry_run` used to run a REAL sweep.
+    let dry_run =
+        crate::mcp::param_guard::optional_bool(params, param_names::DRY_RUN)?.unwrap_or(false);
+
+    // ── #3204 item 7 — gate the SWEEP ────────────────────────────────────
+    // `memory_gc` was the one destructive MCP tool that reached the substrate
+    // with NO permission gate, NO governance consult and NO forensic row,
+    // while its sibling `handle_archive_purge` (above) carries all three. It
+    // deletes across EVERY namespace and EVERY owner, and with `archive_on_gc`
+    // off that delete is a permanent hard-delete + crypto-erase — strictly
+    // more destructive than the purge that IS gated. The gates below run only
+    // for a real sweep; `dry_run` is a pure count and stays ungated so an
+    // operator can always SEE what would be reaped.
+    if !dry_run {
+        gate_gc_sweep(conn, archive)?;
+    }
+
     if dry_run {
         // Just count expired without deleting
         let now = chrono::Utc::now().to_rfc3339();
@@ -161,10 +340,17 @@ pub(super) fn handle_gc(
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        return Ok(json!({"collected": count, "dry_run": true}));
+        // #3171 — surface `archived` on BOTH shapes. The tool advertises
+        // "archives first", but that is conditional on the daemon's
+        // `archive_on_gc` setting: with it OFF the sweep is a permanent
+        // hard-delete + crypto-erase, and the pre-fix response gave the
+        // caller NO way to tell a recoverable move from an unrecoverable
+        // erase. (The archive path's own link-cascade loss is #3161, not
+        // fixed here — see the tool docs.)
+        return Ok(json!({"collected": count, "dry_run": true, "archived": archive}));
     }
     let count = db::gc(conn, archive).map_err(|e| e.to_string())?;
-    Ok(json!({"collected": count, "dry_run": false}))
+    Ok(json!({"collected": count, "dry_run": false, "archived": archive}))
 }
 
 // --- D1.5 (#986): per-tool McpTool impls for the 4 archive-family tools ---
@@ -219,6 +405,18 @@ pub struct ArchivePurgeRequest {
     /// Only purge entries older than N days.
     #[serde(default)]
     pub older_than_days: Option<i64>,
+
+    /// #3171 — the owner whose archived rows are purged. DEFAULT SCOPE IS
+    /// CALLER-ONLY (#936): omitting this purges only the resolved caller's
+    /// archive, never every owner's. Bound to the caller under the
+    /// multi-tenant posture.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    /// #3171 — CROSS-TENANT escalation (#936): `true` purges EVERY owner's
+    /// archived rows, not just the caller's. Irreversible. Default `false`.
+    #[serde(default)]
+    pub as_admin: Option<bool>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_archive_purge`.
@@ -233,7 +431,11 @@ impl McpTool for ArchivePurgeTool {
         "Permanently delete archived memories."
     }
     fn docs() -> &'static str {
-        "Purge archive. Scope via older_than_days. Unrecoverable."
+        "Purge archive. Scope via older_than_days. Unrecoverable. #3171: the DEFAULT SCOPE IS \
+         CALLER-ONLY — only the resolved caller's archived rows are purged; `as_admin: true` \
+         escalates to EVERY owner's. A governance Ask rule returns a SUCCESS-SHAPED \
+         `{status:\"ask\"}` envelope with NOTHING purged — check `status`, not just the \
+         absence of an error."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ArchivePurgeRequest>()
@@ -297,10 +499,16 @@ impl McpTool for GcTool {
         crate::mcp::registry::tool_names::MEMORY_GC
     }
     fn description() -> &'static str {
-        "Trigger garbage collection on expired memories (archives first)."
+        "Trigger garbage collection on expired memories (archives first WHEN ENABLED)."
     }
     fn docs() -> &'static str {
-        "GC expired memories. Archives first when archive_on_gc is on (default). dry_run previews."
+        "GC expired memories. Archives first when archive_on_gc is on (default); with it OFF \
+         this is a PERMANENT hard-delete + crypto-erase with no recoverable copy. #3171: the \
+         response carries `archived` so a caller can tell a recoverable move from an \
+         unrecoverable erase — do not infer it from the tool name. The sweep is \
+         SUBSTRATE-WIDE and ungated (every namespace, every owner) and also prunes the \
+         recall_observations ledger and expired signals. Per #3161 the gc archive path does \
+         not archive link edges, so edges of archived rows are lost. dry_run previews."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<GcRequest>()
@@ -561,6 +769,106 @@ mod tests {
             0,
             "control row expired as scheduled"
         );
+    }
+
+    /// #3204 item 7 — a DESTRUCTIVE sweep must refuse when any namespace
+    /// holding expired rows carries a non-`Any` `delete` policy. Pre-fix
+    /// `memory_gc` reached the substrate with no governance consult, so a
+    /// `delete: Approve` legal-hold was no defence: held rows simply
+    /// expired and vanished. `dry_run` stays ungated; an archiving sweep
+    /// stays recoverable via `memory_archive_restore` and is exempt.
+    #[test]
+    fn gc_destructive_sweep_refuses_delete_governed_namespace_3204() {
+        use crate::models::{
+            CorePolicy, GovernanceLevel, GovernancePolicy, Memory, MemoryKind, Tier,
+            default_metadata,
+        };
+        let conn = open_conn();
+        let ns = "gov-gc-approve-3204";
+        let policy = GovernancePolicy {
+            core: CorePolicy {
+                delete: GovernanceLevel::Approve,
+                ..CorePolicy::default()
+            },
+            ..Default::default()
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut metadata = default_metadata();
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("agent_id".into(), json!("ai:alice"));
+            obj.insert("governance".into(), serde_json::to_value(&policy).unwrap());
+        }
+        let standard = Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: format!("_standards-{ns}"),
+            title: format!("std-{ns}"),
+            content: "policy".into(),
+            tags: vec![],
+            priority: 9,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata,
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        let sid = db::insert(&conn, &standard).expect("insert standard");
+        db::set_namespace_standard(&conn, ns, &sid, None).expect("bind");
+
+        let lapsed = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, \
+                                   updated_at, expires_at) \
+             VALUES ('gc-held-3204', 'short', ?1, 'held', 'c', ?2, ?2, ?3)",
+            rusqlite::params![ns, now, lapsed],
+        )
+        .unwrap();
+
+        let dry = handle_gc(&conn, &json!({"dry_run": true}), false).expect("dry-run ungated");
+        assert_eq!(dry["collected"], 1);
+        assert_eq!(dry["dry_run"], true);
+
+        let err = handle_gc(&conn, &json!({}), false)
+            .expect_err("destructive sweep must refuse a delete-governed namespace");
+        assert!(
+            err.contains("governance") || err.contains("delete policy") || err.contains(ns),
+            "got: {err}"
+        );
+        let still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE id = 'gc-held-3204'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still, 1,
+            "held row must survive a refused destructive sweep"
+        );
+
+        // Archiving is recoverable; the hold is not defeated, so the
+        // documented exemption lets the move proceed.
+        let archived = handle_gc(&conn, &json!({}), true).expect("archiving sweep exempt");
+        assert_eq!(archived["archived"], true);
+        assert_eq!(archived["collected"], 1);
     }
 
     #[test]

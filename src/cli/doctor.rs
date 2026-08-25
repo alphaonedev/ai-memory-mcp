@@ -3929,8 +3929,10 @@ mod tests {
         // The exact-figure invariant lives in
         // `sizes::tests::full_profile_total_in_honest_measured_range`.
         let total = v["full_profile_total_tokens"].as_u64().unwrap();
+        let ceiling = u64::try_from(crate::sizes::VERBOSE_FULL_PROFILE_CEILING_TOKENS)
+            .expect("verbose ceiling fits u64");
         assert!(
-            (5_000..=25_000).contains(&total),
+            (5_000..=ceiling).contains(&total),
             "full_profile_total_tokens out of honest range: {total}"
         );
         assert!(v["active_total_tokens"].as_u64().unwrap() > 0);

@@ -34,7 +34,9 @@ pub struct ListRequest {
     #[serde(default)]
     pub valid_at: Option<String>,
 
-    /// Response format.
+    /// Response format: `toon_compact` (DEFAULT — ~79% smaller), `toon`,
+    /// or `json`. #3171 — the default was undocumented, so a caller that
+    /// omitted this got TOON where it expected JSON.
     #[serde(default)]
     pub format: Option<String>,
 }
@@ -51,7 +53,9 @@ impl McpTool for ListTool {
         "List memories, optionally filtered by namespace or tier."
     }
     fn docs() -> &'static str {
-        "Browse memories. Filters: namespace, tier, agent_id. Limit caps at 200."
+        "Browse memories. Filters: namespace, tier, agent_id, valid_at. Limit caps at 200. \
+         #3171: the default response format is `toon_compact`, NOT json — pass \
+         format=\"json\" for a JSON envelope."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ListRequest>()

@@ -33,6 +33,12 @@ pub struct NamespaceSetStandardRequest {
     /// Task 1.8 policy in metadata.governance.
     #[serde(default)]
     pub governance: Option<serde_json::Value>,
+
+    /// #3171 — the principal the #929/#2541 ownership gate compares against
+    /// the bound standard's (and declared parent's) recorded owner. A
+    /// reserved sentinel is never honoured from the wire (#2721).
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_namespace_set_standard`.
@@ -97,6 +103,13 @@ impl McpTool for NamespaceGetStandardTool {
 pub struct NamespaceClearStandardRequest {
     /// Namespace.
     pub namespace: String,
+
+    /// #3171 — the principal the #1777 ownership gate compares against the
+    /// bound standard's recorded owner. The gate is UNCONDITIONAL: omitting
+    /// this no longer skips it (the caller is resolved from the environment
+    /// instead), it only makes the refusal name the resolved id.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_namespace_clear_standard`.
@@ -258,15 +271,41 @@ fn resolve_namespace_standard_memory(
 /// never obtain the daemon/reserved authority the internal producers carve out
 /// of the cross-tenant gates. Closes the #2706/#2541 hole where `daemon` was
 /// special-cased BEFORE the strict validator.
-fn resolve_namespace_standard_caller(params: &Value, trusted_caller: Option<&str>) -> String {
+/// #3171 — this string is not attribution: it is the LEFT-HAND SIDE of the
+/// ownership predicate itself (`authorize_namespace_standard_owner` refuses
+/// only when `recorded_owner != caller`). Taking it from a self-asserted wire
+/// field meant a caller could satisfy the gate for ANY owned standard simply by
+/// naming that owner — the gate compared a value the attacker supplied against
+/// a value the attacker could read. Under the multi-tenant posture the caller
+/// is therefore the enforced-read caller and a disagreeing wire `agent_id` is
+/// REFUSED (the [`crate::identity::resolve_governance_subject`] rule, inlined
+/// here because the single-operator fallback must stay byte-identical to
+/// #2721: an unresolvable wire id still degrades to
+/// [`sentinels::ANONYMOUS_INVALID`] rather than erroring).
+///
+/// # Errors
+/// A wire `agent_id` that disagrees with the enforced-read caller.
+fn resolve_namespace_standard_caller(
+    params: &Value,
+    trusted_caller: Option<&str>,
+) -> Result<String, String> {
     if let Some(trusted) = trusted_caller {
-        return trusted.to_string();
+        return Ok(trusted.to_string());
     }
-    crate::identity::resolve_agent_id(
-        params.get(param_names::AGENT_ID).and_then(|v| v.as_str()),
-        None,
-    )
-    .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string())
+    let wire = params.get(param_names::AGENT_ID).and_then(|v| v.as_str());
+    if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
+        if let Some(requested) = wire.filter(|s| !s.is_empty())
+            && requested != caller
+        {
+            return Err(format!(
+                "agent_id mismatch: caller '{caller}' may only bind or clear a \
+                 namespace standard as itself (requested '{requested}')"
+            ));
+        }
+        return Ok(caller);
+    }
+    Ok(crate::identity::resolve_agent_id(wire, None)
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string()))
 }
 
 /// MCP wire entry for `memory_namespace_set_standard`. Caller identity is
@@ -323,7 +362,7 @@ fn handle_namespace_set_standard_inner(
     // `params.agent_id`, which the wire-strict `validate_agent_id` rejects
     // (#977). A wire caller spoofing a reserved id downgrades to
     // `anonymous:invalid` and is refused by the ownership gate below.
-    let caller = resolve_namespace_standard_caller(params, trusted_caller);
+    let caller = resolve_namespace_standard_caller(params, trusted_caller)?;
     // #929 SECURITY-high (Track A P6, 2026-05-20) — ownership gate on
     // the MCP entry. Mirrors the HTTP handler gate at
     // `handlers/hook_subscribers.rs::set_namespace_standard_inner`.
@@ -698,9 +737,46 @@ fn record_clear_refusal(caller: &str, namespace: &str) {
     );
 }
 
+/// MCP wire entry for `memory_namespace_clear_standard`. Caller identity is
+/// resolved ONLY from the untrusted wire `params.agent_id`; a reserved
+/// sentinel is never honored (#2721 / CB-19, via
+/// [`resolve_namespace_standard_caller`]). Trusted in-process operators call
+/// [`handle_namespace_clear_standard_trusted`] instead.
+///
+/// # Errors
+/// Returns a message when `namespace` is missing/invalid, when the caller does
+/// not own the bound standard, or when the bound standard is unresolvable
+/// (#2545) — plus the stringified storage error on write failure.
 pub fn handle_namespace_clear_standard(
     conn: &rusqlite::Connection,
     params: &Value,
+) -> Result<Value, String> {
+    handle_namespace_clear_standard_inner(conn, params, None)
+}
+
+/// Trusted in-process entry — the CLI operator surface supplies the daemon
+/// principal OUT OF BAND via `trusted_caller`, never through the wire
+/// `params.agent_id` (#2721 / CB-19). The exact mirror of
+/// [`handle_namespace_set_standard_trusted`]: #3171 made the CLEAR owner gate
+/// unconditional, so the operator remediation path (clearing a standard bound
+/// to a row owned by an agent that is gone) needs the same out-of-band
+/// daemon-principal entry SET already had.
+///
+/// # Errors
+/// Same as [`handle_namespace_clear_standard`]; the daemon principal bypasses
+/// the ownership + unresolvable gates.
+pub fn handle_namespace_clear_standard_trusted(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    trusted_caller: &str,
+) -> Result<Value, String> {
+    handle_namespace_clear_standard_inner(conn, params, Some(trusted_caller))
+}
+
+fn handle_namespace_clear_standard_inner(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    trusted_caller: Option<&str>,
 ) -> Result<Value, String> {
     let namespace = params["namespace"]
         .as_str()
@@ -708,28 +784,41 @@ pub fn handle_namespace_clear_standard(
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
-    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    // #3171 — single-sourced with the SET twin via
+    // `resolve_namespace_standard_caller`, so a reserved sentinel is honored
+    // only when supplied OUT OF BAND by a trusted in-process surface.
+    let caller = resolve_namespace_standard_caller(params, trusted_caller)?;
 
     // #1777 — owner gate, MIRRORING the #929 SET gate above. Clearing a
     // namespace's governance STANDARD reverts it to permissive allow-on-silence,
     // disarming the delete/write/promote gates that protect EVERY memory in the
     // namespace — so it must be gated identically to SETTING it (else a
     // non-owner could disarm protections others rely on, and a non-admin owner
-    // could set-but-never-clear). Gate ONLY when identity is claimed
-    // (params.agent_id present); daemon-internal + unclaimed callers pass, same
-    // as SET.
+    // could set-but-never-clear).
     //
     // #2545 — when the standard is UNRESOLVABLE (severed `standard_id` NULL
     // post-#2503, or dangling id after memory reap), the pre-fix `&&`-chain
     // short-circuited and skipped the gate entirely — any claimed caller could
     // DELETE the last evidence of governance and restore allow-on-silence.
     // Unresolvable + claimed identity → refuse with a re-point remedy.
-    let identity_claimed = params
-        .get(param_names::AGENT_ID)
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty());
-    if identity_claimed {
+    //
+    // #3171 — the gate is UNCONDITIONAL. Pre-fix it ran only when the caller
+    // CLAIMED an identity (`params.agent_id` present + non-empty), so omitting
+    // an UNDECLARED optional param disarmed authz on the op that disarms every
+    // other gate in the namespace: caller-opt-in security. #2541 had already
+    // removed exactly this opt-in from the SET twin ("the gate must NOT be
+    // caller-opt-in via `params.agent_id`. Pre-fix, omitting agent_id skipped
+    // the gate entirely"), leaving CLEAR — the strictly more destructive half
+    // — as the only opt-in survivor, and #1777's own remit was "mirror the #929
+    // ownership gate". An unclaimed caller now resolves through the same
+    // `resolve_agent_id` ladder every other surface uses (env `AI_MEMORY_AGENT_ID`
+    // → `host:<hostname>` → `anonymous:invalid`) and is refused against a
+    // DIFFERENTLY-owned standard, exactly like SET. Unowned / `system` standards
+    // still pass (unowned-pass), the daemon principal still bypasses, and the
+    // HTTP twin is unaffected — `clear_namespace_standard_inner` has threaded a
+    // resolved caller since #2719, so `identity_claimed` was already always
+    // true there and only the MCP stdio lane could skip the gate.
+    {
         let meta_row_exists: bool = conn
             .query_row(
                 "SELECT 1 FROM namespace_meta WHERE namespace = ?1",
@@ -784,8 +873,9 @@ pub fn handle_namespace_clear_standard(
         }
     }
 
-    // #913 + #2634 / CB-24 — the ownership gate above has PASSED (or was
-    // skipped for daemon/unclaimed callers): this clear is ALLOWED. Record
+    // #913 + #2634 / CB-24 — the ownership gate above has PASSED (the standard
+    // is unowned/`system`, the caller owns it, or the caller is the trusted
+    // daemon principal): this clear is ALLOWED. Record
     // "allow" here, still BEFORE the `db::clear_namespace_standard` write so
     // the #913 intent capture holds. Refused clears chain "refuse" at the
     // gate above via `record_clear_refusal`.
@@ -980,8 +1070,9 @@ mod tests {
     #[test]
     fn clear_standard_owner_gate_1777() {
         // #1777 — clearing a namespace standard mirrors the SET #929 owner gate:
-        // a claimed cross-owner caller is refused; the owner (and an unclaimed
-        // caller) may clear.
+        // a cross-owner caller is refused; the owner may clear. (#3171 made the
+        // gate unconditional — an UNCLAIMED caller no longer skips it; see
+        // `clear_standard_omitted_agent_id_still_gates_owned_row_3171`.)
         let conn = fresh_conn();
         let id = insert_owned(&conn, "ns-clear-1777", "standard", "ai:alice");
         handle_namespace_set_standard(
@@ -1047,6 +1138,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(still, 1, "namespace_meta row must survive refused clear");
+    }
+
+    /// #3171 — omitting `agent_id` must NOT skip the CLEAR ownership gate,
+    /// exactly as #2541 established for SET. Pre-fix the gate was
+    /// caller-opt-in: an `identity_claimed` probe on an UNDECLARED optional
+    /// param, so omitting it disarmed authz on the one op that disarms every
+    /// other gate in the namespace (clearing the standard reverts the
+    /// namespace to permissive allow-on-silence).
+    #[test]
+    fn clear_standard_omitted_agent_id_still_gates_owned_row_3171() {
+        // Single-operator posture (env unset): a sibling `_3171` test that
+        // mutates `AI_MEMORY_AGENT_ID` must not leak a multi-tenant caller
+        // into this assertion.
+        let _g = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh_conn();
+        let id = insert_owned(&conn, "ns-clear-3171", "std", "ai:alice-3171");
+        handle_namespace_set_standard(
+            &conn,
+            &json!({"namespace": "ns-clear-3171", "id": id, "agent_id": "ai:alice-3171"}),
+        )
+        .expect("alice sets the standard");
+
+        let err = handle_namespace_clear_standard(&conn, &json!({"namespace": "ns-clear-3171"}))
+            .expect_err("no agent_id must still refuse clearing an alice-owned standard");
+        assert!(err.contains("does not own"), "got: {err}");
+        assert!(
+            db::get_namespace_standard(&conn, "ns-clear-3171")
+                .unwrap()
+                .is_some(),
+            "the standard must survive the refused unclaimed clear"
+        );
+
+        // The trusted in-process (CLI) entry still clears it — the operator
+        // remediation path #3171 preserved, mirroring `set_standard_trusted`.
+        handle_namespace_clear_standard_trusted(
+            &conn,
+            &json!({"namespace": "ns-clear-3171"}),
+            sentinels::DAEMON_PRINCIPAL,
+        )
+        .expect("the trusted daemon principal may still clear");
+        assert!(
+            db::get_namespace_standard(&conn, "ns-clear-3171")
+                .unwrap()
+                .is_none(),
+            "trusted clear removes the standard"
+        );
+    }
+
+    /// #3171 — an UNOWNED / `system` standard is still clearable by an
+    /// unclaimed caller (unowned-pass), so first-clear + fixture flows and the
+    /// zero-config single-operator posture are byte-unchanged.
+    #[test]
+    fn clear_standard_unowned_still_passes_unclaimed_3171() {
+        let _g = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh_conn();
+        let id = insert_one(&conn, "ns-clear-unowned-3171", "std");
+        handle_namespace_set_standard(
+            &conn,
+            &json!({"namespace": "ns-clear-unowned-3171", "id": id}),
+        )
+        .expect("unowned bind ok");
+        let ok =
+            handle_namespace_clear_standard(&conn, &json!({"namespace": "ns-clear-unowned-3171"}))
+                .expect("unowned standard clears for an unclaimed caller");
+        assert_eq!(ok["cleared"], true);
     }
 
     /// #2541 hole 1 — omitting agent_id must NOT skip ownership gate.
@@ -1203,12 +1359,17 @@ mod tests {
     ///       the `unwrap_or_else`).
     #[test]
     fn resolve_namespace_standard_caller_branches_2763() {
+        // #3171 — every branch below asserts the SINGLE-OPERATOR posture
+        // (`AI_MEMORY_AGENT_ID` unset). Pin it: a sibling test that leaks the
+        // var would otherwise flip these into the multi-tenant arm.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         // (a) Trusted caller wins verbatim, regardless of any wire agent_id —
         // even a reserved sentinel present on the wire cannot displace the
         // out-of-band trusted principal.
         let params_with_wire = json!({ "agent_id": sentinels::SYSTEM_PRINCIPAL });
         assert_eq!(
-            resolve_namespace_standard_caller(&params_with_wire, Some(sentinels::DAEMON_PRINCIPAL),),
+            resolve_namespace_standard_caller(&params_with_wire, Some(sentinels::DAEMON_PRINCIPAL))
+                .expect("trusted caller never refuses"),
             sentinels::DAEMON_PRINCIPAL,
             "a trusted_caller must be returned verbatim (out-of-band operator surface)"
         );
@@ -1217,7 +1378,7 @@ mod tests {
         // trusted caller, downgrades to anonymous:invalid (CB-19 security branch).
         let params_daemon = json!({ "agent_id": sentinels::DAEMON_PRINCIPAL });
         assert_eq!(
-            resolve_namespace_standard_caller(&params_daemon, None),
+            resolve_namespace_standard_caller(&params_daemon, None).expect("resolves"),
             sentinels::ANONYMOUS_INVALID,
             "a wire daemon claim must never be honored — it falls to anonymous:invalid"
         );
@@ -1225,10 +1386,81 @@ mod tests {
         // (c) A legitimate wire agent_id (non-reserved) resolves to itself.
         let params_alice = json!({ "agent_id": "ai:alice" });
         assert_eq!(
-            resolve_namespace_standard_caller(&params_alice, None),
+            resolve_namespace_standard_caller(&params_alice, None).expect("resolves"),
             "ai:alice",
             "a non-reserved wire agent_id must resolve to itself"
         );
+    }
+
+    /// #3171 — under the MULTI-TENANT posture the namespace-standard caller
+    /// is the ENFORCED-READ caller, and a disagreeing wire `agent_id` is
+    /// REFUSED.
+    ///
+    /// This string is the left-hand side of the ownership predicate itself
+    /// (`authorize_namespace_standard_owner` refuses only when
+    /// `recorded_owner != caller`), so reading it from the wire let a caller
+    /// satisfy the gate for ANY owned standard by simply naming that owner —
+    /// the gate compared a value the attacker supplied against a value the
+    /// attacker could read. Binding/clearing a standard is the op that arms or
+    /// DISARMS the delete/write/promote gates for every memory in the
+    /// namespace, so this was the highest-value forgery on the surface.
+    #[test]
+    fn namespace_standard_caller_refuses_wire_mismatch_under_posture_3171() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:bob") };
+
+        // A wire agent_id naming a DIFFERENT principal is refused outright.
+        let err = resolve_namespace_standard_caller(&json!({ "agent_id": "ai:alice" }), None)
+            .expect_err("cross-principal wire agent_id must be refused");
+        assert!(err.contains("agent_id mismatch"), "got: {err}");
+
+        // Naming yourself, or omitting it, both resolve to the caller.
+        assert_eq!(
+            resolve_namespace_standard_caller(&json!({ "agent_id": "ai:bob" }), None)
+                .expect("self-naming is honoured"),
+            "ai:bob"
+        );
+        assert_eq!(
+            resolve_namespace_standard_caller(&json!({}), None).expect("omitted resolves"),
+            "ai:bob"
+        );
+
+        // The out-of-band trusted operator entry is unaffected by the posture.
+        assert_eq!(
+            resolve_namespace_standard_caller(
+                &json!({ "agent_id": "ai:alice" }),
+                Some(sentinels::DAEMON_PRINCIPAL)
+            )
+            .expect("trusted caller never refuses"),
+            sentinels::DAEMON_PRINCIPAL
+        );
+
+        // END-TO-END: the same forgery through the real handler. ai:alice owns
+        // the standard; ai:bob claims to be her and is refused, and the
+        // standard survives.
+        let conn = fresh_conn();
+        let id = insert_owned(&conn, "ns-3171-forge", "std", "ai:alice");
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+        handle_namespace_set_standard(
+            &conn,
+            &json!({"namespace": "ns-3171-forge", "id": id, "agent_id": "ai:alice"}),
+        )
+        .expect("alice binds her own standard");
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:bob") };
+        let err = handle_namespace_clear_standard(
+            &conn,
+            &json!({"namespace": "ns-3171-forge", "agent_id": "ai:alice"}),
+        )
+        .expect_err("bob must not clear alice's standard by naming her");
+        assert!(err.contains("agent_id mismatch"), "got: {err}");
+        assert!(
+            db::get_namespace_standard(&conn, "ns-3171-forge")
+                .unwrap()
+                .is_some(),
+            "the standard must survive the refused forged clear"
+        );
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     }
 
     // set_standard: happy path without governance.

@@ -1476,6 +1476,159 @@ mod d1_6_987_tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    /// Per-tool `inputSchema.properties` ADDITIONS allowed against the
+    /// immutable pre-D1.6 snapshot. The snapshot is never re-blessed; every
+    /// deliberate schema extension since D1.6 is recorded here with the issue
+    /// that introduced it, so the diff between "what shipped in v0.7.0" and
+    /// "what ships now" is readable in one place.
+    ///
+    /// Adding a row here is a WIRE-CONTRACT change: it appears in
+    /// `tools/list`, counts against the token budget
+    /// (`tests/budget_tokens.rs`) and must be re-blessed into the five
+    /// `tests/snapshots/tools_list_*.json` profiles.
+    const PROPERTY_ADDITIONS: &[(&str, &[&str])] = &[
+        // #2258 — bitemporal validity on the write schema.
+        (
+            "memory_store",
+            &["valid_from", "valid_until", "citations", "source_span"],
+        ),
+        // #3011 — optional signal TTL, wiring `signals.expires_at`.
+        ("memory_signal_send", &["ttl_secs"]),
+        // ------------------------------------------------------------------
+        // #3171 (2026-08-22) — tool-contract audit. Every name below was
+        // ALREADY HONOURED by its handler (`params["<name>"]`) but was absent
+        // from the schemars-derived request struct, so no schema-conformant
+        // client could discover it. Declaring them makes the advertised
+        // contract match the enforced one; none of them is newly honoured.
+        // ------------------------------------------------------------------
+        ("memory_agent_register", &["caller_agent_id"]),
+        ("memory_archive_purge", &["agent_id", "as_admin"]),
+        ("memory_atomise", &["agent_id"]),
+        ("memory_check_agent_action", &["kind_inner"]),
+        ("memory_checkpoint_resolve", &["resolved_at", "signature"]),
+        ("memory_delete", &["agent_id"]),
+        ("memory_deref", &["agent_id"]),
+        ("memory_get", &["agent_id"]),
+        ("memory_kg_invalidate", &["agent_id"]),
+        ("memory_kg_query", &["as_agent"]),
+        ("memory_link", &["agent_id"]),
+        ("memory_namespace_clear_standard", &["agent_id"]),
+        ("memory_namespace_set_standard", &["agent_id"]),
+        ("memory_offload", &["agent_id"]),
+        ("memory_pending_approve", &["agent_id"]),
+        ("memory_pending_reject", &["agent_id"]),
+        ("memory_promote", &["agent_id"]),
+        ("memory_recall", &["agent_id"]),
+        ("memory_routine_run", &["id"]),
+        ("memory_routine_status", &["id"]),
+        ("memory_search", &["source_uri"]),
+        ("memory_session_start", &["agent_id"]),
+        ("memory_skill_get", &["agent_id"]),
+        ("memory_skill_promote_from_reflection", &["agent_id"]),
+        ("memory_skill_register", &["agent_id"]),
+        ("memory_update", &["agent_id"]),
+    ];
+
+    /// Per-tool `inputSchema.properties` REMOVALS allowed against the
+    /// immutable pre-D1.6 snapshot.
+    ///
+    /// #3171 established this mechanism because the pin previously forbade
+    /// removals OUTRIGHT, with no escape hatch — which meant a property the
+    /// audit proved to be a LIE (declared, never read) could not be retired
+    /// even when leaving it advertised was itself the defect.
+    ///
+    /// SAFETY CONTRACT for adding a row. Removing a property from
+    /// `tools/list` is a BREAKING wire change for any client that sends it, so
+    /// all three must hold and be stated in the PR:
+    /// 1. No handler on ANY surface (MCP, HTTP, CLI, federation) reads the
+    ///    key — proven by a repo-wide search, not by inspection of one file.
+    /// 2. The key is NOT in the tool's `required` set (a required property
+    ///    can never be removed without a tool-version bump).
+    /// 3. Senders that still pass it are UNAFFECTED: the MCP path performs no
+    ///    runtime schema validation and every `*Request` struct that carries
+    ///    `deny_unknown_fields` has been checked, so a stale key is ignored
+    ///    rather than refused.
+    ///
+    /// Deliberately EMPTY at #3171: every ignored-parameter row in the audit
+    /// (`memory_signal_send.from_agent`, `memory_capture_turn.tool_calls`,
+    /// `memory_calibrate_confidence.output_format`) was corrected by
+    /// DOCUMENTING the true behaviour rather than by breaking the wire
+    /// contract — condition 3 held, but silently dropping a field a client
+    /// already sends is exactly the kind of unannounced contract change this
+    /// pin exists to prevent.
+    const PROPERTY_REMOVALS: &[(&str, &[&str])] = &[];
+
+    /// #3171 — tools whose long-form `docs()` text was deliberately
+    /// CORRECTED against the immutable pre-D1.6 snapshot.
+    ///
+    /// Why an exception is safe here and not for `description`/properties:
+    /// `docs` is STRIPPED from the wire `tools/list` payload (pinned by
+    /// `tests/c2_tool_docs_field.rs::c2_bare_tools_list_has_no_docs_field`),
+    /// so a docs correction costs ZERO wire tokens and cannot break a client
+    /// — it is pinned only so the text cannot drift UNNOTICED.
+    ///
+    /// Every entry below is an OVERCLAIM the #3171 tool-contract audit proved
+    /// against the code: text that promised behaviour the handler does not
+    /// implement, or omitted a destructive/scoping effect the handler does
+    /// perform. Correcting an overclaim is a data-integrity fix, not cosmetics
+    /// — an agent that trusts "archives first" and gets a crypto-erase has
+    /// lost data on the strength of our documentation.
+    ///
+    /// The pin still asserts the text ACTUALLY changed, so a stale entry here
+    /// fails the build rather than silently unpinning a tool.
+    const DOCS_CORRECTIONS: &[&str] = &[
+        "memory_archive_purge",
+        "memory_delete",
+        "memory_entity_register",
+        "memory_export_reflection",
+        "memory_forget",
+        "memory_gc",
+        "memory_ingest_multistep",
+        "memory_kg_invalidate",
+        "memory_lease_release",
+        "memory_lease_renew",
+        "memory_list",
+        "memory_pending_list",
+        "memory_promote",
+        "memory_quota_status",
+        "memory_recall",
+        "memory_signal_inbox",
+        "memory_skill_delete",
+        "memory_skill_get",
+        "memory_stats",
+    ];
+
+    /// #3171 — tools whose short `description()` was deliberately CORRECTED.
+    ///
+    /// Held to a stricter bar than [`DOCS_CORRECTIONS`]: `description` IS on
+    /// the wire and IS counted by the `tools/list` token budget
+    /// (`tests/budget_tokens.rs`), so only a description that is FALSE as
+    /// written — not merely incomplete — earns an entry, and the replacement
+    /// must stay within a few characters of the original.
+    const DESCRIPTION_CORRECTIONS: &[&str] = &[
+        // "archives first" is unconditional as written; archiving is
+        // conditional on `archive_on_gc`, and with it off the sweep is a
+        // permanent hard-delete + crypto-erase.
+        "memory_gc",
+        // "Operator-facing" claimed a restriction that is not enforced
+        // anywhere on the MCP path.
+        "memory_quota_status",
+        // Returned UNACKED signals only; the description promised the inbox.
+        "memory_signal_inbox",
+    ];
+
+    /// Look up a tool's allowed-diff row, defaulting to "no exception".
+    fn lookup_exception<'a>(
+        table: &'a [(&'a str, &'a [&'a str])],
+        name: &str,
+    ) -> BTreeSet<&'a str> {
+        table
+            .iter()
+            .find(|(tool, _)| *tool == name)
+            .map(|(_, keys)| keys.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     fn load_snapshot() -> Value {
         let path = "tests/snapshots/tool_definitions_pre_d1_6.json";
         let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
@@ -1553,6 +1706,15 @@ mod d1_6_987_tests {
             let got = post_map
                 .get(name)
                 .unwrap_or_else(|| panic!("post-D1.6 missing tool {name}"));
+            if DESCRIPTION_CORRECTIONS.contains(&name.as_str()) {
+                assert_ne!(
+                    got, want,
+                    "{name} is listed in DESCRIPTION_CORRECTIONS but its \
+                     description is byte-identical to the snapshot; remove \
+                     the stale entry"
+                );
+                continue;
+            }
             assert_eq!(
                 got, want,
                 "post-D1.6 {name}.description drifted from snapshot\n  legacy: {want:?}\n  post-D1.6: {got:?}"
@@ -1586,6 +1748,14 @@ mod d1_6_987_tests {
             let got = post_map
                 .get(name)
                 .unwrap_or_else(|| panic!("post-D1.6 missing tool {name}"));
+            if DOCS_CORRECTIONS.contains(&name.as_str()) {
+                assert_ne!(
+                    got, want,
+                    "{name} is listed in DOCS_CORRECTIONS but its docs are \
+                     byte-identical to the snapshot; remove the stale entry"
+                );
+                continue;
+            }
             assert_eq!(
                 got, want,
                 "post-D1.6 {name}.docs drifted from snapshot\n  legacy: {want:?}\n  post-D1.6: {got:?}"
@@ -1621,30 +1791,40 @@ mod d1_6_987_tests {
         };
         let pre_props = props_by_name(&pre);
         let post_props = props_by_name(&post);
+        // Accumulate EVERY drifting tool and report once: a fail-fast assert
+        // inside the loop reports only the alphabetically-first offender, so a
+        // multi-tool schema change had to be re-run once per tool to discover
+        // its own blast radius.
+        let mut drift: Vec<String> = Vec::new();
         for (name, want) in &pre_props {
             let got = post_props
                 .get(name)
                 .unwrap_or_else(|| panic!("post-D1.6 missing tool {name}"));
             let added: BTreeSet<&str> = got.difference(want).map(String::as_str).collect();
-            let removed: Vec<&String> = want.difference(got).collect();
-            // #2258 deliberately extends only memory_store's write schema. Keep the
-            // historical snapshot immutable and pin that narrow additive exception;
-            // every removal and every other tool/property addition remains forbidden.
-            // #3011 additionally extends memory_signal_send with an optional
-            // `ttl_secs` input (wiring `signals.expires_at`) — a second narrow
-            // additive exception on the same immutable historical snapshot.
-            let expected_added: BTreeSet<&str> = if name == "memory_store" {
-                ["valid_from", "valid_until"].into_iter().collect()
-            } else if name == "memory_signal_send" {
-                ["ttl_secs"].into_iter().collect()
-            } else {
-                BTreeSet::new()
-            };
-            assert!(
-                added == expected_added && removed.is_empty(),
-                "post-D1.6 {name}.inputSchema.properties drifted: added = {added:?} (expected {expected_added:?}), removed = {removed:?}"
-            );
+            let removed: BTreeSet<&str> = want.difference(got).map(String::as_str).collect();
+            let expected_added = lookup_exception(PROPERTY_ADDITIONS, name);
+            let expected_removed = lookup_exception(PROPERTY_REMOVALS, name);
+            if added != expected_added {
+                drift.push(format!(
+                    "  {name}: added = {added:?}, allowed additions = {expected_added:?}"
+                ));
+            }
+            if removed != expected_removed {
+                drift.push(format!(
+                    "  {name}: removed = {removed:?}, allowed removals = {expected_removed:?}"
+                ));
+            }
         }
+        assert!(
+            drift.is_empty(),
+            "post-D1.6 inputSchema.properties drifted from the immutable historical \n\
+             snapshot on {} tool(s):\n{}\n\n\
+             An ADDITION is allowed only after it is entered in \n\
+             `PROPERTY_ADDITIONS` with an issue number; a REMOVAL only via \n\
+             `PROPERTY_REMOVALS` (see the safety contract documented there).",
+            drift.len(),
+            drift.join("\n")
+        );
     }
 
     /// Pre-D1.6 vs. post-D1.6: per-tool `required` array. Order

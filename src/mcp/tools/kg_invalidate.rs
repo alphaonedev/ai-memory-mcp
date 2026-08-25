@@ -30,6 +30,13 @@ pub struct KgInvalidateRequest {
     /// RFC3339 supersession instant. Default now.
     #[serde(default)]
     pub valid_until: Option<String>,
+
+    /// #3171 — operator-as-actor: the id recorded as the ACTOR of this
+    /// operation (audit / provenance). Honoured since before v1.0.0 but
+    /// undeclared until the tool-contract audit. Under the multi-tenant
+    /// posture (`AI_MEMORY_AGENT_ID` set) it is BOUND to the caller.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_kg_invalidate`.
@@ -44,7 +51,13 @@ impl McpTool for KgInvalidateTool {
         "Mark a KG link as superseded by setting its valid_until column."
     }
     fn docs() -> &'static str {
-        "Pillar 2 / Stream C: set valid_until on (source_id, target_id, relation). valid_until defaults to now. Idempotent; response carries previous_valid_until. found:false when no match."
+        "Pillar 2 / Stream C: set valid_until on (source_id, target_id, relation). valid_until \
+         defaults to now. Response carries previous_valid_until; found:false when no match. \
+         #3171: on a SIGNED link this PERMANENTLY clears the signing surface — `signature` is \
+         set to NULL and `attest_level` to `unsigned`, with no archived copy of the original \
+         attestation (a signed audit row records the prior signature). NOT idempotent when \
+         valid_until is omitted: each call re-stamps `now`. Exact-triple only — no cascade to \
+         dependent or transitively-derived links."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<KgInvalidateRequest>()
@@ -94,8 +107,17 @@ pub fn handle_kg_invalidate(
             Ok(Some(m)) => m.namespace,
             _ => crate::DEFAULT_NAMESPACE.to_string(),
         };
-        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-            .map_err(|e| e.to_string())?;
+        // #3171 — bind the K9 permission SUBJECT to the enforced-read caller
+        // (see `resolve_governance_subject`). This op NULLs a signed link's
+        // `signature` and resets `attest_level` to `unsigned` permanently, so a
+        // caller-chosen subject means a caller-chosen permission verdict on an
+        // irreversible attestation downgrade.
+        let agent_id = crate::identity::resolve_governance_subject(
+            params[param_names::AGENT_ID].as_str(),
+            None,
+            "invalidate a link",
+        )
+        .map_err(|e| e.to_string())?;
         let ctx = PermissionContext {
             op: Op::MemoryLink,
             namespace: link_ns,

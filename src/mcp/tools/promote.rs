@@ -37,6 +37,11 @@ pub struct PromoteRequest {
         description = "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this promote to Allow within its caveats."
     )]
     pub capability: Option<String>,
+
+    /// #3171 — the governance / capability-binding subject for this promote.
+    /// Bound to the caller under the multi-tenant posture.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_promote`.
@@ -51,7 +56,7 @@ impl McpTool for PromoteTool {
         "Promote a memory to long (or chosen tier) / ancestor namespace."
     }
     fn docs() -> &'static str {
-        "Default: bump to long (clears expiry); short->long and mid->long are single-call. #831: target_tier ('mid'|'long') stops on intermediate. Task 1.7: to_namespace clones to an ancestor + derived_from link."
+        "Default: bump to long (clears expiry); short->long and mid->long are single-call. #831: target_tier ('mid'|'long') stops on intermediate. Task 1.7: to_namespace clones to an ancestor + derived_from link. #3171: `id` also accepts a UNIQUE ID PREFIX — an over-short prefix resolves to whichever row matches first."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<PromoteRequest>()
@@ -123,11 +128,97 @@ pub(super) fn handle_promote(
         }
     }
 
+    // #3202 Fable HIGH (2) — destination Store-class gate FIRST so a
+    // SOURCE `promote: Approve` cannot queue (and later execute) a clone
+    // into a dest whose `write` policy Denies the caller. Dest Pending
+    // still queues a store-vertical pending (execute arm already clones).
+    let dest_agent_id: Option<String> =
+        if let Some(to_ns) = params[crate::models::field_names::TO_NAMESPACE].as_str() {
+            validate::validate_namespace(to_ns).map_err(|e| e.to_string())?;
+            validate::reject_reserved_write_namespace(to_ns).map_err(|e| e.to_string())?;
+            use crate::models::{GovernanceDecision, GovernedAction};
+            let dest_agent_id = crate::identity::resolve_governance_subject(
+                params[param_names::AGENT_ID].as_str(),
+                mcp_client,
+                "promote",
+            )
+            .map_err(|e| e.to_string())?;
+            let dest_capability = crate::governance::capability::parse_presented_token(
+                params[param_names::CAPABILITY].as_str(),
+                &dest_agent_id,
+            )
+            .map_err(|rej| crate::governance::capability::edge_reject_message(&rej))?;
+            let dest_payload = json!({
+                "id": resolved_id,
+                (crate::models::field_names::TO_NAMESPACE): to_ns,
+                "mode": "vertical",
+            });
+            crate::mcp::consult_pre_governance_decision_gate(
+                to_ns,
+                "promote",
+                &dest_agent_id,
+                Some(&resolved_id),
+            )?;
+            match db::enforce_governance(
+                conn,
+                GovernedAction::Store,
+                to_ns,
+                &dest_agent_id,
+                None,
+                None,
+                &dest_payload,
+                dest_capability.as_ref(),
+            )
+            .map_err(|e| e.to_string())?
+            {
+                GovernanceDecision::Allow => {}
+                GovernanceDecision::Deny(refusal) => {
+                    return Err(crate::governance::deny_message(
+                        "promote",
+                        crate::governance::DenyGate::Governance,
+                        &refusal.reason,
+                    ));
+                }
+                GovernanceDecision::Pending(pending_id) => {
+                    crate::subscriptions::dispatch_approval_requested(conn, &pending_id, db_path);
+                    return Ok(json!({
+                        "status": "pending",
+                        "pending_id": pending_id,
+                        "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
+                        "action": "promote",
+                        "memory_id": resolved_id,
+                        (crate::models::field_names::TO_NAMESPACE): to_ns,
+                    }));
+                }
+            }
+            crate::governance::audit::record_decision(
+                &dest_agent_id,
+                "allow",
+                crate::mcp::registry::tool_names::MEMORY_PROMOTE,
+                to_ns,
+                dest_payload,
+            );
+            Some(dest_agent_id)
+        } else {
+            None
+        };
+
     // Task 1.9: governance enforcement (promote-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
-        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .map_err(|e| e.to_string())?;
+        // #3171 — the governance / capability-binding / mandatory-hook SUBJECT
+        // must not be caller-chosen. `resolve_agent_id` gives the WIRE
+        // `params.agent_id` precedence over the env identity, so a caller could
+        // pick the principal its own promote was judged as while the #1786
+        // ownership gate above stayed keyed on the ENV caller — two controls
+        // that can never agree. Bind the subject to the enforced-read caller
+        // under the multi-tenant posture; single-operator default unchanged.
+        let agent_id = crate::identity::resolve_governance_subject(
+            params[param_names::AGENT_ID].as_str(),
+            mcp_client,
+            "promote",
+        )
+        .map_err(|e| e.to_string())?;
         let mem_owner = target
             .metadata
             .get(param_names::AGENT_ID)
@@ -190,14 +281,13 @@ pub(super) fn handle_promote(
     // When `to_namespace` is supplied, clone (don't move) the memory to the
     // target and link clone → source with `derived_from`. Original is
     // untouched; tier is NOT changed by this path.
-    if let Some(to_ns) = params["to_namespace"].as_str() {
-        validate::validate_namespace(to_ns).map_err(|e| e.to_string())?;
-        // #2357 (W1A4-08) — vertical promotion CLONES a row into `to_ns`,
-        // i.e. a caller write into that namespace; consult the R22
-        // reserved-namespace refusal.
-        validate::reject_reserved_write_namespace(to_ns).map_err(|e| e.to_string())?;
+    if let Some(to_ns) = params[crate::models::field_names::TO_NAMESPACE].as_str() {
+        let dest_agent_id = dest_agent_id.ok_or_else(|| {
+            "internal: vertical dest gate did not stash the dest subject".to_string()
+        })?;
         let clone_id =
-            db::promote_to_namespace(conn, &resolved_id, to_ns).map_err(|e| e.to_string())?;
+            db::promote_to_namespace(conn, &resolved_id, to_ns, Some(dest_agent_id.as_str()))
+                .map_err(|e| e.to_string())?;
         // P5 (G9): fire `memory_promote` webhook for vertical mode AFTER
         // the clone commits. memory_id = source id (subscribers can
         // distinguish via `mode` and `clone_id` in the details block).
@@ -326,6 +416,254 @@ mod tests {
 
     fn open_conn() -> rusqlite::Connection {
         crate::db::open(Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    /// #3202 — vertical promotion must clear the DESTINATION namespace's
+    /// governance, not only the source's.
+    ///
+    /// Pre-fix the Task-1.9 block evaluated `GovernedAction::Promote` against
+    /// `target.namespace` (the SOURCE) and the destination got nothing but
+    /// `reject_reserved_write_namespace`. But vertical promotion is a WRITE
+    /// into `to_ns` — it lands a full copy of the row there — so an operator
+    /// who set `write: Owner` on an ancestor namespace still had every row a
+    /// caller could read from a descendant cloned into it. The ancestor is
+    /// normally the MORE protected namespace, which makes this a governance
+    /// boundary that could be crossed by construction.
+    ///
+    /// The source policy is deliberately permissive here so the assertion can
+    /// only be satisfied by the destination gate.
+    #[test]
+    fn promote_to_namespace_enforces_destination_governance_3202() {
+        use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let _modeg = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
+        let conn = open_conn();
+
+        // Destination `acme` — write: Owner, and the standard is owned by
+        // ai:alice, so ai:bob is not the namespace owner.
+        let dest_std = insert_owned(&conn, "acme-std", "acme", "ai:alice");
+        let dest_policy = serde_json::to_value(GovernancePolicy {
+            core: CorePolicy {
+                write: GovernanceLevel::Owner,
+                ..CorePolicy::default()
+            },
+            ..GovernancePolicy::default()
+        })
+        .expect("policy serialises");
+        crate::db::set_row_metadata(
+            &conn,
+            &dest_std,
+            &json!({"agent_id": "ai:alice", "governance": dest_policy}).to_string(),
+        )
+        .expect("stamp dest policy");
+        crate::db::set_namespace_standard(&conn, "acme", &dest_std, None).expect("bind dest");
+
+        // Source `acme/sub` — its OWN standard, fully permissive, so the
+        // SOURCE gate cannot be what refuses.
+        let src_std = insert_owned(&conn, "sub-std", "acme/sub", "ai:bob");
+        let permissive = serde_json::to_value(GovernancePolicy::default()).expect("serialises");
+        crate::db::set_row_metadata(
+            &conn,
+            &src_std,
+            &json!({"agent_id": "ai:bob", "governance": permissive}).to_string(),
+        )
+        .expect("stamp src policy");
+        crate::db::set_namespace_standard(&conn, "acme/sub", &src_std, None).expect("bind src");
+
+        let row = insert_owned(&conn, "row", "acme/sub", "ai:bob");
+
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:bob") };
+        let err = handle_promote(
+            &conn,
+            Path::new(":memory:"),
+            &json!({"id": row, "to_namespace": "acme"}),
+            None,
+        )
+        .expect_err("a non-owner promote into a write:Owner ancestor must refuse");
+        assert!(
+            err.contains("not the owner"),
+            "the DESTINATION owner gate must be what refuses; got: {err}"
+        );
+
+        // The clone must not exist: a refused promote writes nothing.
+        assert!(
+            crate::db::find_by_title_namespace(&conn, "row", "acme")
+                .expect("probe")
+                .is_none(),
+            "a refused promote must not land the clone in the destination"
+        );
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+    }
+
+    /// #3202 Fable HIGH (2) — SOURCE `promote: Approve` must NOT queue when
+    /// the destination `write` policy refuses. Dest gate runs first.
+    #[test]
+    fn promote_source_approve_cannot_bypass_dest_owner_3202() {
+        use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let _modeg = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
+        let conn = open_conn();
+
+        let dest_std = insert_owned(&conn, "acme3-std", "acme3", "ai:alice");
+        let dest_policy = serde_json::to_value(GovernancePolicy {
+            core: CorePolicy {
+                write: GovernanceLevel::Owner,
+                ..CorePolicy::default()
+            },
+            ..GovernancePolicy::default()
+        })
+        .expect("policy serialises");
+        crate::db::set_row_metadata(
+            &conn,
+            &dest_std,
+            &json!({"agent_id": "ai:alice", "governance": dest_policy}).to_string(),
+        )
+        .expect("stamp dest");
+        crate::db::set_namespace_standard(&conn, "acme3", &dest_std, None).expect("bind dest");
+
+        let src_std = insert_owned(&conn, "sub3-std", "acme3/sub", "ai:bob");
+        let src_approve = serde_json::to_value(GovernancePolicy {
+            core: CorePolicy {
+                promote: GovernanceLevel::Approve,
+                ..CorePolicy::default()
+            },
+            ..GovernancePolicy::default()
+        })
+        .expect("serialises");
+        crate::db::set_row_metadata(
+            &conn,
+            &src_std,
+            &json!({"agent_id": "ai:bob", "governance": src_approve}).to_string(),
+        )
+        .expect("stamp src");
+        crate::db::set_namespace_standard(&conn, "acme3/sub", &src_std, None).expect("bind src");
+
+        let row = insert_owned(&conn, "row-bypass", "acme3/sub", "ai:bob");
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:bob") };
+        let err = handle_promote(
+            &conn,
+            Path::new(":memory:"),
+            &json!({"id": row, "to_namespace": "acme3"}),
+            None,
+        )
+        .expect_err("dest Owner must refuse even when source promote is Approve");
+        assert!(
+            err.contains("not the owner"),
+            "DESTINATION owner gate must refuse; got: {err}"
+        );
+        assert!(
+            crate::db::find_by_title_namespace(&conn, "row-bypass", "acme3")
+                .expect("probe")
+                .is_none(),
+            "must not clone"
+        );
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+    }
+
+    /// #3202 — `write: Approve` on the destination QUEUES the promote instead
+    /// of cloning, exactly as a direct `memory_store` into that namespace
+    /// would; and an ALLOWED promote re-stamps the clone's provenance so the
+    /// destination row is owned by the acting caller with the origin preserved.
+    #[test]
+    fn promote_destination_approve_queues_and_allow_restamps_3202() {
+        use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let _modeg = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
+        let conn = open_conn();
+
+        let dest_std = insert_owned(&conn, "acme2-std", "acme2", "ai:alice");
+        let approve = serde_json::to_value(GovernancePolicy {
+            core: CorePolicy {
+                write: GovernanceLevel::Approve,
+                ..CorePolicy::default()
+            },
+            ..GovernancePolicy::default()
+        })
+        .expect("serialises");
+        crate::db::set_row_metadata(
+            &conn,
+            &dest_std,
+            &json!({"agent_id": "ai:alice", "governance": approve}).to_string(),
+        )
+        .expect("stamp");
+        crate::db::set_namespace_standard(&conn, "acme2", &dest_std, None).expect("bind");
+
+        let src_std = insert_owned(&conn, "sub2-std", "acme2/sub", "ai:bob");
+        let permissive = serde_json::to_value(GovernancePolicy::default()).expect("serialises");
+        crate::db::set_row_metadata(
+            &conn,
+            &src_std,
+            &json!({"agent_id": "ai:bob", "governance": permissive}).to_string(),
+        )
+        .expect("stamp");
+        crate::db::set_namespace_standard(&conn, "acme2/sub", &src_std, None).expect("bind");
+
+        let row = insert_owned(&conn, "row2", "acme2/sub", "ai:bob");
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:bob") };
+        let queued = handle_promote(
+            &conn,
+            Path::new(":memory:"),
+            &json!({"id": row, "to_namespace": "acme2"}),
+            None,
+        )
+        .expect("Approve queues rather than erroring");
+        assert_eq!(queued["status"].as_str(), Some("pending"));
+        assert!(queued["pending_id"].as_str().is_some_and(|s| !s.is_empty()));
+
+        // Now open the destination and re-promote: the clone lands, owned by
+        // the ACTING caller, with the origin preserved (never overwritten).
+        // Drop the multi-tenant env so the #1786 source-owner gate does not
+        // refuse bob promoting alice's row; pass `agent_id` on the wire so
+        // the single-operator ladder still restamps the clone as bob.
+        let open = serde_json::to_value(GovernancePolicy::default()).expect("serialises");
+        crate::db::set_row_metadata(
+            &conn,
+            &dest_std,
+            &json!({"agent_id": "ai:alice", "governance": open}).to_string(),
+        )
+        .expect("reopen");
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+        let row3 = insert_owned(&conn, "row3", "acme2/sub", "ai:alice");
+        handle_promote(
+            &conn,
+            Path::new(":memory:"),
+            &json!({"id": row3, "to_namespace": "acme2", "agent_id": "ai:bob"}),
+            None,
+        )
+        .expect("open destination allows");
+        let clone_id = crate::db::find_by_title_namespace(&conn, "row3", "acme2")
+            .expect("probe")
+            .expect("clone landed");
+        let clone = crate::db::get(&conn, &clone_id)
+            .expect("read clone")
+            .expect("clone present");
+        assert_eq!(
+            clone.metadata["agent_id"].as_str(),
+            Some("ai:bob"),
+            "the clone is attributed to the ACTING caller, not the source author"
+        );
+        assert_eq!(
+            clone.metadata["promoted_from_agent_id"].as_str(),
+            Some("ai:alice"),
+            "the original authorship must be PRESERVED, never overwritten"
+        );
+        assert_eq!(
+            clone.metadata["promoted_from_namespace"].as_str(),
+            Some("acme2/sub")
+        );
+        assert!(clone.metadata["promoted_from"].as_str().is_some());
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     }
 
     #[test]

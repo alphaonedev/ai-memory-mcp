@@ -103,6 +103,25 @@ pub fn tool_sizes_under_ci_gate() -> usize {
         .unwrap_or(0)
 }
 
+/// Verbose (`memory_capabilities { verbose: true }` / full-profile source)
+/// token-budget ceiling in cl100k tokens. SSOT for every pin:
+/// `tests/token_budget_guard.rs`, `tests/mcp_tools_list_schema_discovery.rs`,
+/// `tests/recall_decoration.rs`, `src/cli/doctor.rs` tokens JSON test, and
+/// the `full_profile_total_in_honest_measured_range` pin in this module.
+///
+/// Historical: 10K (#829) → 17K (D1.6 #987) → 18K/20K/22K (v0.8.0 #1709
+/// Pillar-1) → 25K (v1.0.0 #2024 skill retire/delete, 103-tool catalog
+/// ~22.6K).
+///
+/// 2026-08-22 #3171 — 25_000 → 28_000. The MCP tool-contract audit
+/// declared 26 previously-honoured-but-undeclared properties and rewrote
+/// 17 `docs` strings from overclaim to honest contract (the verbose path
+/// includes `docs`; the trimmed `tools/list` wire is unchanged and still
+/// under 11_000). Measured 26_691; ceiling restores ~1.3K headroom,
+/// matching the historical bump cadence. rust-1.98: named const, not a
+/// duplicated magic number across five pins.
+pub const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 28_000;
+
 /// Sum of every tool's `total_tokens` (verbose schema) — the
 /// worst-case prefix cost on a `verbose=true` opt-in harness with
 /// `--profile full`. The actually-paid cost on the default code path
@@ -265,14 +284,15 @@ mod tests {
         // the next field-addition without re-bumping. Floor stays at 5K
         // to catch a wiring break that drops the catalog entirely.
         assert!(
-            (5_000..=25_000).contains(&total),
+            (5_000..=super::VERBOSE_FULL_PROFILE_CEILING_TOKENS).contains(&total),
             "full-profile total {total} tokens is outside the measured \
-             cl100k_base range (5K-25K, post-#987 D1.6; upper bound raised \
-             17K->18K->20K->22K->25K across the v0.8.0 #1709 Pillar-1 memory_action_* / \
-             memory_lease_* / memory_routine_* and the v1.0.0 #2024 skill \
-             retire/delete tool additions, measured ~22.6K at 103 tools). If the schema grew intentionally, update \
-             `tests/token_budget_guard.rs::VERBOSE_FULL_PROFILE_CEILING_TOKENS` \
-             AND this bound together."
+             cl100k_base range (5K-{}K, post-#987 D1.6; upper bound raised \
+             17K->18K->20K->22K->25K->28K across the v0.8.0 #1709 Pillar-1 memory_action_* / \
+             memory_lease_* / memory_routine_* , the v1.0.0 #2024 skill \
+             retire/delete tool additions, and the 2026-08-22 #3171 honest-docs \
+             + 26 declared properties, measured 26_691). If the schema grew intentionally, update \
+             `crate::sizes::VERBOSE_FULL_PROFILE_CEILING_TOKENS` (the SSOT).",
+            super::VERBOSE_FULL_PROFILE_CEILING_TOKENS / 1_000
         );
     }
 

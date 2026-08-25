@@ -392,7 +392,9 @@ pub fn handle_action_edges(conn: &rusqlite::Connection, params: &Value) -> Resul
 /// reachable via `memory_action_list { state: "in_progress" }`.
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on query failure.
+/// Returns `"namespace is required"` when the schema-required `namespace`
+/// is missing/blank (#3171), or the stringified `rusqlite` error on query
+/// failure.
 pub fn handle_action_frontier(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -400,10 +402,11 @@ pub fn handle_action_frontier(
     // #2997 — reclaim expired leases + requeue stranded claimed actions before
     // computing the frontier, so a dead worker's action re-appears here.
     sweep_expired_leases_best_effort(conn);
-    let namespace = params
-        .get(param_names::NAMESPACE)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    // #3171 — `namespace` is schema-REQUIRED. Pre-fix it was read with
+    // `unwrap_or_default()`, so a malformed call queried the `""` namespace
+    // and got a plausible EMPTY-SUCCESS frontier instead of an error — a
+    // worker fleet would read "no work" and idle. Refuse instead (ERRORS-08).
+    let namespace = crate::mcp::param_guard::require_str(params, param_names::NAMESPACE)?;
     let limit = params
         .get(param_names::LIMIT)
         .and_then(Value::as_i64)
@@ -422,14 +425,16 @@ pub fn handle_action_frontier(
 /// field is `null` when the frontier is empty.
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on query failure.
+/// Returns `"namespace is required"` when the schema-required `namespace`
+/// is missing/blank (#3171), or the stringified `rusqlite` error on query
+/// failure.
 pub fn handle_action_next(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     // #2997 — sweep before selecting the next action (see handle_action_frontier).
     sweep_expired_leases_best_effort(conn);
-    let namespace = params
-        .get(param_names::NAMESPACE)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    // #3171 — see `handle_action_frontier`: `namespace` is schema-REQUIRED and
+    // must not degrade into an empty-namespace query that answers `action:
+    // null` (indistinguishable from "the frontier is empty").
+    let namespace = crate::mcp::param_guard::require_str(params, param_names::NAMESPACE)?;
     let agent_id = params
         .get(param_names::AGENT_ID)
         .and_then(Value::as_str)
@@ -467,14 +472,18 @@ pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Resu
     // #2997 — reclaim any expired leases (and requeue their stranded actions)
     // before this acquire, so a dead holder's lease + claim is reconciled.
     sweep_expired_leases_best_effort(conn);
-    let action_id = params
-        .get(param_names::ACTION_ID)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let holder = params
-        .get(param_names::HOLDER)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    // #3171 — `action_id` and `holder` are BOTH schema-REQUIRED, and both were
+    // read with `unwrap_or_default()`. An empty `holder` is not merely a
+    // fail-open empty success: `lease_acquire`'s upsert guard is
+    // `WHERE leases.expires_at <= ? OR leases.holder = ?`, so TWO DISTINCT
+    // agents that each omit `holder` both resolve to `""`, the second is
+    // treated as a same-holder RE-acquire, and both believe they hold the
+    // exclusive lease — a DOUBLE GRANT of a single-holder lease, which
+    // `crate::actions::lease_acquire`'s own contract calls a correctness /
+    // safety violation ("the worst case is a spurious Conflict a caller
+    // retries, never two winners"). Refuse instead.
+    let action_id = crate::mcp::param_guard::require_str(params, param_names::ACTION_ID)?;
+    let holder = crate::mcp::param_guard::require_str(params, param_names::HOLDER)?;
     let ttl_secs = params
         .get(param_names::TTL_SECS)
         .and_then(Value::as_i64)
@@ -529,14 +538,10 @@ pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Resu
 /// - `no lease held by <holder> on <action_id>` when no lease matches.
 /// - The stringified `rusqlite` error on query/update failure.
 pub fn handle_lease_renew(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let action_id = params
-        .get(param_names::ACTION_ID)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let holder = params
-        .get(param_names::HOLDER)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    // #3171 — see `handle_lease_acquire`: both are schema-REQUIRED. A blank
+    // `holder` renewed whatever an empty-holder acquire had minted.
+    let action_id = crate::mcp::param_guard::require_str(params, param_names::ACTION_ID)?;
+    let holder = crate::mcp::param_guard::require_str(params, param_names::HOLDER)?;
     let ttl_secs = params
         .get(param_names::TTL_SECS)
         .and_then(Value::as_i64)
@@ -576,14 +581,11 @@ pub fn handle_lease_renew(conn: &rusqlite::Connection, params: &Value) -> Result
 /// # Errors
 /// Returns the stringified `rusqlite` error on delete failure.
 pub fn handle_lease_release(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let action_id = params
-        .get(param_names::ACTION_ID)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let holder = params
-        .get(param_names::HOLDER)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    // #3171 — both are schema-REQUIRED. Pre-fix a malformed call deleted on
+    // `("", "")` and answered `released: false`, indistinguishable from "you do
+    // not hold that lease" — a worker would conclude it had already released.
+    let action_id = crate::mcp::param_guard::require_str(params, param_names::ACTION_ID)?;
+    let holder = crate::mcp::param_guard::require_str(params, param_names::HOLDER)?;
     let released =
         crate::actions::lease_release(conn, action_id, holder).map_err(|e| e.to_string())?;
 
@@ -610,12 +612,10 @@ pub fn handle_lease_release(conn: &rusqlite::Connection, params: &Value) -> Resu
 /// # Errors
 /// Returns the stringified `rusqlite` error on query failure.
 pub fn handle_lease_get(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let action_id = params
-        .get(param_names::ACTION_ID)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
+    // #3171 — schema-REQUIRED: `lease: null` for a blank id reads as "there is
+    // no lease on that action", which is a different claim from "you did not
+    // name an action".
+    let action_id = crate::mcp::param_guard::require_str(params, param_names::ACTION_ID)?;
     let found = crate::actions::lease_get(conn, action_id).map_err(|e| e.to_string())?;
     let lease = match found {
         Some(l) => serde_json::to_value(&l).map_err(|e| e.to_string())?,
@@ -993,7 +993,10 @@ impl McpTool for LeaseRenewTool {
         "Heartbeat-renew an owned lease on a coordination action (#1709)."
     }
     fn docs() -> &'static str {
-        "Pillar 1 (#1709): extend an owned lease's TTL; errors if no lease is held by the caller. \
+        "Pillar 1 (#1709): extend a lease's TTL; errors if no lease matches the supplied \
+         `holder`. #3171: ownership is decided ENTIRELY by the self-asserted `holder` \
+         string — this tool receives no caller identity, so `holder` is a coordination \
+         token, not an authenticated principal; treat it as unguessable. \
          Renew before expiry (#2419): a lapsed lease is reclaimed by the background sweep, which also returns a still-`claimed` action to `pending` for another holder."
     }
     fn input_schema() -> Value {
@@ -1016,7 +1019,10 @@ impl McpTool for LeaseReleaseTool {
         "Release an owned lease on a coordination action (#1709)."
     }
     fn docs() -> &'static str {
-        "Pillar 1 (#1709): release an owned lease; reports whether a row was removed."
+        "Pillar 1 (#1709): release a lease; reports whether a row was removed. #3171: the \
+         lease released is the one matching the self-asserted `holder` — this tool \
+         receives no caller identity, so any caller that knows a holder string can \
+         release that holder's lease."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<LeaseReleaseRequest>()
@@ -1203,6 +1209,77 @@ mod handler_tests {
         assert_eq!(got["action"]["kind"].as_str(), Some("test.kind"));
         assert_eq!(got["action"]["priority"].as_i64(), Some(5));
         assert_eq!(got["action"]["agent_id"].as_str(), Some("agent-x"));
+    }
+
+    /// #3171 — an OMITTED `holder` must be refused, because
+    /// `unwrap_or_default()` collapsed every anonymous holder to `""` and
+    /// that DOUBLE-GRANTS a single-holder coordination lease.
+    ///
+    /// `crate::actions::lease_acquire`'s upsert guard is
+    /// `WHERE leases.expires_at <= ?now OR leases.holder = ?holder`. With two
+    /// distinct agents both defaulting to `""`, the second acquire matched the
+    /// same-holder arm and SUCCEEDED — both workers then believed they held
+    /// exclusive coordination authority over the action, which that function's
+    /// own contract calls a correctness/safety violation ("the worst case is a
+    /// spurious Conflict a caller retries, never two winners"). Refusing the
+    /// blank at the MCP boundary is what keeps that invariant true.
+    #[test]
+    fn lease_handlers_refuse_blank_required_args_3171() {
+        let conn = fresh();
+        let created = handle_action_create(
+            &conn,
+            &json!({"namespace": "_act", "kind": "k", "title": "t", "payload": {}}),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+
+        // Two DIFFERENT agents, each omitting `holder`, must not both win.
+        let first = handle_lease_acquire(&conn, &json!({ "action_id": id }));
+        assert_eq!(
+            first.expect_err("blank holder refused"),
+            "holder is required"
+        );
+        for bad in [
+            json!({ "action_id": id.clone(), "holder": "" }),
+            json!({ "action_id": id.clone(), "holder": "   " }),
+            json!({ "action_id": id.clone(), "holder": 7 }),
+        ] {
+            assert_eq!(
+                handle_lease_acquire(&conn, &bad).expect_err("refused"),
+                "holder is required",
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            handle_lease_acquire(&conn, &json!({ "holder": "w1" })).expect_err("refused"),
+            "action_id is required"
+        );
+
+        // renew / release / get refuse the same blanks rather than answering
+        // "no lease held" / "released: false" / "lease: null".
+        assert_eq!(
+            handle_lease_renew(&conn, &json!({ "action_id": id.clone() })).expect_err("refused"),
+            "holder is required"
+        );
+        assert_eq!(
+            handle_lease_release(&conn, &json!({ "action_id": id.clone() })).expect_err("refused"),
+            "holder is required"
+        );
+        assert_eq!(
+            handle_lease_get(&conn, &json!({})).expect_err("refused"),
+            "action_id is required"
+        );
+
+        // CONTROL: a well-formed acquire still wins, and a DIFFERENT named
+        // holder is then correctly refused as a conflict rather than granted.
+        handle_lease_acquire(&conn, &json!({ "action_id": id.clone(), "holder": "w1" }))
+            .expect("named holder acquires");
+        let conflict = handle_lease_acquire(&conn, &json!({ "action_id": id, "holder": "w2" }))
+            .expect_err("a second distinct holder must NOT be granted");
+        assert!(conflict.contains("conflict"), "got: {conflict}");
     }
 
     #[test]
@@ -1800,5 +1877,34 @@ mod handler_tests {
 
         let report = crate::signed_events::verify_audit_trail(&conn, None, None).expect("verify");
         assert!(report.chain_intact, "chain must verify; report={report:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // #3171 — schema-REQUIRED `namespace` must be refused when
+    // missing/blank, never silently queried as "".
+    // -----------------------------------------------------------------
+
+    /// A missing / blank / non-string `namespace` is REFUSED on both
+    /// frontier and next. Pre-#3171 `unwrap_or_default()` answered the
+    /// malformed call with an EMPTY-SUCCESS frontier (`actions: []` /
+    /// `action: null`), indistinguishable from "there is no work" — a
+    /// worker fleet would idle forever on a typo'd argument.
+    #[test]
+    fn frontier_and_next_refuse_missing_or_blank_namespace_3171() {
+        let conn = fresh();
+        for bad in [
+            json!({}),
+            json!({ "namespace": "" }),
+            json!({ "namespace": "   " }),
+            json!({ "namespace": 7 }),
+        ] {
+            let e = handle_action_frontier(&conn, &bad).expect_err("frontier refuses");
+            assert_eq!(e, "namespace is required", "frontier: {bad}");
+            let e = handle_action_next(&conn, &bad).expect_err("next refuses");
+            assert_eq!(e, "namespace is required", "next: {bad}");
+        }
+        // CONTROL: a well-formed call still succeeds (and is empty here).
+        let ok = handle_action_frontier(&conn, &json!({ "namespace": "_act" })).expect("ok");
+        assert_eq!(ok["actions"].as_array().expect("array").len(), 0);
     }
 }
