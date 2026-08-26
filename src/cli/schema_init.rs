@@ -70,7 +70,7 @@
 
 use anyhow::{Context, Result};
 use clap::Args;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::CliOutput;
 use crate::migrate;
@@ -91,6 +91,12 @@ const TRACE_TARGET: &str = "schema_init";
 /// CLI compiles without the `sal-postgres` feature, and so `schema-init`
 /// and `serve` land the SAME column dim on a keyword default deploy.
 const DEFAULT_SCHEMA_INIT_EMBEDDING_DIM: u32 = 384;
+
+/// v1.0.0 (#3264) — anyhow context for the pgvector / role / `ag_catalog`
+/// catalog probe that fills the four preflight fields of
+/// [`SchemaInitReport`].
+#[cfg(feature = "sal-postgres")]
+const CTX_PGVECTOR_PREFLIGHT: &str = "probe pgvector / role / ag_catalog preflight";
 
 // ---------------------------------------------------------------------------
 // CLI arg surface
@@ -153,7 +159,12 @@ pub struct SchemaInitArgs {
 /// Schema enumeration report emitted by `schema-init`. The struct
 /// doubles as the `--json` payload, so field names + serialization
 /// order are the wire contract: every field stays `serde`-stable.
-#[derive(Debug, Clone, Serialize)]
+/// \#3264 — `Deserialize` is derived (not just `Serialize`) so the
+/// `#[serde(default)]` markers below are LOAD-BEARING rather than
+/// decorative: a payload emitted by an older binary, without the #3264
+/// preflight fields, still parses in downstream tooling and in the
+/// regression test that pins that contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaInitReport {
     /// The `--store-url` value, with any Postgres userinfo password
     /// masked via [`crate::logging::redact_url_password`]. Useful when
@@ -213,6 +224,32 @@ pub struct SchemaInitReport {
     /// the destructive conversion NULLs them on the way through.
     #[serde(default)]
     pub embedding_dim_migrated: bool,
+    /// v1.0.0 (#3264) — the PostgreSQL server offers a usable `vector`
+    /// extension (a row in `pg_available_extensions` with a non-NULL
+    /// `default_version`). `false` on SQLite, and `false` on a Postgres
+    /// server image that never shipped `vector.so` (issue #1065) — the
+    /// case whose `CREATE EXTENSION` fails with SQLSTATE `0A000`.
+    #[serde(default)]
+    pub pgvector_available: bool,
+    /// v1.0.0 (#3264) — `vector` is installed in THIS database. Once it
+    /// is, the daemon's `CREATE EXTENSION IF NOT EXISTS vector` is
+    /// privilege-free for a plain LOGIN role, which is the supported
+    /// managed-Postgres (CloudNativePG / RDS / Cloud SQL) remedy.
+    /// `false` on SQLite.
+    #[serde(default)]
+    pub pgvector_installed: bool,
+    /// v1.0.0 (#3264) — `current_user` is a PostgreSQL superuser.
+    /// pgvector is not a TRUSTED extension, so only a superuser can
+    /// perform the one-time `CREATE EXTENSION vector`. `false` on SQLite.
+    #[serde(default)]
+    pub role_is_superuser: bool,
+    /// v1.0.0 (#3264) — `current_user` holds `USAGE` on `ag_catalog`.
+    /// `false` when Apache AGE is not installed at all, and `false` on
+    /// SQLite. When AGE IS installed but this is `false`, the AGE
+    /// projection is skipped while `kg_backend` would still report
+    /// `age` — the mismatch `ai-memory doctor` surfaces as a WARN.
+    #[serde(default)]
+    pub age_catalog_usage: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +419,12 @@ fn enumerate_sqlite(url: &str) -> Result<SchemaInitReport> {
         // metadata hint for downstream tooling.
         embedding_dim: None,
         embedding_dim_migrated: false,
+        // #3264 — SQLite has no extension catalog and no role model; the
+        // four Postgres preflight fields stay `false` on this backend.
+        pgvector_available: false,
+        pgvector_installed: false,
+        role_is_superuser: false,
+        age_catalog_usage: false,
     })
 }
 
@@ -606,6 +649,17 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
         false
     };
 
+    // v1.0.0 (#3264) — the SAME catalog probe the bootstrap preflight
+    // runs, surfaced as explicit report fields so `schema-init --json`
+    // answers "is pgvector available / installed, can this role create it,
+    // and can it reach `ag_catalog`" without a second tool. A probe
+    // failure PROPAGATES: reporting `false` off a failed read would be a
+    // fabricated fact, which is the exact fail-open shape this issue
+    // exists to remove.
+    let preflight = crate::store::postgres::probe_pgvector_preflight(&pool)
+        .await
+        .context(CTX_PGVECTOR_PREFLIGHT)?;
+
     // Drop the pool explicitly so the connection slot frees before
     // the verb returns. Not strictly required (it would drop on
     // function exit anyway) but it documents intent.
@@ -630,6 +684,13 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
         // don't need the conversion machinery.
         embedding_dim: None,
         embedding_dim_migrated: false,
+        // #3264 — ground truth read from the live catalog, never inferred
+        // from the `extensions` list above (which cannot say whether the
+        // server COULD install pgvector, nor whether this role may).
+        pgvector_available: preflight.available,
+        pgvector_installed: preflight.installed,
+        role_is_superuser: preflight.role_is_superuser,
+        age_catalog_usage: preflight.age_catalog_usage,
     })
 }
 
@@ -726,6 +787,23 @@ fn render_human(report: &SchemaInitReport, out: &mut CliOutput<'_>) -> Result<()
         )?;
     }
     if report.kind == "postgres" {
+        // #3264 — the pgvector / role / AGE preflight facts, printed for
+        // the human report too (the JSON payload carries the same four).
+        writeln!(
+            out.stdout,
+            "  pgvector:       available={} installed={}",
+            report.pgvector_available, report.pgvector_installed
+        )?;
+        writeln!(
+            out.stdout,
+            "  role:           superuser={}",
+            report.role_is_superuser
+        )?;
+        writeln!(
+            out.stdout,
+            "  ag_catalog:     usage={}",
+            report.age_catalog_usage
+        )?;
         writeln!(
             out.stdout,
             "  age_projection: {}",
@@ -1253,6 +1331,10 @@ mod tests {
             age_projection_created: true,
             embedding_dim: Some(768),
             embedding_dim_migrated: true,
+            pgvector_available: true,
+            pgvector_installed: true,
+            role_is_superuser: false,
+            age_catalog_usage: true,
         };
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -1264,6 +1346,10 @@ mod tests {
         assert!(s.contains("embedding_dim:  768"));
         assert!(s.contains("embedding_dim_migrated: yes"));
         assert!(s.contains("age_projection: created"));
+        // #3264 — the four preflight facts render on the postgres arm.
+        assert!(s.contains("pgvector:       available=true installed=true"));
+        assert!(s.contains("role:           superuser=false"));
+        assert!(s.contains("ag_catalog:     usage=true"));
     }
 
     #[tokio::test]
@@ -1282,6 +1368,10 @@ mod tests {
             age_projection_created: false,
             embedding_dim: None,
             embedding_dim_migrated: false,
+            pgvector_available: true,
+            pgvector_installed: true,
+            role_is_superuser: false,
+            age_catalog_usage: false,
         };
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -1400,6 +1490,10 @@ mod tests {
             age_projection_created: false,
             embedding_dim: Some(384),
             embedding_dim_migrated: false,
+            pgvector_available: false,
+            pgvector_installed: false,
+            role_is_superuser: false,
+            age_catalog_usage: false,
         };
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();

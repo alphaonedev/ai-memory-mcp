@@ -89,6 +89,47 @@ const NOT_IN_RESPONSE: &str = "not_in_response";
 /// has not landed yet.
 const NOT_OBSERVED_PRE_P3: &str = "not_observed (pre-P3 rolling counter)";
 
+/// v1.0.0 (#3264) — operator-visible PostgreSQL extension health. Rendered
+/// only when the RESOLVED store is a `postgres://` DSN; a SQLite
+/// deployment has no extension catalog and the section is omitted
+/// entirely (so a fresh-DB doctor report is unchanged).
+#[cfg(feature = "sal-postgres")]
+const SECTION_POSTGRES_EXTENSIONS: &str = "Postgres extensions (#3264)";
+
+/// #3264 — anyhow context when the ephemeral probe runtime cannot be built.
+#[cfg(feature = "sal-postgres")]
+const MSG_PG_PROBE_RUNTIME: &str = "build ephemeral runtime for the postgres extension probe";
+
+/// #3264 — the probe thread panicked (the future itself panicked).
+#[cfg(feature = "sal-postgres")]
+const MSG_PG_PROBE_PANIC: &str = "postgres extension probe thread panicked";
+
+/// #3264 — rendered for an extension that is not installed in the
+/// probed database.
+#[cfg(feature = "sal-postgres")]
+const PG_EXT_NOT_INSTALLED: &str = "not installed";
+
+/// #3264 — fact key for the AGE-absent explanatory line.
+#[cfg(feature = "sal-postgres")]
+const KG_BACKEND_NOTE_KEY: &str = "kg_backend_note";
+
+/// #3264 — AGE is opt-in; its absence is a legitimate deployment, so the
+/// row stays INFO and simply says what the KG will do instead.
+#[cfg(feature = "sal-postgres")]
+const MSG_AGE_NOT_INSTALLED: &str =
+    "Apache AGE not installed — knowledge-graph reads use the recursive-CTE route";
+
+/// #3264 — WARN note when Apache AGE IS installed but the connecting role
+/// cannot reach `ag_catalog`. This is the silent-degrade shape the row
+/// exists to surface: the AGE projection is skipped while `kg_backend`
+/// still advertises `age`.
+#[cfg(feature = "sal-postgres")]
+const MSG_AGE_CATALOG_USAGE_MISSING: &str = "Apache AGE is installed but the connecting role \
+     has no USAGE on schema `ag_catalog`: the AGE projection is SKIPPED while `kg_backend` \
+     still reports `age`, so graph reads silently fall back to the CTE route. Fix: \
+     `GRANT USAGE ON SCHEMA ag_catalog TO <role>;` (see docs/postgres-age-guide.md, \
+     \"Database setup\").";
+
 /// Severity bucket attached to every doctor finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -731,6 +772,18 @@ fn run_local(db_path: &Path) -> Report {
     // database") is a SYMPTOM whose cause would otherwise never be printed.
     sections.push(section_config_health_3166());
 
+    // v1.0.0 (#3264) — Postgres extension health, BEFORE the SQLite open for
+    // the same reason `section_config_health_3166` is: on a `postgres://`
+    // deployment the local SQLite path is not the real store, so the open
+    // below may legitimately fail and short-circuit the rest of the report.
+    // Omitted entirely on a SQLite deployment (and on a build without the
+    // `sal-postgres` feature, which already refuses a `postgres://` store
+    // URL outright).
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = section_postgres_extensions_3264() {
+        sections.push(pg);
+    }
+
     // Open the connection once; failures bubble into a single Critical
     // section and the rest of the report is N/A. Identity still renders
     // (the keystore is independent of the database).
@@ -842,6 +895,186 @@ fn core_relation_status(
     let stamped = crate::storage::connection::probe_schema_stamp(conn)?.version();
     let missing = crate::storage::schema_integrity::missing_core_tables(conn, stamped)?;
     Ok((stamped, missing))
+}
+
+/// v1.0.0 (#3264) — run one async probe closure on a dedicated OS thread
+/// driving its own current-thread runtime.
+///
+/// `doctor` runs inside `tokio::task::spawn_blocking` (see
+/// `daemon_runtime`), and the rest of this module reaches the network with
+/// `reqwest::blocking`. sqlx has no blocking client, so the probe needs a
+/// runtime; spawning a FRESH thread guarantees there is no ambient tokio
+/// context to re-enter, which is the one shape that can never panic.
+///
+/// # Errors
+///
+/// Returns `Err` when the runtime cannot be built or the probe panicked.
+#[cfg(feature = "sal-postgres")]
+fn run_pg_probe<F, Fut, T>(make_fut: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: std::future::Future<Output = T>,
+    T: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || -> Result<T> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context(MSG_PG_PROBE_RUNTIME)?;
+                Ok(rt.block_on(make_fut()))
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!(MSG_PG_PROBE_PANIC))?
+    })
+}
+
+/// v1.0.0 (#3264) — "Postgres extensions" report row(s).
+///
+/// Returns `None` when the resolved store is not a `postgres://` DSN, so a
+/// SQLite deployment's report is byte-identical to the pre-#3264 one.
+///
+/// Severity contract:
+/// - **Critical** when pgvector is not installed AND this role could not
+///   create it (the daemon's bootstrap `CREATE EXTENSION` would abort —
+///   the note carries the SAME classified remedy the abort prints).
+/// - **Warning** when Apache AGE is installed but the role has no `USAGE`
+///   on `ag_catalog` (the AGE projection is skipped while `kg_backend`
+///   still reports `age`).
+/// - **Critical** when the DSN cannot be reached at all: the daemon would
+///   not be able to reach it either.
+#[cfg(feature = "sal-postgres")]
+fn section_postgres_extensions_3264() -> Option<ReportSection> {
+    use crate::store::postgres::{
+        AGE_EXTENSION_NAME, PGVECTOR_EXTENSION_NAME, PgvectorPreflightFacts,
+        probe_extension_version, probe_pgvector_preflight,
+    };
+
+    let url = crate::store_url::resolve_store_url(None).ok().flatten()?;
+    if !crate::store_url::is_postgres_url(&url) {
+        return None;
+    }
+    // Never echo the DSN credential into a report an operator pastes into a
+    // ticket (#1893 / #1579 A3 discipline).
+    let redacted = crate::logging::redact_url_password(&url);
+
+    type Probe = (PgvectorPreflightFacts, Option<String>, Option<String>);
+    let probed: Result<Probe> = run_pg_probe(|| async move {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect(&url)
+            .await?;
+        let facts = probe_pgvector_preflight(&pool).await?;
+        let vector_version = probe_extension_version(&pool, PGVECTOR_EXTENSION_NAME).await?;
+        let age_version = probe_extension_version(&pool, AGE_EXTENSION_NAME).await?;
+        pool.close().await;
+        Ok::<Probe, sqlx::Error>((facts, vector_version, age_version))
+    })
+    .and_then(|inner| inner.map_err(anyhow::Error::from));
+
+    let (facts, vector_version, age_version) = match probed {
+        Ok(v) => v,
+        Err(e) => {
+            return Some(ReportSection {
+                name: SECTION_POSTGRES_EXTENSIONS.into(),
+                severity: Severity::Critical,
+                facts: vec![
+                    ("store".into(), redacted),
+                    (
+                        "error".into(),
+                        crate::logging::redact_urls_in_message(&format!("{e:#}")),
+                    ),
+                ],
+                note: Some(
+                    "could not probe the configured postgres store for pgvector / AGE — the \
+                     daemon connects to the same DSN, so this is the fault it would hit at \
+                     boot"
+                        .into(),
+                ),
+            });
+        }
+    };
+
+    let verdict = facts.verdict();
+    let mut report_facts = vec![
+        ("store".into(), redacted),
+        ("database".into(), facts.database.clone()),
+        ("pgvector_available".into(), facts.available.to_string()),
+        ("pgvector_installed".into(), facts.installed.to_string()),
+        (
+            "pgvector_version".into(),
+            vector_version.unwrap_or_else(|| PG_EXT_NOT_INSTALLED.to_string()),
+        ),
+        (
+            "role_is_superuser".into(),
+            facts.role_is_superuser.to_string(),
+        ),
+        ("age_installed".into(), age_version.is_some().to_string()),
+        (
+            "age_version".into(),
+            age_version
+                .clone()
+                .unwrap_or_else(|| PG_EXT_NOT_INSTALLED.to_string()),
+        ),
+        (
+            "ag_catalog_usage".into(),
+            facts.age_catalog_usage.to_string(),
+        ),
+        ("pgvector_verdict".into(), verdict.label().to_string()),
+    ];
+
+    // The CRITICAL arm carries the EXACT remedy text the bootstrap abort
+    // prints — one SSOT for both surfaces.
+    let blocking_detail = verdict.blocking_detail(&facts.database);
+    let (severity, note) = pg_extensions_verdict_3264(
+        blocking_detail,
+        age_version.is_some(),
+        facts.age_catalog_usage,
+    );
+
+    if age_version.is_none() {
+        // AGE is opt-in: absence is a legitimate, documented deployment
+        // (the KG falls back to the CTE route). INFO, not WARN.
+        report_facts.push((KG_BACKEND_NOTE_KEY.into(), MSG_AGE_NOT_INSTALLED.into()));
+    }
+
+    Some(ReportSection {
+        name: SECTION_POSTGRES_EXTENSIONS.into(),
+        severity,
+        facts: report_facts,
+        note,
+    })
+}
+
+/// v1.0.0 (#3264) — the PURE severity table behind
+/// [`section_postgres_extensions_3264`], split out so every arm is
+/// unit-testable without a live PostgreSQL (in particular the AGE
+/// `ag_catalog`-USAGE WARN, which needs a bespoke role to reproduce).
+///
+/// - `blocking_detail` is `Some` exactly when the daemon's bootstrap would
+///   REFUSE (`store::postgres::PgvectorPreflight::blocking_detail`) — the
+///   `CRITICAL` arm, carrying that same remedy verbatim.
+/// - AGE installed but no `USAGE` on `ag_catalog` is the silent-degrade
+///   pairing: `WARN`.
+/// - Everything else is `INFO`.
+#[cfg(feature = "sal-postgres")]
+fn pg_extensions_verdict_3264(
+    blocking_detail: Option<String>,
+    age_installed: bool,
+    age_catalog_usage: bool,
+) -> (Severity, Option<String>) {
+    if let Some(detail) = blocking_detail {
+        return (Severity::Critical, Some(detail));
+    }
+    if age_installed && !age_catalog_usage {
+        return (
+            Severity::Warning,
+            Some(MSG_AGE_CATALOG_USAGE_MISSING.to_string()),
+        );
+    }
+    (Severity::Info, None)
 }
 
 /// #3166 — config-health section.
@@ -2853,6 +3086,13 @@ mod tests {
         // "Atomisation Curator"; #3166 prepended "Configuration";
         // #3147/#3155 inserted "Identity" after Configuration — total is
         // now 16.
+        //
+        // #3264 note: "Postgres extensions (#3264)" is a CONDITIONAL 17th
+        // section — emitted only when `store_url::resolve_store_url(None)`
+        // yields a `postgres://` DSN. This test runs with no store URL in
+        // the process env (the pg-backend posture tests that set one are
+        // subprocess-isolated), so the count stays 16 on a SQLite
+        // deployment, which is the invariant this test pins.
         assert_eq!(report.sections.len(), 16);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
@@ -5097,5 +5337,64 @@ enabled = true
         assert_eq!(exit, i32::from(!sqlcipher_compiled) * 2);
 
         drop(stderr);
+    }
+}
+
+// ── v1.0.0 #3264 — "Postgres extensions" severity-table unit tests ─────
+//
+// Placed at EOF (after the main `mod tests`) so the
+// `scripts/check-hardcoded-literals.sh` test boundary is not moved.
+#[cfg(all(test, feature = "sal-postgres"))]
+mod pg_extensions_verdict_tests_3264 {
+    use super::{MSG_AGE_CATALOG_USAGE_MISSING, Severity, pg_extensions_verdict_3264};
+
+    /// A bootstrap-blocking pgvector verdict is CRITICAL (doctor exit 2)
+    /// and carries the SAME remedy text the daemon's abort prints — the
+    /// operator must not have to correlate two different messages.
+    #[test]
+    fn blocking_pgvector_is_critical_and_reuses_the_bootstrap_remedy() {
+        let remedy = "a superuser must run CREATE EXTENSION vector; once".to_string();
+        let (sev, note) = pg_extensions_verdict_3264(Some(remedy.clone()), true, true);
+        assert_eq!(sev, Severity::Critical);
+        assert_eq!(note.as_deref(), Some(remedy.as_str()));
+        // CRITICAL outranks the AGE WARN: the daemon cannot boot at all,
+        // so the graph-projection nuance is not the headline.
+        let (sev, note) = pg_extensions_verdict_3264(Some(remedy.clone()), true, false);
+        assert_eq!(sev, Severity::Critical);
+        assert_eq!(note.as_deref(), Some(remedy.as_str()));
+    }
+
+    /// AGE installed but no `USAGE` on `ag_catalog` is the silent-degrade
+    /// pairing (`age_projection` skipped while `kg_backend` still reports
+    /// `age`) — WARN, with the `GRANT` in the note.
+    #[test]
+    fn age_installed_without_ag_catalog_usage_warns() {
+        let (sev, note) = pg_extensions_verdict_3264(None, true, false);
+        assert_eq!(sev, Severity::Warning);
+        let note = note.expect("WARN must carry a note");
+        assert_eq!(note, MSG_AGE_CATALOG_USAGE_MISSING);
+        assert!(
+            note.contains("GRANT USAGE ON SCHEMA ag_catalog"),
+            "the WARN must name the fix: {note}"
+        );
+    }
+
+    /// AGE absent is a legitimate, documented deployment (CTE fallback),
+    /// and a healthy pgvector + reachable AGE is plain INFO. Neither may
+    /// bump the doctor exit code.
+    #[test]
+    fn healthy_and_age_less_backends_stay_info() {
+        assert_eq!(
+            pg_extensions_verdict_3264(None, false, false),
+            (Severity::Info, None)
+        );
+        assert_eq!(
+            pg_extensions_verdict_3264(None, false, true),
+            (Severity::Info, None)
+        );
+        assert_eq!(
+            pg_extensions_verdict_3264(None, true, true),
+            (Severity::Info, None)
+        );
     }
 }

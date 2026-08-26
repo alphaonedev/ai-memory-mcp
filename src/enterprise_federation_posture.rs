@@ -605,6 +605,36 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
         ));
     }
 
+    // ---- (no pgvector row) — v1.0.0 #3264, DELIBERATELY NOT A CHECK ---
+    // #3264 asked for a `pgvector (certified tier pin)` row here. It is
+    // NOT added, and this comment is the record of why.
+    //
+    // `evaluate` is a PURE function of the RESOLVED PROCESS CONFIGURATION
+    // and NEVER opens the database (`doctor --posture` is contracted that
+    // way in `cli::doctor::run_posture` and in
+    // `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`). Whether
+    // pgvector is INSTALLED is a property of the SERVER, not of any env
+    // var, DSN parameter or build feature — so a DB-free row could only
+    // ever render one of two things:
+    //   (a) an unconditional PASS on every postgres node, which is exactly
+    //       the VACUOUS-PASS defect #2923 removed from the `asi-hard
+    //       pinned knobs` row ("a row that cannot fail is not a control"), or
+    //   (b) a PASS derived from a NEW operator-attestation env var, which
+    //       #3264 explicitly rules out ("do not add a new env var"; the
+    //       ENV_VAR_CENSUS gate is the mechanical half of that rule).
+    // Adding a compensating attestation the way check #15 does was also
+    // rejected: #15 compensates for a control that is UNSATISFIABLE on
+    // postgres (sqlcipher cannot encrypt a pg volume), whereas pgvector is
+    // already MACHINE-ENFORCED — the bootstrap in `store::postgres::connect`
+    // fail-closes on a missing/uncreatable `vector` extension with a
+    // classified `BackendUnavailable` (#3264 item 1), so a running
+    // postgres-backed daemon is itself proof the pin holds, and the
+    // operator-facing live probe is `ai-memory doctor` ("Postgres
+    // extensions", CRITICAL) and `ai-memory schema-init --json`
+    // (`pgvector_available` / `pgvector_installed` / `role_is_superuser` /
+    // `age_catalog_usage`). ENTERPRISE_FEDERATION_CHECK_COUNT is therefore
+    // unchanged.
+
     // ---- 16. peer URLs https-only ------------------------------------
     // Same underlying knob as one of the 22 asi-hard pins (#154) —
     // named separately here because §5.3 calls it out as its own

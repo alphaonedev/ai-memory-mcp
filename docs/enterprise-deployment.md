@@ -449,7 +449,12 @@ ai-memory schema-init --store-url postgres://aimemory:PWD@hub.dc1.internal:5432/
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
 plus the in-process upgrade ladder to schema v90 as a side effect. The
 `vector` (pgvector) extension is required (its absence aborts the
-bootstrap); `age` is opt-in — when installed, the verb additionally
+bootstrap — see
+[`postgres-age-guide.md` §"Managed / non-superuser Postgres (CloudNativePG,
+RDS, Cloud SQL)"](postgres-age-guide.html) for the one-time superuser
+pre-create that lets a non-superuser owner role boot, and for the
+`SQLSTATE 42501` vs `0A000` diagnostics `ai-memory doctor` and
+`schema-init --json` now report); `age` is opt-in — when installed, the verb additionally
 creates the AGE graph `memory_graph` via the idempotent
 `SELECT create_graph('memory_graph')`, otherwise KG queries use the
 recursive-CTE fallback. Exit 0 on success; non-zero on connection /

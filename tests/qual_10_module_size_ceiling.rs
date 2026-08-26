@@ -1088,7 +1088,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // that arrives through a clean auto-merge is UNVERIFIED — always
     // re-measure the merged file), so 33_150 carries the same modest headroom
     // as the neighbouring bumps.
-    ("src/store/postgres.rs", 36_600), /* 2026-08-26 (#3243 Fable items 1/2/4): inbox-target arm + FOR UPDATE owner probe + owner-predicated archive INSERT/DELETE. Never lower the 36_400 floor. PRIOR: 2026-08-25 (#3243 rebase onto #3252): never lower the 36_400 floor. */
+    ("src/store/postgres.rs", 36_970), /* 2026-08-26 (#3264 pgvector bootstrap preflight): the classified fail-closed CREATE EXTENSION diagnostic — the pgvector/role/ag_catalog probe SQL + remedy consts, the `PgvectorPreflight` decision table (`classify_pgvector_preflight` / `classify_init_sql_error`, both pure + unit-tested), `probe_pgvector_preflight` / `probe_extension_version`, the bootstrap preflight arm and the SQLSTATE 42501/0A000 mapping on the `raw_sql` error path, plus the EOF-placed decision-table test module (EOF so the check-hardcoded-literals test-boundary heuristic is not moved ~20k lines earlier). Measured 36_943 post-fmt; ceiling 36_600 -> 36_970 (+27 headroom). Never lower the 36_400 floor. PRIOR: 2026-08-26 (#3243 Fable items 1/2/4): inbox-target arm + FOR UPDATE owner probe + owner-predicated archive INSERT/DELETE. Never lower the 36_400 floor. PRIOR: 2026-08-25 (#3243 rebase onto #3252): never lower the 36_400 floor. */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

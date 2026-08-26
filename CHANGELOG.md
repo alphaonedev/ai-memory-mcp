@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3264 — opaque `CREATE EXTENSION vector` bootstrap abort)
+
+- **`PostgresStore::connect` now CLASSIFIES the two pgvector bootstrap
+  faults instead of aborting with `init schema: <driver error>`.** Under
+  the existing bootstrap advisory lock and before `raw_sql(INIT_SCHEMA)`,
+  the adapter probes `pg_available_extensions` for `vector` and
+  `pg_roles.rolsuper` for `current_user`, and runs a pure, unit-tested
+  decision table (`classify_pgvector_preflight`):
+  - **not available on the server** (`SQLSTATE 0A000`) → `BackendUnavailable`
+    naming the remedy: use an image bundling pgvector 0.8.x
+    (`deploy/docker-1461/Dockerfile.pg-age-vector`, issue #1065);
+  - **available but not installed and the role is not a superuser**
+    (`SQLSTATE 42501` — pgvector is not a `trusted` extension, the
+    CloudNativePG / RDS / Cloud SQL role shape) → `BackendUnavailable`
+    naming the one-time superuser `CREATE EXTENSION vector;` in the exact
+    database, with the CloudNativePG `postInitApplicationSQL` / `Database`
+    CR and `rds_superuser` paths;
+  - installed, or creatable by this role → bootstrap proceeds unchanged.
+  The `raw_sql` error path maps the same two SQLSTATEs, but only when the
+  preflight corroborates or could not run — `42501` from a role lacking
+  `CREATE` on schema `public` (PG15+) keeps the opaque form rather than a
+  wrong pgvector diagnosis. **The abort itself is unchanged and there is no
+  warn-and-continue path**: pgvector stays required, not optional, and the
+  concurrency-retry semantics are untouched. The preflight is skipped under
+  the #2445 schema-AHEAD operator hatch, exactly as `init_attempts = 0` is.
+
+### Added (#3264 — pgvector / AGE preflight surfaces)
+
+- **`ai-memory schema-init --json` reports four explicit fields**:
+  `pgvector_available`, `pgvector_installed`, `role_is_superuser`,
+  `age_catalog_usage` (`has_schema_privilege(current_user, 'ag_catalog',
+  'USAGE')`, `false` when AGE is absent). All are `#[serde(default)]` so
+  older payloads still parse, and the human report prints them too.
+- **`ai-memory doctor` gains a "Postgres extensions" section** when the
+  resolved store is a `postgres://` DSN: pgvector available / installed /
+  version, role superuser, AGE installed + `ag_catalog` USAGE. **CRITICAL**
+  (exit 2) when pgvector is neither installed nor creatable by this role —
+  carrying the same classified remedy the bootstrap prints — and **WARN**
+  when AGE is installed but `ag_catalog` USAGE is missing (the AGE
+  projection would be skipped while `kg_backend` still reports `age`). A
+  SQLite deployment's report is unchanged.
+- **Docs**: `docs/postgres-age-guide.md` gains "Managed / non-superuser
+  Postgres (CloudNativePG, RDS, Cloud SQL)" — why pgvector's lack of
+  `trusted` makes the refusal happen, the one-time superuser pre-create
+  that fixes it, why `IF NOT EXISTS` is then privilege-free, the
+  `GRANT USAGE ON SCHEMA ag_catalog` half, and a per-platform table;
+  `docs/enterprise-deployment.md` points at it from its pgvector
+  "required" statement. No new env var (ENV_VAR_CENSUS unchanged), no new
+  storage mode, no auto-fallback.
+- **Not added**: a `doctor --posture enterprise-federation` pgvector row.
+  The posture module never opens the database by contract, so a DB-free
+  row could only be a vacuous unconditional PASS (the #2923 defect) or a
+  new attestation env var (#3264 forbids one). The rationale is recorded
+  in `src/enterprise_federation_posture.rs`;
+  `ENTERPRISE_FEDERATION_CHECK_COUNT` is unchanged.
+
 ### Security (silent-default cluster Fable follow-up — #3242)
 
 - **#2596 sqlite link-dispatch no longer invents `DEFAULT_NAMESPACE`.** The

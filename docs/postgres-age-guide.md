@@ -219,6 +219,80 @@ Notes:
   function definitions); the AGE projection objects ai-memory creates
   live in the `aimemory` schema by default.
 
+### Managed / non-superuser Postgres (CloudNativePG, RDS, Cloud SQL)
+
+The `psql` block above runs as the `postgres` superuser. On a managed or
+operator-provisioned Postgres you usually cannot: CloudNativePG,
+RDS/Aurora and Cloud SQL hand you an owner role that has `LOGIN` and
+`CREATE` on its own database but is **not** a superuser. That role
+cannot run `CREATE EXTENSION vector` — and, per
+[#3264](https://github.com/alphaonedev/ai-memory-mcp/issues/3264), the
+daemon fails closed with the classified remedy rather than an opaque
+driver error.
+
+Why the refusal happens: **pgvector is not a `trusted` extension.**
+`vector.control` carries no `trusted = true` line (neither does
+`age.control`), and PostgreSQL only lets a non-superuser with `CREATE`
+on the database install *trusted* extensions. A non-superuser
+`CREATE EXTENSION vector` is therefore refused with
+`SQLSTATE 42501 — permission denied to create extension "vector"`.
+
+**The supported remedy — a one-time superuser pre-create:**
+
+```sql
+-- run ONCE, as a superuser, in the ai-memory database
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS age;              -- only if you want the AGE KG
+GRANT USAGE ON SCHEMA ag_catalog TO aimemory;    -- only if you installed age
+```
+
+*Why this makes the plain LOGIN role work.* Once the extension exists in
+the database, the daemon's own bootstrap statement
+(`CREATE EXTENSION IF NOT EXISTS vector`) resolves to a **privilege-free**
+`NOTICE: extension "vector" already exists, skipping`. No privilege is
+consulted, so the non-superuser role boots unchanged. This is why every
+shipped kit pre-creates the extensions
+(`deploy/do-1461/provision/20_pg_age.sh`,
+`deploy/enterprise-federation-repro/initdb/01-extensions.sql`,
+`deploy/docker-1461/provision/00_seed.sh`, and the CI Postgres step)
+rather than granting the daemon role extra privilege.
+
+Where to put the one-time step:
+
+| Platform | Where the superuser pre-create goes |
+| --- | --- |
+| **CloudNativePG** | the `Cluster` spec's `bootstrap.initdb.postInitApplicationSQL`, or the `Database` CR's `extensions` field |
+| **RDS / Aurora PostgreSQL** | connect as a member of `rds_superuser` and run the block once |
+| **Cloud SQL for PostgreSQL** | connect as the `cloudsqlsuperuser` role (the default admin user) and run the block once |
+| **Self-managed / container** | `sudo -u postgres psql -d aimemory -f extensions.sql`, or an `initdb` entrypoint script |
+| **Kubernetes operators generally** | a one-shot `Job` running as the admin role, ordered before the ai-memory Deployment |
+
+`GRANT USAGE ON SCHEMA ag_catalog` is the AGE half of the same problem: a
+role that can *see* the `age` extension but has no `USAGE` on
+`ag_catalog` silently skips the AGE projection while `kg_backend` still
+reports `age`. `ai-memory doctor` reports that pairing as a WARN.
+
+If the server image ships no `vector.so` at all, no amount of privilege
+helps: `CREATE EXTENSION` fails with `SQLSTATE 0A000 — extension "vector"
+is not available`. That is the
+[#1065](https://github.com/alphaonedev/ai-memory-mcp/issues/1065) case —
+use an image that bundles pgvector 0.8.x (see the
+"Docker — pgvector is required, not optional" section above and
+`deploy/docker-1461/Dockerfile.pg-age-vector`).
+
+**Check it before you deploy.** Both preflight surfaces read the live
+catalog, name the exact database, and need no superuser:
+
+```bash
+# explicit fields: pgvector_available / pgvector_installed /
+# role_is_superuser / age_catalog_usage
+ai-memory schema-init --store-url "$AI_MEMORY_STORE_URL" --json
+
+# "Postgres extensions" section; CRITICAL when pgvector is neither
+# installed nor creatable by this role
+ai-memory doctor
+```
+
 ## Bootstrap the schema
 
 `ai-memory schema-init` (Wave 1 Stream B deliverable) is the supported
