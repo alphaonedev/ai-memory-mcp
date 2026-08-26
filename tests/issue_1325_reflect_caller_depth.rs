@@ -53,7 +53,7 @@ fn insert_depth0_observation(conn: &Connection, namespace: &str, title: &str) ->
         updated_at: now,
         last_accessed_at: None,
         expires_at: None,
-        metadata: json!({"agent_id": "ai:test"}),
+        metadata: json!({"agent_id": "ai:test", "scope": "collective"}),
         reflection_depth: 0,
         memory_kind: MemoryKind::Observation,
         entity_id: None,
