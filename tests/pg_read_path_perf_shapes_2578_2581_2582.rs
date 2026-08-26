@@ -280,13 +280,38 @@ async fn ledger_batch_preserves_first_wins_on_intra_batch_duplicate_2581() {
     };
     let pool = store.pool();
     let recall_id = format!("perf2581-{}", uuid::Uuid::new_v4());
+    // Live rows: `recall_observations.memory_id` FKs to `memories` on the
+    // certified pg stack (f1 macos-fed). Synthetic ids like `mem-alpha`
+    // violate that FK. Seed two real memories and use their ids.
+    let ctx = CallerContext::for_agent("perf-2581-probe");
+    let ns = format!("perf2581-{}", uuid::Uuid::new_v4());
+    let alpha_id = store
+        .store(
+            &ctx,
+            &seed_memory(
+                &ns,
+                "alpha".into(),
+                "alpha body".into(),
+                5,
+                "perf-2581-probe",
+            ),
+        )
+        .await
+        .expect("seed alpha");
+    let beta_id = store
+        .store(
+            &ctx,
+            &seed_memory(&ns, "beta".into(), "beta body".into(), 5, "perf-2581-probe"),
+        )
+        .await
+        .expect("seed beta");
 
     // Candidate #1 and #3 are DISTINCT ids; #2 repeats #1's id with different
     // rank/score/retriever so first-wins is observable in the stored row.
     let candidates = vec![
-        ("mem-alpha".to_string(), "fts".to_string(), 1_i64, 1.5_f64),
-        ("mem-alpha".to_string(), "hnsw".to_string(), 2_i64, 9.9_f64),
-        ("mem-beta".to_string(), "fts".to_string(), 3_i64, 3.5_f64),
+        (alpha_id.clone(), "fts".to_string(), 1_i64, 1.5_f64),
+        (alpha_id.clone(), "hnsw".to_string(), 2_i64, 9.9_f64),
+        (beta_id.clone(), "fts".to_string(), 3_i64, 3.5_f64),
     ];
 
     let written = store
@@ -310,8 +335,10 @@ async fn ledger_batch_preserves_first_wins_on_intra_batch_duplicate_2581() {
     .expect("read back ledger");
     assert_eq!(rows.len(), 2, "#2581: exactly two ledger rows expected");
 
-    let alpha = &rows[0];
-    assert_eq!(alpha.get::<String, _>("memory_id"), "mem-alpha");
+    let alpha = rows
+        .iter()
+        .find(|r| r.get::<String, _>("memory_id") == alpha_id)
+        .expect("alpha ledger row");
     assert_eq!(
         alpha.get::<String, _>("retriever"),
         "fts",
