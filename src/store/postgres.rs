@@ -26185,8 +26185,7 @@ impl MemoryStore for PostgresStore {
                 // inlined this SQL (#3161); this cluster routes it through
                 // the `postgres_parity` helper so `forget` / `archive_by_ids`
                 // / `size_gc` share one snapshot funnel.
-                crate::store::postgres_parity::archive_links_for_memory_in_tx(&mut tx, &id)
-                    .await?;
+                crate::store::postgres_parity::archive_links_for_memory_in_tx(&mut tx, &id).await?;
             } else {
                 // v1.0.0 #3177 [data-integrity/security, BLOCKING] —
                 // MANDATORY tombstone + crypto-erase on the byte-cap
