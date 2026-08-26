@@ -128,9 +128,15 @@ jobs:
     # certified stack versions" step still hard-fails on ANY drift from the
     # SSOT-pinned 18.6 / 1.8.0 / 0.8.6, now read off the live native tier.
     runs-on: [self-hosted, linux-fed]
+    # 2026-08-26 rigid-security-controls: never schedule a fork PR onto the
+    # self-hosted enterprise-fed node (defence-in-depth behind the Actions
+    # "require approval for all external contributors" policy). Job-level
+    # `if:` is legitimate here: this job is not a required context and not a
+    # matrix (rule (b1) of scripts/check-required-contexts.sh does not apply).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # FAIL CLOSED if rustup is missing on a self-hosted node — see the
       # `lint` job in ci.yml for the full rationale (#3128).
@@ -143,7 +149,7 @@ jobs:
             exit 1
           }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
           components: clippy
 
@@ -224,7 +230,7 @@ jobs:
       # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
       # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
       # export — is now declared in the workflow `env:` block above.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
 
       - name: Resolve certified stack pins from deploy SSOT

@@ -90,7 +90,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run C8 precheck
         run: bash scripts/qc-codegraph-precheck.sh
 
@@ -99,7 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run vendor-literal gate
         run: bash scripts/check-vendor-literals.sh
       - name: Self-test the gate (regression evidence)
@@ -139,7 +139,7 @@ jobs:
     # NOT changed: it is the exact string branch protection requires, and #2473
     # is the record of what renaming it costs.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run L3-boundary perma-ban gate
         run: bash scripts/check-l3-boundary.sh
       - name: Self-test the gate (regression evidence)
@@ -183,7 +183,7 @@ jobs:
     # existing rot is grandfathered, new duplication fails, baseline only
     # shrinks). See ai-memory `no-hardcoded-literals-enforcement`.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run hardcoded-literal gate
         run: bash scripts/check-hardcoded-literals.sh
       - name: Self-test the gate (regression evidence)
@@ -200,7 +200,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run const-name-literal gate
         run: bash scripts/check-const-name-literals.sh
       - name: Self-test the gate (regression evidence)
@@ -220,7 +220,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run docs-vs-SSOT drift gate
         run: bash scripts/check-docs-vs-ssot.sh
       - name: Self-test the gate (regression evidence)
@@ -247,7 +247,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run doc symbol-anchor gate
         run: bash scripts/check-doc-symbol-anchors.sh
       - name: Self-test the gate (regression evidence)
@@ -278,7 +278,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run SDK-route-path gate
         run: bash scripts/check-sdk-route-paths.sh
       - name: Self-test the gate (regression evidence)
@@ -315,7 +315,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run CI-job-claims gate
         run: bash scripts/check-ci-job-claims.sh
       - name: Self-test the gate (regression evidence)
@@ -350,7 +350,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run doc-surface-completeness gate
         run: bash scripts/check-doc-surface-completeness.sh
       - name: Self-test the gate (regression evidence)
@@ -382,7 +382,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run capacity-claim gate
         run: bash scripts/check-capacity-claims.sh
       - name: Self-test the gate (regression evidence)
@@ -414,7 +414,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run benchmark-claim gate
         run: bash scripts/check-benchmark-claims.sh
       - name: Self-test the gate (regression evidence)
@@ -439,7 +439,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run cloud-init ASCII gate
         run: bash scripts/check-cloud-init-ascii.sh
       - name: Self-test the gate (regression evidence)
@@ -462,7 +462,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run test-stdin gate
         run: bash scripts/check-test-stdin-reads.sh
       - name: Self-test the gate (regression evidence)
@@ -483,7 +483,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run migration-ladder gate
         run: bash scripts/check-migration-ladder.sh
       - name: Self-test the gate (regression evidence)
@@ -506,7 +506,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run installer checksum gate
         run: bash scripts/check-install-checksum.sh
       - name: Self-test the gate (regression evidence)
@@ -537,7 +537,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # The interpreters are PROVISIONED, not assumed. The gate fails closed
       # when they are missing, so relying on whatever the runner image
       # happens to ship would make a controlled proof depend on an accident.
@@ -547,17 +547,17 @@ jobs:
       # GitHub-hosted RUNNER_TOOL_CACHE default, which the runner user cannot
       # create. This job is back on `ubuntu-latest` — no cargo, no pg tier —
       # so the provisioning form is restored with it.)
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
       # Needed only by the gate's R-203 / before-after evidence, which
       # compiles tests/conformance_readers.rs standalone with `rustc --test`
       # (the harness is deliberately crate-dependency-free — no cargo build).
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
       - name: Run conformance-reader gate
         run: bash scripts/check-conformance-readers.sh
       - name: Self-test the gate (regression evidence)
@@ -591,7 +591,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run test-env-lock gate
         run: bash scripts/check-test-env-lock.sh
       - name: Self-test the gate (regression evidence)
@@ -638,7 +638,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run required-contexts gate
         run: bash scripts/check-required-contexts.sh
       - name: One-declaration-source gate (#2534 — branch-protection.yml)
@@ -717,7 +717,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run git-dependency-source gate
         run: bash scripts/check-git-dependency-sources.sh
       - name: Self-test the gate (regression evidence)
@@ -745,7 +745,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run CREATE EXTENSION allowlist gate
         run: bash scripts/check-create-extension-allowlist.sh
       - name: Self-test the gate (regression evidence)
@@ -811,7 +811,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Run commit-signing posture gate
@@ -867,7 +867,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Run enterprise-federation cert-expiry gate
@@ -887,3 +887,71 @@ jobs:
         # fail-closes; workflow_dispatch and a zero-SHA push skip;
         # THIS checkout vs origin/release/v1.0.0 is GREEN.
         run: bash scripts/check-cert-expiry.sh --self-test
+
+  external-pr-operator-approval-gate:
+    # 2026-08-26 operator directive — "we want collaboration with rigid security
+    # controls: PRs require Justin's approval and SSH key code signing". The
+    # repository stays OPEN to outside issues, comments and PRs (no interaction
+    # limits); the control sits at the MERGE boundary, where GitHub can enforce
+    # it mechanically.
+    #
+    # RULE. If the PR author is not OWNER / MEMBER / COLLABORATOR, or the head
+    # is a fork, this job HARD-FAILS unless an APPROVED review by the
+    # accountable operator account (`alphaonedev`) exists for the PR's CURRENT
+    # head SHA. That review is a native GitHub review the biological operator
+    # submits by hand ("Approve" on the PR); it is NOT a label, NOT a comment,
+    # and NOT something an AI agent acting under the operator's token may
+    # submit (docs/AI_DEVELOPER_GOVERNANCE.md §3.1 — Restricted). A new push
+    # to the PR changes the head SHA and voids the approval, so the operator
+    # re-reviews what will actually merge. Team-authored same-repo PRs pass
+    # unconditionally: the single-authority merge train is untouched.
+    #
+    # Commit signing is enforced separately (live `required_signatures`
+    # ruleset + `Commit-signing posture gate (#2486)`); this job does not
+    # duplicate it. It uses only the default read-scoped GITHUB_TOKEN.
+    #
+    # Shape: no `needs:`, no job-level `if:`, no `paths:` filter — it ALWAYS
+    # runs and always reports (rule (f) of scripts/check-required-contexts.sh).
+    # Declared in scripts/qc-allowlists/required-contexts-release.txt
+    # (mirror-first); the branch-protection API addition follows once this job
+    # has reported green on the base branch.
+    name: "External-PR operator-approval gate (author outside team => @alphaonedev review)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate external-PR approval requirement
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_ASSOC: ${{ github.event.pull_request.author_association }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          OPERATOR_LOGIN: alphaonedev
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "event=$EVENT — not a pull_request; gate not applicable (pass)"; exit 0
+          fi
+          team=false
+          case "$PR_ASSOC" in OWNER|MEMBER|COLLABORATOR) team=true ;; esac
+          if [ "$team" = true ] && [ "$PR_HEAD_REPO" = "$REPO" ]; then
+            echo "author=$PR_AUTHOR ($PR_ASSOC), same-repo head — team PR (pass)"; exit 0
+          fi
+          echo "author=$PR_AUTHOR ($PR_ASSOC) head_repo=$PR_HEAD_REPO — EXTERNAL contribution; operator approval required"
+          # An APPROVED review by the operator account for THIS head SHA.
+          approved=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate             --jq "[.[] | select(.user.login == \"$OPERATOR_LOGIN\" and .state == \"APPROVED\" and .commit_id == \"$PR_HEAD_SHA\")] | length")
+          if [ "${approved:-0}" -ge 1 ]; then
+            echo "APPROVED review by @$OPERATOR_LOGIN found for head $PR_HEAD_SHA (pass)"; exit 0
+          fi
+          cat >&2 <<MSG
+          ::error::External-PR operator-approval gate FAILED.
+          This PR was authored by '$PR_AUTHOR' ($PR_ASSOC) from '$PR_HEAD_REPO'. Per project policy
+          (docs/AI_DEVELOPER_GOVERNANCE.md), contributions from outside the team are welcome but can
+          only merge after the accountable biological operator (@$OPERATOR_LOGIN) has reviewed the
+          exact head commit ($PR_HEAD_SHA) and submitted an APPROVED review on it. After approving,
+          re-run this job. Any new push voids the approval.
+          MSG
+          exit 1
