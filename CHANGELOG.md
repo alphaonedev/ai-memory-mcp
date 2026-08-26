@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   production adapters already override. `set_embeddings_batch`'s default
   loop inherits the refusal. Pins:
   `default_update_embedding_refuses_rather_than_dropping_the_vector_3242`,
-  `default_set_embeddings_batch_refuses_when_update_embedding_is_unimplemented_3242`.
+  `default_set_embeddings_batch_refuses_when_update_embedding_is_unimplemented_3242`,
+  `mock_adapters_method_surface_conformance_cov`.
 - **Not changed:** `list_unembedded` non-admin `Ok(vec![])` on both
   adapters is the documented #1586 admin gate (#3241), not "nothing to
   embed". Sqlite `list_by_event` is unbounded (no 1000-row cliff); list
