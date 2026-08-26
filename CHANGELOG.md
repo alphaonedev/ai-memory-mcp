@@ -7,6 +7,1250 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation (2026-08-26)
+
+- **Learn ai-memory** section on the docs site (`docs/learn/`): a hub plus three
+  audience tracks — end users (singleton / small agent setups), C-level
+  decision makers (decision-mapped), and engineers/architects/scientists
+  (mechanism, up to a swarm/hive on the certified enterprise-federation
+  configuration: pg + AGE + pgvector tier, mTLS on all three legs, attestation,
+  Batman mode, posture boot gate). Linked "Learn ai-memory" at the top of the
+  landing page and the doc layout.
+- `docs/contributing-external.md` — external contributions & rigid security
+  controls (merge / agent / runner / supply-chain boundaries).
+- `docs/managed-postgres.md` — managed / non-superuser Postgres (CNPG, RDS,
+  Cloud SQL): pgvector is not a trusted extension; the one-time superuser
+  pre-create; AGE `ag_catalog` grant; verified live 2026-08-26.
+- `docs/audit/pr-3260-3x7-vote-and-nhi-assessment-2026-08-26.md` — durable
+  record of the #3260 3×7 vote, AI-NHI live assessment, disposition and the
+  rejected pgvector-less storage design.
+
+### Security (rigid collaboration controls — operator directive 2026-08-26)
+
+- **External-PR operator-approval gate** (`c8-precheck.yml`, new required
+  context): a PR from outside the team (author not OWNER/MEMBER/COLLABORATOR,
+  or fork head) cannot merge without an APPROVED GitHub review by `@alphaonedev`
+  on its current head SHA. Team PRs unaffected. Governance §5.0.1.
+- **Self-hosted fork refusal**: `ci.yml` `check` refuses the self-hosted legs
+  before checkout on fork PRs; `cert-postgres-age.yml` is job-gated. Fork code
+  never runs on `f2`/`f1`.
+- **Supply chain**: all 177 `uses:` references across 18 workflows pinned to
+  full commit SHAs (resolved via `git ls-remote`, tag comment retained);
+  `.github/dependabot.yml` (github-actions ecosystem) keeps pins current.
+- Repository settings (applied via API, recorded here): secret scanning +
+  push protection, Dependabot security updates + alerts, private vulnerability
+  reporting. Interaction limits deliberately NOT set — the repo stays open.
+
+### Security (silent-default cluster Fable follow-up — #3242)
+
+- **#2596 sqlite link-dispatch no longer invents `DEFAULT_NAMESPACE`.** The
+  postgres arm already WARNed and skipped `memory_link_created` when the
+  source-anchor `get` failed. The sqlite arm used `db::get(…).ok().flatten()
+  .map_or_else(|| DEFAULT_NAMESPACE, …)` and dispatched into the wrong
+  tenant. It now WARNs and skips, matching postgres. Pin:
+  `link_dispatch_anchor_failure_is_warned_not_swallowed_2596`.
+- **#2592 truncation detector is LIMIT+1 / `>`.** A `LIMIT 1000` returning
+  1000 cannot tell "exactly 1000 subscribers" from "cut". The dispatcher
+  fetches 1001 and reports truncation only when `len() > 1000`. The
+  `spawn_blocking` reporter join is WARNed, not swallowed.
+- **`update_embedding` trait default refuses** (`UnsupportedCapability`)
+  instead of `Ok(())` dropping the vector (#2444 / #2638 class). Both
+  production adapters already override. `set_embeddings_batch`'s default
+  loop inherits the refusal. Pins:
+  `default_update_embedding_refuses_rather_than_dropping_the_vector_3242`,
+  `default_set_embeddings_batch_refuses_when_update_embedding_is_unimplemented_3242`,
+  `mock_adapters_method_surface_conformance_cov`.
+- **#2124 sqlite oracle follows #2638.** `sqlite_store_family_stamps_substrate_why_trace_for_system_2124`
+  expected `store_with_embedding` / `store_batch` to succeed on
+  `SqliteStore`. Those methods are trait-default refusals on sqlite
+  (embeddings live in a side table; bulk is `handlers::bulk`). The
+  oracle now pins the refuse and stamps via
+  `store_with_embedding_no_overwrite`.
+- **Not changed:** `list_unembedded` non-admin `Ok(vec![])` on both
+  adapters is the documented #1586 admin gate (#3241), not "nothing to
+  embed". Sqlite `list_by_event` is unbounded (no 1000-row cliff); list
+  failure already WARNs.
+
+### Fixed (#3244 — SAL ConsolidationPass skipped under `spawn_blocking`)
+
+- **#3116's nested-runtime guard used `Handle::try_current()` as the panic
+  probe, which skipped the SAL `ConsolidationPass` on every production
+  cycle.** Quoted at `src/curator/mod.rs` (pre-fix):
+  `if tokio::runtime::Handle::try_current().is_ok() { report.errors.push("consolidation pass: skipped — … wrap the call in spawn_blocking …"); return; }`.
+  A tokio 1.52 `spawn_blocking` thread **has** a current Handle
+  (`runtime/blocking/pool.rs` calls `rt.enter()`) but does **not** call
+  `enter_runtime` — the only condition for "Cannot start a runtime from
+  within a runtime". `Runtime::block_on` inside `spawn_blocking` is
+  therefore legal (that is why the pre-#3116 daemon path worked). Both
+  production entrypoints already wrap the curator in `spawn_blocking`
+  (`daemon_runtime.rs` two sites + CLI `--once`) on a **multi-thread**
+  runtime, so with `compaction.enabled = true` every cycle pushed the
+  skip error and the pass never ran. The skip is now only the
+  current-thread Handle (`#[tokio::test]` default, where `block_in_place`
+  panics); production `spawn_blocking` drives via `block_in_place` + a
+  nested current-thread `block_on` (CONCURRENCY-22 / ERRORS-08). A
+  multi-thread `spawn_blocking` positive-control test asserts the pass
+  ran; the existing `#[tokio::test]` panic-avoidance skip is kept.
+
+### Security (migration core-relation gate: an unreadable `memories` COUNT is not "no corpus"; #3246)
+
+Closes a remaining fail-OPEN in the #3113 sqlite ladder gate. The populated-corpus
+discriminator refused only on `Some(n > 0)`; `corpus_row_count` used `.ok()` so
+any `COUNT(*) FROM memories` fault became `None`, and `None` was treated as the
+same no-brick path as `Some(0)`. `memories` ships in the bootstrap `SCHEMA` and
+is replayed by `db::open` before `migrate`, so `None` never means "fixture
+without a corpus" — it means the count FAILED (corruption / I/O / `BUSY`).
+Under `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1` (pinned ON by `asi-hard`) a
+database with missing core relations AND an unreadable corpus stamped the tip
+with only a WARN. The same PR already removed `.ok()` on the `sqlite_master`
+probe (citing #2445) but kept it for the corpus probe.
+
+- **`Some(0)` stays the documented no-brick path.** An empty fixture / archive-less
+  deployment still opens under enforcement; `asi-hard` does not become more
+  fragile than `standard`.
+- **`None` / a failed COUNT refuses under enforcement** and, under the
+  DEFAULT (non-enforced) posture, **fails the migration** (`Err`) instead of
+  warning-and-stamping — the named change, not a silent tightening of the
+  documented `Some(0)` no-brick path. Either way the tail cannot stamp
+  integrity as intact on the strength of a failed read. The check is still
+  inside the migrate transaction BEFORE the stamp: a refusal rolls the
+  ladder back and leaves the database UNCHANGED.
+- **Truthy grammar SSOT.** `config::migration_require_core_tables` now delegates
+  to `governance::audit::env_flag_enabled` (`1` / `true` / `yes` / `on`); the
+  documented tokens are unchanged.
+### Security (`consult_pre_event_gate` no longer holds a `std::sync::Mutex` across `.await` — #3256)
+
+- **#3256 (CONCURRENCY-20) — `consult_pre_event_gate` (and the sibling
+  PreSignalSend gate) held `std::sync::Mutex<ExecutorRegistry>` across
+  `chain.fire(..).await`.** HTTP create consults that gate on the multi-thread
+  runtime, so concurrent writes serialized on an OS-level lock for the whole
+  hook evaluation. Both process-global registries are now `tokio::sync::Mutex`;
+  the guard is acquired with `.lock().await` inside the already-bridged future.
+  Fail-closed bridge-budget behaviour is unchanged.
+### Fixed (pg delete atomicity — `namespace_meta` sever inside the delete tx; #3245)
+
+- **`PostgresStore::delete` severs `namespace_meta` inside the same
+  transaction as the tombstone leaf + row DELETE.** The sqlite twin
+  (`storage::delete` / `delete_inner`, #3115) already ran SEVER + TOMBSTONE +
+  DELETE under one `BEGIN IMMEDIATE`. Postgres ran
+  `SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID` pool-direct on `&self.pool`
+  *before* `begin()`, so a failing (or rolled-back) delete left the
+  governance binding severed with the memory still live — an unrecoverable
+  policy downgrade from a delete that never happened. Flag-OFF was two
+  autocommit statements with the same window. One tx now covers all three
+  writes on both flag states. Regression:
+  `pg_delete_failure_leaves_namespace_meta_intact_3245`.
+- **NotFound is decided before `tx.commit()`.** A 0-row DELETE used to
+  commit the sever (and flag-ON tombstone leaf) then return `NotFound`.
+  Dropping the tx rolls back. Regression:
+  `pg_delete_unknown_id_does_not_commit_sever_or_tombstone_3245`.
+### Fixed
+
+- **#3185 / #3127 — Postgres keyword search dropped `Filter.since`/`until` and `source_uri`.** `PostgresStore::search` (the HTTP/MCP production caller) bound namespace/tier/tags/agent_id/expiry/visibility/lifecycle but had **no `created_at` window and no `source_uri` predicate**, so `GET /api/v1/search?since=&until=` and `?source_uri=` returned rows outside the requested set (wrong results, fail-open widening). The sqlite twin already honoured both via `db::search` → `db::search_with_source_uri`. Postgres had two forked lanes with different subsets; they now collapse onto **one SSOT** (`search_with_source_uri`, carrying since/until, source_uri, G7 soft-loser, #910/#3110 visibility, tags/agent_id, expiry/lifecycle, plus the 6-factor blend the trait method owned). Trait `search` is a thin wrapper; HTTP puts `?source_uri=` on `Filter.source_uri` so the compose path (`q + source_uri + since`) cannot silently drop the URI filter. Unset filters stay `None` (no silent tightening of a documented default). Worst case after the fix = fewer results, never extra. The previously caller-less inherent keyword lane used `plainto_tsquery` (AND); the SSOT uses `to_tsquery(build_or_tsquery(q))` (OR of sanitised tokens, same as the trait lane at base) — named here so the AND→OR change is not silent.
+### Security (postgres authz catch-up: #3193 #3194 #3195 #3197)
+
+Four fail-closed restorations. None of them tightens a documented default:
+each copies a sqlite/push-lane precedent the postgres or catch-up path
+had silently dropped.
+
+- **#3193 — `PostgresStore::archive_by_ids` discarded `CallerContext`.**
+  Any authenticated tenant on a postgres-backed daemon could
+  bulk-soft-delete another tenant's live rows through
+  `POST /api/v1/archive` (links cascaded). The sqlite HTTP branch has
+  refused since #940. The SAL method now runs
+  `assert_caller_owns_for_mutation_on` **inside the batch transaction**
+  with `FOR UPDATE` + an inbox-target arm (sqlite #940 parity) and
+  owner/inbox predicates on the INSERT…SELECT and DELETE (closes a
+  re-own TOCTOU against a pool-borrowed probe). Unstamped
+  rows REFUSE on postgres (#3124 policy; the row stays live). The
+  handler maps per-id `PermissionDenied`/`NotFound` to `missing` so
+  the response is not an existence oracle over other tenants' ids.
+  The sqlite SAL adapter now also routes through
+  `archive_memory_for_caller` (latent: HTTP sqlite already gated).
+- **#3194 — `PostgresStore::link` / `link_signed` discarded ctx and
+  evaluated K9 as the daemon keypair.** `validate_link_pre_create_pg`
+  now folds source `agent_id` / `target_agent_id` into the existing
+  namespace SELECT (`FOR UPDATE` on the write tx, opened before the
+  owner probe) and applies the sqlite #941 four-way predicate
+  (owner / inbox-target / empty-legacy / daemon). K9
+  `evaluate_link_permission` uses `ctx.effective_principal()` for
+  tenant writes; `bypass_visibility` keeps the prior
+  keypair-or-`"system"` fallback so federation inbound
+  (`apply_remote_link`) and operator lanes stay byte-identical. A
+  missing source skips the owner gate so the FK pre-flight still
+  names the missing memory (no 403 existence oracle).
+- **#3195 — catch-up/PULL hardcoded `existing_namespace: None`.**
+  Layer-1 stored-namespace probe the push lane runs fail-closed
+  (#2447) was structurally absent on PULL, so a `public/*`-scoped
+  peer could relocate/clobber an out-of-scope `secure/ops` row by
+  serving its id under an in-scope claimed namespace. All three
+  apply branches (SAL `store.namespace_by_id`, sqlite
+  `db::namespace_by_id`, no-sal legacy) now pass the stored
+  namespace when `inbound_write_needs_existing_namespace` is true.
+  Probe **error** skips AND halts the watermark (transient →
+  re-pull); a scope **refusal** skips without halt (permanent).
+  Zero-config stays at ZERO extra reads.
+- **#3197 — `entrypoint.plan-c.sh` interpolated `AI_MEMORY_API_KEY`
+  raw into TOML.** A `"`, `\`, or trailing newline (docker-secret
+  artefact) produced invalid TOML; `AppConfig::load_from` fail-opened
+  to defaults (`api_key` absent, `append_only=false`,
+  `require_operator_pubkey=false`, fresh `./ai-memory.db`). Render
+  now goes through `infra/plan-c/config-emit.sh` (TOML basic-string
+  escape, trailing-newline strip with WARN, EX_CONFIG 78 on any
+  other control character; the key is read from the inherited
+  environment, never python argv / `/proc/<pid>/cmdline`) and
+  `ai-memory config check --file`
+  (parse-only; never echoes the file, never fail-opens) before
+  `exec`. Does **not** bump `EXPECTED_CLI_SUBCOMMANDS_*` — `Check` is
+  a sub-verb of the existing `Config` command.
+
+### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
+
+Two CLI paths diverged from the guard the MCP/HTTP reference surface already
+enforces. Both are precedent-copies — the fail-closed posture was already
+decided on the reference surface. Neither tightens behaviour beyond that
+precedent, but the #3036 alignment does change the identity the CLI `link`
+write is permission-evaluated as; see the operator note below.
+
+- **#3036 — CLI `link` edges were permanently unattestable.** `ai-memory link`
+  called the unsigned `db::create_link` while MCP `memory_link` routes through
+  `db::create_link_signed`, so every edge the CLI ever created landed
+  `attest_level=unsigned` and could never be verified under the certified
+  all-signature-lanes posture. The CLI now resolves the active keypair
+  (`--agent-id` selects the signer, else the daemon keypair — mirroring
+  `load_active_keypair_for_mcp_in`) and signs through the same
+  `create_link_signed` funnel, reporting the resulting `attest_level`. With no
+  keypair resolvable the edge still lands `unsigned`, byte-identical to the
+  prior behaviour. **Operator action:** the CLI link is now
+  permission-evaluated as the signing identity rather than `system`; operators
+  with agent-scoped `memory_link` rules must re-check them. (`create_link_signed`
+  derives the K9 actor from the keypair's `agent_id`, falling back to `system`
+  only when no key resolves — so a rule that denies e.g. `ai:*` can now Deny a
+  CLI link that previously evaluated as `system` and succeeded.) A key-load
+  failure that is not a plain "no such key" now warns on stderr instead of
+  silently degrading the edge to `unsigned`, and re-linking an
+  already-existing edge reports the level that is actually STORED on the row
+  rather than the signature level it computed but never persisted (the write
+  is an `INSERT OR IGNORE` no-op).
+- **#2988 — the recall ledger bound a NAMESPACE into the identity column.**
+  Both CLI recall paths wrote `--as-agent` (a namespace) into
+  `recall_observations.agent_id`: `src/cli/recall.rs` passed
+  `args.as_agent`, and the interactive shell passed `None`. The #1705
+  cross-agent replay guard keys on that column (`agent_id IS NULL OR agent_id
+  = ?`), so it was inert on both paths — a namespace cannot gate an identity.
+  Both now bind `resolve_read_visibility_caller()`, the same value the MCP/HTTP
+  writer stamps. `--as-agent` remains the namespace-scope visibility knob.
+
+### Security
+
+- **#3192 — single-row `delete` wrote no `forget_tombstone` and did not crypto-erase, so every MCP `memory_delete` / HTTP DELETE / inbound federation `deletions[]` was LWW-resurrectable.** `db::delete` (`delete_inner`) now reuses the existing `tombstone_and_erase` primitive (the same helper `gc` / `size_gc` already call via `evict_tombstone_and_erase`) *inside* the caller's transaction: forget-tombstone INSERT, envelope crypto-erase + attestation, `cid_genesis` scrub, DLQ/dedup remanence purge, then DELETE. `insert_if_newer`'s G30 resurrection guard therefore sees the tombstone and drops a fresher peer re-push. Postgres `PostgresStore::delete` and `apply_remote_deletion` share one `pg_hard_delete_in_tx` so the two funnels cannot drift. A delete of a never-seen id stays a no-op with no tombstone and no `namespace_meta` sever (probe-then-write). Delete also discards undelivered federation DLQ pushes for that memory. Tombstone `signature` is NULL when no daemon keypair is present (unsigned resurrection guard); refuse-under-enforced-posture is the shared rule with #3240 and must not fork here. The MCP/CLI erasure-outbox remains best-effort + infallible (documented contract; an outbox failure still WARNs and does not fail the local delete). Distinct from #3177 (pg gc).
+
+- **The cert removal-proof harness can no longer leave a DISABLED security control
+  in the working tree** (#3119, closing the #3118 near-miss).
+  `scripts/check-cert-removal-proof.sh` is a mutation-testing harness: for each cited
+  control it rewrites the production source to an always-allow disposition, runs the
+  control's lane test, and asserts the test goes RED. Restoration previously happened
+  only on the happy and handled paths — there was **no `trap`** — so a SIGINT, a
+  `timeout` kill or a crash inside the cargo run left the control off, with nothing in
+  `git status` that reads as "a security control is disabled". On 2026-08-22 an aborted
+  run left `inbound_write_namespace_authorized` short-circuited to always-allow (a
+  cross-tenant inbound federated-write authorization **bypass**) and a `git add -A`
+  swept it onto a pushed PR branch for ~25 minutes (#3118 — never merged, no commit
+  ever contained it, base never affected). Four layers now stand between a mutation
+  and a commit:
+  - **Trap.** Every target is registered in a `MUTATED` array *before* it is rewritten
+    (so a crash between "mutate" and "run" is still covered), and an `EXIT`/`INT`/
+    `TERM`/`HUP` trap restores all of them with `git checkout HEAD --` — index *and*
+    worktree, which is what unwinds the staged `git add -A` variant that an index-only
+    `git checkout --` would have written straight back. Restoration is idempotent. The
+    `EXIT` trap carries the run's real status through unchanged (upgrading only a
+    success that failed to restore); the signal traps clear their handler and
+    **re-raise** (`kill -s "$sig" $$`) so the process dies of the original signal and
+    every parent observes `WIFSIGNALED` / 128+N exactly as with no trap installed.
+    The guard test now runs backgrounded under `wait` rather than in the foreground,
+    because bash defers a trap until the foreground command returns — the whole length
+    of a `cargo test` run was previously an un-interruptible window.
+  - **Start guard.** A marker already present in `src/` (an aborted earlier run) makes
+    the harness refuse to start, loudly and non-zero, instead of stacking a second
+    mutation on a disabled control. `--force-restore` is the deliberate recovery path:
+    it backs the mutated files up under `.local-runs/cert-54-evidence/` first, then
+    resets them to `HEAD` and exits 0.
+  - **End assertion.** The end of the run and the trap both assert the marker is absent
+    from `src/`, printing `SECURITY: mutation still present in <files>` and exiting
+    non-zero otherwise.
+  - **Repo-wide gate.** New `scripts/check-mutation-marker.sh` fails on the marker
+    anywhere under `src/`, however it got there — a crash the trap could not catch, a
+    `git add -A`, a rebase that resurrects a dropped hunk. It runs (with its own
+    `--self-test`, which plants the exact #3118 artefact) in the existing
+    `L3-boundary perma-ban gate` job of `.github/workflows/c8-precheck.yml` — a
+    required context, so the new gate is merge-blocking from the first commit. The
+    marker string lives only outside `src/`, so the gate cannot trip itself.
+
+  The harness `--self-test` gains two interrupt-safety legs that need no cargo: it
+  drives the **real** harness against a **real** control under `timeout 2` and under a
+  re-raised `SIGINT` (with the cargo step stubbed to a sentinel-touch + sleep, so the
+  mutation is provably live when the signal lands) and asserts `git status --porcelain
+  src/` is empty and the marker absent afterwards. Removing the trap turns both legs
+  RED. A `subst` payload whose replacement omits the marker — invisible to the trap,
+  the guard, the assertion and the gate — is now rejected outright. Agent SOP recorded
+  in `docs/AI_DEVELOPER_WORKFLOW.md` §5.6 and `CLAUDE.md`: gate scripts mutate the tree
+  by design; never `git add -A` after running one, stage explicitly.
+
+- **#3025 — CLI `store --json` reported the REQUESTED tier/expiry/version on an
+  upsert, not the persisted row.** On a `(title, namespace)` upsert `db::insert`
+  merges onto the existing row (tier stays monotonic-max, `version` bumps,
+  `expires_at` follows the persisted tier), but the response serialized the
+  in-memory request — so a `--tier short` upsert over a `long` row reported
+  `tier=short`/`version=1`/`exp=+6h` while the DB stayed `long`/`v2`/no-expiry
+  (the #2444 reports-success-doing-nothing / honesty class). The CLI now
+  re-reads the persisted row after the write and echoes it (both `--json` and
+  the text line), matching the MCP `echo_tier` precedent
+  (`src/mcp/tools/store/mod.rs`). The read-back FAILS CLOSED: if the
+  verification read errors, or finds no row (an invariant violation — the id
+  came from `db::insert`), the command errors instead of quietly falling back
+  to echoing the requested values, which would have broken this fix's own
+  guarantee on the error path and left the caller unable to tell a verified
+  echo from an unverified one. Both messages state that the WRITE ALREADY
+  HAPPENED and name the id, so a non-zero exit is not misread as "nothing was
+  stored". The PR-5/#487 Store audit now emits AFTER the read-back using the
+  persisted title/namespace/tier (never the requested ones), and also emits
+  on the fail-closed path as `outcome=error` / `error=verification_failed: …`
+  so a committed row is never silent on the trail (ERRORS-19). Source:
+  `src/cli/store.rs`.
+- **#3040 — MCP `memory_list` ignored `AI_MEMORY_MAX_PAGE_SIZE` while HTTP
+  honored it (asymmetric OOM guard).** The MCP stdio loop carries no `AppState`,
+  so the resolved `[limits].max_page_size` cap is now mirrored into a
+  process-global (`crate::set_max_page_size` / `max_page_size`, the
+  `set_max_inflight_requests` precedent), seeded at boot from
+  `AppConfig::resolve_limits()`, and consulted by the list handler — which caps
+  at the SMALLER of its historical 200-row ceiling and the operator cap, so MCP
+  never exceeds the guard HTTP applies. Source: `src/lib.rs`,
+  `src/daemon_runtime.rs`, `src/mcp/tools/list.rs`.
+- **#3037 — `dependents-of-invalidated --transitive` was unreachable from the
+  CLI (hardcoded non-transitive).** The R55/#1959 transitive taint walk shipped
+  on HTTP + MCP but the CLI subcommand hardcoded `json!({memory_id})`. A
+  `--transitive` flag is added and threaded through to the shared handler, with
+  the downstream suspect set rendered in text output. Source:
+  `src/cli/commands/dependents_of_invalidated.rs`.
+- **#2989 — the `recall_observations` read surface hid `agent_id`/`namespace`/
+  `folded`; the doc claimed a false 1:1 column mirror.** The ledger STORES the
+  v58/#1705 identity binding (`agent_id`, `namespace`) + the v77/#1869 `folded`
+  fold-state, but the `Observation` read struct omitted them, so "who recalled
+  what, in which namespace, folded or not" was unanswerable through the
+  sanctioned MCP/HTTP read surface and the #1705 identity binding was
+  read-invisible. The three columns are now surfaced on the read struct + both
+  backends' `list_recall_observations` SELECT (sqlite + postgres), and the doc
+  now truthfully mirrors the columns. Output-only (no input-schema / tool-count
+  change). Source: `src/observations/mod.rs`, `src/store/postgres.rs`.
+### Fixed (cross-backend PARITY, batch 2 — pg/sqlite divergences)
+
+Every item below is one invariant the sqlite SSOT already held and the postgres
+adapter did not — the #3110 defect class (a gate/check/cap present on one
+backend and missing or divergently implemented on its twin). Pinned by
+`tests/pg_parity_batch_2.rs`, which drives each assertion through BOTH adapters.
+
+- **`signal_inbox` re-served ACKNOWLEDGED signals on postgres (#3011 parity).**
+  The sqlite SSOT (`signals::list_inbox`) filters `acknowledged_at IS NULL`; the
+  postgres adapter carried no such predicate while `signal_ack`
+  stamps-and-KEEPS the row, so a postgres inbox returned finished work on every
+  poll — the same task re-dispatched forever, and a different result set than
+  sqlite for an identical call. `signal_thread` / `signal_get` remain the read
+  paths for an acked signal on both backends.
+
+- **Expired signals were never reaped on postgres (#3011 parity).** `expires_at`
+  was persisted by `signal_send` but no postgres path ever deleted an expired
+  row (`run_gc` touched only memories/AGE/revisions/namespace_meta; the
+  maintenance loop swept memories/archives/leases/pending_actions), so the
+  documented TTL contract was false on postgres and ephemeral signals
+  accumulated unbounded. `PostgresStore::run_gc` now performs the twin of the
+  sqlite gc chokepoint's `signals::prune_expired` — best-effort, WARN-only, and
+  deliberately OUTSIDE the #1026 transaction, mirroring the sqlite failure
+  domain. Only caller-declared-ephemeral rows are reaped; a signal with no
+  `expires_at` is a durable record and always survives.
+
+- **`action_add_edge` lost its cycle-gate atomicity on postgres (#3008
+  parity).** The sqlite twin runs the self-edge check, the reachability probe
+  and the INSERT under ONE held connection mutex. The postgres adapter ran the
+  probe and the `ON CONFLICT DO NOTHING` insert as two INDEPENDENT pool
+  statements, so under READ COMMITTED two concurrent adds of opposing arcs
+  (`A -> B` and `B -> A`) could each observe a cycle-free graph and both commit
+  — closing the exact ordering cycle the gate exists to refuse and wedging
+  `action_frontier` permanently (a corrupted coordination DAG). Gate and write
+  now share one transaction under a tx-scoped advisory lock. One global key is
+  required for correctness: two DISJOINT new edges can co-close a cycle, so
+  endpoint-row locking cannot see the other writer. Wire errors stay byte-equal
+  with the sqlite twin.
+
+- **AGE projection failures were SWALLOWED on the sync-mode link and
+  hard-delete paths.** An AGE runtime failure on a link insert logged a warning
+  and committed the relational row; a failed unprojection after a hard delete
+  logged and returned. Nothing durable remembered either, so once AGE recovered
+  the divergence was PERMANENT in sync mode — `kg_query`/`kg_timeline` serving
+  an edge whose relational row is gone (or missing one that exists), with no
+  retry, no reconcile and no operator-visible signal. Both paths now RECORD the
+  unreconciled item in the existing `kg_projection_outbox` (no schema change):
+  the link path enqueues in the SAME transaction as the relational row, and the
+  delete path enqueues an unprojection marker under a reserved relation value
+  that no caller can forge (`memory_links.relation` is a closed typed set with a
+  SQL CHECK constraint; pinned by a unit test). The existing drainer reconciles
+  both kinds with mirror-image existence guards — a since-deleted link is never
+  resurrected, a re-created id is never detached — under the same
+  attempt/quarantine ceiling and pending-depth gauge. The drainer's marker arm
+  calls the PROPAGATING inner detach, never the swallow-wrapper the hot delete
+  path uses — otherwise an AGE failure during reconciliation would stamp the
+  marker reconciled while the ghost node stayed attached, i.e. the reconciler
+  reporting work it did not do. The drainer is now spawned on ANY postgres+AGE
+  backend, not only `age_projection_mode=deferred`, so sync deployments
+  self-heal; on a healthy sync deployment the queue is empty and each tick is
+  one indexed no-op count.
+
+- **`PostgresStore::search_with_source_uri` silently ignored `tags_any` and
+  `agent_id`.** The reciprocal-provenance FTS surface bound only
+  `namespace/tier/since/until/source_uri/limit`, while its sqlite twin and the
+  postgres `search` trait method both narrow on tags and owner. Because the
+  narrowing was dropped BEFORE `LIMIT`, callers got a page of rows that mostly
+  do not carry the requested tag/owner — wrong results, not merely extra ones.
+  (`search` records this exact defect class as fixed there only.)
+
+- **`kg_query` was UNCAPPED on postgres.** sqlite clamps the result rows to
+  `[1, 1000]` with a 200 default; both postgres branches (recursive CTE and AGE
+  cypher) had no row cap at all, so a dense graph materialized every simple path
+  up to depth 5 into memory and onto the wire, and returned a different result
+  set than sqlite for an identical call. Both branches now apply the sqlite page
+  policy AFTER a deterministic `(depth, target_id)` ordering, so the capped page
+  is a stable prefix — DEGRADE (fewer rows), never wrong rows. The HTTP
+  `body.limit` is still not threaded to the postgres branch (the SAL trait
+  carries no limit parameter); that remains a documented follow-up.
+
+- **`POST /api/v1/notify` stored a DIFFERENT priority depending on the
+  backend.** The sqlite branch clamped into `[1, 10]` via `mcp::handle_notify`
+  while the postgres branch used `i32::try_from(p).ok()`, which silently DROPPED
+  an out-of-`i32` priority to the SAL default 5 (sqlite stored 10) and never
+  clamped an in-`i32` but out-of-band value like 50 (sqlite stored 10, postgres
+  stored 50 — outside the documented domain). All three surfaces (MCP,
+  HTTP-sqlite, HTTP-postgres) now normalize through one SSOT,
+  `models::normalize_priority`, applied ABOVE the backend branch. sqlite
+  behaviour is unchanged for every in-`i32` input (its own clamp is idempotent
+  over the value); postgres is brought onto the documented domain. The SSOT also
+  corrects a latent INVERSION the old inline expression carried on all
+  surfaces: `i32::try_from(raw).unwrap_or(i32::MAX).clamp(1, 10)` saturated a
+  value BELOW `i32::MIN` upward, so `priority = i64::MIN` was stored as the
+  MAXIMUM priority 10. Saturation is now directional — below the band lands on
+  the floor, above it lands on the ceiling, at any magnitude.
+
+- **#2373 CLOSED — the postgres `verify_audit_trail` CHECK side now scopes the
+  #1946 D rollback-evidence verdict by this database's genesis-derived
+  `db_id`,** exactly as the sqlite twin does. Passing `None` was not the
+  conservative posture it claimed: the anchor-lane reader counts EVERY pinned
+  line for an id-less caller, so any sibling database sharing the witness mount
+  convicted this store (the #2370 false-positive class, fixed on sqlite and left
+  live on postgres), and a db-bound operator sanction could never clear, so a
+  legitimately restored postgres store could never be exonerated. The
+  genesis-derived id was already resolved by an async fetch earlier in the same
+  function for the watermark lane, so the stated deferral blocker never applied.
+
+- **PERF-07 / ERRORS-07 hygiene on the postgres store:** the two remaining
+  `usize as i64` limit casts (`list_by_namespace_prefix`,
+  `list_memories_updated_since_counted`) go through `TryFrom` with a saturating
+  fallback (semantics identical), and the provably-guarded `unwrap()` in
+  `prefix_upper_bound` becomes an `expect()` that records the invariant.
+
+### Documentation
+
+- **`docs/postgres-age-guide.md` now discloses the EXACT postgres-unsupported
+  surface,** per the #3064 minimum. The Agent Skills 501 entry is expanded into
+  a path/method/MCP-tool table naming all 8 routes and the 9 `memory_skill_*`
+  tools, with an explicit "this is a hard 501, not a degraded mode" warning. A
+  new *SQLite-only substrate planes* section discloses two capability gaps that
+  are NOT route-gated and were therefore invisible to an operator reading the
+  501 inventory: the **persona** mint/read surface (schema parity exists on
+  postgres, the executor and reader do not) and the **erasure cold tier**
+  (bundle / quarantine / reconcile), including the two concrete consequences on
+  postgres — `archive_restore` cannot self-heal a missing `archived_memories`
+  row from a verified bundle, and the purge-intent refusal has no postgres
+  counterpart. The crypto-erase invariant itself is explicitly noted as present
+  on postgres, so the disclosure neither overstates nor understates the gap.
+### Docs
+
+- **Claims audit, batch 3 — 13 false or stale documentation claims corrected
+  against the code they cite.** Docs-only (plus one shell comment and two JSON
+  metadata fields); zero Rust, zero behavior change. Every replacement figure is
+  re-derived from a named symbol or gate at this tree, not restated from another
+  doc.
+  - `docs/INSTALL.md`: `--profile full` surface **101 -> 103** advertised
+    entries (**100 -> 102** callable + `memory_capabilities`), matching
+    `mcp::registry::tool_names::ALL`. Removed the fabricated assertion that the
+    inventory is "asserted by `Profile::full().expected_tool_count() = 101` in
+    `src/profile.rs`" — no literal count is asserted anywhere; the union is
+    pinned by the `family_tool_names_cover_registry_all` test against `ALL`.
+  - `docs/compliance/_inventory/v1.0.0-capabilities.json`: `power_profile`
+    **77 -> 56** and the matching `authority_source` census (`Power` **70 ->
+    49**, `power=[Core,Power]` **77 -> 56**). Measured family census: Core 7 /
+    Lifecycle 6 / Graph 12 / Governance 8 / Power 49 / Meta 6 / Archive 4 /
+    Other 11 = **103**.
+  - `docs/compliance/_inventory/mcp-registry-submission.json`: marked
+    `superseded_by` the v1.0.0 capabilities inventory — its counts are the
+    frozen v0.7.0 snapshot and must not be quoted as current.
+  - `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`: posture evidence
+    restated for the CURRENT **20**-check count
+    (`ENTERPRISE_FEDERATION_CHECK_COUNT = 20`) — bare leg **9 FAIL of 19 -> 10
+    FAIL of 20**; the removal-proof harness carries **11 -> 14** control rows
+    (adding `emit_federation_newer_wins_supersede_leaf_if_enabled`,
+    `admin_header_trust_boot_refusal`, `consume_execution_exemption`, spanning
+    `src/approvals.rs` and `src/handlers/admin_role.rs`); and the §5.4(2)
+    four-leg proof is explicitly labelled a PRE-#2954 / PRE-#2991 **18**-check
+    CAPTURE rather than the live posture. Post-#2991 tallies (bare **10 FAIL of
+    20** / certified **20 PASS**) are **derived** from the #19/#20 unit tests,
+    not re-captured — `cert-54/` remains the evidence of record.
+  - `scripts/check-cert-removal-proof.sh`: `--self-test` header comment
+    corrected from "all 5 shipped rows" / "BOTH mutation grammars" to all **14**
+    shipped rows across the **three** shapes (`return` / `body` / `subst`).
+  - `docs/CLI_REFERENCE.md`: retracted "`list` supports the same filters as
+    `search`" (it does not — `list` has `--offset` and `--valid-at`, `search`
+    has `--as-agent` and `--include-archived`) and documented the flags that
+    existed in the clap structs but not in the reference: `store`
+    `--valid-from` / `--valid-until` / `--write-v2` / `--capability`; `recall`
+    `--valid-at` / `--confidence-tier` / `--verbose-provenance` / `--format` /
+    `--session-id`; a full `update` flag table (`--content-append`,
+    `--content-replace-from` / `--content-replace-to`, `--metadata`,
+    `--source-uri`, `--valid-until`, `--expected-version`); `promote`
+    `--target-tier`; `forget` `--show-receipt` / `--verify-receipt`; and full
+    `export` / `import` tables (`--full`, `--store-url`, `--expect-withheld`,
+    `--on-conflict`).
+  - `ROADMAP.md`: newest PUBLISHED tag **v0.9.0 -> v0.10.0** (2026-07-12
+    `warn-carrier`, schema v80). FED-RQ-01 (#1936) qualified as LANDED **on the
+    SQLite backend**: a postgres-backed daemon counts `checkpoints` into
+    `unsupported_on_postgres` — an explicit non-ack, not a silent drop
+    (`src/handlers/federation_signing_check.rs:969-975`) — with the full pg lane
+    tracked as #2464.
+  - `docs/postgres-age-guide.md`: retracted "every HTTP endpoint … no residual
+    501 envelope on standard endpoints"; replaced with the gate-pinned
+    **59 pg-supported / 21 fully-501 / 80 total** unique-path inventory
+    (`tests/pg_supported_route_inventory_gate_2799.rs:217-219`), remainder
+    tracked as #2803.
+  - `docs/ADMIN_GUIDE.md`: `max_memory_mb` flagged **parsed but NOT enforced**
+    (FBL-13) with `[limits].max_storage_bytes` named as the real ceiling;
+    `DEFAULT_PORT` / `GC_INTERVAL_SECS` location corrected `main.rs` ->
+    `src/daemon_runtime.rs:97-98`; added the missing
+    `AI_MEMORY_MAX_INFLIGHT_REQUESTS` row (`0` disables; unset ⇒ CPU-scaled
+    `cores x 64` clamped 256..4096, #2032 M3); `AI_MEMORY_API_KEY` is not
+    read by `src/` and there is no `--api-key` flag — container deployments
+    still inject the HTTP shared key via `entrypoint.plan-c.sh` rendering it
+    into `config.toml` ([#3197](https://github.com/alphaonedev/ai-memory-mcp/issues/3197));
+    and the three quota knobs relabelled per-agent -> **per-(agent,
+    namespace)** on SQLite (#1156 / schema v50; the pg DDL divergence is #3209).
+  - `SECURITY.md`: supported-versions table gains **v0.10.x** and **v1.0.x**
+    rows and restates the post-v1.0 support window.
+  - `docs/rfc/RFC-0001-mcp-turn-capture.md`: the `capture_layer_4` capability
+    advertisement is labelled **PROPOSED, not implemented in v1.0.0** — the
+    identifier appears nowhere in `src/` or `tests/`, so `memory_capabilities`
+    does not advertise it (the `memory_capture_turn` tool itself IS shipped).
+  - `docs/security/audit-trail.md`: container examples bumped off the retired
+    `:0.6.3` tag to `:0.10.0`, the newest tag actually published to GHCR.
+  - This file: the #3129 "unchanged on the fleet" list and the nine-job
+    `rust-cache` enumeration are marked SUPERSEDED by #3141 — the current total
+    is **5 self-hosted legs**.
+### Security (data integrity: RAII write transactions — an unwind can no longer strand the shared sqlite writer mid-transaction; #3163)
+
+- **Every explicit `BEGIN IMMEDIATE` in the substrate is now closed by a
+  destructor, not by discipline.** `Cargo.toml` keeps `panic = "unwind"` and
+  there is no `CatchPanicLayer`, so a panic inside a write path unwound past
+  the hand-written `match result { Err(_) => ROLLBACK }` arm at all **34**
+  manual `BEGIN … COMMIT` sites (`rg -n 'WriteTxn::begin' src/` outside
+  `#[cfg(test)]`). Because the daemon's writer is a SINGLE
+  `rusqlite::Connection` behind a `tokio::sync::Mutex` — which, unlike
+  `std::sync::Mutex`, does **not** poison — the unwind released the mutex with
+  the connection still inside an open write transaction and the next caller
+  inherited it. The nested-`BEGIN` outcome is loud and recoverable; the
+  dangerous one is silent: the three `owns_tx = … && conn.is_autocommit()`
+  write funnels (`insert_inner`, `update_with_expected_version`,
+  `insert_if_newer`) see `is_autocommit() == false`, conclude "the caller owns
+  the transaction", skip their own BEGIN/COMMIT, and let their writes JOIN the
+  orphaned transaction — whose durability is then decided by whoever eventually
+  errors or restarts. That is mixed state and unintentional data loss, which
+  the project ranks above every other concern. New
+  `storage::connection::WriteTxn` issues `ROLLBACK` from `Drop`, which runs on
+  an unwind exactly as it runs on an early `?` return, so the worst case after
+  a panic is a ROLLED-BACK transaction on a usable connection. Converted at all
+  34 sites across `storage/mod.rs` (23), `storage/reflect.rs`,
+  `storage/migrations.rs` (`BEGIN EXCLUSIVE`), `storage/connection.rs`,
+  `store/sqlite.rs` (the SAL store's separate shared writer), `quotas.rs` (2),
+  `atomisation/mod.rs`, `federation/push_dlq.rs`,
+  `mcp/tools/store/synthesis.rs`, and `cli/io.rs` (2 — the `mine` importer's
+  chunked `BEGIN`/`COMMIT` loop, via `WriteTxn::begin_deferred`).
+  `mcp/tools/skill_register.rs` and `mcp/tools/skill_retire.rs` already used
+  RAII `rusqlite::Transaction` and are unchanged.
+- **A failed `COMMIT` no longer strands the connection either.** The house
+  pattern propagated a COMMIT failure with `?` and never rolled back, so the
+  writer was left mid-transaction for the next caller to silently join.
+  `WriteTxn::commit` stays ARMED on failure: the drop that follows the `?`
+  rolls the transaction back and the commit error is still returned. Pinned by
+  a deterministic regression test that forces a real COMMIT failure through a
+  DEFERRED foreign-key violation (SQLite reports it at COMMIT time and
+  deliberately leaves the transaction OPEN).
+- **Defense in depth at the mutex boundary.** `handlers::transport::db_op` now
+  runs a `storage::connection::ensure_autocommit` sweep on BOTH sides of the
+  closure and contains the unwind with `catch_unwind`. A connection that is
+  inside a transaction on acquisition, or left inside one on release, is rolled
+  back; if it cannot be rolled back the request is REFUSED rather than writing
+  into an unknown transaction, and the next acquisition retries the sweep — so
+  a transient failure self-heals with no poison flag, no reopen, and no extra
+  state on the `Db` tuple. A closure that returns `Ok` while leaving a
+  transaction open now fails CLOSED (`DbOpError::OrphanedTransaction`) instead
+  of reporting a write that the sweep just erased.
+- **Postgres lane audited, no change required.** Every Postgres transaction goes
+  through `pool.begin()` → `sqlx::Transaction`, whose `Drop` calls
+  `start_rollback` (sqlx-core 0.8.6); the only `BEGIN` literals in
+  `store/postgres.rs` are inside PL/pgSQL `DO $$ BEGIN … END $$` migration
+  blocks, which are not transaction control. Postgres also takes a connection
+  from a POOL rather than sharing one behind a mutex, so an unwind cannot hand a
+  dirty connection to the next caller.
+
+### Fixed (availability: production-reachable panics — JoinError re-panic, boot-time thread spawn, silent dead audit drainer, checkpoint authz; #3164)
+
+- **`db_op` / `db_read_op` return `Result` instead of re-panicking the request
+  task.** Both helpers ended in `.expect("… spawn_blocking worker panicked or
+  runtime shut down")`, so a panic in any handler closure — or a
+  `spawn_blocking` cancelled during graceful shutdown — propagated into the
+  connection task instead of producing a 500. Panics are now contained, logged
+  with their payload, and surfaced as a typed `DbOpError`. The PERF-1 (#982)
+  and #1580 dispatch fast paths are unchanged: the same `spawn_blocking` hop,
+  the same pooled read-only connection, and `catch_unwind` costs nothing when
+  nothing panics.
+- **The forensic-audit writer thread spawn no longer aborts boot.**
+  `governance::audit::writer()` `.expect()`ed the `thread::Builder::spawn`
+  result on the MAIN thread during `init_forensic_audit`, so a `clone(2)`
+  refusal (`EAGAIN` from a pids-cgroup cap or `RLIMIT_NPROC` on a dense host) —
+  a resource condition, not a programmer bug — killed the process with exit
+  101 before it served a request. It now returns `Result` (ERRORS-01/02) and
+  every caller degrades: the boot path applies its existing "continuing
+  unsigned" policy, `flush_blocking` logs and returns, and emission surfaces a
+  typed error. A failure does not poison the `OnceLock`, so a later call
+  retries the spawn.
+- **A dead deferred-audit drainer is now visible while the daemon is still
+  running.** The supervisor `panic!`ed when a sink exhausted `max_restarts`.
+  That was deliberately fail-loud, but a panic in a `tokio::spawn`ed task kills
+  only THAT task: the daemon kept serving with the audit drainer permanently
+  dead, and nothing observed it until shutdown finally awaited the
+  `JoinHandle`. `spawn_supervised_drainer` now returns
+  `JoinHandle<Result<(), DrainError>>` with a typed `DrainTerminalState`
+  (`sink_unresolved` / `sink_panicked`) published on the shared
+  `DeferredAuditMetrics` and on a new Prometheus gauge
+  `ai_memory_deferred_audit_drainer_terminal_state` (0 = running/graceful,
+  1 = unresolved, 2 = panicked) that a fleet can alert on. Fail-loud semantics
+  are unchanged — the supervisor still refuses to advance past an unresolved
+  occurrence, and `close_and_flush` still refuses to report a clean drain,
+  now with a machine-readable cause (`DrainFlushError`) instead of a panic
+  payload.
+- **`CheckpointResolutionAuthz::Accept` now CARRIES the verifying key
+  (ERRORS-09).** `authorize_remote_checkpoint_resolution` returned a bare
+  `Accept` from three branches, only one of which had authenticated anything:
+  the two permissive (`require_sig == false`) branches returned `Accept` with
+  `enrolled_key == None`. `mcp::tools::checkpoint` turned that into
+  `enrolled.expect("Accept implies an enrolled verifying key")`, sound ONLY
+  because that one call site hardcodes `require_sig = true` — while its HTTP
+  sibling in `handlers::federation_receive` already passes the RUNTIME flag.
+  Wiring the same flag into the MCP tool would have made a remote peer's
+  unsigned resolution panic an MCP tool. The unsound pairing is now
+  unrepresentable: `Accept(VerifyingKey)` for the authenticated verdict, a
+  distinct `AcceptUnverified` for the permissive rollout window. Behaviour at
+  both call sites is byte-identical; the split exists so no caller can mistake
+  a permissive accept for an authenticated one.
+
+### Security (boot fails CLOSED on an unusable config; `AI_MEMORY_NO_CONFIG` honours its documented contract — #3166 #3167)
+
+- **#3166 (data-integrity, GA-blocking) — boot was fail-OPEN on a malformed
+  config: a TOML typo (or a silent `EACCES`/`EIO`) made the daemon open a NEW
+  empty `./ai-memory.db` in the current directory, report healthy, and accept
+  writes into that orphan.** `src/main.rs` called the non-propagating
+  `AppConfig::load()`, which swallowed parse errors, the secret-validation
+  rejection, and EVERY io error (`ErrorKind` was discarded, so `EACCES`/`EIO`
+  were indistinguishable from the documented `ENOENT`) and returned
+  `AppConfig::default()`. `effective_db` then resolved the RELATIVE
+  `ai-memory.db`, so a one-character typo in a config carrying
+  `db = "/var/lib/ai-memory/prod.db"` produced corpus split-brain — and
+  `[storage].append_only`, `[governance].require_operator_pubkey` and
+  `[[permissions.rules]]` silently reverted to their defaults in the same
+  stroke. `main` now resolves the config through the PROPAGATING
+  `AppConfig::load_for_boot()` and REFUSES the boot with the error printed to
+  stderr and exit `78` (`EX_CONFIG`, single-sourced as `config::EX_CONFIG`),
+  before any database is opened. `load_for_boot` matches
+  `ErrorKind::NotFound` explicitly, so the documented "no `config.toml` ->
+  compiled defaults" contract and the `AI_MEMORY_NO_CONFIG=1` test escape
+  hatch are byte-identical; every OTHER io error is surfaced. Argv is now
+  parsed BEFORE the config is resolved, so `--version` / `--help` cannot be
+  taken down by a broken config. Four subcommands deliberately keep running on
+  compiled defaults — `doctor` (which now REPORTS the fault in a new
+  `Configuration` report section rather than hiding it), `config` (the repair
+  verb), `completions` and `man`; everything else, including `boot`, fails
+  closed, because serving an agent its context out of the WRONG database is a
+  wrong ANSWER, not degraded function. The lenient `AppConfig::load_from` no
+  longer swallows a non-`NotFound` io error silently either — it prints a loud
+  "config UNREADABLE" line before falling back.
+- **#3167 — `AI_MEMORY_NO_CONFIG=` (empty) and `=0` silently disabled the
+  ENTIRE config file, while a non-UTF-8 value had the inverse effect.** The
+  three production sites tested `std::env::var(..).is_ok()` — mere PRESENCE —
+  against a documented "set to `1`" contract, so an empty placeholder export in
+  a compose / unit file reverted every config-backed knob (including `db`, see
+  #3166) to compiled defaults with no stderr line, and a non-UTF-8 value made
+  `var()` return `Err` so the config LOADED. All three sites now route through
+  one shared `config::skip_config()` that resolves the variable through the
+  substrate-wide truthy grammar (`1`/`true`/`yes`/`on`, trimmed,
+  case-insensitive) already used by every other `AI_MEMORY_*` boolean knob, and
+  WARN once when the variable is present but not truthy. `AI_MEMORY_NO_CONFIG=1`
+  behaviour is unchanged.
+### Security (secret-file handling: close the TOCTOU re-open window; give the capability token a non-argv channel; stop re-publishing the SQLCipher passphrase; caproot directory posture)
+
+- **Four secret-file loaders still did stat-then-reopen (TOCTOU).** #3205. #1790
+  finding 2 established the rule for this codebase — open the file ONCE and run
+  the permission check on THAT handle (`f.metadata()` = fstat), then read the
+  bytes from the SAME handle — and fixed `identity::keypair` (`.priv`), the
+  encryption master KEK and `governance::capability` (`.caproot`) accordingly.
+  Four loaders were missed: `daemon_runtime::passphrase_from_file` (the
+  SQLCipher DB passphrase, #1055 gate), `store_url::store_url_from_file` (the
+  Postgres DSN, which carries a password, #1927 gate),
+  `cli::rules::load_operator_signing_key` (the Ed25519 OPERATOR SIGNING SEED
+  that authenticates every `governance_rules` row, 0600 gate) and the
+  `[llm]` / `[embeddings]` `api_key_file` reader in `config.rs` (the vendor API
+  key, #1146 0400 gate). Each did `fs::metadata(path)` followed by a separate
+  `fs::read*(path)` — two path lookups, so a local attacker able to write the
+  directory could satisfy the 0400/0600 gate with a decoy and have a different
+  file read in its place: the fail-closed gate did not bind the bytes actually
+  read. All four now use the single-handle form; the permission logic, the
+  opt-out env vars, the refusal text and the trimming behaviour are unchanged.
+  The one observable delta is that a MISSING path now fails at the open (with
+  the read context) instead of at the separate stat — pinned by a regression
+  test on each loader.
+- **The macaroon capability token had no channel other than argv.** #3206.
+  `--capability <cap1:…>` on `store` / `delete` / `promote` puts a bearer
+  credential that can flip a governance `Deny`/`Ask` to `Allow` into
+  world-readable `/proc/<pid>/cmdline`, `ps auxww`, shell history and systemd
+  unit files, where any co-tenant local UID can lift and replay it within its
+  caveats — the exact exposure class #1927 closed for the Postgres DSN, which
+  the capability path never got. Adds `--capability-file <path>` and
+  `AI_MEMORY_CAPABILITY_FILE`: a `0600` file (owner-only enforced fail-closed,
+  opt out with `AI_MEMORY_CAPABILITY_FILE_ALLOW_LAX_PERMS=1`), read through the
+  same single-handle open+fstat discipline. Resolution order is
+  `--capability-file` > `AI_MEMORY_CAPABILITY_FILE` > `--capability`; the two
+  flags conflict at clap parse; `--capability` still works and now emits a WARN
+  naming the exposure and the alternatives. A NAMED-but-unusable file channel
+  (missing / unreadable / lax-mode / empty / set-but-non-UTF-8) is a hard
+  error, never a silent downgrade to argv or "no token presented"
+  (`var_os` + `PathBuf`; `Path` needs no UTF-8). No default
+  behaviour changes: a caller that presents nothing is unaffected, and a caller
+  that presents `--capability` gets the same decision it did before.
+- **`--db-passphrase-file` no longer re-publishes the SQLCipher passphrase into
+  the process environment.** #3213. The flag exists because "passing the
+  passphrase directly as an env var or as a flag value leaks to the process
+  list (`ps -E`) and shell history"; `apply_startup_env` then voided that
+  mitigation with `unsafe { set_var("AI_MEMORY_DB_PASSPHRASE", …) }`, so every
+  subsequently spawned child (`hooks/executor`, `cli/wrap`) inherited it — the
+  #2905 env-leak class, which `audit_pubkey` already refused. The file channel
+  now seeds process-private `OnceLock` state (`storage::set_db_passphrase`);
+  `apply_sqlcipher_key` prefers that and keeps `AI_MEMORY_DB_PASSPHRASE` as
+  the documented operator-set fallback. A second seed in the same process is
+  refused, not swapped. No default change for operators who set the env
+  themselves.
+- **`write_root_secret` used a bare `create_dir_all` for the `.caproot`
+  keystore.** #3214. The identity cluster (#3198) closed this class for
+  Ed25519 `.priv`/`.pub` and left the capability HMAC secret as an
+  out-of-scope residual. A group/world-writable directory lets another local
+  UID replace `<issuer>.caproot`; the per-file 0600 check then PASSES on the
+  planted bearer secret, so `mint` produces tokens that `verify` under the
+  attacker's HMAC (there is no private-derives-public cross-check here). Both
+  `write_root_secret` and `read_root_secret` now create at `0o700`
+  (`mkdir(2)`-time) and refuse an existing directory whose `mode & 0o022 !=
+  0`. A merely group-readable `0o755` directory (default `umask 022`) is
+  still accepted — directory read does not enable the swap.
+### Security (MCP tool-contract audit: schema-vs-handler drift — fail-open shapes, caller-chosen authz subjects, overclaimed docs; #3171)
+
+- **Every MCP tool's advertised contract now matches its enforced one, and a CI
+  guard keeps it that way.** Tool input schemas are `schemars`-derived from the
+  per-tool `*Request` structs, but no handler deserializes that struct — each
+  reads the raw `arguments` bag directly, and **there is no runtime JSON-Schema
+  validation on the MCP path**. Nothing coupled the two, so a value that
+  contradicted the advertised schema did not fail: it silently took the
+  handler's fallback branch. The audit of all 103 tools found four repeating
+  fail-open shapes plus a class of undeclared-but-honoured parameters.
+  - **Schema-REQUIRED string read with `unwrap_or_default()` → plausible EMPTY
+    SUCCESS.** `memory_action_frontier` / `memory_action_next` queried the `""`
+    namespace and answered "no work" (a worker fleet would idle on a typo);
+    `memory_signal_thread` threaded on `""` and answered "this thread has no
+    messages"; all four `memory_lease_*` handlers defaulted `action_id` /
+    `holder` to `""`. The lease case was the worst: `lease_acquire`'s upsert
+    guard is `expires_at <= now OR holder = ?`, so **two distinct agents that
+    each omitted `holder` both resolved to `""` and the second was treated as a
+    same-holder re-acquire — a DOUBLE GRANT of a single-holder coordination
+    lease**, defeating the invariant `crate::actions::lease_acquire` documents
+    as "never two winners". All now refuse (ERRORS-08).
+  - **Unknown enum discriminant DROPPED the filter → strictly MORE rows.**
+    `memory_checkpoint_query` (`state`, `condition_type`) and
+    `memory_routine_list` (`state`) turned a typo into "no filter", so a caller
+    asking for the still-open coordination gates got the resolved ones back too,
+    and one filtering for `draft` routines got FROZEN ones it must not treat as
+    editable. Unknown discriminants are now refused, mirroring the #3007
+    `handle_checkpoint_create` gate.
+  - **`i64`-declared integer read via `as_u64` → a schema-valid NEGATIVE read as
+    ABSENT** and silently took a server default: `memory_offload.ttl_seconds`
+    (retention-integrity — caller data kept alive longer than asked),
+    `memory_check_agent_action.byte_estimate` (write-size policy evaluated as if
+    no size had been declared), `memory_find_paths.max_depth`/`max_results` (a
+    caller asking for a NARROWER traversal got a wider one),
+    `memory_pending_list.limit`. All refuse the negative.
+  - **Boolean SAFETY flag read with `.as_bool().unwrap_or(false)`.**
+    `memory_forget` and `memory_gc` ran a REAL, irreversible delete when
+    `dry_run: "true"` / `dry_run: 1` (the shapes a hand-rolled or weakly-typed
+    client emits) requested a PREVIEW. `memory_archive_purge.as_admin` had the
+    same shape on a cross-tenant escalation switch. Present-but-non-boolean is
+    now refused; ABSENT still defaults.
+- **`memory_forget`: a bulk DELETE can no longer be silently WIDER than the
+  pattern the caller wrote.** The forget path shared `sanitize_fts_query` with
+  the ranked-read paths, which CLAMPS: it silently drops a token that sanitises
+  to empty, drops a standalone `AND`/`OR`/`NOT`/`NEAR`, and `.take(128)`s the
+  rest. Under FTS5 implicit-AND every dropped token is a dropped narrowing
+  conjunct, so the delete matched rows the caller never named — unrecoverable
+  data loss from a silent sanitiser. The destructive path now has its own
+  STRICT builder that REFUSES those inputs; read paths keep the clamp.
+- **A caller can no longer choose the principal its own request is judged as.**
+  `identity::resolve_agent_id` gives the EXPLICIT wire argument precedence over
+  the `AI_MEMORY_AGENT_ID` env identity — correct for an attribution field,
+  wrong for an authz SUBJECT. Handlers that fed a wire `params.agent_id` into
+  `Permissions::evaluate` / `enforce_governance` / a capability-token binding /
+  a quota key / an ownership predicate let the caller pick that subject, while
+  the sibling owner gate stayed keyed on the ENV caller — two controls that can
+  never agree by construction. New `identity::resolve_governance_subject`
+  generalises the shipped `handle_inbox` (#1557) / `handle_replay` (#1571)
+  pattern: under the multi-tenant posture the subject IS the enforced-read
+  caller and a disagreeing wire `agent_id` is REFUSED; the single-operator
+  default (env unset) is byte-identical. Applied to `memory_promote`,
+  `memory_kg_invalidate`, `memory_archive_purge`, `memory_pending_approve`,
+  `memory_pending_reject`, `memory_delete`, `memory_update`, `memory_store`
+  (local and forward-to-HTTP), `memory_consolidate`, `memory_link`,
+  `memory_atomise`, `memory_reflect`, `memory_offload` and `memory_deref`.
+  - `memory_pending_approve` was the sharpest: the approver id is the SUBJECT of
+    the separation-of-duties gate itself — it is compared against `requested_by`
+    to refuse self-approval, matched against the named approver, and counted as
+    the DISTINCT-vote key for `ApproverType::Consensus(n)`. Reading it from the
+    wire let one caller defeat self-approval refusal and forge a full human
+    quorum by varying the parameter across N calls.
+  - `memory_namespace_clear_standard` had TWO holes: the #1777 owner gate ran
+    only when the caller CLAIMED an identity (`params.agent_id` present), so
+    omitting an UNDECLARED optional parameter disarmed authz on the one
+    operation that disarms every other gate in the namespace — the exact
+    caller-opt-in shape #2541 had already removed from the SET twin. The gate is
+    now unconditional (the CLI keeps its out-of-band trusted entry,
+    `handle_namespace_clear_standard_trusted`). And the caller string was the
+    LEFT-HAND SIDE of the ownership predicate itself, so a caller could satisfy
+    the gate for any owned standard by naming that owner; it is now bound to the
+    enforced-read caller.
+  - `memory_deref`'s SEC-4 IDOR gate (`caller != blob.agent_id → NotFound`)
+    asserted in its own source note that the MCP handler "always passes an
+    AUTHENTICATED `caller_agent_id`". It did not — the value came verbatim from
+    the request body, so the gate compared the blob's owner against a string the
+    caller supplied. Both `memory_offload` and `memory_deref` also honoured an
+    UNDECLARED second identity channel (`metadata.agent_id`) on tools that have
+    no `metadata` input at all; it is removed. `memory_entity_register` had the
+    same second channel inside `entity_register`, where an inline
+    `metadata.agent_id` WON over the id the handler had just validated and so
+    never crossed the `RESERVED_AGENT_IDS` check (#977) — the resolved id now
+    wins.
+  - The enterprise-audit `actor` field is shape-validated before it reaches the
+    SIEM emitter. It was the one site where an arbitrary, unvalidated caller
+    string reached the audit record — a log-injection vector on every
+    store/update/delete/promote/forget/link/consolidate/approve/reject call.
+- **`memory_quota_status`: an ungated READ no longer WRITES.** It called
+  `quotas::get_status`, which `ensure_row`s, so any MCP caller could
+  `INSERT OR IGNORE` an `agent_quotas` row for an arbitrary
+  `(agent_id, namespace)` pair — an unbounded row-injection primitive that fills
+  an operator's quota census with principals that never existed. New
+  non-materialising `peek_status` / `peek_aggregate_status` twins return the
+  identical wire shape from a synthesised default; the real write paths still
+  materialise on first write, so no accounting is lost. Both parameters are now
+  validated at the boundary. `memory_ingest_multistep` gained the same missing
+  `validate_namespace`.
+- **`memory_skill_get` decompresses BOUNDED.** It was the lone skill decode site
+  still using unbounded `zstd::decode_all` while its three siblings used the
+  #1933 `decode_all_bounded` ceiling, so a hostile `skills.body_blob` row that
+  decodes to gigabytes would OOM the daemon on an activation fetch.
+- **`memory_get_links` reports `attest_level` fail-closed.** The column is
+  nullable and the field is `skip_serializing_if = "Option::is_none"`, so a NULL
+  row made the trust field VANISH from the response while the tool docs promised
+  every link carries one. It now `COALESCE`s to `"unsigned"` — the same
+  projection the reflection export already used. The postgres `get_links`
+  / `get_links_for_anchor` twins now use the same COALESCE; a NULL column
+  on a pg-backed daemon no longer drops the trust field.
+- **`memory_checkpoint_resolve` refuses blank `id` / `resolved_by`.** Both
+  are schema-REQUIRED; they were still `unwrap_or_default()`, so a blank
+  resolver was persisted as attribution. They now go through
+  `param_guard::require_str`. The handler-reads⊆schema guard now matches
+  `param_guard::*(params, KEY)` and scans `src/mcp/mod.rs`. Quota list
+  tests now seed via `record_op` (peek no longer INSERT-on-read). C5
+  trimmed full-profile ceiling 6750 → 7650 (measured 7567).
+
+### Security (governance gates that were missing or pointed at the wrong namespace; #3202, #3204 items 4 and 7)
+
+- **`memory_promote` now governs the DESTINATION namespace, not only the source
+  (#3202).** Vertical promotion CLONES the row into `to_namespace`, i.e. it is a
+  WRITE into that namespace — but the Task-1.9 block evaluated
+  `GovernedAction::Promote` against the SOURCE namespace, and the destination
+  received nothing beyond `reject_reserved_write_namespace`. An operator who set
+  `write: Owner` (or `Approve`) on an ancestor namespace still had every row a
+  caller could read from a descendant clonable into it, and the ancestor is
+  normally the MORE protected namespace — so the governance boundary was
+  crossable by construction. A STORE-class `enforce_governance` now runs against
+  `to_namespace` before the clone (Deny refuses, Approve queues exactly as a
+  direct `memory_store` into that namespace would). Fable HIGH on #3220: that
+  queue recorded `action_type="store"` with payload `{id, to_namespace,
+  mode:"vertical"}`, and `execute_pending_action`'s store arm
+  `from_value::<Memory>`'d it — Approve never cloned. The store arm now
+  dispatches a `mode=vertical` payload onto `promote_to_namespace`. The
+  SOURCE Promote gate used to run FIRST, so `promote: Approve` queued a
+  `"promote"` pending whose execute arm cloned with no dest evaluation
+  (source Approve + dest write:Owner/Deny landed the clone). Dest Store
+  now runs first on MCP and CLI; the promote execute arm re-evaluates dest
+  write without queueing and refuses Deny/still-Pending. The
+  forensic row is chained
+  under the DESTINATION, and the clone's provenance is RE-STAMPED: it was
+  carrying `source.metadata` verbatim, so the new row was owned by the source's
+  author rather than the caller that put it there and nothing in the row
+  recorded its origin. The acting caller becomes the clone's `agent_id`; the
+  original authorship is PRESERVED under `promoted_from_agent_id` alongside
+  `promoted_from` / `promoted_from_namespace` / `promoted_at`, so the durable
+  truth is added to, never replaced. `promote_to_namespace` takes the acting
+  caller explicitly, so the MCP, CLI and approved-pending-action lanes each
+  attribute the clone correctly. Surface audit: MCP and CLI both gained the
+  destination gate; HTTP has no exposure (`handlers/memories.rs` hard-codes
+  `to_namespace: None`); postgres has no `promote_to_namespace` twin, so
+  vertical promotion is sqlite-only.
+- **`memory_gc` is no longer the one ungated destructive tool (#3204 item 7).**
+  It reached the substrate with no permission gate, no governance consult and no
+  forensic row, while its sibling `memory_archive_purge` carries all three —
+  even though gc deletes across EVERY namespace and EVERY owner, and with
+  `archive_on_gc` off that delete is a permanent hard-delete + crypto-erase.
+  A real sweep now clears three gates: a K9 `Permissions::evaluate` (op chosen by
+  disposition — `MemoryArchive` for an archiving sweep, `MemoryDelete` for a
+  reaping one) evaluated at the default namespace with `namespace_pattern = "**"`
+  scoping, the #1849 bulk-delete governance rule on the DESTRUCTIVE disposition
+  (refuse the sweep if any namespace holding reapable rows carries a non-`Any`
+  `delete` level — otherwise a `delete: Approve` legal-hold is no defence at all,
+  since the held rows simply expire and vanish on the next tick, with no approval
+  and no trace), and an `allow` forensic row chained before the write. The
+  governance refusal deliberately does NOT apply to an ARCHIVING sweep: the row
+  moves to `archived_memories` and `memory_archive_restore` recovers it, so the
+  hold is not defeated, and refusing there would strand expired rows in every
+  deployment with any delete-governed namespace — a reliability cost with no
+  integrity benefit. `dry_run` stays ungated so an operator can always SEE what
+  would be reaped. A `Decision::Ask` REFUSES here rather than returning the
+  success-shaped `{status:"ask"}` envelope its sibling returns; a success-shaped
+  body on an unperformed destructive op is itself one of the findings above.
+- **A non-object `tools/call` `arguments` is now `-32602`, not `{}` (#3204
+  item 4).** Coercing it meant `{"arguments": "namespace=acme"}` (or an array, or
+  a number) silently ran the tool with EVERY argument absent — a destructive tool
+  then took its unscoped defaults and a schema-required field took its handler
+  fallback. An ABSENT `arguments` still means "no arguments".
+- **The audit actor rejects RESERVED sentinels (#3204 item 4).** The shape gate
+  alone does not reject them, so a wire caller could stamp the enterprise-audit
+  `actor` with `daemon` / `system` — the internal principals downstream gates
+  carve out as "the internal path is exempt". `resolve_mcp_agent_id` now applies
+  the full `validate_agent_id` (#977).
+
+### Added (MCP tool-contract SSOT: declared parameters, exception mechanisms, and a handler-reads guard; #3171)
+
+- **26 parameters that handlers already honoured are now DECLARED** on their
+  `*Request` structs, so a schema-conformant client can discover them instead of
+  needing to read the source: `agent_id` on `memory_delete`, `memory_update`,
+  `memory_link`, `memory_atomise`, `memory_get`, `memory_recall`,
+  `memory_session_start`, `memory_promote`, `memory_kg_invalidate`,
+  `memory_archive_purge`, `memory_offload`, `memory_deref`,
+  `memory_pending_approve`, `memory_pending_reject`, `memory_skill_get`,
+  `memory_skill_register`, `memory_skill_promote_from_reflection` and the two
+  namespace-standard tools; `as_admin` on `memory_archive_purge`;
+  `caller_agent_id` on `memory_agent_register`; `source_uri` on `memory_search`;
+  `as_agent` on `memory_kg_query`; `citations` / `source_span` on `memory_store`
+  (parsed, validated and persisted since #1421, never advertised); `signature` /
+  `resolved_at` on `memory_checkpoint_resolve`; and the legacy `id` /
+  `kind_inner` aliases on `memory_routine_run`, `memory_routine_status` and
+  `memory_check_agent_action`.
+- **New CI guard `tests/mcp_handler_params_subset_of_schema.rs` closes the class
+  permanently.** It parses every `params["k"]` / `params.get(param_names::K)`
+  read in `src/mcp/tools/`, resolves the constants against the `param_names`
+  SSOT, and asserts the read set is a SUBSET of the properties declared by the
+  tools implemented in the same module unit. The pre-existing pins compared
+  schema against its own past SNAPSHOT and were structurally unable to see any
+  of these defects.
+- **The D1.6 (#987) registry pin gained explicit, documented exception tables**
+  — `PROPERTY_ADDITIONS`, `PROPERTY_REMOVALS`, `DOCS_CORRECTIONS`,
+  `DESCRIPTION_CORRECTIONS` — replacing two inline `if name == …` special cases.
+  The pin previously forbade property REMOVALS outright with no escape hatch,
+  which meant a property the audit proved to be a lie could not be retired even
+  when leaving it advertised was itself the defect; `PROPERTY_REMOVALS` carries
+  the three-condition safety contract such a removal must satisfy and is
+  deliberately EMPTY at #3171 (every ignored parameter was corrected by
+  documenting the truth rather than by breaking the wire contract). The
+  property-key pin now reports EVERY drifting tool in one run instead of
+  fail-fast on the alphabetically-first, and each correction table asserts the
+  text actually changed so a stale entry fails the build rather than silently
+  unpinning a tool.
+- `param_names` SSOT census 133 -> 135: `AS_ADMIN` and `PIPELINE_VARIANT`, both
+  honoured but read as bare literals until the audit.
+- **Verbose tool-catalog token ceiling 25_000 → 28_000**, hoisted to the SSOT
+  `crate::sizes::VERBOSE_FULL_PROFILE_CEILING_TOKENS` (was five duplicated
+  `25_000` pins). The honest-docs rewrite + 26 newly declared properties
+  measured 26_691 cl100k on the verbose drill-down; the trimmed `tools/list`
+  wire is unchanged and still under 11_000. rust-1.98: one named const.
+
+### Fixed (MCP tool descriptions that overclaimed or omitted destructive behaviour; #3171)
+
+- Long-form `docs()` is stripped from the wire `tools/list` payload, so these
+  corrections cost zero tokens — but an agent that trusts "archives first" and
+  gets a crypto-erase has lost data on the strength of our documentation.
+  - `memory_gc` claimed "archives first" unconditionally; archiving is
+    conditional on `archive_on_gc`, and with it OFF the sweep is a permanent
+    hard-delete + crypto-erase. The response now carries `archived` so a caller
+    can tell a recoverable move from an unrecoverable erase (previously it could
+    not), and the docs disclose that the sweep is substrate-wide and ungated,
+    also prunes the `recall_observations` ledger and expired signals, and — per
+    #3161 — does not archive link edges.
+  - `memory_signal_inbox` returns UNACKED signals only; `memory_stats` has no
+    archive counts at all (the docs claimed them); `memory_skill_get`'s
+    "<5000 tok" was never enforced and every fetch APPENDS a `skill.invoked`
+    signed-events row (this "read" is audited and not side-effect free);
+    `memory_pending_list`'s "status filter (default pending)" was false —
+    omitting `status` returns EVERY status; `memory_recall` silently clamps
+    `limit` to 50; `memory_list` defaults to `toon_compact`, not JSON;
+    `memory_kg_invalidate` is NOT idempotent when `valid_until` is omitted and
+    PERMANENTLY clears a signed link's signature and attest level;
+    `memory_archive_purge` defaults to CALLER-ONLY scope and returns a
+    success-shaped `{status:"ask"}` envelope with nothing purged under an Ask
+    rule; `memory_delete` and `memory_promote` accept a unique ID PREFIX;
+    `memory_forget` is silently owner-scoped under `AI_MEMORY_AGENT_ID` and its
+    owner predicate also matches UNOWNED rows; `memory_entity_register` merges
+    aliases only — `metadata` and `agent_id` are discarded on the idempotent
+    path; `memory_ingest_multistep` never populates `ingested_memory_ids` and
+    stores nothing.
+  - Two asymmetries are now DISCLOSED rather than silently carried:
+    `memory_skill_delete` has NO admin gate on the MCP path while its HTTP twin
+    requires the admin role, and the `memory_lease_*` tools decide ownership
+    entirely from a self-asserted `holder` string (they receive no caller
+    identity), so "an owned lease … held by the caller" was not enforced.
+  - Three declared-but-never-read parameters are marked **IGNORED** rather than
+    removed (removing a field a client already sends is itself an unannounced
+    contract change): `memory_signal_send.from_agent` (discarded since #2996 —
+    authorship binds to the signing keypair), `memory_capture_turn.tool_calls`
+    ("preserved verbatim" was false; nothing persists it) and
+    `memory_calibrate_confidence.output_format` (read by no handler on any
+    surface).
+  - The `# Errors` rustdoc on `memory_verify` and `memory_reflection_origin`
+    claimed the dispatcher returns JSON-RPC `-32602`; per the MCP 2025-03-26
+    tool-result convention a handler error is a SUCCESSFUL result carrying
+    `isError: true`, so a client switching on the error code would never see
+    them. `docs/USER_GUIDE.md`'s `memory_get_links` example showed a `signed_at`
+    field that exists nowhere and a `signature` key that is never emitted.
+### Fixed (silent permanent recall loss: `migrate` copied NULL-space vectors as `embedding_space=''`; #3085)
+
+- **`migrate` no longer mints an UNATTRIBUTED embedding stamp, and an
+  already-poisoned corpus now heals.** The #3060 Phase-3 embedding copy bucketed
+  a source row whose `embedding_space` was SQL NULL under
+  `space.unwrap_or_default()` — the EMPTY STRING — and wrote it with
+  `set_embeddings_batch(&ctx, chunk, "")`. On postgres that lands NON-NULL
+  `embedding_space = ''`, which is excluded from the #2167 recall gate (`AND
+  embedding_space = <active_fp>` never matches `''`) **and** from
+  `PostgresStore::list_unembedded`'s NULL-space heal arm (`'' IS NULL` is
+  false). The row was therefore PERMANENTLY non-recallable and unhealable while
+  `migrate` reported `errors: []` — strictly worse than pre-#3060, where such a
+  row landed unembedded and the serve-boot backfill self-healed it. Three
+  changes: (1) a NULL/empty-space source vector is **not copied** (it has no
+  provenance to preserve; the destination re-derives it from the DURABLE TEXT
+  under the live embedder and stamps the ACTIVE space) and is **counted** in the
+  new `MigrationReport.embeddings_unattributed`, surfaced in both the `migrate`
+  text and `--json` reports plus a `tracing::warn!`; (2) every embedding write
+  funnel on both backends (`db::set_embedding`, `db::set_embeddings_batch`,
+  `db::set_embeddings_batch_reembed`, the `MemoryStore::set_embeddings_batch`
+  default, and both adapters' `update_embedding` / `set_embeddings_batch`) now
+  **refuses** an empty or whitespace-only space stamp for a real vector, so the
+  state is structurally un-mintable; (3) every provenance-READ predicate on both
+  backends (the pg boot-backfill heal scan, both `adopt_legacy_embedding_space`
+  [G2] probes and UPDATEs, and `stamp_embedding_space_attested`) now treats `''`
+  as NULL-equivalent, so a corpus an older binary already poisoned heals through
+  the same paths a legacy NULL corpus does. Recall is deliberately **not**
+  widened: an unattributed row stays excluded from scoring until it is healed
+  (degrade, never wrong results).
+
+### Security (fail-closed: inert governance rules, peer-steerable DLQ classification; #3031 #2672)
+
+- **An ENABLED, operator-signed `refuse` rule whose matcher cannot be EVALUATED
+  now REFUSES instead of silently allowing (#3031).** `matcher_applies`
+  collapsed "malformed matcher JSON", "no field this kind recognises", and "was
+  evaluated and did not match" into a single `false`, so `rules add --kind bash
+  --matcher '{"totally_bogus_key":123}' --severity refuse --sign` minted a
+  signed, enabled, operator-attested rule that enforced NOTHING — `rules check`
+  answered `allow` for every command and `rules list` showed nothing amiss. Two
+  halves: `ai-memory rules add` now validates the **per-kind matcher schema**
+  (required keys present, no unrecognised keys, and every recognised key's VALUE
+  TYPE readable by the engine's typed accessor — both a `command_substrng` typo
+  and a `{"glob": 123}` are refused at write time, because the engine reads
+  `glob` with `as_str` and a number is just as inert as a misspelling), and
+  `RuleEngine::evaluate` fails closed on an inert
+  enabled rule whose severity BLOCKS, emitting a loud `tracing::error!` naming
+  the rule. Both `ai-memory rules list` and the MCP `memory_rule_list` gain an
+  `inert` flag, from the same predicate, so a legacy row is visible to the
+  operator and to an agent alike.
+  **Documented-semantics note:** `match_read`'s doc states that for
+  `read_action` "an empty / unrecognized matcher matches nothing, so an operator
+  can't accidentally deny every read with a typo". That property is PRESERVED
+  for the non-blocking severities (`warn` / `log` inert rules stay non-blocking)
+  and DELIBERATELY INVERTED for `refuse` / `escalate`: a typo that disables an
+  intended refusal is a silent security hole, and the typo is now also
+  unmintable through `rules add`.
+- **A federation peer can no longer defeat the push-DLQ quarantine ceiling by
+  returning a count containing `429` (#2672).** `sync::success_report_non_ack_
+  reason` interpolated a `skipped` count read VERBATIM from the peer's own JSON
+  body into a prose `last_error`, which `reset_throttled_quarantine` then
+  matched with `last_error LIKE '%429%'` on BOTH backends and reset
+  `attempt_count = 0`. A peer answering **HTTP 200** with `{"skipped": 429}` had
+  its rows un-quarantined on every sweep, so they could never reach
+  `MAX_REPLAY_ATTEMPTS` — the unbounded no-op POST amplification #1544 exists to
+  stop — and `classify_quarantine_cause`'s `contains("429") => "quota"` arm
+  misdirected the operator to raise a quota. The retry/label signal is now a
+  typed `DlqErrorClass` decided from the REAL HTTP status line or the local call
+  site, persisted as a reserved leading tag (`[ai-memory:class=throttle] …`) that
+  peer-derived text can only ever follow; the SQL is an anchored `LIKE
+  '[ai-memory:class=throttle]%'` on both adapters. Pre-#2672 UNTAGGED rows keep
+  healing on the historical substring rule, scoped by `NOT LIKE
+  '[ai-memory:class=%'` so no in-flight upgrade backlog is stranded. The
+  diagnostic counts stay in `last_error`; only their role as a control signal is
+  removed.
+
+### Fixed (cross-backend parity + observability; #3027 #2908 #2972)
+
+- **The postgres inbox's UNREAD marker is now `access_count`, matching its
+  sqlite/MCP twin (#3027).** The pg arm filtered `metadata['read'] == true`, a
+  key NO production writer sets, so `unread_only=true` filtered nothing and
+  `unread_count` equalled the total forever — while the in-code comment claimed
+  sqlite parity. Both arms now derive read-state from the same durable
+  `access_count` column, and the pg projection surfaces the same `read` /
+  `access_count` pair the sqlite inbox does.
+- **The boot security-posture banner is no longer emitted into a void on a stock
+  `ai-memory serve` console (#2908).** On a default config `[logging].enabled` is
+  off, so no subscriber is installed at `main`, and the console subscriber was
+  installed inside `serve()` — AFTER `run()`'s common boot-report block. Both the
+  asi-hard #1961 pin report and the §5.3 `security.posture.enterprise_federation`
+  banner (#2905) produced 0 lines with `RUST_LOG=info` and no config, so the
+  §5.3 certification could not cite the banner it mandates. The console
+  subscriber is now installed BEFORE the boot-report block, scoped to the
+  commands that install it anyway (`serve` / `curator` / `watch`) so every other
+  subcommand's stdout/stderr stays byte-identical.
+- **`ai-memory reembed` and the daemon now share ONE embedder-model resolver
+  (#2972).** The two-branch rule that decides which vector space a write lands in
+  (`tier_config.embedding_model` for API backends, `resolve_embedder_model`
+  otherwise) was duplicated in `daemon_runtime::build_embedder` and
+  `cmd_reembed`; a drift between the two would have `reembed` REPLACE the whole
+  corpus into a space the daemon refuses to score. Both now call
+  `daemon_runtime::resolve_boot_embedder_model`. That resolver additionally
+  REPORTS a configured `[embeddings].model` it could not construct (the reported
+  case: `backend = "ollama"`, `model = "qwen3-embedding:4b"`, silently swapped
+  for the `all-MiniLM-L6-v2` tier preset behind a `tracing::warn!` a CLI one-shot
+  renders nowhere), and `reembed` now REFUSES rather than rewriting every vector
+  under a substitute model. The daemon keeps its warn-and-degrade boot posture.
+  `ai-memory doctor` no longer states a model the binary will not load: when a
+  configured non-API `[embeddings].model` is unconstructible, the Embeddings
+  Reachability section now WARNs and adds `effective_model` /
+  `model_honoured: false` facts. (The reporter's confusion started there —
+  `doctor` echoed `qwen3-embedding:4b` while both the daemon and `reembed`
+  actually used `all-MiniLM-L6-v2`.)
+### Security (CLI destructive-op guards + tamper-evidence preservation; R-405 cluster — #3013 #3012 #3021)
+
+- **`archive purge` no longer wipes every namespace unconfirmed, unscoped and
+  unpreviewed (#3013).** `archive purge`'s ENTIRE argument surface was
+  `--older-than-days N` ("all if omitted") — it destroys the LAST copy of an
+  archived memory's text, including the `in_place_edit` undo snapshots and the
+  rows `delete` / `forget` left recoverable, and it had none of the guards the
+  strictly LESS destructive `forget` already required. It now mirrors
+  `forget`'s F11 rail: `--namespace <NS>` bounds the blast radius,
+  `--confirm-global` is REQUIRED when `--namespace` is omitted (a refused purge
+  destroys nothing), and `--dry-run` reports what WOULD be purged and exits —
+  reachable without `--confirm-global` because it destroys nothing, and
+  short-circuiting above the audit emit so a preview is not recorded as an
+  `allow` for a purge that never happened. The preview and the delete are
+  single-sourced on one predicate (`db::archive_purge_predicate`), so the count
+  can never understate the blast radius. This is a LOUD refusal with the exact
+  remediation in the message, not a silent behaviour change.
+- **CLI `delete <id>` is now ARCHIVE-FIRST, restoring the documented
+  recoverability contract (#3012).** `docs/CLI_REFERENCE.md` stated "`delete`
+  archives first", but `cmd_delete` called the raw `db::delete`: the TARGETED
+  single-row verb destroyed the last copy of the memory's CURRENT text with no
+  recovery, while the BULK `forget` always archived and stayed restorable. That
+  is the inverse of operator expectation and, under the North Star, an
+  unintentional-data-loss default on the substrate's durable truth. It was also
+  silently WRONG where a #1725 `in_place_edit` snapshot existed: `db::delete`
+  is `DELETE FROM memories` only (no FK, no trigger onto `archived_memories`),
+  so the pre-edit snapshot survived and `archive restore <id>` then resurrected
+  STALE content under that id — a restore that looks successful and is not.
+  `delete` now routes through
+  `db::delete_archive_first` (one transaction: copy the row + its
+  `memory_links` edges into `archived_memories` under
+  `archive_reason = "delete"`, sever namespace standards, remove from the live
+  set), so `ai-memory archive restore <id>` brings it back; JSON output carries
+  `archived: true|false`. The exact previous behaviour remains available as an
+  explicit `--hard` opt-in. Both paths keep the #1955 R45 record-stop fence —
+  the fence is applied in `delete_archive_first` itself so a delete funnel
+  cannot lose it by changing which primitive it calls.
+- **`memory_verify` no longer collapses a FORGED signature into
+  `attest_level="unsigned"` (#3021).** The pubkey-found/verify-FAILED arm in
+  `src/mcp/tools/verify.rs` returned `(false, AttestLevel::Unsigned)` — i.e.
+  "signature present but INVALID" was reported as "never signed", while the
+  adjacent no-pubkey arm correctly returned the STORED level. That erased the
+  tamper evidence at exactly the row where it matters: an auditor sweeping
+  `attest_level != 'unsigned'` to re-check signed edges skipped every forged
+  one, and the DB row still held the 64-byte signature + `self_signed`. The
+  failed-verify arm now returns the stored level with `signature_verified:
+  false` and null `signed_by` / `signed_at`; the verdict rides on
+  `signature_verified`, never on `attest_level`. Pinning tests updated in
+  lockstep (`tests/memory_verify.rs`, `tests/identity_e2e.rs`,
+  `src/mcp/mod.rs`).
+
+### Fixed (CLI surface: declared-but-inert flags; R-405 cluster — #3005 #3017 #3019 #2815)
+
+- **`recall --format {human,json,toon}` actually selects a renderer (#3005).**
+  `RecallArgs.format` was declared with a `value_parser`, marshalled into the
+  `RecallRequest` DTO and pinned by a parity test — but nothing in
+  `src/cli/recall.rs` ever read it. The only renderer branch was the global
+  `--json`, so all three values produced byte-identical HUMAN output:
+  `--format json` silently lied, and TOON was unreachable from the CLI even
+  though MCP and HTTP have honoured it since v0.6.x. The render path now
+  branches on `args.format`, emitting the identical envelope through the
+  shared `crate::toon` encoder for `toon`. The global `--json` keeps
+  precedence, so every existing `--json` script is byte-unchanged.
+- **`agents subkey-certs` is filtered by `--principal`, never silently by
+  `AI_MEMORY_AGENT_ID` (#3017).** The subcommand's own `--agent-id` collided
+  with the root `--agent-id` (`global = true`, `env = "AI_MEMORY_AGENT_ID"`);
+  clap propagates a matched global DOWN into every subcommand's `ArgMatches`,
+  OVERWRITING the same-named subcommand-local arg. The certified posture always
+  exports `AI_MEMORY_AGENT_ID`, so the node-wide sub-key certificate inventory
+  was silently filtered to that one principal and reported `{"count":0}` over a
+  populated `agent_subkey_certs` table — a security-inventory FALSE NEGATIVE on
+  exactly the surface an operator audits. The flag is now `--principal`, a
+  distinct arg id with no `env`, which cannot be shadowed.
+- **`agents bind-key --pubkey <KEY>` accepts keys beginning with `-` / `_`
+  (#3019).** `identity export-pub` emits url-safe-no-pad base64, so ~1 key in
+  40 (2 of the 64 possible leading characters) was parsed by clap as a flag and
+  the enrollment died with a usage error (exit 2) — on the recipe the
+  documentation itself prints. The argument now sets `allow_hyphen_values`, so
+  both `--pubkey <KEY>` and `--pubkey=<KEY>` work for every key.
+- **`doctor --remote` can reach a hardened daemon (#2815).** `doctor --remote`
+  is the disclosed remediation for #2810 (no `--store-url` Postgres path yet),
+  but it exposed NO transport-auth knobs, so on the CERTIFIED enterprise
+  posture (TLS + mandatory client-cert mTLS + top-level `api_key`) it could not
+  complete a request and a certified Postgres deployment had no working
+  first-party `doctor` path at all. Added `--ca-cert`, `--client-cert` /
+  `--client-key`, `--api-key` and the non-argv `--api-key-file` (#1927: a key
+  on argv is world-readable via `/proc/<pid>/cmdline`), reusing the sibling
+  fleet verbs' flag names and TLS builders — `cli::sync::parse_ca_certificate`
+  and `cli::sync::sync_client_identity` are now shared rather than forked. With
+  none of the flags passed the client is byte-for-byte the pre-fix one; nothing
+  is loosened. A malformed `--api-key-file` fails LOUD instead of degrading
+  into an unauthenticated probe that renders a misleading `critical`.
+
 ### Changed
 
 - **`ai-memory export` de-silenced: it is a convenience view, not the portability path** ([#1944](https://github.com/alphaonedev/ai-memory-mcp/issues/1944), B_WARN de-silencing, 2×5-agent vote `woaiwndla` / `4d3ea1c5`). The JSON `ai-memory export` command (and its HTTP sibling `GET`-admin export) emits `{memories, links, count, exported_at}` — a **memories + links CONVENIENCE view** that silently omitted the substrate's tamper-evidence + governance spine (governance rules, the append-only revision log, forget tombstones, derivation lineage, per-write attestations, the signed-events audit chain). It now announces that scope instead of dropping it silently:
