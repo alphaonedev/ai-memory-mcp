@@ -1,7 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! Postgres + pgvector adapter for the Storage Abstraction Layer (v0.7).
+//! Postgres adapter for the Storage Abstraction Layer (v0.7).
 //!
 //! Gated behind the `sal-postgres` cargo feature, which layers on top of
 //! the base `sal` feature. Default builds do not pull sqlx or pgvector.
@@ -9,11 +9,16 @@
 //! # Schema
 //!
 //! The adapter owns its schema (CREATE TABLE IF NOT EXISTS at init) —
-//! no manual DBA step required. The embedding column is `vector(384)`
-//! to match the default `MiniLmL6V2` model; adapters configured for
-//! `NomicEmbedV15` need to drop the column and recreate with
-//! `vector(768)` (tooling for that will land with the migration helper
-//! in a follow-up).
+//! no manual DBA step required. When `CREATE EXTENSION vector` succeeds
+//! the embedding column is `vector(N)` (default 384 / MiniLM). When the
+//! extension is missing, the role cannot create it, or
+//! `AI_MEMORY_PG_NO_VECTOR=1` is set, the column is `BYTEA` (LE f32s)
+//! and semantic recall scores cosine in-process. `tsvector` FTS is
+//! always used — it is built-in.
+//!
+//! Adapters configured for `NomicEmbedV15` still pass `--embedding-dim 768`
+//! so a fresh pgvector schema lands `vector(768)`. BYTEA mode ignores
+//! that as a column type (dim lives in the blob length).
 //!
 //! The full schema — parity with the SQLite backend including
 //! memories, memory_links, archived_memories, namespace_meta,
@@ -59,6 +64,13 @@ use super::{
     VerifyFilter, VerifyLinkReport, VerifyReport, is_visible_to_caller,
 };
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
+
+#[path = "postgres_embedding.rs"]
+mod postgres_embedding;
+use postgres_embedding::{
+    EmbeddingMode, bind_embedding, decode_f32_le, render_schema_sql_with_mode,
+    resolve_embedding_mode,
+};
 
 /// Tracing target for postgres-SAL events. Pre-#1562 these were
 /// emitted as a FIELD (`target = `), which RUST_LOG target filtering
@@ -1315,7 +1327,7 @@ const EMBEDDING_DIM_PLACEHOLDER: &str = "{EMBEDDING_DIM}";
 /// pass the result straight to `sqlx::raw_sql`.
 #[must_use]
 pub fn render_schema_sql(template: &str, dim: u32) -> String {
-    template.replace(EMBEDDING_DIM_PLACEHOLDER, &dim.to_string())
+    render_schema_sql_with_mode(template, dim, EmbeddingMode::PgVector)
 }
 
 /// Connection-pool sizing knobs. Defined in the `sal`-gated parent
@@ -1354,6 +1366,9 @@ pub struct PostgresStore {
     /// back to the recursive-CTE path when AGE is absent. See
     /// [`Self::kg_backend`].
     kg_backend: KgBackend,
+    /// `vector(N)` + HNSW, or BYTEA + in-process cosine when pgvector
+    /// cannot be created. Set once at connect; cannot flip a live column.
+    embedding_mode: EmbeddingMode,
     /// #1955 [P1][R45] — in-process record-stop cache for this store.
     /// Seeded from the `signed_events` chain at connect time (so a
     /// persisted stop survives restart) and flipped by
@@ -1707,16 +1722,13 @@ impl PostgresStore {
                 relocate_app_tables_to_public(&pool).await?;
             }
 
-            // Bootstrap schema — idempotent. The bundled template uses
-            // `vector({EMBEDDING_DIM})` for the two vector columns; we
-            // substitute the caller's chosen dim here. CREATE TABLE IF NOT
-            // EXISTS means the dim only "takes" on first init; subsequent
-            // calls against an already-populated schema are no-ops.
-            //
-            // The retry loop is still in place as defense-in-depth for any
-            // residual catalog-level race the advisory lock can't cover
-            // (e.g., a third process bypassing the lock entirely).
-            let init_sql = render_schema_sql(INIT_SCHEMA, dim);
+            // Embedding mode first: existing column type, else
+            // AI_MEMORY_PG_NO_VECTOR, else CREATE EXTENSION vector
+            // (falls back to BYTEA if the role cannot). Then render
+            // INIT_SCHEMA so we never issue CREATE EXTENSION / HNSW
+            // when the type is BYTEA.
+            let embedding_mode = resolve_embedding_mode(&pool).await?;
+            let init_sql = render_schema_sql_with_mode(INIT_SCHEMA, dim, embedding_mode);
             let mut last_err: Option<sqlx::Error> = None;
             // v1.0.0 #2445 — `0` attempts when the operator hatch authorised a
             // schema-AHEAD database: this binary's bootstrap set must not be
@@ -1754,53 +1766,60 @@ impl PostgresStore {
 
         // Sanity-check pgvector version. We support 0.7.x–0.8.x; older
         // versions have HNSW behaviour differences we haven't tested
-        // against. (#302 item 2.)
-        let extver: Option<(String,)> =
-            sqlx::query_as("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
-                .fetch_optional(&pool)
-                .await
-                .map_err(|e| StoreError::BackendUnavailable {
-                    backend: "postgres".to_string(),
-                    detail: format!("read pgvector version: {e}"),
-                })?;
-        if let Some((ver,)) = extver
-            && !(ver.starts_with("0.7") || ver.starts_with("0.8"))
-        {
-            tracing::warn!(
-                target: TRACE_TARGET,
-                version = %ver,
-                "pgvector version outside the tested range 0.7.x–0.8.x; HNSW recall may differ"
-            );
-        }
+        // against. (#302 item 2.) BYTEA mode has no extension.
+        if embedding_mode.uses_pgvector() {
+            let extver: Option<(String,)> =
+                sqlx::query_as("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| StoreError::BackendUnavailable {
+                        backend: "postgres".to_string(),
+                        detail: format!("read pgvector version: {e}"),
+                    })?;
+            if let Some((ver,)) = extver
+                && !(ver.starts_with("0.7") || ver.starts_with("0.8"))
+            {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    version = %ver,
+                    "pgvector version outside the tested range 0.7.x–0.8.x; HNSW recall may differ"
+                );
+            }
 
-        // Sanity-check that the embedding column dimension matches
-        // what the caller requested at connect time. A mismatch means
-        // an existing schema was created with a different dim (e.g.
-        // operator switched from `MiniLmL6V2` to `NomicEmbedV15` but
-        // didn't run `ai-memory schema-init --embedding-dim 768`); we
-        // log a WARN here so the operator notices before writes start
-        // failing on a dim-mismatch insert. (#304 nit; v0.7.0 L3 made
-        // the comparand parameterisable.)
-        let typmod: Option<(i32,)> = sqlx::query_as(
-            "SELECT atttypmod FROM pg_attribute a
-             JOIN pg_class c ON c.oid = a.attrelid
-             JOIN pg_namespace n ON c.relnamespace = n.oid
-             WHERE c.relname = 'memories' AND a.attname = 'embedding'
-             AND n.nspname = 'public'",
-        )
-        .fetch_optional(&pool)
-        .await
-        .ok()
-        .flatten();
-        let expected_dim = i32::try_from(dim).unwrap_or(384);
-        if let Some((typmod,)) = typmod
-            && typmod != expected_dim
-        {
-            tracing::warn!(
+            // Sanity-check that the embedding column dimension matches
+            // what the caller requested at connect time. A mismatch means
+            // an existing schema was created with a different dim (e.g.
+            // operator switched from `MiniLmL6V2` to `NomicEmbedV15` but
+            // didn't run `ai-memory schema-init --embedding-dim 768`); we
+            // log a WARN here so the operator notices before writes start
+            // failing on a dim-mismatch insert. (#304 nit; v0.7.0 L3 made
+            // the comparand parameterisable.) BYTEA has no atttypmod dim.
+            let typmod: Option<(i32,)> = sqlx::query_as(
+                "SELECT atttypmod FROM pg_attribute a
+                 JOIN pg_class c ON c.oid = a.attrelid
+                 JOIN pg_namespace n ON c.relnamespace = n.oid
+                 WHERE c.relname = 'memories' AND a.attname = 'embedding'
+                 AND n.nspname = 'public'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+            let expected_dim = i32::try_from(dim).unwrap_or(384);
+            if let Some((typmod,)) = typmod
+                && typmod != expected_dim
+            {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    dim = typmod,
+                    expected = expected_dim,
+                    "memories.embedding column dimension ({typmod}) does not match the requested embedder dim ({expected_dim}); run `ai-memory schema-init --store-url <url> --embedding-dim {expected_dim}` to convert in place"
+                );
+            }
+        } else {
+            tracing::info!(
                 target: TRACE_TARGET,
-                dim = typmod,
-                expected = expected_dim,
-                "memories.embedding column dimension ({typmod}) does not match the requested embedder dim ({expected_dim}); run `ai-memory schema-init --store-url <url> --embedding-dim {expected_dim}` to convert in place"
+                "Postgres embedding storage: BYTEA (no pgvector)"
             );
         }
 
@@ -1874,6 +1893,7 @@ impl PostgresStore {
             let store = Self {
                 pool,
                 kg_backend,
+                embedding_mode,
                 record_stop: crate::store::record_stop::RecordStopFlag::default(),
             };
             // v1.0.0 #2445 — the ladder is skipped under the operator hatch for
@@ -7653,6 +7673,13 @@ impl PostgresStore {
     /// - `StoreError::BackendUnavailable` on any SQL failure during
     ///   the conversion.
     pub async fn migrate_embedding_dim(&self, target_dim: u32, force: bool) -> StoreResult<bool> {
+        if !self.embedding_mode.uses_pgvector() {
+            tracing::info!(
+                target: TRACE_TARGET,
+                "skip vector(N) conversion: embedding column is BYTEA"
+            );
+            return Ok(false);
+        }
         let target_i32 = i32::try_from(target_dim).map_err(|_| StoreError::InvalidInput {
             detail: format!("target_dim {target_dim} out of i32 range"),
         })?;
@@ -8177,8 +8204,11 @@ impl PostgresStore {
         let dim_for_archive = existing_dim.map_or(DEFAULT_EMBEDDING_DIM, |(d,)| {
             u32::try_from(d).unwrap_or(DEFAULT_EMBEDDING_DIM)
         });
-        let archive_embedding_ddl =
-            format!("ALTER TABLE archived_memories ADD COLUMN embedding vector({dim_for_archive})");
+        let archive_embedding_ddl = if self.embedding_mode.uses_pgvector() {
+            format!("ALTER TABLE archived_memories ADD COLUMN embedding vector({dim_for_archive})")
+        } else {
+            "ALTER TABLE archived_memories ADD COLUMN embedding BYTEA".to_string()
+        };
 
         for (table, column, ddl) in [
             (
@@ -13163,6 +13193,151 @@ async fn pg_recompute_revision_row_hash_at(pool: &PgPool, sequence: i64) -> Opti
 }
 
 impl PostgresStore {
+    /// BYTEA semantic pool: pull candidate embeddings and score cosine
+    /// in-process. Same 0.2 gate and filter shape as the pgvector `<=>`
+    /// query. Mutates `scored` in place.
+    async fn recall_semantic_bytea(
+        &self,
+        query_embedding: &[f32],
+        filter: &Filter,
+        caller_opt: Option<&str>,
+        tags_first: Option<&str>,
+        agent_filter: Option<&String>,
+        ann_pool: i64,
+        scored: &mut std::collections::HashMap<String, (Memory, f64, f64, i64)>,
+    ) -> StoreResult<()> {
+        let rows = sqlx::query(&format!(
+            "SELECT *, octet_length(content) AS content_len
+             FROM memories
+             WHERE embedding IS NOT NULL
+               AND ($1::text IS NULL OR namespace = $1)
+               AND ($2::text IS NULL OR tier = $2)
+               AND ($3::text IS NULL OR tags @> to_jsonb(ARRAY[$3]))
+               AND ($4::text IS NULL OR metadata ->> 'agent_id' = $4)
+               AND ($5::timestamptz IS NULL OR created_at >= $5)
+               AND ($6::timestamptz IS NULL OR created_at <= $6)
+               AND (expires_at IS NULL OR expires_at > NOW())
+               AND (
+                   $8::text IS NULL
+                   OR COALESCE(metadata->>'scope', 'private') <> 'private'
+                   OR metadata->>'agent_id' = $8
+               )
+               {lifecycle_vis}
+             ORDER BY updated_at DESC
+             LIMIT $7",
+            lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+        ))
+        .bind(filter.namespace.as_ref())
+        .bind(filter.tier.as_ref().map(Tier::as_str))
+        .bind(tags_first)
+        .bind(agent_filter)
+        .bind(filter.since)
+        .bind(filter.until)
+        .bind(ann_pool)
+        .bind(caller_opt)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("recall_hybrid semantic pool bytea", e))?;
+
+        for r in &rows {
+            let blob: Option<Vec<u8>> = r.try_get("embedding").unwrap_or(None);
+            let Some(bytes) = blob else {
+                continue;
+            };
+            let Some(stored) = decode_f32_le(&bytes) else {
+                continue;
+            };
+            let cosine = f64::from(crate::embeddings::Embedder::cosine_similarity(
+                query_embedding,
+                &stored,
+            ));
+            if cosine <= 0.2 {
+                continue;
+            }
+            let mem = Self::row_to_memory(r)?;
+            let content_len: i64 = r.try_get::<i32, _>(COL_CONTENT_LEN).map_or_else(
+                |_| {
+                    r.try_get::<i64, _>(COL_CONTENT_LEN)
+                        .unwrap_or_else(|_| i64::try_from(mem.content.len()).unwrap_or(0))
+                },
+                i64::from,
+            );
+            scored
+                .entry(mem.id.clone())
+                .and_modify(|entry| {
+                    if cosine > entry.2 {
+                        entry.2 = cosine;
+                    }
+                })
+                .or_insert((mem, 0.0, cosine, content_len));
+        }
+        Ok(())
+    }
+
+    async fn check_duplicate_bytea(
+        &self,
+        query_embedding: &[f32],
+        namespace: Option<&str>,
+        now_dt: DateTime<Utc>,
+        effective_threshold: f32,
+        candidates_scanned: usize,
+    ) -> StoreResult<crate::models::DuplicateCheck> {
+        let rows = if let Some(ns) = namespace {
+            sqlx::query(
+                "SELECT id, title, namespace, embedding
+                 FROM memories
+                 WHERE embedding IS NOT NULL
+                   AND namespace = $1
+                   AND (expires_at IS NULL OR expires_at > $2)",
+            )
+            .bind(ns)
+            .bind(now_dt)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text cosine bytea", e))?
+        } else {
+            sqlx::query(
+                "SELECT id, title, namespace, embedding
+                 FROM memories
+                 WHERE embedding IS NOT NULL
+                   AND (expires_at IS NULL OR expires_at > $1)",
+            )
+            .bind(now_dt)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text cosine bytea", e))?
+        };
+
+        let mut nearest: Option<crate::models::DuplicateMatch> = None;
+        for r in &rows {
+            let blob: Option<Vec<u8>> = r.try_get("embedding").unwrap_or(None);
+            let Some(stored) = blob.as_deref().and_then(decode_f32_le) else {
+                continue;
+            };
+            let sim = crate::embeddings::Embedder::cosine_similarity(query_embedding, &stored);
+            if nearest.as_ref().is_none_or(|n| sim > n.similarity) {
+                nearest = Some(crate::models::DuplicateMatch {
+                    id: r.try_get("id").map_err(|e| to_store_err("read id", e))?,
+                    title: r.try_get("title").map_err(|e| to_store_err(READ_TITLE, e))?,
+                    namespace: r
+                        .try_get("namespace")
+                        .map_err(|e| to_store_err(READ_NAMESPACE, e))?,
+                    similarity: sim,
+                });
+            }
+        }
+
+        let is_duplicate = nearest
+            .as_ref()
+            .is_some_and(|n| n.similarity >= effective_threshold);
+        Ok(crate::models::DuplicateCheck {
+            is_duplicate,
+            threshold: effective_threshold,
+            nearest,
+            candidates_scanned,
+        })
+    }
+
     /// v0.9.0 G5b (#1822, item 10 / GATE K3) — POSTGRES `verify_audit_trail`
     /// TWIN. Surfaces IDENTICAL [`crate::signed_events::WitnessCheck`],
     /// [`crate::signed_events::CauseBinding`], and
@@ -17322,12 +17497,15 @@ impl MemoryStore for PostgresStore {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::TRANSACTIONS
-            | Capabilities::NATIVE_VECTOR
+        let mut caps = Capabilities::TRANSACTIONS
             | Capabilities::FULLTEXT
             | Capabilities::DURABLE
             | Capabilities::STRONG_CONSISTENCY
-            | Capabilities::ATOMIC_MULTI_WRITE
+            | Capabilities::ATOMIC_MULTI_WRITE;
+        if self.embedding_mode.uses_pgvector() {
+            caps |= Capabilities::NATIVE_VECTOR;
+        }
+        caps
     }
 
     /// PR-C pg-parity (5-agent vote `4d3ea1c5`) — surface the AGE-vs-CTE
@@ -19121,6 +19299,7 @@ impl MemoryStore for PostgresStore {
         .await
     }
 
+
     /// v1.0.0 #2771 — FAIL-CLOSED create twin of [`Self::store_with_embedding`].
     /// A `(title, namespace)` collision is refused atomically (`INSERT … ON
     /// CONFLICT DO NOTHING`) with a typed [`StoreError::Conflict`] carrying the
@@ -19190,17 +19369,19 @@ impl MemoryStore for PostgresStore {
         if embedding.is_some_and(|v| !v.is_empty()) {
             crate::store::reject_unattributed_space("update_embedding", space)?;
         }
-        let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
         // #2167 — vector + space travel together; a None (cleared) embedding
         // NULLs the space stamp too (no vector, no provenance).
         let space_val: Option<&str> = embedding.map(|_| space);
-        sqlx::query("UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1")
-            .bind(id)
-            .bind(emb_pgvec)
-            .bind(space_val)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| to_store_err("update_embedding", e))?;
+        bind_embedding(
+            self.embedding_mode,
+            sqlx::query("UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1")
+                .bind(id),
+            embedding,
+        )
+        .bind(space_val)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("update_embedding", e))?;
         Ok(())
     }
 
@@ -19381,12 +19562,14 @@ impl MemoryStore for PostgresStore {
         // #2167 — one space stamps the whole batch (live-minted in one process).
         let space_str = space;
         for (id, vec) in entries {
-            let emb_pgvec = pgvector::Vector::from(vec.clone());
-            let res = sqlx::query(
-                "UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1",
+            let res = bind_embedding(
+                self.embedding_mode,
+                sqlx::query(
+                    "UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1",
+                )
+                .bind(id),
+                Some(vec.as_slice()),
             )
-            .bind(id)
-            .bind(emb_pgvec)
             .bind(space_str)
             .execute(&mut *tx)
             .await
@@ -21661,13 +21844,24 @@ impl MemoryStore for PostgresStore {
             scored.insert(mem.id.clone(), (mem, fts_score, 0.0, content_len));
         }
 
-        // Semantic candidates via pgvector cosine_distance. We use the
-        // `<=>` operator (cosine distance) and convert to similarity as
-        // `1 - distance`. The 0.2 cosine gate matches sqlite's
-        // db::recall_hybrid (S18 iteration: relaxed 0.3 → 0.2 to admit
-        // legitimately-related content with phrasing variance).
+        // Semantic candidates. pgvector uses `<=>` (cosine distance →
+        // `1 - distance`). BYTEA mode loads blobs and scores cosine
+        // in-process (SQLite-shaped). The 0.2 cosine gate matches
+        // sqlite's db::recall_hybrid.
         if let Some(qe) = query_embedding {
             let ann_pool: i64 = (limit_eff * 5).max(50);
+            if !self.embedding_mode.uses_pgvector() {
+                self.recall_semantic_bytea(
+                    qe,
+                    filter,
+                    caller_opt,
+                    tags_first,
+                    filter.agent_id.as_ref().or(ctx.as_agent.as_ref()),
+                    ann_pool,
+                    &mut scored,
+                )
+                .await?;
+            } else {
             let qvec = pgvector::Vector::from(qe.to_vec());
             // #910 SAL-level scope=private gate via $9.
             let sem_rows = sqlx::query(&format!(
@@ -21765,6 +21959,7 @@ impl MemoryStore for PostgresStore {
                         }
                     })
                     .or_insert((mem, 0.0, cosine, content_len));
+            }
             }
         }
 
@@ -28603,17 +28798,24 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn get_embedding(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Option<Vec<f32>>> {
-        // Read the stored pgvector `embedding` column for `id`. The outer
-        // Option is "row exists?"; the inner is "embedding non-NULL?" (a
-        // keyword-tier / never-embedded / store-time-skipped row is NULL).
+        // Outer Option is "row exists?"; inner is "embedding non-NULL?".
         // Both collapse to `None`, matching SQLite's `db::get_embedding`.
-        let v: Option<Option<pgvector::Vector>> =
+        if self.embedding_mode.uses_pgvector() {
+            let v: Option<Option<pgvector::Vector>> =
+                sqlx::query_scalar("SELECT embedding FROM memories WHERE id = $1 LIMIT 1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("get_embedding", e))?;
+            return Ok(v.flatten().map(|vec| vec.to_vec()));
+        }
+        let v: Option<Option<Vec<u8>>> =
             sqlx::query_scalar("SELECT embedding FROM memories WHERE id = $1 LIMIT 1")
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| to_store_err("get_embedding", e))?;
-        Ok(v.flatten().map(|vec| vec.to_vec()))
+        Ok(v.flatten().and_then(|b| decode_f32_le(&b)))
     }
 
     async fn get_embedding_with_space(
@@ -28627,13 +28829,26 @@ impl MemoryStore for PostgresStore {
         // is "row exists?"; a NULL embedding collapses to `None` (matching
         // `get_embedding`). `embedding_space` is carried verbatim (`None` =
         // SQL NULL / unverified).
-        let row: Option<(Option<pgvector::Vector>, Option<String>)> =
-            sqlx::query_as("SELECT embedding, embedding_space FROM memories WHERE id = $1 LIMIT 1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| to_store_err("get_embedding_with_space", e))?;
-        Ok(row.and_then(|(emb, space)| emb.map(|vec| (vec.to_vec(), space))))
+        if self.embedding_mode.uses_pgvector() {
+            let row: Option<(Option<pgvector::Vector>, Option<String>)> = sqlx::query_as(
+                "SELECT embedding, embedding_space FROM memories WHERE id = $1 LIMIT 1",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("get_embedding_with_space", e))?;
+            return Ok(row.and_then(|(emb, space)| emb.map(|vec| (vec.to_vec(), space))));
+        }
+        let row: Option<(Option<Vec<u8>>, Option<String>)> = sqlx::query_as(
+            "SELECT embedding, embedding_space FROM memories WHERE id = $1 LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("get_embedding_with_space", e))?;
+        Ok(row.and_then(|(emb, space)| {
+            emb.and_then(|b| decode_f32_le(&b).map(|vec| (vec, space)))
+        }))
     }
 
     async fn next_versioned_title(&self, base_title: &str, namespace: &str) -> StoreResult<String> {
@@ -28803,11 +29018,13 @@ impl MemoryStore for PostgresStore {
             });
         }
 
-        // Use pgvector cosine distance directly — `1 - distance` gives
-        // similarity in `[0, 1]`. We mirror SQLite's `check_duplicate`
-        // scan shape: live rows in `namespace` (or all live rows when
-        // `namespace=None`) with a non-null embedding, ordered by
-        // cosine ascending (= most similar first), limit 1.
+        // pgvector: `<=>` cosine distance. BYTEA: scan blobs and score
+        // in-process (same 1-NN shape).
+        if !self.embedding_mode.uses_pgvector() {
+            return self
+                .check_duplicate_bytea(query_embedding, namespace, now_dt, effective_threshold, candidates_scanned)
+                .await;
+        }
         let emb_pgvec = pgvector::Vector::from(query_embedding.to_vec());
         // v1.0.0 #2167 §3.4/§9 — a dup-check must NEVER match across embedding
         // spaces: comparing the live query vector against a foreign-space
@@ -29417,7 +29634,6 @@ impl PostgresStore {
             serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
                 detail: serialize_err("tags", e),
             })?;
-        let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
         // #2167 — the vector's provenance stamp travels in the SAME
         // statement as the vector (the §2 same-statement rule). Stamp
         // `space` ONLY when a vector is actually written, so a NULL
@@ -29692,7 +29908,7 @@ impl PostgresStore {
                 )
             }
         };
-        let id: Option<String> = sqlx::query(&embed_sql)
+        let insert = sqlx::query(&embed_sql)
             .bind(&memory.id)
             .bind(memory.tier.as_str())
             .bind(&memory.namespace)
@@ -29718,8 +29934,8 @@ impl PostgresStore {
             .bind(confidence_signals_json.as_deref())
             .bind(memory.confidence_decayed_at.as_deref())
             .bind(memory.entity_id.as_deref())
-            .bind(memory.persona_version)
-            .bind(emb_pgvec)
+            .bind(memory.persona_version);
+        let id: Option<String> = bind_embedding(self.embedding_mode, insert, embedding)
             .bind(mentioned_entity_id.as_deref())
             .bind(memory.lifecycle_state.as_str())
             .bind(&embed_cid.cid)
@@ -30615,6 +30831,31 @@ mod tests {
         assert!(
             !rendered.contains(EMBEDDING_DIM_PLACEHOLDER),
             "placeholder not substituted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_schema_sql_no_vector_uses_bytea() {
+        let rendered = render_schema_sql_with_mode(INIT_SCHEMA, 384, EmbeddingMode::Bytea);
+        assert!(
+            !rendered.contains("CREATE EXTENSION IF NOT EXISTS vector"),
+            "no-vector schema must not create the vector extension"
+        );
+        assert!(
+            !rendered.contains("vector_cosine_ops"),
+            "no-vector schema must not create HNSW"
+        );
+        assert!(
+            rendered.contains("embedding         BYTEA"),
+            "memories.embedding must be BYTEA: {rendered}"
+        );
+        assert!(
+            !rendered.contains(EMBEDDING_DIM_PLACEHOLDER),
+            "placeholder not substituted"
+        );
+        assert!(
+            rendered.contains("to_tsvector"),
+            "FTS must remain"
         );
     }
 
@@ -31610,6 +31851,68 @@ mod tests {
 
     fn postgres_url() -> Option<String> {
         std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
+    }
+
+    #[tokio::test]
+    async fn live_no_vector_store_get_and_fts() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        // Force BYTEA even if this Postgres can CREATE EXTENSION vector.
+        // SAFETY: this test process is dedicated; other live tests that
+        // need pgvector should run in a separate invocation.
+        unsafe {
+            std::env::set_var("AI_MEMORY_PG_NO_VECTOR", "1");
+        }
+        let store = PostgresStore::connect(&url)
+            .await
+            .expect("connect without pgvector");
+        assert!(
+            !store.embedding_mode.uses_pgvector(),
+            "expected BYTEA mode"
+        );
+        assert!(!store.capabilities().contains(Capabilities::NATIVE_VECTOR));
+        assert!(store.capabilities().contains(Capabilities::FULLTEXT));
+
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("novec-{}", uuid::Uuid::new_v4());
+        let mem = sample_memory(
+            &format!("novec-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "debug pod postgres",
+            "store and retrieve without the vector extension",
+        );
+        let emb = vec![0.1_f32, 0.2, 0.3, 0.4];
+        let id = store
+            .store_with_embedding(&ctx, &mem, Some(&emb), Some("test-space#none"))
+            .await
+            .expect("store_with_embedding BYTEA");
+        let got = store.get(&ctx, &id).await.expect("get");
+        assert_eq!(got.title, mem.title);
+        let back = store
+            .get_embedding(&ctx, &id)
+            .await
+            .expect("get_embedding")
+            .expect("embedding persisted");
+        assert_eq!(back, emb);
+
+        let hits = store
+            .search(
+                &ctx,
+                "postgres",
+                &Filter {
+                    namespace: Some(ns),
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("fts search");
+        assert!(
+            hits.iter().any(|m| m.id == id),
+            "FTS should find the stored row"
+        );
     }
 
     fn sample_memory(id: &str, ns: &str, title: &str, content: &str) -> Memory {

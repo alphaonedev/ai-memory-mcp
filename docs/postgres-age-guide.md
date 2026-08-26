@@ -153,11 +153,12 @@ PGDG yum repo equivalents and ensure `postgresql18-devel` /
 ### Docker — pgvector is required, not optional ([#1065](https://github.com/alphaonedev/ai-memory-mcp/issues/1065))
 
 The popular `apache/age:release_PG18_*` Docker images **do not bundle
-pgvector**. The SAL postgres adapter's `init schema` step calls
-`CREATE EXTENSION IF NOT EXISTS vector` and fails-fast on missing
-extension with the message `extension "vector" is not available` —
-restarting the daemon container indefinitely on Plan C and any
-Compose / K8s deploy.
+pgvector**. The SAL postgres adapter tries `CREATE EXTENSION vector`
+on first connect. If that fails (image has no `.so`, or the role is
+not superuser) — or `AI_MEMORY_PG_NO_VECTOR=1` is set — it stores
+embeddings as `BYTEA` and scores cosine in-process. Keyword recall
+still uses built-in `tsvector`. The daemon does **not** crash-loop.
+Native HNSW (`<=>`) needs a creatable `vector` extension.
 
 The canonical fix is a 2-line Dockerfile that layers pgvector on top
 of the upstream Apache AGE image:
@@ -235,9 +236,9 @@ What it does (see `src/cli/schema_init.rs`):
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
    schema v90 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
-   `vector` (pgvector) extension is
-   **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
-   aborts the bootstrap.
+   `vector` (pgvector) extension is used when `CREATE EXTENSION vector`
+   succeeds. If it fails, or `AI_MEMORY_PG_NO_VECTOR=1` is set, embeddings
+   are `BYTEA` (same bootstrap, no abort).
 2. If the `age` extension is installed, additionally bootstraps the
    AGE `memory_graph` projection via `SELECT
    create_graph('memory_graph')` (idempotent — "graph already exists"
@@ -923,9 +924,10 @@ A missing `age` extension is non-fatal — `ai-memory schema-init`
 completes, reports `age_projection_created: false` in its `--json`
 output, and the daemon serves KG queries through the recursive-CTE
 fallback. Install AGE (see "Install" above) and re-run `schema-init`
-to enable the Cypher path. The `vector` extension is **not** optional
-— pgvector is required for embeddings, and its absence aborts the
-bootstrap.
+to enable the Cypher path. A missing `vector` extension is also
+non-fatal: embeddings land as `BYTEA` and semantic recall scores
+cosine in-process. Set `AI_MEMORY_PG_NO_VECTOR=1` to force that path
+even when the role could create the extension.
 
 ### Old postgres schema version detected
 
