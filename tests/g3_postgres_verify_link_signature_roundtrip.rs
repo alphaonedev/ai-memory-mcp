@@ -286,8 +286,10 @@ async fn g3_postgres_verify_link_signed_returns_verified_true() {
     let _env_g = env_var_lock();
     let (kp, _keys_keep) = ephemeral_keypair();
     let (base, shutdown, handle) = spawn_daemon(&url, kp.clone()).await;
-    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
-    let client = common::bounded_test_client();
+    // #3194 — store as the signing principal. A headerless client used
+    // to stamp a different (or empty) owner; `link_signed` then ran as
+    // `kp.agent_id` and 403'd on the postgres caller-owns gate.
+    let client = common::pg_test_client(&kp.agent_id);
 
     let suffix = uuid::Uuid::new_v4();
     let ns = format!("g3-verify-{suffix}");
