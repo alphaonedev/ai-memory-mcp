@@ -526,7 +526,26 @@ pub async fn create_link(
                             .map(str::to_string);
                         (Some(m.namespace), owner)
                     }
-                    Err(_) => (None, None),
+                    // v1.0.0 #2596 — the link COMMITTED; only the anchor
+                    // lookup failed, so the `memory_link_created` webhook is
+                    // silently skipped below (`link_namespace` is None).
+                    // Under `AI_MEMORY_ENCRYPT_AT_REST` a source row whose
+                    // envelope will not open fails this FailClosed full-row
+                    // read on every attempt, so a subscriber can lose the
+                    // event permanently with no signal anywhere. Name the
+                    // error so the drop is observable rather than inferred
+                    // from a missing webhook.
+                    Err(e) => {
+                        tracing::warn!(
+                            source_id = %source_id,
+                            target_id = %target_id,
+                            relation = %relation,
+                            error = %e,
+                            "link committed but the source-memory anchor lookup failed — \
+                             memory_link_created will NOT be dispatched for this link (#2596)"
+                        );
+                        (None, None)
+                    }
                 };
                 if let Some(ns) = link_namespace {
                     let details =
@@ -696,31 +715,58 @@ pub async fn create_link(
     // for the namespace + owner agent_id so the event payload matches
     // the MCP contract.
     if create_result.is_ok() {
-        let (link_namespace, link_owner) = db::get(&lock.0, &source_id).ok().flatten().map_or_else(
-            || (crate::DEFAULT_NAMESPACE.to_string(), None),
-            |m| {
+        // #2596 sqlite twin of the postgres WARN-on-anchor-failure arm:
+        // do NOT invent `DEFAULT_NAMESPACE` when the source row cannot
+        // be read — that dispatched a webhook into the wrong (or
+        // empty) tenant. Skip dispatch and name the cause, matching
+        // `dispatch_event_postgres`'s `(None, None)` skip.
+        let (link_namespace, link_owner) = match db::get(&lock.0, &source_id) {
+            Ok(Some(m)) => {
                 let owner = m
                     .metadata
                     .get("agent_id")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                (m.namespace, owner)
-            },
-        );
-        let details = serde_json::to_value(crate::subscriptions::LinkCreatedEventDetails {
-            target_id: target_id.clone(),
-            relation: relation.clone(),
-        })
-        .ok();
-        crate::subscriptions::dispatch_event_with_details(
-            &lock.0,
-            crate::subscriptions::webhook_events::MEMORY_LINK_CREATED,
-            &source_id,
-            &link_namespace,
-            link_owner.as_deref(),
-            &lock.1,
-            details,
-        );
+                (Some(m.namespace), owner)
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    source_id = %source_id,
+                    target_id = %target_id,
+                    relation = %relation,
+                    "link committed but the source-memory anchor lookup returned None — \
+                     memory_link_created will NOT be dispatched for this link (#2596)"
+                );
+                (None, None)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    source_id = %source_id,
+                    target_id = %target_id,
+                    relation = %relation,
+                    error = %e,
+                    "link committed but the source-memory anchor lookup failed — \
+                     memory_link_created will NOT be dispatched for this link (#2596)"
+                );
+                (None, None)
+            }
+        };
+        if let Some(link_namespace) = link_namespace {
+            let details = serde_json::to_value(crate::subscriptions::LinkCreatedEventDetails {
+                target_id: target_id.clone(),
+                relation: relation.clone(),
+            })
+            .ok();
+            crate::subscriptions::dispatch_event_with_details(
+                &lock.0,
+                crate::subscriptions::webhook_events::MEMORY_LINK_CREATED,
+                &source_id,
+                &link_namespace,
+                link_owner.as_deref(),
+                &lock.1,
+                details,
+            );
+        }
     }
     // Drop DB lock before fanning out — peers POST back to our sync_push
     // and we'd deadlock on the shared Mutex if we held it.

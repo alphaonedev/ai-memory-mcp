@@ -1893,10 +1893,30 @@ pub(crate) fn consult_pre_event_gate(
     };
     use crate::hooks::chain::ChainResult;
     match cr {
-        // Allow / ModifiedAllow (the memory-shaped delta has no MCP-store
-        // rewrite mapping over stdio; the #1752 signal path warns similarly) →
-        // proceed.
-        ChainResult::Allow | ChainResult::ModifiedAllow(_) => Ok(()),
+        ChainResult::Allow => Ok(()),
+        // v1.0.0 #2427 — the memory-shaped `MemoryDelta` has NO store-rewrite
+        // mapping on this path, so the hook's rewrite is NOT APPLIED and the
+        // ORIGINAL content is what persists. That was already true before
+        // this WARN existed; what was missing is any way for the operator to
+        // learn it. `HookDecision::Modify` is part of the public
+        // `#[serde(tag = "action")]` hook wire vocabulary
+        // (`src/hooks/decision.rs`), so a redaction / normalization /
+        // policy-rewrite hook written against a pre-event gate was accepted
+        // and silently evaporated — a declared control surface that does
+        // nothing (#1885 / #2233 class). Brings this arm to the same
+        // disposition the #1752 `PreSignalSend` path already applies four
+        // lines away in `map_chain_result_to_signal_decision`.
+        ChainResult::ModifiedAllow(_delta) => {
+            tracing::warn!(
+                target: "hooks",
+                event = ?event,
+                "pre-event hook returned ModifiedAllow (a MemoryDelta) which has no \
+                 store-rewrite mapping on this path; the delta was NOT applied and the \
+                 original content proceeds unmodified. Use an in-process pre_store hook \
+                 to rewrite a memory."
+            );
+            Ok(())
+        }
         // The enforcement refusal (or a fail-closed required hook error). The
         // `reason` already names the event + mode (see
         // `enforce_required_event_presence`).

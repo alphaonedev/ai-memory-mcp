@@ -292,6 +292,18 @@ pub struct Metrics {
     /// id of the dropped row.
     pub subscription_dlq_overflow_total: IntCounter,
 
+    /// v1.0.0 #2592 — subscription-dispatch ticks whose subscriber scan hit
+    /// `SUBSCRIPTION_DISPATCH_LIMIT` and was therefore
+    /// TRUNCATED. Non-zero means subscribers sorting after the ceiling did
+    /// not receive that event and never will: the scan is ordered and
+    /// cursor-less, so the same tail is cut on every write. Each truncated
+    /// tick also emits a `tracing::warn!` and appends a
+    /// `subscription_dlq` row under
+    /// [`crate::subscriptions::DISPATCH_SCAN_TRUNCATED_SUB_ID`], so the loss
+    /// is durable and inspectable rather than inferred from a missing
+    /// webhook.
+    pub subscription_dispatch_truncated_total: IntCounter,
+
     /// FED-P4-e (federation-identity-at-scale §8) — federation
     /// credential-verification outcomes on the receiver path, labeled
     /// `result` (`ok` | `fail`). The verify-failure-rate SLO is
@@ -813,6 +825,18 @@ impl Metrics {
         )?;
         registry.register(Box::new(subscription_dlq_overflow_total.clone()))?;
 
+        // v1.0.0 #2592 — truncated subscription-dispatch scans.
+        let subscription_dispatch_truncated_total = IntCounter::new(
+            "ai_memory_subscription_dispatch_truncated_total",
+            "Monotonic counter of subscription-dispatch ticks whose \
+             subscriber scan hit SUBSCRIPTION_DISPATCH_LIMIT (1000) and was \
+             truncated. Non-zero means subscribers past the ceiling silently \
+             received NO event; the scan is ordered and cursor-less, so the \
+             same tail is cut on every write. Reduce the subscription \
+             population or split the deployment.",
+        )?;
+        registry.register(Box::new(subscription_dispatch_truncated_total.clone()))?;
+
         // FED-P4-e (federation-identity-at-scale §8) — federation
         // identity SLO surfaces: verify-failure-rate, signed-vs-unsigned
         // ratio, max cred age, renewal lag.
@@ -1051,6 +1075,7 @@ impl Metrics {
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
             subscription_dlq_overflow_total,
+            subscription_dispatch_truncated_total,
             federation_cred_verify_total,
             federation_inbound_cred_total,
             federation_cred_max_age_seconds,
@@ -1090,6 +1115,21 @@ pub fn record_subscription_dlq_overflow() {
 #[must_use]
 pub fn subscription_dlq_overflow_count() -> u64 {
     registry().subscription_dlq_overflow_total.get()
+}
+
+/// v1.0.0 #2592 — record one subscription-dispatch tick whose subscriber
+/// scan was TRUNCATED at `SUBSCRIPTION_DISPATCH_LIMIT`.
+/// Pairs with a `tracing::warn!` and a `subscription_dlq` row at the call
+/// site so the undelivered tail is durable, not just counted.
+pub fn record_subscription_dispatch_truncated() {
+    registry().subscription_dispatch_truncated_total.inc();
+}
+
+/// v1.0.0 #2592 — read the current value of the truncated-dispatch counter.
+/// Test-only accessor for the regression that pins the cliff.
+#[must_use]
+pub fn subscription_dispatch_truncated_count() -> u64 {
+    registry().subscription_dispatch_truncated_total.get()
 }
 
 /// FED-P4-e (federation-identity-at-scale §8) — record one federation

@@ -6501,11 +6501,12 @@ pub async fn bootstrap_serve(
     // dead (P3 audit: 37/7,994 rows embedded, 0 backfill journal
     // lines). This sweep drains `MemoryStore::list_unembedded` in
     // bounded `[embeddings].backfill_batch` chunks through the daemon
-    // embedder. SQLite-backed serve daemons are a structural no-op
-    // (the sqlite adapter inherits the empty `list_unembedded`
-    // default — its side-table embeddings are backfilled by the MCP
-    // boot path), so this changes nothing for them. Detached task:
-    // boot readiness never blocks on the sweep.
+    // embedder. v1.0.0 #2639 — SQLite-backed serve daemons are NO LONGER a
+    // structural no-op here: `SqliteStore` now implements `list_unembedded`,
+    // so an HTTP-only `ai-memory serve --db x.db` (which never runs the MCP
+    // stdio boot backfill) finally repairs its own unembedded rows instead of
+    // leaving them permanently invisible to semantic / hybrid recall. Detached
+    // task: boot readiness never blocks on the sweep.
     #[cfg(feature = "sal")]
     if embedder_arc.is_some() {
         let backfill_store = store_handle.clone();

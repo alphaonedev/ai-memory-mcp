@@ -901,8 +901,17 @@ async fn pg_notify_why_trace_param_path_under_enforce_2122() {
 //    with NO clause-1 rationale on postgres while sqlite recorded
 //    `substrate:system-authored` — the drift this test pins closed. ──────────
 
-/// `SQLite` baseline: the store family already stamps on the internal principal.
-/// This is the parity ORACLE the pg test below mirrors (runs without a PG url).
+/// `SQLite` baseline: the write funnels this adapter actually implements
+/// stamp on the internal principal. This is the parity ORACLE the pg test
+/// below mirrors (runs without a PG url).
+///
+/// v1.0.0 #2638 / #3242 — `SqliteStore` deliberately does NOT implement
+/// `store_with_embedding` or `store_batch` (embeddings are a side table;
+/// bulk ingest is `handlers::bulk::bulk_create_sqlite`). Those trait
+/// defaults refuse with `UnsupportedCapability` rather than stamp-and-drop
+/// the vector / approximate atomicity. The sqlite write that replaced
+/// `store_with_embedding` on the HTTP create path is
+/// `store_with_embedding_no_overwrite`.
 #[tokio::test]
 async fn sqlite_store_family_stamps_substrate_why_trace_for_system_2124() {
     use ai_memory::store::sqlite::SqliteStore;
@@ -922,8 +931,9 @@ async fn sqlite_store_family_stamps_substrate_why_trace_for_system_2124() {
         Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
     );
 
-    // store_with_embedding
-    let id_e = store
+    // store_with_embedding — sqlite must REFUSE (ERRORS-01 / #2638). A
+    // success here would mean the default started dropping the vector again.
+    match store
         .store_with_embedding(
             &system,
             &pg_mem("sq-2124-e", "ns/2124", "sys embed", "ai:c", None),
@@ -931,24 +941,44 @@ async fn sqlite_store_family_stamps_substrate_why_trace_for_system_2124() {
             None,
         )
         .await
-        .expect("store_with_embedding");
+    {
+        Err(StoreError::UnsupportedCapability { capability }) => {
+            assert_eq!(capability, "STORE_WITH_EMBEDDING");
+        }
+        Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+        Ok(landed) => panic!("sqlite store_with_embedding succeeded ({landed}); it must refuse"),
+    }
+
+    // store_with_embedding_no_overwrite — the sqlite create funnel that
+    // actually writes. Stamp must match `store`.
+    let id_e = store
+        .store_with_embedding_no_overwrite(
+            &system,
+            &pg_mem("sq-2124-e", "ns/2124", "sys embed", "ai:c", None),
+            None,
+            None,
+        )
+        .await
+        .expect("store_with_embedding_no_overwrite");
     assert_eq!(
         why_trace_of(&store.get(&system, &id_e).await.expect("get")).as_deref(),
         Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
     );
 
-    // store_batch
-    let ids_b = store
+    // store_batch — sqlite must REFUSE (#2638); bulk is not this trait method.
+    match store
         .store_batch(
             &system,
             std::slice::from_ref(&pg_mem("sq-2124-b", "ns/2124", "sys batch", "ai:c", None)),
         )
         .await
-        .expect("store_batch");
-    assert_eq!(
-        why_trace_of(&store.get(&system, &ids_b[0]).await.expect("get")).as_deref(),
-        Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
-    );
+    {
+        Err(StoreError::UnsupportedCapability { capability }) => {
+            assert_eq!(capability, "STORE_BATCH");
+        }
+        Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+        Ok(landed) => panic!("sqlite store_batch succeeded ({landed:?}); it must refuse"),
+    }
 }
 
 /// Postgres regression: the #2124 fix. Each of the three pg store-family

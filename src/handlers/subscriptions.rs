@@ -54,6 +54,17 @@ fn caller_subscription_ns(caller: impl std::fmt::Display) -> String {
 /// Upper bound on subscription rows pulled per dispatch tick. Matches
 /// the sqlite path's implicit ceiling; production deployments rarely
 /// exceed dozens of subscribers.
+///
+/// v1.0.0 #2592 — this is a hard `LIMIT` on an `ORDER BY namespace` scan
+/// with NO cursor, so past this many subscription rows the subscribers
+/// sorting after the ceiling are never consulted — and because the ordering
+/// is stable, the SAME tail is cut on every write, making the loss permanent
+/// rather than transient. That was previously silent (no error, no metric,
+/// no DLQ). It is now reported on all three surfaces by
+/// [`crate::subscriptions::record_dispatch_scan_truncation`]; the ceiling
+/// itself is unchanged, because raising it moves the cliff instead of
+/// removing it and paging needs a cursor the SAL prefix scan does not yet
+/// expose.
 #[cfg(feature = "sal")]
 const SUBSCRIPTION_DISPATCH_LIMIT: usize = 1000;
 
@@ -1007,9 +1018,13 @@ pub async fn dispatch_event_postgres(
     // table seq-scan on EVERY write that scaled with corpus size. The
     // prefix scan lets the planner range-scan the `namespace` index
     // instead, making dispatch O(subscribers) rather than O(corpus).
+    // Fetch LIMIT+1 so an exactly-full population is distinguishable
+    // from a cut (Fable #3242 item 2). A single `LIMIT N` returning N
+    // cannot tell "exactly N" from "N+ more".
+    let fetch_limit = SUBSCRIPTION_DISPATCH_LIMIT.saturating_add(1);
     let memories = match app
         .store
-        .list_by_namespace_prefix(&ctx, SUBSCRIPTION_NS_PREFIX, SUBSCRIPTION_DISPATCH_LIMIT)
+        .list_by_namespace_prefix(&ctx, SUBSCRIPTION_NS_PREFIX, fetch_limit)
         .await
     {
         Ok(rows) => rows,
@@ -1021,6 +1036,59 @@ pub async fn dispatch_event_postgres(
             return;
         }
     };
+
+    // v1.0.0 #2592 — the scan came back PAST the ceiling, so it was cut
+    // and an unknown number of subscribers sorting after it were never
+    // consulted. Report BEFORE the filter loop and before the zero-match
+    // early return: the truncated tail may be exactly where the matching
+    // subscribers were, so "matched zero subscribers" is not evidence
+    // that nothing was lost.
+    let truncated = memories.len() > SUBSCRIPTION_DISPATCH_LIMIT;
+    let memories = if truncated {
+        memories
+            .into_iter()
+            .take(SUBSCRIPTION_DISPATCH_LIMIT)
+            .collect()
+    } else {
+        memories
+    };
+    if truncated {
+        let db_path = {
+            let lock = app.db.lock().await;
+            lock.1.clone()
+        };
+        let (event, memory_id, namespace) = (
+            event.to_string(),
+            memory_id.to_string(),
+            namespace.to_string(),
+        );
+        let scanned = SUBSCRIPTION_DISPATCH_LIMIT;
+        // The DLQ write is blocking sqlite; keep it off the executor thread
+        // (this arm only fires in the already-pathological >1000-subscriber
+        // regime, so the extra hop costs nothing in normal operation).
+        // Fable #3242 item 3: do not swallow the join error — a failed
+        // reporter would restore the silent cliff.
+        match tokio::task::spawn_blocking(move || {
+            crate::subscriptions::record_dispatch_scan_truncation(
+                &db_path,
+                &event,
+                &memory_id,
+                &namespace,
+                scanned,
+                SUBSCRIPTION_DISPATCH_LIMIT,
+            );
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "dispatch_event_postgres: truncation reporter task failed (#2592)"
+                );
+            }
+        }
+    }
 
     let mut matching: Vec<(crate::subscriptions::Subscription, Option<String>)> = Vec::new();
     for m in memories {

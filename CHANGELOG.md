@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (silent-default cluster Fable follow-up — #3242)
+
+- **#2596 sqlite link-dispatch no longer invents `DEFAULT_NAMESPACE`.** The
+  postgres arm already WARNed and skipped `memory_link_created` when the
+  source-anchor `get` failed. The sqlite arm used `db::get(…).ok().flatten()
+  .map_or_else(|| DEFAULT_NAMESPACE, …)` and dispatched into the wrong
+  tenant. It now WARNs and skips, matching postgres. Pin:
+  `link_dispatch_anchor_failure_is_warned_not_swallowed_2596`.
+- **#2592 truncation detector is LIMIT+1 / `>`.** A `LIMIT 1000` returning
+  1000 cannot tell "exactly 1000 subscribers" from "cut". The dispatcher
+  fetches 1001 and reports truncation only when `len() > 1000`. The
+  `spawn_blocking` reporter join is WARNed, not swallowed.
+- **`update_embedding` trait default refuses** (`UnsupportedCapability`)
+  instead of `Ok(())` dropping the vector (#2444 / #2638 class). Both
+  production adapters already override. `set_embeddings_batch`'s default
+  loop inherits the refusal. Pins:
+  `default_update_embedding_refuses_rather_than_dropping_the_vector_3242`,
+  `default_set_embeddings_batch_refuses_when_update_embedding_is_unimplemented_3242`,
+  `mock_adapters_method_surface_conformance_cov`.
+- **#2124 sqlite oracle follows #2638.** `sqlite_store_family_stamps_substrate_why_trace_for_system_2124`
+  expected `store_with_embedding` / `store_batch` to succeed on
+  `SqliteStore`. Those methods are trait-default refusals on sqlite
+  (embeddings live in a side table; bulk is `handlers::bulk`). The
+  oracle now pins the refuse and stamps via
+  `store_with_embedding_no_overwrite`.
+- **Not changed:** `list_unembedded` non-admin `Ok(vec![])` on both
+  adapters is the documented #1586 admin gate (#3241), not "nothing to
+  embed". Sqlite `list_by_event` is unbounded (no 1000-row cliff); list
+  failure already WARNs.
+
 ### Fixed (#3244 — SAL ConsolidationPass skipped under `spawn_blocking`)
 
 - **#3116's nested-runtime guard used `Handle::try_current()` as the panic
@@ -1754,6 +1784,112 @@ backend and missing or divergently implemented on its twin). Pinned by
   execution modes instead of 10 s uninstrumented; and the abandoned-download
   watchdog test's detached sleeper drops from 30 s to 5 s (still
   unconditionally over the assertion's ceiling, so the property is intact).
+- **Silent-default / fail-open cluster: eight surfaces that answered "nothing
+  to do" where they meant "I did not look", or reported success while
+  discarding what they were handed.**
+  ([#2639](https://github.com/alphaonedev/ai-memory-mcp/issues/2639),
+  [#2638](https://github.com/alphaonedev/ai-memory-mcp/issues/2638),
+  [#2592](https://github.com/alphaonedev/ai-memory-mcp/issues/2592),
+  [#2607](https://github.com/alphaonedev/ai-memory-mcp/issues/2607),
+  [#2427](https://github.com/alphaonedev/ai-memory-mcp/issues/2427),
+  [#2431](https://github.com/alphaonedev/ai-memory-mcp/issues/2431),
+  [#2617](https://github.com/alphaonedev/ai-memory-mcp/issues/2617),
+  [#2596](https://github.com/alphaonedev/ai-memory-mcp/issues/2596))
+  - **#2639 — an HTTP-only sqlite daemon had NO embedding backfill at all.**
+    `MemoryStore::list_unembedded` defaulted to `Ok(vec![])` and only
+    `PostgresStore` implemented it, so the `serve`-boot sweep read
+    "end of corpus" on every boot of `ai-memory serve --db x.db` — a process
+    that also never runs the MCP-stdio backfill. Rows that reached storage
+    without a vector stayed permanently invisible to semantic and hybrid
+    recall while still answering keyword search: degraded-but-repairable
+    became permanent purely because the repair path was a silent default.
+    `SqliteStore` now implements the scan (admin-gated, decrypt-or-skip, same
+    `db::get_unembedded_ids_batch` the MCP boot path drains) and the trait
+    default REFUSES with `UnsupportedCapability` so a missing implementation
+    is a logged refusal instead of a clean pass over a corpus nobody looked
+    at.
+  - **#2638 — two trait defaults that discarded data and returned success.**
+    `store_with_embedding` forwarded to `store`, dropping the `embedding` +
+    `space` arguments on the floor; `store_batch` looped `store`, silently
+    downgrading the documented ALL-OR-NOTHING batch contract to
+    PARTIALLY-APPLIED under an unchanged response shape. Both now default to
+    `UnsupportedCapability`, matching the convention every other optional
+    method on the trait already follows. Latent, not live — the only
+    production callers sit inside the postgres branch, which overrides both —
+    but it was the false-success class pre-installed on a data-bearing
+    argument, waiting for its first caller.
+  - **#2592 — the 1000-subscriber dispatch cliff is no longer silent.** The
+    postgres dispatch scan is a hard `LIMIT` on an `ORDER BY namespace` with
+    no cursor, so past 1000 subscription rows the subscribers sorting after
+    the ceiling received no event, no error, no metric and no DLQ entry — and
+    because the ordering is stable, the SAME tail is cut on every write. A
+    truncated scan now emits a `tracing::warn!`, increments
+    `ai_memory_subscription_dispatch_truncated_total`, and appends a
+    `subscription_dlq` row under the reserved
+    `_dispatch_scan_truncated` id (subject to the existing #1253 depth cap, so
+    it cannot fill an operator's disk). Reported BEFORE the zero-match early
+    return: "matched zero subscribers" is not evidence that nothing was lost
+    when the truncated tail is where the matches may have been. The ceiling
+    itself is unchanged — raising it moves the cliff instead of removing it,
+    and paging needs a cursor the SAL prefix scan does not yet expose.
+  - **#2607 — `reembed` exited `0` after leaving 14.7 % of the corpus
+    unembedded.** A measured sweep at the DEFAULT batch size left 1,155 of
+    7,855 rows unembedded and reported success, so an operator who ran the
+    documented vector-space migration once ended up with an 85 %-embedded
+    corpus and no signal that the rest was keyword-only (the boot census
+    cannot flag those rows — they carry NULL embeddings, not a foreign
+    space). Every live run now prints `rows still unembedded: N`, **read back
+    from storage after the sweep** rather than inferred from the loop's own
+    counters, and an incomplete sweep exits the new documented
+    `5` (`EXIT_PARTIAL_COVERAGE`) — the #2490 exit-3 precedent, where the
+    effect is valid but PARTIAL. A `--max-rows` run that consumed its budget
+    is not partial; skipped rows report partial in every mode. The companion
+    `--expect-skipped <N>` ratchet (default `0`, strict) lets an operator
+    attest a genuinely un-embeddable population so a stable poison set is not
+    forever-red, while a poison set that GROWS past `N` still exits `5`; it
+    suppresses the exit code only — the real counts are printed either way.
+    NOT included: the adaptive batch-bisection half of the issue
+    (`src/llm.rs::embed_texts_async`), whose root cause the issue itself marks
+    unverified and requires confirming against a live provider response.
+  - **#2427 — a hook's `ModifiedAllow` delta was discarded in silence.** The
+    `hooks.enforce` pre-event gate (shared by the MCP stdio store path and the
+    HTTP `http_pre_event_gate`) matched `ModifiedAllow(_)` into the plain
+    `Allow` arm, so a redaction / normalization / policy-rewrite hook was
+    accepted, its rewrite dropped, and the ORIGINAL content persisted — a
+    declared control surface that does nothing, while the #1752 signal path
+    four lines away already warned about exactly this. WARN parity restored,
+    naming the event and stating the delta was not applied, and
+    `HookDecision::Modify`'s public doc now says which dispatch sites discard
+    it.
+  - **#2431 — `memory_recall` reported `scheduled_validity: "valid"` for a
+    claim whose `valid_until` closed in 2021.** The function read only the
+    `expires_at`-derived TTL anchor and `created_at`: a TTL-remaining metric
+    carrying a validity NAME, contradicting what `memory_get` showed for the
+    same row. It now honours the #1834 claim interval — horizon
+    `min(anchor, valid_until)`, window start `max(created_at, valid_from)`,
+    half-open `[valid_from, valid_until)` — so a closed claim reports
+    `expired` and a claim closing before its TTL anchor reports `expiring`
+    against the real closure. A claim whose window has NOT OPENED omits the
+    field entirely rather than pick a point on a vocabulary that only
+    describes life remaining, and an unparsable bound fails closed. Rows with
+    no validity interval are byte-identical to before.
+  - **#2617 — `/api/v1/health` ran `SELECT COUNT(*) FROM memories` per probe
+    on postgres.** The pg twin of #2579, on the same endpoint: an Index Only
+    Scan over every row whose result was then DISCARDED (`let _`), measured at
+    ~88 % of the probe's database time and growing linearly, on an endpoint
+    orchestrators scrape on a fixed interval and which is exempt from
+    admission control. Replaced with a constant-cost
+    `SELECT EXISTS (SELECT 1 FROM memories LIMIT 1)` that still touches the
+    relation (so a dropped or unreadable table still fails the probe), per the
+    trait MUST that `health_check` be O(1) in corpus size.
+  - **#2596 — a committed link could silently skip its
+    `memory_link_created` dispatch.** The postgres link path anchors the
+    webhook on a full-row `get` of the source memory and mapped every failure
+    to `Err(_) => (None, None)`, which suppresses the dispatch. Under
+    `AI_MEMORY_ENCRYPT_AT_REST` a source row whose envelope will not open
+    fails that `FailClosed` read on every attempt, so a subscriber loses the
+    event permanently with no signal anywhere. Now WARNs with the error, the
+    ids and the relation.
 
 - **DATA LOSS: `gc(archive = true)` dropped every link of the archived memory;
   the archiving PATH decided whether a memory kept its edge graph (#3161).**

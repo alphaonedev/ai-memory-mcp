@@ -456,42 +456,101 @@ const SCHEDULED_VALIDITY_EXPIRED: &str = "expired";
 /// — the explicit `expires_at` when set, else `created_at + tier TTL — and
 /// the validity START is `created_at`. The window is `[created_at, anchor)`.
 ///
+/// **v1.0.0 #2431 — the #1834 claim-VALID interval now OVERRIDES that TTL
+/// window wherever it is present.** Before this fix the function read only
+/// the `expires_at`-derived anchor and `created_at`: it was a
+/// TTL-remaining metric carrying a validity NAME, so a claim whose stored
+/// `valid_until` closed in 2021 was reported `scheduled_validity: "valid"`
+/// on the recall wire while `memory_get` on the SAME row showed the
+/// closure. That is not a missing signal, it is an affirmatively false
+/// assertion — the substrate stating a claim is valid while its own stored
+/// interval says otherwise. `valid_from` / `valid_until` are the half-open
+/// `[valid_from, valid_until)` bounds off the row (RFC3339, SQL:2011
+/// convention — a claim ending at T is not valid AT T).
+///
 /// `anchor` and `created_at` are RFC3339 strings (the on-row wire form);
 /// `as_of_secs` is the QUANTIZED unix-second as-of bucket from
 /// [`VALIDITY_AS_OF_BUCKET_SECS`]. Mapping:
+///   * `valid_from` present and `as_of < valid_from`      → `None`
+///     (the claim's window has NOT OPENED — the caller OMITS the field
+///     rather than assert any point on a vocabulary that only describes
+///     life REMAINING; silence beats a wrong label)
+///   * `valid_until` present and `as_of >= valid_until`   → `expired`
 ///   * `as_of >= anchor`                                  → `expired`
-///   * unparsable inputs / non-positive window            → `expired`
+///   * unparsable inputs / unparsable bound /
+///     non-positive window                                → `expired`
 ///     (fail-closed: a row we cannot reason about is treated as past its
 ///     scheduled validity rather than asserted `valid`)
-///   * remaining-fraction `(anchor - as_of)/(anchor - created_at)`
+///   * remaining-fraction `(horizon - as_of)/(horizon - start)`
 ///     at or below [`SCHEDULED_VALIDITY_EXPIRING_FRACTION`]              → `expiring`
 ///   * else                                               → `valid`
+///
+/// where `horizon = min(anchor, valid_until)` and
+/// `start = max(created_at, valid_from)` — so a claim closing BEFORE its TTL
+/// anchor reports `expiring` against the real closure, not against a TTL it
+/// will never reach.
 ///
 /// This is **decoration only** — never a ranking key, never written back,
 /// `m.confidence` untouched. Mirrors [`freshness_state`]'s pure style but
 /// QUANTIZED (freshness_state stays un-quantized; this is the new
 /// deterministic-anchor field).
-fn scheduled_validity(anchor: &str, created_at: &str, as_of_secs: i64) -> &'static str {
+fn scheduled_validity(
+    anchor: &str,
+    created_at: &str,
+    as_of_secs: i64,
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
+) -> Option<&'static str> {
     let Ok(anchor_dt) = chrono::DateTime::parse_from_rfc3339(anchor) else {
-        return SCHEDULED_VALIDITY_EXPIRED;
+        return Some(SCHEDULED_VALIDITY_EXPIRED);
     };
     let Ok(start_dt) = chrono::DateTime::parse_from_rfc3339(created_at) else {
-        return SCHEDULED_VALIDITY_EXPIRED;
+        return Some(SCHEDULED_VALIDITY_EXPIRED);
     };
-    let anchor_secs = anchor_dt.timestamp();
-    let start_secs = start_dt.timestamp();
-    let total = anchor_secs - start_secs;
-    let remaining = anchor_secs - as_of_secs;
+    let mut horizon_secs = anchor_dt.timestamp();
+    let mut start_secs = start_dt.timestamp();
+
+    // #2431 — honour the claim's VALID-time start. A window that has not
+    // opened yet carries no current validity at all; the ordered vocabulary
+    // (`valid` > `expiring` > `expired`) describes life REMAINING and has no
+    // point that means "not yet", so the honest answer is to say nothing.
+    if let Some(raw) = valid_from {
+        let Ok(vf) = chrono::DateTime::parse_from_rfc3339(raw) else {
+            return Some(SCHEDULED_VALIDITY_EXPIRED);
+        };
+        let vf_secs = vf.timestamp();
+        if as_of_secs < vf_secs {
+            return None;
+        }
+        start_secs = start_secs.max(vf_secs);
+    }
+    // #2431 — honour the claim's VALID-time close. Half-open interval: a
+    // claim ending at T is NOT valid at T.
+    if let Some(raw) = valid_until {
+        let Ok(vu) = chrono::DateTime::parse_from_rfc3339(raw) else {
+            return Some(SCHEDULED_VALIDITY_EXPIRED);
+        };
+        let vu_secs = vu.timestamp();
+        if as_of_secs >= vu_secs {
+            return Some(SCHEDULED_VALIDITY_EXPIRED);
+        }
+        horizon_secs = horizon_secs.min(vu_secs);
+    }
+
+    // Saturating so a pathological far-future / far-past RFC3339 bound can
+    // never wrap the window arithmetic into a bogus verdict (PERF-03).
+    let total = horizon_secs.saturating_sub(start_secs);
+    let remaining = horizon_secs.saturating_sub(as_of_secs);
     if remaining <= 0 || total <= 0 {
-        return SCHEDULED_VALIDITY_EXPIRED;
+        return Some(SCHEDULED_VALIDITY_EXPIRED);
     }
     // Both are positive i64 second counts; the ratio is in (0.0, 1.0].
     #[allow(clippy::cast_precision_loss)]
     let remaining_fraction = remaining as f64 / total as f64;
     if remaining_fraction <= SCHEDULED_VALIDITY_EXPIRING_FRACTION {
-        SCHEDULED_VALIDITY_EXPIRING
+        Some(SCHEDULED_VALIDITY_EXPIRING)
     } else {
-        SCHEDULED_VALIDITY_VALID
+        Some(SCHEDULED_VALIDITY_VALID)
     }
 }
 
@@ -685,15 +744,20 @@ pub fn decorate_memory_many(
             // is enabled AND the row has an anchor. No anchor (long-tier,
             // no explicit expiry) or decay-off ⇒ field absent (no noise).
             // Decoration only — never a ranking key, never written back.
-            if decay_enabled && let Some(anchor) = mem.effective_expires_at() {
-                obj.insert(
-                    "scheduled_validity".to_string(),
-                    json!(scheduled_validity(
-                        &anchor,
-                        &mem.created_at,
-                        validity_as_of_secs
-                    )),
-                );
+            // v1.0.0 #2431 — `None` ⇒ the row's `[valid_from, ..)` window has
+            // not opened, so NO validity is asserted (field omitted) rather
+            // than a label the vocabulary cannot express honestly.
+            if decay_enabled
+                && let Some(anchor) = mem.effective_expires_at()
+                && let Some(verdict) = scheduled_validity(
+                    &anchor,
+                    &mem.created_at,
+                    validity_as_of_secs,
+                    mem.valid_from.as_deref(),
+                    mem.valid_until.as_deref(),
+                )
+            {
+                obj.insert("scheduled_validity".to_string(), json!(verdict));
             }
             val
         })
@@ -2187,7 +2251,10 @@ mod tests {
         let anchor = (chrono::DateTime::parse_from_rfc3339(created).unwrap()
             + chrono::Duration::hours(100))
         .to_rfc3339();
-        assert_eq!(scheduled_validity(&anchor, created, start), "valid");
+        assert_eq!(
+            scheduled_validity(&anchor, created, start, None, None),
+            Some("valid")
+        );
     }
 
     #[test]
@@ -2198,7 +2265,10 @@ mod tests {
         let anchor_dt = created_dt + chrono::Duration::hours(100);
         let anchor = anchor_dt.to_rfc3339();
         let as_of = (anchor_dt - chrono::Duration::hours(10)).timestamp();
-        assert_eq!(scheduled_validity(&anchor, created, as_of), "expiring");
+        assert_eq!(
+            scheduled_validity(&anchor, created, as_of, None, None),
+            Some("expiring")
+        );
     }
 
     #[test]
@@ -2209,17 +2279,19 @@ mod tests {
         let anchor = anchor_dt.to_rfc3339();
         // exactly at the anchor (remaining == 0) ⇒ expired.
         assert_eq!(
-            scheduled_validity(&anchor, created, anchor_dt.timestamp()),
-            "expired"
+            scheduled_validity(&anchor, created, anchor_dt.timestamp(), None, None),
+            Some("expired")
         );
         // past the anchor ⇒ expired.
         assert_eq!(
             scheduled_validity(
                 &anchor,
                 created,
-                (anchor_dt + chrono::Duration::hours(1)).timestamp()
+                (anchor_dt + chrono::Duration::hours(1)).timestamp(),
+                None,
+                None
             ),
-            "expired"
+            Some("expired")
         );
     }
 
@@ -2227,19 +2299,22 @@ mod tests {
     fn scheduled_validity_unparsable_or_degenerate_fails_closed_to_expired() {
         // unparsable anchor / created ⇒ expired (fail-closed).
         assert_eq!(
-            scheduled_validity("not-a-date", "2026-01-01T00:00:00+00:00", 0),
-            "expired"
+            scheduled_validity("not-a-date", "2026-01-01T00:00:00+00:00", 0, None, None),
+            Some("expired")
         );
         assert_eq!(
-            scheduled_validity("2026-01-01T00:00:00+00:00", "nope", 0),
-            "expired"
+            scheduled_validity("2026-01-01T00:00:00+00:00", "nope", 0, None, None),
+            Some("expired")
         );
         // non-positive window (anchor == created) ⇒ expired.
         let same = "2026-01-01T00:00:00+00:00";
         let ts = chrono::DateTime::parse_from_rfc3339(same)
             .unwrap()
             .timestamp();
-        assert_eq!(scheduled_validity(same, same, ts - 1), "expired");
+        assert_eq!(
+            scheduled_validity(same, same, ts - 1, None, None),
+            Some("expired")
+        );
     }
 
     #[test]
@@ -2253,9 +2328,94 @@ mod tests {
         .to_rfc3339();
         let raw_now = chrono::Utc::now().timestamp();
         let bucket = (raw_now / VALIDITY_AS_OF_BUCKET_SECS) * VALIDITY_AS_OF_BUCKET_SECS;
-        let a = scheduled_validity(&anchor, created, bucket);
-        let b = scheduled_validity(&anchor, created, bucket);
+        let a = scheduled_validity(&anchor, created, bucket, None, None);
+        let b = scheduled_validity(&anchor, created, bucket, None, None);
         assert_eq!(a, b, "same as-of bucket ⇒ identical scheduled_validity");
+    }
+
+    /// v1.0.0 #2431 — a claim whose `valid_until` closed in 2021 must NOT
+    /// be reported `valid`, no matter how much TTL its anchor has left.
+    /// This is the exact live reproduction on the issue: `memory_get`
+    /// showed the closure while `memory_recall` asserted `"valid"` on the
+    /// same row.
+    #[test]
+    fn scheduled_validity_honours_a_closed_valid_until_2431() {
+        // Long TTL window (anchor 100h past `created_at`) — the pre-#2431
+        // computation would report `valid` from it alone.
+        let created = "2020-01-01T00:00:00+00:00";
+        let created_dt = chrono::DateTime::parse_from_rfc3339(created).unwrap();
+        let anchor = (created_dt + chrono::Duration::days(4000)).to_rfc3339();
+        let as_of = chrono::DateTime::parse_from_rfc3339("2026-08-01T00:00:00+00:00")
+            .unwrap()
+            .timestamp();
+
+        // No claim interval ⇒ unchanged: the TTL anchor says valid.
+        assert_eq!(
+            scheduled_validity(&anchor, created, as_of, None, None),
+            Some("valid"),
+            "no validity interval ⇒ pre-#2431 TTL behaviour is preserved byte-for-byte"
+        );
+
+        // The #2431 row: valid_from 2020-01-01, valid_until 2021-01-01.
+        assert_eq!(
+            scheduled_validity(
+                &anchor,
+                created,
+                as_of,
+                Some("2020-01-01T00:00:00.000000Z"),
+                Some("2021-01-01T00:00:00.000000Z"),
+            ),
+            Some("expired"),
+            "a claim whose valid_until closed in 2021 is NOT valid in 2026"
+        );
+    }
+
+    /// v1.0.0 #2431 — the half-open `[valid_from, valid_until)` boundary and
+    /// the not-yet-opened window.
+    #[test]
+    fn scheduled_validity_valid_time_bounds_are_half_open_2431() {
+        let created = "2026-01-01T00:00:00+00:00";
+        let created_dt = chrono::DateTime::parse_from_rfc3339(created).unwrap();
+        let anchor = (created_dt + chrono::Duration::days(365)).to_rfc3339();
+        let vu = "2026-06-01T00:00:00+00:00";
+        let vu_secs = chrono::DateTime::parse_from_rfc3339(vu)
+            .unwrap()
+            .timestamp();
+
+        // Exactly AT valid_until ⇒ expired (SQL:2011 half-open interval).
+        assert_eq!(
+            scheduled_validity(&anchor, created, vu_secs, None, Some(vu)),
+            Some("expired")
+        );
+        // One second BEFORE valid_until ⇒ still inside the window, and the
+        // remaining fraction is measured against the CLOSURE, not the TTL
+        // anchor — so it reads `expiring`, not `valid`.
+        assert_eq!(
+            scheduled_validity(&anchor, created, vu_secs - 1, None, Some(vu)),
+            Some("expiring"),
+            "the horizon is min(anchor, valid_until), so an imminent closure shows"
+        );
+
+        // A window that has NOT opened yet asserts nothing at all.
+        let vf = "2027-01-01T00:00:00+00:00";
+        let before = chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            scheduled_validity(&anchor, created, before, Some(vf), None),
+            None,
+            "a not-yet-open claim must not be labelled on a life-remaining vocabulary"
+        );
+
+        // An unparsable bound fails CLOSED, never to `valid`.
+        assert_eq!(
+            scheduled_validity(&anchor, created, before, Some("not-a-date"), None),
+            Some("expired")
+        );
+        assert_eq!(
+            scheduled_validity(&anchor, created, before, None, Some("not-a-date")),
+            Some("expired")
+        );
     }
 
     // Decorator integration — env-gated + anchor-gated emission.
@@ -2327,6 +2487,39 @@ mod tests {
             out[0].get("scheduled_validity").and_then(|v| v.as_str()),
             Some("expired"),
             "past anchor ⇒ scheduled_validity=expired"
+        );
+        unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
+    }
+
+    /// v1.0.0 #2431 — the decorator itself must stop asserting `"valid"`
+    /// for a row whose stored `valid_until` closed in 2021, and must OMIT
+    /// the field entirely for a row whose window has not opened.
+    #[test]
+    fn decorate_scheduled_validity_honours_the_claim_interval_2431() {
+        let _g = decay_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = fresh_conn();
+        let future = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+
+        let mut closed = mem_with_expiry("sv-closed-2021", Some(&future));
+        closed.valid_from = Some("2020-01-01T00:00:00.000000Z".to_string());
+        closed.valid_until = Some("2021-01-01T00:00:00.000000Z".to_string());
+
+        let mut not_yet = mem_with_expiry("sv-not-yet-open", Some(&future));
+        not_yet.valid_from = Some((chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339());
+
+        unsafe { std::env::set_var(crate::confidence::decay::ENV_DECAY, "1") };
+        let out = decorate_memory_many(&[(closed, 1.0_f64), (not_yet, 1.0_f64)], true, &conn);
+        assert_eq!(
+            out[0].get("scheduled_validity").and_then(|v| v.as_str()),
+            Some("expired"),
+            "a claim closed in 2021 must never be reported valid on the recall wire"
+        );
+        assert!(
+            out[1].get("scheduled_validity").is_none(),
+            "a not-yet-open claim asserts nothing, got {:?}",
+            out[1].get("scheduled_validity")
         );
         unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
     }

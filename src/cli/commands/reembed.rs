@@ -59,6 +59,25 @@ pub const EXIT_EMBEDDER_INIT_FAILED: i32 = 3;
 /// population cannot be safely attested to one space; fail-closed).
 pub const EXIT_STAMP_REFUSED: i32 = 4;
 
+/// v1.0.0 #2607 — exit code when the sweep RAN but did not achieve full
+/// coverage of its scan target: rows were skipped, and/or the corpus still
+/// holds unembedded rows when the sweep finished.
+///
+/// The effect is VALID but PARTIAL — the #2490 exit-3 precedent — which is a
+/// different outcome from both success and a crash. Pre-#2607 both exited
+/// `0`: a measured run left 1,155 of 7,855 rows (14.7%) unembedded at the
+/// DEFAULT batch size and still reported success, so an operator who ran the
+/// documented vector-space migration once ended up with an 85%-embedded
+/// corpus and no signal anywhere that the rest was keyword-only. The boot
+/// census cannot flag it either, because those rows carry NULL embeddings
+/// rather than a foreign space.
+///
+/// A `--max-rows` run is NOT partial: its scan target IS the budget, and
+/// consuming the budget is the documented success condition for a
+/// fleet-orchestrated chunked sweep. Skips still report partial in that mode,
+/// because a skipped row is a row the sweep looked at and could not embed.
+pub const EXIT_PARTIAL_COVERAGE: i32 = 5;
+
 /// CLI args for `ai-memory reembed`.
 #[derive(Args, Debug, Clone)]
 pub struct ReembedArgs {
@@ -108,6 +127,20 @@ pub struct ReembedArgs {
     /// (fleet chunked-run primitive). Default: unlimited.
     #[arg(long)]
     pub max_rows: Option<usize>,
+
+    /// v1.0.0 #2607 — RATCHET: tolerate up to this many rows that the sweep
+    /// could not embed before reporting [`EXIT_PARTIAL_COVERAGE`]. An
+    /// operator ATTESTATION that a known population of the corpus is
+    /// genuinely un-embeddable (true poison rows), so a corpus with a stable
+    /// poison set is not forever-red in CI while a GROWING one still trips
+    /// the gate.
+    ///
+    /// Surfacing is unconditional: the summary prints the real `skipped` and
+    /// `rows still unembedded` counts whether or not the ratchet absorbs
+    /// them, so the ratchet suppresses the EXIT CODE, never the evidence.
+    /// Default 0 — strict, and the ratchet must be asked for explicitly.
+    #[arg(long, default_value_t = 0)]
+    pub expect_skipped: u64,
 }
 
 /// Dry-run migration plan — what the sweep WOULD touch plus the
@@ -156,6 +189,45 @@ pub(crate) fn build_plan(
         target_dim,
         backend: backend.to_string(),
     })
+}
+
+/// v1.0.0 #2607 — did the sweep achieve FULL coverage of its scan target?
+///
+/// `still_unembedded` is read back FROM STORAGE after the sweep, not taken
+/// from the loop's own counters: the loop can only report what it saw, and
+/// the whole defect was a sub-batch failure that left rows it never wrote
+/// while its bookkeeping looked clean.
+///
+/// A `--max-rows` run that consumed its budget stopped ON PURPOSE — its scan
+/// target IS the budget (the fleet chunked-run primitive), so a corpus
+/// remainder is the expected state, not an incomplete migration. A SKIP is
+/// partial in every mode: it is a row the sweep looked at and could not
+/// embed.
+///
+/// `expect_skipped` is the operator's `--expect-skipped` RATCHET: an explicit
+/// attestation that up to that many rows are genuinely un-embeddable, so a
+/// corpus with a STABLE poison set is not forever-red while a GROWING one
+/// still trips the gate. It absorbs an equal allowance on each of the two
+/// independent shortfalls (skips, and rows left unembedded), because a poison
+/// row is normally BOTH. It suppresses only the exit code — the caller prints
+/// the real counts either way.
+pub(crate) fn coverage_is_partial(
+    outcome: &ReembedOutcome,
+    still_unembedded: u64,
+    max_rows: Option<usize>,
+    expect_skipped: u64,
+) -> bool {
+    let budget_consumed = max_rows.is_some_and(|cap| outcome.total >= cap);
+    // usize -> u64 is lossless on every supported target; saturate rather
+    // than wrap on a hypothetical 128-bit usize (PERF-07).
+    let skipped = u64::try_from(outcome.skipped).unwrap_or(u64::MAX);
+    let unexplained_skips = skipped.saturating_sub(expect_skipped);
+    let unexplained_remainder = if budget_consumed {
+        0
+    } else {
+        still_unembedded.saturating_sub(expect_skipped)
+    };
+    unexplained_skips > 0 || unexplained_remainder > 0
 }
 
 /// `--batch` precedence: an explicit positive flag wins; 0 / absent
@@ -276,11 +348,19 @@ pub(crate) struct ReembedPacing {
 /// either prints the plan (`--dry-run`) or runs the replace sweep.
 ///
 /// Exit-code contract (mirrors `ai-memory expand`):
-/// - `0` — success (plan printed, or sweep completed).
+/// - `0` — success (plan printed, or sweep completed with FULL coverage of
+///   its scan target).
 /// - [`EXIT_NO_EMBEDDER`] (`2`) — keyword-only tier, no embedding
 ///   model configured.
 /// - [`EXIT_EMBEDDER_INIT_FAILED`] (`3`) — embedder construction
 ///   failed (dead endpoint, bad key, unknown dim).
+/// - [`EXIT_STAMP_REFUSED`] (`4`) — `--stamp-only` refused a mixed-dim
+///   NULL-space population.
+/// - [`EXIT_PARTIAL_COVERAGE`] (`5`) — v1.0.0 #2607: the sweep ran and
+///   WROTE, but coverage is incomplete (rows skipped, and/or rows still
+///   unembedded when it finished). The summary always names both numbers,
+///   and `rows_still_unembedded` is read back FROM STORAGE after the sweep
+///   rather than inferred from the loop's own bookkeeping.
 ///
 /// # Errors
 ///
@@ -493,6 +573,19 @@ pub async fn cmd_reembed(
     let outcome = run_reembed_live(&mut conn, &embedder, ns, batch_size, pacing, out)?;
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+    // v1.0.0 #2607 — POST-SWEEP VERIFICATION. Coverage is asserted against
+    // STORAGE, not inferred from the loop's own counters: the loop can only
+    // report what it saw, and the whole defect was that a sub-batch failure
+    // left rows it never wrote while its own bookkeeping looked clean.
+    let (post_total, post_embedded) = db::embedding_coverage(&conn, ns)?;
+    let still_unembedded = post_total.saturating_sub(post_embedded);
+    let partial = coverage_is_partial(
+        &outcome,
+        still_unembedded,
+        args.max_rows,
+        args.expect_skipped,
+    );
+
     if args.json {
         writeln!(
             out.stdout,
@@ -501,6 +594,9 @@ pub async fn cmd_reembed(
                 "total": outcome.total,
                 "reembedded": outcome.reembedded,
                 "skipped": outcome.skipped,
+                "rows_still_unembedded": still_unembedded,
+                "expect_skipped": args.expect_skipped,
+                "complete": !partial,
                 "model": target_model,
                 "dim": target_dim,
                 "duration_ms": duration_ms,
@@ -513,6 +609,24 @@ pub async fn cmd_reembed(
              {target_dim}-dim, {duration_ms} ms)",
             outcome.reembedded, outcome.total, outcome.skipped,
         )?;
+        writeln!(
+            out.stdout,
+            "reembed: rows still unembedded: {still_unembedded} (read back from storage \
+             after the sweep)"
+        )?;
+    }
+    if partial {
+        writeln!(
+            out.stderr,
+            "reembed: INCOMPLETE — {} row(s) skipped and {still_unembedded} row(s) still \
+             unembedded after the sweep; the corpus is only PARTIALLY migrated and the \
+             remainder is keyword-only. Re-run (a smaller --batch often clears rows a \
+             provider refused in a large request) and check the per-row skip WARNs above. \
+             If a known population is genuinely un-embeddable, attest it with \
+             --expect-skipped <N> (currently {}). Exiting {EXIT_PARTIAL_COVERAGE} (#2607).",
+            outcome.skipped, args.expect_skipped
+        )?;
+        return Ok(EXIT_PARTIAL_COVERAGE);
     }
     Ok(0)
 }
@@ -521,6 +635,128 @@ pub async fn cmd_reembed(
 mod tests {
     use super::*;
     use crate::models::{Memory, Tier};
+
+    /// v1.0.0 #2607 — the exit contract must distinguish "complete" from
+    /// "ran and wrote, but the corpus is only partially migrated". Pre-#2607
+    /// both exited 0, so a sweep that left 14.7% of rows keyword-only looked
+    /// exactly like a clean vector-space migration.
+    #[test]
+    fn coverage_is_partial_separates_complete_from_partial_2607() {
+        let complete = ReembedOutcome {
+            total: 100,
+            reembedded: 100,
+            skipped: 0,
+        };
+        assert!(
+            !coverage_is_partial(&complete, 0, None, 0),
+            "a full sweep with nothing left unembedded is COMPLETE"
+        );
+
+        // The #2607 reproduction: nothing was "skipped" by the loop's own
+        // bookkeeping, yet storage still holds unembedded rows.
+        assert!(
+            coverage_is_partial(&complete, 1_155, None, 0),
+            "rows still unembedded AFTER the sweep is partial coverage, however \
+             clean the loop's own counters look"
+        );
+
+        // A skip is partial in every mode.
+        let skipped = ReembedOutcome {
+            total: 100,
+            reembedded: 90,
+            skipped: 10,
+        };
+        assert!(coverage_is_partial(&skipped, 0, None, 0));
+        assert!(
+            coverage_is_partial(&skipped, 0, Some(100), 0),
+            "a skipped row is partial even under a consumed --max-rows budget"
+        );
+
+        // A --max-rows run that consumed its budget stopped on purpose.
+        assert!(
+            !coverage_is_partial(&complete, 5_000, Some(100), 0),
+            "a chunked fleet run that consumed its budget is not an incomplete migration"
+        );
+        // ... but one that stopped SHORT of its budget did not.
+        let short = ReembedOutcome {
+            total: 40,
+            reembedded: 40,
+            skipped: 0,
+        };
+        assert!(
+            coverage_is_partial(&short, 5_000, Some(100), 0),
+            "stopping short of the budget with rows left unembedded is partial"
+        );
+    }
+
+    /// v1.0.0 #2607 — the `--expect-skipped` RATCHET. The issue requires it
+    /// as the companion to the non-zero exit, so a corpus with a genuinely
+    /// un-embeddable population is not forever-red; a GROWING poison set must
+    /// still trip the gate, or the ratchet would be a mute button.
+    #[test]
+    fn expect_skipped_ratchet_absorbs_only_the_attested_population_2607() {
+        let poison = ReembedOutcome {
+            total: 100,
+            reembedded: 97,
+            skipped: 3,
+        };
+        // Un-attested: 3 skips + 3 rows still unembedded ⇒ partial.
+        assert!(
+            coverage_is_partial(&poison, 3, None, 0),
+            "the default is STRICT — the ratchet must be asked for explicitly"
+        );
+        // Attested at exactly the poison population ⇒ complete. A poison row
+        // is BOTH a skip and a remaining unembedded row, so the allowance has
+        // to cover each shortfall.
+        assert!(
+            !coverage_is_partial(&poison, 3, None, 3),
+            "an attested, stable poison set must not be forever-red"
+        );
+        // One MORE poison row than attested ⇒ partial again. This is the
+        // property that keeps the ratchet from being a mute button.
+        let grown = ReembedOutcome {
+            total: 100,
+            reembedded: 96,
+            skipped: 4,
+        };
+        assert!(
+            coverage_is_partial(&grown, 4, None, 3),
+            "a poison set that GREW past the attestation must still trip the gate"
+        );
+        // The ratchet does not excuse a shortfall it was never sized for:
+        // the #2607 reproduction (1,155 unembedded) survives a small ratchet.
+        let clean_counters = ReembedOutcome {
+            total: 7_855,
+            reembedded: 6_700,
+            skipped: 0,
+        };
+        assert!(
+            coverage_is_partial(&clean_counters, 1_155, None, 10),
+            "a 10-row attestation cannot absorb a 1,155-row shortfall"
+        );
+    }
+
+    /// The exit codes must stay distinct — a partial sweep must not collide
+    /// with any existing outcome, or an orchestrator cannot branch on it.
+    #[test]
+    fn exit_codes_are_distinct_2607() {
+        let codes = [
+            0,
+            EXIT_NO_EMBEDDER,
+            EXIT_EMBEDDER_INIT_FAILED,
+            EXIT_STAMP_REFUSED,
+            EXIT_PARTIAL_COVERAGE,
+        ];
+        let mut sorted = codes;
+        sorted.sort_unstable();
+        let mut deduped = sorted.to_vec();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            codes.len(),
+            "reembed exit codes must be pairwise distinct: {codes:?}"
+        );
+    }
 
     fn seed(conn: &rusqlite::Connection, ns: &str, title: &str, content: &str) -> String {
         let now = chrono::Utc::now().to_rfc3339();
