@@ -62,6 +62,7 @@ fn seed_memory(
     title: String,
     content: String,
     priority: i32,
+    owner: &str,
 ) -> ai_memory::models::Memory {
     let now = chrono::Utc::now().to_rfc3339();
     ai_memory::models::Memory {
@@ -79,7 +80,7 @@ fn seed_memory(
         updated_at: now,
         last_accessed_at: None,
         expires_at: None,
-        metadata: serde_json::json!({"agent_id": "perf-probe", "scope": "collective"}),
+        metadata: serde_json::json!({"agent_id": owner, "scope": "collective"}),
         reflection_depth: 0,
         memory_kind: ai_memory::models::MemoryKind::Observation,
         entity_id: None,
@@ -219,6 +220,7 @@ async fn v88_namespace_scoped_list_plan_has_no_sort_node_2578() {
             format!("perf2578 title {i} {ns}"),
             format!("perf2578 body {i}"),
             (i % 10) + 1,
+            "perf-2578-probe",
         );
         store.store(&ctx, &m).await.expect("seed row");
     }
@@ -394,6 +396,7 @@ async fn find_paths_returns_correct_paths_via_cte_2582() {
             format!("perf2582 node {i} {ns}"),
             format!("perf2582 body {i}"),
             5,
+            "perf-2582-probe",
         );
         ids.push(store.store(&ctx, &m).await.expect("seed node"));
     }
