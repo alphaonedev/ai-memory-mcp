@@ -68,7 +68,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust 1.96.0 + iOS-sim target (matches rust-toolchain.toml pin)
         # MUST be @1.96.0, not @stable: the repo's rust-toolchain.toml
@@ -78,7 +78,7 @@ jobs:
         # with `E0463: can't find crate for core`. Pinning here installs
         # the target onto the same toolchain that builds (the ci.yml
         # pattern).
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
           # `aarch64-apple-ios-sim` matches the Apple-silicon GH macOS
           # runner (macos-latest is M1 / M2). Intel-sim would need
@@ -86,7 +86,7 @@ jobs:
           # the macos-13 Intel runner image is on its EOL path.
           targets: aarch64-apple-ios-sim
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: mobile-ios-sim
 
@@ -214,24 +214,24 @@ jobs:
       (github.event_name == 'workflow_dispatch' && (inputs.run_android == 'true' || inputs.run_android == ''))
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust 1.96.0 + Android x86_64 target (matches rust-toolchain.toml pin)
         # @1.96.0 (not @stable): same rust-toolchain.toml pin reasoning as
         # the ios-simulator job — the target must be added to the 1.96.0
         # toolchain that actually builds, else `E0463: can't find crate
         # for core`.
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
           targets: x86_64-linux-android
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: mobile-android-emu
 
       - name: Install Android NDK r26d
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
         with:
           ndk-version: r26d
           add-to-path: false
@@ -306,7 +306,7 @@ jobs:
           echo "::notice::built $BIN ($(du -h "$BIN" | cut -f1))"
 
       - name: Boot Android emulator + run tests
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         env:
           # v0.7.0 ship-readiness fix (#1159, post-shell-syntax fixes
           # in PRs #1161/#1162) — pass the NDK's libc++_shared.so path

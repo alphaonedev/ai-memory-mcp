@@ -268,6 +268,23 @@ Benchmark-claim canon gate (#2879)
 # enforced.
 Enterprise-federation cert-expiry gate (cert §7 / F7)
 #
+# EXTERNAL-PR OPERATOR-APPROVAL GATE (2026-08-26 operator directive: "we want
+# collaboration with rigid security controls — PRs require Justin's approval
+# and SSH key code signing"). The repository stays OPEN to outside issues,
+# comments and PRs; the control sits at the MERGE boundary. For a PR whose
+# author_association is not OWNER/MEMBER/COLLABORATOR (or whose head is a
+# fork), this gate HARD-FAILS unless an APPROVED review by the accountable
+# operator account (`alphaonedev`) exists for the CURRENT head SHA — a native
+# GitHub review the operator submits by hand, never an agent-applied label.
+# Team-authored same-repo PRs pass unconditionally, so the single-authority
+# merge train is untouched. Signing is enforced separately by the live
+# `required_signatures` ruleset + `Commit-signing posture gate (#2486)`.
+# Carried by `c8-precheck.yml` (`external-pr-operator-approval-gate`); no
+# `needs:`, no job-level `if:`, no `paths:` filter — always reports. Declared
+# REQUIRED per gate 7 rule (f); mirror-first, the companion branch-protection
+# API call follows once this job has reported green on the base branch.
+External-PR operator-approval gate (author outside team => @alphaonedev review)
+#
 # ---------------------------------------------------------------------------
 # KNOWN GAPS — declared here so they are not mistaken for oversights.
 # Closing any of them is a branch-protection edit, deliberately NOT done in

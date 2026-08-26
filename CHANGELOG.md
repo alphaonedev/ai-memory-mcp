@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (rigid collaboration controls — operator directive 2026-08-26)
+
+- **External-PR operator-approval gate** (`c8-precheck.yml`, new required
+  context): a PR from outside the team (author not OWNER/MEMBER/COLLABORATOR,
+  or fork head) cannot merge without an APPROVED GitHub review by `@alphaonedev`
+  on its current head SHA. Team PRs unaffected. Governance §5.0.1.
+- **Self-hosted fork refusal**: `ci.yml` `check` refuses the self-hosted legs
+  before checkout on fork PRs; `cert-postgres-age.yml` is job-gated. Fork code
+  never runs on `f2`/`f1`.
+- **Supply chain**: all 177 `uses:` references across 18 workflows pinned to
+  full commit SHAs (resolved via `git ls-remote`, tag comment retained);
+  `.github/dependabot.yml` (github-actions ecosystem) keeps pins current.
+- Repository settings (applied via API, recorded here): secret scanning +
+  push protection, Dependabot security updates + alerts, private vulnerability
+  reporting. Interaction limits deliberately NOT set — the repo stays open.
+
 ### Security (silent-default cluster Fable follow-up — #3242)
 
 - **#2596 sqlite link-dispatch no longer invents `DEFAULT_NAMESPACE`.** The

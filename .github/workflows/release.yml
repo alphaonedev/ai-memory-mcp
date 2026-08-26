@@ -44,7 +44,7 @@ jobs:
       sha: ${{ steps.check.outputs.sha }}
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.inputs.tag }}
@@ -98,14 +98,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Git-dependency-source gate (#2050 / #2512)
         # No cargo dependency may resolve from a git source (a deleted/rewritten
@@ -171,7 +171,7 @@ jobs:
             os: macos-latest
             artifact: ai-memory
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
@@ -181,12 +181,12 @@ jobs:
         # target std must be installed onto THAT toolchain — installing it
         # onto `stable` left non-host targets (e.g. x86_64-apple-darwin on
         # the arm64 macOS runner) without `core`, failing with E0463.
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.96.0
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # #2676 packaging residual — release channel must not ship default-only
       # binaries that omit `sal` (federation/SAL surface). Assert via the same
@@ -331,7 +331,7 @@ jobs:
           ls -la
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: ai-memory-${{ matrix.target }}
           path: dist/ai-memory*
@@ -342,7 +342,7 @@ jobs:
         # workflow + repo + commit SHA over every released artifact in
         # dist/ (tarball/zip + deb + rpm). Consumers verify with
         # `gh attestation verify <file> --repo alphaonedev/ai-memory-mcp`.
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: 'dist/ai-memory*'
 
@@ -365,7 +365,7 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
           files: dist/ai-memory*
@@ -412,7 +412,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
@@ -420,11 +420,11 @@ jobs:
         # Pin to rust-toolchain.toml (1.96.0) so cargo-cyclonedx reads
         # the same Cargo.lock / MSRV-compatible metadata every other
         # release job builds against.
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.96.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: sbom-${{ needs.preflight.outputs.tag }}
 
@@ -451,12 +451,12 @@ jobs:
 
       - name: Attest build provenance (CycloneDX SBOM)
         # #2487 — additive to the sha256 above.
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: 'dist/ai-memory.cdx.json'
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
           files: |
@@ -467,7 +467,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload workflow artifact (for cross-job inspection)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: ai-memory-sbom
           path: dist/ai-memory.cdx.json*
@@ -510,19 +510,19 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Install Rust 1.96.0 + iOS targets
         # Pin to rust-toolchain.toml (1.96.0) so the iOS cross-target std
         # lands on the build toolchain (see release-matrix note above).
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.96.0
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: mobile-ios-${{ needs.preflight.outputs.tag }}
 
@@ -596,12 +596,12 @@ jobs:
 
       - name: Attest build provenance (iOS xcframework)
         # #2487 — additive to the sha256 above.
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: 'dist/ai-memory-ios.xcframework.tar.gz'
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
           files: |
@@ -612,7 +612,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload workflow artifact (for cross-job inspection)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: ai-memory-ios-xcframework
           path: dist/ai-memory-ios.xcframework.tar.gz*
@@ -650,25 +650,25 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Install Rust 1.96.0 + Android targets
         # Pin to rust-toolchain.toml (1.96.0) so the Android cross-target
         # std lands on the build toolchain (see release-matrix note above).
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.96.0
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: mobile-android-${{ needs.preflight.outputs.tag }}
 
       - name: Install Android NDK r26d
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
         with:
           ndk-version: r26d
           add-to-path: false
@@ -760,12 +760,12 @@ jobs:
 
       - name: Attest build provenance (Android JNI bundle)
         # #2487 — additive to the sha256 above.
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: 'dist/ai-memory-android.tar.gz'
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
           files: |
@@ -776,7 +776,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload workflow artifact (for cross-job inspection)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: ai-memory-android-aar
           path: dist/ai-memory-android.tar.gz*
@@ -790,7 +790,7 @@ jobs:
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
@@ -798,7 +798,7 @@ jobs:
         # #2895 — pin the publish toolchain to the same 1.96.0 every other
         # release + verification job uses (was bare `@stable`, an unpinned,
         # moving compiler on the one job that mints the crates.io artifact).
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
 
       - name: Publish to crates.io (with retry)
         env:
@@ -887,7 +887,7 @@ jobs:
           done
 
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: alphaonedev/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -982,15 +982,15 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1004,7 +1004,7 @@ jobs:
 
       - name: Build and push Docker image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
@@ -1022,7 +1022,7 @@ jobs:
         # attaches it to GHCR. Consumers verify with
         # `gh attestation verify oci://ghcr.io/alphaonedev/ai-memory:<ver> \
         #    --repo alphaonedev/ai-memory-mcp`.
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/ai-memory
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -1037,7 +1037,7 @@ jobs:
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 

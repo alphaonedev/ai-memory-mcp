@@ -206,7 +206,7 @@ jobs:
       test_impact_total: ${{ steps.cls.outputs.test_impact_total }}
       test_impact_reason: ${{ steps.cls.outputs.test_impact_reason }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 2 }
       - id: cls
         shell: bash
@@ -419,9 +419,9 @@ jobs:
     # hosted pool, as it did before #3109.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
           components: rustfmt, clippy
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
@@ -434,7 +434,7 @@ jobs:
       # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
       # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
       # export — is now declared in the workflow `env:` block above.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
       - name: Check formatting
         run: cargo fmt --check
@@ -482,10 +482,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@1.96.0
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Fetch the locked dependency graph
         # `cargo metadata --offline` resolves the complete CROSS-PLATFORM graph,
         # including target-only crates (the windows_* / wasm / haiku families)
@@ -525,7 +525,7 @@ jobs:
     # container-action step over `.github/workflows/`: no cargo, no Postgres.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: actionlint
         uses: docker://rhysd/actionlint:1.7.1
         with:
@@ -551,9 +551,9 @@ jobs:
     # `cargo check --all-targets` over the whole crate.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust 1.96.0 (declared MSRV)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
       # PERSISTENT and already IS the warm cache, so this action has nothing to
       # add and two ways to do harm: its restore extracts an archive saved by a
@@ -564,7 +564,7 @@ jobs:
       # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
       # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
       # export — is now declared in the workflow `env:` block above.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
       - name: cargo check on MSRV
         run: cargo check --all-targets
@@ -698,7 +698,22 @@ jobs:
             tier: enterprise-fed
             timeout: 80
     steps:
-      - uses: actions/checkout@v4
+      # 2026-08-26 rigid-security-controls: a fork PR must NEVER have its code
+      # checked out on a self-hosted node (f2 = the operator's home gateway,
+      # f1 = the macOS fed node). Primary control is the repository's Actions
+      # policy "require approval for all external contributors"; this step is
+      # the defence-in-depth for an accidental "Approve and run" — it fails the
+      # self-hosted legs BEFORE `actions/checkout` so no fork code lands on the
+      # node. GitHub-hosted legs are unaffected (no secrets, ephemeral VM).
+      # STEP-level, not job-level: this is a matrix job carrying required
+      # contexts and rule (b1) of scripts/check-required-contexts.sh forbids a
+      # job-level `if:` here (#2494 wedge class).
+      - name: Fork-PR refusal (self-hosted legs never run fork code)
+        if: needs.classify.outputs.docs_only != 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && contains(matrix.runner, 'self-hosted')
+        run: |
+          echo "::error::Refusing to run fork PR code on a self-hosted runner (leg ${{ matrix.leg }})."
+          exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: docs-only short-circuit
         if: needs.classify.outputs.docs_only == 'true'
@@ -806,11 +821,11 @@ jobs:
       # a shifting runner image never fails the step. The df -h before/after
       # makes the freed space (or a non-disk root cause) visible in the log.
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
         with:
           node-version: '22'
@@ -834,7 +849,7 @@ jobs:
           }
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         if: needs.classify.outputs.docs_only != 'true'
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
 
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
       # PERSISTENT and already IS the warm cache, so this action has nothing to
@@ -846,7 +861,7 @@ jobs:
       # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
       # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
       # export — is now declared in the workflow `env:` block above.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'github-hosted'
         with:
           # CI-speed (#3089) — SAVE the cache only on trunk `push` events
@@ -1163,7 +1178,7 @@ jobs:
       # the captured log is the honest durable record of what ran.
       - name: Upload test results (durable audit history)
         if: needs.classify.outputs.docs_only != 'true' && always() && env.TEST_RESULT_LOG != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: test-results-${{ matrix.node }}-${{ matrix.tier }}
           path: ${{ env.TEST_RESULT_LOG }}
@@ -1295,10 +1310,10 @@ jobs:
     # for a dedicated self-hosted node, which is not this job's world any more.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
           components: clippy
 
@@ -1312,7 +1327,7 @@ jobs:
       # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
       # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
       # export — is now declared in the workflow `env:` block above.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
         with:
           # CI-speed (#3089) — save the cache only on trunk `push` events;
@@ -1375,7 +1390,7 @@ jobs:
           - target: aarch64-linux-android
             os: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: docs-only short-circuit
         if: needs.classify.outputs.docs_only == 'true'
@@ -1383,11 +1398,11 @@ jobs:
 
       - name: Install Rust 1.96.0 (target ${{ matrix.target }}, matches rust-toolchain.toml pin)
         if: needs.classify.outputs.docs_only != 'true'
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: needs.classify.outputs.docs_only != 'true'
         with:
           key: mobile-${{ matrix.target }}
@@ -1400,7 +1415,7 @@ jobs:
       - name: Install Android NDK r26d
         if: needs.classify.outputs.docs_only != 'true' && matrix.target == 'aarch64-linux-android'
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
         with:
           ndk-version: r26d
           add-to-path: false
@@ -1479,10 +1494,10 @@ jobs:
     # only bound).
     timeout-minutes: 55
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
           components: clippy
 
@@ -1496,7 +1511,7 @@ jobs:
       # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
       # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
       # export — is now declared in the workflow `env:` block above.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
 
       - name: Clippy (sal feature)
@@ -1533,10 +1548,10 @@ jobs:
     # pre-#3109 value measured on this runner class and is unchanged by #3109.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
           components: clippy
 
@@ -1550,7 +1565,7 @@ jobs:
       # fine). `~/.cargo/{registry,git}` persist natively in $HOME on the fleet,
       # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
       # export — is now declared in the workflow `env:` block above.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
 
       - name: Clippy (vectorlite feature, all targets)
@@ -1595,13 +1610,13 @@ jobs:
     # Skip on tag pushes — the docker job below handles those (with push).
     if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.classify.outputs.docs_only != 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build Docker image (validation only)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: false

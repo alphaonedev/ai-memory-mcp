@@ -1,0 +1,16 @@
+# Dependabot — GitHub Actions ONLY (supply-chain control, 2026-08-26 operator
+# directive "rigid security controls"). Every `uses:` in .github/workflows is
+# pinned to a full commit SHA (never a mutable tag); this keeps those pins
+# current via reviewable PRs instead of silently floating. Cargo / npm / pip
+# are deliberately NOT enrolled here — Dependabot SECURITY updates for them are
+# enabled at the repository level, and version-bump churn would flood the
+# v1.0.0 GA merge train.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["ci", "supply-chain"]
+    commit-message:
+      prefix: "ci(actions)"
