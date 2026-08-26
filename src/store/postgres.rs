@@ -9727,6 +9727,13 @@ impl PostgresStore {
         valid_until: Option<&str>,
         actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
+        // #3203 / Fable #3237 item 1 — same #1955 R45 fence the sqlite
+        // `db::invalidate_link` path has. A supersession mutates
+        // `memory_links` and appends a `signed_events` leaf; without
+        // this gate it landed while the record plane was STOPPED.
+        // One call at the dispatcher covers CTE, Cypher, and
+        // `kg_invalidate_via_store`.
+        self.gate_record_stop()?;
         // v0.7.0 S6-M3 — AGE Cypher dispatcher. Same dual-path
         // discipline as `kg_query` / `kg_timeline`. When AGE is
         // available we set the `valid_until` property through Cypher
@@ -9803,7 +9810,10 @@ impl PostgresStore {
         valid_until: Option<&str>,
         actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
-        let stamp = valid_until.map_or_else(|| Utc::now().to_rfc3339(), str::to_string);
+        let stamp = valid_until.map_or_else(
+            || truncate_to_microseconds(Utc::now()).to_rfc3339(),
+            str::to_string,
+        );
 
         // AGE requires `ag_catalog` on the search path and the
         // extension loaded into the session. Both are session-local
@@ -10004,7 +10014,10 @@ impl PostgresStore {
         valid_until: Option<&str>,
         actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
-        let stamp = valid_until.map_or_else(|| Utc::now().to_rfc3339(), str::to_string);
+        let stamp = valid_until.map_or_else(
+            || truncate_to_microseconds(Utc::now()).to_rfc3339(),
+            str::to_string,
+        );
         let mut tx = self
             .pool
             .begin()
@@ -10873,7 +10886,7 @@ impl PostgresStore {
         // to a no-op. The row's existing `signature` / `attest_level`
         // are preserved, so a self-signed write is never silently
         // demoted to unsigned by a subsequent unsigned replay.
-        sqlx::query(
+        let insert_res = sqlx::query(
             "INSERT INTO memory_links
                  (source_id, target_id, relation, created_at, valid_from,
                   valid_until, signature, attest_level, observed_by,
@@ -10895,6 +10908,33 @@ impl PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_link", e))?;
+        // #3051 / Fable #3237 item 2 — ON CONFLICT DO NOTHING preserves the
+        // existing row. Returning the freshly COMPUTED `attest_level` on
+        // that path would report `unsigned` for a replay of an unsigned
+        // payload against a durable `self_signed`/`peer_attested` edge.
+        // Read the stored label (fail-closed to unsigned if missing /
+        // unknown), matching sqlite `stored_link_attest_level`.
+        let attest_level = if insert_res.rows_affected() == 0 {
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT attest_level FROM memory_links \
+                 WHERE source_id = $1 AND target_id = $2 AND relation = $3",
+            )
+            .bind(&link.source_id)
+            .bind(&link.target_id)
+            .bind(link.relation.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("read stored attest_level on link replay", e))?;
+            stored
+                .as_deref()
+                .and_then(crate::models::AttestLevel::from_str)
+                .map_or(
+                    crate::models::AttestLevel::Unsigned.as_str(),
+                    crate::models::AttestLevel::as_str,
+                )
+        } else {
+            attest_level
+        };
 
         if matches!(self.kg_backend, KgBackend::Age) {
             // #1735 (Pillar-4 4.C) — Deferred mode enqueues the AGE

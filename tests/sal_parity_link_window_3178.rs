@@ -44,6 +44,7 @@
 //! | `pg_invalidate_clears_signature_and_emits_event_3178` | `attest_level` stays `self_signed`, no event row |
 //! | `sqlite_invalidate_audit_names_the_actor_not_the_attester_3203` | `agent_id` == the ATTESTER (`bob`) |
 //! | `sqlite_invalidate_is_fenced_by_record_stop_3203` | the supersession COMMITS with the record plane stopped |
+//! | `pg_invalidate_is_fenced_by_record_stop_3203` | postgres kg_invalidate had no fence (Fable #3237 item 1) |
 //! | `sqlite_inbound_link_substitute_stamp_is_microsecond_truncated_3204` | nanosecond `valid_from`, never locally re-verifiable |
 //!
 //! ## Folded in
@@ -536,6 +537,43 @@ async fn sqlite_invalidate_is_fenced_by_record_stop_3203() {
         .expect("invalidate after release");
 }
 
+/// #3204 item 3 / Fable #3237 item 3 — default `valid_until` on
+/// `invalidate_link` must be microsecond-truncated, matching outbound
+/// signers. PRE-FIX: `Utc::now().to_rfc3339()` (nanoseconds).
+#[tokio::test]
+async fn sqlite_invalidate_default_stamp_is_microsecond_truncated_3204() {
+    permissive_attestation_for_tests();
+    let (_dir, path) = fresh_db_path();
+    let store = SqliteStore::open(&path).expect("open SqliteStore");
+    let ctx = CallerContext::for_agent("alice");
+    let (src, dst) = seeded_pair(&store, &ctx).await;
+    store
+        .link(&ctx, &windowed_link(&src, &dst))
+        .await
+        .expect("link");
+    store
+        .invalidate_link(
+            &src,
+            &dst,
+            MemoryLinkRelation::RelatedTo.as_str(),
+            None,
+            Some("alice"),
+        )
+        .await
+        .expect("invalidate with omitted valid_until");
+    let stamp = read_raw_link(&path, &src, &dst)
+        .valid_until
+        .expect("valid_until substituted");
+    let frac = stamp
+        .split('.')
+        .nth(1)
+        .map_or(0, |t| t.chars().take_while(char::is_ascii_digit).count());
+    assert!(
+        frac <= 6,
+        "invalidate default stamp must be microsecond-truncated, got {stamp}"
+    );
+}
+
 /// #3204 item 3 — the receiver-side substitute for a peer's absent
 /// `valid_from` must be microsecond-truncated, or the edge can never
 /// re-verify locally.
@@ -766,5 +804,82 @@ mod pg {
             ai_memory::identity::sentinels::SYSTEM_PRINCIPAL,
             "#3203: unattributed pg supersession names the system sentinel, not the attester"
         );
+    }
+
+    /// #3203 / Fable #3237 item 1 — `PostgresStore::kg_invalidate` must
+    /// refuse while the record plane is STOPPED, matching sqlite
+    /// `invalidate_link`. PRE-FIX the pg dispatcher had no
+    /// `gate_record_stop`.
+    #[tokio::test]
+    async fn pg_invalidate_is_fenced_by_record_stop_3203() {
+        permissive_attestation_for_tests();
+        let Some((store, url)) = store_or_skip().await else {
+            return;
+        };
+        let ctx = CallerContext::for_agent("alice");
+        let kp = ai_memory::identity::keypair::generate("ai:link-3178").expect("keypair");
+        let ns = unique_ns();
+        let src_mem = memory(&ns, "stop-src", "alice");
+        let dst_mem = memory(&ns, "stop-dst", "alice");
+        let (src, dst) = (src_mem.id.clone(), dst_mem.id.clone());
+        store.store(&ctx, &src_mem).await.expect("src");
+        store.store(&ctx, &dst_mem).await.expect("dst");
+        store
+            .link_signed(&ctx, &windowed_link(&src, &dst), Some(&kp))
+            .await
+            .expect("link_signed");
+
+        store
+            .record_stop(&ctx, true, "operator", "all")
+            .await
+            .expect("engage record stop");
+
+        let err = store
+            .invalidate_link(
+                &src,
+                &dst,
+                MemoryLinkRelation::RelatedTo.as_str(),
+                None,
+                Some("alice"),
+            )
+            .await
+            .expect_err("a link-plane mutation must refuse while the record plane is stopped");
+        assert!(
+            format!("{err}").to_lowercase().contains("record"),
+            "the refusal must name the record stop, got {err}"
+        );
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("pool");
+        let until: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT valid_until FROM memory_links WHERE source_id = $1 AND target_id = $2",
+        )
+        .bind(&src)
+        .bind(&dst)
+        .fetch_one(&pool)
+        .await
+        .expect("valid_until");
+        let expected = chrono::DateTime::parse_from_rfc3339(VALID_UNTIL)
+            .expect("VALID_UNTIL")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(until, Some(expected), "refusal must leave the claim window");
+
+        store
+            .record_stop(&ctx, false, "operator", "all")
+            .await
+            .expect("release record stop");
+        store
+            .invalidate_link(
+                &src,
+                &dst,
+                MemoryLinkRelation::RelatedTo.as_str(),
+                None,
+                Some("alice"),
+            )
+            .await
+            .expect("invalidate after release");
     }
 }

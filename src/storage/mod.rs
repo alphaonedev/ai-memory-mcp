@@ -11325,7 +11325,14 @@ pub fn invalidate_link(
     // #3175 class on the sqlite link plane. Placed BEFORE the BEGIN so a
     // refusal leaves no transaction open.
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    let stamp = valid_until.map_or_else(|| Utc::now().to_rfc3339(), str::to_string);
+    // #3204 item 3 / Fable #3237 item 3 — a missing `valid_until` must
+    // substitute a microsecond-truncated `now`, matching outbound
+    // signers and postgres TIMESTAMPTZ. Nanosecond `to_rfc3339()`
+    // made a later verify re-derive a different pre-image.
+    let stamp = valid_until.map_or_else(
+        || truncate_to_microseconds(Utc::now()).to_rfc3339(),
+        str::to_string,
+    );
 
     // P2 (#628 agent-3 follow-up): wrap the SELECT-then-UPDATE-then-
     // audit-INSERT in a single `BEGIN IMMEDIATE` transaction. Without
@@ -20655,7 +20662,7 @@ fn refuse_unapproved_destination_store(
                 &pa.requested_by,
                 None,
                 ns_owner.as_deref(),
-            )
+            )?
         }
         None => ungoverned_namespace_decision(mode, GovernedAction::Store, to_ns, &pa.requested_by),
     };

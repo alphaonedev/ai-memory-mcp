@@ -40,6 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repository settings (applied via API, recorded here): secret scanning +
   push protection, Dependabot security updates + alerts, private vulnerability
   reporting. Interaction limits deliberately NOT set — the repo stays open.
+### Security (sqlite/pg SAL parity Fable follow-up — #3237)
+
+- **#3203 postgres `kg_invalidate` now sits behind `gate_record_stop`.**
+  The sqlite `db::invalidate_link` fence landed in this PR; the pg
+  dispatcher (CTE, Cypher, `kg_invalidate_via_store`) did not call it,
+  so a supersession could commit while the record plane was STOPPED.
+  Pin: `pg_invalidate_is_fenced_by_record_stop_3203`.
+- **#3051 pg link replay returns the STORED `attest_level`.**
+  `link_internal` `ON CONFLICT DO NOTHING` used to return the freshly
+  computed label, so an unsigned replay of a durable `self_signed`
+  edge reported `unsigned`. Matches sqlite `stored_link_attest_level`.
+- **#3204 item 3 invalidate substitute stamp is microsecond-truncated**
+  on sqlite `invalidate_link` and pg `kg_invalidate_{cte,cypher}` when
+  `valid_until` is omitted.
 
 ### Security (silent-default cluster Fable follow-up — #3242)
 
