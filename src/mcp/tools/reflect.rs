@@ -866,7 +866,10 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({"agent_id": "ai:test"}),
+            // #3176 / Fable #3237 item 4 — MCP reflect now scopes source
+            // reads. `collective` is world-readable so fixtures do not
+            // depend on the MCP caller resolving to `ai:test`.
+            metadata: json!({"agent_id": "ai:test", "scope": "collective"}),
             reflection_depth: 0,
             memory_kind: MemoryKind::Observation,
             entity_id: None,

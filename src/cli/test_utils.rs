@@ -177,6 +177,13 @@ pub fn seed_memory(db_path: &Path, namespace: &str, title: &str, content: &str) 
             "agent_id".to_string(),
             serde_json::Value::String("test-agent".to_string()),
         );
+        // #3176 / Fable #3237 item 4 — CLI reflect routes through MCP
+        // handle_reflect, which now scopes source reads. `collective`
+        // is world-readable so fixtures survive any resolved caller.
+        obj.insert(
+            "scope".to_string(),
+            serde_json::Value::String("collective".to_string()),
+        );
     }
     let mem = models::Memory {
         cid: None,
