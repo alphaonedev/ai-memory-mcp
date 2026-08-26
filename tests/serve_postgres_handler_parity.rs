@@ -1027,9 +1027,14 @@ async fn bucket_f_link_signing_observed_by() {
     let a = store_memory(&client, &base, &ns, "src", "source").await;
     let b = store_memory(&client, &base, &ns, "tgt", "target").await;
 
+    // #3194 — PostgresStore::link honours CallerContext. The default
+    // client header is `ai:parity-test` (same principal that stored
+    // `a`/`b`). Overriding to a foreign agent used to 201 because the
+    // pg funnel discarded ctx; it is now 403 (owner-mismatch). Keep
+    // the owner-match caller so this test still pins attest_level on
+    // a successful signed/unsigned link write.
     let resp = client
         .post(format!("{base}/api/v1/links"))
-        .header("x-agent-id", "signer-agent")
         .json(&json!({
             "source_id": a,
             "target_id": b,

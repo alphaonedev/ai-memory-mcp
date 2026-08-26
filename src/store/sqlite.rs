@@ -1964,10 +1964,27 @@ impl MemoryStore for SqliteStore {
 
     async fn archive_by_ids(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         ids: &[String],
         reason: Option<&str>,
     ) -> StoreResult<usize> {
+        // #3193 (in-class parity, 2026-08-22) — honour the trait's
+        // caller-owns contract on this adapter too. Pre-fix this method
+        // discarded `_ctx` and called the owner-BLIND `db::archive_memory`,
+        // exactly as the postgres twin did. It is unreachable from the
+        // HTTP archive handler today (that branch calls
+        // `db::archive_memory_for_caller` directly, per #940), so this is a
+        // latent landmine rather than a live bypass — but the trait method
+        // is a public SAL surface and the next caller to reach for it must
+        // not silently inherit an owner-blind bulk soft-delete.
+        //
+        // `archive_memory_for_caller` is sqlite's own #940 gate: it permits
+        // owner, inbox-target, and the legacy-unowned carve-out (#3124),
+        // and reports a refusal as `Ok(false)` — NOT counted, so the row
+        // stays live and surfaces to the handler as `missing`. That is the
+        // sqlite disposition of the same fail-closed contract postgres
+        // expresses as `PermissionDenied`. Operator lanes
+        // (`ctx.bypass_visibility`) keep the owner-blind funnel.
         let conn = self.state.lock().await;
         // Parity finding #2 (2026-08) — ALL-OR-NOTHING batch, matching the
         // postgres twin (`PostgresStore::archive_by_ids`, ONE `pool.begin()`
@@ -1987,15 +2004,45 @@ impl MemoryStore for SqliteStore {
         // is (a nested `BEGIN` fails with "cannot start a transaction within
         // a transaction"): open our own tx ONLY when the caller does not
         // already hold one.
+        //
+        // #3193 — owner gate INSIDE the same tx, before the owner-blind
+        // `archive_memory_no_tx` core. A foreign-owned / unstamped-refused
+        // / missing id is `continue` (not counted) so sqlite's documented
+        // disposition holds: the row stays live and the handler reports
+        // `missing`. A 403 would be an existence oracle. Operator lanes
+        // (`ctx.bypass_visibility`) skip the gate. The predicate is the
+        // same four-way SQL as `db::archive_memory_for_caller` (#940) so
+        // a nested `BEGIN` is never opened inside this outer tx.
         let owns_tx = conn.is_autocommit();
         let write_txn = if owns_tx {
             Some(crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?)
         } else {
             None
         };
+        let caller = ctx.effective_principal().to_string();
+        let bypass = ctx.bypass_visibility;
         let batch = (|| -> anyhow::Result<usize> {
             let mut moved = 0usize;
             for id in ids {
+                if !bypass {
+                    let owned: bool = conn
+                        .query_row(
+                            "SELECT COUNT(*) > 0 FROM memories \
+                             WHERE id = ?1 \
+                               AND ( \
+                                 json_extract(metadata, '$.agent_id') = ?2 OR \
+                                 json_extract(metadata, '$.target_agent_id') = ?2 OR \
+                                 json_extract(metadata, '$.agent_id') IS NULL OR \
+                                 json_extract(metadata, '$.agent_id') = '' \
+                               )",
+                            rusqlite::params![id, caller],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(false);
+                    if !owned {
+                        continue;
+                    }
+                }
                 if db::archive_memory_no_tx(&conn, id, reason)? {
                     moved += 1;
                 }

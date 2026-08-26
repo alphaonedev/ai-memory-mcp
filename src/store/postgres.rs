@@ -1369,6 +1369,14 @@ const REASON_UNSTAMPED_TENANT_WRITE: &str =
 /// #1628 — delete-verb sibling of [`REASON_UNSTAMPED_TENANT_WRITE`].
 const REASON_UNSTAMPED_TENANT_DELETE: &str =
     "memory has no agent_id stamp; tenant deletes refused (use admin path)";
+/// #3193 — archive-verb sibling of [`REASON_UNSTAMPED_TENANT_WRITE`].
+/// `archive_by_ids` is a caller-scoped MUTATION (cold-store copy + hard
+/// delete of the live row), so it takes the same postgres unstamped-row
+/// posture the write/delete verbs take (REFUSE — see #3124 for the
+/// cross-backend policy decision). Refusing leaves the row LIVE, so the
+/// fail-closed arm can never lose data.
+const REASON_UNSTAMPED_TENANT_ARCHIVE: &str =
+    "memory has no agent_id stamp; tenant archives refused (use admin path)";
 
 /// v0.8.1 W1 (#1821 / gap G29) + #1844 — postgres parity for the sqlite
 /// `db::insert` / `insert_if_newer` credential REDACT backstop. Returns a
@@ -5822,8 +5830,13 @@ impl PostgresStore {
 
     /// #1412/#1628 — owner pre-fetch for the caller-owns mutation gate.
     /// One declaration site (pm-v3.1) for the three gate consumers.
-    const SQL_SELECT_OWNER_AGENT_ID_BY_ID: &'static str =
-        "SELECT metadata->>'agent_id' FROM memories WHERE id = $1";
+    /// Two-column + `FOR UPDATE`: archive (#3193) needs the inbox-target
+    /// arm (Fable #3243 item 1) and a row lock so a concurrent re-own
+    /// cannot slip between probe and INSERT/DELETE (item 4). On the
+    /// autocommit pool (update/delete) the lock releases at statement
+    /// end — same TOCTOU those verbs already had.
+    const SQL_SELECT_OWNER_AGENT_ID_BY_ID: &'static str = "SELECT metadata->>'agent_id', metadata->>'target_agent_id' \
+         FROM memories WHERE id = $1 FOR UPDATE";
 
     /// #1412 caller-owns mutation gate shared by the tenant-facing
     /// write paths: the trait `update`, the trait `delete`, and the
@@ -5847,39 +5860,77 @@ impl PostgresStore {
         action: &str,
         unstamped_reason: &str,
     ) -> StoreResult<()> {
+        Self::assert_caller_owns_for_mutation_on(
+            &self.pool,
+            ctx,
+            id,
+            action,
+            unstamped_reason,
+            false,
+        )
+        .await
+    }
+
+    /// #3193 — executor-parameterised core of
+    /// [`Self::assert_caller_owns_for_mutation`]. Identical logic and
+    /// byte-identical refusal envelopes; the only difference is WHERE the
+    /// owner probe runs.
+    ///
+    /// The `&self.pool` wrapper above is the right shape for the
+    /// single-statement verbs (`update` / `delete` /
+    /// `update_with_expected_version`) whose write is its own statement.
+    /// `archive_by_ids` is different: it copies the row to cold storage and
+    /// then HARD-DELETES the live row inside one multi-statement
+    /// transaction, so its gate MUST read through that same transaction —
+    /// a pool-borrowed probe would run on a different connection and could
+    /// observe a pre-tx snapshot of `metadata.agent_id` (a TOCTOU window
+    /// against a concurrent re-own). Passing `&mut *tx` closes it.
+    async fn assert_caller_owns_for_mutation_on<'e, E>(
+        executor: E,
+        ctx: &CallerContext,
+        id: &str,
+        action: &str,
+        unstamped_reason: &str,
+        allow_inbox: bool,
+    ) -> StoreResult<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         if ctx.bypass_visibility {
             return Ok(());
         }
-        let owner: Option<Option<String>> =
-            sqlx::query_scalar(Self::SQL_SELECT_OWNER_AGENT_ID_BY_ID)
+        // ERRORS-01: probe failure is Result, never unwrap. CONCURRENCY-20:
+        // sqlx executor, no std Mutex held across await.
+        let row: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as(Self::SQL_SELECT_OWNER_AGENT_ID_BY_ID)
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(executor)
                 .await
                 .map_err(|e| to_store_err(&format!("{action}: pre-fetch owner"), e))?;
-        match owner {
-            None => Err(StoreError::NotFound { id: id.to_string() }),
-            Some(None) => {
-                // Row exists but has no agent_id stamp (legacy / migrated
-                // pre-v0.6.3 row). Block tenant mutations — the conservative
-                // posture lets the operator clean up via admin path.
-                Err(StoreError::PermissionDenied {
-                    action: action.to_string(),
-                    target: id.to_string(),
-                    reason: unstamped_reason.to_string(),
-                })
-            }
-            Some(Some(existing_owner)) if existing_owner != ctx.effective_principal() => {
-                Err(StoreError::PermissionDenied {
-                    action: action.to_string(),
-                    target: id.to_string(),
-                    reason: format!(
-                        "caller {:?} does not own memory (owner: {existing_owner:?})",
-                        ctx.effective_principal()
-                    ),
-                })
-            }
-            Some(Some(_)) => Ok(()), // owner matches; proceed
+        let Some((owner, inbox)) = row else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+        let existing_owner = owner.unwrap_or_default();
+        let inbox_target = inbox.unwrap_or_default();
+        let caller = ctx.effective_principal();
+        if existing_owner.is_empty() {
+            // Unstamped: pg #3124 REFUSE (row stays live). Inbox-target
+            // does not override — a missing owner stamp is not an
+            // addressed inbox row.
+            return Err(StoreError::PermissionDenied {
+                action: action.to_string(),
+                target: id.to_string(),
+                reason: unstamped_reason.to_string(),
+            });
         }
+        if existing_owner == caller || (allow_inbox && inbox_target == caller) {
+            return Ok(());
+        }
+        Err(StoreError::PermissionDenied {
+            action: action.to_string(),
+            target: id.to_string(),
+            reason: format!("caller {caller:?} does not own memory (owner: {existing_owner:?})"),
+        })
     }
 
     /// v0.7.0 Provenance Gap 1 (issue #884) — optimistic-concurrency
@@ -10504,27 +10555,80 @@ impl PostgresStore {
     /// inbound path (`apply_remote_link`) is intentionally NOT routed
     /// through this gate — it mirrors sqlite's `create_link_inbound`
     /// peer-attested posture, tracked separately.
-    async fn validate_link_pre_create_pg(
+    async fn validate_link_pre_create_pg<'e, E>(
         &self,
+        owner_exec: E,
+        ctx: &CallerContext,
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
-    ) -> StoreResult<()> {
-        // Same identity fallback as sqlite's `create_link_signed`: the
-        // signing keypair's claim when present (the writer is by
-        // definition the actor), else "system".
-        let agent_id_for_eval = keypair.map_or("system", |kp| kp.agent_id.as_str());
+    ) -> StoreResult<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        // #3194 — K9 is evaluated for the CALLER principal, not the
+        // daemon keypair the handler threads in for signing. Pre-fix
+        // this used `keypair.map_or("system", |kp| kp.agent_id)`, so
+        // every tenant HTTP link was judged as the daemon identity.
+        // Federation/admin (`ctx.bypass_visibility`) keeps the prior
+        // keypair-or-"system" fallback so inbound apply and operator
+        // lanes stay byte-identical. Tenant writes use
+        // `ctx.effective_principal()`.
+        let caller_principal = ctx.effective_principal();
+        let keypair_or_system = keypair.map_or("system", |kp| kp.agent_id.as_str());
+        let agent_id_for_eval = if ctx.bypass_visibility {
+            keypair_or_system
+        } else {
+            caller_principal
+        };
 
         // The source memory's namespace scopes both gates (matches the
         // sqlite/MCP choice). A missing source falls back to the
         // default namespace — the FK pre-flight in `link_internal`
         // surfaces the missing-memory error after this returns.
-        let link_ns: Option<String> =
-            sqlx::query_scalar("SELECT namespace FROM memories WHERE id = $1")
-                .bind(&link.source_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| to_store_err("resolve link source namespace", e))?;
-        let link_ns = link_ns.unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
+        //
+        // #3194 — fold the source-owner columns into this ONE query
+        // rather than a second round-trip. The sqlite #941 four-way
+        // predicate (owner / inbox-target / empty-legacy / daemon
+        // sentinel) runs below; a missing source skips the owner gate
+        // so the later FK pre-flight still names the missing memory
+        // (an owner-gate 403 on a missing id would be an existence
+        // oracle).
+        let source_row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT namespace, metadata->>'agent_id', metadata->>'target_agent_id' \
+             FROM memories WHERE id = $1 FOR UPDATE",
+        )
+        .bind(&link.source_id)
+        .fetch_optional(owner_exec)
+        .await
+        .map_err(|e| to_store_err("resolve link source namespace", e))?;
+        if !ctx.bypass_visibility
+            && let Some((_, ref owner, ref inbox)) = source_row
+        {
+            let source_owner = owner.as_deref().unwrap_or("");
+            let source_inbox = inbox.as_deref().unwrap_or("");
+            let is_unowned_legacy = source_owner.is_empty();
+            if !is_unowned_legacy
+                && source_owner != caller_principal
+                && source_inbox != caller_principal
+                && caller_principal != crate::identity::sentinels::DAEMON_PRINCIPAL
+            {
+                tracing::warn!(
+                    target: crate::handlers::AUTHZ_TRACE_TARGET,
+                    "postgres link 403: caller {caller_principal} != source owner \
+                     {source_owner} (source_id={})",
+                    link.source_id
+                );
+                return Err(StoreError::PermissionDenied {
+                    action: "memory_link".to_string(),
+                    target: link.source_id.clone(),
+                    reason: crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string(),
+                });
+            }
+        }
+        let link_ns = source_row
+            .as_ref()
+            .map(|(ns, _, _)| ns.clone())
+            .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
 
         // Pass 0: v0.9.0 G13-mem (#1859) — lineage-DAG acyclicity guard
         // (postgres twin of the sqlite `validate_link_pre_create` Pass 0).
@@ -10638,13 +10742,24 @@ impl PostgresStore {
 
     async fn link_internal(
         &self,
+        ctx: &CallerContext,
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
         // #1568 (H1 residual) — run the same pre-link gates the sqlite
         // `db::create_link_signed` path runs (reflects_on cycle
         // invariant + K9 governance) BEFORE any FK pre-flight or write.
-        self.validate_link_pre_create_pg(link, keypair).await?;
+        // #3194 threads `ctx` so the source-owner gate + K9 principal
+        // are the CALLER, not the discarded `_ctx` / daemon keypair.
+        // Fable #3243 item 2: begin the write tx FIRST so the owner
+        // probe is FOR UPDATE on the same snapshot the INSERT commits.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin link tx", e))?;
+        self.validate_link_pre_create_pg(&mut *tx, ctx, link, keypair)
+            .await?;
 
         // FK pre-flight — mirror SQLite's explicit existence check so
         // the error message names the missing memory rather than
@@ -10783,12 +10898,8 @@ impl PostgresStore {
         // and is unaffected). When the
         // adapter resolved the CTE backend at connect time the AGE
         // branch is a no-op — the recursive-CTE path reads from
-        // `memory_links` directly.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin link tx", e))?;
+        // `memory_links` directly. The tx was opened before the owner
+        // probe so this INSERT commits on the same snapshot.
 
         // ON CONFLICT … DO NOTHING gives idempotent migrate replays:
         // re-shipping a link the destination already holds collapses
@@ -20051,23 +20162,24 @@ impl MemoryStore for PostgresStore {
         })
     }
 
-    async fn link(&self, _ctx: &CallerContext, link: &MemoryLink) -> StoreResult<()> {
+    async fn link(&self, ctx: &CallerContext, link: &MemoryLink) -> StoreResult<()> {
         self.gate_record_stop()?;
         // F6 Gap 3 (v0.7.0) — unsigned link write. The trait method
         // does not surface a keypair so we always land the row with
         // `attest_level = "unsigned"`. Callers that want signing route
         // through [`MemoryStore::link_signed`].
-        self.link_internal(link, None).await.map(|_| ())
+        // #3194 — pass the real ctx; `link_internal` now gates on it.
+        self.link_internal(ctx, link, None).await.map(|_| ())
     }
 
     async fn link_signed(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
         self.gate_record_stop()?;
-        self.link_internal(link, keypair).await
+        self.link_internal(ctx, link, keypair).await
     }
 
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
@@ -26118,9 +26230,17 @@ impl MemoryStore for PostgresStore {
         Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
     }
 
+    /// # Errors
+    ///
+    /// * `StoreError::PermissionDenied` — when `ctx` does not own one of the
+    ///   `ids` (#3193; same gate as [`MemoryStore::update`] /
+    ///   [`MemoryStore::delete`]). The refusal aborts the batch transaction,
+    ///   so NOTHING is archived — every row stays live (fail-closed with no
+    ///   data loss).
+    /// * `StoreError::BackendUnavailable` — on SQL failure.
     async fn archive_by_ids(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         ids: &[String],
         reason: Option<&str>,
     ) -> StoreResult<usize> {
@@ -26146,14 +26266,39 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("begin archive_by_ids tx", e))?;
 
         for id in ids {
-            // Probe existence first so we can return an accurate count.
-            let exists: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("archive_by_ids exists", e))?;
-            if exists.is_none() {
-                continue;
+            // #3193 (SECURITY-high, 2026-08-22) — SAL-side caller-owns gate,
+            // the archive-verb sibling of the #1412/#1628 gates on the trait
+            // `update` / `delete`. Pre-fix this funnel discarded its
+            // `_ctx: &CallerContext` entirely and the INSERT..SELECT below
+            // matched on `WHERE id = $3` with NO owner predicate, so ANY
+            // authenticated tenant on a postgres-backed daemon could
+            // bulk-soft-delete up to `max_batch` of ANOTHER tenant's live
+            // rows through `POST /api/v1/archive` (links cascaded; the rows
+            // vanished from get/list/search/recall). The sqlite branch has
+            // refused since #940 via `db::archive_memory_for_caller`; #3115
+            // fixed only that side of this class.
+            //
+            // Runs INSIDE the batch transaction (`FOR UPDATE` owner+inbox
+            // probe). A genuinely-absent id is `NotFound` → silent
+            // `continue` (the count-delta contract the handler relies on;
+            // not an existence oracle). A LIVE row owned by someone else
+            // raises `PermissionDenied`. Inbox-target (`metadata.target_agent_id`
+            // == caller) is permitted — sqlite #940 parity (Fable #3243
+            // item 1). Admin/operator lanes (`ctx.bypass_visibility`) skip
+            // the gate, exactly as they do on update/delete.
+            match Self::assert_caller_owns_for_mutation_on(
+                &mut *tx,
+                ctx,
+                id,
+                "archive",
+                REASON_UNSTAMPED_TENANT_ARCHIVE,
+                true,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(StoreError::NotFound { .. }) => continue,
+                Err(e) => return Err(e),
             }
             sqlx::query(&format!(
                 "INSERT INTO archived_memories (
@@ -26178,12 +26323,20 @@ impl MemoryStore for PostgresStore {
                        confidence_source, confidence_signals, confidence_decayed_at,
                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                 FROM memories WHERE id = $3
+                  AND ($4::bool
+                       OR metadata->>'agent_id' = $5
+                       OR metadata->>'target_agent_id' = $5)
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
+                -- $4 bypass / $5 caller: owner-predicated write so a concurrent
+                -- re-own cannot archive a row the FOR UPDATE probe no longer owns
+                -- (Fable #3243 item 4). Bypass short-circuits the owner/inbox arms.
                 {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
             ))
             .bind(now)
             .bind(archive_reason)
             .bind(id)
+            .bind(ctx.bypass_visibility)
+            .bind(ctx.effective_principal())
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("archive_by_ids insert", e))?;
@@ -26247,11 +26400,18 @@ impl MemoryStore for PostgresStore {
                 .await
                 .map_err(|e| to_store_err("append archive revision leaf", e))?;
             }
-            sqlx::query(SQL_DELETE_MEMORY_BY_ID)
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("archive_by_ids delete", e))?;
+            sqlx::query(
+                "DELETE FROM memories WHERE id = $1 \
+                 AND ($2::bool \
+                      OR metadata->>'agent_id' = $3 \
+                      OR metadata->>'target_agent_id' = $3)",
+            )
+            .bind(id)
+            .bind(ctx.bypass_visibility)
+            .bind(ctx.effective_principal())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive_by_ids delete", e))?;
             // #2315 — AGE unprojection parity. This was the ONLY hard-delete
             // path that skipped `unproject_memory_from_age` (delete / forget /
             // apply_remote_deletion / consolidate / run_gc / size_gc all call

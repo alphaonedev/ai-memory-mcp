@@ -110,42 +110,36 @@ if [ ! -f "$FED_KEY_DIR/$FED_IDENTITY.priv" ]; then
     --key-dir "$FED_KEY_DIR" --agent-id "$FED_IDENTITY" --json
 fi
 
-# #845: optional api_key when AI_MEMORY_API_KEY is set. NOTE the
+# #845 / #3197: optional api_key when AI_MEMORY_API_KEY is set. NOTE the
 # substrate error message says "set [api] api_key" but the actual
-# AppConfig schema (src/config.rs:2283) has `api_key` as a TOP-LEVEL
+# AppConfig schema (src/config.rs) has `api_key` as a TOP-LEVEL
 # Option<String> field — NOT inside an [api] section. Serde silently
 # ignores unknown top-level subsections like [api], so the daemon
 # sees api_key=None and the S5-C1 guard refuses to bind 0.0.0.0.
 # Error-message drift filed as a separate sub-defect.
-API_KEY_TOML=""
-if [ -n "${AI_MEMORY_API_KEY:-}" ]; then
-  API_KEY_TOML="api_key = \"${AI_MEMORY_API_KEY}\""
-fi
+#
+# #3197 — do NOT interpolate the secret (or any other value) raw into
+# the heredoc. A trailing newline (docker-secret artefact), `"`, or `\`
+# produced invalid TOML; AppConfig::load_from then fail-opened to
+# defaults (api_key absent, append_only/require_operator_pubkey false,
+# fresh ./ai-memory.db). Render through config-emit.sh (TOML basic-
+# string escape + trailing-newline strip + control-char refuse) and
+# validate with `ai-memory config check` (exit 3 = invalid TOML, does
+# not echo the file — so the secret cannot leak into container logs).
+# shellcheck source=infra/plan-c/config-emit.sh
+# shellcheck disable=SC1091
+. /usr/local/lib/ai-memory/config-emit.sh
 
-# config.toml — top-level fields per AppConfig (see src/config.rs line 1433).
-# Sections [memory], [autonomous], [governance], [federation] are NOT valid
-# AppConfig keys — serde silently ignores them, falling through to defaults.
+# config.toml — top-level fields per AppConfig. Sections [memory],
+# [autonomous], [governance], [federation] are NOT valid AppConfig
+# keys — serde silently ignores them, falling through to defaults.
 # Federation comes from CLI flags below. Plan C uses autonomous tier:
 # Gemma 4 LLM + nomic-embed-text 768-dim embedder via Ollama + cross-encoder.
-cat >/root/.config/ai-memory/config.toml <<TOML
-tier = "${TIER}"
-ollama_url = "${OLLAMA_BASE_URL}"
-embed_url = "${OLLAMA_BASE_URL}"
-embedding_model = "nomic_embed_v15"
-llm_model = "${LLM_MODEL}"
-auto_tag_model = "${AUTO_TAG_MODEL}"
-cross_encoder = true
-${API_KEY_TOML}
-
-[audit]
-enabled = true
-path = "/var/log/ai-memory/audit"
-redact_content = true
-hash_chain = true
-
-[permissions]
-mode = "enforce"
-TOML
+plan_c_render_config >/root/.config/ai-memory/config.toml
+if ! /usr/local/bin/ai-memory config check --file /root/.config/ai-memory/config.toml; then
+  echo "ERROR: generated config.toml is not valid TOML; refusing to exec (#3197)" >&2
+  exit "${PLAN_C_EX_CONFIG:-78}"
+fi
 mkdir -p /etc/ai-memory
 cp /root/.config/ai-memory/config.toml /etc/ai-memory/config.toml
 

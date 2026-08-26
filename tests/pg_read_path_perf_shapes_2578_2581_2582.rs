@@ -62,6 +62,7 @@ fn seed_memory(
     title: String,
     content: String,
     priority: i32,
+    owner: &str,
 ) -> ai_memory::models::Memory {
     let now = chrono::Utc::now().to_rfc3339();
     ai_memory::models::Memory {
@@ -79,7 +80,7 @@ fn seed_memory(
         updated_at: now,
         last_accessed_at: None,
         expires_at: None,
-        metadata: serde_json::json!({"agent_id": "perf-probe", "scope": "collective"}),
+        metadata: serde_json::json!({"agent_id": owner, "scope": "collective"}),
         reflection_depth: 0,
         memory_kind: ai_memory::models::MemoryKind::Observation,
         entity_id: None,
@@ -219,6 +220,7 @@ async fn v88_namespace_scoped_list_plan_has_no_sort_node_2578() {
             format!("perf2578 title {i} {ns}"),
             format!("perf2578 body {i}"),
             (i % 10) + 1,
+            "perf-2578-probe",
         );
         store.store(&ctx, &m).await.expect("seed row");
     }
@@ -278,13 +280,38 @@ async fn ledger_batch_preserves_first_wins_on_intra_batch_duplicate_2581() {
     };
     let pool = store.pool();
     let recall_id = format!("perf2581-{}", uuid::Uuid::new_v4());
+    // Live rows: `recall_observations.memory_id` FKs to `memories` on the
+    // certified pg stack (f1 macos-fed). Synthetic ids like `mem-alpha`
+    // violate that FK. Seed two real memories and use their ids.
+    let ctx = CallerContext::for_agent("perf-2581-probe");
+    let ns = format!("perf2581-{}", uuid::Uuid::new_v4());
+    let alpha_id = store
+        .store(
+            &ctx,
+            &seed_memory(
+                &ns,
+                "alpha".into(),
+                "alpha body".into(),
+                5,
+                "perf-2581-probe",
+            ),
+        )
+        .await
+        .expect("seed alpha");
+    let beta_id = store
+        .store(
+            &ctx,
+            &seed_memory(&ns, "beta".into(), "beta body".into(), 5, "perf-2581-probe"),
+        )
+        .await
+        .expect("seed beta");
 
     // Candidate #1 and #3 are DISTINCT ids; #2 repeats #1's id with different
     // rank/score/retriever so first-wins is observable in the stored row.
     let candidates = vec![
-        ("mem-alpha".to_string(), "fts".to_string(), 1_i64, 1.5_f64),
-        ("mem-alpha".to_string(), "hnsw".to_string(), 2_i64, 9.9_f64),
-        ("mem-beta".to_string(), "fts".to_string(), 3_i64, 3.5_f64),
+        (alpha_id.clone(), "fts".to_string(), 1_i64, 1.5_f64),
+        (alpha_id.clone(), "hnsw".to_string(), 2_i64, 9.9_f64),
+        (beta_id.clone(), "fts".to_string(), 3_i64, 3.5_f64),
     ];
 
     let written = store
@@ -308,8 +335,10 @@ async fn ledger_batch_preserves_first_wins_on_intra_batch_duplicate_2581() {
     .expect("read back ledger");
     assert_eq!(rows.len(), 2, "#2581: exactly two ledger rows expected");
 
-    let alpha = &rows[0];
-    assert_eq!(alpha.get::<String, _>("memory_id"), "mem-alpha");
+    let alpha = rows
+        .iter()
+        .find(|r| r.get::<String, _>("memory_id") == alpha_id)
+        .expect("alpha ledger row");
     assert_eq!(
         alpha.get::<String, _>("retriever"),
         "fts",
@@ -394,6 +423,7 @@ async fn find_paths_returns_correct_paths_via_cte_2582() {
             format!("perf2582 node {i} {ns}"),
             format!("perf2582 body {i}"),
             5,
+            "perf-2582-probe",
         );
         ids.push(store.store(&ctx, &m).await.expect("seed node"));
     }

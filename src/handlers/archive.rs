@@ -534,9 +534,21 @@ pub async fn archive_by_ids(
     // consistency should poll peers.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // QC P1 fix (2026-05-20): use the resolved `caller` (header)
-        // so the SAL #910 visibility filter applies — archive ops
-        // can only touch memories owned by the caller.
+        // QC P1 fix (2026-05-20): use the resolved `caller` (header) as
+        // the SAL context.
+        //
+        // #3193 (SECURITY-high, 2026-08-22) — the comment that stood here
+        // claimed "the SAL #910 visibility filter applies — archive ops can
+        // only touch memories owned by the caller". That was FALSE for the
+        // whole life of this branch: `PostgresStore::archive_by_ids`
+        // discarded its `_ctx` outright and its INSERT..SELECT matched on
+        // `WHERE id = $3` with no owner predicate, so #910 (a READ-path
+        // visibility filter) never ran here at all and any authenticated
+        // tenant could bulk soft-delete another tenant's live rows. The
+        // owner gate now lives in the SAL funnel itself
+        // (`assert_caller_owns_for_mutation_on`, inside the batch tx), which
+        // is where every surface — HTTP, MCP, CLI, future callers —
+        // inherits it uniformly. This ctx is what that gate evaluates.
         let ctx = crate::store::CallerContext::for_agent(caller.clone());
         // Run per-id so we can split archived vs missing — the trait
         // method bulk-archives but doesn't tell us which were missing,
@@ -549,6 +561,27 @@ pub async fn archive_by_ids(
             {
                 Ok(1) => archived.push(id.clone()),
                 Ok(_) => missing.push(id.clone()),
+                // #3193 — WIRE PARITY with the sqlite branch below, which
+                // reports a non-owned (or unstamped-and-refused) id in
+                // `missing` rather than 403-ing the whole batch. Two
+                // reasons, both load-bearing:
+                //   * a 403 that fires only for ids that EXIST and are owned
+                //     by someone else is an existence oracle over other
+                //     tenants' live ids — precisely what the sqlite branch's
+                //     #940 comment says it refuses to build;
+                //   * a per-id refusal must not abort the caller's whole
+                //     batch, since the ids the caller DOES own archived
+                //     successfully in their own transactions.
+                // `NotFound` is the same disposition for the same reason
+                // (it can only arrive from a row that vanished between the
+                // existence probe and the gate). Every other StoreError
+                // still surfaces as its typed HTTP response.
+                Err(
+                    crate::store::StoreError::PermissionDenied { .. }
+                    | crate::store::StoreError::NotFound { .. },
+                ) => {
+                    missing.push(id.clone());
+                }
                 Err(e) => return store_err_to_response(e),
             }
         }
@@ -598,9 +631,10 @@ pub async fn archive_by_ids(
         // `db::archive_memory(&lock.0, id, ...)` and any authenticated
         // HTTP caller could bulk-archive any other owner's live rows
         // (cross-tenant denial-of-service primitive). The postgres SAL
-        // branch above was already QC-P1-fixed (2026-05-20) to pass
-        // `CallerContext::for_agent(caller)`; this routes the sqlite
-        // branch through the caller-scoped variant for parity. A
+        // branch above passes `CallerContext::for_agent(caller)`, but until
+        // #3193 the postgres adapter DISCARDED that ctx — so the two
+        // branches were not at parity at all; this one has been gated since
+        // #940 and the other was gated only from #3193. A
         // non-owner id surfaces in `missing` (same semantics as a row
         // that wasn't live locally) so the surface cannot be used to
         // probe other owners' live ids.

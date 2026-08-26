@@ -40,17 +40,70 @@ fn log_catchup_unparseable_memory(peer_id: &str, e: impl std::fmt::Display) {
     tracing::warn!("catchup: unparseable memory from peer {peer_id}: {e}");
 }
 
+fn log_catchup_ns_probe_failed(peer_id: &str, memory_id: &str, e: impl std::fmt::Display) {
+    tracing::warn!(
+        target: crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET,
+        memory_id = %memory_id,
+        "catchup: namespace-scope pre-resolve failed for {memory_id} from peer {peer_id}: {e}; \
+         refusing the write (#3195 fail-closed, halt watermark — transient probe error)"
+    );
+}
+
+/// #3195 — apply a stored-namespace probe result.
+/// `Ok` proceeds. `Err` is transient: skip the row AND halt the watermark
+/// so the next tick re-pulls. Scope *refusal* is a different path
+/// (`continue` without setting `catchup_halted`).
+fn catchup_take_ns_probe<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    peer_id: &str,
+    memory_id: &str,
+    catchup_halted: &mut bool,
+) -> Option<T> {
+    match result {
+        Ok(v) => Some(v),
+        Err(e) => {
+            log_catchup_ns_probe_failed(peer_id, memory_id, e);
+            *catchup_halted = true;
+            None
+        }
+    }
+}
+
+/// #3195 — sqlite stored-namespace probe for the catch-up Layer-1 gate.
+/// `Ok(None)` means the read was elided OR there is provably no live row.
+/// `Err` is UNRESOLVABLE: the caller MUST skip AND halt the watermark.
+fn catchup_probe_existing_ns_sqlite(
+    conn: &rusqlite::Connection,
+    memory_id: &str,
+    needs: bool,
+) -> anyhow::Result<Option<String>> {
+    if !needs {
+        return Ok(None);
+    }
+    crate::db::namespace_by_id(conn, memory_id)
+}
+
 fn log_catchup_sync_state_observe_failed(peer_id: &str, e: impl std::fmt::Display) {
     tracing::warn!("catchup: sync_state_observe failed for {peer_id}: {e}");
 }
 
-/// Gate 1 / #2480 — may this catchup-pulled memory be applied from `peer_id`?
+/// Gate 1 / #2480 / #3195 — may this catchup-pulled memory be applied from `peer_id`?
 ///
 /// Admin `CallerContext` bypasses SAL *visibility* so the peer snapshot can
 /// round-trip; it must **not** bypass `AI_MEMORY_FED_PEER_ATTESTATION` namespace
 /// scope. Accept-scope reuses the same operator-authored `allowed_namespaces`
-/// as push (bidirectional decision: one list, both directions). Shared choke
-/// with `/sync/push` `memories[]` so dispositions cannot fork.
+/// as push (bidirectional decision: one list, both directions).
+///
+/// Shared choke with `/sync/push` `memories[]` so dispositions cannot fork.
+/// Pre-#3195 this helper hardcoded `existing_namespace: None`, so the
+/// Layer-1 stored-namespace probe the push lane runs fail-closed
+/// (`federation_receive.rs` `#2447`) was structurally absent on PULL —
+/// a `public/*`-scoped peer could relocate/clobber an out-of-scope
+/// `secure/ops` row by serving its id under an in-scope claimed
+/// namespace. Callers MUST pass the stored namespace when
+/// [`inbound_write_needs_existing_namespace`] is true, and `None` only
+/// when that predicate elides the read (zero-config / no declared
+/// scope — ZERO extra reads).
 ///
 /// Zero-config (`!has_allowlist`) short-circuits inside the helper to true.
 #[must_use]
@@ -59,12 +112,13 @@ fn catchup_memory_namespace_authorized(
     require_push_ns_scope: bool,
     peer_id: &str,
     mem: &crate::models::Memory,
+    existing_namespace: Option<&str>,
 ) -> bool {
     crate::federation::receive_auth::inbound_write_namespace_authorized(
         crate::federation::receive_auth::LANE_MEMORIES,
         &mem.id,
         &mem.namespace,
-        None,
+        existing_namespace,
         attest_cfg,
         Some(peer_id),
         require_push_ns_scope,
@@ -429,6 +483,14 @@ pub(super) async fn catchup_once_with_store(
         let attest_cfg = crate::federation::peer_attestation::PeerAttestationConfig::from_env();
         let require_push_ns_scope =
             crate::federation::receive_auth::require_push_namespace_scope_enabled();
+        // #3195 — elide the stored-namespace probe unless Layer 1 is
+        // armed for this peer (same predicate the push lane uses).
+        // Zero-config stays at ZERO extra reads.
+        let ns_scope_needs_existing =
+            crate::federation::receive_auth::inbound_write_needs_existing_namespace(
+                Some(peer.id.as_str()),
+                &attest_cfg,
+            );
 
         // v0.7.0 M3 — when a SAL store handle is supplied (postgres-
         // backed daemons) we dispatch each row through
@@ -456,11 +518,32 @@ pub(super) async fn catchup_once_with_store(
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
                 }
+                // #3195 — SAL stored-namespace probe. Admin ctx is already
+                // in scope (visibility bypass, NOT a namespace-scope
+                // bypass); `namespace_by_id` is the SCALAR projection so
+                // an unopenable at-rest envelope cannot brick the row
+                // (#2488 decrypt trap). Probe error is TRANSIENT → skip
+                // AND halt so the row is re-pulled. A scope REFUSAL
+                // below is PERMANENT → skip without halt.
+                let existing_ns = if ns_scope_needs_existing {
+                    match catchup_take_ns_probe(
+                        store.namespace_by_id(&ctx, &mem.id).await,
+                        &peer.id,
+                        &mem.id,
+                        &mut catchup_halted,
+                    ) {
+                        Some(ns) => ns,
+                        None => continue,
+                    }
+                } else {
+                    None
+                };
                 if !catchup_memory_namespace_authorized(
                     &attest_cfg,
                     require_push_ns_scope,
                     peer.id.as_str(),
                     &mem,
+                    existing_ns.as_deref(),
                 ) {
                     continue;
                 }
@@ -521,11 +604,24 @@ pub(super) async fn catchup_once_with_store(
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
                 }
+                // #3195 — sqlite stored-namespace probe (legacy
+                // `db::insert_if_newer` branch). Same halt-vs-skip
+                // disposition as the SAL twin.
+                let existing_ns = match catchup_take_ns_probe(
+                    catchup_probe_existing_ns_sqlite(&lock.0, &mem.id, ns_scope_needs_existing),
+                    &peer.id,
+                    &mem.id,
+                    &mut catchup_halted,
+                ) {
+                    Some(ns) => ns,
+                    None => continue,
+                };
                 if !catchup_memory_namespace_authorized(
                     &attest_cfg,
                     require_push_ns_scope,
                     peer.id.as_str(),
                     &mem,
+                    existing_ns.as_deref(),
                 ) {
                     continue;
                 }
@@ -661,6 +757,11 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         let attest_cfg = crate::federation::peer_attestation::PeerAttestationConfig::from_env();
         let require_push_ns_scope =
             crate::federation::receive_auth::require_push_namespace_scope_enabled();
+        let ns_scope_needs_existing =
+            crate::federation::receive_auth::inbound_write_needs_existing_namespace(
+                Some(peer.id.as_str()),
+                &attest_cfg,
+            );
         {
             let lock = db.lock().await;
             for raw in &memories {
@@ -674,11 +775,24 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
                 }
+                // #3195 — no-sal catchup_once_legacy twin of the sqlite
+                // probe in `catchup_once_with_store`. Without this, the
+                // default (no-sal) CI clippy leg ships an ungated PULL.
+                let existing_ns = match catchup_take_ns_probe(
+                    catchup_probe_existing_ns_sqlite(&lock.0, &mem.id, ns_scope_needs_existing),
+                    &peer.id,
+                    &mem.id,
+                    &mut catchup_halted,
+                ) {
+                    Some(ns) => ns,
+                    None => continue,
+                };
                 if !catchup_memory_namespace_authorized(
                     &attest_cfg,
                     require_push_ns_scope,
                     peer.id.as_str(),
                     &mem,
+                    existing_ns.as_deref(),
                 ) {
                     continue;
                 }
@@ -831,7 +945,7 @@ pub(super) fn urlencoding_encode(s: &str) -> String {
 mod issue_2480_tests {
     //! #2480 — catchup PULL must refuse out-of-scope namespaces under enrolled
     //! allowlist (admin visibility bypass is not a namespace-scope bypass).
-    use super::catchup_memory_namespace_authorized;
+    use super::{catchup_memory_namespace_authorized, catchup_take_ns_probe};
     use crate::federation::peer_attestation::{PeerAttestationConfig, PeerScope};
     use crate::models::Memory;
 
@@ -850,7 +964,7 @@ mod issue_2480_tests {
     fn zero_config_accepts_any_namespace_2480() {
         let cfg = PeerAttestationConfig::default();
         assert!(
-            catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("secure/ops")),
+            catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("secure/ops"), None),
             "zero-config must stay byte-identical faith pull"
         );
     }
@@ -866,13 +980,64 @@ mod issue_2480_tests {
             },
         );
         assert!(
-            catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("public/ok")),
+            catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("public/ok"), None),
             "in-scope pull accepted"
         );
         assert!(
-            !catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("secure/ops")),
+            !catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("secure/ops"), None),
             "#2480: out-of-scope catchup row must be refused"
         );
+    }
+
+    #[test]
+    fn stored_namespace_out_of_scope_refuses_claimed_in_scope_3195() {
+        // #3195 — the merge-clobber variant: claimed namespace is in
+        // scope (`public/x`) but the LIVE row is `secure/ops`. The
+        // push lane refuses this; catch-up must too.
+        let mut cfg = PeerAttestationConfig::default();
+        cfg.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec![],
+                allowed_namespaces: vec!["public/*".to_string()],
+            },
+        );
+        let claimed_in_scope = mem("public/x");
+        assert!(
+            catchup_memory_namespace_authorized(&cfg, true, "peer-1", &claimed_in_scope, None),
+            "claimed-only (no stored row) in-scope still accepted"
+        );
+        assert!(
+            !catchup_memory_namespace_authorized(
+                &cfg,
+                true,
+                "peer-1",
+                &claimed_in_scope,
+                Some("secure/ops")
+            ),
+            "#3195: stored out-of-scope namespace must refuse even when claimed is in-scope"
+        );
+    }
+
+    #[test]
+    fn probe_error_halts_watermark_3195() {
+        // Probe Err is transient → skip AND halt so the row is re-pulled.
+        // A scope refusal is a different path (no halt); this pins the
+        // helper both SAL and sqlite catch-up branches now share.
+        let mut halted = false;
+        let probe_err: Result<Option<String>, &str> = Err("io timeout");
+        assert!(
+            catchup_take_ns_probe(probe_err, "peer-1", "mem-1", &mut halted).is_none(),
+            "probe Err must skip the row"
+        );
+        assert!(halted, "probe Err must halt the watermark");
+        halted = false;
+        let probe_ok: Result<Option<String>, &str> = Ok(Some("secure/ops".to_string()));
+        assert_eq!(
+            catchup_take_ns_probe(probe_ok, "peer-1", "mem-1", &mut halted),
+            Some(Some("secure/ops".to_string()))
+        );
+        assert!(!halted, "Ok probe must not halt");
     }
 }
 

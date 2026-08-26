@@ -363,8 +363,12 @@ async fn g4_unsigned_http_link_projects_into_age() {
         .await
         .expect("in-process HTTP daemon never bound");
 
-    // v1.0.0 #3140 — bounded: `reqwest::Client::new()` has no request timeout.
-    let client = common::bounded_test_client();
+    // #3194 — store and link as the same principal. A headerless client
+    // used to 201 because PostgresStore::link discarded ctx; it now
+    // 403s when the HTTP store stamps a different owner than
+    // `http_caller_ctx` (no X-Agent-Id). Sibling G2/G4/G5 tests already
+    // pin X-Agent-Id on both verbs.
+    let client = common::pg_test_client("ai:g4-unsigned");
     let base = format!("http://{addr}");
     let suffix = uuid::Uuid::new_v4();
     let ns = format!("g4-unsigned-http-{suffix}");

@@ -941,6 +941,27 @@ at v0.7.x parse time — operators must use `api_key_env` or
 [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html) for the secret-handling
 discipline.
 
+### `config check` (v1.0.0 #3197)
+
+Parse-only TOML validation. Does **not** migrate, does **not** print
+the file (so a secret-bearing `api_key` cannot leak into logs), and
+does **not** run `AppConfig::load_from` (which fail-opens to
+defaults). Used by `entrypoint.plan-c.sh` after rendering so a
+malformed secret refuses `exec` instead of booting a keyless daemon.
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--file PATH` | path | resolved `~/.config/ai-memory/config.toml` | File to validate. |
+
+Exit codes: `0` valid TOML; `2` file not found; `3` not valid TOML
+(error line names the path only — never the toml crate's `Display`,
+which can echo the offending source); `4` unreadable.
+
+```bash
+ai-memory config check
+ai-memory config check --file /root/.config/ai-memory/config.toml
+```
+
 ## v0.7 feature-gated commands
 
 ### `migrate` (`--features sal`)
