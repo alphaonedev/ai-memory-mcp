@@ -324,11 +324,16 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<Vec<String>> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // #3163 / Fable #3237 item 6 — RAII `WriteTxn` (not a raw BEGIN
+        // execute_batch). Drop rolls back; a failed COMMIT leaves the
+        // guard armed so Drop cannot leave this shared writer inside an
+        // open tx.
         let owns_tx = conn.is_autocommit();
-        if owns_tx {
-            conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
-                .map_err(box_err)?;
-        }
+        let write_txn = if owns_tx {
+            Some(crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?)
+        } else {
+            None
+        };
         let batch = (|| -> anyhow::Result<Vec<String>> {
             let mut ids = Vec::with_capacity(memories.len());
             for memory in memories {
@@ -347,22 +352,14 @@ impl MemoryStore for SqliteStore {
         })();
         match batch {
             Ok(ids) => {
-                if owns_tx {
-                    conn.execute_batch(crate::storage::connection::SQL_COMMIT)
-                        .map_err(box_err)?;
+                if let Some(txn) = write_txn {
+                    txn.commit().map_err(box_err)?;
                 }
                 Ok(ids)
             }
             Err(e) => {
-                if owns_tx {
-                    // Surface a FAILED rollback: it means the batch's partial
-                    // rows may still be in an open transaction on this
-                    // connection, which is the one state that would break the
-                    // all-or-nothing contract above. Follows the
-                    // `db::touch` / `db::touch_batch` precedent.
-                    if let Err(rb) = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK) {
-                        tracing::error!("ROLLBACK failed in store_batch: {rb}");
-                    }
+                if let Some(txn) = write_txn {
+                    txn.rollback();
                 }
                 Err(box_err(e))
             }

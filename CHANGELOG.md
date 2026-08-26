@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **#3204 item 3 invalidate substitute stamp is microsecond-truncated**
   on sqlite `invalidate_link` and pg `kg_invalidate_{cte,cypher}` when
   `valid_until` is omitted.
+- **#3163 / Fable item 6 — `SqliteStore::store_batch` uses RAII `WriteTxn`.**
+  Raw `BEGIN IMMEDIATE` execute_batch was outside the #3163 allow-list and
+  swallowed a failed ROLLBACK. Drop of the guard now rolls back; a failed
+  COMMIT stays armed.
 
 ### Security (silent-default cluster Fable follow-up — #3242)
 
