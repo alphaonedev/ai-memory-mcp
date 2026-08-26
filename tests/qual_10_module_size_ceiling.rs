@@ -1088,7 +1088,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // that arrives through a clean auto-merge is UNVERIFIED — always
     // re-measure the merged file), so 33_150 carries the same modest headroom
     // as the neighbouring bumps.
-    ("src/store/postgres.rs", 36_400), /* 2026-08-25 (#3243 rebase onto #3252): never lower the 36_400 floor. Authz catch-up stacked on search SSOT. Re-measure after full rebase. PRIOR: 2026-08-25 (#3252 rebase onto #3253): never lower the 36_400 floor. */
+    ("src/store/postgres.rs", 36_600), /* 2026-08-26 (#3243 Fable items 1/2/4): inbox-target arm + FOR UPDATE owner probe + owner-predicated archive INSERT/DELETE. Never lower the 36_400 floor. PRIOR: 2026-08-25 (#3243 rebase onto #3252): never lower the 36_400 floor. */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

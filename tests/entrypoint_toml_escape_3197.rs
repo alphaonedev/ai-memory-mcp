@@ -113,6 +113,23 @@ fn render_with_key(key: &str) -> (i32, String, String) {
 }
 
 #[test]
+fn config_emit_does_not_pass_api_key_via_argv_3197() {
+    let body = fs::read_to_string(config_emit_path()).expect("read config-emit.sh");
+    assert!(
+        !body.contains("raw = sys.argv[1]"),
+        "Fable #3243 item 3: API key must not be python argv (visible in /proc/pid/cmdline)"
+    );
+    assert!(
+        !body.contains("plan_c_normalize_api_key \"${AI_MEMORY_API_KEY}\""),
+        "must not pass AI_MEMORY_API_KEY as a helper argument"
+    );
+    assert!(
+        body.contains("os.environ.get(\"AI_MEMORY_API_KEY\""),
+        "normaliser must read the key from the inherited environment"
+    );
+}
+
+#[test]
 fn config_emit_escapes_quote_and_backslash_3197() {
     let (code, body, err) = render_with_key(r#"say "hi"\path"#);
     assert_eq!(code, 0, "render must succeed, stderr={err}");

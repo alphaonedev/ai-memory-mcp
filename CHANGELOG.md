@@ -95,7 +95,9 @@ had silently dropped.
   `POST /api/v1/archive` (links cascaded). The sqlite HTTP branch has
   refused since #940. The SAL method now runs
   `assert_caller_owns_for_mutation_on` **inside the batch transaction**
-  (closes a re-own TOCTOU against a pool-borrowed probe). Unstamped
+  with `FOR UPDATE` + an inbox-target arm (sqlite #940 parity) and
+  owner/inbox predicates on the INSERT…SELECT and DELETE (closes a
+  re-own TOCTOU against a pool-borrowed probe). Unstamped
   rows REFUSE on postgres (#3124 policy; the row stays live). The
   handler maps per-id `PermissionDenied`/`NotFound` to `missing` so
   the response is not an existence oracle over other tenants' ids.
@@ -104,7 +106,8 @@ had silently dropped.
 - **#3194 — `PostgresStore::link` / `link_signed` discarded ctx and
   evaluated K9 as the daemon keypair.** `validate_link_pre_create_pg`
   now folds source `agent_id` / `target_agent_id` into the existing
-  namespace SELECT and applies the sqlite #941 four-way predicate
+  namespace SELECT (`FOR UPDATE` on the write tx, opened before the
+  owner probe) and applies the sqlite #941 four-way predicate
   (owner / inbox-target / empty-legacy / daemon). K9
   `evaluate_link_permission` uses `ctx.effective_principal()` for
   tenant writes; `bypass_visibility` keeps the prior
@@ -130,7 +133,9 @@ had silently dropped.
   `require_operator_pubkey=false`, fresh `./ai-memory.db`). Render
   now goes through `infra/plan-c/config-emit.sh` (TOML basic-string
   escape, trailing-newline strip with WARN, EX_CONFIG 78 on any
-  other control character) and `ai-memory config check --file`
+  other control character; the key is read from the inherited
+  environment, never python argv / `/proc/<pid>/cmdline`) and
+  `ai-memory config check --file`
   (parse-only; never echoes the file, never fail-opens) before
   `exec`. Does **not** bump `EXPECTED_CLI_SUBCOMMANDS_*` — `Check` is
   a sub-verb of the existing `Config` command.

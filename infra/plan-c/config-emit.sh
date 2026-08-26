@@ -50,9 +50,13 @@ sys.stdout.write("".join(out))
 # to empty. Prints the normalised key to stdout; warns on stderr when
 # a trailing newline was stripped.
 plan_c_normalize_api_key() {
+  # Read the key from the environment, NEVER argv: `python3 -c … "$KEY"`
+  # would expose it in `/proc/<pid>/cmdline` (Fable #3243 item 3; same
+  # non-argv channel as the #3217 capability probe). The shell already
+  # holds `AI_MEMORY_API_KEY`; the child inherits it.
   python3 -c '
-import sys
-raw = sys.argv[1]
+import os, sys
+raw = os.environ.get("AI_MEMORY_API_KEY", "")
 stripped = raw.rstrip("\n")
 if stripped != raw:
     sys.stderr.write(
@@ -74,7 +78,7 @@ for ch in stripped:
         )
         sys.exit(78)
 sys.stdout.write(stripped)
-' "${1}"
+'
 }
 
 # Print the Plan C config.toml document to stdout. Reads TIER,
@@ -88,7 +92,7 @@ plan_c_render_config() {
   auto_tag=$(printf '%s' "${AUTO_TAG_MODEL}" | toml_escape_basic)
   if [ -n "${AI_MEMORY_API_KEY:-}" ]; then
     local normalised escaped
-    normalised=$(plan_c_normalize_api_key "${AI_MEMORY_API_KEY}") || return "${PLAN_C_EX_CONFIG}"
+    normalised=$(plan_c_normalize_api_key) || return "${PLAN_C_EX_CONFIG}"
     escaped=$(printf '%s' "${normalised}" | toml_escape_basic)
     api_key_line="api_key = \"${escaped}\""
   fi

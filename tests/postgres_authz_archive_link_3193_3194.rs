@@ -84,6 +84,13 @@ fn related_link(source_id: &str, target_id: &str) -> MemoryLink {
     }
 }
 
+struct RestoreK9Rules;
+impl Drop for RestoreK9Rules {
+    fn drop(&mut self) {
+        ai_memory::permissions::clear_active_permission_rules_for_test();
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // #3193 — PostgresStore::archive_by_ids owner gate
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,6 +241,33 @@ async fn postgres_archive_by_ids_unknown_id_is_silent_zero_3193() {
         .await
         .expect("missing id is a silent continue, not PermissionDenied (no existence oracle)");
     assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn postgres_archive_by_ids_inbox_target_carve_out_3193() {
+    let Some(store) = maybe_open().await else {
+        return;
+    };
+    let alice = "ai:3193-alice-inbox-src";
+    let bob = "ai:3193-bob-inbox-target";
+    let mut mem = seed_mem_owned_by(alice, "ns-3193-inb", "inbox-archive");
+    mem.metadata = serde_json::json!({
+        "agent_id": alice,
+        "target_agent_id": bob,
+    });
+    let id = store
+        .store(&CallerContext::for_agent(alice), &mem)
+        .await
+        .expect("seed inbox row");
+    let n = store
+        .archive_by_ids(
+            &CallerContext::for_agent(bob),
+            std::slice::from_ref(&id),
+            Some("inbox-3193"),
+        )
+        .await
+        .expect("inbox-target carve-out: bob may archive a row addressed to him");
+    assert_eq!(n, 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -413,4 +447,46 @@ async fn postgres_link_admin_bypass_skips_owner_gate_3194() {
         )
         .await
         .expect("admin bypass must skip the source-owner gate");
+}
+
+#[tokio::test]
+async fn postgres_link_k9_denies_based_on_the_caller_3194() {
+    // #3194 acceptance: "Deny on the namespace refuses based on the CALLER"
+    // (not the daemon keypair). Pre-fix K9 evaluated as keypair-or-"system".
+    let Some(store) = maybe_open().await else {
+        return;
+    };
+    let alice = "ai:3194-k9-caller-pin";
+    let ns = "ns-3194-k9-caller";
+    ai_memory::config::set_active_permissions_mode(ai_memory::config::PermissionsMode::Enforce);
+    ai_memory::permissions::set_active_permission_rules(vec![
+        ai_memory::permissions::PermissionRule {
+            namespace_pattern: ns.to_string(),
+            op: "memory_link".to_string(),
+            agent_pattern: alice.to_string(),
+            decision: ai_memory::permissions::RuleDecision::Deny,
+            reason: Some("k9 caller pin 3194".to_string()),
+        },
+    ]);
+    let _restore = RestoreK9Rules;
+    let ctx = CallerContext::for_agent(alice);
+    let src = seed_mem_owned_by(alice, ns, "k9-src");
+    let dst = seed_mem_owned_by(alice, ns, "k9-dst");
+    let src_id = store.store(&ctx, &src).await.expect("seed src");
+    let dst_id = store.store(&ctx, &dst).await.expect("seed dst");
+    let err = store
+        .link(&ctx, &related_link(&src_id, &dst_id))
+        .await
+        .expect_err("owner-match link must still refuse when K9 denies the CALLER");
+    match err {
+        StoreError::PermissionDenied { action, reason, .. } => {
+            assert_eq!(action, "memory_link");
+            assert!(
+                reason.contains(ai_memory::storage::LINK_PERMISSION_DENIED_ERR_PREFIX)
+                    || reason.contains("k9 caller pin 3194"),
+                "K9 deny must surface the permission-rule envelope, got: {reason:?}"
+            );
+        }
+        other => panic!("expected PermissionDenied from K9, got: {other:?}"),
+    }
 }
