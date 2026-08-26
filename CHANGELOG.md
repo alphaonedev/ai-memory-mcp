@@ -58,6 +58,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Raw `BEGIN IMMEDIATE` execute_batch was outside the #3163 allow-list and
   swallowed a failed ROLLBACK. Drop of the guard now rolls back; a failed
   COMMIT stays armed.
+- **Fable item 4 — MCP `memory_reflect` scopes source reads** via
+  `reflect_with_hooks_for_caller(Some(enforced agent_id))`. The unscoped
+  wrapper let a tenant pull another agent's private source.
+- **Fable item 5 — `clear_namespace_standard` owner read + DELETE** run in
+  one sqlite `WriteTxn` / one pg transaction (TOCTOU).
+- **Fable item 7 — `store_with_embedding_no_overwrite` persists a supplied
+  vector** (`db::set_embedding`) instead of dropping it. `None` still means
+  HTTP create's out-of-band write.
+- **Fable item 8 — `set_embeddings_batch` namespace lookup** propagates
+  rusqlite errors; only `QueryReturnedNoRows` skips the dim check.
 
 ### Security (silent-default cluster Fable follow-up — #3242)
 

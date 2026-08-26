@@ -373,19 +373,19 @@ impl MemoryStore for SqliteStore {
     /// but refuses a `(title, namespace)` collision atomically instead of
     /// upsert-merging. A collision surfaces as the legacy
     /// `crate::storage::ConflictError`, mapped here to the typed
-    /// [`StoreError::Conflict`] carrying the existing row's id. The `embedding`
-    /// is written separately by the HTTP create handler after this returns,
-    /// so it is deliberately ignored here. v1.0.0 #2638 — that out-of-band
-    /// write is exactly why this adapter does NOT implement
-    /// [`MemoryStore::store_with_embedding`]: a method whose contract is
-    /// "persist the row AND its vector" must refuse rather than accept the
-    /// vector and drop it.
+    /// [`StoreError::Conflict`] carrying the existing row's id. HTTP create
+    /// still writes the vector out-of-band (`None` here). Fable #3237 item 7
+    /// — a SAL caller that DOES pass a vector gets it persisted via
+    /// `db::set_embedding` (refused without a space stamp). This adapter
+    /// still does NOT implement [`MemoryStore::store_with_embedding`]: that
+    /// method's contract is a single inline write postgres has and sqlite
+    /// does not.
     async fn store_with_embedding_no_overwrite(
         &self,
         ctx: &CallerContext,
         memory: &Memory,
-        _embedding: Option<&[f32]>,
-        _space: Option<&str>,
+        embedding: Option<&[f32]>,
+        space: Option<&str>,
     ) -> StoreResult<String> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
@@ -395,13 +395,29 @@ impl MemoryStore for SqliteStore {
             },
             None => box_err(e),
         };
-        if ctx.bypass_visibility {
+        let id = if ctx.bypass_visibility {
             let mut stamped = memory.clone();
             crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
-            db::insert_no_overwrite(&conn, &stamped).map_err(map_err)
+            db::insert_no_overwrite(&conn, &stamped).map_err(map_err)?
         } else {
-            db::insert_no_overwrite(&conn, memory).map_err(map_err)
+            db::insert_no_overwrite(&conn, memory).map_err(map_err)?
+        };
+        // Fable #3237 item 7 — persist a supplied vector. Pre-fix the
+        // argument was `_embedding` and dropped (HTTP create writes
+        // out-of-band). A SAL caller that reaches this method with a
+        // vector must not get SUCCESS without a durable embedding.
+        if let Some(vec) = embedding.filter(|v| !v.is_empty()) {
+            let space =
+                space
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| StoreError::InvalidInput {
+                        detail:
+                            "store_with_embedding_no_overwrite: embedding requires a space stamp"
+                                .into(),
+                    })?;
+            db::set_embedding(&conn, &id, vec, space).map_err(map_err)?;
         }
+        Ok(id)
     }
 
     /// v1.0.0 #2887 — RESTORE-SAFE atomic re-store for the reversible rollback
@@ -1448,6 +1464,10 @@ impl MemoryStore for SqliteStore {
         // (both yield the unquoted scalar as text, NULL-preserving) so a
         // non-string `agent_id` cannot become a hard decode error on one
         // backend and a value on the other.
+        // Fable #3237 item 5 — owner read + DELETE in ONE WriteTxn so a
+        // concurrent SET cannot sneak a foreign standard in between the
+        // check and the act (TOCTOU).
+        let write_txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
         if !ctx.bypass_visibility {
             let meta_exists: bool = conn
                 .query_row(
@@ -1478,7 +1498,9 @@ impl MemoryStore for SqliteStore {
             };
             crate::store::authorize_clear_namespace_standard(ctx, namespace, &binding)?;
         }
-        db::clear_namespace_standard(&conn, namespace).map_err(box_err)
+        let cleared = db::clear_namespace_standard(&conn, namespace).map_err(box_err)?;
+        write_txn.commit().map_err(box_err)?;
+        Ok(cleared)
     }
 
     async fn get_namespace_standard(

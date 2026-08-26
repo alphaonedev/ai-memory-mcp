@@ -16064,10 +16064,15 @@ pub fn set_embeddings_batch(
             if ns_by_id.contains_key(id) {
                 continue;
             }
-            let ns: Option<String> = stmt
-                .query_row(params![id], |r| r.get::<_, Option<String>>(0))
-                .ok()
-                .flatten();
+            // Fable #3237 item 8 — a lookup fault must not skip the
+            // per-namespace dim invariant (`.ok()` treated every error
+            // as "no namespace"). Missing row → None (update will
+            // affect 0); any other rusqlite error propagates.
+            let ns: Option<String> = match stmt.query_row(params![id], |r| r.get(0)) {
+                Ok(ns) => ns,
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            };
             ns_by_id.insert(id.clone(), ns);
         }
     }

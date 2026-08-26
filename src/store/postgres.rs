@@ -22110,12 +22110,18 @@ impl MemoryStore for PostgresStore {
         // (outer = row-presence, inner = agent_id NULL-ness) keeps the two
         // states separable, which is exactly what
         // `NamespaceStandardBinding` encodes.
+        // Fable #3237 item 5 — owner read + DELETE in ONE tx (TOCTOU).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("clear_namespace_standard begin", e))?;
         if !ctx.bypass_visibility {
             let meta_exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = $1)",
             )
             .bind(namespace)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| to_store_err("clear_namespace_standard meta-exists", e))?;
             let binding = if meta_exists {
@@ -22124,7 +22130,7 @@ impl MemoryStore for PostgresStore {
                      JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
                 )
                 .bind(namespace)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("clear_namespace_standard owner pre-fetch", e))?;
                 match owner_row {
@@ -22138,10 +22144,13 @@ impl MemoryStore for PostgresStore {
         }
         let rows_affected = sqlx::query("DELETE FROM namespace_meta WHERE namespace = $1")
             .bind(namespace)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err(crate::OP_CLEAR_NAMESPACE_STANDARD, e))?
             .rows_affected();
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("clear_namespace_standard commit", e))?;
         Ok(rows_affected > 0)
     }
 

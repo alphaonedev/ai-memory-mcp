@@ -557,7 +557,16 @@ pub fn handle_reflect(
         h.active_keypair = active_keypair;
         h
     };
-    let outcome = match db::reflect_with_hooks(conn, &input, &hooks) {
+    // #3176 / Fable #3237 item 4 — MCP is a TENANT write. The unscoped
+    // `reflect_with_hooks` (caller=None) let a tenant pull another
+    // agent's private source into a reflection. Scope the source read
+    // to the enforced governance subject (already bound above).
+    let outcome = match db::reflect_with_hooks_for_caller(
+        conn,
+        &input,
+        &hooks,
+        Some(input.agent_id.as_str()),
+    ) {
         Ok(o) => o,
         Err(e) => return Err(map_reflect_error_to_wire_string(e)),
     };
