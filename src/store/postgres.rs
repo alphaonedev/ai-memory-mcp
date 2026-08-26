@@ -10928,10 +10928,9 @@ impl PostgresStore {
             stored
                 .as_deref()
                 .and_then(crate::models::AttestLevel::from_str)
-                .map_or(
-                    crate::models::AttestLevel::Unsigned.as_str(),
-                    crate::models::AttestLevel::as_str,
-                )
+                .map_or(crate::models::AttestLevel::Unsigned.as_str(), |lvl| {
+                    lvl.as_str()
+                })
         } else {
             attest_level
         };
