@@ -3785,7 +3785,16 @@ mod tests {
             )
             .expect("raw metadata wipe");
         }
-        let report = store.verify(&ctx, &id).await.expect("verify");
+        // #910 / #1624 — tenant verify folds a now-invisible row to
+        // NotFound (empty owner vs named caller). The integrity finding
+        // is an admin/bypass scan; using the tenant ctx here returned
+        // NotFound and the SAL-only gate failed closed on that unwrap.
+        match store.verify(&ctx, &id).await {
+            Err(StoreError::NotFound { .. }) => {}
+            other => panic!("tenant verify after authorship wipe must be NotFound, got {other:?}"),
+        }
+        let admin = CallerContext::for_admin("test-verify-2106");
+        let report = store.verify(&admin, &id).await.expect("admin verify");
         assert!(!report.integrity_ok);
         assert!(
             report
