@@ -946,7 +946,7 @@ async fn sqlite_store_family_stamps_substrate_why_trace_for_system_2124() {
             assert_eq!(capability, "STORE_WITH_EMBEDDING");
         }
         Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
-        Ok(id) => panic!("sqlite store_with_embedding succeeded ({id}); it must refuse"),
+        Ok(landed) => panic!("sqlite store_with_embedding succeeded ({landed}); it must refuse"),
     }
 
     // store_with_embedding_no_overwrite — the sqlite create funnel that
@@ -977,7 +977,7 @@ async fn sqlite_store_family_stamps_substrate_why_trace_for_system_2124() {
             assert_eq!(capability, "STORE_BATCH");
         }
         Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
-        Ok(ids) => panic!("sqlite store_batch succeeded ({ids:?}); it must refuse"),
+        Ok(landed) => panic!("sqlite store_batch succeeded ({landed:?}); it must refuse"),
     }
 }
 
