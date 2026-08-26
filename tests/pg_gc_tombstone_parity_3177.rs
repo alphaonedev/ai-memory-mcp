@@ -60,20 +60,27 @@ async fn pg_ttl_eviction_tombstones_and_crypto_erases_3177() {
 
     // Two ALREADY-EXPIRED rows: one plaintext, one carrying a per-record
     // (0x03) envelope so both erasure KINDS are exercised in one sweep.
-    for (id, env) in [
-        (&plain_id, None::<Vec<u8>>),
-        (&sealed_id, Some(vec![0x03_u8, 0xde, 0xad, 0xbe, 0xef])),
+    // DISTINCT titles: `memories_title_ns_uidx` is UNIQUE over
+    // (title, namespace), so a shared probe title collides on the second row.
+    for (id, title, env) in [
+        (&plain_id, "gc probe plaintext", None::<Vec<u8>>),
+        (
+            &sealed_id,
+            "gc probe sealed",
+            Some(vec![0x03_u8, 0xde, 0xad, 0xbe, 0xef]),
+        ),
     ] {
         sqlx::query(
             "INSERT INTO memories \
                  (id, tier, namespace, title, content, source, metadata, expires_at, \
                   encrypted_envelope) \
-             VALUES ($1, 'short', $2, 'gc probe', 'body', 'test', \
+             VALUES ($1, 'short', $2, $4, 'body', 'test', \
                      jsonb_build_object('agent_id', 'ai:3177'), NOW() - INTERVAL '1 hour', $3)",
         )
         .bind(id)
         .bind(&ns)
         .bind(env)
+        .bind(title)
         .execute(store.pool())
         .await
         .expect("seed expired row");
@@ -96,11 +103,12 @@ async fn pg_ttl_eviction_tombstones_and_crypto_erases_3177() {
             "#3177: a HARD TTL eviction must leave a forget_tombstone for {id} \
              — without it a peer resurrects the evicted row via LWW"
         );
-        let gone: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
-            .bind(id)
-            .fetch_one(store.pool())
-            .await
-            .expect("row-gone probe");
+        let gone: bool =
+            sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
+                .bind(id)
+                .fetch_one(store.pool())
+                .await
+                .expect("row-gone probe");
         assert!(gone, "the evicted row must be deleted: {id}");
     }
 

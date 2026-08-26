@@ -90,11 +90,12 @@ async fn pg_record_stop_covers_undo_and_recover_and_reads_the_chain_3175() {
     let recovered_id = write.memory.id.clone();
     let recover = store_a.recover_turn_idempotent(&ctx, &write).await;
     let recover_stopped = matches!(recover, Err(StoreError::Stopped { .. }));
-    let row_landed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
-        .bind(&recovered_id)
-        .fetch_one(store_a.pool())
-        .await
-        .expect("recovered-row probe");
+    let row_landed: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
+            .bind(&recovered_id)
+            .fetch_one(store_a.pool())
+            .await
+            .expect("recovered-row probe");
 
     // Release BEFORE asserting so a failure cannot leave the cluster stopped.
     store_b

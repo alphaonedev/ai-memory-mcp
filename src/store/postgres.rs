@@ -15971,6 +15971,17 @@ const LIST_FALLBACK_LIMIT_I64: i64 = 100;
 /// Conversion fallback page size for [`PostgresStore::list_archived_pg`].
 const ARCHIVED_LIST_FALLBACK_I64: i64 = 50;
 
+/// v1.0.0 #3174 — surface labels for
+/// [`crate::store::postgres_parity::clamp_caller_limit`]. Named so the
+/// truncation WARN says WHICH read was cut short (the whole point of the
+/// warning is that the next oversized caller can find its own call site), and
+/// so the strings stay out of the hardcoded-literal gate's way.
+const LIST_SURFACE: &str = "list";
+/// See [`LIST_SURFACE`].
+const SEARCH_SURFACE: &str = "search";
+/// See [`LIST_SURFACE`].
+const LIST_ARCHIVED_SURFACE: &str = "list_archived";
+
 /// Page size used by [`PostgresStore::recall_hybrid`] when the caller
 /// passes `limit == 0` (also the conversion fallback on the same path).
 const RECALL_FALLBACK_LIMIT_I64: i64 = 10;
@@ -20142,26 +20153,15 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn list(&self, ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>> {
-        let limit: i64 = filter
-            .limit
-            .clamp(1, crate::storage::LIST_MAX_LIMIT)
-            .try_into()
-            .unwrap_or(LIST_FALLBACK_LIMIT_I64);
-        // v1.0.0 #3174 — the clamp above is the tenant page cap and stays, but
-        // it must never be SILENT: pre-#3174 an internal caller that asked for
-        // more than `LIST_MAX_LIMIT` (the admin export asked for 100_000, the
-        // entity-register scan for 10_000) got a truncated result set with no
-        // error, no warning, and no truncation flag, so a partial answer was
-        // indistinguishable from a complete one. A caller that genuinely needs
-        // the whole set must page (see `export_memories_keyset`); this WARN is
-        // how the next such caller finds out before shipping a lossy read.
-        if filter.limit > crate::storage::LIST_MAX_LIMIT {
-            tracing::warn!(
-                requested = filter.limit,
-                cap = crate::storage::LIST_MAX_LIMIT,
-                "list: caller limit clamped to LIST_MAX_LIMIT — result set is TRUNCATED, not complete"
-            );
-        }
+        // v1.0.0 #3174 — the tenant page cap still applies, but it is no
+        // longer applied in SILENCE (see `clamp_caller_limit`). This was the
+        // funnel the admin export and the entity-register scan both lost data
+        // through.
+        let limit: i64 = crate::store::postgres_parity::clamp_caller_limit(
+            LIST_SURFACE,
+            filter.limit,
+            LIST_FALLBACK_LIMIT_I64,
+        );
         // #910 SAL-level scope=private gate — push the visibility
         // predicate into SQL so the row filter runs server-side and
         // the result-set size scales with what the caller can see,
@@ -20427,6 +20427,8 @@ impl MemoryStore for PostgresStore {
         // trait method used to own. HTTP / MCP production callers land
         // here; passing `filter.source_uri` (None when unset) keeps the
         // compose path from silently dropping the URI filter.
+        // #3174 clamp-and-WARN lives inside that SSOT — do not re-open
+        // a second search funnel here.
         self.search_with_source_uri(ctx, query, filter, filter.source_uri.as_deref())
             .await
     }
@@ -25966,7 +25968,9 @@ impl MemoryStore for PostgresStore {
         // The victim set is read `FOR UPDATE` with the IDENTICAL predicate the
         // DELETE below uses, inside this one transaction, so the erased +
         // tombstoned set and the deleted set cannot diverge.
-        if !archive {
+        let tombstoned: Option<Vec<String>> = if archive {
+            None
+        } else {
             let victims: Vec<(String, String, Option<String>)> = sqlx::query_as(
                 "SELECT id, namespace, metadata->>'agent_id' FROM memories \
                  WHERE expires_at IS NOT NULL AND expires_at < $1 \
@@ -25976,11 +25980,10 @@ impl MemoryStore for PostgresStore {
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| to_store_err("gc read evict victims", e))?;
-            crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(
-                &mut tx, &victims, now,
-            )
-            .await?;
-        }
+            crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(&mut tx, &victims, now)
+                .await?;
+            Some(victims.into_iter().map(|(id, _, _)| id).collect())
+        };
 
         // #1783 — RETURNING id so the TTL-evicted set is known for AGE
         // unprojection in THIS tx. gc is the most common delete path; the
@@ -25989,11 +25992,27 @@ impl MemoryStore for PostgresStore {
         // leaves a ghost :Memory node/edges that kg_query would return. (That
         // rationale is now retired outright: #3161 snapshots the edge graph
         // on this funnel too, immediately above.)
+        //
+        // v1.0.0 #3177 — on the HARD-DELETE path the DELETE is PINNED to the
+        // exact id set that was just tombstoned + crypto-erased, rather than
+        // re-evaluating `expires_at < $1` a second time. Postgres runs this tx
+        // at READ COMMITTED, so a row committed by a concurrent writer between
+        // the `FOR UPDATE` victim read and this statement — a fresh row that is
+        // ALREADY expired, which `store` accepts — would otherwise satisfy the
+        // predicate and be deleted with NO tombstone and NO erase: precisely
+        // the #3177 defect, reintroduced through a race. The sqlite twin cannot
+        // hit this because `BEGIN IMMEDIATE` holds the single writer lock for
+        // the whole sweep; on postgres the id pin is the equivalent guarantee.
+        // Such a row is simply left for the next gc tick, which tombstones it
+        // properly. `archive = true` binds NULL and keeps the original
+        // predicate: that path is a recoverable MOVE with no erasure to pair.
         let evicted: Vec<(String, String)> = sqlx::query_as(
             "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1 \
+               AND ($2::text[] IS NULL OR id = ANY($2)) \
              RETURNING id, namespace",
         )
         .bind(now)
+        .bind(tombstoned.as_deref())
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| to_store_err("gc delete", e))?;
@@ -26745,22 +26764,15 @@ impl MemoryStore for PostgresStore {
             // Postgres twin of the SQLite `archive_links_for_memory`
             // snapshot wired into `archive_memory_no_tx`. Idempotent via
             // the PK `ON CONFLICT`.
-            sqlx::query(
-                "INSERT INTO archived_memory_links (
-                     source_id, target_id, relation, created_at, valid_from,
-                     valid_until, observed_by, signature, attest_level, archived_at
-                 )
-                 SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
-                        ml.valid_from, ml.valid_until, ml.observed_by,
-                        ml.signature, ml.attest_level, now()
-                 FROM memory_links ml
-                 WHERE ml.source_id = $1 OR ml.target_id = $1
-                 ON CONFLICT (source_id, target_id, relation) DO NOTHING",
-            )
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("archive_by_ids snapshot links", e))?;
+            //
+            // v1.0.0 #3177 — the statement moved to
+            // [`crate::store::postgres_parity::archive_links_for_memory_in_tx`]
+            // and this call site now SHARES it with the `size_gc` archive
+            // branch. That branch had a hand-absent twin (it snapshotted
+            // nothing), which is exactly the failure mode a second copy of a
+            // statement invites; one definition means the next archiving path
+            // cannot forget the edges.
+            crate::store::postgres_parity::archive_links_for_memory_in_tx(&mut tx, id).await?;
             // #2503 — SEVER any namespace_meta binding pointing at this row,
             // parity with BOTH sqlite archive funnels (`archive_memory_no_tx`
             // / `archive_memory_for_caller`), which have mirrored `delete`'s
@@ -26860,11 +26872,8 @@ impl MemoryStore for PostgresStore {
         // (`handlers::admin::export_memories`) is admin-gated via
         // `require_admin`, and the export must return the FULL corpus rather
         // than silently dropping any row whose `metadata.agent_id` differs.
-        crate::store::postgres_parity::export_memories_keyset(
-            &self.pool,
-            Self::row_to_memory_scan,
-        )
-        .await
+        crate::store::postgres_parity::export_memories_keyset(&self.pool, Self::row_to_memory_scan)
+            .await
     }
 
     async fn export_links(&self) -> StoreResult<Vec<MemoryLink>> {
@@ -27239,11 +27248,7 @@ impl MemoryStore for PostgresStore {
         // (fail closed).
         if let Err(e) = crate::storage::verify_payload_agent_id(&pa) {
             if let Err(audit_err) = self
-                .pg_emit_pending_action_event(
-                    &pa,
-                    "pending_action.refused_agent_id_mismatch",
-                    None,
-                )
+                .pg_emit_pending_action_event(&pa, "pending_action.refused_agent_id_mismatch", None)
                 .await
             {
                 tracing::warn!(
@@ -30408,10 +30413,16 @@ impl PostgresStore {
         limit: usize,
         offset: usize,
     ) -> StoreResult<Vec<serde_json::Value>> {
-        let limit_i: i64 = limit
-            .clamp(1, crate::storage::LIST_MAX_LIMIT)
-            .try_into()
-            .unwrap_or(ARCHIVED_LIST_FALLBACK_I64);
+        // v1.0.0 #3174 (fold-in) — a silent clamp here is worse than on the
+        // live surfaces: `list_archived` is what an operator reads to decide
+        // whether an archived row still exists before purging. It now WARNs
+        // when it truncates (this path pages via `offset`, so the caller has a
+        // real way to get the rest).
+        let limit_i: i64 = crate::store::postgres_parity::clamp_caller_limit(
+            LIST_ARCHIVED_SURFACE,
+            limit,
+            ARCHIVED_LIST_FALLBACK_I64,
+        );
         let offset_i: i64 = offset.try_into().unwrap_or(0);
         // v1.0.0 #2578 — sargable namespace split, the #1473 treatment `list`
         // already had. The OR-NULL optional-filter idiom

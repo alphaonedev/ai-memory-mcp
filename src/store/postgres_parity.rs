@@ -37,8 +37,7 @@ use sqlx::Row;
 
 use crate::models::Memory;
 use crate::store::postgres::{
-    MEMORY_READ_COLUMNS, PgSignedEventInsert, pg_append_signed_event_with_chain_in_tx,
-    to_store_err,
+    MEMORY_READ_COLUMNS, PgSignedEventInsert, pg_append_signed_event_with_chain_in_tx, to_store_err,
 };
 use crate::store::{StoreError, StoreResult};
 
@@ -51,6 +50,36 @@ type PgTx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 /// cap: the walk continues until the corpus is exhausted.
 fn export_page_rows() -> i64 {
     i64::try_from(crate::storage::LIST_MAX_LIMIT).unwrap_or(1_000)
+}
+
+/// #3174 — clamp a caller-supplied page limit to
+/// [`crate::storage::LIST_MAX_LIMIT`] and **say so** when the clamp actually
+/// bites.
+///
+/// The cap itself is the tenant-facing page cap and stays: raising it would
+/// widen every tenant read. What #3174 established is that applying it in
+/// SILENCE is the defect — an internal caller that asked for 100_000 rows (the
+/// admin export) or 10_000 (the entity-register scan) got a truncated result
+/// set with no error, no warning and no truncation flag, so a PARTIAL answer
+/// was indistinguishable from a COMPLETE one and shipped as a backup. A caller
+/// that genuinely needs the whole set must page (see
+/// [`export_memories_keyset`] for the pattern); this WARN is how the next such
+/// caller finds out before it ships a lossy read.
+///
+/// `fallback` is the surface's own documented fallback for the (unreachable in
+/// practice — the clamp bounds the value to `LIST_MAX_LIMIT`) `usize -> i64`
+/// conversion failure, kept per-surface so this refactor changes no behaviour
+/// beyond adding the WARN.
+pub(crate) fn clamp_caller_limit(surface: &str, requested: usize, fallback: i64) -> i64 {
+    if requested > crate::storage::LIST_MAX_LIMIT {
+        tracing::warn!(
+            surface,
+            requested,
+            cap = crate::storage::LIST_MAX_LIMIT,
+            "caller limit clamped to LIST_MAX_LIMIT — this result set is TRUNCATED, not complete; page for the full set"
+        );
+    }
+    i64::try_from(requested.clamp(1, crate::storage::LIST_MAX_LIMIT)).unwrap_or(fallback)
 }
 
 /// #3174 — UNCAPPED keyset-paged read of the exportable corpus.
@@ -88,7 +117,7 @@ pub(crate) async fn export_memories_keyset(
 ) -> StoreResult<Vec<Memory>> {
     let sql = format!(
         "SELECT {cols} FROM memories \
-         WHERE (expires_at IS NULL OR expires_at > NOW()) \
+         WHERE (expires_at IS NULL OR expires_at > $4) \
            AND ($1::timestamptz IS NULL \
                 OR created_at > $1 \
                 OR (created_at = $1 AND id COLLATE \"C\" > $2::text)) \
@@ -98,6 +127,14 @@ pub(crate) async fn export_memories_keyset(
         cols = MEMORY_READ_COLUMNS,
         lifecycle_vis = crate::models::lifecycle_visible_clause(""),
     );
+    // The expiry cutoff is captured ONCE and bound to every page, never
+    // re-evaluated as `NOW()` per statement. The sqlite reference takes its
+    // `now` once for a single one-shot query; a multi-statement walk that let
+    // the cutoff drift would apply a DIFFERENT retention boundary to page 1
+    // than to page 40, so a row that expired mid-walk would vanish from a
+    // bundle whose earlier pages were read under a boundary that included it.
+    // One cutoff for the whole walk keeps the bundle internally consistent.
+    let as_of = chrono::Utc::now();
     let page_rows = export_page_rows();
     let mut out: Vec<Memory> = Vec::new();
     let mut cursor: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
@@ -107,6 +144,7 @@ pub(crate) async fn export_memories_keyset(
             .bind(cursor.as_ref().map(|(ts, _)| *ts))
             .bind(cursor.as_ref().map(|(_, id)| id.as_str()))
             .bind(page_rows)
+            .bind(as_of)
             .fetch_all(pool)
             .await
             .map_err(|e| to_store_err("export_memories keyset page", e))?;
@@ -118,7 +156,7 @@ pub(crate) async fn export_memories_keyset(
         // policy) must still move the cursor, or the walk would re-fetch the
         // same page forever.
         let last_created: chrono::DateTime<chrono::Utc> = last
-            .try_get("created_at")
+            .try_get(crate::models::field_names::CREATED_AT)
             .map_err(|e| to_store_err("export_memories cursor created_at", e))?;
         let last_id: String = last
             .try_get("id")
@@ -208,11 +246,13 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
     let erased: HashSet<String> = erased_rows.into_iter().map(|(id,)| id).collect();
 
     // (2) Erasure invariant — scrub the cid pre-image (parity with forget).
-    sqlx::query("UPDATE memories SET cid_genesis = NULL WHERE cid_genesis IS NOT NULL AND id = ANY($1)")
-        .bind(&ids)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| to_store_err("evict scrub cid_genesis", e))?;
+    sqlx::query(
+        "UPDATE memories SET cid_genesis = NULL WHERE cid_genesis IS NOT NULL AND id = ANY($1)",
+    )
+    .bind(&ids)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("evict scrub cid_genesis", e))?;
 
     // (3) Signed erasure attestation per victim.
     let ts = now.to_rfc3339();
@@ -294,10 +334,7 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
 /// # Errors
 ///
 /// Propagates the snapshot-insert error.
-pub(crate) async fn archive_links_for_memory_in_tx(
-    tx: &mut PgTx<'_>,
-    id: &str,
-) -> StoreResult<()> {
+pub(crate) async fn archive_links_for_memory_in_tx(tx: &mut PgTx<'_>, id: &str) -> StoreResult<()> {
     sqlx::query(
         "INSERT INTO archived_memory_links (
              source_id, target_id, relation, created_at, valid_from,

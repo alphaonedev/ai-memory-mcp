@@ -1837,9 +1837,12 @@ other with nothing reporting the difference.
   keyset-paged reader** (`(created_at, id COLLATE "C")` cursor, same expiry +
   #1948 lifecycle predicates as the sqlite `export_all`, no OFFSET so a
   concurrent insert cannot make a page skip or duplicate rows). `LIST_MAX_LIMIT`
-  is deliberately **not** raised — it is the tenant page cap — but `list` now
-  WARNs whenever it clamps a caller's limit, so the next oversized reader finds
-  out before shipping a lossy read. The same clamp corrupted
+  is deliberately **not** raised — it is the tenant page cap — but `list`,
+  `search` and `list_archived` now all WARN through one helper whenever they
+  clamp a caller's limit, so the next oversized reader finds out before
+  shipping a lossy read: applying the cap is correct, applying it in silence is
+  what made a partial answer indistinguishable from a complete one. The same
+  clamp corrupted
   `entity_register`, which scanned `limit: 10_000` for a prior entity: in any
   namespace over 1000 rows the prior row fell outside the window and a
   **duplicate entity** landed on every re-register. That lookup is now the
@@ -1886,10 +1889,19 @@ other with nothing reporting the difference.
   signed `substrate.crypto_erase` attestation, mandatory signed tombstone — in
   the SAME transaction as the DELETE, ungated by `append_only_enabled()` (the
   revision leaf is an optional ledger; the tombstone is the retention contract).
-  Separately, the pg `size_gc` **archive** branch copied only the memory row, so
+  On the `run_gc` hard-delete path the DELETE is additionally **pinned to the
+  exact id set that was tombstoned**, rather than re-evaluating the expiry
+  predicate a second time: postgres runs that sweep at READ COMMITTED, so an
+  already-expired row committed by a concurrent writer between the `FOR UPDATE`
+  victim read and the DELETE would otherwise be deleted with no tombstone and
+  no erase — the same defect, reintroduced through a race. (The sqlite twin
+  cannot hit it: `BEGIN IMMEDIATE` holds the single writer lock for the whole
+  sweep.) Separately, the pg `size_gc` **archive** branch copied only the memory row, so
   `archive_restore` returned it isolated with its edge graph reaped by the FK
   cascade; it now snapshots `memory_links` into `archived_memory_links` first,
-  as `forget` and `archive_by_ids` already did.
+  as `forget` and `archive_by_ids` already did — and `archive_by_ids`' copy of
+  that statement was folded into the same shared helper, so a future archiving
+  path cannot forget the edges the way this one did.
 - **`action_frontier` / `action_next` on postgres dispatched unlocks-gated work
   (#3179).** `pg_frontier_where_tail` was a hand-copied twin carrying two of the
   three `NOT EXISTS` clauses: the #3008 `unlocks` clause was never mirrored, so
@@ -1924,10 +1936,10 @@ Non-trivial postgres helpers landed in a new sibling module
 `src/store/postgres.rs`; the QUAL-10 ceiling for that file moves
 34_620 -> 35_120 for the call sites and their rationale.
 
-Known residual, deliberately out of scope: the pg
+Known residual, deliberately out of scope and filed as #3207: the pg
 `sweep_pending_action_timeouts` still emits no `pending_action.timed_out` row
 (the sqlite sweeper does). It is the one governance transition of the four that
-this cluster does not close.
+this cluster does not close — the three an adversary can drive are covered.
 
 ### Fixed
 
