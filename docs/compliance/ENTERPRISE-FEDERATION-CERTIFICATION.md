@@ -62,6 +62,18 @@ triggers re-cert** (see §7).
 > whole point of the wave. An auditor reproducing the 18-check/8-FAIL
 > legs must build at the SHA `SANITIZATION.md` names, not at `e22bc93c`
 > (which yields the pre-#2918 16-check posture).
+>
+> **Amendment (2026-08-26, PR #3243).** `src/federation/receive.rs`
+> catch-up/PULL now runs the stored-namespace probe the push lane
+> already ran fail-closed (#3195): a probe **error** skips AND halts
+> the watermark (transient → re-pull); a scope **refusal** skips
+> without halt. This restores the §7.1 PeerScope control on the PULL
+> path (a `public/*`-scoped peer can no longer relocate/clobber an
+> out-of-scope `secure/ops` row by serving its id under an in-scope
+> claimed namespace). No `AI_MEMORY_FED_*` identifier was added,
+> removed, or renamed. The §7 re-cert trigger fired because a watched
+> federation-wire path changed; this amendment discharges it. §5.4(2)–
+> (5) posture / pg+AGE / adversarial evidence is unchanged.
 
 ---
 
