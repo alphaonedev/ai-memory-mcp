@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation (2026-08-26)
+
+- **Learn ai-memory** section on the docs site (`docs/learn/`): a hub plus three
+  audience tracks — end users (singleton / small agent setups), C-level
+  decision makers (decision-mapped), and engineers/architects/scientists
+  (mechanism, up to a swarm/hive on the certified enterprise-federation
+  configuration: pg + AGE + pgvector tier, mTLS on all three legs, attestation,
+  Batman mode, posture boot gate). Linked "Learn ai-memory" at the top of the
+  landing page and the doc layout.
+- `docs/contributing-external.md` — external contributions & rigid security
+  controls (merge / agent / runner / supply-chain boundaries).
+- `docs/managed-postgres.md` — managed / non-superuser Postgres (CNPG, RDS,
+  Cloud SQL): pgvector is not a trusted extension; the one-time superuser
+  pre-create; AGE `ag_catalog` grant; verified live 2026-08-26.
+- `docs/audit/pr-3260-3x7-vote-and-nhi-assessment-2026-08-26.md` — durable
+  record of the #3260 3×7 vote, AI-NHI live assessment, disposition and the
+  rejected pgvector-less storage design.
+
 ### Security (rigid collaboration controls — operator directive 2026-08-26)
 
 - **External-PR operator-approval gate** (`c8-precheck.yml`, new required
