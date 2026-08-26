@@ -415,7 +415,7 @@ async fn age_to_cte_fallback_clears_a2a1_3() {
     // truth.
     let flip_until = chrono::Utc::now().to_rfc3339();
     let row = store
-        .kg_invalidate(&ids[0], &ids[1], "related_to", Some(&flip_until))
+        .kg_invalidate(&ids[0], &ids[1], "related_to", Some(&flip_until), None)
         .await
         .expect("phase-2: kg_invalidate dispatcher must fall back to CTE on AGE failure");
     assert!(

@@ -163,8 +163,23 @@ pub fn handle_kg_invalidate(
         return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
     }
 
-    match db::invalidate_link(conn, source_id, target_id, relation, valid_until)
-        .map_err(|e| e.to_string())?
+    // #3203 — stamp the ACTING principal on the `memory_link.invalidated`
+    // audit leaf. Deliberately the ENFORCED read-visibility caller (the
+    // daemon-authenticated identity the #1778 owner gate directly above keys
+    // on), NOT the self-asserted `arguments["agent_id"]` request field — an
+    // audit ACTOR must never be forgeable from the wire. `None` (no enforced
+    // identity configured) records the `system` sentinel rather than
+    // borrowing the edge's original attester, which is what this used to do.
+    let actor = crate::identity::resolve_read_visibility_caller();
+    match db::invalidate_link(
+        conn,
+        source_id,
+        target_id,
+        relation,
+        valid_until,
+        actor.as_deref(),
+    )
+    .map_err(|e| e.to_string())?
     {
         Some(res) => {
             // v0.7 J4 / G14 — emit `memory_link_invalidated` webhook

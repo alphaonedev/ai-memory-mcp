@@ -319,7 +319,7 @@ async fn kg_query_cte_filtered_historical_arm_and_timeline_filters() {
 
     // Invalidate the edge so the current-view query hides it.
     let inv = store
-        .invalidate_link(&a, &b, "related_to", None)
+        .invalidate_link(&a, &b, "related_to", None, None)
         .await
         .expect("invalidate_link");
     assert!(inv.found, "the seeded edge must be found + invalidated");

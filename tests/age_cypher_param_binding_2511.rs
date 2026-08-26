@@ -605,7 +605,7 @@ async fn r203_kg_invalidate_sets_valid_until_on_the_age_edge() {
 
     // Drive the cypher path DIRECTLY so a fallback cannot mask the error.
     let row = store
-        .kg_invalidate_cypher(&a_id, &b_id, "related_to", None)
+        .kg_invalidate_cypher(&a_id, &b_id, "related_to", None, None)
         .await
         .expect("kg_invalidate_cypher must succeed against a live AGE edge");
     assert!(

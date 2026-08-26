@@ -1018,6 +1018,11 @@ pub async fn kg_invalidate(
                 &body.target_id,
                 &body.relation,
                 valid_until,
+                // #3203 — the AUTHENTICATED caller (header/identity-bound via
+                // `resolve_caller_agent_id`, already past `enforce_idor_identity`
+                // above), stamped as the actor on the `memory_link.invalidated`
+                // audit leaf. Never the edge's original attester.
+                Some(caller.as_str()),
             )
             .await
         {
@@ -1054,6 +1059,8 @@ pub async fn kg_invalidate(
         &body.target_id,
         &body.relation,
         valid_until,
+        // #3203 — see the postgres arm above.
+        Some(caller.as_str()),
     ) {
         Ok(Some(res)) => (
             StatusCode::OK,

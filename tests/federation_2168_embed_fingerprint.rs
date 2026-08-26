@@ -293,8 +293,13 @@ async fn foreign_model_shipped_vector_not_stored_verbatim_deferred_2168() {
     // refused.
     assert_eq!(v["applied"], 1, "row must land (CRDT convergence): {v}");
 
-    // The deferred local re-embed lands the receiver's OWN vector.
-    let stored = wait_for_embedding(&rx.db, &mem.id, Duration::from_secs(10))
+    // Give the detached `tokio::spawn` a scheduling slice before we
+    // poll. macos-fed CI (2026-08-26, 77e35229) timed the 10s budget
+    // out on this cell while the empty-model twin in the same binary
+    // passed; local default-features reproduce is 0.33s. The mock
+    // delay is ZERO — this is scheduler slop, not embed latency.
+    tokio::task::yield_now().await;
+    let stored = wait_for_embedding(&rx.db, &mem.id, Duration::from_secs(30))
         .await
         .expect("deferred local re-embed must populate the row");
     assert_eq!(stored.len(), dim, "stored vector is receiver-dim");
@@ -371,8 +376,13 @@ async fn empty_model_string_shipped_vector_not_stored_verbatim_deferred_2176() {
     // vector is refused.
     assert_eq!(v["applied"], 1, "row must land (CRDT convergence): {v}");
 
-    // The deferred local re-embed lands the receiver's OWN vector.
-    let stored = wait_for_embedding(&rx.db, &mem.id, Duration::from_secs(10))
+    // Give the detached `tokio::spawn` a scheduling slice before we
+    // poll. macos-fed CI (2026-08-26, 77e35229) timed the 10s budget
+    // out on this cell while the empty-model twin in the same binary
+    // passed; local default-features reproduce is 0.33s. The mock
+    // delay is ZERO — this is scheduler slop, not embed latency.
+    tokio::task::yield_now().await;
+    let stored = wait_for_embedding(&rx.db, &mem.id, Duration::from_secs(30))
         .await
         .expect("deferred local re-embed must populate the row");
     assert_eq!(stored.len(), dim, "stored vector is receiver-dim");

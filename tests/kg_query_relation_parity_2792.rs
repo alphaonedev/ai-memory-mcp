@@ -285,7 +285,7 @@ mod pg {
 
         // Invalidate the edge (SET valid_until = now on the AGE edge + row).
         let res = store
-            .invalidate_link(&src, &tgt, "supersedes", None)
+            .invalidate_link(&src, &tgt, "supersedes", None, None)
             .await
             .expect("invalidate_link");
         assert!(res.found, "invalidate_link must find the supersedes edge");

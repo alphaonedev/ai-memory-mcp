@@ -319,11 +319,47 @@ pub fn reflect(
 ///
 /// Same five [`ReflectError`] variants as [`reflect`] plus
 /// [`ReflectError::HookVeto`] when a pre_reflect handler vetoes.
-#[allow(clippy::too_many_lines)]
 pub fn reflect_with_hooks(
     conn: &Connection,
     input: &ReflectInput,
     hooks: &ReflectHooks<'_>,
+) -> std::result::Result<ReflectOutcome, ReflectError> {
+    // `None` caller == the historical UNSCOPED source read (admin / migrate /
+    // curator / MCP, which gates upstream). See
+    // [`reflect_with_hooks_for_caller`].
+    reflect_with_hooks_for_caller(conn, input, hooks, None)
+}
+
+/// #3176 — [`reflect_with_hooks`] with the caller's principal threaded into
+/// the SOURCE READ so a tenant cannot reflect on a memory it cannot read.
+///
+/// The source-loading loop previously used the raw, unscoped
+/// [`crate::storage::get`] on EVERY path, while the postgres twin
+/// (`PostgresStore::reflect`) loads each source through the #910-gated
+/// `MemoryStore::get(ctx, id)`. On sqlite that let a trait-routed tenant
+/// confirm the existence of — and pull the CONTENT of — another agent's
+/// `scope=private` memory into its own reflection, which postgres refuses.
+///
+/// `caller`:
+/// * `Some(principal)` — a TENANT read. Each source is checked with
+///   [`crate::visibility::is_visible_to_caller`] and an invisible source is
+///   folded to [`ReflectError::SourceNotFound`], byte-identical to a genuinely
+///   missing id (the postgres twin's `StoreError::NotFound` fold), so the gate
+///   leaks no existence signal.
+/// * `None` — an ADMIN/substrate read (`bypass_visibility`, migrate, curator,
+///   and the MCP/HTTP surfaces that gate upstream). Behaviour is byte-identical
+///   to pre-#3176.
+///
+/// # Errors
+///
+/// Same variants as [`reflect_with_hooks`]; a source the caller cannot see
+/// surfaces as [`ReflectError::SourceNotFound`].
+#[allow(clippy::too_many_lines)]
+pub fn reflect_with_hooks_for_caller(
+    conn: &Connection,
+    input: &ReflectInput,
+    hooks: &ReflectHooks<'_>,
+    caller: Option<&str>,
 ) -> std::result::Result<ReflectOutcome, ReflectError> {
     use crate::validate;
     // ─── 1. Validate inputs ──────────────────────────────────────────
@@ -367,8 +403,13 @@ pub fn reflect_with_hooks(
     let mut sources = Vec::with_capacity(input.source_ids.len());
     for id in &input.source_ids {
         match get(conn, id).map_err(|e| ReflectError::Database(e.to_string()))? {
-            Some(m) => sources.push(m),
-            None => return Err(ReflectError::SourceNotFound(id.clone())),
+            // #3176 — a TENANT caller only sees what it may read; an invisible
+            // source folds to the SAME `SourceNotFound` a missing id produces
+            // (no existence leak). `None` caller = substrate/admin read.
+            Some(m) if caller.is_none_or(|c| crate::visibility::is_visible_to_caller(&m, c)) => {
+                sources.push(m);
+            }
+            Some(_) | None => return Err(ReflectError::SourceNotFound(id.clone())),
         }
     }
 

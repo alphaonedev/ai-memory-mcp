@@ -9725,7 +9725,15 @@ impl PostgresStore {
         target_id: &str,
         relation: &str,
         valid_until: Option<&str>,
+        actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
+        // #3203 / Fable #3237 item 1 — same #1955 R45 fence the sqlite
+        // `db::invalidate_link` path has. A supersession mutates
+        // `memory_links` and appends a `signed_events` leaf; without
+        // this gate it landed while the record plane was STOPPED.
+        // One call at the dispatcher covers CTE, Cypher, and
+        // `kg_invalidate_via_store`.
+        self.gate_record_stop()?;
         // v0.7.0 S6-M3 — AGE Cypher dispatcher. Same dual-path
         // discipline as `kg_query` / `kg_timeline`. When AGE is
         // available we set the `valid_until` property through Cypher
@@ -9742,7 +9750,7 @@ impl PostgresStore {
         match self.kg_backend {
             KgBackend::Age => {
                 match self
-                    .kg_invalidate_cypher(source_id, target_id, relation, valid_until)
+                    .kg_invalidate_cypher(source_id, target_id, relation, valid_until, actor)
                     .await
                 {
                     Ok(row) => Ok(row),
@@ -9752,14 +9760,14 @@ impl PostgresStore {
                             source_id,
                             &err,
                         );
-                        self.kg_invalidate_cte(source_id, target_id, relation, valid_until)
+                        self.kg_invalidate_cte(source_id, target_id, relation, valid_until, actor)
                             .await
                     }
                     Err(err) => Err(err),
                 }
             }
             KgBackend::Cte => {
-                self.kg_invalidate_cte(source_id, target_id, relation, valid_until)
+                self.kg_invalidate_cte(source_id, target_id, relation, valid_until, actor)
                     .await
             }
         }
@@ -9800,8 +9808,12 @@ impl PostgresStore {
         target_id: &str,
         relation: &str,
         valid_until: Option<&str>,
+        actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
-        let stamp = valid_until.map_or_else(|| Utc::now().to_rfc3339(), str::to_string);
+        let stamp = valid_until.map_or_else(
+            || truncate_to_microseconds(Utc::now()).to_rfc3339(),
+            str::to_string,
+        );
 
         // AGE requires `ag_catalog` on the search path and the
         // extension loaded into the session. Both are session-local
@@ -9879,7 +9891,7 @@ impl PostgresStore {
                 .await
                 .map_err(|e| to_store_err(CTX_COMMIT_AGE_TX, e))?;
             return self
-                .kg_invalidate_cte(source_id, target_id, relation, valid_until)
+                .kg_invalidate_cte(source_id, target_id, relation, valid_until, actor)
                 .await;
         }
 
@@ -9948,17 +9960,21 @@ impl PostgresStore {
         // effect: the AGE edge was NEVER invalidated and `kg_query`'s
         // current view kept serving it. Latent since v0.7.0 because the cypher
         // read above was parse-rejected long before control reached this line.
-        sqlx::query(
-            "UPDATE memory_links SET valid_until = $4::TIMESTAMPTZ \
-             WHERE source_id = $1 AND target_id = $2 AND relation = $3",
+        //
+        // #3178 — the mirror now runs the FULL relational supersession
+        // contract (clear the signing surface on a previously signed row +
+        // append the `memory_link.invalidated` audit leaf), not just the
+        // `valid_until` stamp. It shares `pg_invalidate_link_relational_in_tx`
+        // with `kg_invalidate_cte` so an AGE deployment and a vanilla-pgvector
+        // deployment cannot end up with different durable rows for the same
+        // supersession — which is exactly how the pre-fix gap would have been
+        // reintroduced had only the CTE branch been repaired. The AGE branch
+        // keeps its OWN `previous_valid_until` (read from the graph above), so
+        // the helper's return is deliberately discarded here.
+        let _ = pg_invalidate_link_relational_in_tx(
+            &mut tx, source_id, target_id, relation, &stamp, actor,
         )
-        .bind(source_id)
-        .bind(target_id)
-        .bind(relation)
-        .bind(&stamp)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("cypher kg_invalidate mirror", e))?;
+        .await?;
 
         tx.commit()
             .await
@@ -9975,89 +9991,53 @@ impl PostgresStore {
     ///
     /// Mirrors the SQLite query in `db::invalidate_link` so deployments
     /// running vanilla Postgres (no AGE extension) get the same
-    /// supersession semantics. Uses `UPDATE ... RETURNING` to atomically
-    /// read the prior `valid_until` and write the new value in one
-    /// round-trip — the SQLite path has to issue a SELECT then an
-    /// UPDATE because rusqlite's RETURNING is gated on a feature flag,
-    /// but Postgres has it natively. Returns the shared
-    /// [`KgInvalidateRow`] shape so the dispatcher in
-    /// [`Self::kg_invalidate`] doesn't have to care which branch ran.
+    /// supersession semantics. Returns the shared [`KgInvalidateRow`] shape so
+    /// the dispatcher in [`Self::kg_invalidate`] doesn't have to care which
+    /// branch ran.
+    ///
+    /// #3178 — the prior-row read (`FOR UPDATE`), the `valid_until` stamp,
+    /// the signing-surface CLEAR on a previously signed row, and the
+    /// `memory_link.invalidated` audit append all run in ONE transaction —
+    /// the full sqlite `db::invalidate_link` contract, which this method
+    /// previously implemented only the `valid_until` half of.
     ///
     /// # Errors
     ///
-    /// `StoreError::BackendUnavailable` for any sqlx error.
+    /// `StoreError::BackendUnavailable` for any sqlx error;
+    /// `StoreError::IntegrityFailed` when the audit pre-image cannot be
+    /// canonicalised.
     pub async fn kg_invalidate_cte(
         &self,
         source_id: &str,
         target_id: &str,
         relation: &str,
         valid_until: Option<&str>,
+        actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
-        let stamp = valid_until.map_or_else(|| Utc::now().to_rfc3339(), str::to_string);
-
-        // `UPDATE ... RETURNING` captures the prior `valid_until` and
-        // writes the new one in a single round-trip. The OLD-row
-        // semantics come from a CTE: Postgres' `RETURNING` clause sees
-        // the NEW row, so we wrap the UPDATE in a CTE and read the
-        // prior value through a separate `SELECT` joined on the same
-        // (source, target, relation) triple.
-        let sql = "WITH prev AS (
-                SELECT valid_until AS prior
-                FROM memory_links
-                WHERE source_id = $1 AND target_id = $2 AND relation = $3
-                FOR UPDATE
-            ),
-            upd AS (
-                UPDATE memory_links
-                SET valid_until = $4::TIMESTAMPTZ
-                WHERE source_id = $1 AND target_id = $2 AND relation = $3
-                RETURNING valid_until AS now_until
-            )
-            SELECT prev.prior, upd.now_until
-            FROM prev FULL OUTER JOIN upd ON TRUE";
-
-        let rows = sqlx::query(sql)
-            .bind(source_id)
-            .bind(target_id)
-            .bind(relation)
-            .bind(&stamp)
-            .fetch_all(&self.pool)
+        let stamp = valid_until.map_or_else(
+            || truncate_to_microseconds(Utc::now()).to_rfc3339(),
+            str::to_string,
+        );
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| to_store_err("cte kg_invalidate", e))?;
-
-        if rows.is_empty() {
+            .map_err(|e| to_store_err("begin kg_invalidate tx", e))?;
+        let Some((prior, _)) = pg_invalidate_link_relational_in_tx(
+            &mut tx, source_id, target_id, relation, &stamp, actor,
+        )
+        .await?
+        else {
+            // Triple did not exist — nothing written, so the tx just drops.
             return Ok(KgInvalidateRow {
                 found: false,
                 valid_until: String::new(),
                 previous_valid_until: None,
             });
-        }
-
-        // The FULL OUTER JOIN yields one row when the triple matched
-        // (both `prior` and `now_until` populated) and zero rows when
-        // it missed. We've handled the empty case above; pull the
-        // first row for the matched case.
-        let row = &rows[0];
-        let prior: Option<DateTime<Utc>> = row
-            .try_get::<Option<DateTime<Utc>>, _>("prior")
-            .map_err(|e| to_store_err("read prior valid_until", e))?;
-        let now_until: Option<DateTime<Utc>> = row
-            .try_get::<Option<DateTime<Utc>>, _>("now_until")
-            .map_err(|e| to_store_err("read new valid_until", e))?;
-
-        // `now_until` is `None` only when the UPDATE matched zero rows
-        // — i.e. the link did not exist. The `WITH prev AS (...)` CTE
-        // would also produce zero rows in that case, so `rows` would
-        // be empty. Defensive double-check: if we got here with `None`
-        // the triple didn't match.
-        if now_until.is_none() {
-            return Ok(KgInvalidateRow {
-                found: false,
-                valid_until: String::new(),
-                previous_valid_until: None,
-            });
-        }
-
+        };
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit kg_invalidate tx", e))?;
         Ok(KgInvalidateRow {
             found: true,
             valid_until: stamp,
@@ -10906,7 +10886,7 @@ impl PostgresStore {
         // to a no-op. The row's existing `signature` / `attest_level`
         // are preserved, so a self-signed write is never silently
         // demoted to unsigned by a subsequent unsigned replay.
-        sqlx::query(
+        let insert_res = sqlx::query(
             "INSERT INTO memory_links
                  (source_id, target_id, relation, created_at, valid_from,
                   valid_until, signature, attest_level, observed_by,
@@ -10928,6 +10908,32 @@ impl PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_link", e))?;
+        // #3051 / Fable #3237 item 2 — ON CONFLICT DO NOTHING preserves the
+        // existing row. Returning the freshly COMPUTED `attest_level` on
+        // that path would report `unsigned` for a replay of an unsigned
+        // payload against a durable `self_signed`/`peer_attested` edge.
+        // Read the stored label (fail-closed to unsigned if missing /
+        // unknown), matching sqlite `stored_link_attest_level`.
+        let attest_level = if insert_res.rows_affected() == 0 {
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT attest_level FROM memory_links \
+                 WHERE source_id = $1 AND target_id = $2 AND relation = $3",
+            )
+            .bind(&link.source_id)
+            .bind(&link.target_id)
+            .bind(link.relation.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("read stored attest_level on link replay", e))?;
+            stored
+                .as_deref()
+                .and_then(crate::models::AttestLevel::from_str)
+                .map_or(crate::models::AttestLevel::Unsigned.as_str(), |lvl| {
+                    lvl.as_str()
+                })
+        } else {
+            attest_level
+        };
 
         if matches!(self.kg_backend, KgBackend::Age) {
             // #1735 (Pillar-4 4.C) — Deferred mode enqueues the AGE
@@ -12708,6 +12714,142 @@ async fn pg_append_signed_event_with_chain(
     pg_append_signed_event_with_chain_in_tx(&mut tx, row).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// #3178 — the RELATIONAL half of a link supersession, run inside a caller's
+/// transaction. Shared by [`PostgresStore::kg_invalidate_cte`] (the
+/// vanilla-pgvector path) and [`PostgresStore::kg_invalidate_cypher`]'s
+/// relational mirror (the AGE path), so the two cannot diverge.
+///
+/// Implements the full sqlite `db::invalidate_link` contract, of which the pg
+/// side previously implemented only the first step:
+///
+/// 1. read the prior row under `FOR UPDATE` (so the signed-vs-unsigned
+///    classification cannot race a concurrent writer — the sqlite twin gets
+///    the same guarantee from its `BEGIN IMMEDIATE` write lock);
+/// 2. stamp `valid_until`, and on a PREVIOUSLY SIGNED row also NULL the
+///    `signature` and reset `attest_level` to `unsigned` (v0.7.0 #628 H5) so a
+///    later `memory_verify` reports an honest "unsigned" instead of a
+///    misleading "signature mismatch" for an edge that is merely superseded;
+/// 3. append ONE `memory_link.invalidated` leaf whose `payload_hash` commits
+///    to the canonical CBOR over the POST-supersession `SignableLink` (so an
+///    auditor can re-derive it from the row as it now stands) and whose
+///    `signature` column carries the PREVIOUS signature (so the auditor can
+///    match it byte-for-byte against the original create event). We
+///    deliberately do NOT re-sign: this writer has no guarantee the original
+///    keypair is loaded — federation may have applied an inbound
+///    `peer_attested` row — so an honest "the signing surface was cleared"
+///    event is the only response that cannot forge.
+///
+/// A failure to append the leaf propagates, which aborts the caller's
+/// transaction: the signature clearing must never happen without its audit
+/// row (P2, #628 agent-3 — the sqlite twin's posture, verbatim).
+///
+/// Returns `None` when the `(source, target, relation)` triple does not exist
+/// (nothing is written), else `Some((prior_valid_until, new_valid_until))`.
+///
+/// # Errors
+///
+/// Any sqlx failure, or `StoreError::IntegrityFailed` when the audit
+/// pre-image cannot be canonicalised.
+async fn pg_invalidate_link_relational_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source_id: &str,
+    target_id: &str,
+    relation: &str,
+    stamp: &str,
+    actor: Option<&str>,
+) -> StoreResult<Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
+    let prior_row: Option<(
+        Option<DateTime<Utc>>,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<DateTime<Utc>>,
+    )> = sqlx::query_as(
+        "SELECT valid_until, signature, observed_by, valid_from \
+         FROM memory_links \
+         WHERE source_id = $1 AND target_id = $2 AND relation = $3 \
+         FOR UPDATE",
+    )
+    .bind(source_id)
+    .bind(target_id)
+    .bind(relation)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("kg_invalidate prior read", e))?;
+
+    let Some((prior, prior_signature, observed_by, prior_valid_from)) = prior_row else {
+        return Ok(None);
+    };
+    let was_signed = prior_signature.is_some();
+
+    let update_sql = if was_signed {
+        "UPDATE memory_links \
+         SET valid_until = $4::TIMESTAMPTZ, signature = NULL, attest_level = 'unsigned' \
+         WHERE source_id = $1 AND target_id = $2 AND relation = $3 \
+         RETURNING valid_until"
+    } else {
+        "UPDATE memory_links SET valid_until = $4::TIMESTAMPTZ \
+         WHERE source_id = $1 AND target_id = $2 AND relation = $3 \
+         RETURNING valid_until"
+    };
+    let now_until: Option<DateTime<Utc>> = sqlx::query_scalar(update_sql)
+        .bind(source_id)
+        .bind(target_id)
+        .bind(relation)
+        .bind(stamp)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("cte kg_invalidate", e))?;
+
+    if was_signed {
+        let valid_from_str = prior_valid_from.map(|t| t.to_rfc3339());
+        let valid_until_str = now_until.map(|t| t.to_rfc3339());
+        let signable = crate::identity::sign::SignableLink {
+            src_id: source_id,
+            dst_id: target_id,
+            relation,
+            observed_by: observed_by.as_deref(),
+            valid_from: valid_from_str.as_deref(),
+            valid_until: valid_until_str.as_deref(),
+        };
+        let cbor = crate::identity::sign::canonical_cbor(&signable).map_err(|e| {
+            StoreError::IntegrityFailed {
+                detail: format!("kg_invalidate canonical_cbor: {e}"),
+            }
+        })?;
+        let payload_hash = crate::signed_events::payload_hash(&cbor);
+        // #3203 — the ACTING principal, byte-identical to the sqlite twin.
+        // NEVER the original attester (`observed_by`): that would name the
+        // peer which signed the edge as the actor of an invalidation it never
+        // performed. `observed_by`'s identity instead travels inside the CBOR
+        // that `payload_hash` commits to, and its Ed25519 proof stays in the
+        // `signature` column below. `None` records the `system` sentinel — an
+        // honest "unattributed substrate path", never a borrowed identity.
+        let event_agent = actor
+            .unwrap_or(crate::identity::sentinels::SYSTEM_PRINCIPAL)
+            .to_string();
+        let event_id = uuid::Uuid::new_v4().to_string();
+        pg_append_signed_event_with_chain_in_tx(
+            tx,
+            PgSignedEventInsert {
+                id: &event_id,
+                agent_id: &event_agent,
+                event_type: crate::signed_events::event_types::MEMORY_LINK_INVALIDATED,
+                payload_hash: &payload_hash,
+                signature: prior_signature.as_deref(),
+                attest_level: crate::models::AttestLevel::Unsigned.as_str(),
+                timestamp: Utc::now(),
+                // Parity with the sqlite twin: no triggering cause is bound on
+                // the supersession path on either backend.
+                cause_hash: None,
+            },
+        )
+        .await
+        .map_err(|e| to_store_err("kg_invalidate append signed_event", e))?;
+    }
+
+    Ok(Some((prior, now_until)))
 }
 
 /// Transaction-scoped twin of [`pg_append_signed_event_with_chain`].
@@ -21951,75 +22093,64 @@ impl MemoryStore for PostgresStore {
         // (NULL) or dangling standard_ids, which skipped the gate. When a
         // namespace_meta row exists but the standard is unresolvable, refuse
         // (non-bypass) so clear cannot disarm fail-closed governance.
+        // #3176 — the DECISION now lives once in
+        // `crate::store::authorize_clear_namespace_standard`; this adapter
+        // only READS the three-state binding. Pre-#3176 the whole gate was
+        // inline HERE and had no sqlite twin at the SAL layer, so a
+        // trait-routed sqlite caller could disarm a namespace pg protects.
+        // Both adapters now share the predicate AND the refusal strings.
+        //
+        // #2704-F2 (CB-18, CWE-284) — the INNER JOIN through `standard_id`
+        // yields NO row for a severed (NULL) or dangling `standard_id`, and a
+        // row with a SQL-NULL `agent_id` when the standard memory exists but
+        // is UNOWNED. `.flatten()` collapsed BOTH into `None`, so an unowned
+        // standard was misclassified as unresolvable and REFUSED — making a
+        // legacy pre-#929 / federated / non-object-metadata pg standard
+        // un-clearable by a non-bypass caller. `Option<Option<String>>`
+        // (outer = row-presence, inner = agent_id NULL-ness) keeps the two
+        // states separable, which is exactly what
+        // `NamespaceStandardBinding` encodes.
+        // Fable #3237 item 5 — owner read + DELETE in ONE tx (TOCTOU).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("clear_namespace_standard begin", e))?;
         if !ctx.bypass_visibility {
             let meta_exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = $1)",
             )
             .bind(namespace)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| to_store_err("clear_namespace_standard meta-exists", e))?;
-            if meta_exists {
-                // #2704-F2 (CB-18, CWE-284) — the INNER JOIN through `standard_id`
-                // yields NO row for a severed (NULL) or dangling `standard_id`, and
-                // a row with a SQL-NULL `agent_id` when the standard memory exists
-                // but is UNOWNED. `.flatten()` collapsed BOTH into `None`, so an
-                // unowned standard (case b) was misclassified as unresolvable
-                // (case a) and REFUSED with a wrong "severed or dangling" error —
-                // making a legacy pre-#929 / federated / non-object-metadata pg
-                // standard un-clearable by a non-bypass caller. Keep the two states
-                // separable: `Option<Option<String>>` (outer = row-presence, inner
-                // = agent_id NULL-ness). `Some(None)` is the documented unowned-pass
-                // (ALLOW, matching the sqlite twin where `recorded_owner == ""` is
-                // `is_unowned`); `None` is the genuinely unresolvable refusal (#2545).
+            let binding = if meta_exists {
                 let owner_row: Option<Option<String>> = sqlx::query_scalar(
                     "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
                      JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
                 )
                 .bind(namespace)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("clear_namespace_standard owner pre-fetch", e))?;
                 match owner_row {
-                    // Row exists with a named owner different from the caller → refuse.
-                    Some(Some(owner))
-                        if !owner.is_empty()
-                            && owner != "system"
-                            && owner != ctx.effective_principal() =>
-                    {
-                        return Err(StoreError::PermissionDenied {
-                            action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
-                            target: namespace.to_string(),
-                            reason: format!(
-                                "caller does not own this namespace standard (owner: {owner})"
-                            ),
-                        });
-                    }
-                    // Row exists, caller owns it OR it is unowned (agent_id
-                    // present-empty/"system", or SQL NULL) → the unowned-pass. ALLOW.
-                    Some(_) => {}
-                    // No joined row → severed (NULL standard_id) or dangling id →
-                    // truly unresolvable. Refuse a non-bypass clear (#2545).
-                    None => {
-                        return Err(StoreError::PermissionDenied {
-                            action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
-                            target: namespace.to_string(),
-                            reason:
-                                "cannot clear namespace standard: the bound standard memory is \
-                                     unresolvable (severed or dangling). Re-point the standard \
-                                     first, then clear — or use an admin/bypass surface."
-                                    .to_string(),
-                        });
-                    }
+                    Some(owner) => crate::store::NamespaceStandardBinding::Resolved(owner),
+                    None => crate::store::NamespaceStandardBinding::Unresolvable,
                 }
-            }
+            } else {
+                crate::store::NamespaceStandardBinding::NoMetaRow
+            };
+            crate::store::authorize_clear_namespace_standard(ctx, namespace, &binding)?;
         }
         let rows_affected = sqlx::query("DELETE FROM namespace_meta WHERE namespace = $1")
             .bind(namespace)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err(crate::OP_CLEAR_NAMESPACE_STANDARD, e))?
             .rows_affected();
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("clear_namespace_standard commit", e))?;
         Ok(rows_affected > 0)
     }
 
@@ -28706,13 +28837,14 @@ impl MemoryStore for PostgresStore {
         target_id: &str,
         relation: &str,
         valid_until: Option<&str>,
+        actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
         // Delegate to the inherent `kg_invalidate` method which carries
         // the AGE↔CTE dual-path fallback discipline. The trait method
         // is the canonical surface; `kg_invalidate_via_store` (the
         // pre-trait `as_any_for_postgres` downcast hatch) is preserved
         // for back-compat but new callers should reach via the trait.
-        self.kg_invalidate(source_id, target_id, relation, valid_until)
+        self.kg_invalidate(source_id, target_id, relation, valid_until, actor)
             .await
     }
 
@@ -29282,9 +29414,10 @@ pub async fn kg_invalidate_via_store(
     target_id: &str,
     relation: &str,
     valid_until: Option<&str>,
+    actor: Option<&str>,
 ) -> StoreResult<crate::store::KgInvalidateRow> {
     let pg = downcast_postgres(store)?;
-    pg.kg_invalidate(source_id, target_id, relation, valid_until)
+    pg.kg_invalidate(source_id, target_id, relation, valid_until, actor)
         .await
 }
 
@@ -31529,6 +31662,7 @@ mod tests {
                 "nonexistent-target",
                 "related_to",
                 None,
+                None,
             )
             .await
         {
@@ -31577,6 +31711,7 @@ mod tests {
                 "nonexistent-target",
                 "related_to",
                 None,
+                None,
             )
             .await
             .expect("cte direct");
@@ -31585,6 +31720,7 @@ mod tests {
                 "nonexistent-source",
                 "nonexistent-target",
                 "related_to",
+                None,
                 None,
             )
             .await
@@ -33452,7 +33588,13 @@ mod tests {
         };
         store.link(&ctx, &link).await.expect("create link");
         let row = store
-            .invalidate_link(&src_id, &dst_id, "related_to", Some("2030-01-01T00:00:00Z"))
+            .invalidate_link(
+                &src_id,
+                &dst_id,
+                "related_to",
+                Some("2030-01-01T00:00:00Z"),
+                None,
+            )
             .await
             .expect("invalidate_link");
         assert!(row.found, "link must be marked found");
@@ -33461,7 +33603,13 @@ mod tests {
         assert!(!row.valid_until.is_empty());
         // Calling again should surface the prior value.
         let row2 = store
-            .invalidate_link(&src_id, &dst_id, "related_to", Some("2031-02-02T00:00:00Z"))
+            .invalidate_link(
+                &src_id,
+                &dst_id,
+                "related_to",
+                Some("2031-02-02T00:00:00Z"),
+                None,
+            )
             .await
             .expect("re-invalidate");
         assert!(row2.found);
@@ -34102,7 +34250,7 @@ mod tests {
         };
         let store = PostgresStore::connect(&url).await.expect("connect");
         let row = store
-            .invalidate_link("nope-src", "nope-dst", "related_to", None)
+            .invalidate_link("nope-src", "nope-dst", "related_to", None, None)
             .await
             .expect("invalidate_link miss");
         assert!(!row.found);

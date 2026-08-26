@@ -451,6 +451,90 @@ pub(crate) fn log_refund_op_failed(agent_id: &str, e: &dyn std::fmt::Display) {
     tracing::warn!("quota refund_op failed for agent {agent_id}: {e}");
 }
 
+/// #3181 — READ-ONLY, MULTI-ROW quota pre-check: the sqlite twin of
+/// `PostgresStore::check_memory_quota`, backing
+/// [`crate::store::MemoryStore::check_memory_quota`] on the sqlite adapter.
+///
+/// The SAL trait method's default body was a silent no-op `Ok(())`, so any
+/// TRAIT-routed sqlite caller got NO quota gate at all while the postgres twin
+/// enforced one — the sqlite enforcement lived only in the HTTP/MCP handlers
+/// (via [`check_and_record`]). This restores the documented contract on the
+/// sqlite side with the SAME arithmetic postgres uses.
+///
+/// Differences from [`check_quota`], and why:
+/// * **Read-only.** No `ensure_row` — a *check* must not create a quota row as
+///   a side effect (the postgres twin uses `fetch_optional` and falls back to
+///   the compiled/operator defaults the record path would seed). A missing row
+///   is "0 used".
+/// * **Multi-row.** Charges `additional_count` memories and `additional_bytes`
+///   bytes, not a fixed single memory, because the bulk/consolidate callers
+///   pre-check a whole batch.
+/// * The daily memory counter is DAY-ROLLED (a stale-day row counts 0) while
+///   storage bytes are CUMULATIVE — identical to both `check_quota` and the
+///   postgres twin.
+///
+/// `saturating_add` keeps the comparison honest against an adversarial
+/// `i64::MAX` input that an unchecked `+` would wrap negative (#1256).
+///
+/// # Errors
+///
+/// [`QuotaCheckError::Quota`] when the projected total would exceed
+/// `max_memories_per_day` or `max_storage_bytes`; [`QuotaCheckError::Sql`]
+/// when the quota row cannot be read.
+pub fn check_memory_quota(
+    conn: &Connection,
+    agent_id: &str,
+    namespace: &str,
+    additional_count: i64,
+    additional_bytes: i64,
+) -> std::result::Result<(), QuotaCheckError> {
+    let row = load_row(conn, agent_id, namespace).map_err(QuotaCheckError::Sql)?;
+    let defaults = quota_defaults();
+    let (memories_today, max_memories, current_bytes, max_bytes) = match row {
+        Some(r) => {
+            let today = day_bucket(&chrono::Utc::now().to_rfc3339());
+            let effective = if day_bucket(&r.day_started_at) == today {
+                r.current_memories_today
+            } else {
+                0
+            };
+            (
+                effective,
+                r.max_memories_per_day,
+                r.current_storage_bytes,
+                r.max_storage_bytes,
+            )
+        }
+        // No row yet (first write for this agent+ns) → effective 0 against the
+        // compiled/operator defaults the record path would seed.
+        None => (
+            0,
+            defaults.max_memories_per_day,
+            0,
+            defaults.max_storage_bytes,
+        ),
+    };
+    if memories_today.saturating_add(additional_count) > max_memories {
+        return Err(QuotaCheckError::Quota(QuotaError {
+            agent_id: agent_id.to_string(),
+            namespace: namespace.to_string(),
+            limit: QuotaLimit::MemoriesPerDay,
+            current: memories_today,
+            max: max_memories,
+        }));
+    }
+    if current_bytes.saturating_add(additional_bytes) > max_bytes {
+        return Err(QuotaCheckError::Quota(QuotaError {
+            agent_id: agent_id.to_string(),
+            namespace: namespace.to_string(),
+            limit: QuotaLimit::StorageBytes,
+            current: current_bytes,
+            max: max_bytes,
+        }));
+    }
+    Ok(())
+}
+
 /// v0.7 K8 / H12 (#628 blocker) — atomic check + record. Combines the
 /// quota check with the counter increment under a single
 /// `BEGIN IMMEDIATE` SQLite transaction so concurrent writers cannot

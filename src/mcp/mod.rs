@@ -7312,7 +7312,7 @@ mod tests {
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 last_accessed_at: None,
                 expires_at: None,
-                metadata: json!({}),
+                metadata: json!({"scope": "collective"}),
                 reflection_depth: 0,
                 memory_kind: crate::models::MemoryKind::Observation,
                 entity_id: None,
@@ -7486,7 +7486,7 @@ mod tests {
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 last_accessed_at: None,
                 expires_at: None,
-                metadata: json!({}),
+                metadata: json!({"scope": "collective"}),
                 reflection_depth: 0,
                 memory_kind: crate::models::MemoryKind::Observation,
                 entity_id: None,
@@ -11964,7 +11964,9 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({"agent_id": "test-agent-reflect"}),
+            // #3176 / Fable #3237 item 4 — MCP reflect scopes source reads;
+            // `collective` is world-readable (same fixture pattern as I4).
+            metadata: json!({"agent_id": "test-agent-reflect", "scope": "collective"}),
             reflection_depth: depth,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,

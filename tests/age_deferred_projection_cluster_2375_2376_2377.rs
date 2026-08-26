@@ -120,6 +120,7 @@ async fn deferred_invalidate_before_drain_takes_effect_2375() {
             &b_id,
             MemoryLinkRelation::RelatedTo.as_str(),
             Some(&past),
+            None,
         )
         .await
         .expect("kg_invalidate under deferred mode");

@@ -539,11 +539,23 @@ pub async fn recover_from_transcript_store(
 
     // Step 2 — watermark fast-path via the store (the SAL twin of the sqlite
     // `MAX(created_at) WHERE agent_id_idx` query).
-    let watermark = store
-        .agent_max_created_at(&opts.agent_id)
-        .await
-        .ok()
-        .flatten();
+    // #3182 — DELIBERATE best-effort discard, now that the adapters propagate
+    // a substrate fault instead of answering `None`. The watermark is a pure
+    // fast-path OPTIMISATION: losing it costs a re-parse of the transcript,
+    // and every per-turn write below is idempotent (`recover_turn_idempotent`
+    // dual-dedups), so degrading to "no watermark" can only do redundant work
+    // — never lose or duplicate a turn. Failing the whole recovery because the
+    // optimisation's read faulted would be strictly worse. The fault is
+    // recorded on the report so it is not silent.
+    let watermark = match store.agent_max_created_at(&opts.agent_id).await {
+        Ok(w) => w,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("watermark read failed (re-parsing in full): {e}"));
+            None
+        }
+    };
     report.elapsed_ms_dedup_query = timer.phase_lap();
     // #2130 — mirror the sqlite twin's `bypass_fast_path` gate (recover_from_transcript,
     // the #2126 fix): the L3 poll watcher opts out of the watermark short-circuit because

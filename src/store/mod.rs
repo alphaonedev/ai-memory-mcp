@@ -669,6 +669,110 @@ impl CallerContext {
 /// substrate code so the move is a no-op for callers.
 pub use crate::visibility::is_visible_to_caller;
 
+// ---------------------------------------------------------------------------
+// #3176 — backend-blind `clear_namespace_standard` authorization core
+// ---------------------------------------------------------------------------
+
+/// #3176 — the resolved state of a namespace's governance standard, as read
+/// by an adapter immediately BEFORE it decides whether a
+/// `clear_namespace_standard` may proceed.
+///
+/// The three states are what the #1777 owner gate + the #2545 fail-closed
+/// unresolvable-standard arm actually discriminate on, and they are the ONLY
+/// backend-specific part of that decision: postgres reads them with
+/// `EXISTS(...)` + a `JOIN … metadata->>'agent_id'`, sqlite with
+/// `SELECT 1 …` + a `JOIN … json_extract(metadata, '$.agent_id')`. Everything
+/// downstream of the read — who may clear, and with exactly which refusal
+/// text — lives once in [`authorize_clear_namespace_standard`] so the two
+/// adapters cannot drift apart again (they had: pg enforced both arms, the
+/// sqlite SAL adapter enforced neither).
+///
+/// Keeping row-presence and owner-nullness SEPARABLE is load-bearing (#2704-F2):
+/// collapsing them makes an UNOWNED standard look UNRESOLVABLE and refuses a
+/// clear that must be allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NamespaceStandardBinding {
+    /// No `namespace_meta` row for this namespace at all. There is no
+    /// governance binding to disarm, so the DELETE is a no-op and the gate
+    /// does not apply on either backend.
+    NoMetaRow,
+    /// A `namespace_meta` row exists AND its `standard_id` resolves to a live
+    /// memory. The payload is that memory's `metadata.agent_id`; `None` means
+    /// the key is absent or SQL-NULL (an UNOWNED standard).
+    Resolved(Option<String>),
+    /// A `namespace_meta` row exists but its `standard_id` is SEVERED (NULL,
+    /// #2503) or DANGLING (points at no surviving row) — the bound standard
+    /// is unresolvable.
+    Unresolvable,
+}
+
+/// #2545 — wire-pinned refusal text for a clear against an UNRESOLVABLE
+/// standard. ONE declaration site (pm-v3.1 no-scattered-literal rule) shared
+/// by both adapters so the refusal is byte-identical whichever backend serves
+/// the request. Lifted verbatim from `store::postgres` when the sqlite SAL
+/// adapter gained the mirror gate (#3176).
+pub(crate) const REASON_CLEAR_STANDARD_UNRESOLVABLE: &str = "cannot clear namespace standard: the bound standard memory is \
+     unresolvable (severed or dangling). Re-point the standard \
+     first, then clear — or use an admin/bypass surface.";
+
+/// #1777 — wire-pinned refusal text for a clear by a caller who is not the
+/// bound standard's owner. Sibling of [`REASON_CLEAR_STANDARD_UNRESOLVABLE`].
+pub(crate) fn reason_clear_standard_not_owner(owner: &str) -> String {
+    format!("caller does not own this namespace standard (owner: {owner})")
+}
+
+/// #3176 — the shared authorization decision for `clear_namespace_standard`.
+///
+/// Clearing a namespace's standard REVERTS the namespace to permissive
+/// allow-on-silence: it deletes the governance policy gating every
+/// delete/write/promote into that namespace. It is therefore gated exactly
+/// like SETTING one (#1777), and a namespace whose standard is unresolvable
+/// is fail-closed refused rather than silently disarmed (#2545).
+///
+/// * `bypass_visibility` contexts (admin/operator surfaces) skip the gate,
+///   the same exemption the SAL scope=private read filter takes.
+/// * An UNOWNED standard (`agent_id` absent, empty, or the `system`
+///   sentinel) is the documented unowned-PASS: a legacy / federated /
+///   pre-#929 standard stays clearable by its namespace's operators.
+///
+/// # Errors
+///
+/// [`StoreError::PermissionDenied`] on a non-owner clear or on an
+/// unresolvable standard.
+pub(crate) fn authorize_clear_namespace_standard(
+    ctx: &CallerContext,
+    namespace: &str,
+    binding: &NamespaceStandardBinding,
+) -> StoreResult<()> {
+    if ctx.bypass_visibility {
+        return Ok(());
+    }
+    match binding {
+        // Nothing bound → nothing to disarm.
+        NamespaceStandardBinding::NoMetaRow => Ok(()),
+        // Row exists with a NAMED owner that is not the caller → refuse.
+        NamespaceStandardBinding::Resolved(Some(owner))
+            if !owner.is_empty()
+                && owner != crate::identity::sentinels::SYSTEM_PRINCIPAL
+                && owner != ctx.effective_principal() =>
+        {
+            Err(StoreError::PermissionDenied {
+                action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
+                target: namespace.to_string(),
+                reason: reason_clear_standard_not_owner(owner),
+            })
+        }
+        // Caller owns it, or it is unowned (absent / empty / `system`) → ALLOW.
+        NamespaceStandardBinding::Resolved(_) => Ok(()),
+        // Severed or dangling → truly unresolvable. Fail closed (#2545).
+        NamespaceStandardBinding::Unresolvable => Err(StoreError::PermissionDenied {
+            action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
+            target: namespace.to_string(),
+            reason: REASON_CLEAR_STANDARD_UNRESOLVABLE.to_string(),
+        }),
+    }
+}
+
 bitflags! {
     /// Capability flags advertised by each adapter. Enables feature
     /// detection at runtime so the upper layers can degrade gracefully
@@ -1027,9 +1131,11 @@ pub trait MemoryStore: Send + Sync {
     /// not a per-row [`store`](Self::store) loop: looping would silently
     /// downgrade the ALL-OR-NOTHING contract to PARTIALLY-APPLIED. An
     /// adapter that cannot honour atomicity must refuse. `PostgresStore`
-    /// overrides with one multi-row `INSERT ... ON CONFLICT`. `SqliteStore`
-    /// does not: sqlite bulk ingest is `handlers::bulk::bulk_create_sqlite`
-    /// over the transactional `crate::storage` funnel.
+    /// overrides with one multi-row `INSERT ... ON CONFLICT`. #3181:
+    /// `SqliteStore` overrides with the same per-row `db::insert` loop
+    /// under ONE `BEGIN IMMEDIATE` (HTTP bulk remains
+    /// `handlers::bulk::bulk_create_sqlite` over the transactional
+    /// `crate::storage` funnel; this override is the SAL surface).
     ///
     /// # Returned-id contract (#2551 — LOAD-BEARING, do not weaken)
     ///
@@ -1158,9 +1264,13 @@ pub trait MemoryStore: Send + Sync {
     /// of work). Returns the number of rows actually updated.
     ///
     /// Default implementation loops [`update_embedding`]
-    /// (Self::update_embedding) so every adapter is correct without an
-    /// override; `PostgresStore` overrides it with a single-transaction
-    /// multi-UPDATE so an N-row chunk costs one commit instead of N.
+    /// (Self::update_embedding) so every adapter is functionally correct
+    /// without an override — but it counts one write per ENTRY, not per row
+    /// actually updated, so an adapter that inherits it OVER-REPORTS when an
+    /// id vanished between the scan and the write (#3181). `SqliteStore`
+    /// overrides it with `db::set_embeddings_batch` and `PostgresStore` with a
+    /// single-transaction multi-UPDATE; both count rows actually written and
+    /// commit one chunk at a time.
     async fn set_embeddings_batch(
         &self,
         ctx: &CallerContext,
@@ -3518,9 +3628,12 @@ pub trait MemoryStore: Send + Sync {
     /// write; the EXEMPT paths (federation-receive, migrate, CLI, curator)
     /// never call it, so they are uncharged by construction.
     ///
-    /// Default is a no-op (`Ok(())`) — non-postgres adapters that already
-    /// enforce at the handler layer (sqlite) or do not enforce keep their
-    /// existing behaviour. Only `PostgresStore` overrides it.
+    /// Default is a no-op (`Ok(())`) for adapters that do not enforce quotas
+    /// at all (in-memory/test doubles). BOTH production adapters override it:
+    /// `PostgresStore` since #1795, and `SqliteStore` since #3181 — the
+    /// sqlite handler-layer enforcement (`quotas::check_and_record`) is real
+    /// but does NOT cover a trait-routed caller, so inheriting the no-op meant
+    /// the SAL surface had no quota gate on the default backend.
     async fn check_memory_quota(
         &self,
         _ctx: &CallerContext,
@@ -3941,6 +4054,15 @@ pub trait MemoryStore: Send + Sync {
     /// `valid_until` (the prior value is returned in
     /// `previous_valid_until` so callers can detect the overwrite).
     ///
+    /// `actor` is the ACTING principal, stamped as the `agent_id` of the
+    /// `memory_link.invalidated` audit leaf both adapters append when they
+    /// clear a signed row's signing surface (#3203). Pre-#3203 that leaf was
+    /// attributed to the edge's ORIGINAL attester, so an audit replay named
+    /// the peer that signed the edge as the actor of an invalidation it never
+    /// performed. Pass the authenticated caller; `None` records the `system`
+    /// sentinel for a substrate path that has no principal — never another
+    /// principal's identity.
+    ///
     /// # Errors
     ///
     /// Returns `Backend` when the underlying store reports an error.
@@ -3950,6 +4072,7 @@ pub trait MemoryStore: Send + Sync {
         _target_id: &str,
         _relation: &str,
         _valid_until: Option<&str>,
+        _actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
         Err(StoreError::UnsupportedCapability {
             capability: "INVALIDATE_LINK".to_string(),
@@ -5512,9 +5635,15 @@ mod tests {
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(
-            s.invalidate_link("src", "tgt", "related_to", Some("2026-01-01T00:00:00Z"))
-                .await
-                .unwrap_err(),
+            s.invalidate_link(
+                "src",
+                "tgt",
+                "related_to",
+                Some("2026-01-01T00:00:00Z"),
+                None
+            )
+            .await
+            .unwrap_err(),
             StoreError::UnsupportedCapability { .. }
         ));
     }

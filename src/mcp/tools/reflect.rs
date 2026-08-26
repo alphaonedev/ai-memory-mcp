@@ -557,7 +557,16 @@ pub fn handle_reflect(
         h.active_keypair = active_keypair;
         h
     };
-    let outcome = match db::reflect_with_hooks(conn, &input, &hooks) {
+    // #3176 / Fable #3237 item 4 — MCP is a TENANT write. The unscoped
+    // `reflect_with_hooks` (caller=None) let a tenant pull another
+    // agent's private source into a reflection. Scope the source read
+    // to the enforced governance subject (already bound above).
+    let outcome = match db::reflect_with_hooks_for_caller(
+        conn,
+        &input,
+        &hooks,
+        Some(input.agent_id.as_str()),
+    ) {
         Ok(o) => o,
         Err(e) => return Err(map_reflect_error_to_wire_string(e)),
     };
@@ -857,7 +866,10 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({"agent_id": "ai:test"}),
+            // #3176 / Fable #3237 item 4 — MCP reflect now scopes source
+            // reads. `collective` is world-readable so fixtures do not
+            // depend on the MCP caller resolving to `ai:test`.
+            metadata: json!({"agent_id": "ai:test", "scope": "collective"}),
             reflection_depth: 0,
             memory_kind: MemoryKind::Observation,
             entity_id: None,
