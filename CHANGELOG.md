@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `default_update_embedding_refuses_rather_than_dropping_the_vector_3242`,
   `default_set_embeddings_batch_refuses_when_update_embedding_is_unimplemented_3242`,
   `mock_adapters_method_surface_conformance_cov`.
+- **#2124 sqlite oracle follows #2638.** `sqlite_store_family_stamps_substrate_why_trace_for_system_2124`
+  expected `store_with_embedding` / `store_batch` to succeed on
+  `SqliteStore`. Those methods are trait-default refusals on sqlite
+  (embeddings live in a side table; bulk is `handlers::bulk`). The
+  oracle now pins the refuse and stamps via
+  `store_with_embedding_no_overwrite`.
 - **Not changed:** `list_unembedded` non-admin `Ok(vec![])` on both
   adapters is the documented #1586 admin gate (#3241), not "nothing to
   embed". Sqlite `list_by_event` is unbounded (no 1000-row cliff); list
