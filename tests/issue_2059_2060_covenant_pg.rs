@@ -414,10 +414,12 @@ async fn sqlite_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
     let tenant = CallerContext::for_agent("ai:tenant-2113");
     let ns = "ns/2113-sq";
 
-    // Seed a source memory as the system principal (exempt), so the reflect
-    // has a valid source_id to synthesize over.
-    let src = pg_mem("sq-src-2113", ns, "source", "ai:curator", None);
-    store.store(&system, &src).await.expect("seed source");
+    // Seed the source as the TENANT so the why_trace gate is reachable.
+    // A system-owned source would fold to SourceNotFound for the tenant
+    // (#910 visibility) before clause-1 can fire — that is not the #2113
+    // pin. Seed before REQUIRE_WHY_TRACE is engaged.
+    let src = pg_mem("sq-src-2113", ns, "source", "ai:tenant-2113", None);
+    store.store(&tenant, &src).await.expect("seed source");
 
     unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
     // Tenant reflect with NO why_trace → REFUSED (pre-#2113 this was ungated).
@@ -905,13 +907,11 @@ async fn pg_notify_why_trace_param_path_under_enforce_2122() {
 /// stamp on the internal principal. This is the parity ORACLE the pg test
 /// below mirrors (runs without a PG url).
 ///
-/// v1.0.0 #2638 / #3242 — `SqliteStore` deliberately does NOT implement
-/// `store_with_embedding` or `store_batch` (embeddings are a side table;
-/// bulk ingest is `handlers::bulk::bulk_create_sqlite`). Those trait
-/// defaults refuse with `UnsupportedCapability` rather than stamp-and-drop
-/// the vector / approximate atomicity. The sqlite write that replaced
-/// `store_with_embedding` on the HTTP create path is
-/// `store_with_embedding_no_overwrite`.
+/// v1.0.0 #2638 / #3242 — `SqliteStore` does NOT implement
+/// `store_with_embedding` (embeddings are a side table; HTTP create uses
+/// `store_with_embedding_no_overwrite`). #3181 / #3237 — `store_batch`
+/// IS implemented (BEGIN-IMMEDIATE / `WriteTxn`); the trait default still
+/// refuses for unimplemented adapters.
 #[tokio::test]
 async fn sqlite_store_family_stamps_substrate_why_trace_for_system_2124() {
     use ai_memory::store::sqlite::SqliteStore;
@@ -965,20 +965,18 @@ async fn sqlite_store_family_stamps_substrate_why_trace_for_system_2124() {
         Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
     );
 
-    // store_batch — sqlite must REFUSE (#2638); bulk is not this trait method.
-    match store
+    // store_batch — #3181 override; must stamp like `store`.
+    let batch_ids = store
         .store_batch(
             &system,
             std::slice::from_ref(&pg_mem("sq-2124-b", "ns/2124", "sys batch", "ai:c", None)),
         )
         .await
-    {
-        Err(StoreError::UnsupportedCapability { capability }) => {
-            assert_eq!(capability, "STORE_BATCH");
-        }
-        Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
-        Ok(landed) => panic!("sqlite store_batch succeeded ({landed:?}); it must refuse"),
-    }
+        .expect("store_batch");
+    assert_eq!(
+        why_trace_of(&store.get(&system, &batch_ids[0]).await.expect("get")).as_deref(),
+        Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
+    );
 }
 
 /// Postgres regression: the #2124 fix. Each of the three pg store-family
