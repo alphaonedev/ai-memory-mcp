@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (silent-default cluster Fable follow-up — #3242)
+
+- **#2596 sqlite link-dispatch no longer invents `DEFAULT_NAMESPACE`.** The
+  postgres arm already WARNed and skipped `memory_link_created` when the
+  source-anchor `get` failed. The sqlite arm used `db::get(…).ok().flatten()
+  .map_or_else(|| DEFAULT_NAMESPACE, …)` and dispatched into the wrong
+  tenant. It now WARNs and skips, matching postgres. Pin:
+  `link_dispatch_anchor_failure_is_warned_not_swallowed_2596`.
+- **#2592 truncation detector is LIMIT+1 / `>`.** A `LIMIT 1000` returning
+  1000 cannot tell "exactly 1000 subscribers" from "cut". The dispatcher
+  fetches 1001 and reports truncation only when `len() > 1000`. The
+  `spawn_blocking` reporter join is WARNed, not swallowed.
+- **`update_embedding` trait default refuses** (`UnsupportedCapability`)
+  instead of `Ok(())` dropping the vector (#2444 / #2638 class). Both
+  production adapters already override. `set_embeddings_batch`'s default
+  loop inherits the refusal. Pins:
+  `default_update_embedding_refuses_rather_than_dropping_the_vector_3242`,
+  `default_set_embeddings_batch_refuses_when_update_embedding_is_unimplemented_3242`.
+- **Not changed:** `list_unembedded` non-admin `Ok(vec![])` on both
+  adapters is the documented #1586 admin gate (#3241), not "nothing to
+  embed". Sqlite `list_by_event` is unbounded (no 1000-row cliff); list
+  failure already WARNs.
+
 ### Fixed (#3244 — SAL ConsolidationPass skipped under `spawn_blocking`)
 
 - **#3116's nested-runtime guard used `Handle::try_current()` as the panic

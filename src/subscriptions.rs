@@ -794,6 +794,10 @@ pub fn dispatch_event_with_details(
     let subs = match list_by_event(conn, event) {
         Ok(s) => s,
         Err(e) => {
+            // Loud on list failure (Fable #3242 item 4). This table is
+            // not LIMIT-capped — the 1000-row ordered cliff +
+            // `record_dispatch_scan_truncation` is the pg SAL prefix
+            // scan (`dispatch_event_postgres`), not this path.
             tracing::warn!("subscription list failed during dispatch: {e}");
             return;
         }

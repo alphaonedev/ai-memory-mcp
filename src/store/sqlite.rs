@@ -2707,6 +2707,11 @@ impl MemoryStore for SqliteStore {
         // `CallerContext::for_admin`. The `ctx` is load-bearing, not
         // decorative.
         if !ctx.bypass_visibility {
+            // #1586 / #3241 — empty here is the documented admin gate
+            // ("you may not see this corpus"), NOT "nothing to embed".
+            // The serve-boot sweep is the sole caller and uses for_admin.
+            // Do not change this to UnsupportedCapability (SUCCESSOR-RULES
+            // §3; pinned by cov_ga2_postgres list_unembedded_refuses_non_admin).
             return Ok(Vec::new());
         }
         let conn = self.state.lock().await;

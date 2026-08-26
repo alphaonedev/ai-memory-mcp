@@ -19243,6 +19243,8 @@ impl MemoryStore for PostgresStore {
         // matching the scope-gate convention every sibling SAL read
         // applies. The `ctx` is load-bearing, not decorative.
         if !ctx.bypass_visibility {
+            // #1586 / #3241 — empty is the documented admin gate, not
+            // "nothing to embed". See SqliteStore::list_unembedded.
             return Ok(Vec::new());
         }
         let cap: i64 = i64::try_from(limit).unwrap_or(LIST_FALLBACK_LIMIT_I64);

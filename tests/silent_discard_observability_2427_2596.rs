@@ -112,4 +112,24 @@ fn link_dispatch_anchor_failure_is_warned_not_swallowed_2596() {
         arm.contains("#2596"),
         "the WARN must be traceable to the finding it closes:\n{arm}"
     );
+
+    // Fable #3242 item 1 — the sqlite create_link arm used to invent
+    // DEFAULT_NAMESPACE on a failed `db::get`, dispatching the webhook
+    // into the wrong tenant. It must skip + WARN like the pg arm.
+    let sqlite_get = src
+        .find("let (link_namespace, link_owner) = match db::get(&lock.0, &source_id)")
+        .expect("the sqlite link-dispatch anchor lookup must exist");
+    let sqlite_arm = &src[sqlite_get..(sqlite_get + 2400).min(src.len())];
+    assert!(
+        !sqlite_arm.contains("DEFAULT_NAMESPACE"),
+        "a failed sqlite source lookup must not invent DEFAULT_NAMESPACE:\n{sqlite_arm}"
+    );
+    assert!(
+        sqlite_arm.contains("tracing::warn!"),
+        "the sqlite skipped dispatch must be logged:\n{sqlite_arm}"
+    );
+    assert!(
+        sqlite_arm.contains("#2596"),
+        "the sqlite WARN must be traceable to #2596:\n{sqlite_arm}"
+    );
 }

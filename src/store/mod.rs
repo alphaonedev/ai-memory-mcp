@@ -1082,14 +1082,20 @@ pub trait MemoryStore: Send + Sync {
     /// Set or clear the embedding column for an existing memory.
     /// v0.7.0 Wave-3 Continuation 5 — federation receivers re-embed
     /// peer-pushed memories via this path so `recall_hybrid` can find
-    /// them. Default implementation is a no-op for adapters that
-    /// don't store embeddings inline (sqlite — embeddings live in a
-    /// side table).
+    /// them.
     /// #2167 — `space` is the embedding-space fingerprint the
     /// `embedding` was minted under; it is stamped in the SAME statement as
     /// the vector (M-PARAMETER-CONSISTENCY) so a row can never hold a vector
     /// from one space and a stamp from another. A `None` embedding NULLs the
     /// stamp with the vector.
+    ///
+    /// v1.0.0 #3242 item 6 — the default is [`StoreError::UnsupportedCapability`],
+    /// not `Ok(())`. A no-op SUCCESS dropped a DATA-BEARING argument (the same
+    /// #2444 / #2638 class `store_with_embedding` already closed). Both
+    /// production adapters override this (`SqliteStore` via `db::set_embedding`,
+    /// `PostgresStore` inline). [`Self::set_embeddings_batch`]'s default loops
+    /// this method, so an unimplemented adapter refuses on the first row
+    /// instead of reporting a fully-written batch it never persisted.
     async fn update_embedding(
         &self,
         _ctx: &CallerContext,
@@ -1097,7 +1103,9 @@ pub trait MemoryStore: Send + Sync {
         _embedding: Option<&[f32]>,
         _space: &str,
     ) -> StoreResult<()> {
-        Ok(())
+        Err(StoreError::UnsupportedCapability {
+            capability: "UPDATE_EMBEDDING".to_string(),
+        })
     }
 
     /// #1579 A4 — bounded scan of memories whose inline `embedding`
@@ -4840,17 +4848,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_update_embedding_is_noop() {
+    async fn default_update_embedding_refuses_rather_than_dropping_the_vector_3242() {
         let s = MinimalStore;
         let ctx = CallerContext::for_agent("alice");
-        s.update_embedding(
-            &ctx,
-            "any",
-            Some(&[0.5_f32]),
-            &crate::embeddings::embedding_space_fingerprint("test-space"),
-        )
-        .await
-        .expect("noop");
+        match s
+            .update_embedding(
+                &ctx,
+                "any",
+                Some(&[0.5_f32]),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
+            )
+            .await
+        {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "UPDATE_EMBEDDING");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(()) => panic!("returned success while discarding the embedding"),
+        }
     }
 
     #[tokio::test]
@@ -5776,26 +5791,31 @@ mod tests {
         );
     }
 
-    /// #1579 A4 — the default `set_embeddings_batch` body loops
-    /// `update_embedding` and reports one written row per entry, so
-    /// every adapter is correct without an override.
+    /// #3242 item 6 — the default `set_embeddings_batch` loops
+    /// `update_embedding`, which now refuses. An adapter that implements
+    /// neither must not report a fully-written batch.
     #[tokio::test]
-    async fn default_set_embeddings_batch_loops_update_embedding() {
+    async fn default_set_embeddings_batch_refuses_when_update_embedding_is_unimplemented_3242() {
         let s = MinimalStore;
         let ctx = CallerContext::for_agent("alice");
         let entries = vec![
             ("a".to_string(), vec![0.1_f32]),
             ("b".to_string(), vec![0.2_f32]),
         ];
-        let written = s
+        match s
             .set_embeddings_batch(
                 &ctx,
                 &entries,
                 &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .await
-            .expect("default batch write");
-        assert_eq!(written, 2, "default body reports one row per entry");
+        {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "UPDATE_EMBEDDING");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(n) => panic!("reported {n} written rows while dropping the vectors"),
+        }
     }
 
     /// #1579 A4 — zero-progress guard: a scan that keeps reporting the

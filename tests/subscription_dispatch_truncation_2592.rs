@@ -134,8 +134,10 @@ fn c_dispatch_path_checks_the_scan_against_the_ceiling_2592() {
     let body = &body[..end];
 
     assert!(
-        body.contains("memories.len() >= SUBSCRIPTION_DISPATCH_LIMIT"),
-        "the dispatcher must compare the scan size against its ceiling:\n{body}"
+        body.contains("saturating_add(1)")
+            && body.contains("memories.len() > SUBSCRIPTION_DISPATCH_LIMIT"),
+        "the dispatcher must fetch LIMIT+1 and compare with `>` so an exactly-full \
+         population is not a false-positive truncation:\n{body}"
     );
     assert!(
         body.contains("record_dispatch_scan_truncation"),
