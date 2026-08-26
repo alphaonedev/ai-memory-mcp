@@ -6635,14 +6635,21 @@ mod tests {
             ),
             "#2639: the default must refuse, not claim an empty corpus"
         );
-        // update_embedding default = Ok.
-        dp.update_embedding(
-            &ctx,
-            "x",
-            None,
-            &crate::embeddings::embedding_space_fingerprint("test-space"),
-        )
-        .await
-        .unwrap();
+        // v1.0.0 #3242 item 6 — update_embedding default REFUSES rather
+        // than Ok(()) dropping the vector (same #2444 / #2638 class as
+        // store_with_embedding). DefaultImplProbeStore does not override.
+        assert!(
+            matches!(
+                dp.update_embedding(
+                    &ctx,
+                    "x",
+                    Some(&[0.5_f32]),
+                    &crate::embeddings::embedding_space_fingerprint("test-space"),
+                )
+                .await,
+                Err(StoreError::UnsupportedCapability { .. })
+            ),
+            "#3242: the default must refuse, not drop the vector"
+        );
     }
 }
