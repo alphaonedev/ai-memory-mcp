@@ -427,17 +427,15 @@ impl MemoryStore for SqliteStore {
         // here).
         let embedding_vec = embedding.filter(|v| !v.is_empty());
         let space_stamp = if embedding_vec.is_some() {
-            let stamp = space.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
-                StoreError::InvalidInput {
-                    detail:
-                        "store_with_embedding_no_overwrite: embedding requires a space stamp"
-                            .into(),
-                }
-            })?;
-            crate::store::reject_unattributed_space(
-                "store_with_embedding_no_overwrite",
-                stamp,
-            )?;
+            let stamp =
+                space
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| StoreError::InvalidInput {
+                        detail:
+                            "store_with_embedding_no_overwrite: embedding requires a space stamp"
+                                .into(),
+                    })?;
+            crate::store::reject_unattributed_space("store_with_embedding_no_overwrite", stamp)?;
             Some(stamp)
         } else {
             None

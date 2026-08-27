@@ -10,9 +10,7 @@
 #![allow(clippy::missing_panics_doc, clippy::uninlined_format_args)]
 #![cfg(feature = "sal")]
 
-use ai_memory::models::{
-    ConfidenceSource, LifecycleState, Memory, MemoryKind, Tier,
-};
+use ai_memory::models::{ConfidenceSource, LifecycleState, Memory, MemoryKind, Tier};
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore, StoreError};
 
