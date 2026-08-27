@@ -1017,6 +1017,58 @@ mod postgres_side {
     use ai_memory::models::Memory;
     use ai_memory::store::postgres::PostgresStore;
 
+    /// RAII snapshot/restore guard for a single process-wide environment
+    /// variable. Constructing it captures the prior value and applies the
+    /// new one; `Drop` restores the prior value (re-setting or removing it).
+    /// Because restoration runs during unwinding, a panic mid-test can no
+    /// longer leak `AI_MEMORY_ENCRYPT_AT_REST` into a sibling test in the
+    /// same binary — where `seed_memory` fails closed with no `agent_id`
+    /// (#3300, #2905 test-isolation class). Mirrors the reviewed `EnvGuard`
+    /// in `src/log_paths.rs`.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        /// Capture `key`'s current value, then set it to `value`.
+        fn set(key: &'static str, value: &str) -> Self {
+            let guard = Self {
+                key,
+                prev: std::env::var_os(key),
+            };
+            // SAFETY: these pg tests are `#[ignore]` and run serially under
+            // `--ignored`; no other thread reads or writes the environment
+            // concurrently, upholding `set_var`'s single-threaded contract
+            // (UNSAFE-01/03).
+            unsafe { std::env::set_var(key, value) };
+            guard
+        }
+
+        /// Clear the variable mid-test without disturbing the captured prior
+        /// value; `Drop` still restores the original.
+        fn clear(&self) {
+            // SAFETY: as in `set` — serial `#[ignore]` pg tests, no
+            // concurrent environment access.
+            unsafe { std::env::remove_var(self.key) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `set` — serial `#[ignore]` pg tests, no
+            // concurrent environment access. Runs during unwinding on
+            // panic, so the variable is always restored to its pre-test
+            // value.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     async fn live_pg() -> Option<PostgresStore> {
         let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()?;
         match PostgresStore::connect(&url).await {
@@ -1409,9 +1461,10 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: pg tests are #[ignore] and run serially under --ignored.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
 
         let agent = "pg-commit-b-on-agent";
         let run = uuid::Uuid::new_v4().simple().to_string();
@@ -1443,14 +1496,6 @@ mod postgres_side {
             fetched.content, plaintext,
             "#228 Commit B (pg): get must recover the plaintext"
         );
-
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
     }
 
     /// #2288 — at-rest encryption parity for the BULK funnel. Under the
@@ -1472,9 +1517,10 @@ mod postgres_side {
         let Some(pg) = live_pg().await else {
             return;
         };
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: pg tests are #[ignore] and run serially under --ignored.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
 
         let agent = "pg-2288-batch-agent";
         let run = uuid::Uuid::new_v4().simple().to_string();
@@ -1505,13 +1551,6 @@ mod postgres_side {
             .bind(&id)
             .execute(pg.pool())
             .await;
-        // SAFETY: restore the env before asserting.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
 
         assert_eq!(
             raw_content, "",
@@ -1608,9 +1647,10 @@ mod postgres_side {
         let run = uuid::Uuid::new_v4().simple().to_string();
 
         // ── ON: content is sealed. ──────────────────────────────────
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: pg tests are #[ignore] and run serially under --ignored.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         let plaintext = "pg SENSITIVE 2292 store_with_embedding";
         let mut mem = sample_memory(&format!("pg-2292-swe-on-{run}"));
         mem.content = plaintext.to_string();
@@ -1619,19 +1659,12 @@ mod postgres_side {
             .await
             .expect("store_with_embedding under encryption");
         let (raw, env, dec) = seal_probe_2292(&pg, &id, &admin_ctx).await;
-        // SAFETY: restore env before asserting.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
         assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
 
         // ── OFF: byte-identical — plaintext stored, envelope NULL. ───
-        let prev_off = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
+        // OFF phase: clear the gate; the guard still restores the
+        // original value on Drop.
+        enc_at_rest.clear();
         let off_plain = "pg plaintext-when-off 2292 swe";
         let mut mem_off = sample_memory(&format!("pg-2292-swe-off-{run}"));
         mem_off.content = off_plain.to_string();
@@ -1640,12 +1673,6 @@ mod postgres_side {
             .await
             .expect("store_with_embedding, gate off");
         let (raw_off, env_off, dec_off) = seal_probe_2292(&pg, &off_id, &admin_ctx).await;
-        // SAFETY: restore.
-        unsafe {
-            if let Some(v) = prev_off {
-                std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v);
-            }
-        }
         assert_eq!(
             raw_off, off_plain,
             "#2292: gate OFF stores plaintext verbatim (byte-identical)"
@@ -1672,9 +1699,10 @@ mod postgres_side {
         let run = uuid::Uuid::new_v4().simple().to_string();
 
         // ── ON. ─────────────────────────────────────────────────────
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: serial #[ignore] pg tests.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
         let plaintext = "pg SENSITIVE 2292 apply_remote";
         let mut mem = sample_memory(&format!("pg-2292-remote-on-{run}"));
         mem.content = plaintext.to_string();
@@ -1683,19 +1711,12 @@ mod postgres_side {
             .await
             .expect("apply_remote_memory under encryption");
         let (raw, env, dec) = seal_probe_2292(&pg, &id, &admin_ctx).await;
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
         assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
 
         // ── OFF: byte-identical. ────────────────────────────────────
-        let prev_off = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
+        // OFF phase: clear the gate; the guard still restores the
+        // original value on Drop.
+        enc_at_rest.clear();
         let off_plain = "pg plaintext-when-off 2292 remote";
         let mut mem_off = sample_memory(&format!("pg-2292-remote-off-{run}"));
         mem_off.content = off_plain.to_string();
@@ -1704,12 +1725,6 @@ mod postgres_side {
             .await
             .expect("apply_remote_memory, gate off");
         let (raw_off, env_off, _dec) = seal_probe_2292(&pg, &off_id, &admin_ctx).await;
-        // SAFETY: restore.
-        unsafe {
-            if let Some(v) = prev_off {
-                std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v);
-            }
-        }
         assert_eq!(
             raw_off, off_plain,
             "#2292: apply_remote gate OFF stores plaintext verbatim"
@@ -1742,9 +1757,10 @@ mod postgres_side {
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2303");
         let run = uuid::Uuid::new_v4().simple().to_string();
 
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: serial #[ignore] pg tests.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
 
         // Capture a tight since-bound BEFORE the insert so the send-path
         // read below scopes to just this row on a shared live DB.
@@ -1784,13 +1800,6 @@ mod postgres_side {
             .bind(&id)
             .execute(pg.pool())
             .await;
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
 
         let wire_content = wire.expect("#2303: row must be present in the send-path result");
         assert_eq!(
@@ -1813,9 +1822,10 @@ mod postgres_side {
         };
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: serial #[ignore] pg tests.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
 
         let plaintext = "pg SENSITIVE 2292 capture_turn";
         let mut mem = sample_memory(&format!("pg-2292-capture-{run}"));
@@ -1849,13 +1859,6 @@ mod postgres_side {
             .bind(format!("sess-{run}"))
             .execute(pg.pool())
             .await;
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
         assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
     }
 
@@ -1869,9 +1872,10 @@ mod postgres_side {
         };
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: serial #[ignore] pg tests.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
 
         let plaintext = "pg SENSITIVE 2292 recover_turn";
         let mut mem = sample_memory(&format!("pg-2292-recover-{run}"));
@@ -1896,13 +1900,6 @@ mod postgres_side {
             .bind(norm)
             .execute(pg.pool())
             .await;
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
         assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
     }
 
@@ -1918,9 +1915,10 @@ mod postgres_side {
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
         let run = uuid::Uuid::new_v4().simple().to_string();
         let ns = format!("parity-test/2292-reflect-{run}");
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: serial #[ignore] pg tests.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
 
         // Seed one source memory to reflect on.
         let mut src = sample_memory(&format!("pg-2292-reflect-src-{run}"));
@@ -1954,13 +1952,6 @@ mod postgres_side {
             .bind(&src_id)
             .execute(pg.pool())
             .await;
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
         assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
     }
 
@@ -1976,9 +1967,10 @@ mod postgres_side {
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
         let run = uuid::Uuid::new_v4().simple().to_string();
         let ns = format!("parity-test/2292-consol-{run}");
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: serial #[ignore] pg tests.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
 
         let mut src = sample_memory(&format!("pg-2292-consol-src-{run}"));
         src.namespace.clone_from(&ns);
@@ -2008,13 +2000,6 @@ mod postgres_side {
             .bind(&ns)
             .execute(pg.pool())
             .await;
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
         assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
     }
 
@@ -2029,9 +2014,10 @@ mod postgres_side {
         };
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: serial #[ignore] pg tests.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
 
         let mut orig = sample_memory(&format!("pg-2292-supersede-{run}"));
         orig.content = "original body".to_string();
@@ -2059,13 +2045,6 @@ mod postgres_side {
             .bind(&old_id)
             .execute(pg.pool())
             .await;
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
         assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
     }
 
@@ -2082,9 +2061,10 @@ mod postgres_side {
         };
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: serial #[ignore] pg tests.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
 
         // Seed the existing row (sealed under the gate).
         let mut orig = sample_memory(&format!("pg-2292-merge-{run}"));
@@ -2106,13 +2086,6 @@ mod postgres_side {
             .expect("merge_inbound under encryption");
         assert_eq!(merged_id, id, "merge resolves the same-id UPDATE path");
         let (raw, env, dec) = seal_probe_2292(&pg, &id, &admin_ctx).await;
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
         assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
     }
 
@@ -2135,9 +2108,10 @@ mod postgres_side {
         };
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: serial #[ignore] pg tests.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // Panic-safe: the guard restores `AI_MEMORY_ENCRYPT_AT_REST` on
+        // Drop, so a panic mid-test cannot leak the at-rest gate into a
+        // sibling test's `seed_memory` (fail-closed, no agent_id) — #3300.
+        let _enc_at_rest = EnvGuard::set("AI_MEMORY_ENCRYPT_AT_REST", "1");
 
         // Seed the row with V1 (sealed under the gate).
         let mut orig = sample_memory(&format!("pg-2292-update-{run}"));
@@ -2195,13 +2169,6 @@ mod postgres_side {
             .bind(&id)
             .execute(pg.pool())
             .await;
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
-                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
-            }
-        }
 
         // (a) content patch sealed + NO silent data loss.
         assert_eq!(
