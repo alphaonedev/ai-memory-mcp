@@ -1312,6 +1312,7 @@ fn verify_edge_envelope(edge: &EdgeEnvelope) -> bool {
         dst_id: &edge.target_id,
         relation: &edge.relation,
         observed_by: Some(observed_by),
+        created_at: Some(edge.created_at.as_str()),
         valid_from: edge.valid_from.as_deref(),
         valid_until: edge.valid_until.as_deref(),
     };

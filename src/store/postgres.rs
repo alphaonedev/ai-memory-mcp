@@ -11925,8 +11925,13 @@ impl PostgresStore {
         // as RFC3339 TEXT and round-trips losslessly so the SQLite
         // path is unaffected — the truncation is a no-op when the
         // input is already microsecond-aligned.
+        // #3291 — `created_at` is now in the SignableLink pre-image, so
+        // it MUST be truncated before sign AND INSERT for the same
+        // round-trip reason as `valid_from`.
+        let created_at_dt = truncate_to_microseconds(created_at_dt);
         let valid_from_dt = truncate_to_microseconds(valid_from_dt);
         let valid_until_dt = valid_until_dt.map(truncate_to_microseconds);
+        let created_at_str = created_at_dt.to_rfc3339();
         let valid_from_str = valid_from_dt.to_rfc3339();
         let valid_until_str = valid_until_dt.map(|t| t.to_rfc3339());
 
@@ -11946,6 +11951,7 @@ impl PostgresStore {
                     dst_id: &link.target_id,
                     relation: link.relation.as_str(),
                     observed_by: Some(kp.agent_id.as_str()),
+                    created_at: Some(created_at_str.as_str()),
                     valid_from: Some(valid_from_str.as_str()),
                     valid_until: valid_until_str.as_deref(),
                 };
@@ -13886,8 +13892,9 @@ async fn pg_invalidate_link_relational_in_tx(
         Option<Vec<u8>>,
         Option<String>,
         Option<DateTime<Utc>>,
+        DateTime<Utc>,
     )> = sqlx::query_as(
-        "SELECT valid_until, signature, observed_by, valid_from \
+        "SELECT valid_until, signature, observed_by, valid_from, created_at \
          FROM memory_links \
          WHERE source_id = $1 AND target_id = $2 AND relation = $3 \
          FOR UPDATE",
@@ -13899,7 +13906,8 @@ async fn pg_invalidate_link_relational_in_tx(
     .await
     .map_err(|e| to_store_err("kg_invalidate prior read", e))?;
 
-    let Some((prior, prior_signature, observed_by, prior_valid_from)) = prior_row else {
+    let Some((prior, prior_signature, observed_by, prior_valid_from, prior_created_at)) = prior_row
+    else {
         return Ok(None);
     };
     let was_signed = prior_signature.is_some();
@@ -13926,11 +13934,13 @@ async fn pg_invalidate_link_relational_in_tx(
     if was_signed {
         let valid_from_str = prior_valid_from.map(|t| t.to_rfc3339());
         let valid_until_str = now_until.map(|t| t.to_rfc3339());
+        let created_at_str = truncate_to_microseconds(prior_created_at).to_rfc3339();
         let signable = crate::identity::sign::SignableLink {
             src_id: source_id,
             dst_id: target_id,
             relation,
             observed_by: observed_by.as_deref(),
+            created_at: Some(created_at_str.as_str()),
             valid_from: valid_from_str.as_deref(),
             valid_until: valid_until_str.as_deref(),
         };
@@ -29488,7 +29498,7 @@ impl MemoryStore for PostgresStore {
 
         let row_opt = match (target_id.as_deref(), relation_filter.as_deref()) {
             (Some(t), Some(r)) => sqlx::query(
-                "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                "SELECT source_id, target_id, relation, created_at, valid_from, valid_until, \
                         observed_by, signature, attest_level
                  FROM memory_links \
                  WHERE source_id = $1 AND target_id = $2 AND relation = $3 \
@@ -29501,7 +29511,7 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err(CTX_VERIFY_LINK_SELECT, e))?,
             (Some(t), None) => sqlx::query(
-                "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                "SELECT source_id, target_id, relation, created_at, valid_from, valid_until, \
                         observed_by, signature, attest_level
                  FROM memory_links \
                  WHERE source_id = $1 AND target_id = $2 \
@@ -29513,7 +29523,7 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err(CTX_VERIFY_LINK_SELECT, e))?,
             (None, _) => sqlx::query(
-                "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                "SELECT source_id, target_id, relation, created_at, valid_from, valid_until, \
                         observed_by, signature, attest_level
                  FROM memory_links \
                  WHERE source_id = $1 \
@@ -29544,6 +29554,9 @@ impl MemoryStore for PostgresStore {
         let rel: String = row
             .try_get("relation")
             .map_err(|e| to_store_err(READ_RELATION, e))?;
+        let ca: DateTime<Utc> = row
+            .try_get(field_names::CREATED_AT)
+            .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
         let vf: Option<DateTime<Utc>> = row
             .try_get(field_names::VALID_FROM)
             .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
@@ -29574,6 +29587,7 @@ impl MemoryStore for PostgresStore {
         // belt-and-braces — if a future writer commits a higher-
         // precision value, this normalization clamps it back to what
         // the column actually stored.
+        let ca_str = truncate_to_microseconds(ca).to_rfc3339();
         let vf_str = vf.map(|t| truncate_to_microseconds(t).to_rfc3339());
         let vu_str = vu.map(|t| truncate_to_microseconds(t).to_rfc3339());
 
@@ -29592,6 +29606,7 @@ impl MemoryStore for PostgresStore {
                         dst_id: &tgt,
                         relation: &rel,
                         observed_by: obs.as_deref(),
+                        created_at: Some(ca_str.as_str()),
                         valid_from: vf_str.as_deref(),
                         valid_until: vu_str.as_deref(),
                     };

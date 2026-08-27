@@ -14,7 +14,7 @@
 //!   list / export-pub.
 //! - H2 ([`ai_memory::identity::sign`] +
 //!   [`ai_memory::db::create_link_signed`]) — outbound canonical
-//!   CBOR + Ed25519 over the six signable link fields, persisted to
+//!   CBOR + Ed25519 over the seven signable link fields, persisted to
 //!   the previously-dead `signature` BLOB column.
 //! - H3 ([`ai_memory::identity::verify`]) — inbound mirror; re-derive
 //!   canonical bytes and verify against the peer's enrolled public key.
@@ -313,13 +313,13 @@ fn signed_events_payload_hash_matches_canonical_cbor() {
     // Read the row back so the audit binding hashes the bytes the
     // signer actually committed to (same `valid_from` instant the
     // INSERT chose, same observed_by claim).
-    let (valid_from, observed_by): (Option<String>, Option<String>) = f
+    let (created_at, valid_from, observed_by): (Option<String>, Option<String>, Option<String>) = f
         .conn
         .query_row(
-            "SELECT valid_from, observed_by FROM memory_links \
+            "SELECT created_at, valid_from, observed_by FROM memory_links \
              WHERE source_id = ?1 AND target_id = ?2",
             params![f.src_id, f.dst_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read row metadata back");
 
@@ -328,6 +328,7 @@ fn signed_events_payload_hash_matches_canonical_cbor() {
         dst_id: &f.dst_id,
         relation: "related_to",
         observed_by: observed_by.as_deref(),
+        created_at: created_at.as_deref(),
         valid_from: valid_from.as_deref(),
         valid_until: None,
     };
@@ -530,13 +531,16 @@ fn peer_attested_inbound_link_verifies() {
     };
     kp_mod::save_public_only(&bob_pub, f.keys_tmp.path()).expect("import bob.pub");
 
-    // Bob signs a link off-host.
-    let valid_from = Utc::now().to_rfc3339();
+    // Bob signs a link off-host. `created_at` is attested (#3291) so the
+    // persisted stamp MUST match the pre-image `memory_verify` re-derives.
+    let created_at = Utc::now().to_rfc3339();
+    let valid_from = created_at.clone();
     let signable = sign::SignableLink {
         src_id: &f.src_id,
         dst_id: &f.dst_id,
         relation: "related_to",
         observed_by: Some("bob"),
+        created_at: Some(&created_at),
         valid_from: Some(&valid_from),
         valid_until: None,
     };
@@ -551,7 +555,7 @@ fn peer_attested_inbound_link_verifies() {
         source_id: f.src_id.clone(),
         target_id: f.dst_id.clone(),
         relation: ai_memory::models::MemoryLinkRelation::RelatedTo,
-        created_at: Utc::now().to_rfc3339(),
+        created_at: created_at.clone(),
         signature: Some(sig),
         observed_by: Some("bob".to_string()),
         valid_from: Some(valid_from.clone()),
@@ -602,12 +606,14 @@ fn inbound_link_with_no_enrolled_pubkey_lands_unsigned() {
     // this receiver — the key dir has no `carol.pub`.
     let carol = kp_mod::generate("carol").expect("generate carol");
 
-    let valid_from = Utc::now().to_rfc3339();
+    let created_at = Utc::now().to_rfc3339();
+    let valid_from = created_at.clone();
     let signable = sign::SignableLink {
         src_id: &f.src_id,
         dst_id: &f.dst_id,
         relation: "related_to",
         observed_by: Some("carol"),
+        created_at: Some(&created_at),
         valid_from: Some(&valid_from),
         valid_until: None,
     };
@@ -622,7 +628,7 @@ fn inbound_link_with_no_enrolled_pubkey_lands_unsigned() {
         source_id: f.src_id.clone(),
         target_id: f.dst_id.clone(),
         relation: ai_memory::models::MemoryLinkRelation::RelatedTo,
-        created_at: Utc::now().to_rfc3339(),
+        created_at: created_at.clone(),
         signature: Some(sig),
         observed_by: Some("carol".to_string()),
         valid_from: Some(valid_from),

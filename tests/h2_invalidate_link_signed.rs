@@ -9,7 +9,7 @@
 //!
 //! Pre-fix behaviour: `db::invalidate_link` mutated `valid_until` on
 //! the row WITHOUT re-signing or clearing the signature. Because
-//! `valid_until` is one of the six fields the H2 outbound signer
+//! `valid_until` is one of the seven fields the H2 outbound signer
 //! commits to (see [`ai_memory::identity::sign::SignableLink`]), every
 //! previously self-signed link silently flipped to
 //! `signature_verified=false / attest_level=unsigned` the moment it

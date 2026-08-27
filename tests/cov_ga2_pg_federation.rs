@@ -966,6 +966,7 @@ async fn pg_sync_push_via_store_tampered_link_signature_skipped() {
         dst_id: "wrong-tgt",
         relation: "related_to",
         observed_by: Some(observer.as_str()),
+        created_at: None,
         valid_from: None,
         valid_until: None,
     };

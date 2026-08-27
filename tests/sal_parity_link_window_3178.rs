@@ -281,6 +281,7 @@ async fn sqlite_link_signature_commits_to_persisted_window_3178() {
         dst_id: &dst,
         relation: MemoryLinkRelation::RelatedTo.as_str(),
         observed_by: row.observed_by.as_deref(),
+        created_at: Some(row.created_at.as_str()),
         valid_from: row.valid_from.as_deref(),
         valid_until: row.valid_until.as_deref(),
     };
@@ -296,6 +297,7 @@ async fn sqlite_link_signature_commits_to_persisted_window_3178() {
         dst_id: &dst,
         relation: MemoryLinkRelation::RelatedTo.as_str(),
         observed_by: row.observed_by.as_deref(),
+        created_at: Some(row.created_at.as_str()),
         valid_from: row.valid_from.as_deref(),
         valid_until: None,
     };

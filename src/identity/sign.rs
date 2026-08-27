@@ -8,11 +8,11 @@
 //! pieces H2 ships:
 //!
 //! 1. [`canonical_cbor`] — RFC 8949 §4.2.1 deterministic CBOR encoding
-//!    of the six link fields the signature commits to:
-//!    `src_id`, `dst_id`, `relation`, `observed_by`, `valid_from`,
-//!    `valid_until`. Same bytes on every host, every architecture,
-//!    every endianness — the precondition for round-tripping a
-//!    signature through the federation wire.
+//!    of the seven link fields the signature commits to:
+//!    `src_id`, `dst_id`, `relation`, `observed_by`, `created_at`,
+//!    `valid_from`, `valid_until`. Same bytes on every host, every
+//!    architecture, every endianness — the precondition for
+//!    round-tripping a signature through the federation wire.
 //! 2. [`sign`] — wraps `canonical_cbor` + Ed25519 over the resulting
 //!    bytes. Returns the 64-byte signature ready to drop into the
 //!    `signature` BLOB column on `memory_links`.
@@ -47,15 +47,18 @@ use ed25519_dalek::Signer;
 
 use crate::identity::keypair::AgentKeypair;
 
-/// The six fields the link signature commits to.
+/// The seven fields the link signature commits to.
 ///
 /// Decoupled from [`crate::models::MemoryLink`] on purpose: that struct
 /// is the public wire shape for `get_links` (4 columns), while the
 /// signed bundle includes the temporal-validity columns (`valid_from`,
-/// `valid_until`, `observed_by`) added in v0.6.3 schema v15. Keeping
-/// `SignableLink` separate means H3's verifier can deserialize directly
-/// from a row without dragging the entire `MemoryLink` shape — and it
-/// gives the canonical encoder a single, audited shape to commit to.
+/// `valid_until`, `observed_by`) added in v0.6.3 schema v15 plus
+/// `created_at` (#3291 — caller-supplied after #3178, previously
+/// unsigned so a self-signed edge did not attest its own timestamp).
+/// Keeping `SignableLink` separate means H3's verifier can deserialize
+/// directly from a row without dragging the entire `MemoryLink` shape
+/// — and it gives the canonical encoder a single, audited shape to
+/// commit to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignableLink<'a> {
     pub src_id: &'a str,
@@ -65,6 +68,9 @@ pub struct SignableLink<'a> {
     /// was created by an unidentified caller (rare on the signing path
     /// — the keypair's owner is normally the observer).
     pub observed_by: Option<&'a str>,
+    /// RFC3339 instant the edge was recorded. Caller-supplied after
+    /// #3178; attested as of #3291 so a forged timestamp fails verify.
+    pub created_at: Option<&'a str>,
     /// RFC3339 instant the link became true. Always present on writes
     /// produced by `db::create_link` (set to "now" at insert time).
     pub valid_from: Option<&'a str>,
@@ -74,12 +80,13 @@ pub struct SignableLink<'a> {
     pub valid_until: Option<&'a str>,
 }
 
-/// RFC 8949 §4.2.1 deterministic CBOR encoding of the six signable
+/// RFC 8949 §4.2.1 deterministic CBOR encoding of the seven signable
 /// link fields.
 ///
-/// The encoded shape is a CBOR map with 6 entries keyed by the field
-/// names below. Map keys are emitted in sort order (per RFC 8949 §4.2.1
-/// "Core Deterministic Encoding"), integers use the shortest form, and
+/// The encoded shape is a CBOR map with 8 entries (7 payload fields +
+/// the #1931 `_dst` domain tag) keyed by the field names below. Map
+/// keys are emitted in sort order (per RFC 8949 §4.2.1 "Core
+/// Deterministic Encoding"), integers use the shortest form, and
 /// `Option::None` is encoded as CBOR `null`. Encoding the same
 /// `SignableLink` twice (or on a different host) produces identical
 /// bytes — the precondition Ed25519 needs.
@@ -87,8 +94,10 @@ pub struct SignableLink<'a> {
 /// Keys are emitted in true RFC-8949 canonical order via
 /// [`canonical_cbor_map`] (length-first, then bytewise over the encoded
 /// keys) so the bytes match what any conformant CBOR verifier re-derives —
-/// for the link keys that order is `dst_id, src_id, relation, valid_from,
-/// observed_by, valid_until` (#1897).
+/// for the link keys that order is `_dst, dst_id, src_id, relation,
+/// created_at, valid_from, observed_by, valid_until` (#1897, `created_at`
+/// added #3291; domain tag stays `ai-memory/link/v1` — a tag bump plus a
+/// field add would be a double forensic break).
 ///
 /// # Errors
 ///
@@ -132,6 +141,7 @@ pub fn canonical_cbor(link: &SignableLink<'_>) -> Result<Vec<u8>> {
         ("dst_id", ciborium::Value::Text(link.dst_id.to_string())),
         ("relation", ciborium::Value::Text(link.relation.to_string())),
         (field_names::OBSERVED_BY, text_or_null(link.observed_by)),
+        (field_names::CREATED_AT, text_or_null(link.created_at)),
         (field_names::VALID_FROM, text_or_null(link.valid_from)),
         (field_names::VALID_UNTIL, text_or_null(link.valid_until)),
     ]);
@@ -1229,6 +1239,7 @@ mod tests {
             dst_id: "dst-002",
             relation: "related_to",
             observed_by: Some("alice"),
+            created_at: Some("2026-05-04T12:00:00+00:00"),
             valid_from: Some("2026-05-05T00:00:00+00:00"),
             valid_until: None,
         }
@@ -1285,7 +1296,7 @@ mod tests {
         // M2 (v0.7.0 round-2): the encoder reads from a `BTreeMap<&str,
         // ...>` which is sorted by construction, so the bytes only ever
         // come out one way regardless of insertion order. We exercise
-        // that property explicitly by inserting the six fields in three
+        // that property explicitly by inserting the seven fields in three
         // distinct permutations and asserting all three encodes match.
         // If a future ciborium upgrade changes ordering semantics (or
         // someone swaps the `BTreeMap` for a `HashMap`), this test
@@ -1298,6 +1309,7 @@ mod tests {
         let dst_id = "dst-002";
         let relation = "related_to";
         let observed_by = Some("alice");
+        let created_at = Some("2026-05-04T12:00:00+00:00");
         let valid_from = Some("2026-05-05T00:00:00+00:00");
         let valid_until: Option<&str> = None;
 
@@ -1316,6 +1328,7 @@ mod tests {
             dst_id,
             relation,
             observed_by,
+            created_at,
             valid_from,
             valid_until,
         };
@@ -1327,6 +1340,7 @@ mod tests {
         let perm2 = SignableLink {
             valid_until,
             valid_from,
+            created_at,
             observed_by,
             relation,
             dst_id,
@@ -1338,6 +1352,7 @@ mod tests {
             relation,
             src_id,
             valid_from,
+            created_at,
             dst_id,
             valid_until,
             observed_by,
@@ -1375,25 +1390,53 @@ mod tests {
         assert_ne!(a, b, "different relation must produce different bytes");
     }
 
+    /// #3291 — `created_at` is in the attested pre-image, so changing it
+    /// MUST change the canonical bytes (otherwise a forged timestamp
+    /// would still verify).
+    #[test]
+    fn canonical_cbor_differs_on_created_at_change_3291() {
+        let base = link_fixture();
+        let mut altered = base.clone();
+        altered.created_at = Some("2026-05-06T00:00:00+00:00");
+        let a = canonical_cbor(&base).expect("encode base");
+        let b = canonical_cbor(&altered).expect("encode altered");
+        assert_ne!(a, b, "different created_at must produce different bytes");
+    }
+
+    /// #3291 — a signature over one `created_at` must fail verify when
+    /// the verifier re-derives bytes from a different timestamp.
+    #[test]
+    fn tampered_created_at_fails_verify_3291() {
+        let kp = keypair::generate("alice").expect("generate");
+        let link = link_fixture();
+        let sig = sign(&kp, &link).expect("sign");
+        let mut tampered = link.clone();
+        tampered.created_at = Some("2099-01-01T00:00:00+00:00");
+        let err = crate::identity::verify::verify(&kp.public, &tampered, &sig)
+            .expect_err("tampered created_at must fail verify");
+        assert_eq!(err, crate::identity::verify::VerifyError::Tampered);
+    }
+
     /// #1897 — the encoder must emit keys in TRUE RFC 8949 §4.2.1 canonical
     /// order (length-first, then bytewise over the ENCODED keys), NOT the
     /// `BTreeMap<&str>` string-lexicographic order. For the link key set the
-    /// canonical order is `dst_id, src_id, relation, valid_from, observed_by,
-    /// valid_until`. The old BTreeMap order wrongly placed `observed_by`
-    /// before `relation` (lexicographic `o` < `r`), so any conformant CBOR
-    /// verifier would re-derive different bytes and reject the signature.
+    /// canonical order is `_dst, dst_id, src_id, relation, created_at,
+    /// valid_from, observed_by, valid_until` (#3291 added `created_at`).
+    /// The old BTreeMap order wrongly placed `observed_by` before `relation`
+    /// (lexicographic `o` < `r`), so any conformant CBOR verifier would
+    /// re-derive different bytes and reject the signature.
     #[test]
     fn canonical_cbor_uses_rfc8949_key_order() {
         let bytes = canonical_cbor(&link_fixture()).expect("encode");
 
-        // Exact header + first key: since #1931 the map carries a 7th entry —
-        // the domain-separation tag under key "_dst" (a 4-byte text string,
-        // 0x64 '_' 'd' 's' 't') — which sorts FIRST under length-first canonical
-        // ordering (4 < 6). So the map opens 0xA7 then "_dst".
+        // Exact header + first key: since #1931 the map carries the domain
+        // tag under key "_dst" (a 4-byte text string, 0x64 '_' 'd' 's' 't')
+        // which sorts FIRST under length-first canonical ordering (4 < 6).
+        // #3291 adds `created_at` so the map is 8 entries: 0xA8 then "_dst".
         assert_eq!(
             &bytes[0..6],
-            &[0xA7, 0x64, b'_', b'd', b's', b't'],
-            "canonical map must open with 7 entries and the #1931 domain tag key _dst"
+            &[0xA8, 0x64, b'_', b'd', b's', b't'],
+            "canonical map must open with 8 entries and the #1931 domain tag key _dst"
         );
 
         let pos = |needle: &str| {
@@ -1407,6 +1450,7 @@ mod tests {
             "dst_id",
             "src_id",
             "relation",
+            "created_at",
             "valid_from",
             "observed_by",
             "valid_until",
@@ -1420,6 +1464,12 @@ mod tests {
         assert!(
             pos("relation") < pos("observed_by"),
             "shorter key 'relation' must precede longer 'observed_by'"
+        );
+        // #3291 — equal-length `created_at` / `valid_from` (both 10) sort
+        // bytewise: 'c' < 'v'.
+        assert!(
+            pos("created_at") < pos("valid_from"),
+            "equal-length 'created_at' must precede 'valid_from' ('c' < 'v')"
         );
     }
 
@@ -1656,6 +1706,7 @@ mod tests {
             dst_id: "d",
             relation: "r",
             observed_by: None,
+            created_at: None,
             valid_from: None,
             valid_until: None,
         };

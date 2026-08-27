@@ -561,6 +561,7 @@ mod tests {
             dst_id: "dst-002",
             relation: "related_to",
             observed_by: Some("alice"),
+            created_at: Some("2026-05-04T12:00:00+00:00"),
             valid_from: Some("2026-05-05T00:00:00+00:00"),
             valid_until: None,
         }
