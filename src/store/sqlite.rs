@@ -1339,7 +1339,10 @@ impl MemoryStore for SqliteStore {
         // RETURNED set, mirroring the MCP/HTTP/CLI writers; rows are
         // stamped pre-folded under the sync legacy flag via the shared
         // insert-layer stamp. A ledger error never blocks the recall.
-        if crate::observations::table_exists(&conn) {
+        // `skip_access_ledger`: caller will record the post-filter set
+        // itself (HTTP postgres is the production user; sqlite HTTP
+        // still goes through `db::` and records in the handler).
+        if !filter.skip_access_ledger && crate::observations::table_exists(&conn) {
             let recall_id = uuid::Uuid::new_v4().to_string();
             let mode = if query_embedding.is_some() {
                 "hybrid"
@@ -4384,6 +4387,61 @@ mod tests {
             "recall_hybrid keyword fallback returned nothing"
         );
         assert!(hits[0].1 > 0.0, "score must be positive");
+    }
+
+    #[tokio::test]
+    async fn recall_hybrid_skip_access_ledger_writes_nothing() {
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mem = test_memory(
+            "skip-ledger-target",
+            "indigo elephant chess fts5 token skip ledger",
+        );
+        store.store(&ctx, &mem).await.expect("store");
+        let recorded = store
+            .recall_hybrid(
+                &ctx,
+                "elephant",
+                None,
+                &Filter {
+                    limit: 10,
+                    ..Filter::default()
+                },
+            )
+            .await
+            .expect("default recall records the ledger");
+        assert!(!recorded.is_empty(), "default recall must hit the row");
+        let after_default = store
+            .list_recall_observations(None, None, None, None, 100)
+            .await
+            .expect("list after default");
+        assert_eq!(
+            after_default.len(),
+            recorded.len(),
+            "default recall_hybrid writes one observation per returned row"
+        );
+        store
+            .recall_hybrid(
+                &ctx,
+                "elephant",
+                None,
+                &Filter {
+                    limit: 10,
+                    skip_access_ledger: true,
+                    ..Filter::default()
+                },
+            )
+            .await
+            .expect("skipped recall");
+        let after_skip = store
+            .list_recall_observations(None, None, None, None, 100)
+            .await
+            .expect("list after skip");
+        assert_eq!(
+            after_skip.len(),
+            after_default.len(),
+            "skip_access_ledger must not append a second observation set"
+        );
     }
 
     #[tokio::test]

@@ -505,6 +505,13 @@ async fn recall_response(
         // (RFC3339 shape validated at the entry handlers). Stored as the raw
         // RFC3339 string; the SAL recall/list SQL binds it directly.
         filter.valid_at = valid_at.map(str::to_string);
+        // This handler records the POST-form4 / kinds / rerank set under
+        // the `recall_id` echoed in the response (touch ops fire on the
+        // FILTERED set — comment at apply_form4 below). Without the skip,
+        // `PostgresStore::recall_hybrid` (#3180) also appended the
+        // PRE-filter set under a different recall_id, so every HTTP pg
+        // recall folded 2× — the #3266 access-fold echo amplifier.
+        filter.skip_access_ledger = true;
         return match app
             .store
             .recall_hybrid(&ctx_caller, context, query_emb.as_deref(), &filter)
@@ -792,11 +799,12 @@ async fn recall_response(
     };
 
     // #1710 — populate the recall_observations ledger on the sqlite
-    // HTTP recall branch too (the postgres branch already does via the
-    // SAL trait, #1705; the MCP path does via the free-fn). Closes the
-    // §2.5 audit-parity gap: a sqlite-backed daemon answering recall
-    // over HTTP never logged the recall. The recall_id is echoed in the
-    // response so a caller can cite it on a later memory_store / link.
+    // HTTP recall branch too (the postgres branch records in the
+    // handler after skip_access_ledger, #1705/#3180; the MCP path
+    // does via the free-fn). Closes the §2.5 audit-parity gap: a
+    // sqlite-backed daemon answering recall over HTTP never logged
+    // the recall. The recall_id is echoed in the response so a
+    // caller can cite it on a later memory_store / link.
     //
     // DEADLOCK GUARD: routing this through `app.store.record_recall_observation`
     // would re-acquire `self.state.lock()` WHILE the recall DB lock below

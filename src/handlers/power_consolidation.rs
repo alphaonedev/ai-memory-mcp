@@ -1119,6 +1119,8 @@ pub async fn load_family_handler(
             metadata_eq: Some(family_eq.clone()),
             // #3185/#3127 — keyword-search-only axis; list ignores it.
             source_uri: None,
+            // Recall-hybrid only; list ignores it (default false).
+            skip_access_ledger: false,
         };
         // QC P1 fix (2026-05-20): load_family lists every memory in
         // the namespace tagged with a `family` metadata field. With

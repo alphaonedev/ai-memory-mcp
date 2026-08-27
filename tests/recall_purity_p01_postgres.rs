@@ -191,6 +191,8 @@ async fn postgres_recall_purity_sal_and_http_entry_paths() {
     let mut expected_growth: i64 = 0;
 
     // ---- SAL entry path (recall_hybrid) — pure read on postgres. ----
+    // #3180: SAL postgres now appends the access ledger (sqlite parity);
+    // count those rows so the growth pin below is exact.
     let ctx = CallerContext::for_agent("ai:test:p01");
     let filter = Filter {
         namespace: Some(ns.to_string()),
@@ -205,6 +207,7 @@ async fn postgres_recall_purity_sal_and_http_entry_paths() {
             .expect("sal recall_hybrid");
         assert!(!rows.is_empty(), "SAL recall must return the corpus");
         let got: Vec<String> = rows.iter().map(|(m, _)| m.id.clone()).collect();
+        expected_growth += i64::try_from(got.len()).expect("SAL row count fits i64");
         match &first_ids {
             None => first_ids = Some(got),
             Some(prev) => assert_eq!(prev, &got, "SAL result set drifted"),
@@ -309,9 +312,11 @@ async fn postgres_recall_purity_sal_and_http_entry_paths() {
         pre_dump, post_dump,
         "PURITY VIOLATION (postgres): recall mutated a table other than recall_observations"
     );
-    // (c) Ledger grew by exactly the HTTP returned-row total (the SAL
-    // trait recall itself does not append on postgres — the handler
-    // does), every row unfolded in the pure default.
+    // (c) Ledger grew by exactly the SAL returned-row total (#3180
+    // append) plus the HTTP returned-row total (handler records the
+    // post-filter set once; skip_access_ledger stops the SAL append
+    // on that path so HTTP is not double-counted). Every row unfolded
+    // in the pure default.
     let (post_total, unfolded) = ledger_counts(&pool).await;
     assert_eq!(post_total - pre_total, expected_growth);
     assert_eq!(unfolded, expected_growth);

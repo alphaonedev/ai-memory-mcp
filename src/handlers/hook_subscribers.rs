@@ -1359,6 +1359,8 @@ pub async fn session_start(
             metadata_eq: None,
             // #3185/#3127 — keyword-search-only axis; list ignores it.
             source_uri: None,
+            // Recall-hybrid only; list ignores it (default false).
+            skip_access_ledger: false,
         };
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.list(&ctx, &filter).await {

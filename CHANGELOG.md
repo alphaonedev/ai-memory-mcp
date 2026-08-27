@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (HTTP postgres double-counted the access ledger)
+
+- **HTTP postgres recall no longer writes the `recall_observations` ledger twice.**
+  `#3180` (landed via the `#3240` SAL-parity cluster) made
+  `PostgresStore::recall_hybrid` append one observation per returned row —
+  the sqlite SAL twin, required so a pg-backed fleet's lifecycle is not
+  frozen. The HTTP handler still recorded the POST-form4 / kinds / rerank
+  set under a *second* `recall_id`. Every HTTP pg recall therefore folded
+  2× (the `#3266` access-fold echo amplifier); the Certified pg+AGE
+  purity pin `postgres_recall_purity_sal_and_http_entry_paths` saw 300
+  ledger rows against an expected 100 (10 SAL + 10 HTTP×2). HTTP now sets
+  `Filter.skip_access_ledger` and remains the single writer for the
+  filtered set / response `recall_id`. Direct SAL callers still append
+  once. Pin: `recall_hybrid_skip_access_ledger_writes_nothing`.
+
 ### Documentation (2026-08-26)
 
 - **Learn ai-memory** section on the docs site (`docs/learn/`): a hub plus three
