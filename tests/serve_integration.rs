@@ -499,7 +499,7 @@ fn serve_api_key_required_when_configured() {
             continue;
         }
 
-        let resp = send_first_request(|| client.get(format!("{}/api/v1/stats", &url)));
+        let resp = send_first_request(|| client.get(format!("{}/api/v1/stats", url)));
         let status = resp.status().as_u16();
         let body = resp.text().unwrap_or_default();
         if status != 401 {
@@ -512,7 +512,7 @@ fn serve_api_key_required_when_configured() {
         }
 
         let resp = client
-            .get(format!("{}/api/v1/stats", &url))
+            .get(format!("{}/api/v1/stats", url))
             .header("x-api-key", api_key)
             .header("x-agent-id", "ai:serve-test-admin")
             .send()
