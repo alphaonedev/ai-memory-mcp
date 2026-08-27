@@ -381,11 +381,23 @@ pub(crate) fn run_with_embedder(
     // v1.0.0 #2167 §3.3 layer 1 — the CLI-local HNSW seed set is filtered
     // to the active embedder's space (foreign vectors never enter the
     // graph). `None` when there is no embedder (keyword-only).
+    // v1.0.0 #2606 — the fingerprint omits the vector dim, so the seed set is
+    // narrowed by the live embedder's width too; otherwise a config-only dim
+    // change seeds the CLI graph with two dim populations under one stamp.
+    // The width is tracked SEPARATELY from the fingerprint on purpose: an
+    // embedder that cannot report its width must not also drop the #2167 §3
+    // space gate below, which is a different (and still-correct) control.
     let cli_active_space: Option<String> = embedder.as_ref().map(|e| e.space_fingerprint());
-    let vector_index = if let Some(active) = cli_active_space.as_deref()
+    // `None` for an embedder that reports no width. The index is then NOT
+    // built — the semantic phase linear-scans the embedding column with the
+    // fail-closed full-dim rescoring, which is slower and always correct;
+    // seeding a graph at a guessed width is the failure this closes.
+    let cli_active_dim: Option<usize> = embedder.as_ref().and_then(|e| e.embedding_dim());
+    let vector_index = if let (Some(active), Some(active_dim)) =
+        (cli_active_space.as_deref(), cli_active_dim)
         && db::count_embedded_memories(conn).is_ok_and(should_build_cli_hnsw)
     {
-        match db::get_all_embeddings(conn, active) {
+        match db::get_all_embeddings(conn, active, active_dim) {
             Ok(entries) if !entries.is_empty() => Some(hnsw::VectorIndex::build(entries)),
             _ => Some(hnsw::VectorIndex::empty()),
         }

@@ -124,6 +124,8 @@ pub mod parity;
 pub mod postgres_gate;
 pub mod power;
 pub mod power_consolidation;
+/// v1.0.0 #2402 — admin-gated operator quarantine inspect/release surface.
+pub mod quarantine;
 /// #1580 — WAL read-pool for the HTTP SQLite read path.
 pub mod read_pool;
 pub mod recall;
@@ -172,6 +174,7 @@ pub(crate) use parity::*;
 pub use postgres_gate::*;
 pub use power::*;
 pub use power_consolidation::*;
+pub use quarantine::*;
 pub use recall::*;
 pub use route_1111::*;
 pub use share::*;

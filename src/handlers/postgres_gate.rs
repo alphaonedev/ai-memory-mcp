@@ -246,8 +246,30 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // BOTH gate tables, working on postgres only by double-miss.
         ("POST", super::routes::CAPTURE_TURN) => true,
         ("POST", super::routes::MEMORY_RECALL_OBSERVATIONS) => true,
+        // v1.0.0 #2402 — the operator quarantine route-OUT. Both handlers
+        // dispatch through `app.store` on postgres
+        // (`MemoryStore::list_quarantined` / `operator_dequarantine`, both
+        // implemented by `PostgresStore`) and never `app.db.lock()`, so the
+        // BINDING SAFETY INVARIANT holds: a postgres-backed daemon reads and
+        // releases from the postgres corpus, not the empty scratch sqlite. The
+        // release lands its `memory.dequarantined` signed-chain row in the SAME
+        // transaction as the state change on that backend (the #1552
+        // SAL-port-fanout requirement), so pg support here is audited support.
+        ("GET", super::routes::ADMIN_QUARANTINE) => true,
+        ("POST", p) if admin_quarantine_release_path(p) => true,
         _ => false,
     }
+}
+
+/// v1.0.0 #2402 — `/api/v1/admin/quarantine/{id}/release` shape check.
+/// Mirrors [`checkpoints_resolve_path`] exactly.
+#[cfg(feature = "sal")]
+fn admin_quarantine_release_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix("/api/v1/admin/quarantine/") else {
+        return false;
+    };
+    rest.strip_suffix("/release")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// Path matcher for `/api/v1/memories/{id}/promote`.
@@ -513,6 +535,9 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         ("POST", super::routes::MEMORY_SUBSCRIPTION_DLQ_LIST) => true,
         ("POST", super::routes::MEMORY_RULE_LIST) => true,
         ("POST", super::routes::MEMORY_CHECK_AGENT_ACTION) => true,
+        // v1.0.0 #2402 — operator quarantine inspect (the release half is a
+        // path-parameter route, matched in the parameterised table below).
+        ("GET", super::routes::ADMIN_QUARANTINE) => true,
         _ => false,
     };
 
@@ -543,6 +568,8 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         // router mirror (Phase-1 anti-regression-gate finding).
         ("POST", p) if actions_transition_path(p) => true,
         ("POST", p) if checkpoints_resolve_path(p) => true,
+        // /api/v1/admin/quarantine/{id}/release (#2402)
+        ("POST", p) if admin_quarantine_release_path(p) => true,
         // /api/v1/approvals/{pending_id}
         ("POST", p) if approvals_decide_path(p) => true,
         // /api/v1/skill/{id} (GET + DELETE).

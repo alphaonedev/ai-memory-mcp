@@ -1056,6 +1056,9 @@ fn test_embed_env_overrides_config_1598() {
         ("OPENROUTER_API_KEY", None),
         ("OPENAI_API_KEY", None),
         ("CONFIG_POINTED_EMBED_KEY_1598", Some("config-ladder-key")),
+        // #2626 — the new dim knob must be CLEARED here or an ambient value
+        // from the operator's shell silently rewrites this ladder's answer.
+        (ai_memory::config::ENV_EMBED_DIM, None),
     ]);
     let r_cfg = cfg.resolve_embeddings();
     assert_eq!(
@@ -1101,6 +1104,7 @@ fn test_embed_env_overrides_config_1598() {
         ("OPENROUTER_API_KEY", None),
         ("OPENAI_API_KEY", None),
         ("CONFIG_POINTED_EMBED_KEY_1598", Some("config-ladder-key")),
+        (ai_memory::config::ENV_EMBED_DIM, None),
     ]);
     let r_env = cfg.resolve_embeddings();
     assert_eq!(
@@ -1134,6 +1138,101 @@ fn test_embed_env_overrides_config_1598() {
         ConfigSource::Env,
         "provenance must report Env"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 9b. v1.0.0 #2626 — AI_MEMORY_EMBED_DIM: the env form of `[embeddings].dim`.
+//
+// Pre-fix the dim was CONFIG-FILE-ONLY while every sibling embeddings knob had
+// an env form, so one model id resolved to TWO different widths depending on
+// which configuration path an operator used, and an env-configured node could
+// not reproduce a file-configured fleet's vector space at all. This pins the
+// three-layer ladder (env > config file > compiled table), the Matryoshka
+// `requested_dim` wiring, and the FAIL-CLOSED handling of an unusable value.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn embed_dim_env_beats_config_file_beats_compiled_table_2626() {
+    use ai_memory::config::{ENV_EMBED_DIM, EmbedDimSource};
+
+    // `google/gemini-embedding-2` is 3072 in KNOWN_EMBEDDING_DIMS — the
+    // model's NATIVE width, and the "surprising default" #2626 is about.
+    let toml_no_pin = r#"
+[embeddings]
+backend = "openrouter"
+model = "google/gemini-embedding-2"
+"#;
+    let toml_pinned = r#"
+[embeddings]
+backend = "openrouter"
+model = "google/gemini-embedding-2"
+dim = 768
+"#;
+    let cfg_no_pin: ai_memory::config::AppConfig = toml::from_str(toml_no_pin).expect("parse");
+    let cfg_pinned: ai_memory::config::AppConfig = toml::from_str(toml_pinned).expect("parse");
+
+    // Layer 3 — no pin anywhere: the compiled table's NATIVE width, and the
+    // source says so rather than implying an operator chose it.
+    {
+        let _g = MultiEnvVarGuard::apply(&[(ENV_EMBED_DIM, None)]);
+        let r = cfg_no_pin.resolve_embeddings();
+        assert_eq!(r.embedding_dim, Some(3072));
+        assert_eq!(r.dim_source, EmbedDimSource::CompiledTable);
+        assert_eq!(
+            r.requested_dim, None,
+            "a TABLE dim describes the model's native output and must never be \
+             re-requested as the wire `dimensions` param"
+        );
+    }
+
+    // Layer 2 — the config-file pin beats the table, and IS re-requested.
+    {
+        let _g = MultiEnvVarGuard::apply(&[(ENV_EMBED_DIM, None)]);
+        let r = cfg_pinned.resolve_embeddings();
+        assert_eq!(r.embedding_dim, Some(768));
+        assert_eq!(r.dim_source, EmbedDimSource::ConfigFile);
+        assert_eq!(r.requested_dim, Some(768));
+    }
+
+    // Layer 1 — the env pin beats BOTH. This is the case that did not exist
+    // before #2626: a container can now reproduce the fleet's vector space.
+    {
+        let _g = MultiEnvVarGuard::apply(&[(ENV_EMBED_DIM, Some("768"))]);
+        let r = cfg_no_pin.resolve_embeddings();
+        assert_eq!(
+            r.embedding_dim,
+            Some(768),
+            "AI_MEMORY_EMBED_DIM env MUST beat the compiled model table"
+        );
+        assert_eq!(r.dim_source, EmbedDimSource::Env);
+        assert_eq!(r.requested_dim, Some(768));
+    }
+    {
+        let _g = MultiEnvVarGuard::apply(&[(ENV_EMBED_DIM, Some("384"))]);
+        let r = cfg_pinned.resolve_embeddings();
+        assert_eq!(
+            r.embedding_dim,
+            Some(384),
+            "AI_MEMORY_EMBED_DIM env MUST beat [embeddings].dim"
+        );
+        assert_eq!(r.dim_source, EmbedDimSource::Env);
+    }
+
+    // Fail closed — an unusable value must NOT fall through to the table (that
+    // would resolve the exact value the operator was overriding) and must NOT
+    // fall through to the config file (guessing at intent). The dim becomes
+    // UNKNOWN, which degrades to keyword rather than embedding at a wrong
+    // width.
+    for bad in ["0", "-1", "768x", "seven", " "] {
+        let _g = MultiEnvVarGuard::apply(&[(ENV_EMBED_DIM, Some(bad))]);
+        let r = cfg_pinned.resolve_embeddings();
+        assert_eq!(
+            r.embedding_dim, None,
+            "AI_MEMORY_EMBED_DIM={bad} must fail CLOSED, not silently resolve another width"
+        );
+        assert_eq!(r.dim_source, EmbedDimSource::Unknown);
+        assert_eq!(r.requested_dim, None);
+    }
 }
 
 // ---------------------------------------------------------------------------

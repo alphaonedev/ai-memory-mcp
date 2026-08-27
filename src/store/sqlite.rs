@@ -615,6 +615,28 @@ impl MemoryStore for SqliteStore {
         db::dequarantine(&conn, id).map_err(box_err)
     }
 
+    /// v1.0.0 #2402 — the AUDITED operator release. Delegates to the sqlite
+    /// reference free fn [`db::operator_dequarantine`], which carries the
+    /// guarded `UPDATE` out of `quarantined` and the `memory.dequarantined`
+    /// signed-chain row in ONE transaction so the audit can never lag the
+    /// state change (the #1552 parity requirement).
+    async fn operator_dequarantine(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let mut conn = self.state.lock().await;
+        db::operator_dequarantine(&mut conn, id, &ctx.agent_id).map_err(box_err)
+    }
+
+    /// v1.0.0 #2402 — operator quarantine listing (delegates to the raw
+    /// [`crate::storage::list_quarantined`] primitive).
+    async fn list_quarantined(
+        &self,
+        namespace: Option<&str>,
+        limit: i64,
+    ) -> StoreResult<Vec<crate::models::QuarantinedMemory>> {
+        let conn = self.state.lock().await;
+        db::list_quarantined(&conn, namespace, limit).map_err(box_err)
+    }
+
     async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;

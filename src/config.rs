@@ -4159,6 +4159,11 @@ pub struct ResolvedEmbeddings {
     /// #1598 — provenance of the resolved API key for boot-banner /
     /// doctor-probe display.
     pub key_source: KeySource,
+    /// v1.0.0 #2626 — provenance of [`Self::embedding_dim`]. Rendered in the
+    /// boot banner so two nodes configured through different paths can be
+    /// compared on ONE line, instead of the divergence only surfacing later
+    /// as a stored blob length or a postgres re-type.
+    pub dim_source: EmbedDimSource,
     /// Provenance of the resolved configuration.
     pub source: ConfigSource,
 }
@@ -4192,6 +4197,8 @@ impl ResolvedEmbeddings {
             requested_dim: None,
             api_key,
             key_source: KeySource::None,
+            // #2626 — a synthesised view carries no operator pin provenance.
+            dim_source: EmbedDimSource::Unknown,
             source: ConfigSource::CompiledDefault,
         }
     }
@@ -4217,6 +4224,7 @@ impl std::fmt::Debug for ResolvedEmbeddings {
                 &self.embedding_dim,
             )
             .field("requested_dim", &self.requested_dim)
+            .field("dim_source", &self.dim_source)
             .field(
                 "api_key",
                 &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
@@ -4723,6 +4731,122 @@ pub const ENV_EMBED_API_KEY: &str = "AI_MEMORY_EMBED_API_KEY";
 /// resolver per the no-hardcoded-literals discipline (#1598).
 pub const ENV_EMBED_BACKFILL_BATCH: &str = "AI_MEMORY_EMBED_BACKFILL_BATCH";
 
+/// v1.0.0 [#2626] — env override for the embedding vector DIMENSION
+/// (`[embeddings].dim`).
+///
+/// # Why this exists
+///
+/// Every other embeddings knob had an env form (`AI_MEMORY_EMBED_BACKEND`,
+/// `_MODEL`, `_BASE_URL`, `_API_KEY`) and the dim did not, so an
+/// env-configured deployment — containers, systemd, CI, i.e. the most
+/// natural deployment path — could not express it AT ALL. One model id
+/// therefore resolved to two different widths depending on which
+/// configuration path an operator used: `google/gemini-embedding-2` is
+/// 3072 from the compiled [`KNOWN_EMBEDDING_DIMS`] table (its NATIVE width)
+/// but 768 on a fleet that pins `[embeddings].dim = 768` to match its
+/// pgvector `vector(768)` columns. The surprising value was the DEFAULT, the
+/// deliberate one was unreachable, and both nodes logged a successful
+/// embedder load. Downstream that converts into the re-type-and-NULL path
+/// (#2567): the durable memory TEXT survives, but a fleet silently discards
+/// its vectors and degrades to keyword recall.
+///
+/// # Semantics
+///
+/// Same meaning as `[embeddings].dim` and strictly higher precedence
+/// (env > config file > compiled table), so a container can reproduce a
+/// file-configured fleet's vector space exactly. For Matryoshka-capable API
+/// models it is sent as the wire `dimensions` param, so the vendor returns a
+/// truncated vector at exactly this width
+/// ([`ResolvedEmbeddings::requested_dim`]).
+///
+/// A value that is not a POSITIVE integer FAILS CLOSED: the resolved dim
+/// becomes UNKNOWN rather than falling through to the compiled table. Falling
+/// through would resolve the model's native width — the very value the
+/// operator was trying to override — so a typo would silently produce the
+/// wrong vector space, which is the class this knob exists to remove.
+/// See [`resolve_embed_dim_pin`].
+///
+/// [#2626]: https://github.com/alphaonedev/ai-memory-mcp/issues/2626
+pub const ENV_EMBED_DIM: &str = "AI_MEMORY_EMBED_DIM";
+
+/// v1.0.0 #2626 — provenance of the resolved embedding vector dim, so a boot
+/// banner can say WHERE the width came from and an operator comparing two
+/// nodes sees the divergence in one line instead of inferring it from a
+/// blob length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EmbedDimSource {
+    /// [`ENV_EMBED_DIM`] — the operator pinned it on the env path.
+    Env,
+    /// `[embeddings].dim` — the operator pinned it in the config file.
+    ConfigFile,
+    /// The compiled [`KNOWN_EMBEDDING_DIMS`] table: the model's NATIVE
+    /// width, which is NOT necessarily the fleet's.
+    CompiledTable,
+    /// No pin and no table entry — the dim is unknown, or
+    /// [`ENV_EMBED_DIM`] was set to something unusable and the resolver
+    /// fenced it off (fail closed) rather than guessing.
+    #[default]
+    Unknown,
+}
+
+impl EmbedDimSource {
+    /// Stable operator-facing label for the boot banner / diagnostics.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => ENV_EMBED_DIM,
+            Self::ConfigFile => "[embeddings].dim",
+            Self::CompiledTable => "compiled model table",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// v1.0.0 #2626 — resolve the operator-expressed dim PIN: env
+/// ([`ENV_EMBED_DIM`]) beats the config file (`[embeddings].dim`), and
+/// neither is `Some` when no pin was given.
+///
+/// Pure (the raw env string is passed in) so the precedence and the
+/// fail-closed rule are unit-testable without touching process env — the
+/// #2115 env-lock hazard.
+///
+/// Returns `(pin, source)`. `source` is [`EmbedDimSource::Unknown`] both when
+/// there is no pin AND when the env value was unusable. The caller MUST
+/// distinguish those by whether the env var was present: a present-but-
+/// unusable env must not fall through to the config file or the compiled
+/// table (#2626). An unusable env value is logged at ERROR here so it can
+/// never be silent.
+#[must_use]
+pub fn resolve_embed_dim_pin(
+    env_raw: Option<&str>,
+    cfg_dim: Option<u32>,
+) -> (Option<u32>, EmbedDimSource) {
+    if let Some(raw) = env_raw.map(str::trim).filter(|s| !s.is_empty()) {
+        return match raw.parse::<u32>() {
+            Ok(d) if d > 0 => (Some(d), EmbedDimSource::Env),
+            _ => {
+                // FAIL CLOSED. Falling through to `[embeddings].dim` or the
+                // compiled table would silently resolve a DIFFERENT vector
+                // space than the operator asked for, and a wrong width is
+                // exactly what makes a fleet discard its vectors (#2567).
+                tracing::error!(
+                    env = ENV_EMBED_DIM,
+                    value = %raw,
+                    "{ENV_EMBED_DIM} is not a positive integer; refusing to guess a \
+                     vector dimension. The embedding dim resolves as UNKNOWN, which \
+                     fails closed (an API embedder does not load and recall degrades \
+                     to keyword) rather than embedding at the wrong width (#2626)"
+                );
+                (None, EmbedDimSource::Unknown)
+            }
+        };
+    }
+    match cfg_dim.filter(|d| *d > 0) {
+        Some(d) => (Some(d), EmbedDimSource::ConfigFile),
+        None => (None, EmbedDimSource::Unknown),
+    }
+}
+
 /// v0.9.0 P0-1 (#1869) — cadence (whole seconds) of the dedicated
 /// recall-access FOLD loop. Default `60`. `0` disables the dedicated
 /// loop — the fold then rides the gc tick only (every
@@ -4932,6 +5056,7 @@ impl Default for ResolvedModels {
                 requested_dim: None,
                 api_key: None,
                 key_source: KeySource::None,
+                dim_source: EmbedDimSource::Unknown,
                 source: ConfigSource::CompiledDefault,
             },
             reranker: ResolvedReranker {
@@ -4990,6 +5115,9 @@ impl ResolvedModels {
                 requested_dim: None,
                 api_key: None,
                 key_source: KeySource::None,
+                // #2626 — the tier preset is a compiled table, not an
+                // operator pin.
+                dim_source: EmbedDimSource::CompiledTable,
                 source: ConfigSource::CompiledDefault,
             },
             reranker: ResolvedReranker {
@@ -8760,18 +8888,46 @@ impl AppConfig {
         // ignored. None when neither layer knows the dim; callers
         // (capabilities surface) fall back to the tier preset's
         // compiled dim.
-        let embedding_dim = cfg
-            .and_then(|e| e.dim)
-            .filter(|d| *d > 0)
-            .or_else(|| canonical_embedding_dim(&model));
+        // v1.0.0 #2626 — the operator PIN, env before config file. Pre-fix
+        // only the config file could express it, so an env-configured node
+        // could not reproduce a file-configured fleet's vector space even
+        // when the operator knew the value.
+        let env_dim_raw = std::env::var(ENV_EMBED_DIM).ok();
+        // Present even when the value is whitespace-only: `Some(" ")` is
+        // operator intent to pin, not "env unset". Grammar SSOT stays
+        // [`resolve_embed_dim_pin`]; this flag is the presence bit that
+        // function cannot encode because `Unknown` covers both cases.
+        let env_dim_set = env_dim_raw.is_some();
+        let (pin, pin_source) =
+            resolve_embed_dim_pin(env_dim_raw.as_deref(), cfg.and_then(|e| e.dim));
+        // #2626 — `pin_source == Unknown` is used for BOTH "env unset" AND
+        // "env set but unusable", so the table lookup would silently
+        // resolve a DIFFERENT width than the operator asked for (the
+        // `AI_MEMORY_EMBED_DIM=0` → compiled 3072 fall-through). When the
+        // env var was present and did not yield an Env pin, fail CLOSED:
+        // no config-file pin, no compiled table.
+        let (embedding_dim, dim_source) = if env_dim_set && pin_source != EmbedDimSource::Env {
+            (None, EmbedDimSource::Unknown)
+        } else {
+            match pin {
+                Some(d) => (Some(d), pin_source),
+                None => match canonical_embedding_dim(&model) {
+                    Some(d) => (Some(d), EmbedDimSource::CompiledTable),
+                    None => (None, EmbedDimSource::Unknown),
+                },
+            }
+        };
 
         // #1598 (fleet follow-up) — the EXPLICIT override alone also
         // becomes the wire `dimensions` request for OpenAI-compatible
         // backends (Matryoshka truncation; see
         // [`ResolvedEmbeddings::requested_dim`]). Deliberately NOT
         // populated from the table lookup — a table dim describes the
-        // model's native output and must not be re-requested.
-        let requested_dim = cfg.and_then(|e| e.dim).filter(|d| *d > 0);
+        // model's native output and must not be re-requested. A
+        // present-but-unusable env also yields None even if the pin
+        // function fell through to a config value (whitespace-only env).
+        let requested_dim =
+            pin.filter(|_| matches!(dim_source, EmbedDimSource::Env | EmbedDimSource::ConfigFile));
 
         // #1598 — embedding API key (None for ollama / keyless
         // self-hosted endpoints).
@@ -8786,6 +8942,7 @@ impl AppConfig {
             requested_dim,
             api_key,
             key_source,
+            dim_source,
             source,
         }
     }
@@ -11949,6 +12106,7 @@ legacy_scoring = false
             ENV_EMBED_MODEL,
             ENV_EMBED_API_KEY,
             ENV_EMBED_BACKFILL_BATCH,
+            ENV_EMBED_DIM,
             "OPENROUTER_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",

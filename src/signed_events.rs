@@ -201,6 +201,25 @@ pub mod event_types {
     /// (`src/notification/invalidation.rs::278`).
     pub const REFLECTION_INVALIDATION_NOTIFIED: &str = "reflection.invalidation_notified";
 
+    /// v1.0.0 [#2402] — `signed_events.event_type` for an OPERATOR
+    /// dequarantine: the sanctioned route OUT of
+    /// [`crate::models::LifecycleState::Quarantined`], invoked through
+    /// `ai-memory quarantine release <id>` or its admin HTTP twin.
+    ///
+    /// Distinct from the SYSTEM route-out (`dequarantine-on-attest`, where a
+    /// later verifying write from the author's now-enrolled key clears the
+    /// row): that one is the substrate re-deciding on new cryptographic
+    /// evidence, this one is a human overriding a containment decision. Under
+    /// `asi-hard` the quarantine knob is PINNED on, so this is the ONLY way a
+    /// held row ever becomes visible again — exactly the kind of action that
+    /// must leave a signed, append-only trace naming WHO released WHAT.
+    /// Emitted in the SAME transaction as the state change on both backends
+    /// (the #1552 SAL-port-fanout parity requirement), so the audit can never
+    /// lag the write.
+    ///
+    /// [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
+    pub const MEMORY_DEQUARANTINED: &str = "memory.dequarantined";
+
     /// `signed_events.event_type` for the recursive-learning depth-cap
     /// trip (`src/cli/doctor.rs::1904`). v0.7.0 #655 Task 1/8.
     pub const REFLECTION_DEPTH_EXCEEDED: &str = "reflection.depth_exceeded";

@@ -262,6 +262,16 @@ pub struct Metrics {
     /// quarantine used to emit nothing while `/sync/push` returned 200).
     pub federation_quarantined_unattributed: IntCounter,
 
+    /// v1.0.0 #2402 — the route-OUT twin of
+    /// [`Self::federation_quarantined_unattributed`]: monotonic count of
+    /// quarantined rows an OPERATOR released through
+    /// `ai-memory quarantine release` / `POST /api/v1/admin/quarantine/{id}/release`.
+    /// A human overriding a containment decision is exactly the action a fleet
+    /// must be able to watch as a rate, not only reconstruct from the signed
+    /// chain after the fact. Incremented once per row actually released; a
+    /// no-op release (the id is not quarantined) never increments.
+    pub operator_dequarantined: IntCounter,
+
     /// pm-v3.1 PR8 (issue #1174) — cumulative HNSW oldest-eviction
     /// count since process start. Replaces the prior process-global
     /// `AtomicU64` `INDEX_EVICTIONS_TOTAL` in `src/hnsw.rs`.
@@ -787,6 +797,22 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_quarantined_unattributed.clone()))?;
 
+        // v1.0.0 #2402 — the route-OUT counter. #1948 advertised "operator
+        // dequarantine" as the way out of quarantine and shipped no caller, so
+        // there was nothing to count; now that the verb exists, releasing a
+        // contained row must be as visible as containing one.
+        let operator_dequarantined = IntCounter::new(
+            "ai_memory_operator_dequarantined_total",
+            "Monotonic count of quarantined memories released by an OPERATOR \
+             through `ai-memory quarantine release` or \
+             `POST /api/v1/admin/quarantine/{id}/release` (#2402). The route-OUT \
+             twin of ai_memory_fed_quarantined_unattributed_total. Each increment \
+             also appends a `memory.dequarantined` signed-chain row naming the \
+             authenticated caller, in the same transaction as the state change. A \
+             no-op release (the id is not quarantined) does not increment.",
+        )?;
+        registry.register(Box::new(operator_dequarantined.clone()))?;
+
         // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability moved
         // from process-global atomics in `src/hnsw.rs` into the metrics
         // registry. The counter mirrors `INDEX_EVICTIONS_TOTAL`; the
@@ -1072,6 +1098,7 @@ impl Metrics {
             federation_push_dlq_legacy_positional,
             federation_erasure_superseded,
             federation_quarantined_unattributed,
+            operator_dequarantined,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
             subscription_dlq_overflow_total,
@@ -1231,6 +1258,22 @@ pub fn inc_fed_quarantined_unattributed() {
 #[must_use]
 pub fn fed_quarantined_unattributed_count() -> u64 {
     registry().federation_quarantined_unattributed.get()
+}
+
+/// v1.0.0 #2402 — record one quarantined memory released by an OPERATOR
+/// (`ai-memory quarantine release` / the admin HTTP twin, on either backend).
+/// Pairs with the `memory.dequarantined` signed-chain row and the
+/// `quarantine.operator_release` WARN emitted at the same site — the counter
+/// is the fleet-watchable rate, the chain row is the forensic record.
+pub fn inc_operator_dequarantined() {
+    registry().operator_dequarantined.inc();
+}
+
+/// v1.0.0 #2402 — read the current value of the operator route-OUT counter.
+/// Test-only accessor pinning the observability wiring.
+#[must_use]
+pub fn operator_dequarantined_count() -> u64 {
+    registry().operator_dequarantined.get()
 }
 
 /// v1.0.0 #2577 — record one recall that degraded to keyword/FTS because

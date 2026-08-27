@@ -64,7 +64,7 @@ kinds, claim-bitemporal columns), and certifies the postgres + Apache
 AGE + pgvector storage backend.
 
 > **Certified-backend scope — read this before choosing Postgres.** The
-> two backends are **not one identical API**: **59 of the 80 unique
+> two backends are **not one identical API**: **61 of the 82 unique
 > production HTTP paths are served on Postgres; the remaining 21 fail
 > closed with a uniform `501 NOT IMPLEMENTED`** (the Agent Skills surface,
 > `/api/v1/share`, the legacy `/api/v1/find_paths` alias, and the
@@ -107,7 +107,7 @@ CLI subcommands):
 |---|---|
 | MCP tools (`--profile full`) | **103 advertised** (102 callable + the always-on `memory_capabilities` bootstrap) |
 | MCP tools (`--profile core`) | **7** (original 5 + `memory_load_family` + `memory_smart_load`) + the `memory_capabilities` bootstrap |
-| HTTP routes | **94 production `.route(...)` registrations** / 80 unique URL paths |
+| HTTP routes | **96 production `.route(...)` registrations** / 82 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
 | Schema | **v90** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and **v90 is additive again**. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v90" |

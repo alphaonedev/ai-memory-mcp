@@ -1436,6 +1436,71 @@ pub trait MemoryStore: Send + Sync {
         Ok(false)
     }
 
+    /// v1.0.0 [#2402] — the OPERATOR release: clear a quarantined row AND
+    /// append a `memory.dequarantined` signed event in the SAME transaction.
+    ///
+    /// This is the sanctioned route OUT that #1948 advertised and never
+    /// exposed. It differs from [`Self::dequarantine`] — the SYSTEM
+    /// dequarantine-on-attest path, where the substrate re-decides on new
+    /// cryptographic evidence — in exactly the way that matters for an audit:
+    /// a human is OVERRIDING a containment decision, so WHO released WHAT
+    /// must be recorded. Under `asi-hard`,
+    /// `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` is pinned on and this is the
+    /// only lever that exists.
+    ///
+    /// Adapters MUST make the state change and the audit row ATOMIC (the
+    /// #1552 SAL-port-fanout failure mode: a postgres branch that silently
+    /// skips the audit half). `ctx.agent_id` is the recorded actor and MUST be
+    /// the authenticated principal, never a self-asserted request field.
+    ///
+    /// Returns `true` when a quarantined row was cleared, `false` when the id
+    /// does not exist or is not quarantined (idempotent, no audit row).
+    ///
+    /// [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific backend error; [`StoreError::UnsupportedCapability`]
+    /// by default so an adapter that cannot audit cannot silently release.
+    async fn operator_dequarantine(&self, _ctx: &CallerContext, _id: &str) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "OPERATOR_DEQUARANTINE".to_string(),
+        })
+    }
+
+    /// v1.0.0 [#2402] — the INSPECTION half of the quarantine route-OUT
+    /// contract: list the rows currently held in
+    /// [`crate::models::LifecycleState::Quarantined`].
+    ///
+    /// Quarantine hides a row from every ordinary lane, so without this an
+    /// operator on an `asi-hard` node (where
+    /// `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` is PINNED on) can neither see
+    /// what is held nor decide whether to release it — the #1948 route-OUT was
+    /// advertised but uninvocable. Backend twin of
+    /// [`crate::storage::list_quarantined`]; returns identifying metadata
+    /// only, never `content` (see [`crate::models::QuarantinedMemory`]).
+    ///
+    /// `namespace` narrows the listing; `limit` bounds the page.
+    ///
+    /// [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific backend error. The DEFAULT refuses with
+    /// [`StoreError::UnsupportedCapability`] rather than returning an empty
+    /// list: an adapter that cannot answer must say so, because "no rows are
+    /// quarantined" and "I did not look" are opposite operator verdicts and
+    /// conflating them is the #2444 reports-success-while-doing-nothing shape.
+    async fn list_quarantined(
+        &self,
+        _namespace: Option<&str>,
+        _limit: i64,
+    ) -> StoreResult<Vec<crate::models::QuarantinedMemory>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_QUARANTINED".to_string(),
+        })
+    }
+
     /// Execute an approved pending governance action — mirrors
     /// `db::execute_pending_action` on the SQLite path. The pending
     /// row's `action_type` selects the operation (`store` / `delete`

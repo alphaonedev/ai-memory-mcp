@@ -91,6 +91,15 @@ pub const SKILL_ID_PROMOTE: &str = "/api/v1/skill/{id}/promote";
 pub const SKILL_ID_RESOURCE: &str = "/api/v1/skill/{id}/resource";
 /// #2024 — operator-authorized skill retire/unretire (admin-gated).
 pub const SKILL_ID_RETIRE: &str = "/api/v1/skill/{id}/retire";
+/// v1.0.0 #2402 — admin-gated operator quarantine INSPECT surface. The
+/// #1948 route-OUT contract advertised "operator dequarantine" and shipped no
+/// caller; under `asi-hard` (where the quarantine knob is pinned on) a held
+/// row was invisible AND unreleasable.
+pub const ADMIN_QUARANTINE: &str = "/api/v1/admin/quarantine";
+/// v1.0.0 #2402 — admin-gated operator quarantine RELEASE surface. Appends a
+/// `memory.dequarantined` signed audit row in the same transaction as the
+/// state change, on both backends.
+pub const ADMIN_QUARANTINE_ID_RELEASE: &str = "/api/v1/admin/quarantine/{id}/release";
 pub const STATS: &str = "/api/v1/stats";
 pub const SUBSCRIPTIONS: &str = "/api/v1/subscriptions";
 pub const SYNC_PUSH: &str = "/api/v1/sync/push";

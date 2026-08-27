@@ -39,8 +39,10 @@
 # The values below are the CANONICAL ones the corrected documents must
 # carry (src/lib.rs:345/:375/:415/:434, src/storage/migrations.rs:867,
 # src/models/memory.rs:1097, src/mcp/registry.rs:295):
-#   routes 94 · unique paths 80 · schema 88 · Memory fields 30
-#   tools at `--profile full` 103 · CLI 89 default / 91 sal
+#   routes 96 · unique paths 82 · schema 88 · Memory fields 30
+#   tools at `--profile full` 103 · CLI 91 default / 93 sal
+#   (2026-08-22 #2402: routes 94->96, paths 80->82, CLI 90->91 / 92->93 for
+#    the operator quarantine route-OUT pair + the `quarantine` subcommand.)
 #   current release 1.0.0 (Cargo.toml)
 # ---------------------------------------------------------------------
 
@@ -50,8 +52,8 @@
 # this is the first live exercise of that loop: the lane landed, the
 # gate went from "5 suppressed" to "5 stale NOTICEs, still green", and
 # the lines came out. The five claims are now HARD-ENFORCED with no
-# suppression: 94 routes / 80 unique paths / 103 tools at
-# `--profile full` / 30-field Memory / schema 88 / 89 CLI default + 91
+# suppression: 96 routes / 82 unique paths / 103 tools at
+# `--profile full` / 30-field Memory / schema 88 / 91 CLI default + 93
 # sal, and any paragraph calling itself the current release must name
 # the Cargo.toml version.
 

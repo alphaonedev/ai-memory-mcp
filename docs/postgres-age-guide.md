@@ -10,7 +10,7 @@ layout: doc
 > is the supported deployment shape.
 >
 > **It is not a parity backend, and this guide does not claim it is.** At
-> v1.0.0 postgres serves **59 of the 80** unique production HTTP paths;
+> v1.0.0 postgres serves **61 of the 82** unique production HTTP paths;
 > the other **21 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
 > is SQLite-only** (`ai-memory mcp` always opens a local rusqlite
 > connection, so a postgres deployment serves MCP clients through the
@@ -56,7 +56,7 @@ ladder ends at `migrate_v90()`).
 version-stamp no-ops rather than real DDL, so a matching version number
 does not mean a matching set of tables: postgres ships no `skills` table
 (`migrate_v82` is a no-op) and no `governance_rules` table. Concretely,
-**59 of the 80 unique production HTTP paths are served on postgres and
+**61 of the 82 unique production HTTP paths are served on postgres and
 21 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
 silent read/write against the wrong database), and the **stdio MCP path
 is SQLite-only**. See "The 21 fully-501 paths" below for the exact
@@ -672,11 +672,11 @@ The eight remaining sqlite-only surfaces land here.
 > on a postgres-backed daemon, with "no residual 501 envelope on
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
-> **RETRACTED**. The measured, gate-pinned inventory is **59
-> pg-supported unique paths, 21 fully-501 paths, 80 unique paths
-> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 59` /
-> `EXPECTED_FULLY_501_PATHS = 21` / `EXPECTED_TOTAL_UNIQUE_PATHS = 80`,
-> `tests/pg_supported_route_inventory_gate_2799.rs:217-219`), and the
+> **RETRACTED**. The measured, gate-pinned inventory is **61
+> pg-supported unique paths, 21 fully-501 paths, 82 unique paths
+> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 61` /
+> `EXPECTED_FULLY_501_PATHS = 21` / `EXPECTED_TOTAL_UNIQUE_PATHS = 82`,
+> `tests/pg_supported_route_inventory_gate_2799.rs:231-233`), and the
 > same gate freezes the allow-list membership so a silent match-arm
 > add or remove fails until the SSOT is updated in a reviewed edit. The
 > 501 envelope is therefore a LIVE, load-bearing refusal on 21 standard
@@ -797,9 +797,9 @@ tool names is unaffected. On sqlite nothing changes.
 
 ### What still returns 501 on postgres
 
-Of the **80 unique production URL paths** (over **94 `.route(...)`
+Of the **82 unique production URL paths** (over **96 `.route(...)`
 registrations in `src/lib.rs`**, surfaced through
-`/api/v1/capabilities`), **59 are served on a postgres-backed daemon
+`/api/v1/capabilities`), **61 are served on a postgres-backed daemon
 and 21 are fully fail-closed** — every HTTP method on those 21 paths
 returns a uniform `501 NOT IMPLEMENTED`. The gate FAILS CLOSED by
 design: an un-migrated handler can never fall through to the empty
@@ -808,7 +808,7 @@ in-memory scratch SQLite database that `bootstrap_serve` opens against
 read/write against the wrong database (data-integrity North Star:
 degrade, never corrupt). This inventory is pinned against regression by
 `tests/pg_supported_route_inventory_gate_2799.rs`, which freezes the
-exact 59-supported / 21-fully-501 partition and fails CI if the router
+exact 61-supported / 21-fully-501 partition and fails CI if the router
 and the `postgres_endpoint_supported()` allow-list ever drift.
 
 **The 21 fully-501 paths (honest v1.0 gaps — do NOT expect these to

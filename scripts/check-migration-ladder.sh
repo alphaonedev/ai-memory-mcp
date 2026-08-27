@@ -125,6 +125,20 @@ fi
 
 set -euo pipefail
 
+# Membership test that is safe under `set -o pipefail`.
+# `printf | grep -q` is a SIGPIPE footgun: grep -q closes the pipe on the
+# first match, printf gets EPIPE, and pipefail makes a HIT look like a miss
+# (CI on 02ee71f8: "NO row for v32" while MIGRATION_LADDER carries v32).
+array_contains() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 BACKENDS=(sqlite postgres)
@@ -471,7 +485,7 @@ run_gate() {
             IFS=$'\n' sorted=($(printf '%s\n' "${prefixes[@]}" | sort -n)); unset IFS
             min="${sorted[0]}"; max="${sorted[-1]}"
             for (( i = min; i <= max; i++ )); do
-                if ! printf '%s\n' "${sorted[@]}" | grep -qx "$i"; then
+                if ! array_contains "$i" "${sorted[@]}"; then
                     if is_known_prefix_gap "$backend" "$i"; then
                         continue
                     fi
@@ -742,7 +756,7 @@ run_gate() {
                     violations=$((violations + 1))
                     continue
                 fi
-                if ! printf '%s\n' "${g_metas[@]}" | grep -qx "$ga"; then
+                if ! array_contains "$ga" "${g_metas[@]}"; then
                     echo "❌ migration-ladder: RULE (g) sqlite ladder arm v$ga has NO row in MIGRATION_LADDER (src/storage/migration_meta.rs). Its reversibility / data-loss / idempotency contract is operator-facing truth and is the input to every rollback plan — add the row, DERIVED from the arm's SQL, never guessed." >&2
                     violations=$((violations + 1))
                 fi
@@ -758,7 +772,7 @@ run_gate() {
             # (g3) gap-free v2..CURRENT_SCHEMA_VERSION.
             local gi
             for (( gi = 2; gi <= cv_sqlite; gi++ )); do
-                if ! printf '%s\n' "${g_metas[@]}" | grep -qx "$gi"; then
+                if ! array_contains "$gi" "${g_metas[@]}"; then
                     echo "❌ migration-ladder: RULE (g) MIGRATION_LADDER has NO row for v$gi — every number from 2 to CURRENT_SCHEMA_VERSION=$cv_sqlite is a real ladder step on at least one adapter (a postgres-only step still needs a row flagged \`LadderArm::PostgresOnly\`)." >&2
                     violations=$((violations + 1))
                 fi

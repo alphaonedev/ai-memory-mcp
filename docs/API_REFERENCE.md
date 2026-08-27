@@ -391,6 +391,36 @@ An operational error such as `SQLITE_BUSY` retains the previous verdict
 rather than recording a failure, so the cadence introduces no false-503
 class.
 
+**A `failed` verdict is DURABLE across restart (v1.0.0,
+[#2630](https://github.com/alphaonedev/ai-memory-mcp/issues/2630)).** `/health`
+is scraped as a liveness probe, and an orchestrator answers a failing liveness
+probe by RESTARTING the container — which used to clear the verdict, because it
+lived only in process memory: the new process started `pending`, answered `200`,
+and served keyword recall over a corrupt index for the whole startup-spread
+window before the next check re-failed it, every restart. A completed verdict is
+now recorded beside the database as `<db-path>.fts-verdict` and adopted at boot,
+so a failure survives the restart until a fresh check clears it. Notes for
+operators:
+
+- **Only a failure is recorded.** A passing check REMOVES the file; a clean boot
+  still starts `pending`. A pass a *previous* process performed is never
+  re-presented as this process's assertion.
+- **A node that boots with an adopted failure skips the startup spread** and
+  re-checks immediately, so a real repair (`INSERT INTO
+  memories_fts(memories_fts) VALUES('rebuild')`) is re-verified in seconds
+  rather than after a full jittered interval — restart is now the fast
+  *re-verification* lever instead of the fast *reset* lever. Only already-failed
+  nodes skip the spread, so fleet desynchronisation is unchanged.
+- **A file that exists but cannot be read or parsed reads as a FAILURE** (fail
+  closed). It is self-healing: the first passing check clears it.
+- **With the checker disabled (`…INTERVAL_SECS=0`) the record is NOT adopted** —
+  nothing would ever run to clear it, so adopting would fence the node at 503
+  with no in-band way back. The file is kept, and its presence is announced at
+  WARN; re-enable the cadence to have it adopted and re-verified.
+- The file is sqlite-only and sits beside the database, so it travels with the
+  same volume and backup as the corpus it describes. It holds no memory content
+  — one line: a format tag, `failed`, and a UNIX timestamp.
+
 ```bash
 curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9077/api/v1/health
 curl -sS http://127.0.0.1:9077/api/v1/health | jq .fts_integrity
@@ -428,6 +458,7 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_query_embed_cache_hits_total` | counter | Query-embedding cache hits (#2577). |
 | `ai_memory_corrupt_provenance_rows_total{column}` | counter | Rows skipped by a discovery scan because a provenance column would not open (e.g. `encrypted_envelope`, #2383). |
 | `ai_memory_fed_quarantined_unattributed_total` | counter | Inbound relayed memories quarantined by the route-IN provenance gate (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, #2966). Always zero when the quarantine knob is off (the default); a non-zero rate means a peer is relaying provenance-less content this node is black-holing until dequarantine. Pairs with the `federation.quarantine.unattributed` WARN. |
+| `ai_memory_operator_dequarantined_total` | counter | The route-OUT twin (#2402): quarantined memories released by an OPERATOR through `ai-memory quarantine release` or `POST /api/v1/admin/quarantine/{id}/release`. Each increment also appends a `memory.dequarantined` signed-chain row naming the authenticated caller, in the same transaction as the state change; a no-op release does not increment. Pairs with the `quarantine.operator_release` WARN. |
 | `ai_memory_hnsw_evictions_total`, `ai_memory_hnsw_size` | counter, gauge | Vector-index pressure; see `AI_MEMORY_VECTOR_INDEX_CAPACITY`. |
 | `ai_memory_federation_push_dlq_depth`, `..._quarantined_by_cause_total{cause}` | gauge, counter | Federation push-DLQ backlog and its cause breakdown. |
 | `ai_memory_deferred_audit_drainer_terminal_state` | gauge | Terminal state of the deferred-audit drainer supervisor: `0` = running/graceful, `1` = sink unresolved past `max_restarts`, `2` = sink panicked past `max_restarts` (#3164). **Page on any non-zero value** — the daemon keeps serving requests, but governance refusals are no longer reaching `signed_events` on that node, so it is audit-degraded until restarted. |
@@ -1287,14 +1318,16 @@ router in `src/lib.rs`.
 | `GET`  | `/api/v1/inbox` | Read the calling agent's inbox. MCP: `memory_inbox`. |
 | `GET` `POST` `DELETE` | `/api/v1/skill/list`, `/api/v1/skill/register`, `/api/v1/skill/{id}`, `/api/v1/skill/{id}/resource`, `/api/v1/skill/{id}/export`, `/api/v1/skill/{id}/promote`, `/api/v1/skill/{id}/compose` | Cluster E API-2 (#767) — Agent Skills HTTP parity for the seven `memory_skill_*` MCP tools. **Admin-gated.** |
 | `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. |
+| `GET`  | `/api/v1/admin/quarantine` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — list the memories currently held in federation quarantine (`handlers::list_quarantined`). **Admin-gated.** Identifying metadata ONLY (id, namespace, title, source, kind, timestamps) — never `content`: a quarantined row is untrusted input by construction and its content may be an at-rest seal sentinel. `?namespace=` narrows, `?limit=` pages (clamped to 1000). |
+| `POST` | `/api/v1/admin/quarantine/{id}/release` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — release one quarantined memory back to `lifecycle_state=open` (`handlers::release_quarantined`), the operator half of the [#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948) route-OUT contract that shipped with no caller. **Admin-gated**; the audit actor is the principal `require_admin` RETURNS — an id it admits only when it is on the admin allowlist AND the deployment has request authentication configured (#1570), and, under the `enforce` identity-binding posture, only when it is key-attested to a per-agent api key (#2044). The handler never reads `X-Agent-Id` itself. Appends a `memory.dequarantined` signed audit row in the SAME transaction as the state change on both backends. Idempotent: an id that is not currently quarantined answers `200 {"released": false}` and writes nothing (deliberately not `404` — that would leak the existence of rows this surface does not return). |
 | `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (103 at `full`, 7 at `core`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
 
-> **Total HTTP surface at v1.0.0: 80 unique URL paths across 94
+> **Total HTTP surface at v1.0.0: 82 unique URL paths across 96
 > production route registrations** (several paths carry more than one
 > method), on the sqlite-backed daemon and on the postgres-backed daemon
 > under `--features sal-postgres`. Both numbers are pinned in
-> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 80` and
-> `EXPECTED_PRODUCTION_ROUTES_COUNT = 94`, asserted by
+> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 82` and
+> `EXPECTED_PRODUCTION_ROUTES_COUNT = 96`, asserted by
 > `tests/route_count_invariant.rs`. Three further routes are
 > `#[cfg(test)]`-gated and never registered in a production build
 > (`EXPECTED_TEST_ROUTES_COUNT = 3`).

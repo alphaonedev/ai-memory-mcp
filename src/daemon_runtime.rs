@@ -327,6 +327,16 @@ pub enum Command {
     /// attestations (`model_attestations` substrate). `enroll` requires
     /// the operator key; `list` is unprivileged.
     ModelAttest(ModelAttestArgs),
+    /// v1.0.0 #2402 — operator inspection + release of QUARANTINED memories.
+    ///
+    /// Quarantine (#1948) hides an unattributed federation write from every
+    /// read lane, and under `asi-hard` the knob is pinned on, so without an
+    /// operator verb a held row is black-holed with no sanctioned recovery
+    /// path. `list` shows what is held (identifying metadata only, never the
+    /// untrusted content); `release <id>` clears one row back to `open` and
+    /// appends a `memory.dequarantined` signed audit row in the same
+    /// transaction. Add `--store-url postgres://…` for the enterprise tier.
+    Quarantine(crate::cli::quarantine::QuarantineArgs),
     /// v0.9.0 §25.3 S5 (RQ-10, #1878) — verify-only epoch-freeze
     /// consumer: `ai-memory epoch-apply <manifest.json>` verifies an
     /// operator-signed epoch manifest and writes the triple anchor
@@ -1922,6 +1932,54 @@ pub async fn run(
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::rules::run(&db_path, a, j, &mut out)
         }
+        Command::Quarantine(a) => {
+            // v1.0.0 #2402 — the operator route OUT of quarantine. Mirrors
+            // `dispatch_recover_previous_session`: a `postgres://` store-url
+            // routes through the SAL so the enterprise tier gets the SAME
+            // verb, and the async store build happens BEFORE the stdout lock
+            // is taken so no `!Send` guard is held across an `.await`.
+            match a.store_url.as_deref().filter(|u| u.starts_with("postgres")) {
+                Some(url) => {
+                    #[cfg(feature = "sal")]
+                    {
+                        let store = build_curator_store(Some(url), &db_path, app_config).await?;
+                        let stdout = std::io::stdout();
+                        let stderr = std::io::stderr();
+                        let mut so = stdout.lock();
+                        let mut se = stderr.lock();
+                        let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                        cli::quarantine::run_store(
+                            store.as_ref(),
+                            &a,
+                            cli_agent_id.as_deref(),
+                            j,
+                            &mut out,
+                        )
+                        .await
+                    }
+                    #[cfg(not(feature = "sal"))]
+                    {
+                        // Fail CLOSED rather than silently operating a
+                        // DIFFERENT database than the operator named: a
+                        // release against the wrong store is an unaudited
+                        // no-op on the store they meant.
+                        anyhow::bail!(
+                            "quarantine --store-url {} requires the 'sal' build feature; \
+                             this binary was built without it",
+                            crate::logging::redact_url_password(url)
+                        )
+                    }
+                }
+                None => {
+                    let stdout = std::io::stdout();
+                    let stderr = std::io::stderr();
+                    let mut so = stdout.lock();
+                    let mut se = stderr.lock();
+                    let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                    cli::quarantine::run(&db_path, &a, cli_agent_id.as_deref(), j, &mut out)
+                }
+            }
+        }
         Command::ModelAttest(a) => {
             // v0.9.0 §25.3 S1 (#1870) — model-attestation substrate CLI.
             // `enroll` requires the operator key; `list` is unprivileged.
@@ -2736,6 +2794,11 @@ pub fn is_write_command(cmd: &Command) -> bool {
             // but we classify the whole family as write-class so the
             // post-run WAL checkpoint runs.
             | Command::Namespace(_)
+            // v1.0.0 #2402 — `quarantine release` writes `memories` +
+            // `signed_events`. `quarantine list` is read-only, but the whole
+            // verb family is classified write-class so the post-run WAL
+            // checkpoint runs (same convention as `Skill` / `Namespace`).
+            | Command::Quarantine(_)
             // v0.7.0 #1095 — `ai-memory share` copies a row into the
             // recipient agent's `_shared/<from>→<to>/` namespace, so
             // it must trip the post-run WAL checkpoint.
@@ -3216,9 +3279,20 @@ pub async fn build_embedder(
     };
     match build {
         Ok(Some(emb)) => {
+            // v1.0.0 #2626 — the resolved dim AND ITS SOURCE. One model id
+            // resolves to two widths depending on the configuration path
+            // (compiled table = the model's NATIVE dim; `[embeddings].dim` /
+            // AI_MEMORY_EMBED_DIM = the fleet's deliberate pin), and pre-fix
+            // both nodes logged an identical successful load. Naming the
+            // source makes a fleet divergence visible on one line at boot
+            // instead of surfacing later as a stored blob length or a
+            // postgres re-type-and-NULL.
             tracing::info!(
-                "embedder loaded ({}) — tier={} semantic recall enabled",
+                dim_source = resolved_embeddings.dim_source.as_str(),
+                "embedder loaded ({}, dim={}, dim source: {}) — tier={} semantic recall enabled",
                 emb.model_description(),
+                emb.dim(),
+                resolved_embeddings.dim_source.as_str(),
                 feature_tier.as_str()
             );
             Some(emb)
@@ -3405,10 +3479,20 @@ pub async fn build_llm_client(
 /// space fingerprint; `None` means no embedder (keyword-only) → no
 /// index. `Some(fp)` filters the seed set to the active space in SQL so
 /// a foreign-fingerprint vector never enters the ANN graph.
+///
+/// v1.0.0 #2606 — `active_dim` is the live embedder's vector width. The
+/// fingerprint deliberately omits the dim, so the space filter alone admitted
+/// two dim populations of the SAME model id (a config-only `dim` change mints
+/// them silently); both filters together are what make the claim above true.
+/// See [`db::get_all_embeddings`].
 #[must_use]
-pub fn build_vector_index(conn: &Connection, active_space: Option<&str>) -> Option<VectorIndex> {
+pub fn build_vector_index(
+    conn: &Connection,
+    active_space: Option<&str>,
+    active_dim: usize,
+) -> Option<VectorIndex> {
     let active = active_space?;
-    match db::get_all_embeddings(conn, active) {
+    match db::get_all_embeddings(conn, active, active_dim) {
         Ok(entries) if !entries.is_empty() => Some(hnsw::VectorIndex::build(entries)),
         _ => Some(hnsw::VectorIndex::empty()),
     }
@@ -3424,6 +3508,10 @@ pub(crate) fn load_boot_index_entries(
     // v1.0.0 #2167 §3.3 layer 1 — the active embedder fingerprint; the
     // boot seed set is filtered to it in SQL.
     active_space: &str,
+    // v1.0.0 #2606 — the active embedder's vector width. The fingerprint
+    // omits the dim, so without this a config-only dim change seeds the ANN
+    // graph with two dim populations under one fingerprint.
+    active_dim: usize,
 ) -> Option<Vec<(String, Vec<f32>)>> {
     let conn = match db::open(db_path) {
         Ok(c) => c,
@@ -3436,7 +3524,7 @@ pub(crate) fn load_boot_index_entries(
             return None;
         }
     };
-    match db::get_all_embeddings(&conn, active_space) {
+    match db::get_all_embeddings(&conn, active_space, active_dim) {
         Ok(entries) => Some(entries),
         Err(e) => {
             tracing::warn!(
@@ -3474,13 +3562,16 @@ pub fn spawn_vector_index_boot_load(
     // v1.0.0 #2167 §3.3 layer 1 — the active embedder space fingerprint,
     // owned so it can move into the boot thread; filters the seed set.
     active_space: String,
+    // v1.0.0 #2606 — the active embedder's vector width; narrows the seed set
+    // to ONE dim population (the fingerprint omits the dim).
+    active_dim: usize,
     // v0.9 #1005 — the shared seam type: boxed [`crate::hnsw::VectorSearchIndex`]
     // (today always the default HNSW backend) behind the AppState mutex.
     vector_index: Arc<tokio::sync::Mutex<Option<Box<dyn crate::hnsw::VectorSearchIndex>>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let Some(entries) = load_boot_index_entries(&db_path, &active_space) else {
+        let Some(entries) = load_boot_index_entries(&db_path, &active_space, active_dim) else {
             return;
         };
         if entries.is_empty() {
@@ -6004,6 +6095,9 @@ pub async fn bootstrap_serve(
         let _boot_index_loader = spawn_vector_index_boot_load(
             db_path.to_path_buf(),
             active_fp,
+            // v1.0.0 #2606 — the space fingerprint omits the dim, so the seed
+            // filter needs the live embedder's width alongside it.
+            emb.dim(),
             Arc::clone(&vector_index_state),
         );
     }
@@ -6685,6 +6779,27 @@ pub async fn bootstrap_serve(
     let fts_integrity_status =
         Arc::clone(&crate::runtime_context::RuntimeContext::global_arc().fts_integrity);
     fts_integrity_status.set_interval_secs(fts_integrity_interval.as_secs());
+
+    // v1.0.0 #2630 — adopt a DURABLY-recorded failed verdict before the router
+    // is built, so the very first `/health` scrape of this process already
+    // answers 503. Without this, an orchestrator's response to a failing
+    // liveness probe (restart the container) CLEARED the fail-closed verdict:
+    // the new process started `Pending` → 200 → served keyword recall over a
+    // corrupt index for the whole startup-spread window → re-failed → restart,
+    // a flap driven by the very signal meant to take the node out of rotation.
+    // Gated on the same sqlite-only predicate as the checker itself: on a
+    // postgres-backed daemon the local sqlite file is a near-empty sidecar, not
+    // the served corpus, so a verdict about it must not fence the node. Gated
+    // AGAIN on a non-zero cadence inside the helper: an adopted failure is
+    // cleared only by a fresh passing check, so adopting one on a node whose
+    // checker is DISABLED would fence it at 503 with no in-band way back.
+    if fts_integrity_enabled {
+        crate::background::fts_integrity::adopt_persisted_verdict_if_enforceable(
+            db_path,
+            &fts_integrity_status,
+            fts_integrity_interval,
+        );
+    }
 
     let mut app_state = AppState {
         db: db_state.clone(),
@@ -9694,7 +9809,7 @@ mod tests {
     fn test_build_vector_index_no_embedder_returns_none() {
         let env = TestEnv::fresh();
         let conn = db::open(&env.db_path).unwrap();
-        assert!(build_vector_index(&conn, None).is_none());
+        assert!(build_vector_index(&conn, None, 3).is_none());
     }
 
     #[test]
@@ -9706,6 +9821,7 @@ mod tests {
             Some(&crate::embeddings::embedding_space_fingerprint(
                 "test-space",
             )),
+            3,
         );
         assert!(
             idx.is_some(),
@@ -10586,6 +10702,7 @@ mod tests {
             Some(&crate::embeddings::embedding_space_fingerprint(
                 "test-space",
             )),
+            3,
         )
         .expect("populated index");
         assert!(
@@ -10662,6 +10779,7 @@ mod tests {
         let handle = spawn_vector_index_boot_load(
             env.db_path.clone(),
             crate::embeddings::embedding_space_fingerprint("test-space"),
+            3,
             Arc::clone(&state),
         );
 
@@ -12200,6 +12318,7 @@ decision = "allow"
             Some(&crate::embeddings::embedding_space_fingerprint(
                 "test-space",
             )),
+            vec_data.len(),
         );
         assert!(idx.is_some());
     }

@@ -375,8 +375,8 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <span>Local-first &middot; air-gappable</span>
       <span>Model-neutral (MCP)</span>
       <span>103 MCP tools</span>
-      <span>94 HTTP routes (80 unique paths)</span>
-      <span>90 CLI subcommands (default build; 92 with <code>sal</code> features)</span>
+      <span>96 HTTP routes (82 unique paths)</span>
+      <span>91 CLI subcommands (default build; 93 with <code>sal</code> features)</span>
       <span>Ed25519 attested audit chain</span>
       <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
       <span><a href="compliance/nsa-csi-mcp.html" style="color:#6ee7ff">NSA CSI MCP 9/10 · 7/7</a></span>
@@ -437,7 +437,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <span class="eyebrow">Why ai-memory</span>
     <h2>One substrate. Five deployment scales. One contract.</h2>
     <p class="lede">
-      Most AI tooling forces a tier choice up front: a hobby SDK, a cloud SaaS, or a bespoke enterprise rollout. ai-memory is one substrate &mdash; <code>memory_store</code>, <code>memory_recall</code>, <code>memory_link</code>, <code>memory_reflect</code> &mdash; that scales from a single laptop with one AI assistant to a global hive of attesting NHI agents. Same tools. Same wire format. Same governance. One honest bound worth knowing up front: on a <strong>PostgreSQL</strong>-backed deployment 59 of the 80 unique HTTP paths are served and 21 fail closed with <code>501</code>, and MCP stdio is SQLite-only &mdash; see <a href="feature-matrix.html">the feature matrix</a>.
+      Most AI tooling forces a tier choice up front: a hobby SDK, a cloud SaaS, or a bespoke enterprise rollout. ai-memory is one substrate &mdash; <code>memory_store</code>, <code>memory_recall</code>, <code>memory_link</code>, <code>memory_reflect</code> &mdash; that scales from a single laptop with one AI assistant to a global hive of attesting NHI agents. Same tools. Same wire format. Same governance. One honest bound worth knowing up front: on a <strong>PostgreSQL</strong>-backed deployment 61 of the 82 unique HTTP paths are served and 21 fail closed with <code>501</code>, and MCP stdio is SQLite-only &mdash; see <a href="feature-matrix.html">the feature matrix</a>.
     </p>
     <div class="continuum">
       <a class="step" href="architectures-t1.html">
@@ -742,13 +742,13 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="int-card" href="API_REFERENCE.html">
         <div class="label">HTTP</div>
         <h4>REST API</h4>
-        <p>94 routes (80 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
+        <p>96 routes (82 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
         <span class="arrow">API reference &rarr;</span>
       </a>
       <a class="int-card" href="CLI_REFERENCE.html">
         <div class="label">CLI</div>
         <h4>Command line</h4>
-        <p>90 subcommands (92 with <code>--features sal</code>), optional <code>--json</code>. For shell scripts, cron, and humans.</p>
+        <p>91 subcommands (93 with <code>--features sal</code>), optional <code>--json</code>. For shell scripts, cron, and humans.</p>
         <span class="arrow">CLI reference &rarr;</span>
       </a>
     </div>
@@ -947,8 +947,8 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="lk" href="evidence.html"><strong>Evidence &mdash; frozen claims</strong><span class="desc">Every public number, pinned to a commit + test artifact. 15,951/0 (2026-05-31 final baseline, v0.7.0 tree &mdash; see evidence.html).</span></a>
       <a class="lk" href="USER_GUIDE.html"><strong>User guide</strong><span class="desc">End-to-end MCP tool reference</span></a>
       <a class="lk" href="DEVELOPER_GUIDE.html"><strong>Developer guide</strong><span class="desc">Build from source, extend, add tools</span></a>
-      <a class="lk" href="API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">94 routes (80 unique paths)</span></a>
-      <a class="lk" href="CLI_REFERENCE.html"><strong>CLI reference</strong><span class="desc">90 subcommands</span></a>
+      <a class="lk" href="API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">96 routes (82 unique paths)</span></a>
+      <a class="lk" href="CLI_REFERENCE.html"><strong>CLI reference</strong><span class="desc">91 subcommands</span></a>
       <a class="lk" href="GLOSSARY.html"><strong>Glossary</strong><span class="desc">Every concept, one place</span></a>
       <a class="lk" href="knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links, temporal validity</span></a>
       <a class="lk" href="agent-identity.html"><strong>Agent identity (NHI)</strong><span class="desc">agent_id semantics</span></a>

@@ -1144,14 +1144,27 @@ impl Embedder {
         };
         if crate::config::is_api_embed_backend(&resolved.backend) {
             let Some(dim) = resolved.embedding_dim else {
+                // v1.0.0 #2626 — this is also where an UNUSABLE
+                // `AI_MEMORY_EMBED_DIM` lands: the resolver fences a
+                // non-positive / unparseable pin off to UNKNOWN rather than
+                // falling through to the compiled table (which would resolve
+                // the exact width the operator was overriding), and the
+                // refusal therefore has to name the dim knobs too — a message
+                // that names only the MODEL knob leaves an env-configured
+                // operator with nowhere to go, which is the #2626 class.
                 anyhow::bail!(
                     "embedding model {:?} (backend {:?}) has no known vector dim — \
                      pick a model from the known-dims table (override with the \
-                     {} env var) or set the `[embeddings].dim` escape hatch in \
-                     config.toml (#1598)",
+                     {} env var) or pin the width explicitly with {} (env) or the \
+                     `[embeddings].dim` escape hatch in config.toml. NOTE: a {} \
+                     that is not a POSITIVE integer resolves the dim as UNKNOWN \
+                     and reaches here deliberately, rather than silently \
+                     embedding at another width (#1598, #2626)",
                     resolved.model,
                     resolved.backend,
                     crate::config::ENV_EMBED_MODEL,
+                    crate::config::ENV_EMBED_DIM,
+                    crate::config::ENV_EMBED_DIM,
                 );
             };
             // Keyless on-prem endpoints get an empty Bearer value (the

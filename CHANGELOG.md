@@ -1703,6 +1703,170 @@ backend and missing or divergently implemented on its twin). Pinned by
   none of the flags passed the client is byte-for-byte the pre-fix one; nothing
   is loosened. A malformed `--api-key-file` fails LOUD instead of degrading
   into an unauthenticated probe that renders a misleading `critical`.
+### Fixed (boot/health cluster: pg blocking-DDL boot brick, restart-cleared FTS verdict, mixed-dim ANN seed; #2614 #2630 #2606)
+
+- **#2614 — a blocking-DDL migrate arm could permanently BRICK daemon boot, and
+  the trigger was one ordinary concurrent writer, not table size.**
+  `PgPoolOptions::after_connect` sets `lock_timeout = 5 s` on EVERY pooled
+  connection and `connect_*` clears it ONLY on the dedicated advisory-lock
+  connection — never on the connection a migrate arm's `self.pool.begin()` hands
+  out. `migrate_v57` (`ADD COLUMN … GENERATED ALWAYS AS … STORED`, a full-table
+  rewrite), `migrate_v67` (the same shape for `memories.target_agent_id_idx` —
+  the issue's list named only v57 and v89, and this arm described itself as
+  "pure additive"; a `GENERATED … STORED` add is a rewrite, not metadata-only)
+  and `migrate_v89` (the v57 column re-expressed via `DROP` + `ADD`) therefore
+  aborted with
+  `canceling statement due to lock timeout` whenever any writer held the table:
+  the tx rolled back, the version was never stamped, `migrate_locked` returned
+  `Err`, and `connect()` propagated it with `?`, so the daemon could not boot and
+  every retry failed identically. Reproduced on the live tier at 5.002 s against
+  an 8 k-row table with a single uncommitted `INSERT` open. All three arms now
+  run through `PostgresStore::run_blocking_ddl_arm`: a DEDICATED connection with an
+  EXPLICIT, documented `lock_timeout` (10 s — neither the request-path 5 s
+  default nor an unbounded `0`, which would hang `connect()` past systemd's 90 s
+  `TimeoutStartSec` and turn a clean wait into a crash-loop), a bounded 600 s
+  `statement_timeout`, retry with backoff on the transient lock-contention
+  SQLSTATEs only — with `57014 query_canceled` disambiguated by its MESSAGE,
+  because postgres emits it for both `due to lock timeout` (transient, retry)
+  and `due to statement timeout` (the rewrite outran its budget: retrying that
+  would mean 3 x 600 s of repeated ACCESS EXCLUSIVE attempts, a far worse
+  crash-loop than the brick) — and a pre-flight INFO naming `pg_class.reltuples` + the
+  projected rewrite duration so a fleet upgrade is auditable instead of a silent
+  multi-minute gap. The DDL and the `schema_version` stamp share ONE transaction,
+  so a refusal is never half-applied. The terminal failure is now a CLEAR
+  REFUSAL naming the arm, the table, the exhausted budget and the two operator
+  moves — not the opaque postgres cancel. The same transient class is retried at
+  the LADDER level for every other (metadata-only) arm, which is idempotent by
+  construction, so losing a 5 s lock race no longer bricks a boot anywhere on the
+  ladder — and that retry lives in a wrapper BOTH entry points share, because
+  `connect_*` calls the lock-free `migrate_locked` body DIRECTLY (it already
+  holds the bootstrap advisory lock, so re-acquiring from another session would
+  deadlock). A retry that only wrapped the trait-level `migrate()` would have
+  covered the `ai-memory migrate` CLI and missed the daemon boot the issue is
+  actually about. Disposition stays fail-CLOSED: a `GENERATED STORED` column is not
+  disposable derived data the way the v88 indexes (fail-open) are. The
+  blocking-arm and ladder retry budgets ADD rather than multiply — an arm that
+  has already spent its own budget marks its refusal non-retryable — so the
+  worst case (57 s) stays inside the 90 s start deadline; a unit test pins that
+  sum. `convert_embedding_dim`'s `ALTER COLUMN … TYPE vector(N)` rewrite is
+  deliberately left on the pooled path and named in the helper's doc: it is
+  operator-initiated (`schema-init --embedding-dim`), so a lost lock race fails
+  one re-runnable CLI invocation rather than bricking a boot. **Named operator
+  caveat:** the 10-minute `statement_timeout` bound makes a too-large rewrite
+  fail deterministically instead of hanging `connect()` forever, but it does
+  NOT fit inside systemd's default 90 s `TimeoutStartSec` — no value of it
+  could, for a corpus that needs minutes of rewrite. The pre-flight INFO exists
+  precisely so an operator sees the projected duration and raises
+  `TimeoutStartSec` (or runs the arm by hand) BEFORE a fleet upgrade, rather
+  than discovering it as a restart loop.
+- **#2630 — the fail-closed FTS verdict was erased by the orchestrator's own
+  remediation.** `IntegrityStatus` lived only in process memory, so a `Failed`
+  verdict — which answers `/health` with `503`, which a Kubernetes LIVENESS
+  probe answers by RESTARTING the container — was cleared by that restart: the
+  new process started `Pending`, `/health` answered `200`, and the node served
+  keyword recall over a corrupt index for the whole jittered startup-spread
+  window before the next check re-failed it, on EVERY restart. The contract held
+  within one process lifetime and broke exactly at the restart boundary where
+  the consumer lives. A completed verdict is now written beside the database
+  (`<db>.fts-verdict`) and ADOPTED at boot, so a failure survives restart until a
+  fresh check clears it. Two deliberate asymmetries: only a FAILURE is adopted (a
+  persisted `Ok` is not re-presented as a pass this process never performed — the
+  #2444 shape), and the record is a sidecar FILE rather than a row in the very
+  database whose corruption it records. A node that boots with an adopted failure
+  skips the startup spread and re-checks immediately, so a genuine repair is
+  re-verified in seconds rather than after a 6 h interval — only already-failed
+  nodes skip it, so fleet desynchronisation is untouched. Sqlite-only, matching
+  the checker: a postgres daemon's local sqlite file is a sidecar, not the served
+  corpus. A third asymmetry keeps the fix from creating its own trap: with the
+  checker DISABLED (`AI_MEMORY_FTS_INTEGRITY_INTERVAL_SECS=0`) the record is NOT
+  adopted — nothing would ever run to clear it, so adopting would fence the node
+  at 503 with no in-band way back AND silently tighten a documented default
+  (`0` means "the control is absent", not "refuse traffic"). The record is kept
+  and announced at WARN instead; re-enabling the cadence adopts it. An
+  unreadable or unrecognised record reads as a FAILURE (fail closed) and is
+  cleared by the first passing check.
+- **#2606 — the #2167 §3.3 layer-1 ANN invariant did not hold, so recall could
+  silently return FEWER results than it should.** `embedding_space_fingerprint`
+  deliberately omits the vector DIMENSION, but the dim for a given model id is
+  CONFIG-determined, so the same model at 768 and at 3072 stamps the IDENTICAL
+  `embedding_space`. The HNSW seed query filtered on that value alone while its
+  doc claimed a foreign vector "can never be an ANN candidate" — both dim
+  populations passed, `hnsw::cosine_distance` fell through to a zip-truncated
+  prefix comparison under the tolerant `AI_MEMORY_REQUIRE_DIM_MATCH` default, and
+  off-dim rows out-ranked true neighbours inside the `ann_limit` cutoff before
+  being dropped by the fail-closed full-dim rescoring: silent recall LOSS,
+  degrade never wrong. `db::get_all_embeddings` now takes the live embedder's
+  `active_dim` and narrows the seed set by it twice — in SQL on the two byte
+  lengths the blob format allows (so mismatched rows are never read) and
+  authoritatively in Rust after decoding. A pure narrowing of an
+  already-filtered set; it cannot admit anything new. The filter is on the BLOB,
+  not the nullable `memories.embedding_dim` column, which would have dropped
+  correctly-sized legacy vectors. Named residual: the LIVE `VectorIndex::insert`
+  guard is still behind the default-off #114 knob (#2606 F3, v1.x), so a
+  mixed-dim corpus can re-admit a foreign-dim vector between rebuilds and every
+  rebuild sweeps it back out. Also NOT in this change: #2606's F1 §6 boot-census
+  dim axis (`GROUP BY embedding_space, embedding_dim` + the strict-mode
+  heterogeneity WARN) — the census still reports a mixed-dim corpus as one
+  homogeneous space. The seed filter does emit a per-boot WARN naming the
+  excluded row count, so the state is no longer entirely silent, but the census
+  itself is unchanged and F1 remains open on #2606.
+
+### Added (operator quarantine route-OUT; env-expressible embedding dim; #2402 #2626)
+
+- **#2402 — `ai-memory quarantine list | release <id>` plus its admin HTTP
+  twin: the operator route OUT that #1948 advertised and never exposed.**
+  Quarantine hides an unattributed inbound federation memory from EVERY read
+  lane, and under `asi-hard` `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` is PINNED
+  on, so enrolling the author's key out-of-band without a re-receive left the row
+  permanently invisible AND permanently unreleasable — unmanaged data
+  unavailability, not containment. The SAL `dequarantine` primitive existed on
+  both backends with ZERO operator callers. New: `GET /api/v1/admin/quarantine`
+  and `POST /api/v1/admin/quarantine/{id}/release` (both `require_admin`-gated,
+  with the KEY-DERIVED principal as the audit actor — never `X-Agent-Id`), the
+  CLI pair with `--store-url postgres://…` for the enterprise tier, and the
+  `MemoryStore::{list_quarantined, operator_dequarantine}` methods on sqlite and
+  postgres. Listings carry identifying metadata ONLY (id, namespace, title,
+  source, kind, timestamps) — never `content`, which is untrusted input by
+  construction and may be an at-rest seal sentinel rather than text. A release
+  appends a `memory.dequarantined` signed-chain row in the SAME transaction as
+  the state change on BOTH backends (the #1552 SAL-port-fanout failure mode), is
+  guarded on `lifecycle_state = 'quarantined'` so a released row cannot be
+  re-released and a tombstoned row cannot be revived, and writes NO audit row on
+  a no-op. Observability rides the BACKEND primitive rather than each caller, so
+  no surface can be added later and silently skip it: one
+  `quarantine.operator_release` WARN and one
+  `ai_memory_operator_dequarantined_total` increment per row actually released
+  — the route-OUT twin of the #2966 `ai_memory_fed_quarantined_unattributed_total`
+  route-IN counter. The ordinary `get()` lane on both backends now also hides
+  a quarantined (or tombstoned) row: sqlite `db::get` returns `None` and
+  `PostgresStore::get` folds into `StoreError::NotFound` (the same existence-
+  non-leak as the #910 permission denial). The shared `SELECT … WHERE id = ?`
+  stays unfiltered so `update()` / dequarantine / `list_quarantined` can still
+  see those rows.
+- **#2626 — `AI_MEMORY_EMBED_DIM`: the embedding vector dim is finally
+  expressible on the env path.** One model id resolved to TWO different widths
+  depending on the configuration path: `google/gemini-embedding-2` is 3072 from
+  the compiled `KNOWN_EMBEDDING_DIMS` table (its NATIVE width) but 768 on a fleet
+  that pins `[embeddings].dim = 768` to match its pgvector `vector(768)` columns
+  — and NO environment variable could express the dim at all, while every
+  sibling embeddings knob had one. A containerised / systemd / CI node therefore
+  could not reproduce a file-configured fleet's vector space even when the
+  operator knew the value, and both nodes logged an identical successful embedder
+  load. The new env knob is the highest-precedence layer (env > config file >
+  compiled table) and, for a Matryoshka-capable API model, rides the wire
+  `dimensions` param so the vendor truncates server-side. A value that is not a
+  POSITIVE integer FAILS CLOSED to an UNKNOWN dim rather than falling through to
+  the compiled table — falling through would resolve the exact width the operator
+  was overriding. `resolve_embed_dim_pin` remains the grammar SSOT; the caller
+  distinguishes "env unset" from "env set but unusable" (both used to share
+  `EmbedDimSource::Unknown`) so `AI_MEMORY_EMBED_DIM=0` cannot silently resolve
+  the compiled 3072. The resolved dim AND its SOURCE are now logged at boot
+  (`embedder loaded (…, dim source: …)`), so an operator comparing two nodes sees
+  a divergence on one line instead of later, as a stored blob length or a
+  postgres re-type. `SUPPORTED_EMBEDDING_DIMS` is deliberately NOT widened: a
+  `vector(3072)` column is UNINDEXABLE (pgvector's `hnsw` / `ivfflat` cap at 2000
+  dimensions), so widening would trade a loud boot refusal for an invisible
+  sequential-scan cliff — the refusal now names both knobs and that reason.
 
 ### Changed
 

@@ -196,8 +196,10 @@ fn multi_hop_ancestry_store_reflect_consolidate() {
         "consolidated source R must be tombstoned, not deleted"
     );
     assert!(
-        db::get(&conn, r).unwrap().is_some(),
-        "tombstoned R must remain resident in memories for traversal"
+        db::get(&conn, r).unwrap().is_none(),
+        "#2402: tombstoned R is hidden from the ordinary get lane \
+         (not recall-visible); residency is the lifecycle_of pin above, \
+         and lineage_ancestors walks links unfiltered"
     );
 
     // lineage_ancestors(C) == {R, A, B} — multi-hop across the
