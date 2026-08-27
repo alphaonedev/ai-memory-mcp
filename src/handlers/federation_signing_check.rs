@@ -1023,6 +1023,18 @@ pub(super) async fn sync_push_via_store(
             noop += 1;
             continue;
         }
+        // #3049 / #3269 / #3278 — federation-RECEIVE secret screen for the
+        // coordination plane on the POSTGRES funnel (sqlite-twin parity; the
+        // sqlite lane screens at `federation_receive::sync_push`). Before this,
+        // the postgres receive path applied signal `subject` / `body` /
+        // `reference_ids` VERBATIM via `apply_remote_signal` — a credential
+        // shipped by an `off`-mode or hostile peer landed unscreened. REDACT-
+        // only, and AFTER the authorship / namespace gates above so those see
+        // the bytes the peer signed. When the screen mutates the SIGNED surface
+        // (`subject`/`body`) the helper clears the now-stale attestation, so the
+        // subsequent `apply_remote_signal` verify accepts it as unsigned (#2340).
+        let screened_signal = crate::secret_screen::redact_signal_for_storage(sig);
+        let sig = screened_signal.as_ref().unwrap_or(sig);
         let bytes = i64::try_from(sig.body.to_string().len()).unwrap_or(i64::MAX);
         {
             let lock = app.db.lock().await;

@@ -1,16 +1,24 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! #3049 — federation-RECEIVE secret screen for the coordination plane.
+//! #3049 / #3269 / #3278 — federation-RECEIVE secret screen for the
+//! coordination plane.
 //!
-//! A `/sync/push` `signals[]` / `checkpoints[]` entry carrying a credential
-//! must be REDACTED (never refused — a refusal would diverge replicas, the
-//! #1821 lesson) before it is persisted. The gate is
+//! A `/sync/push` `signals[]` / `checkpoints[]` / `pendings[]` entry carrying a
+//! credential must be REDACTED (never refused — a refusal would diverge
+//! replicas, the #1821 lesson) before it is persisted. The gate is
 //! `secret_screen::redact_signal_for_storage` / `redact_checkpoint_for_storage`
-//! wired in `handlers::federation_receive` AFTER the forged-signature /
-//! authorship / namespace-scope / checkpoint-resolution-authz gates so those
-//! still see the bytes the peer signed, and BEFORE `signals::insert` /
-//! `checkpoints::apply_inbound_resolution`.
+//! / `redact_pending_action_for_storage` wired in `handlers::federation_receive`
+//! AFTER the forged-signature / authorship / namespace-scope /
+//! checkpoint-resolution-authz gates so those still see the bytes the peer
+//! signed, and BEFORE `signals::insert` / `checkpoints::apply_inbound_resolution`
+//! / `db::upsert_pending_action`.
+//!
+//! #3269 — a hostile peer must NOT be able to bypass the screen by renaming a
+//! JSON key to a `#1844` crypto carve-out name (`*_b64` / the exact set): the
+//! receive helpers screen with the name carve-out DISABLED, recursing into
+//! carved-out subtrees. #3278 — `Signal.reference_ids` and `pendings[].payload`
+//! (previously persisted unscreened on this endpoint) are screened too.
 //!
 //! Dedicated binary: `secret_screen::SCREEN_MODE` is a process-wide
 //! `OnceLock` (first writer wins). This file is the only setter in this
@@ -33,7 +41,9 @@ use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::federation::receive_auth::{REQUIRE_CHECKPOINT_SIG_ENV, REQUIRE_SIGNAL_SIG_ENV};
 use ai_memory::federation::signing::REQUIRE_SIG_ENV;
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
-use ai_memory::models::{Checkpoint, CheckpointState, ConditionType, Signal, SignalType};
+use ai_memory::models::{
+    Checkpoint, CheckpointState, ConditionType, PendingAction, Signal, SignalType,
+};
 use ai_memory::secret_screen::{REDACTION_PLACEHOLDER, SecretScreenMode, set_screen_mode};
 
 /// Canonical AWS access-key fixture the detector is pinned on
@@ -348,6 +358,164 @@ async fn sync_push_checkpoint_resolution_secret_is_redacted_3049() {
     assert!(
         resolution.contains(REDACTION_PLACEHOLDER),
         "persisted resolution must carry {REDACTION_PLACEHOLDER}: {resolution}"
+    );
+}
+
+/// #3269 — a hostile peer renames a body key to end in `_b64` (or reuses a
+/// carve-out key) and buries a credential in a NESTED OBJECT SUBTREE. Pre-fix
+/// the name carve-out inserted the whole subtree verbatim; the receive-mode
+/// screen now recurses and redacts it. Exercises the real `/sync/push` path.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_push_signal_body_b64_carveout_subtree_is_redacted_3269() {
+    let _g = env_lock();
+    seed_screen_mode_refuse();
+    clear_all_env();
+    relax_orthogonal_gates();
+    let (router, db) = setup_router();
+
+    // `x_b64` matches the `_b64` carve-out suffix; the credential is one level
+    // deep so the pre-fix "insert the whole subtree without recursing" bug
+    // would land it verbatim.
+    let sig = make_signal(
+        "ai:peer-3049",
+        "coord/screen",
+        "clean subject",
+        json!({ "x_b64": { "aws": AWS_AKIA_FIXTURE, "note": "buried" } }),
+    );
+    let id = sig.id.clone();
+    let body = json!({
+        "sender_agent_id": "ai:peer-3049",
+        "sender_clock": {"entries": {}},
+        "memories": [],
+        "signals": [serde_json::to_value(&sig).expect("serialize signal")],
+        "dry_run": false,
+    });
+    let (status, resp) = post_sync_push(&router, body, "ai:peer-3049").await;
+    let stored = {
+        let lock = db.lock().await;
+        ai_memory::signals::get(&lock.0, &id)
+            .expect("signals::get")
+            .expect("signal MUST be persisted, not skipped")
+    };
+    clear_all_env();
+
+    assert_eq!(status, StatusCode::OK, "resp={resp}");
+    assert_eq!(i(&resp, "signals_applied"), 1, "resp={resp}");
+    assert!(
+        !stored.body.to_string().contains(AWS_AKIA_FIXTURE),
+        "carve-out-key subtree credential must NOT survive the receive screen (#3269): {}",
+        stored.body
+    );
+    assert!(
+        stored.body.to_string().contains(REDACTION_PLACEHOLDER),
+        "the nested credential must be replaced by {REDACTION_PLACEHOLDER}: {}",
+        stored.body
+    );
+}
+
+/// #3278 — a credential in `Signal.reference_ids` (arbitrary peer JSON, NOT a
+/// `SignableSignal` field) is redacted on the receive path. Because it is
+/// outside the signed surface, the signal still applies.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_push_signal_reference_ids_secret_is_redacted_3278() {
+    let _g = env_lock();
+    seed_screen_mode_refuse();
+    clear_all_env();
+    relax_orthogonal_gates();
+    let (router, db) = setup_router();
+
+    let mut sig = make_signal(
+        "ai:peer-3049",
+        "coord/screen",
+        "clean subject",
+        json!({ "note": "clean" }),
+    );
+    sig.reference_ids = json!([format!("see {AWS_AKIA_FIXTURE}")]);
+    let id = sig.id.clone();
+    let body = json!({
+        "sender_agent_id": "ai:peer-3049",
+        "sender_clock": {"entries": {}},
+        "memories": [],
+        "signals": [serde_json::to_value(&sig).expect("serialize signal")],
+        "dry_run": false,
+    });
+    let (status, resp) = post_sync_push(&router, body, "ai:peer-3049").await;
+    let stored = {
+        let lock = db.lock().await;
+        ai_memory::signals::get(&lock.0, &id)
+            .expect("signals::get")
+            .expect("signal MUST be persisted")
+    };
+    clear_all_env();
+
+    assert_eq!(status, StatusCode::OK, "resp={resp}");
+    assert_eq!(i(&resp, "signals_applied"), 1, "resp={resp}");
+    assert!(
+        !stored.reference_ids.to_string().contains(AWS_AKIA_FIXTURE),
+        "reference_ids credential must NOT survive (#3278): {}",
+        stored.reference_ids
+    );
+    assert!(
+        stored
+            .reference_ids
+            .to_string()
+            .contains(REDACTION_PLACEHOLDER),
+        "reference_ids must carry {REDACTION_PLACEHOLDER}: {}",
+        stored.reference_ids
+    );
+}
+
+/// #3278 — a credential in an inbound `pendings[].payload` (arbitrary peer JSON
+/// surfaced by the approvals API / K10 SSE) is redacted before upsert.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_push_pending_payload_secret_is_redacted_3278() {
+    let _g = env_lock();
+    seed_screen_mode_refuse();
+    clear_all_env();
+    relax_orthogonal_gates();
+    let (router, db) = setup_router();
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let pa = PendingAction {
+        id: id.clone(),
+        action_type: "store".to_string(),
+        memory_id: None,
+        namespace: "coord/screen".to_string(),
+        payload: json!({ "content": format!("rotate {AWS_AKIA_FIXTURE}") }),
+        requested_by: "ai:peer-3049".to_string(),
+        requested_at: "2026-01-01T00:00:00Z".to_string(),
+        status: "pending".to_string(),
+        decided_by: None,
+        decided_at: None,
+        approvals: Vec::new(),
+    };
+    let body = json!({
+        "sender_agent_id": "ai:peer-3049",
+        "sender_clock": {"entries": {}},
+        "memories": [],
+        "pendings": [serde_json::to_value(&pa).expect("serialize pending")],
+        "dry_run": false,
+    });
+    let (status, resp) = post_sync_push(&router, body, "ai:peer-3049").await;
+    let stored = {
+        let lock = db.lock().await;
+        ai_memory::db::get_pending_action(&lock.0, &id)
+            .expect("get_pending_action")
+            .expect("pending MUST be persisted, not skipped")
+    };
+    clear_all_env();
+
+    assert_eq!(status, StatusCode::OK, "resp={resp}");
+    assert_eq!(i(&resp, "pendings_applied"), 1, "resp={resp}");
+    assert!(
+        !stored.payload.to_string().contains(AWS_AKIA_FIXTURE),
+        "pending payload credential must NOT survive (#3278): {}",
+        stored.payload
+    );
+    assert!(
+        stored.payload.to_string().contains(REDACTION_PLACEHOLDER),
+        "pending payload must carry {REDACTION_PLACEHOLDER}: {}",
+        stored.payload
     );
 }
 
