@@ -1088,7 +1088,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // that arrives through a clean auto-merge is UNVERIFIED — always
     // re-measure the merged file), so 33_150 carries the same modest headroom
     // as the neighbouring bumps.
-    ("src/store/postgres.rs", 36_600), /* 2026-08-26 (#3240 rebase onto e9bf9dea): never lower the #3243 floor 36_600. PR's prior 35_720 (#3174/#3177 helpers live in postgres_parity.rs) is below release; re-measure after this rebase. */
+    ("src/store/postgres.rs", 37_080), /* 2026-08-27 (#3240): MEASURED 36_999 after SAL-parity cluster rebased onto #3237 (9cc3df51). Never lower the 36_600 floor. Ceiling 36_600 -> 37_080 (+81 headroom). Helpers live in postgres_parity.rs; this file still grew on the export/gc/record-stop call sites. */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
