@@ -359,54 +359,11 @@ pub fn expand_tilde(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Process-wide lock so tests that mutate env vars (LOG_DIR_ENV /
-    /// AUDIT_DIR_ENV / INVOCATION_ID / HOME / etc.) don't race.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Snapshot+restore an env var across a test body so we don't leak
-    /// state into sibling tests.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<OsString>,
-    }
-    impl EnvGuard {
-        fn capture(key: &'static str) -> Self {
-            Self {
-                key,
-                prev: std::env::var_os(key),
-            }
-        }
-        fn set(&self, v: &str) {
-            // SAFETY: serialised via env_lock() at the test entry; no
-            // other thread is reading the env concurrently.
-            unsafe {
-                std::env::set_var(self.key, v);
-            }
-        }
-        fn unset(&self) {
-            // SAFETY: same as `set`.
-            unsafe {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: same as `set`.
-            unsafe {
-                if let Some(v) = &self.prev {
-                    std::env::set_var(self.key, v);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    // Process-wide env lock + snapshot/restore `EnvGuard` are shared across all
+    // in-process env-mutating unit-test modules (one guard, one lock) so
+    // `set_var`'s single-threaded contract holds and no test observes another's
+    // transient env state (#3301, #2905 class). See `crate::test_support`.
+    use crate::test_support::{EnvGuard, env_lock};
 
     #[test]
     fn log_dir_cli_flag_overrides_env_var() {

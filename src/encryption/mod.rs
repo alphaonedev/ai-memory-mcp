@@ -822,6 +822,15 @@ fn unwrap_record_key(wrapped: &[u8], my_sk: &StaticSecret) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    // Shared, panic-safe env isolation: `env_lock()` serialises every test that
+    // touches `AI_MEMORY_ENCRYPT_AT_REST` (so none observes another's transient
+    // value — the TOCTOU that leaked the at-rest gate into
+    // `seal_content_returns_none_when_encryption_disabled` and reddened
+    // `Check (macos-fed)` / coverage, #3301 / #2905), and `EnvGuard` restores
+    // the prior value on `Drop`, including during a panic. See
+    // `crate::test_support`.
+    use crate::test_support::{EnvGuard, env_lock};
+
     /// Clear the process-wide keypair cache to model a daemon restart:
     /// the in-memory cache is gone and only the on-disk keys remain.
     fn clear_keypair_cache() {
@@ -1007,24 +1016,19 @@ mod tests {
 
     #[test]
     fn encryption_enabled_config_flag_wins() {
-        // Save + clear the env var so other tests aren't perturbed.
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: tests run with serial scope around env-var mutation in
-        // the keypair-cache module; this single-threaded read/restore is
-        // safe for the assertions below.
-        unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
+        // Serialise against sibling env-mutating tests; `env` restores the
+        // prior value on Drop (panic-safe), so this can never leak the at-rest
+        // gate into a sibling test (#3301, #2905 class).
+        let _lock = env_lock();
+        let env = EnvGuard::capture(ENV_ENCRYPT_AT_REST);
+        env.unset();
         assert!(encryption_enabled(Some(true)));
         assert!(!encryption_enabled(Some(false)));
         assert!(!encryption_enabled(None));
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        env.set("1");
         assert!(encryption_enabled(None));
         assert!(encryption_enabled(Some(true)));
-        // Restore.
-        if let Some(v) = prev {
-            unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v) };
-        } else {
-            unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
-        }
+        // `env` restores `AI_MEMORY_ENCRYPT_AT_REST` on Drop.
     }
 
     // --- #228 Commit B — seal_content / open_content helpers ---
@@ -1035,9 +1039,13 @@ mod tests {
         // is a no-op so the caller stores content verbatim with a NULL
         // envelope (byte-identical to pre-wiring behaviour). This test is
         // hermetic — it never sets the env var, relying on the default
-        // disabled gate. (The env-mutating `encryption_enabled_*` test
-        // restores the var, but to avoid cross-test ordering coupling we
-        // assert disabled-by-default explicitly when the var is unset.)
+        // disabled gate. Hold `env_lock()` for the whole body so a sibling
+        // env-mutating test cannot flip the at-rest gate ON between the
+        // `encryption_enabled(None)` check and the `seal_content` call below
+        // — the TOCTOU that reddened `Check (macos-fed)` / coverage (#3301,
+        // #2905 class). The remaining ambient-env skip guards the case where
+        // the process was launched with the var already set.
+        let _lock = env_lock();
         if encryption_enabled(None) {
             // Another test left the var set in this process; skip rather
             // than assert a false negative. The env-guarded integration
@@ -1140,16 +1148,14 @@ mod tests {
     #[test]
     fn seal_content_produces_per_record_envelope_when_enabled() {
         // #1956 — the storage-facing seal_content helper now emits 0x03
-        // envelopes when at-rest encryption is enabled.
-        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
-        // SAFETY: single-threaded test env mutation with restore below.
-        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        // envelopes when at-rest encryption is enabled. Serialise against
+        // sibling env-mutating tests; `env` restores the prior value on Drop
+        // (panic-safe), so a panic mid-body cannot leak the at-rest gate into
+        // a sibling test (#3301, #2905 class).
+        let _lock = env_lock();
+        let env = EnvGuard::capture(ENV_ENCRYPT_AT_REST);
+        env.set("1");
         let sealed = seal_content("hello per-record", "r56-seal-enabled").expect("seal");
-        if let Some(v) = prev {
-            unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v) };
-        } else {
-            unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
-        }
         let (bytes, placeholder) = sealed.expect("encryption enabled => Some");
         assert_eq!(placeholder, "");
         assert_eq!(bytes[0], RECORD_ENVELOPE_VERSION);

@@ -804,6 +804,11 @@ pub mod mcp;
 pub mod metrics;
 pub mod mine;
 pub mod models;
+/// Crate-internal, test-only environment-isolation helpers (process-wide env
+/// lock + snapshot/restore `EnvGuard`) shared by every unit-test module that
+/// mutates process-global env vars — one guard, one lock (#3301, #2905 class).
+#[cfg(test)]
+mod test_support;
 // v0.7.0 Form 3 (issue #756) — multi-step ingest orchestrator. Batman
 // closeout: deterministic helpers run first (Jaccard, cosine, FTS
 // classifier), then LLM stages prepend a SHARED PREFIX and consume
