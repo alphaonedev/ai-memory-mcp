@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connect-time-seeded per-DB-path registry already sees every in-process
   actuation. Pin:
   `pg_write_gate_honors_cross_pool_stop_within_ttl_3276`.
+### Security (#3277 — boot config parse error must not echo `api_key`)
+
+- **`#3277` — a TOML syntax error on boot no longer prints the offending
+  source line.** toml 0.8 `Display` caret-underlines the bad line, so a
+  malformed `api_key = "…"` (the docker-secret trailing-newline artefact
+  `#3197` documents) landed in stderr/journald via `main`'s
+  `eprintln!("… {e:#}")` and `AppConfig::load_from`. The daemon path now
+  reports path + line number only, matching `ai-memory config check`.
+  Pins: `try_load_from_optional_does_not_echo_api_key_on_toml_error_3277`,
+  `malformed_api_key_toml_does_not_echo_secret_on_boot_3277`.
 
 ### Security (federation-receive secret screen — carve-out bypass + completeness)
 
