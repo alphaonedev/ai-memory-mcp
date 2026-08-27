@@ -415,26 +415,19 @@ impl MemoryStore for SqliteStore {
         space: Option<&str>,
     ) -> StoreResult<String> {
         self.gate_record_stop()?;
-        let conn = self.state.lock().await;
-        let map_err = |e: anyhow::Error| match e.downcast_ref::<crate::storage::ConflictError>() {
-            Some(c) => StoreError::Conflict {
-                id: c.existing_id.clone(),
-            },
-            None => box_err(e),
-        };
-        let id = if ctx.bypass_visibility {
-            let mut stamped = memory.clone();
-            crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
-            db::insert_no_overwrite(&conn, &stamped).map_err(map_err)?
-        } else {
-            db::insert_no_overwrite(&conn, memory).map_err(map_err)?
-        };
-        // Fable #3237 item 7 — persist a supplied vector. Pre-fix the
-        // argument was `_embedding` and dropped (HTTP create writes
-        // out-of-band). A SAL caller that reaches this method with a
-        // vector must not get SUCCESS without a durable embedding.
-        if let Some(vec) = embedding.filter(|v| !v.is_empty()) {
-            let space =
+        // #3280 — space is a caller-supplied invariant with no DB
+        // dependency (rust-1.98 ERRORS-09 / PERF-15). Validate it BEFORE
+        // any write so a missing/blank stamp cannot leave an autocommit
+        // orphan that poisons the retry with Conflict. The WriteTxn
+        // below additionally rolls back a set_embedding dim-mismatch
+        // (the same window) so the row+vector land together or not at
+        // all. Fable #3237 item 7 — a SAL caller that DOES pass a
+        // vector still gets it persisted (refused without a space
+        // stamp); HTTP create writes the vector out-of-band (`None`
+        // here).
+        let embedding_vec = embedding.filter(|v| !v.is_empty());
+        let space_stamp = if embedding_vec.is_some() {
+            let stamp =
                 space
                     .filter(|s| !s.trim().is_empty())
                     .ok_or_else(|| StoreError::InvalidInput {
@@ -442,9 +435,51 @@ impl MemoryStore for SqliteStore {
                             "store_with_embedding_no_overwrite: embedding requires a space stamp"
                                 .into(),
                     })?;
-            db::set_embedding(&conn, &id, vec, space).map_err(map_err)?;
+            crate::store::reject_unattributed_space("store_with_embedding_no_overwrite", stamp)?;
+            Some(stamp)
+        } else {
+            None
+        };
+        let conn = self.state.lock().await;
+        let map_err = |e: anyhow::Error| match e.downcast_ref::<crate::storage::ConflictError>() {
+            Some(c) => StoreError::Conflict {
+                id: c.existing_id.clone(),
+            },
+            None => box_err(e),
+        };
+        let owns_tx = conn.is_autocommit();
+        let write_txn = if owns_tx {
+            Some(crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?)
+        } else {
+            None
+        };
+        let written = (|| -> StoreResult<String> {
+            let id = if ctx.bypass_visibility {
+                let mut stamped = memory.clone();
+                crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
+                db::insert_no_overwrite(&conn, &stamped).map_err(map_err)?
+            } else {
+                db::insert_no_overwrite(&conn, memory).map_err(map_err)?
+            };
+            if let (Some(vec), Some(stamp)) = (embedding_vec, space_stamp) {
+                db::set_embedding(&conn, &id, vec, stamp).map_err(map_err)?;
+            }
+            Ok(id)
+        })();
+        match written {
+            Ok(id) => {
+                if let Some(txn) = write_txn {
+                    txn.commit().map_err(box_err)?;
+                }
+                Ok(id)
+            }
+            Err(e) => {
+                if let Some(txn) = write_txn {
+                    txn.rollback();
+                }
+                Err(e)
+            }
         }
-        Ok(id)
     }
 
     /// v1.0.0 #2887 — RESTORE-SAFE atomic re-store for the reversible rollback
