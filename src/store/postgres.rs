@@ -614,11 +614,23 @@ const SQL_INSERT_FORGET_TOMBSTONE: &str = "INSERT INTO forget_tombstones \
      (memory_id, namespace, forgotten_at, agent_id, signature) \
      VALUES ($1, $2, $3, $4, $5) \
      ON CONFLICT (memory_id) DO NOTHING";
-/// #3192 — purge the non-cascaded DLQ cleartext leak for one deleted id.
-const SQL_DELETE_DLQ_BY_MEMORY_ID: &str = "DELETE FROM federation_push_dlq WHERE memory_id = $1";
-/// #3192 — purge the transcript-line content-hash oracle for one deleted id.
-const SQL_DELETE_DEDUP_BY_MEMORY_ID: &str =
-    "DELETE FROM transcript_line_dedup WHERE memory_id = $1";
+/// #3192 / #3286 — purge the non-cascaded DLQ cleartext leak for the victim
+/// ids. `ANY($1)` binds a slice so the single-row and bulk hard-delete
+/// primitives share ONE statement pair (see [`pg_purge_dlq_dedup_in_tx`]).
+const SQL_DELETE_DLQ_BY_MEMORY_IDS: &str =
+    "DELETE FROM federation_push_dlq WHERE memory_id = ANY($1)";
+/// #3192 / #3286 — purge the transcript-line content-hash oracle for the
+/// victim ids (slice-bound twin of [`SQL_DELETE_DLQ_BY_MEMORY_IDS`]).
+const SQL_DELETE_DEDUP_BY_MEMORY_IDS: &str =
+    "DELETE FROM transcript_line_dedup WHERE memory_id = ANY($1)";
+/// #3272 C-2 — clear the FORGET tombstone for one id on an EXPLICIT
+/// operator/rollback RESTORE only (`restore_or_conflict` → the
+/// `RestoreSameId` CAS). Postgres twin of the sqlite
+/// `SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID`. NEVER run on a normal
+/// federation apply / import, so LWW resurrection of a genuinely-deleted id
+/// stays refused.
+const SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID: &str =
+    "DELETE FROM forget_tombstones WHERE memory_id = $1";
 
 /// v0.9.0 G13-mem (#1859) — endpoint content-id read for the lineage-DAG
 /// `memory_links.source_cid`/`target_cid` mirror stamp.
@@ -15025,17 +15037,28 @@ async fn pg_hard_delete_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
 ) -> Result<u64, sqlx::Error> {
-    // Probe via tombstone/erase first: if the row is already gone, do not
-    // sever `namespace_meta` or emit a forget-tombstone for a delete that
-    // never happened (#3253 Fable item 2 / #3245).
-    let leaf = pg_tombstone_and_erase_in_tx(tx, id).await?;
-    let Some((ref ns, ver)) = leaf else {
-        return Ok(0);
-    };
+    // #1642 / #2493 / #2503 / #3272 C-1 — SEVER `namespace_meta`
+    // UNCONDITIONALLY, BEFORE (and regardless of) the row-existence probe. An
+    // inbound federated `deletions[]` (via `apply_remote_deletion`) naming an
+    // id whose live row is already gone locally but whose
+    // `namespace_meta.standard_id` still dangles at it (#1642) MUST reach the
+    // #2503 severed floor, or `resolve_governance_policy` reads
+    // allow-on-silence instead. The sever is an idempotent no-op when nothing
+    // points here, so it never fabricates state for a delete that did not
+    // happen — ONLY the forget-tombstone / crypto-erase below stays gated on
+    // the row existing (a missing row writes no forget-tombstone: no namespace
+    // to bind — a first-arrival hole, not a resurrection of an erased row).
+    // Pre-#3253 this sever ran pool-direct before the existence check; #3253
+    // regressed it behind the leaf probe, contradicting the contract
+    // `apply_remote_deletion` still documents — the #3272 audit reinstates it.
     sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
         .bind(id)
         .execute(&mut **tx)
         .await?;
+    let leaf = pg_tombstone_and_erase_in_tx(tx, id).await?;
+    let Some((ref ns, ver)) = leaf else {
+        return Ok(0);
+    };
     // No-op when the append-only spine is OFF (the helper itself gates).
     pg_emit_revision_leaf_if_enabled(
         tx,
@@ -15084,14 +15107,10 @@ async fn pg_tombstone_and_erase_in_tx(
         .bind(id)
         .execute(&mut **tx)
         .await?;
-    sqlx::query(SQL_DELETE_DLQ_BY_MEMORY_ID)
-        .bind(id)
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query(SQL_DELETE_DEDUP_BY_MEMORY_ID)
-        .bind(id)
-        .execute(&mut **tx)
-        .await?;
+    // #3286 — DLQ/dedup remanence purge via the shared SSOT so every
+    // hard-delete funnel (delete here, evict, forget) purges identically.
+    let purge_victim = [id.to_owned()];
+    pg_purge_dlq_dedup_in_tx(tx, &purge_victim).await?;
 
     let signable = crate::storage::forget_tombstone_signable_bytes(id, &ns, &now_str);
     let signature: Option<Vec<u8>> =
@@ -15138,6 +15157,37 @@ async fn pg_tombstone_and_erase_in_tx(
     )
     .await?;
     Ok(Some((ns, ver)))
+}
+
+/// #3286 — purge the two NON-cascaded crypto-erase remanence tables
+/// (`federation_push_dlq` cleartext + `transcript_line_dedup` content-hash
+/// oracle) for `ids`, inside the caller's transaction. The SINGLE SSOT every
+/// postgres hard-delete funnel routes through — `pg_tombstone_and_erase_in_tx`
+/// (the `delete` / `apply_remote_deletion` primitive),
+/// [`crate::store::postgres_parity::evict_tombstone_and_erase_in_tx`]
+/// (TTL/byte-cap eviction), and the `forget`-by-pattern reap — so no funnel
+/// can leave the remanence behind after a "crypto-erase" (#3286: eviction
+/// previously did). Empty slice is a no-op.
+///
+/// # Errors
+///
+/// Propagates the DELETE error.
+pub(crate) async fn pg_purge_dlq_dedup_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ids: &[String],
+) -> Result<(), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(SQL_DELETE_DLQ_BY_MEMORY_IDS)
+        .bind(ids)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(SQL_DELETE_DEDUP_BY_MEMORY_IDS)
+        .bind(ids)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// v0.9.0 G6 (#1823) STEP 2 — the gated postgres convenience used by every
@@ -24739,16 +24789,12 @@ impl MemoryStore for PostgresStore {
         // THIS tx. 5-agent vote 4d3ea1c5.
         if !deleted.is_empty() {
             let ids: Vec<String> = deleted.iter().map(|(id, _, _)| id.clone()).collect();
-            sqlx::query("DELETE FROM federation_push_dlq WHERE memory_id = ANY($1)")
-                .bind(&ids)
-                .execute(&mut *tx)
+            // #3286 — route through the shared SSOT so this forget reap and the
+            // delete / evict primitives cannot drift on which remanence tables
+            // a crypto-erase purges.
+            pg_purge_dlq_dedup_in_tx(&mut tx, &ids)
                 .await
-                .map_err(|e| to_store_err("forget purge federation_push_dlq", e))?;
-            sqlx::query("DELETE FROM transcript_line_dedup WHERE memory_id = ANY($1)")
-                .bind(&ids)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("forget purge transcript_line_dedup", e))?;
+                .map_err(|e| to_store_err("forget purge dlq/dedup remanence", e))?;
             // W2.3 SIGNED tombstones — bulk insert via UNNEST. Identity + time
             // + owner only (NO content). Each signs the canonical
             // {memory_id, namespace, forgotten_at} bytes with the daemon audit
@@ -31682,6 +31728,27 @@ impl PostgresStore {
             )
             .await
             .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+        }
+
+        // #3272 C-2 — on an EXPLICIT operator/rollback RESTORE only, clear any
+        // FORGET tombstone for the restored id so the revived original is
+        // federation-syncable (`insert_if_newer` drops tombstoned ids) and
+        // re-importable (Portability-v2 refuses them) again. Consolidate's
+        // hard-delete arm (#3192) tombstones every source; a `curator
+        // --rollback` re-inserting the originals via `restore_or_conflict`
+        // otherwise leaves them silently federation-deaf. GATED on the
+        // `RestoreSameId` arm — a normal federation apply / import NEVER reaches
+        // here, so this cannot re-open LWW resurrection of a genuinely-deleted
+        // id. Same tx as the insert (sqlite twin: `db::insert_inner`).
+        if matches!(
+            conflict_arm,
+            crate::storage::InsertConflictArm::RestoreSameId
+        ) {
+            sqlx::query(SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("restore clear forget tombstone", e))?;
         }
 
         // v0.7.0 #1156 — per-namespace quota dimension (v50 PK).
@@ -38644,6 +38711,250 @@ mod tests {
     // sqlite-side note in `storage::tests`); the underlying shared gate
     // logic is exhaustively covered by the isolated integration-test
     // process `tests/issue_2059_2060_covenant_write_gates.rs` instead.
+
+    // ---- #3272 / #3286 erasure-primitive data-integrity pins (live PG) -----
+
+    /// #3272 C-1 — `apply_remote_deletion` of an id whose live row is ALREADY
+    /// GONE but whose `namespace_meta.standard_id` still dangles at it (#1642)
+    /// MUST still sever the pointer to the #2503 severed floor. Pre-fix
+    /// `pg_hard_delete_in_tx` returned before the sever when the leaf was None.
+    #[tokio::test]
+    async fn apply_remote_deletion_of_gone_id_still_severs_namespace_meta_pg_3272() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("c1-sever-3272-{unique}");
+        let sid = format!("c1std-{unique}");
+        let standard = sample_memory(&sid, &ns, "std", "namespace governance standard");
+        store.store(&ctx, &standard).await.expect("store standard");
+        store
+            .set_namespace_standard(&ctx, &ns, &sid, None)
+            .await
+            .expect("set standard");
+        // Create the #1642 dangling state: drop the memories row WITHOUT the
+        // sever funnel, leaving namespace_meta.standard_id pointing at it.
+        sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(&sid)
+            .execute(&store.pool)
+            .await
+            .expect("raw delete memories row");
+        let (dangling,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = $1 AND standard_id = $2)",
+        )
+        .bind(&ns)
+        .bind(&sid)
+        .fetch_one(&store.pool)
+        .await
+        .expect("dangling probe");
+        assert!(
+            dangling,
+            "precondition: pointer dangles at the already-gone id"
+        );
+        // The federated deletions[] lane for an already-gone id.
+        let removed = store
+            .apply_remote_deletion(&ctx, &sid)
+            .await
+            .expect("apply_remote_deletion");
+        assert!(!removed, "no live row remained to delete");
+        let (still_points,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = $1 AND standard_id = $2)",
+        )
+        .bind(&ns)
+        .bind(&sid)
+        .fetch_one(&store.pool)
+        .await
+        .expect("post-sever probe");
+        assert!(
+            !still_points,
+            "#3272 C-1: sever must run unconditionally even when the row is gone"
+        );
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM namespace_meta WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
+    }
+
+    /// #3272 C-2 — a rollback restore via `restore_or_conflict` MUST clear the
+    /// FORGET tombstone so the restored original is federation-syncable again
+    /// (`apply_remote_memory` accepts it) rather than staying silently
+    /// federation-deaf.
+    #[tokio::test]
+    async fn restore_clears_forget_tombstone_so_restored_is_syncable_pg_3272() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("c2-restore-3272-{unique}");
+        let id = format!("c2orig-{unique}");
+        let m = sample_memory(&id, &ns, "orig", "durable original content");
+        store.store(&ctx, &m).await.expect("store original");
+        // Hard delete → tombstone written (#3192).
+        store.delete(&ctx, &id).await.expect("delete");
+        let (has_tomb,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)")
+                .bind(&id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("tombstone probe");
+        assert!(has_tomb, "delete tombstones the id");
+        // While tombstoned, a federation re-push is refused (resurrection guard).
+        let mut premature = sample_memory(&id, &ns, "orig", "resurrection attempt");
+        premature.updated_at = "2099-12-31T23:59:59Z".to_string();
+        store
+            .apply_remote_memory(&ctx, &premature)
+            .await
+            .expect("apply is an idempotent no-op while tombstoned");
+        assert!(
+            matches!(store.get(&ctx, &id).await, Err(StoreError::NotFound { .. })),
+            "tombstone-wins: re-push refused while forgotten"
+        );
+        // Operator rollback restore via the sanctioned funnel.
+        store
+            .restore_or_conflict(&ctx, &m)
+            .await
+            .expect("restore_or_conflict");
+        assert!(
+            store.get(&ctx, &id).await.is_ok(),
+            "restore brings the row back"
+        );
+        let (still_tomb,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)")
+                .bind(&id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("post-restore tombstone probe");
+        assert!(
+            !still_tomb,
+            "#3272 C-2: restore must clear the forget tombstone"
+        );
+        // A later legitimate federation update of the restored row is ACCEPTED.
+        let mut newer = sample_memory(&id, &ns, "orig", "updated after restore");
+        newer.updated_at = "2099-12-31T23:59:59Z".to_string();
+        store
+            .apply_remote_memory(&ctx, &newer)
+            .await
+            .expect("apply_remote_memory after restore");
+        let got = store
+            .get(&ctx, &id)
+            .await
+            .expect("restored row is syncable");
+        assert_eq!(
+            got.content, "updated after restore",
+            "#3272 C-2: apply_remote_memory now accepts an update to the restored id"
+        );
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM forget_tombstones WHERE memory_id = $1")
+            .bind(&id)
+            .execute(&store.pool)
+            .await;
+    }
+
+    /// #3286 — TTL/byte-cap eviction (`size_gc`, hard path via
+    /// `postgres_parity::evict_tombstone_and_erase_in_tx`) MUST purge the two
+    /// non-cascaded crypto-erase remanence tables. Pre-fix only the `delete`
+    /// twin purged, so an evicted encrypted row kept its `federation_push_dlq`
+    /// cleartext + `transcript_line_dedup` content-hash oracle.
+    #[tokio::test]
+    async fn size_gc_eviction_purges_dlq_and_dedup_remanence_pg_3286() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("c3-evict-3286-{unique}");
+        let id = format!("c3victim-{unique}");
+        let mut m = sample_memory(&id, &ns, "victim", "size gc eviction victim");
+        m.tier = Tier::Short;
+        store.store(&ctx, &m).await.expect("store victim");
+        // Seed the two non-cascaded remanence rows for the victim id.
+        sqlx::query(
+            "INSERT INTO federation_push_dlq \
+                 (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at) \
+             VALUES ($1, 'peer-x', '{\"secret\":\"undelivered cleartext\"}', 1, 'boom', \
+                     '2026-01-01T00:00:00Z')",
+        )
+        .bind(&id)
+        .execute(&store.pool)
+        .await
+        .expect("seed dlq");
+        sqlx::query(
+            "INSERT INTO transcript_line_dedup \
+                 (sha256, memory_id, host_kind, recovered_at) \
+             VALUES ($1, $2, 'claude-code', 1)",
+        )
+        .bind(vec![9u8; 32])
+        .bind(&id)
+        .execute(&store.pool)
+        .await
+        .expect("seed dedup");
+        // Byte-cap just under the corpus → hard-evict the victim (archive=false).
+        let corpus: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(\
+                 length(title) + length(content) + length(metadata::text)), 0)::bigint \
+             FROM memories WHERE namespace = $1",
+        )
+        .bind(&ns)
+        .fetch_one(&store.pool)
+        .await
+        .expect("corpus sum");
+        assert!(corpus > 0, "precondition: the namespace has a corpus");
+        let evicted = store
+            .size_gc(&ns, corpus - 1, false)
+            .await
+            .expect("size_gc hard eviction");
+        assert!(evicted >= 1, "size_gc must evict the victim");
+        assert!(
+            matches!(store.get(&ctx, &id).await, Err(StoreError::NotFound { .. })),
+            "victim is hard-evicted from live memories"
+        );
+        let (dlq,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::bigint FROM federation_push_dlq WHERE memory_id = $1")
+                .bind(&id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("dlq count");
+        let (dedup,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM transcript_line_dedup WHERE memory_id = $1",
+        )
+        .bind(&id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("dedup count");
+        assert_eq!(
+            dlq, 0,
+            "#3286: eviction must purge federation_push_dlq cleartext"
+        );
+        assert_eq!(
+            dedup, 0,
+            "#3286: eviction must purge the transcript_line_dedup content-hash oracle"
+        );
+        // The resurrection guard (tombstone) is still written by the evict primitive.
+        let (has_tomb,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)")
+                .bind(&id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("tombstone probe");
+        assert!(
+            has_tomb,
+            "eviction still tombstones for the resurrection guard"
+        );
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM forget_tombstones WHERE memory_id = $1")
+            .bind(&id)
+            .execute(&store.pool)
+            .await;
+    }
 }
 
 // ── v1.0.0 #3264 — pgvector preflight decision-table unit tests ────────

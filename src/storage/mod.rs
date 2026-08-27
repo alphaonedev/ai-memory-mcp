@@ -78,6 +78,15 @@ const SQL_DELETE_DLQ_BY_MEMORY_ID: &str = "DELETE FROM federation_push_dlq WHERE
 /// deleted id.
 const SQL_DELETE_DEDUP_BY_MEMORY_ID: &str =
     "DELETE FROM transcript_line_dedup WHERE memory_id = ?1";
+/// #3272 C-2 — clear the FORGET tombstone for one id on an EXPLICIT
+/// operator/rollback RESTORE only (`insert_restore_same_id`). A restored
+/// original must be federation-syncable ([`insert_if_newer`]) and importable
+/// again; leaving the tombstone made it silently federation-deaf + un-importable.
+/// NEVER run on a normal federation apply / import — only the `RestoreSameId`
+/// conflict arm reaches it, so LWW resurrection stays refused for a genuinely
+/// deleted id.
+const SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID: &str =
+    "DELETE FROM forget_tombstones WHERE memory_id = ?1";
 /// #2447 — scalar namespace-by-id read for the federation receive-side
 /// namespace-scope gates (single SQL SSOT; see [`namespace_by_id`]).
 const SQL_SELECT_NAMESPACE_BY_ID: &str = "SELECT namespace FROM memories WHERE id = ?1";
@@ -2281,6 +2290,20 @@ fn insert_inner(
         // neutralize exactly the #2948 wiring (not the shared emitter) and
         // prove the armed upsert path depends on it.
         emit_upsert_supersede_leaf_if_enabled(conn, prior_version_on_conflict, &actual_id, mem)?;
+        // #3272 C-2 — on an EXPLICIT operator/rollback RESTORE only, clear any
+        // FORGET tombstone for the restored id so the revived original is
+        // federation-syncable (`insert_if_newer` drops tombstoned ids, :15258)
+        // and re-importable (Portability-v2 refuses them, `import.rs`) again.
+        // Consolidate's hard-delete arm (#3192) tombstones every source; a
+        // `curator --rollback` re-inserting the originals via
+        // `insert_restore_same_id` otherwise leaves them silently
+        // federation-deaf. GATED on the `RestoreSameId` arm — a normal
+        // federation apply / import NEVER reaches here, so this cannot re-open
+        // LWW resurrection of a genuinely-deleted id (the tombstone-wins guard
+        // on the federation-receive funnel stays intact). Same tx as the insert.
+        if matches!(conflict_arm, InsertConflictArm::RestoreSameId) {
+            conn.execute(SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID, params![actual_id])?;
+        }
         Ok(actual_id)
     })();
     if let Some(write_txn) = write_txn {
@@ -4416,11 +4439,21 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
 /// `archive_memory_no_tx`, kept private because every external caller wants
 /// the atomic wrapper.
 fn delete_inner(conn: &Connection, id: &str) -> Result<bool> {
-    // #3192 / #3253 Fable item 2 — probe the row FIRST. A missing id must
-    // not sever `namespace_meta` or write a forget-tombstone for a delete
-    // that never happened (sqlite twin of `pg_hard_delete_in_tx`).
     use rusqlite::OptionalExtension;
     let now = Utc::now().to_rfc3339();
+    // #1642 / #2493 / #2503 / #3272 C-1 — SEVER any namespace_meta binding
+    // pointing here UNCONDITIONALLY, BEFORE the row-existence probe. An inbound
+    // federated `deletions[]` (via `apply_remote_deletion` → this funnel)
+    // naming an id whose live row is already gone locally but whose
+    // `namespace_meta.standard_id` still dangles at it (#1642) MUST reach the
+    // #2503 severed floor, or governance policy resolution reads
+    // allow-on-silence instead. `sever_namespace_standards` is an idempotent
+    // no-op when nothing points here (returns 0, no WARN, no signed event), so
+    // this never fabricates state for a delete that did not happen — ONLY the
+    // forget-tombstone / crypto-erase below stays gated on the row existing.
+    // #3253/#3245 regressed this behind the probe; the #3272 audit reinstates
+    // the pre-#3253 unconditional sever (postgres twin: `pg_hard_delete_in_tx`).
+    sever_namespace_standards(conn, id)?;
     if let Some((ns, ver, agent_id)) = conn
         .query_row(SQL_SELECT_NS_VERSION_AGENT_BY_ID, params![id], |r| {
             Ok((
@@ -4431,8 +4464,10 @@ fn delete_inner(conn: &Connection, id: &str) -> Result<bool> {
         })
         .optional()?
     {
-        // #2503 — SEVER (never DELETE) any namespace_meta binding pointing here.
-        sever_namespace_standards(conn, id)?;
+        // #3192 — tombstone + crypto-erase + DLQ/dedup remanence purge, all now
+        // inside the shared `tombstone_and_erase` primitive (#3286) so every
+        // hard-delete funnel — this `delete`, and `gc`/`size_gc` eviction via
+        // `evict_tombstone_and_erase` — purges identically.
         tombstone_and_erase(
             conn,
             id,
@@ -4441,8 +4476,6 @@ fn delete_inner(conn: &Connection, id: &str) -> Result<bool> {
             &now,
             CRYPTO_ERASE_ACTOR_DELETE,
         )?;
-        conn.execute(SQL_DELETE_DLQ_BY_MEMORY_ID, params![id])?;
-        conn.execute(SQL_DELETE_DEDUP_BY_MEMORY_ID, params![id])?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
         // ONE identity-only TOMBSTONE leaf BEFORE the delete. The
         // ns/version lookup now shares the tombstone probe above, so
@@ -6201,6 +6234,14 @@ fn tombstone_and_erase(
     )?;
     // Erasure invariant: scrub the cid_genesis pre-image (parity with forget).
     forget_scrub_cid_genesis(conn, id)?;
+    // #3286 — purge the two NON-cascaded crypto-erase remanence tables in the
+    // SHARED primitive so no hard-delete funnel can leave them behind. Prior to
+    // #3286 this lived in `delete_inner` only, so `gc`/`size_gc` eviction (which
+    // reaches here via `evict_tombstone_and_erase`) left a TTL/byte-cap-evicted
+    // encrypted row's `federation_push_dlq` cleartext + `transcript_line_dedup`
+    // content-hash oracle intact AFTER the "crypto-erase".
+    conn.execute(SQL_DELETE_DLQ_BY_MEMORY_ID, params![id])?;
+    conn.execute(SQL_DELETE_DEDUP_BY_MEMORY_ID, params![id])?;
     Ok(())
 }
 
@@ -30908,5 +30949,186 @@ mod tests {
         assert!(why_trace_present(
             &serde_json::json!({"why_trace": "operator requested a memo of the incident"})
         ));
+    }
+
+    // ---- #3272 / #3286 erasure-primitive data-integrity pins --------------
+
+    /// #3272 C-1 — a federated `deletions[]` (via `apply_remote_deletion` →
+    /// `db::delete` → `delete_inner`) naming an id whose live row is ALREADY
+    /// GONE locally but whose `namespace_meta.standard_id` still dangles at it
+    /// (#1642) MUST still sever the pointer to the #2503 severed floor. Pre-fix
+    /// the probe-first short-circuit returned before the sever, leaving the
+    /// dangling pointer → allow-on-silence governance.
+    #[test]
+    fn apply_remote_deletion_of_gone_id_still_severs_namespace_meta_3272() {
+        use rusqlite::OptionalExtension;
+        // Returns `Some(inner)` when the namespace_meta row exists (`inner` is
+        // the nullable standard_id), `None` when the row is absent.
+        fn standard_id_of(conn: &Connection, ns: &str) -> Option<Option<String>> {
+            conn.query_row(
+                "SELECT standard_id FROM namespace_meta WHERE namespace = ?1",
+                params![ns],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .unwrap()
+        }
+        let conn = test_db();
+        let ns = "c1/dangle";
+        let standard = make_memory("std", ns, Tier::Long, 8);
+        let sid = insert(&conn, &standard).unwrap();
+        set_namespace_standard(&conn, ns, &sid, None).unwrap();
+        // Simulate the #1642 dangling state: raw-delete the memories row WITHOUT
+        // going through the sever funnel, so the pointer is left dangling.
+        conn.execute("DELETE FROM memories WHERE id = ?1", params![sid])
+            .unwrap();
+        assert_eq!(
+            standard_id_of(&conn, ns),
+            Some(Some(sid.clone())),
+            "precondition: pointer dangles at the already-gone id"
+        );
+        // The federated-deletion funnel for an already-gone id.
+        let changed = delete(&conn, &sid).unwrap();
+        assert!(!changed, "no live row remained to delete");
+        assert_eq!(
+            standard_id_of(&conn, ns),
+            Some(None),
+            "#3272 C-1: the row survives (parent link intact) but the pointer is \
+             severed to NULL, even though the memory row was already gone"
+        );
+    }
+
+    /// #3272 C-2 — a curator/operator rollback re-inserts a consolidated
+    /// original via the sanctioned `insert_restore_same_id` funnel; that MUST
+    /// clear the FORGET tombstone so the restored row is federation-syncable
+    /// (`insert_if_newer` accepts a later legitimate update) and re-importable.
+    /// Pre-fix the tombstone survived → the restored original was silently
+    /// federation-deaf + un-importable.
+    #[test]
+    fn restore_same_id_clears_forget_tombstone_so_restored_is_syncable_3272() {
+        let conn = test_db();
+        let ns = "c2/restore";
+        let m = make_memory("orig", ns, Tier::Long, 5);
+        let id = insert(&conn, &m).unwrap();
+        // Consolidate/forget hard-deletes the source → tombstone written.
+        delete(&conn, &id).unwrap();
+        assert!(
+            memory_is_tombstoned(&conn, &id).unwrap(),
+            "delete tombstones the source id (#3192)"
+        );
+        // While tombstoned, a federation re-push is DROPPED (resurrection guard).
+        let mut premature = m.clone();
+        premature.updated_at = "2099-12-31T23:59:59Z".to_string();
+        insert_if_newer(&conn, &premature).unwrap();
+        assert!(
+            get(&conn, &id).unwrap().is_none(),
+            "tombstone-wins: re-push refused while genuinely forgotten"
+        );
+        // Operator rollback restores the original via the sanctioned funnel.
+        insert_restore_same_id(&conn, &m).unwrap();
+        assert!(
+            get(&conn, &id).unwrap().is_some(),
+            "restore brings the row back live"
+        );
+        assert!(
+            !memory_is_tombstoned(&conn, &id).unwrap(),
+            "#3272 C-2: restore must clear the forget tombstone"
+        );
+        // A later legitimate federation update of the restored row is ACCEPTED.
+        let mut newer = m.clone();
+        newer.content = "updated after restore".to_string();
+        newer.updated_at = "2099-12-31T23:59:59Z".to_string();
+        insert_if_newer(&conn, &newer).unwrap();
+        let got = get(&conn, &id)
+            .unwrap()
+            .expect("restored row is federation-syncable");
+        assert_eq!(
+            got.content, "updated after restore",
+            "#3272 C-2: insert_if_newer now accepts an update to the restored id"
+        );
+    }
+
+    /// #3272 C-2 (non-regression) — clearing the tombstone on RESTORE must not
+    /// re-open LWW resurrection: a GENUINELY deleted id (no restore) still
+    /// tombstones and a later fresher-timestamp peer re-push stays REFUSED.
+    #[test]
+    fn genuine_delete_still_refuses_lww_resurrection_3272() {
+        let conn = test_db();
+        let ns = "c2/guard";
+        let m = make_memory("gone", ns, Tier::Long, 5);
+        let id = insert(&conn, &m).unwrap();
+        delete(&conn, &id).unwrap();
+        assert!(memory_is_tombstoned(&conn, &id).unwrap());
+        // No restore. A peer LWW re-push with a far-future timestamp must lose.
+        let mut repush = m.clone();
+        repush.updated_at = "2099-12-31T23:59:59Z".to_string();
+        insert_if_newer(&conn, &repush).unwrap();
+        assert!(
+            get(&conn, &id).unwrap().is_none(),
+            "#3272 C-2 must NOT re-open resurrection: a genuinely deleted id stays refused"
+        );
+        assert!(
+            memory_is_tombstoned(&conn, &id).unwrap(),
+            "the tombstone persists for a genuinely deleted id"
+        );
+    }
+
+    /// #3286 — TTL/byte-cap eviction (via the shared `tombstone_and_erase`
+    /// primitive reached by `evict_tombstone_and_erase`) MUST purge the two
+    /// non-cascaded crypto-erase remanence tables. Pre-fix the purge lived in
+    /// `delete_inner` only, so an evicted encrypted row kept its
+    /// `federation_push_dlq` cleartext + `transcript_line_dedup` content-hash
+    /// oracle after the "crypto-erase".
+    #[test]
+    fn eviction_purges_dlq_and_dedup_remanence_3286() {
+        let conn = test_db();
+        let ns = "c3/evict";
+        let m = make_memory("victim", ns, Tier::Long, 5);
+        let id = insert(&conn, &m).unwrap();
+        conn.execute(
+            "INSERT INTO federation_push_dlq \
+                 (memory_id, peer_id, payload_json, last_error, failed_at) \
+             VALUES (?1, 'peer-x', '{\"secret\":\"undelivered cleartext\"}', 'boom', \
+                     '2026-01-01T00:00:00Z')",
+            params![id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transcript_line_dedup \
+                 (sha256, memory_id, host_kind, recovered_at) \
+             VALUES (?1, ?2, 'claude-code', 1)",
+            params![vec![9u8; 32], id],
+        )
+        .unwrap();
+        // The TTL/byte-cap eviction funnel (gc / size_gc land here).
+        let now = Utc::now().to_rfc3339();
+        evict_tombstone_and_erase(&conn, &id, ns, None, &now).unwrap();
+        let dlq: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM federation_push_dlq WHERE memory_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let dedup: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transcript_line_dedup WHERE memory_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dlq, 0,
+            "#3286: eviction must purge federation_push_dlq cleartext"
+        );
+        assert_eq!(
+            dedup, 0,
+            "#3286: eviction must purge the transcript_line_dedup content-hash oracle"
+        );
+        // The resurrection guard (tombstone) is still written by the same primitive.
+        assert!(
+            memory_is_tombstoned(&conn, &id).unwrap(),
+            "eviction still tombstones for the federation resurrection guard"
+        );
     }
 }
