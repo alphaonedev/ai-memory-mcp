@@ -451,10 +451,14 @@ plus the in-process upgrade ladder to schema v90 as a side effect. The
 `vector` (pgvector) extension is required (its absence aborts the
 bootstrap — see
 [`postgres-age-guide.md` §"Managed / non-superuser Postgres (CloudNativePG,
-RDS, Cloud SQL)"](postgres-age-guide.html) for the one-time superuser
+RDS, Cloud SQL)"](postgres-age-guide.html) for the one-time admin
 pre-create that lets a non-superuser owner role boot, and for the
-`SQLSTATE 42501` vs `0A000` diagnostics `ai-memory doctor` and
-`schema-init --json` now report); `age` is opt-in — when installed, the verb additionally
+`SQLSTATE 42501` vs `0A000` diagnostics). Probe a backend BEFORE
+deploying with `ai-memory doctor`, which is read-only and reports the
+"Postgres extensions (#3264)" section; `schema-init` is not a pre-deploy
+check for a failing backend, because opening the store runs the bootstrap
+and it refuses at connect with the classified remedy before any JSON is
+emitted. `age` is opt-in — when installed, the verb additionally
 creates the AGE graph `memory_graph` via the idempotent
 `SELECT create_graph('memory_graph')`, otherwise KG queries use the
 recursive-CTE fallback. Exit 0 on success; non-zero on connection /
