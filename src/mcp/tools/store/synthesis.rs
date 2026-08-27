@@ -39,6 +39,114 @@ use crate::{db, hnsw::VectorSearchIndex};
 
 use super::AUTONOMY_MIN_CONTENT_LEN;
 
+/// #3173 — `allow_inbox` for every synthesis-plane ownership check.
+///
+/// STRICTER than the `memory_delete` gate (`allow_inbox = true`) and equal to
+/// the `memory_update` / `memory_promote` gates: a synthesis verdict is an
+/// AUTONOMOUS mutation the caller never named, so an inbox RECIPIENT — who
+/// never asked for that row to be merged away or hard-deleted — must not be
+/// treated as an owner here.
+const SYNTHESIS_ALLOW_INBOX: bool = false;
+
+/// #3173 — the single ownership predicate every synthesis-plane mutate site
+/// applies. Thin, named wrapper over the canonical #1786
+/// [`crate::visibility::caller_owns_for_mutation`] so the pool filter in
+/// `mod.rs` and the per-site re-checks below can never drift apart.
+#[must_use]
+pub(super) fn caller_may_mutate(mem: &Memory, caller: &str) -> bool {
+    crate::visibility::caller_owns_for_mutation(mem, caller, SYNTHESIS_ALLOW_INBOX)
+}
+
+/// #3173 — emit the security audit row for a REFUSED cross-owner synthesis
+/// mutation. `AuditOutcome::Deny`, so a SIEM sees the attempt rather than the
+/// pre-#3173 silent success.
+pub(super) fn audit_mutation_refusal(
+    action: crate::audit::AuditAction,
+    mem: &Memory,
+    caller: &str,
+) {
+    tracing::warn!(
+        target: "synthesis",
+        namespace = %mem.namespace,
+        candidate_id = %mem.id,
+        caller = %caller,
+        "synthesis.refused_cross_owner_mutation",
+    );
+    crate::audit::emit(
+        crate::audit::EventBuilder::new(
+            action,
+            crate::audit::actor(
+                caller.to_string(),
+                crate::audit::synthesis_sources::HOST_FALLBACK,
+                None,
+            ),
+            crate::audit::target_memory(
+                mem.id.clone(),
+                mem.namespace.clone(),
+                Some(mem.title.clone()),
+                Some(mem.tier.to_string()),
+                None,
+            ),
+        )
+        .outcome(crate::audit::AuditOutcome::Deny),
+    );
+}
+
+/// #3173 — REFUSE (never silently skip) when a synthesis verdict names a row
+/// the caller may not mutate.
+///
+/// `candidates` is the already-ownership-filtered pool, so the target must be
+/// present in it AND still pass [`caller_may_mutate`]; a target absent from the
+/// vetted pool is refused too (it can only come from a pool/verdict mismatch,
+/// which is exactly the state a mutate site must not act on). A `None` caller
+/// is the single-operator default — trust-all, byte-unchanged.
+///
+/// # Errors
+/// [`crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY`] when the caller is set
+/// and the target is not caller-mutable.
+pub(super) fn assert_caller_may_mutate(
+    candidates: &[Memory],
+    caller: Option<&str>,
+    action: crate::audit::AuditAction,
+    target_id: &str,
+) -> Result<(), String> {
+    let Some(caller) = caller else {
+        return Ok(());
+    };
+    match candidates.iter().find(|c| c.id == target_id) {
+        Some(row) if caller_may_mutate(row, caller) => Ok(()),
+        Some(row) => {
+            audit_mutation_refusal(action, row, caller);
+            Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into())
+        }
+        None => {
+            tracing::warn!(
+                target: "synthesis",
+                candidate_id = %target_id,
+                caller = %caller,
+                "synthesis.refused_unvetted_mutation_target",
+            );
+            Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into())
+        }
+    }
+}
+
+/// #3173 — [`assert_caller_may_mutate`] over a whole verdict queue, used to
+/// vet the deferred delete list BEFORE the standard insert commits.
+///
+/// # Errors
+/// Propagates the first [`assert_caller_may_mutate`] refusal.
+pub(super) fn assert_caller_may_mutate_all(
+    candidates: &[Memory],
+    caller: Option<&str>,
+    target_ids: &[String],
+) -> Result<(), String> {
+    for id in target_ids {
+        assert_caller_may_mutate(candidates, caller, crate::audit::AuditAction::Delete, id)?;
+    }
+    Ok(())
+}
+
 /// Outcome of the synthesis pass that the store handler needs to
 /// thread through the rest of the write path.
 pub(super) struct SynthesisOutcome {
@@ -262,6 +370,17 @@ fn k9_allows_synthesis_delete(namespace: &str, agent_id: &str, candidate_id: &st
 /// Queued deletes that target the primary-update id are skipped so
 /// the store handler does not delete the very row it just merged the
 /// incoming fact into.
+///
+/// #3173 — `caller` is the ENFORCED-read caller (`None` = single-operator
+/// trust-all). Every `db::update` / `db::delete` below re-checks ownership
+/// against the vetted `existing` pool and REFUSES the whole store call
+/// (`Err`) rather than silently skipping a cross-owner mutation. The refusal
+/// is raised BEFORE the transaction opens, so no partial merge can land.
+///
+/// # Errors
+/// [`crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY`] when any queued update
+/// or delete targets a row the caller does not own.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_synthesis_updates_and_deletes(
     conn: &rusqlite::Connection,
     mem: &Memory,
@@ -270,9 +389,26 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     vector_index: Option<&dyn VectorSearchIndex>,
     outcome: &SynthesisOutcome,
     active_keypair: Option<&AgentKeypair>,
-) -> Option<Value> {
+    caller: Option<&str>,
+) -> Result<Option<Value>, String> {
     let primary_update = outcome.updates.first().cloned();
-    let (primary_id, _) = primary_update.as_ref()?;
+    let Some((primary_id, _)) = primary_update.as_ref() else {
+        return Ok(None);
+    };
+
+    // #3173 — vet EVERY queued mutation before the BEGIN IMMEDIATE below, so a
+    // cross-owner verdict can never leave a half-applied merge behind. The pool
+    // is already ownership-filtered in `mod.rs`; this is the mutate-site
+    // re-check the issue requires (`delete.rs:231-236` precedent).
+    for (cand_id, _) in &outcome.updates {
+        assert_caller_may_mutate(existing, caller, crate::audit::AuditAction::Update, cand_id)?;
+    }
+    for del_id in &outcome.deletes {
+        if del_id == primary_id {
+            continue;
+        }
+        assert_caller_may_mutate(existing, caller, crate::audit::AuditAction::Delete, del_id)?;
+    }
 
     // #1700 — apply the whole synthesis merge atomically. db::update /
     // db::insert / db::delete / create_link_signed are all transaction-free, so
@@ -281,13 +417,13 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     // the entire merge back instead of leaving a half-synthesised store.
     // Vector-index mutations are in-memory and DEFERRED until after COMMIT so a
     // rollback can never leave the index out of sync with the DB.
-    // #3163 — RAII guard. The early `return None` arms below keep their
+    // #3163 — RAII guard. The early `return Ok(None)` arms below keep their
     // explicit ROLLBACK so the write lock is released at the exact bail-out
     // point; the guard is what covers a PANIC unwind out of any of the
     // update/link/delete calls, and it no-ops once the connection is back in
     // autocommit, so the two are idempotent with each other.
     let Ok(write_txn) = crate::storage::connection::WriteTxn::begin(conn) else {
-        return None;
+        return Ok(None);
     };
     let mut deferred_index_ops: Vec<(String, Vec<f32>)> = Vec::new();
 
@@ -327,7 +463,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
                     "synthesis update failed for {cand_id}: {e}; rolling back merge",
                 );
                 let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
-                return None;
+                return Ok(None);
             }
         };
         if content_changed && let Some(emb) = embedder {
@@ -431,7 +567,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
                 "synthesis delete failed for {del_id}: {e}; rolling back merge",
             );
             let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
-            return None;
+            return Ok(None);
         }
     }
 
@@ -441,7 +577,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     // whole merge back, so the deferred vector-index swaps below are never
     // applied against a store that did not durably change.
     if write_txn.commit().is_err() {
-        return None;
+        return Ok(None);
     }
     if let Some(idx) = vector_index {
         for (id, embedding) in deferred_index_ops {
@@ -451,7 +587,9 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     }
 
     // Construct the response from the PRIMARY update's target.
-    let target = existing.iter().find(|c| c.id == *primary_id).cloned()?;
+    let Some(target) = existing.iter().find(|c| c.id == *primary_id).cloned() else {
+        return Ok(None);
+    };
     let preserved_metadata =
         crate::identity::preserve_provenance_keys(&target.metadata, &mem.metadata);
     let echoed_agent_id = preserved_metadata
@@ -474,7 +612,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
         resp["synthesis_failed"] = json!(true);
         resp["synthesis_failed_reason"] = json!(reason);
     }
-    Some(resp)
+    Ok(Some(resp))
 }
 
 /// Apply pending delete verdicts when no update fired — the store
@@ -504,13 +642,32 @@ pub(super) fn pending_synthesis_delete_targets(outcome: &SynthesisOutcome) -> Ve
 ///
 /// Best-effort: a per-candidate failure (link emit, delete) is
 /// warn-logged and does not roll back the standard insert.
+///
+/// #3173 — the LAST-RESORT ownership re-check. The queue was already vetted
+/// by [`assert_caller_may_mutate_all`] BEFORE the standard insert committed
+/// (that is where a cross-owner verdict REFUSES the store call); by the time
+/// this runs the new row is durable, so a violation here cannot refuse — it
+/// skips the candidate with a WARN + a `Deny` audit row rather than
+/// hard-deleting a row the caller does not own.
 pub(super) fn apply_pending_synthesis_deletes_with_links(
     conn: &rusqlite::Connection,
     new_id: &str,
     pending_deletes: &[String],
     active_keypair: Option<&AgentKeypair>,
+    candidates: &[Memory],
+    caller: Option<&str>,
 ) {
     for del_id in pending_deletes {
+        if assert_caller_may_mutate(
+            candidates,
+            caller,
+            crate::audit::AuditAction::Delete,
+            del_id,
+        )
+        .is_err()
+        {
+            continue;
+        }
         if let Err(e) = db::create_link_signed(
             conn,
             new_id,
@@ -547,4 +704,93 @@ pub(super) fn synthesis_eligible(
         && content_len >= AUTONOMY_MIN_CONTENT_LEN
         && !namespace.starts_with('_')
         && !ns_policy.effective_legacy_per_pair_classifier()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn owned_by(owner: &str) -> Memory {
+        Memory {
+            id: "mem-3173-alice".to_string(),
+            namespace: "shared/ns".to_string(),
+            title: "shared title".to_string(),
+            metadata: json!({ crate::META_KEY_AGENT_ID: owner }),
+            ..Memory::default()
+        }
+    }
+
+    fn inbox_for(owner: &str, target: &str) -> Memory {
+        Memory {
+            metadata: json!({
+                crate::META_KEY_AGENT_ID: owner,
+                crate::META_KEY_TARGET_AGENT_ID: target,
+            }),
+            ..owned_by(owner)
+        }
+    }
+
+    #[test]
+    fn caller_may_mutate_owner_yes_cross_owner_no_3173() {
+        let alice = owned_by("ai:alice");
+        assert!(caller_may_mutate(&alice, "ai:alice"));
+        assert!(
+            !caller_may_mutate(&alice, "ai:bob"),
+            "cross-owner MUST fail the synthesis-plane gate"
+        );
+    }
+
+    #[test]
+    fn caller_may_mutate_inbox_recipient_is_not_owner_3173() {
+        // SYNTHESIS_ALLOW_INBOX = false: an inbox recipient never asked
+        // for the row to be merged away, so they must not count as owner.
+        let inbox = inbox_for("ai:alice", "ai:bob");
+        assert!(
+            !caller_may_mutate(&inbox, "ai:bob"),
+            "inbox recipient must NOT own a synthesis mutation"
+        );
+        assert!(caller_may_mutate(&inbox, "ai:alice"));
+    }
+
+    #[test]
+    fn assert_caller_may_mutate_refuses_cross_owner_and_unvetted_3173() {
+        let alice = owned_by("ai:alice");
+        let pool = [alice];
+        assert!(
+            assert_caller_may_mutate(
+                &pool,
+                Some("ai:alice"),
+                crate::audit::AuditAction::Update,
+                "mem-3173-alice",
+            )
+            .is_ok()
+        );
+        let err = assert_caller_may_mutate(
+            &pool,
+            Some("ai:bob"),
+            crate::audit::AuditAction::Update,
+            "mem-3173-alice",
+        )
+        .expect_err("cross-owner MUST refuse, never skip");
+        assert_eq!(err, crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY);
+        let missing = assert_caller_may_mutate(
+            &pool,
+            Some("ai:alice"),
+            crate::audit::AuditAction::Delete,
+            "not-in-pool",
+        )
+        .expect_err("unvetted target MUST refuse");
+        assert_eq!(missing, crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY);
+        assert!(
+            assert_caller_may_mutate(
+                &pool,
+                None,
+                crate::audit::AuditAction::Update,
+                "mem-3173-alice",
+            )
+            .is_ok(),
+            "None caller is the single-operator trust-all default"
+        );
+    }
 }

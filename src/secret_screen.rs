@@ -456,13 +456,32 @@ pub fn screen_for_caller(content: &str) -> Result<(), SecretRefusal> {
     }
 }
 
-/// STORAGE-funnel screen (the origin-blind backstop wired into
-/// `db::insert` / `db::insert_if_newer` and the postgres store path). When
-/// the mode is not `Off` and a credential is detected, returns the REDACTED
-/// content to persist instead — NEVER refuses, so federation-receive /
-/// recovery / internal re-store paths preserve CRDT convergence + the
-/// capture-first guarantee (the 5-agent vote's killer objection). Returns
-/// `None` when the content is clean or screening is `Off`.
+/// STORAGE-funnel screen for ONE string. When the mode is not `Off` and a
+/// credential is detected, returns the REDACTED content to persist instead —
+/// NEVER refuses, so federation-receive / recovery / internal re-store paths
+/// preserve CRDT convergence + the capture-first guarantee (the 5-agent
+/// vote's killer objection). Returns `None` when the content is clean or
+/// screening is `Off`.
+///
+/// # What is (and is not) wired to this function — #3049 claims-truth fix
+///
+/// This is the per-STRING primitive, NOT the memory-row funnel. The
+/// origin-blind backstop the memory lane runs is the whole-row wrapper
+/// [`redact_memory_for_storage`], which is what is actually wired into
+/// `db::insert` (`storage::insert_inner`), `db::insert_if_newer`,
+/// `storage::merge_inbound`, the postgres store path
+/// (`store::postgres::screen_storage_memory`), and the forensic bundle.
+/// Before #3049 this doc claimed THIS function was "wired into `db::insert` /
+/// `db::insert_if_newer` and the postgres store path", which is false and
+/// invited the reading that any surface reaching a `db::*` insert inherits a
+/// string-level screen. Its own direct non-test callers are the entity-alias
+/// canonicalization (`storage::entity_register` on both backends), the
+/// forensic bundle's decrypted-content arm, the whole-row / metadata
+/// recursions in this module, and the coordination helpers at the bottom of
+/// this file. Everything else screens through one of those wrappers or is
+/// NOT screened at all — the coordination plane (#2994 caller arm, #3049
+/// federation-receive arm) is screened only because it calls the helpers
+/// below explicitly.
 #[must_use]
 pub fn redact_for_storage(content: &str) -> Option<String> {
     if screen_mode() == SecretScreenMode::Off {
@@ -722,6 +741,184 @@ pub fn screen_json_field_for_caller(field: &mut serde_json::Value) -> Result<(),
         *field = redacted;
     }
     Ok(())
+}
+
+// ── #3049 — coordination-plane FEDERATION-RECEIVE screen ─────────────────
+//
+// #2994 (above) closed the CALLER-origin coordination leak. The federation
+// RECEIVE arm — `POST /sync/push` `signals[]` / `checkpoints[]` — had ZERO
+// screening at v1.0.0 base: neither apply loop in
+// `handlers::federation_receive` called any `secret_screen` entry point, so
+// a peer running `AI_MEMORY_SECRET_SCREEN_MODE=off` (or a hostile peer)
+// could land a credential verbatim in this node's `signals` /
+// `checkpoints` tables, where it is queryable, forensic-exported, and
+// re-egressed on the next `/sync/push`.
+//
+// Disposition is REDACT-ONLY, never refuse — a refused inbound row would
+// diverge replicas (the #1821 lesson, and the same rule the memory lane's
+// `redact_memory_for_storage` follows). The screen runs AFTER the lane's
+// authorization gates (signature / authorship / namespace-scope), because
+// those gates answer "did this peer really send these bytes" and must see
+// exactly the bytes the peer signed — screening first would false-accuse a
+// legitimately-signed secret-bearing row of forgery and silently drop it.
+//
+// Because the screen mutates bytes that are INSIDE the signed canonical
+// surface, it carries the #2340 discipline: when the redaction touches a
+// signed field, the presented attestation can no longer cover any bytes
+// this node will persist, so it is DROPPED (loud WARN) and the row lands
+// honestly UNSIGNED rather than carrying a signature that silently fails
+// against its own stored content.
+
+/// Tracing target for a federation-receive coordination redaction that also
+/// had to drop the presented attestation (#3049 / #2340 discipline).
+const COORD_SCREEN_TRACE_TARGET: &str = "secret.redacted";
+
+/// FEDERATION-RECEIVE screen for an inbound `/sync/push` signal (#3049).
+///
+/// Screens the two caller-controlled credential vectors the #2994 caller arm
+/// screens — [`crate::models::Signal::subject`] (plain text) and
+/// [`crate::models::Signal::body`] (JSON string leaves, minus the
+/// [`METADATA_SCREEN_CARVE_OUT_KEYS`] crypto carve-out) — and returns the
+/// row to persist. NEVER refuses. Returns `None` (zero-copy) when the signal
+/// is clean or screening is `Off`.
+///
+/// `subject` and `sha256(body)` are both inside
+/// [`crate::identity::sign::SignableSignal`], so any redaction invalidates
+/// the wire signature: the returned clone therefore has `signature` and
+/// `sender_pubkey` CLEARED (#2340 discipline — an honestly-unsigned row
+/// beats one whose signature cannot cover its own stored bytes).
+#[must_use]
+pub fn redact_signal_for_storage(sig: &crate::models::Signal) -> Option<crate::models::Signal> {
+    if screen_mode() == SecretScreenMode::Off {
+        return None;
+    }
+    fold_screened_signal(
+        sig,
+        redact_for_storage(&sig.subject),
+        redact_metadata_values(&sig.body),
+    )
+}
+
+/// Pure core of [`redact_signal_for_storage`] — split out so the
+/// attestation-drop disposition is unit-testable without touching the
+/// process-global screen-mode `OnceLock` (the `apply_screened_inbound`
+/// precedent).
+fn fold_screened_signal(
+    sig: &crate::models::Signal,
+    subject: Option<String>,
+    body: Option<serde_json::Value>,
+) -> Option<crate::models::Signal> {
+    if subject.is_none() && body.is_none() {
+        return None;
+    }
+    let mut out = sig.clone();
+    if let Some(subject) = subject {
+        out.subject = subject;
+    }
+    if let Some(body) = body {
+        out.body = body;
+    }
+    // Every screened signal field is inside the signed canonical bytes, so a
+    // hit ALWAYS invalidates the presented signature.
+    if !out.signature.is_empty() || !out.sender_pubkey.is_empty() {
+        tracing::warn!(
+            target: COORD_SCREEN_TRACE_TARGET,
+            signal_id = %sig.id,
+            "sync_push: secret screen redacted the SIGNED surface of an inbound \
+             signal; dropping the presented signature (it covers raw bytes this \
+             node will not persist) so the row cannot read as tampered (#3049 / \
+             #2340). Origin should redact-before-sign (#1801)."
+        );
+        out.signature.clear();
+        out.sender_pubkey.clear();
+    }
+    Some(out)
+}
+
+/// FEDERATION-RECEIVE screen for an inbound `/sync/push` resolved checkpoint
+/// (#3049).
+///
+/// Screens every free-text / structured field
+/// [`crate::checkpoints::apply_inbound_resolution`] can persist from the
+/// wire: `title`, `condition`, `resolution`, `resolution_note`, and
+/// `metadata`. That is a SUPERSET of the #2994 caller arm (`title` /
+/// `condition` / `metadata`) because the resolution CAS additionally
+/// persists the wire `resolution` + `resolution_note` onto a locally-pending
+/// anchor. NEVER refuses. Returns `None` (zero-copy) when the checkpoint is
+/// clean or screening is `Off`.
+///
+/// Only `resolution` is inside
+/// [`crate::identity::sign::SignableCheckpointResolution`]; when THAT field
+/// is redacted the presented resolution attestation (`signature` /
+/// `resolver_pubkey`) is CLEARED for the same #2340 reason as
+/// [`redact_signal_for_storage`]. A hit confined to the unsigned fields
+/// keeps the attestation intact — it still covers exactly the bytes it
+/// signed.
+#[must_use]
+pub fn redact_checkpoint_for_storage(
+    cp: &crate::models::Checkpoint,
+) -> Option<crate::models::Checkpoint> {
+    if screen_mode() == SecretScreenMode::Off {
+        return None;
+    }
+    fold_screened_checkpoint(
+        cp,
+        redact_for_storage(&cp.title),
+        redact_metadata_values(&cp.condition),
+        cp.resolution.as_deref().and_then(redact_for_storage),
+        cp.resolution_note.as_deref().and_then(redact_for_storage),
+        redact_metadata_values(&cp.metadata),
+    )
+}
+
+/// Pure core of [`redact_checkpoint_for_storage`] (see
+/// [`fold_screened_signal`] for why the fold is split out).
+fn fold_screened_checkpoint(
+    cp: &crate::models::Checkpoint,
+    title: Option<String>,
+    condition: Option<serde_json::Value>,
+    resolution: Option<String>,
+    resolution_note: Option<String>,
+    metadata: Option<serde_json::Value>,
+) -> Option<crate::models::Checkpoint> {
+    if title.is_none()
+        && condition.is_none()
+        && resolution.is_none()
+        && resolution_note.is_none()
+        && metadata.is_none()
+    {
+        return None;
+    }
+    let signed_surface_mutated = resolution.is_some();
+    let mut out = cp.clone();
+    if let Some(title) = title {
+        out.title = title;
+    }
+    if let Some(condition) = condition {
+        out.condition = condition;
+    }
+    if let Some(resolution) = resolution {
+        out.resolution = Some(resolution);
+    }
+    if let Some(note) = resolution_note {
+        out.resolution_note = Some(note);
+    }
+    if let Some(metadata) = metadata {
+        out.metadata = metadata;
+    }
+    if signed_surface_mutated && (!out.signature.is_empty() || !out.resolver_pubkey.is_empty()) {
+        tracing::warn!(
+            target: COORD_SCREEN_TRACE_TARGET,
+            checkpoint_id = %cp.id,
+            "sync_push: secret screen redacted the SIGNED `resolution` of an inbound \
+             checkpoint; dropping the presented resolution attestation (it covers raw \
+             bytes this node will not persist) so the row cannot read as tampered \
+             (#3049 / #2340). Origin should redact-before-sign (#1801)."
+        );
+        out.signature.clear();
+        out.resolver_pubkey.clear();
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -996,5 +1193,119 @@ mod tests {
                 "case {i}: key bytes must not survive: {r}"
             );
         }
+    }
+
+    // ── #3049 — federation-receive coordination-plane folds ──────────
+    //
+    // These drive the PURE cores (`fold_screened_signal` /
+    // `fold_screened_checkpoint`) so they do not touch the process-global
+    // `SCREEN_MODE` OnceLock. The integration binary
+    // `tests/federation_receive_coord_screen_3049.rs` is the load-bearing
+    // `/sync/push` proof.
+
+    fn sample_signal(subject: &str) -> crate::models::Signal {
+        crate::models::Signal {
+            id: "sig-3049-unit".to_string(),
+            namespace: "coord/screen".to_string(),
+            from_agent: "ai:peer".to_string(),
+            to_agent: None,
+            subject: subject.to_string(),
+            body: serde_json::json!({"hello": "world"}),
+            signal_type: crate::models::SignalType::Notify,
+            in_reply_to: None,
+            correlation_id: None,
+            reference_ids: serde_json::json!([]),
+            created_at: 1_700_000_000,
+            expires_at: None,
+            delivered_at: None,
+            read_at: None,
+            acknowledged_at: None,
+            signature: vec![0xAB; 64],
+            sender_pubkey: vec![0xCD; 32],
+        }
+    }
+
+    fn sample_checkpoint() -> crate::models::Checkpoint {
+        crate::models::Checkpoint {
+            id: "cp-3049-unit".to_string(),
+            namespace: "coord/screen".to_string(),
+            title: "needs approval".to_string(),
+            condition_type: crate::models::ConditionType::Approval,
+            condition: serde_json::json!({}),
+            state: crate::models::CheckpointState::Resolved,
+            created_by: "ai:peer".to_string(),
+            resolved_by: Some("ai:peer".to_string()),
+            resolution: Some("approved".to_string()),
+            resolution_note: None,
+            signature: vec![0xAB; 64],
+            resolver_pubkey: vec![0xCD; 32],
+            created_at: 1_700_000_000,
+            deadline_at: None,
+            resolved_at: Some(1_700_000_900),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn fold_screened_signal_redacted_subject_clears_attestation_3049() {
+        let sig = sample_signal("clean subject");
+        let out = fold_screened_signal(&sig, Some(REDACTION_PLACEHOLDER.to_string()), None)
+            .expect("hit must clone");
+        assert_eq!(out.subject, REDACTION_PLACEHOLDER);
+        assert!(
+            out.signature.is_empty() && out.sender_pubkey.is_empty(),
+            "signed surface mutation MUST drop the presented attestation (#2340)"
+        );
+        assert_eq!(out.body, sig.body, "un-hit body is preserved");
+    }
+
+    #[test]
+    fn fold_screened_signal_clean_is_none_3049() {
+        let sig = sample_signal("clean subject");
+        assert!(
+            fold_screened_signal(&sig, None, None).is_none(),
+            "clean signal is a zero-copy None so the receive loop binds the original"
+        );
+        assert!(!sig.signature.is_empty(), "fixture itself stays signed");
+    }
+
+    #[test]
+    fn fold_screened_checkpoint_resolution_hit_clears_attestation_3049() {
+        let cp = sample_checkpoint();
+        let out = fold_screened_checkpoint(
+            &cp,
+            None,
+            None,
+            Some(REDACTION_PLACEHOLDER.to_string()),
+            None,
+            None,
+        )
+        .expect("hit must clone");
+        assert_eq!(out.resolution.as_deref(), Some(REDACTION_PLACEHOLDER));
+        assert!(
+            out.signature.is_empty() && out.resolver_pubkey.is_empty(),
+            "redacting the SIGNED `resolution` MUST drop the presented attestation"
+        );
+    }
+
+    #[test]
+    fn fold_screened_checkpoint_title_hit_preserves_attestation_3049() {
+        let cp = sample_checkpoint();
+        let out = fold_screened_checkpoint(
+            &cp,
+            Some(REDACTION_PLACEHOLDER.to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("hit must clone");
+        assert_eq!(out.title, REDACTION_PLACEHOLDER);
+        assert_eq!(
+            out.signature, cp.signature,
+            "a hit confined to unsigned fields (title) MUST keep the resolution attestation"
+        );
+        assert_eq!(out.resolver_pubkey, cp.resolver_pubkey);
+        assert_eq!(out.resolution, cp.resolution);
     }
 }

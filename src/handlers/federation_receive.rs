@@ -3497,6 +3497,18 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
+        // #3049 — federation-RECEIVE secret screen for the coordination plane.
+        // The caller-origin arm (#2994) screens `subject` / `body` before a
+        // LOCAL signal is signed + inserted, but the RECEIVE arm had none, so a
+        // credential shipped by an `off`-mode (or hostile) peer landed verbatim
+        // in this node's `signals` table and re-egressed on the next push.
+        // REDACT-only — a refusal here would diverge replicas (#1821) — and it
+        // runs AFTER the forged-signature / authorship / namespace gates above
+        // so those still see exactly the bytes the peer signed. The helper
+        // clears the now-stale `signature`/`sender_pubkey` when it mutates the
+        // signed surface (#2340 discipline).
+        let screened_signal = crate::secret_screen::redact_signal_for_storage(sig);
+        let sig = screened_signal.as_ref().unwrap_or(sig);
         let bytes = i64::try_from(sig.body.to_string().len()).unwrap_or(i64::MAX);
         if let Err(e) = crate::quotas::check_and_record_storage_only(
             &lock.0,
@@ -3752,6 +3764,18 @@ pub async fn sync_push(
                     noop += 1;
                     continue;
                 }
+                // #3049 — federation-RECEIVE secret screen, checkpoint arm.
+                // `apply_inbound_resolution` persists the wire `resolution` /
+                // `resolution_note` onto a locally-pending anchor and the WHOLE
+                // wire row (`title` / `condition` / `metadata` too) on the
+                // first-landing INSERT arm — none of it screened before #3049.
+                // REDACT-only, and applied AFTER
+                // `authorize_remote_checkpoint_resolution` so the resolver-key
+                // attestation is still checked against the bytes the resolver
+                // actually signed. The helper clears the presented attestation
+                // iff it had to redact the SIGNED `resolution` field (#2340).
+                let screened_cp = crate::secret_screen::redact_checkpoint_for_storage(cp);
+                let cp = screened_cp.as_ref().unwrap_or(cp);
                 match crate::checkpoints::apply_inbound_resolution(&lock.0, cp) {
                     Ok(crate::checkpoints::InboundResolutionOutcome::Applied) => {
                         checkpoints_applied += 1;
