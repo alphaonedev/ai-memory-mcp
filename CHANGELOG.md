@@ -43,6 +43,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Pins: `try_load_from_optional_does_not_echo_api_key_on_toml_error_3277`,
   `malformed_api_key_toml_does_not_echo_secret_on_boot_3277`.
 
+### Fixed (`store_with_embedding_no_overwrite` orphan row on space refusal — #3280)
+
+- **`#3280` — sqlite `store_with_embedding_no_overwrite` no longer commits the
+  memory row before validating `embedding_space`.** Pre-fix `insert_no_overwrite`
+  ran in autocommit, then a None/blank space returned `InvalidInput`, leaving
+  an orphan row that poisoned the caller's retry with `Conflict` (uncompletable
+  without out-of-band cleanup). The same window existed on a `set_embedding`
+  dim-mismatch after insert. Space is now validated before any DB write
+  (no DB access needed), and the insert + vector stamp share one `WriteTxn` so
+  a later dim-mismatch rolls the row back. Pin:
+  `sqlite_no_overwrite_missing_space_leaves_no_orphan_3280`.
+
 ### Security (federation-receive secret screen — carve-out bypass + completeness)
 
 - **`#3269` (HIGH) — the federation-receive secret screen is no longer
