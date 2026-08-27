@@ -26,7 +26,6 @@
 #![allow(
     clippy::missing_panics_doc,
     clippy::too_many_lines,
-    clippy::doc_markdown,
     clippy::similar_names,
     clippy::uninlined_format_args
 )]
