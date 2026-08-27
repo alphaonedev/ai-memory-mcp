@@ -6083,6 +6083,117 @@ async fn http_lineage_private_root_refused_for_stranger_1859() {
 }
 
 #[tokio::test]
+async fn http_lineage_tombstoned_root_conserved_for_owner_refused_for_stranger_3303() {
+    // #3303 / #3270 (sqlite lane) — regression pin for the total `db::get_any`
+    // gate. #3235 made `db::get` HIDE tombstoned rows (`Ok(None)`), so the
+    // pre-#3270 `if let Ok(Some(mem))` chain SKIPPED the owner check for a
+    // tombstoned root and a NON-OWNER walked its conserved provenance. The fix
+    // reads UNFILTERED via `db::get_any`, so:
+    //   * a stranger is refused (403 — no leak of the hidden root's lineage);
+    //   * the OWNER keeps access to their own tombstoned root's conserved
+    //     lineage (200), the #3270 stated intent.
+    let state = test_state();
+    let now = "2026-03-01T00:00:00+00:00";
+    let mk = |title: &str, meta: serde_json::Value| Memory {
+        cid: None,
+        valid_from: None,
+        valid_until: None,
+        id: Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        namespace: "http-lineage-3303".into(),
+        title: title.into(),
+        content: "tombstoned lineage fixture".into(),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        access_count: 0,
+        created_at: now.into(),
+        updated_at: now.into(),
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: meta,
+        reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: crate::models::ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
+    };
+    let owner_meta = serde_json::json!({"agent_id": "ai:owner", "scope": "private"});
+    let (root, ancestor) = {
+        let lock = state.lock().await;
+        let a = db::insert(&lock.0, &mk("tomb-ancestor", owner_meta.clone())).unwrap();
+        let r = db::insert(&lock.0, &mk("tomb-root", owner_meta.clone())).unwrap();
+        db::create_link(&lock.0, &r, &a, "reflects_on").unwrap();
+        // Logically delete the root: `db::get` now hides it, `db::get_any`
+        // does not — exactly the #3235 condition that made the gate skippable.
+        lock.0
+            .execute(
+                "UPDATE memories SET lifecycle_state = 'tombstoned' WHERE id = ?1",
+                rusqlite::params![r],
+            )
+            .unwrap();
+        (r, a)
+    };
+    // A CLOSED admin allowlist so the stranger is a genuine non-admin (the
+    // production posture); the cfg(test) `"*"` wildcard would otherwise bypass.
+    let app = Router::new()
+        .route(
+            crate::handlers::routes::MEMORIES_ID_LINEAGE,
+            axum::routing::get(get_lineage),
+        )
+        .with_state(test_app_state_with_admin(state, "ai:someadmin"));
+
+    // Stranger: the tombstoned root's provenance must NOT leak (403).
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/memories/{root}/lineage"))
+                .header(crate::HEADER_AGENT_ID, "ai:stranger")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "stranger must be refused a hidden root's lineage"
+    );
+
+    // Owner: conserved lineage of their own tombstoned root (200 + ancestor).
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/memories/{root}/lineage"))
+                .header(crate::HEADER_AGENT_ID, "ai:owner")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "owner keeps conserved lineage of own tombstoned root"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["count"], 1, "conserved ancestor present: {v}");
+    assert_eq!(v["nodes"][0]["id"], serde_json::json!(ancestor), "{v}");
+}
+
+#[tokio::test]
 async fn http_list_namespaces_returns_empty_for_fresh_db() {
     let state = test_state();
     let app = Router::new()
