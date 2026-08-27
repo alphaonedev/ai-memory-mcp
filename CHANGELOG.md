@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation (2026-08-26)
 
+- **ROADMAP v1.1.0 w8 — swarm/hive groupthink cascades and memory contamination (#3266).**
+  Source Dave Blundin; R1–R6 (corroboration, contamination propagation, cascade
+  detector, swarm rewind, profile defaults, same-DNA benchmark) recorded as a
+  P2 workstream. v1.0.0 GA can attribute/bound/reverse a cascade; v1.1.0 is
+  what makes one hard to start. Vote record lives on #3266.
 - **Learn ai-memory** section on the docs site (`docs/learn/`): a hub plus three
   audience tracks — end users (singleton / small agent setups), C-level
   decision makers (decision-mapped), and engineers/architects/scientists

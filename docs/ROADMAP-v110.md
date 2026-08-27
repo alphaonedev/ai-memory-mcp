@@ -300,6 +300,27 @@ Priority rationale: this is the acceptance gate for every other workstream's mit
 
 ---
 
+### P2 — w8-swarm-hive-groupthink: Swarm / hive groupthink cascades and memory contamination — #3266
+
+> Source: Dave Blundin, https://x.com/DaveBlundin/status/2092731291087069433 ("5,000 copies of the same agent … a harebrained idea propagates across the whole swarm … $50,000 of tokens"). Two failure classes routed through shared memory: (A) groupthink cascade — one agent's wrong conclusion recalled by all as established; (B) memory contamination — wrong/stale/poisoned memories reaching every reader. v1.0.0 GA makes a cascade attributable, boundable and reversible (provenance + lineage, namespaces/quotas/enforce, contradiction detection, record-stop, invalidate-not-delete + dependents, replay, checkpoints/frozen routines) but does not make it hard to start.
+
+**Current state:** v1.0.0 GA can *attribute, bound, and reverse* a cascade once it is recognized. It does not make starting one hard. Shared-memory recall has no corroboration floor, no writer-diversity signal, no cascade detector, and no swarm rewind.
+
+**v1.1.0 items** (acceptance criteria in #3266; 3×7 vote record attached there):
+
+- **R1** namespace `require_corroboration` + quarantine tier + independent-writer rule (identity + model-version distinctness).
+- **R2** writer-diversity / lineage-depth confidence signals + automatic `contaminated` propagation on invalidation.
+- **R3** cascade detector (same-claim burst, contradiction storm, fan-out) with signed signals + optional auto record-stop.
+- **R4** `memory_swarm_rewind` + per-lineage token/cost accounting.
+- **R5** multi-agent/federation profile defaults ON.
+- **R6** synthetic same-DNA cascade benchmark + cert addendum.
+
+**Constraints:** fail-closed, no data loss, backend parity, certified 500–1000-agent scope. Default-OFF until the R6 harness produces a committed number (same measurement gate as w5). No schema migration unless named in #3266.
+
+**Effort:** L (issue-sized; vote + design live on #3266).
+
+---
+
 ### P3 — w7-docs-claims-cert: Docs truth — no-overclaim rule, cert-scope note, citation plumbing
 
 > **Code-comment citation:** `// MemTrapBench (Wang et al. 2026, arXiv:2608.20202) — meta-mitigation only. A CI prose rule mitigates NONE of the four runtime trap classes (Cognitive Bias, Trauma, Task Boundary, Safety); it prevents PUBLISHING unmeasured downstream-performance claims of the class the paper refutes.`
@@ -357,7 +378,7 @@ The paper's discipline applies to us: **no mechanism in this roadmap may be clai
 - **No schema migrations.** Origin/applicability stamps are reserved metadata-key conventions (`KindProvenance` precedent); recall-side work is response-layer or existing-bind-parameter only.
 - **sqlite/postgres parity** is structural where possible (pure helpers over fetched rows) and pg-lane-tested (mTLS :5445, `--include-ignored`) where not; the two open routing premises (pg path through `decorate_memory_many`; pg SAL ORDER BY anchor for kind weights) are BLOCKING audit items in their issues, not assumptions.
 - **Federation:** validation/enforcement applies at authoring surfaces only; replicated ingest accepts peer rows verbatim (conservation-of-peer-corpus) — a peer must never silently lose a row it cannot re-validate.
-- **Sequencing:** P1 first (w5 harness, w1 advisory, w2 columns — independently landable; w1's cross-session counts degrade honestly to all-unknown until w3). P2 next (w3 stamp unlocks w1's full value; w4; w6). P3 (w7) can land any time after w5's SSOT contract exists. Nothing here blocks or is blocked by the v1.0.0 GA queue.
+- **Sequencing:** P1 first (w5 harness, w1 advisory, w2 columns — independently landable; w1's cross-session counts degrade honestly to all-unknown until w3). P2 next (w3 stamp unlocks w1's full value; w4; w6; w8 swarm/hive groupthink — #3266). P3 (w7) can land any time after w5's SSOT contract exists. Nothing here blocks or is blocked by the v1.0.0 GA queue.
 
 ## Considered and rejected
 
@@ -374,6 +395,7 @@ Recorded per the synthesis rules (majority-REJECT or explicit descope with reaso
 
 ## References
 
+- Blundin, D. 2026. Swarm/hive groupthink via shared memory (5,000 same-DNA agents, cascade cost). https://x.com/DaveBlundin/status/2092731291087069433 — tracked as #3266 / w8.
 - Wang, M.; Luo, H.; Xu, Z.; Cui, Z.; Xu, H.; Yang, Q.; Fang, J.; Fang, J.; Zhang, N. 2026. *MemTrapBench: Benchmarking Cognitive Traps in LLM Memory Use.* arXiv:2608.20202. Code/data: https://github.com/zjunlp/MemTrapBench (unreleased at time of writing; the w5 adapter fails closed on unknown formats).
   - Short cite for code comments (verbatim, SSOT): `MemTrapBench (Wang et al. 2026, arXiv:2608.20202)`
 - Process record: 7 workstream drafts + 21 adversarial ballots (3 lenses × 7 workstreams: north-star/integrity, code-grounding, trap-mitigation/claims-truth), all REVISE, all REQUIRED-CHANGES applied above; produced by the ox-alpha roadmap lab, 2026-08-23, synthesized and reviewed by Fable 5. Lane artifacts: `.local-runs/ox-c9-{rmdraft,rmvote,rmauthor}/` (not shipped).
