@@ -85,6 +85,18 @@ fn fresh_db() -> (rusqlite::Connection, tempfile::TempDir) {
     (conn, dir)
 }
 
+/// The dequarantine counter is process-global (`prometheus::IntCounter`).
+/// Tests that assert a DELTA must serialize against every other test in
+/// this binary that can increment it — macos-fed runs this crate with
+/// many threads; #3235 CI observed delta=2. CONCURRENCY-18: recover a
+/// poisoned lock rather than turning a sibling panic into this test's
+/// failure.
+fn dequarantine_metric_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn dequarantine_audit_rows(conn: &rusqlite::Connection, agent_id: &str) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
@@ -168,6 +180,7 @@ fn the_listing_is_namespace_scopable_and_bounded() {
 
 #[test]
 fn release_restores_the_row_and_leaves_a_signed_audit_row() {
+    let _metric = dequarantine_metric_lock();
     let (mut conn, _d) = fresh_db();
     let id = seed_quarantined(&conn, "fed", "held inbound");
     let operator = "operator:alice";
@@ -210,6 +223,7 @@ fn release_restores_the_row_and_leaves_a_signed_audit_row() {
 
 #[test]
 fn release_is_idempotent_and_never_revives_a_non_quarantined_row() {
+    let _metric = dequarantine_metric_lock();
     let (mut conn, _d) = fresh_db();
     let id = seed_quarantined(&conn, "fed", "held inbound");
     let operator = "operator:alice";
@@ -241,6 +255,7 @@ fn release_is_idempotent_and_never_revives_a_non_quarantined_row() {
 
 #[test]
 fn release_does_not_revive_a_tombstoned_row() {
+    let _metric = dequarantine_metric_lock();
     let (mut conn, _d) = fresh_db();
     let id = seed_quarantined(&conn, "fed", "held inbound");
     conn.execute(
@@ -266,6 +281,7 @@ fn release_does_not_revive_a_tombstoned_row() {
 
 #[test]
 fn release_is_fenced_by_the_record_stop() {
+    let _metric = dequarantine_metric_lock();
     // #1955 R45 — `ai-memory stop` fences the substrate's RECORD plane, and a
     // release is a write (it moves `lifecycle_state` AND appends to
     // `signed_events`). The CLI-local and HTTP-sqlite lanes reach the free
