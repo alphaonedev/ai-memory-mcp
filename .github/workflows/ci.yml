@@ -831,6 +831,7 @@ jobs:
           echo "python3=$(python3 --version) node=$(node --version)"
 
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        if: needs.classify.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
 
       # HOSTED ONLY (#3128). On the self-hosted fleet the workspace `target/` is
