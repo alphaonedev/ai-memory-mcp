@@ -53,6 +53,14 @@ fn permissive_attestation_for_tests() {
 /// `SqliteStore`. This drives every `if matches!(Postgres)` branch
 /// without requiring an actual postgres connection.
 fn build_fake_pg_router() -> (axum::Router, NamedTempFile) {
+    build_fake_pg_router_with_admins(Vec::new())
+}
+
+/// #3303 — variant of [`build_fake_pg_router`] with a populated admin
+/// allowlist, for exercising the admin-bypass branch of a pg-lane authz gate
+/// (e.g. `get_lineage`). Every other wiring detail is identical to
+/// [`build_fake_pg_router`].
+fn build_fake_pg_router_with_admins(admins: Vec<String>) -> (axum::Router, NamedTempFile) {
     permissive_attestation_for_tests();
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
@@ -93,7 +101,7 @@ fn build_fake_pg_router() -> (axum::Router, NamedTempFile) {
         atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
-        admin_agent_ids: Arc::new(Vec::new()),
+        admin_agent_ids: Arc::new(admins),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(ai_memory::reload::Swappable::new(
             ai_memory::config::ResolvedModels::default(),
@@ -2289,6 +2297,131 @@ async fn pg_create_memory_rejects_spoofed_metadata_agent_id_907() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "got {status} body={v}");
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/memories/{id}/lineage — PG lane of the #3270 TOTAL caller-owns
+// authz gate (#3303). The #3270 fix expanded the pg lane from an
+// `if let Ok(mem)` chain into a total `match app.store.get(..)` (Ok / NotFound
+// / other-Err) whose branches shipped with NO handler-level test, dropping
+// `handlers/links.rs` line coverage below its 79% floor. These tests drive the
+// pg lane through the fake-pg harness (StorageBackend::Postgres backed by a
+// SqliteStore delegate, whose `get` folds scope-denial + hidden lifecycle
+// states into NotFound exactly as PostgresStore::get does), restoring coverage
+// AND pinning the fail-closed / no-existence-oracle behavior.
+// ---------------------------------------------------------------------------
+
+/// Seed a private, owner-keyed lineage pair — root `R` `reflects_on` ancestor
+/// `A` — directly into the fake-pg harness's backing SQLite file, so the
+/// pg-lane authz gate + ancestry walk in `get_lineage` can be exercised
+/// without a live Postgres. Both rows are `scope=private` owned by `owner`.
+/// Returns `(root_id, ancestor_id)`.
+fn seed_owned_lineage(db_path: &std::path::Path, owner: &str) -> (String, String) {
+    let conn = ai_memory::db::open(db_path).expect("open backing db for lineage seed");
+    let now = "2026-03-01T00:00:00+00:00";
+    let mk = |title: &str, content: &str| ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: ai_memory::models::Tier::Long,
+        namespace: "pgfake-lineage".to_string(),
+        title: title.to_string(),
+        content: content.to_string(),
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+        metadata: serde_json::json!({ "agent_id": owner, "scope": "private" }),
+        ..Default::default()
+    };
+    let a = ai_memory::db::insert(&conn, &mk("A", "ancestor")).expect("insert ancestor A");
+    let r = ai_memory::db::insert(&conn, &mk("R", "root")).expect("insert root R");
+    ai_memory::db::create_link(&conn, &r, &a, "reflects_on").expect("link R -> A");
+    (r, a)
+}
+
+#[tokio::test]
+async fn pg_lineage_owner_walks_own_private_root_3303() {
+    // pg lane, `Ok(mem)` + visible-to-owner arm: the gate passes and the
+    // ancestry walk round-trips (SqliteStore delegate under the fake-pg
+    // harness). Exercises the walk-selection + `Ok(nodes)` JSON response.
+    let (router, f) = build_fake_pg_router();
+    let (root, ancestor) = seed_owned_lineage(f.path(), "ai:pg-owner");
+    let (status, v) = get_uri_as(
+        &router,
+        &format!("/api/v1/memories/{root}/lineage"),
+        "ai:pg-owner",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner may walk own lineage: {v}");
+    assert_eq!(v["count"], json!(1), "exactly one ancestor: {v}");
+    assert_eq!(v["nodes"][0]["id"], json!(ancestor), "{v}");
+    assert_eq!(v["nodes"][0]["relation"], "reflects_on", "{v}");
+}
+
+#[tokio::test]
+async fn pg_lineage_stranger_refused_404_no_oracle_3303() {
+    // pg lane, `Err(NotFound)` arm: a NON-OWNER requesting another tenant's
+    // private lineage root gets 404 (store.get folds the scope denial into
+    // NotFound) with NO ancestry/node data disclosed — indistinguishable
+    // from a truly-absent id, so the route is not an existence oracle.
+    let (router, f) = build_fake_pg_router();
+    let (root, _ancestor) = seed_owned_lineage(f.path(), "ai:pg-owner");
+    let (status, v) = get_uri_as(
+        &router,
+        &format!("/api/v1/memories/{root}/lineage"),
+        "ai:pg-stranger",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "stranger refused: {v}");
+    assert!(
+        v.get("nodes").is_none() && v.get("count").is_none(),
+        "404 must disclose no ancestry/node data: {v}"
+    );
+}
+
+#[tokio::test]
+async fn pg_lineage_absent_root_is_404_matching_hidden_3303() {
+    // pg lane no-oracle equivalence: a genuinely-absent root returns the SAME
+    // 404 a hidden foreign root returns, so existence cannot be probed. A
+    // header-less (anonymous, non-admin) caller drives the `!caller_is_admin`
+    // gate.
+    let (router, _f) = build_fake_pg_router();
+    let (status, v) = get_uri(
+        &router,
+        "/api/v1/memories/00000000-0000-0000-0000-000000000000/lineage",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "absent root is 404: {v}");
+    assert!(v.get("nodes").is_none(), "no ancestry on 404: {v}");
+}
+
+/// #3303 — opt THIS test binary into request-authn-configured so an
+/// allowlisted admin NAME (with no per-agent key enrolled) is trusted by
+/// `is_admin_caller_trusted`. Safe for every other test in this binary: they
+/// use an EMPTY admin allowlist, so `is_admin_caller` is `false` regardless of
+/// this flag. Sets a process-global atomic (not an env var), so no unsafe /
+/// no cross-thread env race.
+fn mark_request_authn_for_admin_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        ai_memory::handlers::admin_role::mark_request_authn_configured(true);
+    });
+}
+
+#[tokio::test]
+async fn pg_lineage_admin_bypass_walks_foreign_root_3303() {
+    // pg lane, `caller_is_admin == true`: the per-root visibility gate is
+    // SKIPPED and a trusted admin still round-trips a FOREIGN private root's
+    // lineage — the total gate must not over-restrict admins.
+    mark_request_authn_for_admin_tests();
+    let (router, f) = build_fake_pg_router_with_admins(vec!["ai:pg-admin".to_string()]);
+    let (root, ancestor) = seed_owned_lineage(f.path(), "ai:pg-owner");
+    let (status, v) = get_uri_as(
+        &router,
+        &format!("/api/v1/memories/{root}/lineage"),
+        "ai:pg-admin",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin walks foreign lineage: {v}");
+    assert_eq!(v["count"], json!(1), "{v}");
+    assert_eq!(v["nodes"][0]["id"], json!(ancestor), "{v}");
 }
 
 #[tokio::test]
