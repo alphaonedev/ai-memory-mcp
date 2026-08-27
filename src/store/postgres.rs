@@ -21924,7 +21924,7 @@ impl MemoryStore for PostgresStore {
     /// CTE, so a lagging edge is tolerated (no inline unprojection).
     async fn delete_link(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         source_id: &str,
         target_id: &str,
     ) -> StoreResult<bool> {
@@ -21934,6 +21934,43 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin delete_link tx", e))?;
+
+        // v1.0.0 #3275 — SAL-side caller-owns gate (defense-in-depth with the
+        // #939 HTTP `delete_link` gate; closes the latent owner-blind funnel a
+        // future SAL caller could reach). Pre-fix this discarded `_ctx` and let
+        // any caller sever any edge by (source, target). A non-owner gets
+        // `Ok(false)` — the same "no edge removed" a truly-absent edge gives,
+        // so there is no existence oracle. Endpoint owners are read INSIDE the
+        // tx (raw metadata, unfiltered by lifecycle). Operator lanes
+        // (`ctx.bypass_visibility`) skip the gate.
+        if !ctx.bypass_visibility {
+            let source: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT metadata->>'agent_id', metadata->>'target_agent_id' \
+                 FROM memories WHERE id = $1",
+            )
+            .bind(source_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("delete_link source owner lookup", e))?;
+            let target_owner: Option<Option<String>> =
+                sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
+                    .bind(target_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("delete_link target owner lookup", e))?;
+            let (source_owner, source_target) = source
+                .map(|(o, t)| (o.unwrap_or_default(), t.unwrap_or_default()))
+                .unwrap_or_default();
+            let target_owner = target_owner.flatten().unwrap_or_default();
+            if !crate::store::caller_may_delete_link(
+                &source_owner,
+                &source_target,
+                &target_owner,
+                ctx.effective_principal(),
+            ) {
+                return Ok(false);
+            }
+        }
 
         let res = sqlx::query("DELETE FROM memory_links WHERE source_id = $1 AND target_id = $2")
             .bind(source_id)
@@ -27460,19 +27497,54 @@ impl MemoryStore for PostgresStore {
         Ok(evicted)
     }
 
-    async fn archive_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+    async fn archive_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| to_store_err("begin archive_restore tx", e))?;
 
-        let exists: Option<(String,)> =
+        // v1.0.0 #3271 (SECURITY-high) — SAL-side caller-owns gate, the
+        // archive-RESTORE sibling of the #3193 `archive_by_ids` gate. Pre-fix
+        // this funnel discarded its `_ctx` and matched on `WHERE id = $1` with
+        // NO owner predicate, so on a postgres-backed daemon ANY authenticated
+        // tenant could `POST /api/v1/archive/{victim's id}/restore` and pull a
+        // DIFFERENT tenant's deliberately-archived row back into the live set —
+        // and the 200-vs-404 split was an enumeration oracle over other
+        // tenants' archived ids (the sqlite twin has refused via
+        // `db::restore_archived_for_caller` since #940; #3193 fixed only the
+        // archive side of this class). The existence probe now carries the
+        // three-way owner predicate (owner OR inbox-target), so a non-owner
+        // sees the SAME `Ok(false)` a truly-absent id gives → the handler's
+        // 404 `NOT_FOUND_IN_ARCHIVE`, no oracle. Admin/operator lanes
+        // (`ctx.bypass_visibility`) round-trip regardless of ownership, exactly
+        // as they do on update / delete / archive.
+        let exists: Option<(String,)> = if ctx.bypass_visibility {
             sqlx::query_as("SELECT id FROM archived_memories WHERE id = $1")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("archive_restore lookup", e))?;
+                .map_err(|e| to_store_err("archive_restore lookup", e))?
+        } else {
+            sqlx::query_as(
+                // Owner OR inbox-target OR the legacy-unowned carve-out
+                // (unstamped rows are restorable by anyone — the
+                // single-operator default; exact parity with the sqlite
+                // `db::restore_archived_for_caller` #940/#3124 predicate). Only
+                // a row owned by a DIFFERENT, NAMED agent is refused.
+                "SELECT id FROM archived_memories \
+                 WHERE id = $1 \
+                   AND (metadata->>'agent_id' = $2 \
+                        OR metadata->>'target_agent_id' = $2 \
+                        OR metadata->>'agent_id' IS NULL \
+                        OR metadata->>'agent_id' = '')",
+            )
+            .bind(id)
+            .bind(ctx.effective_principal())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive_restore owner lookup", e))?
+        };
         if exists.is_none() {
             return Ok(false);
         }
@@ -27623,7 +27695,18 @@ impl MemoryStore for PostgresStore {
                                       ('declared','channel_derived','regex','llm')
                                  THEN metadata->>'kind_provenance' END),
                    valid_from, valid_until
-            FROM archived_memories WHERE id = $2",
+            FROM archived_memories WHERE id = $2
+              -- v1.0.0 #3271 — owner-predicated write (defense-in-depth with
+              -- the owner probe above; same predicate). $6 bypass
+              -- short-circuits the owner/inbox/legacy arms so operator lanes
+              -- still round-trip any row. The legacy-unowned carve-out
+              -- (agent_id NULL / '') keeps unstamped rows restorable, matching
+              -- the sqlite `db::restore_archived_for_caller` predicate.
+              AND ($6::bool
+                   OR metadata->>'agent_id' = $7
+                   OR metadata->>'target_agent_id' = $7
+                   OR metadata->>'agent_id' IS NULL
+                   OR metadata->>'agent_id' = '')",
         )
         .bind(now)
         .bind(id)
@@ -27632,6 +27715,8 @@ impl MemoryStore for PostgresStore {
         // v1.0.0 #2167 (S8) — $5: the process-wide active-space fp (NULL when
         // this process resolved no embedder) driving the restore heal above.
         .bind(crate::embeddings::active_embedding_space())
+        .bind(ctx.bypass_visibility)
+        .bind(ctx.effective_principal())
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("archive_restore insert", e))?;
@@ -27885,7 +27970,17 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin archive_by_ids tx", e))?;
 
-        for id in ids {
+        // v1.0.0 #3296 A6 (CONCURRENCY-04) — lock rows in a GLOBAL order. The
+        // per-id `FOR UPDATE` owner probe below (`SQL_SELECT_MEMORY_ROW_BY_ID`
+        // gained `FOR UPDATE` in the same PR that shares the const across
+        // update/delete/archive) locks in the CALLER-SUPPLIED id order, so two
+        // overlapping batches submitted in opposite order can deadlock. Locking
+        // the id set in a fixed (sorted) order breaks the cycle. Sorting only
+        // reorders the work; `moved` and the all-or-nothing tx are unchanged.
+        let mut ordered: Vec<&str> = ids.iter().map(String::as_str).collect();
+        ordered.sort_unstable();
+
+        for id in ordered {
             // #3193 (SECURITY-high, 2026-08-22) — SAL-side caller-owns gate,
             // the archive-verb sibling of the #1412/#1628 gates on the trait
             // `update` / `delete`. Pre-fix this funnel discarded its
@@ -27920,7 +28015,7 @@ impl MemoryStore for PostgresStore {
                 Err(StoreError::NotFound { .. }) => continue,
                 Err(e) => return Err(e),
             }
-            sqlx::query(&format!(
+            let insert_result = sqlx::query(&format!(
                 "INSERT INTO archived_memories (
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
@@ -27960,6 +28055,20 @@ impl MemoryStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("archive_by_ids insert", e))?;
+            // v1.0.0 #3296 A2 — only count an id whose live row was ACTUALLY
+            // archived. On the `bypass_visibility` (admin/CLI) lane
+            // `assert_caller_owns_for_mutation_on` returns `Ok(())` immediately
+            // WITHOUT proving the row exists, so a nonexistent id reached here
+            // and `moved += 1` ran even though the owner-predicated
+            // INSERT..SELECT matched 0 live rows — contradicting the trait
+            // contract ("an id with no live row is skipped and not counted").
+            // Skipping on a zero-row insert also protects the non-bypass lane
+            // against a concurrent delete between the probe and this write. The
+            // link snapshot / namespace sever / delete / AGE unprojection below
+            // are all no-ops for an id with no live row, so `continue` is safe.
+            if insert_result.rows_affected() == 0 {
+                continue;
+            }
             // #1771 (5-agent vote 4d3ea1c5) — snapshot this memory's
             // `memory_links` into `archived_memory_links` BEFORE the
             // same-tx cascade delete reaps them (FK `ON DELETE CASCADE`).
@@ -36529,6 +36638,142 @@ mod tests {
                 .iter()
                 .any(|l| l.source_id == a_id && l.target_id == b_id),
             "A->B edge must be preserved across archive_by_ids + archive_restore"
+        );
+    }
+
+    /// v1.0.0 #3271 (SECURITY-high) — the postgres `archive_restore` SAL
+    /// method must refuse a NON-owner. Pre-fix it discarded `_ctx` and any
+    /// authenticated tenant could restore another tenant's archived row via
+    /// `POST /api/v1/archive/{id}/restore`, with the 200-vs-404 split an
+    /// enumeration oracle. A non-owner now gets `Ok(false)` — the SAME
+    /// disposition a missing id gives, so there is no oracle; the owner still
+    /// restores. Gated on `AI_MEMORY_TEST_POSTGRES_URL`; skips cleanly when
+    /// unset. CI's Postgres-gate runs it for real.
+    #[tokio::test]
+    async fn archive_restore_refuses_non_owner_pg_3271() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let owner = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("restore-authz-3271-{unique}");
+        let id = format!("ra-3271-{unique}");
+        // sample_memory stamps metadata.agent_id = "ai:sal-test".
+        let m = sample_memory(&id, &ns, "private", "secret archived row");
+        store.store(&owner, &m).await.expect("store");
+        let moved = store
+            .archive_by_ids(&owner, std::slice::from_ref(&id), Some("test-3271"))
+            .await
+            .expect("archive_by_ids");
+        assert_eq!(moved, 1);
+
+        // A different, NAMED tenant must not restore it (no oracle: Ok(false)).
+        let attacker = CallerContext::for_agent(&format!("ai:sal-attacker-{unique}"));
+        let restored = store
+            .archive_restore(&attacker, &id)
+            .await
+            .expect("archive_restore attacker");
+        assert!(
+            !restored,
+            "a non-owner must not restore another tenant's archived row"
+        );
+
+        // The owner still can — the refusal did not consume the archived row.
+        let restored = store
+            .archive_restore(&owner, &id)
+            .await
+            .expect("archive_restore owner");
+        assert!(restored, "the owner must still be able to restore");
+    }
+
+    /// v1.0.0 #3275 — the postgres `delete_link` SAL funnel must refuse a
+    /// caller who owns NEITHER endpoint (pre-fix it discarded `_ctx`). A
+    /// non-owner gets `Ok(false)` (no edge removed, no oracle); the owner
+    /// severs it. Gated on `AI_MEMORY_TEST_POSTGRES_URL`.
+    #[tokio::test]
+    async fn delete_link_refuses_non_owner_pg_3275() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let owner = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("dl-authz-3275-{unique}");
+        let a_id = format!("dl-a-{unique}");
+        let b_id = format!("dl-b-{unique}");
+        store
+            .store(&owner, &sample_memory(&a_id, &ns, "a", "src"))
+            .await
+            .expect("store a");
+        store
+            .store(&owner, &sample_memory(&b_id, &ns, "b", "dst"))
+            .await
+            .expect("store b");
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&owner, &link).await.expect("create link");
+
+        // A non-owner of both endpoints must not sever the edge.
+        let attacker = CallerContext::for_agent(&format!("ai:sal-attacker-{unique}"));
+        let removed = store
+            .delete_link(&attacker, &a_id, &b_id)
+            .await
+            .expect("delete_link attacker");
+        assert!(!removed, "a non-owner must not sever another tenant's edge");
+        let after = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("links after attacker");
+        assert!(
+            after
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "the edge must survive a non-owner delete attempt"
+        );
+
+        // The owner severs it for real.
+        let removed = store
+            .delete_link(&owner, &a_id, &b_id)
+            .await
+            .expect("delete_link owner");
+        assert!(removed, "the owner must sever the edge");
+    }
+
+    /// v1.0.0 #3296 A2 — on the `bypass_visibility` (admin/CLI) lane a
+    /// nonexistent id must NOT be counted as archived. Pre-fix
+    /// `assert_caller_owns_for_mutation_on` returned `Ok(())` immediately under
+    /// bypass and `moved += 1` ran even though the owner-predicated
+    /// INSERT..SELECT matched 0 live rows. Gated on `AI_MEMORY_TEST_POSTGRES_URL`.
+    #[tokio::test]
+    async fn archive_by_ids_bypass_nonexistent_not_counted_pg_3296() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let admin = CallerContext::for_admin("ops:admin");
+        let missing = format!("nonexistent-3296-{}", uuid::Uuid::new_v4());
+        let moved = store
+            .archive_by_ids(&admin, std::slice::from_ref(&missing), Some("test-3296"))
+            .await
+            .expect("archive_by_ids bypass missing");
+        assert_eq!(
+            moved, 0,
+            "a nonexistent id must not be counted as archived on the bypass lane"
         );
     }
 

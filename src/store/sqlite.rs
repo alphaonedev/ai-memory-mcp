@@ -97,6 +97,33 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// v1.0.0 #3275 — `(agent_id, target_agent_id)` owner strings of a memory
+/// (empty when the key is absent), for the SAL `delete_link` caller-owns gate.
+fn link_owner_target_of(m: &Memory) -> (String, String) {
+    let owner = m
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let target = m
+        .metadata
+        .get(crate::META_KEY_TARGET_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (owner, target)
+}
+
+/// v1.0.0 #3275 — the `agent_id` owner string of a memory (empty when absent).
+fn link_owner_of(m: &Memory) -> String {
+    m.metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Parity finding #4 (2026-08) — SAL-level caller-owns mutation gate for
 /// the sqlite adapter's `update` / `delete`.
 ///
@@ -958,12 +985,39 @@ impl MemoryStore for SqliteStore {
     /// edge unprojection).
     async fn delete_link(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         source_id: &str,
         target_id: &str,
     ) -> StoreResult<bool> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // v1.0.0 #3275 — SAL-side caller-owns gate (defense-in-depth with the
+        // #939 HTTP `delete_link` gate; closes the latent owner-blind funnel a
+        // future SAL caller could reach). Pre-fix this discarded `_ctx` and
+        // let any caller sever any edge in the graph. A non-owner gets
+        // `Ok(false)` — the same "no edge removed" a truly-absent edge gives,
+        // so there is no existence oracle. Endpoint owners are read UNFILTERED
+        // (`db::get_any`) so a tombstoned endpoint is still owner-checked.
+        // Operator lanes (`ctx.bypass_visibility`) skip the gate.
+        if !ctx.bypass_visibility {
+            let caller = ctx.effective_principal();
+            let (source_owner, source_target) = db::get_any(&conn, source_id)
+                .map_err(box_err)?
+                .map(|m| link_owner_target_of(&m))
+                .unwrap_or_default();
+            let target_owner = db::get_any(&conn, target_id)
+                .map_err(box_err)?
+                .map(|m| link_owner_of(&m))
+                .unwrap_or_default();
+            if !crate::store::caller_may_delete_link(
+                &source_owner,
+                &source_target,
+                &target_owner,
+                caller,
+            ) {
+                return Ok(false);
+            }
+        }
         db::delete_link(&conn, source_id, target_id).map_err(box_err)
     }
 
@@ -2184,9 +2238,25 @@ impl MemoryStore for SqliteStore {
         db::size_gc(&conn, namespace, max_corpus_bytes, archive).map_err(box_err)
     }
 
-    async fn archive_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+    async fn archive_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        // v1.0.0 #3271 (in-class parity) — honour the trait's caller-owns
+        // contract on this adapter too. Pre-fix this method discarded `_ctx`
+        // and called the owner-BLIND `db::restore_archived`, exactly as the
+        // postgres twin did. The HTTP restore handler's sqlite branch has
+        // gated since #940 (it calls `db::restore_archived_for_caller`
+        // directly), so this was a latent landmine rather than a live bypass —
+        // but the trait method is a public SAL surface and the next caller to
+        // reach for it must not silently inherit an owner-blind un-archive.
+        // A non-owner gets `Ok(false)` (→ handler 404), the same disposition a
+        // truly-absent id gives — no existence oracle. Operator lanes
+        // (`ctx.bypass_visibility`) keep the owner-blind funnel, matching
+        // `archive_purge` right above and the postgres twin.
         let conn = self.state.lock().await;
-        db::restore_archived(&conn, id).map_err(box_err)
+        if ctx.bypass_visibility {
+            db::restore_archived(&conn, id).map_err(box_err)
+        } else {
+            db::restore_archived_for_caller(&conn, id, ctx.effective_principal()).map_err(box_err)
+        }
     }
 
     async fn archive_purge(
@@ -2274,20 +2344,28 @@ impl MemoryStore for SqliteStore {
             let mut moved = 0usize;
             for id in ids {
                 if !bypass {
-                    let owned: bool = conn
-                        .query_row(
-                            "SELECT COUNT(*) > 0 FROM memories \
-                             WHERE id = ?1 \
-                               AND ( \
-                                 json_extract(metadata, '$.agent_id') = ?2 OR \
-                                 json_extract(metadata, '$.target_agent_id') = ?2 OR \
-                                 json_extract(metadata, '$.agent_id') IS NULL OR \
-                                 json_extract(metadata, '$.agent_id') = '' \
-                               )",
-                            rusqlite::params![id, caller],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(false);
+                    // v1.0.0 #3296 A5 (ERRORS-19) — PROPAGATE the probe's
+                    // Result. Pre-fix this `.unwrap_or(false)` masked a DB
+                    // error as a non-ownership SKIP, silently leaving a row
+                    // live (the caller saw a smaller `moved` count with no
+                    // error), while the postgres twin was hardened the
+                    // opposite way in the same commit — the two adapters
+                    // disagreed on probe-error disposition. `COUNT(*) > 0`
+                    // always returns exactly one row, so the only `Err` here
+                    // is a genuine backend fault, which must roll the whole
+                    // batch back (the closure returns `anyhow::Result`).
+                    let owned: bool = conn.query_row(
+                        "SELECT COUNT(*) > 0 FROM memories \
+                         WHERE id = ?1 \
+                           AND ( \
+                             json_extract(metadata, '$.agent_id') = ?2 OR \
+                             json_extract(metadata, '$.target_agent_id') = ?2 OR \
+                             json_extract(metadata, '$.agent_id') IS NULL OR \
+                             json_extract(metadata, '$.agent_id') = '' \
+                           )",
+                        rusqlite::params![id, caller],
+                        |r| r.get(0),
+                    )?;
                     if !owned {
                         continue;
                     }
@@ -4540,6 +4618,94 @@ mod tests {
             .await
             .expect("archive_restore missing");
         assert!(!restored);
+    }
+
+    /// v1.0.0 #3271 — the SAL `archive_restore` trait method honours the
+    /// caller-owns contract on THIS adapter too (pre-fix it discarded `_ctx`
+    /// and called the owner-blind `db::restore_archived`). A non-owner gets
+    /// `Ok(false)` — the SAME disposition a missing id gives, so there is no
+    /// enumeration oracle over another tenant's archived ids. The owner can
+    /// still restore.
+    #[tokio::test]
+    async fn archive_restore_refuses_non_owner_3271() {
+        let store = fresh_store();
+        let alice = CallerContext::for_agent("alice");
+        let mut mem = test_memory("owned-by-alice-3271", "secret");
+        mem.metadata = serde_json::json!({ "agent_id": "alice" });
+        let id = store.store(&alice, &mem).await.expect("store");
+        let moved = store
+            .archive_by_ids(&alice, &[id.clone()], None)
+            .await
+            .expect("archive");
+        assert_eq!(moved, 1);
+
+        // A different tenant must NOT restore alice's archived row.
+        let bob = CallerContext::for_agent("bob");
+        let restored = store
+            .archive_restore(&bob, &id)
+            .await
+            .expect("archive_restore bob");
+        assert!(
+            !restored,
+            "a non-owner must not restore another tenant's archived row"
+        );
+
+        // The refusal did not restore it — the owner still can.
+        let restored = store
+            .archive_restore(&alice, &id)
+            .await
+            .expect("archive_restore alice");
+        assert!(restored, "the owner must still be able to restore");
+    }
+
+    /// v1.0.0 #3275 — the SAL `delete_link` funnel is owner-gated (pre-fix it
+    /// discarded `_ctx` and let any caller sever any edge). A non-owner of
+    /// EITHER endpoint gets `Ok(false)` (no edge removed, no oracle); the owner
+    /// severs it for real.
+    #[tokio::test]
+    async fn delete_link_refuses_non_owner_3275() {
+        let store = fresh_store();
+        let alice = CallerContext::for_agent("alice");
+        let mut a = test_memory("link-src-3275", "source");
+        a.metadata = serde_json::json!({ "agent_id": "alice" });
+        let mut b = test_memory("link-dst-3275", "target");
+        b.metadata = serde_json::json!({ "agent_id": "alice" });
+        let src = store.store(&alice, &a).await.expect("store a");
+        let dst = store.store(&alice, &b).await.expect("store b");
+        let link = MemoryLink {
+            source_id: src.clone(),
+            target_id: dst.clone(),
+            relation: crate::models::MemoryLinkRelation::default(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link_signed(&alice, &link, None).await.expect("link");
+
+        // A non-owner of both endpoints cannot sever the edge.
+        let bob = CallerContext::for_agent("bob");
+        let removed = store
+            .delete_link(&bob, &src, &dst)
+            .await
+            .expect("delete_link bob");
+        assert!(!removed, "a non-owner must not sever another tenant's edge");
+        assert_eq!(
+            store.get_links_for_anchor(&src).await.expect("links").len(),
+            1,
+            "the edge must survive a non-owner delete attempt"
+        );
+
+        // The owner severs it for real.
+        let removed = store
+            .delete_link(&alice, &src, &dst)
+            .await
+            .expect("delete_link alice");
+        assert!(removed, "the owner must sever the edge");
     }
 
     // #2196 (data-integrity archive-parity) — a memory archived in a

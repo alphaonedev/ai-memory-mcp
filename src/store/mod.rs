@@ -677,6 +677,39 @@ impl CallerContext {
 /// substrate code so the move is a no-op for callers.
 pub use crate::visibility::is_visible_to_caller;
 
+/// v1.0.0 #3275 — shared caller-owns-a-link-endpoint predicate for the SAL
+/// `delete_link` funnel. Returns `true` when `caller` may sever the
+/// `(source, target)` edge. Mirrors the #939 HTTP `delete_link` gate exactly,
+/// so wiring it into the SAL adapters refuses precisely the set the handler
+/// already refuses (defense-in-depth; no legitimate call is newly rejected):
+///
+///   * caller owns EITHER endpoint — links are symmetric, either party may
+///     sever (author `agent_id` on source or target, or the source's inbox
+///     `target_agent_id`);
+///   * the legacy-unowned carve-out — BOTH endpoints unstamped (the
+///     single-operator default, where rows may carry no `agent_id`);
+///   * the `daemon` sentinel (curator / internal paths).
+///
+/// The owner strings are the raw `metadata.agent_id` / `metadata.target_agent_id`
+/// of the endpoints (empty string when absent / row missing). NOTE: `agent_id`
+/// is a CLAIMED identity, so this gate's strength is bounded by caller
+/// attestation (#48) — it closes the cross-id gap, not impersonation.
+#[must_use]
+pub(crate) fn caller_may_delete_link(
+    source_owner: &str,
+    source_target: &str,
+    target_owner: &str,
+    caller: &str,
+) -> bool {
+    let is_unowned_legacy = source_owner.is_empty() && target_owner.is_empty();
+    let owns_source = source_owner == caller || source_target == caller;
+    let owns_target = !target_owner.is_empty() && target_owner == caller;
+    is_unowned_legacy
+        || owns_source
+        || owns_target
+        || caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+}
+
 // ---------------------------------------------------------------------------
 // #3176 — backend-blind `clear_namespace_standard` authorization core
 // ---------------------------------------------------------------------------

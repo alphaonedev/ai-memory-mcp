@@ -88,11 +88,22 @@ pub fn handle_find_paths(
     // rather than leak its id-chain neighborhood. A `None` caller
     // (single-tenant trust-all) or a missing source row proceeds
     // unchanged. Gates on source_id only, matching the HTTP twin.
-    if let Some(caller) = caller
-        && let Ok(Some(mem)) = db::get(conn, source_id)
-        && !crate::visibility::is_visible_to_caller(&mem, caller)
-    {
-        return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
+    //
+    // v1.0.0 #3270 — TOTAL over `Result<Option<Memory>>` via the UNFILTERED
+    // `db::get_any`, so a hidden (tombstoned / quarantined per #3235) source
+    // is still owner-checked instead of its `Ok(None)` short-circuiting the
+    // gate and letting a non-owner walk it. A lookup error fails closed.
+    if let Some(caller) = caller {
+        match db::get_any(conn, source_id) {
+            Ok(Some(mem)) if !crate::visibility::is_visible_to_caller(&mem, caller) => {
+                return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!("handle_find_paths: source ownership lookup failed: {e}");
+                return Err(crate::errors::msg::INTERNAL_SERVER_ERROR.to_string());
+            }
+        }
     }
 
     // #3171 — both are declared `integer` (i64) but read via `as_u64`, so a
@@ -155,5 +166,46 @@ mod d1_4_985_tests {
     fn memory_find_paths_tool_metadata_985() {
         assert_eq!(FindPathsTool::name(), "memory_find_paths");
         assert_eq!(FindPathsTool::family(), "graph");
+    }
+
+    /// v1.0.0 #3270 — the source-owner gate is TOTAL over a HIDDEN source. A
+    /// non-owner must be refused before the id-chain walk even when the source
+    /// row is tombstoned (which #3235 made `db::get` hide, silently skipping
+    /// the pre-fix gate).
+    #[test]
+    fn memory_find_paths_hidden_source_refuses_non_owner() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let source_id = "44444444-4444-4444-8444-444444444444";
+        let target_id = "55555555-5555-4555-8555-555555555555";
+        let mut src = crate::models::Memory {
+            id: source_id.to_string(),
+            title: "private source".to_string(),
+            content: "secret".to_string(),
+            ..Default::default()
+        };
+        src.metadata = json!({ "agent_id": "alice" });
+        db::insert(&conn, &src).unwrap();
+        conn.execute(
+            "UPDATE memories SET lifecycle_state = 'tombstoned' WHERE id = ?1",
+            rusqlite::params![source_id],
+        )
+        .unwrap();
+
+        let err = handle_find_paths(
+            &conn,
+            &json!({ "source_id": source_id, "target_id": target_id }),
+            Some("bob"),
+        )
+        .unwrap_err();
+        assert_eq!(err, crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER);
+
+        // Owner still proceeds (empty path set, not an authz refusal).
+        let out = handle_find_paths(
+            &conn,
+            &json!({ "source_id": source_id, "target_id": target_id }),
+            Some("alice"),
+        )
+        .unwrap();
+        assert_eq!(out["count"], 0);
     }
 }
