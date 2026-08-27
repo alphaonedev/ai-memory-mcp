@@ -72,11 +72,23 @@ pub fn handle_kg_timeline(
     // namespace / relation / valid_from). A `None` caller (single-tenant
     // trust-all) or a missing source row proceeds unchanged. Gates on
     // source_id only, matching the HTTP twin.
-    if let Some(caller) = caller
-        && let Ok(Some(mem)) = db::get(conn, source_id)
-        && !crate::visibility::is_visible_to_caller(&mem, caller)
-    {
-        return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
+    //
+    // v1.0.0 #3270 — TOTAL over `Result<Option<Memory>>` via the UNFILTERED
+    // `db::get_any`, so a hidden (tombstoned / quarantined per #3235) source
+    // is still owner-checked instead of its `Ok(None)` short-circuiting the
+    // gate and letting a non-owner read its outbound timeline. A lookup
+    // error fails closed.
+    if let Some(caller) = caller {
+        match db::get_any(conn, source_id) {
+            Ok(Some(mem)) if !crate::visibility::is_visible_to_caller(&mem, caller) => {
+                return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!("handle_kg_timeline: source ownership lookup failed: {e}");
+                return Err(crate::errors::msg::INTERNAL_SERVER_ERROR.to_string());
+            }
+        }
     }
     let since = params["since"]
         .as_str()
@@ -107,12 +119,20 @@ pub fn handle_kg_timeline(
     // to the caller (mirrors `get_links` / postgres `find_paths` per-row
     // filtering). `None` caller = single-tenant trust-all (unchanged); a
     // missing target row has no metadata to leak so it is retained.
+    //
+    // v1.0.0 #3270 (same #3235 root cause as the source gate above) — read
+    // through the UNFILTERED `db::get_any` and make the retain TOTAL. The
+    // pre-fix `db::get(..).ok().flatten().is_none_or(..)` folded a HIDDEN
+    // (tombstoned / quarantined) target into `None` → `is_none_or` RETAINED
+    // it → the timeline disclosed a hidden target's title/namespace
+    // cross-principal. Unfiltered, a hidden target is owner-checked (dropped
+    // for a non-owner, kept for its owner); a genuinely-missing target has no
+    // metadata to leak and is kept; a lookup error fails closed (drop).
     if let Some(caller) = caller {
-        events.retain(|e| {
-            db::get(conn, &e.target_id)
-                .ok()
-                .flatten()
-                .is_none_or(|m| crate::visibility::is_visible_to_caller(&m, caller))
+        events.retain(|e| match db::get_any(conn, &e.target_id) {
+            Ok(Some(m)) => crate::visibility::is_visible_to_caller(&m, caller),
+            Ok(None) => true,
+            Err(_) => false,
         });
     }
 
@@ -157,5 +177,37 @@ mod d1_4_985_tests {
     fn memory_kg_timeline_tool_metadata_985() {
         assert_eq!(KgTimelineTool::name(), "memory_kg_timeline");
         assert_eq!(KgTimelineTool::family(), "graph");
+    }
+
+    /// v1.0.0 #3270 — the source-owner gate is TOTAL over a HIDDEN source. A
+    /// non-owner must be refused before the outbound link-event timeline even
+    /// when the source row is tombstoned (which #3235 made `db::get` hide,
+    /// silently skipping the pre-fix gate).
+    #[test]
+    fn memory_kg_timeline_hidden_source_refuses_non_owner() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let source_id = "66666666-6666-4666-8666-666666666666";
+        let mut src = crate::models::Memory {
+            id: source_id.to_string(),
+            title: "private source".to_string(),
+            content: "secret".to_string(),
+            ..Default::default()
+        };
+        src.metadata = json!({ "agent_id": "alice" });
+        db::insert(&conn, &src).unwrap();
+        conn.execute(
+            "UPDATE memories SET lifecycle_state = 'tombstoned' WHERE id = ?1",
+            rusqlite::params![source_id],
+        )
+        .unwrap();
+
+        let err =
+            handle_kg_timeline(&conn, &json!({ "source_id": source_id }), Some("bob")).unwrap_err();
+        assert_eq!(err, crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER);
+
+        // Owner still proceeds (empty timeline, not an authz refusal).
+        let out =
+            handle_kg_timeline(&conn, &json!({ "source_id": source_id }), Some("alice")).unwrap();
+        assert_eq!(out["count"], 0);
     }
 }

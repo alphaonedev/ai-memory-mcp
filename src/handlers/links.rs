@@ -1360,14 +1360,39 @@ pub async fn get_lineage(
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         if !caller_is_admin {
             let ctx = crate::store::CallerContext::for_agent(&caller);
-            if let Ok(mem) = app.store.get(&ctx, &id).await
-                && !crate::visibility::is_visible_to_caller(&mem, &caller)
-            {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER})),
-                )
-                    .into_response();
+            // v1.0.0 #3270 — TOTAL over the `get` Result. `PostgresStore::get`
+            // folds a non-recall-visible (tombstoned / quarantined) row AND a
+            // scope-denied row AND a genuinely-absent row all into
+            // `Err(NotFound)`; the old `if let Ok(mem)` chain skipped the gate
+            // on that `Err`, so a non-owner walked a hidden root's lineage. An
+            // `Ok` row already passed `get`'s own visibility filter, so the
+            // recheck is defense-in-depth; every `NotFound` disposition refuses
+            // the walk with a 404 (fail closed, and indistinguishable to the
+            // caller from a truly-absent id — no existence oracle). A real
+            // backend error surfaces as itself, never as ALLOW (ERRORS-19).
+            match app.store.get(&ctx, &id).await {
+                Ok(mem) => {
+                    if !crate::visibility::is_visible_to_caller(&mem, &caller) {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({
+                                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+                Err(crate::store::StoreError::NotFound { .. }) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({
+                            "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
+                            "id": id,
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(e) => return store_err_to_response(e),
             }
         }
         let walk = if direction == crate::mcp::LINEAGE_DIRECTION_DESCENDANTS {
@@ -1388,16 +1413,34 @@ pub async fn get_lineage(
     }
 
     let lock = app.db.lock().await;
-    if !caller_is_admin
-        && let Ok(Some(mem)) = db::get(&lock.0, &id)
-        && !crate::visibility::is_visible_to_caller(&mem, &caller)
-    {
-        drop(lock);
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER})),
-        )
-            .into_response();
+    // v1.0.0 #3270 — TOTAL over the UNFILTERED `db::get_any`. #3235 made
+    // `db::get` return `Ok(None)` for hidden (tombstoned / quarantined) rows,
+    // so the old `if let Ok(Some(mem))` chain skipped the gate for a hidden
+    // root and a non-owner walked it. Reading unfiltered keeps a hidden row
+    // owner-checked (non-owner → 403; the owner keeps access to their own
+    // tombstoned root's conserved lineage). A genuinely-absent root still
+    // proceeds to the empty walk (unchanged); a lookup error fails closed.
+    if !caller_is_admin {
+        match db::get_any(&lock.0, &id) {
+            Ok(Some(mem)) if !crate::visibility::is_visible_to_caller(&mem, &caller) => {
+                drop(lock);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER})),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                drop(lock);
+                tracing::error!("get_lineage: root ownership lookup failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                )
+                    .into_response();
+            }
+        }
     }
     let walk = if direction == crate::mcp::LINEAGE_DIRECTION_DESCENDANTS {
         db::lineage_descendants(&lock.0, &id, max_depth)

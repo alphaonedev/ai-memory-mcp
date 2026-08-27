@@ -87,11 +87,29 @@ pub fn handle_lineage(
     // the caller, refuse rather than leak its provenance neighborhood. A
     // `None` caller (single-tenant trust-all) or a missing root proceeds
     // unchanged (mirrors `handle_find_paths`).
-    if let Some(caller) = caller
-        && let Ok(Some(mem)) = db::get(conn, id)
-        && !crate::visibility::is_visible_to_caller(&mem, caller)
-    {
-        return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
+    //
+    // v1.0.0 #3270 — the gate is TOTAL over `Result<Option<Memory>>`, read
+    // through the UNFILTERED `db::get_any`. #3235 made the recall-visible
+    // `db::get` return `Ok(None)` for hidden (tombstoned / quarantined)
+    // rows; the old `if let Ok(Some(mem))` chain then short-circuited on that
+    // `None` and SKIPPED the gate for exactly the hidden rows, so a non-owner
+    // walked their conserved ancestry. Reading unfiltered means a hidden row
+    // is still owner-checked (non-owner refused; the owner keeps access to
+    // their own tombstoned root's lineage). A lookup error fails closed
+    // (ERRORS-19) rather than folding into ALLOW.
+    if let Some(caller) = caller {
+        match db::get_any(conn, id) {
+            Ok(Some(mem)) if !crate::visibility::is_visible_to_caller(&mem, caller) => {
+                return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
+            }
+            // Visible row (incl. the owner's own hidden root) or a genuinely
+            // absent root → proceed unchanged.
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!("handle_lineage: root ownership lookup failed: {e}");
+                return Err(crate::errors::msg::INTERNAL_SERVER_ERROR.to_string());
+            }
+        }
     }
 
     let direction = params[crate::mcp::param_names::DIRECTION]
@@ -186,5 +204,48 @@ mod g13_1859_tests {
         assert_eq!(out["count"], 0);
         assert_eq!(out["direction"], "ancestors");
         assert!(out["nodes"].as_array().unwrap().is_empty());
+    }
+
+    /// Insert a row owned by `owner`, then raw-tombstone it (bypassing the
+    /// transition gate, exactly as the consolidation / quarantine system
+    /// paths do), so `db::get` hides it but `db::get_any` still sees it.
+    fn seed_owned_tombstoned(conn: &rusqlite::Connection, id: &str, owner: &str) {
+        let mut mem = crate::models::Memory {
+            id: id.to_string(),
+            title: "private root".to_string(),
+            content: "secret ancestry".to_string(),
+            ..Default::default()
+        };
+        mem.metadata = json!({ "agent_id": owner });
+        db::insert(conn, &mem).unwrap();
+        conn.execute(
+            "UPDATE memories SET lifecycle_state = 'tombstoned' WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    /// v1.0.0 #3270 — the caller-owns gate is TOTAL over a HIDDEN root. Before
+    /// the fix, `db::get` returned `Ok(None)` for a tombstoned row, so the
+    /// `if let Ok(Some(mem))` chain skipped the gate and a NON-owner walked the
+    /// owner's conserved ancestry. The gate now reads unfiltered: a non-owner
+    /// is refused, the owner still gets through.
+    #[test]
+    fn memory_lineage_hidden_root_refuses_non_owner_and_admits_owner() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let id = "33333333-3333-4333-8333-333333333333";
+        seed_owned_tombstoned(&conn, id, "alice");
+
+        // Non-owner is refused (was: silently walked the hidden root).
+        let err = handle_lineage(&conn, &json!({ "id": id }), Some("bob")).unwrap_err();
+        assert_eq!(
+            err,
+            crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
+            "a non-owner must be refused the hidden root's lineage (no cross-principal disclosure)"
+        );
+
+        // Owner keeps access to their own tombstoned root's conserved lineage.
+        let out = handle_lineage(&conn, &json!({ "id": id }), Some("alice")).unwrap();
+        assert_eq!(out["count"], 0);
     }
 }

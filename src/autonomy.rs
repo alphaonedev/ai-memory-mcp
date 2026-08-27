@@ -747,7 +747,16 @@ fn forget_if_superseded(
     // snapshot. Re-read the selected loser from the DB and no-op when a
     // prior iteration (or cycle) already conserved it — exactly one
     // conserve per pair, no duplicate SUPERSEDE leaf.
-    if let Some(fresh_loser) = db::get(conn, &loser.id)?
+    //
+    // v1.0.0 #3270 sweep — read through the UNFILTERED `db::get_any`. This is
+    // the fresh-state re-entry GUARD, not an authz gate, but #3235 made
+    // `db::get` fold a now-hidden (tombstoned / quarantined) loser into
+    // `Ok(None)`, which would SKIP the already-conserved short-circuit and
+    // re-run the conserve on a row whose lifecycle already moved — a duplicate
+    // SUPERSEDE leaf. Reading unfiltered restores the pre-#3235 guard: the
+    // conserved-marker check runs regardless of the loser's lifecycle state.
+    // `?` still propagates a real lookup error (ERRORS-19).
+    if let Some(fresh_loser) = db::get_any(conn, &loser.id)?
         && fresh_loser
             .metadata
             .get(field_names::CONTRADICTION_CONSERVED)

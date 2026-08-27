@@ -173,9 +173,15 @@ pub async fn restore_archive(
     // operators relying on multi-node consistency should poll peers.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // QC P1 fix (2026-05-20): use the resolved `caller` (header)
-        // so the SAL #910 visibility filter applies — archive ops
-        // can only touch memories owned by the caller.
+        // v1.0.0 #3271 — pass the resolved `caller` (header) so the SAL
+        // `archive_restore` caller-owns gate applies: a non-owner tenant gets
+        // `Ok(false)` → the 404 `NOT_FOUND_IN_ARCHIVE` below, the SAME
+        // response a truly-absent id gives (no enumeration oracle). Before
+        // #3271 the postgres `archive_restore` discarded this ctx entirely and
+        // any authenticated tenant could restore another tenant's archived row
+        // — the comment here CLAIMED the control was present while the adapter
+        // had none. The gate now lives on the SAL trait method (both
+        // backends), so every surface routing through it inherits it.
         let ctx = crate::store::CallerContext::for_agent(caller.clone());
         return match app.store.archive_restore(&ctx, &id).await {
             Ok(true) => {

@@ -2804,6 +2804,36 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
     }
 }
 
+/// v1.0.0 #3270 — UNFILTERED single-row read for AUTHZ decisions.
+///
+/// Identical to [`get`] except it does NOT fold non-recall-visible
+/// lifecycle states (`Quarantined` / `Tombstoned`) into `Ok(None)`: it
+/// returns the raw row whatever its lifecycle state, or `Ok(None)` only
+/// when the id genuinely has no row.
+///
+/// This exists because #3235 made [`get`] hide tombstoned/quarantined rows
+/// (correctly, for the recall lane). The caller-owns gates in front of the
+/// lineage / find_paths / kg_timeline traversals must decide ownership over
+/// the ROW THAT EXISTS — a hidden row still has an owner and its ancestry
+/// must not leak cross-principal. Reading through [`get`] there let a hidden
+/// row's `Ok(None)` short-circuit the gate, so a non-owner walked it. Gates
+/// must run their ownership predicate on this unfiltered read and refuse a
+/// non-owner regardless of lifecycle state, while the owner keeps access to
+/// their own tombstoned row's conserved lineage (the point of the walk).
+///
+/// This is an authz-precondition read ONLY. It is NOT a recall/list/get
+/// surface — never route caller-facing content reads through it, or hidden
+/// rows would leak back into the read lanes #3235 closed.
+pub fn get_any(conn: &Connection, id: &str) -> Result<Option<Memory>> {
+    let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+    let mut rows = stmt.query_map(params![id], row_to_memory)?;
+    match rows.next() {
+        Some(Ok(m)) => Ok(Some(m)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
 /// Batch-fetch memories by ID. Mirrors [`get`] but issues a single
 /// `WHERE id IN (?, ?, ...)` SELECT instead of N per-id round-trips.
 ///
