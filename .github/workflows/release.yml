@@ -102,8 +102,8 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
@@ -175,15 +175,15 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install Rust 1.96.0 + target std
-        # Pin to the rust-toolchain.toml channel (1.96.0). The build below
+      - name: Install Rust 1.98.0 + target std
+        # Pin to the rust-toolchain.toml channel (1.98.0). The build below
         # resolves the toolchain from rust-toolchain.toml, so the cross
         # target std must be installed onto THAT toolchain — installing it
         # onto `stable` left non-host targets (e.g. x86_64-apple-darwin on
         # the arm64 macOS runner) without `core`, failing with E0463.
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.98.0
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -416,13 +416,13 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install Rust 1.96.0
-        # Pin to rust-toolchain.toml (1.96.0) so cargo-cyclonedx reads
+      - name: Install Rust 1.98.0
+        # Pin to rust-toolchain.toml (1.98.0) so cargo-cyclonedx reads
         # the same Cargo.lock / MSRV-compatible metadata every other
         # release job builds against.
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.98.0
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -514,12 +514,12 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install Rust 1.96.0 + iOS targets
-        # Pin to rust-toolchain.toml (1.96.0) so the iOS cross-target std
+      - name: Install Rust 1.98.0 + iOS targets
+        # Pin to rust-toolchain.toml (1.98.0) so the iOS cross-target std
         # lands on the build toolchain (see release-matrix note above).
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.98.0
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -654,12 +654,12 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install Rust 1.96.0 + Android targets
-        # Pin to rust-toolchain.toml (1.96.0) so the Android cross-target
+      - name: Install Rust 1.98.0 + Android targets
+        # Pin to rust-toolchain.toml (1.98.0) so the Android cross-target
         # std lands on the build toolchain (see release-matrix note above).
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.98.0
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -794,11 +794,11 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        # #2895 — pin the publish toolchain to the same 1.96.0 every other
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        # #2895 — pin the publish toolchain to the same 1.98.0 every other
         # release + verification job uses (was bare `@stable`, an unpinned,
         # moving compiler on the one job that mints the crates.io artifact).
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
 
       - name: Publish to crates.io (with retry)
         env:

@@ -1209,7 +1209,7 @@ async fn http_load_family_invalid_family_400() {
     let (router, _f) = build_router_fixture();
     let body = json!({"family": "🎉 not real"});
     let (status, _payload) = post_json(&router, "/api/v1/memory_load_family", body).await;
-    assert!(status == StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

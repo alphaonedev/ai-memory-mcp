@@ -556,8 +556,8 @@ jobs:
       # Needed only by the gate's R-203 / before-after evidence, which
       # compiles tests/conformance_readers.rs standalone with `rustc --test`
       # (the harness is deliberately crate-dependency-free — no cargo build).
-      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
-        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
       - name: Run conformance-reader gate
         run: bash scripts/check-conformance-readers.sh
       - name: Self-test the gate (regression evidence)

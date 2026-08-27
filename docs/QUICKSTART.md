@@ -23,7 +23,7 @@ on how you want to use it.
 # macOS / Linux (with Homebrew or prebuilt binary)
 curl -sSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh | sh
 
-# Or from cargo (any platform with Rust 1.96+)
+# Or from cargo (any platform with Rust 1.98+)
 cargo install --git https://github.com/alphaonedev/ai-memory-mcp ai-memory
 ```
 

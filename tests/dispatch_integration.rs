@@ -89,7 +89,7 @@ fn boot_dispatch_emits_header() {
     assert!(
         text.starts_with("# ai-memory boot:"),
         "expected header prefix, got first 80 chars: {:?}",
-        &text.chars().take(80).collect::<String>()
+        text.chars().take(80).collect::<String>()
     );
 }
 

@@ -83,8 +83,7 @@ fn assert_snapshot_matches(profile_name: &str, profile: &Profile) {
     let actual = canonical_json(&tool_definitions_for_profile(profile));
     let path = snapshot_path(profile_name);
     let bless = std::env::var("AI_MEMORY_BLESS_SNAPSHOTS")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     if bless {
         std::fs::create_dir_all(path.parent().unwrap()).expect("create snapshot dir");
         std::fs::write(&path, &actual)

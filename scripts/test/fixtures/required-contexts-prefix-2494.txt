@@ -96,7 +96,7 @@
 # `required-contexts-joblevel-if-allow.txt` with its justification.
 Lint (fmt + clippy)
 actionlint (workflow-injection guard)
-MSRV (Rust 1.96)
+MSRV (Rust 1.98)
 Postgres feature gate
 SAL-only feature gate
 vectorlite feature gate
