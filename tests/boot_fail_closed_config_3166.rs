@@ -162,6 +162,39 @@ fn typo_in_config_refuses_boot_and_creates_no_orphan_db_3166() {
     );
 }
 
+/// #3277 — a malformed `api_key` line must refuse the boot AND must not
+/// echo the secret. toml 0.8 Display caret-underlines the offending
+/// source line; `main` used to print `{e:#}` of the anyhow chain that
+/// wrapped that Display (#3197 closed the same leak on `config check`).
+#[test]
+fn malformed_api_key_toml_does_not_echo_secret_on_boot_3277() {
+    let sb = Sandbox::new();
+    sb.write_config("api_key = \"sekrit-must-not-leak\"unclosed\n");
+
+    let out = sb.run(&["stats", "--json"], None);
+
+    assert_eq!(
+        out.status.code(),
+        Some(EX_CONFIG),
+        "#3277: malformed api_key TOML must refuse boot with EX_CONFIG; \
+         stderr={}",
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("UNUSABLE") && stderr.contains("config parse error"),
+        "expected the redacted parse banner; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("sekrit-must-not-leak"),
+        "#3277: boot stderr must not echo api_key; stderr={stderr}"
+    );
+    assert!(
+        !sb.orphan_db().exists(),
+        "the refusal must fire before any database is opened"
+    );
+}
+
 /// An UNREADABLE config (`EACCES`) is not the documented "missing file"
 /// case: it must be surfaced, not flattened into compiled defaults.
 #[cfg(unix)]
