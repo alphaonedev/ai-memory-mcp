@@ -304,18 +304,22 @@ Priority rationale: this is the acceptance gate for every other workstream's mit
 
 > Source: Dave Blundin, https://x.com/DaveBlundin/status/2092731291087069433 ("5,000 copies of the same agent … a harebrained idea propagates across the whole swarm … $50,000 of tokens"). Two failure classes routed through shared memory: (A) groupthink cascade — one agent's wrong conclusion recalled by all as established; (B) memory contamination — wrong/stale/poisoned memories reaching every reader. v1.0.0 GA makes a cascade attributable, boundable and reversible (provenance + lineage, namespaces/quotas/enforce, contradiction detection, record-stop, invalidate-not-delete + dependents, replay, checkpoints/frozen routines) but does not make it hard to start.
 
-**Current state:** v1.0.0 GA can *attribute, bound, and reverse* a cascade once it is recognized. It does not make starting one hard. Shared-memory recall has no corroboration floor, no writer-diversity signal, no cascade detector, and no swarm rewind.
+**Current state:** v1.0.0 GA can *attribute, bound, and reverse* a cascade once it is recognized. It does not make starting one hard. Shared-memory recall has no corroboration floor, no writer-diversity signal, no cascade detector, and no swarm rewind. The access-fold is an echo amplifier: repeated recall of an uncorroborated claim raises its rank, so a 2×/3× ledger write makes the cascade 2×/3× worse.
 
-**v1.1.0 items** (acceptance criteria in #3266; 3×7 vote record attached there):
+**v1.1.0 items — R1–R6** (consolidated from the 3×7 vote on #3266, [header + 21 records](https://github.com/alphaonedev/ai-memory-mcp/issues/3266#issuecomment-5433563173); folded here from [PR #3257 comment 5433573635](https://github.com/alphaonedev/ai-memory-mcp/issues/3257#issuecomment-5433573635). This supersedes the pre-vote R1–R6 sketch: the measuring rig is now R1, not R6; default flip is last.)
 
-- **R1** namespace `require_corroboration` + quarantine tier + independent-writer rule (identity + model-version distinctness).
-- **R2** writer-diversity / lineage-depth confidence signals + automatic `contaminated` propagation on invalidation.
-- **R3** cascade detector (same-claim burst, contradiction storm, fan-out) with signed signals + optional auto record-stop.
-- **R4** `memory_swarm_rewind` + per-lineage token/cost accounting.
-- **R5** multi-agent/federation profile defaults ON.
-- **R6** synthetic same-DNA cascade benchmark + cert addendum.
+All seven judges converged on the same core items (7–10 each); consolidated into six, in dependency order. Every item extends shipped prior art (decorrelation gate #1870-class, `prior_corroboration_count` #1767, `recall_observations` #886/#1705, the signed_events spine) — **no parallel machinery**. North-Star constraints on every item: no data loss, no corruption, fail-closed, manageable at swarm scale.
 
-**Constraints:** fail-closed, no data loss, backend parity, certified 500–1000-agent scope. Default-OFF until the R6 harness produces a committed number (same measurement gate as w5). No schema migration unless named in #3266.
+- **R1 — SWARM-BENCH: the measuring rig ships FIRST.** Synthetic monoculture cascade harness (same-DNA agent fleet, seeded bad claim, measured propagation / containment / rewind cost) + a **published v1.0.0 baseline**. Every later item is gated on moving these numbers; the harness result gates the v1.1.0 tag last. Acceptance: reproducible baseline report checked into the repo. (This is w8's own measuring rig, distinct from w5 MemTrapBench — cascade contamination vs use-time trap semantics.)
+- **R2 — Claim lifecycle + independence-aware corroboration ledger.** `asserted → corroborated → established`, with corroboration counted only from structurally independent sources: attested distinct keys + lineage-disjoint evidence (echoes excluded over `derives_from`) + attested-model-family discount. Adds the missing `supports` relation. Extends the reflection-lane quorum gate to claim-kind writes.
+- **R3 — Epistemically-weighted recall.** Replace the caller-asserted confidence term with **effective confidence** (bare claims default ~0.6, never 1.0 — kills the `DEFAULT_CONFIDENCE=1.0` defect); add a provenance/corroboration term to ranking (provenance stops being "decoration only"); **neutralize the access-fold amplifier** for uncorroborated claims (distinct-attested-reader folding, Sybil-closed). Shadow-release the new ranking first, then flip the default.
+- **R4 — Containment: quarantine + transitive taint.** Make `quarantined`/probation reachable for LOCAL writes (today only federation ingress can set it); `quarantine-by-lineage` + `kg_invalidate --cascade` with dry-run and push notification via the shipped invalidation webhook; dequarantine as an explicit ceremony.
+- **R5 — Detection + forensics.** `cascade_watch`: LLM-free detectors — same-claim burst × monoculture ratio, fan-out velocity, writer dominance, contradiction storm — with **compiled numeric budgets** and signed Alert broadcast; upgrade the `recall_observations` contract to forensic grade (identity-mandatory, implicated-row retention exemption, all-paths coverage gate); chain-anchored cost accounting with per-lineage burn rollup (the Blundin "$50,000 of tokens" number becomes queryable).
+- **R6 — Intercept + rewind + swarm-safe defaults.** Scoped record-stop **with read-freeze** (today reads stay live during a stop); one-command rewind on the append-only spine verified by AS-OF recall + a blast-radius report ("which agents were served the poison", from R5's ledger); flip the swarm-safety defaults; `doctor --swarm`; `docs/honest-limits` + certification addendum + claims audit stating plainly what a memory layer can never do (Stage 1 formation is the model's problem — ai-memory makes dissent cheap, corroboration required, and reversal lossless).
+
+**Sequencing (inside w8):** R1 first (rig + v1.0.0 baseline), R2→R3 (epistemics), R4/R5 parallel, R6 last (defaults flip only after shadow data). Proof: SWARM-BENCH baseline vs post-R6 run must show contamination containment and rewind cost reduced by the margins recorded in the judge ballots.
+
+**Constraints:** fail-closed, no data loss, backend parity, certified 500–1000-agent scope. Default-OFF until R1 publishes the v1.0.0 baseline and a post-change run with `evidence_grade: "real"` moves the numbers (same measurement gate as w5). No schema migration unless named in #3266.
 
 **Effort:** L (issue-sized; vote + design live on #3266).
 
@@ -378,7 +382,7 @@ The paper's discipline applies to us: **no mechanism in this roadmap may be clai
 - **No schema migrations.** Origin/applicability stamps are reserved metadata-key conventions (`KindProvenance` precedent); recall-side work is response-layer or existing-bind-parameter only.
 - **sqlite/postgres parity** is structural where possible (pure helpers over fetched rows) and pg-lane-tested (mTLS :5445, `--include-ignored`) where not; the two open routing premises (pg path through `decorate_memory_many`; pg SAL ORDER BY anchor for kind weights) are BLOCKING audit items in their issues, not assumptions.
 - **Federation:** validation/enforcement applies at authoring surfaces only; replicated ingest accepts peer rows verbatim (conservation-of-peer-corpus) — a peer must never silently lose a row it cannot re-validate.
-- **Sequencing:** P1 first (w5 harness, w1 advisory, w2 columns — independently landable; w1's cross-session counts degrade honestly to all-unknown until w3). P2 next (w3 stamp unlocks w1's full value; w4; w6; w8 swarm/hive groupthink — #3266). P3 (w7) can land any time after w5's SSOT contract exists. Nothing here blocks or is blocked by the v1.0.0 GA queue.
+- **Sequencing:** P1 first (w5 harness, w1 advisory, w2 columns — independently landable; w1's cross-session counts degrade honestly to all-unknown until w3). P2 next (w3 stamp unlocks w1's full value; w4; w6; w8 swarm/hive groupthink — #3266, itself sequenced R1 rig → R2/R3 epistemics → R4/R5 parallel → R6 defaults last). P3 (w7) can land any time after w5's SSOT contract exists. Nothing here blocks or is blocked by the v1.0.0 GA queue.
 
 ## Considered and rejected
 
@@ -399,5 +403,6 @@ Recorded per the synthesis rules (majority-REJECT or explicit descope with reaso
 - Wang, M.; Luo, H.; Xu, Z.; Cui, Z.; Xu, H.; Yang, Q.; Fang, J.; Fang, J.; Zhang, N. 2026. *MemTrapBench: Benchmarking Cognitive Traps in LLM Memory Use.* arXiv:2608.20202. Code/data: https://github.com/zjunlp/MemTrapBench (unreleased at time of writing; the w5 adapter fails closed on unknown formats).
   - Short cite for code comments (verbatim, SSOT): `MemTrapBench (Wang et al. 2026, arXiv:2608.20202)`
 - Process record: 7 workstream drafts + 21 adversarial ballots (3 lenses × 7 workstreams: north-star/integrity, code-grounding, trap-mitigation/claims-truth), all REVISE, all REQUIRED-CHANGES applied above; produced by the ox-alpha roadmap lab, 2026-08-23, synthesized and reviewed by Fable 5. Lane artifacts: `.local-runs/ox-c9-{rmdraft,rmvote,rmauthor}/` (not shipped).
+- #3266 3×7 vote (21 records + R1–R6 consolidation): https://github.com/alphaonedev/ai-memory-mcp/issues/3266#issuecomment-5433563173 ; folded into this document from https://github.com/alphaonedev/ai-memory-mcp/issues/3257#issuecomment-5433573635 .
 
 <!-- Provenance: authored from MemTrapBench (Wang et al. 2026, arXiv:2608.20202) analysis vs ai-memory v1.0.0 tip 8fb6e9eb; grounded file:line cites verified by 21-ballot adversarial review; final review + tail sections by Fable 5. -->
