@@ -604,22 +604,59 @@ pub fn redact_metadata_values(meta: &serde_json::Value) -> Option<serde_json::Va
     if screen_mode() == SecretScreenMode::Off {
         return None;
     }
-    redact_value_leaves(meta)
+    redact_value_leaves(meta, CarveOutMode::TrustedByName)
+}
+
+/// #3269 — the trust disposition the JSON-leaf recursion applies to the
+/// [`METADATA_SCREEN_CARVE_OUT_KEYS`] / `_b64` name carve-out.
+///
+/// The carve-out was introduced by #1844 to protect the #626 / #1464
+/// attestation ENVELOPE — legitimate base64 Ed25519 signatures / pubkeys and
+/// attestation JWTs the machinery writes into a memory's `metadata` — from
+/// being false-refused or mangled by the anchored credential detectors (a
+/// random base64 blob can incidentally contain an `sk-` / `ghp_` / `AKIA`
+/// prefix, and an attestation JWT trips the `eyJ…` detector). That was written
+/// for a TRUSTED LOCAL WRITER. On the federation-RECEIVE path the writer is a
+/// hostile peer, and a name-based skip is 100% attacker-controllable: a peer
+/// renames a key to end in `_b64` (or reuses an exact carve-out key) and the
+/// whole value — including a nested object subtree of credentials — is inserted
+/// verbatim, unscreened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarveOutMode {
+    /// Trusted local writer (#1844): honour the name carve-out exactly as
+    /// shipped — a carve-out key's value is exempted wholesale (string, array,
+    /// or object). Used by the caller-origin redact path
+    /// ([`redact_metadata_values`], via `screen_json_field_for_caller`) and the
+    /// memory storage funnel ([`redact_memory_for_storage`]), whose `metadata`
+    /// legitimately carries the attestation envelope. Preserves the convergence
+    /// guarantee pinned by the #1844 funnel test (an attestation JWT under a
+    /// `_b64` key survives byte-identical).
+    TrustedByName,
+    /// Hostile federation-receive writer (#3269): the name carve-out is
+    /// DISABLED — every string leaf is screened and every subtree recursed,
+    /// regardless of key name. Used ONLY on the coordination receive path
+    /// (a signal's `body` / `reference_ids`, a checkpoint's `condition` /
+    /// `metadata`), where the cryptographic attestation lives in DEDICATED
+    /// columns (`signature`/`sender_pubkey`, `signature`/`resolver_pubkey`) and
+    /// NEVER inside the screened JSON — so the name carve-out protects nothing
+    /// here and only opens the bypass.
+    ScreenAll,
 }
 
 /// Recursive worker for [`redact_metadata_values`]. Returns `Some(rebuilt)`
 /// only when a descendant string leaf was actually redacted, so the clean
-/// path keeps the caller's original value (zero rebuild).
-fn redact_value_leaves(val: &serde_json::Value) -> Option<serde_json::Value> {
+/// path keeps the caller's original value (zero rebuild). `mode` selects
+/// whether the name carve-out is honoured (see [`CarveOutMode`]).
+fn redact_value_leaves(val: &serde_json::Value, mode: CarveOutMode) -> Option<serde_json::Value> {
     match val {
         serde_json::Value::String(s) => redact_for_storage(s).map(serde_json::Value::String),
         serde_json::Value::Object(map) => {
             let mut changed = false;
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
-                if metadata_key_is_carved_out(k) {
+                if mode == CarveOutMode::TrustedByName && metadata_key_is_carved_out(k) {
                     out.insert(k.clone(), v.clone());
-                } else if let Some(red) = redact_value_leaves(v) {
+                } else if let Some(red) = redact_value_leaves(v, mode) {
                     changed = true;
                     out.insert(k.clone(), red);
                 } else {
@@ -632,7 +669,7 @@ fn redact_value_leaves(val: &serde_json::Value) -> Option<serde_json::Value> {
             let mut changed = false;
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
-                if let Some(red) = redact_value_leaves(v) {
+                if let Some(red) = redact_value_leaves(v, mode) {
                     changed = true;
                     out.push(red);
                 } else {
@@ -643,6 +680,21 @@ fn redact_value_leaves(val: &serde_json::Value) -> Option<serde_json::Value> {
         }
         _ => None,
     }
+}
+
+/// #3269 — federation-RECEIVE JSON redact: screens EVERY string leaf with the
+/// #1844 name carve-out DISABLED ([`CarveOutMode::ScreenAll`]), so a hostile
+/// peer cannot smuggle a credential past the screen under an attacker-chosen
+/// `*_b64` / carve-out key name (as a bare string leaf OR a nested object
+/// subtree). Returns `Some(rebuilt)` only when a leaf actually changed.
+///
+/// The caller MUST gate on `screen_mode() == Off` first (the coordination
+/// entrypoints [`redact_signal_for_storage`] / [`redact_checkpoint_for_storage`]
+/// / [`redact_pending_action_for_storage`] already do), so this helper is only
+/// reached under a non-`Off` mode.
+#[must_use]
+fn redact_json_for_receive(val: &serde_json::Value) -> Option<serde_json::Value> {
+    redact_value_leaves(val, CarveOutMode::ScreenAll)
 }
 
 /// STORAGE-funnel WHOLE-ROW redact (#1844): masks credential material in
@@ -783,10 +835,19 @@ const COORD_SCREEN_TRACE_TARGET: &str = "secret.redacted";
 /// is clean or screening is `Off`.
 ///
 /// `subject` and `sha256(body)` are both inside
-/// [`crate::identity::sign::SignableSignal`], so any redaction invalidates
-/// the wire signature: the returned clone therefore has `signature` and
-/// `sender_pubkey` CLEARED (#2340 discipline — an honestly-unsigned row
-/// beats one whose signature cannot cover its own stored bytes).
+/// [`crate::identity::sign::SignableSignal`], so a redaction of EITHER
+/// invalidates the wire signature: the returned clone then has `signature` and
+/// `sender_pubkey` CLEARED (#2340 discipline — an honestly-unsigned row beats
+/// one whose signature cannot cover its own stored bytes).
+///
+/// `reference_ids` (#3278) is an arbitrary peer-controlled JSON value that is
+/// **not** a [`crate::identity::sign::SignableSignal`] field, so it is screened
+/// too and a hit there is FREE — it never touches the signed surface, so the
+/// attestation is preserved when only `reference_ids` changes. `body` /
+/// `reference_ids` are screened with the name carve-out DISABLED
+/// ([`redact_json_for_receive`]) — a signal's attestation is in
+/// `signature`/`sender_pubkey`, never inside this JSON, so the #1844 carve-out
+/// protects nothing here and would only reopen the #3269 renamed-key bypass.
 #[must_use]
 pub fn redact_signal_for_storage(sig: &crate::models::Signal) -> Option<crate::models::Signal> {
     if screen_mode() == SecretScreenMode::Off {
@@ -795,7 +856,8 @@ pub fn redact_signal_for_storage(sig: &crate::models::Signal) -> Option<crate::m
     fold_screened_signal(
         sig,
         redact_for_storage(&sig.subject),
-        redact_metadata_values(&sig.body),
+        redact_json_for_receive(&sig.body),
+        redact_json_for_receive(&sig.reference_ids),
     )
 }
 
@@ -807,10 +869,14 @@ fn fold_screened_signal(
     sig: &crate::models::Signal,
     subject: Option<String>,
     body: Option<serde_json::Value>,
+    reference_ids: Option<serde_json::Value>,
 ) -> Option<crate::models::Signal> {
-    if subject.is_none() && body.is_none() {
+    if subject.is_none() && body.is_none() && reference_ids.is_none() {
         return None;
     }
+    // Only `subject` + `body` are inside the signed canonical bytes; a
+    // `reference_ids`-only hit must NOT drop the still-valid attestation.
+    let signed_surface_mutated = subject.is_some() || body.is_some();
     let mut out = sig.clone();
     if let Some(subject) = subject {
         out.subject = subject;
@@ -818,9 +884,11 @@ fn fold_screened_signal(
     if let Some(body) = body {
         out.body = body;
     }
-    // Every screened signal field is inside the signed canonical bytes, so a
-    // hit ALWAYS invalidates the presented signature.
-    if !out.signature.is_empty() || !out.sender_pubkey.is_empty() {
+    if let Some(reference_ids) = reference_ids {
+        out.reference_ids = reference_ids;
+    }
+    // A redaction of a SIGNED signal field invalidates the presented signature.
+    if signed_surface_mutated && (!out.signature.is_empty() || !out.sender_pubkey.is_empty()) {
         tracing::warn!(
             target: COORD_SCREEN_TRACE_TARGET,
             signal_id = %sig.id,
@@ -864,10 +932,14 @@ pub fn redact_checkpoint_for_storage(
     fold_screened_checkpoint(
         cp,
         redact_for_storage(&cp.title),
-        redact_metadata_values(&cp.condition),
+        // #3269 — `condition` / `metadata` are unsigned peer-controlled JSON
+        // (only `resolution` is inside `SignableCheckpointResolution`), so they
+        // are screened with the name carve-out DISABLED to close the renamed-key
+        // bypass. No attestation lives in this JSON, so nothing is mangled.
+        redact_json_for_receive(&cp.condition),
         cp.resolution.as_deref().and_then(redact_for_storage),
         cp.resolution_note.as_deref().and_then(redact_for_storage),
-        redact_metadata_values(&cp.metadata),
+        redact_json_for_receive(&cp.metadata),
     )
 }
 
@@ -918,6 +990,45 @@ fn fold_screened_checkpoint(
         out.signature.clear();
         out.resolver_pubkey.clear();
     }
+    Some(out)
+}
+
+/// FEDERATION-RECEIVE screen for an inbound `/sync/push` pending action
+/// (#3278).
+///
+/// The `pendings[]` lane persists the arbitrary peer-controlled `payload` JSON
+/// (an approve-later governance request) via [`crate::db::upsert_pending_action`]
+/// — surfaced by the approvals API and the K10 SSE stream, and whose executor
+/// sink is, by the lane's own comment, "strictly more destructive than
+/// `memories[]`" — with NO secret screen before this. Screens every `payload`
+/// string leaf with the name carve-out DISABLED ([`redact_json_for_receive`]):
+/// a [`crate::models::PendingAction`] carries NO signed canonical bytes, so
+/// there is no attestation to drop and the redaction is FREE. NEVER refuses (a
+/// refused inbound row would diverge replicas — the #1821 lesson the sibling
+/// coordination helpers follow). Returns `None` (zero-copy) when the payload is
+/// clean or screening is `Off`.
+///
+/// Screen the row AFTER the lane's authorship / namespace-scope gates
+/// ([`crate::handlers::federation_receive::pending_author_authorized`] and the
+/// namespace confinement) so those still read the exact bytes the peer sent —
+/// credential-shaped agent-ids / namespaces are not detector matches, so the
+/// screen leaves the gate-relevant keys intact regardless.
+#[must_use]
+pub fn redact_pending_action_for_storage(
+    pa: &crate::models::PendingAction,
+) -> Option<crate::models::PendingAction> {
+    if screen_mode() == SecretScreenMode::Off {
+        return None;
+    }
+    let payload = redact_json_for_receive(&pa.payload)?;
+    tracing::warn!(
+        target: COORD_SCREEN_TRACE_TARGET,
+        pending_id = %pa.id,
+        "sync_push: secret screen redacted credential material from an inbound pending \
+         action payload (#3278) before upsert"
+    );
+    let mut out = pa.clone();
+    out.payload = payload;
     Some(out)
 }
 
@@ -1249,7 +1360,7 @@ mod tests {
     #[test]
     fn fold_screened_signal_redacted_subject_clears_attestation_3049() {
         let sig = sample_signal("clean subject");
-        let out = fold_screened_signal(&sig, Some(REDACTION_PLACEHOLDER.to_string()), None)
+        let out = fold_screened_signal(&sig, Some(REDACTION_PLACEHOLDER.to_string()), None, None)
             .expect("hit must clone");
         assert_eq!(out.subject, REDACTION_PLACEHOLDER);
         assert!(
@@ -1263,10 +1374,28 @@ mod tests {
     fn fold_screened_signal_clean_is_none_3049() {
         let sig = sample_signal("clean subject");
         assert!(
-            fold_screened_signal(&sig, None, None).is_none(),
+            fold_screened_signal(&sig, None, None, None).is_none(),
             "clean signal is a zero-copy None so the receive loop binds the original"
         );
         assert!(!sig.signature.is_empty(), "fixture itself stays signed");
+    }
+
+    /// #3278 — a hit confined to `reference_ids` (NOT a `SignableSignal` field)
+    /// updates the field but PRESERVES the still-valid attestation.
+    #[test]
+    fn fold_screened_signal_reference_ids_only_hit_preserves_attestation_3278() {
+        let sig = sample_signal("clean subject");
+        let redacted_refs = serde_json::json!([REDACTION_PLACEHOLDER]);
+        let out = fold_screened_signal(&sig, None, None, Some(redacted_refs.clone()))
+            .expect("reference_ids hit must clone");
+        assert_eq!(out.reference_ids, redacted_refs);
+        assert_eq!(
+            out.signature, sig.signature,
+            "a reference_ids-only hit is outside the signed surface and MUST keep the signature"
+        );
+        assert_eq!(out.sender_pubkey, sig.sender_pubkey);
+        assert_eq!(out.subject, sig.subject, "un-hit subject preserved");
+        assert_eq!(out.body, sig.body, "un-hit body preserved");
     }
 
     #[test]

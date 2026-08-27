@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (federation-receive secret screen — carve-out bypass + completeness)
+
+- **`#3269` (HIGH) — the federation-receive secret screen is no longer
+  bypassable by an attacker-chosen metadata key name.** The `#1844` credential
+  carve-out (`METADATA_SCREEN_CARVE_OUT_KEYS` / any `*_b64` key) was designed
+  to protect a TRUSTED local writer's attestation envelope (legitimate base64
+  Ed25519 signatures / pubkeys / attestation JWTs) from the anchored detectors.
+  On the federation-RECEIVE path the writer is a hostile peer, and the name
+  carve-out let it smuggle a credential past the screen — as a bare string OR a
+  whole nested object subtree — under a renamed `*_b64` / carve-out key (e.g.
+  `signals[0].body = {"x_b64": {"aws": "AKIA…"}}`), landing verbatim in the
+  `signals` / `checkpoints` tables. The coordination receive helpers
+  (`redact_signal_for_storage`, `redact_checkpoint_for_storage`) now screen the
+  peer JSON with the name carve-out DISABLED (`CarveOutMode::ScreenAll`) —
+  every string leaf screened, every subtree recursed — which is safe there
+  because a signal's / checkpoint's cryptographic attestation lives in dedicated
+  columns, never inside the screened JSON. The trusted-local caller path and the
+  memory storage funnel keep the `#1844` name carve-out byte-identical (its
+  convergence pin still passes).
+- **`#3278` (MEDIUM) — the same `/sync/push` receive path now screens the
+  previously-unscreened peer-controlled fields.** `Signal.reference_ids`
+  (arbitrary JSON, not a `SignableSignal` field, so its redaction is free and
+  never drops the attestation) and `pendings[].payload` (the approvals-API /
+  K10-SSE-surfaced governance-request JSON, whose executor sink is strictly
+  more destructive than `memories[]`) are now redacted before persistence.
+- **Backend parity:** the postgres `sync_push_via_store` funnel now applies the
+  same signal secret screen before `apply_remote_signal` — the `#3049` signal
+  screen was sqlite-only, so a pg-backed receiver persisted signal
+  `subject`/`body`/`reference_ids` verbatim. Both backends now screen inbound
+  coordination rows identically. Pins:
+  `sync_push_signal_body_b64_carveout_subtree_is_redacted_3269`,
+  `sync_push_signal_reference_ids_secret_is_redacted_3278`,
+  `sync_push_pending_payload_secret_is_redacted_3278`,
+  `fold_screened_signal_reference_ids_only_hit_preserves_attestation_3278`.
+
 ### Fixed (HTTP postgres double-counted the access ledger)
 
 - **HTTP postgres recall no longer writes the `recall_observations` ledger twice.**

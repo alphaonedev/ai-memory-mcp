@@ -3166,6 +3166,16 @@ pub async fn sync_push(
                 continue;
             }
         }
+        // #3278 — federation-RECEIVE secret screen for the pending-action
+        // payload. The authorship (#1920) + namespace-scope (#2478) gates above
+        // read the ORIGINAL bytes; the screen runs here, AFTER them and BEFORE
+        // the upsert, so a credential in the arbitrary peer-controlled `payload`
+        // (surfaced by the approvals API + K10 SSE stream, and whose executor
+        // sink is strictly more destructive than `memories[]`) is masked before
+        // it is persisted. REDACT-only — a `PendingAction` carries no signed
+        // canonical bytes, so there is nothing to drop and nothing to diverge.
+        let screened_pa = crate::secret_screen::redact_pending_action_for_storage(pa);
+        let pa = screened_pa.as_ref().unwrap_or(pa);
         match db::upsert_pending_action(&lock.0, pa) {
             Ok(()) => {
                 pendings_applied += 1;
