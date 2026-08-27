@@ -14,9 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claim lifecycle, epistemically-weighted recall / access-fold neutralization,
   quarantine + taint, cascade_watch forensics, intercept/rewind/swarm-safe
   defaults) recorded as a P2 workstream, superseding the pre-vote sketch.
+  Numbering IS the #3266 R-list (R1 = harness-first). Headline defects named
+  first-class: `DEFAULT_CONFIDENCE = 1.0` and the `access_count` echo amplifier.
   v1.0.0 GA can attribute/bound/reverse a cascade; v1.1.0 is what makes one
   hard to start. Vote record: #3266 issuecomment-5433563173; folded from
-  PR #3257 comment 5433573635.
+  PR #3257 comment 5433573635; Fable review notes 5439215947.
 - **Learn ai-memory** section on the docs site (`docs/learn/`): a hub plus three
   audience tracks — end users (singleton / small agent setups), C-level
   decision makers (decision-mapped), and engineers/architects/scientists
