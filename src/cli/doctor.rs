@@ -5370,6 +5370,48 @@ enabled = true
         );
     }
 
+    /// Text (non-JSON) renderer of `doctor --posture`. The JSON tests
+    /// above never enter the `else` arm that prints `[FAIL]` / `fix:` /
+    /// `overall: FAIL`. After #3267 grew this file, Per-Module Coverage
+    /// on #3239 measured 89.87% < the 90% floor; this pins the operator
+    /// path so the floor holds (TEST-01/02, ERRORS-24).
+    #[test]
+    fn run_posture_enterprise_federation_text_report_names_fail_and_fix() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::doctor::tests::run_posture_enterprise_federation_text_report_names_fail_and_fix",
+        ) {
+            return;
+        }
+        let _g = posture_env_lock();
+        clear_posture_env();
+        let _cleanup = PostureEnvGuard;
+
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let exit = run_posture(
+            crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION,
+            false,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(exit, 2, "a bare env must exit non-zero (§5.4(2))");
+        let stdout_str = String::from_utf8(stdout).unwrap();
+        assert!(
+            stdout_str.contains("[FAIL]"),
+            "text report must name FAIL rows: {stdout_str}"
+        );
+        assert!(
+            stdout_str.contains("fix:"),
+            "text report must carry remediation: {stdout_str}"
+        );
+        assert!(
+            stdout_str.contains("overall: FAIL"),
+            "text report must close with overall FAIL: {stdout_str}"
+        );
+        drop(stderr);
+    }
+
     /// PASSES on a fully-hardened env (asi-hard engaged + every
     /// federation-specific §5.3 addition satisfied). Skips only the
     /// at-rest-encryption row when this test binary was not compiled
