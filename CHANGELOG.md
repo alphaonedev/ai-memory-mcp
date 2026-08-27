@@ -42,6 +42,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sync_push_pending_payload_secret_is_redacted_3278`,
   `fold_screened_signal_reference_ids_only_hit_preserves_attestation_3278`.
 
+### Fixed (erasure / tombstone data-integrity — #3272 / #3286)
+
+- **`#3272` C-1 (HIGH) — a federated deletion of an already-gone id again
+  severs `namespace_meta` unconditionally.** `#3253` regressed the
+  `#2493`/`#2503` contract by short-circuiting `pg_hard_delete_in_tx` /
+  `delete_inner` before the namespace-standard SEVER when the live row was
+  already gone. An inbound `deletions[]` naming an id whose row had vanished
+  locally but whose `namespace_meta.standard_id` still dangled (`#1642`) left
+  the dangling pointer intact → governance resolved allow-on-silence instead of
+  the `#2503` severed floor. The SEVER now runs unconditionally (idempotent
+  no-op when nothing points there), before the row-existence probe, on both
+  backends; only the forget-tombstone / crypto-erase stays gated on the row
+  existing.
+- **`#3272` C-2 (HIGH) — a curator/operator rollback no longer leaves the
+  restored original permanently federation-deaf.** `consolidate`'s hard-delete
+  arm (`#3192`) tombstones every source id; `reverse_rollback_entry`
+  (`Consolidate`/`Forget`) re-inserts the originals via `insert_restore_same_id`
+  / `restore_or_conflict`, which did not clear the `forget_tombstones` row — so
+  `insert_if_newer` dropped every inbound federated write for the restored id
+  and the Portability-v2 importer refused it, silently. The sanctioned
+  restore-only funnel (the `RestoreSameId` conflict arm) now clears the forget
+  tombstone on both backends. Gated strictly to that arm, so a normal federation
+  apply / import never clears it — LWW resurrection of a genuinely-deleted id
+  stays refused.
+- **`#3286` (MEDIUM) — TTL/byte-cap eviction no longer leaves crypto-erase
+  remanence.** The `federation_push_dlq` cleartext + `transcript_line_dedup`
+  content-hash oracle purge (`#3192`) lived only in the delete funnel, so
+  `gc`/`size_gc` eviction left an evicted encrypted row's undelivered DLQ
+  cleartext and content-hash oracle behind after "crypto-erase". The purge now
+  lives in the shared `tombstone_and_erase` primitive (sqlite) and a shared
+  `pg_purge_dlq_dedup_in_tx` SSOT routed from the delete, evict, and forget
+  funnels (postgres), so no hard-delete funnel can skip it.
+
 ### Fixed (HTTP postgres double-counted the access ledger)
 
 - **HTTP postgres recall no longer writes the `recall_observations` ledger twice.**

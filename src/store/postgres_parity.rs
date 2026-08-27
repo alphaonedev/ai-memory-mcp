@@ -37,7 +37,8 @@ use sqlx::Row;
 
 use crate::models::Memory;
 use crate::store::postgres::{
-    MEMORY_READ_COLUMNS, PgSignedEventInsert, pg_append_signed_event_with_chain_in_tx, to_store_err,
+    MEMORY_READ_COLUMNS, PgSignedEventInsert, pg_append_signed_event_with_chain_in_tx,
+    pg_purge_dlq_dedup_in_tx, to_store_err,
 };
 use crate::store::{StoreError, StoreResult};
 
@@ -200,6 +201,11 @@ pub(crate) async fn export_memories_keyset(
 ///    recorded as `RowDeletedTombstoned` rather than `KeyDestroyed`.
 /// 2. **scrubs the `cid_genesis` pre-image** (erasure invariant parity with
 ///    `forget`).
+/// 2b. #3286 — **purges the non-cascaded remanence** (`federation_push_dlq`
+///    cleartext + `transcript_line_dedup` content-hash oracle) via the shared
+///    [`crate::store::postgres::pg_purge_dlq_dedup_in_tx`] SSOT, so an evicted
+///    encrypted row keeps neither oracle after crypto-erase (parity with the
+///    `delete` / `forget` funnels, which already purged).
 /// 3. appends a signed `substrate.crypto_erase` **erasure attestation**
 ///    committing `{id, erasure-kind, actor, timestamp}`.
 /// 4. inserts the mandatory signed **forget tombstone** — the federation
@@ -253,6 +259,17 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
     .execute(&mut **tx)
     .await
     .map_err(|e| to_store_err("evict scrub cid_genesis", e))?;
+
+    // (2b) #3286 — purge the two NON-cascaded crypto-erase remanence tables
+    // (`federation_push_dlq` cleartext + `transcript_line_dedup` content-hash
+    // oracle) via the shared SSOT. The `delete` twin
+    // (`pg_tombstone_and_erase_in_tx`) and the `forget` reap already do this;
+    // eviction previously did NOT, so a TTL/byte-cap-evicted encrypted row kept
+    // its content-hash oracle and any undelivered DLQ cleartext after the
+    // "crypto-erase". Same tx as the erase + tombstone below.
+    pg_purge_dlq_dedup_in_tx(tx, &ids)
+        .await
+        .map_err(|e| to_store_err("evict purge dlq/dedup remanence", e))?;
 
     // (3) Signed erasure attestation per victim.
     let ts = now.to_rfc3339();
