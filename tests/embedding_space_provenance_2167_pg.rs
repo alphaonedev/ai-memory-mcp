@@ -137,6 +137,8 @@ async fn pg_recall_never_scores_foreign_space_2167() {
         // #2580 — metadata-equality pushdown axis unused on this path.
         metadata_eq: None,
         source_uri: None,
+        // #3240 D1 — recall path, not the double-writing HTTP recall funnel.
+        skip_access_ledger: false,
     };
     let results = store
         .recall_hybrid(&ctx, "zzznomatchtokenzzz", Some(&vec), &filter)

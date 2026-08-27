@@ -93,6 +93,8 @@ fn filter(ns: &str, valid_at: Option<&str>) -> Filter {
         // #2580 — metadata-equality pushdown axis unused on this path.
         metadata_eq: None,
         source_uri: None,
+        // #3240 D1 — this recall path is not the double-writing HTTP funnel.
+        skip_access_ledger: false,
     }
 }
 

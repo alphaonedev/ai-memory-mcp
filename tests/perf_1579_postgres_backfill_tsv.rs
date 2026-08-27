@@ -424,6 +424,8 @@ async fn b2_search_still_returns_matches_through_sal() {
         // #2580 — metadata-equality pushdown axis unused on this path.
         metadata_eq: None,
         source_uri: None,
+        // #3240 D1 — search path, not the double-writing HTTP recall funnel.
+        skip_access_ledger: false,
     };
     let hits = store
         .search(&ctx, "substrate recall", &filter)
