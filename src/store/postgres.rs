@@ -23336,37 +23336,45 @@ impl MemoryStore for PostgresStore {
         // downstream signal could not be recorded would trade a working read
         // for a bookkeeping row. The discard is explicit, never a dropped
         // `Result` (ERRORS-19).
-        let candidates: Vec<(String, String, i64, f64)> = results
-            .iter()
-            .enumerate()
-            .map(|(i, (m, score))| {
-                (
-                    m.id.clone(),
-                    if query_embedding.is_some() {
-                        "hybrid"
-                    } else {
-                        "keyword"
-                    }
-                    .to_string(),
-                    i64::try_from(i + 1).unwrap_or(i64::MAX),
-                    *score,
-                )
-            })
-            .collect();
-        if !candidates.is_empty() {
-            let recall_id = uuid::Uuid::new_v4().to_string();
-            if let Err(e) = self
-                .recall_observation_insert(
-                    &recall_id,
-                    &candidates,
-                    Some(ctx.effective_principal()),
-                    filter.namespace.as_deref(),
-                )
-                .await
-            {
-                tracing::warn!(
-                    "recall_hybrid (SAL-postgres): ledger append failed (non-fatal): {e}"
-                );
+        //
+        // `skip_access_ledger`: HTTP postgres sets this so the handler, not
+        // this method, is the single writer — it records the POST-form4 /
+        // kinds / rerank set under the `recall_id` the response echoes.
+        // Recording here AND in the handler double-counted every HTTP hit
+        // (two recall_ids) and the access fold amplified recall 2×.
+        if !filter.skip_access_ledger {
+            let candidates: Vec<(String, String, i64, f64)> = results
+                .iter()
+                .enumerate()
+                .map(|(i, (m, score))| {
+                    (
+                        m.id.clone(),
+                        if query_embedding.is_some() {
+                            "hybrid"
+                        } else {
+                            "keyword"
+                        }
+                        .to_string(),
+                        i64::try_from(i + 1).unwrap_or(i64::MAX),
+                        *score,
+                    )
+                })
+                .collect();
+            if !candidates.is_empty() {
+                let recall_id = uuid::Uuid::new_v4().to_string();
+                if let Err(e) = self
+                    .recall_observation_insert(
+                        &recall_id,
+                        &candidates,
+                        Some(ctx.effective_principal()),
+                        filter.namespace.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "recall_hybrid (SAL-postgres): ledger append failed (non-fatal): {e}"
+                    );
+                }
             }
         }
         Ok(results)

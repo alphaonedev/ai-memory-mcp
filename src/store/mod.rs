@@ -949,6 +949,22 @@ pub struct Filter {
     /// filter. Empty string is treated as `None` by the HTTP parser
     /// before it reaches this field.
     pub source_uri: Option<String>,
+    /// v1.0.0 — skip the `recall_hybrid` access-ledger append.
+    ///
+    /// Default `false` (`#[derive(Default)]`): SAL / MCP / CLI callers
+    /// that invoke `recall_hybrid` directly still get one observation
+    /// per returned row (#3180 postgres twin of the sqlite SAL append).
+    /// Set `true` ONLY when the caller will record the POST-filter set
+    /// itself — the HTTP postgres handler applies form-4 / kinds /
+    /// rerank / session-recency AFTER `recall_hybrid` returns, then
+    /// writes the ledger under the `recall_id` echoed in the response.
+    /// Without this flag, HTTP postgres double-counted every hit
+    /// (SAL append + handler append, two `recall_id`s) and the access
+    /// fold amplified recall 2× — the #3266 echo-amplifier class.
+    /// Honoured by `recall_hybrid` on both adapters. Ignored by `list`
+    /// / `search`. Existing `..Default::default()` call sites are
+    /// byte-identical.
+    pub skip_access_ledger: bool,
 }
 
 /// The core trait. Every backend implements this; ai-memory's HTTP /
