@@ -1986,6 +1986,39 @@ pub const DEFAULT_STATEMENT_TIMEOUT_SECS: u64 = 30;
 /// which also drops the lock_timeout.
 pub const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 5;
 
+/// #3276 — TTL (milliseconds) for the WRITE-gate durable record-stop
+/// re-check on postgres. Within this window a write rides the process-local
+/// cache (one acquire-load, no DB round-trip); once per window a single
+/// elected writer re-derives the durable state from the `signed_events`
+/// chain and reconciles the cache. This bounds the fleet-wide effect
+/// latency of a stop engaged by ANOTHER daemon: `≤ TTL + one chain-read
+/// latency`, honored WITHOUT a reconnect and WITHOUT a per-write DB read.
+/// Steady-state overhead is ~one cheap chain read per TTL window per
+/// process. Smaller = faster fleet-wide freeze but more chain reads;
+/// 1000 ms trades a ~1 s cross-pool window for at most ~1 read/s/pool.
+/// The same-process effect latency is unchanged (an actuation flips the
+/// shared cache synchronously); this constant governs only cross-pool
+/// propagation via the durable chain.
+///
+/// Exposed so the #3276 live-PG parity test can pin the exact window rather
+/// than hard-coding a magic sleep duration.
+pub const RECORD_STOP_REFRESH_TTL_MS: u64 = 1000;
+
+/// #3276 — process-global monotonic baseline for the record-stop re-check
+/// clock. [`std::time::Instant`] is monotonic and unaffected by wall-clock
+/// adjustments, so elapsed-millis since this baseline is a stable TTL clock.
+static RECORD_STOP_REFRESH_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// #3276 — milliseconds since [`RECORD_STOP_REFRESH_EPOCH`], saturating at
+/// [`u64::MAX`] (a process would need to run ~584 million years to reach it).
+fn record_stop_refresh_now_ms() -> u64 {
+    // `as_millis` returns `u128`; narrow via `try_from` (never `as`), and on
+    // the impossible overflow saturate high so the value only ever appears
+    // "stale" (forcing a re-check), never spuriously "fresh".
+    u64::try_from(RECORD_STOP_REFRESH_EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// `PostgresStore` — sqlx + pgvector backend. Owns a connection pool.
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -1999,8 +2032,21 @@ pub struct PostgresStore {
     /// #1955 [P1][R45] — in-process record-stop cache for this store.
     /// Seeded from the `signed_events` chain at connect time (so a
     /// persisted stop survives restart) and flipped by
-    /// [`Self::record_stop`]. The funnel gate is a single atomic load.
+    /// [`Self::record_stop`]. The funnel gate is a single atomic load
+    /// PLUS, per #3276, a TTL-bounded durable re-check (see
+    /// [`Self::record_stop_refreshed_ms`]).
     record_stop: crate::store::record_stop::RecordStopFlag,
+    /// #3276 — last time (ms since [`RECORD_STOP_REFRESH_EPOCH`]) this
+    /// process re-derived the durable record-stop state from the
+    /// `signed_events` chain for the WRITE gate. Shared across pool
+    /// clones (an `Arc`) so every clone of this store observes and
+    /// advances ONE window, and used as a single-flight election token:
+    /// the writer that CAS-advances it past
+    /// [`RECORD_STOP_REFRESH_TTL_MS`] performs the chain read, every
+    /// other write in the window rides the cache. Closes the fail-OPEN
+    /// window where a stop engaged by ANOTHER daemon did not reach this
+    /// pool's write gate until it reconnected.
+    record_stop_refreshed_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// #1628 — wire-pinned refusal text for legacy rows with no
@@ -2602,6 +2648,13 @@ impl PostgresStore {
                 pool,
                 kg_backend,
                 record_stop: crate::store::record_stop::RecordStopFlag::default(),
+                // #3276 — seed the re-check clock to "now": the
+                // `seed_record_stop` call below establishes a fresh
+                // durable read at connect, so the first write need not
+                // immediately re-read; the next re-check fires one TTL later.
+                record_stop_refreshed_ms: std::sync::Arc::new(
+                    std::sync::atomic::AtomicU64::new(record_stop_refresh_now_ms()),
+                ),
             };
             // v1.0.0 #2445 — the ladder is skipped under the operator hatch for
             // the same reason the bootstrap is: the database is AHEAD, so there
@@ -10801,7 +10854,7 @@ impl PostgresStore {
         // this gate it landed while the record plane was STOPPED.
         // One call at the dispatcher covers CTE, Cypher, and
         // `kg_invalidate_via_store`.
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // v0.7.0 S6-M3 — AGE Cypher dispatcher. Same dual-path
         // discipline as `kg_query` / `kg_timeline`. When AGE is
         // available we set the `valid_until` property through Cypher
@@ -18521,9 +18574,74 @@ async fn record_memory_quota_batch_in_tx(
 }
 
 impl PostgresStore {
-    /// #1955 R45 — SAL write-funnel gate (one atomic load).
-    fn gate_record_stop(&self) -> StoreResult<()> {
+    /// #1955 R45 / #3276 — SAL write-funnel gate. Fail-CLOSED fleet-wide
+    /// kill switch.
+    ///
+    /// The record-stop is a DURABLE, fleet-wide "freeze all writes" control
+    /// persisted in the `signed_events` chain, so a stop engaged by ANY
+    /// daemon must freeze EVERY daemon's writes. Pre-#3276 this gate read
+    /// ONLY the process-local cache seeded once at [`Self::connect`]; on the
+    /// multi-pool deployment postgres exists for, a stop engaged by another
+    /// daemon did NOT stop this pool's HTTP/MCP writes until it reconnected —
+    /// a fail-OPEN kill switch (#3276).
+    ///
+    /// The gate now first runs a TTL-bounded, single-flight durable re-check
+    /// ([`Self::refresh_record_stop_if_stale`]) that reconciles the cache
+    /// from the chain, then evaluates the (reconciled) cache. Steady-state
+    /// cost is one acquire-load per write plus, at most once per
+    /// [`RECORD_STOP_REFRESH_TTL_MS`] window per process, one chain read — so
+    /// a remote stop is honored within `≤ TTL + one chain-read latency`
+    /// WITHOUT a reconnect and WITHOUT a per-write DB round-trip.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Stopped`] when the record plane is stopped.
+    async fn gate_record_stop(&self) -> StoreResult<()> {
+        self.refresh_record_stop_if_stale().await;
         crate::store::record_stop::gate_flag(&self.record_stop)
+    }
+
+    /// #3276 — TTL-bounded, single-flight durable re-check of the record-stop
+    /// state for the write gate.
+    ///
+    /// Fast path: if the shared re-check clock was advanced within
+    /// [`RECORD_STOP_REFRESH_TTL_MS`], return immediately (the caller rides
+    /// the process-local cache — one atomic load, no DB round-trip).
+    ///
+    /// Otherwise, elect a SINGLE refresher for this window via a
+    /// compare-exchange on the shared timestamp: only the writer that moves
+    /// the clock forward performs the chain read; concurrent writers lose the
+    /// CAS and ride the cache. This bounds the durable read to at most one per
+    /// window per process (no per-write and no thundering-herd re-read).
+    ///
+    /// Fail-CLOSED: the reconciliation reuses [`Self::seed_record_stop`],
+    /// whose read-error arm leaves the cache UNTOUCHED — so a transient chain
+    /// read failure NEVER downgrades a cached STOPPED to RUNNING; it degrades
+    /// to the last-known state (and the next window's elected writer retries).
+    /// The clock is advanced by the elected writer regardless of read outcome
+    /// so a persistent DB outage backs off to at most one probe per window
+    /// (single-flight), never a retry storm.
+    async fn refresh_record_stop_if_stale(&self) {
+        use std::sync::atomic::Ordering;
+        let now_ms = record_stop_refresh_now_ms();
+        let last = self.record_stop_refreshed_ms.load(Ordering::Acquire);
+        // Monotonic clock, but `saturating_sub` guards against any conceivable
+        // skew (e.g. the saturated-now sentinel) rather than wrapping.
+        if now_ms.saturating_sub(last) < RECORD_STOP_REFRESH_TTL_MS {
+            return; // within TTL — ride the cache (the cheap steady-state path)
+        }
+        // Elect a single refresher: AcqRel on success publishes the new clock;
+        // Acquire on failure observes the winner's write (CONCURRENCY-09).
+        if self
+            .record_stop_refreshed_ms
+            .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // another concurrent writer owns this window's refresh
+        }
+        // Winner: re-derive the durable state and reconcile the cache. On a
+        // read error `seed_record_stop` leaves the cache as-is (fail-closed).
+        self.seed_record_stop().await;
     }
 
     /// v1.0.0 #3180 / #3175 — append ONE `pending_action.<state>` audit row
@@ -18743,7 +18861,7 @@ impl MemoryStore for PostgresStore {
     /// the state change without the audit — the #1552 SAL-port-fanout failure
     /// mode this method is explicitly written against.
     async fn operator_dequarantine(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         let mut tx = self
             .pool
             .begin()
@@ -18888,7 +19006,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
         // parity with the sqlite db::insert funnel). No-op unless screening
         // was seeded non-`off` and content carries credential material.
@@ -19339,7 +19457,7 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         memories: &[Memory],
     ) -> StoreResult<Vec<String>> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         if memories.is_empty() {
             return Ok(Vec::new());
         }
@@ -19917,7 +20035,7 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         write: &CaptureTurnWrite,
     ) -> StoreResult<CaptureTurnResult> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // Step 1 — dedup fast-path (no transaction needed for the read).
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT memory_id FROM transcript_line_dedup \
@@ -20292,7 +20410,7 @@ impl MemoryStore for PostgresStore {
         // the highest-volume appenders there is. Gated BEFORE the dedup read
         // so a stopped plane refuses uniformly rather than returning a
         // dedup-hit for some inputs and refusing for others.
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // Step 1 — dual dedup fast-path (no transaction needed for the read).
         if let (Some(sid), Some(tix)) = (write.host_session_id.as_deref(), write.host_turn_index) {
             let hit: Option<String> = sqlx::query_scalar(
@@ -20965,7 +21083,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn update(&self, ctx: &CallerContext, id: &str, patch: UpdatePatch) -> StoreResult<()> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // v0.7.0 #1412 (CRITICAL, 2026-05-30) — SAL-side caller-owns
         // gate. Pre-fix `PostgresStore::update` discarded `_ctx` and
         // let any authenticated HTTP/MCP caller rewrite any tenant's
@@ -21362,7 +21480,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // v0.7.0 #1412 (CRITICAL, 2026-05-30) — SAL-side caller-owns
         // gate. Sister fix to `PostgresStore::update` above; same
         // threat model (cross-tenant write hijack on postgres-backed
@@ -21713,7 +21831,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn link(&self, ctx: &CallerContext, link: &MemoryLink) -> StoreResult<()> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // F6 Gap 3 (v0.7.0) — unsigned link write. The trait method
         // does not surface a keypair so we always land the row with
         // `attest_level = "unsigned"`. Callers that want signing route
@@ -21728,7 +21846,7 @@ impl MemoryStore for PostgresStore {
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         self.link_internal(ctx, link, keypair).await
     }
 
@@ -21978,7 +22096,7 @@ impl MemoryStore for PostgresStore {
         source_id: &str,
         target_id: &str,
     ) -> StoreResult<bool> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         let mut tx = self
             .pool
             .begin()
@@ -22214,7 +22332,7 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         memory: &Memory,
     ) -> StoreResult<String> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // #2314 — sqlite `insert_if_newer` guard parity on the pg
         // federation-apply funnel (reached by the /sync/push receive path
         // AND the catchup puller). (a) G30 resurrection guard: DROP an
@@ -22726,7 +22844,7 @@ impl MemoryStore for PostgresStore {
         inbound: &Memory,
         receiver_verified: bool,
     ) -> StoreResult<String> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard (postgres parity
         // with the sqlite insert_if_newer gate). DROP an inbound write for a
         // tombstoned id (tombstone-wins) so a peer cannot revive a forgotten
@@ -22961,7 +23079,7 @@ impl MemoryStore for PostgresStore {
         link: &MemoryLink,
         attest_level: &str,
     ) -> StoreResult<()> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // Mirrors sqlite db::create_link_inbound. The unique
         // (source_id, target_id, relation) index makes duplicate
         // pushes a no-op (ON CONFLICT DO NOTHING), so retries and
@@ -23072,7 +23190,7 @@ impl MemoryStore for PostgresStore {
     /// `_ctx` is deliberately discarded — see the trait doc on
     /// [`MemoryStore::apply_remote_deletion`] (#2488).
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // #2493 / #2503 / #3192 — this override still does NOT compose
         // `self.delete` (that path carries the caller-owns gate this
         // inbound lane must not apply — `_ctx` is discarded). It DOES
@@ -24960,7 +25078,7 @@ impl MemoryStore for PostgresStore {
         source: &str,
         consolidator_agent_id: &str,
     ) -> StoreResult<String> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         if ids.is_empty() {
             return Err(StoreError::InvalidInput {
                 detail: "consolidate requires at least one source id".to_string(),
@@ -25564,7 +25682,7 @@ impl MemoryStore for PostgresStore {
         id: &str,
         metadata_json: &str,
     ) -> StoreResult<()> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         sqlx::query("UPDATE memories SET metadata = $1::jsonb WHERE id = $2")
             .bind(metadata_json)
             .bind(id)
@@ -25901,7 +26019,7 @@ impl MemoryStore for PostgresStore {
         claim_unowned: bool,
         dry_run: bool,
     ) -> StoreResult<crate::storage::ReownReport> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // v0.8.0 #1709/#1720 WS-B B2 — postgres twin of
         // `crate::storage::reown`. `metadata` is JSONB; `jsonb_set` on
         // the single `{agent_id}` path preserves every other key, and
@@ -28564,7 +28682,7 @@ impl MemoryStore for PostgresStore {
         // a record-plane write on a STOPPED plane. Gating first makes the
         // refusal uniform (and keeps this method inside the guard set
         // `tests/qual_pg_record_stop_gate_parity_3175.rs` pins).
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // Mirror sqlite `db::execute_pending_action`. Loads the row,
         // asserts status='approved', and applies the action via the
         // standard SAL surfaces (`store_with_embedding` for create-
@@ -29980,7 +30098,7 @@ impl MemoryStore for PostgresStore {
         id: &str,
         new_kind: crate::models::MemoryKind,
     ) -> StoreResult<bool> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         let new_kind_str = new_kind.as_str();
         let mut tx = self
             .pool
@@ -30112,7 +30230,7 @@ impl MemoryStore for PostgresStore {
         // stop's contract ("every mutating record-plane operation REFUSES")
         // one predicate rather than a per-argument exception a future
         // refactor could lose.
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         let caller: Option<&str> = if ctx.bypass_visibility {
             None
         } else {
@@ -31304,7 +31422,7 @@ impl PostgresStore {
         space: Option<&str>,
         conflict_arm: crate::storage::InsertConflictArm,
     ) -> StoreResult<String> {
-        self.gate_record_stop()?;
+        self.gate_record_stop().await?;
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
         // parity); masks before the embedding + bind. No-op unless seeded.
         let screened = screen_storage_memory(memory);
