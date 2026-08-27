@@ -424,7 +424,7 @@ fn binding_map_rejects_malformed_peer_id() {
 }
 
 #[test]
-fn posture_parse_defaults_to_warn() {
+fn posture_parse_unknown_fails_closed_to_enforce() {
     assert_eq!(CertPeerBindingMode::parse("off"), CertPeerBindingMode::Off);
     assert_eq!(
         CertPeerBindingMode::parse("ENFORCE"),
@@ -434,9 +434,30 @@ fn posture_parse_defaults_to_warn() {
         CertPeerBindingMode::parse("warn"),
         CertPeerBindingMode::Warn
     );
-    // Unrecognised / typo falls through to the secure-but-non-bricking default.
+    // #3201 — unrecognised / typo FAIL CLOSED to Enforce (a typo must
+    // not silently weaken the cross-check to Warn). The documented
+    // `standard` UNSET default remains Warn via `cert_peer_binding_mode`,
+    // which does not go through this arm.
     assert_eq!(
         CertPeerBindingMode::parse("banana"),
-        CertPeerBindingMode::Warn
+        CertPeerBindingMode::Enforce
+    );
+    assert_eq!(
+        CertPeerBindingMode::parse("enforc"),
+        CertPeerBindingMode::Enforce
+    );
+}
+
+/// #3201 decision: the documented `standard` UNSET default stays Warn.
+/// Only `asi-hard` pins the env to `enforce`. An empty-or-missing env
+/// must not pick up the typo-fail-closed Enforce arm.
+#[test]
+fn cert_peer_binding_mode_unset_stays_warn() {
+    let _g = env_lock();
+    clear_env();
+    assert_eq!(
+        ai_memory::tls::cert_peer_binding_mode(),
+        CertPeerBindingMode::Warn,
+        "documented standard-posture default is Warn; #3201 must not flip it"
     );
 }

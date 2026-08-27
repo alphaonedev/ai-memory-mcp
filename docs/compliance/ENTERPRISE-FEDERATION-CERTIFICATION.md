@@ -354,17 +354,26 @@ code.)
 2. `asi-hard pinned knobs` — post-#2927 this row **FAILs honestly under
    a `standard` profile** (`profile=standard — asi-hard pins not in
    force; the N-knob hard floor was not evaluated`, where N is
-   `pinned_knobs().len()` — **22** post-#3113, 17 in the captured
+   `pinned_knobs().len()` — **27** post-#3201, 17 in the captured
    evidence below) instead of the pre-#2927 vacuous
-   `N/N at floor` PASS (#2923). **Evidence note (#3033, #3113):** the
-   `cert-54/` `.out` captures in §2 predate both and render the
+   `N/N at floor` PASS (#2923). **Evidence note (#3033, #3113, #3168, #3201):** the
+   `cert-54/` `.out` captures in §2 predate all three and render the
    `17`-knob text; the count rose to 21 when the four outer
-   federation-transport gates were pinned (#3033) and to 22 when the
+   federation-transport gates were pinned (#3033), to 22 when the
    migration core-relation gate was pinned (#3113 — the first
    SCHEMA-INTEGRITY pin: under `asi-hard` a migration REFUSES to stamp a
    schema version whose core relations were lost, rather than warning),
+   and to 25 when `AI_MEMORY_PERMISSIONS_MODE` /
+   `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` /
+   `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` were pinned (#3168 — residual
+   #3033 knobs that certified deployments already refused; plain
+   `asi-hard` was the hole), and to 27 when
+   `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` and
+   `AI_MEMORY_FED_CERT_PEER_BINDING` were pinned (#3201 — the unenrolled
+   hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT`, plus cert↔peer-id
+   binding Enforce; the documented `standard` unset default stays Warn),
    and the doctor render is `pinned_knobs().len()`-driven, so re-capture
-   on the post-#3113 release binary shows `22/22`. The PASS/FAIL verdict
+   on the post-#3201 release binary shows `27/27`. The PASS/FAIL verdict
    per leg is unchanged (the row is one check regardless of the knob
    count).
 3. `AI_MEMORY_FED_TRUST_DOMAIN` (unset)

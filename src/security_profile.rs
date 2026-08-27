@@ -60,6 +60,11 @@
 //! | `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` | *(unset)* | the plaintext-peer hatch is NOT in force — an `http://` peer on a non-loopback host is refused (#2477) |
 //! | `AI_MEMORY_DB_SYNCHRONOUS` | `FULL` | power-loss durability (fsync every commit) — #1961 part C |
 //! | `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES` | `1` | a migration REFUSES to stamp a schema version whose ladder-created core relations were lost, instead of warning (#3113) |
+//! | `AI_MEMORY_PERMISSIONS_MODE` | `enforce` | the K3/K9 governance gate is ON — `off`/`advisory` refuse boot (#3168). Certified deployments already required this; plain `asi-hard` was the hole |
+//! | `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` | *(unset)* | PERMISSIVE-shaped: the fail-OPEN hatch is NOT in force — a rule-consultation error stays fail-CLOSED (#3168) |
+//! | `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` | `1` | inbound federated push with a DETECTED-stale `policy_version` is refused (#3168; live name `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` — the unprefixed `REQUIRE_POLICY_CURRENT` does not exist) |
+//! | `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` | *(unset)* | PERMISSIVE-shaped: the unenrolled-peer hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT` is NOT in force (#3201) |
+//! | `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` | mTLS cert↔`X-Peer-Id` cross-check ENFORCES; `off`/`warn` refuse boot. The documented `standard` unset default stays `warn` (#3201) |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
 //! `[governance].require_operator_pubkey` to `true` (see
@@ -242,6 +247,42 @@ fn plaintext_peers_hatch_meets_floor(v: &str) -> bool {
     )
 }
 
+/// #3168 — `AI_MEMORY_PERMISSIONS_MODE` floor: only a token the live
+/// reader ([`crate::config::AppConfig::permissions_mode_from_env_token`])
+/// resolves as [`crate::config::PermissionsMode::Enforce`]. The live env
+/// arm lowercases WITHOUT trimming, so `" enforce "` is NOT Enforce
+/// (it falls through to config) and must not pass the floor.
+fn permissions_mode_meets_floor(v: &str) -> bool {
+    matches!(
+        crate::config::AppConfig::permissions_mode_from_env_token(v),
+        Some(crate::config::PermissionsMode::Enforce)
+    )
+}
+
+/// #3168 — `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` floor: the hatch
+/// is NOT in force. Delegates to the live value-level reader so a token
+/// that would not arm fail-OPEN (`yes`/`on`/`false`/`0`) cannot refuse
+/// boot (NB1). Inverse of [`crate::daemon_runtime::governance_fail_open_value_enabled`].
+fn governance_fail_open_hatch_meets_floor(v: &str) -> bool {
+    !crate::daemon_runtime::governance_fail_open_value_enabled(v)
+}
+
+/// #3201 — `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` floor: the hatch is
+/// NOT in force. Inverse of the live receive-path reader
+/// ([`crate::handlers::federation_signing_check::allow_unenrolled_peers_value_enabled`]).
+fn unenrolled_peers_hatch_meets_floor(v: &str) -> bool {
+    !crate::handlers::federation_signing_check::allow_unenrolled_peers_value_enabled(v)
+}
+
+/// #3201 — `AI_MEMORY_FED_CERT_PEER_BINDING` floor: only the exact
+/// `enforce` token (case-insensitive, trimmed) meets it. A typo such as
+/// `enforc` is NOT `enforce`, so `asi-hard` refuses boot (fail-loud)
+/// even though [`crate::tls::CertPeerBindingMode::parse`] fail-closes
+/// that same typo to Enforce at runtime under `standard`.
+fn cert_peer_binding_meets_floor(v: &str) -> bool {
+    v.trim().eq_ignore_ascii_case("enforce")
+}
+
 /// The pinned-knob table. SSOT for the module docs table above and the
 /// [`pinned_knobs`] accessor; the `asi_hard_pins_documented_set` test pins
 /// the two in agreement.
@@ -391,6 +432,51 @@ const KNOBS: &[KnobSpec] = &[
         hard_value: "1",
         meets_floor: is_truthy,
     },
+    // #3168 — three residual #3033 knobs that #3094 left un-pinned.
+    // Certified deployments already refuse them via
+    // `enterprise_federation_posture` (checks #7 / #8 / #18) when
+    // `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` is set; plain
+    // `asi-hard` is the hole: `PERMISSIONS_MODE=off` boots with
+    // `db::enforce_governance` OFF, `GOVERNANCE_FAIL_OPEN_ON_ERROR` can
+    // arm fail-OPEN, and `FED_REQUIRE_POLICY_CURRENT` can be disabled.
+    // Each `meets_floor` delegates to the SAME grammar the live reader
+    // uses (NB1 / #3033 lesson — never a naive `is_truthy`).
+    KnobSpec {
+        env: crate::config::AppConfig::ENV_PERMISSIONS_MODE,
+        hard_value: "enforce",
+        meets_floor: permissions_mode_meets_floor,
+    },
+    KnobSpec {
+        env: crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
+        hard_value: "",
+        meets_floor: governance_fail_open_hatch_meets_floor,
+    },
+    KnobSpec {
+        env: crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+        hard_value: "1",
+        meets_floor: crate::federation::receive_auth::flag_value_default_on,
+    },
+    // #3201 — two federation escape hatches that the already-pinned
+    // outer-transport gates do not cover. `REQUIRE_PEER_ENROLLMENT` is
+    // pinned ON, but `ALLOW_UNENROLLED_PEERS=1` still opens the
+    // `(None,None)` arm (`require_peer_enrollment_enabled() &&
+    // !allow_unenrolled_peers_enabled()`). `FED_CERT_PEER_BINDING` still
+    // defaulted to Warn and fail-opened to Warn on a typo. Certified
+    // deployments refuse the unenrolled hatch via
+    // `enterprise_federation_posture` check #3 only when
+    // `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` is set; plain
+    // `asi-hard` is the hole. The documented `standard` unset default
+    // for cert-peer-binding stays Warn — only this pin tightens it.
+    KnobSpec {
+        env: crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV,
+        hard_value: "",
+        meets_floor: unenrolled_peers_hatch_meets_floor,
+    },
+    KnobSpec {
+        env: crate::tls::FED_CERT_PEER_BINDING_ENV,
+        hard_value: "enforce",
+        meets_floor: cert_peer_binding_meets_floor,
+    },
 ];
 
 /// The number of env knobs `asi-hard` pins — ONE named SSOT for a count that
@@ -442,7 +528,7 @@ pub fn pinned_knobs() -> Vec<(&'static str, &'static str)> {
 /// [`enforce_at_boot`], which may only run in the synchronous
 /// pre-runtime phase of `fn main()` (#2386), this is safe to call from
 /// any live process (e.g. `ai-memory doctor --posture
-/// enterprise-federation`, which reuses this as ONE SSOT for the 22
+/// enterprise-federation`, which reuses this as ONE SSOT for the 27
 /// `asi-hard` pinned knobs rather than re-deriving the KNOBS table).
 ///
 /// Returns `(env, current_value, hard_value)` triples.
@@ -1084,6 +1170,45 @@ mod tests {
                 .any(|(e, v)| *e == crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV && v.is_empty()),
             "asi-hard must pin the plaintext-peer hatch OFF (#2477)"
         );
+        // #3168 — three residual #3033 knobs. Certified deployments already
+        // refuse them via enterprise_federation_posture; plain asi-hard is
+        // the hole. PERMISSIONS_MODE pins to enforce (not a naive truthy
+        // floor — only the live token `enforce` meets it). The
+        // GOVERNANCE_FAIL_OPEN hatch pins CLOSED (hard_value empty).
+        // REQUIRE_POLICY_CURRENT pins ON via the live default-ON grammar
+        // (the live name is `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`).
+        assert!(
+            pins.iter().any(
+                |(e, v)| *e == crate::config::AppConfig::ENV_PERMISSIONS_MODE && *v == "enforce"
+            ),
+            "asi-hard must pin AI_MEMORY_PERMISSIONS_MODE to enforce (#3168)"
+        );
+        assert!(
+            pins.iter().any(
+                |(e, v)| *e == crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN && v.is_empty()
+            ),
+            "asi-hard must pin the governance fail-OPEN hatch OFF (#3168)"
+        );
+        assert!(
+            pins.iter().any(|(e, v)| {
+                *e == crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV && *v == "1"
+            }),
+            "asi-hard must pin AI_MEMORY_FED_REQUIRE_POLICY_CURRENT ON (#3168)"
+        );
+        // #3201 — unenrolled-peer hatch of the already-pinned
+        // REQUIRE_PEER_ENROLLMENT, and cert↔peer-id binding Enforce.
+        assert!(
+            pins.iter().any(|(e, v)| {
+                *e == crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV
+                    && v.is_empty()
+            }),
+            "asi-hard must pin the unenrolled-peer hatch OFF (#3201)"
+        );
+        assert!(
+            pins.iter()
+                .any(|(e, v)| *e == crate::tls::FED_CERT_PEER_BINDING_ENV && *v == "enforce"),
+            "asi-hard must pin AI_MEMORY_FED_CERT_PEER_BINDING to enforce (#3201)"
+        );
         // #3033 — the FOUR OUTER federation-transport gates are pinned ON, so
         // the "no-disable" contract covers the outermost network
         // access-control gates (per-message sig + nonce, enrolled-peer
@@ -1158,6 +1283,224 @@ mod tests {
         }
     }
 
+    /// #3168 — `asi-hard` REFUSES to boot when an operator tries to turn
+    /// governance OFF (`PERMISSIONS_MODE=off`), arm the fail-OPEN hatch,
+    /// or disable the stale-policy refusal. Exercises the live-reader
+    /// grammars: `off` is the exact live Off token (not a truthy invert);
+    /// `"1"` arms fail-OPEN (the live `== "1"` arm); `"0"` disables the
+    /// default-ON policy-current gate (the live `flag_value_default_on`
+    /// falsy token).
+    #[test]
+    fn asi_hard_refuses_governance_loosening_3168() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_refuses_governance_loosening_3168",
+        ) {
+            return;
+        }
+        let cases = [
+            (crate::config::AppConfig::ENV_PERMISSIONS_MODE, "off"),
+            (crate::config::AppConfig::ENV_PERMISSIONS_MODE, "advisory"),
+            (crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "1"),
+            (crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "TRUE"),
+            (
+                crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+                "0",
+            ),
+            (
+                crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+                "false",
+            ),
+        ];
+        for (env, disabling_value) in cases {
+            let _g = env_lock();
+            unsafe {
+                clear_all();
+            }
+            let _cleanup = KnobsGuard;
+            unsafe {
+                std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+                std::env::set_var(env, disabling_value);
+            }
+            let err = enforce_at_boot().unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("asi-hard") && msg.contains(env),
+                "refusal must name the posture + the loosened knob {env}={disabling_value:?}: {msg}"
+            );
+            let below = asi_hard_below_floor();
+            assert!(
+                below.iter().any(|(e, _, _)| *e == env),
+                "asi_hard_below_floor must report the loosened knob {env}"
+            );
+        }
+    }
+
+    /// #3168 — a value the LIVE reader would NOT treat as loosening must
+    /// still boot. `PERMISSIONS_MODE=ENFORCE` (case-insensitive live
+    /// match); `GOVERNANCE_FAIL_OPEN=yes` does NOT arm the live hatch
+    /// (exact `"1"` / case-insensitive `"true"` only); `FED_REQUIRE_POLICY_CURRENT=FALSE`
+    /// stays ON under the case-sensitive default-ON grammar.
+    #[test]
+    fn asi_hard_accepts_live_compliant_governance_values_3168() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_accepts_live_compliant_governance_values_3168",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = KnobsGuard;
+        unsafe {
+            std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+            std::env::set_var(crate::config::AppConfig::ENV_PERMISSIONS_MODE, "ENFORCE");
+            std::env::set_var(crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "yes");
+            std::env::set_var(
+                crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+                "FALSE",
+            );
+        }
+        let (posture, reports) = enforce_at_boot().unwrap();
+        assert_eq!(posture, SecurityPosture::AsiHard);
+        assert!(
+            reports.iter().any(|r| {
+                r.env == crate::config::AppConfig::ENV_PERMISSIONS_MODE
+                    && r.action == PinAction::AlreadyCompliant
+            }),
+            "ENFORCE must meet the permissions-mode floor"
+        );
+        assert!(
+            reports.iter().any(|r| {
+                r.env == crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN
+                    && r.action == PinAction::AlreadyCompliant
+            }),
+            "yes must NOT be treated as arming the fail-OPEN hatch (live grammar)"
+        );
+        assert!(
+            reports.iter().any(|r| {
+                r.env == crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV
+                    && r.action == PinAction::AlreadyCompliant
+            }),
+            "FALSE must keep the default-ON policy-current gate enabled (live grammar)"
+        );
+    }
+
+    /// #3168 END-TO-END. Pinning the env is not the claim; the claim is
+    /// that after boot enforcement the LIVE readers report the hard
+    /// posture, so a certified (or plain-asi-hard) deployment really
+    /// does enforce governance, keep fail-OPEN disarmed, and refuse a
+    /// DETECTED-stale inbound policy_version.
+    #[test]
+    fn asi_hard_actually_enables_governance_floors_3168() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_actually_enables_governance_floors_3168",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = KnobsGuard;
+        unsafe {
+            std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+        }
+        let (posture, _reports) = enforce_at_boot().unwrap();
+        assert_eq!(posture, SecurityPosture::AsiHard);
+        assert_eq!(
+            crate::config::AppConfig::default().effective_permissions_mode(),
+            crate::config::PermissionsMode::Enforce,
+            "asi-hard must leave the K3/K9 governance gate ENFORCING at its read site"
+        );
+        assert!(
+            !crate::daemon_runtime::governance_fail_open_on_error(),
+            "asi-hard must leave the governance fail-OPEN hatch DISARMED at its read site"
+        );
+        assert!(
+            crate::federation::receive_auth::require_policy_current_enabled(),
+            "asi-hard must leave the stale-policy refusal ON at its read site"
+        );
+    }
+
+    /// #3201 — `asi-hard` REFUSES to boot when the unenrolled-peer hatch
+    /// is armed, or when cert-peer-binding is anything other than
+    /// `enforce` (including the typo `enforc` that previously fail-opened
+    /// to Warn, and the documented `standard` default `warn`).
+    #[test]
+    fn asi_hard_refuses_federation_hatches_3201() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_refuses_federation_hatches_3201",
+        ) {
+            return;
+        }
+        let cases = [
+            (
+                crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV,
+                "1",
+            ),
+            (
+                crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV,
+                "true",
+            ),
+            (crate::tls::FED_CERT_PEER_BINDING_ENV, "off"),
+            (crate::tls::FED_CERT_PEER_BINDING_ENV, "warn"),
+            (crate::tls::FED_CERT_PEER_BINDING_ENV, "enforc"),
+        ];
+        for (env, disabling_value) in cases {
+            let _g = env_lock();
+            unsafe {
+                clear_all();
+            }
+            let _cleanup = KnobsGuard;
+            unsafe {
+                std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+                std::env::set_var(env, disabling_value);
+            }
+            let err = enforce_at_boot().unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("asi-hard") && msg.contains(env),
+                "refusal must name the posture + the loosened knob {env}={disabling_value:?}: {msg}"
+            );
+            let below = asi_hard_below_floor();
+            assert!(
+                below.iter().any(|(e, _, _)| *e == env),
+                "asi_hard_below_floor must report the loosened knob {env}"
+            );
+        }
+    }
+
+    /// #3201 END-TO-END. After pinning, the live unenrolled-peer hatch
+    /// is CLOSED and cert-peer-binding resolves Enforce.
+    #[test]
+    fn asi_hard_actually_closes_federation_hatches_3201() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_actually_closes_federation_hatches_3201",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = KnobsGuard;
+        unsafe {
+            std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
+        }
+        let (posture, _reports) = enforce_at_boot().unwrap();
+        assert_eq!(posture, SecurityPosture::AsiHard);
+        assert!(
+            !crate::handlers::federation_signing_check::allow_unenrolled_peers_enabled(),
+            "asi-hard must leave the unenrolled-peer hatch CLOSED at its read site"
+        );
+        assert_eq!(
+            crate::tls::cert_peer_binding_mode(),
+            crate::tls::CertPeerBindingMode::Enforce,
+            "asi-hard must leave cert↔peer-id binding ENFORCING at its read site"
+        );
+    }
+
     #[test]
     fn asi_hard_below_floor_is_read_only_and_reports_violations() {
         if crate::config::run_env_isolated_child_or_spawn(
@@ -1166,7 +1509,7 @@ mod tests {
             return;
         }
         // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
-        // reuses this accessor as the SSOT for the 22-knob asi-hard set
+        // reuses this accessor as the SSOT for the 27-knob asi-hard set
         // rather than re-deriving KNOBS; pin its own read-only contract
         // directly (in addition to the exhaustive coverage the
         // `enterprise_federation_posture::tests` module gives it

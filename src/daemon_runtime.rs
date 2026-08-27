@@ -4795,8 +4795,18 @@ const WIRE_ACTION_ACTOR: &str = "daemon:wire_action";
 // identical cross-surface.
 pub fn governance_fail_open_on_error() -> bool {
     std::env::var(ENV_GOVERNANCE_FAIL_OPEN)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| governance_fail_open_value_enabled(&v))
         .unwrap_or(false)
+}
+
+/// Value-level half of [`governance_fail_open_on_error`]. The live grammar
+/// is exact `"1"` OR case-insensitive `"true"` — NOT the house `is_truthy`
+/// set (`yes`/`on` do NOT arm fail-OPEN) and NOT trimmed. Shared with the
+/// `asi-hard` KNOBS `meets_floor` (#3168) so a value the live reader would
+/// not arm cannot refuse boot (NB1).
+#[must_use]
+pub(crate) fn governance_fail_open_value_enabled(v: &str) -> bool {
+    v == "1" || v.eq_ignore_ascii_case("true")
 }
 
 /// #1455 legacy fail-open opt-out env var — one spelling shared by the

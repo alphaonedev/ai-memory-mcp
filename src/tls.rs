@@ -444,7 +444,10 @@ pub const FED_CERT_PEER_BINDING_MAP_ENV: &str = "AI_MEMORY_FED_CERT_PEER_BINDING
 /// Env var selecting the enforcement posture of the mTLS cert↔`X-Peer-Id`
 /// cross-check (#2045 L6): `off` | `warn` | `enforce`. Independent of
 /// `AI_MEMORY_FED_REQUIRE_SIG` — it is the compensating control for the
-/// `FED_REQUIRE_SIG=0` window. Default `warn` (one release, then `enforce`).
+/// `FED_REQUIRE_SIG=0` window. Default (UNSET) `warn` — the documented
+/// `standard` posture default; `asi-hard` pins to `enforce` (#3201).
+/// The "one release, then `enforce`" flip of the *unset* default is
+/// **not** taken here (would silently tighten `standard`).
 pub const FED_CERT_PEER_BINDING_ENV: &str = "AI_MEMORY_FED_CERT_PEER_BINDING";
 
 /// Error-prefix label for the cert-peer-binding map parser (one named site
@@ -463,15 +466,28 @@ pub enum CertPeerBindingMode {
 }
 
 impl CertPeerBindingMode {
-    /// Parse the posture token (case-insensitive). Unrecognised ⇒ `Warn`
-    /// (the secure-but-non-bricking default), matching the enum-resolve
-    /// fall-through shape of the other `off|warn|enforce` knobs.
+    /// Parse the posture token (case-insensitive, trimmed).
+    ///
+    /// - `off` → [`Self::Off`]
+    /// - `warn` → [`Self::Warn`]
+    /// - `enforce` → [`Self::Enforce`]
+    /// - anything else (typo `enforc`, empty, unknown word) → [`Self::Enforce`]
+    ///   (fail-CLOSED: a typo must not silently weaken the cross-check to
+    ///   Warn — #3201).
+    ///
+    /// UNSET is **not** parsed here; [`cert_peer_binding_mode`] maps a missing
+    /// env var to [`Self::Warn`], which remains the documented `standard`
+    /// posture default. `asi-hard` pins the env to `enforce` (#3201); it
+    /// does not change the unset default.
     #[must_use]
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "off" => Self::Off,
-            "enforce" => Self::Enforce,
-            _ => Self::Warn,
+            "warn" => Self::Warn,
+            // `enforce` AND any unrecognised token (typo `enforc`, empty,
+            // unknown word). Fail-CLOSED: a typo must not silently weaken
+            // the cross-check to Warn (#3201).
+            _ => Self::Enforce,
         }
     }
 }
