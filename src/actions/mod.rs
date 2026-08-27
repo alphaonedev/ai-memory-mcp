@@ -295,10 +295,37 @@ pub fn list(
 ///   `unlocks` got silent no-ordering, even though the edge documents one.
 ///
 /// `?1` is the namespace; the caller appends the ordering + limit binds.
+///
+/// v1.0.0 #3179 — the predicate BODY lives in [`frontier_where_tail_with`],
+/// which the postgres adapter formats with its own `$1` placeholder, so
+/// neither backend can carry a clause the other lacks.
 fn frontier_where_tail() -> String {
+    frontier_where_tail_with(SQLITE_NS_PLACEHOLDER)
+}
+
+/// The sqlite namespace bind placeholder for [`frontier_where_tail_with`].
+const SQLITE_NS_PLACEHOLDER: &str = "?1";
+
+/// v1.0.0 #3179 — the ONE definition of the FRONTIER unblocked predicate,
+/// parameterized by the backend's namespace bind placeholder (`?1` on
+/// sqlite, `$1` on postgres).
+///
+/// This exists because the postgres adapter had a HAND-COPIED twin
+/// (`pg_frontier_where_tail`) that carried only TWO of the three
+/// `NOT EXISTS` clauses: the #3008 `unlocks` clause was added to the sqlite
+/// original and never mirrored, so on a postgres-backed coordination plane
+/// an action whose only dependency was an `EdgeType::Unlocks` edge was
+/// dispatched to agents while sqlite correctly held it back — out-of-order
+/// execution, under a doc comment that claimed the two were "byte-for-byte
+/// the same predicate". Formatting BOTH backends from this one fragment
+/// makes that class of drift structurally impossible: a future `EdgeType`
+/// clause lands on both backends or neither.
+///
+/// The caller appends the ordering + limit binds.
+pub(crate) fn frontier_where_tail_with(ns_placeholder: &str) -> String {
     use crate::models::{ActionState, EdgeType};
     format!(
-        "a.namespace = ?1 AND a.state = '{pending}' \
+        "a.namespace = {ns_placeholder} AND a.state = '{pending}' \
            AND NOT EXISTS ( \
              SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.to_action \
              WHERE e.from_action = a.id \

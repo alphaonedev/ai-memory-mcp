@@ -388,6 +388,128 @@ decision to a place both adapters share, not by adding a second copy of it.
   new row", so a transient fault forked a duplicate lineage instead of updating
   the existing memory, and `next_versioned_title` handed back a title that was
   already taken. A genuine miss is still `Ok(None)`; a fault is now an error.
+### Security (SAL parity cluster: the postgres adapter's five sqlite-SSOT gaps; #3174 #3175 #3177 #3179 #3180)
+
+Scout-verified (R-405) findings from the 152-method SAL parity audit. Every one
+is a divergence where the postgres backend behaved differently from the sqlite
+SSOT for the identical wire call — the class the substrate's data-integrity
+guarantee cannot tolerate, because an operator's claim about retention,
+erasure, stoppability, or auditability was true on one backend and false on the
+other with nothing reporting the difference.
+
+- **`GET /api/v1/admin/export` on postgres emitted a bundle marked complete
+  carrying at most 1000 memories (#3174).** `PostgresStore::export_memories`
+  built `Filter { limit: 100_000 }` and delegated to `list`, whose first
+  statement is `filter.limit.clamp(1, LIST_MAX_LIMIT)` with `LIST_MAX_LIMIT =
+  1000` — no error, no warning, no truncation flag. `export_links` was uncapped,
+  so a restored bundle also carried edges pointing at memories it did not
+  contain. Silent backup loss. The export now uses a dedicated **uncapped
+  keyset-paged reader** (`(created_at, id COLLATE "C")` cursor, same expiry +
+  #1948 lifecycle predicates as the sqlite `export_all`, no OFFSET so a
+  concurrent insert cannot make a page skip or duplicate rows). `LIST_MAX_LIMIT`
+  is deliberately **not** raised — it is the tenant page cap — but `list`,
+  `search` and `list_archived` now all WARN through one helper whenever they
+  clamp a caller's limit, so the next oversized reader finds out before
+  shipping a lossy read: applying the cap is correct, applying it in silence is
+  what made a partial answer indistinguishable from a complete one. The same
+  clamp corrupted
+  `entity_register`, which scanned `limit: 10_000` for a prior entity: in any
+  namespace over 1000 rows the prior row fell outside the window and a
+  **duplicate entity** landed on every re-register. That lookup is now the
+  direct indexed probe the sqlite SSOT uses. Also on postgres, the canonical
+  name was never written to `entity_aliases`, so
+  `entity_get_by_alias(canonical_name)` returned `Some` on sqlite and `None` on
+  postgres — an entity registered with no aliases was unreachable by name. The
+  canonical alias row is now written unconditionally, and the returned alias set
+  is the join-table read (the sqlite `list_entity_aliases` shape), which also
+  stops the pg response echoing a raw credential that `secret_screen` redact
+  mode had already masked in storage.
+- **The fleet-wide write kill switch did not cover two postgres write paths
+  (#3175).** `undo_in_place_edit` (a destructive content restore that overwrites
+  the live row and appends a signed audit event) and `recover_turn_idempotent`
+  (L2 transcript recovery, a high-volume durable-row appender) contained **zero**
+  `gate_record_stop` calls while 18 sibling pg methods gated — so both kept
+  writing while the record plane was STOPPED. Both now gate on their first
+  statement, as their sqlite twins do; `execute_pending_action` gains an
+  explicit gate too, so its audit emits cannot land on a stopped plane. A new
+  source-scanning guard
+  (`tests/qual_pg_record_stop_gate_parity_3175.rs`) enumerates every
+  record-stop-gated `SqliteStore` method and requires the `PostgresStore` twin
+  to gate directly or to delegate to a method that does — resolving the callee
+  rather than assuming it — so a future mutating method cannot ship ungated on
+  one backend. Separately, `record_stop_status` on postgres read the
+  **process-local cache** seeded once at `connect`: a stop engaged by another
+  pool (the deployment postgres exists for) left every other daemon confidently
+  reporting RUNNING. It now re-derives from the persisted `signed_events` chain,
+  which also reconciles that pool's hot-path gate — self-healing in the
+  fail-closed direction. Finally, the S5-H4 approver-on-behalf laundering gate
+  (`verify_payload_agent_id` + the
+  `pending_action.refused_agent_id_mismatch` audit row) existed only on sqlite,
+  so it was absent on the multi-tenant HTTP daemon — the one surface with a real
+  adversary. postgres now calls the same storage-layer function.
+- **postgres TTL / byte-cap eviction hard-deleted rows with no tombstone and no
+  crypto-erase (#3177).** `evict_tombstone_and_erase` had sqlite callers only:
+  the pg `run_gc` / `size_gc` twins DELETEd outright. Two consequences — an
+  evicted **encrypted** row left its per-record envelope key intact (the
+  retention/erasure claim held on sqlite and not on postgres), and the eviction
+  left no forget-tombstone, so a federated peer's copy of the evicted row was
+  accepted straight back under LWW where sqlite refuses it. "Evicted" that
+  silently un-evicts is data the operator believes is gone. Both paths now run a
+  postgres twin of the sqlite primitive — crypto-erase, `cid_genesis` scrub,
+  signed `substrate.crypto_erase` attestation, mandatory signed tombstone — in
+  the SAME transaction as the DELETE, ungated by `append_only_enabled()` (the
+  revision leaf is an optional ledger; the tombstone is the retention contract).
+  On the `run_gc` hard-delete path the DELETE is additionally **pinned to the
+  exact id set that was tombstoned**, rather than re-evaluating the expiry
+  predicate a second time: postgres runs that sweep at READ COMMITTED, so an
+  already-expired row committed by a concurrent writer between the `FOR UPDATE`
+  victim read and the DELETE would otherwise be deleted with no tombstone and
+  no erase — the same defect, reintroduced through a race. (The sqlite twin
+  cannot hit it: `BEGIN IMMEDIATE` holds the single writer lock for the whole
+  sweep.) Separately, the pg `size_gc` **archive** branch copied only the memory row, so
+  `archive_restore` returned it isolated with its edge graph reaped by the FK
+  cascade; it now snapshots `memory_links` into `archived_memory_links` first,
+  as `forget` and `archive_by_ids` already did — and `archive_by_ids`' copy of
+  that statement was folded into the same shared helper, so a future archiving
+  path cannot forget the edges the way this one did.
+- **`action_frontier` / `action_next` on postgres dispatched unlocks-gated work
+  (#3179).** `pg_frontier_where_tail` was a hand-copied twin carrying two of the
+  three `NOT EXISTS` clauses: the #3008 `unlocks` clause was never mirrored, so
+  an action whose only dependency was an `EdgeType::Unlocks` edge was served to
+  agents on postgres while sqlite held it back — out-of-order execution — under
+  a doc comment asserting the two were "byte-for-byte the same predicate", which
+  hid the divergence from reviewers. Both backends now format the predicate from
+  **one** fragment (`actions::frontier_where_tail_with`, parameterized only by
+  the bind placeholder), so a future `EdgeType` clause lands on both or neither.
+- **postgres lost three audit/signal writes the sqlite SSOT makes (#3180).**
+  (a) A governance DENY appended nothing to the signed chain on pg
+  (`pending_action.denied` matched `storage/mod.rs` only), leaving refusals
+  unprovable once the mutable `pending_actions` row moved on; the emit now
+  shares the decision's transaction — the postgres chain append must be
+  transactional to compute `sequence`/`prev_hash`, and the resulting disposition
+  is the fail-closed one (no unaudited deny commits). The post-execute
+  `pending_action.approved` emit is added in the same family so the governance
+  transitions are audit-complete together. (b) `recall_hybrid` on pg appended
+  **no** access-ledger rows, so every pg-backed fleet produced zero
+  `recall_observations` — and the memory lifecycle that folds from exactly those
+  rows (TTL extension, mid→long promotion, priority decay) was **frozen**, with
+  nothing reporting it. The ledger is now appended over the post-filter returned
+  set, best-effort with a WARN (a read must not fail because a bookkeeping row
+  could not be written), matching the sqlite twin. (c) `reclassify_memory_kind`
+  bound `cause_hash: None` on pg while sqlite bound
+  `compute_cause_hash(...)`; the cause is now threaded into **both** the
+  signature fold and the stored column, and pinned byte-equal to the sqlite
+  value by test.
+
+Non-trivial postgres helpers landed in a new sibling module
+`src/store/postgres_parity.rs` rather than growing the 34.5k-line
+`src/store/postgres.rs`; the QUAL-10 ceiling for that file moves
+35_200 -> 35_720 for the call sites and their rationale (measured 35_652 on the ae3e0aec rebase).
+
+Known residual, deliberately out of scope and filed as #3207: the pg
+`sweep_pending_action_timeouts` still emits no `pending_action.timed_out` row
+(the sqlite sweeper does). It is the one governance transition of the four that
+this cluster does not close — the three an adversary can drive are covered.
 
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 
@@ -1818,6 +1940,128 @@ backend and missing or divergently implemented on its twin). Pinned by
   On the HTTP surface the postgres gate maps `SCHEMA_STAMP_INVALID` to **503**,
   not 500 — the same disposition as the schema-ahead refusal, so an
   orchestrator parks the node rather than crash-looping it into the replay.
+### Security (SAL parity cluster: the postgres adapter's five sqlite-SSOT gaps; #3174 #3175 #3177 #3179 #3180)
+
+Scout-verified (R-405) findings from the 152-method SAL parity audit. Every one
+is a divergence where the postgres backend behaved differently from the sqlite
+SSOT for the identical wire call — the class the substrate's data-integrity
+guarantee cannot tolerate, because an operator's claim about retention,
+erasure, stoppability, or auditability was true on one backend and false on the
+other with nothing reporting the difference.
+
+- **`GET /api/v1/admin/export` on postgres emitted a bundle marked complete
+  carrying at most 1000 memories (#3174).** `PostgresStore::export_memories`
+  built `Filter { limit: 100_000 }` and delegated to `list`, whose first
+  statement is `filter.limit.clamp(1, LIST_MAX_LIMIT)` with `LIST_MAX_LIMIT =
+  1000` — no error, no warning, no truncation flag. `export_links` was uncapped,
+  so a restored bundle also carried edges pointing at memories it did not
+  contain. Silent backup loss. The export now uses a dedicated **uncapped
+  keyset-paged reader** (`(created_at, id COLLATE "C")` cursor, same expiry +
+  #1948 lifecycle predicates as the sqlite `export_all`, no OFFSET so a
+  concurrent insert cannot make a page skip or duplicate rows). `LIST_MAX_LIMIT`
+  is deliberately **not** raised — it is the tenant page cap — but `list`,
+  `search` and `list_archived` now all WARN through one helper whenever they
+  clamp a caller's limit, so the next oversized reader finds out before
+  shipping a lossy read: applying the cap is correct, applying it in silence is
+  what made a partial answer indistinguishable from a complete one. The same
+  clamp corrupted
+  `entity_register`, which scanned `limit: 10_000` for a prior entity: in any
+  namespace over 1000 rows the prior row fell outside the window and a
+  **duplicate entity** landed on every re-register. That lookup is now the
+  direct indexed probe the sqlite SSOT uses. Also on postgres, the canonical
+  name was never written to `entity_aliases`, so
+  `entity_get_by_alias(canonical_name)` returned `Some` on sqlite and `None` on
+  postgres — an entity registered with no aliases was unreachable by name. The
+  canonical alias row is now written unconditionally, and the returned alias set
+  is the join-table read (the sqlite `list_entity_aliases` shape), which also
+  stops the pg response echoing a raw credential that `secret_screen` redact
+  mode had already masked in storage.
+- **The fleet-wide write kill switch did not cover two postgres write paths
+  (#3175).** `undo_in_place_edit` (a destructive content restore that overwrites
+  the live row and appends a signed audit event) and `recover_turn_idempotent`
+  (L2 transcript recovery, a high-volume durable-row appender) contained **zero**
+  `gate_record_stop` calls while 18 sibling pg methods gated — so both kept
+  writing while the record plane was STOPPED. Both now gate on their first
+  statement, as their sqlite twins do; `execute_pending_action` gains an
+  explicit gate too, so its audit emits cannot land on a stopped plane. A new
+  source-scanning guard
+  (`tests/qual_pg_record_stop_gate_parity_3175.rs`) enumerates every
+  record-stop-gated `SqliteStore` method and requires the `PostgresStore` twin
+  to gate directly or to delegate to a method that does — resolving the callee
+  rather than assuming it — so a future mutating method cannot ship ungated on
+  one backend. Separately, `record_stop_status` on postgres read the
+  **process-local cache** seeded once at `connect`: a stop engaged by another
+  pool (the deployment postgres exists for) left every other daemon confidently
+  reporting RUNNING. It now re-derives from the persisted `signed_events` chain,
+  which also reconciles that pool's hot-path gate — self-healing in the
+  fail-closed direction. Finally, the S5-H4 approver-on-behalf laundering gate
+  (`verify_payload_agent_id` + the
+  `pending_action.refused_agent_id_mismatch` audit row) existed only on sqlite,
+  so it was absent on the multi-tenant HTTP daemon — the one surface with a real
+  adversary. postgres now calls the same storage-layer function.
+- **postgres TTL / byte-cap eviction hard-deleted rows with no tombstone and no
+  crypto-erase (#3177).** `evict_tombstone_and_erase` had sqlite callers only:
+  the pg `run_gc` / `size_gc` twins DELETEd outright. Two consequences — an
+  evicted **encrypted** row left its per-record envelope key intact (the
+  retention/erasure claim held on sqlite and not on postgres), and the eviction
+  left no forget-tombstone, so a federated peer's copy of the evicted row was
+  accepted straight back under LWW where sqlite refuses it. "Evicted" that
+  silently un-evicts is data the operator believes is gone. Both paths now run a
+  postgres twin of the sqlite primitive — crypto-erase, `cid_genesis` scrub,
+  signed `substrate.crypto_erase` attestation, mandatory signed tombstone — in
+  the SAME transaction as the DELETE, ungated by `append_only_enabled()` (the
+  revision leaf is an optional ledger; the tombstone is the retention contract).
+  On the `run_gc` hard-delete path the DELETE is additionally **pinned to the
+  exact id set that was tombstoned**, rather than re-evaluating the expiry
+  predicate a second time: postgres runs that sweep at READ COMMITTED, so an
+  already-expired row committed by a concurrent writer between the `FOR UPDATE`
+  victim read and the DELETE would otherwise be deleted with no tombstone and
+  no erase — the same defect, reintroduced through a race. (The sqlite twin
+  cannot hit it: `BEGIN IMMEDIATE` holds the single writer lock for the whole
+  sweep.) Separately, the pg `size_gc` **archive** branch copied only the memory row, so
+  `archive_restore` returned it isolated with its edge graph reaped by the FK
+  cascade; it now snapshots `memory_links` into `archived_memory_links` first,
+  as `forget` and `archive_by_ids` already did — and `archive_by_ids`' copy of
+  that statement was folded into the same shared helper, so a future archiving
+  path cannot forget the edges the way this one did.
+- **`action_frontier` / `action_next` on postgres dispatched unlocks-gated work
+  (#3179).** `pg_frontier_where_tail` was a hand-copied twin carrying two of the
+  three `NOT EXISTS` clauses: the #3008 `unlocks` clause was never mirrored, so
+  an action whose only dependency was an `EdgeType::Unlocks` edge was served to
+  agents on postgres while sqlite held it back — out-of-order execution — under
+  a doc comment asserting the two were "byte-for-byte the same predicate", which
+  hid the divergence from reviewers. Both backends now format the predicate from
+  **one** fragment (`actions::frontier_where_tail_with`, parameterized only by
+  the bind placeholder), so a future `EdgeType` clause lands on both or neither.
+- **postgres lost three audit/signal writes the sqlite SSOT makes (#3180).**
+  (a) A governance DENY appended nothing to the signed chain on pg
+  (`pending_action.denied` matched `storage/mod.rs` only), leaving refusals
+  unprovable once the mutable `pending_actions` row moved on; the emit now
+  shares the decision's transaction — the postgres chain append must be
+  transactional to compute `sequence`/`prev_hash`, and the resulting disposition
+  is the fail-closed one (no unaudited deny commits). The post-execute
+  `pending_action.approved` emit is added in the same family so the governance
+  transitions are audit-complete together. (b) `recall_hybrid` on pg appended
+  **no** access-ledger rows, so every pg-backed fleet produced zero
+  `recall_observations` — and the memory lifecycle that folds from exactly those
+  rows (TTL extension, mid→long promotion, priority decay) was **frozen**, with
+  nothing reporting it. The ledger is now appended over the post-filter returned
+  set, best-effort with a WARN (a read must not fail because a bookkeeping row
+  could not be written), matching the sqlite twin. (c) `reclassify_memory_kind`
+  bound `cause_hash: None` on pg while sqlite bound
+  `compute_cause_hash(...)`; the cause is now threaded into **both** the
+  signature fold and the stored column, and pinned byte-equal to the sqlite
+  value by test.
+
+Non-trivial postgres helpers landed in a new sibling module
+`src/store/postgres_parity.rs` rather than growing the 34.5k-line
+`src/store/postgres.rs`; the QUAL-10 ceiling for that file moves
+34_620 -> 35_120 for the call sites and their rationale.
+
+Known residual, deliberately out of scope and filed as #3207: the pg
+`sweep_pending_action_timeouts` still emits no `pending_action.timed_out` row
+(the sqlite sweeper does). It is the one governance transition of the four that
+this cluster does not close — the three an adversary can drive are covered.
 
 ### Fixed
 

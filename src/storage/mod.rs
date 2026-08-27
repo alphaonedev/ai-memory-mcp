@@ -5811,7 +5811,7 @@ impl ErasureKind {
 /// #1956 [R56] — actor recorded on an erasure attestation when an autonomous
 /// substrate eviction (TTL / byte-cap) drove the delete, with no human/agent
 /// caller in scope.
-const CRYPTO_ERASE_ACTOR_SUBSTRATE: &str = "substrate:eviction";
+pub const CRYPTO_ERASE_ACTOR_SUBSTRATE: &str = "substrate:eviction";
 
 /// #1956 [R56] — actor recorded on an erasure attestation for a `forget` with
 /// no identifiable caller/owner (both backends share this fallback).
@@ -20343,7 +20343,10 @@ fn emit_pending_action_event(
 /// that includes `agent_id`). `delete` / `promote` payloads do not
 /// carry an agent_id (the action is attributed to `pa.requested_by`
 /// directly), so this function returns `Ok(())` on those.
-fn verify_payload_agent_id(pa: &PendingAction) -> Result<()> {
+/// v1.0.0 #3175 — `pub(crate)` so the postgres adapter's
+/// `execute_pending_action` runs the IDENTICAL check rather than a
+/// hand-copied twin (the copy is what diverged in the first place).
+pub(crate) fn verify_payload_agent_id(pa: &PendingAction) -> Result<()> {
     let payload_agent_id = pa
         .payload
         .get("agent_id")

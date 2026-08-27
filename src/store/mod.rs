@@ -54,6 +54,14 @@ pub mod sqlite;
 #[cfg(feature = "sal-postgres")]
 pub mod postgres;
 
+/// v1.0.0 SAL parity cluster (#3174 / #3175 / #3177 / #3180) — postgres
+/// twins of sqlite-SSOT storage invariants (uncapped admin export,
+/// eviction tombstone + crypto-erase, archive link snapshot, governance
+/// audit emit), hosted beside `postgres` so that ~34.5k-line module stays
+/// under its QUAL-10 ceiling.
+#[cfg(feature = "sal-postgres")]
+pub(crate) mod postgres_parity;
+
 /// #1955 [P1][R45] — substrate record-stop actuator + signed
 /// stop-attestation. Backend-agnostic flag/attestation logic + the
 /// per-DB sqlite flag registry.
@@ -4434,6 +4442,11 @@ pub struct UpdatePatch {
 /// envelope. Single SSOT so the sqlite + postgres adapters cannot drift
 /// (and the hardcoded-literal gate stays green).
 pub const UNDO_IN_PLACE_EDIT_ACTION: &str = "undo_in_place_edit";
+
+/// v1.0.0 #3175 — the `action` an [`StoreError::PermissionDenied`]
+/// envelope names when [`MemoryStore::execute_pending_action`] refuses an
+/// approver-on-behalf laundering attempt (S5-H4).
+pub const EXECUTE_PENDING_ACTION: &str = "execute_pending_action";
 
 /// #1727 (v0.8.0) — outcome of an [`MemoryStore::undo_in_place_edit`]
 /// call: enough before/after detail to render a dry-run diff and to
