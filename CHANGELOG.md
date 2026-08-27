@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (record-stop fleet kill-switch fail-open — #3276)
+
+- **`#3276` (HIGH) — a postgres write gate now honors a record-stop engaged by
+  ANOTHER daemon within a bounded window, without a reconnect.** The record-stop
+  is a durable, fleet-wide "freeze all writes" control persisted in the
+  `signed_events` chain. `#3175` fixed the STATUS read to derive from the chain,
+  but every WRITE gate (`PostgresStore::gate_record_stop`) still read only the
+  process-local cache seeded once at `connect`. On the multi-daemon postgres
+  fleet a stop engaged by one daemon did NOT stop another daemon's HTTP/MCP
+  writes until it reconnected — a fail-OPEN kill switch. The write gate now runs
+  a TTL-bounded, single-flight durable re-check (`RECORD_STOP_REFRESH_TTL_MS`,
+  1000 ms) that re-derives the durable state from the chain and reconciles the
+  cache: a remote stop is honored within `≤ TTL + one chain-read latency` with
+  no reconnect, at a steady-state cost of ~one cheap chain read per TTL window
+  per process (the local-cache fast path is preserved for every other write; a
+  single elected writer per window performs the read, so there is no per-write
+  round-trip and no thundering-herd re-read). Fail-CLOSED: a chain-read error
+  leaves the cache untouched, so a transient DB hiccup never downgrades a cached
+  STOPPED to RUNNING. The residual cross-pool window (≤ TTL) is the deliberate,
+  documented cost of not paying a DB read on every write; same-process stops
+  remain instant (the shared cache flips synchronously). The sqlite gate is
+  unchanged: sqlite is the single-process embedded/stdio topology, so its
+  connect-time-seeded per-DB-path registry already sees every in-process
+  actuation. Pin:
+  `pg_write_gate_honors_cross_pool_stop_within_ttl_3276`.
+
 ### Security (federation-receive secret screen — carve-out bypass + completeness)
 
 - **`#3269` (HIGH) — the federation-receive secret screen is no longer
