@@ -329,9 +329,27 @@ async fn live_archive_restore_preserves_the_genesis_cid_2385() {
     .await
     .expect("drift the archived agent_id");
 
+    // #3271 — this test deliberately drifted the archived row's `agent_id`
+    // to `ai:mallory` above (to prove a drifted re-mint input does not
+    // re-address the durable row). The #3271 caller-owns gate on
+    // `archive_restore` now correctly refuses a NON-owner: `ctx` (the seed
+    // `owner`) no longer owns the drifted row, so a plain-agent restore is
+    // `Ok(false)` — the intended security behaviour, asserted here so the
+    // #3271 gate has live-PG coverage (the gap that let it ship untested).
     assert!(
-        pg.archive_restore(&ctx, &id).await.expect("restore"),
-        "restore must report success"
+        !pg.archive_restore(&ctx, &id)
+            .await
+            .expect("restore probe (non-owner)"),
+        "#3271: a non-owner restore of the drifted row must be refused (Ok(false))"
+    );
+    // The legitimate restore of a tampered/drifted archived row is the
+    // operator lane (`bypass_visibility`), which is what this #2385 CID
+    // test actually exercises — CID preservation is orthogonal to authz.
+    assert!(
+        pg.archive_restore(&CallerContext::for_admin(owner), &id)
+            .await
+            .expect("restore"),
+        "restore must report success on the operator lane"
     );
     let restored_cid: Option<String> = sqlx::query_scalar("SELECT cid FROM memories WHERE id = $1")
         .bind(&id)
