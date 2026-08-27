@@ -7713,7 +7713,10 @@ impl AppConfig {
                         }
                     },
                     Err(e) => {
-                        eprintln!("ai-memory: config parse error ({}): {}", path.display(), e);
+                        eprintln!(
+                            "ai-memory: {}",
+                            Self::toml_parse_error_redacted(path, &contents, &e)
+                        );
                         Self::default()
                     }
                 }
@@ -7780,6 +7783,30 @@ impl AppConfig {
         Self::from_toml_contents(path, &contents)
     }
 
+    /// #3277 / #3197 — never interpolate `toml::de::Error` into logs.
+    /// toml 0.8 renders the offending source line with a caret; that
+    /// line may carry `api_key`. Report path + 1-based line only.
+    fn toml_parse_error_redacted(path: &Path, contents: &str, err: &toml::de::Error) -> String {
+        let line = err.span().map(|span| {
+            let start = span.start.min(contents.len());
+            contents.as_bytes()[..start]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count()
+                .saturating_add(1)
+        });
+        match line {
+            Some(n) => format!(
+                "config parse error at {path}:{n} (offending source line omitted — may contain secrets; #3277)",
+                path = path.display()
+            ),
+            None => format!(
+                "config parse error at {path} (offending source omitted — may contain secrets; #3277)",
+                path = path.display()
+            ),
+        }
+    }
+
     /// The shared PROPAGATING parse+validate tail of [`Self::try_load_from`]
     /// and [`Self::try_load_from_optional`] (#3166): unknown-key WARN, TOML
     /// parse, secret-handling validation, legacy-drift WARN.
@@ -7789,12 +7816,18 @@ impl AppConfig {
     /// Returns an error when the TOML fails to parse or the secret-handling
     /// validation rejects the resolved config.
     fn from_toml_contents(path: &Path, contents: &str) -> anyhow::Result<Self> {
-        use anyhow::Context as _;
         // Mirror `load_from`'s L1 unknown-top-level-key WARN (best-effort;
         // does not fail the load).
         Self::warn_unknown_top_level_keys(path, contents);
-        let cfg: Self = toml::from_str(contents)
-            .with_context(|| format!("parsing config {}", path.display()))?;
+        // #3277 / #3197 — toml 0.8 Display echoes the offending source
+        // line (caret-underlined). A malformed `api_key = "…"` therefore
+        // lands in stderr/journald if we chain the toml error through
+        // anyhow (`{e:#}` in `main`). Map to a line-number-only message
+        // and drop the toml error so it cannot reappear as `Error::source`.
+        let cfg: Self = match toml::from_str(contents) {
+            Ok(cfg) => cfg,
+            Err(e) => anyhow::bail!("{}", Self::toml_parse_error_redacted(path, contents, &e)),
+        };
         cfg.validate_secret_handling()
             .map_err(|reason| anyhow::anyhow!("config rejected ({}): {reason}", path.display()))?;
         eprintln!("ai-memory: loaded config from {}", path.display());
@@ -11025,9 +11058,31 @@ legacy_scoring = false
         .unwrap();
         let err = AppConfig::try_load_from_optional(tmp.path())
             .expect_err("a TOML syntax error must NOT resolve to compiled defaults");
+        let rendered = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("parsing config"),
-            "expected the parse error to be surfaced; got {err:#}"
+            rendered.contains("config parse error"),
+            "expected the parse error to be surfaced; got {rendered}"
+        );
+        assert!(
+            !rendered.contains("/var/lib/ai-memory/prod.db"),
+            "#3277: toml Display must not echo the source line; got {rendered}"
+        );
+    }
+
+    #[test]
+    fn try_load_from_optional_does_not_echo_api_key_on_toml_error_3277() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "api_key = \"sekrit-must-not-leak\"unclosed\n").unwrap();
+        let err = AppConfig::try_load_from_optional(tmp.path())
+            .expect_err("malformed api_key TOML must refuse, not default");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("config parse error"),
+            "expected a redacted parse error; got {rendered}"
+        );
+        assert!(
+            !rendered.contains("sekrit-must-not-leak"),
+            "#3277: boot parse error must not echo api_key; got {rendered}"
         );
     }
 
