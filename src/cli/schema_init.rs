@@ -238,9 +238,15 @@ pub struct SchemaInitReport {
     /// `false` on SQLite.
     #[serde(default)]
     pub pgvector_installed: bool,
-    /// v1.0.0 (#3264) — `current_user` is a PostgreSQL superuser.
-    /// pgvector is not a TRUSTED extension, so only a superuser can
-    /// perform the one-time `CREATE EXTENSION vector`. `false` on SQLite.
+    /// v1.0.0 (#3264) — `pg_roles.rolsuper` for `current_user`. `false`
+    /// on SQLite.
+    ///
+    /// A HINT, not a privilege oracle: pgvector is not a TRUSTED
+    /// extension, but every managed PostgreSQL delegates `CREATE
+    /// EXTENSION` to a role that is NOT `rolsuper` (`rds_superuser`,
+    /// `cloudsqlsuperuser`, `azure_pg_admin`, …), so `false` here does not
+    /// mean the one-time create will fail. See
+    /// `store::postgres::classify_pgvector_preflight`.
     #[serde(default)]
     pub role_is_superuser: bool,
     /// v1.0.0 (#3264) — `current_user` holds `USAGE` on `ag_catalog`.
@@ -1501,5 +1507,16 @@ mod tests {
         render_human(&report, &mut out).unwrap();
         let s = String::from_utf8(stdout).unwrap();
         assert!(!s.contains("age_projection"));
+        // #3264 review fix (S4) — negative pin: the whole postgres-only
+        // block (pgvector / role / ag_catalog, added by #3264) is gated on
+        // `kind == "postgres"` too, so a SQLite report stays byte-for-byte
+        // what it was before #3264. Without this, a future edit could
+        // hoist those lines out of the `if` and nothing would fail.
+        for postgres_only in ["pgvector:", "role:", "ag_catalog:"] {
+            assert!(
+                !s.contains(postgres_only),
+                "a SQLite report must not carry the postgres-only line {postgres_only:?}: {s}"
+            );
+        }
     }
 }

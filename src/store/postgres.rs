@@ -492,33 +492,45 @@ pub(crate) const PG_ERR_ALREADY_EXISTS: &str = "already exists";
 // rejected for v1.0.0 (see the #3260 vote record). What is added here is
 // the CLASSIFICATION and the remedy, so the operator is told WHICH of the
 // two faults they have and the single command that fixes it.
+//
+// The classification NEVER pre-empts the DDL on a privilege GUESS. The
+// only fault the preflight refuses on its own is `0A000` (no `vector.so`
+// on the server), which no role can fix. The `42501` shape is diagnosed
+// from the DDL's OWN SQLSTATE, because `pg_roles.rolsuper` does not decide
+// it: every managed PostgreSQL delegates extension creation to a
+// non-`rolsuper` admin role (`rds_superuser`, `cloudsqlsuperuser`,
+// `azure_pg_admin`, and the DO / Neon / Timescale / Aiven equivalents).
 
-/// #3264 — availability probe for pgvector. An ABSENT row means the
-/// server has no `vector` extension available at all, so `CREATE
-/// EXTENSION` would fail with SQLSTATE `0A000`; a present row whose
-/// `installed_version` is non-NULL means it is already installed in THIS
-/// database, which is the privilege-free path for any LOGIN role.
-const SQL_PGVECTOR_AVAILABILITY: &str = "SELECT installed_version IS NOT NULL, \
-     default_version IS NOT NULL FROM pg_available_extensions WHERE name = 'vector'";
-
-/// #3264 — superuser probe for the CONNECTING role. pgvector is not a
-/// trusted extension, so only a superuser may create it.
-const SQL_CURRENT_ROLE_IS_SUPERUSER: &str =
-    "SELECT rolsuper FROM pg_roles WHERE rolname = current_user";
-
-/// #3264 — the database `CREATE EXTENSION vector` has to be run in. Named
-/// verbatim in the classified remedy so the operator does not have to
-/// re-derive it from a redacted DSN.
-const SQL_CURRENT_DATABASE: &str = "SELECT current_database()";
-
-/// #3264 — `ag_catalog` USAGE probe for the connecting role, reported by
-/// `schema-init --json` and `doctor`. Resolved through `pg_namespace.oid`
-/// rather than the schema NAME so an AGE-less server returns "no row"
-/// (rendered `false`) instead of raising `schema "ag_catalog" does not
-/// exist`.
-const SQL_AG_CATALOG_USAGE: &str = "SELECT COALESCE((SELECT \
-     has_schema_privilege(current_user, n.oid, 'USAGE') FROM pg_namespace n \
-     WHERE n.nspname = 'ag_catalog'), false)";
+/// #3264 — every preflight catalog fact in ONE round trip, ordered
+/// `(installed, available, rolsuper, ag_catalog_usage, database)`.
+///
+/// - `installed` is read from **`pg_extension`**, the authoritative record
+///   of what is installed in THIS database. `pg_available_extensions` is a
+///   control-FILE scan of `SHAREDIR/extension`, so a server whose
+///   `vector.control` is absent or unreadable (a slimmed image that keeps
+///   `vector.so` but drops the control file, a fork that hides it, a
+///   restricted `SHAREDIR`) reports no row there while the extension is
+///   installed and working. Deriving `installed` from that scan produced a
+///   FALSE `NotAvailableOnServer` refusal against a database that already
+///   has pgvector — the exact fail-open-into-fail-closed inversion this
+///   preflight must never introduce.
+/// - `available` stays on `pg_available_extensions`, which IS the
+///   "could `CREATE EXTENSION` find a control file" question, narrowed to
+///   a non-NULL `default_version`.
+/// - `rolsuper` is a HINT only — see [`classify_pgvector_preflight`].
+/// - the `ag_catalog` probe resolves through `pg_namespace.oid` rather
+///   than the schema NAME so an AGE-less server yields `false` instead of
+///   raising `schema "ag_catalog" does not exist`.
+/// - `current_database()` is named verbatim in the classified remedy so
+///   the operator does not have to re-derive it from a redacted DSN.
+const SQL_PGVECTOR_PREFLIGHT_FACTS: &str = "SELECT \
+     EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector'), \
+     EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector' \
+     AND default_version IS NOT NULL), \
+     COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false), \
+     COALESCE((SELECT has_schema_privilege(current_user, n.oid, 'USAGE') \
+     FROM pg_namespace n WHERE n.nspname = 'ag_catalog'), false), \
+     current_database()";
 
 /// SQLSTATE `42501` (`insufficient_privilege`) — what PostgreSQL returns
 /// for `CREATE EXTENSION vector` issued by a non-superuser.
@@ -552,19 +564,27 @@ const PGVECTOR_DETAIL_NOT_AVAILABLE: &str = "pgvector is NOT available on this P
 
 /// #3264 — classified `BackendUnavailable` detail for
 /// [`PgvectorPreflight::AvailableNeedsSuperuserCreate`] (the managed /
-/// CloudNativePG / RDS non-superuser role shape). `{DATABASE}` is
-/// substituted with `current_database()`.
+/// CloudNativePG / RDS role shape). `{DATABASE}` is substituted with
+/// `current_database()`.
+///
+/// Rendered ONLY after a real `CREATE EXTENSION vector` came back `42501`
+/// — never preemptively off `pg_roles.rolsuper`, which is not the
+/// privilege oracle on managed PostgreSQL (see
+/// [`classify_pgvector_preflight`]). That is why it can state the refusal
+/// as fact.
 const PGVECTOR_DETAIL_NEEDS_SUPERUSER: &str = "pgvector is available on this PostgreSQL \
-     server but is NOT installed in database `{DATABASE}`, and the connecting role is not a \
-     superuser — pgvector is not a TRUSTED extension, so `CREATE EXTENSION vector` is \
-     refused with SQLSTATE 42501 (insufficient_privilege). Remedy: a superuser must run \
-     `CREATE EXTENSION vector;` ONCE in database `{DATABASE}` — CloudNativePG: the cluster's \
-     `postInitApplicationSQL`, or the `Database` CR `extensions` field; RDS / Aurora: \
-     connect as a member of `rds_superuser`; self-managed: `sudo -u postgres psql -d \
-     {DATABASE} -c 'CREATE EXTENSION vector;'`. After that one-time step this daemon's own \
-     `CREATE EXTENSION IF NOT EXISTS vector` needs no privilege at all (it is a \
-     privilege-free `already exists, skipping` NOTICE). See docs/postgres-age-guide.md \
-     (\"Managed / non-superuser Postgres (CloudNativePG, RDS, Cloud SQL)\").";
+     server but is NOT installed in database `{DATABASE}`, and `CREATE EXTENSION vector` was \
+     refused with SQLSTATE 42501 (insufficient_privilege) — pgvector is not a TRUSTED \
+     extension, so the connecting role does not hold the privilege to create it. Remedy: an \
+     admin role that CAN create extensions must run `CREATE EXTENSION vector;` ONCE in \
+     database `{DATABASE}` — CloudNativePG: the cluster's `postInitApplicationSQL`, or the \
+     `Database` CR `extensions` field; RDS / Aurora: connect as a member of `rds_superuser`; \
+     Cloud SQL: as `cloudsqlsuperuser`; Azure Database for PostgreSQL: as a member of \
+     `azure_pg_admin`; self-managed: `sudo -u postgres psql -d {DATABASE} -c 'CREATE \
+     EXTENSION vector;'`. After that one-time step this daemon's own `CREATE EXTENSION IF \
+     NOT EXISTS vector` needs no privilege at all (it is a privilege-free `already exists, \
+     skipping` NOTICE). See docs/postgres-age-guide.md (\"Managed / non-superuser Postgres \
+     (CloudNativePG, RDS, Cloud SQL)\").";
 
 /// #3264 — WARN emitted when the preflight probe itself cannot run. The
 /// probe is DIAGNOSTIC ONLY: the authoritative fail-closed gate is the
@@ -578,6 +598,53 @@ const MSG_PGVECTOR_PREFLIGHT_PROBE_FAILED: &str = "pgvector bootstrap preflight 
 const MSG_PGVECTOR_PREFLIGHT_REFUSED: &str =
     "pgvector bootstrap preflight refused — see detail for the remedy";
 
+/// #3264 — the `AvailableNeedsSuperuserCreate` advisory. Emitted as a WARN
+/// by the bootstrap preflight and reused verbatim as the `ai-memory
+/// doctor` WARNING note, so both surfaces say the same thing (tense-
+/// neutral for exactly that reason).
+///
+/// This is deliberately NOT a refusal. `rolsuper` is not the privilege
+/// oracle on managed PostgreSQL (see [`classify_pgvector_preflight`]), so
+/// the authoritative gate stays the real `CREATE EXTENSION` inside
+/// `INIT_SCHEMA`; if that genuinely comes back `42501`, the classified
+/// [`PGVECTOR_DETAIL_NEEDS_SUPERUSER`] remedy is what aborts the boot.
+pub(crate) const MSG_PGVECTOR_MAY_NEED_ADMIN_CREATE: &str = "pgvector is not installed in this \
+     database and `pg_roles.rolsuper` is false for the connecting role. This is NOT a refusal: \
+     bootstrap attempts `CREATE EXTENSION vector` regardless, because managed PostgreSQL \
+     delegates extension creation to non-`rolsuper` admin roles (rds_superuser / \
+     cloudsqlsuperuser / azure_pg_admin). If the server does refuse it, the boot aborts with a \
+     classified SQLSTATE 42501 error carrying the one-time admin pre-create remedy.";
+
+/// #3264 — is `database` safe to interpolate VERBATIM into an
+/// operator-facing string? [`PG_UNKNOWN_DATABASE`] is our own placeholder,
+/// not a server-supplied name, so it is admitted explicitly.
+fn database_name_is_plain(database: &str) -> bool {
+    database == PG_UNKNOWN_DATABASE
+        || (!database.is_empty()
+            && database
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+}
+
+/// #3264 — render a server-supplied `current_database()` for an
+/// operator-facing string.
+///
+/// The value is chosen by whoever created the database, not by this
+/// daemon, and it lands in a `sudo -u postgres psql -d {DATABASE} -c
+/// '...'` line the remedy invites an operator to paste into a SUPERUSER
+/// shell — and in log lines. A name carrying a quote, a semicolon, a
+/// newline or an ANSI escape could break out of that pasted command or
+/// forge log output, so anything outside `[A-Za-z0-9_]` is rendered
+/// ESCAPED (`Debug` escapes quotes, backslashes and control characters)
+/// instead of verbatim. Legitimate names are unaffected.
+pub(crate) fn render_database_for_operator(database: &str) -> String {
+    if database_name_is_plain(database) {
+        database.to_string()
+    } else {
+        format!("{database:?}")
+    }
+}
+
 /// #3264 — classification of the pgvector bootstrap preflight. Produced by
 /// the pure [`classify_pgvector_preflight`] decision table so the mapping
 /// is unit-testable without a live PostgreSQL.
@@ -587,10 +654,17 @@ pub(crate) enum PgvectorPreflight {
     /// unchanged: `CREATE EXTENSION IF NOT EXISTS vector` is a
     /// privilege-free no-op for any LOGIN role.
     Installed,
-    /// The server has no `vector` extension available at all. Blocking.
+    /// The server has no `vector` extension available at all. The ONE
+    /// preemptively-blocking class: no privilege and no platform admin
+    /// role can conjure a `vector.so` the image never shipped.
     NotAvailableOnServer,
-    /// Available on the server, not installed in this database, and the
-    /// connecting role is not a superuser. Blocking.
+    /// Available on the server, not installed in this database, and
+    /// `pg_roles.rolsuper` is false for the connecting role.
+    ///
+    /// NOT preemptively blocking: `rolsuper` is not the privilege oracle
+    /// on managed PostgreSQL (see [`classify_pgvector_preflight`]).
+    /// Bootstrap WARNs and proceeds; this verdict's classified detail is
+    /// rendered only if the real `CREATE EXTENSION` then returns `42501`.
     AvailableNeedsSuperuserCreate,
     /// Available, not installed, and the connecting role IS a superuser —
     /// `INIT_SCHEMA` will create it. Bootstrap proceeds unchanged.
@@ -598,9 +672,9 @@ pub(crate) enum PgvectorPreflight {
 }
 
 impl PgvectorPreflight {
-    /// The classified detail TEMPLATE for the two blocking classes;
-    /// `None` for the two proceed classes.
-    const fn blocking_template(self) -> Option<&'static str> {
+    /// The classified detail TEMPLATE for the two FAULT classes; `None`
+    /// for the two healthy classes.
+    const fn classified_template(self) -> Option<&'static str> {
         match self {
             Self::NotAvailableOnServer => Some(PGVECTOR_DETAIL_NOT_AVAILABLE),
             Self::AvailableNeedsSuperuserCreate => Some(PGVECTOR_DETAIL_NEEDS_SUPERUSER),
@@ -609,10 +683,40 @@ impl PgvectorPreflight {
     }
 
     /// Classified `BackendUnavailable` detail with `{DATABASE}`
-    /// substituted, or `None` when this class does not block bootstrap.
-    pub(crate) fn blocking_detail(self, database: &str) -> Option<String> {
-        self.blocking_template()
-            .map(|t| t.replace(PGVECTOR_DETAIL_DB_PLACEHOLDER, database))
+    /// substituted, or `None` when this class names no fault.
+    ///
+    /// Carrying a detail is NOT the same as blocking bootstrap: the
+    /// `AvailableNeedsSuperuserCreate` text is a post-hoc explanation of a
+    /// real SQLSTATE `42501`, produced by [`classify_init_sql_error`] on
+    /// the `INIT_SCHEMA` error path. See [`Self::preemptive_refusal_detail`]
+    /// for the one class that refuses BEFORE the DDL runs.
+    pub(crate) fn classified_detail(self, database: &str) -> Option<String> {
+        let rendered = render_database_for_operator(database);
+        self.classified_template()
+            .map(|t| t.replace(PGVECTOR_DETAIL_DB_PLACEHOLDER, &rendered))
+    }
+
+    /// Classified detail for the ONE class that refuses bootstrap BEFORE
+    /// the real `CREATE EXTENSION` is attempted; `None` for every other.
+    ///
+    /// Only `NotAvailableOnServer` (SQLSTATE `0A000`) qualifies: the
+    /// server image ships no `vector.so`, so the DDL is certain to fail
+    /// for every role and refusing early costs nothing. Every other
+    /// verdict — including `AvailableNeedsSuperuserCreate` — lets the DDL
+    /// be the gate, because `pg_roles.rolsuper` is not the privilege
+    /// oracle on managed PostgreSQL and a preemptive refusal there is a
+    /// FALSE refusal of a backend that boots fine (see
+    /// [`classify_pgvector_preflight`]).
+    ///
+    /// The match is exhaustive on purpose: a new verdict cannot silently
+    /// inherit either disposition.
+    pub(crate) fn preemptive_refusal_detail(self, database: &str) -> Option<String> {
+        match self {
+            Self::NotAvailableOnServer => self.classified_detail(database),
+            Self::Installed
+            | Self::AvailableNeedsSuperuserCreate
+            | Self::AvailableCreatableProceed => None,
+        }
     }
 
     /// Stable machine label for the `doctor` / `schema-init` surfaces.
@@ -628,11 +732,23 @@ impl PgvectorPreflight {
 
 /// #3264 — the pure decision table. `available` is "the server offers a
 /// usable `vector` extension", `installed` is "it is installed in THIS
-/// database", `rolsuper` is "`current_user` is a superuser".
+/// database", `rolsuper` is `pg_roles.rolsuper` for `current_user`.
 ///
 /// `installed` wins outright: an installed extension makes the bootstrap
 /// `CREATE EXTENSION IF NOT EXISTS` privilege-free regardless of what the
 /// availability catalog or the role's superuser bit say.
+///
+/// **`rolsuper` is a HINT, never a refusal oracle.** Every managed
+/// PostgreSQL delegates extension creation to a role that is NOT
+/// `rolsuper` — RDS / Aurora (`rds_superuser`), Cloud SQL
+/// (`cloudsqlsuperuser`), Azure Database for PostgreSQL (`azure_pg_admin`),
+/// and the DO / Neon / Timescale / Aiven equivalents — so
+/// `rolsuper = false` does NOT mean `CREATE EXTENSION vector` will fail.
+/// [`PgvectorPreflight::AvailableNeedsSuperuserCreate`] therefore only
+/// downgrades the boot to a WARN; the authoritative gate is the real DDL,
+/// whose `42501` is mapped back onto this same verdict by
+/// [`classify_init_sql_error`]. Refusing on `rolsuper` alone would fail a
+/// fresh managed deployment that works.
 pub(crate) const fn classify_pgvector_preflight(
     available: bool,
     installed: bool,
@@ -659,6 +775,14 @@ pub(crate) const fn classify_pgvector_preflight(
 /// the classification fires only when the preflight either could not run
 /// (probe failure, or the schema-AHEAD hatch skipped it — the SQLSTATE is
 /// then the only evidence there is) or agrees with it.
+///
+/// The `42501` corroboration arm is the PRIMARY path for the managed /
+/// CloudNativePG role shape: the connect path no longer refuses on
+/// `AvailableNeedsSuperuserCreate`, it records that verdict and lets the
+/// DDL run, so a genuine privilege refusal arrives here with the
+/// preflight already agreeing. `0A000` reaches here only from the probe-
+/// failure / schema-AHEAD arms, since an observed `NotAvailableOnServer`
+/// is refused before `INIT_SCHEMA` is issued at all.
 pub(crate) fn classify_init_sql_error(
     sqlstate: Option<&str>,
     preflight: Option<PgvectorPreflight>,
@@ -687,7 +811,9 @@ pub(crate) struct PgvectorPreflightFacts {
     pub(crate) available: bool,
     /// `vector` is installed in this database.
     pub(crate) installed: bool,
-    /// `current_user` is a superuser.
+    /// `pg_roles.rolsuper` for `current_user`, or `false` when the role
+    /// has no `pg_roles` row. A HINT, not a privilege oracle — see
+    /// [`classify_pgvector_preflight`].
     pub(crate) role_is_superuser: bool,
     /// `current_user` holds USAGE on `ag_catalog` (false when AGE is not
     /// installed at all).
@@ -743,24 +869,24 @@ pub(crate) async fn probe_extension_version(
 pub(crate) async fn probe_pgvector_preflight(
     pool: &PgPool,
 ) -> Result<PgvectorPreflightFacts, sqlx::Error> {
-    let row: Option<(bool, bool)> = sqlx::query_as(SQL_PGVECTOR_AVAILABILITY)
-        .fetch_optional(pool)
+    // ONE statement, not four serialized round trips: the probe runs while
+    // the bootstrap advisory lock is held, so every avoidable round trip is
+    // lock-hold time every other booting replica waits on. A role absent
+    // from `pg_roles`, and a server with no `ag_catalog`, both COALESCE to
+    // `false` server-side rather than needing an `Option` arm here.
+    let (installed, available, role_is_superuser, age_catalog_usage, database): (
+        bool,
+        bool,
+        bool,
+        bool,
+        String,
+    ) = sqlx::query_as(SQL_PGVECTOR_PREFLIGHT_FACTS)
+        .fetch_one(pool)
         .await?;
-    // An absent row is "not available on this server" — the #1065 case.
-    let (installed, available) = row.unwrap_or((false, false));
-    let rolsuper: Option<(bool,)> = sqlx::query_as(SQL_CURRENT_ROLE_IS_SUPERUSER)
-        .fetch_optional(pool)
-        .await?;
-    let (age_catalog_usage,): (bool,) =
-        sqlx::query_as(SQL_AG_CATALOG_USAGE).fetch_one(pool).await?;
-    let (database,): (String,) = sqlx::query_as(SQL_CURRENT_DATABASE).fetch_one(pool).await?;
     Ok(PgvectorPreflightFacts {
         available,
         installed,
-        // A role that cannot be found in `pg_roles` is treated as NOT a
-        // superuser: the only effect is a classified refusal instead of an
-        // opaque one on a `CREATE EXTENSION` that would have failed anyway.
-        role_is_superuser: rolsuper.is_some_and(|(s,)| s),
+        role_is_superuser,
         age_catalog_usage,
         database,
     })
@@ -2013,7 +2139,7 @@ impl PostgresStore {
             // `CREATE EXTENSION IF NOT EXISTS vector;`). Classifies the two
             // faults an operator actually hits — a server image with no
             // pgvector (SQLSTATE 0A000) and the managed / CloudNativePG
-            // non-superuser role shape (SQLSTATE 42501) — and refuses with the
+            // privilege shape (SQLSTATE 42501) — so the abort carries the
             // remedy instead of the opaque `init schema: <driver error>`.
             //
             // Skipped when `schema_ahead`, mirroring `init_attempts = 0`
@@ -2021,10 +2147,19 @@ impl PostgresStore {
             // DDL and hands the database back exactly as found, so it must not
             // refuse on a `CREATE EXTENSION` it is not going to issue.
             //
-            // NEVER warn-and-continue: the two blocking classes RETURN, and a
-            // probe that cannot run falls through to the unchanged
-            // fail-closed `CREATE EXTENSION` abort below (only the MESSAGE
-            // degrades, via `classify_init_sql_error`).
+            // EXACTLY ONE class refuses here: `NotAvailableOnServer`, where the
+            // server ships no `vector.so` and the DDL is certain to fail for
+            // every role. `AvailableNeedsSuperuserCreate` deliberately does NOT
+            // refuse — `pg_roles.rolsuper` is not the privilege oracle on
+            // managed PostgreSQL (RDS `rds_superuser`, Cloud SQL
+            // `cloudsqlsuperuser`, Azure `azure_pg_admin` all create extensions
+            // without it), so refusing on it would fail-close a fresh managed
+            // deployment that boots fine. It WARNs, records the verdict, and
+            // lets the real `CREATE EXTENSION` be the gate; a genuine 42501
+            // then aborts with the identical classified remedy via
+            // `classify_init_sql_error`. A probe that cannot run falls through
+            // to the same unchanged fail-closed abort (only the MESSAGE
+            // degrades). The abort itself is never softened.
             let mut pgvector_preflight: Option<PgvectorPreflight> = None;
             let mut pgvector_database: String = PG_UNKNOWN_DATABASE.to_string();
             if !schema_ahead {
@@ -2040,8 +2175,7 @@ impl PostgresStore {
                             verdict = verdict.label(),
                             "pgvector bootstrap preflight"
                         );
-                        pgvector_database = facts.database.clone();
-                        if let Some(detail) = verdict.blocking_detail(&facts.database) {
+                        if let Some(detail) = verdict.preemptive_refusal_detail(&facts.database) {
                             tracing::error!(
                                 target: TRACE_TARGET,
                                 verdict = verdict.label(),
@@ -2053,6 +2187,16 @@ impl PostgresStore {
                                 detail,
                             });
                         }
+                        if verdict == PgvectorPreflight::AvailableNeedsSuperuserCreate {
+                            tracing::warn!(
+                                target: TRACE_TARGET,
+                                verdict = verdict.label(),
+                                database = %render_database_for_operator(&facts.database),
+                                "{MSG_PGVECTOR_MAY_NEED_ADMIN_CREATE}"
+                            );
+                        }
+                        // Moved, not cloned: `facts` is dead from here.
+                        pgvector_database = facts.database;
                         pgvector_preflight = Some(verdict);
                     }
                     Err(e) => {
@@ -2096,12 +2240,18 @@ impl PostgresStore {
             }
             if let Some(e) = last_err {
                 // v1.0.0 #3264 — classify the two pgvector faults from the
-                // driver SQLSTATE when the preflight above could not (probe
-                // failure, or the schema-AHEAD hatch). Everything else keeps
-                // the historical opaque form verbatim.
+                // driver SQLSTATE. This is the AUTHORITATIVE gate for the
+                // 42501 privilege shape: the preflight above records
+                // `AvailableNeedsSuperuserCreate` and proceeds, so a real
+                // refusal lands here with the verdict already corroborating.
+                // It also covers the arms where the preflight has no verdict
+                // at all (probe failure, or the schema-AHEAD hatch), where the
+                // SQLSTATE is the only evidence there is. A `42501` the
+                // preflight CONTRADICTS keeps the historical opaque form
+                // verbatim rather than a wrong pgvector diagnosis.
                 let sqlstate = e.as_database_error().and_then(|db| db.code());
                 let detail = classify_init_sql_error(sqlstate.as_deref(), pgvector_preflight)
-                    .and_then(|verdict| verdict.blocking_detail(&pgvector_database))
+                    .and_then(|verdict| verdict.classified_detail(&pgvector_database))
                     .unwrap_or_else(|| format!("init schema: {e}"));
                 return Err(StoreError::BackendUnavailable {
                     backend: "postgres".to_string(),
@@ -36769,6 +36919,7 @@ mod pgvector_preflight_tests_3264 {
     use super::{
         PG_SQLSTATE_FEATURE_NOT_SUPPORTED, PG_SQLSTATE_INSUFFICIENT_PRIVILEGE, PgvectorPreflight,
         PgvectorPreflightFacts, classify_init_sql_error, classify_pgvector_preflight,
+        render_database_for_operator,
     };
 
     /// The full 2^3 decision table, enumerated. `installed` wins outright:
@@ -36809,21 +36960,25 @@ mod pgvector_preflight_tests_3264 {
         );
     }
 
-    /// Exactly the two blocking classes carry a classified detail, and each
-    /// one names its remedy. The two proceed classes carry none — that is
+    /// Exactly the two FAULT classes carry a classified detail, and each
+    /// one names its remedy. The two healthy classes carry none — that is
     /// what keeps the happy path byte-identical to the pre-#3264 bootstrap.
     #[test]
-    fn only_the_two_blocking_classes_carry_a_classified_detail() {
-        assert!(PgvectorPreflight::Installed.blocking_detail("db").is_none());
+    fn only_the_two_fault_classes_carry_a_classified_detail() {
+        assert!(
+            PgvectorPreflight::Installed
+                .classified_detail("db")
+                .is_none()
+        );
         assert!(
             PgvectorPreflight::AvailableCreatableProceed
-                .blocking_detail("db")
+                .classified_detail("db")
                 .is_none()
         );
 
         let not_available = PgvectorPreflight::NotAvailableOnServer
-            .blocking_detail("aimemory")
-            .expect("blocking class must carry a detail");
+            .classified_detail("aimemory")
+            .expect("fault class must carry a detail");
         assert!(
             not_available.contains("0A000"),
             "must name the SQLSTATE: {not_available}"
@@ -36838,8 +36993,8 @@ mod pgvector_preflight_tests_3264 {
         );
 
         let needs_su = PgvectorPreflight::AvailableNeedsSuperuserCreate
-            .blocking_detail("aimemory")
-            .expect("blocking class must carry a detail");
+            .classified_detail("aimemory")
+            .expect("fault class must carry a detail");
         assert!(
             needs_su.contains("42501"),
             "must name the SQLSTATE: {needs_su}"
@@ -36864,8 +37019,8 @@ mod pgvector_preflight_tests_3264 {
     #[test]
     fn database_placeholder_is_substituted_everywhere() {
         let detail = PgvectorPreflight::AvailableNeedsSuperuserCreate
-            .blocking_detail("prod_mem")
-            .expect("blocking class must carry a detail");
+            .classified_detail("prod_mem")
+            .expect("fault class must carry a detail");
         assert!(
             !detail.contains("{DATABASE}"),
             "placeholder left in: {detail}"
@@ -36921,6 +37076,76 @@ mod pgvector_preflight_tests_3264 {
             None,
             "a driverless error must never be classified from the preflight alone"
         );
+    }
+
+    /// #3264 review fix (B1) — ONLY the `0A000` class refuses bootstrap
+    /// before the DDL runs.
+    ///
+    /// `pg_roles.rolsuper` is not the privilege oracle on managed
+    /// PostgreSQL (RDS `rds_superuser`, Cloud SQL `cloudsqlsuperuser`,
+    /// Azure `azure_pg_admin` all create extensions without it), so a
+    /// preemptive refusal on `AvailableNeedsSuperuserCreate` would
+    /// fail-close a fresh managed deployment that boots fine. That verdict
+    /// still CARRIES its classified detail — rendered only once the real
+    /// `CREATE EXTENSION` has actually returned `42501`.
+    #[test]
+    fn only_the_0a000_class_refuses_before_the_ddl_runs() {
+        assert!(
+            PgvectorPreflight::NotAvailableOnServer
+                .preemptive_refusal_detail("aimemory")
+                .is_some_and(|d| d.contains("0A000")),
+            "the no-vector.so image must still refuse preemptively"
+        );
+        for proceeding in [
+            PgvectorPreflight::Installed,
+            PgvectorPreflight::AvailableCreatableProceed,
+            PgvectorPreflight::AvailableNeedsSuperuserCreate,
+        ] {
+            assert_eq!(
+                proceeding.preemptive_refusal_detail("aimemory"),
+                None,
+                "{proceeding:?} must let the real CREATE EXTENSION be the gate"
+            );
+        }
+        // The 42501 remedy is intact for the SQLSTATE path that DOES fire.
+        assert!(
+            PgvectorPreflight::AvailableNeedsSuperuserCreate
+                .classified_detail("aimemory")
+                .is_some_and(|d| d.contains("42501")),
+            "the classified 42501 remedy must survive the non-preemptive shape"
+        );
+    }
+
+    /// #3264 review fix (S1) — a server-supplied `current_database()` is
+    /// escaped before it reaches the pasteable `psql` remedy and the log
+    /// lines. A quote, a semicolon, a newline or an ANSI escape in a
+    /// database name must not break out of the superuser one-liner the
+    /// operator is invited to paste.
+    #[test]
+    fn database_name_is_escaped_before_it_reaches_an_operator() {
+        for plain in ["aimemory", "prod_mem_2", "A1", "<unknown>"] {
+            assert_eq!(
+                render_database_for_operator(plain),
+                plain,
+                "a legitimate name must reach the operator verbatim"
+            );
+        }
+        let hostile = "mem'; DROP DATABASE mem; --\n\u{1b}[31mFORGED";
+        let rendered = render_database_for_operator(hostile);
+        assert!(
+            !rendered.contains('\n') && !rendered.contains('\u{1b}'),
+            "control characters must be escaped: {rendered}"
+        );
+        let detail = PgvectorPreflight::AvailableNeedsSuperuserCreate
+            .classified_detail(hostile)
+            .expect("fault class must carry a detail");
+        assert!(
+            !detail.contains('\n') && !detail.contains('\u{1b}'),
+            "the pasteable remedy must carry no injected control characters: {detail}"
+        );
+        // An empty name is not "plain" either — it would silently produce
+        // `psql -d  -c ...`, which targets the wrong database.
+        assert_eq!(render_database_for_operator(""), "\"\"");
     }
 
     /// `PgvectorPreflightFacts::verdict` is the same pure table — the

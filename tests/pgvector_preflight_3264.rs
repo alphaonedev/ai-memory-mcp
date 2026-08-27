@@ -10,9 +10,17 @@
 //!
 //! | DSN shape | expected |
 //! |---|---|
-//! | non-superuser role, `vector` NOT installed | `SQLSTATE 42501` class — classified superuser-pre-create remedy |
-//! | server image without `vector.so` | `SQLSTATE 0A000` class — classified image remedy (#1065) |
+//! | server image without `vector.so` | `SQLSTATE 0A000` class — classified image remedy (#1065), refused BEFORE the DDL |
+//! | `vector` available but not installed | the DDL is ATTEMPTED; success, or a classified `SQLSTATE 42501` remedy |
 //! | `vector` pre-created (any role) | connect SUCCEEDS, `schema-init --json` reports the facts |
+//!
+//! #3264 review fix (B1): the middle row is deliberately NOT predicted
+//! from `pg_roles.rolsuper`. Managed `PostgreSQL` delegates `CREATE
+//! EXTENSION` to non-`rolsuper` admin roles (`rds_superuser`,
+//! `cloudsqlsuperuser`, `azure_pg_admin`), so `rolsuper = false` does not
+//! mean the create fails — the DDL's own SQLSTATE is the oracle, and this
+//! suite pins BOTH outcomes as acceptable while still forbidding the
+//! opaque `init schema: <driver error>` form.
 //!
 //! The oracle deliberately re-derives the catalog facts with its OWN SQL
 //! rather than calling the adapter's probe: a test that reuses the
@@ -35,18 +43,23 @@ async fn live_catalog_facts(url: &str) -> (bool, bool, bool, String) {
         .await
         .expect("connect for the independent catalog oracle");
 
-    let ext: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT installed_version, default_version FROM pg_available_extensions \
-         WHERE name = 'vector'",
-    )
-    .fetch_optional(&pool)
-    .await
-    .expect("read pg_available_extensions");
+    // #3264 review fix (B2): "installed in THIS database" is answered by
+    // `pg_extension`, not by the `pg_available_extensions` control-file
+    // scan — a server that installed `vector` but whose `vector.control`
+    // is absent/unreadable has no row in the latter while the extension is
+    // present and working.
+    let (installed,): (bool,) =
+        sqlx::query_as("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')")
+            .fetch_one(&pool)
+            .await
+            .expect("read pg_extension");
 
-    let installed = ext
-        .as_ref()
-        .is_some_and(|(inst, _)| inst.as_ref().is_some());
-    let available = ext.as_ref().is_some_and(|(_, def)| def.as_ref().is_some());
+    let avail: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT default_version FROM pg_available_extensions WHERE name = 'vector'")
+            .fetch_optional(&pool)
+            .await
+            .expect("read pg_available_extensions");
+    let available = avail.is_some_and(|(def,)| def.is_some());
 
     let rolsuper: Option<(bool,)> =
         sqlx::query_as("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
@@ -80,51 +93,71 @@ async fn bootstrap_classifies_the_live_pgvector_posture_3264() {
     let (available, installed, rolsuper, database) = live_catalog_facts(&url).await;
     let result = PostgresStore::connect(&url).await;
 
-    if installed || (available && rolsuper) {
+    if installed {
         assert!(
             result.is_ok(),
-            "pgvector installed={installed} available={available} rolsuper={rolsuper}: \
-             bootstrap must proceed unchanged, got {:?}",
+            "pgvector is installed in this database: `CREATE EXTENSION IF NOT EXISTS` is \
+             privilege-free, so bootstrap must proceed unchanged (rolsuper={rolsuper}), \
+             got {:?}",
             result.err()
         );
         return;
     }
 
-    let err = match result {
-        Ok(_) => panic!(
-            "bootstrap SUCCEEDED with pgvector installed={installed} available={available} \
-             rolsuper={rolsuper} — the fail-closed CREATE EXTENSION gate is gone"
-        ),
-        Err(e) => e.to_string(),
-    };
-
-    assert!(
-        !err.contains("init schema:"),
-        "a classifiable fault must not surface the opaque form: {err}"
-    );
-
-    if available {
-        // Available on the server, absent from this database, non-superuser
-        // role: the CloudNativePG / RDS / Cloud SQL shape.
-        for needle in [
-            "42501",
-            "CREATE EXTENSION vector;",
-            "postInitApplicationSQL",
-            "rds_superuser",
-            database.as_str(),
-        ] {
-            assert!(
-                err.contains(needle),
-                "42501 remedy must name {needle:?}: {err}"
-            );
-        }
-    } else {
-        // The server image ships no pgvector at all (#1065).
+    if !available {
+        // The server image ships no pgvector at all (#1065). Refused
+        // BEFORE the DDL — no role can fix a missing `vector.so`.
+        let err = match result {
+            Ok(_) => panic!(
+                "bootstrap SUCCEEDED with pgvector neither installed nor available — the \
+                 fail-closed CREATE EXTENSION gate is gone"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !err.contains("init schema:"),
+            "a classifiable fault must not surface the opaque form: {err}"
+        );
         for needle in ["0A000", "Dockerfile.pg-age-vector", "#1065"] {
             assert!(
                 err.contains(needle),
                 "0A000 remedy must name {needle:?}: {err}"
             );
+        }
+        return;
+    }
+
+    // Available on the server, absent from this database. #3264 review fix
+    // (B1): the daemon ATTEMPTS the create rather than pre-judging on
+    // `rolsuper`, so BOTH outcomes are legitimate here — what is pinned is
+    // that a refusal is CLASSIFIED and a success actually installed it.
+    match result {
+        Ok(_) => {
+            let (_, installed_after, _, _) = live_catalog_facts(&url).await;
+            assert!(
+                installed_after,
+                "bootstrap reported success (rolsuper={rolsuper}) but `vector` is still not \
+                 in pg_extension — the schema would have no working embedding columns"
+            );
+        }
+        Err(e) => {
+            let err = e.to_string();
+            assert!(
+                !err.contains("init schema:"),
+                "a classifiable fault must not surface the opaque form: {err}"
+            );
+            for needle in [
+                "42501",
+                "CREATE EXTENSION vector;",
+                "postInitApplicationSQL",
+                "rds_superuser",
+                database.as_str(),
+            ] {
+                assert!(
+                    err.contains(needle),
+                    "42501 remedy must name {needle:?}: {err}"
+                );
+            }
         }
     }
 }
@@ -140,8 +173,8 @@ async fn schema_init_json_reports_the_preflight_fields_3264() {
         return;
     };
     let (available, installed, rolsuper, _db) = live_catalog_facts(&url).await;
-    if !(installed || (available && rolsuper)) {
-        eprintln!("backend refuses bootstrap by design — skipping the success-path field pin");
+    if !installed && !available {
+        eprintln!("backend refuses bootstrap by design (#1065) — skipping the field pin");
         return;
     }
 
@@ -154,9 +187,22 @@ async fn schema_init_json_reports_the_preflight_fields_3264() {
         embedding_dim: Some(384),
         force_reembed: false,
     };
-    ai_memory::cli::schema_init::run(&args, None, &mut out)
-        .await
-        .expect("schema-init against the live postgres");
+    // A role that genuinely cannot create the extension refuses HERE with
+    // the classified 42501 remedy (the test above pins that text); the
+    // field pin below only applies to a backend that actually bootstraps.
+    if let Err(e) = ai_memory::cli::schema_init::run(&args, None, &mut out).await {
+        let err = e.to_string();
+        assert!(
+            !installed,
+            "schema-init failed against a database that already has pgvector: {err}"
+        );
+        assert!(
+            err.contains("42501") && !err.contains("init schema:"),
+            "a refusal here must be the classified 42501 remedy: {err}"
+        );
+        eprintln!("this role cannot create the extension — skipping the success-path field pin");
+        return;
+    }
 
     let raw = String::from_utf8(stdout).expect("utf-8 json");
     let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
@@ -272,12 +318,17 @@ fn doctor_reports_the_postgres_extensions_section_3264() {
     );
 
     let installed = facts.get("pgvector_installed").map(String::as_str) == Some("true");
-    let superuser = facts.get("role_is_superuser").map(String::as_str) == Some("true");
     let available = facts.get("pgvector_available").map(String::as_str) == Some("true");
-    if installed || (available && superuser) {
+    // #3264 review fix (B5): only the `0A000` shape — pgvector neither
+    // installed NOR available — is CRITICAL. `rolsuper = false` with the
+    // extension available is a WARNING, because the daemon attempts the
+    // create and managed admin roles succeed at it; exiting 2 there would
+    // fail a backend that boots fine.
+    if installed || available {
         assert_ne!(
             section["severity"], "critical",
-            "a bootstrappable backend must not be CRITICAL: {section}"
+            "a backend the daemon will at least ATTEMPT to bootstrap must not be \
+             CRITICAL: {section}"
         );
     } else {
         assert_eq!(

@@ -104,6 +104,31 @@ const MSG_PG_PROBE_RUNTIME: &str = "build ephemeral runtime for the postgres ext
 #[cfg(feature = "sal-postgres")]
 const MSG_PG_PROBE_PANIC: &str = "postgres extension probe thread panicked";
 
+/// #3264 review fix (B4) — wall-clock budget for the ENTIRE postgres
+/// extension probe: connect, the preflight statement and the two version
+/// reads. `doctor` is the tool an operator reaches for when the store is
+/// already misbehaving, so an unbounded probe against a wedged server is
+/// exactly the case that must NOT hang it forever. Doubles as the pool's
+/// `acquire_timeout` (which alone bounds only connection checkout).
+#[cfg(feature = "sal-postgres")]
+const PG_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// #3264 review fix (B4) — the probe exceeded [`PG_PROBE_TIMEOUT`].
+/// Reported as a CRITICAL section, not a silent omission: a store the
+/// daemon cannot reach in time is the fault it would hit at boot.
+#[cfg(feature = "sal-postgres")]
+const MSG_PG_PROBE_TIMEOUT: &str =
+    "postgres extension probe exceeded its timeout — the configured store did not answer";
+
+/// #3264 review fix (S2) — the configured store URL could not be resolved
+/// at all (e.g. the #1927 refusal of a group/world-readable
+/// `AI_MEMORY_STORE_URL_FILE`). Surfaced instead of silently dropping the
+/// section, because `serve` would refuse to start on the same fault.
+#[cfg(feature = "sal-postgres")]
+const MSG_PG_STORE_URL_UNRESOLVED: &str = "the configured store URL could not be resolved — \
+     `ai-memory serve` refuses to start on this same fault, so no backend health could be \
+     probed";
+
 /// #3264 — rendered for an extension that is not installed in the
 /// probed database.
 #[cfg(feature = "sal-postgres")]
@@ -926,7 +951,20 @@ where
                 Ok(rt.block_on(make_fut()))
             })
             .join()
-            .map_err(|_| anyhow::anyhow!(MSG_PG_PROBE_PANIC))?
+            .map_err(|payload| {
+                // ERRORS-15 — carry the panic's own message instead of
+                // collapsing it. `std` panics carry `&str` (a literal
+                // `panic!`) or `String` (a formatted one); anything else
+                // is genuinely opaque and degrades to the bare label.
+                let detail = payload
+                    .downcast_ref::<&'static str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned());
+                match detail {
+                    Some(d) => anyhow::anyhow!("{MSG_PG_PROBE_PANIC}: {d}"),
+                    None => anyhow::anyhow!(MSG_PG_PROBE_PANIC),
+                }
+            })?
     })
 }
 
@@ -951,7 +989,28 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
         probe_extension_version, probe_pgvector_preflight,
     };
 
-    let url = crate::store_url::resolve_store_url(None).ok().flatten()?;
+    // #3264 review fix (S2) — a resolver ERROR is a finding, not a reason
+    // to drop the section. `resolve_store_url` refuses a group/world-
+    // readable `AI_MEMORY_STORE_URL_FILE` (#1927), and `serve` refuses to
+    // start on exactly that; swallowing it made `doctor` report a clean
+    // bill of health for a daemon that cannot boot.
+    let url = match crate::store_url::resolve_store_url(None) {
+        Ok(Some(url)) => url,
+        // No configured store URL at all: this is a SQLite deployment and
+        // the section is legitimately absent (the pre-#3264 report).
+        Ok(None) => return None,
+        Err(e) => {
+            return Some(ReportSection {
+                name: SECTION_POSTGRES_EXTENSIONS.into(),
+                severity: Severity::Critical,
+                facts: vec![(
+                    "error".into(),
+                    crate::logging::redact_urls_in_message(&format!("{e:#}")),
+                )],
+                note: Some(MSG_PG_STORE_URL_UNRESOLVED.into()),
+            });
+        }
+    };
     if !crate::store_url::is_postgres_url(&url) {
         return None;
     }
@@ -961,18 +1020,29 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
 
     type Probe = (PgvectorPreflightFacts, Option<String>, Option<String>);
     let probed: Result<Probe> = run_pg_probe(|| async move {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect(&url)
-            .await?;
-        let facts = probe_pgvector_preflight(&pool).await?;
-        let vector_version = probe_extension_version(&pool, PGVECTOR_EXTENSION_NAME).await?;
-        let age_version = probe_extension_version(&pool, AGE_EXTENSION_NAME).await?;
-        pool.close().await;
-        Ok::<Probe, sqlx::Error>((facts, vector_version, age_version))
+        // #3264 review fix (B4) — the whole probe runs inside ONE
+        // wall-clock envelope. `acquire_timeout` bounds only the pool
+        // checkout; the connect and the three catalog reads were
+        // unbounded, so a server that accepts a connection and then never
+        // answers hung `ai-memory doctor` indefinitely.
+        let probe = async {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(PG_PROBE_TIMEOUT)
+                .connect(&url)
+                .await?;
+            let facts = probe_pgvector_preflight(&pool).await?;
+            let vector_version = probe_extension_version(&pool, PGVECTOR_EXTENSION_NAME).await?;
+            let age_version = probe_extension_version(&pool, AGE_EXTENSION_NAME).await?;
+            pool.close().await;
+            Ok::<Probe, sqlx::Error>((facts, vector_version, age_version))
+        };
+        tokio::time::timeout(PG_PROBE_TIMEOUT, probe)
+            .await
+            .map_err(|_elapsed| anyhow::anyhow!(MSG_PG_PROBE_TIMEOUT))?
+            .map_err(anyhow::Error::from)
     })
-    .and_then(|inner| inner.map_err(anyhow::Error::from));
+    .and_then(|inner| inner);
 
     let (facts, vector_version, age_version) = match probed {
         Ok(v) => v,
@@ -1000,7 +1070,14 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
     let verdict = facts.verdict();
     let mut report_facts = vec![
         ("store".into(), redacted),
-        ("database".into(), facts.database.clone()),
+        // #3264 review fix (S1) — the database NAME is server-supplied and
+        // lands in a report an operator pastes into a terminal or a
+        // ticket; escape anything outside `[A-Za-z0-9_]` so it cannot
+        // forge lines or emit ANSI.
+        (
+            "database".into(),
+            crate::store::postgres::render_database_for_operator(&facts.database),
+        ),
         ("pgvector_available".into(), facts.available.to_string()),
         ("pgvector_installed".into(), facts.installed.to_string()),
         (
@@ -1027,9 +1104,9 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
 
     // The CRITICAL arm carries the EXACT remedy text the bootstrap abort
     // prints — one SSOT for both surfaces.
-    let blocking_detail = verdict.blocking_detail(&facts.database);
     let (severity, note) = pg_extensions_verdict_3264(
-        blocking_detail,
+        verdict,
+        &facts.database,
         age_version.is_some(),
         facts.age_catalog_usage,
     );
@@ -1053,20 +1130,37 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
 /// unit-testable without a live PostgreSQL (in particular the AGE
 /// `ag_catalog`-USAGE WARN, which needs a bespoke role to reproduce).
 ///
-/// - `blocking_detail` is `Some` exactly when the daemon's bootstrap would
-///   REFUSE (`store::postgres::PgvectorPreflight::blocking_detail`) — the
-///   `CRITICAL` arm, carrying that same remedy verbatim.
-/// - AGE installed but no `USAGE` on `ag_catalog` is the silent-degrade
-///   pairing: `WARN`.
+/// - **CRITICAL** exactly when the daemon's bootstrap would REFUSE before
+///   it even attempts the DDL (`PgvectorPreflight::preemptive_refusal_detail`
+///   — the `0A000` no-`vector.so` image), carrying that same remedy
+///   verbatim.
+/// - **WARNING** for `AvailableNeedsSuperuserCreate`. #3264 review fix
+///   (B5): this is NOT critical. `pg_roles.rolsuper` is not the privilege
+///   oracle on managed PostgreSQL — `rds_superuser`, `cloudsqlsuperuser`
+///   and `azure_pg_admin` all create extensions without it — so the daemon
+///   ATTEMPTS `CREATE EXTENSION vector` on this shape and usually
+///   succeeds. Reporting CRITICAL (and exiting 2) for a backend that boots
+///   fine would train operators to ignore the exit code.
+/// - **WARNING** when AGE is installed but the role has no `USAGE` on
+///   `ag_catalog` — the silent-degrade pairing.
 /// - Everything else is `INFO`.
 #[cfg(feature = "sal-postgres")]
 fn pg_extensions_verdict_3264(
-    blocking_detail: Option<String>,
+    verdict: crate::store::postgres::PgvectorPreflight,
+    database: &str,
     age_installed: bool,
     age_catalog_usage: bool,
 ) -> (Severity, Option<String>) {
-    if let Some(detail) = blocking_detail {
+    use crate::store::postgres::{MSG_PGVECTOR_MAY_NEED_ADMIN_CREATE, PgvectorPreflight};
+
+    if let Some(detail) = verdict.preemptive_refusal_detail(database) {
         return (Severity::Critical, Some(detail));
+    }
+    if verdict == PgvectorPreflight::AvailableNeedsSuperuserCreate {
+        return (
+            Severity::Warning,
+            Some(MSG_PGVECTOR_MAY_NEED_ADMIN_CREATE.to_string()),
+        );
     }
     if age_installed && !age_catalog_usage {
         return (
@@ -3049,7 +3143,32 @@ mod tests {
     // Local-DB mode — basic happy path
     // -------------------------------------------------------------------
 
+    /// #3264 review fix (B3) — every `run_local` in these tests goes
+    /// through here, under the SHARED store-url env lock and with the
+    /// store-url channels cleared.
+    ///
+    /// `run_local` now calls `section_postgres_extensions_3264`, which
+    /// resolves the PROCESS-GLOBAL `AI_MEMORY_STORE_URL` /
+    /// `AI_MEMORY_STORE_URL_FILE`. `src/store_url.rs`'s own tests set that
+    /// variable to `postgres://u:hunter2@db.internal/mem` in-process under
+    /// `store_url_env_lock()`. Without taking the SAME lock here, a
+    /// `cargo test` interleaving would have these tests attempt a real
+    /// outbound Postgres connection and grow a 17th section — the #2905
+    /// deterministic-env-leak class, not a flake. Taking the lock (and
+    /// clearing the vars while we hold it) makes the SQLite report
+    /// independent of test ordering.
     fn run_local_collect(db_path: &Path) -> Report {
+        let _guard = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: `store_url_env_lock` is the process-global mutex EVERY
+        // reader/mutator of these two variables takes, and it is held for
+        // the whole of `run_local` below, so no concurrent thread observes
+        // or races the mutation.
+        unsafe {
+            std::env::remove_var(crate::store_url::STORE_URL_ENV);
+            std::env::remove_var(crate::store_url::STORE_URL_FILE_ENV);
+        }
         let mut report = run_local(db_path);
         report.compute_overall();
         report
@@ -3089,9 +3208,13 @@ mod tests {
         //
         // #3264 note: "Postgres extensions (#3264)" is a CONDITIONAL 17th
         // section — emitted only when `store_url::resolve_store_url(None)`
-        // yields a `postgres://` DSN. This test runs with no store URL in
-        // the process env (the pg-backend posture tests that set one are
-        // subprocess-isolated), so the count stays 16 on a SQLite
+        // yields a `postgres://` DSN, or errors. #3264 review fix (B3):
+        // `run_local_collect` holds `store_url_env_lock()` and CLEARS both
+        // store-url channels, which is what actually guarantees "no store
+        // URL in the process env" here. It is NOT true that every test
+        // setting one is subprocess-isolated — `src/store_url.rs`'s own
+        // in-process tests set `AI_MEMORY_STORE_URL` to a `postgres://`
+        // DSN under that same lock. The count stays 16 on a SQLite
         // deployment, which is the invariant this test pins.
         assert_eq!(report.sections.len(), 16);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
@@ -5347,21 +5470,60 @@ enabled = true
 #[cfg(all(test, feature = "sal-postgres"))]
 mod pg_extensions_verdict_tests_3264 {
     use super::{MSG_AGE_CATALOG_USAGE_MISSING, Severity, pg_extensions_verdict_3264};
+    use crate::store::postgres::PgvectorPreflight;
 
-    /// A bootstrap-blocking pgvector verdict is CRITICAL (doctor exit 2)
-    /// and carries the SAME remedy text the daemon's abort prints — the
-    /// operator must not have to correlate two different messages.
+    const DB: &str = "aimemory";
+
+    /// The one bootstrap-blocking pgvector verdict (`0A000` — the server
+    /// image ships no `vector.so`) is CRITICAL (doctor exit 2) and carries
+    /// the SAME remedy text the daemon's abort prints; the operator must
+    /// not have to correlate two different messages.
     #[test]
-    fn blocking_pgvector_is_critical_and_reuses_the_bootstrap_remedy() {
-        let remedy = "a superuser must run CREATE EXTENSION vector; once".to_string();
-        let (sev, note) = pg_extensions_verdict_3264(Some(remedy.clone()), true, true);
-        assert_eq!(sev, Severity::Critical);
-        assert_eq!(note.as_deref(), Some(remedy.as_str()));
-        // CRITICAL outranks the AGE WARN: the daemon cannot boot at all,
-        // so the graph-projection nuance is not the headline.
-        let (sev, note) = pg_extensions_verdict_3264(Some(remedy.clone()), true, false);
-        assert_eq!(sev, Severity::Critical);
-        assert_eq!(note.as_deref(), Some(remedy.as_str()));
+    fn unavailable_pgvector_is_critical_and_reuses_the_bootstrap_remedy() {
+        let remedy = PgvectorPreflight::NotAvailableOnServer
+            .preemptive_refusal_detail(DB)
+            .expect("the 0A000 class refuses bootstrap");
+        for age_usage in [false, true] {
+            // CRITICAL outranks the AGE WARN: the daemon cannot boot at
+            // all, so the graph-projection nuance is not the headline.
+            let (sev, note) = pg_extensions_verdict_3264(
+                PgvectorPreflight::NotAvailableOnServer,
+                DB,
+                true,
+                age_usage,
+            );
+            assert_eq!(sev, Severity::Critical);
+            assert_eq!(note.as_deref(), Some(remedy.as_str()));
+        }
+    }
+
+    /// #3264 review fix (B5) — `rolsuper = false` with pgvector absent is
+    /// a WARNING, never CRITICAL. Managed PostgreSQL delegates extension
+    /// creation to non-`rolsuper` admin roles, so the daemon ATTEMPTS the
+    /// `CREATE EXTENSION` and usually succeeds; exiting 2 on a backend
+    /// that boots fine would train operators to ignore the exit code.
+    #[test]
+    fn needs_admin_create_warns_rather_than_failing_a_bootable_backend() {
+        let (sev, note) = pg_extensions_verdict_3264(
+            PgvectorPreflight::AvailableNeedsSuperuserCreate,
+            DB,
+            false,
+            false,
+        );
+        assert_eq!(
+            sev,
+            Severity::Warning,
+            "a non-rolsuper managed role must not be CRITICAL"
+        );
+        let note = note.expect("WARN must carry a note");
+        assert!(
+            note.contains("rds_superuser"),
+            "the WARN must say why rolsuper is not the oracle: {note}"
+        );
+        assert!(
+            note.contains("42501"),
+            "the WARN must name what a genuine refusal looks like: {note}"
+        );
     }
 
     /// AGE installed but no `USAGE` on `ag_catalog` is the silent-degrade
@@ -5369,7 +5531,7 @@ mod pg_extensions_verdict_tests_3264 {
     /// `age`) — WARN, with the `GRANT` in the note.
     #[test]
     fn age_installed_without_ag_catalog_usage_warns() {
-        let (sev, note) = pg_extensions_verdict_3264(None, true, false);
+        let (sev, note) = pg_extensions_verdict_3264(PgvectorPreflight::Installed, DB, true, false);
         assert_eq!(sev, Severity::Warning);
         let note = note.expect("WARN must carry a note");
         assert_eq!(note, MSG_AGE_CATALOG_USAGE_MISSING);
@@ -5384,17 +5546,17 @@ mod pg_extensions_verdict_tests_3264 {
     /// bump the doctor exit code.
     #[test]
     fn healthy_and_age_less_backends_stay_info() {
-        assert_eq!(
-            pg_extensions_verdict_3264(None, false, false),
-            (Severity::Info, None)
-        );
-        assert_eq!(
-            pg_extensions_verdict_3264(None, false, true),
-            (Severity::Info, None)
-        );
-        assert_eq!(
-            pg_extensions_verdict_3264(None, true, true),
-            (Severity::Info, None)
-        );
+        for verdict in [
+            PgvectorPreflight::Installed,
+            PgvectorPreflight::AvailableCreatableProceed,
+        ] {
+            for (age_installed, age_usage) in [(false, false), (false, true), (true, true)] {
+                assert_eq!(
+                    pg_extensions_verdict_3264(verdict, DB, age_installed, age_usage),
+                    (Severity::Info, None),
+                    "{verdict:?} / age={age_installed} usage={age_usage}"
+                );
+            }
+        }
     }
 }
