@@ -84,6 +84,16 @@ fn method_name(line: &str) -> Option<String> {
 
 const GATE_CALL: &str = "self.gate_record_stop()";
 
+/// Inherent PostgresStore writes whose sqlite twin gates in a db::
+/// free-fn (not a SqliteStore SAL method). Floor-count so this list
+/// cannot silently shrink (B8' durability).
+const INHERENT_PG_PARITY: &[&str] = &[
+    "update_with_expected_version",
+    "update_with_expected_version_once",
+    "dequarantine",
+    "dequarantine_raw",
+];
+
 fn read(rel: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -222,15 +232,14 @@ fn ssot_gated_inherent_pg_twins_must_gate_3175() {
 fn pg_if_match_and_dequarantine_raw_gate_directly_b8() {
     // Direct pins so a parser regression cannot drop the If-Match /
     // dequarantine_raw paths that #3175's original twin-matching missed.
+    assert!(
+        INHERENT_PG_PARITY.len() >= 4,
+        "INHERENT_PG_PARITY shrank — put update_with_expected_version back"
+    );
     let postgres = methods(&read("src/store/postgres.rs"));
-    for name in [
-        "update_with_expected_version",
-        "update_with_expected_version_once",
-        "dequarantine",
-        "dequarantine_raw",
-    ] {
+    for name in INHERENT_PG_PARITY {
         let body = postgres
-            .get(name)
+            .get(*name)
             .unwrap_or_else(|| panic!("PostgresStore::{name} not found"));
         assert!(
             body.contains(GATE_CALL),

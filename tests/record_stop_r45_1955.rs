@@ -1137,3 +1137,29 @@ fn b7_entity_register_existing_alias_refuses_under_stop() {
         "existing-entity alias err was not RecordStopped: {err}"
     );
 }
+
+/// Wave-2 B8 — source pin: the If-Match / dequarantine pg paths that
+/// #3175's original SAL-trait scan missed must still call
+/// `gate_record_stop` (live-pg behavioural pin is `pg_record_stop_parity_3175`).
+#[test]
+fn b8_pg_if_match_and_dequarantine_source_pin() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store/postgres.rs"),
+    )
+    .expect("read postgres.rs");
+    for method in [
+        "async fn dequarantine(",
+        "async fn dequarantine_raw(",
+        "pub async fn update_with_expected_version(",
+        "async fn update_with_expected_version_once(",
+    ] {
+        let idx = src
+            .find(method)
+            .unwrap_or_else(|| panic!("missing {method}"));
+        let window = &src[idx..src.len().min(idx.saturating_add(600))];
+        assert!(
+            window.contains("gate_record_stop"),
+            "{method} must call gate_record_stop in the first 600 bytes"
+        );
+    }
+}
