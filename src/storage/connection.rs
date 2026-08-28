@@ -392,15 +392,47 @@ pub fn set_db_passphrase(passphrase: String) -> Result<()> {
 /// seeded one. `None` when the file channel was not used (operators
 /// may still set [`ENV_DB_PASSPHRASE`] themselves).
 ///
-/// The production reader is [`apply_sqlcipher_key`], which is compiled
-/// out of the default (non-`sqlcipher`) build; tests are the other
-/// reader. Allowed unused on the default lib so `-D warnings` clippy
-/// without `--features sqlcipher` does not fail closed on a helper
-/// whose only production consumer is feature-gated.
+/// The production reader is [`apply_sqlcipher_key`]. Wave-1 S1 also
+/// reads this on the default (non-`sqlcipher`) build so a passphrase
+/// request cannot silently fall through to plaintext.
 #[must_use]
-#[cfg_attr(not(feature = "sqlcipher"), allow(dead_code))]
 pub(crate) fn db_passphrase() -> Option<&'static str> {
     DB_PASSPHRASE.get().map(String::as_str)
+}
+
+/// Operator asked for whole-DB encryption: `--db-passphrase-file` or
+/// [`ENV_DB_PASSPHRASE`] is non-empty.
+#[must_use]
+pub fn passphrase_requested() -> bool {
+    if db_passphrase().is_some_and(|s| !s.is_empty()) {
+        return true;
+    }
+    std::env::var(ENV_DB_PASSPHRASE)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
+/// Wave-1 S1 — singleton-sqlite fail-closed at-rest boot gate.
+///
+/// On a **non-sqlcipher** build, a passphrase or `AI_MEMORY_ENCRYPT_AT_REST`
+/// means the operator asked for at-rest encryption that this binary cannot
+/// honour. Refuse rather than silently persist plaintext (ERRORS-09).
+/// No-op on a sqlcipher build (the sqlcipher [`apply_sqlcipher_key`] arm
+/// already refuses a missing key).
+pub fn refuse_at_rest_requested_without_sqlcipher() -> Result<()> {
+    if crate::build_features::has_feature("sqlcipher") {
+        return Ok(());
+    }
+    let passphrase = passphrase_requested();
+    let encrypt_at_rest = crate::encryption::encryption_enabled(None);
+    if passphrase || encrypt_at_rest {
+        anyhow::bail!(
+            "you asked for at-rest encryption but this binary has no sqlcipher / no key — \
+             build --features sqlcipher and provide a passphrase, or unset \
+             AI_MEMORY_DB_PASSPHRASE / --db-passphrase-file / AI_MEMORY_ENCRYPT_AT_REST"
+        );
+    }
+    Ok(())
 }
 
 /// The effective `PRAGMA mmap_size` for this process.
@@ -827,8 +859,9 @@ fn apply_check_constraint_triggers(conn: &Connection) -> Result<()> {
 /// **not** re-publish into the environment (#3213 / #2905 env-leak
 /// class) so spawned children cannot inherit it.
 ///
-/// When the `sqlcipher` feature is NOT enabled, this function is a
-/// no-op — standard SQLite has no `PRAGMA key` so setting one errors.
+/// When the `sqlcipher` feature is NOT enabled, refuse if the operator
+/// asked for at-rest encryption (Wave-1 S1) — never silently persist
+/// plaintext while a passphrase / `AI_MEMORY_ENCRYPT_AT_REST` is set.
 #[cfg(feature = "sqlcipher")]
 fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
     let passphrase = db_passphrase()
@@ -852,9 +885,8 @@ fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
 }
 
 #[cfg(not(feature = "sqlcipher"))]
-#[allow(clippy::unnecessary_wraps)]
 fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
-    Ok(())
+    refuse_at_rest_requested_without_sqlcipher()
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,5 +1468,68 @@ mod tests {
             res.is_err(),
             "INSERT with bad tier must be rejected by R1-M2 trigger"
         );
+    }
+
+    /// Wave-1 S1 pin: passphrase-set + non-sqlcipher build must NOT
+    /// silently open a plaintext DB.
+    #[cfg(not(feature = "sqlcipher"))]
+    #[test]
+    fn passphrase_set_on_non_sqlcipher_refuses_open_s1() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "storage::connection::tests::passphrase_set_on_non_sqlcipher_refuses_open_s1",
+        ) {
+            return;
+        }
+        let _lock = crate::test_support::env_lock();
+        let guard = crate::test_support::EnvGuard::capture(ENV_DB_PASSPHRASE);
+        guard.set("s1-test-passphrase");
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let err = open(tmp.path()).expect_err("passphrase + non-sqlcipher must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sqlcipher"),
+            "refusal must name sqlcipher: {msg}"
+        );
+        assert!(
+            msg.contains("AI_MEMORY_DB_PASSPHRASE") || msg.contains("passphrase"),
+            "refusal must name the passphrase request: {msg}"
+        );
+    }
+
+    /// Wave-1 S1: ENCRYPT_AT_REST on a non-sqlcipher build also refuses.
+    #[cfg(not(feature = "sqlcipher"))]
+    #[test]
+    fn encrypt_at_rest_on_non_sqlcipher_refuses_open_s1() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "storage::connection::tests::encrypt_at_rest_on_non_sqlcipher_refuses_open_s1",
+        ) {
+            return;
+        }
+        let _lock = crate::test_support::env_lock();
+        let guard = crate::test_support::EnvGuard::capture(crate::encryption::ENV_ENCRYPT_AT_REST);
+        guard.set("1");
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let err = open(tmp.path()).expect_err("ENCRYPT_AT_REST + non-sqlcipher must refuse");
+        assert!(
+            err.to_string().contains("sqlcipher"),
+            "refusal must name sqlcipher: {err}"
+        );
+    }
+
+    #[cfg(not(feature = "sqlcipher"))]
+    #[test]
+    fn refuse_helper_is_ok_when_at_rest_not_requested_s1() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "storage::connection::tests::refuse_helper_is_ok_when_at_rest_not_requested_s1",
+        ) {
+            return;
+        }
+        let _lock = crate::test_support::env_lock();
+        let p = crate::test_support::EnvGuard::capture(ENV_DB_PASSPHRASE);
+        let e = crate::test_support::EnvGuard::capture(crate::encryption::ENV_ENCRYPT_AT_REST);
+        p.unset();
+        e.unset();
+        refuse_at_rest_requested_without_sqlcipher()
+            .expect("default plaintext standalone must still boot");
     }
 }

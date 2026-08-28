@@ -116,6 +116,15 @@ fn main() -> Result<()> {
     // tokio runtime workers) exists. See `daemon_runtime::apply_startup_env`.
     daemon_runtime::apply_startup_env(&cli, &app_config)?;
 
+    // Wave-1 S1 — singleton-sqlite fail-closed at-rest gate. After
+    // `--db-passphrase-file` has been seeded. `doctor` still opens so it
+    // can surface the same refusal as a Storage Critical (plus a WARN
+    // on default-plaintext standalone).
+    let is_doctor = matches!(&cli.command, daemon_runtime::Command::Doctor(_));
+    if !is_doctor {
+        ai_memory::storage::refuse_at_rest_requested_without_sqlcipher()?;
+    }
+
     // #2386 (v1.0.0 #1961 posture) — resolve + enforce the security posture
     // HERE too, under the same #1889 pre-runtime contract: under `asi-hard`
     // the enforcement PINS every unset fail-closed knob via

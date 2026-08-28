@@ -838,7 +838,10 @@ pub use connection::{assert_schema_not_ahead, open_unmigrated, probe_schema_stam
 // out on (also consumed by the config-precedence tests).
 pub use connection::{DEFAULT_DB_MMAP_SIZE_BYTES, set_db_mmap_size};
 // v1.0.0 #3213 — process-private SQLCipher passphrase (file channel).
-pub use connection::{ENV_DB_PASSPHRASE, set_db_passphrase};
+pub use connection::{
+    ENV_DB_PASSPHRASE, passphrase_requested, refuse_at_rest_requested_without_sqlcipher,
+    set_db_passphrase,
+};
 // v1.0.0 #1961 (R23/R7) — power-loss durability knob (`PRAGMA synchronous`).
 pub use connection::{DEFAULT_DB_SYNCHRONOUS, ENV_DB_SYNCHRONOUS, db_synchronous};
 // v0.7.0 refactor PR-1 (#793) — schema-pins SSOT. Re-export the
