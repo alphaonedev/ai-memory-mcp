@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mold (#1148/#3090 pinned tarball, same as coverage.yml) and sets
   `CARGO_PROFILE_DEV_DEBUG=0` + `RUSTFLAGS=-C debuginfo=0 -C link-arg=-fuse-ld=mold`
   for that leg only. macos-fed/linux-fed keep debuginfo=1 and the system linker.
+- **Isolation shot (e380ca5d follow-up):** mold fixed the link, then
+  `hot_swap_llm_2166` SIGSEGV'd at runtime. That binary does not load
+  candle models (hermetic `OllamaClient`); #2469 already aborted it in CI
+  on GNU ld. Drop mold, keep `debuginfo=0` + system `ld.bfd` on the hosted
+  sqlite Check only — if it still SIGSEGV after a clean link, it is not
+  mold.
 
 ### Security (record-stop fleet kill-switch fail-open — #3276)
 
