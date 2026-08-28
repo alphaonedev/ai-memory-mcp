@@ -1057,3 +1057,83 @@ fn coordination_sal_write_methods_gate_record_stop_b6() {
         }
     }
 }
+
+/// Wave-2 B7 — the four round-4 siblings refuse under record-stop.
+#[test]
+fn b7_enumerated_funnels_refuse_under_record_stop() {
+    let f = NamedTempFile::new().expect("tempfile");
+    let conn = ai_memory::db::open(f.path()).expect("open");
+    assert!(
+        ai_memory::storage::record_stop::actuate_sqlite(
+            &conn,
+            true,
+            "ai:operator",
+            SCOPE_RECORD_PLANE,
+        )
+        .expect("engage")
+    );
+
+    let err = ai_memory::db::queue_pending_action(
+        &conn,
+        ai_memory::models::GovernedAction::Store,
+        NS,
+        None,
+        "ai:x",
+        &json!({}),
+    )
+    .expect_err("queue_pending_action must refuse under stop");
+    assert!(
+        stopped_anyhow(&err),
+        "queue_pending_action err was not RecordStopped: {err}"
+    );
+
+    let err = ai_memory::db::entity_register(&conn, "b7-ent", NS, &[], &json!({}), Some("ai:x"))
+        .expect_err("entity_register must refuse under stop");
+    assert!(
+        stopped_anyhow(&err),
+        "entity_register err was not RecordStopped: {err}"
+    );
+
+    let err =
+        ai_memory::quotas::get_status(&conn, "fresh-b7-agent", ai_memory::quotas::GLOBAL_NAMESPACE)
+            .expect_err("quota lazy INSERT must refuse under stop");
+    assert!(
+        err.to_string().contains("record plane stopped")
+            || err.chain().any(|e| e
+                .downcast_ref::<StorageError>()
+                .is_some_and(|s| matches!(s, StorageError::RecordStopped { .. }))),
+        "get_status lazy insert err was not RecordStopped: {err}"
+    );
+}
+
+/// Wave-2 B7 — existing-entity alias INSERT OR IGNORE is fenced (the
+/// arm that skipped gated `insert()`).
+#[test]
+fn b7_entity_register_existing_alias_refuses_under_stop() {
+    let f = NamedTempFile::new().expect("tempfile");
+    let conn = ai_memory::db::open(f.path()).expect("open");
+    ai_memory::db::entity_register(&conn, "b7-ent", NS, &[], &json!({}), Some("ai:x"))
+        .expect("register while running");
+    assert!(
+        ai_memory::storage::record_stop::actuate_sqlite(
+            &conn,
+            true,
+            "ai:operator",
+            SCOPE_RECORD_PLANE,
+        )
+        .expect("engage")
+    );
+    let err = ai_memory::db::entity_register(
+        &conn,
+        "b7-ent",
+        NS,
+        &["alias-under-stop".into()],
+        &json!({}),
+        Some("ai:x"),
+    )
+    .expect_err("existing-entity alias insert must refuse under stop");
+    assert!(
+        stopped_anyhow(&err),
+        "existing-entity alias err was not RecordStopped: {err}"
+    );
+}

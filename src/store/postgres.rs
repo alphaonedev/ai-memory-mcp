@@ -29167,6 +29167,9 @@ impl MemoryStore for PostgresStore {
         // Enforce mode — Pending queues a pending_actions row inside
         // the same tx so the audit trail is atomic with the decision.
         if let GovernanceDecision::Pending(_) = decision {
+            // Wave-2 B7 — Allow arm is read-only; the Pending INSERT is
+            // a durable record-plane write (ERRORS-09).
+            self.gate_record_stop().await?;
             let pending_id = uuid::Uuid::new_v4().to_string();
             let now = chrono::Utc::now();
             let action_str = match action {
@@ -29213,6 +29216,10 @@ impl MemoryStore for PostgresStore {
         // agent has written into. Auto-inserts a `_global` row when
         // the agent has no rows at all (matches SQLite parity in
         // `quotas::get_aggregate_status`).
+        // Wave-2 B7 — lazy INSERT is a record-plane write (ERRORS-09).
+        // MCP `memory_quota_status` stays a read at dispatch; this SAL
+        // gate fences the side-effect.
+        self.gate_record_stop().await?;
         let now = Utc::now();
         sqlx::query(
             "INSERT INTO agent_quotas (
@@ -29261,6 +29268,8 @@ impl MemoryStore for PostgresStore {
     async fn quota_status_ns(&self, agent_id: &str, namespace: &str) -> StoreResult<QuotaStatus> {
         // v0.7.0 #1156 — per-(agent, namespace) single-row lookup.
         // Auto-inserts a default row when none exists.
+        // Wave-2 B7 — lazy INSERT is a record-plane write (ERRORS-09).
+        self.gate_record_stop().await?;
         let now = Utc::now();
         sqlx::query(
             "INSERT INTO agent_quotas (

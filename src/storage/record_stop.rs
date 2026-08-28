@@ -7,7 +7,8 @@
 //! operations REFUSE with a typed error. Coverage is the SSOT write
 //! free-fns that call [`gate_storage_conn`] (store / update / link /
 //! delete / promote / consolidate / forget / archive / lineage bind /
-//! pending-action / namespace-standard / embedding, plus the
+//! pending-action / namespace-standard / embedding / entity-register /
+//! quota default-row, plus the
 //! federation-receive `/sync/push` chokepoint) AND the coordination
 //! mutations (`crate::actions` create / transition / add_edge / lease_*;
 //! `crate::signals` insert / ack / prune; `crate::checkpoints` insert /

@@ -11157,6 +11157,10 @@ pub fn entity_register(
 ) -> Result<crate::models::EntityRegistration> {
     use crate::models::{ENTITY_KIND, ENTITY_TAG, EntityRegistration};
 
+    // Wave-2 B7 — fence the existing-entity alias INSERT OR IGNORE as
+    // well as the new-entity `insert()` arm (ERRORS-09).
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+
     // #2993 — refuse a credential-bearing alias BEFORE any write. The entity
     // content/title is secret-screened at `insert`, but the `entity_aliases`
     // table bypasses that funnel, so a credential passed as an alias would
@@ -20393,6 +20397,8 @@ pub fn queue_pending_action(
     requested_by: &str,
     payload: &serde_json::Value,
 ) -> Result<String> {
+    // Wave-2 B7 — sibling of gated `upsert_pending_action` (ERRORS-09).
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     let payload_json = serde_json::to_string(payload)?;
