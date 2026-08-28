@@ -31,11 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on GNU ld. Drop mold, keep `debuginfo=0` + system `ld.bfd` on the hosted
   sqlite Check only — if it still SIGSEGV after a clean link, it is not
   mold.
-- **#2469 quarantine (hosted-only):** `concurrent_swap_and_reads_no_panic_2166`
-  returns early when `GITHUB_ACTIONS` + `RUNNER_ENVIRONMENT=github-hosted`.
-  The rest of `hot_swap_llm_2166` still runs on hosted; the concurrent cell
-  still runs on macos-fed + linux-fed. Not a `Swappable` UB race. Issue
-  stays OPEN for OnceLock rustls init / fewer client constructions.
+- **#2469 quarantine (hosted-only, superseded):** `concurrent_swap_and_reads_no_panic_2166`
+  used to return early on GitHub-hosted. Replaced by the proper fix below.
+- **#2469 proper fix:** install rustls `ring` `CryptoProvider` once via
+  `OnceLock` (CONCURRENCY-16) before any `reqwest::Client` build, and
+  retarget the 2000 hot-swap iterations with `OllamaClient::with_model`
+  (cheap HTTP-client Arc clone) instead of 2000 TLS constructions. The
+  github-hosted skip is gone; the concurrent cell runs everywhere.
 ### Security (#3291 — attest `memory_links.created_at` in SignableLink)
 
 - **`#3291` — a self-signed edge now attests its own `created_at`.** After

@@ -1040,6 +1040,23 @@ impl OllamaClient {
         &self.model
     }
 
+    /// Cheap retarget: share this handle's HTTP pool (`reqwest::Client` is
+    /// an Arc bump — OWNERSHIP-21) and provider, with a different model
+    /// name. Circuit breaker is reset. Used by the #2469 hot-swap stress
+    /// so 2000 swaps do not re-run rustls `CryptoProvider` / TLS client
+    /// construction on the hosted runner.
+    #[must_use]
+    pub fn with_model(&self, model: impl Into<String>) -> Self {
+        Self {
+            provider: self.provider.clone(),
+            base_url: self.base_url.clone(),
+            model: model.into(),
+            client: self.client.clone(),
+            breaker: Mutex::new(BreakerState::new()),
+            embed_dimensions: self.embed_dimensions,
+        }
+    }
+
     /// v0.9.0 §25.3 S1 (D3-012, #1870) — the resolved backend/provider
     /// wire-shape selector, for model-family attestation
     /// (`model_attestations.provider`).

@@ -27,16 +27,16 @@ use ai_memory::storage;
 use serde_json::json;
 use tempfile::NamedTempFile;
 
-/// #2469 — GitHub-hosted `ubuntu-latest` Check aborts this binary (exit 101 /
-/// SIGSEGV, no per-test lines). `Swappable` is sound (`current()` clones the
-/// `Arc` then drops the read guard). Suspect: concurrent native TLS init
-/// (rustls/aws-lc) under 2000 `OllamaClient` constructions on the 14/16 GB
-/// hosted image. macos-fed + linux-fed still run the concurrent cell.
-/// Proper fix (`OnceLock` rustls provider + fewer client constructions) is
-/// follow-up, not a GA blocker.
-fn github_hosted_ci() -> bool {
-    std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
-        && std::env::var("RUNNER_ENVIRONMENT").ok().as_deref() == Some("github-hosted")
+/// rustls 0.23 requires an explicit `CryptoProvider`. `install_default` is
+/// process-global; wrapping it in `OnceLock` makes concurrent first-use from
+/// this binary (`cargo test --test-threads>1` + the 2000-swap writer) safe
+/// ([CONCURRENCY-16]). `Err` means another thread already installed it —
+/// discard deliberately (ERRORS-19).
+fn ensure_rustls_crypto_provider() {
+    static INSTALL: OnceLock<()> = OnceLock::new();
+    INSTALL.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 /// Env-var tests must serialize — `resolve_and_build_mcp_llm` reads
@@ -49,6 +49,7 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn client(model: &str) -> OllamaClient {
+    ensure_rustls_crypto_provider();
     // `new_with_url_no_health_check` constructs WITHOUT touching the
     // network, so the test is hermetic.
     OllamaClient::new_with_url_no_health_check("http://127.0.0.1:11434", model)
@@ -191,13 +192,12 @@ fn egress_deny_reload_disables_client_2166() {
 // deadlock (own-rwlock-readers; the read guard is dropped before return).
 #[test]
 fn concurrent_swap_and_reads_no_panic_2166() {
-    if github_hosted_ci() {
-        eprintln!(
-            "skip concurrent_swap_and_reads_no_panic_2166 on github-hosted (#2469); kept on macos-fed + linux-fed"
-        );
-        return;
-    }
+    // #2469: install rustls before spawning so concurrent first-use cannot
+    // race CryptoProvider init (hosted SIGSEGV). One HTTP client; 2000
+    // swaps retarget the model via `with_model` (cheap Arc clone).
+    ensure_rustls_crypto_provider();
     let swap = Arc::new(SwappableLlm::new(Some(client("gen-0"))));
+    let template = client("gen-template");
     let mut handles = Vec::new();
 
     // Readers.
@@ -218,7 +218,7 @@ fn concurrent_swap_and_reads_no_panic_2166() {
         let s = Arc::clone(&swap);
         handles.push(std::thread::spawn(move || {
             for i in 0..2_000 {
-                s.store(Some(client(&format!("gen-{i}"))));
+                s.store(Some(template.with_model(format!("gen-{i}"))));
             }
         }));
     }
