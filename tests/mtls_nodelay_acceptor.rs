@@ -337,11 +337,11 @@ async fn peer_binding_acceptor_resolves_bound_peer_id() {
 #[tokio::test]
 async fn peer_binding_acceptor_unbound_cert_is_legacy_none() {
     // No binding map ⇒ the allowlisted cert has no operator binding ⇒ the
-    // cross-check degrades to WARN and never bricks.
+    // cross-check degrades to WARN when no map is configured.
     let bound = peer_binding_resolved(allowlisted_client_config().await, None).await;
     assert_eq!(
         bound.0, None,
         "a cert whose fingerprint carries no operator binding resolves to \
-         None (legacy — never bricks) (#2045 L6)"
+         None (legacy; no ClientCertPeerId) (#2045 L6)"
     );
 }

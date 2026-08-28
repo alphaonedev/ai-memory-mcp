@@ -424,33 +424,31 @@ fn binding_map_rejects_malformed_peer_id() {
 }
 
 #[test]
-fn posture_parse_unknown_fails_closed_to_enforce() {
-    assert_eq!(CertPeerBindingMode::parse("off"), CertPeerBindingMode::Off);
+fn posture_parse_unknown_is_err_3289() {
     assert_eq!(
-        CertPeerBindingMode::parse("ENFORCE"),
+        CertPeerBindingMode::parse("off").unwrap(),
+        CertPeerBindingMode::Off
+    );
+    assert_eq!(
+        CertPeerBindingMode::parse("ENFORCE").unwrap(),
         CertPeerBindingMode::Enforce
     );
     assert_eq!(
-        CertPeerBindingMode::parse("warn"),
+        CertPeerBindingMode::parse("warn").unwrap(),
         CertPeerBindingMode::Warn
     );
-    // #3201 — unrecognised / typo FAIL CLOSED to Enforce (a typo must
-    // not silently weaken the cross-check to Warn). The documented
-    // `standard` UNSET default remains Warn via `cert_peer_binding_mode`,
-    // which does not go through this arm.
-    assert_eq!(
-        CertPeerBindingMode::parse("banana"),
-        CertPeerBindingMode::Enforce
-    );
-    assert_eq!(
-        CertPeerBindingMode::parse("enforc"),
-        CertPeerBindingMode::Enforce
-    );
+    // #3289 — unrecognised / typo / empty are fail-loud (not silent Enforce).
+    for bad in ["banana", "enforc", "", "  "] {
+        let err = CertPeerBindingMode::parse(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("unrecognised"),
+            "parse({bad:?}) must fail-loud, got {err}"
+        );
+    }
 }
 
 /// #3201 decision: the documented `standard` UNSET default stays Warn.
-/// Only `asi-hard` pins the env to `enforce`. An empty-or-missing env
-/// must not pick up the typo-fail-closed Enforce arm.
+/// Only `asi-hard` pins the env to `enforce`.
 #[test]
 fn cert_peer_binding_mode_unset_stays_warn() {
     let _g = env_lock();
@@ -460,4 +458,19 @@ fn cert_peer_binding_mode_unset_stays_warn() {
         CertPeerBindingMode::Warn,
         "documented standard-posture default is Warn; #3201 must not flip it"
     );
+}
+
+/// #3289 A1 — a bare `AI_MEMORY_FED_CERT_PEER_BINDING=` (empty assignment,
+/// common "leave default" idiom) must NOT silently flip to Enforce.
+#[test]
+fn cert_peer_binding_mode_empty_string_stays_warn_3289() {
+    let _g = env_lock();
+    clear_env();
+    unsafe { std::env::set_var(FED_CERT_PEER_BINDING_ENV, "") };
+    assert_eq!(
+        ai_memory::tls::cert_peer_binding_mode(),
+        CertPeerBindingMode::Warn,
+        "empty assignment is the leave-default idiom, not Enforce"
+    );
+    unsafe { std::env::remove_var(FED_CERT_PEER_BINDING_ENV) };
 }

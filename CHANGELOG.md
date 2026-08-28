@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#3289 — cert-peer-binding parse)
+
+- **`CertPeerBindingMode::parse` is fail-loud.** Empty
+  `AI_MEMORY_FED_CERT_PEER_BINDING=` (common "leave default" idiom) and
+  typos (`enforc`) no longer silently become `Enforce` (A1/A5). Known
+  tokens `off`/`warn`/`enforce` only; unknown → `Err`. Per-request
+  resolver holds the documented `standard` default `warn` on a bad
+  token. `asi-hard` still refuses anything other than exact `enforce`
+  at boot.
+- **Docs/cert honesty:** the `asi-hard` pin is the *mode*, not the
+  binding map. Without `AI_MEMORY_FED_CERT_PEER_BINDING_MAP` the
+  control is inert even at `enforce`. CLAUDE.md no longer claims
+  unbound certs "always degrade to WARN (never bricks)" — `enforce`
+  401s a mismatch when a map is configured.
+- **Upgrade:** a `config.toml` advisory for this knob is silently
+  overridden by the env pin, not refused. Pinning `enforce` on an
+  existing mTLS mesh with no map does not suddenly 401 (inert);
+  adding a map without enrolling every peer cert **will** partition
+  the mesh.
+
 ### Security / CI (#3293)
 
 - **Restore two fail-closed `#3128` rustup-provisioning asserts** dropped
