@@ -20,9 +20,9 @@ use ai_memory::atomisation::{Atomiser, AtomiserConfig};
 use ai_memory::autonomy::AutonomyLlm as _;
 use ai_memory::config::{AppConfig, FeatureTier};
 use ai_memory::llm::OllamaClient;
-use ai_memory::mcp::tools::{handle_atomise, AtomiseToolHandler};
+use ai_memory::mcp::tools::{AtomiseToolHandler, handle_atomise};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
-use ai_memory::reload::{resolve_and_build_mcp_llm, Swappable, SwappableLlm};
+use ai_memory::reload::{Swappable, SwappableLlm, resolve_and_build_mcp_llm};
 use ai_memory::storage;
 use serde_json::json;
 use tempfile::NamedTempFile;
@@ -32,7 +32,7 @@ use tempfile::NamedTempFile;
 /// `Arc` then drops the read guard). Suspect: concurrent native TLS init
 /// (rustls/aws-lc) under 2000 `OllamaClient` constructions on the 14/16 GB
 /// hosted image. macos-fed + linux-fed still run the concurrent cell.
-/// Proper fix (OnceLock rustls provider + fewer client constructions) is
+/// Proper fix (`OnceLock` rustls provider + fewer client constructions) is
 /// follow-up, not a GA blocker.
 fn github_hosted_ci() -> bool {
     std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
