@@ -46,10 +46,11 @@ traffic to/from PostgreSQL. Each tier enforces:
   (federation peer auth); swap the commented `cert clientcert=verify-full` HBA
   line to require it.
 
-Canonical test URL shape (harness reads `AI_MEMORY_TEST_POSTGRES_URL`):
+Canonical test URL shape (harness reads `AI_MEMORY_TEST_POSTGRES_URL`;
+credentials live in the operator-local env file, **not** in this repo):
 
 ```
-postgres://ai_memory:ai_memory_test@127.0.0.1:5445/ai_memory_test?sslmode=verify-full&sslrootcert=<ca.crt>
+postgres://USER:PASSWORD@127.0.0.1:5445/DBNAME?sslmode=verify-full&sslrootcert=<ca.crt>
 ```
 
 `verify-full` (not `verify-ca`) is deliberate — it checks the hostname against
@@ -59,34 +60,30 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
 
 ## 3. CI nodes
 
-### 3.1 Linux node — `pop-os` ("f2")
+### 3.1 Linux node (self-hosted `linux-fed`)
 
-- **Host:** pop-os · Pop!_OS 24.04 LTS (noble) · x86_64
+- **OS:** Linux x86_64 (Ubuntu/Pop!_OS noble-class)
 - **Data tier:** **native** (pgdg apt pg18.6 + pgvector 0.8.6; **AGE 1.8.0 built
   from source** — AGE is not packaged in pgdg apt)
-  - Debian cluster **`18/aimemfed`** on `127.0.0.1:5445`
-  - Data dir `/var/lib/postgresql/18/aimemfed`, config `/etc/postgresql/18/aimemfed/`
-  - Certs `/etc/ai-memory-certs/` (postgres-owned; CA reused from `pg-age-stack/certs`)
-  - Boot-managed: `systemctl enable postgresql@18-aimemfed.service`
-- **Self-hosted runner:** `f2-linux-fed` · labels `self-hosted,Linux,X64,linux-fed`
-  · systemd service `actions.runner.alphaonedev-ai-memory-mcp.f2-linux-fed`
+  - Cluster listens on `127.0.0.1:5445`
+  - TLS certs operator-local (postgres-owned; CA reused from `pg-age-stack/certs`)
+  - Boot-managed via the distro postgresql systemd template
+- **Self-hosted runner labels:** `self-hosted,Linux,X64,linux-fed`
 - **sqlite tier:** local ai-memory default (no service needed)
 
-### 3.2 macOS node — `FROSTYi` ("f1", ssh alias `f1`)
+### 3.2 macOS node (self-hosted `macos-fed`)
 
-- **Host:** FROSTYi.local · macOS 26.5 · arm64 (Apple Silicon)
+- **OS:** macOS arm64 (Apple Silicon)
 - **Data tier:** **native** (Homebrew `postgresql@18` 18.6 + pgvector 0.8.6 built
   from source; **AGE 1.8.0 built from source**, branch `release/PG18/1.8.0`)
-  - Cluster at `~/pg-age-stack/pgdata` on `127.0.0.1:5445`
-  - Certs `~/pg-age-stack/certs/`, env `~/pg-age-stack/env.sh`
-  - Init script `~/f1-tier-init.sh` (also in-repo `.local-runs/f1-tier-init.sh`)
-- **Self-hosted runner:** `f1-macos-fed` · labels `self-hosted,macOS,ARM64,macos-fed`
-  · launchd service `actions.runner.alphaonedev-ai-memory-mcp.f1-macos-fed`
-- **Rust toolchain:** rustup-managed ONLY, with `~/.cargo/bin` FIRST in the
-  runner's `.path` (`/Users/fate/.cargo/bin:/opt/homebrew/opt/postgresql@18/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin`,
-  both runners; f2 already had `~/.cargo/bin` first). 1.96.0 and 1.98.0 are
-  installed on BOTH nodes with `clippy` + `rustfmt`, so a `rust-toolchain.toml`
-  pin flip needs no runner-side install. Never `brew install rust` — see §9.
+  - Cluster listens on `127.0.0.1:5445`
+  - Certs / env / init script live under the operator-local `pg-age-stack/` tree
+- **Self-hosted runner labels:** `self-hosted,macOS,ARM64,macos-fed`
+- **Rust toolchain:** rustup-managed ONLY, with `~/.cargo/bin` FIRST on `PATH`
+  on both nodes. 1.96.0 and 1.98.0 are installed with `clippy` + `rustfmt`, so
+  a `rust-toolchain.toml` pin flip needs no runner-side install. Never
+  `brew install rust` — see §9. Host-specific paths and runner service names
+  are operator-local, not published here.
 
 ---
 
@@ -147,10 +144,10 @@ the PostgreSQL *test* tiers. No CI database test can touch real memory data.
 |---|---|---|
 | Session memory (`mcp__memory__`) | **SQLite** | `~/.claude/ai-memory.db` |
 | Hive (`mcp__ai-memory-hive__`, :9077) | **SQLite** | `.local-runs/cert-federation/hive/hive.db` |
-| Enterprise-fed test tier | PostgreSQL | `:5445` / db `ai_memory_test` (test-only) |
+| Enterprise-fed test tier | PostgreSQL | `:5445` / ephemeral per-job test db |
 
 > Note: the retired container was named `ai-memory-hive-pg186`, but it only ever
-> held `ai_memory_test` — **not** hive data. The hive daemon uses SQLite.
+> held a test-only database — **not** hive data. The hive daemon uses SQLite.
 
 ---
 
@@ -172,30 +169,29 @@ cd pg-age-stack && docker compose up -d      # brings up the certified pg+AGE+pg
 
 ## 8. Runbook
 
-### Linux native tier (f2)
+### Linux native tier
 ```bash
-sudo pg_ctlcluster 18 aimemfed start|stop|restart
-pg_lsclusters | grep aimemfed
-sudo -u postgres psql -p 5445 -d ai_memory_test    # local socket (trust)
-# rebuild from scratch:
-bash .local-runs/linux-native-tier.sh
+# start/stop the native pg cluster (operator-local cluster name)
+sudo pg_ctlcluster 18 <cluster> start|stop|restart
+pg_lsclusters
+sudo -u postgres psql -p 5445 -d <test-db>    # local socket (trust)
+# rebuild from scratch: operator-local linux-native-tier.sh
 ```
 
-### macOS native tier (f1)
+### macOS native tier
 ```bash
-ssh f1 'eval "$(/opt/homebrew/bin/brew shellenv)"; export PATH=/opt/homebrew/opt/postgresql@18/bin:$PATH; pg_ctl -D ~/pg-age-stack/pgdata start|stop'
-ssh f1 'source ~/pg-age-stack/env.sh'      # exports AI_MEMORY_TEST_POSTGRES_URL
-# rebuild from scratch: ssh f1 'bash ~/f1-tier-init.sh'
+# PATH: keg-only postgresql@18, then:
+pg_ctl -D <pg-age-stack>/pgdata start|stop
+# env file on the node exports AI_MEMORY_TEST_POSTGRES_URL (never committed)
+# rebuild: operator-local f1-tier-init.sh equivalent
 ```
 
 ### Self-hosted runners
 ```bash
-# status
+# status (names/ids are not published here)
 gh api repos/alphaonedev/ai-memory-mcp/actions/runners --jq '.runners[]|"\(.name) [\(.status)]"'
-# Linux service
-sudo /home/fate_two/actions-runner/svc.sh status|start|stop
-# macOS service
-ssh f1 '~/actions-runner/svc.sh status|start|stop'
+# service control: the runner `svc.sh` lives in the operator-local
+# actions-runner install dir on each node — not in this repo.
 ```
 
 ---
@@ -217,19 +213,18 @@ stubs. Fix by symlinking each to the keg subdir
 **Linux:** pgdg apt provides pg18.6 + pgvector 0.8.6 (`noble-pgdg`); AGE must be
 built from source (`release/PG18/1.8.0`) with the same BISONFLAGS patch.
 
-**Rust on a CI node must be rustup-managed, never Homebrew (f1, 2026-08-22):**
+**Rust on a CI node must be rustup-managed, never Homebrew (2026-08-22):**
 Homebrew's `rustup` formula installs proxies in `~/.cargo/bin` (`cargo -> rustup`,
 `rustc -> rustup`, …) but the real binary lives at
 `/opt/homebrew/opt/rustup/libexec/bin/rustup`; `/opt/homebrew/bin/rustup` is only a
 bash wrapper. With `~/.cargo/bin/rustup` missing, every proxy dangles. Fix:
 `ln -sfn /opt/homebrew/opt/rustup/libexec/bin/rustup ~/.cargo/bin/rustup` — it MUST
 point at the real Mach-O binary, not the wrapper (the wrapper resets `argv[0]`, which
-breaks proxy dispatch). Because both f1 runners listed `/opt/homebrew/bin` ahead of
-`~/.cargo/bin`, CI on f1 had silently been building with the Homebrew **`rust`
-formula (1.95.0)**, which cannot honor `rust-toolchain.toml` at all. A Homebrew
-`llhttp` 9.3 -> 9.4 bump then broke that formula's libgit2 link (dyld abort, exit 134)
-and red-lit every macOS leg. Resolution: `brew uninstall rust` (no dependents;
-Homebrew autoremove also dropped `libgit2` and `ripgrep` — `ripgrep` reinstalled),
-then put `~/.cargo/bin` first in both runners' `.path`. **Rule: never install Rust via
-Homebrew (or any OS package manager) on a CI node — rustup-managed only, with
-`~/.cargo/bin` first on `PATH`, so `rust-toolchain.toml` is what decides the compiler.**
+breaks proxy dispatch). If Homebrew `bin` is ahead of `~/.cargo/bin` on PATH, CI
+silently builds with the Homebrew **`rust` formula**, which cannot honor
+`rust-toolchain.toml` at all. A Homebrew `llhttp` bump then broke that formula's
+libgit2 link (dyld abort, exit 134) and red-lit every macOS leg. Resolution:
+`brew uninstall rust`, then put `~/.cargo/bin` first in the runner PATH.
+**Rule: never install Rust via Homebrew (or any OS package manager) on a CI
+node — rustup-managed only, with `~/.cargo/bin` first on `PATH`, so
+`rust-toolchain.toml` is what decides the compiler.**

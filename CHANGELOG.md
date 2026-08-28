@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security / CI (#3293)
+
+- **Restore two fail-closed `#3128` rustup-provisioning asserts** dropped
+  by the 1.98 rebase (`Check` in `ci.yml` + `cert-postgres-age.yml`). A
+  self-hosted node missing `$HOME/.cargo/bin/rustup` now fails with
+  "repair the node" instead of inside `dtolnay/rust-toolchain`.
+- **Scrub `docs/DEV-CI-ENVIRONMENT.md`:** no test DSN password, no
+  hostnames / ssh aliases / runner service paths / data dirs. Topology
+  is labels + ports only.
+
 ### Fixed (hosted `Check (ubuntu-latest,sqlite)` ld SIGBUS / ENOSPC)
 
 - **Hosted sqlite Check is a REQUIRED context and was chronically
