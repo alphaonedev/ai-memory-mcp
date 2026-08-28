@@ -22351,10 +22351,12 @@ impl MemoryStore for PostgresStore {
         // idempotent no-op return, logged for audit. (b) G29 credential
         // REDACT: ALWAYS redact, NEVER refuse (a refused inbound row
         // would diverge replicas; no-op unless screening was seeded
-        // non-`off`). Both guards previously existed ONLY on
-        // `merge_inbound`, leaving every apply_remote_memory caller
-        // unguarded on postgres while sqlite carries them inside
-        // `db::insert_if_newer` itself.
+        // non-`off`). Wave-2 B4 — use `redact_memory_for_receive`
+        // (ReceiveAttestationLeaves), matching `merge_inbound`. The
+        // pre-B4 TrustedByName carve-out
+        // wholesale-preserved any string leaf under a `*_b64` key, so a
+        // credential-shaped catchup-pull leaf egressed verbatim. Local
+        // `store` / `store_batch` keep the TrustedByName storage screen.
         let tombstoned: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
         )
@@ -22371,7 +22373,7 @@ impl MemoryStore for PostgresStore {
             );
             return Ok(memory.id.clone());
         }
-        let screened = screen_storage_memory(memory);
+        let screened = crate::secret_screen::redact_memory_for_receive(memory);
         let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
         // Federation-pushed memories must clear the same pre-write

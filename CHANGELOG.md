@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-2 B4 — pg apply_remote_memory receive-redact + author-less pull)
+
+- **Postgres `apply_remote_memory`** now calls `redact_memory_for_receive`
+  (ReceiveAttestationLeaves), matching `merge_inbound`. Pre-B4 it used
+  `screen_storage_memory` / TrustedByName, which wholesale-preserved any
+  string leaf under a `*_b64` key — a credential-shaped catchup-pull leaf
+  egressed verbatim. Local `store` / `store_batch` stay TrustedByName.
+- **`attest_inbound_pull_memory`** receive-redacts BEFORE the author-less
+  early-return. Omitting `metadata.agent_id` no longer skips the secret
+  screen, and a peer-asserted `agent_attested` on an author-less row is
+  downgraded to `claimed` (LWW `attest_rank` cannot inflate). Author-less
+  rows are still applied (no owner claim to verify). Pins:
+  `pull_attestation_no_author_receive_redacts_credential_under_b64_b4`,
+  `apply_remote_memory_authorless_redacts_credential_under_b64_b4`.
+
 ### Security (Wave-2 B2 — record-stop on sqlite same-id merge + pg CAS)
 
 - **`db::merge_inbound` existing-row overwrite** now calls

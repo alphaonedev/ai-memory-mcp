@@ -998,24 +998,54 @@ pub(super) fn apply_inbound_write_attestation(
 /// dropped inside the redactor and the row lands honestly `claimed` instead of a
 /// false `agent_attested`.
 ///
+/// Wave-2 B4 — author-less rows (no `metadata.agent_id`) still receive-redact
+/// before apply. Omitting `agent_id` must not skip the secret screen, and a
+/// peer cannot self-assert `agent_attested` with no author to verify against
+/// (AttestLevel is Claimed | AgentAttested only; LWW `attest_rank` would
+/// otherwise let an author-less catchup row beat a claimed local twin).
+/// Author-less rows are still applied (`true`) — there is no owner claim to
+/// verify, matching the #2715 degrade-never-corrupt pull model.
+///
 /// Returns `true` when the (now-attested) row may be applied, `false` when it
 /// must be skipped.
 #[must_use]
 pub(crate) fn attest_inbound_pull_memory(mem: &mut Memory) -> bool {
-    let Some(author) = mem
+    // Capture the claimed author BEFORE redaction so a credential-shaped
+    // `agent_id` (pathological) still attests against the presented claim;
+    // the screen may rewrite the stored leaf. Wave-2 B4: do NOT return
+    // before the screen — omitting agent_id must not skip redaction.
+    let author = mem
         .metadata
         .get(crate::META_KEY_AGENT_ID)
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-    else {
+        .map(str::to_string);
+    // #2340 — redact BEFORE verify/stamp so the attestation commits over
+    // the persisted bytes (see fn docs). Also runs for author-less rows.
+    crate::federation::receive_auth::redact_inbound_before_attestation(mem);
+    let Some(author) = author else {
         // No claimed author → no owner claim to verify a signature against.
-        // Apply unchanged (byte-identical to the pre-#2715 pull behaviour for
-        // an author-less row).
+        // Still apply (pull has no attested relayer) but never land a
+        // peer-asserted `agent_attested` (ERRORS-09: illegal state).
+        if row_is_agent_attested(mem) {
+            if let Some(obj) = mem.metadata.as_object_mut() {
+                obj.insert(
+                    crate::models::field_names::ATTEST_LEVEL.to_string(),
+                    serde_json::Value::String(
+                        crate::identity::verify::AttestLevel::Claimed
+                            .as_str()
+                            .to_string(),
+                    ),
+                );
+            }
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                memory_id = %mem.id,
+                "federation pull: author-less inbound self-asserted \
+                 agent_attested — downgraded to claimed (Wave-2 B4)"
+            );
+        }
         return true;
     };
-    // #2340 — redact BEFORE verify/stamp so the attestation commits over the
-    // persisted bytes (see fn docs).
-    crate::federation::receive_auth::redact_inbound_before_attestation(mem);
     // #2865 — single-source the author-key resolution through the shared
     // helper. The pull lane has no DB-registry source (it is backend-uniform by
     // design), so it passes `None` and the helper resolves the enrolled key-dir
@@ -4303,7 +4333,8 @@ mod tests {
     }
 
     /// A pulled row with NO claimed author (`metadata.agent_id` absent) has no
-    /// owner claim to attest against — applied unchanged (no env / key needed).
+    /// owner claim to attest against — applied (no env / key needed). Wave-2 B4
+    /// still receive-redacts; a clean author-less row is byte-identical.
     #[test]
     fn pull_attestation_no_author_applies_unchanged_2715() {
         let mut mem = Memory {
@@ -4317,7 +4348,106 @@ mod tests {
         };
         assert!(
             attest_inbound_pull_memory(&mut mem),
-            "an author-less pulled row carries no claim to verify; applied unchanged"
+            "an author-less pulled row carries no claim to verify; applied"
+        );
+    }
+
+    /// Wave-2 B4 — omitting `agent_id` cannot self-assert `agent_attested`.
+    /// The pull model still applies the row (no owner claim to verify) but
+    /// the illegal level is claimed-floor so LWW attest_rank cannot inflate.
+    #[test]
+    fn pull_attestation_no_author_strips_self_asserted_agent_attested_b4() {
+        let mut mem = Memory {
+            id: "m-b4-no-author-attest".to_string(),
+            namespace: "team/alpha".to_string(),
+            title: "t".to_string(),
+            content: "c".to_string(),
+            created_at: "2026-06-01T12:00:00+00:00".to_string(),
+            metadata: serde_json::json!({ "attest_level": "agent_attested" }),
+            ..Memory::default()
+        };
+        assert!(
+            attest_inbound_pull_memory(&mut mem),
+            "author-less row is still applied"
+        );
+        assert_eq!(
+            mem.metadata["attest_level"], "claimed",
+            "author-less inbound must not land agent_attested"
+        );
+    }
+
+    /// Wave-2 B4 — author-less pull still receive-redacts. A credential under
+    /// a `*_b64` key (sk-/ghp_/AKIA/PEM/Bearer) is screened; JWT / clean b64
+    /// survive. Omitting agent_id must not skip `redact_inbound_before_attestation`.
+    #[test]
+    fn pull_attestation_no_author_receive_redacts_credential_under_b64_b4() {
+        crate::secret_screen::set_screen_mode(crate::secret_screen::SecretScreenMode::Redact);
+        let sk = "sk-proj-Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56";
+        let ghp = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let akia = "AKIAIOSFODNN7EXAMPLE";
+        let bearer = "Bearer 7f3a9c2e1b8d4f6a0c5e9b2d7a1f4c8e3b";
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEbody+AAAA\n-----END RSA PRIVATE KEY-----";
+        let jwt = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJhaTp0ZXN0IiwiaWF0IjoxNzAwMDAwMDAwfQ.aGVsbG8td29ybGQtc2lnbmF0dXJl";
+        let sig = "MEUCIQDk3l2bQm9xY7vN4pR8sT1uW0zA6cF5gH7jK9lM2nO3pQ==";
+        let mut mem = Memory {
+            id: "m-b4-no-author-secret".to_string(),
+            namespace: "team/alpha".to_string(),
+            title: "t".to_string(),
+            content: "c".to_string(),
+            created_at: "2026-06-01T12:00:00+00:00".to_string(),
+            metadata: serde_json::json!({
+                "attestation_b64": jwt,
+                "host_signature_b64": sig,
+                "api_key_b64": sk,
+                "github_b64": ghp,
+                "aws_b64": akia,
+                "bearer_b64": bearer,
+                "pem_b64": pem,
+            }),
+            ..Memory::default()
+        };
+        assert!(
+            attest_inbound_pull_memory(&mut mem),
+            "author-less credential row is still applied (redact, never refuse)"
+        );
+        assert_eq!(
+            mem.metadata
+                .get("attestation_b64")
+                .and_then(serde_json::Value::as_str),
+            Some(jwt),
+            "JWT string leaf must survive receive"
+        );
+        assert_eq!(
+            mem.metadata
+                .get("host_signature_b64")
+                .and_then(serde_json::Value::as_str),
+            Some(sig),
+            "bare-base64 signature must survive receive"
+        );
+        let leaked = mem.metadata.to_string();
+        assert!(
+            !leaked.contains(sk),
+            "sk- under *_b64 must not persist; got {leaked}"
+        );
+        assert!(
+            !leaked.contains(ghp),
+            "ghp_ under *_b64 must not persist; got {leaked}"
+        );
+        assert!(
+            !leaked.contains(akia),
+            "AKIA under *_b64 must not persist; got {leaked}"
+        );
+        assert!(
+            !leaked.contains("7f3a9c2e1b8d4f6a0c5e9b2d7a1f4c8e3b"),
+            "Bearer token under *_b64 must not persist; got {leaked}"
+        );
+        assert!(
+            !leaked.contains("MIIEbody"),
+            "PEM under *_b64 must not persist; got {leaked}"
+        );
+        assert!(
+            leaked.contains(crate::secret_screen::REDACTION_PLACEHOLDER),
+            "credential-shaped *_b64 string must be redacted; got {leaked}"
         );
     }
 

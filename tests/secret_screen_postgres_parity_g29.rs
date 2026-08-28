@@ -305,3 +305,90 @@ fn carveout_const_matches_canonical_set_postgres_parity_1844() {
         "1844: the metadata carve-out const drifted from the canonical crypto/system field set"
     );
 }
+
+/// Wave-2 B4 — pg `apply_remote_memory` (catchup-pull funnel) screens with
+/// `redact_memory_for_receive` (ReceiveAttestationLeaves), not
+/// `redact_memory_for_storage` (TrustedByName). A credential under a `*_b64`
+/// key on an AUTHOR-LESS row is redacted; JWT / detector-clean bare-base64
+/// survive. Pre-B4 TrustedByName wholesale-preserved the string leaf.
+#[tokio::test]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL (live postgres); run with --include-ignored"]
+async fn apply_remote_memory_authorless_redacts_credential_under_b64_b4() {
+    set_screen_mode(SecretScreenMode::Redact);
+
+    let Some(pg) = maybe_open_pg().await else {
+        return;
+    };
+    let admin = CallerContext::for_admin("operator:test-b4");
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let ns = format!("g29-b4-authorless-{tag}");
+    let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEbody+AAAA\n-----END RSA PRIVATE KEY-----";
+    let ghp = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    let akia = "AKIAIOSFODNN7EXAMPLE";
+    let bearer = "Bearer 7f3a9c2e1b8d4f6a0c5e9b2d7a1f4c8e3b";
+    let metadata = serde_json::json!({
+        // no agent_id — the attest_inbound_pull_memory author-less bypass
+        "attestation_b64": FAKE_JWT,
+        "host_signature_b64": FAKE_SIG_B64,
+        "api_key_b64": FAKE_KEY,
+        "github_b64": ghp,
+        "aws_b64": akia,
+        "bearer_b64": bearer,
+        "pem_b64": pem,
+    });
+    let m = mem_full(
+        &ns,
+        "a clean title",
+        "clean content",
+        vec!["b4-authorless".to_string()],
+        metadata,
+    );
+    assert!(
+        m.metadata.get("agent_id").is_none(),
+        "b4 fixture must be author-less"
+    );
+
+    let id = MemoryStore::apply_remote_memory(&pg, &admin, &m)
+        .await
+        .expect("b4: apply_remote_memory must accept (never refuse)");
+    let back = pg.get(&admin, &id).await.expect("pg get");
+    assert_eq!(
+        back.metadata
+            .get("attestation_b64")
+            .and_then(serde_json::Value::as_str),
+        Some(FAKE_JWT),
+        "b4: attestation JWT string leaf must survive apply_remote_memory"
+    );
+    assert_eq!(
+        back.metadata
+            .get("host_signature_b64")
+            .and_then(serde_json::Value::as_str),
+        Some(FAKE_SIG_B64),
+        "b4: bare-base64 signature must survive apply_remote_memory"
+    );
+    let leaked = back.metadata.to_string();
+    assert!(
+        !leaked.contains(FAKE_KEY),
+        "b4: sk- under *_b64 must not persist on pg apply_remote_memory; got {leaked}"
+    );
+    assert!(
+        !leaked.contains(ghp),
+        "b4: ghp_ under *_b64 must not persist; got {leaked}"
+    );
+    assert!(
+        !leaked.contains(akia),
+        "b4: AKIA under *_b64 must not persist; got {leaked}"
+    );
+    assert!(
+        !leaked.contains("7f3a9c2e1b8d4f6a0c5e9b2d7a1f4c8e3b"),
+        "b4: Bearer token under *_b64 must not persist; got {leaked}"
+    );
+    assert!(
+        !leaked.contains("MIIEbody"),
+        "b4: PEM under *_b64 must not persist; got {leaked}"
+    );
+    assert!(
+        leaked.contains(REDACTION_MARKER),
+        "b4: credential-shaped *_b64 string must be redacted; got {leaked}"
+    );
+}
