@@ -259,6 +259,9 @@ fn ensure_row(conn: &Connection, agent_id: &str, namespace: &str) -> Result<Quot
     if let Some(row) = load_row(conn, agent_id, namespace)? {
         return Ok(row);
     }
+    // Wave-2 B7 — the lazy default-row INSERT is a record-plane write.
+    // Existing-row reads stay live (ERRORS-09).
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = chrono::Utc::now().to_rfc3339();
     let day = day_bucket(&now);
     let defaults = quota_defaults();

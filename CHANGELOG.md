@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-2 B7 — record-stop remaining siblings + structural completeness)
+
+- Gate the four round-4 siblings that write *outside* the B6-gated
+  SSOT free-fns: `queue_pending_action`, postgres
+  `enforce_governance_action` Pending INSERT, sqlite
+  `entity_register` existing-entity alias `INSERT OR IGNORE`, and the
+  lazy `agent_quotas` default-row INSERT (`quotas::ensure_row` +
+  postgres `quota_status` / `quota_status_ns`). MCP
+  `memory_quota_status` stays a read at dispatch; the side-effect
+  INSERT is fenced at SSOT/SAL (ERRORS-09).
+- STRUCTURAL completeness test
+  `record_stop_write_sql_fns_are_gated_or_allowlisted_b7` scans
+  `src/**/*.rs` write-SQL and requires the enclosing fn to call a
+  record-stop gate or sit on an explicit reviewed exception
+  allowlist (`append_signed_event` stays ungated so resume works).
+  Pins: `b7_enumerated_funnels_refuse_under_record_stop`.
+- B7': postgres SAL twins of gated sqlite SSOT methods now gate
+  (`pending_decide`, `governance_approve_with_consensus`,
+  `set_namespace_standard`, `clear_namespace_standard`,
+  `bind_agent_api_key`, `set_embeddings_batch`) and are removed from
+  the allowlist. Structural test asserts pg/sqlite gate parity so an
+  allowlist exemption cannot mask the split.
+
 ### Security (Wave-2 B6 — CLASS-level record-stop completeness)
 
 - Every mutating SSOT write free-fn now calls `gate_storage_conn` at
