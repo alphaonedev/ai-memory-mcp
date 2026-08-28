@@ -641,6 +641,13 @@ enum CarveOutMode {
     /// NEVER inside the screened JSON — so the name carve-out protects nothing
     /// here and only opens the bypass.
     ScreenAll,
+    /// Hostile federation-receive MEMORY metadata (#3299): carve-out
+    /// STRING leaves (attestation JWT / Ed25519 b64 — the #1844 envelope)
+    /// are preserved so `convergence_carveout_metadata_survives_*` still
+    /// holds; carved-out OBJECT/ARRAY subtrees are recursed with
+    /// [`Self::ScreenAll`] so a peer cannot smuggle `{api_key: "sk-…"}`
+    /// under `foo_b64`.
+    ReceiveAttestationLeaves,
 }
 
 /// Recursive worker for [`redact_metadata_values`]. Returns `Some(rebuilt)`
@@ -654,9 +661,22 @@ fn redact_value_leaves(val: &serde_json::Value, mode: CarveOutMode) -> Option<se
             let mut changed = false;
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
-                if mode == CarveOutMode::TrustedByName && metadata_key_is_carved_out(k) {
+                let carved = metadata_key_is_carved_out(k);
+                let preserve = match mode {
+                    CarveOutMode::TrustedByName if carved => true,
+                    CarveOutMode::ReceiveAttestationLeaves if carved && v.is_string() => true,
+                    _ => false,
+                };
+                if preserve {
                     out.insert(k.clone(), v.clone());
-                } else if let Some(red) = redact_value_leaves(v, mode) {
+                    continue;
+                }
+                let child_mode = if mode == CarveOutMode::ReceiveAttestationLeaves && carved {
+                    CarveOutMode::ScreenAll
+                } else {
+                    mode
+                };
+                if let Some(red) = redact_value_leaves(v, child_mode) {
                     changed = true;
                     out.insert(k.clone(), red);
                 } else {
@@ -710,6 +730,27 @@ pub fn redact_memory_for_storage(mem: &crate::models::Memory) -> Option<crate::m
     if screen_mode() == SecretScreenMode::Off {
         return None;
     }
+    redact_memory_with_carveout(mem, CarveOutMode::TrustedByName)
+}
+
+/// #3299 — federation-RECEIVE memory redact. Same as
+/// [`redact_memory_for_storage`] for content/title/tags, but metadata
+/// uses [`CarveOutMode::ReceiveAttestationLeaves`]: attestation STRING
+/// leaves under `_b64` / known keys survive; hostile OBJECT subtrees
+/// under those keys are screened. Wire this into receive funnels only
+/// (`insert_if_newer` / `merge_inbound` / `redact_inbound_before_attestation`).
+#[must_use]
+pub fn redact_memory_for_receive(mem: &crate::models::Memory) -> Option<crate::models::Memory> {
+    if screen_mode() == SecretScreenMode::Off {
+        return None;
+    }
+    redact_memory_with_carveout(mem, CarveOutMode::ReceiveAttestationLeaves)
+}
+
+fn redact_memory_with_carveout(
+    mem: &crate::models::Memory,
+    meta_mode: CarveOutMode,
+) -> Option<crate::models::Memory> {
     let content = redact_for_storage(&mem.content);
     let title = redact_for_storage(&mem.title);
     let tags: Option<Vec<String>> = {
@@ -729,7 +770,11 @@ pub fn redact_memory_for_storage(mem: &crate::models::Memory) -> Option<crate::m
             .collect();
         changed.then_some(rebuilt)
     };
-    let metadata = redact_metadata_values(&mem.metadata);
+    let metadata = if screen_mode() == SecretScreenMode::Off {
+        None
+    } else {
+        redact_value_leaves(&mem.metadata, meta_mode)
+    };
 
     if content.is_none() && title.is_none() && tags.is_none() && metadata.is_none() {
         return None;

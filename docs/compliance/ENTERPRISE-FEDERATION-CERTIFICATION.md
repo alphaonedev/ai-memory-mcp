@@ -94,7 +94,22 @@ triggers re-cert** (see §7).
 > unchanged; Certified Postgres + AGE + pgvector (#2548) was GREEN on
 > parent `e41f9480` (no stack/pin/workflow change in #3291), so
 > §5.4(3) holds.
-
+>
+> **Amendment (2026-08-28, #3299).** The §7-watched path
+> `src/federation/receive_auth.rs` now screens inbound MEMORY metadata
+> with a receive-only carve-out: attestation STRING leaves under `_b64`
+> / known keys are preserved (the #1844 envelope); hostile OBJECT
+> subtrees under those keys are screened (`CarveOutMode::
+> ReceiveAttestationLeaves`). Closes the `{*_b64: {api_key: …}}`
+> bypass #3269 left on the memory funnel. Additive security-hardening —
+> no wire/schema/`AI_MEMORY_FED_*` identifier add/remove/rename, no
+> certified control removed. This amendment discharges the §7 trigger.
+> **This amendment does NOT re-mint the certification** (bind remains
+> `e22bc93c`; the 2026-08-12 5-agent adversarial ratification stands).
+> §5.4(2)–(5) re-attested at `00dd0162`: Certified Postgres + AGE +
+> pgvector (#2548) GREEN on that tip (run 33182767671); live stack
+> 18.6 / 1.8.0 / 0.8.6. No stack/pin/workflow change.
+>
 ---
 
 ## 1. The trust boundary (what is certified)

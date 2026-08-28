@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#3299 — receive memory `*_b64` subtree)
+
+- **Federation-receive MEMORY metadata** no longer skips a whole object
+  under a `*_b64` / carve-out key. Attestation STRING leaves (JWT /
+  Ed25519 b64) still survive unmangled (#1844). Hostile `{api_key: …}`
+  subtrees under those keys are screened. Local caller path unchanged
+  (`TrustedByName`).
+
 ### Security (#3289 — cert-peer-binding parse)
 
 - **`CertPeerBindingMode::parse` is fail-loud.** Empty

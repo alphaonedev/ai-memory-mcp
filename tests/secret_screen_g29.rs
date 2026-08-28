@@ -512,6 +512,61 @@ fn convergence_carveout_metadata_survives_validate_and_funnel_1844() {
     );
 }
 
+/// #3299 — a hostile OBJECT subtree under a `*_b64` key on the receive
+/// funnel is screened (the #3269 sibling bypass); attestation STRING
+/// leaves still survive.
+#[test]
+fn receive_screens_hostile_b64_object_subtree_3299() {
+    set_screen_mode(SecretScreenMode::Redact);
+
+    let metadata = serde_json::json!({
+        "agent_id": "ai:test:3299",
+        "attestation_b64": FAKE_JWT,
+        "host_signature_b64": {
+            "api_key": FAKE_OPENAI_KEY,
+            "note": "nested under a carved-out key"
+        }
+    });
+    let mem = valid_mem(
+        "ns-3299-receive",
+        "a clean title",
+        "clean content",
+        metadata,
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let conn = db::open(&dir.path().join("3299.db")).expect("open db");
+    let id = db::insert_if_newer(&conn, &mem).expect("3299: funnel must accept (never refuse)");
+
+    let stored: String = conn
+        .query_row(
+            "SELECT metadata FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .expect("row persisted");
+    let stored: serde_json::Value = serde_json::from_str(&stored).expect("metadata json");
+    assert_eq!(
+        stored
+            .get("attestation_b64")
+            .and_then(serde_json::Value::as_str),
+        Some(FAKE_JWT),
+        "3299: attestation JWT string leaf must survive receive"
+    );
+    let nested = stored
+        .get("host_signature_b64")
+        .expect("carved-out object present");
+    let leaked = nested.to_string();
+    assert!(
+        !leaked.contains(FAKE_OPENAI_KEY),
+        "3299: hostile subtree under *_b64 must not persist the credential; got {leaked}"
+    );
+    assert!(
+        leaked.contains(REDACTION_MARKER),
+        "3299: hostile subtree under *_b64 must be redacted; got {leaked}"
+    );
+}
+
 /// #1844 (2, funnel-redacts-never-refuses) — a NON-carve-out metadata secret
 /// reaching the federation-receive funnel directly (bypassing caller
 /// validate, as a relayed row does) is REDACTED, never refused: the funnel

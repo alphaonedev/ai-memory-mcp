@@ -22880,7 +22880,7 @@ impl MemoryStore for PostgresStore {
         // federation RECEIVE funnel (parity with sqlite insert_if_newer).
         // ALWAYS redact, NEVER refuse — a rejected inbound row would diverge
         // replicas. No-op unless screening was seeded non-`off`.
-        let screened = screen_storage_memory(inbound);
+        let screened = crate::secret_screen::redact_memory_for_receive(inbound);
         let inbound = screened.as_ref().unwrap_or(inbound);
         // ARCH-1 parity (mirrors apply_remote_memory) — a federation-
         // pushed row must clear the same pre-write governance hook as a
