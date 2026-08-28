@@ -113,6 +113,7 @@ fn insert_signed_reflects_on(
         dst_id: tgt,
         relation: "reflects_on",
         observed_by: Some(&agent.agent_id),
+        created_at: Some(&now),
         valid_from: Some(&now),
         valid_until: None,
     };

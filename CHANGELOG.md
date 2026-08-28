@@ -36,6 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The rest of `hot_swap_llm_2166` still runs on hosted; the concurrent cell
   still runs on macos-fed + linux-fed. Not a `Swappable` UB race. Issue
   stays OPEN for OnceLock rustls init / fewer client constructions.
+### Security (#3291 — attest `memory_links.created_at` in SignableLink)
+
+- **`#3291` — a self-signed edge now attests its own `created_at`.** After
+  `#3178` the recorded-at stamp is caller-supplied, but `SignableLink`'s
+  six-field CBOR (`src_id` / `dst_id` / `relation` / `observed_by` /
+  `valid_from` / `valid_until`) omitted it, so a forged timestamp still
+  verified. `created_at` is now in the pre-image on sqlite and postgres
+  (pg truncates to microseconds before sign **and** INSERT so the
+  `TIMESTAMPTZ` round-trip matches; domain tag stays `ai-memory/link/v1`).
+  Tampering `created_at` fails verify. **Pre-GA:** existing self-signed
+  `memory_links` must be re-signed. Pins:
+  `canonical_cbor_differs_on_created_at_change_3291`,
+  `tampered_created_at_fails_verify_3291`,
+  `sqlite_link_signed_signature_commits_to_created_at_3291`,
+  `sqlite_tampered_created_at_fails_verify_3291`.
 
 ### Security (record-stop fleet kill-switch fail-open — #3276)
 

@@ -320,13 +320,16 @@ fn peer_attested_link_verifies_and_reports_peer_attested() {
     };
     kp_mod::save_public_only(&bob_pub, f.keys_tmp.path()).expect("import bob.pub");
 
-    // Bob signs a link off-host.
-    let valid_from = Utc::now().to_rfc3339();
+    // Bob signs a link off-host. `created_at` is attested (#3291) so the
+    // persisted stamp MUST match the pre-image `memory_verify` re-derives.
+    let created_at = Utc::now().to_rfc3339();
+    let valid_from = created_at.clone();
     let signable = sign::SignableLink {
         src_id: &f.src_id,
         dst_id: &f.dst_id,
         relation: "related_to",
         observed_by: Some("bob"),
+        created_at: Some(&created_at),
         valid_from: Some(&valid_from),
         valid_until: None,
     };
@@ -340,7 +343,7 @@ fn peer_attested_link_verifies_and_reports_peer_attested() {
         source_id: f.src_id.clone(),
         target_id: f.dst_id.clone(),
         relation: ai_memory::models::MemoryLinkRelation::RelatedTo,
-        created_at: Utc::now().to_rfc3339(),
+        created_at: created_at.clone(),
         signature: Some(sig),
         observed_by: Some("bob".to_string()),
         valid_from: Some(valid_from.clone()),

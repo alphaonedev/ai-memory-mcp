@@ -91,6 +91,7 @@ fn insert_signed_reflects_on(
         dst_id: target_id,
         relation: "reflects_on",
         observed_by: Some(&keypair.agent_id),
+        created_at: Some(&now),
         valid_from: Some(&now),
         valid_until: None,
     };

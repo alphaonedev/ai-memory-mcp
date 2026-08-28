@@ -126,6 +126,7 @@ fn decide_attest_level(
                         dst_id: &link.target_id,
                         relation: link.relation.as_str(),
                         observed_by: Some(observed_by),
+                        created_at: Some(link.created_at.as_str()),
                         valid_from: link.valid_from.as_deref(),
                         valid_until: link.valid_until.as_deref(),
                     };
@@ -194,6 +195,7 @@ fn happy_path_peer_attested() {
         dst_id: &link.target_id,
         relation: link.relation.as_str(),
         observed_by: Some(&h.alice.agent_id),
+        created_at: Some(link.created_at.as_str()),
         valid_from: Some(&valid_from),
         valid_until: None,
     };
@@ -230,6 +232,7 @@ fn tampered_signature_byte_is_rejected() {
         dst_id: &link.target_id,
         relation: link.relation.as_str(),
         observed_by: Some(&h.alice.agent_id),
+        created_at: Some(link.created_at.as_str()),
         valid_from: Some(&valid_from),
         valid_until: None,
     };
@@ -266,6 +269,7 @@ fn tampered_link_content_is_rejected() {
         dst_id: &h.dst_id,
         relation: "related_to",
         observed_by: Some(&h.alice.agent_id),
+        created_at: None,
         valid_from: Some(&valid_from),
         valid_until: None,
     };
@@ -296,6 +300,7 @@ fn no_public_key_for_observed_by_lands_as_unsigned() {
         dst_id: &link.target_id,
         relation: link.relation.as_str(),
         observed_by: Some(&h.alice.agent_id),
+        created_at: Some(link.created_at.as_str()),
         valid_from: Some(&valid_from),
         valid_until: None,
     };

@@ -80,7 +80,7 @@ pub mod keypair;
 /// normalizer for the model-attestation substrate.
 pub mod model_family;
 // H2 — outbound link signing. Canonical CBOR + Ed25519 sign over the
-// six signable link fields. Consumed by `db::create_link_signed` to
+// seven signable link fields. Consumed by `db::create_link_signed` to
 // fill the previously-dead `signature` BLOB column on `memory_links`.
 pub mod sign;
 // H3 — inbound link verification. Mirror of `sign`: re-derives the

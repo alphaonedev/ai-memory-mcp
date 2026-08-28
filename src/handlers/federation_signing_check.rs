@@ -870,6 +870,7 @@ pub(super) async fn sync_push_via_store(
                             dst_id: &link.target_id,
                             relation: link.relation.as_str(),
                             observed_by: Some(observed_by),
+                            created_at: Some(link.created_at.as_str()),
                             valid_from: link.valid_from.as_deref(),
                             valid_until: link.valid_until.as_deref(),
                         };

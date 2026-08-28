@@ -2695,12 +2695,13 @@ impl MemoryStore for SqliteStore {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
             Option<Vec<u8>>,
             Option<String>,
         )> = match (target_id.as_deref(), relation_filter.as_deref()) {
             (Some(t), Some(r)) => conn
                 .query_row(
-                    "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                    "SELECT source_id, target_id, relation, created_at, valid_from, valid_until, \
                             observed_by, signature, attest_level
                      FROM memory_links \
                      WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3 \
@@ -2714,8 +2715,9 @@ impl MemoryStore for SqliteStore {
                             r.get::<_, Option<String>>(3)?,
                             r.get::<_, Option<String>>(4)?,
                             r.get::<_, Option<String>>(5)?,
-                            r.get::<_, Option<Vec<u8>>>(6)?,
-                            r.get::<_, Option<String>>(7)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, Option<Vec<u8>>>(7)?,
+                            r.get::<_, Option<String>>(8)?,
                         ))
                     },
                 )
@@ -2723,7 +2725,7 @@ impl MemoryStore for SqliteStore {
                 .map_err(box_err)?,
             (Some(t), None) => conn
                 .query_row(
-                    "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                    "SELECT source_id, target_id, relation, created_at, valid_from, valid_until, \
                             observed_by, signature, attest_level
                      FROM memory_links \
                      WHERE source_id = ?1 AND target_id = ?2 \
@@ -2737,8 +2739,9 @@ impl MemoryStore for SqliteStore {
                             r.get::<_, Option<String>>(3)?,
                             r.get::<_, Option<String>>(4)?,
                             r.get::<_, Option<String>>(5)?,
-                            r.get::<_, Option<Vec<u8>>>(6)?,
-                            r.get::<_, Option<String>>(7)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, Option<Vec<u8>>>(7)?,
+                            r.get::<_, Option<String>>(8)?,
                         ))
                     },
                 )
@@ -2746,7 +2749,7 @@ impl MemoryStore for SqliteStore {
                 .map_err(box_err)?,
             (None, _) => conn
                 .query_row(
-                    "SELECT source_id, target_id, relation, valid_from, valid_until, \
+                    "SELECT source_id, target_id, relation, created_at, valid_from, valid_until, \
                             observed_by, signature, attest_level
                      FROM memory_links \
                      WHERE source_id = ?1 \
@@ -2760,8 +2763,9 @@ impl MemoryStore for SqliteStore {
                             r.get::<_, Option<String>>(3)?,
                             r.get::<_, Option<String>>(4)?,
                             r.get::<_, Option<String>>(5)?,
-                            r.get::<_, Option<Vec<u8>>>(6)?,
-                            r.get::<_, Option<String>>(7)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, Option<Vec<u8>>>(7)?,
+                            r.get::<_, Option<String>>(8)?,
                         ))
                     },
                 )
@@ -2769,7 +2773,7 @@ impl MemoryStore for SqliteStore {
                 .map_err(box_err)?,
         };
 
-        let Some((src, tgt, rel, vf, vu, obs, sig, attest)) = row else {
+        let Some((src, tgt, rel, ca, vf, vu, obs, sig, attest)) = row else {
             return Err(StoreError::NotFound {
                 id: format!(
                     "link {source_id} -> {} {}",
@@ -2807,6 +2811,7 @@ impl MemoryStore for SqliteStore {
                         dst_id: &tgt,
                         relation: &rel,
                         observed_by: obs.as_deref(),
+                        created_at: ca.as_deref(),
                         valid_from: vf.as_deref(),
                         valid_until: vu.as_deref(),
                     };

@@ -233,18 +233,20 @@ struct EdgeRow {
     signature: Option<Vec<u8>>,
     observed_by: Option<String>,
     attest_level: Option<String>,
+    created_at: Option<String>,
     valid_from: Option<String>,
     valid_until: Option<String>,
 }
 
 /// Fetch all `reflects_on` edges whose `source_id = memory_id`,
 /// including the temporal-validity columns that are part of the
-/// signed bundle (H2 signs `valid_from` + `valid_until` alongside
-/// the other link fields — verification must re-derive the same
-/// canonical CBOR, so these must round-trip from the DB).
+/// signed bundle (H2 signs `created_at` + `valid_from` + `valid_until`
+/// alongside the other link fields — verification must re-derive the
+/// same canonical CBOR, so these must round-trip from the DB).
 fn fetch_reflects_on_edges(conn: &Connection, source_id: &str) -> Result<Vec<EdgeRow>> {
     let mut stmt = conn.prepare(
-        "SELECT target_id, signature, observed_by, attest_level, valid_from, valid_until \
+        "SELECT target_id, signature, observed_by, attest_level, created_at, \
+                valid_from, valid_until \
          FROM memory_links \
          WHERE source_id = ?1 AND relation = 'reflects_on'",
     )?;
@@ -254,8 +256,9 @@ fn fetch_reflects_on_edges(conn: &Connection, source_id: &str) -> Result<Vec<Edg
             signature: row.get::<_, Option<Vec<u8>>>(1)?,
             observed_by: row.get::<_, Option<String>>(2)?,
             attest_level: row.get::<_, Option<String>>(3)?,
-            valid_from: row.get::<_, Option<String>>(4)?,
-            valid_until: row.get::<_, Option<String>>(5)?,
+            created_at: row.get::<_, Option<String>>(4)?,
+            valid_from: row.get::<_, Option<String>>(5)?,
+            valid_until: row.get::<_, Option<String>>(6)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -407,6 +410,7 @@ pub fn build_chain_report_at(
                 row.observed_by.as_deref(),
                 row.valid_from.as_deref(),
                 row.valid_until.as_deref(),
+                row.created_at.as_deref(),
                 &attest_level,
             );
 
@@ -472,14 +476,15 @@ pub fn build_chain_report_at(
 /// before attestation was enabled.
 /// Verify a single `reflects_on` edge's Ed25519 signature.
 ///
-/// `valid_from` and `valid_until` must be the raw values stored in
-/// `memory_links` — they are part of the signed canonical CBOR bundle
-/// (H2 commits to all six `SignableLink` fields at sign time). Passing
-/// the wrong values causes the re-derived payload to diverge from what
-/// the signer committed to, which makes Ed25519 reject the signature
-/// even for an otherwise honest edge.
+/// `created_at`, `valid_from` and `valid_until` must be the raw values
+/// stored in `memory_links` — they are part of the signed canonical
+/// CBOR bundle (H2 commits to all seven `SignableLink` fields at sign
+/// time). Passing the wrong values causes the re-derived payload to
+/// diverge from what the signer committed to, which makes Ed25519
+/// reject the signature even for an otherwise honest edge.
 ///
 /// Returns `(verified, failure_reason, signature_hex)`.
+#[allow(clippy::too_many_arguments)] // #3291 adds created_at; signature is the checklist
 fn verify_edge(
     source_id: &str,
     target_id: &str,
@@ -487,6 +492,7 @@ fn verify_edge(
     observed_by: Option<&str>,
     valid_from: Option<&str>,
     valid_until: Option<&str>,
+    created_at: Option<&str>,
     attest_level: &str,
 ) -> (bool, Option<String>, Option<String>) {
     let signature_hex = sig_blob.map(bytes_to_hex);
@@ -533,6 +539,7 @@ fn verify_edge(
         dst_id: target_id,
         relation: crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
         observed_by: Some(agent_id),
+        created_at,
         valid_from,
         valid_until,
     };
@@ -833,6 +840,7 @@ mod tests {
             dst_id: &d0,
             relation: "reflects_on",
             observed_by: Some(&agent.agent_id),
+            created_at: Some(&now),
             valid_from: Some(&now),
             valid_until: None,
         };
@@ -950,6 +958,7 @@ mod tests {
             Some("alice"),
             None,
             None,
+            None,
             "unsigned",
         );
         assert!(verified);
@@ -960,8 +969,16 @@ mod tests {
     #[test]
     fn verify_edge_signed_but_no_observed_by_fails() {
         let sig = vec![0xff; 64];
-        let (verified, reason, sig_hex) =
-            verify_edge("src", "tgt", Some(&sig), None, None, None, "self_signed");
+        let (verified, reason, sig_hex) = verify_edge(
+            "src",
+            "tgt",
+            Some(&sig),
+            None,
+            None,
+            None,
+            None,
+            "self_signed",
+        );
         assert!(!verified);
         let reason = reason.expect("reason set");
         assert!(reason.contains("observed_by is NULL"), "got: {reason}");
@@ -976,6 +993,7 @@ mod tests {
             "tgt",
             Some(&sig),
             Some(""),
+            None,
             None,
             None,
             "self_signed",
@@ -1007,6 +1025,7 @@ mod tests {
             "tgt",
             Some(&sig),
             Some("never-enrolled-agent"),
+            None,
             None,
             None,
             "self_signed",

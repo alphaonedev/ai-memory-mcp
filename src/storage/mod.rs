@@ -8685,9 +8685,9 @@ pub fn create_link(
 /// v0.7 H2 — link write that optionally signs with the active agent's
 /// Ed25519 keypair.
 ///
-/// When `keypair` carries a private key, the six signable fields
-/// (`src_id`, `dst_id`, `relation`, `observed_by`, `valid_from`,
-/// `valid_until`) are encoded to deterministic CBOR per RFC 8949
+/// When `keypair` carries a private key, the seven signable fields
+/// (`src_id`, `dst_id`, `relation`, `observed_by`, `created_at`,
+/// `valid_from`, `valid_until`) are encoded to deterministic CBOR per RFC 8949
 /// §4.2.1, signed, and the 64-byte signature is persisted in the
 /// existing `signature` BLOB column with `attest_level = "self_signed"`.
 ///
@@ -8935,6 +8935,8 @@ pub fn create_link_signed_with_window(
                     dst_id: target_id,
                     relation,
                     observed_by: Some(kp.agent_id.as_str()),
+                    // #3291 — attest the recorded-at stamp the row carries.
+                    created_at: Some(created_at_str.as_str()),
                     // #3178 — sign the window that is actually PERSISTED.
                     // Pre-fix this signed `valid_from: Some(now),
                     // valid_until: None` regardless of what the caller
@@ -9025,6 +9027,7 @@ pub fn create_link_signed_with_window(
             dst_id: target_id,
             relation,
             observed_by: observed_by_col,
+            created_at: Some(created_at_str.as_str()),
             // #3178 — the audit pre-image must be re-derivable from the ROW,
             // so it commits to the persisted window, not to `now`/`None`.
             valid_from: Some(valid_from_str.as_str()),
@@ -9305,6 +9308,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
             dst_id: link.target_id.as_str(),
             relation: link.relation.as_str(),
             observed_by: link.observed_by.as_deref(),
+            created_at: Some(created_at.as_str()),
             valid_from: Some(valid_from.as_str()),
             valid_until: link.valid_until.as_deref(),
         };
@@ -9433,6 +9437,8 @@ pub struct LinkVerifyRecord {
     pub relation: String,
     pub signature: Option<Vec<u8>>,
     pub observed_by: Option<String>,
+    /// #3291 — recorded-at stamp; part of the SignableLink pre-image.
+    pub created_at: Option<String>,
     pub valid_from: Option<String>,
     pub valid_until: Option<String>,
     /// Raw column value as stored by H2/H3 (`"unsigned"`, `"self_signed"`,
@@ -9462,7 +9468,7 @@ pub fn get_link_for_verify(
 ) -> Result<Option<LinkVerifyRecord>> {
     let mut stmt = conn.prepare(
         "SELECT source_id, target_id, relation, signature, observed_by, \
-                valid_from, valid_until, attest_level \
+                created_at, valid_from, valid_until, attest_level \
          FROM memory_links \
          WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
     )?;
@@ -9474,9 +9480,10 @@ pub fn get_link_for_verify(
             relation: row.get(2)?,
             signature: row.get::<_, Option<Vec<u8>>>(3)?,
             observed_by: row.get::<_, Option<String>>(4)?,
-            valid_from: row.get::<_, Option<String>>(5)?,
-            valid_until: row.get::<_, Option<String>>(6)?,
-            attest_level: row.get::<_, Option<String>>(7)?,
+            created_at: row.get::<_, Option<String>>(5)?,
+            valid_from: row.get::<_, Option<String>>(6)?,
+            valid_until: row.get::<_, Option<String>>(7)?,
+            attest_level: row.get::<_, Option<String>>(8)?,
         }))
     } else {
         Ok(None)
@@ -11508,7 +11515,7 @@ pub struct InvalidateResult {
 ///
 /// # v0.7.0 #628 H5 — signed-row preservation
 ///
-/// `valid_until` is one of the six fields the H2 outbound signer
+/// `valid_until` is one of the seven fields the H2 outbound signer
 /// commits to (see [`crate::identity::sign::SignableLink`]). Mutating
 /// it on a previously self-signed link silently flips every future
 /// `memory_verify` to `signature_verified=false / attest_level=unsigned`
@@ -11602,8 +11609,9 @@ pub fn invalidate_link(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     ) = match conn.query_row(
-        "SELECT valid_until, signature, attest_level, observed_by, valid_from \
+        "SELECT valid_until, signature, attest_level, observed_by, valid_from, created_at \
              FROM memory_links \
              WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
         params![source_id, target_id, relation],
@@ -11614,6 +11622,7 @@ pub fn invalidate_link(
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         },
     ) {
@@ -11627,7 +11636,7 @@ pub fn invalidate_link(
             return Err(e.into());
         }
     };
-    let (prior, prior_signature, _prior_attest, observed_by, valid_from) = prior_row;
+    let (prior, prior_signature, _prior_attest, observed_by, valid_from, created_at) = prior_row;
     let was_signed = prior_signature.is_some();
 
     let update_result = if was_signed {
@@ -11672,6 +11681,7 @@ pub fn invalidate_link(
             dst_id: target_id,
             relation,
             observed_by: observed_by.as_deref(),
+            created_at: created_at.as_deref(),
             valid_from: valid_from.as_deref(),
             valid_until: Some(stamp.as_str()),
         };
@@ -26260,12 +26270,17 @@ mod tests {
         assert_eq!(level, "self_signed");
 
         // Read back the persisted row and confirm the signature shape.
-        let (sig, attest, valid_from): (Option<Vec<u8>>, Option<String>, Option<String>) = conn
+        let (sig, attest, created_at, valid_from): (
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
             .query_row(
-                "SELECT signature, attest_level, valid_from FROM memory_links \
+                "SELECT signature, attest_level, created_at, valid_from FROM memory_links \
                  WHERE source_id = ?1 AND target_id = ?2",
                 params![&src.id, &tgt.id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         let sig_bytes = sig.expect("signature must be present when keypair is provided");
@@ -26281,6 +26296,7 @@ mod tests {
             dst_id: &tgt.id,
             relation: "supersedes",
             observed_by: Some(kp.agent_id.as_str()),
+            created_at: created_at.as_deref(),
             valid_from: Some(valid_from.as_str()),
             valid_until: None,
         };
@@ -26319,12 +26335,12 @@ mod tests {
         let level = create_link_signed(&conn, &src.id, &tgt.id, "related_to", Some(&kp)).unwrap();
         assert_eq!(level, "self_signed");
 
-        let (sig, valid_from): (Option<Vec<u8>>, Option<String>) = conn
+        let (sig, created_at, valid_from): (Option<Vec<u8>>, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT signature, valid_from FROM memory_links \
+                "SELECT signature, created_at, valid_from FROM memory_links \
                  WHERE source_id = ?1 AND target_id = ?2",
                 params![&src.id, &tgt.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         let valid_from = valid_from.expect("valid_from set on signed insert path");
@@ -26354,6 +26370,7 @@ mod tests {
             dst_id: &tgt.id,
             relation: "related_to",
             observed_by: Some(kp.agent_id.as_str()),
+            created_at: created_at.as_deref(),
             valid_from: Some(valid_from.as_str()),
             valid_until: None,
         };
@@ -27907,16 +27924,17 @@ mod tests {
         let signed_start = "2026-01-01T01:00:00+01:00";
         let signed_end = "2026-01-01T02:00:00+01:00";
         let kp = keypair::generate("ai:peer").expect("generate signing key");
+        let created_at = chrono::Utc::now().to_rfc3339();
         let signable = link_sign::SignableLink {
             src_id: &src.id,
             dst_id: &target.id,
             relation: "related_to",
             observed_by: Some(kp.agent_id.as_str()),
+            created_at: Some(created_at.as_str()),
             valid_from: Some(signed_start),
             valid_until: Some(signed_end),
         };
         let signature = link_sign::sign(&kp, &signable).expect("sign noncanonical-offset link");
-        let created_at = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO memory_links \
              (source_id, target_id, relation, created_at, valid_from, valid_until, \
@@ -27999,6 +28017,7 @@ mod tests {
             dst_id: &target.id,
             relation: "related_to",
             observed_by: Some(kp.agent_id.as_str()),
+            created_at: Some(created_at.as_str()),
             valid_from: Some(stored_start.as_str()),
             valid_until: Some(stored_end.as_str()),
         };
@@ -29741,12 +29760,18 @@ mod tests {
 
         // Read back the link row's signature + valid_from so we can
         // re-derive the canonical CBOR the audit row should commit to.
-        let (link_sig, valid_from): (Vec<u8>, String) = conn
+        let (link_sig, created_at, valid_from): (Vec<u8>, String, String) = conn
             .query_row(
-                "SELECT signature, valid_from FROM memory_links \
+                "SELECT signature, created_at, valid_from FROM memory_links \
                  WHERE source_id = ?1 AND target_id = ?2",
                 params![&src.id, &tgt.id],
-                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )
             .unwrap();
         let signable = link_sign::SignableLink {
@@ -29754,6 +29779,7 @@ mod tests {
             dst_id: &tgt.id,
             relation: "supersedes",
             observed_by: Some(kp.agent_id.as_str()),
+            created_at: Some(created_at.as_str()),
             valid_from: Some(valid_from.as_str()),
             valid_until: None,
         };

@@ -174,6 +174,7 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
                     dst_id: &record.target_id,
                     relation: &record.relation,
                     observed_by: Some(observed_by),
+                    created_at: record.created_at.as_deref(),
                     valid_from: record.valid_from.as_deref(),
                     valid_until: record.valid_until.as_deref(),
                 };
