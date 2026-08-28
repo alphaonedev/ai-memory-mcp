@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-2 B8 — postgres record-stop parity, #3175 oracle green)
+
+- `PostgresStore::dequarantine` + `dequarantine_raw` now call
+  `gate_record_stop` (sqlite twin already gated; #3175 was RED because
+  pg delegated to an ungated inner).
+- `update_with_expected_version` + `update_with_expected_version_once`
+  gate too (If-Match HTTP + auto_tag_worker write path). Removed both
+  inners from the B7 structural allowlist. Authoritative parity guard
+  is `tests/qual_pg_record_stop_gate_parity_3175.rs`.
+
 ### Security (Wave-2 B7 — record-stop remaining siblings + structural completeness)
 
 - Gate the four round-4 siblings that write *outside* the B6-gated
