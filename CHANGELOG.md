@@ -7,14 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-2 B3 — S1 regression: ENCRYPT_AT_REST is ChaCha, not SQLCipher)
+
+- `refuse_at_rest_requested_without_sqlcipher` keys on
+  `passphrase_requested()` only. `AI_MEMORY_ENCRYPT_AT_REST=1` and
+  `[encryption].at_rest = true` engage app-level ChaCha20-Poly1305 on
+  the default (non-sqlcipher) build and no longer refuse boot. A
+  passphrase without `--features sqlcipher` still refuses (whole-DB
+  SQLCipher genuinely needs the feature). Doctor Storage agrees with
+  serve. Pins: `tests/encryption_at_rest.rs` (now a required CI
+  always-run) + `encrypt_at_rest_on_non_sqlcipher_opens_s1`.
+
 ### Security (Wave-1 S1 — standalone at-rest fail-closed boot)
 
 - A non-sqlcipher standalone/daemon no longer silently ignores
-  `AI_MEMORY_DB_PASSPHRASE` / `--db-passphrase-file` /
-  `AI_MEMORY_ENCRYPT_AT_REST`. Boot and `open()` refuse with a message
-  naming sqlcipher + passphrase (ERRORS-09). Pin:
+  `AI_MEMORY_DB_PASSPHRASE` / `--db-passphrase-file`. Boot and `open()`
+  refuse with a message naming sqlcipher + passphrase (ERRORS-09). Pin:
   passphrase-set + non-sqlcipher must NOT persist plaintext.
-  `ai-memory doctor` WARNs when standalone runs unencrypted.
+  `AI_MEMORY_ENCRYPT_AT_REST` is app-level ChaCha (Wave-2 B3), not a
+  SQLCipher request. `ai-memory doctor` WARNs when standalone runs
+  unencrypted.
 
 ### Docs (Wave-1 C3 — enterprise-fed cert honesty)
 

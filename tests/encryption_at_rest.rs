@@ -34,7 +34,7 @@
 //! network dependencies.
 
 use ai_memory::encryption::{
-    Envelope, decrypt, encrypt, encryption_enabled, get_or_create_keypair,
+    Envelope, decrypt, encrypt, encryption_enabled, get_or_create_keypair, set_config_at_rest,
 };
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::storage as db;
@@ -284,9 +284,13 @@ fn encryption_gate_consults_config_flag_and_env_var() {
     let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
     // SAFETY: serialized via ENV_GATE_LOCK; restored at the end.
     unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
+    set_config_at_rest(false);
     assert!(!encryption_enabled(None), "default off");
     assert!(encryption_enabled(Some(true)), "config flag opts in");
     assert!(!encryption_enabled(Some(false)), "explicit false stays off");
+    set_config_at_rest(true);
+    assert!(encryption_enabled(None), "config.toml seed opts in");
+    set_config_at_rest(false);
     unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
     assert!(encryption_enabled(None), "env var opts in");
     unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "no") };

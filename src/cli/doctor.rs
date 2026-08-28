@@ -1474,22 +1474,24 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
         }
     }
 
-    // Wave-1 S1 — standalone default is plaintext at rest. WARN so a
-    // small-business operator cannot miss it. Fail-closed boot (passphrase
-    // / ENCRYPT_AT_REST on a non-sqlcipher binary) is the `open()` path.
+    // Wave-1 S1 / Wave-2 B3 — standalone default is plaintext at rest.
+    // WARN so a small-business operator cannot miss it. Fail-closed boot
+    // (passphrase on a non-sqlcipher binary) is the `open()` path.
+    // ENCRYPT_AT_REST / `[encryption].at_rest` engages app-level ChaCha
+    // and must AGREE with serve boot (healthy, not a refuse).
     let sqlcipher = crate::build_features::has_feature("sqlcipher");
     let encrypt_at_rest = crate::encryption::encryption_enabled(None);
     if !sqlcipher && !encrypt_at_rest {
         facts.push((
             "at_rest".into(),
-            "plaintext (no sqlcipher; AI_MEMORY_ENCRYPT_AT_REST unset)".into(),
+            "plaintext (no sqlcipher; content encryption off)".into(),
         ));
         if severity == Severity::Info {
             severity = Severity::Warning;
         }
         let at_rest_note = "standalone is running unencrypted at rest. Build --features sqlcipher \
-             and provide a passphrase, or set AI_MEMORY_ENCRYPT_AT_REST=1, if this \
-             node holds secrets.";
+             and provide a passphrase (whole-DB), or set AI_MEMORY_ENCRYPT_AT_REST=1 / \
+             [encryption].at_rest = true (content encryption), if this node holds secrets.";
         note = Some(note.take().map_or_else(
             || at_rest_note.to_string(),
             |existing| format!("{existing} | {at_rest_note}"),
@@ -3352,6 +3354,32 @@ mod tests {
             dim.contains("not_observed") || dim == "0",
             "unexpected dim_violations value: {dim}"
         );
+    }
+
+    /// Wave-2 B3 — doctor must AGREE with serve: ENCRYPT_AT_REST on a
+    /// default (non-sqlcipher) build is healthy ChaCha, not a refuse.
+    #[cfg(not(feature = "sqlcipher"))]
+    #[test]
+    fn encrypt_at_rest_storage_section_agrees_with_serve_boot_b3() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::doctor::tests::encrypt_at_rest_storage_section_agrees_with_serve_boot_b3",
+        ) {
+            return;
+        }
+        let _lock = crate::test_support::env_lock();
+        let guard = crate::test_support::EnvGuard::capture(crate::encryption::ENV_ENCRYPT_AT_REST);
+        guard.set("1");
+        crate::encryption::set_config_at_rest(false);
+        let env = TestEnv::fresh();
+        let report = run_local_collect(&env.db_path);
+        let storage = find(&report, "Storage");
+        assert_eq!(
+            fact(storage, "at_rest"),
+            "ENCRYPT_AT_REST",
+            "doctor must agree with serve: ENCRYPT_AT_REST on default build is healthy ChaCha"
+        );
+        assert_eq!(storage.severity, Severity::Info);
+        crate::encryption::set_config_at_rest(false);
     }
 
     #[test]

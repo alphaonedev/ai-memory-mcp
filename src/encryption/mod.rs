@@ -58,12 +58,14 @@
 //! Callers gate at-rest encryption behind either:
 //!
 //! * The `[encryption].at_rest = true` config field (operator opt-in
-//!   via `config.toml`), OR
+//!   via `config.toml`), seeded at boot into a process-wide flag so
+//!   [`encryption_enabled`]`(None)` sees it, OR
 //! * The `AI_MEMORY_ENCRYPT_AT_REST=1` environment variable (CLI /
 //!   container-runtime opt-in).
 //!
-//! Both surfaces feed the same [`encryption_enabled`] gate, which the
-//! storage write path consults before invoking [`encrypt`] / [`decrypt`].
+//! Either truthy source engages app-level ChaCha20-Poly1305 content
+//! encryption on the default (non-sqlcipher) build. Whole-DB SQLCipher
+//! is a separate control (`--features sqlcipher` + a passphrase).
 
 use anyhow::{Context, Result, anyhow};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -75,6 +77,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 use zeroize::Zeroize;
 
@@ -584,17 +587,33 @@ pub(crate) fn decrypt_bytes(envelope: &Envelope, my_sk: &StaticSecret) -> Result
 /// re-declaring the env-var-name literal.
 pub const ENV_ENCRYPT_AT_REST: &str = "AI_MEMORY_ENCRYPT_AT_REST";
 
+/// Process-wide snapshot of `[encryption].at_rest = true` from config.toml,
+/// seeded at boot by [`set_config_at_rest`] (Wave-2 B3). Default `false`
+/// so tests and the compiled default stay encryption-off until opted in.
+/// Atomic (not `OnceLock`) so tests can reset it; production seeds once
+/// from `apply_startup_env` and never writes the env (the #2905 leak class).
+static CONFIG_AT_REST: AtomicBool = AtomicBool::new(false);
+
+/// Seed `[encryption].at_rest` from resolved config. Called from
+/// [`crate::daemon_runtime::apply_startup_env`]. `true` opts in; `false`
+/// clears a previous seed (test isolation). Does **not** `set_var` the
+/// env (ERRORS-09 / #3213).
+pub fn set_config_at_rest(enabled: bool) {
+    CONFIG_AT_REST.store(enabled, Ordering::Relaxed);
+}
+
 /// Consult the [encryption].at_rest config flag OR the
 /// `AI_MEMORY_ENCRYPT_AT_REST=1` env var. Truthy env values:
 /// `1` / `true` / `yes` / `on` (case-insensitive). Used by the storage
 /// write path to gate the encrypt-on-insert / decrypt-on-read branches.
 ///
-/// The config flag is consulted first when present, then the env var.
-/// Either truthy source enables encryption. This mirrors the precedence
-/// shape of the existing `AI_MEMORY_PERMISSIONS_MODE` config knob.
+/// Either truthy source enables encryption: the explicit `config_flag`
+/// argument, the process-wide [`set_config_at_rest`] seed (config.toml),
+/// or the env var. This mirrors the precedence shape of the existing
+/// `AI_MEMORY_PERMISSIONS_MODE` config knob.
 #[must_use]
 pub fn encryption_enabled(config_flag: Option<bool>) -> bool {
-    if let Some(true) = config_flag {
+    if matches!(config_flag, Some(true)) || CONFIG_AT_REST.load(Ordering::Relaxed) {
         return true;
     }
     matches!(
@@ -1022,6 +1041,7 @@ mod tests {
         let _lock = env_lock();
         let env = EnvGuard::capture(ENV_ENCRYPT_AT_REST);
         env.unset();
+        set_config_at_rest(false);
         assert!(encryption_enabled(Some(true)));
         assert!(!encryption_enabled(Some(false)));
         assert!(!encryption_enabled(None));
@@ -1029,6 +1049,26 @@ mod tests {
         assert!(encryption_enabled(None));
         assert!(encryption_enabled(Some(true)));
         // `env` restores `AI_MEMORY_ENCRYPT_AT_REST` on Drop.
+        set_config_at_rest(false);
+    }
+
+    #[test]
+    fn encryption_enabled_config_toml_seed_opts_in_b3() {
+        // Wave-2 B3 — `[encryption].at_rest = true` must opt in without
+        // exporting the env (the #2905 leak class).
+        let _lock = env_lock();
+        let env = EnvGuard::capture(ENV_ENCRYPT_AT_REST);
+        env.unset();
+        set_config_at_rest(false);
+        assert!(!encryption_enabled(None));
+        set_config_at_rest(true);
+        assert!(encryption_enabled(None), "config seed must opt in");
+        assert!(
+            std::env::var(ENV_ENCRYPT_AT_REST).is_err(),
+            "config seed must not export {ENV_ENCRYPT_AT_REST}"
+        );
+        set_config_at_rest(false);
+        assert!(!encryption_enabled(None), "clearing the seed must opt out");
     }
 
     // --- #228 Commit B — seal_content / open_content helpers ---

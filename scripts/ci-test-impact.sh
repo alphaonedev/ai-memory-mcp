@@ -150,6 +150,9 @@ ALWAYS_RUN_PARITY_TESTS=(
     mcp_input_schema_no_false_strict_1052
     token_budget_guard
     config_precedence
+    # Wave-2 B3 — at-rest content-encryption E2E is a release gate (default
+    # build RED when S1 refused ChaCha). Not millisecond-cheap; required.
+    encryption_at_rest
 )
 
 # --------------------------------------------------------------------

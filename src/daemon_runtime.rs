@@ -2986,6 +2986,11 @@ pub fn apply_startup_env(cli: &Cli, app_config: &AppConfig) -> Result<()> {
         let passphrase = passphrase_from_file(path)?;
         crate::storage::set_db_passphrase(passphrase)?;
     }
+    // Wave-2 B3 — seed `[encryption].at_rest` into the process-wide
+    // content-encryption gate without exporting the env (#2905 / #3213).
+    crate::encryption::set_config_at_rest(
+        app_config.encryption.as_ref().and_then(|e| e.at_rest) == Some(true),
+    );
     apply_anonymize_default(app_config);
     Ok(())
 }
@@ -11501,6 +11506,7 @@ mod tests {
         // state (`storage::set_db_passphrase`) and MUST NOT re-publish into
         // `AI_MEMORY_DB_PASSPHRASE` (the #2905 env-leak class; children
         // spawned afterwards would inherit it).
+        let _enc = crate::test_support::env_lock();
         let _g = env_var_lock();
         // SAFETY: serialized via env_var_lock.
         unsafe { std::env::remove_var(crate::storage::ENV_DB_PASSPHRASE) };
@@ -11540,6 +11546,37 @@ mod tests {
         assert!(crate::storage::set_db_passphrase("other".into()).is_err());
         // SAFETY: serialized via env_var_lock.
         unsafe { std::env::remove_var(crate::storage::ENV_DB_PASSPHRASE) };
+    }
+
+    #[test]
+    fn test_apply_startup_env_seeds_encryption_at_rest_from_config_b3() {
+        // Wave-2 B3 — `[encryption].at_rest = true` must opt in without
+        // exporting `AI_MEMORY_ENCRYPT_AT_REST` (#2905 env-leak class).
+        let _enc = crate::test_support::env_lock();
+        let _g = env_var_lock();
+        crate::encryption::set_config_at_rest(false);
+        // SAFETY: serialized via env_var_lock.
+        unsafe { std::env::remove_var(crate::encryption::ENV_ENCRYPT_AT_REST) };
+        let cfg = AppConfig {
+            encryption: Some(crate::config::EncryptionSection {
+                at_rest: Some(true),
+            }),
+            ..AppConfig::default()
+        };
+        let env = TestEnv::fresh();
+        let cli =
+            Cli::try_parse_from(["ai-memory", "--db", env.db_path.to_str().unwrap(), "stats"])
+                .unwrap();
+        apply_startup_env(&cli, &cfg).unwrap();
+        assert!(
+            crate::encryption::encryption_enabled(None),
+            "[encryption].at_rest = true must opt in without setting the env"
+        );
+        assert!(
+            std::env::var(crate::encryption::ENV_ENCRYPT_AT_REST).is_err(),
+            "must not export AI_MEMORY_ENCRYPT_AT_REST"
+        );
+        crate::encryption::set_config_at_rest(false);
     }
 
     // ----- init_tracing idempotence ------------------------------------
