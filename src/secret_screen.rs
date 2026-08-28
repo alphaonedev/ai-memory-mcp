@@ -780,7 +780,8 @@ pub fn redact_memory_for_storage(mem: &crate::models::Memory) -> Option<crate::m
 /// bare-base64 STRING leaves under `_b64` / known keys survive;
 /// credential-shaped STRING leaves and hostile OBJECT subtrees under
 /// those keys are screened. Wire this into receive funnels only
-/// (`insert_if_newer` / `merge_inbound` / `redact_inbound_before_attestation`).
+/// (`insert_if_newer` / `merge_inbound` / `apply_remote_memory` /
+/// `redact_inbound_before_attestation`).
 #[must_use]
 pub fn redact_memory_for_receive(mem: &crate::models::Memory) -> Option<crate::models::Memory> {
     if screen_mode() == SecretScreenMode::Off {

@@ -110,6 +110,20 @@ triggers re-cert** (see §7).
 > pgvector (#2548) GREEN on that tip (run 33182767671); live stack
 > 18.6 / 1.8.0 / 0.8.6. No stack/pin/workflow change.
 >
+> **Amendment (2026-08-28, Wave-2 B4).** The §7-watched path
+> `src/handlers/federation_receive.rs` now receive-redacts author-less
+> catchup-pull rows (`attest_inbound_pull_memory`) before apply: omitting
+> `metadata.agent_id` no longer skips the secret screen, and a
+> peer-asserted `agent_attested` with no author is claimed-floor.
+> Postgres `apply_remote_memory` (not a watched path; sibling of
+> `merge_inbound`) now uses `redact_memory_for_receive` so a
+> credential-shaped `*_b64` string leaf cannot egress on catchup-pull.
+> Additive security-hardening — no wire/schema/`AI_MEMORY_FED_*`
+> identifier add/remove/rename, no certified control removed. This
+> amendment discharges the §7 trigger. **This amendment does NOT re-mint
+> the certification** (bind remains `e22bc93c`; the 2026-08-12 5-agent
+> adversarial ratification stands).
+>
 > **Amendment (2026-08-28, Wave-1 C3).** Cert-doc honesty only — no
 > federation-wire / `AI_MEMORY_FED_*` identifier add/remove/rename.
 > (a) §6 now **names** equivocation runtime detection/eviction as

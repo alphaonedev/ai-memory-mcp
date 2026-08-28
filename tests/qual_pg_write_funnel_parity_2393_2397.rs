@@ -241,6 +241,16 @@ fn span_extractor_is_load_bearing() {
         "the LATE span must contain apply_remote_memory's own error label"
     );
     assert!(
+        late.contains("redact_memory_for_receive"),
+        "Wave-2 B4: apply_remote_memory must receive-redact (ReceiveAttestationLeaves), \
+         not TrustedByName storage-screen"
+    );
+    assert!(
+        !late.contains("let screened = screen_storage_memory"),
+        "Wave-2 B4: apply_remote_memory must not call the TrustedByName \
+         storage-screen helper (local store / store_batch keep that path)"
+    );
+    assert!(
         !late.contains("async fn merge_inbound("),
         "the LATE span must NOT bleed into the following function"
     );
