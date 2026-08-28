@@ -436,7 +436,7 @@ here cannot claim a hardening guarantee the binary does not enforce
 | `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` | *(unset)* — PERMISSIVE-shaped: the fail-OPEN hatch must be disarmed; a truthy live-grammar token (`1`/`true`) REFUSES boot (#3168) |
 | `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` | `1` (inbound federated push with a DETECTED-stale `policy_version` is refused — #3168; live name, not the unprefixed `REQUIRE_POLICY_CURRENT`) |
 | `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` | *(unset)* — PERMISSIVE-shaped: the unenrolled-peer hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT` must be CLOSED; a truthy value REFUSES boot (#3201) |
-| `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` (mTLS cert↔`X-Peer-Id` cross-check ENFORCES; `off`/`warn` refuse boot. Documented `standard` unset default stays `warn` — #3201) |
+| `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` (mTLS cert↔`X-Peer-Id` cross-check mode is `enforce`; `off`/`warn` refuse boot. Inert without a binding map. Documented `standard` unset default stays `warn` — #3201 / #3289) |
 
 In addition, `asi-hard` forces the config-backed governance knob
 `[governance].require_operator_pubkey` to `true` at the governance boot

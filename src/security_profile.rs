@@ -64,7 +64,7 @@
 //! | `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` | *(unset)* | PERMISSIVE-shaped: the fail-OPEN hatch is NOT in force — a rule-consultation error stays fail-CLOSED (#3168) |
 //! | `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` | `1` | inbound federated push with a DETECTED-stale `policy_version` is refused (#3168; live name `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` — the unprefixed `REQUIRE_POLICY_CURRENT` does not exist) |
 //! | `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` | *(unset)* | PERMISSIVE-shaped: the unenrolled-peer hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT` is NOT in force (#3201) |
-//! | `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` | mTLS cert↔`X-Peer-Id` cross-check ENFORCES; `off`/`warn` refuse boot. The documented `standard` unset default stays `warn` (#3201) |
+//! | `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` | mTLS cert↔`X-Peer-Id` cross-check mode is `enforce`; `off`/`warn` refuse boot. Inert without `AI_MEMORY_FED_CERT_PEER_BINDING_MAP`. The documented `standard` unset default stays `warn` (#3201 / #3289) |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
 //! `[governance].require_operator_pubkey` to `true` (see
@@ -274,11 +274,11 @@ fn unenrolled_peers_hatch_meets_floor(v: &str) -> bool {
     !crate::handlers::federation_signing_check::allow_unenrolled_peers_value_enabled(v)
 }
 
-/// #3201 — `AI_MEMORY_FED_CERT_PEER_BINDING` floor: only the exact
-/// `enforce` token (case-insensitive, trimmed) meets it. A typo such as
-/// `enforc` is NOT `enforce`, so `asi-hard` refuses boot (fail-loud)
-/// even though [`crate::tls::CertPeerBindingMode::parse`] fail-closes
-/// that same typo to Enforce at runtime under `standard`.
+/// #3201 / #3289 — `AI_MEMORY_FED_CERT_PEER_BINDING` floor: only the
+/// exact `enforce` token (case-insensitive, trimmed) meets it. A typo
+/// such as `enforc` is NOT `enforce`, so `asi-hard` refuses boot
+/// (fail-loud). Runtime parse is also fail-loud (`Result`) — empty /
+/// unknown tokens are no longer silently Enforce.
 fn cert_peer_binding_meets_floor(v: &str) -> bool {
     v.trim().eq_ignore_ascii_case("enforce")
 }

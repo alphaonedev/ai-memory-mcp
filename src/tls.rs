@@ -46,7 +46,7 @@
 //! at the W3 commit, with `pub` added for cross-module visibility. Behaviour
 //! must remain bit-for-bit identical at the call sites.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -437,8 +437,9 @@ pub fn serve_rustls_acceptor(
 /// Env var naming an operator-authored file that binds each pinned mTLS
 /// client-cert SHA-256 fingerprint to the ONE `x-peer-id` that cert is
 /// allowed to assert on the inbound federation `/sync/*` path (#2045 L6).
-/// Unset / empty ⇒ no bindings ⇒ every cert is "legacy" and the cross-check
-/// degrades to a WARN (never bricks). See [`load_cert_peer_binding_map`].
+/// Unset / empty ⇒ no bindings ⇒ the peer-binding acceptor is not
+/// installed and the cross-check is inert (even if the mode is `enforce`).
+/// See [`load_cert_peer_binding_map`].
 pub const FED_CERT_PEER_BINDING_MAP_ENV: &str = "AI_MEMORY_FED_CERT_PEER_BINDING_MAP";
 
 /// Env var selecting the enforcement posture of the mTLS cert↔`X-Peer-Id`
@@ -471,23 +472,27 @@ impl CertPeerBindingMode {
     /// - `off` → [`Self::Off`]
     /// - `warn` → [`Self::Warn`]
     /// - `enforce` → [`Self::Enforce`]
-    /// - anything else (typo `enforc`, empty, unknown word) → [`Self::Enforce`]
-    ///   (fail-CLOSED: a typo must not silently weaken the cross-check to
-    ///   Warn — #3201).
+    /// - anything else (typo `enforc`, empty string, unknown word) → `Err`
+    ///   (fail-loud — #3289). An empty assignment is a common "leave
+    ///   default" idiom and must NOT silently become Enforce (A1). A typo
+    ///   must NOT be honoured as Enforce either (A5).
     ///
     /// UNSET is **not** parsed here; [`cert_peer_binding_mode`] maps a missing
     /// env var to [`Self::Warn`], which remains the documented `standard`
     /// posture default. `asi-hard` pins the env to `enforce` (#3201); it
     /// does not change the unset default.
-    #[must_use]
-    pub fn parse(raw: &str) -> Self {
+    ///
+    /// # Errors
+    /// Returns an error for an unrecognised token (including empty).
+    pub fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "off" => Self::Off,
-            "warn" => Self::Warn,
-            // `enforce` AND any unrecognised token (typo `enforc`, empty,
-            // unknown word). Fail-CLOSED: a typo must not silently weaken
-            // the cross-check to Warn (#3201).
-            _ => Self::Enforce,
+            "off" => Ok(Self::Off),
+            "warn" => Ok(Self::Warn),
+            "enforce" => Ok(Self::Enforce),
+            other => bail!(
+                "unrecognised {FED_CERT_PEER_BINDING_ENV} value {other:?} \
+                 (expected \"off\", \"warn\", or \"enforce\")"
+            ),
         }
     }
 }
@@ -496,13 +501,27 @@ impl CertPeerBindingMode {
 /// (default `warn`). Read per request — the env is cheap and re-reading
 /// lets an operator flip posture without a restart (mirrors the other
 /// direct-read federation knobs).
+///
+/// Missing **or unparseable** (empty / typo) values hold the documented
+/// `standard` default [`CertPeerBindingMode::Warn`] rather than silently
+/// tightening to Enforce (#3289 A1/A5). `asi-hard` still refuses unknown
+/// tokens at boot via [`crate::security_profile`] (`meets_floor` is exact
+/// `enforce` only).
 #[must_use]
 pub fn cert_peer_binding_mode() -> CertPeerBindingMode {
-    std::env::var(FED_CERT_PEER_BINDING_ENV)
-        .ok()
-        .map_or(CertPeerBindingMode::Warn, |v| {
-            CertPeerBindingMode::parse(&v)
-        })
+    match std::env::var(FED_CERT_PEER_BINDING_ENV) {
+        Err(_) => CertPeerBindingMode::Warn,
+        Ok(v) => match CertPeerBindingMode::parse(&v) {
+            Ok(mode) => mode,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "invalid AI_MEMORY_FED_CERT_PEER_BINDING; holding standard default warn (#3289)"
+                );
+                CertPeerBindingMode::Warn
+            }
+        },
+    }
 }
 
 /// Parse an operator-authored cert-peer-binding map: one
@@ -581,7 +600,7 @@ pub fn cert_peer_binding_map_from_env() -> Result<Option<HashMap<[u8; 32], Strin
 /// resolved from the presenting client cert's SHA-256 fingerprint:
 ///   - `Some(peer_id)` — the fingerprint is bound to exactly this id;
 ///   - `None` — the fingerprint has NO binding ("legacy" cert): the
-///     cross-check degrades to WARN and never bricks.
+///     cross-check degrades to WARN (no `ClientCertPeerId` to enforce).
 ///
 /// Absence of the extension entirely means the request did not arrive over
 /// the peer-binding mTLS acceptor (plain HTTP / no binding map configured),
