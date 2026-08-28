@@ -110,6 +110,17 @@ triggers re-cert** (see §7).
 > pgvector (#2548) GREEN on that tip (run 33182767671); live stack
 > 18.6 / 1.8.0 / 0.8.6. No stack/pin/workflow change.
 >
+> **Amendment (2026-08-28, Wave-1 C3).** Cert-doc honesty only — no
+> federation-wire / `AI_MEMORY_FED_*` identifier add/remove/rename.
+> (a) §6 now **names** equivocation runtime detection/eviction as
+> v1.x-deferred ([#2002](https://github.com/alphaonedev/ai-memory-mcp/issues/2002));
+> only the proof-format ships. (b) §3 cites current-triple GREEN run
+> [`33182767671`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33182767671)
+> (head `00dd0162`, Certified Postgres + AGE + pgvector, conclusion
+> `success`). (d) §1/§2/§7 bare-line anchors refreshed to the current
+> tree (symbols intact; numbers had rotted). **This amendment does NOT
+> re-mint the certification** (bind remains `e22bc93c`).
+>
 ---
 
 ## 1. The trust boundary (what is certified)
@@ -204,11 +215,11 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
      `--db-passphrase-file`). A sqlcipher build that is started without
      the passphrase **hard-refuses to open any database**
      (`StorageError::SqlcipherMissingPassphrase`,
-     `src/storage/connection.rs:478-482` / `src/storage/error.rs:118-120`).
+     `src/storage/connection.rs:833-839` / `src/storage/error.rs:118-122`).
    - **Per-content envelope:** `AI_MEMORY_ENCRYPT_AT_REST=1` seals each
      memory's `content` under a per-agent X25519 / ChaCha20-Poly1305
      envelope (`src/encryption/mod.rs`, `ENV_ENCRYPT_AT_REST` at
-     `:567`). This is **not** the same control as SQLCipher, and it is
+     `:585`). This is **not** the same control as SQLCipher, and it is
      **not** end-to-end across federation (see §6).
 
    > **Control #15 is BACKEND-AWARE (#3061) — and the two backends carry
@@ -332,7 +343,7 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 `ai-memory doctor --posture enterprise-federation` renders PASS/FAIL per
 requirement and **exits non-zero on any deviation of the running process**
 (the ruling's "a non-zero exit is falsifiable" bar). `run_posture`
-(`src/cli/doctor.rs:561`) returns **0 iff all 20 checks pass, else 2**
+(`src/cli/doctor.rs:739`) returns **0 iff all 20 checks pass, else 2**
 (the posture grew 16 → 18 when #2918/#2911 landed checks #17
 boot-refusal-env self-attest and #18 FED-RQ-03, then **18 → 19 when #2954
 landed check #19 append-only-audit-spine-armed** — append-only spine ON
@@ -355,7 +366,7 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 > (escalate-producer approver-key enrollment). A re-capture at the current
 > release tip **is expected to show** 20 checks — **bare leg 10 FAIL of 20**,
 > certified leg **20 `[PASS]`, 0 `[FAIL]`** — derived from the #19/#20 unit
-> tests (`src/enterprise_federation_posture.rs:1663-1676`); **not re-captured**.
+> tests (`src/enterprise_federation_posture.rs:1024-1028`); **not re-captured**.
 > The `cert-54/` captures remain the evidence of record (`grep -c '[PASS]'
 > posture-sqlcipher-pass.out` = 18). The certified pass leg is expected to stay
 > `overall: PASS` because the checked-in `enterprise-federation.env` profile
@@ -430,7 +441,7 @@ FED-RQ-03 policy-current, check #18).
 
 - `doctor --posture` attests the **resolved config of the process it
   runs in** (`AppConfig::load()` + that process's env —
-  `src/cli/doctor.rs:571-573`). It does **not** inspect a running
+  `src/cli/doctor.rs:749-751`). It does **not** inspect a running
   daemon. Under systemd, run it with the daemon's exact
   `EnvironmentFile`.
 - **RESOLVED (#2911 items 1-2, PR #2918, 2026-08-13):** a doctor PASS
@@ -502,7 +513,7 @@ release binary is deliberately NOT enterprise-federation-compliant.
 
 ---
 
-## 3. §5.4(3) — Postgres + AGE + pgvector evidence (executed at the PRIOR triple; the current triple is CI-asserted, not yet cited by run ID)
+## 3. §5.4(3) — Postgres + AGE + pgvector evidence (current triple 18.6 / 1.8.0 / 0.8.6 executed GREEN — run 33182767671)
 
 The certified stack is **executed in-PR** by `.github/workflows/cert-postgres-age.yml`
 (#2548), which BUILDS and runs the exact certified triple and hard-fails on any
@@ -534,18 +545,15 @@ stack. (Those specific dated runs executed the historical **18.4 / 1.7.0 /
 0.8.6** — is the tier this same workflow asserts in-PR on `release/**` from
 the SSOT pins, per the STANDARD data-tier note below.)
 
-> **Evidence status, stated plainly (2026-08-22).** **No `actions/runs/<id>`
-> citation for an executed GREEN run at the CURRENT triple (18.6 / 1.8.0 /
-> 0.8.6) appears anywhere in this document.** Every run ID cited above
-> executed the superseded **18.4 / 1.7.0 / 0.8.5** round. The current triple
-> rests on the *prospective* CI semantics described in the STANDARD data-tier
-> note below — the `Assert certified stack versions` step reads the SSOT pins
-> and hard-fails on drift, so a GREEN `cert-postgres-age.yml` run on
-> `release/**` IS build+assert evidence at those versions — but that argument
-> is only as good as a specific green run, and none is cited here. Discharging
-> this means triggering one run at the release tip and citing its run ID +
-> head SHA in the same format as the citations above. Until then, read §5.4(3)
-> as **executed at the prior triple, CI-asserted at the current one**.
+> **Evidence status, stated plainly (2026-08-28 Wave-1 C3).** Current
+> triple **PG 18.6 / AGE 1.8.0 / pgvector 0.8.6** is executed GREEN:
+> run [`33182767671`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33182767671)
+> (`Certified Postgres + AGE + pgvector tier (#2548)`, push of
+> `release/v1.0.0` head `00dd0162`, conclusion `success`,
+> 2026-08-28T14:57:36Z). The historical run IDs cited above
+> (`31601974424`, `31601912912`) remain the original-cert SHA evidence
+> at the superseded **18.4 / 1.7.0 / 0.8.5** round. The
+> `Assert certified stack versions` step still hard-fails on pin drift.
 
 > **pgvector pin advance from 0.8.5 to 0.8.6 (2026-08-14, honest evidence
 > status).** The certified pgvector pin was advanced from `0.8.5-1.pgdg13+1`
@@ -812,6 +820,10 @@ following should **not** treat v1.0.0 as sufficient:
   not header-trust.
 - **Hive/T8 is a pilot**, not a certified production topology.
 - **Reproducible builds are not claimed.**
+- **No runtime equivocation detection/eviction.** Only the
+  proof-format ships. Runtime detection/eviction of an equivocating
+  peer is **v1.x-deferred**
+  ([#2002](https://github.com/alphaonedev/ai-memory-mcp/issues/2002)).
 
 ---
 
@@ -833,7 +845,7 @@ is observed:**
 2. **`ai-memory doctor --posture enterprise-federation` exits 0 on a process
    that is NOT in the hardened+sqlcipher configuration** (a false-green posture)
    voids it.
-   *Observable:* `run_posture` (`src/cli/doctor.rs:606`) returns `2` on any
+   *Observable:* `run_posture` (`src/cli/doctor.rs:739`) returns `2` on any
    FAIL and prints `overall: FAIL`. A false-green is exit 0 + `overall: PASS`
    on a process that is not the hardened+sqlcipher configuration.
 3. **Any control in `scripts/check-cert-removal-proof.sh` failing its removal
