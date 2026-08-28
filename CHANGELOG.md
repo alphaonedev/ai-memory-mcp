@@ -125,6 +125,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows are still applied (no owner claim to verify). Pins:
   `pull_attestation_no_author_receive_redacts_credential_under_b64_b4`,
   `apply_remote_memory_authorless_redacts_credential_under_b64_b4`.
+### Docs (C3 follow-up — enterprise-fed §2 20-check recapture)
+
+- `docs/compliance/evidence/cert-55/` records a four-leg
+  `doctor --posture enterprise-federation` run at **20 checks** on the
+  release-built binary at `f61dcab2` (bare 10 FAIL / 10 PASS exit 2;
+  hardened non-sqlcipher 2 FAIL / 18 PASS exit 2, pins 27/27;
+  boot-gate armed exit 1; sqlcipher certified 20 PASS exit 0).
+  `ENTERPRISE-FEDERATION-CERTIFICATION.md` §2/§8 now bind those
+  measured captures. Bind remains `e22bc93c` (does not re-mint).
+  `cert-54/` stays the removal-proof evidence of record.
 
 ### Security (Wave-2 B2 — record-stop on sqlite same-id merge + pg CAS)
 

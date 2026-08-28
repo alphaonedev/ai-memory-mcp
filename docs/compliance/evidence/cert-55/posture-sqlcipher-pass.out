@@ -1,0 +1,65 @@
+ai-memory doctor --posture enterprise-federation
+  (v1.0.0 3x7 cutline ruling §5.3 — docs/audit/3x7-v1-cutline-ruling-2026-08-01.md)
+
+  [PASS] AI_MEMORY_SECURITY_PROFILE
+         required: asi-hard
+         actual:   asi-hard
+  [PASS] asi-hard pinned knobs
+         required: asi-hard engaged AND all 27 at hard floor (security_profile::KNOBS)
+         actual:   27/27 at floor
+  [PASS] AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT
+         required: not explicitly disabled (peer enrollment required) AND AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS not truthy (no rollout hatch open)
+         actual:   AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT="1"; AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=""
+  [PASS] AI_MEMORY_FED_REQUIRE_SIG
+         required: not explicitly disabled (per-message Ed25519 signatures required)
+         actual:   1
+  [PASS] AI_MEMORY_FED_REQUIRE_NONCE
+         required: not explicitly disabled (per-message nonce freshness required)
+         actual:   1
+  [PASS] AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE
+         required: not explicitly disabled (inbound-write namespace confinement required)
+         actual:   1
+  [PASS] AI_MEMORY_PERMISSIONS_MODE (ruling: AI_MEMORY_FED_PERMISSIONS_MODE)
+         required: enforce
+         actual:   enforce
+  [PASS] AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR
+         required: 0 (fail-CLOSED on governance rule-consultation error)
+         actual:   
+  [PASS] AI_MEMORY_FED_TRUST_DOMAIN
+         required: <set> (scopes the trust bundle to one fleet)
+         actual:   cert-fleet-01
+  [PASS] AI_MEMORY_FED_PEER_FINGERPRINTS
+         required: <set> to a readable peer server-cert pin file
+         actual:   <repo-root>/.local-runs/cert-55-fixtures/peer-fingerprints.txt
+  [PASS] AI_MEMORY_FED_PEER_ATTESTATION
+         required: <set>; valid JSON (MALFORMED must refuse, never silently fall back)
+         actual:   valid JSON, 1 peer(s) enrolled
+  [PASS] AI_MEMORY_FED_PEER_ATTESTATION (no `**` allow-all glob)
+         required: no peer scope's allowed_namespaces contains a literal `**`
+         actual:   none
+  [PASS] AI_MEMORY_FED_SYNC_TRUST_PEER
+         required: UNSET (or not the literal `1` — the real gate's exact-match grammar)
+         actual:   (unset)
+  [PASS] AI_MEMORY_FED_TRUST_BODY_AGENT_ID
+         required: UNSET (or not the literal `1` — the real gate's exact-match grammar)
+         actual:   (unset)
+  [PASS] AI_MEMORY_ENCRYPT_AT_REST
+         required: 1, on a binary built with --features sqlcipher
+         actual:   env=1 sqlcipher_build=true
+  [PASS] AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS (https-only peers)
+         required: not truthy (the plaintext-peer refusal stays in force)
+         actual:   
+  [PASS] AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE
+         required: truthy (boot-refusal gate armed so future posture drift cannot silently boot)
+         actual:   1
+  [PASS] AI_MEMORY_FED_REQUIRE_POLICY_CURRENT
+         required: not explicitly disabled (detected-stale inbound policy_version refused)
+         actual:   1
+  [PASS] append-only audit spine
+         required: append-only spine ON (AI_MEMORY_APPEND_ONLY / [storage].append_only) AND the daemon audit signing key armed (federation supersede leaves are SIGNED, not unsigned)
+         actual:   append_only=true; audit_signing_key=armed
+  [PASS] R40 escalate producer
+         required: approver keys enrolled so the wired L1-6 escalate producer routes to a SATISFIABLE signed-approval gate (AI_MEMORY_OPERATOR_PUBKEY / AI_MEMORY_APPROVER_PUBKEYS)
+         actual:   1 approver key(s) enrolled
+
+overall: PASS

@@ -1,0 +1,11 @@
+# posture-legs transcript — recorded exit codes (2026-08-28 recapture @ f61dcab2)
+# each leg: the doctor invocation shape, then the observed shell exit status.
+
+## leg 1: bare (env -i, AI_MEMORY_NO_CONFIG=1 only)
+exit: 2
+## leg 2: hardened non-sqlcipher, boot gate NOT armed
+exit: 2
+## leg 3: hardened non-sqlcipher, boot gate ARMED (AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1)
+exit: 1
+## leg 4: sqlcipher build, ENCRYPT_AT_REST=1, boot gate ARMED
+exit: 0
