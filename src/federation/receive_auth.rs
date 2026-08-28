@@ -772,7 +772,7 @@ pub fn evaluate_inbound_policy_freshness(
 /// Returns `true` when the screen mutated the SIGNED surface (any presented
 /// raw-bytes `write_signature` was dropped alongside).
 pub fn redact_inbound_before_attestation(mem: &mut crate::models::Memory) -> bool {
-    let screened = crate::secret_screen::redact_memory_for_storage(mem);
+    let screened = crate::secret_screen::redact_memory_for_receive(mem);
     apply_screened_inbound(mem, screened)
 }
 

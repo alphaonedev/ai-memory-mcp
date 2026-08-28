@@ -15349,11 +15349,12 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // federation RECEIVE funnel. ALWAYS redact, NEVER refuse: a refused
     // inbound row would diverge replicas (the merge primitive), so a relayed
     // secret is masked, not rejected. #1844 extends the mask from `content`
-    // to title / tags / metadata string-leaf values (minus the crypto/system
-    // carve-out, so the inbound attestation envelope is preserved intact).
+    // to title / tags / metadata string-leaf values. #3299: receive uses
+    // `redact_memory_for_receive` so attestation STRING leaves survive but
+    // hostile `*_b64` OBJECT subtrees are screened.
     // No-op unless screening was seeded non-`off`.
     let redacted_mem;
-    let mem = if let Some(redacted) = crate::secret_screen::redact_memory_for_storage(mem) {
+    let mem = if let Some(redacted) = crate::secret_screen::redact_memory_for_receive(mem) {
         redacted_mem = redacted;
         &redacted_mem
     } else {
@@ -15817,7 +15818,7 @@ pub fn merge_inbound(
                 // then the never-refuse inbound why_trace gate (advisory
                 // WARN + forensic record only — CRDT convergence is the
                 // load-bearing property of the merge primitive).
-                let screened = crate::secret_screen::redact_memory_for_storage(inbound);
+                let screened = crate::secret_screen::redact_memory_for_receive(inbound);
                 let inbound = screened.as_ref().unwrap_or(inbound);
                 consult_governance_pre_write(inbound)?;
                 consult_why_trace_gate_inbound(inbound);
