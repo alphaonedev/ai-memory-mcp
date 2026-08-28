@@ -74,6 +74,26 @@ triggers re-cert** (see §7).
 > removed, or renamed. The §7 re-cert trigger fired because a watched
 > federation-wire path changed; this amendment discharges it. §5.4(2)–
 > (5) posture / pg+AGE / adversarial evidence is unchanged.
+>
+> **Amendment (2026-08-28, #3291 @ `eb7e7f5a`).** Two §7-watched
+> federation-wire paths changed when #3291 landed:
+> `src/handlers/federation_receive.rs` and
+> `src/handlers/federation_signing_check.rs` (`+1` each). Both now
+> pass `created_at` into `SignableLink` on `/sync/push` verify so a
+> self-signed federated edge attests its own timestamp (RFC-8949
+> preimage; domain tag stays `ai-memory/link/v1`; tampered
+> `created_at` fails verify). Additive security-hardening — no
+> wire/schema/`AI_MEMORY_FED_*` identifier add/remove/rename, no
+> certified control removed. The §7 re-cert trigger fired because
+> those watched paths changed (the merge was not a PR, so
+> `check-cert-expiry.sh` first ran on the push of `eb7e7f5a`). This
+> amendment discharges it. **This amendment does NOT re-mint the
+> certification** (bind remains `e22bc93c`; the 2026-08-12 5-agent
+> adversarial ratification stands). §5.4(2)–(5) re-attested at
+> `eb7e7f5a`: posture / adversarial / removal-proof harnesses are
+> unchanged; Certified Postgres + AGE + pgvector (#2548) was GREEN on
+> parent `e41f9480` (no stack/pin/workflow change in #3291), so
+> §5.4(3) holds.
 
 ---
 
