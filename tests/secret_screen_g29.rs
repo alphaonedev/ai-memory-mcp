@@ -567,6 +567,64 @@ fn receive_screens_hostile_b64_object_subtree_3299() {
     );
 }
 
+/// Wave-2 B1 — a hostile BARE STRING credential under a `*_b64` key on
+/// the receive funnel is redacted. #3299 closed only OBJECT/ARRAY
+/// subtrees; STRING leaves were preserved verbatim.
+#[test]
+fn receive_screens_hostile_b64_string_leaf_b1() {
+    set_screen_mode(SecretScreenMode::Redact);
+
+    let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEbody+AAAA\n-----END RSA PRIVATE KEY-----";
+    let metadata = serde_json::json!({
+        "agent_id": "ai:test:b1",
+        "attestation_b64": FAKE_JWT,
+        "host_signature_b64": FAKE_SIG_B64,
+        "api_key_b64": FAKE_OPENAI_KEY,
+        "pem_b64": pem,
+    });
+    let mem = valid_mem("ns-b1-receive", "a clean title", "clean content", metadata);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let conn = db::open(&dir.path().join("b1.db")).expect("open db");
+    let id = db::insert_if_newer(&conn, &mem).expect("b1: funnel must accept (never refuse)");
+
+    let stored: String = conn
+        .query_row(
+            "SELECT metadata FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .expect("row persisted");
+    let stored: serde_json::Value = serde_json::from_str(&stored).expect("metadata json");
+    assert_eq!(
+        stored
+            .get("attestation_b64")
+            .and_then(serde_json::Value::as_str),
+        Some(FAKE_JWT),
+        "b1: attestation JWT string leaf must survive receive"
+    );
+    assert_eq!(
+        stored
+            .get("host_signature_b64")
+            .and_then(serde_json::Value::as_str),
+        Some(FAKE_SIG_B64),
+        "b1: bare-base64 signature must survive receive"
+    );
+    let leaked = stored.to_string();
+    assert!(
+        !leaked.contains(FAKE_OPENAI_KEY),
+        "b1: credential-shaped *_b64 string must not persist; got {leaked}"
+    );
+    assert!(
+        !leaked.contains("MIIEbody"),
+        "b1: PEM-shaped *_b64 string must not persist; got {leaked}"
+    );
+    assert!(
+        leaked.contains(REDACTION_MARKER),
+        "b1: credential-shaped *_b64 string must be redacted; got {leaked}"
+    );
+}
+
 /// #1844 (2, funnel-redacts-never-refuses) — a NON-carve-out metadata secret
 /// reaching the federation-receive funnel directly (bypassing caller
 /// validate, as a relayed row does) is REDACTED, never refused: the funnel

@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SQLCipher genuinely needs the feature). Doctor Storage agrees with
   serve. Pins: `tests/encryption_at_rest.rs` (now a required CI
   always-run) + `encrypt_at_rest_on_non_sqlcipher_opens_s1`.
+### Security (Wave-2 B1 — receive `*_b64` STRING-leaf credentials)
+
+- **Federation-receive MEMORY metadata** no longer preserves a carved-out
+  STRING leaf verbatim. JWT (`eyJ…`) and detector-clean bare-base64
+  signatures still survive (#1844 / #626 / #1464). Credential-shaped
+  strings (`PEM`/`-----BEGIN`, `sk-`, `ghp_`, `AKIA`, `Bearer `) under
+  a `*_b64` / carve-out key are screened. #3299 closed only OBJECT/ARRAY
+  subtrees. Local caller path unchanged (`TrustedByName`). Pin:
+  `receive_screens_hostile_b64_string_leaf_b1`.
 
 ### Security (Wave-1 S1 — standalone at-rest fail-closed boot)
 
