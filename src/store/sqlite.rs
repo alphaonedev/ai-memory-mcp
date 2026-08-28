@@ -2048,6 +2048,10 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn lease_sweep_expired(&self, now: i64) -> StoreResult<usize> {
+        // Wave-2 B9 — pg twin gates; the sqlite SAL path used to skip
+        // `gate_record_stop` and land in the (previously ungated) audited
+        // reclaim. ERRORS-09.
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         // #2371 — emit one coordination-audit `signed_events` row per reclaimed
         // lease (the FORCED-revocation twin of the voluntary lease-op audit).

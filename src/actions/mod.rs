@@ -812,6 +812,11 @@ pub fn sweep_expired_leases(
 /// # Errors
 /// Propagates the `rusqlite` delete/update/query error.
 pub fn sweep_expired_leases_audited(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+    // Wave-2 B9 — pg `lease_sweep_expired` already gates; the sqlite
+    // audited wrapper used to skip `gate_record_stop_actions` and go
+    // straight to reclaim (coordination read surfaces piggybacked an
+    // ungated lease-reclaim DELETE). ERRORS-09.
+    gate_record_stop_actions(conn)?;
     let reclaimed = sweep_expired_leases_reclaim(conn, now)?;
     let mut requeued_count = 0usize;
     for (action_id, holder, requeued) in &reclaimed {

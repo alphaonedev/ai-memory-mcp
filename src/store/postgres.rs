@@ -2902,6 +2902,7 @@ impl PostgresStore {
         active_fp: &str,
         active_dim: usize,
     ) -> StoreResult<usize> {
+        self.gate_record_stop().await?;
         // [G2] — refuse if any embedded row already carries a DIFFERENT
         // stamp (a corpus with demonstrated multi-space history never
         // auto-adopts; its NULL rows stay excluded until explicit
@@ -6856,6 +6857,7 @@ impl PostgresStore {
     /// Propagates a genuine SQL failure (SELECT / UPDATE / tx) — NOT a
     /// per-row decrypt failure, which is swallowed as a skip.
     async fn backfill_memory_cids(&self) -> StoreResult<usize> {
+        self.gate_record_stop().await?;
         // Rows stamped per transaction (chunked, tx-per-chunk).
         const CHUNK: usize = 500;
 
@@ -7169,6 +7171,8 @@ impl PostgresStore {
         target: Option<crate::models::LifecycleState>,
     ) -> StoreResult<()> {
         use crate::models::LifecycleState;
+
+        self.gate_record_stop().await?;
         let Some(target) = target else {
             return Ok(());
         };
@@ -7640,6 +7644,7 @@ impl PostgresStore {
         expected_version: Option<i64>,
         edit_source: crate::models::EditSource,
     ) -> StoreResult<(String, String)> {
+        self.gate_record_stop().await?;
         let mut tx = self
             .pool
             .begin()
@@ -8782,6 +8787,7 @@ impl PostgresStore {
     /// - `StoreError::BackendUnavailable` on any SQL failure during
     ///   the conversion.
     pub async fn migrate_embedding_dim(&self, target_dim: u32, force: bool) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
         let target_i32 = i32::try_from(target_dim).map_err(|_| StoreError::InvalidInput {
             detail: format!("target_dim {target_dim} out of i32 range"),
         })?;
@@ -10939,6 +10945,7 @@ impl PostgresStore {
         valid_until: Option<&str>,
         actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
+        self.gate_record_stop().await?;
         let stamp = valid_until.map_or_else(
             || truncate_to_microseconds(Utc::now()).to_rfc3339(),
             str::to_string,
@@ -11143,6 +11150,7 @@ impl PostgresStore {
         valid_until: Option<&str>,
         actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
+        self.gate_record_stop().await?;
         let stamp = valid_until.map_or_else(
             || truncate_to_microseconds(Utc::now()).to_rfc3339(),
             str::to_string,
@@ -11855,6 +11863,7 @@ impl PostgresStore {
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
+        self.gate_record_stop().await?;
         // #1568 (H1 residual) — run the same pre-link gates the sqlite
         // `db::create_link_signed` path runs (reflects_on cycle
         // invariant + K9 governance) BEFORE any FK pre-flight or write.
@@ -12971,6 +12980,9 @@ impl PostgresStore {
         use crate::db::ReflectError;
         use crate::validate;
 
+        self.gate_record_stop()
+            .await
+            .map_err(|e| ReflectError::Database(e.to_string()))?;
         // ─── 1. Validate inputs ─────────────────────────────────────
         validate::validate_title(&input.title)
             .map_err(|e| ReflectError::Validation(e.to_string()))?;
@@ -20858,6 +20870,7 @@ impl MemoryStore for PostgresStore {
         embedding: Option<&[f32]>,
         space: &str,
     ) -> StoreResult<()> {
+        self.gate_record_stop().await?;
         // #3085 — a REAL vector must carry a REAL space stamp; refuse an
         // empty (unattributed) stamp before the write.
         if embedding.is_some_and(|v| !v.is_empty()) {
@@ -24152,13 +24165,15 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn revoke_agent_pubkey(&self, _ctx: &CallerContext, agent_id: &str) -> StoreResult<()> {
+        use crate::models::AGENTS_NAMESPACE;
+        // Wave-2 B9 — record-plane UPDATE of the agent registration row.
+        self.gate_record_stop().await?;
         // #626 Layer-3 (Task 1.3 / C5) — parity with
         // `db::revoke_agent_pubkey` on the sqlite path. Strip the
         // `agent_pubkey` + `pubkey_bound_at` keys from both `metadata`
         // (jsonb) and the mirrored `content` (text), stamping a
         // `pubkey_revoked_at` marker. The agent must already be
         // registered; revoking an unbound agent is a no-op success.
-        use crate::models::AGENTS_NAMESPACE;
 
         let title = crate::models::agent_registration_title(agent_id);
         let now = Utc::now().to_rfc3339();
@@ -24280,6 +24295,7 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         agent_id: &str,
     ) -> StoreResult<usize> {
+        self.gate_record_stop().await?;
         let res = sqlx::query("DELETE FROM agent_api_keys WHERE agent_id = $1")
             .bind(agent_id)
             .execute(&self.pool)
@@ -29423,6 +29439,7 @@ impl MemoryStore for PostgresStore {
         old_bytes: i64,
         new_bytes: i64,
     ) -> StoreResult<i64> {
+        self.gate_record_stop().await?;
         let delta = new_bytes.saturating_sub(old_bytes);
         if delta <= 0 || owner.is_empty() {
             return Ok(0);
@@ -31025,6 +31042,7 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<crate::models::EntityRegistration> {
         use crate::models::{ConfidenceSource, ENTITY_KIND, EntityRegistration, MemoryKind, Tier};
 
+        self.gate_record_stop().await?;
         // Resolve effective agent_id: explicit arg wins; otherwise
         // fall back to the caller context's agent_id.
         let resolved_agent = agent_id
