@@ -26190,6 +26190,7 @@ impl MemoryStore for PostgresStore {
         claimed_by: Option<&str>,
         now: i64,
     ) -> StoreResult<crate::actions::CasOutcome> {
+        self.gate_record_stop().await?;
         use crate::actions::CasOutcome;
         // Reject illegal edges before locking the row (mirrors the sqlite
         // free-fn order in `crate::actions::transition_cas`).
