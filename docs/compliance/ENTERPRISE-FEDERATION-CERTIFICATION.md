@@ -121,6 +121,16 @@ triggers re-cert** (see §7).
 > tree (symbols intact; numbers had rotted). **This amendment does NOT
 > re-mint the certification** (bind remains `e22bc93c`).
 >
+> **Amendment (2026-08-28, C3 follow-up — cert-55 20-check recapture).**
+> Four-leg `doctor --posture enterprise-federation` evidence re-captured
+> at `f61dcab2` (20 checks measured: bare 10 FAIL / 10 PASS exit 2;
+> hardened non-sqlcipher 2 FAIL / 18 PASS exit 2 with 27/27 knobs at
+> floor; boot-gate armed exit 1; sqlcipher certified 20 PASS exit 0).
+> Committed under `docs/compliance/evidence/cert-55/`. No federation-wire
+> / `AI_MEMORY_FED_*` identifier add/remove/rename. **This amendment does
+> NOT re-mint the certification** (bind remains `e22bc93c`). `cert-54/`
+> remains the removal-proof evidence of record.
+>
 ---
 
 ## 1. The trust boundary (what is certified)
@@ -357,44 +367,30 @@ post-remediation tree (the merged cert wave: #2915-#2920, #2925-#2927,
 #2929); raw output in `docs/compliance/evidence/cert-54/` (see that
 directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 
-> **Evidence note (#2954 + #2991, 2026-08-22):** the `cert-54/` §2 captures
-> below PREDATE BOTH #2954 and #2991 and reflect the **18**-check posture.
-> The shipped binary now renders **20** checks — `ENTERPRISE_FEDERATION_CHECK_COUNT
-> = 20` (`src/enterprise_federation_posture.rs:129`), pinned by that module's own
-> `evaluate() must return exactly …` assertion. #2954 added check **#19**
-> (append-only spine flag + daemon audit signing key); #2991 added check **#20**
-> (escalate-producer approver-key enrollment). A re-capture at the current
-> release tip **is expected to show** 20 checks — **bare leg 10 FAIL of 20**,
-> certified leg **20 `[PASS]`, 0 `[FAIL]`** — derived from the #19/#20 unit
-> tests (`src/enterprise_federation_posture.rs:1024-1028`); **not re-captured**.
-> The `cert-54/` captures remain the evidence of record (`grep -c '[PASS]'
-> posture-sqlcipher-pass.out` = 18). The certified pass leg is expected to stay
-> `overall: PASS` because the checked-in `enterprise-federation.env` profile
-> sets `AI_MEMORY_APPEND_ONLY=1` and a certified deployment provisions both
-> the daemon audit signing key and the approver pubkey enrollment.
->
-> **These post-#2954/#2991 tallies are DERIVED, not measured.** The PASS/FAIL
-> *verdict per leg* is unchanged for the certified config; only the check
-> count and the bare-leg FAIL tally grew. Re-capturing the four legs on a
-> release-built binary at the current tip, committing them under
-> `docs/compliance/evidence/cert-<next>/`, and re-binding §2/§8 to that
-> bundle is tracked as remaining certification hygiene. (Same handling
-> precedent as the #3033 knob-count note below.)
+> **Evidence note (2026-08-28 recapture, `cert-55/`):** the four-leg
+> §2 captures are **measured** at 20 checks on the release-built binary
+> at `f61dcab2` (Wave-2 B3/B1/B2 tip). `ENTERPRISE_FEDERATION_CHECK_COUNT
+> = 20` (`src/enterprise_federation_posture.rs:129`). Raw output in
+> `docs/compliance/evidence/cert-55/` (`SANITIZATION.md` +
+> `MANIFEST.sha256`). The `cert-54/` 18-check captures (2026-08-13)
+> remain the removal-proof evidence of record; they are **not** the
+> posture-leg evidence of record after this recapture. Bind stays
+> `e22bc93c` (this recapture does not re-mint).
 
 | Environment | Exit | Result |
 |---|---|---|
-| Bare (`AI_MEMORY_NO_CONFIG=1`, no posture knobs) | **2** | `overall: FAIL`, **exactly 8 `[FAIL]` rows of 18** (named below) |
-| Fully hardened, **non-sqlcipher** binary, boot gate not armed | **2** | `overall: FAIL`, exactly TWO remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) and `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (the boot gate itself, unset on this leg by construction) |
+| Bare (`AI_MEMORY_NO_CONFIG=1`, no posture knobs) | **2** | `overall: FAIL`, **exactly 10 `[FAIL]` rows of 20** (named below) |
+| Fully hardened, **non-sqlcipher** binary, boot gate not armed | **2** | `overall: FAIL`, exactly TWO remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) and `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (the boot gate itself, unset on this leg by construction). Pins **27/27** at floor. |
 | Same hardened non-sqlcipher env **with the boot gate ARMED** | **1** | the binary **refuses to boot**, naming the below-floor control (`posture-hardened-boot-refusal.out`) — #2911 item 1's enforcement demonstrated, not merely reported |
-| Fully hardened, **sqlcipher** binary + `ENCRYPT_AT_REST=1`, boot gate ARMED | **0** | `overall: PASS` (`posture-sqlcipher-pass.out`; 18 `[PASS]`, 0 `[FAIL]`) — the certified configuration boots under the armed gate and passes clean |
+| Fully hardened, **sqlcipher** binary + `ENCRYPT_AT_REST=1`, boot gate ARMED | **0** | `overall: PASS` (`posture-sqlcipher-pass.out`; 20 `[PASS]`, 0 `[FAIL]`) — the certified configuration boots under the armed gate and passes clean |
 
 (The four exit statuses **2 / 2 / 1 / 0** are recorded in
-`docs/compliance/evidence/cert-54/posture-legs-exit-codes.txt`; the
+`docs/compliance/evidence/cert-55/posture-legs-exit-codes.txt`; the
 rendered `.out` files show the PASS/FAIL rows but not the process exit
 code.)
 
-**Bare-leg FAIL rows** (from `posture-bare-env.out`, counted with
-`rg -c '\[FAIL\]'` = 8):
+**Bare-leg FAIL rows** (from `cert-55/posture-bare-env.out`, counted with
+`rg -c '\[FAIL\]'` = 10):
 
 1. `AI_MEMORY_SECURITY_PROFILE` (unset → `standard`)
 2. `asi-hard pinned knobs` — post-#2927 this row **FAILs honestly under
@@ -418,10 +414,10 @@ code.)
    `AI_MEMORY_FED_CERT_PEER_BINDING` were pinned (#3201 — the unenrolled
    hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT`, plus cert↔peer-id
    binding Enforce; the documented `standard` unset default stays Warn),
-   and the doctor render is `pinned_knobs().len()`-driven, so re-capture
-   on the post-#3201 release binary shows `27/27`. The PASS/FAIL verdict
-   per leg is unchanged (the row is one check regardless of the knob
-   count).
+   and the doctor render is `pinned_knobs().len()`-driven. The
+   `cert-55/` recapture **measures** `27/27 at floor` on the hardened
+   non-sqlcipher leg. The PASS/FAIL verdict per leg is unchanged (the
+   row is one check regardless of the knob count).
 3. `AI_MEMORY_FED_TRUST_DOMAIN` (unset)
 4. `AI_MEMORY_FED_PEER_FINGERPRINTS` (unset)
 5. `AI_MEMORY_FED_PEER_ATTESTATION` (unset)
@@ -430,8 +426,12 @@ code.)
 7. `AI_MEMORY_ENCRYPT_AT_REST` (`env=(unset) sqlcipher_build=false`)
 8. `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (unset — check
    #17, the boot-refusal env self-attest added by #2918)
+9. `append-only audit spine` (check #19 / #2954 — `AI_MEMORY_APPEND_ONLY`
+   unset and no daemon audit signing key)
+10. `R40 escalate producer` (check #20 / #2991 — no approver pubkey
+    enrolled)
 
-The other 10 of 18 are PASS on the bare leg because those knobs already
+The other 10 of 20 are PASS on the bare leg because those knobs already
 default to the certified-compliant state when unset (peer enrollment /
 sig / nonce / push-namespace-scope / permissions / governance-fail-open
 / sync-trust-peer / trust-body-agent-id / plaintext-peers /
@@ -1005,19 +1005,17 @@ this document does not self-authorize a tag cut.
 
 **Status at `e22bc93c` (original artifacts at `580d8427`; this re-issue
 amended through the merged 2026-08-13 remediation wave — #2915-#2920,
-#2925-#2927, #2929 — with evidence re-captured at that tree):** the
+#2925-#2927, #2929 — with posture legs re-captured 2026-08-28 at
+`f61dcab2`):** the
 seven §5.4 falsifiability requirements are met as follows — §5.4(1)
 canonical doc = this document; §5.4(2) machine-checked posture = CLOSED
-(four-leg localhost proof **executed and committed at 18 checks** —
-PRE-#2954 and PRE-#2991: bare→exit 2 / **8 FAIL**,
-hardened-non-sqlcipher→exit 2 / 2 FAIL, hardened-with-boot-gate-armed→
-**boot refusal** demonstrated, hardened-sqlcipher-armed→exit 0 /
-18 PASS. The shipped binary now renders **20** checks; see the §2
-#2954+#2991 evidence note for the **derived** post-#2991 tallies
-(expected bare 10 FAIL of 20 / certified 20 PASS — not re-captured;
-`cert-54/` remains the evidence of record) and for the outstanding
-re-capture. The gate mechanism and the per-leg PASS/FAIL verdicts are
-unchanged; only the check count grew); §5.4(3) executed pg+AGE+pgvector = green on the cert SHA at
+(four-leg localhost proof **executed and committed at 20 checks** in
+`docs/compliance/evidence/cert-55/`: bare→exit 2 / **10 FAIL of 20**,
+hardened-non-sqlcipher→exit 2 / 2 FAIL (27/27 knobs at floor),
+hardened-with-boot-gate-armed→ **boot refusal** demonstrated,
+hardened-sqlcipher-armed→exit 0 / **20 PASS**. Bind remains
+`e22bc93c`; this recapture does not re-mint. `cert-54/` remains the
+removal-proof evidence of record); §5.4(3) executed pg+AGE+pgvector = green on the cert SHA at
 the pinned triple (single-node CI; see §3 stack-evidence note);
 §5.4(4) adversarial negative lanes = covered (including the five
 previously-omitted in-tree lanes named in §4); §5.4(5) removal proof =
