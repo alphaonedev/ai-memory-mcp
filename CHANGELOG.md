@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-1 S1 — standalone at-rest fail-closed boot)
+
+- A non-sqlcipher standalone/daemon no longer silently ignores
+  `AI_MEMORY_DB_PASSPHRASE` / `--db-passphrase-file` /
+  `AI_MEMORY_ENCRYPT_AT_REST`. Boot and `open()` refuse with a message
+  naming sqlcipher + passphrase (ERRORS-09). Pin:
+  passphrase-set + non-sqlcipher must NOT persist plaintext.
+  `ai-memory doctor` WARNs when standalone runs unencrypted.
+
 ### Docs (Wave-1 C3 — enterprise-fed cert honesty)
 
 - `ENTERPRISE-FEDERATION-CERTIFICATION.md`: §6 now names equivocation

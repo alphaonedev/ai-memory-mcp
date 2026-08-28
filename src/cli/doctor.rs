@@ -1474,6 +1474,32 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
         }
     }
 
+    // Wave-1 S1 — standalone default is plaintext at rest. WARN so a
+    // small-business operator cannot miss it. Fail-closed boot (passphrase
+    // / ENCRYPT_AT_REST on a non-sqlcipher binary) is the `open()` path.
+    let sqlcipher = crate::build_features::has_feature("sqlcipher");
+    let encrypt_at_rest = crate::encryption::encryption_enabled(None);
+    if !sqlcipher && !encrypt_at_rest {
+        facts.push((
+            "at_rest".into(),
+            "plaintext (no sqlcipher; AI_MEMORY_ENCRYPT_AT_REST unset)".into(),
+        ));
+        if severity == Severity::Info {
+            severity = Severity::Warning;
+        }
+        let at_rest_note = "standalone is running unencrypted at rest. Build --features sqlcipher \
+             and provide a passphrase, or set AI_MEMORY_ENCRYPT_AT_REST=1, if this \
+             node holds secrets.";
+        note = Some(note.take().map_or_else(
+            || at_rest_note.to_string(),
+            |existing| format!("{existing} | {at_rest_note}"),
+        ));
+    } else if sqlcipher {
+        facts.push(("at_rest".into(), "sqlcipher".into()));
+    } else {
+        facts.push(("at_rest".into(), "ENCRYPT_AT_REST".into()));
+    }
+
     ReportSection {
         name: "Storage".into(),
         severity,
@@ -3306,7 +3332,17 @@ mod tests {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         let storage = find(&report, "Storage");
-        assert_eq!(storage.severity, Severity::Info);
+        // Wave-1 S1: default non-sqlcipher standalone is plaintext at rest
+        // → Storage WARNs. sqlcipher builds stay Info here.
+        if crate::build_features::has_feature("sqlcipher") {
+            assert_eq!(storage.severity, Severity::Info);
+        } else {
+            assert_eq!(storage.severity, Severity::Warning);
+            assert!(
+                fact(storage, "at_rest").contains("plaintext"),
+                "S1 doctor WARN must name plaintext at_rest"
+            );
+        }
         assert_eq!(fact(storage, "total_memories"), "0");
         // Pre-P2 schema (current release) has no `embedding_dim` column —
         // `db::doctor_dim_violations` returns Ok(None), rendered as
@@ -3934,7 +3970,12 @@ mod tests {
         let s = env.stdout_str();
         // Header + section labels.
         assert!(s.contains("ai-memory doctor — local mode"));
-        assert!(s.contains("[INFO] Storage"));
+        if crate::build_features::has_feature("sqlcipher") {
+            assert!(s.contains("[INFO] Storage"));
+        } else {
+            assert!(s.contains("[WARN] Storage"));
+            assert!(s.contains("unencrypted at rest"));
+        }
         assert!(s.contains("[INFO] Index"));
         assert!(s.contains("[N/A ] Capabilities"));
         // The label-prefixed fact key column is left-padded to 32 chars
