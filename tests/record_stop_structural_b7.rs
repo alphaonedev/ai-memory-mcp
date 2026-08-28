@@ -35,6 +35,8 @@ const MUST_BE_GATED: &[&str] = &[
     "quota_status_ns",
     "pending_decide",
     "governance_approve_with_consensus",
+    "reflect_with_hooks",
+    "update_embedding",
 ];
 
 /// Sqlite SSOT fn → postgres SAL method. If the sqlite twin's body
@@ -51,6 +53,7 @@ const SQLITE_PG_TWINS: &[(&str, &str)] = &[
     ("bind_agent_api_key", "bind_agent_api_key"),
     ("set_embeddings_batch", "set_embeddings_batch"),
     ("queue_pending_action", "enforce_governance_action"),
+    ("set_embedding", "update_embedding"),
 ];
 
 fn write_sql_line(line: &str) -> bool {

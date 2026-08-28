@@ -1163,3 +1163,43 @@ fn b8_pg_if_match_and_dequarantine_source_pin() {
         );
     }
 }
+
+/// Wave-2 B9 — source pin: pg reflect / embedding / the sqlite audited
+/// lease-reclaim wrapper that used to skip the coordination fence.
+#[test]
+fn b9_pg_reflect_embedding_and_sqlite_lease_source_pin() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let pg = std::fs::read_to_string(root.join("src/store/postgres.rs")).expect("postgres.rs");
+    for method in [
+        "pub async fn reflect_with_hooks(",
+        "async fn update_embedding(",
+        "async fn link_internal(",
+    ] {
+        let idx = pg
+            .find(method)
+            .unwrap_or_else(|| panic!("missing {method}"));
+        let window = &pg[idx..pg.len().min(idx.saturating_add(800))];
+        assert!(
+            window.contains("gate_record_stop"),
+            "{method} must call gate_record_stop in the first 800 bytes"
+        );
+    }
+    let actions = std::fs::read_to_string(root.join("src/actions/mod.rs")).expect("actions/mod.rs");
+    let idx = actions
+        .find("pub fn sweep_expired_leases_audited(")
+        .expect("missing sweep_expired_leases_audited");
+    let window = &actions[idx..actions.len().min(idx.saturating_add(600))];
+    assert!(
+        window.contains("gate_record_stop_actions"),
+        "sweep_expired_leases_audited must call gate_record_stop_actions"
+    );
+    let sqlite = std::fs::read_to_string(root.join("src/store/sqlite.rs")).expect("sqlite.rs");
+    let idx = sqlite
+        .find("async fn lease_sweep_expired(")
+        .expect("missing sqlite lease_sweep_expired");
+    let window = &sqlite[idx..sqlite.len().min(idx.saturating_add(400))];
+    assert!(
+        window.contains("gate_record_stop"),
+        "SqliteStore::lease_sweep_expired must call gate_record_stop"
+    );
+}

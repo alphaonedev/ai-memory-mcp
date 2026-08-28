@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-2 B9 — pg-write structural completeness + reflect/embedding/lease)
+
+- `PostgresStore::reflect_with_hooks` now calls `gate_record_stop` before
+  the `INSERT INTO memories` (sqlite twin already refused via
+  `insert_with_conflict` → `gate_storage_conn`). Round-6 6th sibling,
+  previously masked by the B7 allowlist.
+- `PostgresStore::update_embedding` gates (sqlite `db::set_embedding`
+  already did). Sqlite `sweep_expired_leases_audited` and
+  `SqliteStore::lease_sweep_expired` now match the gated pg
+  `lease_sweep_expired` (the audited wrapper used to skip the fence
+  and DELETE leases under stop).
+- Remaining postgres.rs *methods* that write record-plane tables
+  (`link_internal`, `charge_update_growth`, `revoke_agent_pubkey` /
+  `revoke_agent_api_key`, `adopt_legacy_embedding_space`,
+  `entity_register`, `backfill_memory_cids`, `apply_lifecycle_patch`,
+  `update_with_archive_on_supersede`, `migrate_embedding_dim`,
+  `kg_invalidate_cypher` / `kg_invalidate_cte`) gate too. The B7
+  allowlist is purged to read-bookkeeping + in-tx free fns (no `&self`)
+  + the signed-events resume actuator.
+- STRUCTURAL test `record_stop_pg_write_methods_gate_or_bookkeeping_b9`
+  scans `PostgresStore` methods for INSERT/UPDATE/DELETE on record-plane
+  tables and requires `gate_record_stop` except a minimal bookkeeping
+  set (touch / fold_recall / decay / recall-obs). Convergence by
+  construction: a new ungated pg method write fails this test.
+
 ### Security (Wave-2 B8 — postgres record-stop parity, #3175 oracle green)
 
 - `PostgresStore::dequarantine` + `dequarantine_raw` now call

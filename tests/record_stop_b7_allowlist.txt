@@ -44,30 +44,34 @@ src/quotas.rs	check_and_record_storage_only
 src/quotas.rs	refund_storage_only
 src/quotas.rs	record_op
 src/quotas.rs	reset_daily
+# B9 (2026-08-28): postgres.rs methods that write record-plane tables now
+# GATE (reflect_with_hooks, update_embedding, link_internal, charge_update_growth,
+# revoke_*, adopt_legacy_embedding_space, entity_register, backfill_memory_cids,
+# apply_lifecycle_patch, update_with_archive_on_supersede, migrate_embedding_dim,
+# kg_invalidate_{cypher,cte}). Remaining postgres.rs rows:
+#   (a) genuine read-bookkeeping (touch/fold/decay/recall-obs)
+#   (b) in-tx FREE FNS with no &self — cannot call gate_record_stop; gated
+#       callers named in the comment above the row
+#   (c) signed-events resume actuator (append stays live so stop can persist)
 src/store/postgres.rs	touch_after_recall
 src/store/postgres.rs	fold_recall_accesses
 src/store/postgres.rs	apply_confidence_decay_stamp
 src/store/postgres.rs	recall_observation_insert
 src/store/postgres.rs	recall_observation_prune_guarded
-src/store/postgres.rs	charge_update_growth
+# in-tx quota helper; callers: gated store/update paths
 src/store/postgres.rs	record_memory_quota_batch_in_tx
-src/store/postgres.rs	link_internal
-src/store/postgres.rs	reflect_with_hooks
+# in-tx free fn; callers: kg_invalidate / kg_invalidate_cte / kg_invalidate_cypher (gated)
 src/store/postgres.rs	pg_invalidate_link_relational_in_tx
+# resume actuator — append_signed_event stays ungated so stop can persist
 src/store/postgres.rs	pg_append_signed_event_with_chain_in_tx
+# in-tx free fn; caller: pg_append_signed_event_with_chain_in_tx (resume)
 src/store/postgres.rs	pg_emit_audit_head_witness_in_tx
+# in-tx free fn; callers: gated store/update/supersede paths
 src/store/postgres.rs	pg_append_revision_leaf_in_tx
+# in-tx free fn; callers: gated store/update paths
 src/store/postgres.rs	reconcile_envelope_owner_known
-src/store/postgres.rs	update_embedding
-src/store/postgres.rs	revoke_agent_pubkey
-src/store/postgres.rs	revoke_agent_api_key
-src/store/postgres.rs	adopt_legacy_embedding_space
-src/store/postgres.rs	entity_register
+# scanner false-positive: this fn has no write-SQL; the next helper's SQL
+# is attributed to it. No record-plane mutation.
 src/store/postgres.rs	close_timeout_relaxed_conn
-src/store/postgres.rs	backfill_memory_cids
-src/store/postgres.rs	apply_lifecycle_patch
-
-src/store/postgres.rs	update_with_archive_on_supersede
-src/store/postgres.rs	migrate_embedding_dim
 src/store/postgres_parity.rs	evict_tombstone_and_erase_in_tx
 src/store/postgres_parity.rs	archive_links_for_memory_in_tx
