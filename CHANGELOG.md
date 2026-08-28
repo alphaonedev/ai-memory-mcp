@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-2 B2 — record-stop on sqlite same-id merge + pg CAS)
+
+- **`db::merge_inbound` existing-row overwrite** now calls
+  `gate_storage_conn` at the top, matching `insert_if_newer`. A same-id
+  federation `/sync/push` can no longer mutate a memory under record-stop
+  on sqlite (`overwrite_full_row_by_id` used to bypass the chokepoints).
+  Federation-receive calls this free-fn directly, so the SAL adapter gate
+  was not sufficient. Pin: `db_merge_inbound_same_id_refuses_under_record_stop_b2`.
+- **Postgres `action_transition_cas`** now calls `gate_record_stop` like
+  its write-funnel siblings.
+
 ### Security (Wave-2 B3 — S1 regression: ENCRYPT_AT_REST is ChaCha, not SQLCipher)
 
 - `refuse_at_rest_requested_without_sqlcipher` keys on

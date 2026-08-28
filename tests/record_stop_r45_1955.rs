@@ -273,6 +273,53 @@ async fn federation_receive_is_stopped() {
     );
 }
 
+/// Wave-2 B2 — same-id federation merge (existing-row `overwrite_full_row_by_id`
+/// branch) must refuse under record-stop. The SAL adapter already gated
+/// `merge_inbound`; the hole was the free-fn `db::merge_inbound` that
+/// `federation_receive` calls directly, which skipped `gate_storage_conn`
+/// on the existing-row path (`insert_if_newer` already gated the no-row path).
+#[test]
+fn db_merge_inbound_same_id_refuses_under_record_stop_b2() {
+    let f = NamedTempFile::new().expect("tempfile");
+    let conn = ai_memory::db::open(f.path()).expect("open");
+    let mut mem = mk_memory("same-id-b2", "local row");
+    let id = ai_memory::db::insert(&conn, &mem).expect("seed local row");
+    mem.id.clone_from(&id);
+
+    assert!(
+        ai_memory::storage::record_stop::actuate_sqlite(
+            &conn,
+            true,
+            "ai:operator",
+            SCOPE_RECORD_PLANE,
+        )
+        .expect("engage record-stop"),
+        "first engage must report a state change"
+    );
+
+    mem.content = "hostile overwrite".to_string();
+    mem.updated_at = chrono::Utc::now().to_rfc3339();
+    let err = ai_memory::db::merge_inbound(&conn, &mem, false)
+        .expect_err("same-id merge_inbound must refuse under stop");
+    let se = err
+        .downcast_ref::<ai_memory::storage::StorageError>()
+        .expect("typed StorageError in the anyhow chain");
+    assert!(
+        matches!(se, ai_memory::storage::StorageError::RecordStopped { .. }),
+        "existing-row merge must refuse with RecordStopped, got {se:?}"
+    );
+
+    let stored: String = conn
+        .query_row("SELECT content FROM memories WHERE id = ?1", [&id], |r| {
+            r.get(0)
+        })
+        .expect("read");
+    assert_eq!(
+        stored, "local row",
+        "stopped merge must not overwrite the local row"
+    );
+}
+
 /// v1.0.0 #3140 — ceiling on how long the refusal may take.
 ///
 /// This is a SHAPE guard, not a performance budget: it fails if the stop plane

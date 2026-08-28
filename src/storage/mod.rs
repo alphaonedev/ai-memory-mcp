@@ -15801,6 +15801,12 @@ pub fn merge_inbound(
     inbound: &Memory,
     receiver_verified: bool,
 ) -> Result<String> {
+    // Wave-2 B2 — record-stop fence on the same-id overwrite path.
+    // `insert_if_newer` (no-row fall-through) already gated; the existing-row
+    // branch used to bypass via `overwrite_full_row_by_id`. Federation-receive
+    // (`handlers/federation_receive.rs`) calls this free-fn directly, so the
+    // SAL `SqliteStore::merge_inbound` gate is not sufficient (ERRORS-09).
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     // Take the write lock up front so the read-merge-write is atomic
     // against a concurrent peer push (BEGIN IMMEDIATE — same idiom as
     // `consolidate` / `size_gc`).
