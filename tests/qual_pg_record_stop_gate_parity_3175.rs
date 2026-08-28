@@ -145,6 +145,100 @@ fn every_sqlite_record_stop_gated_method_is_gated_on_postgres_3175() {
     );
 }
 
+/// Column-0 sqlite SSOT free-fns (`pub fn foo` in `storage/mod.rs`).
+fn ssot_free_fns(src: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    let mut body = String::new();
+    for line in src.lines() {
+        if let Some(rest) = line
+            .strip_prefix("pub(crate) fn ")
+            .or_else(|| line.strip_prefix("pub fn "))
+        {
+            let end = rest.find(['(', '<', ' ']).unwrap_or(rest.len());
+            let name = &rest[..end];
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                if let Some(prev) = current.take() {
+                    out.insert(prev, std::mem::take(&mut body));
+                }
+                current = Some(name.to_string());
+            }
+        }
+        if current.is_some() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if let Some(prev) = current {
+        out.insert(prev, body);
+    }
+    out
+}
+
+#[test]
+fn ssot_gated_inherent_pg_twins_must_gate_3175() {
+    // B8 extension: #3175 originally only compared SAL *trait* method
+    // names across adapters, so inherent PostgresStore writes whose
+    // sqlite SSOT twin gates (update_with_expected_version — the
+    // If-Match path) were invisible. Pair storage/mod.rs gated free-fns
+    // with same-named PostgresStore methods.
+    let ssot = ssot_free_fns(&read("src/storage/mod.rs"));
+    let postgres = methods(&read("src/store/postgres.rs"));
+    let pg_directly_gated: BTreeSet<&String> = postgres
+        .iter()
+        .filter(|(_, body)| body.contains(GATE_CALL))
+        .map(|(name, _)| name)
+        .collect();
+
+    let mut ungated = Vec::new();
+    for (name, body) in &ssot {
+        if !body.contains("gate_storage_conn") {
+            continue;
+        }
+        let Some(pg_body) = postgres.get(name) else {
+            continue; // no pg method of this name — not a twin
+        };
+        if pg_directly_gated.contains(name) {
+            continue;
+        }
+        let delegates = pg_directly_gated
+            .iter()
+            .any(|target| pg_body.contains(&format!("self.{target}(")));
+        if !delegates {
+            ungated.push(format!(
+                "{name}: sqlite SSOT gates via gate_storage_conn; pg twin \
+                 neither calls {GATE_CALL} nor delegates to a gated method"
+            ));
+        }
+    }
+    assert!(
+        ungated.is_empty(),
+        "#3175 B8 inherent-pg/SSOT parity:\n  {}",
+        ungated.join("\n  ")
+    );
+}
+
+#[test]
+fn pg_if_match_and_dequarantine_raw_gate_directly_b8() {
+    // Direct pins so a parser regression cannot drop the If-Match /
+    // dequarantine_raw paths that #3175's original twin-matching missed.
+    let postgres = methods(&read("src/store/postgres.rs"));
+    for name in [
+        "update_with_expected_version",
+        "update_with_expected_version_once",
+        "dequarantine",
+        "dequarantine_raw",
+    ] {
+        let body = postgres
+            .get(name)
+            .unwrap_or_else(|| panic!("PostgresStore::{name} not found"));
+        assert!(
+            body.contains(GATE_CALL),
+            "#3175 B8: PostgresStore::{name} must call {GATE_CALL}"
+        );
+    }
+}
+
 #[test]
 fn the_two_methods_3175_fixed_gate_directly_on_postgres() {
     // Regression pin for the exact pair the R-405 scout found. Kept separate

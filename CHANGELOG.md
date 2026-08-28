@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `update_with_expected_version` + `update_with_expected_version_once`
   gate too (If-Match HTTP + auto_tag_worker write path). Removed both
   inners from the B7 structural allowlist. Authoritative parity guard
-  is `tests/qual_pg_record_stop_gate_parity_3175.rs`.
+  is `tests/qual_pg_record_stop_gate_parity_3175.rs`, now extended to
+  pair gated sqlite SSOT free-fns with same-named inherent pg methods
+  (so `update_with_expected_version` cannot slip the trait-only scan)
+  plus a direct pin on the If-Match / `dequarantine_raw` paths.
 
 ### Security (Wave-2 B7 — record-stop remaining siblings + structural completeness)
 
