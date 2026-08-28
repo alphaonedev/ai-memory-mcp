@@ -7088,6 +7088,9 @@ impl PostgresStore {
         patch: UpdatePatch,
         expected_version: Option<i64>,
     ) -> StoreResult<i64> {
+        // Wave-2 B8 — If-Match HTTP + auto_tag_worker write this
+        // path; sqlite `update` gates (ERRORS-09).
+        self.gate_record_stop().await?;
         // #1641 — bounded gate-CAS retry. The governance pre-write
         // gate evaluates a pre-read snapshot; the UPDATE re-asserts
         // the snapshot's version atomically (see the $11 bind). For
@@ -7215,6 +7218,9 @@ impl PostgresStore {
     /// # Errors
     /// [`StoreError::BackendUnavailable`] on any sqlx error.
     async fn dequarantine_raw(&self, id: &str) -> StoreResult<bool> {
+        // Wave-2 B8 — sqlite `dequarantine` gates; this inner is reached
+        // from the trait method AND from other pg callers (ERRORS-09).
+        self.gate_record_stop().await?;
         let res = sqlx::query(
             "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
              WHERE id = $2 AND lifecycle_state = $3",
@@ -7239,6 +7245,8 @@ impl PostgresStore {
         patch: UpdatePatch,
         expected_version: Option<i64>,
     ) -> StoreResult<Option<i64>> {
+        // Wave-2 B8 — inner CAS attempt of If-Match update (ERRORS-09).
+        self.gate_record_stop().await?;
         // #1628 — caller-owns write gate, mirroring the trait `update`
         // (#1412). This method gained its first production caller (the
         // HTTP `PUT /memories/{id}` If-Match branch), so it must apply
@@ -18862,6 +18870,8 @@ impl MemoryStore for PostgresStore {
     /// v1.0.0 R19/A3 (#1948) — route-OUT dequarantine (delegates to the
     /// inherent [`PostgresStore::dequarantine_raw`]).
     async fn dequarantine(&self, id: &str) -> StoreResult<bool> {
+        // Wave-2 B8 — sqlite twin gates at the trait method (ERRORS-09).
+        self.gate_record_stop().await?;
         self.dequarantine_raw(id).await
     }
 

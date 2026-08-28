@@ -66,8 +66,7 @@ src/store/postgres.rs	entity_register
 src/store/postgres.rs	close_timeout_relaxed_conn
 src/store/postgres.rs	backfill_memory_cids
 src/store/postgres.rs	apply_lifecycle_patch
-src/store/postgres.rs	dequarantine_raw
-src/store/postgres.rs	update_with_expected_version_once
+
 src/store/postgres.rs	update_with_archive_on_supersede
 src/store/postgres.rs	migrate_embedding_dim
 src/store/postgres_parity.rs	evict_tombstone_and_erase_in_tx
