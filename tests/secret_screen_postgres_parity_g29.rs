@@ -307,10 +307,10 @@ fn carveout_const_matches_canonical_set_postgres_parity_1844() {
 }
 
 /// Wave-2 B4 — pg `apply_remote_memory` (catchup-pull funnel) screens with
-/// `redact_memory_for_receive` (ReceiveAttestationLeaves), not
-/// `redact_memory_for_storage` (TrustedByName). A credential under a `*_b64`
+/// `redact_memory_for_receive` (`ReceiveAttestationLeaves`), not
+/// `redact_memory_for_storage` (`TrustedByName`). A credential under a `*_b64`
 /// key on an AUTHOR-LESS row is redacted; JWT / detector-clean bare-base64
-/// survive. Pre-B4 TrustedByName wholesale-preserved the string leaf.
+/// survive. Pre-B4 `TrustedByName` wholesale-preserved the string leaf.
 #[tokio::test]
 #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL (live postgres); run with --include-ignored"]
 async fn apply_remote_memory_authorless_redacts_credential_under_b64_b4() {
