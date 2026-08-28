@@ -116,10 +116,11 @@ fn main() -> Result<()> {
     // tokio runtime workers) exists. See `daemon_runtime::apply_startup_env`.
     daemon_runtime::apply_startup_env(&cli, &app_config)?;
 
-    // Wave-1 S1 — singleton-sqlite fail-closed at-rest gate. After
-    // `--db-passphrase-file` has been seeded. `doctor` still opens so it
-    // can surface the same refusal as a Storage Critical (plus a WARN
-    // on default-plaintext standalone).
+    // Wave-1 S1 / Wave-2 B3 — singleton-sqlite fail-closed at-rest gate.
+    // After `--db-passphrase-file` has been seeded. Passphrase without
+    // sqlcipher refuses; ENCRYPT_AT_REST engages ChaCha and boots.
+    // `doctor` still opens so it can surface a passphrase refusal as a
+    // Storage Critical (plus a WARN on default-plaintext standalone).
     let is_doctor = matches!(&cli.command, daemon_runtime::Command::Doctor(_));
     if !is_doctor {
         ai_memory::storage::refuse_at_rest_requested_without_sqlcipher()?;

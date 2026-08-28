@@ -3227,6 +3227,13 @@ pub struct AppConfig {
     /// high event-rate workloads raise them per-deployment without
     /// recompiling. See [`LimitsSection`].
     pub limits: Option<LimitsSection>,
+
+    /// Wave-2 B3 — `[encryption]` section. Operator opt-in for app-level
+    /// ChaCha20-Poly1305 content encryption (NOT SQLCipher whole-DB).
+    /// Either `at_rest = true` here or `AI_MEMORY_ENCRYPT_AT_REST=1`
+    /// engages [`crate::encryption::encryption_enabled`]. Default off.
+    /// Seeded at boot via [`crate::encryption::set_config_at_rest`].
+    pub encryption: Option<EncryptionSection>,
 }
 
 // #1454 (SEC, LOW) — manual `Debug` so the `api_key` secret renders as
@@ -3300,6 +3307,7 @@ impl std::fmt::Debug for AppConfig {
             .field("reranker", &self.reranker)
             .field("storage", &self.storage)
             .field("limits", &self.limits)
+            .field("encryption", &self.encryption)
             .finish()
     }
 }
@@ -3319,6 +3327,24 @@ impl AppConfig {
             key.zeroize();
         }
     }
+}
+
+/// Wave-2 B3 — `[encryption]` top-level block. App-level ChaCha20-Poly1305
+/// content encryption opt-in (NOT SQLCipher whole-DB). Either this flag
+/// or `AI_MEMORY_ENCRYPT_AT_REST=1` engages
+/// [`crate::encryption::encryption_enabled`].
+///
+/// Wire format:
+/// ```toml
+/// [encryption]
+/// at_rest = true
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncryptionSection {
+    /// When `true`, seal memory `content` at rest under ChaCha20-Poly1305.
+    /// Whole-DB SQLCipher still requires `--features sqlcipher` + a passphrase.
+    #[serde(default)]
+    pub at_rest: Option<bool>,
 }
 
 /// v0.7.0 SEC-2 (Cluster D, issue #767) — `[governance]` top-level
@@ -6939,8 +6965,9 @@ impl AuditComplianceConfig {
     /// build's `sqlcipher` feature.
     ///
     /// - `encrypt_at_rest = true` is unenforced when at-rest content encryption
-    ///   is NOT active (env #37 `AI_MEMORY_ENCRYPT_AT_REST` + `--features
-    ///   sqlcipher`).
+    ///   is NOT active (env #37 `AI_MEMORY_ENCRYPT_AT_REST` or
+    ///   `[encryption].at_rest = true` — app-level ChaCha20-Poly1305; whole-DB
+    ///   SQLCipher is a separate control).
     /// - `pseudonymize_actors = true` is ALWAYS unenforced at v1.0.0: the knob
     ///   has NO consumer anywhere in the substrate (reserved / unimplemented),
     ///   so an `applied` preset asserting it can never be honored this release.
@@ -6967,8 +6994,9 @@ impl AuditComplianceConfig {
                         "the daemon does NOT encrypt memory content at rest — memory content is \
                          persisted in PLAINTEXT",
                     remediation:
-                        "build with `--features sqlcipher` AND set AI_MEMORY_ENCRYPT_AT_REST=1 \
-                         (env #37), or remove `encrypt_at_rest` from the preset",
+                        "set AI_MEMORY_ENCRYPT_AT_REST=1 or [encryption].at_rest = true \
+                         (app-level ChaCha20-Poly1305 content encryption), or remove \
+                         `encrypt_at_rest` from the preset",
                 });
             }
             if cfg.pseudonymize_actors == Some(true) {
@@ -7041,13 +7069,14 @@ pub struct CompliancePreset {
     pub attestation_cadence_minutes: Option<u32>,
     /// Enforcement-gated CLAIM of at-rest content encryption — NOT a switch
     /// (#2401). This field has no consumer that turns encryption on; at-rest
-    /// content encryption is active ONLY under `--features sqlcipher` +
-    /// `AI_MEMORY_ENCRYPT_AT_REST=1` (env #37,
-    /// [`crate::encryption::encryption_enabled`]). When an `applied` preset sets
+    /// content encryption is active under `AI_MEMORY_ENCRYPT_AT_REST=1`
+    /// (env #37) or `[encryption].at_rest = true` (Wave-2 B3), via
+    /// [`crate::encryption::encryption_enabled`]. When an `applied` preset sets
     /// this `true` while that gate is inactive,
     /// [`AuditComplianceConfig::unenforced_claims`] flags it and the boot path
     /// REFUSES to boot (operator ruling 2026-08-01) — the preset must not
-    /// advertise a control the daemon does not perform.
+    /// advertise a control the daemon does not perform. Whole-DB SQLCipher
+    /// (`--features sqlcipher` + passphrase) is a separate control.
     pub encrypt_at_rest: Option<bool>,
     /// RESERVED / NOT IMPLEMENTED at v1.0.0 (#2401). The GDPR-style
     /// actor-pseudonymization toggle has NO consumer anywhere in the substrate —
@@ -8056,6 +8085,7 @@ impl AppConfig {
             "curator",
             "storage",
             "limits",
+            "encryption",
         ];
 
         let value: toml::Value = match toml::from_str(contents) {
@@ -9569,6 +9599,12 @@ impl AppConfig {
 # Path to SQLite database
 # db = "~/.claude/ai-memory.db"
 
+# App-level ChaCha20-Poly1305 content encryption (NOT SQLCipher whole-DB).
+# Either this or AI_MEMORY_ENCRYPT_AT_REST=1 engages at-rest content sealing.
+# Default off. Whole-DB SQLCipher still needs --features sqlcipher + a passphrase.
+# [encryption]
+# at_rest = false
+
 # Ollama base URL (for smart/autonomous tiers)
 # ollama_url = "http://localhost:11434"
 
@@ -9650,10 +9686,11 @@ impl AppConfig {
 # retention_days = 2190
 # redact_content = true
 # # encrypt_at_rest is an ENFORCEMENT-GATED CLAIM, not a switch (#2401): it does
-# # NOT turn on at-rest encryption. That requires --features sqlcipher AND
-# # AI_MEMORY_ENCRYPT_AT_REST=1 (env #37); an applied preset asserting it without
-# # the gate REFUSES to boot (a compliance defaults-lie is a hard error) rather
-# # than silently storing content in PLAINTEXT.
+# # NOT turn on at-rest encryption. That requires AI_MEMORY_ENCRYPT_AT_REST=1
+# # (env #37) or [encryption].at_rest = true; an applied preset asserting it
+# # without the gate REFUSES to boot (a compliance defaults-lie is a hard error)
+# # rather than silently storing content in PLAINTEXT. Whole-DB SQLCipher is a
+# # separate control (--features sqlcipher + passphrase).
 # # encrypt_at_rest = true
 #
 # [audit.compliance.gdpr]
@@ -11306,6 +11343,7 @@ legacy_scoring = false
             curator: Some(CuratorSection::default()),
             storage: Some(StorageSection::default()),
             limits: Some(LimitsSection::default()),
+            encryption: Some(EncryptionSection::default()),
         };
 
         let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");
@@ -11364,6 +11402,7 @@ legacy_scoring = false
             "curator",
             "storage",
             "limits",
+            "encryption",
         ];
 
         for key in table.keys() {

@@ -116,7 +116,7 @@ fn hipaa_encrypt_at_rest_without_gate_is_named_unenforced_2401() {
         c.does_not
     );
     assert!(
-        c.remediation.contains("sqlcipher") && c.remediation.contains("AI_MEMORY_ENCRYPT_AT_REST"),
+        c.remediation.contains("AI_MEMORY_ENCRYPT_AT_REST"),
         "remediation must name the real gate: {}",
         c.remediation
     );

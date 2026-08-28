@@ -412,24 +412,28 @@ pub fn passphrase_requested() -> bool {
         .unwrap_or(false)
 }
 
-/// Wave-1 S1 — singleton-sqlite fail-closed at-rest boot gate.
+/// Wave-1 S1 / Wave-2 B3 — singleton-sqlite fail-closed at-rest boot gate.
 ///
-/// On a **non-sqlcipher** build, a passphrase or `AI_MEMORY_ENCRYPT_AT_REST`
-/// means the operator asked for at-rest encryption that this binary cannot
-/// honour. Refuse rather than silently persist plaintext (ERRORS-09).
+/// On a **non-sqlcipher** build, a passphrase (`--db-passphrase-file` /
+/// [`ENV_DB_PASSPHRASE`]) means the operator asked for whole-DB SQLCipher
+/// that this binary cannot honour. Refuse rather than silently persist
+/// plaintext (ERRORS-09).
+///
+/// `AI_MEMORY_ENCRYPT_AT_REST` / `[encryption].at_rest` is **not** a
+/// SQLCipher request: it engages app-level ChaCha20-Poly1305 content
+/// encryption, which is correct on the default build (Wave-2 B3). The
+/// original fail-open (passphrase → silent plaintext) stays closed.
 /// No-op on a sqlcipher build (the sqlcipher [`apply_sqlcipher_key`] arm
 /// already refuses a missing key).
 pub fn refuse_at_rest_requested_without_sqlcipher() -> Result<()> {
     if crate::build_features::has_feature("sqlcipher") {
         return Ok(());
     }
-    let passphrase = passphrase_requested();
-    let encrypt_at_rest = crate::encryption::encryption_enabled(None);
-    if passphrase || encrypt_at_rest {
+    if passphrase_requested() {
         anyhow::bail!(
-            "you asked for at-rest encryption but this binary has no sqlcipher / no key — \
+            "you asked for whole-db sqlcipher encryption but this binary has no sqlcipher — \
              build --features sqlcipher and provide a passphrase, or unset \
-             AI_MEMORY_DB_PASSPHRASE / --db-passphrase-file / AI_MEMORY_ENCRYPT_AT_REST"
+             AI_MEMORY_DB_PASSPHRASE / --db-passphrase-file"
         );
     }
     Ok(())
@@ -860,8 +864,9 @@ fn apply_check_constraint_triggers(conn: &Connection) -> Result<()> {
 /// class) so spawned children cannot inherit it.
 ///
 /// When the `sqlcipher` feature is NOT enabled, refuse if the operator
-/// asked for at-rest encryption (Wave-1 S1) — never silently persist
-/// plaintext while a passphrase / `AI_MEMORY_ENCRYPT_AT_REST` is set.
+/// asked for whole-DB encryption via a passphrase (Wave-1 S1 / Wave-2 B3)
+/// — never silently persist plaintext while a passphrase is set.
+/// `AI_MEMORY_ENCRYPT_AT_REST` is app-level ChaCha and is allowed here.
 #[cfg(feature = "sqlcipher")]
 fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
     let passphrase = db_passphrase()
@@ -1496,12 +1501,13 @@ mod tests {
         );
     }
 
-    /// Wave-1 S1: ENCRYPT_AT_REST on a non-sqlcipher build also refuses.
+    /// Wave-2 B3: ENCRYPT_AT_REST on a non-sqlcipher build must OPEN —
+    /// it is app-level ChaCha, not a SQLCipher request.
     #[cfg(not(feature = "sqlcipher"))]
     #[test]
-    fn encrypt_at_rest_on_non_sqlcipher_refuses_open_s1() {
+    fn encrypt_at_rest_on_non_sqlcipher_opens_s1() {
         if crate::config::run_env_isolated_child_or_spawn(
-            "storage::connection::tests::encrypt_at_rest_on_non_sqlcipher_refuses_open_s1",
+            "storage::connection::tests::encrypt_at_rest_on_non_sqlcipher_opens_s1",
         ) {
             return;
         }
@@ -1509,11 +1515,10 @@ mod tests {
         let guard = crate::test_support::EnvGuard::capture(crate::encryption::ENV_ENCRYPT_AT_REST);
         guard.set("1");
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let err = open(tmp.path()).expect_err("ENCRYPT_AT_REST + non-sqlcipher must refuse");
-        assert!(
-            err.to_string().contains("sqlcipher"),
-            "refusal must name sqlcipher: {err}"
-        );
+        open(tmp.path())
+            .expect("ENCRYPT_AT_REST + non-sqlcipher must open (ChaCha, not SQLCipher)");
+        refuse_at_rest_requested_without_sqlcipher()
+            .expect("ChaCha opt-in is not a sqlcipher request");
     }
 
     #[cfg(not(feature = "sqlcipher"))]
