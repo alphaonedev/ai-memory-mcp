@@ -404,11 +404,15 @@ pub fn handle_capture_turn(
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
-                return Err(crate::governance::deny_message(
-                    ACTION_CAPTURE_TURN,
-                    crate::governance::DenyGate::Governance,
-                    &refusal.reason,
-                ));
+                // #3292 M7 — unowned-standard remedy: Owner + no resolvable
+                // ns owner must not lock capture_turn for every caller.
+                if !refusal.is_unowned_owner_lock() {
+                    return Err(crate::governance::deny_message(
+                        ACTION_CAPTURE_TURN,
+                        crate::governance::DenyGate::Governance,
+                        &refusal.reason,
+                    ));
+                }
             }
             GovernanceDecision::Pending(pending_id) => {
                 return Ok(json!({

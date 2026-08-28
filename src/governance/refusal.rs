@@ -115,6 +115,16 @@ impl GovernanceRefusal {
         self.owner = Some(owner.into());
         self
     }
+
+    /// #3292 M7 — `Owner` level with no resolvable standard owner. The
+    /// same state is unowned-PASS in `clear_namespace_standard`; MCP
+    /// `memory_update` / `memory_capture_turn` use this to avoid locking
+    /// the namespace for every caller. Store still fail-closes at
+    /// `evaluate_level`.
+    #[must_use]
+    pub fn is_unowned_owner_lock(&self) -> bool {
+        self.denied_level == GovernanceLevel::Owner && self.reason.contains("no resolvable owner")
+    }
 }
 
 /// OPT-IN strict admission posture: under `permissions.mode = "enforce"`,
