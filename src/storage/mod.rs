@@ -20075,10 +20075,20 @@ fn evaluate_level(
             }
         }
         GovernanceLevel::Approve => {
-            // Caller translates this into a queued pending_action — the enforcement
-            // helpers below own the queueing so the db layer is the single source
-            // of truth for pending ids.
-            GovernanceDecision::Pending(String::new())
+            // #3292 M6 — sqlite↔pg parity: the namespace-standard owner
+            // auto-allows (same as `PostgresStore::enforce_governance_action`).
+            // Non-owner still queues a pending_action. Caller translates
+            // `Pending` into the queue so the db layer stays the SSOT for
+            // pending ids.
+            let owner = match action {
+                GovernedAction::Store => namespace_owner,
+                _ => memory_owner,
+            };
+            if matches!(owner, Some(o) if o == agent_id) {
+                GovernanceDecision::Allow
+            } else {
+                GovernanceDecision::Pending(String::new())
+            }
         }
     })
 }

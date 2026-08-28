@@ -26,6 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing mTLS mesh with no map does not suddenly 401 (inert);
   adding a map without enrolling every peer cert **will** partition
   the mesh.
+### Breaking / governance (#3292)
+
+- **Approve arm sqlite↔pg parity:** sqlite now auto-allows the
+  namespace-standard owner on `GovernanceLevel::Approve` (postgres
+  already did). Non-owner still queues `Pending`. Same call, same
+  verdict on both backends.
+- **BREAKING (Owner-governed MCP update/capture_turn):** after #3176
+  `evaluate_level` Store uses the namespace-standard owner, so
+  `memory_update` / `memory_capture_turn` DENY when the caller is not
+  that owner (an agent cannot update its own memory in someone else's
+  Owner-governed ns). Closing the self-asserted-owner bypass is
+  intentional. **Unowned-standard remedy:** if the Owner-level policy
+  has no resolvable owner, those two verbs now unowned-PASS (same
+  position as `clear_namespace_standard`) instead of locking the
+  namespace for every caller. Store still fail-closes on that state.
 
 ### Security / CI (#3293)
 

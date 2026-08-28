@@ -1277,6 +1277,41 @@ fn governance_pending_returns_pending_envelope_for_store() {
     crate::config::clear_permissions_mode_override_for_test();
 }
 
+/// #3292 M6 — sqlite Approve arm auto-allows the namespace-standard owner
+/// (postgres already did). Same call as the pending test above, owner
+/// principal, must land not queue.
+#[test]
+fn governance_approve_owner_allows_store_3292() {
+    let _gate = crate::config::lock_permissions_mode_for_test();
+    crate::config::override_active_permissions_mode_for_test(
+        crate::config::PermissionsMode::Enforce,
+    );
+    let conn = fresh_conn();
+    let ns = "gov-approve-owner-3292";
+    install_store_policy(
+        &conn,
+        ns,
+        crate::models::GovernanceLevel::Approve,
+        crate::models::ApproverType::Human,
+        "ai:alice",
+    );
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let mut params = base_params("owner-write");
+    params["namespace"] = json!(ns);
+    params["agent_id"] = json!("ai:alice");
+    let out = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("owner store under Approve must Allow");
+    assert_ne!(
+        out.get("status").and_then(|v| v.as_str()),
+        Some("pending"),
+        "owner must not be queued on Approve (sqlite↔pg parity); got {out}"
+    );
+    crate::config::clear_permissions_mode_override_for_test();
+}
+
 // ---- #1720 C: required_scope (refuse-only) at the sqlite gate -----------
 
 /// Install a namespace standard whose governance pins `required_scope`

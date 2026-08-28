@@ -455,11 +455,16 @@ pub(super) fn handle_update(
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
-                return Err(crate::governance::deny_message(
-                    "update",
-                    crate::governance::DenyGate::Governance,
-                    &refusal.reason,
-                ));
+                // #3292 M7 — unowned-standard remedy: Owner + no resolvable
+                // ns owner must not lock the namespace for every caller
+                // (matches `clear_namespace_standard` unowned-PASS).
+                if !refusal.is_unowned_owner_lock() {
+                    return Err(crate::governance::deny_message(
+                        "update",
+                        crate::governance::DenyGate::Governance,
+                        &refusal.reason,
+                    ));
+                }
             }
             GovernanceDecision::Pending(pending_id) => {
                 return Ok(json!({
