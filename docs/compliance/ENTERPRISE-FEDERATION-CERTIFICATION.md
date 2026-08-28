@@ -110,6 +110,19 @@ triggers re-cert** (see §7).
 > pgvector (#2548) GREEN on that tip (run 33182767671); live stack
 > 18.6 / 1.8.0 / 0.8.6. No stack/pin/workflow change.
 >
+> **Amendment (2026-08-28, Wave-2 B5).** The §7-watched paths
+> `src/handlers/federation_receive.rs` and
+> `src/handlers/federation_signing_check.rs` now refuse `/sync/push`
+> writes at ONE record-stop CHOKEPOINT (sqlite:
+> `refuse_if_record_stopped` after the db lock; SAL:
+> `record_stop_status` before the apply loops). Completes the kill
+> switch B2 left partial (memory plane only). Additive
+> security-hardening — no wire/schema/`AI_MEMORY_FED_*` identifier
+> add/remove/rename, no certified control removed. This amendment
+> discharges the §7 trigger. **This amendment does NOT re-mint the
+> certification** (bind remains `e22bc93c`; the 2026-08-12 5-agent
+> adversarial ratification stands).
+>
 > **Amendment (2026-08-28, Wave-2 B4).** The §7-watched path
 > `src/handlers/federation_receive.rs` now receive-redacts author-less
 > catchup-pull rows (`attest_inbound_pull_memory`) before apply: omitting

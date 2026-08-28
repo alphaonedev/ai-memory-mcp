@@ -133,6 +133,23 @@ pub(super) async fn sync_push_via_store(
     }
 
     let ctx = crate::store::CallerContext::for_agent(body.sender_agent_id.clone());
+    // Wave-2 B5 — SAL `/sync/push` write-dispatch record-stop CHOKEPOINT
+    // (postgres twin of `refuse_if_record_stopped` on the sqlite path).
+    // Every receive write below is fenced here so a new funnel cannot
+    // slip past a per-op miss (ERRORS-09).
+    match app.store.record_stop_status(&ctx).await {
+        Ok(st) if st.stopped => {
+            return super::postgres_gate::store_err_to_response(
+                crate::store::StoreError::Stopped {
+                    issued_by: st.issued_by,
+                    scope: st.scope,
+                },
+            );
+        }
+        Ok(_) => {}
+        Err(crate::store::StoreError::UnsupportedCapability { .. }) => {}
+        Err(e) => return super::postgres_gate::store_err_to_response(e),
+    }
     let mut applied = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;

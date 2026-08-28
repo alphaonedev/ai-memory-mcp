@@ -323,6 +323,26 @@ fn stale_policy_refusal_response(sender_seq: i64, local_seq: i64) -> Response {
 /// fails the push is refused `503` (retryable — the peer re-sends once the
 /// fault clears, so a genuine transient fault degrades to a retry rather than
 /// data loss). The documented operator opt-out is UNCHANGED: with
+/// Wave-2 B5 — sqlite `/sync/push` write-dispatch record-stop CHOKEPOINT.
+/// Returns `Some(503 RECORD_STOPPED)` when the record plane is stopped so
+/// every receive write in this request is fenced at one call site
+/// (ERRORS-09). `None` means the write-dispatch may proceed.
+fn refuse_if_record_stopped(conn: &rusqlite::Connection) -> Option<Response> {
+    match crate::storage::record_stop::gate_storage_conn(conn) {
+        Ok(()) => None,
+        Err(e) => Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "code": crate::errors::error_codes::RECORD_STOPPED,
+                    "error": e.to_string(),
+                })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 /// `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0` the gate is disabled and a read
 /// fault still accepts, exactly as before.
 async fn refuse_if_stale_policy(app: &AppState, body: &SyncPushBody) -> Option<Response> {
@@ -2125,6 +2145,14 @@ pub async fn sync_push(
     check_sender_clock_skew(&body.sender_agent_id, &body);
 
     let lock = state.lock().await;
+    // Wave-2 B5 — ONE record-stop CHOKEPOINT at the sqlite `/sync/push`
+    // write-dispatch entry. Every receive write below (memories, links,
+    // actions, lifecycle, embeddings, namespace_meta, sync_state) is
+    // fenced here so a new funnel cannot slip past a per-op miss
+    // (ERRORS-09). Reads stay live; this is the write fence.
+    if let Some(refusal) = refuse_if_record_stopped(&lock.0) {
+        return refusal;
+    }
     let mut applied = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;

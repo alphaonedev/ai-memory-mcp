@@ -34,7 +34,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
+use ai_memory::models::{
+    ActionState, ConfidenceSource, Memory, MemoryKind, MemoryLink, MemoryLinkRelation, Tier,
+};
 use ai_memory::store::record_stop::SCOPE_RECORD_PLANE;
 use ai_memory::store::{CallerContext, Filter, MemoryStore, StoreError, sqlite::SqliteStore};
 use serde_json::json;
@@ -317,6 +319,131 @@ fn db_merge_inbound_same_id_refuses_under_record_stop_b2() {
     assert_eq!(
         stored, "local row",
         "stopped merge must not overwrite the local row"
+    );
+}
+
+/// Wave-2 B5 — record-stop completeness: a same-id link, an action
+/// execute, a dequarantine, and sqlite `action_transition_cas` all
+/// refuse under stop (federation-receive / local action planes, not
+/// just the memory plane B2 fenced).
+#[tokio::test]
+async fn federation_receive_link_action_dequarantine_cas_refused_under_stop_b5() {
+    let (store, _f) = fresh_store();
+    let c = ctx();
+    let src = store
+        .store(&c, &mk_memory("b5-src", "s"))
+        .await
+        .expect("seed src");
+    let tgt = store
+        .store(&c, &mk_memory("b5-tgt", "t"))
+        .await
+        .expect("seed tgt");
+
+    store
+        .record_stop(&c, true, "ai:operator", SCOPE_RECORD_PLANE)
+        .await
+        .expect("engage");
+
+    let link = MemoryLink {
+        source_id: src.clone(),
+        target_id: tgt,
+        relation: MemoryLinkRelation::RelatedTo,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        signature: None,
+        observed_by: None,
+        valid_from: None,
+        valid_until: None,
+        attest_level: None,
+        source_cid: None,
+        target_cid: None,
+    };
+    assert!(
+        matches!(
+            store.apply_remote_link(&c, &link, "unsigned").await,
+            Err(StoreError::Stopped { .. })
+        ),
+        "same-id/inbound link via federation-receive must refuse under stop"
+    );
+    assert!(
+        matches!(
+            store.execute_pending_action(&c, "no-such-pending-b5").await,
+            Err(StoreError::Stopped { .. })
+        ),
+        "action execute via federation-receive must refuse under stop (gate before lookup)"
+    );
+    assert!(
+        matches!(
+            store.dequarantine(&src).await,
+            Err(StoreError::Stopped { .. })
+        ),
+        "dequarantine via federation-receive must refuse under stop"
+    );
+    assert!(
+        matches!(
+            store
+                .action_transition_cas(
+                    &c,
+                    "no-such-action-b5",
+                    ActionState::Pending,
+                    ActionState::Claimed,
+                    None,
+                    1,
+                )
+                .await,
+            Err(StoreError::Stopped { .. })
+        ),
+        "sqlite action_transition_cas must refuse under stop (B2 pg-parity)"
+    );
+}
+
+/// Wave-2 B5 — the sqlite `/sync/push` write-dispatch has ONE
+/// record-stop chokepoint (`refuse_if_record_stopped`) after taking the
+/// connection lock and before any `db::` write funnel. A new write
+/// funnel added without going through that gate fails this pin.
+#[test]
+fn sync_push_write_dispatch_has_record_stop_chokepoint_b5() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/federation_receive.rs"),
+    )
+    .expect("read federation_receive.rs");
+    let after_lock = src
+        .split("let lock = state.lock().await")
+        .nth(1)
+        .expect("sqlite sync_push must take the db lock");
+    let gate_at = after_lock
+        .find("refuse_if_record_stopped(&lock.0)")
+        .expect("sqlite sync_push must call refuse_if_record_stopped at the write-dispatch");
+    let merge_at = after_lock
+        .find("db::merge_inbound")
+        .expect("sqlite sync_push still reaches merge_inbound");
+    assert!(
+        gate_at < merge_at,
+        "record-stop chokepoint must sit after the lock and before the first db:: write"
+    );
+    for funnel in [
+        "create_link_inbound",
+        "upsert_pending_action",
+        "execute_pending_action",
+        "dequarantine",
+        "archive_memory",
+        "restore_archived",
+        "set_embedding",
+        "sync_state_observe",
+        "sync_state_merge_authorized",
+    ] {
+        assert!(
+            src.contains(funnel),
+            "sync_push must still reach {funnel} (update this pin if the funnel was renamed)"
+        );
+    }
+    let sal = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/handlers/federation_signing_check.rs"),
+    )
+    .expect("read federation_signing_check.rs");
+    assert!(
+        sal.contains("record_stop_status"),
+        "SAL sync_push_via_store must chokepoint via record_stop_status"
     );
 }
 
