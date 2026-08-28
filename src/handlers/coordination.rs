@@ -498,6 +498,18 @@ async fn local_transition_via_db(
         }
     };
     let from_state = current.state;
+    // Wave-2 B5 — local action CAS is a record-plane mutation. Reads
+    // (the `get` above) stay live; the write is fenced (ERRORS-09).
+    if let Err(e) = crate::storage::record_stop::gate_storage_conn(&lock.0) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "code": crate::errors::error_codes::RECORD_STOPPED,
+                "error": e.to_string(),
+            })),
+        )
+            .into_response());
+    }
     let outcome =
         crate::actions::transition_cas(&lock.0, action_id, from_state, to, claimed_by, now)
             .map_err(|e| {

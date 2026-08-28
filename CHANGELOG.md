@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-2 B5 — record-stop CHOKEPOINT at sync_push write-dispatch)
+
+- **`/sync/push` sqlite path** now calls `refuse_if_record_stopped` once
+  after taking the db lock, before any `db::` write. A new receive
+  write funnel cannot slip past a per-op miss (B2 only fenced
+  `merge_inbound`). SAL `sync_push_via_store` chokepoints via
+  `record_stop_status`.
+- **Sqlite `action_transition_cas`** now calls `gate_record_stop` like
+  the postgres twin (B2 parity). Local `local_transition_via_db` gates
+  before CAS. Sqlite SAL `dequarantine` is gated (route-OUT mutation).
+  Pins: `federation_receive_link_action_dequarantine_cas_refused_under_stop_b5`,
+  `sync_push_write_dispatch_has_record_stop_chokepoint_b5`.
+
 ### Security (Wave-2 B4 — pg apply_remote_memory receive-redact + author-less pull)
 
 - **Postgres `apply_remote_memory`** now calls `redact_memory_for_receive`

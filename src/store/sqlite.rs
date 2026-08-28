@@ -673,6 +673,8 @@ impl MemoryStore for SqliteStore {
     /// v1.0.0 R19/A3 (#1948) — route-OUT dequarantine (delegates to the raw
     /// [`crate::storage::dequarantine`] primitive).
     async fn dequarantine(&self, id: &str) -> StoreResult<bool> {
+        // Wave-2 B5 — route-OUT dequarantine is a record-plane mutation.
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::dequarantine(&conn, id).map_err(box_err)
     }
@@ -1909,6 +1911,9 @@ impl MemoryStore for SqliteStore {
         claimed_by: Option<&str>,
         now: i64,
     ) -> StoreResult<crate::actions::CasOutcome> {
+        // Wave-2 B5 — B2 gated the postgres twin; sqlite CAS was the
+        // remaining backend-parity hole (ERRORS-09).
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::actions::transition_cas(&conn, id, from, to, claimed_by, now).map_err(box_err)
     }
