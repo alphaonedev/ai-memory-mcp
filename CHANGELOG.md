@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs (Wave-1 C2 — #1980 PE-7 honesty)
+
+- Epic + ROADMAP no longer read #1980 as shipped enforcement. The
+  v1.0 residue is proof/template only (`docs/governance/signed-rule-pack.md`);
+  apply/enforce is v1.x [#2047](https://github.com/alphaonedev/ai-memory-mcp/issues/2047).
+  Zero `rule.pack` symbols in `src/`.
+
 ### Security (Wave-1 C1 — `updated_at` LWW canonical UTC)
 
 - Federation ingest now rewrites parseable `updated_at` through
