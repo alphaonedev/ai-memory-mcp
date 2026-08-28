@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs (Wave-1 C3 — enterprise-fed cert honesty)
+
+- `ENTERPRISE-FEDERATION-CERTIFICATION.md`: §6 now names equivocation
+  runtime detection/eviction as v1.x-deferred (#2002); §3 cites
+  current-triple GREEN run 33182767671 @ `00dd0162`; §1/§2/§7 line
+  anchors refreshed. Does not re-mint (bind remains `e22bc93c`).
+  §2 20-check re-capture remains outstanding (cert-54 is still the
+  18-check evidence of record).
+
 ### Docs (Wave-1 C2 — #1980 PE-7 honesty)
 
 - Epic + ROADMAP no longer read #1980 as shipped enforcement. The
