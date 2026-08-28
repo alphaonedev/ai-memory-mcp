@@ -986,17 +986,69 @@ jobs:
           echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"
           echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"
 
-      # Hosted sqlite Check only — serialise rustc/ld. The REQUIRED
-      # `Check (ubuntu-latest,sqlite)` context chronically ENOSPC / ld
-      # SIGBUS on the 14/16 GB GitHub-hosted image (605ae49c rerun #1
-      # ENOSPC, rerun #2 `ld terminated with signal 7`). macos-fed,sqlite
-      # + linux-fed + coverage + cert are GREEN on the same SHA, so this
-      # is runner capacity, not code. CARGO_BUILD_JOBS=1 is job-env so
-      # cargo audit + the `once` release smoke inherit it. Name and
-      # required-context UNCHANGED.
-      - name: Serialise hosted sqlite compile (CARGO_BUILD_JOBS=1)
+      # Hosted sqlite Check only. CARGO_BUILD_JOBS=1 (5495b547) serializes
+      # cargo's crate graph but does NOT cap a SINGLE GNU-ld invocation
+      # linking one large debug test binary (candle+tokenizers+sqlx).
+      # 5495b547 still died with `ld terminated with signal 7 [Bus error]`
+      # on `sync_since_visibility_gate_948`. Coverage.yml already solved
+      # this class with mold (#1148) + debuginfo=0. Same recipe, same
+      # gate (`matrix.leg == 'ubuntu-latest,sqlite'`), name/required-
+      # context UNCHANGED. Self-hosted legs keep job-level
+      # CARGO_PROFILE_DEV_DEBUG=1 and the system linker.
+      - name: Install mold linker (hosted sqlite Check only, #1148/#3090)
         if: needs.classify.outputs.docs_only != 'true' && matrix.leg == 'ubuntu-latest,sqlite'
-        run: echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
+        timeout-minutes: 6
+        env:
+          MOLD_VERSION: "2.4.1"
+        run: |
+          set -euo pipefail
+          # Byte-identical install recipe to coverage.yml (#3090): pinned
+          # first-party tarball, apt fallback, step timeout, no new Action.
+          if command -v mold >/dev/null 2>&1 && mold --version | grep -q "${MOLD_VERSION}"; then
+            echo "mold ${MOLD_VERSION} already present: $(mold --version)"; exit 0
+          fi
+          install_from_tarball() {
+            local arch tgz url dir ok attempt
+            arch="$(uname -m)"
+            tgz="mold-${MOLD_VERSION}-${arch}-linux.tar.gz"
+            url="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${tgz}"
+            dir="$(mktemp -d)"; ok=0
+            for attempt in 1 2; do
+              if timeout 120 curl -fsSL --retry 2 --retry-delay 3 -o "${dir}/${tgz}" "${url}"; then
+                ok=1; break
+              fi
+              echo "mold tarball fetch attempt ${attempt} failed; retrying" >&2; sleep 3
+            done
+            [ "${ok}" = 1 ] || return 1
+            tar -xzf "${dir}/${tgz}" -C "${dir}"
+            sudo install -m0755 "${dir}/mold-${MOLD_VERSION}-${arch}-linux/bin/mold" /usr/local/bin/mold
+            sudo ln -sf /usr/local/bin/mold /usr/local/bin/ld.mold
+          }
+          install_from_apt() {
+            local ok attempt; ok=0
+            for attempt in 1 2; do
+              if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y mold; then
+                ok=1; break
+              fi
+              echo "apt mold install attempt ${attempt} failed; retrying" >&2; sleep 5
+            done
+            [ "${ok}" = 1 ]
+          }
+          if ! install_from_tarball; then
+            echo "::warning::pinned mold tarball unavailable — falling back to apt"
+            install_from_apt || { echo "::error::mold install failed (tarball + apt both failed)"; exit 1; }
+          fi
+          command -v mold >/dev/null 2>&1 || { echo "::error::mold not on PATH after install"; exit 1; }
+          mold --version
+
+      - name: Low-mem hosted sqlite link (mold + debuginfo=0)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.leg == 'ubuntu-latest,sqlite'
+        run: |
+          {
+            echo "CARGO_BUILD_JOBS=1"
+            echo "CARGO_PROFILE_DEV_DEBUG=0"
+            echo "RUSTFLAGS=-C debuginfo=0 -C link-arg=-fuse-ld=mold"
+          } >> "$GITHUB_ENV"
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
