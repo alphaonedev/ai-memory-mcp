@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record-stop gate or sit on an explicit reviewed exception
   allowlist (`append_signed_event` stays ungated so resume works).
   Pins: `b7_enumerated_funnels_refuse_under_record_stop`.
+- B7': postgres SAL twins of gated sqlite SSOT methods now gate
+  (`pending_decide`, `governance_approve_with_consensus`,
+  `set_namespace_standard`, `clear_namespace_standard`,
+  `bind_agent_api_key`, `set_embeddings_batch`) and are removed from
+  the allowlist. Structural test asserts pg/sqlite gate parity so an
+  allowlist exemption cannot mask the split.
 
 ### Security (Wave-2 B6 — CLASS-level record-stop completeness)
 

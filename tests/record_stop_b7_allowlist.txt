@@ -59,14 +59,8 @@ src/store/postgres.rs	pg_emit_audit_head_witness_in_tx
 src/store/postgres.rs	pg_append_revision_leaf_in_tx
 src/store/postgres.rs	reconcile_envelope_owner_known
 src/store/postgres.rs	update_embedding
-src/store/postgres.rs	set_embeddings_batch
-src/store/postgres.rs	pending_decide
-src/store/postgres.rs	set_namespace_standard
-src/store/postgres.rs	clear_namespace_standard
 src/store/postgres.rs	revoke_agent_pubkey
-src/store/postgres.rs	bind_agent_api_key
 src/store/postgres.rs	revoke_agent_api_key
-src/store/postgres.rs	governance_approve_with_consensus
 src/store/postgres.rs	adopt_legacy_embedding_space
 src/store/postgres.rs	entity_register
 src/store/postgres.rs	close_timeout_relaxed_conn

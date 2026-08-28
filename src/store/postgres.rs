@@ -21026,6 +21026,8 @@ impl MemoryStore for PostgresStore {
         entries: &[(String, Vec<f32>)],
         space: &str,
     ) -> StoreResult<usize> {
+        // Wave-2 B7' — sqlite twin `db::set_embeddings_batch` gates (ERRORS-09).
+        self.gate_record_stop().await?;
         if entries.is_empty() {
             return Ok(0);
         }
@@ -23621,6 +23623,8 @@ impl MemoryStore for PostgresStore {
         approve: bool,
         decided_by: &str,
     ) -> StoreResult<bool> {
+        // Wave-2 B7' — sqlite twin `decide_pending_action` gates (ERRORS-09).
+        self.gate_record_stop().await?;
         let new_status = if approve { "approved" } else { "rejected" };
         let mut tx = self
             .pool
@@ -23686,6 +23690,8 @@ impl MemoryStore for PostgresStore {
         standard_id: &str,
         parent: Option<&str>,
     ) -> StoreResult<()> {
+        // Wave-2 B7' — sqlite twin `db::set_namespace_standard` gates (ERRORS-09).
+        self.gate_record_stop().await?;
         // Require the standard memory to exist first (parity with
         // sqlite db::set_namespace_standard).
         let exists: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
@@ -23725,6 +23731,8 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         namespace: &str,
     ) -> StoreResult<bool> {
+        // Wave-2 B7' — sqlite twin `db::clear_namespace_standard` gates (ERRORS-09).
+        self.gate_record_stop().await?;
         // #1777 — owner gate (parity with the MCP/sqlite #929 mirror). Clearing a
         // namespace's governance standard disarms the delete/write/promote gates
         // protecting every memory in the namespace, so it must be owner-gated
@@ -24229,6 +24237,8 @@ impl MemoryStore for PostgresStore {
         agent_id: &str,
         token_sha256: &str,
     ) -> StoreResult<()> {
+        // Wave-2 B7' — sqlite twin `db::bind_agent_api_key` gates (ERRORS-09).
+        self.gate_record_stop().await?;
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO agent_api_keys (token_sha256, agent_id, bound_at)
@@ -28548,6 +28558,8 @@ impl MemoryStore for PostgresStore {
         pending_id: &str,
         approver_agent_id: &str,
     ) -> StoreResult<super::ApproveOutcome> {
+        // Wave-2 B7' — sqlite twin `approve_with_approver_type` gates (ERRORS-09).
+        self.gate_record_stop().await?;
         // Load the pending row + assert state. Missing pending_id surfaces
         // as StoreError::NotFound so the HTTP layer maps it to 404 (the
         // contract the sqlite path provides via db::approve_with_approver_type's

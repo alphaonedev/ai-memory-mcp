@@ -33,6 +33,24 @@ const MUST_BE_GATED: &[&str] = &[
     "enforce_governance_action",
     "quota_status",
     "quota_status_ns",
+    "pending_decide",
+    "governance_approve_with_consensus",
+];
+
+/// Sqlite SSOT fn → postgres SAL method. If the sqlite twin's body
+/// contains a record-stop gate, the pg method must too (B7' parity —
+/// an allowlist exemption cannot mask a gated-sqlite / ungated-pg split).
+const SQLITE_PG_TWINS: &[(&str, &str)] = &[
+    ("decide_pending_action", "pending_decide"),
+    (
+        "approve_with_approver_type",
+        "governance_approve_with_consensus",
+    ),
+    ("set_namespace_standard", "set_namespace_standard"),
+    ("clear_namespace_standard", "clear_namespace_standard"),
+    ("bind_agent_api_key", "bind_agent_api_key"),
+    ("set_embeddings_batch", "set_embeddings_batch"),
+    ("queue_pending_action", "enforce_governance_action"),
 ];
 
 fn write_sql_line(line: &str) -> bool {
@@ -134,6 +152,20 @@ fn rel_src(path: &Path, root: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn fn_body_has_gate(src: &str, fn_name: &str) -> bool {
+    let needle = format!("fn {fn_name}");
+    let Some(idx) = src.find(&needle) else {
+        return false;
+    };
+    let rest = &src[idx..];
+    let end = rest
+        .find("\n    async fn ")
+        .or_else(|| rest.find("\npub fn "))
+        .unwrap_or(rest.len().min(8000));
+    let body = &rest[..end];
+    GATE_MARKERS.iter().any(|g| body.contains(g))
 }
 
 #[test]
@@ -243,5 +275,31 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         extra.is_empty(),
         "B7 structural completeness: write-SQL functions are neither gated nor allowlisted:\n  {}\n(add a gate or a reviewed ALLOWLIST row)",
         extra.join("\n  ")
+    );
+
+    let sqlite_src = fs::read_to_string(root.join("src/storage/mod.rs")).expect("storage/mod.rs");
+    let pg_src = fs::read_to_string(root.join("src/store/postgres.rs")).expect("postgres.rs");
+    let allow_txt = include_str!("record_stop_b7_allowlist.txt");
+    let mut parity_fail = Vec::new();
+    for (sqlite_fn, pg_fn) in SQLITE_PG_TWINS {
+        if !fn_body_has_gate(&sqlite_src, sqlite_fn) {
+            continue;
+        }
+        if !fn_body_has_gate(&pg_src, pg_fn) {
+            parity_fail.push(format!("sqlite {sqlite_fn} is gated but pg {pg_fn} is not"));
+        }
+        let exempt = allow_txt.lines().any(|l| {
+            l.starts_with("src/store/postgres.rs\t") && l.ends_with(&format!("\t{pg_fn}"))
+        });
+        if exempt {
+            parity_fail.push(format!(
+                "pg {pg_fn} is allowlisted while sqlite twin {sqlite_fn} gates — remove from allowlist"
+            ));
+        }
+    }
+    assert!(
+        parity_fail.is_empty(),
+        "B7 pg/sqlite gate parity failures:\n  {}",
+        parity_fail.join("\n  ")
     );
 }
