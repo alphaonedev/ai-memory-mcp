@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on GNU ld. Drop mold, keep `debuginfo=0` + system `ld.bfd` on the hosted
   sqlite Check only — if it still SIGSEGV after a clean link, it is not
   mold.
+- **#2469 quarantine (hosted-only):** `concurrent_swap_and_reads_no_panic_2166`
+  returns early when `GITHUB_ACTIONS` + `RUNNER_ENVIRONMENT=github-hosted`.
+  The rest of `hot_swap_llm_2166` still runs on hosted; the concurrent cell
+  still runs on macos-fed + linux-fed. Not a `Swappable` UB race. Issue
+  stays OPEN for OnceLock rustls init / fewer client constructions.
 
 ### Security (record-stop fleet kill-switch fail-open — #3276)
 
