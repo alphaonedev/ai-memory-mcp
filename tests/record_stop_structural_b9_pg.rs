@@ -5,7 +5,7 @@
 //!
 //! Every `PostgresStore` method whose body contains INSERT/UPDATE/DELETE
 //! against a record-plane table must call `gate_record_stop`, except a
-//! minimal bookkeeping allowlist (touch / fold_recall / confidence-decay /
+//! minimal bookkeeping allowlist (touch / `fold_recall` / confidence-decay /
 //! recall-observation). In-tx free functions (no `&self`) are out of
 //! scope here — they cannot call the SAL gate; the B7 allowlist names
 //! their gated callers. `append_signed_event` stays ungated so resume
@@ -59,9 +59,7 @@ fn write_sql_table(line: &str) -> Option<String> {
     }
     let upper = line.to_ascii_uppercase();
     let extract_after = |needle: &str| -> Option<String> {
-        let Some(idx) = upper.find(needle) else {
-            return None;
-        };
+        let idx = upper.find(needle)?;
         let rest = &line[idx + needle.len()..];
         let name: String = rest
             .trim_start()
