@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-1 C1 — `updated_at` LWW canonical UTC)
+
+- Federation ingest now rewrites parseable `updated_at` through
+  `render_canonical_utc` (micros + `Z`) at `clamp_inbound_updated_at`,
+  and `remote_wins_lww` compares canonical instants. A peer `...Z`
+  same-second unsigned edit can no longer beat an attested
+  `...+00:00` local row via string order.
+
 ### Security (#3299 — receive memory `*_b64` subtree)
 
 - **Federation-receive MEMORY metadata** no longer skips a whole object

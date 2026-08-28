@@ -264,9 +264,13 @@ pub fn clamp_inbound_updated_at(mut inbound: Memory, now_rfc3339: &str, skew_sec
         chrono::DateTime::parse_from_rfc3339(&inbound.updated_at),
     ) {
         let ceiling = now + chrono::Duration::seconds(skew_secs);
-        if updated > ceiling {
-            inbound.updated_at = ceiling.to_rfc3339();
-        }
+        let chosen = if updated > ceiling { ceiling } else { updated };
+        // Wave-1 C1: persist the SAME canonical UTC rendering the create
+        // funnel uses (`validate::render_canonical_utc` — micros + `Z`).
+        // A peer `...Z` vs local `...+00:00` same wall-second must not
+        // win LWW by string order.
+        inbound.updated_at =
+            crate::validate::render_canonical_utc(chosen.with_timezone(&chrono::Utc));
     }
     inbound
 }
@@ -297,13 +301,19 @@ fn merge_counter<T: PartialOrd + Clone>(local: T, remote: T) -> T {
 /// property (it is a deterministic function of each operand) while
 /// preventing a same-`updated_at` unsigned edit from clobbering a
 /// locally-attested row by `id` manipulation.
+fn lww_updated_at_key(m: &Memory) -> String {
+    chrono::DateTime::parse_from_rfc3339(&m.updated_at)
+        .map(|dt| crate::validate::render_canonical_utc(dt.with_timezone(&chrono::Utc)))
+        .unwrap_or_else(|_| m.updated_at.clone())
+}
+
 fn remote_wins_lww(local: &Memory, remote: &Memory) -> bool {
     (
-        remote.updated_at.as_str(),
+        lww_updated_at_key(remote),
         attest_rank(remote),
         remote.id.as_str(),
     ) > (
-        local.updated_at.as_str(),
+        lww_updated_at_key(local),
         attest_rank(local),
         local.id.as_str(),
     )
@@ -1280,20 +1290,47 @@ mod tests {
 
     #[test]
     fn clamp_inbound_updated_at_leaves_honest_timestamp_untouched() {
-        // An honest updated_at at-or-before now + skew (incl. small clock
-        // skew) is unchanged.
+        // An honest updated_at at-or-before now + skew is kept at the
+        // SAME INSTANT, rewritten to canonical UTC (micros + `Z`) so a
+        // peer `...Z` cannot beat `...+00:00` in string LWW (Wave-1 C1).
         let now = "2026-06-20T12:00:00+00:00";
         let skew = 300;
-        // 2s of clock skew — well within the window.
         let honest = base("a", "2026-06-20T12:00:02+00:00");
         let out = clamp_inbound_updated_at(honest, now, skew);
-        assert_eq!(out.updated_at, "2026-06-20T12:00:02+00:00");
-        // A past timestamp is also untouched.
+        assert_eq!(
+            out.updated_at,
+            crate::validate::render_canonical_utc(
+                chrono::DateTime::parse_from_rfc3339("2026-06-20T12:00:02+00:00")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
+        );
         let past = base("a", "2026-06-20T09:00:00+00:00");
         assert_eq!(
             clamp_inbound_updated_at(past, now, skew).updated_at,
-            "2026-06-20T09:00:00+00:00"
+            crate::validate::render_canonical_utc(
+                chrono::DateTime::parse_from_rfc3339("2026-06-20T09:00:00+00:00")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
         );
+    }
+
+    /// Wave-1 C1: a same-wall-second inbound `...Z` claimed row must NOT
+    /// beat a locally attested `...+00:00` row via string LWW.
+    #[test]
+    fn z_suffix_same_second_does_not_beat_attested_plus00_c1() {
+        let mut local = with_attest(base("a", "2026-06-16T00:00:00+00:00"), "agent_attested");
+        local.title = "attested-local".into();
+        let mut remote = with_attest(base("a", "2026-06-16T00:00:00Z"), "claimed");
+        remote.title = "unsigned-z".into();
+        let merged = merge_memory(&local, &remote);
+        assert_eq!(
+            merged.title, "attested-local",
+            "same-instant Z vs +00:00 must fall through to attest_rank, not string order"
+        );
+        let merged_rev = merge_memory(&remote, &local);
+        assert_eq!(merged_rev.title, "attested-local");
     }
 
     #[test]
