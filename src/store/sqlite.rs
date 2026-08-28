@@ -1147,6 +1147,7 @@ impl MemoryStore for SqliteStore {
         agent_id: &str,
         pubkey_b64: &str,
     ) -> StoreResult<()> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::bind_agent_pubkey(&conn, agent_id, pubkey_b64).map_err(box_err)
     }
@@ -1203,6 +1204,7 @@ impl MemoryStore for SqliteStore {
         record: &crate::identity::lineage::LineageRecord,
         signature: &[u8],
     ) -> StoreResult<()> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::append_lineage_record(&conn, agent_id, record, signature).map_err(box_err)
     }
@@ -1669,6 +1671,7 @@ impl MemoryStore for SqliteStore {
         tier: Option<&Tier>,
         archive: bool,
     ) -> StoreResult<usize> {
+        self.gate_record_stop()?;
         if namespace.is_none() && pattern.is_none() && tier.is_none() {
             return Err(StoreError::InvalidInput {
                 detail: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
@@ -1867,6 +1870,7 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         action: &crate::models::Action,
     ) -> StoreResult<String> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::actions::create(&conn, action).map_err(box_err)
     }
@@ -1888,6 +1892,7 @@ impl MemoryStore for SqliteStore {
         claimed_by: Option<&str>,
         now: i64,
     ) -> StoreResult<crate::models::Action> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         match crate::actions::transition(&conn, id, to, claimed_by, now).map_err(box_err)? {
             crate::actions::TransitionOutcome::NotFound => {
@@ -1937,6 +1942,7 @@ impl MemoryStore for SqliteStore {
         edge_type: crate::models::EdgeType,
         now: i64,
     ) -> StoreResult<()> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         // #3008 — a self-edge / ordering-cycle edge is refused (would wedge the
         // frontier). The typed outcome is mapped to an integrity error here.
@@ -1992,6 +1998,7 @@ impl MemoryStore for SqliteStore {
         now: i64,
         expires_at: i64,
     ) -> StoreResult<crate::models::Lease> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         match crate::actions::lease_acquire(&conn, action_id, holder, now, expires_at)
             .map_err(box_err)?
@@ -2011,6 +2018,7 @@ impl MemoryStore for SqliteStore {
         now: i64,
         expires_at: i64,
     ) -> StoreResult<crate::models::Lease> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::actions::lease_renew(&conn, action_id, holder, now, expires_at)
             .map_err(box_err)?
@@ -2025,6 +2033,7 @@ impl MemoryStore for SqliteStore {
         action_id: &str,
         holder: &str,
     ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::actions::lease_release(&conn, action_id, holder).map_err(box_err)
     }
@@ -2049,6 +2058,7 @@ impl MemoryStore for SqliteStore {
         &self,
         default_secs: i64,
     ) -> StoreResult<Vec<(String, String)>> {
+        self.gate_record_stop()?;
         // FBL-22 — thin delegate to the existing rusqlite free fn, which
         // already SELECTs the candidate `(id, namespace)` pairs, flips them to
         // `status='expired'` in one transaction, and returns them (the RETURNING
@@ -2064,6 +2074,7 @@ impl MemoryStore for SqliteStore {
         signal: &crate::models::Signal,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
+        self.gate_record_stop()?;
         // #1709 Pillar 1 — mirror `link_signed`: sign a clone when a signing
         // keypair is present, else persist the signal verbatim (unsigned).
         let conn = self.state.lock().await;
@@ -2111,6 +2122,7 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn signal_ack(&self, _ctx: &CallerContext, id: &str, now: i64) -> StoreResult<bool> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::signals::mark_acked(&conn, id, now).map_err(box_err)
     }
@@ -2120,6 +2132,7 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         cp: &crate::models::Checkpoint,
     ) -> StoreResult<String> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::checkpoints::insert(&conn, cp).map_err(box_err)
     }
@@ -2155,6 +2168,7 @@ impl MemoryStore for SqliteStore {
         resolved_at: i64,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<crate::checkpoints::ResolveOutcome> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::checkpoints::resolve(
             &conn,
@@ -2186,6 +2200,7 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         r: &crate::models::Routine,
     ) -> StoreResult<String> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::routines::routine_insert(&conn, r).map_err(box_err)
     }
@@ -2217,6 +2232,7 @@ impl MemoryStore for SqliteStore {
         frozen_at: i64,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<Option<crate::models::Routine>> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::routines::routine_freeze(&conn, id, frozen_at, keypair).map_err(box_err)
     }
@@ -2226,6 +2242,7 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         run: &crate::models::RoutineRun,
     ) -> StoreResult<String> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::routines::run_insert(&conn, run).map_err(box_err)
     }
@@ -2258,12 +2275,14 @@ impl MemoryStore for SqliteStore {
         created_action_ids: Option<&serde_json::Value>,
         error: Option<&str>,
     ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::routines::run_set_state(&conn, run_id, state, finished_at, created_action_ids, error)
             .map_err(box_err)
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::gc(&conn, archive).map_err(box_err)
     }
@@ -2274,6 +2293,7 @@ impl MemoryStore for SqliteStore {
         max_corpus_bytes: i64,
         archive: bool,
     ) -> StoreResult<usize> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::size_gc(&conn, namespace, max_corpus_bytes, archive).map_err(box_err)
     }
@@ -2291,6 +2311,7 @@ impl MemoryStore for SqliteStore {
         // truly-absent id gives — no existence oracle. Operator lanes
         // (`ctx.bypass_visibility`) keep the owner-blind funnel, matching
         // `archive_purge` right above and the postgres twin.
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         if ctx.bypass_visibility {
             db::restore_archived(&conn, id).map_err(box_err)
@@ -2312,6 +2333,7 @@ impl MemoryStore for SqliteStore {
         // the operator full-wipe surface. The shared admin-role
         // allowlist at `handlers::admin_role::require_admin`
         // exclusively controls who reaches the bypass branch.
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         if ctx.bypass_visibility {
             db::purge_archive(&conn, older_than_days).map_err(box_err)
@@ -2327,6 +2349,7 @@ impl MemoryStore for SqliteStore {
         ids: &[String],
         reason: Option<&str>,
     ) -> StoreResult<usize> {
+        self.gate_record_stop()?;
         // #3193 (in-class parity, 2026-08-22) — honour the trait's
         // caller-owns contract on this adapter too. Pre-fix this method
         // discarded `_ctx` and called the owner-BLIND `db::archive_memory`,

@@ -3614,6 +3614,7 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
 /// # Errors
 /// Propagates the `rusqlite` update error.
 pub fn dequarantine(conn: &Connection, id: &str) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     let n = conn.execute(
         "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
@@ -4698,6 +4699,7 @@ pub fn reverse_conserve_contradiction(
 ///
 /// Returns an error if the INSERT-SELECT or DELETE fails.
 pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let write_txn = connection::WriteTxn::begin(conn)?;
     let result = archive_memory_no_tx(conn, id, reason);
     match result {
@@ -5271,6 +5273,7 @@ pub fn archive_memory_for_caller(
     reason: Option<&str>,
     caller: &str,
 ) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     let reason = reason.unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT);
     let write_txn = connection::WriteTxn::begin(conn)?;
@@ -6257,6 +6260,7 @@ pub fn forget(
     tier: Option<&Tier>,
     archive: bool,
 ) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
         // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -6739,6 +6743,7 @@ pub fn forget_for_caller(
     archive: bool,
     caller: &str,
 ) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
         // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -9415,6 +9420,7 @@ pub fn get_links(conn: &Connection, id: &str) -> Result<Vec<MemoryLink>> {
 
 #[allow(dead_code)]
 pub fn delete_link(conn: &Connection, source_id: &str, target_id: &str) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let changed = conn.execute(
         "DELETE FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
         params![source_id, target_id],
@@ -12565,6 +12571,7 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
 /// - the agent is not registered (no `_agents` row for `agent_id`)
 /// - the underlying `UPDATE` fails
 pub fn bind_agent_pubkey(conn: &Connection, agent_id: &str, pubkey_b64: &str) -> Result<()> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let title = crate::models::agent_registration_title(agent_id);
     let now = Utc::now().to_rfc3339();
     let affected = conn.execute(
@@ -12654,6 +12661,7 @@ pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>>
 ///
 /// Surfaces `INSERT` failures.
 pub fn bind_agent_api_key(conn: &Connection, agent_id: &str, token_sha256: &str) -> Result<()> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "INSERT OR REPLACE INTO agent_api_keys (token_sha256, agent_id, bound_at)
@@ -12949,6 +12957,7 @@ pub fn append_lineage_record(
     record: &crate::identity::lineage::LineageRecord,
     signature: &[u8],
 ) -> Result<()> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     use crate::identity::lineage::{LineageReason, RecoveryPolicy, verify_succession};
 
     if record.agent_id != agent_id {
@@ -13373,6 +13382,7 @@ pub fn enroll_lineage(
     keypair: &crate::identity::keypair::AgentKeypair,
     recovery_pubkey_b64: Option<&str>,
 ) -> Result<crate::identity::lineage::LineageRecord> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     if !keypair.can_sign() {
         anyhow::bail!("keypair for '{agent_id}' is public-only — cannot self-sign a genesis");
     }
@@ -13766,6 +13776,7 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
 /// behavior #1869 pure-recall removed; pinned by
 /// `tests/recall_purity_p01.rs`).
 pub fn gc_if_needed(conn: &Connection, archive: bool) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     let has_expired: bool = conn
         .query_row(
@@ -13814,6 +13825,7 @@ const SQL_GC_EXPIRED_CHUNK_IDS: &str = "SELECT id FROM memories \
      ORDER BY rowid LIMIT ?2";
 
 pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     // #2308 (FBL-04) — fold-before-gc at the eviction chokepoint. With
     // recall pure (#1869), a recalled row's TTL floor-extension lives
     // in unfolded `recall_observations` rows until a fold applies it,
@@ -14077,6 +14089,7 @@ pub fn size_gc(
     max_corpus_bytes: i64,
     archive: bool,
 ) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     // Disabled-cap guard: a non-positive cap is a no-op. The curator
     // gates on `Option::is_some`, so this only fires on a misconfigured
     // explicit `<= 0` cap — fail safe (evict nothing) rather than panic.
@@ -14408,6 +14421,7 @@ fn canonical_archived_expiry(conn: &Connection, id: &str) -> Result<Option<Strin
 }
 
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     let _erasure_guard = crate::erasure::archive_sync::coordination_lock_if_enabled(conn)?;
     let write_txn = connection::WriteTxn::begin(conn)?;
@@ -14644,6 +14658,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
 /// by this helper. Returns `Ok(false)` on a non-owner attempt so the
 /// surface cannot be used to probe other owners' archived ids.
 pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     let _erasure_guard = crate::erasure::archive_sync::coordination_lock_if_enabled(conn)?;
     let write_txn = connection::WriteTxn::begin(conn)?;
@@ -15104,6 +15119,7 @@ pub fn purge_archive_scoped(
     namespace: Option<&str>,
     older_than_days: Option<i64>,
 ) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let (where_clause, binds) = archive_purge_predicate(namespace, older_than_days)?;
     let sql_params: Vec<&dyn rusqlite::types::ToSql> = binds
         .iter()
@@ -15113,6 +15129,7 @@ pub fn purge_archive_scoped(
 }
 
 pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     purge_archive_scoped(conn, None, older_than_days)
 }
 
@@ -15142,6 +15159,7 @@ pub fn purge_archive_for_caller(
     caller: &str,
     older_than_days: Option<i64>,
 ) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     match older_than_days {
         Some(days) if days < 0 => {
             // #962 typed envelope.
@@ -16223,6 +16241,7 @@ pub fn reject_unattributed_embedding_space(op: &str, space: &str) -> Result<()> 
 /// dimensionality differs from what the namespace established, or the
 /// underlying SQLite error on failure.
 pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32], space: &str) -> Result<()> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     // Resolve namespace + check the dim invariant before mutating.
     let namespace: Option<String> = conn
         .query_row(
@@ -16304,6 +16323,7 @@ pub fn set_embeddings_batch(
     entries: &[(String, Vec<f32>)],
     space: &str,
 ) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     if entries.is_empty() {
         return Ok(0);
     }
@@ -19241,6 +19261,7 @@ pub fn set_namespace_standard(
     standard_id: &str,
     parent: Option<&str>,
 ) -> Result<()> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     // Verify the memory exists (but allow cross-namespace — shared policy)
     let _mem = get(conn, standard_id)?.ok_or_else(|| {
         // #962 typed envelope — 404 NOT_FOUND.
@@ -19345,6 +19366,7 @@ pub fn get_namespace_meta_entry(
 
 /// Clear the standard for a namespace.
 pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let changed = conn.execute(
         "DELETE FROM namespace_meta WHERE namespace = ?1",
         params![namespace],
@@ -20434,6 +20456,7 @@ pub fn queue_pending_action(
 /// never matches), while the legitimate re-push of an originator's own row
 /// (identical `requested_by`) still converges.
 pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let payload_json = serde_json::to_string(&pa.payload)?;
     conn.execute(
         "INSERT INTO pending_actions
@@ -20550,6 +20573,7 @@ pub fn decide_pending_action(
     approve: bool,
     decided_by: &str,
 ) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let new_status = if approve { "approved" } else { "rejected" };
     let now = Utc::now().to_rfc3339();
     let updated = conn.execute(
@@ -20809,6 +20833,7 @@ pub fn approve_with_approver_type(
     approver_agent_id: &str,
     surface: ApproveSurface,
 ) -> Result<ApproveOutcome> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #1620 — typed NotFound (was Rejected → 403; postgres 404'd).
         return Ok(ApproveOutcome::NotFound);
@@ -21053,6 +21078,7 @@ fn refuse_unapproved_destination_store(
 }
 
 pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Option<String>> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #962 typed envelope — 404 NOT_FOUND.
         return Err(anyhow::Error::new(StorageError::PendingActionNotFound {

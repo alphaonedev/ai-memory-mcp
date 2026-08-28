@@ -155,6 +155,7 @@ pub fn row_to_signal(r: &rusqlite::Row<'_>) -> rusqlite::Result<Signal> {
 /// # Errors
 /// Propagates the `rusqlite` insert error.
 pub fn insert(conn: &Connection, signal: &Signal) -> rusqlite::Result<String> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     conn.execute(
         "INSERT INTO signals \
             (id, namespace, from_agent, to_agent, subject, body, signal_type, \
@@ -267,6 +268,7 @@ pub fn thread(conn: &Connection, correlation_id: &str) -> rusqlite::Result<Vec<S
 /// # Errors
 /// Propagates the `rusqlite` delete error.
 pub fn prune_expired(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     let n = conn.execute(
         "DELETE FROM signals WHERE expires_at IS NOT NULL AND expires_at <= ?1",
         params![now],
@@ -280,6 +282,7 @@ pub fn prune_expired(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
 /// # Errors
 /// Propagates the `rusqlite` update error.
 pub fn mark_delivered(conn: &Connection, id: &str, now: i64) -> rusqlite::Result<bool> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     let n = conn.execute(
         "UPDATE signals SET delivered_at = ?1 WHERE id = ?2 AND delivered_at IS NULL",
         params![now, id],
@@ -293,6 +296,7 @@ pub fn mark_delivered(conn: &Connection, id: &str, now: i64) -> rusqlite::Result
 /// # Errors
 /// Propagates the `rusqlite` update error.
 pub fn mark_read(conn: &Connection, id: &str, now: i64) -> rusqlite::Result<bool> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     let n = conn.execute(
         "UPDATE signals SET read_at = ?1 WHERE id = ?2 AND read_at IS NULL",
         params![now, id],
@@ -306,6 +310,7 @@ pub fn mark_read(conn: &Connection, id: &str, now: i64) -> rusqlite::Result<bool
 /// # Errors
 /// Propagates the `rusqlite` update error.
 pub fn mark_acked(conn: &Connection, id: &str, now: i64) -> rusqlite::Result<bool> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     let n = conn.execute(
         "UPDATE signals SET acknowledged_at = ?1 WHERE id = ?2 AND acknowledged_at IS NULL",
         params![now, id],

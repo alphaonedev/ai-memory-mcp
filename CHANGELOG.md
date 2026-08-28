@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-2 B6 — CLASS-level record-stop completeness)
+
+- Every mutating SSOT write free-fn now calls `gate_storage_conn` at
+  the top (`forget`, `archive_*`, `restore_archived`, `dequarantine`,
+  `delete_link`, `bind_agent_pubkey`, `append_lineage_record`,
+  `purge_archive*`, `set_embedding`, `set/clear_namespace_standard`,
+  pending-action execute/approve, `gc`, …). Coordination plane is
+  gated at the sqlite SSOT (`actions` / `signals` / `checkpoints` /
+  `routines`) via `gate_storage_conn_rusqlite`, and at both SAL
+  adapters (`gate_record_stop`). MCP `tools/call` refuses non-read
+  tools at dispatch (fail-closed for a future write tool). Pins:
+  `mutating_ssot_funnels_refuse_under_record_stop_b6`,
+  `mcp_dispatch_fail_closed_record_stop_b6`,
+  `coordination_sal_write_methods_gate_record_stop_b6`. Retracts the
+  B5 "completes the kill switch" overclaim.
+
 ### Security (Wave-2 B5 — record-stop CHOKEPOINT at sync_push write-dispatch)
 
 - **`/sync/push` sqlite path** now calls `refuse_if_record_stopped` once

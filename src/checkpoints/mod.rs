@@ -84,6 +84,7 @@ pub fn store_resolution_attestation(
     signature: &[u8],
     resolver_pubkey: &[u8],
 ) -> rusqlite::Result<()> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     conn.execute(
         "UPDATE checkpoints SET signature = ?1, resolver_pubkey = ?2 WHERE id = ?3",
         params![signature, resolver_pubkey, id],
@@ -186,6 +187,7 @@ pub fn row_to_checkpoint(r: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> 
 /// # Errors
 /// Propagates the `rusqlite` insert error.
 pub fn insert(conn: &Connection, cp: &Checkpoint) -> rusqlite::Result<String> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     conn.execute(
         "INSERT INTO checkpoints \
             (id, namespace, title, condition_type, condition, state, created_by, \
@@ -390,6 +392,7 @@ pub fn resolve(
     resolved_at: i64,
     keypair: Option<&AgentKeypair>,
 ) -> rusqlite::Result<ResolveOutcome> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     let n = conn.execute(
         RESOLVE_CAS_SQL,
         params![
@@ -576,6 +579,7 @@ pub fn apply_inbound_resolution(
     conn: &Connection,
     incoming: &Checkpoint,
 ) -> rusqlite::Result<InboundResolutionOutcome> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     // Step 0 — PR-1 / L5 (#2708-sibling, CWE-284): refuse a resolution touching a
     // substrate-RESERVED anchor at the CAS FUNNEL, so EVERY caller of this
     // function (the sqlite `/sync/push` loop today, any future path) is closed.

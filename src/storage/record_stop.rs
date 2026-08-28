@@ -3,11 +3,17 @@
 
 //! #1955 [P1][R45] — substrate **record-stop** actuator (storage layer).
 //!
-//! A record-plane stop primitive: when engaged, every *mutating*
-//! record-plane operation (store / update / link / delete / promote /
-//! consolidate — plus the federation-receive convergence writes)
-//! REFUSES with a typed error. On the bare-`Connection` `db::` funnel
-//! that the MCP stdio path uses the refusal is
+//! A record-plane stop primitive: when engaged, mutating record-plane
+//! operations REFUSE with a typed error. Coverage is the SSOT write
+//! free-fns that call [`gate_storage_conn`] (store / update / link /
+//! delete / promote / consolidate / forget / archive / lineage bind /
+//! pending-action / namespace-standard / embedding, plus the
+//! federation-receive `/sync/push` chokepoint) AND the coordination
+//! mutations (`crate::actions` create / transition / add_edge / lease_*;
+//! `crate::signals` insert / ack / prune; `crate::checkpoints` insert /
+//! resolve; `crate::routines` insert / freeze / run) AND the MCP
+//! `tools/call` dispatch fence for non-read tools. On the
+//! bare-`Connection` `db::` funnel that the MCP stdio path uses the refusal is
 //! [`crate::storage::StorageError::RecordStopped`]; the SAL trait
 //! surface maps the same stop state to `StoreError::Stopped` (see the
 //! sal-gated `crate::store::record_stop` wrapper). **Reads stay live**
@@ -290,6 +296,15 @@ pub fn gate_storage_conn(conn: &rusqlite::Connection) -> Result<(), crate::stora
         }
         None => Ok(()),
     }
+}
+
+/// Wave-2 B6 — rusqlite-shaped twin of [`gate_storage_conn`] for the
+/// coordination free-fn SSOTs (`actions` / `signals` / `checkpoints` /
+/// `routines`). Maps [`crate::storage::StorageError::RecordStopped`]
+/// through `ToSqlConversionFailure` so MCP + SAL callers still see a
+/// typed stop in the error chain (ERRORS-09).
+pub fn gate_storage_conn_rusqlite(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    gate_storage_conn(conn).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
 }
 
 /// Persist + apply a record-stop actuation on the sqlite backend:

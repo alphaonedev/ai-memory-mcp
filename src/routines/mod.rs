@@ -154,6 +154,7 @@ pub fn row_to_routine(r: &rusqlite::Row<'_>) -> rusqlite::Result<Routine> {
 /// # Errors
 /// Propagates the `rusqlite` insert error.
 pub fn routine_insert(conn: &Connection, rt: &Routine) -> rusqlite::Result<String> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     conn.execute(
         "INSERT INTO routines \
             (id, namespace, name, template, parameters, state, created_by, \
@@ -247,6 +248,7 @@ pub fn routine_freeze(
     frozen_at: i64,
     keypair: Option<&AgentKeypair>,
 ) -> rusqlite::Result<Option<Routine>> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     // Only flip a Draft → Frozen (set frozen_at on the transition); an
     // already-frozen routine keeps its original frozen_at (idempotent no-op
     // update). A missing id → `None`.
@@ -309,6 +311,7 @@ pub fn row_to_routine_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RoutineRun>
 /// # Errors
 /// Propagates the `rusqlite` insert error.
 pub fn run_insert(conn: &Connection, run: &RoutineRun) -> rusqlite::Result<String> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     conn.execute(
         "INSERT INTO routine_runs \
             (id, routine_id, namespace, arguments, state, created_action_ids, \
@@ -379,6 +382,7 @@ pub fn run_set_state(
     created_action_ids: Option<&serde_json::Value>,
     error: Option<&str>,
 ) -> rusqlite::Result<Option<RoutineRun>> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
     // COALESCE-style partial update: each optional column is overwritten only
     // when the corresponding argument is `Some` (`?N IS NOT NULL` guard keeps
     // the existing value otherwise), so a state-only advance never clobbers a
