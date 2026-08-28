@@ -32,6 +32,11 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 /// Invalid method parameter(s) (spec `-32602 Invalid params`).
 pub const INVALID_PARAMS: i64 = -32602;
 
+/// Internal JSON-RPC error (spec `-32603 Internal error`). Used for
+/// application refusals that are not a protocol violation, e.g. a
+/// record-stop write fence on `tools/call`.
+pub const INTERNAL_ERROR: i64 = -32603;
+
 /// MCP protocol revision advertised in the `initialize` result's
 /// `protocolVersion` field.
 pub const PROTOCOL_REVISION: &str = "2024-11-05";

@@ -153,6 +153,7 @@ pub fn sweep_pending_action_timeouts(
     conn: &Connection,
     global_default_secs: i64,
 ) -> Result<Vec<(String, String)>> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     // Step 1 — find candidates. We compute age in SQL via julianday()
     // arithmetic so the sweep is index-friendly and avoids parsing
     // every `requested_at` row in Rust. The composite index

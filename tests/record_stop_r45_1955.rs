@@ -31,12 +31,16 @@
 //! - Federation-receive IS stopped (the "atomic write-fence" — inbound
 //!   convergence pauses under record-stop).
 
+use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ai_memory::models::{
-    ActionState, ConfidenceSource, Memory, MemoryKind, MemoryLink, MemoryLinkRelation, Tier,
+    Action, ActionState, Checkpoint, CheckpointState, ConditionType, ConfidenceSource, EdgeType,
+    Memory, MemoryKind, MemoryLink, MemoryLinkRelation, Routine, RoutineRun, RoutineRunState,
+    RoutineState, Signal, SignalType, Tier,
 };
+use ai_memory::storage::StorageError;
 use ai_memory::store::record_stop::SCOPE_RECORD_PLANE;
 use ai_memory::store::{CallerContext, Filter, MemoryStore, StoreError, sqlite::SqliteStore};
 use serde_json::json;
@@ -586,4 +590,470 @@ async fn redundant_stop_is_idempotent_no_duplicate_attestation() {
         stop_rows, 1,
         "a redundant stop emits no duplicate attestation"
     );
+}
+
+fn stopped_anyhow(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        e.downcast_ref::<StorageError>()
+            .is_some_and(|s| matches!(s, StorageError::RecordStopped { .. }))
+            || e.to_string().contains("record plane stopped")
+    })
+}
+
+fn stopped_rusqlite(err: &rusqlite::Error) -> bool {
+    let mut cur: Option<&dyn Error> = Some(err);
+    while let Some(e) = cur {
+        if e.downcast_ref::<StorageError>()
+            .is_some_and(|s| matches!(s, StorageError::RecordStopped { .. }))
+            || e.to_string().contains("record plane stopped")
+        {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// Wave-2 B6 — TABLE-DRIVEN completeness: every named mutating SSOT
+/// free-fn refuses under record-stop. A new sibling that is not in this
+/// table AND not gated will not be caught here — add the row when adding
+/// the funnel (the SSOT pin).
+#[allow(clippy::too_many_lines)] // completeness table is the pin; splitting hides siblings
+#[test]
+fn mutating_ssot_funnels_refuse_under_record_stop_b6() {
+    let f = NamedTempFile::new().expect("tempfile");
+    let conn = ai_memory::db::open(f.path()).expect("open");
+    assert!(
+        ai_memory::storage::record_stop::actuate_sqlite(
+            &conn,
+            true,
+            "ai:operator",
+            SCOPE_RECORD_PLANE,
+        )
+        .expect("engage")
+    );
+
+    let mut failures = Vec::new();
+    macro_rules! check_any {
+        ($name:expr, $res:expr) => {{
+            match $res {
+                Ok(_) => failures.push(format!("{} returned Ok under stop", $name)),
+                Err(e) => {
+                    if !stopped_anyhow(&e) {
+                        failures.push(format!("{} err was not RecordStopped: {e}", $name));
+                    }
+                }
+            }
+        }};
+    }
+
+    check_any!(
+        "forget",
+        ai_memory::db::forget(&conn, Some(NS), None, None, false).map(|_| ())
+    );
+    check_any!(
+        "archive_memory",
+        ai_memory::db::archive_memory(&conn, "no-such", None).map(|_| ())
+    );
+    check_any!(
+        "restore_archived",
+        ai_memory::db::restore_archived(&conn, "no-such").map(|_| ())
+    );
+    check_any!(
+        "dequarantine",
+        ai_memory::db::dequarantine(&conn, "no-such").map(|_| ())
+    );
+    check_any!(
+        "delete_link",
+        ai_memory::db::delete_link(&conn, "a", "b").map(|_| ())
+    );
+    check_any!(
+        "bind_agent_pubkey",
+        ai_memory::db::bind_agent_pubkey(&conn, "ai:x", "AAAA")
+    );
+    check_any!(
+        "purge_archive",
+        ai_memory::db::purge_archive(&conn, None).map(|_| ())
+    );
+    check_any!(
+        "purge_archive_for_caller",
+        ai_memory::db::purge_archive_for_caller(&conn, "ai:x", None).map(|_| ())
+    );
+    check_any!(
+        "set_embedding",
+        ai_memory::db::set_embedding(&conn, "no-such", &[0.1], "space")
+    );
+    check_any!(
+        "set_namespace_standard",
+        ai_memory::db::set_namespace_standard(&conn, NS, "no-such", None)
+    );
+    check_any!(
+        "clear_namespace_standard",
+        ai_memory::db::clear_namespace_standard(&conn, NS).map(|_| ())
+    );
+    check_any!("gc", ai_memory::db::gc(&conn, false).map(|_| ()));
+
+    let action = Action {
+        id: "b6-act".into(),
+        namespace: NS.into(),
+        kind: "test".into(),
+        state: ActionState::Pending,
+        title: "t".into(),
+        payload: json!({}),
+        priority: 5,
+        agent_id: Some("ai:x".into()),
+        claimed_by: None,
+        vector_clock: json!({}),
+        metadata: json!({}),
+        created_at: 1,
+        updated_at: 1,
+    };
+    match ai_memory::actions::create(&conn, &action) {
+        Ok(_) => failures.push("actions::create returned Ok under stop".into()),
+        Err(e) => {
+            if !stopped_rusqlite(&e) {
+                failures.push(format!("actions::create err was not RecordStopped: {e}"));
+            }
+        }
+    }
+    match ai_memory::actions::transition(&conn, "b6-act", ActionState::Claimed, None, 2) {
+        Ok(_) => failures.push("actions::transition returned Ok under stop".into()),
+        Err(e) => {
+            if !stopped_rusqlite(&e) {
+                failures.push(format!(
+                    "actions::transition err was not RecordStopped: {e}"
+                ));
+            }
+        }
+    }
+    match ai_memory::actions::add_edge(&conn, "a", "b", EdgeType::Requires, 1) {
+        Ok(_) => failures.push("actions::add_edge returned Ok under stop".into()),
+        Err(e) => {
+            if !stopped_rusqlite(&e) {
+                failures.push(format!("actions::add_edge err was not RecordStopped: {e}"));
+            }
+        }
+    }
+    match ai_memory::actions::lease_acquire(&conn, "b6-act", "h", 1, 2) {
+        Ok(_) => failures.push("actions::lease_acquire returned Ok under stop".into()),
+        Err(e) => {
+            if !stopped_rusqlite(&e) {
+                failures.push(format!(
+                    "actions::lease_acquire err was not RecordStopped: {e}"
+                ));
+            }
+        }
+    }
+    match ai_memory::actions::lease_renew(&conn, "b6-act", "h", 1, 2) {
+        Ok(_) => failures.push("actions::lease_renew returned Ok under stop".into()),
+        Err(e) => {
+            if !stopped_rusqlite(&e) {
+                failures.push(format!(
+                    "actions::lease_renew err was not RecordStopped: {e}"
+                ));
+            }
+        }
+    }
+    match ai_memory::actions::lease_release(&conn, "b6-act", "h") {
+        Ok(_) => failures.push("actions::lease_release returned Ok under stop".into()),
+        Err(e) => {
+            if !stopped_rusqlite(&e) {
+                failures.push(format!(
+                    "actions::lease_release err was not RecordStopped: {e}"
+                ));
+            }
+        }
+    }
+
+    macro_rules! check_rusqlite {
+        ($name:expr, $res:expr) => {{
+            match $res {
+                Ok(_) => failures.push(format!("{} returned Ok under stop", $name)),
+                Err(e) => {
+                    if !stopped_rusqlite(&e) {
+                        failures.push(format!("{} err was not RecordStopped: {e}", $name));
+                    }
+                }
+            }
+        }};
+    }
+
+    let signal = Signal {
+        id: "b6-sig".into(),
+        namespace: NS.into(),
+        from_agent: "ai:x".into(),
+        to_agent: Some("ai:y".into()),
+        subject: "s".into(),
+        body: json!({}),
+        signal_type: SignalType::Notify,
+        in_reply_to: None,
+        correlation_id: None,
+        reference_ids: json!([]),
+        created_at: 1,
+        expires_at: None,
+        delivered_at: None,
+        read_at: None,
+        acknowledged_at: None,
+        signature: vec![],
+        sender_pubkey: vec![],
+    };
+    check_rusqlite!(
+        "signals::insert",
+        ai_memory::signals::insert(&conn, &signal)
+    );
+    check_rusqlite!(
+        "signals::mark_acked",
+        ai_memory::signals::mark_acked(&conn, "b6-sig", 1)
+    );
+    check_rusqlite!(
+        "signals::mark_read",
+        ai_memory::signals::mark_read(&conn, "b6-sig", 1)
+    );
+    check_rusqlite!(
+        "signals::mark_delivered",
+        ai_memory::signals::mark_delivered(&conn, "b6-sig", 1)
+    );
+    check_rusqlite!(
+        "signals::prune_expired",
+        ai_memory::signals::prune_expired(&conn, 1)
+    );
+
+    let checkpoint = Checkpoint {
+        id: "b6-cp".into(),
+        namespace: NS.into(),
+        title: "t".into(),
+        condition_type: ConditionType::Approval,
+        condition: json!({}),
+        state: CheckpointState::Pending,
+        created_by: "ai:x".into(),
+        resolved_by: None,
+        resolution: None,
+        resolution_note: None,
+        signature: vec![],
+        resolver_pubkey: vec![],
+        created_at: 1,
+        deadline_at: None,
+        resolved_at: None,
+        metadata: json!({}),
+    };
+    check_rusqlite!(
+        "checkpoints::insert",
+        ai_memory::checkpoints::insert(&conn, &checkpoint)
+    );
+    check_rusqlite!(
+        "checkpoints::resolve",
+        ai_memory::checkpoints::resolve(
+            &conn,
+            "b6-cp",
+            CheckpointState::Resolved,
+            "ai:x",
+            None,
+            None,
+            1,
+            None,
+        )
+    );
+    check_rusqlite!(
+        "checkpoints::store_resolution_attestation",
+        ai_memory::checkpoints::store_resolution_attestation(&conn, "b6-cp", &[], &[])
+    );
+    check_rusqlite!(
+        "checkpoints::apply_inbound_resolution",
+        ai_memory::checkpoints::apply_inbound_resolution(&conn, &checkpoint)
+    );
+
+    let routine = Routine {
+        id: "b6-rt".into(),
+        namespace: NS.into(),
+        name: "n".into(),
+        template: json!({"actions": []}),
+        parameters: json!([]),
+        state: RoutineState::Draft,
+        created_by: "ai:x".into(),
+        created_at: 1,
+        frozen_at: None,
+        signature: vec![],
+        signer_pubkey: vec![],
+        metadata: json!({}),
+    };
+    check_rusqlite!(
+        "routines::routine_insert",
+        ai_memory::routines::routine_insert(&conn, &routine)
+    );
+    check_rusqlite!(
+        "routines::routine_freeze",
+        ai_memory::routines::routine_freeze(&conn, "b6-rt", 1, None)
+    );
+    let run = RoutineRun {
+        id: "b6-run".into(),
+        routine_id: "b6-rt".into(),
+        namespace: NS.into(),
+        arguments: json!({}),
+        state: RoutineRunState::Pending,
+        created_action_ids: json!([]),
+        started_at: 1,
+        finished_at: None,
+        error: None,
+        metadata: json!({}),
+    };
+    check_rusqlite!(
+        "routines::run_insert",
+        ai_memory::routines::run_insert(&conn, &run)
+    );
+    check_rusqlite!(
+        "routines::run_set_state",
+        ai_memory::routines::run_set_state(
+            &conn,
+            "b6-run",
+            RoutineRunState::Failed,
+            None,
+            None,
+            None
+        )
+    );
+
+    check_any!(
+        "size_gc",
+        ai_memory::db::size_gc(&conn, NS, 1, false).map(|_| ())
+    );
+    check_any!(
+        "sweep_pending_action_timeouts",
+        ai_memory::db::sweep_pending_action_timeouts(&conn, 60).map(|_| ())
+    );
+
+    assert!(
+        failures.is_empty(),
+        "B6 completeness failures:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// Wave-2 B6 — MCP dispatch fail-closed: write tools (including
+/// `memory_routine_*` create/freeze/run) are NOT in the read-only
+/// allowlist, and `tools/call` calls `gate_storage_conn` before dispatch.
+#[test]
+fn mcp_dispatch_fail_closed_record_stop_b6() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/mod.rs"),
+    )
+    .expect("read mcp/mod.rs");
+    let start = src
+        .find("fn mcp_tool_is_read_only")
+        .expect("mcp_tool_is_read_only must exist");
+    let allow = src[start..].split("\n}\n").next().expect("allowlist body");
+    for write in [
+        "MEMORY_FORGET",
+        "MEMORY_STORE",
+        "MEMORY_ROUTINE_CREATE",
+        "MEMORY_ROUTINE_FREEZE",
+        "MEMORY_ROUTINE_RUN",
+        "MEMORY_SIGNAL_SEND",
+        "MEMORY_SIGNAL_ACK",
+        "MEMORY_CHECKPOINT_CREATE",
+        "MEMORY_CHECKPOINT_RESOLVE",
+        "MEMORY_ACTION_CREATE",
+        "MEMORY_ACTION_TRANSITION",
+        "MEMORY_LEASE_ACQUIRE",
+    ] {
+        assert!(
+            !allow.contains(write),
+            "{write} must not be classified read-only (fail-closed write)"
+        );
+    }
+    for read in [
+        "MEMORY_RECALL",
+        "MEMORY_ROUTINE_LIST",
+        "MEMORY_ROUTINE_STATUS",
+        "MEMORY_SIGNAL_INBOX",
+        "MEMORY_SIGNAL_READ",
+        "MEMORY_CHECKPOINT_QUERY",
+        "MEMORY_ACTION_GET",
+    ] {
+        assert!(
+            allow.contains(read),
+            "{read} must stay live under record-stop"
+        );
+    }
+    let dispatch = src
+        .split("Wave-2 B6 — MCP dispatch-layer record-stop fence")
+        .nth(1)
+        .expect("MCP tools/call must carry the B6 dispatch fence");
+    assert!(
+        dispatch.contains("if !mcp_tool_is_read_only(tool_name)"),
+        "dispatch must fail-closed on non-read tools"
+    );
+    assert!(
+        dispatch.contains("gate_storage_conn(conn)"),
+        "dispatch must call gate_storage_conn"
+    );
+}
+
+/// Wave-2 B6 — both SAL adapters must fence coordination-plane writes
+/// at `gate_record_stop` (postgres is sqlx-native; sqlite is defense
+/// in depth on top of the rusqlite SSOT). A new sibling method that
+/// is not in this list will not be caught — add the name when adding
+/// the funnel.
+#[test]
+fn coordination_sal_write_methods_gate_record_stop_b6() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (file, methods) in [
+        (
+            "src/store/postgres.rs",
+            &[
+                "async fn action_create",
+                "async fn action_transition(",
+                "async fn action_add_edge",
+                "async fn lease_acquire",
+                "async fn lease_renew",
+                "async fn lease_release",
+                "async fn signal_send",
+                "async fn signal_ack",
+                "async fn checkpoint_create",
+                "async fn checkpoint_resolve",
+                "async fn routine_create",
+                "async fn routine_freeze",
+                "async fn routine_run_create",
+                "async fn routine_run_set_state",
+                "async fn run_gc",
+                "async fn size_gc",
+            ][..],
+        ),
+        (
+            "src/store/sqlite.rs",
+            &[
+                "async fn action_create",
+                "async fn signal_send",
+                "async fn checkpoint_create",
+                "async fn routine_create",
+                "async fn routine_freeze",
+                "async fn run_gc",
+                "async fn size_gc",
+            ][..],
+        ),
+        ("src/routines/mod.rs", &["gate_storage_conn_rusqlite"][..]),
+        (
+            "src/checkpoints/mod.rs",
+            &["gate_storage_conn_rusqlite"][..],
+        ),
+        ("src/signals/mod.rs", &["gate_storage_conn_rusqlite"][..]),
+        ("src/actions/mod.rs", &["gate_storage_conn_rusqlite"][..]),
+    ] {
+        let src = std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| {
+            panic!("read {file}: {e}");
+        });
+        for method in methods {
+            if *method == "gate_storage_conn_rusqlite" {
+                assert!(src.contains(method), "{file} must call {method}");
+                continue;
+            }
+            let idx = src.find(method).unwrap_or_else(|| {
+                panic!("{file} must contain {method}");
+            });
+            let window = &src[idx..src.len().min(idx.saturating_add(500))];
+            assert!(
+                window.contains("gate_record_stop"),
+                "{file} {method} must call gate_record_stop in the first 500 bytes"
+            );
+        }
+    }
 }

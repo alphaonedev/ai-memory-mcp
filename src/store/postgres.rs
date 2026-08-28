@@ -24030,6 +24030,7 @@ impl MemoryStore for PostgresStore {
         agent_id: &str,
         pubkey_b64: &str,
     ) -> StoreResult<()> {
+        self.gate_record_stop().await?;
         // #626 Layer-3 (Task 1.3 / C3) — parity with
         // `db::bind_agent_pubkey` on the sqlite path. Read the existing
         // `_agents` row metadata, augment it with `agent_pubkey` +
@@ -24291,6 +24292,7 @@ impl MemoryStore for PostgresStore {
         record: &crate::identity::lineage::LineageRecord,
         signature: &[u8],
     ) -> StoreResult<()> {
+        self.gate_record_stop().await?;
         use crate::identity::lineage::{LineageReason, verify_succession};
         use crate::models::AGENTS_NAMESPACE;
 
@@ -24687,6 +24689,7 @@ impl MemoryStore for PostgresStore {
         tier: Option<&Tier>,
         archive: bool,
     ) -> StoreResult<usize> {
+        self.gate_record_stop().await?;
         if namespace.is_none() && pattern.is_none() && tier.is_none() {
             return Err(StoreError::InvalidInput {
                 detail: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
@@ -26092,6 +26095,7 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         action: &crate::models::Action,
     ) -> StoreResult<String> {
+        self.gate_record_stop().await?;
         // #1709 Pillar 1 — JSON columns stored as TEXT (parity with sqlite).
         sqlx::query(
             "INSERT INTO actions \
@@ -26141,6 +26145,7 @@ impl MemoryStore for PostgresStore {
         claimed_by: Option<&str>,
         now: i64,
     ) -> StoreResult<crate::models::Action> {
+        self.gate_record_stop().await?;
         let mut tx = self
             .pool
             .begin()
@@ -26279,6 +26284,7 @@ impl MemoryStore for PostgresStore {
         edge_type: crate::models::EdgeType,
         now: i64,
     ) -> StoreResult<()> {
+        self.gate_record_stop().await?;
         // #3008 — refuse a self-edge / ordering-cycle edge (would wedge the
         // frontier) BEFORE the insert, mirroring the sqlite free-fn guards.
         if from_action == to_action {
@@ -26440,6 +26446,7 @@ impl MemoryStore for PostgresStore {
         now: i64,
         expires_at: i64,
     ) -> StoreResult<crate::models::Lease> {
+        self.gate_record_stop().await?;
         let mut tx = self
             .pool
             .begin()
@@ -26510,6 +26517,7 @@ impl MemoryStore for PostgresStore {
         now: i64,
         expires_at: i64,
     ) -> StoreResult<crate::models::Lease> {
+        self.gate_record_stop().await?;
         let n = sqlx::query(
             "UPDATE leases SET expires_at = $1, heartbeat_at = $2 \
               WHERE action_id = $3 AND holder = $4",
@@ -26541,6 +26549,7 @@ impl MemoryStore for PostgresStore {
         action_id: &str,
         holder: &str,
     ) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
         let n = sqlx::query("DELETE FROM leases WHERE action_id = $1 AND holder = $2")
             .bind(action_id)
             .bind(holder)
@@ -26567,6 +26576,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn lease_sweep_expired(&self, now: i64) -> StoreResult<usize> {
+        self.gate_record_stop().await?;
         use sqlx::Row;
         // #2371 — `RETURNING` makes the reclaimed set EXACTLY the rows deleted
         // (atomic; no SELECT-then-DELETE TOCTOU), so the FORCED reclamation
@@ -26666,6 +26676,7 @@ impl MemoryStore for PostgresStore {
         &self,
         default_secs: i64,
     ) -> StoreResult<Vec<(String, String)>> {
+        self.gate_record_stop().await?;
         use sqlx::Row;
         // FBL-22 — backend twin of the sqlite `db::sweep_pending_action_timeouts`
         // free fn. A non-positive global default disables the sweeper (operator
@@ -26711,6 +26722,7 @@ impl MemoryStore for PostgresStore {
         signal: &crate::models::Signal,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
+        self.gate_record_stop().await?;
         // #1709 Pillar 1 — JSON columns (body, reference_ids) stored as TEXT
         // (parity with sqlite); signature/sender_pubkey are BYTEA. Mirror
         // `link_signed`: sign a clone when a signing keypair is present, else
@@ -26833,6 +26845,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn signal_ack(&self, _ctx: &CallerContext, id: &str, now: i64) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
         let res = sqlx::query(
             "UPDATE signals SET acknowledged_at = $1 WHERE id = $2 AND acknowledged_at IS NULL",
         )
@@ -26849,6 +26862,7 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         cp: &crate::models::Checkpoint,
     ) -> StoreResult<String> {
+        self.gate_record_stop().await?;
         // #1709 Pillar 1 — JSON columns (condition, metadata) stored as TEXT
         // (parity with sqlite); signature/resolver_pubkey are BYTEA, persisted
         // verbatim (empty for an unattested checkpoint).
@@ -26936,6 +26950,7 @@ impl MemoryStore for PostgresStore {
         resolved_at: i64,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<crate::checkpoints::ResolveOutcome> {
+        self.gate_record_stop().await?;
         use crate::checkpoints::ResolveOutcome;
         // #2995 — FIRST-RESOLUTION-WINS: the `AND state = 'pending'` guard is the
         // postgres twin of the sqlite `RESOLVE_CAS_SQL`, so an already-resolved
@@ -27048,6 +27063,7 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         r: &crate::models::Routine,
     ) -> StoreResult<String> {
+        self.gate_record_stop().await?;
         // #1709 Pillar 1 — JSON columns (template, parameters, metadata)
         // stored as TEXT (parity with sqlite); signature/signer_pubkey are
         // BYTEA, persisted verbatim (empty for an unfrozen Draft routine).
@@ -27125,6 +27141,7 @@ impl MemoryStore for PostgresStore {
         frozen_at: i64,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<Option<crate::models::Routine>> {
+        self.gate_record_stop().await?;
         // Only flip a Draft → Frozen (set frozen_at on the transition); an
         // already-frozen routine keeps its original frozen_at. The UPDATE is a
         // no-op on a frozen / missing row, so RETURNING yields no row in those
@@ -27183,6 +27200,7 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         run: &crate::models::RoutineRun,
     ) -> StoreResult<String> {
+        self.gate_record_stop().await?;
         sqlx::query(
             "INSERT INTO routine_runs \
                 (id, routine_id, namespace, arguments, state, created_action_ids, \
@@ -27252,6 +27270,7 @@ impl MemoryStore for PostgresStore {
         created_action_ids: Option<&serde_json::Value>,
         error: Option<&str>,
     ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        self.gate_record_stop().await?;
         // COALESCE-style partial update: each optional column is overwritten
         // only when the corresponding argument is `Some`, so a state-only
         // advance never clobbers a previously-set column. RETURNING yields the
@@ -27279,6 +27298,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
+        self.gate_record_stop().await?;
         // #1026 (CRITICAL, 2026-05-21): wrap archive-INSERT + live-DELETE
         // in a single transaction. Pre-#1026 each statement auto-committed
         // on the unwrapped pool — a crash, statement_timeout, or pool
@@ -27511,6 +27531,7 @@ impl MemoryStore for PostgresStore {
         max_corpus_bytes: i64,
         archive: bool,
     ) -> StoreResult<usize> {
+        self.gate_record_stop().await?;
         // v0.8.0 Pillar-2.5 (#1709) — corpus byte-cap eviction, the
         // postgres twin of `crate::storage::size_gc`. Same metric
         // (`SUM(length(title)+length(content)+length(metadata))` over the
@@ -27675,6 +27696,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn archive_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
         let mut tx = self
             .pool
             .begin()
@@ -28040,6 +28062,7 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         older_than_days: Option<i64>,
     ) -> StoreResult<usize> {
+        self.gate_record_stop().await?;
         if let Some(days) = older_than_days {
             if days < 0 {
                 return Err(StoreError::InvalidInput {
@@ -28126,6 +28149,7 @@ impl MemoryStore for PostgresStore {
         ids: &[String],
         reason: Option<&str>,
     ) -> StoreResult<usize> {
+        self.gate_record_stop().await?;
         if ids.is_empty() {
             return Ok(0);
         }

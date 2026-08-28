@@ -115,8 +115,10 @@ triggers re-cert** (see §7).
 > `src/handlers/federation_signing_check.rs` now refuse `/sync/push`
 > writes at ONE record-stop CHOKEPOINT (sqlite:
 > `refuse_if_record_stopped` after the db lock; SAL:
-> `record_stop_status` before the apply loops). Completes the kill
-> switch B2 left partial (memory plane only). Additive
+> `record_stop_status` before the apply loops). That closed the
+> federation-receive sibling class B2 left open; it did **not**
+> complete the kill switch (forget / archive / action / lease /
+> MCP-stdio write planes were still ungated — Wave-2 B6). Additive
 > security-hardening — no wire/schema/`AI_MEMORY_FED_*` identifier
 > add/remove/rename, no certified control removed. This amendment
 > discharges the §7 trigger. **This amendment does NOT re-mint the

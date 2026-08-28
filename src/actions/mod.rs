@@ -13,6 +13,12 @@
 use crate::models::Action;
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// Wave-2 B6 — record-stop fence for the coordination-action sqlite
+/// free-fn SSOT. Reads (`get` / `list` / `frontier`) stay live.
+fn gate_record_stop_actions(conn: &Connection) -> rusqlite::Result<()> {
+    crate::storage::record_stop::gate_storage_conn_rusqlite(conn)
+}
+
 /// Outcome of a state-guarded transition (free-fn shared by SAL + MCP).
 ///
 /// The SAL adapter maps these to its `StoreError` variants; the MCP
@@ -74,6 +80,7 @@ pub fn row_to_action(r: &rusqlite::Row<'_>) -> rusqlite::Result<Action> {
 /// # Errors
 /// Propagates the `rusqlite` insert error.
 pub fn create(conn: &Connection, action: &Action) -> rusqlite::Result<String> {
+    gate_record_stop_actions(conn)?;
     conn.execute(
         "INSERT INTO actions \
             (id, namespace, kind, state, title, payload, priority, agent_id, \
@@ -135,6 +142,7 @@ pub fn transition(
     claimed_by: Option<&str>,
     now: i64,
 ) -> rusqlite::Result<TransitionOutcome> {
+    gate_record_stop_actions(conn)?;
     let current: Option<String> = conn
         .query_row(
             "SELECT state FROM actions WHERE id = ?1",
@@ -209,6 +217,7 @@ pub fn transition_cas(
     claimed_by: Option<&str>,
     now: i64,
 ) -> rusqlite::Result<CasOutcome> {
+    gate_record_stop_actions(conn)?;
     // Legality is a static property of the edge — reject illegal edges before
     // touching the row (cheap, and keeps an illegal op from racing a legal one).
     if !from.can_transition_to(to) {
@@ -466,6 +475,7 @@ pub fn add_edge(
     edge_type: crate::models::EdgeType,
     now: i64,
 ) -> rusqlite::Result<AddEdgeOutcome> {
+    gate_record_stop_actions(conn)?;
     if from_action == to_action {
         return Ok(AddEdgeOutcome::SelfEdge);
     }
@@ -579,6 +589,7 @@ pub fn lease_acquire(
     now: i64,
     expires_at: i64,
 ) -> rusqlite::Result<LeaseAcquire> {
+    gate_record_stop_actions(conn)?;
     // The `DO UPDATE` arm's `WHERE` re-derives the acquire predicate against
     // the EXISTING row (`leases.*` = pre-update values): acquisition is
     // permitted only when the current lease is EXPIRED (`expires_at <= now`)
@@ -620,6 +631,7 @@ pub fn lease_renew(
     now: i64,
     expires_at: i64,
 ) -> rusqlite::Result<Option<crate::models::Lease>> {
+    gate_record_stop_actions(conn)?;
     let n = conn.execute(
         "UPDATE leases SET expires_at = ?1, heartbeat_at = ?2 \
           WHERE action_id = ?3 AND holder = ?4",
@@ -638,6 +650,7 @@ pub fn lease_renew(
 /// # Errors
 /// Propagates the `rusqlite` delete error.
 pub fn lease_release(conn: &Connection, action_id: &str, holder: &str) -> rusqlite::Result<bool> {
+    gate_record_stop_actions(conn)?;
     let n = conn.execute(
         "DELETE FROM leases WHERE action_id = ?1 AND holder = ?2",
         params![action_id, holder],
@@ -772,6 +785,7 @@ pub fn sweep_expired_leases(
     conn: &Connection,
     now: i64,
 ) -> rusqlite::Result<Vec<(String, String)>> {
+    gate_record_stop_actions(conn)?;
     Ok(sweep_expired_leases_reclaim(conn, now)?
         .into_iter()
         .map(|(action_id, holder, _requeued)| (action_id, holder))
