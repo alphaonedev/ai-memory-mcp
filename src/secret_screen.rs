@@ -289,21 +289,40 @@ fn redact_aws_keys(content: &str, kinds: &mut Vec<&'static str>) -> Option<Strin
     }
 }
 
+/// True when `token` is a compact JWS: `eyJ` header + three base64url
+/// segments each ≥ 8 chars. Shared by [`redact_jwts`] (detector) and
+/// [`receive_carveout_string_is_attestation_leaf`] (Wave-2 B1 preserve).
+fn looks_like_jwt(token: &str) -> bool {
+    const JWT_HEADER_MARKER: &str = "eyJ";
+    const MIN_SEG_LEN: usize = 8;
+    if !token.starts_with(JWT_HEADER_MARKER) {
+        return false;
+    }
+    let mut n = 0usize;
+    for seg in token.split('.') {
+        if seg.len() < MIN_SEG_LEN {
+            return false;
+        }
+        n += 1;
+        if n > 3 {
+            return false;
+        }
+    }
+    n == 3
+}
+
 /// Redact JWTs: `<seg>.<seg>.<seg>` of base64url chars, each ≥ 8 long, the
 /// first segment starting with `eyJ` (the `{"` JOSE header marker) so we do
 /// not flag arbitrary dotted identifiers.
 fn redact_jwts(content: &str, kinds: &mut Vec<&'static str>) -> Option<String> {
     const JWT_HEADER_MARKER: &str = "eyJ";
-    const MIN_SEG_LEN: usize = 8;
     let mut out = String::with_capacity(content.len());
     let mut search_from = 0usize;
     let mut hit = false;
     while let Some(rel) = content[search_from..].find(JWT_HEADER_MARKER) {
         let start = search_from + rel;
         let token = token_at(content, start);
-        let segs: Vec<&str> = token.split('.').collect();
-        let looks_jwt = segs.len() == 3 && segs.iter().all(|s| s.len() >= MIN_SEG_LEN);
-        if looks_jwt {
+        if looks_like_jwt(token) {
             out.push_str(&content[search_from..start]);
             out.push_str(REDACTION_PLACEHOLDER);
             search_from = start + token.len();
@@ -641,13 +660,29 @@ enum CarveOutMode {
     /// NEVER inside the screened JSON — so the name carve-out protects nothing
     /// here and only opens the bypass.
     ScreenAll,
-    /// Hostile federation-receive MEMORY metadata (#3299): carve-out
-    /// STRING leaves (attestation JWT / Ed25519 b64 — the #1844 envelope)
-    /// are preserved so `convergence_carveout_metadata_survives_*` still
-    /// holds; carved-out OBJECT/ARRAY subtrees are recursed with
-    /// [`Self::ScreenAll`] so a peer cannot smuggle `{api_key: "sk-…"}`
-    /// under `foo_b64`.
+    /// Hostile federation-receive MEMORY metadata (#3299 / Wave-2 B1):
+    /// carve-out STRING leaves are preserved ONLY when they are the
+    /// #626/#1464 envelope (JWT `eyJ…` or a detector-clean bare-base64
+    /// signature). Credential-shaped strings (`PEM`/`-----BEGIN`, `sk-`,
+    /// `ghp_`, `AKIA`, `Bearer `, …) under a `*_b64` key are screened.
+    /// Carved-out OBJECT/ARRAY subtrees still recurse with
+    /// [`Self::ScreenAll`] (#3299).
     ReceiveAttestationLeaves,
+}
+
+/// Wave-2 B1 — a carved-out STRING leaf on the receive path is an
+/// attestation envelope (preserve) iff it is a compact JWT or the
+/// credential detectors report [`ScreenOutcome::Clean`]. Any
+/// `-----BEGIN` blob is rejected even when it is not a private-key
+/// PEM, so a hostile peer cannot hide a key under a certificate-shaped
+/// wrapper. Entropy remains a prefix-token confirmation, never a
+/// standalone trigger ([`screen`]).
+fn receive_carveout_string_is_attestation_leaf(s: &str) -> bool {
+    let t = s.trim();
+    if t.contains(PEM_BEGIN_MARKER) {
+        return false;
+    }
+    looks_like_jwt(t) || matches!(screen(s), ScreenOutcome::Clean)
 }
 
 /// Recursive worker for [`redact_metadata_values`]. Returns `Some(rebuilt)`
@@ -664,7 +699,13 @@ fn redact_value_leaves(val: &serde_json::Value, mode: CarveOutMode) -> Option<se
                 let carved = metadata_key_is_carved_out(k);
                 let preserve = match mode {
                     CarveOutMode::TrustedByName if carved => true,
-                    CarveOutMode::ReceiveAttestationLeaves if carved && v.is_string() => true,
+                    CarveOutMode::ReceiveAttestationLeaves
+                        if carved
+                            && v.as_str()
+                                .is_some_and(receive_carveout_string_is_attestation_leaf) =>
+                    {
+                        true
+                    }
                     _ => false,
                 };
                 if preserve {
@@ -733,11 +774,12 @@ pub fn redact_memory_for_storage(mem: &crate::models::Memory) -> Option<crate::m
     redact_memory_with_carveout(mem, CarveOutMode::TrustedByName)
 }
 
-/// #3299 — federation-RECEIVE memory redact. Same as
+/// #3299 / Wave-2 B1 — federation-RECEIVE memory redact. Same as
 /// [`redact_memory_for_storage`] for content/title/tags, but metadata
-/// uses [`CarveOutMode::ReceiveAttestationLeaves`]: attestation STRING
-/// leaves under `_b64` / known keys survive; hostile OBJECT subtrees
-/// under those keys are screened. Wire this into receive funnels only
+/// uses [`CarveOutMode::ReceiveAttestationLeaves`]: JWT / detector-clean
+/// bare-base64 STRING leaves under `_b64` / known keys survive;
+/// credential-shaped STRING leaves and hostile OBJECT subtrees under
+/// those keys are screened. Wire this into receive funnels only
 /// (`insert_if_newer` / `merge_inbound` / `redact_inbound_before_attestation`).
 #[must_use]
 pub fn redact_memory_for_receive(mem: &crate::models::Memory) -> Option<crate::models::Memory> {
@@ -1196,6 +1238,71 @@ mod tests {
         );
         assert_eq!(SecretScreenMode::parse("garbage"), None);
         assert_eq!(SecretScreenMode::default(), SecretScreenMode::Refuse);
+    }
+
+    #[test]
+    fn looks_like_jwt_pins_compact_jws() {
+        assert!(looks_like_jwt(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N"
+        ));
+        assert!(!looks_like_jwt("eyJtoo-short"));
+        assert!(!looks_like_jwt("not-a-jwt"));
+    }
+
+    #[test]
+    fn receive_carveout_leaf_preserves_jwt_and_clean_b64_not_credentials() {
+        let jwt = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJhaTp0ZXN0IiwiaWF0IjoxNzAwMDAwMDAwfQ.aGVsbG8td29ybGQtc2lnbmF0dXJl";
+        let sig = "MEUCIQDk3l2bQm9xY7vN4pR8sT1uW0zA6cF5gH7jK9lM2nO3pQ==";
+        let sk = "sk-proj-AbCdEf0123456789AbCdEf0123";
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEbody+AAAA\n-----END RSA PRIVATE KEY-----";
+        assert!(receive_carveout_string_is_attestation_leaf(jwt));
+        assert!(receive_carveout_string_is_attestation_leaf(sig));
+        assert!(!receive_carveout_string_is_attestation_leaf(sk));
+        assert!(!receive_carveout_string_is_attestation_leaf(pem));
+        assert!(!receive_carveout_string_is_attestation_leaf(
+            "-----BEGIN CERTIFICATE-----\nMIIBcert\n-----END CERTIFICATE-----"
+        ));
+    }
+
+    #[test]
+    fn receive_redacts_credential_string_under_b64_key_b1() {
+        // First-writer OnceLock: lib tests never seed the mode otherwise.
+        set_screen_mode(SecretScreenMode::Redact);
+        let jwt = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJhaTp0ZXN0IiwiaWF0IjoxNzAwMDAwMDAwfQ.aGVsbG8td29ybGQtc2lnbmF0dXJl";
+        let sig = "MEUCIQDk3l2bQm9xY7vN4pR8sT1uW0zA6cF5gH7jK9lM2nO3pQ==";
+        let sk = "sk-proj-AbCdEf0123456789AbCdEf0123";
+        let mem = crate::models::Memory {
+            metadata: serde_json::json!({
+                "attestation_b64": jwt,
+                "host_signature_b64": sig,
+                "api_key_b64": sk,
+            }),
+            ..Default::default()
+        };
+        let out = redact_memory_for_receive(&mem).expect("credential string leaf must change");
+        assert_eq!(
+            out.metadata
+                .get("attestation_b64")
+                .and_then(serde_json::Value::as_str),
+            Some(jwt),
+            "JWT string leaf must survive receive"
+        );
+        assert_eq!(
+            out.metadata
+                .get("host_signature_b64")
+                .and_then(serde_json::Value::as_str),
+            Some(sig),
+            "bare-base64 signature must survive receive"
+        );
+        let leaked = out.metadata.to_string();
+        assert!(
+            !leaked.contains(sk),
+            "credential-shaped *_b64 string must not persist; got {leaked}"
+        );
+        assert!(
+            leaked.contains(REDACTION_PLACEHOLDER),
+            "credential-shaped *_b64 string must be redacted; got {leaked}"
+        );
     }
 
     #[test]
