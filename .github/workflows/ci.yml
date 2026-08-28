@@ -790,11 +790,22 @@ jobs:
           # exhausted the ubuntu runner disk on c3087e33 with
           # `rustc-LLVM ERROR: No space left on device`; the extra ~10 GiB
           # restores headroom. macOS Check + Coverage were unaffected.
-          # #1407 — add 8 GB swap on /mnt (ephemeral data disk) so the
+          # #1407 — add swap on /mnt (ephemeral data disk) so the
           # heavy lib-test link step has headroom above the ~7 GB RAM
           # ceiling and stops dying with `ld ... signal 7 [Bus error]`.
           # Mirrors the postgres-feature / coverage swap recipe.
-          sudo fallocate -l 8G /mnt/swapfile-1407
+          # 2026-08-28 — 8G was not enough: 605ae49c rerun of this
+          # REQUIRED Check (ubuntu-latest,sqlite) leg died with
+          # `collect2: fatal error: ld terminated with signal 7
+          # [Bus error], core dumped` on the hosted 14/16 GB image
+          # (prior attempt was ENOSPC). 16G is still well inside
+          # /mnt on the hosted image; combined with CARGO_BUILD_JOBS=1
+          # on this leg only (step below) it serialises rustc/ld so
+          # peak RSS stays under the hosted ceiling. Do NOT apply
+          # CARGO_BUILD_JOBS=1 to self-hosted legs (operator topology:
+          # f2 is pg-tier only; macos-fed already covers sqlite on
+          # capable HW).
+          sudo fallocate -l 16G /mnt/swapfile-1407
           sudo chmod 600 /mnt/swapfile-1407
           sudo mkswap /mnt/swapfile-1407
           sudo swapon /mnt/swapfile-1407
@@ -974,6 +985,18 @@ jobs:
           fi
           echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"
           echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"
+
+      # Hosted sqlite Check only — serialise rustc/ld. The REQUIRED
+      # `Check (ubuntu-latest,sqlite)` context chronically ENOSPC / ld
+      # SIGBUS on the 14/16 GB GitHub-hosted image (605ae49c rerun #1
+      # ENOSPC, rerun #2 `ld terminated with signal 7`). macos-fed,sqlite
+      # + linux-fed + coverage + cert are GREEN on the same SHA, so this
+      # is runner capacity, not code. CARGO_BUILD_JOBS=1 is job-env so
+      # cargo audit + the `once` release smoke inherit it. Name and
+      # required-context UNCHANGED.
+      - name: Serialise hosted sqlite compile (CARGO_BUILD_JOBS=1)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.leg == 'ubuntu-latest,sqlite'
+        run: echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
