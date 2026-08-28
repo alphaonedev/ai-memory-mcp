@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (hosted `Check (ubuntu-latest,sqlite)` ld SIGBUS / ENOSPC)
+
+- **Hosted sqlite Check is a REQUIRED context and was chronically
+  resource-crashing on the 14/16 GB GitHub-hosted image** (`ld terminated
+  with signal 7 [Bus error]` on 605ae49c rerun #2; ENOSPC on rerun #1;
+  rustc ICE on earlier passes). Not a code defect: `Check (macos-fed,sqlite)`,
+  linux-fed, coverage, and cert pg+AGE were GREEN on the same SHA. The
+  hosted sqlite leg now sets `CARGO_BUILD_JOBS=1` (serialise rustc/ld;
+  job name / required-context unchanged) and the #1407 `/mnt` swapfile
+  is 16G instead of 8G. Self-hosted legs are untouched (operator topology:
+  f2 is pg-tier only).
+
 ### Security (record-stop fleet kill-switch fail-open — #3276)
 
 - **`#3276` (HIGH) — a postgres write gate now honors a record-stop engaged by
