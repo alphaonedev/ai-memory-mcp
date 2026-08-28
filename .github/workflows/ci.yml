@@ -841,6 +841,16 @@ jobs:
           command -v node    >/dev/null || { echo "::error::node not on PATH on $RUNNER_NAME"; exit 1; }
           echo "python3=$(python3 --version) node=$(node --version)"
 
+      # FAIL CLOSED if rustup is missing on a self-hosted node — see the
+      # `lint` job in ci.yml for the full rationale (#3128 / restore #3293).
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted' && needs.classify.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
       - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
         if: needs.classify.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
