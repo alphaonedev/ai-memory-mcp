@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job name / required-context unchanged) and the #1407 `/mnt` swapfile
   is 16G instead of 8G. Self-hosted legs are untouched (operator topology:
   f2 is pg-tier only).
+- **Follow-up: `CARGO_BUILD_JOBS=1` was not enough.** 5495b547 still died
+  linking `sync_since_visibility_gate_948` with `ld signal 7 [Bus error]`
+  — GNU ld + full debuginfo OOMs *per binary* on the 14/16 GB image; swap
+  cannot save an mmap-heavy link. The hosted sqlite Check now also installs
+  mold (#1148/#3090 pinned tarball, same as coverage.yml) and sets
+  `CARGO_PROFILE_DEV_DEBUG=0` + `RUSTFLAGS=-C debuginfo=0 -C link-arg=-fuse-ld=mold`
+  for that leg only. macos-fed/linux-fed keep debuginfo=1 and the system linker.
 
 ### Security (record-stop fleet kill-switch fail-open — #3276)
 
