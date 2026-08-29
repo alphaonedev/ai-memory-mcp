@@ -891,7 +891,22 @@ pub async fn delete_memory(
         };
         let ctx =
             crate::store::CallerContext::for_agent(agent_id.clone()).with_capability(capability);
-        let target = app.store.get(&ctx, &id).await.ok();
+        // #3228 — a get() transport/DB fault is 503, never "not found".
+        // `.ok()` collapsed every Err onto None, skipped the governance
+        // consult, and still called delete (ERRORS-19 fail-open).
+        // NotFound stays None so a missing row still 404s at delete.
+        let target = match app.store.get(&ctx, &id).await {
+            Ok(mem) => Some(mem),
+            Err(crate::store::StoreError::NotFound { .. }) => None,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    id = %id,
+                    "postgres delete pre-get failed; refusing (#3228)"
+                );
+                return store_err_to_response(e);
+            }
+        };
 
         // F-A2A1.2 (#700) — governance enforcement on the postgres delete
         // path. Mirrors the sqlite gate at line ~1913 below: a denied

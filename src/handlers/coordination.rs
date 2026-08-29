@@ -142,9 +142,23 @@ pub async fn transition_action(
             .into_response();
     };
     let now = chrono::Utc::now().timestamp();
+    if let Some(cb) = body.claimed_by.as_deref()
+        && let Err(e) = crate::validate::validate_agent_id(cb)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::invalid(
+                crate::mcp::param_names::CLAIMED_BY,
+                e,
+            )})),
+        )
+            .into_response();
+    }
 
     // Local write (dual-path): sqlite via app.db + crate::actions (default),
-    // postgres via the SAL trait (under --features sal).
+    // postgres via the SAL trait (under --features sal). The #3009/#3226
+    // lease-holder bind lives inside each local-write helper so sqlite and
+    // postgres cannot drift.
     let local = {
         #[cfg(feature = "sal")]
         {
@@ -241,11 +255,22 @@ pub async fn send_signal(
                 .into_response();
         }
     };
-    let signal_type = body
-        .signal_type
-        .as_deref()
-        .and_then(crate::models::SignalType::from_str)
-        .unwrap_or_default();
+    // #3226 — reject an unknown `signal_type` like MCP `handle_signal_send`
+    // (A6-13 / #3007 sibling). An ABSENT value still defaults; a PRESENT
+    // but unknown token is 400, never silently coerced to `notify`.
+    let signal_type = match body.signal_type.as_deref() {
+        Some(s) => match crate::models::SignalType::from_str(s) {
+            Some(t) => t,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid signal_type: {s}")})),
+                )
+                    .into_response();
+            }
+        },
+        None => crate::models::SignalType::default(),
+    };
     let now = chrono::Utc::now().timestamp();
     // #3011 — wire `signals.expires_at` from an optional `ttl_secs` (validated +
     // overflow-checked), so the gc pruner can reap the caller-declared-ephemeral
@@ -484,6 +509,21 @@ async fn local_transition_via_db(
     now: i64,
 ) -> Result<(crate::models::Action, crate::models::ActionState, String), Response> {
     let lock = app.db.lock().await;
+    if let Some(cb) = claimed_by {
+        let lease = match crate::actions::lease_get(&lock.0, action_id) {
+            Ok(l) => l,
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("lease_get failed: {e}")})),
+                )
+                    .into_response());
+            }
+        };
+        if let Err(msg) = crate::actions::authorize_claimed_by(cb, lease.as_ref(), now, action_id) {
+            return Err((StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response());
+        }
+    }
     let current = match crate::actions::get(&lock.0, action_id) {
         Ok(Some(a)) => a,
         Ok(None) => {
@@ -535,6 +575,15 @@ async fn local_transition_via_store(
     now: i64,
 ) -> Result<(crate::models::Action, crate::models::ActionState, String), Response> {
     let ctx = crate::store::CallerContext::for_agent(node_agent_id.to_string());
+    if let Some(cb) = claimed_by {
+        let lease = match app.store.lease_get(&ctx, action_id).await {
+            Ok(l) => l,
+            Err(e) => return Err(super::store_err_to_response(e)),
+        };
+        if let Err(msg) = crate::actions::authorize_claimed_by(cb, lease.as_ref(), now, action_id) {
+            return Err((StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response());
+        }
+    }
     let current = match app.store.action_get(&ctx, action_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {

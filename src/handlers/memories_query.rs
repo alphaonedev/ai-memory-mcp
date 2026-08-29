@@ -626,13 +626,26 @@ pub async fn forget_memories(
             }
         };
         for ns in &matched {
-            let governed = app
-                .store
-                .resolve_governance_policy(ns)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|p| !matches!(p.core.delete, crate::models::GovernanceLevel::Any));
+            // #3227 — a policy-probe Err is 503, never "ungoverned". `.ok()`
+            // mapped a DB fault onto the ungoverned arm and the forget
+            // proceeded (ERRORS-19 fail-open delete).
+            let governed = match app.store.resolve_governance_policy(ns).await {
+                Ok(policy) => policy
+                    .is_some_and(|p| !matches!(p.core.delete, crate::models::GovernanceLevel::Any)),
+                Err(e) => {
+                    // #3227 — 503, not "ungoverned". A probe that could not
+                    // run is not evidence the namespace is ungoverned.
+                    // Route through `store_err_to_response` (same as #3225
+                    // capture_turn) so the literal is not triplicated and
+                    // the status mapping stays typed (ERRORS-02).
+                    tracing::error!(
+                        error = %e,
+                        namespace = %ns,
+                        "forget governance policy probe failed; refusing (#3227)"
+                    );
+                    return store_err_to_response(e);
+                }
+            };
             if governed {
                 return (
                     StatusCode::FORBIDDEN,

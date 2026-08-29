@@ -79,6 +79,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closed.
 - QUAL-10 lockstep: `src/store/postgres.rs` 39_500 → 39_650
   (never lower).
+### Fixed (B17 BRANCH 2 — HTTP/gov: #3225 #3226 #3227 #3228)
+
+- `#3225` HTTP `POST /api/v1/capture_turn` now honours K9 + namespace
+  governance (Deny → 403, Ask/Pending → 202) before the durable write,
+  matching MCP `memory_capture_turn`. `#3292` M7 unowned-owner-lock
+  Deny is allow-through on both HTTP helpers (MCP parity; HTTP is
+  not stricter).
+- `#3226` HTTP `POST /api/v1/actions/{id}/transition` binds
+  `claimed_by` to the live lease holder (`authorize_claimed_by`) and
+  rejects control-char / non-holder callers (403/400). Shared with MCP
+  `#3009`.
+- `#3227` namespace-less bulk forget: `resolve_governance_policy` Err
+  is 503, not ungoverned (ERRORS-19). Forget does not run.
+- `#3228` postgres HTTP DELETE: non-`NotFound` pre-get Err is 503;
+  governance is not skipped. `NotFound` still 404s at delete.
+
+- Coverage test-drift (#3250): `cid_migration_v74.rs` re-open pin,
+  `recall_purity_p01.rs` tip pin, and `skill_retire_lifecycle.rs`
+  upgrade/re-open pins now expect schema v91 (were still 90 after
+  BRANCH1 advanced the ladder). Migration is correct; the second
+  assertion was missed.
+
+### Tests (B17 BRANCH 2)
+
+- `tests/http_capture_turn_k9_3225.rs` (live-pg twin, ignored without
+  URL); lib `http_capture_turn_respects_namespace_deny`.
+- `tests/http_transition_claimed_by_3226.rs`; lib
+  `authorize_claimed_by_binds_live_holder_3009`.
+- Review follow-up (Fable 3712a9bc): lib
+  `forget_policy_probe_fault_is_503_and_does_not_delete_3227`,
+  `postgres_delete_pre_get_fault_is_503_and_does_not_delete_3228`,
+  `http_capture_turn_k9_ask_returns_202`,
+  `http_capture_turn_namespace_governance_pending_returns_202`.
+  `#3227`/`#3228` Err arms now go through `store_err_to_response`
+  (no third `"storage backend unavailable"` site). HTTP capture_turn
+  Deny reproduces MCP `#3292` M7 unowned-owner-lock allow-through.
 
 ### Fixed (B15 — remaining six CI tests; Approve-arm pending queue)
 
@@ -1206,6 +1242,22 @@ this cluster does not close — the three an adversary can drive are covered.
   an autonomous mutation the caller never named). No postgres synthesis
   lane exists (`memory_store` is sqlite-native). Source:
   `src/mcp/tools/store/{mod,synthesis}.rs`.
+### Security (HTTP/pg governance skip cluster: #3225 capture_turn K9; #3227 forget probe; #3228 pg delete pre-get)
+
+- **#3227 — namespace-less bulk forget treated a `resolve_governance_policy` Err as ungoverned.** `#1849` refuses a cross-namespace forget when any matched ns carries a non-`Any` delete level, but the probe used `.ok().flatten()` so a DB fault skipped the gate and the forget proceeded (ERRORS-19). Probe `Err` is now 503; the forget does not run.
+- **#3228 — postgres HTTP DELETE skipped governance when `get()` failed.** `app.store.get(&ctx, &id).await.ok()` collapsed a transport/DB error to `None`, the `if let Some(mem)` consult was skipped, and `delete` still ran. Non-`NotFound` get errors are now 503; the delete does not run. `NotFound` still 404s at delete.
+
+### Security (HTTP/pg governance skip cluster: #3225 capture_turn K9)
+
+- **#3225 — HTTP `POST /api/v1/capture_turn` skipped the K9 permission gate
+  and namespace governance that MCP `memory_capture_turn` enforces.** The
+  HTTP route ran `prepare_capture_turn` then `capture_turn_idempotent` only
+  (`src/handlers/capture_turn.rs`), so an HTTP client could write a turn into
+  a namespace a Deny rule / `delete`/`write` standard would refuse on MCP.
+  HTTP now mirrors MCP: `Permissions::evaluate` (Deny → 403, Ask → 202) then
+  `enforce_governance` / `enforce_governance_action` (Deny → 403, Pending →
+  202) before the durable write. A dedup-hit is a no-op, so gating first is
+  safe. Pinned by `http_capture_turn_respects_namespace_deny`.
 
 ### Security (CLI-surface parity: sign `link` edges #3036; bind the recall ledger to the CALLER, not a namespace #2988)
 

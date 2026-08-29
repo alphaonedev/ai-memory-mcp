@@ -635,7 +635,10 @@ pub fn canonical_cbor_transition(t: &SignableTransition<'_>) -> Result<Vec<u8>> 
             ciborium::Value::Text(t.from_state.to_string()),
         ),
         ("to_state", ciborium::Value::Text(t.to_state.to_string())),
-        ("claimed_by", text_or_null(t.claimed_by)),
+        (
+            crate::mcp::param_names::CLAIMED_BY,
+            text_or_null(t.claimed_by),
+        ),
         ("nonce", ciborium::Value::Bytes(t.nonce.to_vec())),
         (
             field_names::CREATED_AT,

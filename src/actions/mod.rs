@@ -670,6 +670,37 @@ pub fn lease_get(
         .optional()
 }
 
+/// #3009 / #3226 — shape-validate a caller-supplied `claimed_by` and bind
+/// it to the live lease holder.
+///
+/// A `claimed_by` with embedded control characters is refused (audit
+/// log-injection guard). A live (non-expired) lease whose holder is not
+/// `claimed_by` is refused so two agents cannot each believe they own
+/// the action. `lease = None` (or an expired lease) is the unbound /
+/// lease-free flow — leases are the ownership primitive, so this never
+/// blocks a lease-less transition.
+///
+/// # Errors
+/// Returns a caller-facing string on a shape or holder mismatch.
+pub fn authorize_claimed_by(
+    claimed_by: &str,
+    lease: Option<&crate::models::Lease>,
+    now: i64,
+    action_id: &str,
+) -> Result<(), String> {
+    crate::validate::validate_agent_id(claimed_by).map_err(|e| e.to_string())?;
+    if let Some(lease) = lease
+        && lease.expires_at > now
+        && lease.holder != claimed_by
+    {
+        return Err(format!(
+            "claimed_by '{claimed_by}' is not the live lease holder '{}' on action {action_id}",
+            lease.holder
+        ));
+    }
+    Ok(())
+}
+
 /// `tracing` target for the lease-expiry reclaim/requeue sweep. Hoisted here
 /// (the lowest layer that logs under it) so the background loop
 /// [`crate::background::lease_sweep`] and this module share ONE spelling of
@@ -1486,5 +1517,35 @@ mod tests {
             persisted.holder, winners[0],
             "the persisted holder must be the reported winner"
         );
+    }
+
+    /// #3009 / #3226 — `authorize_claimed_by` shape-validates and binds to
+    /// the live lease holder; an expired or missing lease is unbound.
+    #[test]
+    fn authorize_claimed_by_binds_live_holder_3009() {
+        let live = crate::models::Lease {
+            action_id: "act-1".to_string(),
+            holder: "ai:w1".to_string(),
+            acquired_at: 1,
+            expires_at: 1_000,
+            heartbeat_at: 1,
+        };
+        assert!(authorize_claimed_by("ai:w1", Some(&live), 10, "act-1").is_ok());
+        let err = authorize_claimed_by("ai:w2", Some(&live), 10, "act-1")
+            .expect_err("non-holder must be refused");
+        assert!(
+            err.contains("not the live lease holder"),
+            "holder-mismatch wording, got {err}"
+        );
+        // Expired lease is unbound.
+        let expired = crate::models::Lease {
+            expires_at: 5,
+            ..live.clone()
+        };
+        assert!(authorize_claimed_by("ai:w2", Some(&expired), 10, "act-1").is_ok());
+        // No lease is unbound.
+        assert!(authorize_claimed_by("ai:w2", None, 10, "act-1").is_ok());
+        // Control-char claimed_by is refused even with no lease.
+        assert!(authorize_claimed_by("bad\nid", None, 10, "act-1").is_err());
     }
 }
