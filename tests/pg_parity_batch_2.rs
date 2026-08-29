@@ -464,16 +464,30 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
 
     // Two rows on the SAME source_uri matching the SAME FTS token, differing
     // ONLY in tags + metadata.agent_id.
+    //
+    // #3110: absent `metadata.scope` defaults to private, so a tenant
+    // `CallerContext::for_agent("ai:parity-uri")` cannot see rows owned
+    // by `ai:owner-keep` / `ai:owner-drop`. The axis under test is
+    // `tags_any` / `agent_id` FILTER narrowing, not the visibility
+    // gate — stamp `collective` (world-readable) so the unfiltered
+    // FTS+source_uri sanity query can observe both fixtures. Same
+    // class as the #2384 stale-assert (fixture vs later posture).
     let keep_id = uid("uri-keep");
     let mut keep = mem(&keep_id, &ns, &uid("keep-title"), &format!("{token} keep"));
     keep.tags = vec!["parity-keep".to_string()];
-    keep.metadata = serde_json::json!({"agent_id": "ai:owner-keep"});
+    keep.metadata = serde_json::json!({
+        "agent_id": "ai:owner-keep",
+        "scope": "collective",
+    });
     keep.source_uri = Some(uri.clone());
 
     let drop_id = uid("uri-drop");
     let mut dropped = mem(&drop_id, &ns, &uid("drop-title"), &format!("{token} drop"));
     dropped.tags = vec!["parity-drop".to_string()];
-    dropped.metadata = serde_json::json!({"agent_id": "ai:owner-drop"});
+    dropped.metadata = serde_json::json!({
+        "agent_id": "ai:owner-drop",
+        "scope": "collective",
+    });
     dropped.source_uri = Some(uri.clone());
 
     for m in [&keep, &dropped] {

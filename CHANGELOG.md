@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #3064c postgres export arm (read-only unfiltered twin of sqlite
   `db::get`; Fable security-approved 2026-08-29). Drop stale
   `src/store/postgres.rs:EXPORT_INTERNAL` (site no longer in source).
+### Fixed (B17 Lane 1 — pg search_with_source_uri fixture visibility)
+
+- `pg_search_with_source_uri_honours_tags_any_and_agent_id` fixture
+  sanity expected 2 FTS hits but got `[]`. Not an FTS/tsvector gap:
+  #3110 default-private + owner ≠ `CallerContext` hid both rows.
+  Fixtures now stamp `scope=collective` so the axis under test
+  (`tags_any` / `agent_id` filter narrowing) is observable. Un-reds
+  the postgres-ignored job.
 
 ### Fixed (B17 Lane 1 — #2384 pg catchup fidelity test)
 
