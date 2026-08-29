@@ -863,3 +863,49 @@ pg_test!(pg_memory_dependents_not_501_3064, url, {
     assert_eq!(deps.len(), 1, "body={body}");
     assert_eq!(deps[0]["id"], json!(child), "body={body}");
 });
+
+pg_test!(pg_memory_export_reflection_not_501_3064, url, {
+    // #3064 batch C — pre-fix 501. Seed an observation, reflect, export.
+    let r = pg_router(&url).await;
+    let ns = uniq_ns();
+    let src = seed_memory(&r, &ns, "export-src-3064", "src body").await;
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/memory_reflect",
+        json!({
+            "title": "export-ref-3064",
+            "content": "reflection body",
+            "source_ids": [src],
+            "namespace": ns,
+            "agent_id": CALLER,
+        }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "seed reflect status={status} body={body}"
+    );
+    let rid = body["id"].as_str().expect("reflect returns id").to_string();
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/memory_export_reflection",
+        json!({"memory_id": rid, "format": "json"}),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "pre-#3064c 501; body={body}"
+    );
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(
+        body.get("content").and_then(Value::as_str).is_some(),
+        "export content; body={body}"
+    );
+    assert!(
+        body.get("suggested_filename")
+            .and_then(Value::as_str)
+            .is_some(),
+        "suggested_filename; body={body}"
+    );
+});

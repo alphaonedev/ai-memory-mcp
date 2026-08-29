@@ -92,9 +92,7 @@ fn parse_format_for_mcp(spec: &str) -> Result<ExportFormat, String> {
     match spec.to_lowercase().as_str() {
         "md" | "markdown" => Ok(ExportFormat::Markdown),
         "json" => Ok(ExportFormat::Json),
-        other => Err(format!(
-            "unsupported export format '{other}' (expected 'md' or 'json')"
-        )),
+        other => Err(crate::errors::msg::unsupported_export_format(other)),
     }
 }
 

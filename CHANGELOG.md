@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Never `app.db.lock()`. Inventory 62→63 pg-supported / 20→19 fully-501.
   Remaining #3064 501s (skills ×8, share, atomise, …) stay fail-closed.
 
+### Fixed (B17 Lane 1 — #3064 batch C: export_reflection on postgres)
+
+- `POST /api/v1/memory_export_reflection` is no longer 501 on a
+  postgres daemon. SAL `get` (visibility-bypass, matching sqlite
+  `db::get`) + `list_outbound_reflects_on`; same CLI renderer as MCP.
+  Never `app.db.lock()`. Inventory 63→64 pg-supported / 19→18 fully-501.
+
 ### Changed (B17 Lane 1 — #3274 CI ignored-pg + #3294 Filter pin)
 
 - **#3274:** new workflow `.github/workflows/postgres-ignored.yml`

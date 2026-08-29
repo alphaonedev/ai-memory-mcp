@@ -25243,6 +25243,44 @@ impl MemoryStore for PostgresStore {
         Ok(out)
     }
 
+    async fn list_outbound_reflects_on(
+        &self,
+        memory_id: &str,
+    ) -> StoreResult<Vec<crate::store::OutboundReflectsOn>> {
+        // Twin of sqlite `list_outbound_reflects_on` / MCP
+        // `collect_outbound_reflects_on`. `created_at` is TIMESTAMPTZ —
+        // render micros+Z (#2515 / C1 class).
+        let unsigned = crate::models::AttestLevel::Unsigned.as_str();
+        let rows = sqlx::query(
+            "SELECT target_id, COALESCE(attest_level, $3) AS attest_level, created_at \
+             FROM memory_links \
+             WHERE source_id = $1 AND relation = $2 \
+             ORDER BY created_at ASC",
+        )
+        .bind(memory_id)
+        .bind(crate::models::MemoryLinkRelation::ReflectsOn.as_str())
+        .bind(unsigned)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_outbound_reflects_on", e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let created_at: DateTime<Utc> = row
+                .try_get(field_names::CREATED_AT)
+                .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
+            out.push(crate::store::OutboundReflectsOn {
+                target_id: row
+                    .try_get("target_id")
+                    .map_err(|e| to_store_err("read target_id", e))?,
+                attest_level: row
+                    .try_get(field_names::ATTEST_LEVEL)
+                    .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?,
+                created_at: crate::validate::render_canonical_utc(created_at),
+            });
+        }
+        Ok(out)
+    }
+
     async fn consolidate(
         &self,
         ctx: &CallerContext,

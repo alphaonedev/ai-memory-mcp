@@ -3869,6 +3869,18 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #3064 batch C — outbound `reflects_on` edges from `memory_id`
+    /// (MCP `memory_export_reflection` provenance list). Read-only.
+    /// Default returns `UnsupportedCapability`.
+    async fn list_outbound_reflects_on(
+        &self,
+        _memory_id: &str,
+    ) -> StoreResult<Vec<OutboundReflectsOn>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_OUTBOUND_REFLECTS_ON".to_string(),
+        })
+    }
+
     /// v0.7 J7 / Continuation 6 — enumerate up to `max_results` paths
     /// between two memories, bounded by `max_depth`. Mirrors the
     /// adapter-specific `find_paths` call but lifted to the trait
@@ -4740,6 +4752,17 @@ pub struct InvalidationDependent {
     pub id: String,
     /// Namespace of that dependent row.
     pub namespace: String,
+}
+
+/// #3064 batch C — one outbound `reflects_on` edge for export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundReflectsOn {
+    /// Target memory id of the `reflects_on` edge.
+    pub target_id: String,
+    /// Stored `attest_level` (`unsigned` when the column is NULL).
+    pub attest_level: String,
+    /// Edge `created_at` (canonical micros+Z on postgres).
+    pub created_at: String,
 }
 
 /// #1579 A4 — SAL-level embedding-backfill sweep. Drains every row the
