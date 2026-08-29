@@ -518,11 +518,7 @@ async fn local_transition_via_db(
             }
         };
         if let Err(msg) = crate::actions::authorize_claimed_by(cb, lease.as_ref(), now, action_id) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": msg})),
-            )
-                .into_response());
+            return Err((StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response());
         }
     }
     let current = match crate::actions::get(&lock.0, action_id) {
@@ -582,11 +578,7 @@ async fn local_transition_via_store(
             Err(e) => return Err(super::store_err_to_response(e)),
         };
         if let Err(msg) = crate::actions::authorize_claimed_by(cb, lease.as_ref(), now, action_id) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": msg})),
-            )
-                .into_response());
+            return Err((StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response());
         }
     }
     let current = match app.store.action_get(&ctx, action_id).await {

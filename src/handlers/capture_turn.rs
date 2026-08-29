@@ -116,13 +116,9 @@ pub async fn capture_turn(
             Ok(c) => c,
             Err(resp) => return resp,
         };
-        if let Some(resp) = http_capture_turn_governance_via_store(
-            &app,
-            &write,
-            &agent_id,
-            capability.as_ref(),
-        )
-        .await
+        if let Some(resp) =
+            http_capture_turn_governance_via_store(&app, &write, &agent_id, capability.as_ref())
+                .await
         {
             return resp;
         }
@@ -229,9 +225,12 @@ async fn http_capture_turn_governance_via_store(
         "title": write.memory.title,
         "namespace": ns,
     });
-    if let Some(resp) =
-        super::create::http_pre_governance_decision_gate(ns, "store", agent_id, Some(&write.memory.id))
-    {
+    if let Some(resp) = super::create::http_pre_governance_decision_gate(
+        ns,
+        "store",
+        agent_id,
+        Some(&write.memory.id),
+    ) {
         return Some(resp);
     }
     match app
@@ -292,9 +291,12 @@ fn http_capture_turn_governance_via_db(
         "title": write.memory.title,
         "namespace": ns,
     });
-    if let Some(resp) =
-        super::create::http_pre_governance_decision_gate(ns, "store", agent_id, Some(&write.memory.id))
-    {
+    if let Some(resp) = super::create::http_pre_governance_decision_gate(
+        ns,
+        "store",
+        agent_id,
+        Some(&write.memory.id),
+    ) {
         return Some(resp);
     }
     match crate::db::enforce_governance(

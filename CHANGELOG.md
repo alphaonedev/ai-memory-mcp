@@ -79,6 +79,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closed.
 - QUAL-10 lockstep: `src/store/postgres.rs` 39_500 → 39_650
   (never lower).
+### Fixed (B17 BRANCH 2 — HTTP/gov: #3225 #3226 #3227 #3228)
+
+- `#3225` HTTP `POST /api/v1/capture_turn` now honours K9 + namespace
+  governance (Deny → 403, Ask/Pending → 202) before the durable write,
+  matching MCP `memory_capture_turn`.
+- `#3226` HTTP `POST /api/v1/actions/{id}/transition` binds
+  `claimed_by` to the live lease holder (`authorize_claimed_by`) and
+  rejects control-char / non-holder callers (403/400). Shared with MCP
+  `#3009`.
+- `#3227` namespace-less bulk forget: `resolve_governance_policy` Err
+  is 503, not ungoverned (ERRORS-19). Forget does not run.
+- `#3228` postgres HTTP DELETE: non-`NotFound` pre-get Err is 503;
+  governance is not skipped. `NotFound` still 404s at delete.
+
+### Tests (B17 BRANCH 2)
+
+- `tests/http_capture_turn_k9_3225.rs` (live-pg twin, ignored without
+  URL); lib `http_capture_turn_respects_namespace_deny`.
+- `tests/http_transition_claimed_by_3226.rs`; lib
+  `authorize_claimed_by_binds_live_holder_3009`.
 
 ### Fixed (B15 — remaining six CI tests; Approve-arm pending queue)
 
