@@ -1097,7 +1097,6 @@ mod issue_2714_2441_tests {
     const T3: &str = "2026-06-15T00:00:03Z";
 
     #[test]
-    #[test]
     fn catchup_does_not_leap_skipped_ns() {
         // #3233 — a receiver-side skip of a *delivered* row (ns-scope or
         // attest) is the same cursor disposition as an apply halt: do NOT

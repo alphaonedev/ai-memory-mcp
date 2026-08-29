@@ -477,6 +477,58 @@ pg_test!(pg_check_duplicate_invalid_title_is_400, url, {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 });
 
+pg_test!(pg_check_duplicate_hides_private, url, {
+    // #3234 — pg check_duplicate had no #947 visibility mask. A
+    // byte-equal probe from a different tenant must not disclose the
+    // private row (existence + similarity oracle). CALLER is on the
+    // admin allowlist but `is_admin_caller_trusted` stays false here
+    // (keyless + no `AI_MEMORY_ADMIN_HEADER_TRUST`), so the mask runs.
+    let r = pg_router(&url).await;
+    let ns = uniq_ns();
+    let title = "cov-ga2 private dup 3234";
+    let content = format!("private-owned content for {ns}");
+    let owner = "ai:alice-3234";
+    let seed = Request::builder()
+        .method("POST")
+        .uri("/api/v1/memories")
+        .header("content-type", "application/json")
+        .header("x-agent-id", owner)
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "title": title,
+                "content": content,
+                "namespace": ns,
+                "agent_id": owner,
+                "metadata": {"scope": "private", "agent_id": owner},
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, body) = decode(&r, seed).await;
+    assert!(
+        status.is_success(),
+        "seed private status={status} body={body}"
+    );
+
+    // Probe as CALLER (not owner). Exact hash match would flag duplicate
+    // pre-mask; the #947/#3234 post-filter must hide it.
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/check_duplicate",
+        json!({"title": title, "content": content, "namespace": ns}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(
+        body["is_duplicate"], false,
+        "private foreign nearest must be masked; body={body}"
+    );
+    assert!(
+        body["nearest"].is_null(),
+        "nearest must be hidden; body={body}"
+    );
+});
+
 // ---------------------------------------------------------------------------
 // power::get_taxonomy — admin-gated postgres `get_taxonomy` trait arm
 // ---------------------------------------------------------------------------

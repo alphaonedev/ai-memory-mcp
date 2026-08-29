@@ -1326,6 +1326,14 @@ write is permission-evaluated as; see the operator note below.
   tokens to Enforce; the documented `standard` UNSET default stays
   Warn (not silently flipped). Count 25 → 27.
 
+- **#3234 — pg HTTP `check_duplicate` is no longer a cross-tenant oracle.**
+  The SAL scan is namespace-only (no caller mask). Embed *failure* now
+  returns 503 (`embedder failed to encode input`) matching the sqlite arm
+  instead of `unwrap_or_default()` (empty vec = silent miss). After the
+  scan, a non-admin caller is post-filtered with the #947 mask:
+  `store.get` (visibility-filtered; Err ⇒ hide) +
+  `is_visible_to_caller`. Hidden nearest clears `is_duplicate`.
+  Test: `pg_check_duplicate_hides_private`.
 - **#3233 — catchup cursor no longer leaps past skipped (ns/attest) delivered rows.**
   `#1687/#2714` halted the watermark only on apply `Err`. A receiver-side
   `continue` on namespace-scope or content-attestation skip still consumed the
