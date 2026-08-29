@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B17-B1b — clippy doc_markdown on BRANCH1 test docs)
+
+- `tests/archive_restore_link_cid_3250.rs` and
+  `tests/b17_integrity_3230_3231.rs`: backtick identifiers in `///`
+  docs (`SignableLink`, `memory_id`, `expires_at`, `capture_turn`,
+  `archive_by_ids`, `archive_restore`) and rename pg `a_cid`/`b_cid`
+  → `src_cid`/`dst_cid` (`clippy::similar_names`). Un-reds Lint,
+  vectorlite feature gate, and Postgres feature gate.
+
 ### Fixed (B17-B1a — hardcoded-literal ratchet after B1 merge)
 
 - `archived_memory_links` is named once as

@@ -142,7 +142,7 @@ fn pre_v91_null_cids_restore_as_null_3250() {
 }
 
 /// A signed edge still verifies after archive→restore (cids are not in
-/// the SignableLink preimage — COND 2). Pins still round-trip.
+/// the `SignableLink` preimage — COND 2). Pins still round-trip.
 #[test]
 fn signed_edge_still_verifies_after_restore_3250() {
     let conn = open_db();
@@ -260,7 +260,7 @@ mod pg {
         }
     }
 
-    /// Live-pg twin: archive_by_ids + archive_restore round-trips the
+    /// Live-pg twin: `archive_by_ids` + `archive_restore` round-trips the
     /// lineage-DAG pins. Skips when `AI_MEMORY_TEST_POSTGRES_URL` is unset.
     #[tokio::test]
     async fn archive_restore_round_trips_link_cids_pg_3250() {
@@ -283,16 +283,16 @@ mod pg {
             .await
             .expect("store b");
 
-        let a_cid: String = sqlx::query_scalar("SELECT cid FROM memories WHERE id = $1")
+        let src_cid: String = sqlx::query_scalar("SELECT cid FROM memories WHERE id = $1")
             .bind(&a_id)
             .fetch_one(store.pool())
             .await
-            .expect("a cid");
-        let b_cid: String = sqlx::query_scalar("SELECT cid FROM memories WHERE id = $1")
+            .expect("src cid");
+        let dst_cid: String = sqlx::query_scalar("SELECT cid FROM memories WHERE id = $1")
             .bind(&b_id)
             .fetch_one(store.pool())
             .await
-            .expect("b cid");
+            .expect("dst cid");
 
         store
             .link(
@@ -317,8 +317,8 @@ mod pg {
             "UPDATE memory_links SET source_cid = $1, target_cid = $2 \
              WHERE source_id = $3 AND target_id = $4",
         )
-        .bind(&a_cid)
-        .bind(&b_cid)
+        .bind(&src_cid)
+        .bind(&dst_cid)
         .bind(&a_id)
         .bind(&b_id)
         .execute(store.pool())
@@ -342,12 +342,12 @@ mod pg {
         .expect("archived pins");
         assert_eq!(
             arch_src.as_deref(),
-            Some(a_cid.as_str()),
+            Some(src_cid.as_str()),
             "snapshot carries source_cid"
         );
         assert_eq!(
             arch_tgt.as_deref(),
-            Some(b_cid.as_str()),
+            Some(dst_cid.as_str()),
             "snapshot carries target_cid"
         );
 
@@ -364,8 +364,8 @@ mod pg {
         .fetch_one(store.pool())
         .await
         .expect("restored pins");
-        assert_eq!(live_src.as_deref(), Some(a_cid.as_str()));
-        assert_eq!(live_tgt.as_deref(), Some(b_cid.as_str()));
+        assert_eq!(live_src.as_deref(), Some(src_cid.as_str()));
+        assert_eq!(live_tgt.as_deref(), Some(dst_cid.as_str()));
 
         let _ = store.delete(&ctx, &a_id).await;
         let _ = store.delete(&ctx, &b_id).await;

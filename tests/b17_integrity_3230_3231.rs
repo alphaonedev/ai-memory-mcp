@@ -153,7 +153,7 @@ fn sqlite_capture_turn_same_session_turn_is_first_write_wins_3231() {
 /// #3231 — two connections racing the same `(session, turn)` with
 /// different sha256. Both miss the out-of-tx fast-path (neither has
 /// committed yet); `BEGIN IMMEDIATE` serializes; the loser's in-tx
-/// re-probe must return the first writer's memory_id and content.
+/// re-probe must return the first writer's `memory_id` and content.
 ///
 /// Pre-fix this test fails: the waiter takes the insert path, ON CONFLICT
 /// LWW-overwrites content, and both results report `dedup_hit: false`.
@@ -298,7 +298,7 @@ mod pg {
         std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
     }
 
-    /// #3230 — postgres trait `update` (no If-Match) PATCH expires_at on
+    /// #3230 — postgres trait `update` (no If-Match) PATCH `expires_at` on
     /// stored-LONG must keep expiry NULL.
     #[tokio::test]
     async fn pg_patch_expires_at_on_stored_long_stays_null_3230() {
@@ -365,7 +365,7 @@ mod pg {
         let _ = store.delete(&ctx, &id).await;
     }
 
-    /// #3231 — postgres capture_turn same (session, turn) is FWW.
+    /// #3231 — postgres `capture_turn` same (session, turn) is FWW.
     #[tokio::test]
     async fn pg_capture_turn_same_session_turn_is_first_write_wins_3231() {
         let Some(url) = pg_url() else {
