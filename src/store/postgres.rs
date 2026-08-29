@@ -12810,7 +12810,12 @@ impl PostgresStore {
             created_at: created_at.to_rfc3339(),
             updated_at: updated_at.to_rfc3339(),
             last_accessed_at: last_accessed_at.map(|t| t.to_rfc3339()),
-            expires_at: expires_at.map(|t| t.to_rfc3339()),
+            // #2515 / C1/#2462 — TIMESTAMPTZ → string must be micros+Z
+            // (canonical RFC3339), not chrono's default `+00:00`.
+            // Sqlite stores TEXT already canonicalized; a pg get() that
+            // emitted `+00:00` broke lexical TTL compare + sqlite↔pg
+            // parity (`tests/expiry_floor_restore_2515.rs`).
+            expires_at: expires_at.map(crate::validate::render_canonical_utc),
             metadata,
             reflection_depth,
             memory_kind,
