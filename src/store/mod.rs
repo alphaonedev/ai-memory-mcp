@@ -3857,6 +3857,18 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #3064 batch B — inbound `reflects_on` dependents of `memory_id`
+    /// (MCP `memory_dependents_of_invalidated` direct list). Read-only.
+    /// Default returns `UnsupportedCapability`.
+    async fn list_dependents_of_invalidated(
+        &self,
+        _memory_id: &str,
+    ) -> StoreResult<Vec<InvalidationDependent>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_DEPENDENTS_OF_INVALIDATED".to_string(),
+        })
+    }
+
     /// v0.7 J7 / Continuation 6 — enumerate up to `max_results` paths
     /// between two memories, bounded by `max_depth`. Mirrors the
     /// adapter-specific `find_paths` call but lifted to the trait
@@ -4717,6 +4729,17 @@ pub struct VerifyLinkReport {
     /// adapter (e.g. "signature blob present but no enrolled peer key
     /// for observed_by"). Empty on a clean verify.
     pub findings: Vec<String>,
+}
+
+/// #3064 batch B — one inbound `reflects_on` dependent of an
+/// invalidated reflection. Wire `{id, namespace}` on MCP/HTTP
+/// `memory_dependents_of_invalidated`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidationDependent {
+    /// Dependent memory id (the `source_id` of the `reflects_on` edge).
+    pub id: String,
+    /// Namespace of that dependent row.
+    pub namespace: String,
 }
 
 /// #1579 A4 — SAL-level embedding-backfill sweep. Drains every row the

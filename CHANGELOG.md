@@ -22,8 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The handler dispatches to `MemoryStore::verify_link` (already
   implemented on `PostgresStore`); never `app.db.lock()`. MCP
   `signed_at` is `VerifyLinkReport::signed_at` (link `valid_from`).
-  Inventory 61→62 pg-supported / 21→20 fully-501. Remaining #3064
-  501s (skills ×8, share, atomise, …) stay fail-closed.
+  Inventory 61→62 pg-supported / 21→20 fully-501.
+
+### Fixed (B17 Lane 1 — #3064 batch B: dependents_of_invalidated on postgres)
+
+- `POST /api/v1/memory_dependents_of_invalidated` is no longer 501 on
+  a postgres daemon. Direct list is `MemoryStore::list_dependents_of_invalidated`
+  (inbound `reflects_on`); `transitive` reuses `lineage_descendants`.
+  Never `app.db.lock()`. Inventory 62→63 pg-supported / 20→19 fully-501.
+  Remaining #3064 501s (skills ×8, share, atomise, …) stay fail-closed.
 
 ### Changed (B17 Lane 1 — #3274 CI ignored-pg + #3294 Filter pin)
 

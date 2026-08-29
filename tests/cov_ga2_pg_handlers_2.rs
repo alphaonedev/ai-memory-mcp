@@ -826,3 +826,40 @@ pg_test!(pg_memory_verify_not_501_3064, url, {
         "MCP envelope; body={body}"
     );
 });
+
+pg_test!(pg_memory_dependents_not_501_3064, url, {
+    // #3064 batch B — pre-fix postgres_route_gate 501'd this MCP-parity
+    // route. Fail-on-old-code: 501 is the regression. Seed a
+    // `reflects_on` edge so the SAL list is non-empty.
+    let r = pg_router(&url).await;
+    let ns = uniq_ns();
+    let origin = seed_memory(&r, &ns, "dep-origin-3064", "origin body").await;
+    let child = seed_memory(&r, &ns, "dep-child-3064", "child body").await;
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/links",
+        json!({"source_id": child, "target_id": origin, "relation": "reflects_on"}),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "seed reflects_on status={status} body={body}"
+    );
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/memory_dependents_of_invalidated",
+        json!({"memory_id": origin}),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "pre-#3064b 501; body={body}"
+    );
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body.get("memory_id"), Some(&json!(origin)), "body={body}");
+    assert_eq!(body.get("count"), Some(&json!(1)), "body={body}");
+    let deps = body["dependents"].as_array().expect("dependents array");
+    assert_eq!(deps.len(), 1, "body={body}");
+    assert_eq!(deps[0]["id"], json!(child), "body={body}");
+});

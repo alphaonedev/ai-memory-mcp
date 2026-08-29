@@ -974,6 +974,23 @@ impl MemoryStore for SqliteStore {
         db::lineage_descendants(&conn, id, max_depth).map_err(box_err)
     }
 
+    async fn list_dependents_of_invalidated(
+        &self,
+        memory_id: &str,
+    ) -> StoreResult<Vec<crate::store::InvalidationDependent>> {
+        let conn = self.state.lock().await;
+        crate::notification::invalidation::list_dependents_of_invalidated(&conn, memory_id)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|d| crate::store::InvalidationDependent {
+                        id: d.id,
+                        namespace: d.namespace,
+                    })
+                    .collect()
+            })
+            .map_err(box_err)
+    }
+
     async fn link_signed(
         &self,
         _ctx: &CallerContext,
