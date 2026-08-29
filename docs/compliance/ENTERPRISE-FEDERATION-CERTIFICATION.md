@@ -125,6 +125,15 @@ triggers re-cert** (see §7).
 > certification** (bind remains `e22bc93c`; the 2026-08-12 5-agent
 > adversarial ratification stands).
 >
+> **Amendment (2026-08-29, Wave-2 B10 — cert-doc honesty, not a §7
+> trigger).** Record-stop *propagation* latency is scoped: SAME-STORE
+> (the process that engaged the stop; sqlite in-process flag) is the
+> ≤100 ms R45 actuator shape. Cross-node / postgres-pool honor is
+> bounded by `RECORD_STOP_REFRESH_TTL_MS = 1000` (~1 s, fail-closed
+> single-flight CAS, #3276). No §7-watched path and no
+> `AI_MEMORY_FED_*` identifier changed. **This amendment does NOT
+> re-mint the certification** (bind remains `e22bc93c`).
+>
 > **Amendment (2026-08-28, Wave-2 B4).** The §7-watched path
 > `src/handlers/federation_receive.rs` now receive-redacts author-less
 > catchup-pull rows (`attest_inbound_pull_memory`) before apply: omitting

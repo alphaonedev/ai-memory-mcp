@@ -1518,6 +1518,8 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn fold_recall_accesses(&self) -> StoreResult<usize> {
+        // Wave-2 B10 — SAL twin of the gated SSOT fold (mid→long promote).
+        self.gate_record_stop()?;
         // v0.9.0 P0-1 (#1869) — delegate to the substrate fold
         // (`db::fold_recall_accesses`) with the same compiled default
         // extend windows the SAL touch verb uses (1h short / 1d mid),

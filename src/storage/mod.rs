@@ -3178,6 +3178,10 @@ pub fn fold_recall_accesses(
     short_extend: i64,
     mid_extend: i64,
 ) -> Result<usize> {
+    // Wave-2 B10 — mid→long promote is a record-plane mutation; the
+    // kill switch freezes it. Callers treat fold errors as WARN so
+    // recall/reads stay live under stop (ERRORS-09).
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     // Hand-rolled fixtures that skip `storage::open` may lack the
     // ledger table entirely — nothing to fold.
     if !crate::observations::table_exists(conn) {

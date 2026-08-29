@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (Wave-2 B10 — record-stop final polish)
+
+- `tests/record_stop_structural_b9_pg.rs` now scans the function BODY
+  for write-SQL, so multi-line `UPDATE <table>\\n SET` is visible, and
+  `is_fn_start` recognizes `pub(super)` / `const` / `unsafe` / `extern`.
+  `refund_update_growth` + `mark_recall_consumed` are bookkeeping
+  (MUST_SURFACE pin so the scanner cannot silently miss them).
+- `fold_recall_accesses` (sqlite SSOT + both SAL adapters) now gates:
+  mid→long promote is a record-plane mutation. Recall/reads stay live
+  (callers WARN on fold error). `quotas::reset_daily` and
+  `offload::sweep_expired` documented out-of-plane.
+- Cert-doc honesty: ≤100 ms record-stop is SAME-STORE; cross-node/pool
+  is `RECORD_STOP_REFRESH_TTL_MS = 1000`.
+
 ### Security (Wave-2 B9 — pg-write structural completeness + reflect/embedding/lease)
 
 - `PostgresStore::reflect_with_hooks` now calls `gate_record_stop` before

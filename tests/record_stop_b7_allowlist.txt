@@ -7,7 +7,6 @@ src/checkpoints/mod.rs	is_constraint_violation
 src/actions/mod.rs	sweep_expired_leases_reclaim
 src/storage/mod.rs	touch
 src/storage/mod.rs	touch_many
-src/storage/mod.rs	fold_recall_accesses
 src/storage/mod.rs	archive_links_for_memory
 src/storage/mod.rs	restore_links_for_memory
 src/storage/mod.rs	archive_memory_no_tx
@@ -54,7 +53,6 @@ src/quotas.rs	reset_daily
 #       callers named in the comment above the row
 #   (c) signed-events resume actuator (append stays live so stop can persist)
 src/store/postgres.rs	touch_after_recall
-src/store/postgres.rs	fold_recall_accesses
 src/store/postgres.rs	apply_confidence_decay_stamp
 src/store/postgres.rs	recall_observation_insert
 src/store/postgres.rs	recall_observation_prune_guarded

@@ -1203,3 +1203,37 @@ fn b9_pg_reflect_embedding_and_sqlite_lease_source_pin() {
         "SqliteStore::lease_sweep_expired must call gate_record_stop"
     );
 }
+
+/// Wave-2 B10 — `fold_recall` (mid→long promote) must gate on sqlite SSOT
+/// and both SAL adapters; reads stay live because callers WARN.
+#[test]
+fn b10_fold_recall_accesses_gates_source_pin() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let storage = std::fs::read_to_string(root.join("src/storage/mod.rs")).expect("storage/mod.rs");
+    let idx = storage
+        .find("pub fn fold_recall_accesses(")
+        .expect("missing sqlite fold_recall_accesses");
+    let window = &storage[idx..storage.len().min(idx.saturating_add(500))];
+    assert!(
+        window.contains("gate_storage_conn"),
+        "db::fold_recall_accesses must call gate_storage_conn"
+    );
+    let sqlite = std::fs::read_to_string(root.join("src/store/sqlite.rs")).expect("sqlite.rs");
+    let idx = sqlite
+        .find("async fn fold_recall_accesses(")
+        .expect("missing sqlite SAL fold_recall_accesses");
+    let window = &sqlite[idx..sqlite.len().min(idx.saturating_add(400))];
+    assert!(
+        window.contains("gate_record_stop"),
+        "SqliteStore::fold_recall_accesses must call gate_record_stop"
+    );
+    let pg = std::fs::read_to_string(root.join("src/store/postgres.rs")).expect("postgres.rs");
+    let idx = pg
+        .find("async fn fold_recall_accesses(")
+        .expect("missing pg fold_recall_accesses");
+    let window = &pg[idx..pg.len().min(idx.saturating_add(400))];
+    assert!(
+        window.contains("gate_record_stop"),
+        "PostgresStore::fold_recall_accesses must call gate_record_stop"
+    );
+}
