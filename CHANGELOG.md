@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (C8 allowlist — export_reflection for_admin)
+
+- Allowlist `CallerContext::for_admin("http:export-reflection")` on the
+  #3064c postgres export arm (read-only unfiltered twin of sqlite
+  `db::get`; Fable security-approved 2026-08-29). Drop stale
+  `src/store/postgres.rs:EXPORT_INTERNAL` (site no longer in source).
+
 ### Fixed (B17 Lane 1 — #2384 pg catchup fidelity test)
 
 - `pg_federation_catchup_send_carries_every_durable_field_2384` compared
