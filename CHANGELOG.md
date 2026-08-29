@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B17 Lane 1 — #2515 pg expires_at canonical Z)
+
+- Postgres `row_to_memory` now renders `expires_at` via
+  `validate::render_canonical_utc` (micros + `Z`). Chrono's default
+  `to_rfc3339()` emitted `+00:00` for the same instant, breaking
+  sqlite↔pg lexical TTL compare. Floor/extend logic was already
+  correct; this is the C1/#2462 rendering class `#3274`'s
+  postgres-ignored job surfaced.
+
 ### Changed (B17 Lane 1 — #3274 CI ignored-pg + #3294 Filter pin)
 
 - **#3274:** new workflow `.github/workflows/postgres-ignored.yml`
