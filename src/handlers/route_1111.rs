@@ -600,6 +600,13 @@ pub async fn handle_export_reflection_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #3064 batch C — postgres SAL dispatch. `get` (admin-bypass, matching
+    // sqlite `db::get` with no caller gate) + `list_outbound_reflects_on`
+    // + the same CLI renderer the MCP handler uses.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return export_reflection_http_via_store(&app, &body).await;
+    }
     let lock = app.db.lock().await;
     let result = crate::mcp::handle_export_reflection(&lock.0, &body);
     drop(lock);
@@ -607,6 +614,83 @@ pub async fn handle_export_reflection_http(
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => err_response(e),
     }
+}
+
+/// #3064 batch C — postgres arm of [`handle_export_reflection_http`].
+#[cfg(feature = "sal")]
+async fn export_reflection_http_via_store(
+    app: &AppState,
+    params: &Value,
+) -> axum::response::Response {
+    use crate::cli::commands::export_reflections::{self, ExportFormat, ReflectsOnEdge};
+    use crate::mcp::param_names;
+    use crate::models::MemoryKind;
+    use crate::store::{CallerContext, StoreError};
+
+    let memory_id = match params.get(param_names::MEMORY_ID).and_then(Value::as_str) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        Some(_) => return err_response(crate::errors::msg::MEMORY_ID_EMPTY.to_string()),
+        None => return err_response(crate::errors::msg::MEMORY_ID_REQUIRED.to_string()),
+    };
+    if let Err(e) = crate::validate::validate_id(&memory_id) {
+        return err_response(e.to_string());
+    }
+    let format_str = match params.get(param_names::FORMAT) {
+        None | Some(Value::Null) => "md",
+        Some(v) => match v.as_str() {
+            Some(s) => s,
+            None => {
+                return err_response(
+                    "format must be a string ('md', 'markdown' or 'json')".to_string(),
+                );
+            }
+        },
+    };
+    let format = match format_str.to_lowercase().as_str() {
+        "md" | "markdown" => ExportFormat::Markdown,
+        "json" => ExportFormat::Json,
+        other => {
+            return err_response(crate::errors::msg::unsupported_export_format(other));
+        }
+    };
+    // sqlite `db::get` is unfiltered; SAL `get` with `for_admin` is the
+    // bypass_visibility twin so private reflections still export (parity).
+    let ctx = CallerContext::for_admin("http:export-reflection");
+    let mem = match app.store.get(&ctx, &memory_id).await {
+        Ok(m) => m,
+        Err(StoreError::NotFound { .. }) => {
+            return err_response(crate::errors::msg::memory_not_found(&memory_id));
+        }
+        Err(e) => return super::store_err_to_response(e),
+    };
+    if !matches!(mem.memory_kind, MemoryKind::Reflection) {
+        return err_response(format!("memory is not a reflection: {memory_id}"));
+    }
+    let edges = match app.store.list_outbound_reflects_on(&memory_id).await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|e| ReflectsOnEdge {
+                target_id: e.target_id,
+                attest_level: e.attest_level,
+                created_at: e.created_at,
+            })
+            .collect::<Vec<_>>(),
+        Err(e) => return super::store_err_to_response(e),
+    };
+    let attest_level = export_reflections::summarise_attest_level(&edges);
+    let content = export_reflections::render_payload(&mem, &edges, attest_level, format);
+    let ns_clean = mem.namespace.trim_matches('/');
+    let ext = format.extension();
+    let suggested = if ns_clean.is_empty() {
+        format!("{}.{ext}", mem.id)
+    } else {
+        format!("{ns_clean}/{}.{ext}", mem.id)
+    };
+    Json(json!({
+        "content": content,
+        "suggested_filename": suggested,
+    }))
+    .into_response()
 }
 
 /// `POST /api/v1/memory_atomise` — WT-1-F atomiser. Decomposes a

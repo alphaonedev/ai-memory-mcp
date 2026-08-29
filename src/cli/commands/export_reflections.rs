@@ -151,7 +151,7 @@ pub(crate) fn parse_format(spec: &str) -> Result<ExportFormat> {
     match spec.to_lowercase().as_str() {
         "md" | "markdown" => Ok(ExportFormat::Markdown),
         "json" => Ok(ExportFormat::Json),
-        other => anyhow::bail!("unsupported export format '{other}' (expected 'md' or 'json')"),
+        other => anyhow::bail!("{}", crate::errors::msg::unsupported_export_format(other)),
     }
 }
 

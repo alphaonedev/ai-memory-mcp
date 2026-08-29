@@ -165,7 +165,7 @@ fn all_registered_paths() -> Vec<&'static str> {
 const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DELETE];
 
 /// The AUTHORITATIVE pg-supported inventory (2026-08-09, Phase-1 vote
-/// `4d3ea1c5`): of the 82 unique production URL paths, exactly these 19
+/// `4d3ea1c5`): of the 82 unique production URL paths, exactly these 18
 /// are FULLY fail-closed (no HTTP method reaches a postgres-backed
 /// handler). Each is honest-v1.x-rescoped OR verified app.db-bound /
 /// SAL-less:
@@ -176,7 +176,7 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 ///   - route_1111 family that is verified app.db-bound (calls `app.db.lock()`
 ///     with no pg branch) or has NO SAL trait method:
 ///       memory_atomise, memory_calibrate_confidence, memory_smart_load,
-///       memory_export_reflection, memory_replay, memory_subscription_replay,
+///       memory_replay, memory_subscription_replay,
 ///       memory_subscription_dlq_list  (do-not-touch honest-v1.x set);
 ///       memory_rule_list + memory_check_agent_action (postgres ships NO
 ///         `governance_rules` table — a ~300+ LOC new-table gap the vote
@@ -185,6 +185,8 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 /// `verify_link` + `signed_at` on `VerifyLinkReport`.
 /// 2026-08-29 (#3064 batch B): `memory_dependents_of_invalidated` LEFT
 /// this set — SAL `list_dependents_of_invalidated` + `lineage_descendants`.
+/// 2026-08-29 (#3064 batch C): `memory_export_reflection` LEFT this set —
+/// SAL `get` + `list_outbound_reflects_on`.
 /// Opening ANY of these requires proving SAL dispatch first (see the
 /// module doc) and updating this list with justification.
 fn expected_fully_501_paths() -> BTreeSet<&'static str> {
@@ -194,7 +196,6 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
         routes::MEMORY_ATOMISE,
         routes::MEMORY_CALIBRATE_CONFIDENCE,
         routes::MEMORY_CHECK_AGENT_ACTION,
-        routes::MEMORY_EXPORT_REFLECTION,
         routes::MEMORY_REPLAY,
         routes::MEMORY_RULE_LIST,
         routes::MEMORY_SMART_LOAD,
@@ -234,8 +235,11 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // `POST /api/v1/memory_dependents_of_invalidated` SAL-dispatches to
 // `list_dependents_of_invalidated` (+ `lineage_descendants` when
 // `transitive`). Never `app.db.lock()`.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 63;
-const EXPECTED_FULLY_501_PATHS: usize = 19;
+// 2026-08-29 (#3064 batch C) — bumped 63 -> 64 / 19 -> 18:
+// `POST /api/v1/memory_export_reflection` SAL-dispatches to `get` +
+// `list_outbound_reflects_on`. Never `app.db.lock()`.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 64;
+const EXPECTED_FULLY_501_PATHS: usize = 18;
 const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 82;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
@@ -274,6 +278,7 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "MEMORIES",
     "MEMORIES_BULK",
     "MEMORY_DEPENDENTS_OF_INVALIDATED",
+    "MEMORY_EXPORT_REFLECTION",
     "MEMORY_LOAD_FAMILY",
     "MEMORY_RECALL_OBSERVATIONS",
     "MEMORY_REFLECT",
@@ -497,6 +502,11 @@ fn already_open_sal_route_1111_routes_stay_supported() {
     assert!(postgres_endpoint_supported(
         &Method::POST,
         routes::MEMORY_DEPENDENTS_OF_INVALIDATED
+    ));
+    // #3064 batch C — export_reflection now SAL-dispatches on postgres.
+    assert!(postgres_endpoint_supported(
+        &Method::POST,
+        routes::MEMORY_EXPORT_REFLECTION
     ));
     // Conversely, the verified app.db-bound / SAL-less siblings must stay
     // fail-closed (opening them would convert a safe 501 into a silent

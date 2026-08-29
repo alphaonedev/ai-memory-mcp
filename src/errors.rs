@@ -193,6 +193,10 @@ pub mod msg {
     /// MCP `memory_verify` / HTTP `POST /api/v1/memory_verify` — caller
     /// supplied neither the composite `link_id` nor a source+target pair.
     pub const MEMORY_VERIFY_ARGS_REQUIRED: &str = "link_id or source_id+target_id is required";
+    /// MCP/HTTP/CLI `memory_export_reflection` — `format` was not md/json.
+    pub fn unsupported_export_format(other: &str) -> String {
+        format!("unsupported export format '{other}' (expected 'md' or 'json')")
+    }
     pub const ENTITY_ID_EMPTY: &str = "entity_id cannot be empty";
     pub const MEMORY_ID_EMPTY: &str = "memory_id cannot be empty";
 

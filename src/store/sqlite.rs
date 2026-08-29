@@ -991,6 +991,39 @@ impl MemoryStore for SqliteStore {
             .map_err(box_err)
     }
 
+    async fn list_outbound_reflects_on(
+        &self,
+        memory_id: &str,
+    ) -> StoreResult<Vec<crate::store::OutboundReflectsOn>> {
+        // Twin of `mcp::tools::export_reflection::collect_outbound_reflects_on`.
+        let conn = self.state.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT target_id, COALESCE(attest_level, ?3), created_at \
+                 FROM memory_links \
+                 WHERE source_id = ?1 AND relation = ?2 \
+                 ORDER BY created_at ASC",
+            )
+            .map_err(box_err)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    memory_id,
+                    crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
+                    crate::models::AttestLevel::Unsigned.as_str(),
+                ],
+                |row| {
+                    Ok(crate::store::OutboundReflectsOn {
+                        target_id: row.get(0)?,
+                        attest_level: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(box_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(box_err)
+    }
+
     async fn link_signed(
         &self,
         _ctx: &CallerContext,
