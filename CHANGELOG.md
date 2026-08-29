@@ -49,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `db::get`) + `list_outbound_reflects_on`; same CLI renderer as MCP.
   Never `app.db.lock()`. Inventory 63→64 pg-supported / 19→18 fully-501.
 
+### Fixed (B17 Lane 1 — #3064 batch D: memory_replay on postgres)
+
+- `POST /api/v1/memory_replay` is no longer 501 on a postgres daemon.
+  SAL `replay_transcript_union` (BFS over `reflects_on` + I2 links)
+  + `fetch_transcript_content` (zstd-3); never `app.db.lock()`.
+  Postgres SQL lives in `postgres_parity.rs` (QUAL-10). Inventory
+  64→65 pg-supported / 18→17 fully-501.
+
 ### Changed (B17 Lane 1 — #3274 CI ignored-pg + #3294 Filter pin)
 
 - **#3274:** new workflow `.github/workflows/postgres-ignored.yml`

@@ -6,7 +6,9 @@
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::field_names;
-use crate::transcripts::replay::{ReplayEntry, replay_transcript_union};
+use crate::transcripts::replay::{
+    REPLAY_VERBOSE_THRESHOLD_BYTES, ReplayEntry, replay_transcript_union,
+};
 use crate::validate;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -68,14 +70,6 @@ impl McpTool for ReplayTool {
         crate::profile::Family::Graph.name()
     }
 }
-
-/// v0.7.0 I4 — single-transcript content threshold above which the
-/// replay tool omits decompressed text unless the caller opted into
-/// `verbose=true`. 100 KB matches the "operators must opt into large
-/// dumps" carve-out called out in the I4 prompt; below that, even a
-/// long chat fits comfortably in an LLM context window without
-/// truncation surprise.
-pub(super) const REPLAY_VERBOSE_THRESHOLD_BYTES: i64 = 100 * 1024;
 
 /// v0.7.0 I4 + L2-4 — `memory_replay(memory_id, verbose=false, depth=null)`.
 ///
@@ -247,7 +241,7 @@ pub fn handle_replay(
             agent_id: agent_id.clone(),
             payload: json!({
                 "memory_id": memory_id,
-                "transcript_id": entry.meta.id,
+                (field_names::TRANSCRIPT_ID): entry.meta.id,
                 (field_names::SOURCE_MEMORY_ID): entry.memory_id,
             }),
         };
@@ -285,15 +279,18 @@ pub fn handle_replay(
             field_names::CREATED_AT.into(),
             Value::String(meta.created_at.clone()),
         );
-        obj.insert("compressed_size".into(), json!(meta.compressed_size));
-        obj.insert("original_size".into(), json!(meta.original_size));
         obj.insert(
-            "span_start".into(),
+            field_names::COMPRESSED_SIZE.into(),
+            json!(meta.compressed_size),
+        );
+        obj.insert(field_names::ORIGINAL_SIZE.into(), json!(meta.original_size));
+        obj.insert(
+            field_names::SPAN_START.into(),
             link.span_start
                 .map_or(Value::Null, |v| Value::Number(v.into())),
         );
         obj.insert(
-            "span_end".into(),
+            field_names::SPAN_END.into(),
             link.span_end
                 .map_or(Value::Null, |v| Value::Number(v.into())),
         );

@@ -257,6 +257,10 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // #3064 batch C — export a reflection via SAL get +
         // `list_outbound_reflects_on`. Never `app.db.lock()`.
         ("POST", super::routes::MEMORY_EXPORT_REFLECTION) => true,
+        // #3064 batch D — I4 transcript replay via SAL
+        // `replay_transcript_union` + `fetch_transcript_content`.
+        // Never `app.db.lock()`.
+        ("POST", super::routes::MEMORY_REPLAY) => true,
         // v1.0.0 #2402 — the operator quarantine route-OUT. Both handlers
         // dispatch through `app.store` on postgres
         // (`MemoryStore::list_quarantined` / `operator_dequarantine`, both

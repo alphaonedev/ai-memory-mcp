@@ -878,6 +878,11 @@ pub async fn handle_replay_http(
     if let Some(obj) = owned.as_object_mut() {
         obj.insert("agent_id".to_string(), Value::String(caller.clone()));
     }
+    // #3064 batch D — postgres SAL dispatch. Never `app.db.lock()`.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return replay_http_via_store(&app, &owned, &caller).await;
+    }
     let lock = app.db.lock().await;
     // #1571 — the header-attributed principal is the bound caller; the
     // body `agent_id` was already forced to match above.
@@ -887,6 +892,157 @@ pub async fn handle_replay_http(
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => err_response(e),
     }
+}
+
+/// #3064 batch D — postgres arm of [`handle_replay_http`].
+/// `replay_transcript_union` + `get` visibility + `fetch_transcript_content`.
+/// Envelope matches sqlite [`crate::mcp::handle_replay`]. ERRORS-01.
+#[cfg(feature = "sal")]
+async fn replay_http_via_store(
+    app: &AppState,
+    params: &Value,
+    caller: &str,
+) -> axum::response::Response {
+    use crate::mcp::param_names;
+    use crate::store::{CallerContext, StoreError};
+    use crate::transcripts::replay::REPLAY_VERBOSE_THRESHOLD_BYTES;
+
+    let memory_id = match params.get(param_names::MEMORY_ID).and_then(Value::as_str) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        Some(_) => return err_response(crate::errors::msg::MEMORY_ID_EMPTY.to_string()),
+        None => return err_response(crate::errors::msg::MEMORY_ID_REQUIRED.to_string()),
+    };
+    if let Err(e) = crate::validate::validate_id(&memory_id) {
+        return err_response(e.to_string());
+    }
+    let verbose = params
+        .get("verbose")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let depth: Option<u32> = match params.get(param_names::DEPTH) {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_i64() {
+            Some(n) if n < 0 => Some(0),
+            Some(n) => Some(u32::try_from(n).unwrap_or(u32::MAX)),
+            None => return err_response("depth must be an integer or null".to_string()),
+        },
+    };
+
+    let entries = match app.store.replay_transcript_union(&memory_id, depth).await {
+        Ok(v) => v,
+        Err(e) => return super::store_err_to_response(e),
+    };
+
+    let vis_ctx = CallerContext::for_agent(caller);
+    for entry in &entries {
+        match app.store.get(&vis_ctx, &entry.memory_id).await {
+            Ok(_) => {}
+            Err(StoreError::NotFound { .. }) => {
+                return Json(json!({
+                    "memory_id": memory_id,
+                    (field_names::TRANSCRIPTS): Vec::<Value>::new(),
+                    "count": 0,
+                }))
+                .into_response();
+            }
+            Err(e) => return super::store_err_to_response(e),
+        }
+    }
+
+    for entry in &entries {
+        use crate::permissions::{Op, PermissionContext, Permissions};
+        let ctx = PermissionContext {
+            op: Op::MemoryReplay,
+            namespace: entry.namespace.clone(),
+            agent_id: caller.to_string(),
+            payload: json!({
+                "memory_id": memory_id,
+                (field_names::TRANSCRIPT_ID): entry.transcript_id,
+                (field_names::SOURCE_MEMORY_ID): entry.memory_id,
+            }),
+        };
+        match Permissions::evaluate(&ctx, &[]) {
+            crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
+            crate::permissions::Decision::Deny(reason) => {
+                return err_response(crate::governance::deny_message(
+                    "replay",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
+            }
+            crate::permissions::Decision::Ask(prompt) => {
+                return Json(json!({
+                    "status": "ask",
+                    "reason": prompt,
+                    "action": "replay",
+                    "memory_id": memory_id,
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    let mut transcripts_json: Vec<Value> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let truncate = !verbose && entry.original_size > REPLAY_VERBOSE_THRESHOLD_BYTES;
+        let mut obj = serde_json::Map::new();
+        obj.insert("id".into(), Value::String(entry.transcript_id.clone()));
+        obj.insert(
+            field_names::CREATED_AT.into(),
+            Value::String(entry.created_at),
+        );
+        obj.insert(
+            field_names::COMPRESSED_SIZE.into(),
+            json!(entry.compressed_size),
+        );
+        obj.insert(
+            field_names::ORIGINAL_SIZE.into(),
+            json!(entry.original_size),
+        );
+        obj.insert(
+            field_names::SPAN_START.into(),
+            entry
+                .span_start
+                .map_or(Value::Null, |v| Value::Number(v.into())),
+        );
+        obj.insert(
+            field_names::SPAN_END.into(),
+            entry
+                .span_end
+                .map_or(Value::Null, |v| Value::Number(v.into())),
+        );
+        obj.insert(
+            field_names::SOURCE_MEMORY_ID.into(),
+            Value::String(entry.memory_id),
+        );
+        if truncate {
+            obj.insert("truncated".into(), Value::Bool(true));
+        } else {
+            let content = match app
+                .store
+                .fetch_transcript_content(&entry.transcript_id)
+                .await
+            {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    return err_response(format!(
+                        "transcript {} disappeared between metadata read and content fetch",
+                        entry.transcript_id
+                    ));
+                }
+                Err(e) => return super::store_err_to_response(e),
+            };
+            obj.insert("content".into(), Value::String(content));
+        }
+        transcripts_json.push(Value::Object(obj));
+    }
+
+    Json(json!({
+        "memory_id": memory_id,
+        (field_names::TRANSCRIPTS): transcripts_json,
+        "count": transcripts_json.len(),
+    }))
+    .into_response()
 }
 
 /// `POST /api/v1/memory_subscription_replay` — replay HMAC-signed

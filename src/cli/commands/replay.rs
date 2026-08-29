@@ -107,7 +107,7 @@ pub fn cmd_replay(
     {
         for t in arr {
             let tid = t
-                .get("transcript_id")
+                .get(field_names::TRANSCRIPT_ID)
                 .and_then(Value::as_str)
                 .unwrap_or("?");
             let created = t
@@ -115,7 +115,10 @@ pub fn cmd_replay(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let truncated = t.get("truncated").and_then(Value::as_bool).unwrap_or(false);
-            let osize = t.get("original_size").and_then(Value::as_u64).unwrap_or(0);
+            let osize = t
+                .get(field_names::ORIGINAL_SIZE)
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             writeln!(
                 out.stdout,
                 "  {tid}  created={created}  bytes={osize}  truncated={truncated}",

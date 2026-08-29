@@ -58,6 +58,11 @@ use crate::transcripts::storage::{
     Transcript, TranscriptLink, fetch_metadata, transcripts_for_memory,
 };
 
+/// I4 truncation threshold — transcripts larger than this omit
+/// decompressed content unless `verbose=true`. Shared by MCP and the
+/// postgres HTTP SAL arm so the two surfaces cannot drift.
+pub const REPLAY_VERBOSE_THRESHOLD_BYTES: i64 = 100 * 1024;
+
 /// One row of the L2-4 union replay stream. Carries both the transcript
 /// metadata (compressed/original size, namespace, created_at) and the
 /// I2 link span — plus the `memory_id` the link was discovered through,
