@@ -582,7 +582,6 @@ fn federation_catchup_send_still_decrypts_2384() {
 #[cfg(feature = "sal-postgres")]
 mod postgres_side {
     use super::{FIXTURE_SINCE, maximal_memory};
-    use ai_memory::models::{ConfidenceSource, LifecycleState, MemoryKind, Tier};
     use ai_memory::store::postgres::PostgresStore;
     use ai_memory::store::{CallerContext, MemoryStore};
 
@@ -602,6 +601,13 @@ mod postgres_side {
 
     /// #2384 postgres twin — the catch-up SEND path must carry the full
     /// durable field set on postgres too.
+    ///
+    /// #2399 changed `maximal_memory().tier` from Long to Short (a fresh
+    /// long-tier write is permanent and would strip `expires_at`). The
+    /// hardcoded `assert_eq!(sent.tier, Tier::Long)` was not updated, so
+    /// postgres-ignored went red on a *correct* Short round-trip. Mirror
+    /// the sqlite test: compare SEND-path vs targeted `get` (SELECT
+    /// `MEMORY_READ_COLUMNS` + `row_to_memory`).
     #[tokio::test]
     #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
     async fn pg_federation_catchup_send_carries_every_durable_field_2384() {
@@ -609,9 +615,16 @@ mod postgres_side {
             return;
         };
         let ctx = CallerContext::for_admin("fed-2384-parity");
-        let mem = maximal_memory();
-        let id = mem.id.clone();
-        pg.store(&ctx, &mem).await.expect("pg seed store");
+        let mut mem = maximal_memory();
+        // Unique (title, namespace) so a shared live DB + re-runs do not
+        // ON CONFLICT merge onto a prior fixture row (store would return
+        // the old id; get of the new id is NotFound).
+        let uniq = uuid::Uuid::new_v4();
+        mem.namespace = format!("team/fed-2384-{uniq}");
+        mem.title = format!("federation catch-up column fidelity — #2384 {uniq}");
+        let id = pg.store(&ctx, &mem).await.expect("pg seed store");
+
+        let truth = pg.get(&ctx, &id).await.expect("pg targeted get");
 
         let sent = pg
             .list_memories_updated_since(Some(FIXTURE_SINCE), 500)
@@ -621,37 +634,6 @@ mod postgres_side {
             .find(|m| m.id == id)
             .expect("fixture row must be present in the pg send-path result");
 
-        assert_eq!(sent.tier, Tier::Long, "#2384 pg: tier");
-        assert_eq!(
-            sent.memory_kind,
-            MemoryKind::Decision,
-            "#2384 pg: memory_kind must not default to Observation"
-        );
-        assert_eq!(
-            sent.lifecycle_state,
-            LifecycleState::Active,
-            "#2384 pg: lifecycle_state"
-        );
-        assert_eq!(
-            sent.confidence_source,
-            ConfidenceSource::Calibrated,
-            "#2384 pg: confidence_source"
-        );
-        assert_eq!(sent.reflection_depth, 3, "#2384 pg: reflection_depth");
-        assert!(sent.valid_from.is_some(), "#2384 pg: valid_from");
-        assert!(sent.valid_until.is_some(), "#2384 pg: valid_until");
-        assert!(sent.source_uri.is_some(), "#2384 pg: source_uri");
-        assert!(sent.source_span.is_some(), "#2384 pg: source_span");
-        assert!(!sent.citations.is_empty(), "#2384 pg: citations");
-        assert!(sent.entity_id.is_some(), "#2384 pg: entity_id");
-        assert!(sent.persona_version.is_some(), "#2384 pg: persona_version");
-        assert!(
-            sent.confidence_signals.is_some(),
-            "#2384 pg: confidence_signals"
-        );
-        assert!(
-            sent.confidence_decayed_at.is_some(),
-            "#2384 pg: confidence_decayed_at"
-        );
+        super::assert_full_field_parity(&sent, &truth);
     }
 }
