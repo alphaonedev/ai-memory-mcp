@@ -1,0 +1,75 @@
+ai-memory doctor --posture enterprise-federation
+  (v1.0.0 3x7 cutline ruling §5.3 — docs/audit/3x7-v1-cutline-ruling-2026-08-01.md)
+
+  [FAIL] AI_MEMORY_SECURITY_PROFILE
+         required: asi-hard
+         actual:   (unset -> standard)
+         fix:      set AI_MEMORY_SECURITY_PROFILE=asi-hard
+  [FAIL] asi-hard pinned knobs
+         required: asi-hard engaged AND all 27 at hard floor (security_profile::KNOBS)
+         actual:   (profile=standard — asi-hard pins not in force; the 27-knob hard floor was not evaluated)
+         fix:      set AI_MEMORY_SECURITY_PROFILE=asi-hard so the hardened pins are in force, then re-run this check to evaluate the hard floor; see `src/security_profile.rs::KNOBS`
+  [PASS] AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT
+         required: not explicitly disabled (peer enrollment required) AND AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS not truthy (no rollout hatch open)
+         actual:   AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT="(unset — defaults strict)"; AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS="(unset)"
+  [PASS] AI_MEMORY_FED_REQUIRE_SIG
+         required: not explicitly disabled (per-message Ed25519 signatures required)
+         actual:   (unset — defaults strict)
+  [PASS] AI_MEMORY_FED_REQUIRE_NONCE
+         required: not explicitly disabled (per-message nonce freshness required)
+         actual:   (unset — defaults strict)
+  [PASS] AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE
+         required: not explicitly disabled (inbound-write namespace confinement required)
+         actual:   (unset — defaults strict)
+  [PASS] AI_MEMORY_PERMISSIONS_MODE (ruling: AI_MEMORY_FED_PERMISSIONS_MODE)
+         required: enforce
+         actual:   enforce
+  [PASS] AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR
+         required: 0 (fail-CLOSED on governance rule-consultation error)
+         actual:   (unset -> 0)
+  [FAIL] AI_MEMORY_FED_TRUST_DOMAIN
+         required: <set> (scopes the trust bundle to one fleet)
+         actual:   (unset)
+         fix:      set AI_MEMORY_FED_TRUST_DOMAIN to this deployment's fleet identifier
+  [FAIL] AI_MEMORY_FED_PEER_FINGERPRINTS
+         required: <set> to a readable peer server-cert pin file
+         actual:   (unset)
+         fix:      set AI_MEMORY_FED_PEER_FINGERPRINTS to a `<host> <sha256-hex>` pin file (#1678)
+  [FAIL] AI_MEMORY_FED_PEER_ATTESTATION
+         required: <set>; valid JSON (MALFORMED must refuse, never silently fall back)
+         actual:   (unset)
+         fix:      set AI_MEMORY_FED_PEER_ATTESTATION to valid JSON per `PeerAttestationConfig::from_env` (peer-id -> {allowed_sender_agent_ids, allowed_namespaces})
+  [FAIL] AI_MEMORY_FED_PEER_ATTESTATION (no `**` allow-all glob)
+         required: no peer scope's allowed_namespaces contains a literal `**`
+         actual:   (unset — nothing to check)
+         fix:      replace the `**` allow-all glob with an explicit per-namespace allowlist for the named peer(s) — enterprise-federation confinement forbids a deliberate allow-all scope
+  [PASS] AI_MEMORY_FED_SYNC_TRUST_PEER
+         required: UNSET (or not the literal `1` — the real gate's exact-match grammar)
+         actual:   (unset)
+  [PASS] AI_MEMORY_FED_TRUST_BODY_AGENT_ID
+         required: UNSET (or not the literal `1` — the real gate's exact-match grammar)
+         actual:   (unset)
+  [FAIL] AI_MEMORY_ENCRYPT_AT_REST
+         required: 1, on a binary built with --features sqlcipher
+         actual:   env=(unset) sqlcipher_build=false
+         fix:      rebuild with --features sqlcipher AND set AI_MEMORY_ENCRYPT_AT_REST=1
+  [PASS] AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS (https-only peers)
+         required: not truthy (the plaintext-peer refusal stays in force)
+         actual:   (unset)
+  [FAIL] AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE
+         required: truthy (boot-refusal gate armed so future posture drift cannot silently boot)
+         actual:   (unset — boot gate inert)
+         fix:      set AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1
+  [PASS] AI_MEMORY_FED_REQUIRE_POLICY_CURRENT
+         required: not explicitly disabled (detected-stale inbound policy_version refused)
+         actual:   (unset — defaults strict)
+  [FAIL] append-only audit spine
+         required: append-only spine ON (AI_MEMORY_APPEND_ONLY / [storage].append_only) AND the daemon audit signing key armed (federation supersede leaves are SIGNED, not unsigned)
+         actual:   append_only=false; audit_signing_key=armed
+         fix:      set AI_MEMORY_APPEND_ONLY=1 (or [storage].append_only = true) AND provision the daemon audit signing key (see `governance::audit::load_daemon_signing_key`) so the append-only federation supersede leaves are signed
+  [FAIL] R40 escalate producer
+         required: approver keys enrolled so the wired L1-6 escalate producer routes to a SATISFIABLE signed-approval gate (AI_MEMORY_OPERATOR_PUBKEY / AI_MEMORY_APPROVER_PUBKEYS)
+         actual:   0 approver key(s) enrolled
+         fix:      enroll at least one approver key (set AI_MEMORY_OPERATOR_PUBKEY or provision the on-disk operator.key.pub, and/or AI_MEMORY_APPROVER_PUBKEYS) so an escalated write can be approved rather than blocked by the keyless fail-closed guardrail
+
+overall: FAIL
