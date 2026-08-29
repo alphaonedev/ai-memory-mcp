@@ -359,9 +359,9 @@ fn migration_v82_applies_and_is_idempotent() {
         )
         .unwrap();
     assert_eq!(
-        version, 90,
+        version, 91,
         "upgrade-from-v81 runs the full ladder to the current tip (v82 re-adds the \
-         retire columns; v83 adds agent_api_keys; v90 adds the archive cid pair)"
+         retire columns; v83 adds agent_api_keys; v91 adds archive-link cids)"
     );
     assert!(
         conn2
@@ -380,7 +380,7 @@ fn migration_v82_applies_and_is_idempotent() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v3, 90, "re-open stays at the current tip idempotently");
+    assert_eq!(v3, 91, "re-open stays at the current tip idempotently");
     // A retire round-trips end-to-end on the migrated DB.
     let _: Value = handle_skill_register(
         &conn3,

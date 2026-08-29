@@ -95,6 +95,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `#3228` postgres HTTP DELETE: non-`NotFound` pre-get Err is 503;
   governance is not skipped. `NotFound` still 404s at delete.
 
+- Coverage test-drift (#3250): `cid_migration_v74.rs` re-open pin,
+  `recall_purity_p01.rs` tip pin, and `skill_retire_lifecycle.rs`
+  upgrade/re-open pins now expect schema v91 (were still 90 after
+  BRANCH1 advanced the ladder). Migration is correct; the second
+  assertion was missed.
+
 ### Tests (B17 BRANCH 2)
 
 - `tests/http_capture_turn_k9_3225.rs` (live-pg twin, ignored without

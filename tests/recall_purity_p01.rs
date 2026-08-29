@@ -1217,9 +1217,8 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     let dir = tempfile::tempdir_in(&root).expect("tempdir");
     let path = dir.path().join("v77.db");
 
-    // Fresh open reaches the current tip (v90, #2385 archive genesis-cid
-    // parity: additive `archived_memories.cid` / `cid_genesis`) with the v77
-    // `folded` column present.
+    // Fresh open reaches the current tip (v91, #3250 archive-link cids)
+    // with the v77 `folded` column present.
     let conn = db::open(&path).expect("open");
     assert_eq!(db::migrations::current_schema_version_for_tests(), 91);
     let version: i64 = conn
@@ -1229,7 +1228,7 @@ fn v77_migration_backfills_preexisting_rows_folded() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 90, "fresh open reaches the current tip");
+    assert_eq!(version, 91, "fresh open reaches the current tip");
     assert!(
         conn.prepare("SELECT folded FROM recall_observations LIMIT 0")
             .is_ok(),

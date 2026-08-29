@@ -60,11 +60,9 @@ fn v74_columns_and_version_both_backends() {
         db::migrations::current_schema_version_for_tests(),
         "fresh open reaches the current schema tip"
     );
-    // Tip pin: the ladder head advanced to v90 (#2385 archive genesis-cid
-    // parity — the v74 pair below MIRRORED onto `archived_memories`, so
-    // archive->restore carries the address instead of re-minting it; was v89 =
-    // #2392 postgres FTS `tags` fold) — the v74 cid columns asserted below
-    // still exist, only the tip moved.
+    // Tip pin: the ladder head advanced to v91 (#3250 archived_memory_links
+    // source_cid/target_cid). The v74 cid columns asserted below still
+    // exist; only the tip moved (was v90 = #2385 archive genesis-cid).
     assert_eq!(db::migrations::current_schema_version_for_tests(), 91);
     // The additive columns exist and are queryable.
     assert!(
@@ -78,7 +76,7 @@ fn v74_columns_and_version_both_backends() {
     let conn2 = db::open(&path).unwrap();
     assert_eq!(
         schema_version(&conn2),
-        90,
+        db::migrations::current_schema_version_for_tests(),
         "re-open stays at the current tip idempotently"
     );
     assert!(
