@@ -6395,7 +6395,7 @@ impl PostgresStore {
     /// them instead of NULL. Tip arm — stamps [`CURRENT_SCHEMA_VERSION`].
     async fn migrate_v91(&self) -> StoreResult<()> {
         debug_assert!(
-            MIGRATION_V91_ARCHIVED_LINKS_CID.contains("archived_memory_links"),
+            MIGRATION_V91_ARCHIVED_LINKS_CID.contains(crate::storage::TABLE_ARCHIVED_MEMORY_LINKS),
             "#3250: the v91 DDL doc twin must ship with the binary"
         );
         let mut tx = self

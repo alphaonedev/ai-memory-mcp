@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B17-B1a — hardcoded-literal ratchet after B1 merge)
+
+- `archived_memory_links` is named once as
+  `storage::TABLE_ARCHIVED_MEMORY_LINKS` (next to the existing
+  `TABLE_MEMORIES` / `TABLE_ARCHIVED_MEMORIES` SSOT). emit omitted-class
+  marker, sqlite v91 `contains` probe, and postgres v91 `contains`
+  probe all reference the const. Do not raise the pm-v3.1 baseline.
+- `TX_COMMIT_FAILED: {e}` is produced by one helper
+  (`storage::tx_commit_failed`) used at the three capture/recover
+  commit sites (in-tx re-probe, capture commit, recover commit).
+  Prefix no longer exists as three production format strings.
+  ERRORS-02 / ERRORS-15: cause still rendered via `Display`.
+
 ### Fixed (B17 BRANCH 1 review — owner-scope paren + concurrent #3231 pin)
 
 - `forget_for_caller` archive-links `source_id` subquery: restore the

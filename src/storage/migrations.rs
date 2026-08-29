@@ -3982,7 +3982,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // prove. Canonical DDL:
             // migrations/sqlite/0075_v91_archived_memory_links_cid.sql.
             debug_assert!(
-                MIGRATION_V91_SQLITE.contains("archived_memory_links"),
+                MIGRATION_V91_SQLITE.contains(super::TABLE_ARCHIVED_MEMORY_LINKS),
                 "v91 doc twin must ship the archived_memory_links DDL"
             );
             let has_archive_links: bool = conn

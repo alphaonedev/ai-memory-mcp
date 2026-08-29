@@ -413,7 +413,7 @@ pub fn build_full_envelope_audited(
         ConformanceLevel::L1,
     );
     note(
-        "archived_memory_links",
+        crate::storage::TABLE_ARCHIVED_MEMORY_LINKS,
         archived_memory_links.is_empty(),
         ConformanceLevel::L1,
     );
