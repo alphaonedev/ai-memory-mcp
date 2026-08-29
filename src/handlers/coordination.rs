@@ -147,7 +147,10 @@ pub async fn transition_action(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": crate::errors::msg::invalid("claimed_by", e)})),
+            Json(json!({"error": crate::errors::msg::invalid(
+                crate::mcp::param_names::CLAIMED_BY,
+                e,
+            )})),
         )
             .into_response();
     }

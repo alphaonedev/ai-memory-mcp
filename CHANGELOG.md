@@ -83,7 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `#3225` HTTP `POST /api/v1/capture_turn` now honours K9 + namespace
   governance (Deny → 403, Ask/Pending → 202) before the durable write,
-  matching MCP `memory_capture_turn`.
+  matching MCP `memory_capture_turn`. `#3292` M7 unowned-owner-lock
+  Deny is allow-through on both HTTP helpers (MCP parity; HTTP is
+  not stricter).
 - `#3226` HTTP `POST /api/v1/actions/{id}/transition` binds
   `claimed_by` to the live lease holder (`authorize_claimed_by`) and
   rejects control-char / non-holder callers (403/400). Shared with MCP
@@ -99,6 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   URL); lib `http_capture_turn_respects_namespace_deny`.
 - `tests/http_transition_claimed_by_3226.rs`; lib
   `authorize_claimed_by_binds_live_holder_3009`.
+- Review follow-up (Fable 3712a9bc): lib
+  `forget_policy_probe_fault_is_503_and_does_not_delete_3227`,
+  `postgres_delete_pre_get_fault_is_503_and_does_not_delete_3228`,
+  `http_capture_turn_k9_ask_returns_202`,
+  `http_capture_turn_namespace_governance_pending_returns_202`.
+  `#3227`/`#3228` Err arms now go through `store_err_to_response`
+  (no third `"storage backend unavailable"` site). HTTP capture_turn
+  Deny reproduces MCP `#3292` M7 unowned-owner-lock allow-through.
 
 ### Fixed (B15 — remaining six CI tests; Approve-arm pending queue)
 

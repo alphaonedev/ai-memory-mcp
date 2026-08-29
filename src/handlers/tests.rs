@@ -15875,6 +15875,378 @@ async fn http_capture_turn_respects_namespace_deny() {
     );
 }
 
+/// #3225 — K9 `Ask` on capture_turn is 202, not an ungated write.
+/// The Deny test only exercises `Permissions::evaluate` Deny; Ask is
+/// the other K9 short-circuit before namespace governance.
+#[tokio::test]
+async fn http_capture_turn_k9_ask_returns_202() {
+    use crate::governance::{
+        PermissionRule, RuleDecision, clear_active_permission_rules_for_test,
+        set_active_permission_rules,
+    };
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _mode = crate::config::lock_permissions_mode_for_test();
+    clear_active_permission_rules_for_test();
+    // Enforce escalates K9 Ask → Deny. Advisory is the mode where
+    // `Permissions::evaluate` actually returns `Decision::Ask`, which
+    // is the HTTP 202 arm Fable asked for (3712a9bc).
+    crate::config::override_active_permissions_mode_for_test(
+        crate::config::PermissionsMode::Advisory,
+    );
+    set_active_permission_rules(vec![PermissionRule {
+        namespace_pattern: "askme/*".to_string(),
+        op: crate::governance::Op::MemoryStore.as_str().to_string(),
+        agent_pattern: "*".to_string(),
+        decision: RuleDecision::Ask,
+        reason: Some("confirm HTTP capture".to_string()),
+    }]);
+
+    let state = test_state();
+    let app = capture_turn_test_router(state);
+    let (status, payload) = post_capture_turn(
+        &app,
+        "alice",
+        &json!({
+            "host_session_id": "sess-3225-ask",
+            "host_turn_index": 0,
+            "role": "user",
+            "content": "please confirm this capture",
+            "namespace": "askme/ops"
+        }),
+    )
+    .await;
+    clear_active_permission_rules_for_test();
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "#3225: K9 Ask on capture_turn must be 202, got {status} {payload}"
+    );
+    assert_eq!(payload["status"].as_str(), Some("ask"));
+    assert_eq!(payload["action"].as_str(), Some("capture_turn"));
+}
+
+/// B17-B2 review (3712a9bc): mock SAL adapter that injects get/probe
+/// faults and counts mutating calls so 503 cannot still delete.
+#[cfg(feature = "sal")]
+struct B17B2FaultStore {
+    get_fault: bool,
+    probe_fault: bool,
+    delete_calls: std::sync::atomic::AtomicUsize,
+    forget_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "sal")]
+impl B17B2FaultStore {
+    fn get_fault() -> Self {
+        Self {
+            get_fault: true,
+            probe_fault: false,
+            delete_calls: std::sync::atomic::AtomicUsize::new(0),
+            forget_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn probe_fault() -> Self {
+        Self {
+            get_fault: false,
+            probe_fault: true,
+            delete_calls: std::sync::atomic::AtomicUsize::new(0),
+            forget_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "sal")]
+#[async_trait::async_trait]
+impl crate::store::MemoryStore for B17B2FaultStore {
+    fn capabilities(&self) -> crate::store::Capabilities {
+        crate::store::Capabilities::empty()
+    }
+    async fn store(
+        &self,
+        _ctx: &crate::store::CallerContext,
+        mem: &crate::models::Memory,
+    ) -> crate::store::StoreResult<String> {
+        Ok(mem.id.clone())
+    }
+    async fn get(
+        &self,
+        _ctx: &crate::store::CallerContext,
+        id: &str,
+    ) -> crate::store::StoreResult<crate::models::Memory> {
+        if self.get_fault {
+            return Err(crate::store::StoreError::BackendUnavailable {
+                backend: "mock".into(),
+                detail: "injected fault".into(),
+            });
+        }
+        Err(crate::store::StoreError::NotFound { id: id.to_string() })
+    }
+    async fn update(
+        &self,
+        _ctx: &crate::store::CallerContext,
+        _id: &str,
+        _patch: crate::store::UpdatePatch,
+    ) -> crate::store::StoreResult<()> {
+        Ok(())
+    }
+    async fn delete(
+        &self,
+        _ctx: &crate::store::CallerContext,
+        _id: &str,
+    ) -> crate::store::StoreResult<()> {
+        self.delete_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn list(
+        &self,
+        _ctx: &crate::store::CallerContext,
+        _filter: &crate::store::Filter,
+    ) -> crate::store::StoreResult<Vec<crate::models::Memory>> {
+        Ok(vec![])
+    }
+    async fn search(
+        &self,
+        _ctx: &crate::store::CallerContext,
+        _query: &str,
+        _filter: &crate::store::Filter,
+    ) -> crate::store::StoreResult<Vec<crate::models::Memory>> {
+        Ok(vec![])
+    }
+    async fn verify(
+        &self,
+        _ctx: &crate::store::CallerContext,
+        id: &str,
+    ) -> crate::store::StoreResult<crate::store::VerifyReport> {
+        Ok(crate::store::VerifyReport {
+            memory_id: id.to_string(),
+            integrity_ok: true,
+            findings: vec![],
+            signature_verified: false,
+            cid_ok: None,
+            cid_mismatch: None,
+        })
+    }
+    async fn link(
+        &self,
+        _ctx: &crate::store::CallerContext,
+        _link: &crate::models::MemoryLink,
+    ) -> crate::store::StoreResult<()> {
+        Ok(())
+    }
+    async fn list_links(
+        &self,
+        _namespace: Option<&str>,
+    ) -> crate::store::StoreResult<Vec<crate::models::MemoryLink>> {
+        Ok(vec![])
+    }
+    async fn register_agent(
+        &self,
+        _ctx: &crate::store::CallerContext,
+        _agent: &crate::models::AgentRegistration,
+    ) -> crate::store::StoreResult<()> {
+        Ok(())
+    }
+    async fn forget(
+        &self,
+        _ctx: &crate::store::CallerContext,
+        _namespace: Option<&str>,
+        _pattern: Option<&str>,
+        _tier: Option<&crate::models::Tier>,
+        _archive: bool,
+    ) -> crate::store::StoreResult<usize> {
+        self.forget_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(0)
+    }
+    async fn forget_distinct_namespaces(
+        &self,
+        _pattern: Option<&str>,
+        _tier: Option<&crate::models::Tier>,
+    ) -> crate::store::StoreResult<Vec<String>> {
+        if self.probe_fault {
+            Ok(vec!["fault-ns".to_string()])
+        } else {
+            Ok(vec![])
+        }
+    }
+    async fn resolve_governance_policy(
+        &self,
+        _namespace: &str,
+    ) -> crate::store::StoreResult<Option<crate::models::GovernancePolicy>> {
+        if self.probe_fault {
+            Err(crate::store::StoreError::BackendUnavailable {
+                backend: "mock".into(),
+                detail: "injected fault".into(),
+            })
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(feature = "sal")]
+fn b17_b2_state_with_store(
+    store: Arc<dyn crate::store::MemoryStore>,
+    backend: StorageBackend,
+    admins: Vec<String>,
+) -> AppState {
+    let mut state = test_app_state(test_state());
+    state.store = store;
+    state.storage_backend = backend;
+    state.admin_agent_ids = Arc::new(admins);
+    state
+}
+
+/// #3227 — policy-probe Err is 503 and forget does not run.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn forget_policy_probe_fault_is_503_and_does_not_delete_3227() {
+    use std::sync::atomic::Ordering;
+    let store = Arc::new(B17B2FaultStore::probe_fault());
+    let app = Router::new()
+        .route("/api/v1/forget", axum_post(forget_memories))
+        .with_state(b17_b2_state_with_store(
+            store.clone(),
+            StorageBackend::Sqlite,
+            vec!["alice".to_string()],
+        ));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/forget")
+                .method("POST")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .header("x-agent-id", "alice")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "pattern": "alpha" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "#3227: probe fault must 503"
+    );
+    assert_eq!(
+        store.forget_calls.load(Ordering::SeqCst),
+        0,
+        "#3227: forget must not run after a probe fault"
+    );
+}
+
+/// #3228 — postgres DELETE pre-get non-NotFound Err is 503 and delete
+/// does not run.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn postgres_delete_pre_get_fault_is_503_and_does_not_delete_3228() {
+    use std::sync::atomic::Ordering;
+    let store = Arc::new(B17B2FaultStore::get_fault());
+    let app = Router::new()
+        .route(
+            "/api/v1/memories/{id}",
+            axum::routing::delete(delete_memory),
+        )
+        .with_state(b17_b2_state_with_store(
+            store.clone(),
+            StorageBackend::Postgres,
+            vec!["alice".to_string()],
+        ));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/memories/mem-3228")
+                .method("DELETE")
+                .header("x-agent-id", "alice")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "#3228: pre-get fault must 503"
+    );
+    assert_eq!(
+        store.delete_calls.load(Ordering::SeqCst),
+        0,
+        "#3228: delete must not run after a pre-get fault"
+    );
+}
+
+/// #3225 — namespace-governance Pending (not K9) returns 202.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn http_capture_turn_namespace_governance_pending_returns_202() {
+    let _gate = pin_governance_enforce_for_test();
+    crate::governance::clear_active_permission_rules_for_test();
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let path = f.path().to_path_buf();
+    let conn = crate::db::open(&path).unwrap();
+    let ns = "gov-capture-3225";
+    // seed_governance_policy talks to a Db mutex; seed the same file
+    // the SAL store will open.
+    drop(conn);
+    {
+        let db: Db = Arc::new(Mutex::new((
+            crate::db::open(&path).unwrap(),
+            path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        seed_governance_policy(
+            &db,
+            ns,
+            serde_json::json!({
+                "write": "approve",
+                "delete": "owner",
+                "promote": "any",
+                "approver": "human",
+            }),
+        )
+        .await;
+    }
+    let store: Arc<dyn crate::store::MemoryStore> =
+        Arc::new(crate::store::sqlite::SqliteStore::open(&path).unwrap());
+    let db: Db = Arc::new(Mutex::new((
+        crate::db::open(&path).unwrap(),
+        path,
+        ResolvedTtl::default(),
+        true,
+    )));
+    let mut state = b17_b2_state_with_store(store, StorageBackend::Sqlite, vec!["alice".into()]);
+    state.db = db;
+    let app = Router::new()
+        .route("/api/v1/capture_turn", axum_post(capture_turn))
+        .with_state(state);
+    let (status, payload) = post_capture_turn(
+        &app,
+        "alice",
+        &json!({
+            "host_session_id": "sess-3225-pending",
+            "host_turn_index": 0,
+            "role": "user",
+            "content": "queued capture, not stored",
+            "namespace": ns
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "#3225: namespace-gov Pending must be 202, got {status} {payload}"
+    );
+    assert_eq!(payload["status"].as_str(), Some("pending"));
+    assert_eq!(payload["action"].as_str(), Some("capture_turn"));
+    assert!(payload["pending_id"].is_string(), "pending_id: {payload}");
+}
+
 // ---------------------------------------------------------------------------
 // #1579 B4 — gzip response compression + TOON format negotiation
 // ---------------------------------------------------------------------------

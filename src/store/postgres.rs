@@ -16047,7 +16047,7 @@ fn pg_row_to_action(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Act
         payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
         priority: r.try_get("priority").map_err(|e| g("action.priority", e))?,
         agent_id: r.try_get("agent_id").ok(),
-        claimed_by: r.try_get("claimed_by").ok(),
+        claimed_by: r.try_get(crate::mcp::param_names::CLAIMED_BY).ok(),
         vector_clock: serde_json::from_str(&vector_clock).unwrap_or(serde_json::Value::Null),
         metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
         created_at: r

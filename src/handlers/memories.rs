@@ -904,11 +904,7 @@ pub async fn delete_memory(
                     id = %id,
                     "postgres delete pre-get failed; refusing (#3228)"
                 );
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"error": "storage backend unavailable"})),
-                )
-                    .into_response();
+                return store_err_to_response(e);
             }
         };
 

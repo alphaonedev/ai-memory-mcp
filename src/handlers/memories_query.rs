@@ -635,16 +635,15 @@ pub async fn forget_memories(
                 Err(e) => {
                     // #3227 — 503, not "ungoverned". A probe that could not
                     // run is not evidence the namespace is ungoverned.
+                    // Route through `store_err_to_response` (same as #3225
+                    // capture_turn) so the literal is not triplicated and
+                    // the status mapping stays typed (ERRORS-02).
                     tracing::error!(
                         error = %e,
                         namespace = %ns,
                         "forget governance policy probe failed; refusing (#3227)"
                     );
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"error": "storage backend unavailable"})),
-                    )
-                        .into_response();
+                    return store_err_to_response(e);
                 }
             };
             if governed {

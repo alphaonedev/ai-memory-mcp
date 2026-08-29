@@ -247,19 +247,28 @@ async fn http_capture_turn_governance_via_store(
         .await
     {
         Ok(GovernanceDecision::Allow) => None,
-        Ok(GovernanceDecision::Deny(refusal)) => Some(
-            (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": crate::governance::deny_message(
-                        ACTION_CAPTURE_TURN,
-                        crate::governance::DenyGate::Governance,
-                        &refusal.reason,
-                    ),
-                })),
-            )
-                .into_response(),
-        ),
+        Ok(GovernanceDecision::Deny(refusal)) => {
+            // #3292 M7 — unowned-standard Owner lock must not 403 a
+            // legitimate capture. MCP `memory_capture_turn` allow-through
+            // (`is_unowned_owner_lock`); HTTP was stricter (over-refuse).
+            if refusal.is_unowned_owner_lock() {
+                None
+            } else {
+                Some(
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": crate::governance::deny_message(
+                                ACTION_CAPTURE_TURN,
+                                crate::governance::DenyGate::Governance,
+                                &refusal.reason,
+                            ),
+                        })),
+                    )
+                        .into_response(),
+                )
+            }
+        }
         Ok(GovernanceDecision::Pending(pending_id)) => Some(
             (
                 StatusCode::ACCEPTED,
@@ -310,19 +319,26 @@ fn http_capture_turn_governance_via_db(
         None,
     ) {
         Ok(GovernanceDecision::Allow) => None,
-        Ok(GovernanceDecision::Deny(refusal)) => Some(
-            (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": crate::governance::deny_message(
-                        ACTION_CAPTURE_TURN,
-                        crate::governance::DenyGate::Governance,
-                        &refusal.reason,
-                    ),
-                })),
-            )
-                .into_response(),
-        ),
+        Ok(GovernanceDecision::Deny(refusal)) => {
+            // #3292 M7 — MCP↔HTTP parity: unowned-owner-lock allow-through.
+            if refusal.is_unowned_owner_lock() {
+                None
+            } else {
+                Some(
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": crate::governance::deny_message(
+                                ACTION_CAPTURE_TURN,
+                                crate::governance::DenyGate::Governance,
+                                &refusal.reason,
+                            ),
+                        })),
+                    )
+                        .into_response(),
+                )
+            }
+        }
         Ok(GovernanceDecision::Pending(pending_id)) => Some(
             (
                 StatusCode::ACCEPTED,
