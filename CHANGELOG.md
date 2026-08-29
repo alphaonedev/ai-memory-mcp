@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B12' — canonical `updated_at` only)
+
+- Sqlite row-write funnels persist `updated_at` via
+  `validate::canonical_rfc3339` (micros+`Z`) so local-won vs inbound-won
+  provenance cannot store two RFC3339 renderings of the same instant
+  (#2207 `both_merge_orders_converge_to_identical_rows`). `created_at`
+  stays caller-signed-verbatim (attestation binds those bytes). Local
+  `version_vector` stamp uses the same canonical `updated_at` (#1757).
+  LWW comparison is unchanged. `valid_from` / `valid_until` /
+  `expires_at` were already canonical at these funnels.
+
 ### Fixed (B11 — DB_PASSPHRASE test isolation)
 
 - `DB_PASSPHRASE` stays `OnceLock` in production (first-writer-wins,

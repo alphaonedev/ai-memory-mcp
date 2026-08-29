@@ -1826,12 +1826,16 @@ fn insert_inner(
     // #2211 — `insert_imported` skips the stamp entirely (remote admission:
     // the row was authored elsewhere; bumping this node's component here
     // would misattribute clock authorship).
+    // Wave-2 B12' — persist `updated_at` as micros+Z; stamp THIS node's
+    // version_vector component with the SAME rendering so #1757 stays
+    // consistent. `created_at` stays caller-signed-verbatim.
+    let updated_at_canon = crate::validate::canonical_rfc3339(&mem.updated_at);
     let stamped_metadata = if stamp_local_clock {
         let mut m = mem.metadata.clone();
         crate::models::stamp_version_vector(
             &mut m,
             crate::federation::identity::resolver::local_node_identity(),
-            &mem.updated_at,
+            &updated_at_canon,
         );
         m
     } else {
@@ -2234,7 +2238,7 @@ fn insert_inner(
                     mem.source,
                     mem.access_count,
                     mem.created_at,
-                    mem.updated_at,
+                    updated_at_canon,
                     mem.last_accessed_at,
                     expires_canon,
                     metadata_json,
@@ -2770,7 +2774,10 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                 params![
                     mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
                     tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-                    mem.created_at, mem.updated_at, mem.last_accessed_at,
+                    mem.created_at,
+                    // Wave-2 B12' / #2207 — `updated_at` only (micros+Z).
+                    crate::validate::canonical_rfc3339(&mem.updated_at),
+                    mem.last_accessed_at,
                     // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry
                     // rendering (the v86 valid_* precedent below).
                     crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
@@ -15674,7 +15681,9 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                 mem.source,
                 mem.access_count,
                 mem.created_at,
-                mem.updated_at,
+                // Wave-2 B12' / #2207 — `updated_at` only (micros+Z).
+                // `created_at` is caller-signed-verbatim.
+                crate::validate::canonical_rfc3339(&mem.updated_at),
                 mem.last_accessed_at,
                 // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry rendering at
                 // the federation-receive funnel too (the v86 valid_* precedent
@@ -16036,7 +16045,9 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             mem.source,
             mem.access_count,
             mem.created_at,
-            mem.updated_at,
+            // Wave-2 B12' / #2207 — `updated_at` only (micros+Z).
+            // `created_at` is caller-signed-verbatim.
+            crate::validate::canonical_rfc3339(&mem.updated_at),
             mem.last_accessed_at,
             // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry rendering on
             // the federation merge-writer path (v86 valid_* precedent).
