@@ -20120,11 +20120,13 @@ fn evaluate_level(
             // Non-owner still queues a pending_action. Caller translates
             // `Pending` into the queue so the db layer stays the SSOT for
             // pending ids.
-            let owner = match action {
-                GovernedAction::Store => namespace_owner,
-                _ => memory_owner,
-            };
-            if matches!(owner, Some(o) if o == agent_id) {
+            //
+            // B15: auto-allow is the NAMESPACE-STANDARD owner on EVERY
+            // action, not `memory_owner` for promote/delete. Using the
+            // row author skipped the pending queue (ERRORS-09) and
+            // broke `promote:approve` / `delete:approve` for the
+            // memory's own agent.
+            if matches!(namespace_owner, Some(o) if o == agent_id) {
                 GovernanceDecision::Allow
             } else {
                 GovernanceDecision::Pending(String::new())
@@ -20307,11 +20309,9 @@ pub fn enforce_governance(
         // no current callsite passes `GovernedAction::Reflect` here.
         GovernedAction::Reflect => &policy.core.write,
     };
-    let ns_owner = if matches!(action, GovernedAction::Store) {
-        namespace_owner(conn, namespace)
-    } else {
-        None
-    };
+    // Always resolve the namespace-standard owner: Owner-level Store
+    // uses it, and Approve uses it for every action (B15).
+    let ns_owner = namespace_owner(conn, namespace);
 
     let mut decision = evaluate_level(
         conn,

@@ -113,8 +113,10 @@ fn doctor_reports_clean_on_fresh_db() {
     let db = tmp.path().join("ai-memory.db");
     init_db(&db);
 
-    // Default invocation — text mode, no --fail-on-warn. A fresh DB has
-    // no critical findings and the process exits 0.
+    // Default invocation — text mode, no --fail-on-warn. Wave-2 B3
+    // WARNs on unencrypted-at-rest for a fresh non-sqlcipher db, so
+    // overall is WARN (not INFO). Still exits 0 without --fail-on-warn.
+    // No section is Critical.
     ai_memory(&db)
         .args(["doctor"])
         .assert()
@@ -123,7 +125,7 @@ fn doctor_reports_clean_on_fresh_db() {
         .stdout(predicate::str::contains("Storage"))
         .stdout(predicate::str::contains("Governance"))
         .stdout(predicate::str::contains("Webhook"))
-        .stdout(predicate::str::contains("overall:      INFO"));
+        .stdout(predicate::str::contains("overall:      WARN"));
 
     // JSON mode produces a parseable document with the expected shape.
     let out = ai_memory(&db)

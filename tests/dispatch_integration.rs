@@ -621,13 +621,11 @@ fn cli_agent_id_flag_propagates_to_subcommand() {
 
 #[test]
 fn cli_db_passphrase_file_flag_accepted() {
-    // `--db-passphrase-file <PATH>` is global. On non-sqlcipher builds
-    // the env var is read but ignored — what we want to assert here is
-    // that the flag *parses* and the dispatch *reads the file* without
-    // erroring out. An empty passphrase is rejected; a non-empty one
-    // round-trips through to the env without affecting the (standard
-    // sqlite) DB. We use `stats` because it's a no-op subcommand that
-    // doesn't depend on passphrase contents.
+    // `--db-passphrase-file <PATH>` is global. Wave-1 S1 / Wave-2 B3:
+    // a non-sqlcipher build must REFUSE the flag (fail-closed — never
+    // persist plaintext while a passphrase was requested). The flag
+    // still *parses*; the refuse is the S1 boot gate, not clap. Do NOT
+    // weaken `refuse_at_rest_requested_without_sqlcipher`.
     let tmp = TempDir::new().unwrap();
     let pass = tmp.path().join("passphrase.txt");
     std::fs::write(&pass, b"correct-horse-battery-staple\n").unwrap();
@@ -641,15 +639,33 @@ fn cli_db_passphrase_file_flag_accepted() {
         std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(0o400)).unwrap();
     }
     let db = tmp.path().join("passphrase-flag.db");
-    ai_memory(&db)
-        .args([
-            "--db-passphrase-file",
-            pass.to_str().unwrap(),
-            "--json",
-            "stats",
-        ])
-        .assert()
-        .success();
+    #[cfg(not(feature = "sqlcipher"))]
+    {
+        ai_memory(&db)
+            .args([
+                "--db-passphrase-file",
+                pass.to_str().unwrap(),
+                "--json",
+                "stats",
+            ])
+            .assert()
+            .failure()
+            .stderr(
+                predicate::str::contains("sqlcipher").or(predicate::str::contains("passphrase")),
+            );
+    }
+    #[cfg(feature = "sqlcipher")]
+    {
+        ai_memory(&db)
+            .args([
+                "--db-passphrase-file",
+                pass.to_str().unwrap(),
+                "--json",
+                "stats",
+            ])
+            .assert()
+            .success();
+    }
 }
 
 // ---------------------------------------------------------------------------

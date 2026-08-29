@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B15 — remaining six CI tests; Approve-arm pending queue)
+
+- `#3292` M6 auto-allow on `GovernanceLevel::Approve` is the
+  **namespace-standard owner** on every action (sqlite + postgres).
+  Using `memory_owner` for promote/delete let the row's author skip
+  the pending queue (left=`Null` vs right=`pending`). Store-owner
+  auto-allow (`governance_approve_owner_allows_store_3292`) is
+  unchanged. S1 refuse and B3 doctor WARN are untouched.
+- Curator daemon cycle-loop raw open now calls
+  `assert_schema_not_ahead` immediately (#2445). Kept off `db::open`
+  so the interval tick does not pay bootstrap + ladder.
+
+### Tests (B15)
+
+- QUAL-10 lockstep: `src/mcp/mod.rs` 16_760 → 16_890; `src/config.rs`
+  14_040 → 14_140 (never lower).
+- `#2445` production-prefix: cut at the first `#[cfg(test)]` **module**
+  (any name), not every `#[cfg(test)]`. B11's interior
+  `DB_PASSPHRASE` seam no longer hides `connection.rs`'s 3 funnel
+  opens; `cfg(test)` helper fns (vectorlite `broken_for_test`) stay
+  uncounted. Ledger adds `src/curator/mod.rs`.
+- `cli_db_passphrase_file_flag_accepted`: non-sqlcipher expects S1
+  refuse (do not weaken the gate).
+- `doctor_reports_clean_on_fresh_db`: overall WARN (B3 at-rest), not
+  INFO.
+
 ### Fixed (B14 — `updated_at` round-trips verbatim; clamp only far-future)
 
 - `clamp_inbound_updated_at` preserves honest inbound `updated_at`

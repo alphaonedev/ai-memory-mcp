@@ -981,32 +981,45 @@ pub fn run_daemon(
     while !shutdown.load(Ordering::Relaxed) {
         match Connection::open(&db_path) {
             Ok(conn) => {
-                let llm_ref = llm.as_deref();
-                let kp_ref = active_keypair.as_deref();
-                match run_once(&conn, llm_ref, &cfg, kp_ref) {
-                    // v1.0.0 — `deferred` / `autonomy_budget` are the
-                    // budget-pressure pair. A steady non-zero `deferred` means
-                    // the corpus is growing faster than `max_ops_per_cycle`
-                    // can curate it; an `autonomy_budget` of 0 against a
-                    // non-zero `eligible` means Pass-1 consolidation did not
-                    // run at all this cycle. Neither was visible from the
-                    // daemon log before, which is how the Pass-1 starvation
-                    // this reserve fixes could have run unnoticed for the life
-                    // of a deployment.
-                    Ok(report) => tracing::info!(
-                        "curator cycle: scanned={} eligible={} tagged={} contradictions={} personas={} deferred={} autonomy_budget={} errors={} ({}ms, dry_run={})",
-                        report.memories_scanned,
-                        report.memories_eligible,
-                        report.auto_tagged,
-                        report.contradictions_found,
-                        report.personas_generated,
-                        report.operations_skipped_cap,
-                        report.autonomy_ops_budget,
-                        report.errors.len(),
-                        report.cycle_duration_ms,
-                        report.dry_run
-                    ),
-                    Err(e) => tracing::error!("curator cycle errored: {e}"),
+                // #2445 — this cycle-loop open is off `db::open` so the
+                // daemon does not pay bootstrap + ladder every interval.
+                // Guard schema-ahead immediately (ERRORS-01, ERRORS-19).
+                if let Err(e) =
+                    crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())
+                {
+                    tracing::error!(
+                        "curator refused db {} (schema-ahead): {e}",
+                        db_path.display()
+                    );
+                    // Fall through to the interval sleep; next cycle retries.
+                } else {
+                    let llm_ref = llm.as_deref();
+                    let kp_ref = active_keypair.as_deref();
+                    match run_once(&conn, llm_ref, &cfg, kp_ref) {
+                        // v1.0.0 — `deferred` / `autonomy_budget` are the
+                        // budget-pressure pair. A steady non-zero `deferred` means
+                        // the corpus is growing faster than `max_ops_per_cycle`
+                        // can curate it; an `autonomy_budget` of 0 against a
+                        // non-zero `eligible` means Pass-1 consolidation did not
+                        // run at all this cycle. Neither was visible from the
+                        // daemon log before, which is how the Pass-1 starvation
+                        // this reserve fixes could have run unnoticed for the life
+                        // of a deployment.
+                        Ok(report) => tracing::info!(
+                            "curator cycle: scanned={} eligible={} tagged={} contradictions={} personas={} deferred={} autonomy_budget={} errors={} ({}ms, dry_run={})",
+                            report.memories_scanned,
+                            report.memories_eligible,
+                            report.auto_tagged,
+                            report.contradictions_found,
+                            report.personas_generated,
+                            report.operations_skipped_cap,
+                            report.autonomy_ops_budget,
+                            report.errors.len(),
+                            report.cycle_duration_ms,
+                            report.dry_run
+                        ),
+                        Err(e) => tracing::error!("curator cycle errored: {e}"),
+                    }
                 }
             }
             Err(e) => tracing::error!("curator could not open db {}: {e}", db_path.display()),
