@@ -2350,17 +2350,8 @@ async fn http_sync_since_includes_s39_diagnostic_fields() {
     assert_eq!(v["count"], 3);
     // Echoed `since` (unparsed, verbatim — that's the point).
     assert_eq!(v["updated_since"], "2024-01-01T00:00:00+00:00");
-    // Wave-2 B12' — `updated_at` is stored micros+Z; these diagnostics
-    // are derived from the stored column (system-mutated), not the
-    // caller-signed `created_at`.
-    assert_eq!(
-        v["earliest_updated_at"],
-        crate::validate::canonical_rfc3339(mid_ts)
-    );
-    assert_eq!(
-        v["latest_updated_at"],
-        crate::validate::canonical_rfc3339(newest_ts)
-    );
+    assert_eq!(v["earliest_updated_at"], mid_ts);
+    assert_eq!(v["latest_updated_at"], newest_ts);
 
     // Empty set → both timestamp fields are null. The `updated_since`
     // field still echoes the parsed input.
