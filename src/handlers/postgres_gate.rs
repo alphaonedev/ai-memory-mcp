@@ -246,6 +246,11 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // BOTH gate tables, working on postgres only by double-miss.
         ("POST", super::routes::CAPTURE_TURN) => true,
         ("POST", super::routes::MEMORY_RECALL_OBSERVATIONS) => true,
+        // #3064 — `POST /api/v1/memory_verify` dispatches to
+        // `MemoryStore::verify_link` (implemented on PostgresStore).
+        // Never `app.db.lock()`. MCP `signed_at` is `VerifyLinkReport::signed_at`
+        // (link `valid_from`).
+        ("POST", super::routes::MEMORY_VERIFY) => true,
         // v1.0.0 #2402 — the operator quarantine route-OUT. Both handlers
         // dispatch through `app.store` on postgres
         // (`MemoryStore::list_quarantined` / `operator_dequarantine`, both
@@ -1218,6 +1223,11 @@ mod transport_postgres_gate_tests {
         assert!(postgres_endpoint_supported(
             &Method::POST,
             crate::handlers::routes::LINKS_VERIFY
+        ));
+        // #3064 — MCP-parity compact verify now SAL-dispatches too.
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            crate::handlers::routes::MEMORY_VERIFY
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,

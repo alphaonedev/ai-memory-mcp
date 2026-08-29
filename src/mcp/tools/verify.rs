@@ -119,11 +119,11 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
             let src = params
                 .get(param_names::SOURCE_ID)
                 .and_then(Value::as_str)
-                .ok_or("link_id or source_id+target_id is required")?;
+                .ok_or(crate::errors::msg::MEMORY_VERIFY_ARGS_REQUIRED)?;
             let dst = params
                 .get(param_names::TARGET_ID)
                 .and_then(Value::as_str)
-                .ok_or("link_id or source_id+target_id is required")?;
+                .ok_or(crate::errors::msg::MEMORY_VERIFY_ARGS_REQUIRED)?;
             let rel = params
                 .get(param_names::RELATION)
                 .and_then(Value::as_str)

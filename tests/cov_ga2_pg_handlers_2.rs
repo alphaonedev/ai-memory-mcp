@@ -782,3 +782,47 @@ pg_test!(pg_expand_query_no_llm_503, url, {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
     assert_eq!(body["error"], "LLM not configured");
 });
+
+pg_test!(pg_memory_verify_not_501_3064, url, {
+    // #3064 — pre-fix postgres_route_gate 501'd this MCP-parity route.
+    // Fail-on-old-code: 501 is the regression. SAL `verify_link` must run.
+    let r = pg_router(&url).await;
+    let ns = uniq_ns();
+    let src = seed_memory(&r, &ns, "verify-src-3064", "src body").await;
+    let dst = seed_memory(&r, &ns, "verify-dst-3064", "dst body").await;
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/links",
+        json!({"source_id": src, "target_id": dst, "relation": "related_to"}),
+    )
+    .await;
+    assert!(status.is_success(), "seed link status={status} body={body}");
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/memory_verify",
+        json!({"source_id": src, "target_id": dst, "relation": "related_to"}),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "pre-#3064 501; body={body}"
+    );
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    // sqlite↔pg MCP envelope parity: the seed link is unsigned, so
+    // `memory_verify` reports signature_verified=false + null
+    // signed_by/signed_at (same as sqlite `handle_verify`). SAL
+    // `VerifyLinkReport.verified` is true for unsigned rows — the HTTP
+    // mapper must not leak that as signature_verified=true.
+    assert_eq!(
+        body.get("signature_verified"),
+        Some(&json!(false)),
+        "unsigned seed; MCP parity; body={body}"
+    );
+    assert_eq!(body.get("signed_by"), Some(&json!(null)), "body={body}");
+    assert_eq!(body.get("signed_at"), Some(&json!(null)), "body={body}");
+    assert!(
+        body.get("attest_level").is_some(),
+        "MCP envelope; body={body}"
+    );
+});

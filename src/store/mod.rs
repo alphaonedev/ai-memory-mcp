@@ -4705,6 +4705,14 @@ pub struct VerifyLinkReport {
     pub signature_present: bool,
     /// Agent id that signed the row, or `None` for unsigned links.
     pub observed_by: Option<String>,
+    /// #3064 — `valid_from` of the link row, surfaced as MCP
+    /// `memory_verify.signed_at` on a successful *cryptographic*
+    /// re-verify (`verified && signature_present`). `None` when the row
+    /// is unsigned / unverified (matches the sqlite MCP handler).
+    /// `serde(default)` so older JSON without the field still
+    /// deserializes (PERF-15 / additive Option).
+    #[serde(default)]
+    pub signed_at: Option<String>,
     /// Diagnostic findings — non-fatal observations populated by the
     /// adapter (e.g. "signature blob present but no enrolled peer key
     /// for observed_by"). Empty on a clean verify.

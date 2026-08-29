@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct; this is the C1/#2462 rendering class `#3274`'s
   postgres-ignored job surfaced.
 
+### Fixed (B17 Lane 1 — #3064 batch A: memory_verify on postgres)
+
+- `POST /api/v1/memory_verify` is no longer 501 on a postgres daemon.
+  The handler dispatches to `MemoryStore::verify_link` (already
+  implemented on `PostgresStore`); never `app.db.lock()`. MCP
+  `signed_at` is `VerifyLinkReport::signed_at` (link `valid_from`).
+  Inventory 61→62 pg-supported / 21→20 fully-501. Remaining #3064
+  501s (skills ×8, share, atomise, …) stay fail-closed.
+
 ### Changed (B17 Lane 1 — #3274 CI ignored-pg + #3294 Filter pin)
 
 - **#3274:** new workflow `.github/workflows/postgres-ignored.yml`
