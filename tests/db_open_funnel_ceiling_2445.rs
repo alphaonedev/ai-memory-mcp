@@ -88,6 +88,15 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
          mechanical.)",
     ),
     (
+        "src/curator/mod.rs",
+        1,
+        "GUARDED via `assert_schema_not_ahead` (#2445). The curator daemon \
+         re-opens the file each cycle off `db::open` so it does not pay \
+         bootstrap + ladder on every interval tick. Hidden until B15 stopped \
+         cutting production at the first interior `#[cfg(test)]` (`use crate::db` \
+         near the top of this file).",
+    ),
+    (
         "src/cli/schema_init.rs",
         1,
         "READ-ONLY catalog enumeration (`sqlite_master` + `schema_version`), \
@@ -111,30 +120,149 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
-/// Byte offset of the first test-module marker, or the whole file when there is
-/// none. Mirrors the production-vs-test boundary heuristic the shell gates use
-/// (`scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh`) so
-/// the three agree on what "production code" means.
-fn production_prefix(src: &str) -> &str {
-    let cut = ["#[cfg(test)]", "mod tests {", "pub mod tests {"]
-        .iter()
-        .filter_map(|m| src.find(m))
-        .min();
-    cut.map_or(src, |i| &src[..i])
+/// Strip a leading visibility qualifier so `pub(super) mod foo {` and
+/// `pub fn open` share the same item-start checks.
+fn strip_vis(t: &str) -> &str {
+    let t = t.trim_start();
+    let Some(rest) = t.strip_prefix("pub") else {
+        return t;
+    };
+    let rest = rest.trim_start();
+    if rest.starts_with('(') {
+        if let Some(idx) = rest.find(')') {
+            return rest[idx + 1..].trim_start();
+        }
+        return rest;
+    }
+    rest
 }
 
-/// Count raw sqlite connection constructions on non-comment lines.
+fn is_cfg_test_attr(t: &str) -> bool {
+    let t = t.trim_start();
+    t.starts_with("#[cfg(test)]")
+        || t.starts_with("#[cfg(any(test")
+        || t.starts_with("#[cfg(all(test")
+}
+
+fn is_inline_mod(t: &str) -> bool {
+    let t = strip_vis(t);
+    t.starts_with("mod ") && t.contains('{')
+}
+
+fn is_fn_start(t: &str) -> bool {
+    let t = strip_vis(t);
+    let t = t.strip_prefix("async ").unwrap_or(t);
+    let t = t.strip_prefix("const ").unwrap_or(t);
+    let t = t.strip_prefix("unsafe ").unwrap_or(t);
+    t.starts_with("fn ")
+}
+
+fn is_comment_or_empty(t: &str) -> bool {
+    let t = t.trim_start();
+    t.is_empty() || t.starts_with("//") || t.starts_with('*')
+}
+
+/// Attributes immediately above `item_idx` include `#[cfg(test)]`.
+fn attrs_above_include_cfg_test(lines: &[&str], item_idx: usize) -> bool {
+    for line in lines[..item_idx].iter().rev() {
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with("///") || t.starts_with("//!") || t.starts_with("//") {
+            continue;
+        }
+        if is_cfg_test_attr(t) {
+            return true;
+        }
+        if t.starts_with("#[") {
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+/// True when the raw-open sits inside a `#[cfg(test)] fn` (e.g.
+/// `vectorlite::broken_for_test`). An interior `#[cfg(test)]` on a
+/// `static`/`use` (B11 `DB_PASSPHRASE`) must NOT trip this.
+fn enclosing_fn_is_cfg_test(lines: &[&str], idx: usize) -> bool {
+    for i in (0..idx).rev() {
+        let t = lines[i].trim_start();
+        if is_comment_or_empty(t) || t.starts_with("#[") {
+            continue;
+        }
+        if is_fn_start(t) {
+            return attrs_above_include_cfg_test(lines, i);
+        }
+        let head = strip_vis(t);
+        if head.starts_with("impl ")
+            || head.starts_with("struct ")
+            || head.starts_with("enum ")
+            || head.starts_with("trait ")
+            || head.starts_with("use ")
+            || head.starts_with("static ")
+            || head.starts_with("const ")
+            || head.starts_with("type ")
+            || head.starts_with("mod ")
+        {
+            return false;
+        }
+    }
+    false
+}
+
+/// Byte offset of the first `#[cfg(test)]` test *module*, or the whole
+/// file when there is none. Matches `scripts/qc-codegraph-precheck.sh`
+/// and `scripts/check-hardcoded-literals.sh`: only a cfg(test) whose
+/// next item opens an inline `mod … {` ends the production region.
+/// Interior `#[cfg(test)]` on `use`/`fn`/`static` (Wave-2 B11
+/// `DB_PASSPHRASE` seam in `connection.rs`) must NOT hide later
+/// production `Connection::open*` sites.
+fn production_prefix(src: &str) -> &str {
+    let mut pending_attr_start: Option<usize> = None;
+    let mut line_start = 0;
+    for line in src.split_inclusive('\n') {
+        let content = line.trim_start().trim_end_matches(['\n', '\r']);
+        if is_comment_or_empty(content) {
+            line_start += line.len();
+            continue;
+        }
+        if is_cfg_test_attr(content) {
+            if pending_attr_start.is_none() {
+                pending_attr_start = Some(line_start);
+            }
+            line_start += line.len();
+            continue;
+        }
+        if content.starts_with("#[") {
+            line_start += line.len();
+            continue;
+        }
+        if let Some(cut) = pending_attr_start {
+            if is_inline_mod(content) {
+                return &src[..cut];
+            }
+            pending_attr_start = None;
+        }
+        line_start += line.len();
+    }
+    src
+}
+
+/// Count production raw sqlite connection constructions.
 fn count_raw_opens(src: &str) -> usize {
-    production_prefix(src)
-        .lines()
-        .filter(|l| {
+    let src = production_prefix(src);
+    let lines: Vec<&str> = src.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| {
             let t = l.trim_start();
-            !t.starts_with("//") && !t.starts_with('*')
-        })
-        .filter(|l| {
-            l.contains("Connection::open(")
+            if t.starts_with("//") || t.starts_with('*') {
+                return false;
+            }
+            let is_open = l.contains("Connection::open(")
                 || l.contains("Connection::open_with_flags(")
-                || l.contains("Connection::open_in_memory(")
+                || l.contains("Connection::open_in_memory(");
+            is_open && !enclosing_fn_is_cfg_test(&lines, *i)
         })
         .count()
 }
@@ -218,9 +346,26 @@ fn the_production_test_boundary_heuristic_is_load_bearing_2445() {
         "a production raw open must be counted"
     );
     assert_eq!(
-        count_raw_opens("#[cfg(test)]\nmod t { fn f() { Connection::open(p); } }"),
+        count_raw_opens("#[cfg(test)]\nmod tests { fn f() { Connection::open(p); } }"),
         0,
         "a test-module raw open must NOT be counted"
+    );
+    assert_eq!(
+        count_raw_opens("#[cfg(test)]\nstatic X: i32 = 0;\nConnection::open(p);"),
+        1,
+        "an interior #[cfg(test)] seam must NOT hide later production opens"
+    );
+    assert_eq!(
+        count_raw_opens(
+            "#[cfg(test)]\nmod transport_helpers_tests {\nConnection::open_in_memory();\n}"
+        ),
+        0,
+        "a cfg(test) module that is not named `tests` must NOT be counted"
+    );
+    assert_eq!(
+        count_raw_opens("#[cfg(test)]\nfn broken_for_test() {\nConnection::open_in_memory();\n}"),
+        0,
+        "a cfg(test) helper fn must NOT be counted"
     );
     assert_eq!(
         count_raw_opens("// Connection::open(p) in a comment"),

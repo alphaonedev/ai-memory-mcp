@@ -29028,28 +29028,25 @@ impl MemoryStore for PostgresStore {
         // v0.7.0 Wave-3 Continuation 4 (Bucket C / S60+S80) — resolve
         // the namespace owner via the inheritance chain. Walks leaf→root
         // under the same tx snapshot as the policy lookup above.
-        let ns_owner = if matches!(action, super::GovernedAction::Store) {
-            let mut found: Option<String> = None;
-            for ns in chain.iter().rev() {
-                let row: Option<(Option<String>,)> = sqlx::query_as(
-                    "SELECT m.metadata->>'agent_id' AS agent_id \
-                     FROM namespace_meta nm \
-                     JOIN memories m ON m.id = nm.standard_id \
-                     WHERE nm.namespace = $1",
-                )
-                .bind(ns)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("namespace_owner chain lookup (tx)", e))?;
-                if let Some((Some(o),)) = row {
-                    found = Some(o);
-                    break;
-                }
+        // B15: always resolve — Approve uses ns_owner for promote/delete
+        // as well as Store.
+        let mut ns_owner: Option<String> = None;
+        for ns in chain.iter().rev() {
+            let row: Option<(Option<String>,)> = sqlx::query_as(
+                "SELECT m.metadata->>'agent_id' AS agent_id \
+                 FROM namespace_meta nm \
+                 JOIN memories m ON m.id = nm.standard_id \
+                 WHERE nm.namespace = $1",
+            )
+            .bind(ns)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("namespace_owner chain lookup (tx)", e))?;
+            if let Some((Some(o),)) = row {
+                ns_owner = Some(o);
+                break;
             }
-            found
-        } else {
-            None
-        };
+        }
 
         // Inline is_registered_agent under the same tx — the existing
         // helper takes &self.pool; we reproduce its single-row probe.
@@ -29152,11 +29149,10 @@ impl MemoryStore for PostgresStore {
                 }
             }
             GovernanceLevel::Approve => {
-                let owner_to_compare = match action {
-                    super::GovernedAction::Store => ns_owner.as_deref(),
-                    _ => memory_owner,
-                };
-                if matches!(owner_to_compare, Some(o) if o == agent_id) {
+                // B15: namespace-standard owner auto-allows on every
+                // action (M6 contract). Do not use `memory_owner` for
+                // promote/delete — that skipped the pending queue.
+                if matches!(ns_owner.as_deref(), Some(o) if o == agent_id) {
                     GovernanceDecision::Allow
                 } else {
                     GovernanceDecision::Pending(String::new())
