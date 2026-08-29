@@ -32,9 +32,15 @@ src/handlers/federation_signing_check.rs:probe_principal
 src/handlers/admin.rs:DAEMON_PRINCIPAL
 src/handlers/hook_subscribers.rs:AI_HTTP_INTERNAL
 src/handlers/http.rs:AI_HTTP_INTERNAL
+# #3064 batch C — POST /api/v1/memory_export_reflection postgres SAL
+# arm. Read-only UNFILTERED export matching sqlite `db::get` (no
+# caller-ownership gate by design, #1075-era). `for_admin` adds NO new
+# privilege vs the already-allowlisted sqlite path. SECURITY APPROVAL
+# 2026-08-29 (Fable, d2d34b6e): JUSTIFIED. Raw literal (not a sentinel)
+# because the principal is HTTP-route-scoped, not a daemon identity.
+src/handlers/route_1111.rs:http:export-reflection
 src/handlers/subscriptions.rs:SUBSCRIPTION_DISPATCH
 src/migrate.rs:AI_MIGRATE
-src/store/postgres.rs:EXPORT_INTERNAL
 src/store/postgres.rs:GOVERNANCE_INTERNAL
 src/cli/stop.rs:AI_OPERATOR
 # #2121 — L2 transcript-recovery walker (recover_from_transcript_store): a
