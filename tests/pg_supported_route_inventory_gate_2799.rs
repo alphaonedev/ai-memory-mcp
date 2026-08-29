@@ -165,7 +165,7 @@ fn all_registered_paths() -> Vec<&'static str> {
 const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DELETE];
 
 /// The AUTHORITATIVE pg-supported inventory (2026-08-09, Phase-1 vote
-/// `4d3ea1c5`): of the 80 unique production URL paths, exactly these 21
+/// `4d3ea1c5`): of the 82 unique production URL paths, exactly these 20
 /// are FULLY fail-closed (no HTTP method reaches a postgres-backed
 /// handler). Each is honest-v1.x-rescoped OR verified app.db-bound /
 /// SAL-less:
@@ -178,13 +178,12 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 ///       memory_atomise, memory_calibrate_confidence, memory_smart_load,
 ///       memory_export_reflection, memory_replay, memory_subscription_replay,
 ///       memory_subscription_dlq_list  (do-not-touch honest-v1.x set);
-///       memory_verify (compact link-verify; `signed_at` not reproducible
-///         from the `verify_link` SAL — `/api/v1/links/verify` IS the
-///         pg-supported link-verify surface);
 ///       memory_dependents_of_invalidated (NO SAL trait method);
 ///       memory_rule_list + memory_check_agent_action (postgres ships NO
 ///         `governance_rules` table — a ~300+ LOC new-table gap the vote
 ///         explicitly refused to rush into the cert window).
+/// 2026-08-29 (#3064): `memory_verify` LEFT this set — SAL
+/// `verify_link` + `signed_at` on `VerifyLinkReport`.
 /// Opening ANY of these requires proving SAL dispatch first (see the
 /// module doc) and updating this list with justification.
 fn expected_fully_501_paths() -> BTreeSet<&'static str> {
@@ -201,7 +200,6 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
         routes::MEMORY_SMART_LOAD,
         routes::MEMORY_SUBSCRIPTION_DLQ_LIST,
         routes::MEMORY_SUBSCRIPTION_REPLAY,
-        routes::MEMORY_VERIFY,
         routes::SKILL_ID,
         routes::SKILL_ID_COMPOSE,
         routes::SKILL_ID_EXPORT,
@@ -228,8 +226,12 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // postgres_operator_quarantine_surface_parity_2402` drives both verbs against a
 // live postgres and asserts the row AND its `memory.dequarantined` signed-chain
 // audit row land on that backend. The fully-501 inventory is unchanged.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 61;
-const EXPECTED_FULLY_501_PATHS: usize = 21;
+// 2026-08-29 (#3064) — bumped 61 -> 62 pg-supported / 21 -> 20 fully-501:
+// `POST /api/v1/memory_verify` now SAL-dispatches to `MemoryStore::verify_link`
+// (PostgresStore impl already existed). MCP `signed_at` is
+// `VerifyLinkReport::signed_at` (link valid_from). Never `app.db.lock()`.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 62;
+const EXPECTED_FULLY_501_PATHS: usize = 20;
 const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 82;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
@@ -271,6 +273,7 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "MEMORY_RECALL_OBSERVATIONS",
     "MEMORY_REFLECT",
     "MEMORY_REFLECTION_ORIGIN",
+    "MEMORY_VERIFY",
     "METRICS",
     "METRICS_BARE",
     "NAMESPACES",
@@ -461,9 +464,9 @@ fn pg_supported_inventory_and_counts_are_pinned() {
     );
 }
 
-/// The three route_1111 routes that ARE pg-supported (SAL-backed with a
+/// The route_1111 routes that ARE pg-supported (SAL-backed with a
 /// verified `StorageBackend::Postgres` branch dispatching to
-/// `app.store.{reflect,get_reflection_origin,list_recall_observations}`)
+/// `app.store.{reflect,get_reflection_origin,list_recall_observations,verify_link}`)
 /// must stay supported — a regression that dropped them would silently
 /// 501 a working pg surface.
 #[test]
@@ -480,13 +483,14 @@ fn already_open_sal_route_1111_routes_stay_supported() {
         &Method::POST,
         routes::MEMORY_RECALL_OBSERVATIONS
     ));
-    // Conversely, the verified app.db-bound / SAL-less siblings must stay
-    // fail-closed (opening them would convert a safe 501 into a silent
-    // scratch-sqlite read/write on a pg daemon).
-    assert!(!postgres_endpoint_supported(
+    // #3064 — memory_verify now SAL-dispatches on postgres.
+    assert!(postgres_endpoint_supported(
         &Method::POST,
         routes::MEMORY_VERIFY
     ));
+    // Conversely, the verified app.db-bound / SAL-less siblings must stay
+    // fail-closed (opening them would convert a safe 501 into a silent
+    // scratch-sqlite read/write on a pg daemon).
     assert!(!postgres_endpoint_supported(
         &Method::POST,
         routes::MEMORY_DEPENDENTS_OF_INVALIDATED

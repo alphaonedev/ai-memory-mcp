@@ -572,12 +572,106 @@ pub async fn handle_verify_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #3064 — postgres SAL dispatch. `PostgresStore::verify_link` already
+    // exists; the gate used to 501 this route so the sqlite MCP handler
+    // never ran against the empty scratch db.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return verify_http_via_store(&app, &body).await;
+    }
     let lock = app.db.lock().await;
     let result = crate::mcp::handle_verify(&lock.0, &body);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => err_response(e),
+    }
+}
+
+/// #3064 — postgres arm of [`handle_verify_http`]. Parses the MCP body
+/// into [`crate::store::VerifyFilter`] (SAL `link_id` is
+/// `source|target|relation`) and maps [`crate::store::VerifyLinkReport`]
+/// onto the MCP `memory_verify` envelope. ERRORS-01: store faults go
+/// through [`super::store_err_to_response`].
+#[cfg(feature = "sal")]
+async fn verify_http_via_store(app: &AppState, params: &Value) -> axum::response::Response {
+    use crate::mcp::param_names;
+    use crate::store::{StoreError, VerifyFilter};
+
+    let parsed: Result<(String, String, String), String> =
+        if let Some(lid) = params.get(param_names::LINK_ID).and_then(Value::as_str) {
+            // MCP composite is `source--relation-->target` (not the SAL
+            // `source|target|relation` form `verify_link` uses).
+            match lid.split_once("-->").and_then(|(left, target)| {
+                left.split_once("--")
+                    .map(|(source, relation)| (source, target, relation))
+            }) {
+                Some((source, target, relation))
+                    if !source.is_empty() && !target.is_empty() && !relation.is_empty() =>
+                {
+                    Ok((source.to_string(), target.to_string(), relation.to_string()))
+                }
+                _ => Err(format!(
+                    "link_id '{lid}' is not in the expected form \
+                     'source_id--relation-->target_id'"
+                )),
+            }
+        } else {
+            let src = params.get(param_names::SOURCE_ID).and_then(Value::as_str);
+            let dst = params.get(param_names::TARGET_ID).and_then(Value::as_str);
+            match (src, dst) {
+                (Some(s), Some(d)) => {
+                    let rel = params
+                        .get(param_names::RELATION)
+                        .and_then(Value::as_str)
+                        .unwrap_or(crate::models::MemoryLinkRelation::RelatedTo.as_str());
+                    Ok((s.to_string(), d.to_string(), rel.to_string()))
+                }
+                _ => Err(crate::errors::msg::MEMORY_VERIFY_ARGS_REQUIRED.to_string()),
+            }
+        };
+    let (source_id, target_id, relation) = match parsed {
+        Ok(t) => t,
+        Err(e) => return err_response(e),
+    };
+    if let Err(e) =
+        crate::validate::RequestValidator::validate_link_triple(&source_id, &target_id, &relation)
+    {
+        return err_response(e.to_string());
+    }
+    let filter = VerifyFilter {
+        source_id: None,
+        target_id: None,
+        link_id: Some(format!("{source_id}|{target_id}|{relation}")),
+    };
+    match app.store.verify_link(filter).await {
+        Ok(report) => {
+            // SAL `verified` is true for structurally-valid UNSIGNED
+            // rows (LINKS_VERIFY / cert harness). MCP `memory_verify`
+            // reports `signature_verified=false` on that path — map
+            // here so postgres HTTP matches sqlite MCP (ERRORS-09:
+            // don't conflate the two verdicts).
+            let signature_verified = report.verified && report.signature_present;
+            let signed_by = if signature_verified {
+                report.observed_by.map_or(Value::Null, Value::String)
+            } else {
+                Value::Null
+            };
+            let signed_at = if signature_verified {
+                report.signed_at.map_or(Value::Null, Value::String)
+            } else {
+                Value::Null
+            };
+            Json(json!({
+                "signature_verified": signature_verified,
+                (field_names::ATTEST_LEVEL): report.attest_level,
+                "signed_by": signed_by,
+                "signed_at": signed_at,
+            }))
+            .into_response()
+        }
+        Err(StoreError::NotFound { id }) => err_response(format!("link not found: {id}")),
+        Err(e) => super::store_err_to_response(e),
     }
 }
 

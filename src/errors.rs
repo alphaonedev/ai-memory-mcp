@@ -190,6 +190,9 @@ pub mod msg {
          scope the forget to that namespace or use per-memory delete so governance applies";
     pub const MAX_DEPTH_MIN: &str = "max_depth must be >= 1";
     pub const VERIFY_LINK_ARGS_REQUIRED: &str = "verify_link requires either source_id or link_id";
+    /// MCP `memory_verify` / HTTP `POST /api/v1/memory_verify` — caller
+    /// supplied neither the composite `link_id` nor a source+target pair.
+    pub const MEMORY_VERIFY_ARGS_REQUIRED: &str = "link_id or source_id+target_id is required";
     pub const ENTITY_ID_EMPTY: &str = "entity_id cannot be empty";
     pub const MEMORY_ID_EMPTY: &str = "memory_id cannot be empty";
 

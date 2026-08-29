@@ -29802,6 +29802,11 @@ impl MemoryStore for PostgresStore {
             attest_level,
             signature_present,
             observed_by: obs,
+            signed_at: if verified && signature_present {
+                vf_str
+            } else {
+                None
+            },
             findings,
         })
     }

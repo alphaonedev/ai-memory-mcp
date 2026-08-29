@@ -2874,6 +2874,11 @@ impl MemoryStore for SqliteStore {
             attest_level,
             signature_present,
             observed_by: obs,
+            signed_at: if verified && signature_present {
+                vf
+            } else {
+                None
+            },
             findings,
         })
     }
