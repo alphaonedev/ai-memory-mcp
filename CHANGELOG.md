@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B17 BRANCH 1 review — owner-scope paren + concurrent #3231 pin)
+
+- `forget_for_caller` archive-links `source_id` subquery: restore the
+  #1772 owner-group parens (`AND (agent_id = ?4 OR IS NULL OR = '')`).
+  A premature `)` made AND bind tighter than OR so unowned rows in
+  other namespaces were snapshotted. Paired DELETE was already
+  correctly grouped. Regression:
+  `forget_for_caller_archive_links_source_id_respects_owner_scope`.
+- `#3231` tests now include a genuine two-connection / two-task race
+  of the same `(session, turn)` with different sha256 so the in-tx
+  re-probe is actually reached (sequential tests only hit the
+  out-of-tx fast-path).
+
 ### Fixed (B17 BRANCH 1 — integrity: #3230 #3231 #3238 #3250)
 
 - `#3230` CRITICAL: postgres PATCH `expires_at` on a stored-LONG row

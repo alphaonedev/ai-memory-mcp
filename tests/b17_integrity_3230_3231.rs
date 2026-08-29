@@ -123,6 +123,10 @@ fn capture_write(
 /// #3231 — sequential same-(session, turn) capture with different
 /// content/sha must return the first memory and leave its content
 /// byte-identical (first-write-wins).
+///
+/// This pins the happy-path contract. It does NOT exercise the in-tx
+/// re-probe: the out-of-tx fast-path already hits after the first
+/// commit. See `sqlite_capture_turn_concurrent_same_session_turn_fww_3231`.
 #[test]
 fn sqlite_capture_turn_same_session_turn_is_first_write_wins_3231() {
     let conn = open();
@@ -143,6 +147,144 @@ fn sqlite_capture_turn_same_session_turn_is_first_write_wins_3231() {
     assert_eq!(
         got.content, "first-content",
         "#3231: second capture must not last-write-wins overwrite"
+    );
+}
+
+/// #3231 — two connections racing the same `(session, turn)` with
+/// different sha256. Both miss the out-of-tx fast-path (neither has
+/// committed yet); `BEGIN IMMEDIATE` serializes; the loser's in-tx
+/// re-probe must return the first writer's memory_id and content.
+///
+/// Pre-fix this test fails: the waiter takes the insert path, ON CONFLICT
+/// LWW-overwrites content, and both results report `dedup_hit: false`.
+#[test]
+fn sqlite_capture_turn_concurrent_same_session_turn_fww_3231() {
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("c3231.db");
+    // Bootstrap the ladder on ONE connection first. Two racing `db::open`
+    // calls fight the schema-version stamp (SQLITE_BUSY / "database is
+    // locked") and never reach capture_turn.
+    let boot = db::open(&path).expect("bootstrap");
+    drop(boot);
+    let conn_a = db::open(&path).expect("open a");
+    let conn_b = db::open(&path).expect("open b");
+    conn_a
+        .busy_timeout(Duration::from_secs(10))
+        .expect("busy a");
+    conn_b
+        .busy_timeout(Duration::from_secs(10))
+        .expect("busy b");
+
+    let session = uuid::Uuid::new_v4().to_string();
+    let title = format!("turn-{session}-0");
+    let write_a = capture_write(&session, 0, &title, "content-a", "sha-a-race");
+    let write_b = capture_write(&session, 0, &title, "content-b", "sha-b-race");
+    let barrier = Arc::new(Barrier::new(2));
+
+    let b_a = Arc::clone(&barrier);
+    let b_b = Arc::clone(&barrier);
+    let handle_a = std::thread::spawn(move || {
+        b_a.wait();
+        db::capture_turn_idempotent(&conn_a, &write_a, true)
+    });
+    let handle_b = std::thread::spawn(move || {
+        b_b.wait();
+        db::capture_turn_idempotent(&conn_b, &write_b, true)
+    });
+
+    let r_a = handle_a.join().expect("join a").expect("capture a");
+    let r_b = handle_b.join().expect("join b").expect("capture b");
+    assert_eq!(r_a.memory_id, r_b.memory_id, "same (session, turn) one row");
+    assert!(
+        r_a.dedup_hit ^ r_b.dedup_hit,
+        "exactly one writer must miss (in-tx re-probe); got a.dedup_hit={} b.dedup_hit={}",
+        r_a.dedup_hit,
+        r_b.dedup_hit
+    );
+    let expected = if r_a.dedup_hit {
+        "content-b"
+    } else {
+        "content-a"
+    };
+    let conn = db::open(&path).expect("reopen");
+    let got = db::get(&conn, &r_a.memory_id)
+        .expect("get")
+        .expect("present");
+    assert_eq!(
+        got.content, expected,
+        "#3231 concurrent: first writer's content must survive (LWW would clobber)"
+    );
+}
+
+/// #3250 follow-up / #1772: `forget_for_caller` archive-links
+/// `source_id` subquery must keep namespace+tier+owner grouping.
+/// A premature `)` after `agent_id = ?4` made AND bind tighter than OR
+/// so unowned rows in OTHER namespaces were snapshotted.
+#[test]
+fn forget_for_caller_archive_links_source_id_respects_owner_scope() {
+    use ai_memory::models::MemoryLinkRelation;
+    use rusqlite::params;
+
+    let conn = open();
+    let now = chrono::Utc::now().to_rfc3339();
+    let unowned = || {
+        let mut m = default_metadata();
+        m["agent_id"] = serde_json::Value::String(String::new());
+        m
+    };
+    let seed = |title: &str, ns: &str| {
+        db::insert(
+            &conn,
+            &Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: ns.into(),
+                title: title.into(),
+                content: title.into(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                metadata: unowned(),
+                ..Memory::default()
+            },
+        )
+        .expect("seed")
+    };
+    let a = seed("scope-a", "ns-a");
+    let a2 = seed("scope-a2", "ns-a");
+    let c = seed("scope-c", "ns-b");
+    let d = seed("scope-d", "ns-b");
+    db::create_link(&conn, &a, &a2, MemoryLinkRelation::RelatedTo.as_str()).expect("link a");
+    db::create_link(&conn, &c, &d, MemoryLinkRelation::RelatedTo.as_str()).expect("link c");
+
+    db::forget_for_caller(&conn, Some("ns-a"), None, None, true, "ai:alice").expect("forget ns-a");
+
+    let leaked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memory_links \
+             WHERE source_id = ?1 OR target_id = ?1",
+            params![&c],
+            |r| r.get(0),
+        )
+        .expect("count leaked");
+    assert_eq!(
+        leaked, 0,
+        "ns-b unowned edge must NOT be snapshotted by ns-a forget_for_caller \
+         (source_id owner-group paren)"
+    );
+    let kept: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memory_links \
+             WHERE source_id = ?1 OR target_id = ?1",
+            params![&a],
+            |r| r.get(0),
+        )
+        .expect("count kept");
+    assert!(
+        kept > 0,
+        "ns-a unowned edge must still be snapshotted (got {kept})"
     );
 }
 
@@ -274,6 +416,56 @@ mod pg {
 
         let got = store.get(&ctx, &r1.memory_id).await.expect("get");
         assert_eq!(got.content, "first-content");
+        let _ = store.delete(&ctx, &r1.memory_id).await;
+    }
+
+    /// #3231 pg — two tasks racing the same (session, turn). The
+    /// advisory lock + in-tx re-probe must keep the first writer's
+    /// content (sequential tests never reach that path).
+    #[tokio::test]
+    async fn pg_capture_turn_concurrent_same_session_turn_fww_3231() {
+        let Some(url) = pg_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let session = format!("sess-race-{unique}");
+        let title = format!("turn-race-{unique}-0");
+        let ns = format!("b17-3231-{unique}");
+        let first = {
+            let mut w = capture_write(&session, 0, &title, "content-a", &format!("sha-a-{unique}"));
+            w.memory.namespace = ns.clone();
+            w.memory.metadata = serde_json::json!({ "agent_id": "ai:sal-test" });
+            w
+        };
+        let second = {
+            let mut w = capture_write(&session, 0, &title, "content-b", &format!("sha-b-{unique}"));
+            w.memory.namespace = ns;
+            w.memory.metadata = serde_json::json!({ "agent_id": "ai:sal-test" });
+            w
+        };
+        let (r1, r2) = tokio::join!(
+            store.capture_turn_idempotent(&ctx, &first),
+            store.capture_turn_idempotent(&ctx, &second),
+        );
+        let r1 = r1.expect("r1");
+        let r2 = r2.expect("r2");
+        assert_eq!(r1.memory_id, r2.memory_id);
+        assert!(
+            r1.dedup_hit ^ r2.dedup_hit,
+            "exactly one miss; a.dedup_hit={} b.dedup_hit={}",
+            r1.dedup_hit,
+            r2.dedup_hit
+        );
+        let expected = if r1.dedup_hit {
+            "content-b"
+        } else {
+            "content-a"
+        };
+        let got = store.get(&ctx, &r1.memory_id).await.expect("get");
+        assert_eq!(got.content, expected);
         let _ = store.delete(&ctx, &r1.memory_id).await;
     }
 }

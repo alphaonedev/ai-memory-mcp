@@ -6920,7 +6920,7 @@ pub fn forget_for_caller(
                      WHERE ml.source_id IN (
                             SELECT id FROM memories
                             WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
-                              AND (json_extract(metadata,'$.agent_id') = ?4)
+                              AND (json_extract(metadata,'$.agent_id') = ?4
                                    OR json_extract(metadata,'$.agent_id') IS NULL
                                    OR json_extract(metadata,'$.agent_id') = '')
                         )
