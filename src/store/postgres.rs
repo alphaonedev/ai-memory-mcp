@@ -25951,6 +25951,8 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn fold_recall_accesses(&self) -> StoreResult<usize> {
+        // Wave-2 B10 — mid→long promote is a record-plane mutation.
+        self.gate_record_stop().await?;
         // v0.9.0 P0-1 (#1869) — postgres FOLD: batch-apply the legacy
         // touch ladders from unfolded ledger rows in ONE data-modifying
         // CTE statement per chunk, so the mark and the count derive

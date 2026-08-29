@@ -1016,6 +1016,10 @@ pub fn record_op(conn: &Connection, agent_id: &str, namespace: &str, op: QuotaOp
 ///
 /// Wrapped SQL errors on update failure.
 pub fn reset_daily(conn: &Connection) -> Result<usize> {
+    // Wave-2 B10 — OUT-OF-PLANE for record-stop: this is a quota
+    // calendar roll (`agent_quotas` day-bucket), not record-plane
+    // content. Freezing it under stop would leave daily caps stuck
+    // across a resume. B7 allowlist keeps the write-SQL exception.
     let now = chrono::Utc::now().to_rfc3339();
     let today = day_bucket(&now);
     let affected = conn.execute(

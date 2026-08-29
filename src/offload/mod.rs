@@ -611,6 +611,10 @@ pub fn sweep_expired(
     max_per_run: usize,
     sleep_between_deletes: std::time::Duration,
 ) -> Result<usize> {
+    // Wave-2 B10 — OUT-OF-PLANE for record-stop: TTL GC of
+    // `offloaded_blobs` is not record-plane content. The B7 structural
+    // scanner already skip_paths `src/offload/`. A stop must not
+    // accumulate expired blob files.
     let limit_i64 = i64::try_from(max_per_run).unwrap_or(i64::MAX);
     let mut stmt = conn
         .prepare(

@@ -5,8 +5,10 @@
 //!
 //! Every `PostgresStore` method whose body contains INSERT/UPDATE/DELETE
 //! against a record-plane table must call `gate_record_stop`, except a
-//! minimal bookkeeping allowlist (touch / `fold_recall` / confidence-decay /
-//! recall-observation). In-tx free functions (no `&self`) are out of
+//! minimal bookkeeping allowlist (touch / confidence-decay /
+//! recall-observation / `refund_update_growth` / `mark_recall_consumed`).
+//! `fold_recall_accesses` GATES (mid→long promote is a record-plane
+//! mutation). In-tx free functions (no `&self`) are out of
 //! scope here — they cannot call the SAL gate; the B7 allowlist names
 //! their gated callers. `append_signed_event` stays ungated so resume
 //! can persist the attestation (ERRORS-09).
@@ -43,66 +45,131 @@ const RECORD_PLANE: &[&str] = &[
 /// Genuine read-bookkeeping. A write-SQL method not in this set must gate.
 const BOOKKEEPING: &[&str] = &[
     "touch_after_recall",
-    "fold_recall_accesses",
     "apply_confidence_decay_stamp",
     "recall_observation_insert",
     "recall_observation_prune_guarded",
+    "refund_update_growth",
+    "mark_recall_consumed",
 ];
+
+/// Multi-line UPDATE methods that the B9 same-line scanner missed.
+/// Must surface as write-SQL after the B10 body scan (or the scanner
+/// silently regressed).
+const MUST_SURFACE_AS_WRITE: &[&str] = &["refund_update_growth", "mark_recall_consumed"];
 
 /// Round-6 named siblings. Must gate even if someone re-allowlists them.
 const MUST_BE_GATED: &[&str] = &["reflect_with_hooks", "update_embedding", "link_internal"];
 
-fn write_sql_table(line: &str) -> Option<String> {
-    let t = line.trim_start();
-    if t.starts_with("//") {
-        return None;
+fn next_ident(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    let n = s
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .count();
+    if n == 0 {
+        None
+    } else {
+        Some((&s[..n], &s[n..]))
     }
-    let upper = line.to_ascii_uppercase();
-    let extract_after = |needle: &str| -> Option<String> {
-        let idx = upper.find(needle)?;
-        let rest = &line[idx + needle.len()..];
-        let name: String = rest
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if name.is_empty() {
-            None
+}
+
+/// Body-level write-SQL table names. Understands multi-line
+/// `UPDATE <table>\\n SET` (the dominant postgres style).
+fn tables_written(body: &str) -> HashSet<String> {
+    let cleaned: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let upper = cleaned.to_ascii_uppercase();
+    let mut tables = HashSet::new();
+    let mut rest = upper.as_str();
+    while let Some(at) = ["INSERT", "DELETE", "UPDATE"]
+        .iter()
+        .filter_map(|kw| rest.find(kw))
+        .min()
+    {
+        let slice = &rest[at..];
+        if let Some(after) = slice.strip_prefix("INSERT") {
+            if let Some(into_at) = slice.find(" INTO ")
+                && let Some((name, _)) = next_ident(&slice[into_at + 6..])
+            {
+                tables.insert(name.to_ascii_lowercase());
+            }
+            rest = after;
+        } else if let Some(after) = slice.strip_prefix("DELETE") {
+            if let Some(from_at) = slice.find(" FROM ")
+                && let Some((name, _)) = next_ident(&slice[from_at + 6..])
+            {
+                tables.insert(name.to_ascii_lowercase());
+            }
+            rest = after;
+        } else if let Some(after) = slice.strip_prefix("UPDATE") {
+            // SET may be on a later line.
+            if let Some((name, after_name)) = next_ident(after.trim_start())
+                && after_name.trim_start().starts_with("SET")
+            {
+                tables.insert(name.to_ascii_lowercase());
+            }
+            rest = after;
         } else {
-            Some(name.to_ascii_lowercase())
+            rest = &slice[1..];
         }
-    };
-    if upper.contains("INSERT") && upper.contains(" INTO ") {
-        return extract_after(" INTO ");
     }
-    if upper.contains("DELETE FROM") {
-        return extract_after(" FROM ");
+    tables
+}
+
+fn strip_fn_prefixes(mut t: &str) -> &str {
+    loop {
+        let n = t.trim_start();
+        if let Some(rest) = n.strip_prefix("pub(")
+            && let Some(idx) = rest.find(')')
+        {
+            t = rest[idx + 1..].trim_start();
+            continue;
+        }
+        if let Some(rest) = n.strip_prefix("pub ") {
+            t = rest;
+            continue;
+        }
+        if let Some(rest) = n.strip_prefix("const ") {
+            t = rest;
+            continue;
+        }
+        if let Some(rest) = n.strip_prefix("async ") {
+            t = rest;
+            continue;
+        }
+        if let Some(rest) = n.strip_prefix("unsafe ") {
+            t = rest;
+            continue;
+        }
+        if let Some(rest) = n.strip_prefix("extern ") {
+            t = rest.trim_start();
+            if let Some(quoted) = t.strip_prefix('"')
+                && let Some(end) = quoted.find('"')
+            {
+                t = quoted[end + 1..].trim_start();
+            }
+            continue;
+        }
+        return n;
     }
-    if upper.contains("UPDATE ") && upper.contains(" SET") {
-        return extract_after("UPDATE ");
-    }
-    None
 }
 
 fn is_fn_start(line: &str) -> Option<(usize, String)> {
     let indent = line.len() - line.trim_start().len();
-    let t = line.trim_start();
-    let t = t
-        .strip_prefix("pub(crate) ")
-        .or_else(|| t.strip_prefix("pub "))
-        .unwrap_or(t);
-    let t = t.strip_prefix("async ").unwrap_or(t);
-    if let Some(rest) = t.strip_prefix("fn ") {
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if name.is_empty() {
-            return None;
-        }
-        return Some((indent, name));
+    let t = strip_fn_prefixes(line.trim_start());
+    let rest = t.strip_prefix("fn ")?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some((indent, name))
     }
-    None
 }
 
 fn strip_test_mod(src: &str) -> &str {
@@ -148,35 +215,26 @@ fn record_stop_pg_write_methods_gate_or_bookkeeping_b9() {
         .map(|n| ((*n).to_string(), false))
         .collect();
     let mut ungated: Vec<(String, usize, String)> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut surfaced: HashSet<String> = HashSet::new();
 
-    for (idx, line) in lines.iter().enumerate() {
-        let Some(table) = write_sql_table(line) else {
-            continue;
-        };
-        if !record_plane.contains(table.as_str()) {
-            continue;
-        }
-        let Some(&(start, ref name)) = starts.iter().rev().find(|(s, _)| *s <= idx) else {
-            continue;
-        };
-        if !signature_has_self(&lines, start) {
+    for (i, (start, name)) in starts.iter().enumerate() {
+        if !signature_has_self(&lines, *start) {
             continue;
         }
         if name.starts_with("migrate_v") || name.starts_with("test_") {
             continue;
         }
-        if !seen.insert(name.clone()) {
+        let end = starts.get(i + 1).map_or(lines.len(), |(s, _)| *s);
+        let body = lines[*start..end].join("\n");
+        let tables: Vec<String> = tables_written(&body)
+            .into_iter()
+            .filter(|t| record_plane.contains(t.as_str()))
+            .collect();
+        if tables.is_empty() {
             continue;
         }
-        let end = starts
-            .iter()
-            .find(|(s, _)| *s > start)
-            .map_or(lines.len(), |(s, _)| *s);
-        let body = &lines[start..end];
-        let has_gate = body
-            .iter()
-            .any(|l| GATE_MARKERS.iter().any(|g| l.contains(g)));
+        surfaced.insert(name.clone());
+        let has_gate = GATE_MARKERS.iter().any(|g| body.contains(g));
         if has_gate {
             if let Some(flag) = gated_hits.get_mut(name) {
                 *flag = true;
@@ -186,7 +244,7 @@ fn record_stop_pg_write_methods_gate_or_bookkeeping_b9() {
         if bookkeeping.contains(name.as_str()) {
             continue;
         }
-        ungated.push((name.clone(), start + 1, table));
+        ungated.push((name.clone(), start + 1, tables.join(",")));
     }
 
     let mut missing_required: Vec<String> = gated_hits
@@ -209,5 +267,17 @@ fn record_stop_pg_write_methods_gate_or_bookkeeping_b9() {
             .map(|(n, line, table)| format!("postgres.rs:{line} {n} writes {table}"))
             .collect::<Vec<_>>()
             .join("\n  ")
+    );
+
+    let mut missed_surface: Vec<&str> = MUST_SURFACE_AS_WRITE
+        .iter()
+        .copied()
+        .filter(|n| !surfaced.contains(*n))
+        .collect();
+    missed_surface.sort_unstable();
+    assert!(
+        missed_surface.is_empty(),
+        "B10 multi-line UPDATE scanner missed: {} (the body scan must see these writes)",
+        missed_surface.join(", ")
     );
 }
