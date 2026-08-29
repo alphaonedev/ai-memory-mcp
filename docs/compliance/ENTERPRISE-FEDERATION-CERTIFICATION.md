@@ -159,9 +159,9 @@ triggers re-cert** (see §7).
 > tree (symbols intact; numbers had rotted). **This amendment does NOT
 > re-mint the certification** (bind remains `e22bc93c`).
 >
-> **Amendment (2026-08-28, C3 follow-up — cert-55 20-check recapture).**
+> **Amendment (2026-08-29, C3 follow-up — cert-55 20-check recapture).**
 > Four-leg `doctor --posture enterprise-federation` evidence re-captured
-> at `f61dcab2` (20 checks measured: bare 10 FAIL / 10 PASS exit 2;
+> at certified tip `23f943ca` (20 checks measured: bare 10 FAIL / 10 PASS exit 2;
 > hardened non-sqlcipher 2 FAIL / 18 PASS exit 2 with 27/27 knobs at
 > floor; boot-gate armed exit 1; sqlcipher certified 20 PASS exit 0).
 > Committed under `docs/compliance/evidence/cert-55/`. No federation-wire
@@ -405,9 +405,9 @@ post-remediation tree (the merged cert wave: #2915-#2920, #2925-#2927,
 #2929); raw output in `docs/compliance/evidence/cert-54/` (see that
 directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 
-> **Evidence note (2026-08-28 recapture, `cert-55/`):** the four-leg
+> **Evidence note (2026-08-29 recapture, `cert-55/`):** the four-leg
 > §2 captures are **measured** at 20 checks on the release-built binary
-> at `f61dcab2` (Wave-2 B3/B1/B2 tip). `ENTERPRISE_FEDERATION_CHECK_COUNT
+> at `23f943ca` (Wave-2 B10 certified tip). `ENTERPRISE_FEDERATION_CHECK_COUNT
 > = 20` (`src/enterprise_federation_posture.rs:129`). Raw output in
 > `docs/compliance/evidence/cert-55/` (`SANITIZATION.md` +
 > `MANIFEST.sha256`). The `cert-54/` 18-check captures (2026-08-13)
@@ -1043,8 +1043,8 @@ this document does not self-authorize a tag cut.
 
 **Status at `e22bc93c` (original artifacts at `580d8427`; this re-issue
 amended through the merged 2026-08-13 remediation wave — #2915-#2920,
-#2925-#2927, #2929 — with posture legs re-captured 2026-08-28 at
-`f61dcab2`):** the
+#2925-#2927, #2929 — with posture legs re-captured 2026-08-29 at
+certified tip `23f943ca`):** the
 seven §5.4 falsifiability requirements are met as follows — §5.4(1)
 canonical doc = this document; §5.4(2) machine-checked posture = CLOSED
 (four-leg localhost proof **executed and committed at 20 checks** in

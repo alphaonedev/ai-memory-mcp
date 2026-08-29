@@ -1,4 +1,4 @@
-# posture-legs transcript — recorded exit codes (2026-08-28 recapture @ f61dcab2)
+# posture-legs transcript — recorded exit codes (2026-08-29 recapture @ 23f943ca)
 # each leg: the doctor invocation shape, then the observed shell exit status.
 
 ## leg 1: bare (env -i, AI_MEMORY_NO_CONFIG=1 only)
