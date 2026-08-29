@@ -909,3 +909,51 @@ pg_test!(pg_memory_export_reflection_not_501_3064, url, {
         "suggested_filename; body={body}"
     );
 });
+
+pg_test!(pg_memory_replay_not_501_3064, url, {
+    // #3064 batch D — pre-fix 501. Seed a memory + transcript on pg
+    // (SAL store_transcript + link_memory_transcript), then HTTP
+    // replay must return that content — proving SAL dispatch, not the
+    // empty scratch sqlite.
+    let r = pg_router(&url).await;
+    let ns = uniq_ns();
+    let mid = seed_memory(&r, &ns, "replay-src-3064", "src body").await;
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres for transcript seed");
+    let body_text = format!("replay transcript body {ns}");
+    let meta = store
+        .store_transcript(&ns, &body_text)
+        .await
+        .expect("store transcript on pg");
+    store
+        .link_memory_transcript(&mid, &meta.id, None, None)
+        .await
+        .expect("link transcript on pg");
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/memory_replay",
+        json!({"memory_id": mid, "verbose": true}),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "pre-#3064d 501; body={body}"
+    );
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body.get("memory_id"), Some(&json!(mid)), "body={body}");
+    assert_eq!(body.get("count"), Some(&json!(1)), "body={body}");
+    let transcripts = body["transcripts"].as_array().expect("transcripts array");
+    assert_eq!(transcripts.len(), 1, "body={body}");
+    assert_eq!(
+        transcripts[0].get("content"),
+        Some(&json!(body_text)),
+        "SAL-written pg blob must round-trip; body={body}"
+    );
+    assert_eq!(
+        transcripts[0].get("id"),
+        Some(&json!(meta.id)),
+        "body={body}"
+    );
+});

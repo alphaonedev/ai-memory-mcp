@@ -176,7 +176,7 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 ///   - route_1111 family that is verified app.db-bound (calls `app.db.lock()`
 ///     with no pg branch) or has NO SAL trait method:
 ///       memory_atomise, memory_calibrate_confidence, memory_smart_load,
-///       memory_replay, memory_subscription_replay,
+///       memory_subscription_replay,
 ///       memory_subscription_dlq_list  (do-not-touch honest-v1.x set);
 ///       memory_rule_list + memory_check_agent_action (postgres ships NO
 ///         `governance_rules` table — a ~300+ LOC new-table gap the vote
@@ -187,6 +187,9 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 /// this set — SAL `list_dependents_of_invalidated` + `lineage_descendants`.
 /// 2026-08-29 (#3064 batch C): `memory_export_reflection` LEFT this set —
 /// SAL `get` + `list_outbound_reflects_on`.
+/// 2026-08-29 (#3064 batch D): `memory_replay` LEFT this set —
+/// SAL `replay_transcript_union` + `fetch_transcript_content`
+/// (pg `memory_transcripts` / `memory_transcript_links` v22/v24).
 /// Opening ANY of these requires proving SAL dispatch first (see the
 /// module doc) and updating this list with justification.
 fn expected_fully_501_paths() -> BTreeSet<&'static str> {
@@ -196,7 +199,6 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
         routes::MEMORY_ATOMISE,
         routes::MEMORY_CALIBRATE_CONFIDENCE,
         routes::MEMORY_CHECK_AGENT_ACTION,
-        routes::MEMORY_REPLAY,
         routes::MEMORY_RULE_LIST,
         routes::MEMORY_SMART_LOAD,
         routes::MEMORY_SUBSCRIPTION_DLQ_LIST,
@@ -238,8 +240,12 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // 2026-08-29 (#3064 batch C) — bumped 63 -> 64 / 19 -> 18:
 // `POST /api/v1/memory_export_reflection` SAL-dispatches to `get` +
 // `list_outbound_reflects_on`. Never `app.db.lock()`.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 64;
-const EXPECTED_FULLY_501_PATHS: usize = 18;
+// 2026-08-29 (#3064 batch D) — bumped 64 -> 65 / 18 -> 17:
+// `POST /api/v1/memory_replay` SAL-dispatches to
+// `replay_transcript_union` + `fetch_transcript_content`. Never
+// `app.db.lock()`.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 65;
+const EXPECTED_FULLY_501_PATHS: usize = 17;
 const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 82;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
@@ -283,6 +289,7 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "MEMORY_RECALL_OBSERVATIONS",
     "MEMORY_REFLECT",
     "MEMORY_REFLECTION_ORIGIN",
+    "MEMORY_REPLAY",
     "MEMORY_VERIFY",
     "METRICS",
     "METRICS_BARE",
@@ -507,6 +514,11 @@ fn already_open_sal_route_1111_routes_stay_supported() {
     assert!(postgres_endpoint_supported(
         &Method::POST,
         routes::MEMORY_EXPORT_REFLECTION
+    ));
+    // #3064 batch D — replay now SAL-dispatches on postgres.
+    assert!(postgres_endpoint_supported(
+        &Method::POST,
+        routes::MEMORY_REPLAY
     ));
     // Conversely, the verified app.db-bound / SAL-less siblings must stay
     // fail-closed (opening them would convert a safe 501 into a silent

@@ -1105,11 +1105,11 @@ use update::handle_update;
 // leaking into the public crate surface.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
+use crate::transcripts::replay::REPLAY_VERBOSE_THRESHOLD_BYTES;
+#[cfg(test)]
 use agent::messages_namespace_for;
 #[cfg(test)]
 use namespace::{auto_register_path_hierarchy, extract_governance};
-#[cfg(test)]
-use replay::REPLAY_VERBOSE_THRESHOLD_BYTES;
 
 // ---------------------------------------------------------------------------
 // Shared helper functions — called from multiple tool modules via super::*.
