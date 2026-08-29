@@ -19,13 +19,13 @@
       "source": "system",
       "access_count": 0,
       "created_at": "2026-07-14T00:00:00Z",
-      "updated_at": "2026-07-14T00:00:00Z",
+      "updated_at": "2026-07-14T00:00:00.000000Z",
       "expires_at": "2099-01-01T00:00:00.000000Z",
       "metadata": {
         "agent_id": "alice",
         "version_vector": {
           "entries": {
-            "conformance-fixture-writer": "2026-07-14T00:00:00Z"
+            "conformance-fixture-writer": "2026-07-14T00:00:00.000000Z"
           }
         }
       },
