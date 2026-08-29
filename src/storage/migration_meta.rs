@@ -3,7 +3,7 @@
 
 //! ARCH-8 (FX-C4-batch2, 2026-05-26) — per-migration metadata matrix.
 //!
-//! The substrate ships an 89-step migration ladder (v2 → v90) whose
+//! The substrate ships a 90-step migration ladder (v2 → v91) whose
 //! "reversible? data-loss-risk? idempotent?" contract an operator needs
 //! BEFORE they plan a rollback — restore-from-backup is the only
 //! fallback for an irreversible arm, and they must know which arms
@@ -376,9 +376,14 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     meta(89, "REBUILD_TSV_INCLUDE_TAGS", true, true, NoLoss, PostgresOnly),
     // v90 (#2385, v1.0.0) — ARCHIVE CID PARITY. Additive `cid` TEXT +
     // `cid_genesis` BLOB/BYTEA on `archived_memories`, probe-guarded,
-    // no backfill, no full-table rebuild. Literal tail: MUST equal
-    // CURRENT_SCHEMA_VERSION. Postgres twin is `PostgresStore::migrate_v90`.
+    // no backfill, no full-table rebuild. Settled (literal arm).
+    // Postgres twin is `PostgresStore::migrate_v90`.
     meta(90, "ARCHIVED_CID_PARITY", true, true, NoLoss, Sqlite),
+    // v91 (#3250, v1.0.0) — ARCHIVE-LINK CID PARITY. Additive `source_cid`
+    // TEXT + `target_cid` TEXT on `archived_memory_links`. Literal tail:
+    // MUST equal CURRENT_SCHEMA_VERSION. Postgres twin is
+    // `PostgresStore::migrate_v91`.
+    meta(91, "ARCHIVED_MEMORY_LINKS_CID_PARITY", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

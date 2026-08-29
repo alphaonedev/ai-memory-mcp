@@ -1,0 +1,39 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v1.0.0 #3250 — schema v91: ARCHIVE-LINK CID PARITY. Additive, instant, NO
+-- table rebuild (so the v63/v65 "a full-table rebuild silently drops every
+-- trigger" hazard does not arise).
+--
+-- The defect
+-- ----------
+-- Schema v75 (#1859) added `memory_links.source_cid` / `target_cid` — the
+-- lineage-DAG mirrors of each endpoint's v74 genesis content-id, stamped at
+-- link-creation so a traversal still resolves identity after a source is
+-- tombstoned. The v70 `archived_memory_links` snapshot never gained them.
+-- Every archive INSERT...SELECT therefore DROPPED the pins, and
+-- `restore_links_for_memory` re-inserted edges with NULL CIDs. A restored
+-- graph silently lost navigable lineage identity: no write intent, no
+-- error, durable-tier corruption of derived-from / reflects_on /
+-- derives_from walks that key on the mirror.
+--
+-- The CIDs are NOT in the Ed25519 `SignableLink` preimage (COND 2, #1859)
+-- so a restored signature still verifies either way; the loss is the
+-- advisory-resolution columns, not attestation.
+--
+-- The heal
+-- --------
+-- Add the two columns to `archived_memory_links` so the snapshot is a
+-- CARRIED fact. Archive funnels SELECT `source_cid, target_cid` verbatim
+-- and restore INSERTs them back onto `memory_links`. Pre-v91 snapshot
+-- rows keep NULL (legacy restore behaviour exactly) — the migration
+-- never invents a cid it cannot prove (degrade, never corrupt).
+--
+-- The DDL below is applied by the probe-guarded in-code arm in
+-- src/storage/migrations.rs (SQLite has no `ADD COLUMN IF NOT EXISTS`);
+-- this file is the canonical doc twin, following the v90/#2385
+-- archive-column-parity precedent. The postgres twin is
+-- migrations/postgres/0048_v91_archived_memory_links_cid.sql.
+
+ALTER TABLE archived_memory_links ADD COLUMN source_cid TEXT;
+ALTER TABLE archived_memory_links ADD COLUMN target_cid TEXT;

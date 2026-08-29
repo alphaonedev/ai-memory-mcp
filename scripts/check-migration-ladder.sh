@@ -197,6 +197,8 @@ LADDER_EXEMPT_FILES=(
 # 2026-08-22 (#2385): sqlite 7 -> 8 — the v90 archive cid-parity arm takes the
 # const-phrased tip slot sqlite left empty at v88/v89. Bumped in lockstep with
 # tests/migration_ladder_integrity.rs::EXPECTED_CONST_ARMS_SQLITE.
+# 2026-08-29 (#3250): counts UNCHANGED — settled v90 is LITERALIZED and v91
+# (archived_memory_links cid pins) takes the const tip slot on both backends.
 EXPECTED_CONST_ARMS_SQLITE=8
 EXPECTED_CONST_ARMS_POSTGRES=1
 

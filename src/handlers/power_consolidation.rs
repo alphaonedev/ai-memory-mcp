@@ -475,16 +475,44 @@ pub async fn consolidate_memories(
                 // branch's `sqlite_finalize_and_disposition`). Source reads stay on
                 // the tenant `ctx` (the tenant owns the sources); `set_row_metadata`
                 // is by-id and ctx-agnostic.
-                let disp = crate::handlers::consolidate_federation::store_finalize_and_disposition(
-                    app.store.as_ref(),
-                    &ctx,
-                    &mut mem,
-                    &source_ids,
-                    &pg_author_id,
-                    &consolidator_agent_id,
-                    body.summary.as_deref(),
-                )
-                .await;
+                let disp =
+                    match crate::handlers::consolidate_federation::store_finalize_and_disposition(
+                        app.store.as_ref(),
+                        &ctx,
+                        &mut mem,
+                        &source_ids,
+                        &pg_author_id,
+                        &consolidator_agent_id,
+                        body.summary.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            // #3238 — fail-closed: do NOT fanout a row whose
+                            // origin persist / tombstone read failed.
+                            tracing::error!(
+                                "consolidate(pg): finalize failed (skipping fanout): {e}"
+                            );
+                            return (
+                                StatusCode::CREATED,
+                                Json(json!({
+                                    "id": new_id,
+                                    (field_names::CONSOLIDATED): body.ids.len(),
+                                    "summary": summary,
+                                    "content": summary,
+                                    "memory": {
+                                        "id": new_id,
+                                        "title": body.title,
+                                        "content": summary,
+                                        "namespace": body.namespace,
+                                    },
+                                    (field_names::STORAGE_BACKEND): "postgres",
+                                })),
+                            )
+                                .into_response();
+                        }
+                    };
                 if let Some(resp) = consolidate_fanout(
                     app.federation.as_ref().as_ref(),
                     &mem,
@@ -649,16 +677,27 @@ pub async fn consolidate_memories(
     // postgres twin `store_finalize_and_disposition` runs the identical body
     // through the SAL trait, so the two backends cannot drift).
     let disposition = if fed_enabled {
-        new_mem.as_mut().map(|mem| {
-            crate::handlers::consolidate_federation::sqlite_finalize_and_disposition(
-                &lock.0,
-                mem,
-                &source_ids,
-                &author_id,
-                &consolidator_agent_id,
-                body.summary.as_deref(),
-            )
-        })
+        match new_mem.as_mut() {
+            Some(mem) => {
+                match crate::handlers::consolidate_federation::sqlite_finalize_and_disposition(
+                    &lock.0,
+                    mem,
+                    &source_ids,
+                    &author_id,
+                    &consolidator_agent_id,
+                    body.summary.as_deref(),
+                ) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        // #3238 — fail-closed: do NOT fanout a row whose
+                        // origin persist / tombstone read failed.
+                        tracing::error!("consolidate: finalize failed (skipping fanout): {e}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
     } else {
         None
     };

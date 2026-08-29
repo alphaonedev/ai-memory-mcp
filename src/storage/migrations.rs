@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 90).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 91).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -331,6 +331,9 @@ CREATE TABLE IF NOT EXISTS archived_memory_links (
     signature    BLOB,
     attest_level TEXT,
     archived_at  TEXT NOT NULL,
+    -- v91 (#3250) — lineage-DAG cid pins carried through archive→restore.
+    source_cid   TEXT,
+    target_cid   TEXT,
     PRIMARY KEY (source_id, target_id, relation)
 );
 CREATE INDEX IF NOT EXISTS idx_archived_memory_links_source
@@ -864,7 +867,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 90;
+const CURRENT_SCHEMA_VERSION: i64 = 91;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1566,6 +1569,15 @@ const MIGRATION_V83_SQLITE: &str =
 // postgres twin is `PostgresStore::migrate_v90`.
 const MIGRATION_V90_SQLITE: &str =
     include_str!("../../migrations/sqlite/0074_v90_archived_cid.sql");
+
+// v91 (#3250, v1.0.0) — ARCHIVE-LINK CID PARITY. Two additive nullable
+// `archived_memory_links` columns (`source_cid TEXT`, `target_cid TEXT`)
+// mirroring the v75 (#1859) lineage-DAG pins on `memory_links`, so archive
+// snapshots CARRY the pins and restore stops re-inserting NULL. Probe-guarded
+// ALTER. Purely additive, no full-table rebuild. The postgres twin is
+// `PostgresStore::migrate_v91`.
+const MIGRATION_V91_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0075_v91_archived_memory_links_cid.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3351,6 +3363,8 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                     signature    BLOB,
                     attest_level TEXT,
                     archived_at  TEXT NOT NULL,
+                    source_cid   TEXT,
+                    target_cid   TEXT,
                     PRIMARY KEY (source_id, target_id, relation)
                 );
                 CREATE INDEX IF NOT EXISTS idx_archived_memory_links_source
@@ -3896,7 +3910,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 90 {
             // v90 (#2385, v1.0.0) — ARCHIVE CID PARITY: mirror the v74
             // (#1825) genesis content-id pair (`cid` TEXT / `cid_genesis`
             // BLOB) onto `archived_memories`, closing the archive→restore
@@ -3951,6 +3965,50 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 {
                     conn.execute(
                         "ALTER TABLE archived_memories ADD COLUMN cid_genesis BLOB",
+                        [],
+                    )?;
+                }
+            }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v91 (#3250, v1.0.0) — ARCHIVE-LINK CID PARITY: mirror the v75
+            // (#1859) lineage-DAG `source_cid` / `target_cid` pair onto
+            // `archived_memory_links`, closing the archive→restore DROP of
+            // the pins. Probe-guarded (SQLite has no `ADD COLUMN IF NOT
+            // EXISTS`), table-presence-guarded for partial-schema fixtures.
+            // NO full-table rebuild (v63/v65 lesson). Pre-v91 snapshots keep
+            // NULL and restore binds NULL — never invent a cid we cannot
+            // prove. Canonical DDL:
+            // migrations/sqlite/0075_v91_archived_memory_links_cid.sql.
+            debug_assert!(
+                MIGRATION_V91_SQLITE.contains("archived_memory_links"),
+                "v91 doc twin must ship the archived_memory_links DDL"
+            );
+            let has_archive_links: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'archived_memory_links')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_archive_links {
+                if conn
+                    .prepare("SELECT source_cid FROM archived_memory_links LIMIT 0")
+                    .is_err()
+                {
+                    conn.execute(
+                        "ALTER TABLE archived_memory_links ADD COLUMN source_cid TEXT",
+                        [],
+                    )?;
+                }
+                if conn
+                    .prepare("SELECT target_cid FROM archived_memory_links LIMIT 0")
+                    .is_err()
+                {
+                    conn.execute(
+                        "ALTER TABLE archived_memory_links ADD COLUMN target_cid TEXT",
                         [],
                     )?;
                 }

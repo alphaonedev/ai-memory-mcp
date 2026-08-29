@@ -383,6 +383,9 @@ pub struct ArchivedMemoryLinkRow {
     pub signature: Option<Vec<u8>>,
     pub attest_level: Option<String>,
     pub archived_at: String,
+    /// v91 (#3250) — lineage-DAG cid pins. NULL on pre-v91 snapshots.
+    pub source_cid: Option<String>,
+    pub target_cid: Option<String>,
 }
 
 /// Read EVERY `archived_memory_links` row, ordered deterministically so the
@@ -393,7 +396,7 @@ pub struct ArchivedMemoryLinkRow {
 pub fn read_all_archived_memory_links(conn: &Connection) -> Result<Vec<ArchivedMemoryLinkRow>> {
     let mut stmt = conn.prepare(
         "SELECT source_id, target_id, relation, created_at, valid_from, valid_until, \
-                observed_by, signature, attest_level, archived_at \
+                observed_by, signature, attest_level, archived_at, source_cid, target_cid \
          FROM archived_memory_links \
          ORDER BY archived_at ASC, source_id ASC, target_id ASC, relation ASC",
     )?;
@@ -409,6 +412,8 @@ pub fn read_all_archived_memory_links(conn: &Connection) -> Result<Vec<ArchivedM
             signature: r.get(7)?,
             attest_level: r.get(8)?,
             archived_at: r.get(9)?,
+            source_cid: r.get(10)?,
+            target_cid: r.get(11)?,
         })
     })?;
     let mut out = Vec::new();
