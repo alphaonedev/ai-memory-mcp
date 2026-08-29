@@ -169,6 +169,28 @@ triggers re-cert** (see §7).
 > NOT re-mint the certification** (bind remains `e22bc93c`). `cert-54/`
 > remains the removal-proof evidence of record.
 >
+> **Amendment (2026-08-29, B17-B3 federation-wire HARDENING @
+> `eaa56647`).** Two federation-identity fail-closed paths landed with
+> B17-B3 (#3229 / #3232 / #3233 / #3234). The §7-watched path
+> `src/federation/receive.rs` now **halts the catchup watermark** on a
+> recoverable skip of a *delivered* row (namespace-scope or content
+> attestation) so skipped inbound rows are retried — not leapt past via
+> `next_since` (#3233; distinct from the #3195 apply-`Err` halt and the
+> #2441 empty-window advance). Independently, `src/identity/verify.rs`
+> `lookup_peer_public_key` now reads only `<id>.pub` via `load_public`
+> (#3229): an unloadable/loose-mode `.priv` no longer collapses to
+> "unenrolled", so a forged inbound link from that peer is
+> signature-rejected rather than landing `attest_level=unsigned`.
+> Additive security-hardening — no wire/schema/`AI_MEMORY_FED_*`
+> identifier add/remove/rename, no certified control removed. The
+> certified enterprise-federation posture is UNCHANGED/hardened from
+> `e22bc93c`. The §7 re-cert trigger fired because a watched
+> federation-wire path changed (B17-B3 merged without this ledger
+> entry; `check-cert-expiry.sh` first ran on the push of `eaa56647`).
+> This amendment discharges it against `eaa56647`. **This amendment
+> does NOT re-mint the certification** (bind remains `e22bc93c`; the
+> 2026-08-12 5-agent adversarial ratification stands).
+>
 ---
 
 ## 1. The trust boundary (what is certified)
