@@ -47,6 +47,9 @@ const BACKENDS: [&str; 2] = ["sqlite", "postgres"];
 // on BOTH backends, so sqlite gains a const-phrased tip arm where v88/v89 had
 // none. postgres stays 1 (the settled v89 arm is LITERALIZED to
 // `if current_version < 89`; migrate_v90 takes the const tail slot).
+// 2026-08-29 (#3250): counts UNCHANGED — settled v90 is LITERALIZED
+// (`if version < 90` / `if current_version < 90`) and v91 (archived_memory_links
+// cid pins) takes the const tip slot on both backends.
 const EXPECTED_CONST_ARMS_SQLITE: usize = 8;
 const EXPECTED_CONST_ARMS_POSTGRES: usize = 1;
 

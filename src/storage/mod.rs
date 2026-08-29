@@ -2458,6 +2458,36 @@ pub fn capture_turn_idempotent(
     let write_txn =
         connection::WriteTxn::begin(conn).map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
+    // #3231 — in-tx re-probe. BEGIN IMMEDIATE serializes writers, so a
+    // racing first-capture that committed while we waited is now visible.
+    // Returning here is first-write-wins: no memory INSERT, no LWW overwrite
+    // of the surviving (title, namespace) row. Postgres twin takes a
+    // transaction-scoped advisory lock then the same re-probe.
+    let existing_in_tx: Option<String> = conn
+        .prepare_cached(
+            "SELECT memory_id FROM transcript_line_dedup \
+             WHERE host_session_id IS NOT NULL \
+               AND host_session_id = ?1 \
+               AND host_turn_index = ?2",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![&write.host_session_id, write.host_turn_index],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+    if let Some(memory_id) = existing_in_tx {
+        write_txn
+            .commit()
+            .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
+        return Ok(crate::models::CaptureTurnResult {
+            memory_id,
+            dedup_hit: true,
+        });
+    }
+
     let tx_result = (|| -> std::result::Result<String, String> {
         // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
         // substrate why_trace is recorded ONLY for the authenticated internal
@@ -4744,9 +4774,9 @@ pub fn archive_links_for_memory(conn: &Connection, id: &str) -> Result<usize> {
     let snapshotted = conn.execute(
         "INSERT OR IGNORE INTO archived_memory_links
              (source_id, target_id, relation, created_at, valid_from, valid_until,
-              observed_by, signature, attest_level, archived_at)
+              observed_by, signature, attest_level, archived_at, source_cid, target_cid)
          SELECT source_id, target_id, relation, created_at, valid_from, valid_until,
-                observed_by, signature, attest_level, ?2
+                observed_by, signature, attest_level, ?2, source_cid, target_cid
          FROM memory_links WHERE source_id = ?1 OR target_id = ?1",
         params![id, now],
     )?;
@@ -4771,10 +4801,10 @@ fn restore_links_for_memory(conn: &Connection, id: &str) -> Result<usize> {
     let restored = conn.execute(
         "INSERT OR IGNORE INTO memory_links
              (source_id, target_id, relation, created_at, valid_from, valid_until,
-              observed_by, signature, attest_level)
+              observed_by, signature, attest_level, source_cid, target_cid)
          SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
                 aml.valid_from, aml.valid_until, aml.observed_by, aml.signature,
-                aml.attest_level
+                aml.attest_level, aml.source_cid, aml.target_cid
          FROM archived_memory_links aml
          WHERE (aml.source_id = ?1 OR aml.target_id = ?1)
            AND EXISTS (SELECT 1 FROM memories WHERE id = aml.source_id)
@@ -6372,10 +6402,10 @@ pub fn forget(
                 conn.execute(
                     "INSERT OR IGNORE INTO archived_memory_links
                          (source_id, target_id, relation, created_at, valid_from, valid_until,
-                          observed_by, signature, attest_level, archived_at)
+                          observed_by, signature, attest_level, archived_at, source_cid, target_cid)
                      SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
                             ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
-                            ml.attest_level, ?4
+                            ml.attest_level, ?4, ml.source_cid, ml.target_cid
                      FROM memory_links ml
                      WHERE ml.source_id IN (
                             SELECT m.id FROM memories_fts fts
@@ -6398,10 +6428,10 @@ pub fn forget(
                 conn.execute(
                     "INSERT OR IGNORE INTO archived_memory_links
                          (source_id, target_id, relation, created_at, valid_from, valid_until,
-                          observed_by, signature, attest_level, archived_at)
+                          observed_by, signature, attest_level, archived_at, source_cid, target_cid)
                      SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
                             ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
-                            ml.attest_level, ?3
+                            ml.attest_level, ?3, ml.source_cid, ml.target_cid
                      FROM memory_links ml
                      WHERE ml.source_id IN (
                             SELECT id FROM memories
@@ -6850,10 +6880,10 @@ pub fn forget_for_caller(
                 conn.execute(
                     "INSERT OR IGNORE INTO archived_memory_links
                          (source_id, target_id, relation, created_at, valid_from, valid_until,
-                          observed_by, signature, attest_level, archived_at)
+                          observed_by, signature, attest_level, archived_at, source_cid, target_cid)
                      SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
                             ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
-                            ml.attest_level, ?4
+                            ml.attest_level, ?4, ml.source_cid, ml.target_cid
                      FROM memory_links ml
                      WHERE ml.source_id IN (
                             SELECT m.id FROM memories_fts fts
@@ -6882,10 +6912,10 @@ pub fn forget_for_caller(
                 conn.execute(
                     "INSERT OR IGNORE INTO archived_memory_links
                          (source_id, target_id, relation, created_at, valid_from, valid_until,
-                          observed_by, signature, attest_level, archived_at)
+                          observed_by, signature, attest_level, archived_at, source_cid, target_cid)
                      SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
                             ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
-                            ml.attest_level, ?3
+                            ml.attest_level, ?3, ml.source_cid, ml.target_cid
                      FROM memory_links ml
                      WHERE ml.source_id IN (
                             SELECT id FROM memories
@@ -13951,9 +13981,11 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                 let mut links_stmt = conn.prepare_cached(&format!(
                     "INSERT OR IGNORE INTO archived_memory_links
                          (source_id, target_id, relation, created_at, valid_from,
-                          valid_until, observed_by, signature, attest_level, archived_at)
+                          valid_until, observed_by, signature, attest_level, archived_at,
+                          source_cid, target_cid)
                      SELECT source_id, target_id, relation, created_at, valid_from,
-                            valid_until, observed_by, signature, attest_level, ?1
+                            valid_until, observed_by, signature, attest_level, ?1,
+                            source_cid, target_cid
                      FROM memory_links
                      WHERE source_id IN ({SQL_GC_EXPIRED_CHUNK_IDS})
                         OR target_id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"

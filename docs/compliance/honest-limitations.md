@@ -6,7 +6,7 @@ layout: doc
 **Document classification:** Public-facing, procurement-grade.
 **Date:** first published 2026-05-23; version stamp, mitigation claims, and code
 anchors re-verified against `release/v1.0.0` HEAD on 2026-08-01.
-**ai-memory version:** v1.0.0 (sqlite + postgres schema **v90**, lockstep).
+**ai-memory version:** v1.0.0 (sqlite + postgres schema **v91**, lockstep).
 **Companion document:** [`docs/compliance/nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.html) — the NSA CSI concern + recommendation mapping that Task E ships.
 **Source-of-truth inventory:** [`docs/compliance/_inventory/v1.0.0-capabilities.json`](_inventory/v1.0.0-capabilities.json) (46 capabilities, codegraph-verified at commit `580d8427bb4da887f7a25731792c55c4e49d56d6` on `release/v1.0.0`). The v0.7.0 file ([`v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json), 27 primitives at `4add7a85`) is retained as a historical artefact.
 

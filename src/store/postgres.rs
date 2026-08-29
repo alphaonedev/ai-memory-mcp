@@ -1468,6 +1468,16 @@ const MIGRATION_V89_TSV_INCLUDE_TAGS: &str =
 const MIGRATION_V90_ARCHIVED_CID: &str =
     include_str!("../../migrations/postgres/0047_v90_archived_cid.sql");
 
+/// v1.0.0 #3250 — schema v91 canonical DDL, executed via `raw_sql` (the v90
+/// pattern). Mirrors the v75 (#1859) lineage-DAG `source_cid` / `target_cid`
+/// pair onto `archived_memory_links` so archive snapshots CARRY the pins
+/// and [`PostgresStore::archive_restore`] stops re-inserting NULL CIDs.
+/// Additive + `IF NOT EXISTS` (idempotent). The sqlite twin is the
+/// probe-guarded arm in `storage::migrations`
+/// (`migrations/sqlite/0075_v91_archived_memory_links_cid.sql`).
+const MIGRATION_V91_ARCHIVED_LINKS_CID: &str =
+    include_str!("../../migrations/postgres/0048_v91_archived_memory_links_cid.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -1858,7 +1868,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 90;
+const CURRENT_SCHEMA_VERSION: i32 = 91;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -3531,8 +3541,11 @@ impl PostgresStore {
         if current_version < 89 {
             self.migrate_v89().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 90 {
             self.migrate_v90().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v91().await?;
         }
 
         Ok(())
@@ -6360,8 +6373,9 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v90 archived-cid ddl", e))?;
 
-        // Tip arm — stamp the symbolic const (the current-tip convention).
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Settled arm — stamp the LITERAL 90, not CURRENT_SCHEMA_VERSION
+        // (the #2218 convention: only the current tip stays symbolic).
+        record_schema_version(&mut tx, 90).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v90 migration", e))?;
@@ -6371,6 +6385,39 @@ impl PostgresStore {
             "schema migration v90 applied (#2385: archived_memories.cid / \
              cid_genesis — archive->restore now CARRIES the v74 genesis \
              content-id instead of re-minting it)"
+        );
+        Ok(())
+    }
+
+    /// v91 (#3250, v1.0.0) — ARCHIVE-LINK CID PARITY. Additive
+    /// `source_cid` / `target_cid` TEXT on `archived_memory_links` so the
+    /// snapshot CARRIES the v75 lineage-DAG pins and restore re-inserts
+    /// them instead of NULL. Tip arm — stamps [`CURRENT_SCHEMA_VERSION`].
+    async fn migrate_v91(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V91_ARCHIVED_LINKS_CID.contains("archived_memory_links"),
+            "#3250: the v91 DDL doc twin must ship with the binary"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v91 archived-links-cid ddl tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V91_ARCHIVED_LINKS_CID)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v91 archived-links-cid ddl", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v91 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v91 applied (#3250: archived_memory_links.source_cid / \
+             target_cid — archive->restore now CARRIES the v75 lineage-DAG pins)"
         );
         Ok(())
     }
@@ -7496,15 +7543,18 @@ impl PostgresStore {
                 -- ($14). valid_from is IMMUTABLE (absent from this SET), so the
                 -- genesis assertion instant is always preserved. TEXT RFC3339.
                 valid_until = COALESCE($14, valid_until),
-                -- #1628/#1626 — If-Match PUTs route through this method
-                -- on postgres, so it must mirror the trait `update`'s
+                -- #1628/#1626/#3230 — If-Match PUTs route through this
+                -- method on postgres, so it must mirror the trait `update`'s
                 -- expires_at semantics including the #1626 tier→long
-                -- coupling: when the patch tier IS long the clear wins
-                -- over an explicitly-supplied $12; when the patch tier
-                -- is NOT long an explicit $12 wins and an absent $12
-                -- leaves the stored value untouched.
+                -- coupling keyed on the EFFECTIVE tier (sqlite
+                -- `update_with_expected_version` + upsert
+                -- `EXCLUDED.tier = 'long' OR memories.tier = 'long'`).
+                -- Stored-long is sticky (`tier_rank` CASE above never
+                -- downgrades), so a PATCH that supplies expires_at without
+                -- changing tier must still NULL expiry — otherwise GC
+                -- reaps a documented-permanent row (#3230 CRITICAL).
                 expires_at = CASE
-                    WHEN $4::TEXT = 'long' THEN NULL
+                    WHEN $4::TEXT = 'long' OR tier = 'long' THEN NULL
                     ELSE COALESCE($12, expires_at)
                 END,
                 updated_at = NOW(),
@@ -7899,11 +7949,13 @@ impl PostgresStore {
         sqlx::query(
             "INSERT INTO archived_memory_links (
                  source_id, target_id, relation, created_at, valid_from,
-                 valid_until, observed_by, signature, attest_level, archived_at
+                 valid_until, observed_by, signature, attest_level, archived_at,
+                 source_cid, target_cid
              )
              SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
                     ml.valid_from, ml.valid_until, ml.observed_by,
-                    ml.signature, ml.attest_level, now()
+                    ml.signature, ml.attest_level, now(),
+                    ml.source_cid, ml.target_cid
              FROM memory_links ml
              WHERE ml.source_id = $1 OR ml.target_id = $1
              ON CONFLICT (source_id, target_id, relation) DO NOTHING",
@@ -20158,6 +20210,41 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin capture_turn tx", e))?;
 
+        // #3231 — serialize same-(session, turn) writers then RE-PROBE inside
+        // the tx. The out-of-tx fast-path above is a TOCTOU under READ
+        // COMMITTED: two concurrent first-captures of the same turn with
+        // different sha256 both miss, both INSERT memories ON CONFLICT LWW,
+        // both INSERT transcript_line_dedup (PK is sha256, not the L4 key)
+        // → last-write-wins content. sqlite BEGIN IMMEDIATE serializes
+        // writers; postgres uses a transaction-scoped advisory lock so the
+        // re-probe sees the first writer's commit. First-write-wins.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2::text))")
+            .bind(&write.host_session_id)
+            .bind(write.host_turn_index)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("capture_turn advisory lock", e))?;
+        let existing_in_tx: Option<String> = sqlx::query_scalar(
+            "SELECT memory_id FROM transcript_line_dedup \
+             WHERE host_session_id IS NOT NULL \
+               AND host_session_id = $1 \
+               AND host_turn_index = $2",
+        )
+        .bind(&write.host_session_id)
+        .bind(write.host_turn_index)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("capture_turn in-tx dedup re-probe", e))?;
+        if let Some(memory_id) = existing_in_tx {
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("commit capture_turn dedup-hit tx", e))?;
+            return Ok(CaptureTurnResult {
+                memory_id,
+                dedup_hit: true,
+            });
+        }
+
         // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
         // existing (title, namespace) row's version BEFORE the upsert so a
         // conflict-merge that overwrites durable content in place appends ONE
@@ -21399,19 +21486,19 @@ impl MemoryStore for PostgresStore {
                     ))
                 END,
                 source_uri = COALESCE($10, source_uri),
-                -- #1626 — tier→long ⇒ expires_at = NULL. A patch that
-                -- promotes to 'long' always wins the tier ladder above,
-                -- so the row must shed its expiry or GC reaps the
-                -- promoted row at the stale mid/short deadline. Rule:
-                -- when the patch tier IS long the clear wins over any
-                -- explicitly-supplied $11 (matching the sqlite upsert
-                -- semantics: expiry is only cleared when the new tier
-                -- is long, and the sqlite promote handler's explicit
-                -- `UPDATE memories SET expires_at = NULL`); when the
-                -- patch tier is NOT long an explicit $11 wins and an
-                -- absent $11 leaves the stored value untouched.
+                -- #1626/#3230 — tier→long ⇒ expires_at = NULL, keyed on
+                -- the EFFECTIVE tier. A patch that promotes to 'long'
+                -- always wins the tier ladder above, so the row must
+                -- shed its expiry or GC reaps the promoted row at the
+                -- stale mid/short deadline. Stored-long is sticky, so a
+                -- PATCH that supplies expires_at WITHOUT a tier change
+                -- must still NULL expiry (#3230 CRITICAL: the previous
+                -- `$4::TEXT = 'long'`-only CASE armed GC on a
+                -- documented-permanent row). Mirrors sqlite
+                -- `effective_tier` and the upsert
+                -- `EXCLUDED.tier = 'long' OR memories.tier = 'long'`.
                 expires_at = CASE
-                    WHEN $4::TEXT = 'long' THEN NULL
+                    WHEN $4::TEXT = 'long' OR tier = 'long' THEN NULL
                     ELSE COALESCE($11, expires_at)
                 END,
                 -- v1.0.0 #1834 — opt-in claim-bitemporal valid_until patch
@@ -24843,11 +24930,12 @@ impl MemoryStore for PostgresStore {
             sqlx::query(
                 "INSERT INTO archived_memory_links (
                      source_id, target_id, relation, created_at, valid_from,
-                     valid_until, observed_by, signature, attest_level, archived_at
+                     valid_until, observed_by, signature, attest_level, archived_at,
+                     source_cid, target_cid
                  )
                  SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
                         ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
-                        ml.attest_level, now()
+                        ml.attest_level, now(), ml.source_cid, ml.target_cid
                  FROM memory_links ml
                  WHERE ml.source_id IN (
                            SELECT id FROM memories
@@ -27399,11 +27487,13 @@ impl MemoryStore for PostgresStore {
             sqlx::query(
                 "INSERT INTO archived_memory_links (
                      source_id, target_id, relation, created_at, valid_from,
-                     valid_until, observed_by, signature, attest_level, archived_at
+                     valid_until, observed_by, signature, attest_level, archived_at,
+                     source_cid, target_cid
                  )
                  SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
                         ml.valid_from, ml.valid_until, ml.observed_by,
-                        ml.signature, ml.attest_level, $1::timestamptz
+                        ml.signature, ml.attest_level, $1::timestamptz,
+                        ml.source_cid, ml.target_cid
                  FROM memory_links ml
                  WHERE ml.source_id IN (
                            SELECT id FROM memories
@@ -27983,11 +28073,13 @@ impl MemoryStore for PostgresStore {
         )> = sqlx::query_as(
             "INSERT INTO memory_links (
                  source_id, target_id, relation, created_at, valid_from,
-                 valid_until, observed_by, signature, attest_level
+                 valid_until, observed_by, signature, attest_level,
+                 source_cid, target_cid
              )
              SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
                     aml.valid_from, aml.valid_until, aml.observed_by,
-                    aml.signature, aml.attest_level
+                    aml.signature, aml.attest_level,
+                    aml.source_cid, aml.target_cid
              FROM archived_memory_links aml
              WHERE (aml.source_id = $1 OR aml.target_id = $1)
                AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)

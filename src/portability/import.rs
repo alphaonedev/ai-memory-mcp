@@ -1227,8 +1227,8 @@ fn apply_all_classes(
             .execute(
                 "INSERT OR IGNORE INTO archived_memory_links \
                     (source_id, target_id, relation, created_at, valid_from, valid_until, \
-                     observed_by, signature, attest_level, archived_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     observed_by, signature, attest_level, archived_at, source_cid, target_cid) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     link.source_id,
                     link.target_id,
@@ -1240,6 +1240,8 @@ fn apply_all_classes(
                     link.signature.as_ref().map(|h| h.0.as_slice()),
                     link.attest_level,
                     link.archived_at,
+                    link.source_cid,
+                    link.target_cid,
                 ],
             )
             .with_context(|| {
@@ -3510,6 +3512,8 @@ mod tests {
             signature: None,
             attest_level: attest_level.map(ToString::to_string),
             archived_at: "2026-01-01T00:00:00Z".into(),
+            source_cid: None,
+            target_cid: None,
         }
     }
 

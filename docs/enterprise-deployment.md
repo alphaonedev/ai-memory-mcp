@@ -447,7 +447,7 @@ ai-memory schema-init --store-url postgres://aimemory:PWD@hub.dc1.internal:5432/
 ```
 
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
-plus the in-process upgrade ladder to schema v90 as a side effect. The
+plus the in-process upgrade ladder to schema v91 as a side effect. The
 `vector` (pgvector) extension is required (its absence aborts the
 bootstrap — see
 [`postgres-age-guide.md` §"Managed / non-superuser Postgres (CloudNativePG,

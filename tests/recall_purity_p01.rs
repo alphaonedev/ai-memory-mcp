@@ -1221,7 +1221,7 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     // parity: additive `archived_memories.cid` / `cid_genesis`) with the v77
     // `folded` column present.
     let conn = db::open(&path).expect("open");
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 90);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 91);
     let version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",

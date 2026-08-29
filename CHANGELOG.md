@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B17 BRANCH 1 review — owner-scope paren + concurrent #3231 pin)
+
+- `forget_for_caller` archive-links `source_id` subquery: restore the
+  #1772 owner-group parens (`AND (agent_id = ?4 OR IS NULL OR = '')`).
+  A premature `)` made AND bind tighter than OR so unowned rows in
+  other namespaces were snapshotted. Paired DELETE was already
+  correctly grouped. Regression:
+  `forget_for_caller_archive_links_source_id_respects_owner_scope`.
+- `#3231` tests now include a genuine two-connection / two-task race
+  of the same `(session, turn)` with different sha256 so the in-tx
+  re-probe is actually reached (sequential tests only hit the
+  out-of-tx fast-path).
+
+### Fixed (B17 BRANCH 1 — integrity: #3230 #3231 #3238 #3250)
+
+- `#3230` CRITICAL: postgres PATCH `expires_at` on a stored-LONG row
+  no longer arms GC. Both update SQL funnels (If-Match
+  `update_with_expected_version_once` and the trait `update`) now key
+  the CASE on the **effective** tier (`$4::TEXT = 'long' OR tier =
+  'long'`), matching the upsert
+  `EXCLUDED.tier = 'long' OR memories.tier = 'long'` and sqlite
+  `effective_tier`. Long never downgrades; a TTL patch without a
+  tier change must keep expiry NULL.
+- `#3231`: postgres `capture_turn` last-write-wins on concurrent
+  same-`(host_session_id, host_turn_index)` captures. In-tx re-probe
+  after `pg_advisory_xact_lock` (sqlite: re-probe after `BEGIN
+  IMMEDIATE`) returns the first writer's memory_id and does not
+  overwrite content.
+- `#3238`: federated consolidate persist-fail is fail-closed
+  (ERRORS-01 / ERRORS-19). `set_row_metadata` errors no longer
+  WARN-and-continue (origin-byte-match). Tombstone source reads no
+  longer use `get().ok().flatten()` / `if let Ok` — missing or
+  failing sources skip fanout instead of silently omitting
+  provenance.
+- `#3250`: schema v91 adds `archived_memory_links.source_cid` /
+  `target_cid` (sqlite 0075 / postgres 0048). Archive snapshots
+  CARRY the v75 lineage-DAG pins; restore re-inserts them. Pre-v91
+  NULL snapshots stay NULL (never invent a pin).
+
+### Tests (B17 BRANCH 1)
+
+- `tests/b17_integrity_3230_3231.rs` — sqlite + live-pg PATCH-on-LONG
+  and capture_turn first-write-wins.
+- `tests/archive_restore_link_cid_3250.rs` — archive→restore CID
+  round-trip, signed-edge verify, bootstrap SCHEMA columns, live-pg
+  twin.
+- Consolidate unit tests: missing tombstone / missing origin fail
+  closed.
+- QUAL-10 lockstep: `src/store/postgres.rs` 39_500 → 39_650
+  (never lower).
+
 ### Fixed (B15 — remaining six CI tests; Approve-arm pending queue)
 
 - `#3292` M6 auto-allow on `GovernanceLevel::Approve` is the

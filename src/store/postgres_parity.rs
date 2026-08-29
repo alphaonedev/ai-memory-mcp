@@ -355,11 +355,13 @@ pub(crate) async fn archive_links_for_memory_in_tx(tx: &mut PgTx<'_>, id: &str) 
     sqlx::query(
         "INSERT INTO archived_memory_links (
              source_id, target_id, relation, created_at, valid_from,
-             valid_until, observed_by, signature, attest_level, archived_at
+             valid_until, observed_by, signature, attest_level, archived_at,
+             source_cid, target_cid
          )
          SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
                 ml.valid_from, ml.valid_until, ml.observed_by,
-                ml.signature, ml.attest_level, now()
+                ml.signature, ml.attest_level, now(),
+                ml.source_cid, ml.target_cid
          FROM memory_links ml
          WHERE ml.source_id = $1 OR ml.target_id = $1
          ON CONFLICT (source_id, target_id, relation) DO NOTHING",

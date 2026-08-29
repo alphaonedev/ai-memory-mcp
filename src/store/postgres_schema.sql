@@ -576,6 +576,9 @@ CREATE TABLE IF NOT EXISTS archived_memory_links (
     signature    BYTEA,
     attest_level TEXT,
     archived_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- v91 (#3250) — lineage-DAG cid pins carried through archive→restore.
+    source_cid   TEXT,
+    target_cid   TEXT,
     PRIMARY KEY (source_id, target_id, relation)
 );
 CREATE INDEX IF NOT EXISTS archived_memory_links_source_idx ON archived_memory_links (source_id);

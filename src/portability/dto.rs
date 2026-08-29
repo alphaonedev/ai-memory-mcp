@@ -552,6 +552,12 @@ pub struct ArchivedMemoryLinkDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attest_level: Option<String>,
     pub archived_at: String,
+    /// v91 (#3250) — lineage-DAG cid pins. Optional so a pre-v91 bundle
+    /// still deserializes (NULL on import = legacy restore).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_cid: Option<String>,
 }
 
 impl From<&ArchivedMemoryLinkRow> for ArchivedMemoryLinkDto {
@@ -567,6 +573,8 @@ impl From<&ArchivedMemoryLinkRow> for ArchivedMemoryLinkDto {
             signature: r.signature.clone().map(HexBytes),
             attest_level: r.attest_level.clone(),
             archived_at: r.archived_at.clone(),
+            source_cid: r.source_cid.clone(),
+            target_cid: r.target_cid.clone(),
         }
     }
 }
@@ -584,6 +592,8 @@ impl From<ArchivedMemoryLinkDto> for ArchivedMemoryLinkRow {
             signature: d.signature.map(|h| h.0),
             attest_level: d.attest_level,
             archived_at: d.archived_at,
+            source_cid: d.source_cid,
+            target_cid: d.target_cid,
         }
     }
 }
@@ -887,6 +897,8 @@ mod tests {
             signature: Some(vec![0xab; 64]),
             attest_level: Some("signed".into()),
             archived_at: "2026-01-02T00:00:00Z".into(),
+            source_cid: None,
+            target_cid: None,
         };
         let json = serde_json::to_string(&ArchivedMemoryLinkDto::from(&row)).unwrap();
         assert_no_number_array(&json);

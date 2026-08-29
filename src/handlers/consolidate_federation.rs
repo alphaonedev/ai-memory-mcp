@@ -196,6 +196,7 @@ pub(crate) fn derived_from_edges(consolidated: &Memory, source_ids: &[String]) -
 /// The broadcast disposition for a federated consolidation: the source ids to
 /// hard-DELETE at peers (legacy), the RETAINED tombstoned source rows to
 /// re-broadcast (tombstone disposition), and the `derived_from` edges to ship.
+#[derive(Debug)]
 pub(crate) struct FanoutDisposition {
     pub deletions: Vec<String>,
     pub tombstoned_sources: Vec<Memory>,
@@ -218,7 +219,7 @@ pub(crate) fn sqlite_finalize_and_disposition(
     author_id: &str,
     consolidator_tenant: &str,
     raw_summary: Option<&str>,
-) -> FanoutDisposition {
+) -> Result<FanoutDisposition, String> {
     let summary_source = summary_source_of(raw_summary);
     let author_kp = load_author_signing_keypair(author_id);
     let (final_meta, _signed) = finalize_consolidation_metadata(
@@ -228,32 +229,52 @@ pub(crate) fn sqlite_finalize_and_disposition(
         consolidator_tenant,
         summary_source,
     );
-    if let Ok(js) = serde_json::to_string(&final_meta) {
-        if let Err(e) = crate::db::set_row_metadata(conn, &mem.id, &js) {
-            tracing::warn!(
-                "consolidate: failed to persist federated attestation metadata for {}: {e}",
-                mem.id
-            );
-        }
+    // #3238 / ERRORS-01 / ERRORS-19 — persist-fail must not WARN-and-continue:
+    // that broadcasts metadata the origin row never stored (origin-byte-match
+    // contract). Serialize + persist first; only then mutate `mem.metadata`.
+    let js = serde_json::to_string(&final_meta)
+        .map_err(|e| format!("CONSOLIDATE_METADATA_SERIALIZE_FAILED: {e}"))?;
+    let n = conn
+        .execute(
+            "UPDATE memories SET metadata = ?1 WHERE id = ?2",
+            rusqlite::params![js, &mem.id],
+        )
+        .map_err(|e| format!("CONSOLIDATE_METADATA_PERSIST_FAILED: {e}"))?;
+    if n == 0 {
+        return Err(format!(
+            "CONSOLIDATE_METADATA_PERSIST_FAILED: origin row {} missing",
+            mem.id
+        ));
     }
     mem.metadata = final_meta;
     if crate::config::consolidate_tombstone_sources_enabled() {
-        let tombstoned_sources = source_ids
-            .iter()
-            .filter_map(|id| crate::db::get(conn, id).ok().flatten())
-            .collect();
+        let mut tombstoned_sources = Vec::with_capacity(source_ids.len());
+        for id in source_ids {
+            // #3238 — do not swallow get errors or omit missing tombstones
+            // (`get().ok().flatten()` silently dropped provenance the
+            // origin-byte-match + lineage contract requires).
+            match crate::db::get(conn, id) {
+                Ok(Some(src)) => tombstoned_sources.push(src),
+                Ok(None) => {
+                    return Err(format!("CONSOLIDATE_TOMBSTONE_MISSING: {id}"));
+                }
+                Err(e) => {
+                    return Err(format!("CONSOLIDATE_TOMBSTONE_READ_FAILED: {id}: {e}"));
+                }
+            }
+        }
         let derived_edges = derived_from_edges(mem, source_ids);
-        FanoutDisposition {
+        Ok(FanoutDisposition {
             deletions: Vec::new(),
             tombstoned_sources,
             derived_edges,
-        }
+        })
     } else {
-        FanoutDisposition {
+        Ok(FanoutDisposition {
             deletions: source_ids.to_vec(),
             tombstoned_sources: Vec::new(),
             derived_edges: Vec::new(),
-        }
+        })
     }
 }
 
@@ -272,7 +293,7 @@ pub(crate) async fn store_finalize_and_disposition(
     author_id: &str,
     consolidator_tenant: &str,
     raw_summary: Option<&str>,
-) -> FanoutDisposition {
+) -> crate::store::StoreResult<FanoutDisposition> {
     let summary_source = summary_source_of(raw_summary);
     let author_kp = load_author_signing_keypair(author_id);
     let (final_meta, _signed) = finalize_consolidation_metadata(
@@ -282,34 +303,38 @@ pub(crate) async fn store_finalize_and_disposition(
         consolidator_tenant,
         summary_source,
     );
-    if let Ok(js) = serde_json::to_string(&final_meta) {
-        if let Err(e) = store.set_row_metadata(ctx, &mem.id, &js).await {
-            tracing::warn!(
-                "consolidate(pg): failed to persist federated attestation metadata for {}: {e}",
-                mem.id
-            );
+    // #3238 / ERRORS-01 / ERRORS-19 — persist-fail must not WARN-and-continue.
+    let js = serde_json::to_string(&final_meta).map_err(|e| {
+        crate::store::StoreError::IntegrityFailed {
+            detail: format!("CONSOLIDATE_METADATA_SERIALIZE_FAILED: {e}"),
         }
-    }
+    })?;
+    store.set_row_metadata(ctx, &mem.id, &js).await?;
     mem.metadata = final_meta;
     if crate::config::consolidate_tombstone_sources_enabled() {
         let mut tombstoned_sources = Vec::with_capacity(source_ids.len());
         for id in source_ids {
-            if let Ok(src) = store.get(ctx, id).await {
-                tombstoned_sources.push(src);
+            match store.get(ctx, id).await {
+                Ok(src) => tombstoned_sources.push(src),
+                Err(e) => {
+                    return Err(crate::store::StoreError::IntegrityFailed {
+                        detail: format!("CONSOLIDATE_TOMBSTONE_READ_FAILED: {id}: {e}"),
+                    });
+                }
             }
         }
         let derived_edges = derived_from_edges(mem, source_ids);
-        FanoutDisposition {
+        Ok(FanoutDisposition {
             deletions: Vec::new(),
             tombstoned_sources,
             derived_edges,
-        }
+        })
     } else {
-        FanoutDisposition {
+        Ok(FanoutDisposition {
             deletions: source_ids.to_vec(),
             tombstoned_sources: Vec::new(),
             derived_edges: Vec::new(),
-        }
+        })
     }
 }
 
@@ -516,7 +541,8 @@ mod tests {
             SENDER,
             TENANT,
             Some("a caller summary"),
-        );
+        )
+        .expect("finalize");
 
         crate::config::set_lineage_dag(false);
         crate::config::set_consolidate_tombstone_sources(false);
@@ -575,7 +601,8 @@ mod tests {
             SENDER,
             TENANT,
             None,
-        );
+        )
+        .expect("finalize");
         assert_eq!(
             disp.deletions.len(),
             2,
@@ -628,7 +655,8 @@ mod tests {
             TENANT,
             Some("caller text"),
         )
-        .await;
+        .await
+        .expect("finalize");
 
         crate::config::set_lineage_dag(false);
         crate::config::set_consolidate_tombstone_sources(false);
@@ -643,6 +671,54 @@ mod tests {
         assert_eq!(
             consolidated.metadata[META_SUMMARY_SOURCE],
             serde_json::json!(SUMMARY_SOURCE_CALLER)
+        );
+    }
+
+    /// #3238 — missing tombstone source must fail closed, not silently omit.
+    #[test]
+    fn sqlite_finalize_missing_tombstone_fails_closed_3238() {
+        let _g = FLAG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::config::set_lineage_dag(true);
+        crate::config::set_consolidate_tombstone_sources(true);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = crate::db::open(&dir.path().join("t.db")).expect("open");
+        let mut consolidated = seed_mem("c-3238", "ns", "merged", SENDER);
+        crate::db::insert(&conn, &consolidated).expect("c");
+        let err = sqlite_finalize_and_disposition(
+            &conn,
+            &mut consolidated,
+            &["missing-src".to_string()],
+            SENDER,
+            TENANT,
+            None,
+        )
+        .expect_err("missing tombstone must fail closed");
+        crate::config::set_lineage_dag(false);
+        crate::config::set_consolidate_tombstone_sources(false);
+        assert!(err.contains("CONSOLIDATE_TOMBSTONE_MISSING"), "got {err}");
+    }
+
+    /// #3238 — persist against a missing origin row must fail closed.
+    #[test]
+    fn sqlite_finalize_missing_origin_fails_closed_3238() {
+        let _g = FLAG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::config::set_lineage_dag(false);
+        crate::config::set_consolidate_tombstone_sources(false);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = crate::db::open(&dir.path().join("t.db")).expect("open");
+        let mut consolidated = seed_mem("c-ghost", "ns", "merged", SENDER);
+        let err =
+            sqlite_finalize_and_disposition(&conn, &mut consolidated, &[], SENDER, TENANT, None)
+                .expect_err("missing origin must fail closed");
+        assert!(
+            err.contains("CONSOLIDATE_METADATA_PERSIST_FAILED"),
+            "got {err}"
         );
     }
 }
