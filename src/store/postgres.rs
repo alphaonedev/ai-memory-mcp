@@ -25211,6 +25211,38 @@ impl MemoryStore for PostgresStore {
         self.lineage_traverse(id, max_depth, false).await
     }
 
+    async fn list_dependents_of_invalidated(
+        &self,
+        memory_id: &str,
+    ) -> StoreResult<Vec<crate::store::InvalidationDependent>> {
+        // Twin of `notification::invalidation::list_dependents_of_invalidated`
+        // (sqlite): inbound `reflects_on` edges, no valid_until filter
+        // (parity with the sqlite MCP handler).
+        let rows = sqlx::query(
+            "SELECT m.id, m.namespace \
+             FROM memory_links l \
+             JOIN memories m ON m.id = l.source_id \
+             WHERE l.target_id = $1 AND l.relation = $2",
+        )
+        .bind(memory_id)
+        .bind(crate::models::MemoryLinkRelation::ReflectsOn.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_dependents_of_invalidated", e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(crate::store::InvalidationDependent {
+                id: row
+                    .try_get("id")
+                    .map_err(|e| to_store_err("read dependent id", e))?,
+                namespace: row
+                    .try_get("namespace")
+                    .map_err(|e| to_store_err(READ_NAMESPACE, e))?,
+            });
+        }
+        Ok(out)
+    }
+
     async fn consolidate(
         &self,
         ctx: &CallerContext,

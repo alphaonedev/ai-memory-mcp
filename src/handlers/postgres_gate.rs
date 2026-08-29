@@ -251,6 +251,9 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // Never `app.db.lock()`. MCP `signed_at` is `VerifyLinkReport::signed_at`
         // (link `valid_from`).
         ("POST", super::routes::MEMORY_VERIFY) => true,
+        // #3064 batch B — inbound `reflects_on` dependents + optional
+        // `lineage_descendants` for `transitive`. Never `app.db.lock()`.
+        ("POST", super::routes::MEMORY_DEPENDENTS_OF_INVALIDATED) => true,
         // v1.0.0 #2402 — the operator quarantine route-OUT. Both handlers
         // dispatch through `app.store` on postgres
         // (`MemoryStore::list_quarantined` / `operator_dequarantine`, both

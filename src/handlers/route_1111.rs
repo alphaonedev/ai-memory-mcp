@@ -496,6 +496,14 @@ pub async fn handle_dependents_of_invalidated_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #3064 batch B — postgres SAL dispatch. Direct list is
+    // `MemoryStore::list_dependents_of_invalidated`; opt-in
+    // `transitive` reuses `lineage_descendants` (sqlite
+    // `db::transitive_suspects` is an alias of that).
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return dependents_http_via_store(&app, &body).await;
+    }
     let lock = app.db.lock().await;
     let result = crate::mcp::handle_dependents_of_invalidated(&lock.0, &body);
     drop(lock);
@@ -503,6 +511,84 @@ pub async fn handle_dependents_of_invalidated_http(
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => err_response(e),
     }
+}
+
+/// #3064 batch B — postgres arm of [`handle_dependents_of_invalidated_http`].
+/// ERRORS-01: store faults go through [`super::store_err_to_response`].
+#[cfg(feature = "sal")]
+async fn dependents_http_via_store(app: &AppState, params: &Value) -> axum::response::Response {
+    use crate::mcp::param_names;
+    use crate::store::StoreError;
+
+    let memory_id = match params.get(param_names::MEMORY_ID).and_then(Value::as_str) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        Some(_) => return err_response(crate::errors::msg::MEMORY_ID_EMPTY.to_string()),
+        None => return err_response(crate::errors::msg::MEMORY_ID_REQUIRED.to_string()),
+    };
+    if let Err(e) = crate::validate::validate_id(&memory_id) {
+        return err_response(e.to_string());
+    }
+    let dependents = match app.store.list_dependents_of_invalidated(&memory_id).await {
+        Ok(v) => v,
+        Err(e) => return super::store_err_to_response(e),
+    };
+    let rendered: Vec<Value> = dependents
+        .iter()
+        .map(|d| {
+            json!({
+                "id": d.id,
+                "namespace": d.namespace,
+            })
+        })
+        .collect();
+    let mut out = json!({
+        "memory_id": memory_id,
+        "count": rendered.len(),
+        (field_names::DEPENDENTS): rendered,
+    });
+    if params
+        .get(param_names::TRANSITIVE)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        match app
+            .store
+            .lineage_descendants(&memory_id, crate::db::LINEAGE_MAX_DEPTH)
+            .await
+        {
+            Ok(suspects) => {
+                let rendered_suspects: Vec<Value> = suspects
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "id": n.id,
+                            "cid": n.cid,
+                            "relation": n.relation,
+                            "depth": n.depth,
+                        })
+                    })
+                    .collect();
+                if let Value::Object(map) = &mut out {
+                    map.insert(
+                        field_names::TRANSITIVE_COUNT.to_string(),
+                        json!(rendered_suspects.len()),
+                    );
+                    map.insert(
+                        field_names::TRANSITIVE_SUSPECTS.to_string(),
+                        Value::Array(rendered_suspects),
+                    );
+                }
+            }
+            Err(StoreError::NotFound { .. }) => {
+                if let Value::Object(map) = &mut out {
+                    map.insert(field_names::TRANSITIVE_COUNT.to_string(), json!(0));
+                    map.insert(field_names::TRANSITIVE_SUSPECTS.to_string(), json!([]));
+                }
+            }
+            Err(e) => return super::store_err_to_response(e),
+        }
+    }
+    Json(out).into_response()
 }
 
 /// `POST /api/v1/memory_export_reflection` — export a reflection

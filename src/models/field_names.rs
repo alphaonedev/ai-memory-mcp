@@ -198,6 +198,8 @@ pub const DECIDED_BY: &str = "decided_by";
 pub const DEFAULT_TIMEOUT_SECONDS: &str = "default_timeout_seconds";
 /// `description` — wire/row field name.
 pub const DESCRIPTION: &str = "description";
+/// `dependents` — MCP/HTTP `memory_dependents_of_invalidated` list key.
+pub const DEPENDENTS: &str = "dependents";
 /// `earliest_updated_at` — wire/row field name.
 pub const EARLIEST_UPDATED_AT: &str = "earliest_updated_at";
 /// `elapsed_ms` — wire/row field name.
@@ -466,6 +468,10 @@ pub const TOTAL_MEMORIES: &str = "total_memories";
 pub const TO_NAMESPACE: &str = "to_namespace";
 /// `transcripts` — wire/row field name.
 pub const TRANSCRIPTS: &str = "transcripts";
+/// `transitive_count` — MCP/HTTP `memory_dependents_of_invalidated`.
+pub const TRANSITIVE_COUNT: &str = "transitive_count";
+/// `transitive_suspects` — MCP/HTTP `memory_dependents_of_invalidated`.
+pub const TRANSITIVE_SUSPECTS: &str = "transitive_suspects";
 /// `unread_only` — wire/row field name.
 pub const UNREAD_ONLY: &str = "unread_only";
 /// `unretired` — #2024 skill-retire lifecycle response flag (bool; the
