@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests (B13 — conformance export fixture for canonical `updated_at`)
+
+- Regenerated `conformance/vectors/export/round_trip_l3.json` from the
+  pinned exporter so `updated_at` (and the matching local
+  `version_vector` stamp) is micros+`Z`. `created_at` stays verbatim
+  `2026-07-14T00:00:00Z`. Sibling audit: this is the only JSON export
+  golden under `conformance/vectors/` that pins `updated_at`.
+
 ### Fixed (B12' — canonical `updated_at` only)
 
 - Sqlite row-write funnels persist `updated_at` via
