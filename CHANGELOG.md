@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B17 Lane 1 — #2384 pg catchup fidelity test)
+
+- `pg_federation_catchup_send_carries_every_durable_field_2384` compared
+  catch-up SEND `tier` to `Long` after #2399 changed `maximal_memory()`
+  to `Short` (a fresh long-tier write is permanent and strips
+  `expires_at`). Postgres `list_memories_updated_since_counted` already
+  uses `MEMORY_READ_COLUMNS` + `row_to_memory_scan`. The pg twin now
+  mirrors sqlite: unique fixture, targeted `get` as truth,
+  `assert_full_field_parity`. Un-reds the postgres-ignored job.
+
 ### Fixed (B17 Lane 1 — #2515 pg expires_at canonical Z)
 
 - Postgres `row_to_memory` now renders `expires_at` via
