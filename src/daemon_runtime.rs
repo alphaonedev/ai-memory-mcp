@@ -8202,10 +8202,12 @@ pub async fn sync_cycle_once(
             // #2715 (CB-11 / B-4) — per-write content attestation, the pull
             // sibling of the `/sync/push` gate: a forged `metadata.write_signature`
             // is refused, a valid one lands `agent_attested`, absent → `claimed`.
-            // A refused row is a permanent (not transient) refusal, so `continue`
-            // WITHOUT halting — re-pull cannot fix a forged signature.
+            // #3233 — a delivered skip MUST halt the watermark: missing-author-key
+            // is recoverable after enrollment, and leaping `next_since` is silent
+            // inbound data loss (same disposition as the serve catchup puller).
             let mut to_insert = mem.clone();
             if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut to_insert) {
+                apply_halted = true;
                 continue;
             }
             match db::insert_if_newer(&conn, &to_insert) {

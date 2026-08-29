@@ -1326,6 +1326,36 @@ write is permission-evaluated as; see the operator note below.
   tokens to Enforce; the documented `standard` UNSET default stays
   Warn (not silently flipped). Count 25 → 27.
 
+- **#3234 — pg HTTP `check_duplicate` is no longer a cross-tenant oracle.**
+  The SAL scan is namespace-only (no caller mask). Embed *failure* now
+  returns 503 (`embedder failed to encode input`) matching the sqlite arm
+  instead of `unwrap_or_default()` (empty vec = silent miss). After the
+  scan, a non-admin caller is post-filtered with the #947 mask:
+  `store.get` (visibility-filtered; Err ⇒ hide) +
+  `is_visible_to_caller`. Hidden nearest clears `is_duplicate`.
+  Test: `pg_check_duplicate_hides_private`.
+- **#3233 — catchup cursor no longer leaps past skipped (ns/attest) delivered rows.**
+  `#1687/#2714` halted the watermark only on apply `Err`. A receiver-side
+  `continue` on namespace-scope or content-attestation skip still consumed the
+  peer's `next_since`, so skipped rows were never retried (silent inbound lag
+  / data loss). Distinct from #2441: an *empty* window (peer filtered; nothing
+  delivered) still advances via `next_since`. A skip of a *delivered* row now
+  sets `catchup_halted` (serve puller + sync-daemon attest skip).
+- **#3232 — pg `entity_get_by_alias` no longer treats an invisible row as visible.**
+  The postgres handler used `store.get(...).ok().as_ref().is_none_or(...)`.
+  Under a non-admin `CallerContext`, a `scope=private` row owned by someone else
+  maps to `Err(NotFound)`; `.ok()` made that look like "no backing memory"
+  which the sqlite path treats as visible — disclosing the private entity
+  id/name. Disposition now matches `kg_timeline`: `Ok(m)` → `is_visible_to_caller`,
+  `Err(_)` → hidden (`found: false`).
+- **#3229 — `lookup_peer_public_key` no longer treats an unloadable `.priv` as unenrolled.**
+  Federation inbound link verify used `keypair::load(...).ok()`, and `load` refuses a
+  group/world-readable private file (S4-LOW1). That collapse made a *forged* signed
+  link from a peer whose key material was present-but-unloadable land
+  `attest_level=unsigned` instead of being signature-rejected. Lookup now reads only
+  `<id>.pub` via `load_public` (verify never needs the private key). A missing `.pub`
+  is still unenrolled (unsigned, the documented back-compat posture); any other load
+  fault is logged so it is not indistinguishable from "no key enrolled" (#3051).
 - **The cert removal-proof harness can no longer leave a DISABLED security control
   in the working tree** (#3119, closing the #3118 near-miss).
   `scripts/check-cert-removal-proof.sh` is a mutation-testing harness: for each cited

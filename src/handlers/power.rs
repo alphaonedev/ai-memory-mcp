@@ -757,19 +757,65 @@ pub async fn check_duplicate(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let embedding_text = crate::embeddings::embedding_document(&body.title, &body.content);
-        // Best-effort: when the embedder is loaded, compute the query
-        // vector so phase 2 (cosine nearest) is available. Without it
-        // the trait method falls through to phase-1 hash-only.
+        // When the embedder is loaded, compute the query vector so phase 2
+        // (cosine nearest) is available. Without it the trait method falls
+        // through to phase-1 hash-only. #3234 — embed *failure* is 503
+        // (sqlite parity; ERRORS-01 / ERRORS-06), never `unwrap_or_default()`
+        // (empty vec = silent miss / fail-open).
         let query_embedding: Vec<f32> = match app.embedder.as_ref().as_ref() {
-            Some(emb) => emb.embed(&embedding_text).unwrap_or_default(),
+            Some(emb) => match emb.embed(&embedding_text) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("embedding generation failed: {e}");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "embedder failed to encode input"})),
+                    )
+                        .into_response();
+                }
+            },
             None => Vec::new(),
         };
+        // #947 / #3234 — resolve caller for the visibility post-filter.
+        // The pg trait scan is namespace-scoped only (no caller mask);
+        // an attacker must not learn whether their input matches another
+        // tenant's private memory. Admin bypasses. Same disposition as
+        // the sqlite arm below.
+        let caller = {
+            let header_agent_id = headers
+                .get(crate::HEADER_AGENT_ID)
+                .and_then(|v| v.to_str().ok());
+            crate::identity::resolve_http_agent_id(None, header_agent_id)
+                .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+        };
+        let caller_is_admin =
+            crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
         return match app
             .store
             .check_duplicate_with_text(&query_embedding, &embedding_text, namespace, threshold)
             .await
         {
-            Ok(check) => {
+            Ok(mut check) => {
+                if !caller_is_admin && let Some(near) = check.nearest.as_ref() {
+                    // Clone the id so the SAL get does not hold a borrow of
+                    // `check` across `.await` (CONCURRENCY-20 / OWNERSHIP-11).
+                    let near_id = near.id.clone();
+                    let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+                    // SAL `get` is already visibility-filtered (unlike sqlite
+                    // `db::get`): NotFound / any Err ⇒ hide. On Ok, still
+                    // apply `is_visible_to_caller` so an adapter that
+                    // returns the row cannot leak it.
+                    let hide = match app.store.get(&ctx, &near_id).await {
+                        Ok(full_mem) => {
+                            !crate::visibility::is_visible_to_caller(&full_mem, &caller)
+                        }
+                        Err(_) => true,
+                    };
+                    if hide {
+                        check.nearest = None;
+                        check.is_duplicate = false;
+                    }
+                }
                 let near_json = match check.nearest {
                     Some(n) => json!({
                         "id": n.id,
