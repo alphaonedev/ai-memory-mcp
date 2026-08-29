@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B14 — `updated_at` round-trips verbatim; clamp only far-future)
+
+- `clamp_inbound_updated_at` preserves honest inbound `updated_at`
+  byte-verbatim. `render_canonical_utc` applies ONLY when clamping a
+  far-future postdate. LWW comparison (`lww_updated_at_key`) stays
+  canonical (C1 Z vs `+00:00` intact).
+- Reverts B12/B12' store-path canonicalization of `updated_at` and the
+  matching `version_vector` stamp, plus B13's golden
+  (`round_trip_l3.json` `updated_at` / VV stamp back to verbatim).
+  `created_at` stays caller-signed-verbatim. #2207 both-order
+  convergence holds because both replicas now store the authored
+  rendering.
+
 ### Tests (B13 — conformance export fixture for canonical `updated_at`)
 
 - Regenerated `conformance/vectors/export/round_trip_l3.json` from the

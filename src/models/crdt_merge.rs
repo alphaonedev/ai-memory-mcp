@@ -264,13 +264,14 @@ pub fn clamp_inbound_updated_at(mut inbound: Memory, now_rfc3339: &str, skew_sec
         chrono::DateTime::parse_from_rfc3339(&inbound.updated_at),
     ) {
         let ceiling = now + chrono::Duration::seconds(skew_secs);
-        let chosen = if updated > ceiling { ceiling } else { updated };
-        // Wave-1 C1: persist the SAME canonical UTC rendering the create
-        // funnel uses (`validate::render_canonical_utc` — micros + `Z`).
-        // A peer `...Z` vs local `...+00:00` same wall-second must not
-        // win LWW by string order.
-        inbound.updated_at =
-            crate::validate::render_canonical_utc(chosen.with_timezone(&chrono::Utc));
+        if updated > ceiling {
+            // Wave-2 B14: rewrite ONLY a real far-future postdate.
+            // Honest inbound `updated_at` is preserved BYTE-VERBATIM
+            // (round-trip invariant). Z vs `+00:00` LWW is the
+            // comparison key [`lww_updated_at_key`], not this clamp.
+            inbound.updated_at =
+                crate::validate::render_canonical_utc(ceiling.with_timezone(&chrono::Utc));
+        }
     }
     inbound
 }
@@ -1290,29 +1291,25 @@ mod tests {
 
     #[test]
     fn clamp_inbound_updated_at_leaves_honest_timestamp_untouched() {
-        // An honest updated_at at-or-before now + skew is kept at the
-        // SAME INSTANT, rewritten to canonical UTC (micros + `Z`) so a
-        // peer `...Z` cannot beat `...+00:00` in string LWW (Wave-1 C1).
+        // Wave-2 B14: honest updated_at at-or-before now + skew is kept
+        // BYTE-VERBATIM. Canonicalization is the LWW comparison key
+        // (`lww_updated_at_key`), not this clamp.
         let now = "2026-06-20T12:00:00+00:00";
         let skew = 300;
         let honest = base("a", "2026-06-20T12:00:02+00:00");
         let out = clamp_inbound_updated_at(honest, now, skew);
-        assert_eq!(
-            out.updated_at,
-            crate::validate::render_canonical_utc(
-                chrono::DateTime::parse_from_rfc3339("2026-06-20T12:00:02+00:00")
-                    .unwrap()
-                    .with_timezone(&chrono::Utc)
-            )
-        );
+        assert_eq!(out.updated_at, "2026-06-20T12:00:02+00:00");
         let past = base("a", "2026-06-20T09:00:00+00:00");
         assert_eq!(
             clamp_inbound_updated_at(past, now, skew).updated_at,
-            crate::validate::render_canonical_utc(
-                chrono::DateTime::parse_from_rfc3339("2026-06-20T09:00:00+00:00")
-                    .unwrap()
-                    .with_timezone(&chrono::Utc)
-            )
+            "2026-06-20T09:00:00+00:00"
+        );
+        // A `...Z` honest inbound is also left verbatim (not rewritten
+        // to micros+Z).
+        let z = base("a", "2026-06-20T12:00:02Z");
+        assert_eq!(
+            clamp_inbound_updated_at(z, now, skew).updated_at,
+            "2026-06-20T12:00:02Z"
         );
     }
 
