@@ -924,7 +924,13 @@ impl MetadataEq {
 /// Filter shape passed to `list` / `search` / `recall`. Each field
 /// narrows the result set; `None` / empty means "don't narrow on this
 /// axis".
+///
+/// #3294 / API-07 — `#[non_exhaustive]` so a later axis is a
+/// non-breaking change. In-crate literals MUST use
+/// `..Default::default()` (or `..Filter::default()`); a missing `..`
+/// is a compile error, which is the cascade this pin prevents.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct Filter {
     pub namespace: Option<String>,
     pub tier: Option<Tier>,
@@ -998,6 +1004,17 @@ pub struct Filter {
     /// / `search`. Existing `..Default::default()` call sites are
     /// byte-identical.
     pub skip_access_ledger: bool,
+}
+
+impl Filter {
+    /// #3294 / API-22 — out-of-crate constructor twin of [`Default`].
+    /// Integration tests and downstream cannot use a struct literal on a
+    /// `#[non_exhaustive]` type (E0639); they call this then assign fields.
+    /// In-crate literals still use `Filter { ..Default::default() }`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// The core trait. Every backend implements this; ai-memory's HTTP /

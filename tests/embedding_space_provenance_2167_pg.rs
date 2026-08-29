@@ -123,22 +123,22 @@ async fn pg_recall_never_scores_foreign_space_2167() {
     // A query text that matches NO content token → the FTS/keyword pool is
     // empty, so the returned set is exactly the SEMANTIC-scored set. The
     // active-space fingerprint gates the `<=>` pool.
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        tier: None,
-        tags_any: vec![],
-        agent_id: None,
-        since: None,
-        until: None,
-        limit: 50,
-        offset: 0,
-        active_embedding_space: Some(active.clone()),
-        valid_at: None,
-        // #2580 — metadata-equality pushdown axis unused on this path.
-        metadata_eq: None,
-        source_uri: None,
-        // #3240 D1 — recall path, not the double-writing HTTP recall funnel.
-        skip_access_ledger: false,
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.tier = None;
+        __f.tags_any = vec![];
+        __f.agent_id = None;
+        __f.since = None;
+        __f.until = None;
+        __f.limit = 50;
+        __f.offset = 0;
+        __f.active_embedding_space = Some(active.clone());
+        __f.valid_at = None;
+        __f.metadata_eq = None;
+        __f.source_uri = None;
+        __f.skip_access_ledger = false;
+        __f
     };
     let results = store
         .recall_hybrid(&ctx, "zzznomatchtokenzzz", Some(&vec), &filter)

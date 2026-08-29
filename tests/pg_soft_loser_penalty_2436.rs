@@ -246,9 +246,10 @@ mod postgres_side {
         let _ = MemoryStore::store(&pg, &ctx, &loser).await;
         let _ = MemoryStore::store(&pg, &ctx, &winner).await;
 
-        let filter = Filter {
-            limit: 10,
-            ..Filter::default()
+        let filter = {
+            let mut __f = Filter::new();
+            __f.limit = 10;
+            __f
         };
         let ranked = pg
             .search_with_source_uri(&ctx, tok, &filter, None)

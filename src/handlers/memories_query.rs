@@ -170,6 +170,8 @@ pub async fn list_memories(
             source_uri: None,
             // Recall-hybrid only; list ignores it (default false).
             skip_access_ledger: false,
+
+            ..Default::default()
         };
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.list(&ctx, &filter).await {
@@ -398,6 +400,8 @@ pub async fn search_memories(
             source_uri: source_uri.map(str::to_string),
             // Recall-hybrid only; search ignores it (default false).
             skip_access_ledger: false,
+
+            ..Default::default()
         };
         // #942 SECURITY-high (Track A QC sweep, 2026-05-20) — replace
         // the hardcoded `"ai:http"` principal with the header-resolved

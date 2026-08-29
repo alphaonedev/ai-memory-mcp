@@ -249,10 +249,11 @@ async fn postgres_sqlite_decorrelation_equivalence_and_visibility() {
     assert_eq!(pg_ns, vec![bal_ns.to_string(), dom_ns.to_string()]);
 
     // Sanity: the admin sweep really did read the private rows on postgres.
-    let filter = ai_memory::store::Filter {
-        namespace: Some(dom_ns.to_string()),
-        limit: CAP_WINDOW,
-        ..Default::default()
+    let filter = {
+        let mut __f = ai_memory::store::Filter::new();
+        __f.namespace = Some(dom_ns.to_string());
+        __f.limit = CAP_WINDOW;
+        __f
     };
     let rows = pg_store.list(&admin, &filter).await.expect("pg list dom");
     assert_eq!(rows.len(), 10, "for_admin sees every dom-ns reflection");

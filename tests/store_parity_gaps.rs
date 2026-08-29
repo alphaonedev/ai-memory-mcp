@@ -2561,9 +2561,10 @@ mod postgres_side {
         let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m1).await;
         let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m2).await;
 
-        let filter = ai_memory::store::Filter {
-            limit: 10,
-            ..ai_memory::store::Filter::default()
+        let filter = {
+            let mut __f = ai_memory::store::Filter::new();
+            __f.limit = 10;
+            __f
         };
         let scoped = pg
             .search_with_source_uri(&ctx, "matching", &filter, Some("uri:pg-doc/a"))
@@ -2730,10 +2731,11 @@ mod postgres_side {
         let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m1).await;
         let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &m2).await;
 
-        let filter = ai_memory::store::Filter {
-            agent_id: Some("ai:alice".into()),
-            limit: 100,
-            ..ai_memory::store::Filter::default()
+        let filter = {
+            let mut __f = ai_memory::store::Filter::new();
+            __f.agent_id = Some("ai:alice".into());
+            __f.limit = 100;
+            __f
         };
         let hits = ai_memory::store::MemoryStore::list(&pg, &ctx, &filter)
             .await
@@ -2917,10 +2919,11 @@ mod postgres_side {
         let _ = ai_memory::store::MemoryStore::store(&pg, &seed_ctx, &priv_mem).await;
         let _ = ai_memory::store::MemoryStore::store(&pg, &seed_ctx, &inbox_mem).await;
 
-        let filter = ai_memory::store::Filter {
-            namespace: Some(NS.to_string()),
-            limit: 100,
-            ..ai_memory::store::Filter::default()
+        let filter = {
+            let mut __f = ai_memory::store::Filter::new();
+            __f.namespace = Some(NS.to_string());
+            __f.limit = 100;
+            __f
         };
 
         let has = |rows: &[Memory], id: &str| rows.iter().any(|m| m.id == id);

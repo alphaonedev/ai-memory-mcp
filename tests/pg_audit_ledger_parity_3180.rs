@@ -154,10 +154,11 @@ async fn pg_recall_hybrid_appends_the_access_ledger_3180() {
         ids.push(store.store(&ctx, &mem).await.expect("store probe row"));
     }
 
-    let filter = ai_memory::store::Filter {
-        namespace: Some(ns.clone()),
-        limit: 10,
-        ..Default::default()
+    let filter = {
+        let mut __f = ai_memory::store::Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.limit = 10;
+        __f
     };
     let results = store
         .recall_hybrid(&ctx, &token, None, &filter)

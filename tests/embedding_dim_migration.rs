@@ -424,10 +424,11 @@ async fn list_survives_embedding_dim_alter_without_cached_plan_503_1881() {
     // prepared plan (result type includes `vector(384)`) is cached across
     // the pool's connections — exactly what a live daemon does while
     // serving `GET /api/v1/memories` before the boot-time auto-migrate.
-    let filter = Filter {
-        namespace: Some("issue-1881".to_string()),
-        limit: 50,
-        ..Default::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some("issue-1881".to_string());
+        __f.limit = 50;
+        __f
     };
     for _ in 0..10 {
         store
@@ -570,10 +571,11 @@ async fn default_deploy_no_boot_alter_cross_process_1882() {
     // vector(768)) is cached across its connections — the plan the #1881
     // 503 came from invalidating.
     let ctx = CallerContext::for_agent("issue-1882-test");
-    let filter = Filter {
-        namespace: Some("issue-1882".to_string()),
-        limit: 50,
-        ..Default::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some("issue-1882".to_string());
+        __f.limit = 50;
+        __f
     };
     for _ in 0..10 {
         serve

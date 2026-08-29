@@ -159,10 +159,11 @@ async fn store_batch_upserts_all_rows_in_order() {
         .collect();
     let ids = store.store_batch(&ctx, &rows).await.expect("store_batch");
     assert_eq!(ids.len(), 5);
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        limit: 50,
-        ..Filter::default()
+    let filter = {
+        let mut f = Filter::new();
+        f.namespace = Some(ns.clone());
+        f.limit = 50;
+        f
     };
     let listed = store.list(&ctx, &filter).await.expect("list");
     assert_eq!(listed.len(), 5);
@@ -463,10 +464,11 @@ async fn recall_hybrid_returns_scored_results() {
         )
         .await
         .unwrap();
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        limit: 5,
-        ..Filter::default()
+    let filter = {
+        let mut f = Filter::new();
+        f.namespace = Some(ns.clone());
+        f.limit = 5;
+        f
     };
     let scored = store
         .recall_hybrid(&ctx, &token, None, &filter)
@@ -490,10 +492,11 @@ async fn search_empty_namespace_returns_no_hits() {
     };
     let ctx = CallerContext::for_agent("ai:cov4");
     let ns = uid("cov-empty");
-    let filter = Filter {
-        namespace: Some(ns),
-        limit: 5,
-        ..Filter::default()
+    let filter = {
+        let mut f = Filter::new();
+        f.namespace = Some(ns);
+        f.limit = 5;
+        f
     };
     let hits = store
         .search(&ctx, "nothingmatcheshere", &filter)

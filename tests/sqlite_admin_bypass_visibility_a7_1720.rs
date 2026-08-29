@@ -141,10 +141,11 @@ fn admin_bypass_ctx(with_as_agent: bool) -> CallerContext {
 }
 
 fn ns_filter() -> Filter {
-    Filter {
-        namespace: Some(NS.to_string()),
-        limit: 100,
-        ..Filter::default()
+    {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 100;
+        __f
     }
 }
 

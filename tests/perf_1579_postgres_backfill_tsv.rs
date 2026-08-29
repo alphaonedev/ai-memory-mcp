@@ -410,22 +410,22 @@ async fn b2_search_still_returns_matches_through_sal() {
         store.store(&ctx, &mem).await.expect("seed store");
     }
 
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        tier: None,
-        tags_any: vec![],
-        agent_id: None,
-        since: None,
-        until: None,
-        valid_at: None,
-        limit: 10,
-        offset: 0,
-        active_embedding_space: None,
-        // #2580 — metadata-equality pushdown axis unused on this path.
-        metadata_eq: None,
-        source_uri: None,
-        // #3240 D1 — search path, not the double-writing HTTP recall funnel.
-        skip_access_ledger: false,
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.tier = None;
+        __f.tags_any = vec![];
+        __f.agent_id = None;
+        __f.since = None;
+        __f.until = None;
+        __f.valid_at = None;
+        __f.limit = 10;
+        __f.offset = 0;
+        __f.active_embedding_space = None;
+        __f.metadata_eq = None;
+        __f.source_uri = None;
+        __f.skip_access_ledger = false;
+        __f
     };
     let hits = store
         .search(&ctx, "substrate recall", &filter)

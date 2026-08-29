@@ -373,10 +373,11 @@ fn purity_pure_default_all_sqlite_entry_paths() {
         let store =
             ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore");
         let ctx = ai_memory::store::CallerContext::for_agent("ai:purity-test");
-        let filter = ai_memory::store::Filter {
-            namespace: Some("purity-ns".to_string()),
-            limit: 10,
-            ..Default::default()
+        let filter = {
+            let mut __f = ai_memory::store::Filter::new();
+            __f.namespace = Some("purity-ns".to_string());
+            __f.limit = 10;
+            __f
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

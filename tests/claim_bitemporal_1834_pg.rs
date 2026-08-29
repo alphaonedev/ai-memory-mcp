@@ -79,22 +79,12 @@ fn mem(
 }
 
 fn filter(ns: &str, valid_at: Option<&str>) -> Filter {
-    Filter {
-        namespace: Some(ns.to_string()),
-        tier: None,
-        tags_any: vec![],
-        agent_id: None,
-        since: None,
-        until: None,
-        valid_at: valid_at.map(str::to_string),
-        limit: 50,
-        offset: 0,
-        active_embedding_space: None,
-        // #2580 — metadata-equality pushdown axis unused on this path.
-        metadata_eq: None,
-        source_uri: None,
-        // #3240 D1 — this recall path is not the double-writing HTTP funnel.
-        skip_access_ledger: false,
+    {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.to_string());
+        __f.valid_at = valid_at.map(str::to_string);
+        __f.limit = 50;
+        __f
     }
 }
 

@@ -80,10 +80,11 @@ async fn tag_only_hit_ids(store: &dyn MemoryStore, namespace: &str, owner: &str)
         .await
         .expect("store probe row");
 
-    let filter = Filter {
-        namespace: Some(namespace.to_string()),
-        limit: 50,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(namespace.to_string());
+        __f.limit = 50;
+        __f
     };
     let hits = store
         .search(&ctx, PROBE_TAG, &filter)

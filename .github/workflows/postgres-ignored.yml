@@ -1,0 +1,128 @@
+# #3274 — execute `#[ignore]`+sal-postgres pg regression tests.
+#
+# THE GAP. `ci.yml` Check (linux-fed, enterprise-fed) runs
+# `cargo test --features sal-postgres -- --test-threads=1` with NO
+# `--ignored` / `--include-ignored`. `cert-postgres-age.yml` passes
+# `--include-ignored` but only for a hand-maintained `--test <name>`
+# allow-list. Any `#[ignore]` pg binary not on that list has zero
+# executing CI coverage (confirmed: pg_blocking_ddl_boot_brick_2614,
+# pg_search_filter_ssot_3185, pg_delete_namespace_meta_atomicity_3245).
+#
+# THIS JOB. Runs ONLY the ignored tests (`--ignored`, not a full-suite
+# `--include-ignored` duplicate of the already-required enterprise-fed
+# Check). Same native pg18.6+AGE1.8.0+pgvector0.8.6 tier, same
+# per-job ephemeral db pattern as cert-postgres-age.yml.
+#
+# RUNNER PLACEMENT — self-hosted linux-fed (pg-tier). Needs :5445.
+# NOT a required context (do not add to ci-allow.ssot / T2-1).
+# Job-level `if:` is legitimate here: not a required context, not a
+# matrix (check-required-contexts.sh rule (b1) does not apply).
+
+name: Postgres ignored tests (#3274)
+
+on:
+  pull_request:
+    branches: ["release/**"]
+  push:
+    branches: ["release/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pg-ignored-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  postgres-ignored:
+    name: "Postgres ignored tests (sal-postgres --ignored)"
+    runs-on: [self-hosted, linux-fed]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
+        if: runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          test -x "$HOME/.cargo/bin/rustup" || {
+            echo "::error::rustup is not provisioned at \$HOME/.cargo/bin/rustup on $RUNNER_NAME — repair the node."
+            exit 1
+          }
+
+      - name: Install Rust 1.98.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+
+      - name: Point at the native enterprise-fed tier (per-job ephemeral db)
+        run: |
+          set -euo pipefail
+          for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do
+            if [ -d "$d" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+              PATH="$d:$PATH"
+            fi
+          done
+          export PATH
+          url_file="$HOME/.ai-memory-ci-fed-url"
+          if [ ! -f "$url_file" ]; then
+            echo "::error::$RUNNER_NAME is missing $url_file — the native cert tier URL is not provisioned on this node"
+            exit 1
+          fi
+          base_url="$(cat "$url_file")"
+          CI_FED_DB="$(printf '%s' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_ignored" | cut -c1-63)"
+          echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"
+          if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$CI_FED_DB\";"; then
+            echo "::error::$RUNNER_NAME failed to CREATE DATABASE $CI_FED_DB on the native cert tier"
+            exit 1
+          fi
+          case "$base_url" in
+            *\?*) q="?${base_url#*\?}"; head="${base_url%%\?*}" ;;
+            *)    q=""; head="$base_url" ;;
+          esac
+          new_url="${head%/*}/${CI_FED_DB}${q}"
+          if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
+            echo "::error::$RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"
+            exit 1
+          fi
+          {
+            echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url"
+            echo "AI_MEMORY_TEST_AGE_URL=$new_url"
+          } >> "$GITHUB_ENV"
+          echo "::notice::[#3274] ignored pg tests pointed at ephemeral db $CI_FED_DB on $RUNNER_NAME"
+
+      - name: cargo test --features sal-postgres -- --ignored
+        run: |
+          set -euo pipefail
+          cargo test --features sal-postgres -- --ignored --test-threads=1
+
+      - name: Cleanup enterprise-fed ephemeral db
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -z "${CI_FED_DB:-}" ]; then
+            echo "::notice::no ephemeral db to drop (CI_FED_DB unset — configure never ran)"
+            exit 0
+          fi
+          for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do
+            [ -d "$d" ] && PATH="$d:$PATH"
+          done
+          export PATH
+          url_file="$HOME/.ai-memory-ci-fed-url"
+          if [ ! -f "$url_file" ]; then
+            echo "::warning::cannot drop $CI_FED_DB — $url_file missing on $RUNNER_NAME (leaked ephemeral db)"
+            exit 0
+          fi
+          base_url="$(cat "$url_file")"
+          if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
+            echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"
+          else
+            echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
+          fi
