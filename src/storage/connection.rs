@@ -372,10 +372,21 @@ pub const ENV_DB_PASSPHRASE: &str = "AI_MEMORY_DB_PASSPHRASE";
 
 /// Process-private SQLCipher passphrase seeded from `--db-passphrase-file`.
 /// Never re-published to the environment (#3213).
+///
+/// Production: [`OnceLock`] first-writer-wins, never-clearable
+/// (CONCURRENCY-16). Tests: [`RwLock<Option<String>>`] so a seeding
+/// test cannot poison later store-open tests in the same process
+/// (B11 / `coverage.yml` `--test-threads=1`). The S1 gate
+/// [`refuse_at_rest_requested_without_sqlcipher`] is unchanged.
+#[cfg(not(test))]
 static DB_PASSPHRASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+#[cfg(test)]
+static DB_PASSPHRASE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
 /// Seed the process-private SQLCipher passphrase. First writer wins
-/// ([`OnceLock::set`], CONCURRENCY-16).
+/// (production [`OnceLock::set`], CONCURRENCY-16; tests keep the same
+/// fail-closed second-seed error).
 ///
 /// # Errors
 ///
@@ -383,21 +394,82 @@ static DB_PASSPHRASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// `--db-passphrase-file` — fail-closed rather than silently swapping
 /// the key).
 pub fn set_db_passphrase(passphrase: String) -> Result<()> {
-    DB_PASSPHRASE.set(passphrase).map_err(|_| {
-        anyhow::anyhow!("--db-passphrase-file: DB passphrase already set this process")
-    })
+    #[cfg(not(test))]
+    {
+        DB_PASSPHRASE.set(passphrase).map_err(|_| {
+            anyhow::anyhow!("--db-passphrase-file: DB passphrase already set this process")
+        })
+    }
+    #[cfg(test)]
+    {
+        let mut slot = DB_PASSPHRASE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner); // CONCURRENCY-18
+        if slot.is_some() {
+            anyhow::bail!("--db-passphrase-file: DB passphrase already set this process");
+        }
+        *slot = Some(passphrase);
+        Ok(())
+    }
 }
 
 /// The process-private SQLCipher passphrase, if `--db-passphrase-file`
 /// seeded one. `None` when the file channel was not used (operators
 /// may still set [`ENV_DB_PASSPHRASE`] themselves).
 ///
-/// The production reader is [`apply_sqlcipher_key`]. Wave-1 S1 also
-/// reads this on the default (non-`sqlcipher`) build so a passphrase
-/// request cannot silently fall through to plaintext.
+/// Returns an owned [`String`] (OWNERSHIP-03) so the `cfg(test)`
+/// [`RwLock`] path does not need a `'static` borrow. The production
+/// reader is [`apply_sqlcipher_key`]. Wave-1 S1 also reads this on the
+/// default (non-`sqlcipher`) build so a passphrase request cannot
+/// silently fall through to plaintext.
 #[must_use]
-pub(crate) fn db_passphrase() -> Option<&'static str> {
-    DB_PASSPHRASE.get().map(String::as_str)
+pub(crate) fn db_passphrase() -> Option<String> {
+    #[cfg(not(test))]
+    {
+        DB_PASSPHRASE.get().cloned()
+    }
+    #[cfg(test)]
+    {
+        DB_PASSPHRASE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) // CONCURRENCY-18
+            .clone()
+    }
+}
+
+/// B11 — clear the test-only passphrase slot. Production [`OnceLock`]
+/// stays never-clearable (CONCURRENCY-16).
+#[cfg(test)]
+fn reset_db_passphrase_for_tests() {
+    *DB_PASSPHRASE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None; // CONCURRENCY-18
+}
+
+/// B11 — RAII reset of the test-only passphrase slot (OWNERSHIP-24).
+/// [`Self::enter`] clears any prior seed; [`Drop`] clears again so a
+/// seeding test cannot poison later store-open tests in the same
+/// process. Production has no equivalent: [`OnceLock`] is
+/// never-clearable. Drop is infallible (OWNERSHIP-25).
+#[cfg(test)]
+#[must_use = "dropping this guard resets the test passphrase slot"]
+pub(crate) struct DbPassphraseGuard {
+    _private: (),
+}
+
+#[cfg(test)]
+impl DbPassphraseGuard {
+    pub(crate) fn enter() -> Self {
+        reset_db_passphrase_for_tests();
+        Self { _private: () }
+    }
+}
+
+#[cfg(test)]
+impl Drop for DbPassphraseGuard {
+    fn drop(&mut self) {
+        reset_db_passphrase_for_tests();
+    }
 }
 
 /// Operator asked for whole-DB encryption: `--db-passphrase-file` or
@@ -870,7 +942,6 @@ fn apply_check_constraint_triggers(conn: &Connection) -> Result<()> {
 #[cfg(feature = "sqlcipher")]
 fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
     let passphrase = db_passphrase()
-        .map(str::to_owned)
         .or_else(|| std::env::var(ENV_DB_PASSPHRASE).ok())
         .ok_or_else(|| {
             // #962 typed envelope — fatal boot refusal.
@@ -1536,5 +1607,38 @@ mod tests {
         e.unset();
         refuse_at_rest_requested_without_sqlcipher()
             .expect("default plaintext standalone must still boot");
+    }
+
+    /// B11 pin: a `set_db_passphrase` seed that is RAII-reset must not
+    /// poison a later store-open in the same process. The S1 gate must
+    /// still fire *while* the seed is live (do not weaken the gate).
+    #[cfg(not(feature = "sqlcipher"))]
+    #[test]
+    fn db_passphrase_test_reset_does_not_poison_later_open_b11() {
+        let _lock = crate::test_support::env_lock();
+        let env_g = crate::test_support::EnvGuard::capture(ENV_DB_PASSPHRASE);
+        env_g.unset();
+        {
+            let _pass = DbPassphraseGuard::enter();
+            set_db_passphrase("b11-poison-probe".into()).expect("first seed");
+            assert!(
+                passphrase_requested(),
+                "live seed must be visible to the S1 gate"
+            );
+            refuse_at_rest_requested_without_sqlcipher()
+                .expect_err("seeded passphrase must still trip the S1 gate");
+            assert!(
+                set_db_passphrase("other".into()).is_err(),
+                "first-writer-wins must still refuse a second seed"
+            );
+        }
+        assert!(
+            !passphrase_requested(),
+            "RAII Drop must clear the test-only slot"
+        );
+        refuse_at_rest_requested_without_sqlcipher()
+            .expect("cleared passphrase must not trip the S1 gate");
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        open(tmp.path()).expect("store-open after reset must succeed on non-sqlcipher");
     }
 }

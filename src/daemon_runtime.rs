@@ -11508,6 +11508,7 @@ mod tests {
         // spawned afterwards would inherit it).
         let _enc = crate::test_support::env_lock();
         let _g = env_var_lock();
+        let _pass = crate::storage::connection::DbPassphraseGuard::enter();
         // SAFETY: serialized via env_var_lock.
         unsafe { std::env::remove_var(crate::storage::ENV_DB_PASSPHRASE) };
         let env = TestEnv::fresh();
@@ -11538,7 +11539,7 @@ mod tests {
             ENV = crate::storage::ENV_DB_PASSPHRASE
         );
         assert_eq!(
-            crate::storage::connection::db_passphrase(),
+            crate::storage::connection::db_passphrase().as_deref(),
             Some("test-passphrase"),
             "file-derived passphrase must land in process-private state"
         );

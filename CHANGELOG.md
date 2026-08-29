@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B11 — DB_PASSPHRASE test isolation)
+
+- `DB_PASSPHRASE` stays `OnceLock` in production (first-writer-wins,
+  never-clearable). Under `cfg(test)` it is `RwLock<Option<String>>`
+  with a RAII reset so
+  `test_apply_startup_env_with_db_passphrase_file_does_not_export_env`
+  cannot poison later store-open tests in `cargo test --lib --features
+  sal,sal-postgres -- --test-threads=1`. The S1
+  `refuse_at_rest_requested_without_sqlcipher` gate is unchanged.
+
 ### Docs (C3 follow-up — enterprise-fed §2 20-check recapture at 23f943ca)
 
 - `docs/compliance/evidence/cert-55/` records a four-leg
