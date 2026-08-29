@@ -1021,11 +1021,12 @@ pub fn canonical_valid_time_opt(v: Option<&str>) -> Option<String> {
 /// RFC3339 → micros+`Z` ([`render_canonical_utc`]); unparseable values
 /// pass through byte-for-byte (fail-safe).
 ///
-/// Wave-2 B12 / #2207: `created_at` / `updated_at` must use this at
-/// every sqlite row-write funnel so local-won vs inbound-won provenance
-/// cannot store two renderings of the same instant. Does **not** change
-/// the C1 LWW comparison key ([`crate::models::crdt_merge`] already
-/// canonicalizes the tiebreak).
+/// Wave-2 B12' / #2207: `updated_at` uses this at every sqlite
+/// row-write funnel so local-won vs inbound-won provenance cannot store
+/// two renderings of the same instant. `created_at` stays
+/// caller-signed-verbatim. Does **not** change the C1 LWW comparison
+/// key ([`crate::models::crdt_merge`] already canonicalizes the
+/// tiebreak).
 #[must_use]
 pub fn canonical_rfc3339(ts: &str) -> String {
     canonicalize_valid_time(ts).unwrap_or_else(|| ts.to_string())

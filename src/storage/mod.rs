@@ -1826,12 +1826,16 @@ fn insert_inner(
     // #2211 — `insert_imported` skips the stamp entirely (remote admission:
     // the row was authored elsewhere; bumping this node's component here
     // would misattribute clock authorship).
+    // Wave-2 B12' — persist `updated_at` as micros+Z; stamp THIS node's
+    // version_vector component with the SAME rendering so #1757 stays
+    // consistent. `created_at` stays caller-signed-verbatim.
+    let updated_at_canon = crate::validate::canonical_rfc3339(&mem.updated_at);
     let stamped_metadata = if stamp_local_clock {
         let mut m = mem.metadata.clone();
         crate::models::stamp_version_vector(
             &mut m,
             crate::federation::identity::resolver::local_node_identity(),
-            &mem.updated_at,
+            &updated_at_canon,
         );
         m
     } else {
@@ -1967,16 +1971,6 @@ fn insert_inner(
         let valid_from_canon = crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref());
         let valid_until_canon =
             crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref());
-        // Wave-2 B12 / #2207 — same funnel, `created_at` / `updated_at`
-        // (and the other RFC3339 TEXT columns). C1 canonicalized the
-        // inbound LWW *comparison* but local insert stored raw `+00:00`,
-        // so both-order merge left two renderings of one instant.
-        let created_at_canon = crate::validate::canonical_rfc3339(&mem.created_at);
-        let updated_at_canon = crate::validate::canonical_rfc3339(&mem.updated_at);
-        let last_accessed_canon =
-            crate::validate::canonical_valid_time_opt(mem.last_accessed_at.as_deref());
-        let confidence_decayed_canon =
-            crate::validate::canonical_valid_time_opt(mem.confidence_decayed_at.as_deref());
         // v1.0.0 #2332 (FBL-02) — canonicalize `expires_at` at the SAME funnel
         // the v86 #1834 work canonicalized valid_from/valid_until: every expiry
         // consumer (GC reap, recall/list visibility, the #1596 touch/fold MAX()
@@ -2243,9 +2237,9 @@ fn insert_inner(
                     mem.confidence,
                     mem.source,
                     mem.access_count,
-                    created_at_canon,
+                    mem.created_at,
                     updated_at_canon,
-                    last_accessed_canon,
+                    mem.last_accessed_at,
                     expires_canon,
                     metadata_json,
                     mem.reflection_depth,
@@ -2257,7 +2251,7 @@ fn insert_inner(
                     source_span_json,
                     mem.confidence_source.as_str(),
                     confidence_signals_json,
-                    confidence_decayed_canon,
+                    mem.confidence_decayed_at,
                     mentioned_entity_id,
                     mem.lifecycle_state.as_str(),
                     encrypted_envelope,
@@ -2780,18 +2774,17 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                 params![
                     mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
                     tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-                    // Wave-2 B12 / #2207 — store micros+Z uniformly.
-                    crate::validate::canonical_rfc3339(&mem.created_at),
+                    mem.created_at,
+                    // Wave-2 B12' / #2207 — `updated_at` only (micros+Z).
                     crate::validate::canonical_rfc3339(&mem.updated_at),
-                    crate::validate::canonical_valid_time_opt(mem.last_accessed_at.as_deref()),
+                    mem.last_accessed_at,
                     // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry
                     // rendering (the v86 valid_* precedent below).
                     crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
                     metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
                     mem.entity_id, mem.persona_version,
                     citations_json, mem.source_uri, source_span_json,
-                    mem.confidence_source.as_str(), confidence_signals_json,
-                    crate::validate::canonical_valid_time_opt(mem.confidence_decayed_at.as_deref()),
+                    mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
                     mentioned_entity_id, mem.lifecycle_state.as_str(), encrypted_envelope,
                     cid_stamp.cid, cid_stamp.genesis,
                     // v1.0.0 #1834 — claim-bitemporal validity, canonicalized
@@ -15687,11 +15680,11 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                 mem.confidence,
                 mem.source,
                 mem.access_count,
-                // Wave-2 B12 / #2207 — store micros+Z uniformly (C1 LWW
-                // comparison is unchanged; this is the persisted rendering).
-                crate::validate::canonical_rfc3339(&mem.created_at),
+                mem.created_at,
+                // Wave-2 B12' / #2207 — `updated_at` only (micros+Z).
+                // `created_at` is caller-signed-verbatim.
                 crate::validate::canonical_rfc3339(&mem.updated_at),
-                crate::validate::canonical_valid_time_opt(mem.last_accessed_at.as_deref()),
+                mem.last_accessed_at,
                 // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry rendering at
                 // the federation-receive funnel too (the v86 valid_* precedent
                 // below): a peer's offset rendering must never mis-order against
@@ -15707,7 +15700,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                 source_span_json,
                 mem.confidence_source.as_str(),
                 confidence_signals_json,
-                crate::validate::canonical_valid_time_opt(mem.confidence_decayed_at.as_deref()),
+                mem.confidence_decayed_at,
                 mentioned_entity_id,
                 mem.version,
                 mem.lifecycle_state.as_str(),
@@ -16051,12 +16044,11 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             mem.confidence,
             mem.source,
             mem.access_count,
-            // Wave-2 B12 / #2207 — store micros+Z uniformly so a local-won
-            // merge cannot persist raw `+00:00` next to an inbound-won
-            // micros+`Z` (C1 LWW comparison is unchanged).
-            crate::validate::canonical_rfc3339(&mem.created_at),
+            mem.created_at,
+            // Wave-2 B12' / #2207 — `updated_at` only (micros+Z).
+            // `created_at` is caller-signed-verbatim.
             crate::validate::canonical_rfc3339(&mem.updated_at),
-            crate::validate::canonical_valid_time_opt(mem.last_accessed_at.as_deref()),
+            mem.last_accessed_at,
             // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry rendering on
             // the federation merge-writer path (v86 valid_* precedent).
             crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
@@ -16070,7 +16062,7 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             source_span_json,
             mem.confidence_source.as_str(),
             confidence_signals_json,
-            crate::validate::canonical_valid_time_opt(mem.confidence_decayed_at.as_deref()),
+            mem.confidence_decayed_at,
             mentioned_entity_id,
             mem.version,
             mem.lifecycle_state.as_str(),
