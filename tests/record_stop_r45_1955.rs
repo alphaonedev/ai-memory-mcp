@@ -147,14 +147,12 @@ async fn stop_refuses_writes_reads_stay_live_resume_restores() {
         .expect("get is live under stop");
     assert_eq!(got.id, seed_id);
     let listed = store
-        .list(
-            &c,
-            &Filter {
-                namespace: Some(NS.to_string()),
-                limit: 50,
-                ..Default::default()
-            },
-        )
+        .list(&c, &{
+            let mut __f = Filter::new();
+            __f.namespace = Some(NS.to_string());
+            __f.limit = 50;
+            __f
+        })
         .await
         .expect("list is live under stop");
     assert!(

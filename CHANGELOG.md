@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (B17 Lane 1 — #3274 CI ignored-pg + #3294 Filter pin)
+
+- **#3274:** new workflow `.github/workflows/postgres-ignored.yml`
+  runs `cargo test --features sal-postgres -- --ignored --test-threads=1`
+  against a per-job ephemeral db on the native pg18.6+AGE+pgvector
+  tier. Closes the gap where `#[ignore]` pg regressions (not on the
+  cert-postgres-age `--test` allow-list) had zero executing CI
+  coverage. Does **not** touch `ci-allow.ssot` / T2-1 (not a required
+  context).
+- **#3294 / API-07:** `store::Filter` is `#[non_exhaustive]`. In-crate
+  literals use `..Default::default()`. Integration tests (a separate
+  crate) cannot construct a non-exhaustive struct literal (E0639) even
+  with FRU — they use `Filter::new()` (API-22 twin of `Default`) and
+  assign fields, so a later axis is not a literal-cascade.
+
 ### Fixed (B17-B1b — clippy doc_markdown on BRANCH1 test docs)
 
 - `tests/archive_restore_link_cid_3250.rs` and

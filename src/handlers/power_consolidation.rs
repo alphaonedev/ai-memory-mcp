@@ -1160,6 +1160,8 @@ pub async fn load_family_handler(
             source_uri: None,
             // Recall-hybrid only; list ignores it (default false).
             skip_access_ledger: false,
+
+            ..Default::default()
         };
         // QC P1 fix (2026-05-20): load_family lists every memory in
         // the namespace tagged with a `family` metadata field. With

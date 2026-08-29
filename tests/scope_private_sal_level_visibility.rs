@@ -114,10 +114,11 @@ async fn fixture() -> (Arc<dyn MemoryStore>, NamedTempFile, String, String) {
 async fn bob_list_excludes_alice_private_910_sal() {
     let (store, _f, _pid, _cid) = fixture().await;
     let bob = CallerContext::for_agent("bob");
-    let filter = Filter {
-        namespace: Some(NS.to_string()),
-        limit: 100,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 100;
+        __f
     };
     let rows = store.list(&bob, &filter).await.expect("list");
     assert_eq!(
@@ -143,10 +144,11 @@ async fn bob_list_excludes_alice_private_910_sal() {
 async fn alice_list_includes_own_private_910_sal() {
     let (store, _f, _pid, _cid) = fixture().await;
     let alice = CallerContext::for_agent("alice");
-    let filter = Filter {
-        namespace: Some(NS.to_string()),
-        limit: 100,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 100;
+        __f
     };
     let rows = store.list(&alice, &filter).await.expect("list");
     assert_eq!(
@@ -164,10 +166,11 @@ async fn alice_list_includes_own_private_910_sal() {
 async fn bob_search_excludes_alice_private_910_sal() {
     let (store, _f, _pid, _cid) = fixture().await;
     let bob = CallerContext::for_agent("bob");
-    let filter = Filter {
-        namespace: Some(NS.to_string()),
-        limit: 100,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 100;
+        __f
     };
     let rows = store.search(&bob, "body", &filter).await.expect("search");
     for r in &rows {
@@ -188,10 +191,11 @@ async fn bob_search_excludes_alice_private_910_sal() {
 async fn alice_search_includes_own_private_910_sal() {
     let (store, _f, _pid, _cid) = fixture().await;
     let alice = CallerContext::for_agent("alice");
-    let filter = Filter {
-        namespace: Some(NS.to_string()),
-        limit: 100,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 100;
+        __f
     };
     let rows = store
         .search(&alice, "private", &filter)
@@ -211,10 +215,11 @@ async fn alice_search_includes_own_private_910_sal() {
 async fn bob_recall_excludes_alice_private_910_sal() {
     let (store, _f, _pid, _cid) = fixture().await;
     let bob = CallerContext::for_agent("bob");
-    let filter = Filter {
-        namespace: Some(NS.to_string()),
-        limit: 100,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 100;
+        __f
     };
     let results = store
         .recall_hybrid(&bob, "body", None, &filter)

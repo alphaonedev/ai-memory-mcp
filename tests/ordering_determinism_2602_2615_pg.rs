@@ -163,10 +163,11 @@ async fn pg_list_id_tiebreak_matches_sqlite_binary_order_2602() {
     seed_tied_memory(&store, &id_mem_b, &ns).await;
     seed_tied_memory(&store, &id_mem_c, &ns).await;
 
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        limit: 100,
-        ..Default::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.limit = 100;
+        __f
     };
     let pg_ids: Vec<String> = store
         .list(&admin_ctx(), &filter)

@@ -156,10 +156,11 @@ async fn search_with_source_uri_filters_on_provenance() {
     m.source_uri = Some(uri.clone());
     store.store(&ctx, &m).await.expect("store with source_uri");
 
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        limit: 10,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.limit = 10;
+        __f
     };
     // With the matching source_uri the row surfaces.
     let hits = store
@@ -269,10 +270,11 @@ async fn search_with_source_uri_enforces_scope_private_gate_3110() {
          namespace), so the two fixtures' titles must differ)"
     );
 
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        limit: 10,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.limit = 10;
+        __f
     };
 
     // (a) bob (non-owner, non-recipient of the private row) is FAIL-CLOSED

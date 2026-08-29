@@ -151,10 +151,11 @@ async fn recall_scoring_parity_top_10_within_2_swaps() {
         pg.store(&ctx(), mem).await.expect("seed pg");
     }
 
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        limit: 50,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.limit = 50;
+        __f
     };
 
     let sqlite_hits = sqlite

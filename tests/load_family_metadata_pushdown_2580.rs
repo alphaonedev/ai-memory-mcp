@@ -154,11 +154,12 @@ async fn metadata_eq_pushdown_matches_rust_predicate_on_every_json_shape_2580() 
 
     let store = SqliteStore::open(f.path()).expect("open SqliteStore");
     let ctx = CallerContext::for_admin("test-2580");
-    let filter = Filter {
-        namespace: Some(NS.to_string()),
-        limit: 1000,
-        metadata_eq: Some(MetadataEq::new(ai_memory::META_KEY_FAMILY, "core")),
-        ..Default::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 1000;
+        __f.metadata_eq = Some(MetadataEq::new(ai_memory::META_KEY_FAMILY, "core"));
+        __f
     };
 
     let rows = store.list(&ctx, &filter).await.expect("list");
@@ -223,11 +224,12 @@ async fn metadata_eq_key_is_bound_never_json_path_interpolated_2580() {
 
     // A metacharacter-laden key must be matched LITERALLY, selecting only
     // the row that really carries that key.
-    let filter = Filter {
-        namespace: Some(NS.to_string()),
-        limit: 1000,
-        metadata_eq: Some(MetadataEq::new("a\".b$[0]", "core")),
-        ..Default::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 1000;
+        __f.metadata_eq = Some(MetadataEq::new("a\".b$[0]", "core"));
+        __f
     };
     let rows = store.list(&ctx, &filter).await.expect("list");
     let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
@@ -239,11 +241,12 @@ async fn metadata_eq_key_is_bound_never_json_path_interpolated_2580() {
     );
 
     // ...and a key that exists on no row selects nothing (never everything).
-    let filter = Filter {
-        namespace: Some(NS.to_string()),
-        limit: 1000,
-        metadata_eq: Some(MetadataEq::new("$", "core")),
-        ..Default::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 1000;
+        __f.metadata_eq = Some(MetadataEq::new("$", "core"));
+        __f
     };
     let rows = store.list(&ctx, &filter).await.expect("list");
     assert!(
@@ -270,11 +273,12 @@ async fn unset_metadata_eq_is_byte_identical_legacy_list_2580() {
 
     let store = SqliteStore::open(f.path()).expect("open SqliteStore");
     let ctx = CallerContext::for_admin("test-2580");
-    let filter = Filter {
-        namespace: Some(NS.to_string()),
-        limit: 1000,
-        metadata_eq: None,
-        ..Default::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 1000;
+        __f.metadata_eq = None;
+        __f
     };
     let rows = store.list(&ctx, &filter).await.expect("list");
     assert_eq!(

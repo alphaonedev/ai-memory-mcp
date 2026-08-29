@@ -129,10 +129,11 @@ async fn contract_list_respects_limit(store: &dyn MemoryStore) {
         );
         store.store(&ctx(), &mem).await.expect("store");
     }
-    let f3 = Filter {
-        namespace: Some(ns.clone()),
-        limit: 3,
-        ..Filter::default()
+    let f3 = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.limit = 3;
+        __f
     };
     let listed = store.list(&ctx(), &f3).await.expect("list");
     assert!(
@@ -140,10 +141,11 @@ async fn contract_list_respects_limit(store: &dyn MemoryStore) {
         "limit=3 must cap result count, got {}",
         listed.len()
     );
-    let f10 = Filter {
-        namespace: Some(ns.clone()),
-        limit: 10,
-        ..Filter::default()
+    let f10 = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.limit = 10;
+        __f
     };
     let all = store.list(&ctx(), &f10).await.expect("list-all");
     assert_eq!(all.len(), 6, "all 6 inserted rows should be reachable");
@@ -226,10 +228,11 @@ async fn contract_namespace_filter_isolates(store: &dyn MemoryStore) {
         .await
         .expect("store b1");
 
-    let filter_a = Filter {
-        namespace: Some(ns_a.clone()),
-        limit: 100,
-        ..Filter::default()
+    let filter_a = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns_a.clone());
+        __f.limit = 100;
+        __f
     };
     let only_a = store.list(&ctx(), &filter_a).await.expect("list");
     assert_eq!(only_a.len(), 2);
@@ -322,10 +325,11 @@ async fn contract_fts_search_finds_inserted(store: &dyn MemoryStore) {
         "hello world this is the body content for full text search",
     );
     let id = store.store(&ctx(), &mem).await.expect("store");
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        limit: 10,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.limit = 10;
+        __f
     };
     let hits = store
         .search(&ctx(), "hello", &filter)
@@ -368,14 +372,12 @@ where
         h.await.expect("join").expect("store");
     }
     let listed = store
-        .list(
-            &ctx(),
-            &Filter {
-                namespace: Some(ns),
-                limit: 100,
-                ..Filter::default()
-            },
-        )
+        .list(&ctx(), &{
+            let mut __f = Filter::new();
+            __f.namespace = Some(ns);
+            __f.limit = 100;
+            __f
+        })
         .await
         .expect("list");
     assert_eq!(
@@ -594,10 +596,11 @@ async fn contract_agent_registration_roundtrip(store: &dyn MemoryStore) {
     // `registered_at` must NOT regress on re-register; both adapters
     // store the agent as a memory in `_agents`, so we read it back via
     // `list` to assert.
-    let f = Filter {
-        namespace: Some("_agents".to_string()),
-        limit: 100,
-        ..Filter::default()
+    let f = {
+        let mut __f = Filter::new();
+        __f.namespace = Some("_agents".to_string());
+        __f.limit = 100;
+        __f
     };
     let all = store.list(&ctx(), &f).await.expect("list _agents");
     let row_first = all

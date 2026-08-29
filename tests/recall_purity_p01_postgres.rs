@@ -194,10 +194,11 @@ async fn postgres_recall_purity_sal_and_http_entry_paths() {
     // #3180: SAL postgres now appends the access ledger (sqlite parity);
     // count those rows so the growth pin below is exact.
     let ctx = CallerContext::for_agent("ai:test:p01");
-    let filter = Filter {
-        namespace: Some(ns.to_string()),
-        limit: 10,
-        ..Default::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.to_string());
+        __f.limit = 10;
+        __f
     };
     let mut first_ids: Option<Vec<String>> = None;
     for _ in 0..10 {

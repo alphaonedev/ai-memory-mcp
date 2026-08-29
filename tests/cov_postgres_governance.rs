@@ -464,10 +464,11 @@ async fn read_surfaces_namespaces_taxonomy_stats_health() {
         .await
         .expect("get_taxonomy");
 
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        limit: 5,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.limit = 5;
+        __f
     };
     let listed = store.list(&ctx, &filter).await.expect("list");
     assert_eq!(listed.len(), 1);

@@ -94,10 +94,11 @@ fn seed(path: &Path, mems: &[Memory]) {
 /// the per-row visibility filter so the test sees the seeded rows).
 async fn kind_of(store: &SqliteStore, id: &str) -> MemoryKind {
     let ctx = CallerContext::for_admin("test-admin");
-    let f = Filter {
-        namespace: Some(NS.to_string()),
-        limit: 500,
-        ..Default::default()
+    let f = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(NS.to_string());
+        __f.limit = 500;
+        __f
     };
     store
         .list(&ctx, &f)

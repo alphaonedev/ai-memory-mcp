@@ -196,11 +196,12 @@ async fn pg_search_since_until_excludes_rows_outside_window_3185() {
     store.store(&ctx, &recent).await.expect("store recent");
 
     let since = now - Duration::days(2);
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        since: Some(since),
-        limit: 50,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.since = Some(since);
+        __f.limit = 50;
+        __f
     };
 
     let via_trait = MemoryStore::search(&store, &ctx, &token, &filter)
@@ -283,11 +284,12 @@ async fn pg_search_source_uri_and_visibility_3127() {
     store.store(&alice, &dropped).await.expect("store drop");
     store.store(&alice, &private).await.expect("store private");
 
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        source_uri: Some(keep_uri.clone()),
-        limit: 50,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.source_uri = Some(keep_uri.clone());
+        __f.limit = 50;
+        __f
     };
 
     let alice_hits = MemoryStore::search(&store, &alice, &token, &filter)

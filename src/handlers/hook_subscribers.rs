@@ -1361,6 +1361,8 @@ pub async fn session_start(
             source_uri: None,
             // Recall-hybrid only; list ignores it (default false).
             skip_access_ledger: false,
+
+            ..Default::default()
         };
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.list(&ctx, &filter).await {

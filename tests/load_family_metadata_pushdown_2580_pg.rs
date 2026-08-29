@@ -128,11 +128,12 @@ async fn pg_metadata_eq_pushdown_matches_rust_predicate_on_every_json_shape_2580
             .expect("store");
     }
 
-    let filter = Filter {
-        namespace: Some(ns.to_string()),
-        limit: ai_memory::storage::LIST_MAX_LIMIT,
-        metadata_eq: Some(MetadataEq::new(ai_memory::META_KEY_FAMILY, "core")),
-        ..Default::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.to_string());
+        __f.limit = ai_memory::storage::LIST_MAX_LIMIT;
+        __f.metadata_eq = Some(MetadataEq::new(ai_memory::META_KEY_FAMILY, "core"));
+        __f
     };
     let rows = store.list(&ctx, &filter).await.expect("list");
     let got: std::collections::BTreeSet<String> = rows.iter().map(|m| m.id.clone()).collect();
@@ -187,11 +188,12 @@ async fn pg_unset_metadata_eq_is_inert_2580() {
             .expect("store");
     }
 
-    let filter = Filter {
-        namespace: Some(ns.to_string()),
-        limit: ai_memory::storage::LIST_MAX_LIMIT,
-        metadata_eq: None,
-        ..Default::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.to_string());
+        __f.limit = ai_memory::storage::LIST_MAX_LIMIT;
+        __f.metadata_eq = None;
+        __f
     };
     let rows = store.list(&ctx, &filter).await.expect("list");
     assert_eq!(
@@ -241,10 +243,11 @@ async fn pg_pushdown_recovers_family_rows_below_the_legacy_1000_row_window_2580(
 
     // Legacy pipeline, replayed verbatim: fetch the top MAX_BULK_SIZE
     // rows with NO pushdown, then filter in Rust.
-    let legacy = Filter {
-        namespace: Some(ns.to_string()),
-        limit: cap,
-        ..Default::default()
+    let legacy = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.to_string());
+        __f.limit = cap;
+        __f
     };
     let eq = MetadataEq::new(ai_memory::META_KEY_FAMILY, "core");
     let legacy_hits: Vec<String> = store
@@ -262,11 +265,12 @@ async fn pg_pushdown_recovers_family_rows_below_the_legacy_1000_row_window_2580(
     );
 
     // Pushdown pipeline: the same window, filtered FIRST.
-    let pushed = Filter {
-        namespace: Some(ns.to_string()),
-        limit: cap,
-        metadata_eq: Some(eq.clone()),
-        ..Default::default()
+    let pushed = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.to_string());
+        __f.limit = cap;
+        __f.metadata_eq = Some(eq.clone());
+        __f
     };
     let mut ids: Vec<String> = store
         .list(&ctx, &pushed)

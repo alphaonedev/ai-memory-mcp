@@ -143,11 +143,12 @@ async fn semantic_pool_returns_targeted_private_row_for_target_agent_3070() {
         .await
         .expect("store_with_embedding");
 
-    let filter = Filter {
-        namespace: Some(ns.clone()),
-        active_embedding_space: Some(space.to_string()),
-        limit: 10,
-        ..Filter::default()
+    let filter = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.active_embedding_space = Some(space.to_string());
+        __f.limit = 10;
+        __f
     };
 
     // Caller A (the target) — must receive the row via the semantic pool.

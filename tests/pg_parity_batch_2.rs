@@ -480,10 +480,11 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
         store.store(&ctx, m).await.expect("store fixture");
     }
 
-    let base = Filter {
-        namespace: Some(ns.clone()),
-        limit: 50,
-        ..Default::default()
+    let base = {
+        let mut __f = Filter::new();
+        __f.namespace = Some(ns.clone());
+        __f.limit = 50;
+        __f
     };
 
     // No narrowing: BOTH rows surface (proves the fixture is sound).
@@ -502,9 +503,10 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
         .search_with_source_uri(
             &ctx,
             &token,
-            &Filter {
-                tags_any: vec!["parity-keep".to_string()],
-                ..base.clone()
+            &{
+                let mut __f = Filter::new();
+                __f.tags_any = vec!["parity-keep".to_string()];
+                __f
             },
             Some(uri.as_str()),
         )
@@ -522,9 +524,10 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
         .search_with_source_uri(
             &ctx,
             &token,
-            &Filter {
-                agent_id: Some("ai:owner-keep".to_string()),
-                ..base.clone()
+            &{
+                let mut __f = Filter::new();
+                __f.agent_id = Some("ai:owner-keep".to_string());
+                __f
             },
             Some(uri.as_str()),
         )
@@ -542,9 +545,10 @@ async fn pg_search_with_source_uri_honours_tags_any_and_agent_id() {
         .search_with_source_uri(
             &ctx,
             &token,
-            &Filter {
-                tags_any: vec![uid("no-such-tag")],
-                ..base.clone()
+            &{
+                let mut __f = Filter::new();
+                __f.tags_any = vec![uid("no-such-tag")];
+                __f
             },
             Some(uri.as_str()),
         )
