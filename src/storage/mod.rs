@@ -28,6 +28,9 @@ use std::path::Path;
 pub(crate) const TABLE_MEMORIES: &str = "memories";
 /// Cold mirror of [`TABLE_MEMORIES`]; see its docs.
 pub(crate) const TABLE_ARCHIVED_MEMORIES: &str = "archived_memories";
+/// v70 / #1771 / #3250 — edge-preservation snapshot of `memory_links`.
+/// Named ONCE (pm-v3.1 hardcoded-literal ratchet: B17-B1a).
+pub(crate) const TABLE_ARCHIVED_MEMORY_LINKS: &str = "archived_memory_links";
 
 const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = ?1";
 /// Reused dynamic-query namespace-filter fragment (pm-v3.1 no-scattered-literals
@@ -2388,6 +2391,13 @@ impl std::fmt::Display for ConflictError {
 
 impl std::error::Error for ConflictError {}
 
+/// pm-v3.1 / B17-B1a — named ONCE so the `TX_COMMIT_FAILED: {e}` prefix
+/// cannot scatter across capture/recover commit sites. Preserves the
+/// rusqlite cause via `Display` (ERRORS-15); callers still `?` (ERRORS-02).
+fn tx_commit_failed(err: impl std::fmt::Display) -> String {
+    format!("TX_COMMIT_FAILED: {err}")
+}
+
 /// v0.7.0 #1416 / RFC-0001 — sqlite SSOT for the L4 layered-capture
 /// idempotent write. Both the MCP `memory_capture_turn` handler (which
 /// holds a raw `&rusqlite::Connection`) and `SqliteStore::
@@ -2479,9 +2489,7 @@ pub fn capture_turn_idempotent(
         })
         .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
     if let Some(memory_id) = existing_in_tx {
-        write_txn
-            .commit()
-            .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
+        write_txn.commit().map_err(tx_commit_failed)?;
         return Ok(crate::models::CaptureTurnResult {
             memory_id,
             dedup_hit: true,
@@ -2529,9 +2537,7 @@ pub fn capture_turn_idempotent(
 
     match tx_result {
         Ok(memory_id) => {
-            write_txn
-                .commit()
-                .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
+            write_txn.commit().map_err(tx_commit_failed)?;
             Ok(crate::models::CaptureTurnResult {
                 memory_id,
                 dedup_hit: false,
@@ -2653,9 +2659,7 @@ pub fn recover_turn_idempotent(
 
     match tx_result {
         Ok(memory_id) => {
-            write_txn
-                .commit()
-                .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
+            write_txn.commit().map_err(tx_commit_failed)?;
             Ok(crate::models::RecoverTurnResult {
                 memory_id,
                 dedup_hit: false,
