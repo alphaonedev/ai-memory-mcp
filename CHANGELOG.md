@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     author-id switch, `sqlite_finalize_and_disposition`, and `consolidate_fanout`
     broadcast; `201` with the peer observing the fanout).
   Test-only change; no product behavior touched.
+### Added (#3064 batch D — memory_replay on postgres)
+
+- `POST /api/v1/memory_replay` now SAL-dispatches on the postgres backend
+  (`MemoryStore::replay_transcript_union` + `fetch_transcript_content`)
+  instead of returning 501. The pg transcript-union walk mirrors the
+  sqlite `transcripts::replay` reference (BFS over `reflects_on`,
+  Reflection-gated, depth-capped, first-seen transcript wins, ordered by
+  `target_id`); the HTTP envelope (`{memory_id, count, transcripts}`,
+  verbose vs. truncated content) matches the sqlite MCP handler. Transcript
+  `created_at` renders via `to_rfc3339` to match sqlite's non-canonical
+  stored form. Inventory gate: 64→65 pg-supported / 18→17 fully-501.
 
 ### Fixed (postgres expires_at SAL-patch test — stale Long-tier fixture)
 
