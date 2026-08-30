@@ -301,6 +301,14 @@ enum BootStatus {
     /// opposite remedy (`consider upgrading`) for a database whose
     /// binary is already the right one.
     WarnSchemaStampInvalid { observed: i64 },
+    /// v1.0.0 #2555 — `db::open` refused because the recorded schema stamp is
+    /// ABOVE the maximum any real migration ladder can reach (a fabricated /
+    /// corrupted `schema_version`, an unconstrained-integer kill-switch).
+    /// Distinct from [`Self::WarnSchemaUnsupported`] (a plausible newer schema
+    /// → "install a newer binary") and [`Self::WarnSchemaStampInvalid`] (a
+    /// destroyed stamp): this one names the repair verb, because no binary ever
+    /// wrote the observed version.
+    WarnSchemaVersionPoisoned { observed: i64 },
 }
 
 impl BootStatus {
@@ -310,7 +318,8 @@ impl BootStatus {
             Self::InfoFallback | Self::InfoEmpty => "info",
             Self::WarnDbUnavailable
             | Self::WarnSchemaUnsupported { .. }
-            | Self::WarnSchemaStampInvalid { .. } => "warn",
+            | Self::WarnSchemaStampInvalid { .. }
+            | Self::WarnSchemaVersionPoisoned { .. } => "warn",
         }
     }
 }
@@ -490,6 +499,15 @@ impl BootManifest {
                  database was last migrated to). Run `ai-memory doctor` for \
                  the full diagnosis."
             ),
+            BootStatus::WarnSchemaVersionPoisoned { observed } => format!(
+                "db schema stamp POISONED (observed {observed}) — above the \
+                 maximum any real migration ladder can reach. No ai-memory \
+                 binary wrote this; it is a fabricated / corrupted \
+                 `schema_version` value, so upgrading cannot fix it. Snapshot \
+                 first with `ai-memory backup`, then restamp with \
+                 `ai-memory doctor --repair-schema-version <N>`. Run \
+                 `ai-memory doctor` for the full diagnosis."
+            ),
         };
 
         Self {
@@ -575,6 +593,16 @@ pub fn run(
                         crate::storage::schema_guard::schema_stamp_zeroed(&e).map(|zeroed| {
                             BootStatus::WarnSchemaStampInvalid {
                                 observed: zeroed.observed,
+                            }
+                        })
+                    })
+                    // v1.0.0 #2555 — a POISONED ledger gets its OWN status so
+                    // the manifest names the repair verb, not "consider
+                    // upgrading" (no newer binary wrote a fabricated version).
+                    .or_else(|| {
+                        crate::storage::schema_guard::schema_version_poisoned(&e).map(|poisoned| {
+                            BootStatus::WarnSchemaVersionPoisoned {
+                                observed: poisoned.observed,
                             }
                         })
                     })
@@ -898,6 +926,17 @@ fn emit_status_header(
                         "#   namespace:  {} (db schema stamp invalid \
                          (observed {}); snapshot first with `ai-memory backup`, \
                          then restore the `schema_version` row. \
+                         Run `ai-memory doctor` for the full diagnosis.)",
+                        manifest.namespace, observed,
+                    )?;
+                }
+                BootStatus::WarnSchemaVersionPoisoned { observed } => {
+                    writeln!(
+                        out.stdout,
+                        "#   namespace:  {} (db schema stamp POISONED \
+                         (observed {}) — above the max any real ladder can reach; \
+                         no binary wrote it. Snapshot first with `ai-memory backup`, \
+                         then restamp with `ai-memory doctor --repair-schema-version <N>`. \
                          Run `ai-memory doctor` for the full diagnosis.)",
                         manifest.namespace, observed,
                     )?;

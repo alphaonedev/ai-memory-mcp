@@ -43,7 +43,8 @@ use std::path::{Path, PathBuf};
 /// call sites in that file (the `fn refuse_pg_store` DEFINITION in
 /// `src/cli/backup.rs` is NOT a call — it lacks the `backup::` path prefix — so
 /// it is correctly excluded). Test-module sites are excluded by
-/// [`production_prefix`]. Total = 30 across 19 files.
+/// [`production_prefix`]. Total = 31 across 20 files (#2555: +1 doctor.rs
+/// `--repair-schema-version`).
 const GUARDED: &[(&str, usize, &str)] = &[
     ("src/cli/store.rs", 1, "`store` write."),
     (
@@ -121,6 +122,15 @@ const GUARDED: &[(&str, usize, &str)] = &[
         1,
         "`calibrate confidence` — a WRITE (UPDATEs `confidence_shadow_observations`) \
          despite its \"read-only\" docstring; guarded at its raw `Connection::open` site.",
+    ),
+    (
+        "src/cli/doctor.rs",
+        1,
+        "#2555 — `doctor --repair-schema-version` restamps the local sqlite \
+         `schema_version` ledger; it refuses a served pg store because \
+         restamping the sqlite sidecar would be a phantom write (the pg ledger \
+         is repaired via the admin DELETE the poison message names). The regular \
+         doctor health pass is READ-ONLY and correctly carries no guard.",
     ),
 ];
 
@@ -231,8 +241,8 @@ fn every_class_a_guard_call_is_enumerated_2572() {
 
     let total: usize = GUARDED.iter().map(|(_, n, _)| n).sum();
     assert_eq!(
-        total, 30,
-        "the pinned class-(a) guard total drifted from 30 (#2572)"
+        total, 31,
+        "the pinned class-(a) guard total drifted from 31 (#2572)"
     );
     assert!(
         problems.is_empty(),

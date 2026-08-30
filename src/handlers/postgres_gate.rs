@@ -833,6 +833,16 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         // two integers and a store label (no DSN, no credentials), so it is
         // emitted unsanitised like its twin.
         StoreError::SchemaStampInvalid { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        // v1.0.0 #2555 — a POISONED ledger (a `schema_version` stamp above the
+        // maximum any real ladder can reach). Same disposition as the two
+        // schema-drift arms above: not our fault, not transient, persists until
+        // an operator restamps the ledger — 503 so an orchestrator PARKS the
+        // node rather than crash-looping it. The message carries integers and a
+        // store label (no DSN, no credentials), so it is emitted unsanitised
+        // like its twins.
+        StoreError::SchemaVersionPoisoned { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+        }
         // #1795 — UNREACHABLE in practice: the `if let` above returns the full
         // 429 QUOTA_EXCEEDED envelope before this match runs. Named here only
         // because #2445 replaced the `_` wildcard with an exhaustive terminal

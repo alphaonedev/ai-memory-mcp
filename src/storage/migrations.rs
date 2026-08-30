@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 91).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 92).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -498,8 +498,17 @@ CREATE TRIGGER IF NOT EXISTS memories_au
     VALUES (new.rowid, new.title, new.content, new.tags);
 END;
 
+-- v1.0.0 #2555 — the `version <= 100000` upper CHECK bounds the stamp so an
+-- unconstrained fleet kill-switch write (`INSERT ... VALUES (2147483647)`) is
+-- rejected at the boundary. The literal MUST equal `MAX_SCHEMA_VERSION`
+-- (asserted by `schema_version_ceiling_ssot_2555`). It is UPPER-BOUND ONLY on
+-- purpose: the low end (0 / negative / deleted) is #2564's read-time domain
+-- (the ZEROED guard), and a `version >= 0` bound here would reject #2564's own
+-- negative-stamp recovery fixtures. Existing databases are retrofitted by the
+-- v92 forward migration (`MIGRATION_V92_SQLITE`), which rebuilds the table
+-- when this CHECK is absent.
 CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER NOT NULL
+    version INTEGER NOT NULL CHECK (version <= 100000)
 );
 
 -- v1.0.0 (#3172) — durable high-water marks for the SCHEMA-masks-data-loss
@@ -885,7 +894,43 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 91;
+const CURRENT_SCHEMA_VERSION: i64 = 92;
+
+/// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
+/// the single source of truth shared by the SQL-side `CHECK` constraint (the
+/// v92 forward migration + the bootstrap `SCHEMA`, and the postgres twin) and
+/// the read-time poison classifier
+/// ([`crate::storage::schema_guard::SchemaStamp::Poisoned`]).
+///
+/// # Why this exists (2026-08-30)
+///
+/// `schema_version` was an UNCONSTRAINED integer and therefore a fleet
+/// kill-switch: `INSERT INTO schema_version VALUES (2147483647)` is permanent,
+/// reads back through `COALESCE(MAX(version), 0)`, and — on a SHARED postgres
+/// cluster where the ai-memory role has full DML — takes EVERY daemon down at
+/// once via the #2445 schema-ahead DENY, with no in-product recovery. The
+/// `CHECK (version <= MAX_SCHEMA_VERSION)` rejects such a write at the boundary
+/// (fail closed), and any stamp that is nonetheless observed ABOVE this ceiling
+/// (a legacy database poisoned before this migration shipped, or one on a
+/// backend where the constraint could not be retrofitted) is classified as a
+/// POISONED LEDGER — a different failure from a legitimate downgrade — and
+/// routed to the operator-gated repair verb rather than the "run a newer
+/// binary" remediation.
+///
+/// # Why 100_000
+///
+/// The ladder tip is `92` after the ENTIRE project history (single-digit
+/// growth per release), so 100,000 is on the order of a thousand
+/// product-lifetimes of schema evolution — permanently unreachable by a real
+/// ladder, which keeps the ceiling from ever rejecting a legitimate future
+/// stamp (a newer binary writing a genuinely newer schema stays FAR below it
+/// and classifies as an ordinary downgrade). Yet it sits four orders of
+/// magnitude below `i32::MAX` (2,147,483,647), so every fabricated / overflow
+/// value in the #2555 poison class is rejected at write time and named as
+/// poison at read time. It is a PERMANENT ceiling: shipping a schema beyond it
+/// would be a deliberate, breaking change requiring a new migration — which,
+/// four orders of magnitude away, will never arise in practice.
+pub(crate) const MAX_SCHEMA_VERSION: i64 = 100_000;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1047,6 +1092,14 @@ pub const fn current_schema_version_for_tests() -> i64 {
 #[must_use]
 pub const fn current_schema_version() -> i64 {
     CURRENT_SCHEMA_VERSION
+}
+
+/// v1.0.0 #2555 — the absolute upper ceiling a `schema_version` stamp may not
+/// exceed, exposed for the schema-guard poison classifier and cross-surface
+/// regression tests. See [`MAX_SCHEMA_VERSION`] for the rationale.
+#[must_use]
+pub const fn max_schema_version() -> i64 {
+    MAX_SCHEMA_VERSION
 }
 
 const MIGRATION_V15_SQLITE: &str =
@@ -1597,6 +1650,14 @@ const MIGRATION_V90_SQLITE: &str =
 const MIGRATION_V91_SQLITE: &str =
     include_str!("../../migrations/sqlite/0075_v91_archived_memory_links_cid.sql");
 
+// v92 (#2555, v1.0.0) — BOUND schema_version with the `version <= 100000`
+// upper CHECK. Full-table rebuild (SQLite cannot ADD a column CHECK), applied
+// by the terminal ladder arm only when the live table lacks the CHECK. The
+// literal MUST equal `MAX_SCHEMA_VERSION` (asserted by
+// `schema_version_ceiling_ssot_2555`).
+const MIGRATION_V92_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0076_v92_schema_version_bound.sql");
+
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
 // markers. When the canonical SCHEMA constant already ships a target
@@ -1631,6 +1692,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     let version = super::connection::probe_schema_stamp(conn)?.operable_version(
         super::schema_guard::BACKEND_SQLITE,
         conn.path().unwrap_or(""),
+    )?;
+
+    // v1.0.0 #2555 — POISON guard, before the #2445 downgrade DENY: a stamp
+    // ABOVE `MAX_SCHEMA_VERSION` is a fabricated/corrupted ledger, not a
+    // legitimate downgrade, so it must not be handed to `evaluate` (which would
+    // offer the "run a newer binary" remediation that cannot recover it).
+    // Defense-in-depth behind the pre-bootstrap gate in `db::open`.
+    super::schema_guard::assert_schema_not_poisoned(
+        version,
+        super::schema_guard::BACKEND_SQLITE,
+        &conn.path().unwrap_or("<in-memory>").to_string(),
     )?;
 
     // v1.0.0 #2445 — DOWNGRADE guard, defense-in-depth behind the pre-bootstrap
@@ -3989,7 +4061,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 91 {
             // v91 (#3250, v1.0.0) — ARCHIVE-LINK CID PARITY: mirror the v75
             // (#1859) lineage-DAG `source_cid` / `target_cid` pair onto
             // `archived_memory_links`, closing the archive→restore DROP of
@@ -4030,6 +4102,39 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                         [],
                     )?;
                 }
+            }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v92 (#2555, v1.0.0) — BOUND schema_version with the
+            // `version <= MAX_SCHEMA_VERSION` upper CHECK so an unconstrained
+            // fleet kill-switch write (`INSERT ... VALUES (2147483647)`) is
+            // refused at the boundary. SQLite cannot ADD a column CHECK to an
+            // existing table, so this is a full-table rebuild — safe and
+            // lossless because `schema_version` is a standalone one-column
+            // table with no indexes / triggers / views / foreign keys (the
+            // v63/v65 trigger-recreation lesson does not arise). Applied ONLY
+            // when the live table lacks the CHECK, so it is idempotent and a
+            // no-op on a fresh database whose bootstrap SCHEMA already ships it.
+            // A poisoned database (a stamp already ABOVE the ceiling) never
+            // reaches here: the pre-bootstrap guard refuses it before `migrate`
+            // runs, so the rebuild's `INSERT ... SELECT` copy only ever sees
+            // in-bounds rows. Canonical DDL:
+            // migrations/sqlite/0076_v92_schema_version_bound.sql.
+            debug_assert!(
+                MIGRATION_V92_SQLITE.contains("CHECK (version <= 100000)"),
+                "v92 doc twin must ship the schema_version CHECK DDL"
+            );
+            let ddl: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            if !ddl.contains("CHECK") {
+                conn.execute_batch(MIGRATION_V92_SQLITE)?;
             }
         }
 
@@ -4409,6 +4514,56 @@ mod tests {
     /// which tracks the moving ladder tip and would skip the v54 arm
     /// entirely once v55+ are terminal.
     const V54_DISPATCH_TRIGGER: i64 = 54;
+
+    /// v1.0.0 #2555 — the `schema_version` CHECK literal is a single source of
+    /// truth: the ceiling baked into the bootstrap `SCHEMA` and the v92 forward
+    /// migration MUST equal [`MAX_SCHEMA_VERSION`], or a fresh database and an
+    /// upgraded one would bound the stamp differently.
+    #[test]
+    fn schema_version_ceiling_ssot_2555() {
+        assert_eq!(
+            MAX_SCHEMA_VERSION, 100_000,
+            "the SQL CHECK literals pin 100000"
+        );
+        let needle = format!("CHECK (version <= {MAX_SCHEMA_VERSION})");
+        assert!(
+            SCHEMA.contains(&needle),
+            "bootstrap SCHEMA must bound schema_version with `{needle}`"
+        );
+        assert!(
+            MIGRATION_V92_SQLITE.contains(&needle),
+            "the v92 forward migration must rebuild schema_version with `{needle}`"
+        );
+    }
+
+    /// v1.0.0 #2555 — a fresh database's `schema_version` table carries the
+    /// bounding CHECK (so an out-of-band write is refused), and the tip stamp
+    /// is comfortably inside the ceiling.
+    #[test]
+    fn fresh_schema_version_is_bounded_2555() {
+        let conn = fresh_db_via_migrate();
+        let ddl: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("schema_version DDL");
+        assert!(
+            ddl.contains("CHECK"),
+            "fresh schema_version must carry the CHECK: {ddl}"
+        );
+        let err = conn
+            .execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![MAX_SCHEMA_VERSION + 1],
+            )
+            .expect_err("an out-of-band stamp must be rejected by the CHECK");
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "expected a CHECK-constraint failure, got: {err}"
+        );
+    }
 
     /// Open an in-memory DB and apply the production schema + every
     /// migration. Mirrors `crate::db::open(":memory:")` without going

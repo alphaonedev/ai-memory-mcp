@@ -694,6 +694,11 @@ pub fn resolve_schema_posture(conn: &Connection, target: &str) -> Result<SchemaP
     // diagnostic verbs, the same shape as the #2445 schema-ahead refusal.
     let observed = probe_schema_stamp(conn)?.operable_version(BACKEND_SQLITE, target)?;
     let supported = super::migrations::current_schema_version();
+    // v1.0.0 #2555 — a POISONED stamp (above `MAX_SCHEMA_VERSION`) is refused
+    // with its own typed error BEFORE `evaluate`: it is a fabricated ledger,
+    // not a downgrade the operator hatch could authorise, and it routes to the
+    // repair verb instead of "run a newer binary".
+    super::schema_guard::assert_schema_not_poisoned(observed, BACKEND_SQLITE, target)?;
     super::schema_guard::evaluate(observed, supported, BACKEND_SQLITE, target)?;
     Ok(if observed > supported {
         SchemaPosture::AheadButAuthorised

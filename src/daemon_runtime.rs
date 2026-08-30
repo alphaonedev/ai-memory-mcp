@@ -805,6 +805,17 @@ pub struct DoctorCliArgs {
     /// `--tokens` / `--hooks`); exits non-zero on any deviation.
     #[arg(long, value_name = "NAME")]
     pub posture: Option<String>,
+    /// v1.0.0 #2555 — RESTAMP a poisoned `schema_version` ledger to version
+    /// `<N>` (the version this database was last migrated to, `1..=` the tip
+    /// this binary understands). The recovery the #2445 schema-ahead DENY
+    /// lacks: a fabricated stamp (an unconstrained-integer kill-switch, e.g.
+    /// `2147483647`) that no binary wrote and no snapshot predates. Bypasses
+    /// the health pass, WRITES the database (the one doctor path that does),
+    /// and is SNAPSHOT-FIRST — a sibling `VACUUM INTO` backup is taken before
+    /// the stamp is touched, and a snapshot failure refuses the repair. Refused
+    /// on a served postgres store (#2572).
+    #[arg(long, value_name = "N")]
+    pub repair_schema_version: Option<i64>,
 }
 
 #[derive(Args)]
@@ -2185,6 +2196,21 @@ pub async fn run(
             // panics when dropped on a tokio runtime thread, so the
             // entire doctor pass runs inside `spawn_blocking`.
             let db_path_doctor = db_path.clone();
+            // v1.0.0 #2555 — `--repair-schema-version <N>` bypasses the health
+            // pass entirely (same short-circuit shape as `--posture` /
+            // `--tokens` below) and is the ONE doctor path that WRITES the
+            // database. Snapshot-first + postgres-refused; see
+            // `cli::doctor::run_repair_schema_version`.
+            if let Some(target) = a.repair_schema_version {
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                let mut so = stdout.lock();
+                let mut se = stderr.lock();
+                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                let exit =
+                    cli::doctor::run_repair_schema_version(&db_path_doctor, target, &mut out)?;
+                std::process::exit(exit);
+            }
             // v1.0.0 §5.3 (3x7 cutline ruling) — `--posture <name>` bypasses
             // the regular health pass entirely (same short-circuit shape as
             // `--tokens` / `--hooks` below). Machine-checks the RESOLVED
