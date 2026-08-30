@@ -25,7 +25,7 @@ code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);pad
 h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:2rem;margin-bottom:.5rem}h3{font-size:1.15rem}
 p{color:var(--text-muted)}
 
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav{position:sticky;top:0;z-index:50;background:var(--bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
 .topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
 .topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
 .topnav .home-link{color:var(--text);font-weight:600}
@@ -125,8 +125,8 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Release Pipeline</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
+      <a href="at-a-glance.html" style="color:var(--accent-ink)">Atlas</a>
+      <a href="whats-new-v09.html" style="color:var(--accent-ink)">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn active">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -349,7 +349,7 @@ footer a{color:var(--text-muted)}
         <path class="arrow flow" d="M 870 295 L 930 285"/>
         <path class="arrow flow" d="M 870 295 L 930 345"/>
 
-        <text x="40" y="350" fill="#999" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ trigger</text>
+        <text x="40" y="350" fill="var(--muted)" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ trigger</text>
         <text x="220" y="430" fill="#ffb86b" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ check (must pass)</text>
         <text x="440" y="370" fill="#b07d10" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ build matrix · 7 platforms (5 desktop + 2 mobile #1068)</text>
         <text x="690" y="370" fill="#b07d10" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ package + sign</text>
