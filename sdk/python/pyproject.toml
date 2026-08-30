@@ -48,6 +48,17 @@ dev = [
     "ruff>=0.3",
     "cryptography>=42.0",
 ]
+# TEST-ONLY acceptance-swarm driver (`swarm/` package). NOT shipped in the
+# wheel — `[tool.setuptools.packages.find].include` is `ai_memory*` only, so
+# `swarm` is excluded from the built distribution. This extra just declares the
+# deps needed to RUN the swarm from the source checkout: httpx (already a core
+# dep, restated for clarity) + Ed25519 attestation. The GLM-5.3-Flash decide
+# call uses stdlib + httpx directly, so there is NO heavy LLM-SDK dependency.
+# The shipped `ai_memory` client gains NO dependency on `swarm`.
+swarm = [
+    "httpx>=0.27",
+    "cryptography>=42.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/alphaonedev/ai-memory-mcp"
