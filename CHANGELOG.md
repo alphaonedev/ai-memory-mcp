@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (cross-backend parity — search/list/recall `since`/`until` compared by INSTANT on sqlite #3279)
+
+- **#3279 (correctness / backend divergence, GA-blocker) — the sqlite
+  adapter byte-compared the RAW RFC3339 `created_at` TEXT column against the
+  `since`/`until` bound, while postgres compares `timestamptz` INSTANTS.**
+  Because `created_at` is stored caller-signed-VERBATIM (never
+  canonicalized — a federated/imported row can carry a non-UTC offset, and a
+  local write is `Z`/`+00:00`), a lexicographic `m.created_at >= ?`
+  comparison dropped or admitted HOURS of rows relative to postgres: a
+  `-05:00`-offset stored value sorted before an earlier-instant UTC bound,
+  and a `Z`-suffixed whole-second value sorted after an equal-instant
+  `+00:00` bound (the #3252 / #1724 collation class). The fix routes BOTH
+  sides of every `created_at` since/until predicate through one SQLite
+  `strftime('%Y-%m-%dT%H:%M:%f', …)` renderer
+  (`storage::CREATED_AT_INSTANT_FMT` + `created_at_instant_window`) that
+  normalizes any offset / `Z` to a fixed-width UTC string, so the
+  lexicographic TEXT compare is exactly instant comparison — matching
+  postgres. Applied to all four Filter/recall-driven sqlite read paths that
+  bound `created_at`: `build_list_query` (list), `search_with_source_uri`
+  (search), `recall`, and `recall_hybrid`'s FTS + semantic phases. Bounds
+  are Rust-canonicalized before binding (raw-byte fallback for an unparseable
+  bound). Storage-only; no `src/identity/*` change (cert §7 unaffected).
+  Precision note: `strftime %f` is millisecond-resolution, so a row within
+  one millisecond of a bound may tie where postgres (`timestamptz`,
+  microsecond) would not — a sub-millisecond boundary degradation, never the
+  hours-scale offset divergence (North Star: degrade, never corrupt). New
+  regression suite `tests/search_since_until_instant_parity_3279.rs` asserts
+  the instant-correct sqlite row set unconditionally (fails pre-fix on sqlite
+  alone) and, when `AI_MEMORY_TEST_POSTGRES_URL` is set, that sqlite and
+  postgres return the IDENTICAL set for the same filter.
+
 ### Fixed (identity read-visibility — reflect source read gated as a write #3282)
 
 - **#3282 (default-config functional regression, GA-blocker) — MCP
