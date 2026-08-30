@@ -73,3 +73,10 @@ src/store/postgres.rs	reconcile_envelope_owner_known
 src/store/postgres.rs	close_timeout_relaxed_conn
 src/store/postgres_parity.rs	evict_tombstone_and_erase_in_tx
 src/store/postgres_parity.rs	archive_links_for_memory_in_tx
+# #3064 batch D (2026-08-30, Fable review): pg transcript-write twins. Write
+# ONLY the content-addressed transcript tables (memory_transcripts /
+# memory_transcript_links), NOT the record-stop memory-record plane. Their sqlite
+# twins (transcripts::storage::store/link) sit under src/transcripts/, which
+# skip_path() exempts — these rows preserve that backend parity.
+src/store/postgres_parity.rs	store_transcript
+src/store/postgres_parity.rs	link_memory_transcript
