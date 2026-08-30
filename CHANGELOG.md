@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#3196 — find_paths / kg find_paths traversal budget)
+
+- `memory_find_paths` / `kg find_paths` ran an **unbudgeted** graph traversal:
+  a crafted hub graph (one hub wired to a dozen mutually-linked spokes)
+  explodes the simple-path prefix count as `branching_factor ^ depth` well
+  inside the depth ceiling. On SQLite that ran inside one synchronous recursive
+  CTE **on the single writer connection**, so a crafted call stalled the entire
+  write plane (the H7 request timeout drops the response future but cannot
+  cancel the in-flight synchronous `rusqlite` call); on Postgres it burned
+  unbounded CPU / buffers (the #2612 re-dedup pathology). GA-blocking
+  availability defect. Fixed with three changes, semantically identical on both
+  backends:
+  - **Bounded, level-by-level BFS.** The recursive CTE (SQLite `db::find_paths`
+    and Postgres `find_paths_cte`) is replaced by one shared, backend-agnostic
+    BFS engine (`storage::FindPathsTraversal` + `build_undirected_adjacency`)
+    that counts every materialised path-prefix and **refuses fail-closed** the
+    moment the count would exceed the new `FIND_PATHS_MAX_PREFIXES` (100_000)
+    budget. Within budget the results are byte-identical to the old CTE
+    (undirected closure, current-view filter, cycle guard,
+    `depth ASC, path ASC` ordering) — a caller gets either the exact, complete
+    answer or an explicit refusal, never a truncated set reported as complete.
+    Fetching only the current frontier's adjacency per hop also removes the
+    #2612 re-dedup of the whole edge set at every recursion level.
+  - **Write-plane de-stall (SQLite).** `SqliteStore::find_paths` now runs on a
+    dedicated **read-only** connection (WAL multi-reader), so a bounded
+    traversal shares no mutex with the write plane and concurrent
+    `memory_store` calls complete alongside it.
+  - **Typed refusal.** New `TRAVERSAL_BUDGET_EXCEEDED` error
+    (`StorageError::TraversalBudgetExceeded` /
+    `StoreError::TraversalBudgetExceeded`) → HTTP **400** with a caller-safe
+    message naming the budget knob, byte-identical across backends.
+  - Verified on both backends: new sqlite unit + SAL tests (budget trip,
+    within-budget correctness, concurrent-writes de-stall) and a live-Postgres
+    budget test; the AGE-vs-CTE equivalence, `memory_find_paths`,
+    `cov_postgres_kg`, and visibility suites all pass unchanged.
+
 ### Fixed (B7 structural gate — pg transcript-write twins allowlisted)
 
 - The #3064 batch D merge added two write-SQL functions in

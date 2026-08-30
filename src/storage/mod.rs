@@ -12240,6 +12240,221 @@ pub const FIND_PATHS_MAX_DEPTH: usize = 7;
 /// v0.7 J7 charter's "shallow by default, opt-in deep traversal" rule.
 pub const FIND_PATHS_DEFAULT_DEPTH: usize = 4;
 
+/// v1.0.0 #3196 — hard ceiling on the number of path-prefixes a single
+/// [`find_paths`] traversal may materialise before it is refused.
+///
+/// ## Why a prefix budget exists
+///
+/// `find_paths` enumerates *simple paths* between two memories over the
+/// undirected closure of `memory_links`. The count of distinct prefixes
+/// grows as roughly `branching_factor ^ depth`, so a crafted hub graph (one
+/// hub wired to a dozen mutually-linked spokes) explodes into millions of
+/// prefixes well inside the depth ceiling ([`FIND_PATHS_MAX_DEPTH`] = 7).
+/// Before #3196 that work ran unbudgeted inside one synchronous statement:
+/// on SQLite it held the single writer connection for its whole duration,
+/// so a crafted call stalled the entire write plane (the H7 request timeout
+/// drops the response future but cannot cancel the in-flight synchronous
+/// `rusqlite` call); on Postgres it burned unbounded CPU / buffers (#2612,
+/// the inner `UNION` re-dedup of ~120k edges per recursion level).
+///
+/// The traversal now runs as a bounded, level-by-level BFS in Rust that
+/// counts every materialised prefix and REFUSES — fail-closed with a typed
+/// budget-exceeded error — the moment the count would exceed this ceiling.
+/// It never returns a truncated path set as if it were complete (the
+/// North-Star "degrade, never corrupt" rule): a caller either gets the
+/// exact, complete answer within budget or an explicit refusal.
+///
+/// ## Choosing the value
+///
+/// 100_000 sits comfortably above what any legitimate query materialises —
+/// a sparse KG (avg out-degree ~3, the #2612 measured shape) explores only a
+/// few thousand prefixes even at the depth-7 ceiling — while tripping a
+/// crafted dense hub within the first few hops. Worst-case transient memory
+/// is `~budget * max_path_len * avg_id_len`, a few tens of MB, and the CPU
+/// cost is a few milliseconds. Raise it only after benchmarking a
+/// representative dense corpus; it is the single tunable knob and the
+/// refusal message names it so operators can grep for it.
+pub const FIND_PATHS_MAX_PREFIXES: usize = 100_000;
+
+/// #3196 — canonical, backend-blind refusal message for a [`find_paths`]
+/// traversal that would exceed [`FIND_PATHS_MAX_PREFIXES`]. Routed through
+/// one function so the SQLite (`StorageError::TraversalBudgetExceeded`) and
+/// Postgres (`StoreError::TraversalBudgetExceeded`) surfaces emit a
+/// byte-identical wire string — the cross-backend parity discipline the
+/// `LinkRefused` / `InvalidTransition` variants already follow.
+#[must_use]
+pub fn find_paths_budget_exceeded_message() -> String {
+    format!(
+        "path traversal exceeded the materialised-prefix budget \
+         (FIND_PATHS_MAX_PREFIXES={FIND_PATHS_MAX_PREFIXES}); narrow the request \
+         (lower max_depth, or choose a less densely connected source/target pair)"
+    )
+}
+
+/// #3196 — zero-sized signal that a [`FindPathsTraversal`] hit its
+/// materialised-prefix budget. Each backend maps it to its own typed
+/// budget-exceeded error carrying [`find_paths_budget_exceeded_message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraversalBudgetExceeded;
+
+/// #3196 — backend-agnostic, level-by-level BFS enumerator for
+/// [`find_paths`]. The SQLite (`db::find_paths`) and Postgres
+/// (`PostgresStore::find_paths_cte`) surfaces both drive THIS one engine,
+/// differing only in how they fetch a level's adjacency, so the two backends
+/// are provably identical: the same paths within budget, and the same trip
+/// point at the budget. See [`FIND_PATHS_MAX_PREFIXES`] for the rationale.
+///
+/// The traversal reproduces the pre-#3196 recursive CTE exactly within
+/// budget: undirected closure of `memory_links`, a simple-path cycle guard,
+/// completed paths reported at any depth >= 1 while still being extended,
+/// and a final `depth ASC, path ASC` ordering truncated to the result cap.
+pub struct FindPathsTraversal {
+    target: String,
+    budget: usize,
+    /// Prefixes ending at the current BFS level (each a source-first chain
+    /// of ids); the anchor is the single-element `[source]`.
+    frontier: Vec<Vec<String>>,
+    /// Completed paths whose last node is `target` (any depth >= 1).
+    completed: Vec<Vec<String>>,
+    /// Total prefixes materialised so far (anchor included). The budget is
+    /// enforced against THIS running count (ERRORS-09: the invariant is
+    /// carried in the type, not re-derived at each call site).
+    prefixes: usize,
+}
+
+impl FindPathsTraversal {
+    /// Seed the traversal at `source`. The caller handles the
+    /// `source == target` self-path short-circuit before constructing this.
+    #[must_use]
+    pub fn seed(source: &str, target: &str, budget: usize) -> Self {
+        Self {
+            target: target.to_string(),
+            budget,
+            frontier: vec![vec![source.to_string()]],
+            completed: Vec::new(),
+            prefixes: 1,
+        }
+    }
+
+    /// Distinct end-nodes of the current frontier — the nodes whose
+    /// adjacency the next hop needs. Order-stable (first-seen) for tidy
+    /// query binding; the final result order does not depend on it.
+    #[must_use]
+    pub fn frontier_nodes(&self) -> Vec<String> {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for prefix in &self.frontier {
+            if let Some(end) = prefix.last() {
+                if seen.insert(end.as_str()) {
+                    out.push(end.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the frontier is exhausted (no further hop can extend it).
+    #[must_use]
+    pub fn frontier_is_empty(&self) -> bool {
+        self.frontier.is_empty()
+    }
+
+    /// Extend every frontier prefix by one hop using `adjacency`
+    /// (frontier-node -> its distinct undirected neighbours). A neighbour
+    /// already present in a prefix is skipped (the simple-path cycle guard,
+    /// byte-for-byte the recursive CTE's `NOT EXISTS(json_each(path))` /
+    /// `NOT (next = ANY(path))` rule). Every prefix that reaches `target` is
+    /// recorded AND kept in the frontier so a longer path through the target
+    /// can still be found — matching the CTE, whose completed-path filter
+    /// lives in the outer SELECT.
+    ///
+    /// # Errors
+    ///
+    /// [`TraversalBudgetExceeded`] the moment the running prefix count would
+    /// exceed the budget — fail-closed, before the offending prefix is kept.
+    pub fn expand(
+        &mut self,
+        adjacency: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<(), TraversalBudgetExceeded> {
+        let mut next: Vec<Vec<String>> = Vec::new();
+        for prefix in &self.frontier {
+            let Some(end) = prefix.last() else { continue };
+            let Some(neighbours) = adjacency.get(end) else {
+                continue;
+            };
+            for neighbour in neighbours {
+                if prefix.iter().any(|node| node == neighbour) {
+                    continue; // simple-path cycle guard
+                }
+                // PERF-02: saturating is unnecessary (bounded by budget),
+                // but the check happens BEFORE the prefix is kept so the
+                // budget is a hard ceiling, never a soft target.
+                self.prefixes += 1;
+                if self.prefixes > self.budget {
+                    return Err(TraversalBudgetExceeded);
+                }
+                let mut extended = Vec::with_capacity(prefix.len() + 1);
+                extended.extend_from_slice(prefix);
+                extended.push(neighbour.clone());
+                if neighbour == &self.target {
+                    self.completed.push(extended.clone());
+                }
+                next.push(extended);
+            }
+        }
+        self.frontier = next;
+        Ok(())
+    }
+
+    /// Finish the traversal: order completed paths shortest-first, then
+    /// lexicographically (the recursive CTE's `ORDER BY depth ASC, path
+    /// ASC`), and keep at most `cap`.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<Vec<String>> {
+        self.completed
+            .sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+        self.completed
+    }
+
+    /// Number of completed paths found so far (before the `cap` truncation).
+    #[must_use]
+    pub fn completed_len(&self) -> usize {
+        self.completed.len()
+    }
+}
+
+/// #3196 — build a frontier-node -> distinct-undirected-neighbours map from
+/// raw `(source_id, target_id)` edge rows. An edge contributes its target as
+/// a neighbour of its source and its source as a neighbour of its target
+/// (undirected closure), but only for endpoints that are in `frontier`.
+/// Per-node neighbours are de-duplicated and sorted (via `BTreeSet`) so the
+/// adjacency — and therefore the traversal — is deterministic and matches
+/// the recursive CTE's `UNION` (not `UNION ALL`) edge de-dup on both
+/// backends.
+#[must_use]
+pub fn build_undirected_adjacency(
+    edges: &[(String, String)],
+    frontier: &std::collections::HashSet<&str>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut sets: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
+        std::collections::HashMap::new();
+    for (source, target) in edges {
+        if frontier.contains(source.as_str()) {
+            sets.entry(source.clone())
+                .or_default()
+                .insert(target.clone());
+        }
+        if frontier.contains(target.as_str()) {
+            sets.entry(target.clone())
+                .or_default()
+                .insert(source.clone());
+        }
+    }
+    sets.into_iter()
+        .map(|(node, neighbours)| (node, neighbours.into_iter().collect()))
+        .collect()
+}
+
 /// v0.7 J7 — enumerate up to N undirected paths between two memories.
 ///
 /// Walks `memory_links` with a recursive CTE that carries the full
@@ -12325,78 +12540,102 @@ pub fn find_paths(
         return Ok(vec![vec![source_id.to_string()]]);
     }
 
-    // "Current view" filter — exclude edges whose `valid_until` lies in
-    // the past (invalidated via `memory_kg_invalidate`). Caller can pass
-    // `include_invalidated=true` to traverse the full historical link
-    // graph. NHI-P3-T7 regression: prior versions enumerated paths
-    // through invalidated edges by default.
-    let invalidated_filter = if include_invalidated {
+    // v1.0.0 #3196 — bounded, level-by-level BFS over the undirected closure
+    // of `memory_links`, replacing the pre-#3196 unbudgeted recursive CTE.
+    // Each hop fetches ONLY the current frontier's adjacency (once), so a
+    // crafted hub graph is refused via the prefix budget instead of stalling
+    // the caller — and, on the SAL surface, the writer connection it would
+    // otherwise hold (see `SqliteStore::find_paths`, which drives this on a
+    // dedicated read-only connection).
+    //
+    // "Current view" filter — exclude edges whose `valid_until` lies in the
+    // past (invalidated via `memory_kg_invalidate`). Caller can pass
+    // `include_invalidated=true` to traverse the full historical link graph.
+    // NHI-P3-T7 regression: prior versions enumerated paths through
+    // invalidated edges by default. The filter clause is byte-identical to
+    // the pre-#3196 CTE, so within-budget results — including the
+    // malformed-`valid_until` fail-closed semantics — are unchanged.
+    //
+    // The instant is snapshotted ONCE so every hop shares one "current view",
+    // exactly as the single-statement CTE did.
+    let now = chrono::Utc::now().timestamp_micros();
+    let valid_time_fn = connection::SQL_FN_RFC3339_EPOCH_MICROS;
+    let current_filter = if include_invalidated {
         String::new()
     } else {
-        let valid_time_fn = connection::SQL_FN_RFC3339_EPOCH_MICROS;
-        let now = chrono::Utc::now().timestamp_micros();
-        format!(" WHERE (valid_until IS NULL OR {valid_time_fn}(valid_until) > {now})")
+        format!("(valid_until IS NULL OR {valid_time_fn}(valid_until) > {now}) AND ")
     };
 
-    // The CTE walks symmetric edges: for each row in `memory_links` we
-    // also generate its reverse so the traversal is undirected. Cycle
-    // detection uses the JSON-encoded path array (same trick as
-    // `kg_query`) — `NOT EXISTS (... json_each ...)` short-circuits the
-    // recursion as soon as the next hop would revisit a node already in
-    // the prefix.
-    //
-    // The completed-path filter sits in the outer SELECT rather than
-    // the recursive member because a partial prefix that lands on
-    // `target_id` should be reported AND continue to extend (a longer
-    // path through `target_id` might reach itself through a different
-    // route — though for the KG that should be rare, the CTE doesn't
-    // need to know that). `ORDER BY depth, path` keeps the shortest
-    // paths first so the `LIMIT` cap drops the longest tail.
-    let sql = format!(
-        "WITH RECURSIVE traversal(current_id, depth, path) AS (
-            SELECT ?1, 0, json_array(?1)
-            UNION ALL
-            SELECT next_id, t.depth + 1,
-                   json_insert(t.path, '$[' || json_array_length(t.path) || ']', next_id)
-            FROM traversal t
-            JOIN (
-                SELECT source_id AS from_id, target_id AS next_id
-                FROM memory_links{invalidated_filter}
-                UNION
-                SELECT target_id AS from_id, source_id AS next_id
-                FROM memory_links{invalidated_filter}
-            ) edges ON edges.from_id = t.current_id
-            WHERE t.depth < ?3
-              AND NOT EXISTS (
-                  SELECT 1 FROM json_each(t.path) WHERE value = next_id
-              )
-         )
-         SELECT path
-         FROM traversal
-         WHERE current_id = ?2 AND depth >= 1
-         ORDER BY depth ASC, path ASC
-         LIMIT ?4"
-    );
-
-    let depth_i64 = i64::try_from(depth).unwrap_or(i64::MAX);
-    let cap_i64 = i64::try_from(cap).unwrap_or(i64::MAX);
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![source_id, target_id, depth_i64, cap_i64], |row| {
-        let json_path: String = row.get(0)?;
-        Ok(json_path)
-    })?;
-
-    let mut paths: Vec<Vec<String>> = Vec::new();
-    for row in rows {
-        let json = row?;
-        let parsed: Vec<String> = serde_json::from_str(&json).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-        })?;
-        paths.push(parsed);
+    let mut traversal = FindPathsTraversal::seed(source_id, target_id, FIND_PATHS_MAX_PREFIXES);
+    for _hop in 0..depth {
+        let nodes = traversal.frontier_nodes();
+        if nodes.is_empty() {
+            break;
+        }
+        let node_refs: std::collections::HashSet<&str> = nodes.iter().map(String::as_str).collect();
+        let edges = fetch_frontier_edges(conn, &nodes, &current_filter)?;
+        let adjacency = build_undirected_adjacency(&edges, &node_refs);
+        // Fail-closed: a budget trip is a typed refusal, never a silently
+        // truncated (partial-as-complete) result.
+        if traversal.expand(&adjacency).is_err() {
+            return Err(anyhow::Error::new(StorageError::TraversalBudgetExceeded));
+        }
+        if traversal.frontier_is_empty() {
+            break;
+        }
     }
 
+    let mut paths = traversal.finish();
+    paths.truncate(cap);
     Ok(paths)
+}
+
+/// #3196 — fetch the `(source_id, target_id)` edge rows incident to any node
+/// in `frontier`, honouring the caller's pre-rendered current-view
+/// `edge_filter` (a `"<predicate> AND "` fragment, or empty for
+/// `include_invalidated`). Two indexed lookups per chunk (forward on
+/// `source_id`, reverse on `target_id`) keep each hop bounded to the actual
+/// frontier rather than the pre-#3196 CTE's full `memory_links UNION
+/// memory_links` scan re-joined per level (#2612). De-duplication of the two
+/// arms is deferred to [`build_undirected_adjacency`].
+///
+/// # Errors
+///
+/// Propagates any `rusqlite` prepare / query failure.
+fn fetch_frontier_edges(
+    conn: &Connection,
+    frontier: &[String],
+    edge_filter: &str,
+) -> Result<Vec<(String, String)>> {
+    // SQLite has no array-parameter binding, so chunk the frontier into
+    // IN-lists comfortably under SQLITE_MAX_VARIABLE_NUMBER (999 on the
+    // oldest supported builds).
+    const CHUNK: usize = 400;
+    let mut edges: Vec<(String, String)> = Vec::new();
+    for chunk in frontier.chunks(CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        // Forward arm: the frontier node is the source, the neighbour is the
+        // target. Reverse arm: the frontier node is the target, the
+        // neighbour is the source. Both arms carry the current-view filter.
+        let forward = format!(
+            "SELECT source_id, target_id FROM memory_links \
+             WHERE {edge_filter}source_id IN ({placeholders})"
+        );
+        let reverse = format!(
+            "SELECT source_id, target_id FROM memory_links \
+             WHERE {edge_filter}target_id IN ({placeholders})"
+        );
+        for sql in [&forward, &reverse] {
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                edges.push(row?);
+            }
+        }
+    }
+    Ok(edges)
 }
 
 /// List all aliases registered for an entity, ordered by registration
@@ -27744,6 +27983,155 @@ mod tests {
         // Opt-in: include_invalidated=true returns both paths.
         let full = find_paths(&conn, &a.id, &c.id, Some(3), None, true).unwrap();
         assert_eq!(full.len(), 2);
+    }
+
+    // ---- v1.0.0 #3196 — find_paths traversal-budget BFS engine ------------
+
+    fn adj(pairs: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(node, ns)| {
+                (
+                    (*node).to_string(),
+                    ns.iter().map(|n| (*n).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn find_paths_bfs_reports_completed_and_orders_shortest_lexicographic_3196() {
+        // Two routes a->d: the direct a->d and the longer a->b->d. The engine
+        // records both and `finish` orders shortest-first, then lexicographic
+        // — matching the recursive CTE's `ORDER BY depth ASC, path ASC`.
+        let mut t = FindPathsTraversal::seed("a", "d", FIND_PATHS_MAX_PREFIXES);
+        t.expand(&adj(&[("a", &["b", "d"])])).unwrap();
+        t.expand(&adj(&[("b", &["d"]), ("d", &["a", "b"])]))
+            .unwrap();
+        let paths = t.finish();
+        assert_eq!(
+            paths,
+            vec![
+                vec!["a".to_string(), "d".to_string()],
+                vec!["a".to_string(), "b".to_string(), "d".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn find_paths_bfs_cycle_guard_skips_revisited_nodes_3196() {
+        // From prefix [a,b], neighbour `a` is already in the prefix and must
+        // be skipped (the CTE's `NOT EXISTS(json_each(path))` rule); `c` is
+        // fresh and extends the path.
+        let mut t = FindPathsTraversal::seed("a", "c", FIND_PATHS_MAX_PREFIXES);
+        t.expand(&adj(&[("a", &["b"])])).unwrap();
+        t.expand(&adj(&[("b", &["a", "c"])])).unwrap();
+        let paths = t.finish();
+        assert_eq!(
+            paths,
+            vec![vec!["a".to_string(), "b".to_string(), "c".to_string()]]
+        );
+    }
+
+    #[test]
+    fn find_paths_bfs_trips_budget_fail_closed_3196() {
+        // A tight budget trips on a fan-out that would otherwise materialise
+        // more prefixes than allowed — fail-closed, never a partial result.
+        let mut t = FindPathsTraversal::seed("hub", "none", 3);
+        let err = t
+            .expand(&adj(&[("hub", &["s0", "s1", "s2", "s3", "s4"])]))
+            .is_err();
+        assert!(err, "expand must refuse once the prefix budget is exceeded");
+    }
+
+    #[test]
+    fn build_undirected_adjacency_dedups_and_is_undirected_3196() {
+        // Edges: a->b (twice), b->a (reverse dup of a<->b), a->c, and x->y
+        // (neither endpoint in the frontier). Frontier = {a, b}. Expect a's
+        // neighbours = {b, c} and b's = {a}, de-duplicated and sorted; x/y
+        // absent.
+        let edges = vec![
+            ("a".to_string(), "b".to_string()),
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+            ("a".to_string(), "c".to_string()),
+            ("x".to_string(), "y".to_string()),
+        ];
+        let frontier: std::collections::HashSet<&str> = ["a", "b"].into_iter().collect();
+        let map = build_undirected_adjacency(&edges, &frontier);
+        assert_eq!(map.get("a"), Some(&vec!["b".to_string(), "c".to_string()]));
+        assert_eq!(map.get("b"), Some(&vec!["a".to_string()]));
+        assert!(!map.contains_key("x"));
+        assert!(!map.contains_key("y"));
+    }
+
+    #[test]
+    fn find_paths_dense_clique_refuses_with_typed_budget_error_3196() {
+        // A dense clique explodes the prefix count well past
+        // FIND_PATHS_MAX_PREFIXES inside the depth ceiling, so `db::find_paths`
+        // must REFUSE with the typed TraversalBudgetExceeded rather than stall
+        // (the write-plane-availability property) or truncate silently.
+        let conn = test_db();
+        let n = 14usize;
+        let ids: Vec<String> = (0..n)
+            .map(|i| {
+                let m = make_memory(&format!("clique-{i}"), "ns", Tier::Long, 5);
+                insert(&conn, &m).unwrap();
+                m.id
+            })
+            .collect();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                insert_link_full(&conn, &ids[i], &ids[j], "related_to", None, None, None);
+            }
+        }
+        let err = find_paths(&conn, &ids[0], &ids[n - 1], Some(7), Some(50), false)
+            .expect_err("dense clique at depth 7 must trip the prefix budget");
+        let typed = err
+            .downcast_ref::<StorageError>()
+            .expect("budget refusal must be a typed StorageError");
+        assert!(
+            matches!(typed, StorageError::TraversalBudgetExceeded),
+            "expected TraversalBudgetExceeded, got: {typed:?}"
+        );
+        // The wire message names the tunable knob so operators can grep it.
+        assert!(
+            err.to_string().contains("FIND_PATHS_MAX_PREFIXES"),
+            "refusal must name the budget knob: {err}"
+        );
+    }
+
+    #[test]
+    fn find_paths_within_budget_multi_hop_unchanged_3196() {
+        // A small chain a-b-c-d plus a shortcut a-d: within budget the BFS
+        // returns the SAME set the recursive CTE did (direct first, then the
+        // 3-hop), proving the rewrite preserves results.
+        let conn = test_db();
+        let ids: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|t| {
+                let m = make_memory(&format!("chain-{t}"), "ns", Tier::Long, 5);
+                insert(&conn, &m).unwrap();
+                m.id
+            })
+            .collect();
+        insert_link_full(&conn, &ids[0], &ids[1], "related_to", None, None, None);
+        insert_link_full(&conn, &ids[1], &ids[2], "related_to", None, None, None);
+        insert_link_full(&conn, &ids[2], &ids[3], "related_to", None, None, None);
+        insert_link_full(&conn, &ids[0], &ids[3], "related_to", None, None, None);
+        let paths = find_paths(&conn, &ids[0], &ids[3], Some(4), Some(10), false).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                vec![ids[0].clone(), ids[3].clone()],
+                vec![
+                    ids[0].clone(),
+                    ids[1].clone(),
+                    ids[2].clone(),
+                    ids[3].clone()
+                ],
+            ]
+        );
     }
 
     #[test]

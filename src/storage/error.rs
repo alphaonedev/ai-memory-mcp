@@ -126,6 +126,22 @@ pub enum StorageError {
     /// funnel the MCP stdio write path uses). Mirrors the SAL
     /// [`crate::store::StoreError::Stopped`]; reads are unaffected.
     RecordStopped { issued_by: String, scope: String },
+
+    /// v1.0.0 #3196 — a `find_paths` traversal was refused because it would
+    /// materialise more than
+    /// [`crate::storage::FIND_PATHS_MAX_PREFIXES`] path-prefixes. Emitted by
+    /// [`crate::storage::find_paths`] (the SQLite / bare-`Connection` funnel
+    /// the MCP + CLI surfaces use). Fail-closed: a crafted hub graph is
+    /// refused rather than allowed to stall the caller (and, on the SAL
+    /// surface, the writer connection). Mirrors the SAL
+    /// [`crate::store::StoreError::TraversalBudgetExceeded`]; the Display is
+    /// routed through
+    /// [`crate::storage::find_paths_budget_exceeded_message`] so both
+    /// surfaces emit a byte-identical wire string.
+    ///
+    /// Wire shape (HTTP, SAL twin): `400 BAD_REQUEST` with code
+    /// `TRAVERSAL_BUDGET_EXCEEDED`.
+    TraversalBudgetExceeded,
 }
 
 impl std::fmt::Display for StorageError {
@@ -191,6 +207,15 @@ impl std::fmt::Display for StorageError {
                 "substrate record plane stopped by {issued_by} (scope={scope}); \
                  mutating operations refused until resume",
             ),
+            // #3196 — routed through the shared message builder so the SQLite
+            // and Postgres budget-exceeded surfaces are byte-identical.
+            Self::TraversalBudgetExceeded => {
+                write!(
+                    f,
+                    "{}",
+                    crate::storage::find_paths_budget_exceeded_message()
+                )
+            }
         }
     }
 }
@@ -236,6 +261,7 @@ impl StorageError {
                 crate::errors::error_codes::SQLCIPHER_MISSING_PASSPHRASE
             }
             Self::RecordStopped { .. } => crate::errors::error_codes::RECORD_STOPPED,
+            Self::TraversalBudgetExceeded => crate::errors::error_codes::TRAVERSAL_BUDGET_EXCEEDED,
         }
     }
 }

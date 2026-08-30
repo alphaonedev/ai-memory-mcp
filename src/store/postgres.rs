@@ -11594,19 +11594,32 @@ impl PostgresStore {
             .await
     }
 
-    /// Recursive-CTE fallback for `find_paths` on Postgres.
+    /// Relational path enumerator for `find_paths` on Postgres.
     ///
-    /// Mirrors the SQLite recursive-CTE in `db::find_paths` so vanilla
-    /// Postgres deployments (no AGE extension) get the same enumeration
-    /// semantics. The walk is undirected: edges are unioned with their
-    /// reverse so paths can traverse `memory_links` against the
-    /// declared direction. Cycle prevention uses a TEXT-array prefix
-    /// of visited ids.
+    /// v1.0.0 #3196 — this is now a bounded, level-by-level BFS in Rust
+    /// (formerly a single unbudgeted recursive CTE — the `_cte` suffix is
+    /// retained only because the cross-backend equivalence + coverage suites
+    /// reference this method name). It drives the SAME
+    /// [`crate::storage::FindPathsTraversal`] engine as the SQLite
+    /// `db::find_paths`, so the two backends are provably identical: the same
+    /// paths within budget, and the same trip point at
+    /// [`crate::storage::FIND_PATHS_MAX_PREFIXES`].
+    ///
+    /// The walk is undirected (each hop fetches both edge directions),
+    /// current-view filtered (#1689 — invalidated edges are excluded, matching
+    /// the SQLite default), and cycle-guarded (a node already in a prefix is
+    /// not re-added). Fetching only the CURRENT frontier's adjacency per hop
+    /// also removes the #2612 pathology, where the CTE's inner `UNION`
+    /// re-deduped the whole ~120k-row edge set at every recursion level.
     ///
     /// # Errors
     ///
-    /// `StoreError::InvalidInput` for an out-of-range `max_depth`;
-    /// `StoreError::BackendUnavailable` for any sqlx error.
+    /// - `StoreError::InvalidInput` for an out-of-range `max_depth`.
+    /// - `StoreError::TraversalBudgetExceeded` when the traversal would
+    ///   materialise more than [`crate::storage::FIND_PATHS_MAX_PREFIXES`]
+    ///   prefixes (fail-closed; never a truncated result reported as
+    ///   complete).
+    /// - `StoreError::BackendUnavailable` for any sqlx error.
     pub async fn find_paths_cte(
         &self,
         source_id: &str,
@@ -11624,56 +11637,75 @@ impl PostgresStore {
             return Ok(vec![vec![source_id.to_string()]]);
         }
 
-        let depth_i32 = i32::try_from(depth).unwrap_or(i32::MAX);
-        let cap_i64 = i64::try_from(cap).unwrap_or(i64::MAX);
+        // Snapshot "now" ONCE so every hop shares one current view, exactly as
+        // the single-statement CTE's `NOW()` did within one statement.
+        let now = chrono::Utc::now();
+        let mut traversal = crate::storage::FindPathsTraversal::seed(
+            source_id,
+            target_id,
+            crate::storage::FIND_PATHS_MAX_PREFIXES,
+        );
+        for _hop in 0..depth {
+            let nodes = traversal.frontier_nodes();
+            if nodes.is_empty() {
+                break;
+            }
+            let edges = self.find_paths_frontier_edges(&nodes, now).await?;
+            let node_refs: std::collections::HashSet<&str> =
+                nodes.iter().map(String::as_str).collect();
+            let adjacency = crate::storage::build_undirected_adjacency(&edges, &node_refs);
+            // Fail-closed: a budget trip is a typed refusal, never a silently
+            // truncated (partial-as-complete) result.
+            if traversal.expand(&adjacency).is_err() {
+                return Err(StoreError::TraversalBudgetExceeded {
+                    detail: crate::storage::find_paths_budget_exceeded_message(),
+                });
+            }
+            if traversal.frontier_is_empty() {
+                break;
+            }
+        }
 
-        // The CTE walks symmetric edges via a UNION over the original
-        // and reverse direction. The visited-id prefix is carried as
-        // TEXT[] so we can both check membership (= ANY) and append
-        // (array_append). Rows whose `current_id` matches the target
-        // and whose depth is at least 1 are reported as completed
-        // paths; ordering by depth then path keeps the shortest paths
-        // first so the LIMIT cap drops the longest tail.
-        let sql = "WITH RECURSIVE traversal(current_id, depth, path) AS (
-                SELECT $1::TEXT, 0, ARRAY[$1::TEXT]
-                UNION ALL
-                SELECT edges.next_id, t.depth + 1, t.path || edges.next_id
-                FROM traversal t
-                JOIN (
-                    -- #1689 — exclude invalidated edges from traversal so a
-                    -- retracted link no longer influences path-finding, matching
-                    -- the sqlite find_paths current-view default and pg
-                    -- kg_query_cte_filtered. Both UNION arms get the filter.
-                    SELECT source_id AS from_id, target_id AS next_id FROM memory_links
-                    WHERE valid_until IS NULL OR valid_until > NOW()
-                    UNION
-                    SELECT target_id AS from_id, source_id AS next_id FROM memory_links
-                    WHERE valid_until IS NULL OR valid_until > NOW()
-                ) edges ON edges.from_id = t.current_id
-                WHERE t.depth < $3
-                  AND NOT (edges.next_id = ANY(t.path))
-            )
-            SELECT path
-            FROM traversal
-            WHERE current_id = $2 AND depth >= 1
-            ORDER BY depth ASC, path ASC
-            LIMIT $4";
+        let mut paths = traversal.finish();
+        paths.truncate(cap);
+        Ok(paths)
+    }
 
+    /// #3196 — fetch the `(source_id, target_id)` edge rows incident to any
+    /// node in `frontier`, current-view filtered at the snapshot `now`. Two
+    /// index-friendly arms (forward on `source_id`, reverse on `target_id`)
+    /// unioned; the undirected de-dup is deferred to
+    /// [`crate::storage::build_undirected_adjacency`], mirroring the SQLite
+    /// [`crate::storage::find_paths`] hop query.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::BackendUnavailable` for any sqlx error.
+    async fn find_paths_frontier_edges(
+        &self,
+        frontier: &[String],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<Vec<(String, String)>> {
+        let sql = "SELECT source_id, target_id FROM memory_links \
+                   WHERE (valid_until IS NULL OR valid_until > $2) AND source_id = ANY($1) \
+                   UNION ALL \
+                   SELECT source_id, target_id FROM memory_links \
+                   WHERE (valid_until IS NULL OR valid_until > $2) AND target_id = ANY($1)";
         let rows = sqlx::query(sql)
-            .bind(source_id)
-            .bind(target_id)
-            .bind(depth_i32)
-            .bind(cap_i64)
+            .bind(frontier)
+            .bind(now)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| to_store_err("cte find_paths", e))?;
-
+            .map_err(|e| to_store_err("cte find_paths frontier", e))?;
         rows.iter()
             .map(|r| {
-                let path: Vec<String> = r
-                    .try_get::<Vec<String>, _>("path")
-                    .map_err(|e| to_store_err("read path", e))?;
-                Ok(path)
+                let source: String = r
+                    .try_get::<String, _>("source_id")
+                    .map_err(|e| to_store_err("read source_id", e))?;
+                let target: String = r
+                    .try_get::<String, _>("target_id")
+                    .map_err(|e| to_store_err("read target_id", e))?;
+                Ok((source, target))
             })
             .collect()
     }

@@ -47,6 +47,22 @@ pub struct SqliteStore {
     /// by that backstop). Caching the connection's key here restores a
     /// single source of truth across every layer at zero hot-path cost.
     record_stop_key: PathBuf,
+
+    /// v1.0.0 #3196 — a dedicated **read-only** connection used for the
+    /// read-heavy KG path traversal ([`Self::find_paths`]). The traversal is
+    /// now budget-bounded, but even a bounded walk should not contend the
+    /// single writer [`Self::state`] mutex with the write plane: a crafted
+    /// hub graph must never stall concurrent `memory_store` calls (the #3196
+    /// availability property). WAL permits any number of concurrent readers
+    /// alongside the one writer, so `find_paths` runs entirely on THIS
+    /// connection while writes proceed on `state`.
+    ///
+    /// Falls back to an `Arc::clone` of [`Self::state`] when a separate
+    /// reader cannot be opened (an in-memory database has no on-disk file to
+    /// reopen; a read-only open can fail on an exotic VFS). That degrades to
+    /// the pre-#3196 shared-connection behaviour — correct, just not
+    /// de-stalled — which is a fail-SAFE fallback, never a fail-open one.
+    read_state: Arc<Mutex<rusqlite::Connection>>,
 }
 
 impl SqliteStore {
@@ -66,11 +82,47 @@ impl SqliteStore {
         // always consistent with those touchpoints regardless of any
         // VFS-level symlink resolution.
         let record_stop_key = crate::storage::record_stop::conn_key(&conn);
+        let state = Arc::new(Mutex::new(conn));
+        // #3196 — see the `read_state` field doc. The writer's `db::open`
+        // above already brought the on-disk schema to `CURRENT_SCHEMA_VERSION`
+        // and created the `-wal`/`-shm` files, so a read-only attach is safe.
+        let read_state = Self::open_reader(&path)
+            .map_or_else(|| Arc::clone(&state), |reader| Arc::new(Mutex::new(reader)));
         Ok(Self {
-            state: Arc::new(Mutex::new(conn)),
+            state,
             path,
             record_stop_key,
+            read_state,
         })
+    }
+
+    /// #3196 — try to open a dedicated read-only connection for
+    /// [`Self::find_paths`]. Returns `None` (caller shares the writer) when
+    /// the database is in-memory — a second open would attach a FRESH empty
+    /// database rather than the same store — or when the read-only open
+    /// fails for any reason (logged; a missing reader is a de-stall
+    /// optimisation, not a correctness requirement).
+    fn open_reader(path: &std::path::Path) -> Option<rusqlite::Connection> {
+        if Self::is_in_memory(path) {
+            return None;
+        }
+        match crate::db::open_read_only(path) {
+            Ok(conn) => Some(conn),
+            Err(e) => {
+                tracing::warn!(
+                    "SqliteStore: read-only traversal connection unavailable, \
+                     find_paths will share the writer connection: {e}"
+                );
+                None
+            }
+        }
+    }
+
+    /// #3196 — whether `path` names an in-memory SQLite database (which has
+    /// no shared on-disk file a second connection could reopen).
+    fn is_in_memory(path: &std::path::Path) -> bool {
+        let raw = path.to_string_lossy();
+        raw == ":memory:" || raw.contains("mode=memory") || raw.contains(":memory:")
     }
 
     /// Path the adapter opened. Useful for diagnostics and for
@@ -2998,11 +3050,34 @@ impl MemoryStore for SqliteStore {
         max_depth: Option<usize>,
         max_results: Option<usize>,
     ) -> StoreResult<Vec<Vec<String>>> {
-        let conn = self.state.lock().await;
+        // #3196 — run the read-heavy traversal on the dedicated read-only
+        // connection (see the `read_state` field doc) so a bounded-but-
+        // nontrivial walk never contends the writer mutex with the write
+        // plane. CONCURRENCY-04: `find_paths` locks ONLY `read_state` (the
+        // visibility `db::get` below reuses the same guard), and no code path
+        // locks both `read_state` and `state`, so there is no lock-order
+        // cycle. CONCURRENCY-20: the guard is a `tokio::sync::Mutex` and no
+        // `.await` occurs while it is held.
+        let conn = self.read_state.lock().await;
         // SQLite's find_paths defaults to current-view (excludes
         // invalidated edges) — match the trait/HTTP contract.
         let paths = db::find_paths(&conn, source_id, target_id, max_depth, max_results, false)
-            .map_err(box_err)?;
+            // #3196 — preserve the typed budget refusal across the SAL
+            // boundary so the HTTP surface returns 400 TRAVERSAL_BUDGET_EXCEEDED
+            // (byte-parity with the postgres twin), not a generic 500 Backend.
+            // Any other db error keeps the existing `box_err` wrapping.
+            .map_err(|e| {
+                e.downcast_ref::<crate::storage::StorageError>()
+                    .filter(|se| {
+                        matches!(se, crate::storage::StorageError::TraversalBudgetExceeded)
+                    })
+                    .map_or_else(
+                        || box_err(&e),
+                        |_| StoreError::TraversalBudgetExceeded {
+                            detail: crate::storage::find_paths_budget_exceeded_message(),
+                        },
+                    )
+            })?;
         // #910 SAL-level scope=private gate (path-traversal flavour) —
         // any path that walks through a memory the caller cannot see
         // is dropped. Fetch each node's metadata once and cache so

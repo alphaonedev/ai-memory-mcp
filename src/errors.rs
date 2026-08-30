@@ -79,6 +79,16 @@ pub mod error_codes {
     pub const ARCHIVE_SUPERSEDE_FAILED: &str = "ARCHIVE_SUPERSEDE_FAILED";
     pub const SQLCIPHER_MISSING_PASSPHRASE: &str = "SQLCIPHER_MISSING_PASSPHRASE";
 
+    /// v1.0.0 #3196 — a `find_paths` traversal was refused because it would
+    /// exceed the materialised-prefix budget
+    /// ([`crate::storage::FIND_PATHS_MAX_PREFIXES`]). Shared slug for the SAL
+    /// [`crate::store::StoreError::TraversalBudgetExceeded`] and the
+    /// `db::`-funnel
+    /// [`crate::storage::StorageError::TraversalBudgetExceeded`] so the
+    /// HTTP / MCP / CLI surfaces emit one canonical code across both
+    /// backends.
+    pub const TRAVERSAL_BUDGET_EXCEEDED: &str = "TRAVERSAL_BUDGET_EXCEEDED";
+
     // ---- StoreError-side (SAL trait-facing) ---------------------------------
     pub const STORE_BACKEND_UNAVAILABLE: &str = "BACKEND_UNAVAILABLE";
     pub const STORE_UNSUPPORTED_CAPABILITY: &str = "UNSUPPORTED_CAPABILITY";
@@ -346,6 +356,9 @@ mod arch_9_slug_tests {
         // #2564 — the low-end twin of the #2445 refusal, same un-prefixed
         // convention.
         assert_eq!(SCHEMA_STAMP_INVALID, "SCHEMA_STAMP_INVALID");
+        // #3196 — un-prefixed like RECORD_STOPPED: a deliberate, caller-
+        // triggerable refusal shared across both backends, not a fault.
+        assert_eq!(TRAVERSAL_BUDGET_EXCEEDED, "TRAVERSAL_BUDGET_EXCEEDED");
     }
 
     // FX-E1 (2026-05-27) — `crate::store` is gated behind
@@ -387,6 +400,7 @@ mod arch_9_slug_tests {
             },
             StoreError::SchemaAheadOfBinary { detail: "d".into() },
             StoreError::SchemaStampInvalid { detail: "d".into() },
+            StoreError::TraversalBudgetExceeded { detail: "d".into() },
             StoreError::Backend(BoxBackendError::new("boom")),
         ];
         let expected = [
@@ -402,6 +416,7 @@ mod arch_9_slug_tests {
             RECORD_STOPPED,
             SCHEMA_AHEAD_OF_BINARY,
             SCHEMA_STAMP_INVALID,
+            TRAVERSAL_BUDGET_EXCEEDED,
             DATABASE_ERROR,
         ];
         // #2445 — `zip` TRUNCATES to the shorter side, so a variant added to
@@ -464,6 +479,7 @@ mod arch_9_slug_tests {
                 issued_by: "ai:operator".into(),
                 scope: "record-plane".into(),
             },
+            StorageError::TraversalBudgetExceeded,
         ];
         let expected = [
             NOT_FOUND,
@@ -480,7 +496,16 @@ mod arch_9_slug_tests {
             ARCHIVE_SUPERSEDE_FAILED,
             SQLCIPHER_MISSING_PASSPHRASE,
             RECORD_STOPPED,
+            TRAVERSAL_BUDGET_EXCEEDED,
         ];
+        // #3196 — pin the lengths so a variant added to only one array is a
+        // loud failure, not a silently `zip`-truncated skip.
+        assert_eq!(
+            variants.len(),
+            expected.len(),
+            "ARCH-9 StorageError arrays out of step — a new variant was added \
+             to only one of them"
+        );
         for (got, want) in variants.iter().zip(expected.iter()) {
             assert_eq!(got.code(), *want, "ARCH-9 StorageError code drift");
         }
@@ -734,6 +759,11 @@ impl From<anyhow::Error> for MemoryError {
                 SE::ArchiveSupersedeFailed { .. } | SE::SqlcipherMissingPassphrase => {
                     Self::DatabaseError(se.to_string())
                 }
+                // #3196 — a find_paths traversal-budget refusal is a
+                // caller-triggerable 400 (the request is too broad to serve
+                // within budget), matching the SAL twin's BAD_REQUEST and the
+                // depth-ceiling InvalidArgument it sits beside.
+                SE::TraversalBudgetExceeded => Self::ValidationFailed(se.to_string()),
             };
         }
         Self::DatabaseError(e.to_string())
