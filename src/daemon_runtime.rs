@@ -133,6 +133,42 @@ const AGENT_QUOTA_RESET_INTERVAL_SECS: u64 = 60;
 // take them as parameters. `main.rs` re-exports `Cli` and immediately
 // delegates here.
 
+/// #3142 — refuse a URL-shaped `--db` / `AI_MEMORY_DB` value fail-closed,
+/// before any store is opened or any file is created.
+///
+/// `--db` binds a SQLite **filesystem path**; Postgres is selected ONLY
+/// through `--store-url` / `AI_MEMORY_STORE_URL` / `AI_MEMORY_STORE_URL_FILE`.
+/// Before this guard a `--db postgres://…` (e.g. the value an operator
+/// meant for `--store-url`) was taken verbatim as a path, so the daemon
+/// silently created a SQLite file literally named `postgres://…` and ran
+/// on SQLite while the operator believed it was on Postgres — a silent
+/// wrong-backend run and a data-integrity footgun. A real filesystem path
+/// never carries a `://` scheme separator, so any value that does is a URL
+/// and is refused (fail-closed, same rule as the schema-guard "an
+/// unrecognised token must never widen").
+///
+/// This is enforced here in the [`run`] dispatch funnel rather than as a
+/// clap `value_parser` deliberately: clap prefixes a value-parser failure
+/// with `invalid value '<raw>' for '--db'`, which would echo a mis-pasted
+/// `postgres://user:pass@…` credential to the terminal verbatim. Owning
+/// the whole message here lets us redact the password (#1579 A3) while
+/// still refusing before `effective_db` / any `db::open`. A non-UTF-8
+/// path (`to_str() == None`) cannot be a URL, so it passes through.
+fn reject_url_shaped_db_path(db: &Path) -> Result<()> {
+    if let Some(raw) = db.to_str() {
+        if raw.contains("://") {
+            anyhow::bail!(
+                "--db expects a filesystem path, not a URL (got `{}`). To use \
+                 Postgres, pass it via --store-url (or AI_MEMORY_STORE_URL / \
+                 AI_MEMORY_STORE_URL_FILE); --db / AI_MEMORY_DB is a SQLite file \
+                 path only.",
+                crate::logging::redact_url_password(raw)
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(
     name = "ai-memory",
@@ -1179,6 +1215,11 @@ pub async fn run(
     // its file/syslog subscriber because that one was installed first, in
     // `main`.
     install_boot_console_subscriber(&cli.command);
+    // #3142 — refuse a URL-shaped `--db` / `AI_MEMORY_DB` value fail-closed,
+    // before `effective_db` resolves it or any store is opened, so a
+    // `--db postgres://…` never silently creates a SQLite file named after
+    // the URL. See [`reject_url_shaped_db_path`].
+    reject_url_shaped_db_path(&cli.db)?;
     let db_path = app_config.effective_db(&cli.db);
     // #1937 V08-PE-3 — seed the process-wide audit DB path for the best-effort
     // spawn-audit chokepoint (`crate::spawn_audit`). Every serve / mcp / CLI
@@ -8569,6 +8610,81 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
+
+    /// #3142 — the `--db` / `AI_MEMORY_DB` URL-scheme guard refuses any
+    /// value carrying a `://` scheme separator, redacts a credential, and
+    /// lets plain filesystem paths through. This is the logic behind the
+    /// fail-closed refusal that stops the silent wrong-backend run where
+    /// `--db postgres://…` created a SQLite file literally named
+    /// `postgres://…` while the operator believed it was Postgres.
+    #[test]
+    fn reject_url_shaped_db_path_3142() {
+        // A postgres URL mis-pasted into --db is refused with an actionable
+        // message that names the correct flag.
+        let err = reject_url_shaped_db_path(Path::new("postgres://x"))
+            .expect_err("postgres:// db path must be refused")
+            .to_string();
+        assert!(
+            err.contains("filesystem path") && err.contains("--store-url"),
+            "refusal must be actionable, got: {err}"
+        );
+
+        // Every URL scheme is refused the same way — the guard keys on the
+        // `://` separator, not a specific scheme allow-list.
+        for url in [
+            "postgresql://h/db",
+            "http://example/db",
+            "sqlite:///tmp/x.db",
+        ] {
+            assert!(
+                reject_url_shaped_db_path(Path::new(url)).is_err(),
+                "{url} must be refused"
+            );
+        }
+
+        // A credential-bearing URL is refused WITHOUT echoing the password
+        // (#1579 A3): the refusal redacts the userinfo secret.
+        let leaky = reject_url_shaped_db_path(Path::new("postgres://u:secretpw@h/db"))
+            .expect_err("credential URL must be refused")
+            .to_string();
+        assert!(
+            !leaky.contains("secretpw"),
+            "password must be redacted from the refusal, got: {leaky}"
+        );
+
+        // Plain filesystem paths pass through untouched.
+        for ok in ["ai-memory.db", "/var/lib/ai-memory/mem.db", ":memory:"] {
+            assert!(
+                reject_url_shaped_db_path(Path::new(ok)).is_ok(),
+                "{ok} is a valid path and must pass"
+            );
+        }
+    }
+
+    /// #3142 (wiring) — the guard is live in the `run` dispatch funnel: a
+    /// URL-shaped `--db` refuses BEFORE any store is opened, so no SQLite
+    /// file is ever created for it, and the credential never reaches the
+    /// error surface.
+    #[tokio::test]
+    async fn run_refuses_url_shaped_db_3142() {
+        let _g = no_config_env();
+        let cfg = AppConfig::default();
+        // Parsing accepts the value (a PathBuf); the funnel refuses it.
+        let cli = Cli::try_parse_from(["ai-memory", "--db", "postgres://u:secretpw@h/db", "stats"])
+            .expect("clap parses --db into a PathBuf");
+        let err = run(cli, &cfg, None)
+            .await
+            .expect_err("run must refuse a URL-shaped --db")
+            .to_string();
+        assert!(
+            err.contains("filesystem path") && err.contains("--store-url"),
+            "refusal must be actionable, got: {err}"
+        );
+        assert!(
+            !err.contains("secretpw"),
+            "password must be redacted from the refusal, got: {err}"
+        );
+    }
 
     // ---- #3065 (Wave-2 Cluster B) — ADMIN_HEADER_TRUST boot-gate WIRING ---
     //
