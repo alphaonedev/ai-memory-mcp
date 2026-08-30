@@ -969,7 +969,51 @@ pub fn dispatch_event_to_subs(
                 record_subscription_event(&db_path, &sub_id, &correlation_id, &event_owned, &body)
             };
             if let Err(e) = event_audit_result {
-                tracing::warn!("subscription event audit write failed: {e}");
+                // #3191 F-5 (fail-closed) — the per-delivery `subscription_events`
+                // row is the DURABLE record that this webhook fired. Pre-fix a
+                // failed audit write only logged a WARN and then dispatched the
+                // payload ANYWAY, so a webhook could reach the subscriber with NO
+                // audit row — an unattributable, unreplayable side effect. Refuse
+                // to dispatch: route the delivery to the DLQ (durable + replayable
+                // via `memory_subscription_replay`) and return, so the event is
+                // never lost — only deferred. An event that cannot be audited is
+                // not sent.
+                tracing::warn!(
+                    "subscription {sub_id} dispatch refused: event audit write failed: {e}; \
+                     routing to DLQ instead of dispatching unaudited (#3191 F-5)"
+                );
+                let failed_at = chrono::Utc::now().to_rfc3339();
+                let last_error =
+                    format!("event audit write failed; dispatch refused fail-closed: {e}");
+                let dlq_result = if let Some(c) = worker_conn.as_ref() {
+                    record_dlq_with_conn(
+                        c,
+                        &sub_id,
+                        &correlation_id,
+                        &event_owned,
+                        &body,
+                        0,
+                        &last_error,
+                        &failed_at,
+                        &failed_at,
+                    )
+                } else {
+                    record_dlq(
+                        &db_path,
+                        &sub_id,
+                        &correlation_id,
+                        &event_owned,
+                        &body,
+                        0,
+                        &last_error,
+                        &failed_at,
+                        &failed_at,
+                    )
+                };
+                if let Err(de) = dlq_result {
+                    tracing::warn!("subscription DLQ write failed after audit failure: {de}");
+                }
+                return;
             }
             let secret_hash = secret_hash_owned;
             // Canonical string: "<timestamp>.<body>". Keyed HMAC over
@@ -2126,25 +2170,45 @@ pub fn record_dlq_with_conn(
     first_failed_at: &str,
     last_failed_at: &str,
 ) -> Result<()> {
-    // #1253 — refuse the insert if the per-subscription DLQ is full.
-    // Counting before the INSERT keeps the cap honest under
-    // concurrent dispatch threads (the SQLite single-writer lock
-    // serialises this read+write pair against any sibling DLQ
-    // insert against the same subscription).
-    let depth: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1",
-            params![sub_id],
-            |row| row.get(0),
+    // #3191 F-4 / #1253 — enforce the per-subscription DLQ cap ATOMICALLY. The
+    // pre-fix code ran a `SELECT COUNT(*)` probe and then a SEPARATE `INSERT` as
+    // two autocommit statements; its claim that "the SQLite single-writer lock
+    // serialises this read+write pair" was FALSE — the shared lock is not held
+    // across the two statements, and [`record_dlq`] opens a FRESH connection per
+    // call, so two concurrent dispatch workers could both observe depth ==
+    // cap-1, both pass the guard, and both INSERT — OVERSHOOTING the cap (the
+    // #1253 disk-fill DoS the cap exists to stop). The compare now lives INSIDE
+    // the insert: `INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < cap` is a
+    // single statement, so the count and the insert can never be split and the
+    // cap holds exactly under any concurrency.
+    let inserted = conn
+        .execute(
+            "INSERT INTO subscription_dlq \
+             (subscription_id, correlation_id, event_type, payload, retry_count, last_error, first_failed_at, last_failed_at) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+             WHERE (SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1) < ?9",
+            params![
+                sub_id,
+                correlation_id,
+                event_type,
+                payload,
+                retry_count,
+                last_error,
+                first_failed_at,
+                last_failed_at,
+                MAX_SUBSCRIPTION_DLQ_ROWS,
+            ],
         )
-        .context("subscription_dlq depth probe")?;
-    if depth >= MAX_SUBSCRIPTION_DLQ_ROWS {
+        .context("subscription_dlq insert")?;
+    if inserted == 0 {
+        // The atomic `< cap` guard refused the row: the per-subscription DLQ is
+        // at cap. Emit the typed overflow signal (metric + WARN + typed error)
+        // so an operator drains it before further inserts.
         crate::metrics::record_subscription_dlq_overflow();
         tracing::warn!(
             subscription_id = %sub_id,
             correlation_id = %correlation_id,
             event_type = %event_type,
-            depth = depth,
             cap = MAX_SUBSCRIPTION_DLQ_ROWS,
             "dlq_overflow: refusing subscription_dlq insert — per-subscription cap reached",
         );
@@ -2152,22 +2216,6 @@ pub fn record_dlq_with_conn(
             "dlq_overflow: subscription {sub_id} dlq at cap ({MAX_SUBSCRIPTION_DLQ_ROWS}); drain before further inserts"
         ));
     }
-    conn.execute(
-        "INSERT INTO subscription_dlq \
-         (subscription_id, correlation_id, event_type, payload, retry_count, last_error, first_failed_at, last_failed_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            sub_id,
-            correlation_id,
-            event_type,
-            payload,
-            retry_count,
-            last_error,
-            first_failed_at,
-            last_failed_at,
-        ],
-    )
-    .context("subscription_dlq insert")?;
     Ok(())
 }
 

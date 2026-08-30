@@ -26555,16 +26555,34 @@ impl MemoryStore for PostgresStore {
                 detail: crate::actions::illegal_transition_detail(from, to),
             });
         }
-        sqlx::query(
-            "UPDATE actions SET state = $1, claimed_by = $2, updated_at = $3 WHERE id = $4",
+        // #3191 F-2 — the `SELECT ... FOR UPDATE` above already holds the row
+        // lock for the whole compare-and-swap window, so this backend is not
+        // vulnerable to the sqlite "one action, many winners" TOCTOU. The
+        // `AND state = $5` predicate mirrors the sqlite guarded CAS for
+        // structural parity + defense-in-depth: it can only miss if the locked
+        // state changed under us (impossible under `FOR UPDATE`), in which case
+        // we fail closed rather than silently refetching a row we did not write.
+        let changed = sqlx::query(
+            "UPDATE actions SET state = $1, claimed_by = $2, updated_at = $3 \
+             WHERE id = $4 AND state = $5",
         )
         .bind(to.as_str())
         .bind(claimed_by)
         .bind(now)
         .bind(id)
+        .bind(from.as_str())
         .execute(&mut *tx)
         .await
-        .map_err(|e| to_store_err("action_transition update", e))?;
+        .map_err(|e| to_store_err("action_transition update", e))?
+        .rows_affected();
+        if changed == 0 {
+            return Err(StoreError::IntegrityFailed {
+                detail: format!(
+                    "action_transition CAS miss under row lock for {id}: expected state {}",
+                    from.as_str()
+                ),
+            });
+        }
         let row = sqlx::query(PG_ACTION_SELECT_BY_ID)
             .bind(id)
             .fetch_one(&mut *tx)
@@ -27341,6 +27359,22 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<crate::checkpoints::ResolveOutcome> {
         self.gate_record_stop().await?;
         use crate::checkpoints::ResolveOutcome;
+        // #3191 F-1 (CRITICAL, fail-closed / ERRORS-09) — the postgres twin of
+        // the sqlite `crate::checkpoints::resolve` fix. Pre-fix the CAS
+        // state-flip and the attestation-signature write ran as TWO separate
+        // autocommit statements on the pool: a signing failure (or a crash)
+        // after the CAS committed left the checkpoint `state=resolved` with an
+        // EMPTY signature, and — because the CAS is first-resolution-wins —
+        // every retry then answered `Conflict` FOREVER, permanently stranding
+        // the anchor unsigned. Both writes now run inside ONE transaction:
+        // a signing failure returns before `commit`, so the `Transaction` drops
+        // and the state-flip ROLLS BACK — a resolved checkpoint can never
+        // persist without its attestation.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("checkpoint_resolve begin", e))?;
         // #2995 — FIRST-RESOLUTION-WINS: the `AND state = 'pending'` guard is the
         // postgres twin of the sqlite `RESOLVE_CAS_SQL`, so an already-resolved
         // freeze anchor is never silently overwritten.
@@ -27358,12 +27392,13 @@ impl MemoryStore for PostgresStore {
         .bind(resolved_at)
         .bind(id)
         .bind(crate::models::CheckpointState::Pending.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| to_store_err("checkpoint_resolve", e))?;
         let Some(mut cp) = row.as_ref().map(pg_row_to_checkpoint).transpose()? else {
             // The CAS did not fire: distinguish an absent id (NotFound) from an
             // already-resolved checkpoint (Conflict — first-resolution-wins).
+            // This arm writes nothing; the txn rolls back on drop (read-only).
             let existing = sqlx::query(
                 "SELECT id, namespace, title, condition_type, condition, state, created_by, \
                         resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
@@ -27371,7 +27406,7 @@ impl MemoryStore for PostgresStore {
                    FROM checkpoints WHERE id = $1",
             )
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| to_store_err("checkpoint_resolve conflict-probe", e))?;
             return Ok(
@@ -27384,7 +27419,8 @@ impl MemoryStore for PostgresStore {
         // Sign the resolved row's canonical RESOLUTION + persist the
         // attestation columns when a signing keypair is supplied — mirroring
         // the sqlite free-fn (`crate::checkpoints::resolve`) and the
-        // `signal_send` signed path.
+        // `signal_send` signed path, and inside the SAME transaction as the CAS
+        // so the two can never diverge (#3191 F-1).
         //
         // #3007 (Wave-2 Cluster B) — WITHHOLD the auto-supplied key from an
         // `epoch_advance` freeze anchor under the certified posture
@@ -27395,6 +27431,10 @@ impl MemoryStore for PostgresStore {
         if let Some(kp) = keypair {
             if kp.can_sign() && !crate::checkpoints::withhold_daemon_signature(&cp) {
                 crate::checkpoints::sign_resolution_into(&mut cp, kp).map_err(|e| {
+                    // Returning here drops `tx` before `commit` -> the CAS
+                    // state-flip ROLLS BACK, so the checkpoint stays PENDING and
+                    // a retry can succeed (never a stranded resolved-but-unsigned
+                    // row).
                     StoreError::IntegrityFailed {
                         detail: format!("checkpoint resolution sign failed: {e:#}"),
                     }
@@ -27405,11 +27445,14 @@ impl MemoryStore for PostgresStore {
                 .bind(&cp.signature)
                 .bind(&cp.resolver_pubkey)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("checkpoint_resolve sign-persist", e))?;
             }
         }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("checkpoint_resolve commit", e))?;
         Ok(ResolveOutcome::Resolved(Box::new(cp)))
     }
 

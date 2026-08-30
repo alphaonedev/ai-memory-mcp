@@ -37,6 +37,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/g10_capability_tokens.rs`, `src/config.rs` (the R9 default-on
   additive test), `docs/CLI_REFERENCE.md`,
   `docs/spec/TRACT-L1-CLAIM-CONTRACT.md`.
+### Fixed (#3191 — coordination-plane atomicity, GA-blocking freeze)
+
+- **F-1 (CRITICAL, both backends) — `checkpoints::resolve` /
+  `PostgresStore::checkpoint_resolve` committed the first-resolution-wins CAS
+  state-flip and the attestation-signature write as TWO separate autocommit
+  statements.** A signing failure (or a crash) after the CAS committed left the
+  checkpoint `state=resolved` with an EMPTY signature; because the CAS is
+  first-resolution-wins, every retry then answered `Conflict` FOREVER —
+  permanently stranding the anchor unsigned, so every peer running
+  `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` rejected it. The CAS state-flip and the
+  attestation write now run inside ONE transaction (sqlite
+  `unchecked_transaction`; postgres `pool.begin()`), so a signing failure rolls
+  the state-flip back — a resolved checkpoint can NEVER persist with an
+  empty/absent signature (fail-closed, ERRORS-09), restoring the fail-closed
+  behaviour the function's own doc comment already promised.
+- **F-2 (both backends) — `actions::transition` composed a bare `SELECT state`
+  with an UNGUARDED `UPDATE actions SET state ... WHERE id = ?`** — a
+  read-then-write TOCTOU that let concurrent transitions of one action all win
+  ("one action, many winners"). The sqlite UPDATE is now a guarded
+  compare-and-swap (`AND state = ?<expected>` + `rows_affected` check, mirroring
+  `transition_cas`): exactly one racer's write applies, the losers re-read and
+  reclassify to a non-`Updated` outcome (never a false success). The postgres
+  twin was already race-safe via `SELECT ... FOR UPDATE`; the same `AND state`
+  guard is added for structural parity + defense-in-depth (fail-closed if it
+  ever misses under the row lock).
+- **F-3 (sqlite / MCP routine path) — a rejected routine-template edge stranded
+  already-inserted actions.** `materialize_template` inserted each action via a
+  separate autocommit `actions::create`, so a template whose LATER edges were
+  rejected (self-edge / cycle / out-of-range index / malformed spec) left the
+  EARLIER actions ORPHANED in the frontier while the run was recorded Failed. The
+  whole materialisation now runs in ONE transaction, so a rejected edge rolls the
+  inserted actions back — no orphans.
+- **F-4 (sqlite subscription DLQ) — the #1253 per-subscription DLQ depth cap
+  could be overshot.** `record_dlq_with_conn` ran a `SELECT COUNT(*)` probe and a
+  separate `INSERT` as two autocommit statements (and `record_dlq` opens a fresh
+  connection per call), so concurrent dispatch workers could each observe
+  `depth == cap-1`, both pass the guard, and both insert. The compare now lives
+  inside the insert (`INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < cap`),
+  so the cap holds exactly under any concurrency.
+- **F-5 (sqlite webhook dispatch) — a webhook could dispatch with NO audit
+  row.** When the per-delivery `subscription_events` audit write failed, the
+  dispatcher only logged a WARN and sent the payload anyway (an unattributable,
+  unreplayable side effect). The delivery is now routed to the DLQ (durable +
+  replayable via `memory_subscription_replay`) and the webhook is NOT dispatched
+  — an event that cannot be audited is not sent (fail-closed; the event is
+  deferred, never lost).
+- New live regressions: `tests/coordination_atomicity_3191.rs` (F-1 rollback +
+  happy-path, F-4 concurrent cap, F-5 audit-failure-DLQs-not-dispatches),
+  `tests/coordination_atomicity_3191_pg.rs` (F-1 + F-2 postgres twins), an inline
+  cross-connection single-winner race for F-2 (`src/actions/mod.rs`), and an
+  inline orphan-free rejected-edge test for F-3 (`src/mcp/tools/routine.rs`).
+  No `src/identity/*` or `src/federation/*` change — cert §7 unaffected.
 
 ### Fixed (cross-backend parity — search/list/recall `since`/`until` compared by INSTANT on sqlite #3279)
 
