@@ -604,11 +604,22 @@ pub(crate) fn run_with_embedder(
                 score: *s,
             })
             .collect();
+        // #2988 — bind the RECALLING agent's identity into the ledger, NOT
+        // `--as-agent` (a NAMESPACE). The MCP/HTTP recall path stamps the
+        // read-visibility caller (`resolve_read_visibility_caller`) here
+        // (see `mcp::tools::recall::record_recall_observations`, which passes
+        // `caller`); reuse the same `vis_caller` so the #1705 cross-agent
+        // replay guard (`mark_consumed_guarded`: `agent_id IS NULL OR
+        // agent_id = ?`) is bound to the true recaller (or `NULL` when no
+        // stable identity is set) instead of a namespace in the identity
+        // column. Pre-fix `args.as_agent.as_deref()` wrote the namespace into
+        // the identity slot, making the guard inert on the CLI surface.
+        // `--as-agent` remains the namespace-scope visibility knob.
         if let Err(e) = crate::observations::record_recall_with_identity(
             conn,
             &recall_id,
             &candidates,
-            args.as_agent.as_deref(),
+            vis_caller.as_deref(),
             effective_namespace.as_deref(),
         ) {
             writeln!(out.stderr, "ai-memory: recall ledger append failed: {e}")?;
@@ -1138,6 +1149,75 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", v) },
             None => unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") },
         }
+    }
+
+    /// #2988 — the recall ledger MUST bind the RECALLING agent's identity
+    /// (the `resolve_read_visibility_caller` value the MCP/HTTP surface
+    /// stamps), NEVER the `--as-agent` NAMESPACE. Pre-fix the CLI wrote
+    /// `--as-agent` into the `agent_id` column, making the #1705 cross-agent
+    /// replay guard (`mark_consumed_guarded`: `agent_id IS NULL OR
+    /// agent_id = ?`) inert — a namespace can't gate an identity, and a
+    /// WRONG identity is worse than NULL. This pins the caller-identity bind.
+    #[test]
+    fn recall_ledger_binds_caller_identity_not_as_agent_2988() {
+        // Serialize on the crate-wide agent-id env lock (#1772) since this
+        // test mutates `AI_MEMORY_AGENT_ID` process-wide.
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let prev = std::env::var_os("AI_MEMORY_AGENT_ID");
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Seed a COLLECTIVE row so the #2990 per-row ownership post-filter does
+        // not hide it from the non-owner caller (else there would be no ledger
+        // row to inspect).
+        seed_scoped(
+            &db,
+            "proj/a",
+            "needle ledger title",
+            "content",
+            "collective",
+            "ai:owner",
+        );
+
+        let mut args = default_args();
+        args.namespace = Some("proj/a".to_string());
+        // A NAMESPACE, deliberately equal-shaped to a slash-scoped id so the
+        // pre-fix "namespace in the identity column" bug would go unnoticed by
+        // a shape check alone.
+        args.as_agent = Some("proj/a".to_string());
+        let cfg = AppConfig::default();
+
+        // SAFETY: process-global env mutation serialized on the crate-wide
+        // agent-id test lock held for this test's body.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:cert-fed-proxy") };
+        {
+            let mut out = env.output();
+            let _ = run(&db, &args, true, &cfg, &mut out);
+        }
+        // Restore BEFORE asserting so a failure never leaks the var.
+        // SAFETY: serialized on the crate-wide agent-id test lock.
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") },
+        }
+
+        let conn = db::open(&db).unwrap();
+        let ids: Vec<Option<String>> = conn
+            .prepare("SELECT DISTINCT agent_id FROM recall_observations")
+            .unwrap()
+            .query_map([], |r| r.get::<_, Option<String>>(0))
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect();
+        assert!(
+            ids.iter()
+                .any(|id| id.as_deref() == Some("ai:cert-fed-proxy")),
+            "recall ledger must bind the caller identity (#2988); got {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.as_deref() == Some("proj/a")),
+            "the --as-agent NAMESPACE must NOT land in the agent_id column (#2988); got {ids:?}"
+        );
     }
 
     #[test]

@@ -100,11 +100,17 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                                 score: *s,
                             })
                             .collect();
+                        // #2988 — bind the recalling agent's identity into the
+                        // ledger (MCP/HTTP precedent), so the #1705 cross-agent
+                        // replay guard is not inert on the shell recall path.
+                        // `None` (unset AI_MEMORY_AGENT_ID) preserves the
+                        // single-tenant trust-all posture.
+                        let vis_caller = crate::identity::resolve_read_visibility_caller();
                         if let Err(e) = crate::observations::record_recall_with_identity(
                             conn,
                             &recall_id,
                             &candidates,
-                            None,
+                            vis_caller.as_deref(),
                             None,
                         ) {
                             let _ =
