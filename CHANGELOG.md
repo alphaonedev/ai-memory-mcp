@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (conformance corpus schema-version SSOT drift)
+
+- `tests/conformance_corpus.rs` `CORPUS_SCHEMA_VERSION` and
+  `conformance/manifest.json` `schema_version` were left at `90` when
+  `#3250` (dc83fa51) bumped `CURRENT_SCHEMA_VERSION` to `91`, so
+  `corpus_schema_version_matches_canonical` failed in the full-suite
+  coverage run (the Per-Module Coverage job's `Generate coverage JSON`
+  step). Both bumped to `91`; the manifest `corpus_digest` is computed
+  over vectors+groups only (not `schema_version`), so no regeneration
+  was required. Verified: `corpus_schema_version_matches_canonical` +
+  `corpus_matches_pinned_encoder` pass.
+
 ### Fixed (capture_turn K9 governance test — cross-test isolation)
 
 - `http_capture_turn_respects_namespace_deny` held only a fn-local mutex
