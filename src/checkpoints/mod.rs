@@ -393,7 +393,19 @@ pub fn resolve(
     keypair: Option<&AgentKeypair>,
 ) -> rusqlite::Result<ResolveOutcome> {
     crate::storage::record_stop::gate_storage_conn_rusqlite(conn)?;
-    let n = conn.execute(
+    // #3191 F-1 (CRITICAL, fail-closed / ERRORS-09) — the first-resolution-wins
+    // CAS state-flip and the attestation-signature write MUST commit as ONE
+    // atomic unit. Pre-fix they ran as TWO separate autocommit statements: a
+    // signing failure (or a crash) AFTER the CAS committed left the checkpoint
+    // `state=resolved` with an EMPTY signature, and — because the CAS is
+    // first-resolution-wins — every retry then answered `Conflict` FOREVER,
+    // permanently stranding the anchor unsigned so every peer running
+    // `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` rejects it. Wrapping both writes in
+    // one `unchecked_transaction` makes the whole resolve fail closed: a signing
+    // failure rolls the state-flip back (the `?` drops `tx`), so a resolved
+    // checkpoint can NEVER persist with an empty/absent attestation.
+    let tx = conn.unchecked_transaction()?;
+    let n = tx.execute(
         RESOLVE_CAS_SQL,
         params![
             state.as_str(),
@@ -408,18 +420,25 @@ pub fn resolve(
     if n == 0 {
         // The CAS did not fire: either no row exists, or the checkpoint is
         // already resolved (first-resolution-wins — keep the prior verdict).
-        return Ok(match get(conn, id)? {
+        // This arm writes nothing; commit is a clean no-op close of the txn.
+        let outcome = match get(&tx, id)? {
             None => ResolveOutcome::NotFound,
             Some(existing) => ResolveOutcome::Conflict(Box::new(existing)),
-        });
+        };
+        tx.commit()?;
+        return Ok(outcome);
     }
-    let Some(mut row) = get(conn, id)? else {
+    let Some(mut row) = get(&tx, id)? else {
+        // Cannot happen after a firing CAS, but fail closed: dropping `tx` here
+        // rolls the state-flip back rather than reporting a resolve we cannot
+        // read back.
         return Ok(ResolveOutcome::NotFound);
     };
     // Sign the resolution + persist the attestation columns when a signing
     // keypair is supplied — done after the resolution-field UPDATE so the
     // signable view reads the final resolved state/resolved_by/resolution/
-    // resolved_at.
+    // resolved_at, and inside the SAME transaction as the CAS so the two can
+    // never diverge (#3191 F-1).
     // #3007 (Wave-2 Cluster B) — WITHHOLD the auto-supplied key from an
     // `epoch_advance` freeze anchor under the certified posture
     // ([`withhold_daemon_signature`]): a daemon/node-signed epoch anchor is
@@ -429,16 +448,20 @@ pub fn resolve(
     if let Some(kp) = keypair {
         if kp.can_sign() && !withhold_daemon_signature(&row) {
             sign_resolution_into(&mut row, kp).map_err(|e| {
+                // `?` below drops `tx` -> the CAS state-flip ROLLS BACK, so the
+                // checkpoint stays PENDING and a retry can succeed (never a
+                // permanently-stranded resolved-but-unsigned row).
                 rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
                     "checkpoint resolution sign failed: {e:#}"
                 ))))
             })?;
-            conn.execute(
+            tx.execute(
                 "UPDATE checkpoints SET signature = ?1, resolver_pubkey = ?2 WHERE id = ?3",
                 params![row.signature, row.resolver_pubkey, id],
             )?;
         }
     }
+    tx.commit()?;
     Ok(ResolveOutcome::Resolved(Box::new(row)))
 }
 

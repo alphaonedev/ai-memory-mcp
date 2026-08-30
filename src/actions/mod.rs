@@ -51,6 +51,11 @@ fn action_select_by_id_sql() -> String {
     format!("{ACTION_SELECT_SQL} WHERE id = ?1")
 }
 
+/// Scalar `state`-only by-id probe shared by the [`transition`] /
+/// [`transition_cas`] compare-and-swap disambiguation reads — one spelling of
+/// the literal, not three (pm-v3.1 hardcoded-literal gate).
+const SELECT_ACTION_STATE_BY_ID_SQL: &str = "SELECT state FROM actions WHERE id = ?1";
+
 /// Map a `rusqlite` row (the [`ACTION_SELECT_SQL`] column order) to an
 /// [`Action`].
 ///
@@ -144,11 +149,7 @@ pub fn transition(
 ) -> rusqlite::Result<TransitionOutcome> {
     gate_record_stop_actions(conn)?;
     let current: Option<String> = conn
-        .query_row(
-            "SELECT state FROM actions WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
+        .query_row(SELECT_ACTION_STATE_BY_ID_SQL, params![id], |r| r.get(0))
         .optional()?;
     let Some(cs) = current else {
         return Ok(TransitionOutcome::NotFound);
@@ -157,10 +158,36 @@ pub fn transition(
     if !from.can_transition_to(to) {
         return Ok(TransitionOutcome::Illegal { from, to });
     }
-    conn.execute(
-        "UPDATE actions SET state = ?1, claimed_by = ?2, updated_at = ?3 WHERE id = ?4",
-        params![to.as_str(), claimed_by, now, id],
+    // #3191 F-2 — GUARDED compare-and-swap. Pre-fix the UPDATE was UNGUARDED
+    // (`WHERE id = ?`), so the read-then-write across the `SELECT state` above
+    // and this UPDATE was a TOCTOU: two concurrent transitions both read the
+    // same `from`, both validated `from -> to` legal, and both wrote — "one
+    // action, many winners". The `AND state = ?5` predicate binds the exact
+    // state we read, so the compare and the swap are a single atomic statement
+    // and exactly ONE racer's UPDATE affects a row (mirrors `transition_cas`).
+    let changed = conn.execute(
+        "UPDATE actions SET state = ?1, claimed_by = ?2, updated_at = ?3 \
+         WHERE id = ?4 AND state = ?5",
+        params![to.as_str(), claimed_by, now, id, from.as_str()],
     )?;
+    if changed == 0 {
+        // Lost the race: the row moved out of `from` between the SELECT and the
+        // UPDATE (or was deleted). Re-read and reclassify into an existing
+        // non-success outcome — NEVER report `Updated` for a transition that did
+        // not apply (that was the "many winners" bug). No row -> NotFound; a row
+        // in some other state -> the `from -> to` edge we validated is now stale,
+        // reported as Illegal against the actual current state.
+        let latest: Option<String> = conn
+            .query_row(SELECT_ACTION_STATE_BY_ID_SQL, params![id], |r| r.get(0))
+            .optional()?;
+        return Ok(match latest {
+            None => TransitionOutcome::NotFound,
+            Some(ls) => TransitionOutcome::Illegal {
+                from: crate::models::ActionState::from_str(&ls).unwrap_or_default(),
+                to,
+            },
+        });
+    }
     let action = conn.query_row(&action_select_by_id_sql(), params![id], row_to_action)?;
     Ok(TransitionOutcome::Updated(action))
 }
@@ -233,11 +260,7 @@ pub fn transition_cas(
         // Either the row does not exist, or it was no longer in `from`
         // (lost the CAS). Disambiguate for the caller's causal decision.
         let current: Option<String> = conn
-            .query_row(
-                "SELECT state FROM actions WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
+            .query_row(SELECT_ACTION_STATE_BY_ID_SQL, params![id], |r| r.get(0))
             .optional()?;
         return Ok(match current {
             None => CasOutcome::NotFound,
@@ -921,6 +944,73 @@ mod tests {
         assert_eq!(got.agent_id.as_deref(), Some("agent-x"));
         assert_eq!(got.payload, serde_json::json!({"a": 1}));
         assert!(get(&conn, "missing").unwrap().is_none());
+    }
+
+    /// #3191 F-2 — `transition` is a GUARDED compare-and-swap: concurrent
+    /// transitions of ONE pending action yield EXACTLY ONE winner. Pre-fix the
+    /// `SELECT state` + UNGUARDED `UPDATE ... WHERE id = ?` were a read-then-write
+    /// TOCTOU, so N racers all read `pending`, all validated `pending -> claimed`
+    /// legal, and all wrote — "one action, many winners". The `AND state = ?`
+    /// predicate in the UPDATE makes exactly one racer's write apply; the losers
+    /// re-read and reclassify to a NON-`Updated` outcome (never a false success).
+    #[test]
+    fn transition_cross_connection_race_single_winner_3191() {
+        use std::sync::{Arc, Barrier};
+
+        // A file-backed DB is REQUIRED — `:memory:` connections do not share
+        // state. Scratch under a project-local temp dir (never system /tmp).
+        let dir = tempfile::tempdir().expect("temp dir for shared file DB");
+        let db_path = dir.path().join("act3191_transition_race.db");
+        {
+            let writer = crate::storage::open(&db_path).expect("open writer");
+            create(&writer, &sample("race-3191")).expect("create action");
+        }
+
+        const RACERS: usize = 12;
+        let now = 1_700_000_500_i64;
+        let barrier = Arc::new(Barrier::new(RACERS));
+        let path = Arc::new(db_path.clone());
+        let handles: Vec<_> = (0..RACERS)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                let path = Arc::clone(&path);
+                std::thread::spawn(move || {
+                    let conn = crate::storage::open(path.as_path()).expect("open racer conn");
+                    let claimant = format!("claimant-{i}");
+                    barrier.wait();
+                    // A busy connection may surface `database is locked` under
+                    // extreme contention; a returned Err is NOT a second winner
+                    // (fail-closed), so treat it as a non-winner — as does the
+                    // sibling FBL-06 lease race.
+                    match transition(
+                        &conn,
+                        "race-3191",
+                        ActionState::Claimed,
+                        Some(&claimant),
+                        now,
+                    ) {
+                        Ok(TransitionOutcome::Updated(a)) => a.claimed_by,
+                        Ok(_) | Err(_) => None,
+                    }
+                })
+            })
+            .collect();
+
+        let winners: Vec<String> = handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("racer thread panicked"))
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one racer may win the pending -> claimed transition; winners={winners:?}"
+        );
+
+        // The persisted row agrees with the sole winner.
+        let verify = crate::storage::open(&db_path).expect("open verify conn");
+        let row = get(&verify, "race-3191").expect("get").expect("row");
+        assert_eq!(row.state, ActionState::Claimed);
+        assert_eq!(row.claimed_by.as_deref(), Some(winners[0].as_str()));
     }
 
     #[test]

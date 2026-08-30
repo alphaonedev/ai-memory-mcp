@@ -252,6 +252,15 @@ fn materialize_template(
         }
     }
 
+    // #3191 F-3 — materialise every action + edge inside ONE transaction so a
+    // rejected edge (self-edge / cycle / out-of-range index / malformed spec)
+    // or any mid-loop failure rolls the WHOLE materialisation back. Pre-fix the
+    // per-action `crate::actions::create` calls each auto-committed, so a
+    // template whose LATER edges were rejected left the EARLIER actions inserted
+    // and ORPHANED in the frontier while the run was recorded Failed — first-
+    // class coordination rows with no routine run owning them. Every `return
+    // Err(..)`/`?` below drops `tx` and rolls the inserts back; success commits.
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let mut created_ids: Vec<String> = Vec::new();
 
     if let Some(actions_val) = template.get("actions") {
@@ -304,7 +313,7 @@ fn materialize_template(
                 created_at: now,
                 updated_at: now,
             };
-            crate::actions::create(conn, &action).map_err(|e| e.to_string())?;
+            crate::actions::create(&tx, &action).map_err(|e| e.to_string())?;
             created_ids.push(action.id);
         }
     }
@@ -341,7 +350,7 @@ fn materialize_template(
             // #3008 — a self-edge / ordering-cycle template edge fails the run
             // (recorded Failed by the caller) rather than silently wedging the
             // materialised frontier.
-            match crate::actions::add_edge(conn, from_id, to_id, edge_type, now)
+            match crate::actions::add_edge(&tx, from_id, to_id, edge_type, now)
                 .map_err(|e| e.to_string())?
             {
                 crate::actions::AddEdgeOutcome::SelfEdge => {
@@ -368,11 +377,15 @@ fn materialize_template(
     // idempotent), so a timeout-retry duplicates work. A run-key primitive is a
     // design call left out of this change per the issue.
     if created_ids.is_empty() {
+        // Dropping `tx` here rolls back — nothing to commit for a zero-action run.
         return Err(
             "routine template materialised zero actions (no `actions` entries)".to_string(),
         );
     }
 
+    // #3191 F-3 — all actions + edges materialised without a rejection; commit
+    // the whole set atomically.
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(created_ids)
 }
 
@@ -980,6 +993,55 @@ mod handler_tests {
                 .expect("list")
                 .is_empty(),
             "an unrecognized-key template materialises no actions"
+        );
+    }
+
+    /// #3191 F-3 — a REJECTED edge strands NO actions. The template's `actions`
+    /// materialise first, then a self-edge is rejected. Pre-fix each
+    /// `actions::create` auto-committed, so the earlier actions were left
+    /// ORPHANED in the frontier while the run was recorded Failed. Post-fix the
+    /// whole materialisation is ONE transaction, so a rejected edge rolls the
+    /// inserted actions back — the frontier is empty.
+    #[test]
+    fn run_rejected_edge_strands_no_actions_3191() {
+        let conn = fresh();
+        let created = handle_routine_create(
+            &conn,
+            &json!({
+                "namespace": "_rt",
+                "name": "two-then-bad-edge",
+                // Two valid actions materialise, then a self-edge (from == to)
+                // is rejected by `add_edge`.
+                "template": {
+                    "actions": [
+                        {"kind": "task.a", "title": "step-a"},
+                        {"kind": "task.b", "title": "step-b"}
+                    ],
+                    "edges": [{"from": 0, "to": 0, "type": "requires"}]
+                },
+            }),
+        )
+        .expect("create ok");
+        let routine_id = created[param_names::ID].as_str().expect("id").to_string();
+        handle_routine_freeze(&conn, &json!({ "id": routine_id }), None).expect("freeze ok");
+
+        let ran = handle_routine_run(&conn, &json!({ "routine_id": routine_id, "arguments": {} }))
+            .expect("run returns Ok carrying the failed run");
+        assert_eq!(ran["run"]["state"].as_str(), Some("failed"));
+        assert!(
+            ran["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("self-edge"),
+            "the failure names the rejected edge: {:?}",
+            ran["error"]
+        );
+        // The two already-inserted actions were rolled back — NO orphans.
+        assert!(
+            crate::actions::list(&conn, Some("_rt"), None, 16)
+                .expect("list")
+                .is_empty(),
+            "a rejected edge must strand no inserted actions (#3191 F-3)"
         );
     }
 
