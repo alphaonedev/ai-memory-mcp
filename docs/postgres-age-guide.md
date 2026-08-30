@@ -50,7 +50,7 @@ choice. Switch to postgres+AGE when one or more of these is true:
 
 The two backends are at **schema parity at v91**
 (`CURRENT_SCHEMA_VERSION = 92` on both ladders — the postgres upgrade
-ladder ends at `migrate_v91()`).
+ladder ends at `migrate_v92()`).
 
 **Schema parity is NOT feature parity.** Some postgres ladder arms are
 version-stamp no-ops rather than real DDL, so a matching version number
