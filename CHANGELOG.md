@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (CI — certified-postgres cert gate RED since the #3198 key-dir hardening, #3117 SHIP-BLOCKER)
+
+- **#3117 (CI / GA ship-blocker) — the `cert-postgres-age.yml` "Cluster-A
+  cert-posture armability gate" was RED because the #3198 key-directory
+  permission hardening refuses the cert-gate harness's own key dirs on the
+  self-hosted `linux-fed` runner.** `scripts/check-bootstrap-cert-gate.sh`
+  mints throwaway Ed25519 keypairs into `mkdir -p` directories (LEG A's
+  `KEYDIR_A`, LEG B's node/witness/recorder + empty-custody dirs). The #3198
+  whole-chain gate (`identity::keypair::enforce_key_dir_secure`,
+  `KEY_DIR_FORBIDDEN_BITS = 0o022`) refuses a group- or world-WRITABLE key
+  directory — deliberately tuned to ACCEPT a default-`umask 022` tree (mode
+  0755, readable but not writable). The self-hosted cert runner runs the fleet
+  `umask 0002`, so a bare `mkdir -p` was born 0775 (group-writable) and every
+  `identity generate` refused with "key directory … is group- or
+  world-writable (mode 775)". LEG A aborted at "could not mint an R40 approver
+  pubkey" (exit 3) BEFORE `doctor --posture` ran, reding the whole gate. Fixed
+  by forcing `umask 022` at the top of the harness so every directory it
+  creates is born 0755 — the exact mode #3198 was built to accept — with no
+  other behavioural change (strictly tighter than the fleet default, never
+  looser). Harness-only: no production keystore posture change, no
+  federation-wire or `AI_MEMORY_FED_*` change, so the §7 re-cert trigger does
+  not fire. The pre-existing R40-approver enrollment in LEG A's
+  `posture_pg_env()` was already correct.
+
 ### Security (#2555 — `schema_version` unconstrained fleet kill-switch, GA-blocker)
 
 - **#2555 (availability / data-integrity, GA-blocker) — `schema_version` was

@@ -33,6 +33,26 @@
 #   AI_MEMORY_BIN=/path/to/ai-memory scripts/check-bootstrap-cert-gate.sh
 set -uo pipefail
 
+# #3117 — normalise to the STANDARD umask before creating ANY key directory.
+# LEG A / LEG B mint throwaway Ed25519 keypairs into `mkdir -p` directories
+# (KEYDIR_A, KEYDIR_B, WDIR_B, RDIR_B, the empty witness/recorder dirs,
+# KEYDIR_D/E). The #3198 whole-chain key-dir gate
+# (`identity::keypair::enforce_key_dir_secure`, `KEY_DIR_FORBIDDEN_BITS=0o022`)
+# REFUSES a group- or world-WRITABLE key directory: a second local UID could
+# swap in an attacker-controlled matched `.priv`/`.pub` pair. That gate is
+# deliberately tuned to ACCEPT a default-`umask 022` tree (mode 0755, readable
+# but not writable) and REFUSE only the write bits. The self-hosted
+# `linux-fed` cert runner (this fleet) runs `umask 0002`, so a bare `mkdir -p`
+# is born 0775 — group-writable — and every `identity generate` refuses with
+# "key directory … is group- or world-writable (mode 775)". That aborted LEG
+# A at "could not mint an R40 approver pubkey" (exit 3) BEFORE `doctor
+# --posture` ever ran, reding the cert gate. Forcing `umask 022` here makes
+# every directory this script creates born 0755 — the exact mode #3198 was
+# built to accept — with no other behavioural change (it is stricter than the
+# fleet default, never looser). Keeps the fix in the harness, not in the
+# production keystore posture, which is correct as-is.
+umask 022
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 # Absolute so the `cd "$WORK_B"` bring-up subshells below still resolve it.
