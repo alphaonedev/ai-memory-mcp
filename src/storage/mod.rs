@@ -6999,6 +6999,46 @@ pub fn forget_for_caller(
     }
 }
 
+/// #3279 — SQLite `strftime` format string that normalizes ANY RFC3339
+/// timestamp (arbitrary UTC offset, a trailing `Z`, or `+00:00`; 0–9
+/// fractional-second digits) to a fixed-width UTC `YYYY-MM-DDTHH:MM:SS.mmm`
+/// rendering. Applied to BOTH sides of every `created_at` since/until
+/// comparison — the stored (caller-signed, possibly non-canonical) column
+/// value AND the bound — so the lexicographic TEXT comparison SQLite
+/// performs is EXACTLY instant comparison, matching the postgres
+/// `timestamptz` semantics.
+///
+/// WHY (data integrity): `created_at` is stored caller-signed-VERBATIM
+/// (never canonicalized — unlike `valid_from`/`valid_until`, which schema
+/// v86 healed), so a federated/imported row can carry e.g. a `-05:00`
+/// offset. A raw `created_at >= ?bound` byte-compare then dropped/admitted
+/// HOURS of rows relative to postgres (which compares `timestamptz`
+/// instants). Routing both sides through this ONE `strftime` renderer
+/// restores cross-backend row-set parity.
+///
+/// Precision: `%f` is millisecond-resolution, so two instants inside the
+/// same millisecond of a bound tie; postgres `timestamptz` is microsecond-
+/// resolution. That is a sub-millisecond boundary degradation (a row within
+/// one ms of the bound may fall on the other side) — never the HOURS-scale
+/// offset divergence, and never a wrong-by-hours result (North Star:
+/// degrade, never corrupt).
+pub(crate) const CREATED_AT_INSTANT_FMT: &str = "%Y-%m-%dT%H:%M:%f";
+
+/// #3279 — render the two `created_at` since/until predicates as INSTANT
+/// comparisons for a FIXED-placeholder query. `alias` is the table-alias
+/// prefix on the column (`"m."` for the aliased FTS/search joins, `""` for
+/// the unqualified semantic scan); `since_ph`/`until_ph` are the 1-based
+/// placeholder indices the caller binds with a Rust-canonicalized bound
+/// (see [`CREATED_AT_INSTANT_FMT`]). Both placeholders are NULL-guarded, so
+/// an absent bound is a no-op.
+#[must_use]
+fn created_at_instant_window(alias: &str, since_ph: u8, until_ph: u8) -> String {
+    let f = CREATED_AT_INSTANT_FMT;
+    format!(
+        "AND (?{since_ph} IS NULL OR strftime('{f}', {alias}created_at) >= strftime('{f}', ?{since_ph}))\n           AND (?{until_ph} IS NULL OR strftime('{f}', {alias}created_at) <= strftime('{f}', ?{until_ph}))"
+    )
+}
+
 /// #1579 A2 — build the sargable `list` SQL + parameter vector.
 ///
 /// The legacy single-shape query expressed every optional filter as a
@@ -7061,12 +7101,21 @@ pub fn build_list_query(
         params_vec.push(Box::new(p));
     }
     if let Some(s) = since {
-        sql.push_str(" AND created_at >= ?");
-        params_vec.push(Box::new(s.to_string()));
+        // #3279 — instant comparison (strftime both sides) so a verbatim,
+        // non-canonical stored `created_at` offset compares by INSTANT, not
+        // bytes — matching the postgres `timestamptz` window.
+        sql.push_str(&format!(
+            " AND strftime('{f}', created_at) >= strftime('{f}', ?)",
+            f = CREATED_AT_INSTANT_FMT
+        ));
+        params_vec.push(Box::new(crate::validate::canonical_rfc3339(s)));
     }
     if let Some(u) = until {
-        sql.push_str(" AND created_at <= ?");
-        params_vec.push(Box::new(u.to_string()));
+        sql.push_str(&format!(
+            " AND strftime('{f}', created_at) <= strftime('{f}', ?)",
+            f = CREATED_AT_INSTANT_FMT
+        ));
+        params_vec.push(Box::new(crate::validate::canonical_rfc3339(u)));
     }
     if let Some(tag) = tags_filter {
         sql.push_str(
@@ -7334,8 +7383,7 @@ pub fn search_with_source_uri(
            AND (?3 IS NULL OR m.tier = ?3)
            AND (?4 IS NULL OR m.priority >= ?4)
            AND (m.expires_at IS NULL OR m.expires_at > ?5)
-           AND (?6 IS NULL OR m.created_at >= ?6)
-           AND (?7 IS NULL OR m.created_at <= ?7)
+           {created_at_window}
            AND (?8 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?8))
            AND (?10 IS NULL OR m.agent_id_idx = ?10)
            {archived_fragment}
@@ -7357,7 +7405,14 @@ pub fn search_with_source_uri(
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
         // v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight factor.
         soft_loser_factor = SOFT_LOSER_SCORE_FACTOR,
+        // #3279 — instant-based `created_at` since/until window (?6/?7).
+        created_at_window = created_at_instant_window("m.", 6, 7),
     );
+    // #3279 — canonicalize the since/until bounds so the SQL `strftime`
+    // comparison (which also normalizes the stored column) is exactly
+    // instant comparison; an unparseable bound falls back to its raw bytes.
+    let since = crate::validate::canonical_valid_time_opt(since);
+    let until = crate::validate::canonical_valid_time_opt(until);
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(uri) = source_uri {
         stmt.query_map(
@@ -7963,8 +8018,7 @@ pub fn recall(
            {hierarchy_fragment}
            AND (m.expires_at IS NULL OR m.expires_at > ?3)
            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
-           AND (?5 IS NULL OR m.created_at >= ?5)
-           AND (?6 IS NULL OR m.created_at <= ?6)
+           {created_at_window}
            -- #1834 claim-bitemporal AS-OF (?13): return only claims asserted to
            -- hold at valid_at — half-open [valid_from, valid_until), END-
            -- EXCLUSIVE, symmetric NULL=unbounded. NULL-guarded so `None`
@@ -7984,7 +8038,13 @@ pub fn recall(
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
         // v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight factor.
         soft_loser_factor = SOFT_LOSER_SCORE_FACTOR,
+        // #3279 — instant-based `created_at` since/until window (?5/?6).
+        created_at_window = created_at_instant_window("m.", 5, 6),
     );
+    // #3279 — canonicalize the since/until bounds; the SQL `strftime`
+    // normalizes both sides so byte order equals instant order.
+    let since = crate::validate::canonical_valid_time_opt(since);
+    let until = crate::validate::canonical_valid_time_opt(until);
     let mut stmt = conn.prepare(&sql)?;
     // Bind ?13 only when the source-URI fragment is active; SQLite
     // errors on parameter-count mismatch.
@@ -18066,8 +18126,7 @@ fn fts_keyword_phase(
            {fts_hierarchy_fragment}
            AND (m.expires_at IS NULL OR m.expires_at > ?3)
            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
-           AND (?5 IS NULL OR m.created_at >= ?5)
-           AND (?6 IS NULL OR m.created_at <= ?6)
+           {created_at_window}
            {fts_archived_fragment}
            {fts_source_uri_fragment}
            {fts_valid_at_fragment}
@@ -18076,6 +18135,8 @@ fn fts_keyword_phase(
          ORDER BY fts_score DESC
          LIMIT ?7",
         fts_hierarchy_fragment = prep.fts_hierarchy_fragment,
+        // #3279 — instant-based `created_at` since/until window (?5/?6).
+        created_at_window = created_at_instant_window("m.", 5, 6),
         fts_archived_fragment = prep.fts_archived_fragment,
         fts_source_uri_fragment = prep.fts_source_uri_fragment,
         // v1.0.0 #1834 — claim-bitemporal AS-OF at the fixed ?13 slot (binds
@@ -18089,6 +18150,11 @@ fn fts_keyword_phase(
         // hybrid-recall FTS branch.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
     );
+    // #3279 — canonicalize the since/until bounds; the SQL `strftime`
+    // normalizes the stored column and the bound identically, so byte
+    // order equals instant order (postgres `timestamptz` parity).
+    let since = crate::validate::canonical_valid_time_opt(since);
+    let until = crate::validate::canonical_valid_time_opt(until);
     // #1579 B6 — recall’s FTS branch is the hottest read statement;
     // prepare_cached amortises re-parsing across recalls (shape cardinality
     // is small: the optional fragments expand to a handful of variants).
@@ -18490,14 +18556,15 @@ fn semantic_phase(
            {sem_hierarchy_fragment}
            AND (expires_at IS NULL OR expires_at > ?2)
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE json_each.value = ?3))
-           AND (?4 IS NULL OR created_at >= ?4)
-           AND (?5 IS NULL OR created_at <= ?5)
+           {created_at_window}
            {sem_archived_fragment}
            {sem_source_uri_fragment}
            {sem_valid_at_fragment}
            {vis}
            {lifecycle_vis}",
         sem_hierarchy_fragment = prep.sem_hierarchy_fragment,
+        // #3279 — instant-based `created_at` since/until window (?4/?5).
+        created_at_window = created_at_instant_window("", 4, 5),
         sem_archived_fragment = prep.sem_archived_fragment,
         sem_source_uri_fragment = prep.sem_source_uri_fragment,
         // v1.0.0 #1834 — claim-bitemporal AS-OF at the fixed ?11 slot (binds
@@ -18511,6 +18578,11 @@ fn semantic_phase(
         // semantic linear-scan branch (unqualified `memories` columns).
         lifecycle_vis = crate::models::lifecycle_visible_clause("memories"),
     );
+    // #3279 — canonicalize the since/until bounds so the SQL `strftime`
+    // comparison is exactly instant comparison (postgres `timestamptz`
+    // parity); the stored column is normalized by the same `strftime`.
+    let since = crate::validate::canonical_valid_time_opt(since);
+    let until = crate::validate::canonical_valid_time_opt(until);
     // #1579 B6 — same prepare_cached treatment as the FTS branch above.
     let mut sem_stmt = conn.prepare_cached(&sem_sql)?;
     let sem_row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<
