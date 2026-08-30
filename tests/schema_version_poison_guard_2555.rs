@@ -104,6 +104,34 @@ fn poisoned_stamp_yields_poison_error_that_names_the_repair_verb_2555() {
     );
 }
 
+/// `doctor` reports a poisoned ledger BY NAME (Storage section critical, naming
+/// the repair verb) rather than flattening it into "could not open database".
+#[test]
+fn doctor_reports_poisoned_ledger_by_name_2555() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = db_poisoned_at(dir.path(), 2_147_483_647);
+
+    let mut so: Vec<u8> = Vec::new();
+    let mut se: Vec<u8> = Vec::new();
+    let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
+    let args = ai_memory::cli::doctor::DoctorArgs {
+        json: true,
+        ..Default::default()
+    };
+    // A poisoned database yields a Critical report (exit 2), not a panic.
+    let code = ai_memory::cli::doctor::run(&path, &args, &mut out).expect("doctor runs");
+    assert_eq!(code, 2, "a poisoned ledger is a Critical finding");
+    let report = String::from_utf8_lossy(&so);
+    assert!(
+        report.contains("poisoned"),
+        "doctor names the poison state: {report}"
+    );
+    assert!(
+        report.contains("--repair-schema-version"),
+        "doctor names the repair verb: {report}"
+    );
+}
+
 /// The bounding CHECK rejects an out-of-band INSERT on a migrated database.
 #[test]
 fn check_rejects_out_of_band_insert_2555() {

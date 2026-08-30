@@ -1637,6 +1637,58 @@ mod tests {
         );
     }
 
+    /// v1.0.0 #2555 — a POISONED stamp (above the ceiling) warns by NAME and
+    /// names the repair verb, never "consider upgrading" (no binary wrote it).
+    #[test]
+    fn boot_warns_on_schema_version_poisoned_2555() {
+        let _g = test_lock();
+        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // SAFETY: process-wide env mutation, serialised by `_guard_env`.
+        unsafe {
+            std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
+        }
+        let mut env = TestEnv::fresh();
+        seed_memory(&env.db_path, "ns-poison", "row", "x");
+        {
+            // The migrated table carries the bounding CHECK, so plant the poison
+            // on a legacy CHECK-less table (the #2555 pre-migration shape).
+            let conn = rusqlite::Connection::open(&env.db_path).expect("rusqlite::open");
+            conn.execute_batch(
+                "DROP TABLE schema_version; \
+                 CREATE TABLE schema_version (version INTEGER NOT NULL);",
+            )
+            .expect("recreate legacy check-less schema_version");
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (2147483647)",
+                [],
+            )
+            .expect("plant the poison stamp");
+        }
+        let db_path = env.db_path.clone();
+        let cfg = default_config();
+        let mut args = default_args();
+        args.namespace = Some("ns-poison".to_string());
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        assert!(
+            stdout.contains("# ai-memory boot: warn"),
+            "expected warn header for a poisoned stamp: {stdout}"
+        );
+        assert!(
+            stdout.to_lowercase().contains("poison"),
+            "expected the poisoned-stamp diagnosis by name: {stdout}"
+        );
+        assert!(
+            stdout.contains("--repair-schema-version"),
+            "expected the repair verb remedy: {stdout}"
+        );
+        assert!(
+            !stdout.contains("consider upgrading"),
+            "must not tell the operator to upgrade — no binary wrote this version: {stdout}"
+        );
+    }
+
     #[test]
     fn boot_json_schema_stamp_invalid_does_not_recommend_upgrade() {
         let _g = test_lock();
