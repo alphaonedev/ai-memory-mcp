@@ -87,3 +87,7 @@ src/store/postgres_parity.rs	link_memory_transcript
 # record-stoppable writes. Fable review: bootstrap-time integrity bookkeeping.
 src/storage/schema_integrity.rs	record_lineage_watermark
 src/store/postgres.rs	record_lineage_watermark_pg
+# #2555 — render_poisoned builds an OPERATOR-FACING message that quotes a
+# `DELETE FROM schema_version ...` for the postgres admin recovery; it EXECUTES
+# no SQL (pure string formatting). Reviewed false positive.
+src/storage/schema_guard.rs	render_poisoned

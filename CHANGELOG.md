@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#2555 — `schema_version` unconstrained fleet kill-switch, GA-blocker)
+
+- **#2555 (availability / data-integrity, GA-blocker) — `schema_version` was
+  an unconstrained integer with no in-product repair, a fleet kill-switch.**
+  `INSERT INTO schema_version VALUES (2147483647)` was permanent: it read back
+  through `COALESCE(MAX(version), 0)` and tripped the #2445 schema-ahead DENY on
+  every daemon, and on a SHARED postgres cluster (where the ai-memory role has
+  full DML) any co-tenant / migration tool / restore script / one `psql` session
+  took the whole fleet down — with NO in-product recovery (the DENY's
+  remediations "run the binary that wrote this" and "restore a pre-upgrade
+  snapshot" cannot recover a fabricated version, and the operator hatch left the
+  poisoned stamp in place forever). Closed in three parts, both backends:
+  - **Headroom band + distinct typed error.** A stamp a sane amount above the
+    ladder tip stays a legitimate downgrade (the #2445 DENY, "run a newer
+    binary"). A stamp ABOVE the absolute ceiling `MAX_SCHEMA_VERSION` (100000 —
+    ~1000 product-lifetimes of single-digit-per-release growth, permanently
+    unreachable by a real ladder, yet four orders of magnitude below `i32::MAX`)
+    is a POISONED LEDGER: it now yields a NEW typed error
+    (`SchemaVersionPoisoned`, slug `SCHEMA_VERSION_POISONED`) whose remediation
+    points at the repair verb, refused BEFORE the downgrade `evaluate` and
+    WITHOUT consulting the operator hatch. `boot` / `doctor` report it by name.
+  - **Bounding CHECK.** A new forward migration (sqlite v92 full-table rebuild;
+    postgres v92 `ADD CONSTRAINT`) and the bootstrap SCHEMA on both backends now
+    carry `CHECK (version <= 100000)`, so an out-of-band write is refused at the
+    boundary. Upper-bound only (the low end is #2564's read-time domain).
+  - **Operator-gated in-product repair verb.** `ai-memory doctor
+    --repair-schema-version <N>` restamps a poisoned ledger to a correct
+    in-band version — SNAPSHOT-FIRST (a sibling `VACUUM INTO` backup is written
+    before the stamp is touched; a snapshot failure refuses the repair) and
+    refused on a served postgres store (#2572). It is the recovery the DENY
+    lacked.
+
 ### Security (capability-token grant can NEVER override an operator Deny — #3111, GA-blocker)
 
 - **#3111 (security / operator-permission bypass, GA-blocker) — a

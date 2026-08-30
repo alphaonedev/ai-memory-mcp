@@ -1478,6 +1478,17 @@ const MIGRATION_V90_ARCHIVED_CID: &str =
 const MIGRATION_V91_ARCHIVED_LINKS_CID: &str =
     include_str!("../../migrations/postgres/0048_v91_archived_memory_links_cid.sql");
 
+/// v1.0.0 #2555 — schema v92 canonical DDL: `ALTER TABLE schema_version ADD
+/// CONSTRAINT schema_version_bounded CHECK (version <= MAX_SCHEMA_VERSION)`,
+/// applied by [`PostgresStore::migrate_v92`] after a `pg_constraint` probe +
+/// out-of-band pre-flight. The `100000` literal MUST equal
+/// [`crate::storage::migrations::MAX_SCHEMA_VERSION`] (asserted by
+/// `schema_version_ceiling_ssot_2555`). The sqlite twin is the probe-guarded
+/// rebuild arm in `storage::migrations`
+/// (`migrations/sqlite/0076_v92_schema_version_bound.sql`).
+const MIGRATION_V92_SCHEMA_BOUND: &str =
+    include_str!("../../migrations/postgres/0049_v92_schema_version_bound.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -1868,7 +1879,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 91;
+const CURRENT_SCHEMA_VERSION: i32 = 92;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -2373,6 +2384,18 @@ impl PostgresStore {
                 }
             }
             if relation.is_some() {
+                // v1.0.0 #2555 — a POISONED stamp (above `MAX_SCHEMA_VERSION`)
+                // is refused with its own typed error BEFORE the #2445
+                // downgrade DENY. On a SHARED postgres cluster an unconstrained
+                // `INSERT INTO schema_version VALUES (2147483647)` by any
+                // co-tenant with DML would otherwise take every daemon down via
+                // the schema-ahead DENY with no in-product recovery; this routes
+                // it to the operator repair procedure instead.
+                crate::storage::schema_guard::assert_schema_not_poisoned(
+                    observed,
+                    crate::storage::schema_guard::BACKEND_POSTGRES,
+                    &store_label,
+                )?;
                 crate::storage::schema_guard::evaluate(
                     observed,
                     i64::from(CURRENT_SCHEMA_VERSION),
@@ -3663,10 +3686,84 @@ impl PostgresStore {
         if current_version < 90 {
             self.migrate_v90().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 91 {
             self.migrate_v91().await?;
         }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v92().await?;
+        }
 
+        Ok(())
+    }
+
+    /// v92 (#2555, v1.0.0) — BOUND schema_version with the
+    /// `version <= MAX_SCHEMA_VERSION` upper CHECK so an unconstrained fleet
+    /// kill-switch write (`INSERT INTO schema_version VALUES (2147483647)`) by
+    /// any co-tenant with DML on this SHARED cluster is rejected at the
+    /// boundary. The postgres twin of the sqlite v92 rebuild.
+    ///
+    /// Mirrors [`Self::migrate_v30`]: probe `pg_constraint` first (a fresh
+    /// schema inherits the constraint inline from `postgres_schema.sql`), then
+    /// `ALTER TABLE ... ADD CONSTRAINT`. Postgres validates existing rows on
+    /// ADD CONSTRAINT, so a pre-flight refuses with a clear error rather than a
+    /// half-applied migration if any row is already out of band — though a
+    /// poisoned cluster never reaches here (the bootstrap guard refuses it
+    /// before the ladder runs), so in practice every existing row is `<= tip`.
+    async fn migrate_v92(&self) -> StoreResult<()> {
+        let max = crate::storage::migrations::MAX_SCHEMA_VERSION;
+        debug_assert!(
+            MIGRATION_V92_SCHEMA_BOUND.contains("schema_version_bounded"),
+            "#2555: the v92 DDL doc twin must ship with the binary"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v92 schema_version-bound ddl tx", e))?;
+
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT conname FROM pg_constraint
+              WHERE conname = 'schema_version_bounded'
+                AND conrelid = 'schema_version'::regclass",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("probe schema_version_bounded", e))?;
+
+        if exists.is_none() {
+            let bad_count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM schema_version WHERE version > {max}"
+            ))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("count out-of-band schema_version rows", e))?;
+
+            if bad_count > 0 {
+                return Err(StoreError::IntegrityFailed {
+                    detail: format!(
+                        "v92 migration aborted: {bad_count} schema_version row(s) exceed the \
+                         ceiling v{max}; restamp the ledger \
+                         (DELETE the out-of-band rows) before re-running"
+                    ),
+                });
+            }
+
+            sqlx::raw_sql(MIGRATION_V92_SCHEMA_BOUND)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("add schema_version_bounded check", e))?;
+        }
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v92 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v92 applied (#2555: schema_version CHECK (version <= {max}) — the unconstrained-integer fleet kill-switch is now \
+             rejected at the boundary)"
+        );
         Ok(())
     }
 

@@ -365,6 +365,18 @@ pub enum StoreError {
     #[error("{detail}")]
     SchemaStampInvalid { detail: String },
 
+    /// v1.0.0 #2555 — this database's recorded `schema_version` is ABOVE the
+    /// maximum any real migration ladder can reach
+    /// ([`crate::storage::migrations::MAX_SCHEMA_VERSION`]), i.e. a
+    /// fabricated / corrupted stamp (an unconstrained integer let one be
+    /// written), so operating it would trip the schema-ahead DENY on every
+    /// daemon reading the (shared postgres) ledger with no in-product recovery.
+    /// A SEPARATE variant from [`Self::SchemaAheadOfBinary`] because the
+    /// operator action differs: not "run a newer binary" (none wrote this
+    /// version) but the operator-gated repair verb that restamps the ledger.
+    #[error("{detail}")]
+    SchemaVersionPoisoned { detail: String },
+
     /// v1.0.0 #3196 — a `find_paths` traversal was refused because it would
     /// materialise more than [`crate::storage::FIND_PATHS_MAX_PREFIXES`]
     /// path-prefixes. Carries a rendered `detail` (following the
@@ -402,6 +414,15 @@ impl From<crate::storage::schema_guard::SchemaAheadOfBinary> for StoreError {
 impl From<crate::storage::schema_guard::SchemaStampZeroed> for StoreError {
     fn from(e: crate::storage::schema_guard::SchemaStampZeroed) -> Self {
         Self::SchemaStampInvalid { detail: e.detail }
+    }
+}
+
+/// v1.0.0 #2555 — the poisoned-ledger refusal, lifted the same way so `?` works
+/// verbatim in the postgres bootstrap funnel and both backends emit a
+/// byte-identical message.
+impl From<crate::storage::schema_guard::SchemaVersionPoisoned> for StoreError {
+    fn from(e: crate::storage::schema_guard::SchemaVersionPoisoned) -> Self {
+        Self::SchemaVersionPoisoned { detail: e.detail }
     }
 }
 
@@ -448,6 +469,11 @@ impl StoreError {
             // DATABASE's version stamp is the thing that is wrong, and the
             // operator action differs from the schema-ahead one.
             Self::SchemaStampInvalid { .. } => error_codes::SCHEMA_STAMP_INVALID,
+            // #2555 — a poisoned-ledger refusal carries its own slug: the
+            // backend is healthy and the adapter is capable; the DATABASE's
+            // version stamp is out of band, and the operator action (restamp
+            // via the repair verb) differs from both schema-drift twins.
+            Self::SchemaVersionPoisoned { .. } => error_codes::SCHEMA_VERSION_POISONED,
             // #3196 — a traversal-budget refusal is caller-triggerable and
             // backend-blind (the same budget on both adapters); it carries its
             // own slug rather than a generic backend fault.

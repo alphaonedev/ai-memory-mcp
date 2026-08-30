@@ -438,6 +438,148 @@ pub fn schema_ahead_of(err: &anyhow::Error) -> Option<&SchemaAheadOfBinary> {
     err.downcast_ref::<SchemaAheadOfBinary>()
 }
 
+/// v1.0.0 #2555 — the typed refusal for a POISONED `schema_version` ledger: a
+/// stamp ABOVE [`crate::storage::migrations::MAX_SCHEMA_VERSION`], the absolute
+/// ceiling no real migration ladder can reach.
+///
+/// Deliberately a SEPARATE type from [`SchemaAheadOfBinary`] (the plausible
+/// newer-schema downgrade the #2445 guard handles) for the same reason
+/// [`SchemaStampZeroed`] is: the two failures need DIFFERENT operator actions.
+/// A downgrade says "run a newer binary, or restore a pre-upgrade snapshot" —
+/// but a FABRICATED version (`2147483647`) was written by no binary and has no
+/// snapshot, so those remediations are dead ends. This one names the
+/// operator-gated repair verb (`ai-memory doctor --repair-schema-version <N>`,
+/// snapshot-first) that RESTAMPS the ledger to a correct value — the recovery
+/// path the plain DENY lacks. The diagnostic verbs downcast on the concrete
+/// type to say which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaVersionPoisoned {
+    /// The out-of-band version recorded in the database's `schema_version`
+    /// relation (e.g. `2147483647`).
+    pub observed: i64,
+    /// The absolute ceiling a legitimate stamp may not exceed
+    /// ([`crate::storage::migrations::MAX_SCHEMA_VERSION`]).
+    pub max: i64,
+    /// The tip this binary's ladder produces (`CURRENT_SCHEMA_VERSION`).
+    pub supported: i64,
+    /// [`BACKEND_SQLITE`] or [`BACKEND_POSTGRES`].
+    pub backend: &'static str,
+    /// The database file path (sqlite) or a redacted store label (postgres).
+    pub target: String,
+    /// The fully rendered operator-facing message.
+    pub detail: String,
+}
+
+impl SchemaVersionPoisoned {
+    /// Build the refusal for `observed`, rendering the operator message and
+    /// filling `max`/`supported` from the live ladder constants.
+    #[must_use]
+    pub fn new(observed: i64, backend: &'static str, target: &str) -> Self {
+        let max = crate::storage::migrations::MAX_SCHEMA_VERSION;
+        let supported = crate::storage::migrations::current_schema_version();
+        Self {
+            observed,
+            max,
+            supported,
+            backend,
+            target: target.to_string(),
+            detail: render_poisoned(observed, max, supported, backend, target),
+        }
+    }
+}
+
+impl fmt::Display for SchemaVersionPoisoned {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for SchemaVersionPoisoned {}
+
+/// Render the operator-facing refusal for a poisoned (out-of-band) stamp.
+///
+/// The remediation is BACKEND-AWARE: on sqlite it names the first-party repair
+/// verb (which restamps the local file, snapshot-first); on postgres — where
+/// the ledger is SHARED across the cluster and the CLI deliberately refuses to
+/// write the served store (#2572) — it names the admin `DELETE` that removes
+/// the out-of-band row so the `MAX(version)` read drops back to a real value.
+fn render_poisoned(observed: i64, max: i64, supported: i64, backend: &str, target: &str) -> String {
+    let remediation = if backend == BACKEND_POSTGRES {
+        format!(
+            "This shared postgres ledger cannot be repaired through the CLI (which refuses to \
+             write a served store, #2572): remove the out-of-band row with an admin connection \
+             — `DELETE FROM schema_version WHERE version > {supported};` — so `MAX(version)` \
+             reads a real value again, then restart the fleet. New out-of-band writes are \
+             rejected at the boundary by the `schema_version` CHECK once this database has \
+             migrated."
+        )
+    } else {
+        format!(
+            "To repair: `ai-memory doctor --repair-schema-version <N>` restamps this database to \
+             version <N> (SNAPSHOT-FIRST — it writes a sibling backup before touching the \
+             stamp), where <N> is the version this database was last migrated to (at most \
+             {supported}, the tip this binary understands)."
+        )
+    };
+    format!(
+        "database schema stamp is POISONED: {target} ({backend}) records schema version \
+         {observed}, which is ABOVE the maximum any real migration ladder can reach \
+         (v{max}). No ai-memory binary ever wrote this — it is a fabricated / corrupted \
+         `schema_version` value (an unconstrained integer let one be written), NOT a database \
+         from a newer binary, so \"run a newer binary\" and \"restore a pre-upgrade snapshot\" \
+         cannot recover it. Refusing to operate it — treating it as a downgrade would replay \
+         nothing and leave every daemon reading this ledger locked out. Reads still work: \
+         `ai-memory backup` continues to operate against this database, so snapshot it before \
+         doing anything else. {remediation} On postgres this schema is SHARED by every daemon \
+         on the cluster (#2555)."
+    )
+}
+
+/// v1.0.0 #2555 — refuse a POISONED stamp (`observed > MAX_SCHEMA_VERSION`)
+/// with a typed error distinct from the #2445 downgrade DENY.
+///
+/// Called at every schema funnel immediately before [`evaluate`]: a stamp
+/// beyond the ceiling is a poisoned ledger, not a legitimate downgrade, so it
+/// must NOT be handed to [`evaluate`] (which would classify it as a downgrade
+/// and offer the "run a newer binary" / operator-hatch remediations that
+/// cannot recover a fabricated version). The hatch is deliberately NOT
+/// consulted here — an impossible version is not a database any binary can
+/// operate, and honouring a hatch would "leave the poisoned stamp forever"
+/// (the exact defect #2555 closes) instead of routing to the repair verb.
+///
+/// # Errors
+///
+/// [`SchemaVersionPoisoned`] when `observed > MAX_SCHEMA_VERSION`.
+pub fn assert_schema_not_poisoned(
+    observed: i64,
+    backend: &'static str,
+    target: &str,
+) -> Result<(), SchemaVersionPoisoned> {
+    if observed > crate::storage::migrations::MAX_SCHEMA_VERSION {
+        let refusal = SchemaVersionPoisoned::new(observed, backend, target);
+        tracing::warn!(
+            target: TRACE_TARGET,
+            observed,
+            max = refusal.max,
+            backend,
+            target,
+            "schema-version guard REFUSED an open — the recorded schema version is above the \
+             maximum any real migration ladder can reach (a poisoned ledger)"
+        );
+        return Err(refusal);
+    }
+    Ok(())
+}
+
+/// v1.0.0 #2555 — recover the poisoned-ledger verdict from an `anyhow` chain,
+/// the [`schema_ahead_of`] / [`schema_stamp_zeroed`] twin, so `boot` / `doctor`
+/// / `backup` report the poison by name (and point at the repair verb) instead
+/// of dying with an opaque open failure.
+#[must_use]
+pub fn schema_version_poisoned(err: &anyhow::Error) -> Option<&SchemaVersionPoisoned> {
+    err.downcast_ref::<SchemaVersionPoisoned>()
+}
+
 /// Shared serialisation for tests that mutate [`ENV_ALLOW_SCHEMA_AHEAD`] —
 /// process-wide state, so every in-crate test that touches it must take the
 /// SAME lock or the mutations race.

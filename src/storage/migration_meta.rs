@@ -3,7 +3,7 @@
 
 //! ARCH-8 (FX-C4-batch2, 2026-05-26) — per-migration metadata matrix.
 //!
-//! The substrate ships a 90-step migration ladder (v2 → v91) whose
+//! The substrate ships a 91-step migration ladder (v2 → v92) whose
 //! "reversible? data-loss-risk? idempotent?" contract an operator needs
 //! BEFORE they plan a rollback — restore-from-backup is the only
 //! fallback for an irreversible arm, and they must know which arms
@@ -384,6 +384,14 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // MUST equal CURRENT_SCHEMA_VERSION. Postgres twin is
     // `PostgresStore::migrate_v91`.
     meta(91, "ARCHIVED_MEMORY_LINKS_CID_PARITY", true, true, NoLoss, Sqlite),
+    // v92 (#2555, v1.0.0) — SCHEMA_VERSION BOUND. Adds the
+    // `version <= MAX_SCHEMA_VERSION` upper CHECK so an unconstrained
+    // fleet kill-switch write (`INSERT ... VALUES (2147483647)`) is rejected at
+    // the boundary. SQLite: full-table rebuild (no indexes/triggers → lossless,
+    // idempotent — applied only when the CHECK is absent). Literal tail: MUST
+    // equal CURRENT_SCHEMA_VERSION. Postgres twin is
+    // `PostgresStore::migrate_v92` (ADD CONSTRAINT).
+    meta(92, "SCHEMA_VERSION_BOUND", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

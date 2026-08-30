@@ -45,9 +45,16 @@ $$;
 -- Idempotent: if the table exists, the migration runner skips schema
 -- setup steps already applied.
 -- ─────────────────────────────────────────────────────────────────────
+-- v1.0.0 #2555 — the `version <= 100000` CHECK bounds the stamp so an
+-- unconstrained fleet kill-switch write (`INSERT ... VALUES (2147483647)`) by
+-- any co-tenant with DML on this SHARED cluster is rejected at the boundary.
+-- The literal MUST equal `MAX_SCHEMA_VERSION`. UPPER-BOUND ONLY on purpose:
+-- the low end (0 / negative / deleted) is #2564's read-time domain. Existing
+-- clusters are retrofitted by `PostgresStore::migrate_v92` (ADD CONSTRAINT).
 CREATE TABLE IF NOT EXISTS schema_version (
     version    INTEGER PRIMARY KEY,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT schema_version_bounded CHECK (version <= 100000)
 );
 
 -- ─────────────────────────────────────────────────────────────────────

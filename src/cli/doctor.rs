@@ -58,6 +58,10 @@ use std::time::Duration;
 /// #3166 — the resolved `config.toml` path, reported by both the `--hooks`
 /// JSON payload and the `Configuration` report section. One name, one spelling.
 const FACT_CONFIG_PATH: &str = "config_path";
+/// #2555 — schema-refusal fact labels, shared by the schema-ahead / zeroed /
+/// poisoned Storage-Critical arms so the three refusals report one spelling.
+const FACT_DB_SCHEMA: &str = "db_schema";
+const FACT_BINARY_SUPPORTS_SCHEMA: &str = "binary_supports_schema";
 const FACT_DIM_VIOLATIONS: &str = "dim_violations";
 
 /// v1.0.0 (#3113) — `doctor` fact naming the core-relation integrity state
@@ -784,6 +788,168 @@ pub fn run_posture(name: &str, json: bool, out: &mut CliOutput<'_>) -> Result<i3
     Ok(if overall_pass { 0 } else { 2 })
 }
 
+/// v1.0.0 #2555 — `ai-memory doctor --repair-schema-version <N>`, the
+/// operator-gated, SNAPSHOT-FIRST recovery the #2445 schema-ahead DENY lacks.
+///
+/// A poisoned `schema_version` ledger (a stamp above
+/// [`crate::storage::migrations::MAX_SCHEMA_VERSION`] — the unconstrained-
+/// integer kill-switch #2555 closes going forward with a CHECK) locks every
+/// daemon out with no in-product recovery: the DENY's remediations ("run the
+/// binary that wrote this" / "restore a snapshot") cannot recover a FABRICATED
+/// version. This verb restamps the ledger to a correct, in-band value.
+///
+/// It is the ONE doctor path that writes the database, a deliberate exception
+/// to this module's read-only rule, and it is gated three ways:
+/// * OPERATOR-GATED — a local CLI verb (no HTTP/MCP surface) run by an operator
+///   who already holds filesystem access to the database.
+/// * SNAPSHOT-FIRST — a sibling `VACUUM INTO` backup is written BEFORE the
+///   stamp is touched; a snapshot failure REFUSES the repair (never restamp
+///   without a recoverable copy).
+/// * POSTGRES-REFUSED — on a served postgres store it refuses via
+///   [`crate::cli::backup::refuse_pg_store`] (#2572: the CLI never writes the
+///   served store, so restamping the local sqlite sidecar would be a phantom
+///   write). The postgres recovery is the admin `DELETE` the poison message
+///   names.
+///
+/// Opens through [`db::open_unmigrated`] (no guard, no ladder) so a database
+/// the ordinary [`db::open`] refuses can still be restamped.
+///
+/// Exit codes: `0` on a successful restamp; `2` on a bad target, a missing
+/// database, or a postgres store.
+///
+/// # Errors
+///
+/// Returns `Err` when the database cannot be opened, the snapshot cannot be
+/// written, or the restamp write fails — never after a partial restamp (the
+/// two statements run in one `IMMEDIATE` transaction).
+pub fn run_repair_schema_version(
+    db_path: &Path,
+    target: i64,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    const VERB: &str = "doctor --repair-schema-version";
+
+    // #2572 — refuse a served postgres store rather than phantom-restamp the
+    // local sqlite sidecar. Returns the resolved sqlite path otherwise.
+    let resolved = crate::cli::backup::refuse_pg_store(db_path, VERB, out)?;
+
+    let supported = crate::storage::migrations::current_schema_version();
+    // Validate the target: an operator restamps to the version the database was
+    // LAST MIGRATED TO, which is a real in-band version and cannot exceed this
+    // binary's tip (a higher value would just re-arm the schema-ahead DENY).
+    // Refuse anything else rather than write a fresh bad stamp.
+    if !(1..=supported).contains(&target) {
+        writeln!(
+            out.stderr,
+            "ai-memory {VERB}: target {target} is out of range — it must be between 1 and \
+             {supported} (the schema this binary understands). Restamp to the version this \
+             database was last migrated to."
+        )?;
+        return Ok(2);
+    }
+
+    if !resolved.exists() {
+        writeln!(
+            out.stderr,
+            "ai-memory {VERB}: no database at {}",
+            resolved.display()
+        )?;
+        return Ok(2);
+    }
+
+    let mut conn =
+        db::open_unmigrated(&resolved).context("open database for schema-version repair")?;
+
+    let observed: i64 = conn
+        .query_row(
+            crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
+            [],
+            |r| r.get(0),
+        )
+        .context("read current schema_version")?;
+
+    // SNAPSHOT-FIRST — a sibling backup BEFORE any mutation. A failure here
+    // REFUSES the repair; the `?` propagates it so the stamp is never touched
+    // without a recoverable copy.
+    let snapshot = snapshot_before_repair(&conn, &resolved, observed, target)
+        .context("snapshot-first backup before restamping schema_version")?;
+
+    // Restamp atomically: DELETE the (poisoned) rows, INSERT the correct
+    // version, in ONE transaction so a mid-failure leaves the ledger exactly as
+    // found.
+    {
+        let tx = conn
+            .transaction()
+            .context("begin schema-version restamp transaction")?;
+        tx.execute("DELETE FROM schema_version", [])
+            .context("clear schema_version")?;
+        tx.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            rusqlite::params![target],
+        )
+        .context("write the repaired schema_version")?;
+        tx.commit().context("commit schema-version restamp")?;
+    }
+
+    writeln!(
+        out.stdout,
+        "ai-memory {VERB}: restamped {path}\n  observed schema_version: {observed}\n  \
+         repaired schema_version: {target}\n  snapshot: {snap}\n  next: run `ai-memory boot` \
+         (or `ai-memory doctor`) to confirm the database now opens; the next open applies the \
+         pending migration ladder.",
+        path = resolved.display(),
+        snap = snapshot.as_deref().map_or_else(
+            || "(in-memory — none)".to_string(),
+            |p| p.display().to_string()
+        ),
+    )?;
+    Ok(0)
+}
+
+/// v1.0.0 #2555 — write a `VACUUM INTO` sibling snapshot before a schema-version
+/// restamp. `None` when the connection has no on-disk file (an in-memory DB).
+///
+/// `VACUUM INTO` (not a raw file copy) produces a transactionally-consistent,
+/// openable image that folds in any pending WAL frames and inherits the
+/// source connection's SQLCipher keying — the same choice
+/// `snapshot_before_migration` makes.
+///
+/// # Errors
+///
+/// Propagates a `VACUUM INTO` failure so the caller REFUSES the restamp — a
+/// repair that could not be backed up must not proceed.
+fn snapshot_before_repair(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+    observed: i64,
+    target: i64,
+) -> Result<Option<PathBuf>> {
+    let file_name = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if file_name.is_empty() {
+        return Ok(None);
+    }
+    let parent = db_path.parent().map(PathBuf::from).unwrap_or_default();
+    let token = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let snapshot_name =
+        format!("{file_name}.pre-repair-schema-version-v{observed}-to-v{target}-{token}.sqlite");
+    let snapshot_path = parent.join(snapshot_name);
+    // Single-quote-escape the target for the SQL string literal (crate-derived
+    // path, but doubling quotes is the correct hygiene).
+    let escaped = snapshot_path.to_string_lossy().replace('\'', "''");
+    conn.execute(&format!("VACUUM INTO '{escaped}'"), [])
+        .with_context(|| {
+            format!(
+                "snapshot before schema-version restamp failed; refusing to touch the stamp \
+                 without a recoverable backup at {}",
+                snapshot_path.display()
+            )
+        })?;
+    Ok(Some(snapshot_path))
+}
+
 // ---------------------------------------------------------------------------
 // Local (--db) mode
 // ---------------------------------------------------------------------------
@@ -830,15 +996,28 @@ fn run_local(db_path: &Path) -> Report {
             // the exact moment it is needed.
             let ahead = crate::storage::schema_guard::schema_ahead_of(&e);
             let zeroed = crate::storage::schema_guard::schema_stamp_zeroed(&e);
+            // v1.0.0 #2555 — the POISONED-ledger refusal gets the same
+            // by-name treatment: it is the incident whose remedy differs most
+            // from the others (no binary wrote the observed version, so
+            // "upgrade" is a dead end — the repair verb is the recovery), so
+            // flattening it into "could not open database" would hide the one
+            // fact the operator needs.
+            let poisoned = crate::storage::schema_guard::schema_version_poisoned(&e);
             let mut facts = vec![("error".into(), e.to_string())];
             if let Some(a) = ahead {
-                facts.push(("db_schema".into(), a.observed.to_string()));
-                facts.push(("binary_supports_schema".into(), a.supported.to_string()));
+                facts.push((FACT_DB_SCHEMA.into(), a.observed.to_string()));
+                facts.push((FACT_BINARY_SUPPORTS_SCHEMA.into(), a.supported.to_string()));
             }
             if let Some(z) = zeroed {
-                facts.push(("db_schema".into(), z.observed.to_string()));
-                facts.push(("binary_supports_schema".into(), z.supported.to_string()));
+                facts.push((FACT_DB_SCHEMA.into(), z.observed.to_string()));
+                facts.push((FACT_BINARY_SUPPORTS_SCHEMA.into(), z.supported.to_string()));
                 facts.push(("schema_stamp".into(), "invalid".into()));
+            }
+            if let Some(p) = poisoned {
+                facts.push((FACT_DB_SCHEMA.into(), p.observed.to_string()));
+                facts.push(("max_schema_version".into(), p.max.to_string()));
+                facts.push((FACT_BINARY_SUPPORTS_SCHEMA.into(), p.supported.to_string()));
+                facts.push(("schema_stamp".into(), "poisoned".into()));
             }
             sections.push(section_identity_3147(None));
             sections.push(ReportSection {
@@ -861,6 +1040,16 @@ fn run_local(db_path: &Path) -> Report {
                          snapshot suppressed. Every other section is N/A. `ai-memory \
                          backup` still works against this database: snapshot it BEFORE \
                          repairing the `schema_version` row.",
+                        db_path.display()
+                    )
+                } else if poisoned.is_some() {
+                    format!(
+                        "database at {} records a POISONED schema version (above the \
+                         maximum any real migration ladder can reach) — refusing to \
+                         operate it. No ai-memory binary wrote this value, so upgrading \
+                         cannot fix it. Every other section is N/A. `ai-memory backup` \
+                         still works against this database: snapshot it, then restamp \
+                         with `ai-memory doctor --repair-schema-version <N>`.",
                         db_path.display()
                     )
                 } else {

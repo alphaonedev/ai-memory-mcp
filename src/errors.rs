@@ -125,6 +125,17 @@ pub mod error_codes {
     /// operator action is the opposite one ("your stamp row was destroyed",
     /// not "run a newer binary").
     pub const SCHEMA_STAMP_INVALID: &str = "SCHEMA_STAMP_INVALID";
+
+    /// v1.0.0 #2555 — this database's recorded `schema_version` is ABOVE the
+    /// maximum any real migration ladder can reach, i.e. a fabricated /
+    /// corrupted stamp (an unconstrained integer let one be written). The
+    /// substrate refuses to operate it rather than trip the schema-ahead DENY
+    /// on every daemon reading the (shared postgres) ledger with no in-product
+    /// recovery. Un-prefixed for the same reason as [`SCHEMA_AHEAD_OF_BINARY`]:
+    /// a deliberate refusal STATE shared across surfaces, not a backend fault.
+    /// A SEPARATE slug because the operator action differs ("restamp the
+    /// poisoned ledger", not "run a newer binary").
+    pub const SCHEMA_VERSION_POISONED: &str = "SCHEMA_VERSION_POISONED";
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +411,7 @@ mod arch_9_slug_tests {
             },
             StoreError::SchemaAheadOfBinary { detail: "d".into() },
             StoreError::SchemaStampInvalid { detail: "d".into() },
+            StoreError::SchemaVersionPoisoned { detail: "d".into() },
             StoreError::TraversalBudgetExceeded { detail: "d".into() },
             StoreError::Backend(BoxBackendError::new("boom")),
         ];
@@ -416,6 +428,7 @@ mod arch_9_slug_tests {
             RECORD_STOPPED,
             SCHEMA_AHEAD_OF_BINARY,
             SCHEMA_STAMP_INVALID,
+            SCHEMA_VERSION_POISONED,
             TRAVERSAL_BUDGET_EXCEEDED,
             DATABASE_ERROR,
         ];
