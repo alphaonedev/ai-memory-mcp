@@ -598,8 +598,8 @@ The G10.1 capability primitive (`Caveat::NamespacePrefix`, `op_level_of("Reflect
 → OpLevel::Read`) is the **intended** bridge, but recall does not consume it, and
 wiring it is neither a clean reuse nor fully specified:
 
-- **Not a reuse.** `apply_capability_grant` is a write-gate joiner that only flips
-  `Deny`/`Ask`→`Allow`; recall is Allow-by-default, with no `GovernedAction::Read`
+- **Not a reuse.** `apply_capability_grant` is a write-gate joiner that only lifts
+  `Ask`→`Allow` (a `Deny` is terminal, #3111); recall is Allow-by-default, with no `GovernedAction::Read`
   / `policy.core.read` and no gate call. A read-bridge must first *invent* a
   base-`Deny`-on-cross-namespace posture (a security-posture inversion), then
   thread a token through the recall chain (both SAL backends + MCP/HTTP/CLI

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (capability-token grant can NEVER override an operator Deny — #3111, GA-blocker)
+
+- **#3111 (security / operator-permission bypass, GA-blocker) — a
+  capability token could flip an EXPLICIT operator/rule-derived `Deny` to
+  `Allow`.** `apply_capability_grant` (the write-gate joiner behind
+  `apply_at_gate` / `enforce_governance`, on BOTH the sqlite and postgres
+  gates) treated a `Deny` base as flippable alongside `Ask`: a holder of a
+  valid delegated token whose caveat chain + issuer ceiling covered the
+  in-flight `(action, namespace)` tuple flipped the base to `Allow`. But
+  `verify` checks only the token's version / issuer / HMAC chain / caveats /
+  issuer ceiling — it NEVER consults the permission rules that produced the
+  `Deny` — so a delegated (possibly attenuated, AI-held) token silently
+  bypassed a standing operator refusal (e.g. a `[permissions]` "no writes to
+  `secrets/*`" rule, or an owner-policy namespace Deny). This violates the
+  mission-critical security pillar that operator permission rules can NEVER
+  be bypassed by AI agents. **Ruled FREEZE 20-0 (unanimous)** by the 3×7
+  adversarial GA panel. The fix makes an operator/rule-derived `Deny`
+  **terminal**: `apply_capability_grant` now short-circuits every non-`Ask`
+  base (a `Deny` or a `Modify`) to `GrantOutcome::NoOp` **before** `verify`
+  runs, so no code path from a `Deny` base can reach `Allow` — the property
+  is structural, not conditional. Only an `Ask`/`Pending` (a pending human
+  court) base remains liftable, which is the intended delegation model
+  (delegation-over-deny is not). Zero product-API change for compliant
+  flows; a token presented against a `Deny` is now inert (no grant, and no
+  new audit bytes). Live regressions cover the pure joiner, the wired sqlite
+  gate, the sqlite/postgres parity matrix, and the forensic-audit surface.
+  Files: `src/governance/capability.rs` (the joiner + its contract docs),
+  `tests/g10_capability_tokens.rs`, `src/config.rs` (the R9 default-on
+  additive test), `docs/CLI_REFERENCE.md`,
+  `docs/spec/TRACT-L1-CLAIM-CONTRACT.md`.
+
 ### Fixed (cross-backend parity — search/list/recall `since`/`until` compared by INSTANT on sqlite #3279)
 
 - **#3279 (correctness / backend divergence, GA-blocker) — the sqlite

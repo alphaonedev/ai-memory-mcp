@@ -81,7 +81,7 @@ never downgrades.
 | `--entity-id` | string | — | QW-2 persona binding; required with `--kind persona`. |
 | `--sign` | bool | `false` | **#626 Layer-3** — sign the write with the resolved agent's local Ed25519 keypair so the stored row is *attested* (`attest_level = "agent_attested"`) rather than merely *claimed*. Requires a `<agent_id>.priv` under the key directory (`AI_MEMORY_KEY_DIR` or the platform default) and a matching bound public key (`ai-memory agents bind-key`). Without `--sign`, the CLI `store` surface is **permissive by default** (operator-as-actor, #1985) — an unsigned write lands *claimed*, not rejected. It is rejected only when the operator has forced strict enforcement via `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` (or `=true`); see the env-var table above for the full surface-scoped default. |
 | `--write-v2` | path | — | v1.0.0 crypto-core (#1942/#1941) — path to a JSON `write_v2` presentation envelope (certified sub-key signature over the v2 CBOR-array pre-image). Takes precedence over `--sign`; on success stamps `agent_attested`. An invalid/forged envelope is REJECTED. See `docs/attestation.md` §"v2". |
-| `--capability` | string | — | v0.9.0 G10.1 (#1827) — macaroon capability token (`cap1:...`) that may flip a governance Deny/Pending to Allow within its caveats. Inert unless `[capabilities].enabled`. |
+| `--capability` | string | — | v0.9.0 G10.1 (#1827) — macaroon capability token (`cap1:...`) that may lift a governance `Pending` (human court) to Allow within its caveats. An explicit operator/rule-derived `Deny` is terminal and is never token-flippable (#3111). Inert unless `[capabilities].enabled`. |
 
 ```bash
 ai-memory store --title "Q2 roadmap" \
@@ -1313,8 +1313,10 @@ this document claims to track. Each maps 1:1 to a `Command` variant in
 
 Stateless bearer grants consumed by the governance gates. A valid token
 whose caveat chain and issuer ceiling cover the in-flight
-`(action, namespace)` flips an otherwise-`Deny`/`Ask` coarse-gate
-decision to `Allow` — **attenuation-only widening**, never escalation.
+`(action, namespace)` lifts an otherwise-`Ask`/`Pending` (human-court)
+coarse-gate decision to `Allow` — **attenuation-only widening**, never
+escalation. An explicit operator/rule-derived `Deny` is terminal and is
+never token-flippable (#3111).
 Tokens are presented via the MCP `capability` param, the
 `X-AI-Memory-Capability` HTTP header, or `--capability` / `--capability-file`
 on governed CLI verbs (`store`, `delete`, `promote`). A caller that presents
