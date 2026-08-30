@@ -19,7 +19,7 @@
 <meta name="description" content="ai-memory v0.8.0 (distributed-coordination) makes the substrate multi-agent: a typed action DAG, single-holder TTL leases, Ed25519-signed inter-agent signals, attested checkpoints, and replayable routines (Pillar-1 #1709); Goal/Plan/Step typed cognition with a lifecycle_state machine and three new link relations (Pillar-2); federation hardened secure-by-default (peer enrollment #1789, per-transition signatures #1718, per-write content attestation #1464, replay nonces #1805, peer-cert pinning #1678); a Claude Code PreToolUse governance hook that actually BLOCKS a refused action (#1811) plus mandatory-hook-presence enforcement (#1734). Schema v57 → v70, 100 MCP tools at --profile full / 7 core, 9 typed link relations, 27-field Memory. SQLite and PostgreSQL+AGE, identical API.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/whats-new-v08.html">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#2ea043;--warn:#ffb86b;--bad:#f85149;--prog:#c8a2ff;--accent:#6ee7ff;--green:#2ea043;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1200px}
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#2ea043;--warn:#ffb86b;--bad:#f85149;--prog:#c8a2ff;--accent:#b07d10;--green:#2ea043;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1200px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
@@ -37,7 +37,7 @@ p{color:var(--text-muted);margin-bottom:1rem}
 .topnav a{color:var(--text-muted);margin-right:1.25rem}
 .topnav a:hover,.topnav a.active{color:var(--text)}
 .topnav .home-link{color:var(--text);font-weight:600}
-.hero{padding:6rem 1.5rem 4rem;text-align:center;background:radial-gradient(ellipse at center,rgba(110,231,255,0.08),transparent 60%),radial-gradient(ellipse at bottom,rgba(200,162,255,0.06),transparent 70%);border-bottom:1px solid var(--border)}
+.hero{padding:6rem 1.5rem 4rem;text-align:center;background:radial-gradient(ellipse at center,rgba(176,125,16,0.08),transparent 60%),radial-gradient(ellipse at bottom,rgba(200,162,255,0.06),transparent 70%);border-bottom:1px solid var(--border)}
 .hero .badge{display:inline-block;padding:.4rem 1rem;background:rgba(200,162,255,0.1);border:1px solid var(--p3);color:var(--p3);border-radius:999px;font-family:var(--font-mono);font-size:.85rem;margin-bottom:1.5rem}
 .hero .subtitle{font-size:1.2rem;color:var(--text-muted);max-width:760px;margin:0 auto 2rem}
 .hero .meta{display:flex;justify-content:center;gap:2rem;color:var(--text-dim);font-family:var(--font-mono);font-size:.85rem;flex-wrap:wrap}
@@ -60,7 +60,7 @@ section{padding:5rem 0;border-bottom:1px solid var(--border)}
 table{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.92rem}
 th,td{text-align:left;padding:.65rem .85rem;border-bottom:1px solid var(--border);color:var(--text-muted)}
 th{color:#fff;font-weight:600;background:var(--bg-elev);font-size:.85rem}
-tr:hover{background:rgba(110,231,255,0.03)}
+tr:hover{background:rgba(176,125,16,0.03)}
 ul.checked{list-style:none;padding-left:0}
 ul.checked li{padding-left:1.5rem;position:relative;margin:.35rem 0;color:var(--text-muted);font-size:.92rem}
 ul.checked li::before{content:"✓";position:absolute;left:0;color:var(--good);font-weight:800}
@@ -103,6 +103,7 @@ footer .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wr
 footer a{color:var(--text-dim)}
 footer a:hover{color:var(--accent)}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 

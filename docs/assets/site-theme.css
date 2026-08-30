@@ -1,0 +1,54 @@
+/* ai-memory docs — shared site theme.
+   Copyright 2026 AlphaOne LLC · SPDX-License-Identifier: Apache-2.0
+   Overrides the chrome palette + fonts of every doc page to match the
+   landing page (main:/docs/index.html). Linked LAST in each page's <head>
+   so it wins the cascade. Pages are var(--bg)/var(--text)/var(--font-sans)
+   driven, so redefining those tokens reskins the page. Semantic/diagram
+   colors (--p2/--p3/--pillar-*/vendor hues/etc.) are intentionally left
+   to each page. */
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
+
+:root{
+  /* backgrounds */
+  --bg:#f4f0e8; --bg2:#ebe4d6; --bg-raised:#efe9dc; --bg-card:#fcf9f3; --bg-elev:#fcf9f3;
+  --panel:#fcf9f3; --raise:#f8f4ec; --bg-code:#efe9dc; --code-bg:#efe9dc;
+  /* text */
+  --text:#1a1712; --ink:#1a1712; --ink-mid:#544b3d; --ink-soft:#7a7161;
+  --text-muted:#6f6656; --muted:#6f6656; --text-dim:#8a8272; --dim:#8a8272;
+  /* borders */
+  --border:#ddd4c2; --border-hi:#c9bfa8; --border-hl:#c9bfa8; --line:#ddd4c2; --line-soft:#e9e2d4;
+  /* primary accent (brand) — amber */
+  --accent:#b07d10; --accent-ink:#6e4f0f; --accent-soft:#f2e8cf; --accent-deep:#8a6314;
+  --on-accent:#211a0a; --cyan:#b07d10; --accent-cyan:#b07d10; --p1:#b07d10;
+  /* fonts */
+  --font-sans:'IBM Plex Sans',system-ui,-apple-system,sans-serif;
+  --sans:'IBM Plex Sans',system-ui,-apple-system,sans-serif;
+  --font-mono:'IBM Plex Mono',ui-monospace,"SF Mono",monospace;
+  --mono:'IBM Plex Mono',ui-monospace,"SF Mono",monospace;
+  --disp:'Archivo',system-ui,sans-serif;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0c0b08; --bg2:#120f0a; --bg-raised:#15130e; --bg-card:#15130e; --bg-elev:#191610;
+  --panel:#15130e; --raise:#191610; --bg-code:#1e1b13; --code-bg:#1e1b13;
+  --text:#f3eee3; --ink:#f3eee3; --ink-mid:#bdb2a0; --ink-soft:#988f7f;
+  --text-muted:#988f7f; --muted:#988f7f; --text-dim:#8a8272; --dim:#8a8272;
+  --border:#2a2619; --border-hi:#3a3524; --border-hl:#3a3524; --line:#2a2619; --line-soft:#1f1c13;
+  --accent:#e3ad33; --accent-ink:#f2c968; --accent-soft:#241c0c; --accent-deep:#caa02a;
+  --on-accent:#1a1207; --cyan:#e3ad33; --accent-cyan:#e3ad33; --p1:#e3ad33;
+}}
+:root[data-theme="dark"]{
+  --bg:#0c0b08; --bg2:#120f0a; --bg-raised:#15130e; --bg-card:#15130e; --bg-elev:#191610;
+  --panel:#15130e; --raise:#191610; --bg-code:#1e1b13; --code-bg:#1e1b13;
+  --text:#f3eee3; --ink:#f3eee3; --ink-mid:#bdb2a0; --ink-soft:#988f7f;
+  --text-muted:#988f7f; --muted:#988f7f; --text-dim:#8a8272; --dim:#8a8272;
+  --border:#2a2619; --border-hi:#3a3524; --border-hl:#3a3524; --line:#2a2619; --line-soft:#1f1c13;
+  --accent:#e3ad33; --accent-ink:#f2c968; --accent-soft:#241c0c; --accent-deep:#caa02a;
+  --on-accent:#1a1207; --cyan:#e3ad33; --accent-cyan:#e3ad33; --p1:#e3ad33;
+}
+
+/* base element enforcement (beats inline <style> loaded earlier in <head>) */
+html,body{background:var(--bg);color:var(--text);font-family:var(--font-sans)}
+h1,h2,h3,h4,h5,h6{font-family:var(--disp)}
+a{color:var(--accent-ink)}
+code,pre,kbd,samp,tt{font-family:var(--font-mono)}
+::selection{background:var(--accent-soft);color:var(--accent-ink)}

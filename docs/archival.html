@@ -12,7 +12,7 @@
 <meta name="description" content="ai-memory v0.9.0 archival surface. memory_archive_list/restore/purge/stats, memory_forget patterns, archive_on_gc soft-delete, auto_purge_archive retention. Two-stage retention model: archive then purge.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/archival.html">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
@@ -95,6 +95,7 @@ footer a{color:var(--text-muted)}
 .topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
 @media(max-width:800px){.topnav .mnav{display:block}}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -102,7 +103,7 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Archival</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
       <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
@@ -264,7 +265,7 @@ footer a{color:var(--text-muted)}
     <svg class="flow-svg" viewBox="0 0 1180 360" xmlns="http://www.w3.org/2000/svg">
       <style>
         .b{stroke-width:1.8;rx:10;ry:10}
-        .b.live{fill:rgba(110,231,255,0.15);stroke:#6ee7ff}
+        .b.live{fill:rgba(176,125,16,0.15);stroke:#b07d10}
         .b.arch{fill:rgba(255,184,107,0.15);stroke:#ffb86b}
         .b.gone{fill:rgba(255,107,157,0.1);stroke:#ff6b9d}
         .ll{stroke:#999;stroke-width:1.5;fill:none;marker-end:url(#arr3)}

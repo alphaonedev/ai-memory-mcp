@@ -13,11 +13,11 @@
 <meta name="description" content="API embeddings on commodity CPU + memory nodes — no GPU, no Ollama, full semantic/autonomous tier. The #1598 reference shape for enterprise federated ai-memory deployments.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reference-architecture/enterprise-cpu-memory.html">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
 /* three-leg accents (centerpiece) */
---leg1:#6ee7ff;--leg2:#c8a2ff;--leg3:#ffb86b;
+--leg1:#b07d10;--leg2:#c8a2ff;--leg3:#ffb86b;
 /* three regions */
---rg-nyc:#6ee7ff;--rg-fra:#c8a2ff;--rg-sgp:#ffb86b;
+--rg-nyc:#b07d10;--rg-fra:#c8a2ff;--rg-sgp:#ffb86b;
 --font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
@@ -123,7 +123,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 @keyframes march{to{stroke-dashoffset:-32}}
 @keyframes pulse-glow{0%,100%{opacity:.55}50%{opacity:1}}
 @keyframes shimmer{0%,100%{stroke-opacity:.35}50%{stroke-opacity:.9}}
-@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px rgba(110,231,255,0.25))}50%{filter:drop-shadow(0 0 7px rgba(110,231,255,0.55))}}
+@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px rgba(176,125,16,0.25))}50%{filter:drop-shadow(0 0 7px rgba(176,125,16,0.55))}}
 @keyframes shield-flicker{0%,100%{opacity:.85}50%{opacity:1}}
 
 .flow{stroke-width:2.4;fill:none;stroke-linecap:round;stroke-dasharray:9 7}
@@ -168,6 +168,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 .hero.doc h1{font-size:clamp(1.7rem,3.6vw,2.6rem);text-align:left;margin-bottom:.5rem}
 .hero.doc .tagline{margin:0;text-align:left;max-width:62rem}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -175,8 +176,8 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
   <div class="inner">
     <a class="home-link" href="../">ai-memory <span style="opacity:.5">▸ Reference Architecture</span></a>
     <div class="right">
-      <a href="../at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="../whats-new-v09.html" style="color:#6ee7ff">v0.9.0</a>
+      <a href="../at-a-glance.html" style="color:#b07d10">Atlas</a>
+      <a href="../whats-new-v09.html" style="color:#b07d10">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
         <div class="menu-pane">

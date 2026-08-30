@@ -12,7 +12,7 @@
 <meta name="description" content="ai-memory v0.9.0 knowledge graph. memory_links with 9 relations (related_to, supersedes, contradicts, derived_from, reflects_on, derives_from, decomposes_into, depends_on, advances), entity registry, temporal validity columns, memory_kg_query + memory_kg_timeline + memory_kg_invalidate + memory_find_paths. The structured-cognition layer that v0.6.3 Streams B+C unlocked, v0.7.0 extended with recursive-learning + atomisation provenance, and v0.8.0 completed with the Pillar-2 typed-cognition relations.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/knowledge-graph.html">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
@@ -98,6 +98,7 @@ footer a{color:var(--text-muted)}
 .topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
 @media(max-width:800px){.topnav .mnav{display:block}}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -105,7 +106,7 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Knowledge Graph</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
       <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
@@ -269,12 +270,12 @@ footer a{color:var(--text-muted)}
     <svg class="kg-svg" viewBox="0 0 1180 420" xmlns="http://www.w3.org/2000/svg">
       <style>
         .nb{stroke-width:2;rx:8;ry:8}
-        .nb.m{fill:#0a0a0a;stroke:#6ee7ff}
+        .nb.m{fill:#0a0a0a;stroke:#b07d10}
         .nb.e{fill:rgba(255,184,107,0.12);stroke:#ffb86b}
         .nb.s{fill:rgba(255,107,157,0.10);stroke:#ff6b9d}
         .ll{stroke-width:1.8;fill:none}
         .ll.r1{stroke:#999;stroke-dasharray:none}
-        .ll.r2{stroke:#6ee7ff}
+        .ll.r2{stroke:#b07d10}
         .ll.r3{stroke:#ff6b9d}
         .ll.r4{stroke:#c8a2ff;stroke-dasharray:4 4}
         .h{fill:#fff;font-family:monospace;font-size:11px;font-weight:700}
@@ -283,7 +284,7 @@ footer a{color:var(--text-muted)}
       </style>
       <defs>
         <marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#999"/></marker>
-        <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6ee7ff"/></marker>
+        <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b07d10"/></marker>
         <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#ff6b9d"/></marker>
         <marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#c8a2ff"/></marker>
       </defs>
@@ -327,7 +328,7 @@ footer a{color:var(--text-muted)}
       <text class="lab" x="305" y="73" text-anchor="middle">related_to</text>
 
       <line class="ll r2" x1="560" y1="80" x2="698" y2="80" marker-end="url(#ar2)"/>
-      <text class="lab" x="625" y="73" text-anchor="middle" fill="#6ee7ff">supersedes</text>
+      <text class="lab" x="625" y="73" text-anchor="middle" fill="#b07d10">supersedes</text>
 
       <line class="ll r4" x1="470" y1="110" x2="790" y2="200" marker-end="url(#ar4)"/>
       <text class="lab" x="630" y="155" text-anchor="middle" fill="#c8a2ff">derived_from</text>

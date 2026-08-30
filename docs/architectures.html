@@ -14,7 +14,7 @@
 <meta property="og:description" content="Five reference architectures for ai-memory — from one agent to a global hive.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures.html">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
@@ -28,7 +28,7 @@ p{color:var(--text-muted)}
 .topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
 .topnav .home-link{color:var(--text);font-weight:600}
 .topnav .right{display:flex;gap:1.25rem;flex-wrap:wrap}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(110,231,255,0.08),transparent 60%);border-bottom:1px solid var(--border)}
+.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(176,125,16,0.08),transparent 60%);border-bottom:1px solid var(--border)}
 .hero h1{font-size:clamp(2rem,4.5vw,3.25rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
 .hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin:0 auto 1rem}
 .hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
@@ -55,7 +55,7 @@ footer a{color:var(--text-muted)}
 
 /* capability badges */
 .cap-badge{display:inline-block;padding:.15em .55em;font-family:var(--font-mono);font-size:.7rem;font-weight:600;border-radius:4px;border:1px solid;letter-spacing:.04em;margin:.1em .15em}
-.cap-today{color:#6ee7ff;border-color:#2a6571;background:rgba(110,231,255,.08)}
+.cap-today{color:#b07d10;border-color:#2a6571;background:rgba(176,125,16,.08)}
 .cap-roadmap{color:#c8a2ff;border-color:#5a4280;background:rgba(200,162,255,.08)}
 .cap-partial{color:#ffb86b;border-color:#7a5328;background:rgba(255,184,107,.08)}
 .cap-future{color:#ff6b9d;border-color:#7a3251;background:rgba(255,107,157,.08)}
@@ -79,7 +79,7 @@ footer a{color:var(--text-muted)}
 .tier-matrix tr:hover td{background:var(--bg-elev)}
 
 /* honesty notice */
-.honesty-notice{background:rgba(110,231,255,.05);border:1px solid #2a6571;border-left:4px solid var(--p1);border-radius:8px;padding:1.1rem 1.25rem;margin:2rem 0;color:var(--text-muted);font-size:.9rem;line-height:1.6}
+.honesty-notice{background:rgba(176,125,16,.05);border:1px solid #2a6571;border-left:4px solid var(--p1);border-radius:8px;padding:1.1rem 1.25rem;margin:2rem 0;color:var(--text-muted);font-size:.9rem;line-height:1.6}
 .honesty-notice strong{color:var(--p1);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.05em}
 
 ul,ol{padding-left:1.5rem;color:var(--text-muted);font-size:.92rem;margin:.5rem 0 1rem}
@@ -98,6 +98,7 @@ section p{margin-bottom:.85rem}
 .topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
 @media(max-width:800px){.topnav .mnav{display:block}}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -105,7 +106,7 @@ section p{margin-bottom:.85rem}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
       <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>

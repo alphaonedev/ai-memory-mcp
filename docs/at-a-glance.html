@@ -53,12 +53,12 @@
   --accent:       #ffffff;
 
   /* Three-pillar accents (used for the v0.6.3 grand-slam) */
-  --pillar-1:     #6ee7ff;  /* cyan — hierarchy */
+  --pillar-1:     #b07d10;  /* cyan — hierarchy */
   --pillar-2:     #ffb86b;  /* orange — knowledge graph */
   --pillar-3:     #c8a2ff;  /* purple — performance */
 
   /* Quantitative palette */
-  --good:         #6ee7ff;
+  --good:         #b07d10;
   --warn:         #ffb86b;
   --bad:          #ff6b9d;
 
@@ -141,7 +141,7 @@ section .eyebrow {
   border: 1px solid var(--border-hl);
   border-radius: 999px;
 }
-section .eyebrow.p1 { color: var(--pillar-1); border-color: rgba(110,231,255,.4); }
+section .eyebrow.p1 { color: var(--pillar-1); border-color: rgba(176,125,16,.4); }
 section .eyebrow.p2 { color: var(--pillar-2); border-color: rgba(255,184,107,.4); }
 section .eyebrow.p3 { color: var(--pillar-3); border-color: rgba(200,162,255,.4); }
 section .lede {
@@ -162,7 +162,7 @@ section .lede {
   justify-content: center;
   text-align: center;
   padding: 6rem 1.5rem 4rem;
-  background: radial-gradient(ellipse at top, rgba(110,231,255,0.04), transparent 50%),
+  background: radial-gradient(ellipse at top, rgba(176,125,16,0.04), transparent 50%),
               radial-gradient(ellipse at bottom, rgba(200,162,255,0.05), transparent 60%);
   border-bottom: 1px solid var(--border);
   overflow: hidden;
@@ -511,8 +511,8 @@ section .lede {
   color: #ffb0c8;
 }
 .persona .persona-fix {
-  background: rgba(110,231,255,0.07);
-  border: 1px solid rgba(110,231,255,0.2);
+  background: rgba(176,125,16,0.07);
+  border: 1px solid rgba(176,125,16,0.2);
   border-radius: 8px;
   padding: .65rem .85rem;
   font-size: .85rem;
@@ -619,7 +619,7 @@ section .lede {
 }
 .compare-matrix th.spec { text-align: left; }
 .compare-matrix td.spec { text-align: left; color: var(--text-muted); }
-.compare-matrix td.aim { background: rgba(110,231,255,0.04); border-left: 1px solid rgba(110,231,255,0.2); border-right: 1px solid rgba(110,231,255,0.2); }
+.compare-matrix td.aim { background: rgba(176,125,16,0.04); border-left: 1px solid rgba(176,125,16,0.2); border-right: 1px solid rgba(176,125,16,0.2); }
 .compare-matrix tbody tr:hover { background: var(--bg-raised); }
 .tick     { color: var(--good); font-weight: 700; font-size: 1.1rem; }
 .cross    { color: var(--bad); font-weight: 700; font-size: 1.1rem; }
@@ -662,7 +662,7 @@ section .lede {
 .trust-step .step-title { font-size: 1rem; font-weight: 700; margin-bottom: .35rem; margin-top: .25rem; }
 .trust-step .step-tier  { font-family: var(--font-mono); font-size: .7rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: .1em; }
 .trust-step .step-desc  { font-size: .85rem; color: var(--text-muted); margin-top: .5rem; line-height: 1.5; }
-.trust-step.shipped { border-color: rgba(110,231,255,0.4); }
+.trust-step.shipped { border-color: rgba(176,125,16,0.4); }
 .trust-step.shipped .step-num { background: var(--pillar-1); color: var(--bg); border-color: var(--pillar-1); }
 .trust-step.next { border-color: rgba(255,184,107,0.4); }
 .trust-step.next .step-num { background: var(--pillar-2); color: var(--bg); border-color: var(--pillar-2); }
@@ -696,7 +696,7 @@ section .lede {
 .cta-section {
   text-align: center;
   padding: 6rem 1.5rem;
-  background: radial-gradient(ellipse at center, rgba(110,231,255,0.04), transparent 60%);
+  background: radial-gradient(ellipse at center, rgba(176,125,16,0.04), transparent 60%);
 }
 .cta-section h2 { font-size: clamp(2rem, 4vw, 3rem); margin-bottom: 1rem; }
 .cta-section p  { max-width: 640px; margin: 0 auto 2rem; }
@@ -751,6 +751,7 @@ footer.site-foot a { color: var(--text-muted); }
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -761,7 +762,7 @@ footer.site-foot a { color: var(--text-muted); }
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ At a Glance</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
       <a href="whats-new-v09.html" style="color:#c8a2ff">v0.9.0</a>
       <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
@@ -869,9 +870,9 @@ footer.site-foot a { color: var(--text-muted); }
 
     <!-- The three pillar nodes -->
     <g>
-      <circle class="node-pulse" cx="180" cy="140" r="6" fill="#6ee7ff"/>
-      <circle cx="180" cy="140" r="40" fill="none" stroke="#6ee7ff" stroke-opacity="0.25" stroke-width="1"/>
-      <text x="180" y="210" fill="#6ee7ff" font-family="monospace" font-size="13" text-anchor="middle">HIERARCHY</text>
+      <circle class="node-pulse" cx="180" cy="140" r="6" fill="#b07d10"/>
+      <circle cx="180" cy="140" r="40" fill="none" stroke="#b07d10" stroke-opacity="0.25" stroke-width="1"/>
+      <text x="180" y="210" fill="#b07d10" font-family="monospace" font-size="13" text-anchor="middle">HIERARCHY</text>
       <text x="180" y="225" fill="#999" font-size="10" text-anchor="middle">tree of namespaces</text>
     </g>
     <g>
@@ -888,7 +889,7 @@ footer.site-foot a { color: var(--text-muted); }
     </g>
 
     <!-- Connecting links -->
-    <path class="link" d="M 220 140 Q 270 100 320 140" stroke="#6ee7ff" stroke-opacity="0.5" fill="none" stroke-width="1.5"/>
+    <path class="link" d="M 220 140 Q 270 100 320 140" stroke="#b07d10" stroke-opacity="0.5" fill="none" stroke-width="1.5"/>
     <path class="link" d="M 400 140 Q 450 100 500 140" stroke="#ffb86b" stroke-opacity="0.5" fill="none" stroke-width="1.5"/>
     <path class="link" d="M 220 140 Q 360 50 500 140" stroke="#c8a2ff" stroke-opacity="0.3" fill="none" stroke-width="1.5"/>
 
@@ -985,7 +986,7 @@ footer.site-foot a { color: var(--text-muted); }
     <div class="arch-stack">
       <div class="arch-layer surface">
         <div class="icon-wrap">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#6ee7ff" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#b07d10" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
         </div>
         <div style="flex:1">
           <div class="layer-tag">Surface</div>
@@ -1015,7 +1016,7 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="arch-layer state">
         <div class="icon-wrap">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#6ee7ff" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.66 4.03 3 9 3s9-1.34 9-3V5M3 11v6c0 1.66 4.03 3 9 3s9-1.34 9-3v-6"/></svg>
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#b07d10" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.66 4.03 3 9 3s9-1.34 9-3V5M3 11v6c0 1.66 4.03 3 9 3s9-1.34 9-3v-6"/></svg>
         </div>
         <div style="flex:1">
           <div class="layer-tag">State</div>
@@ -1199,11 +1200,11 @@ footer.site-foot a { color: var(--text-muted); }
       <!-- Arrow marker -->
       <defs>
         <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
-          <path d="M 0 0 L 10 5 L 0 10 z" fill="#6ee7ff"/>
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#b07d10"/>
         </marker>
       </defs>
 
-      <text x="20" y="35" fill="#6ee7ff" font-size="13" font-family="monospace" font-weight="700">─── HAPPY PATH ───</text>
+      <text x="20" y="35" fill="#b07d10" font-size="13" font-family="monospace" font-weight="700">─── HAPPY PATH ───</text>
       <text x="20" y="225" fill="#ff6b9d" font-size="13" font-family="monospace" font-weight="700">─── CONTRADICTION / FORGET PATH ───</text>
     </svg>
 
@@ -1940,7 +1941,7 @@ footer.site-foot a { color: var(--text-muted); }
 
     <div class="grid-3" style="gap:1rem">
       <a href="compliance/nsa-csi-mcp.html" style="text-decoration:none">
-        <div class="card p1" style="height:100%;display:flex;flex-direction:column;border:2px solid rgba(110,231,255,0.4)">
+        <div class="card p1" style="height:100%;display:flex;flex-direction:column;border:2px solid rgba(176,125,16,0.4)">
           <div class="card-eyebrow" style="color:var(--pillar-1)">▸ PROCUREMENT-GRADE · COMPLIANCE</div>
           <div class="card-title">NSA CSI MCP Security Compliance</div>
           <p class="card-body">v0.7.x substrate-level coverage of the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26, May 2026). <strong>10 of 10 NSA concerns structurally addressed + 7 of 7 NSA recommendations implemented.</strong> Every claim codegraph-verified, file-anchored, independently reproducible by federal procurement reviewers. 47 dedicated tests pin the #1154 daemon-serverInfo signing contract.</p>

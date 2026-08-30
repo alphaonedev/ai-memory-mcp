@@ -23,7 +23,7 @@
 <meta name="theme-color" content="#0d1117">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/evidence.html">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1100px}
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1100px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.65;-webkit-font-smoothing:antialiased;overflow-x:hidden}
@@ -50,10 +50,10 @@ p{color:var(--text-muted);margin-bottom:.85rem}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
 
-.hero{padding:3.5rem 1.5rem 2rem;text-align:center;border-bottom:1px solid var(--border);background:radial-gradient(ellipse at center,rgba(110,231,255,.06),transparent 60%)}
+.hero{padding:3.5rem 1.5rem 2rem;text-align:center;border-bottom:1px solid var(--border);background:radial-gradient(ellipse at center,rgba(176,125,16,.06),transparent 60%)}
 .hero h1{font-size:clamp(1.8rem,4vw,2.6rem);line-height:1.15;margin-bottom:.85rem}
 .hero .lead{color:var(--text-muted);max-width:780px;margin:0 auto;font-size:1rem}
-.frozen-badge{display:inline-block;background:rgba(110,231,255,.12);border:1px solid var(--p1);color:var(--p1);font-family:var(--font-mono);font-size:.75rem;padding:.3rem .8rem;border-radius:4px;letter-spacing:.05em;margin-bottom:1rem}
+.frozen-badge{display:inline-block;background:rgba(176,125,16,.12);border:1px solid var(--p1);color:var(--p1);font-family:var(--font-mono);font-size:.75rem;padding:.3rem .8rem;border-radius:4px;letter-spacing:.05em;margin-bottom:1rem}
 
 section{padding:2.5rem 0;border-bottom:1px solid var(--border)}
 .eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
@@ -74,7 +74,7 @@ section{padding:2.5rem 0;border-bottom:1px solid var(--border)}
 .status-card.unsupported{border-left-color:var(--bad)}
 .status-card h3{font-family:var(--font-mono);font-size:.95rem;margin-bottom:.4rem;color:var(--text)}
 .status-card .tag{display:inline-block;font-family:var(--font-mono);font-size:.7rem;padding:.15em .55em;border-radius:4px;margin-right:.4em;letter-spacing:.05em;text-transform:uppercase}
-.status-card.production .tag{background:rgba(110,231,255,.12);color:var(--p1);border:1px solid #2a6571}
+.status-card.production .tag{background:rgba(176,125,16,.12);color:var(--p1);border:1px solid #2a6571}
 .status-card.beta .tag{background:rgba(255,184,107,.12);color:var(--p2);border:1px solid #7a5328}
 .status-card.experimental .tag{background:rgba(255,215,0,.12);color:var(--gold);border:1px solid #6a5e10}
 .status-card.unsupported .tag{background:rgba(255,107,157,.12);color:var(--bad);border:1px solid #7a3251}
@@ -86,6 +86,7 @@ section{padding:2.5rem 0;border-bottom:1px solid var(--border)}
 footer{padding:3rem 1.5rem;text-align:center;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)}
 footer a{color:var(--text-muted)}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -93,7 +94,7 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Evidence</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
       <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
@@ -182,7 +183,7 @@ footer a{color:var(--text-muted)}
       No other page invents its own counts. If a number on another page disagrees with this page, this page is correct and the other is a bug — please <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/new">file an issue</a>.
     </p>
     <div style="display:flex;justify-content:center;gap:.75rem;flex-wrap:wrap;margin-top:1.75rem">
-      <a href="https://alphaonedev.github.io/ai-memory-test-hub/" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--p1);color:var(--p1);background:rgba(110,231,255,.06);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;font-weight:600;text-decoration:none">🧪 Live test-hub →</a>
+      <a href="https://alphaonedev.github.io/ai-memory-test-hub/" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--p1);color:var(--p1);background:rgba(176,125,16,.06);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;font-weight:600;text-decoration:none">🧪 Live test-hub →</a>
       <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--p2);color:var(--p2);background:rgba(255,184,107,.06);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;font-weight:600;text-decoration:none">📊 v0.6.3 release evidence (historical) →</a>
       <a href="https://alphaonedev.github.io/ai-memory-ship-gate/" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--text-muted);color:var(--text-muted);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;text-decoration:none">🚢 ship-gate</a>
       <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--text-muted);color:var(--text-muted);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;text-decoration:none">🤝 A2A-gate</a>

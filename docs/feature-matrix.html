@@ -20,8 +20,8 @@
   --bg:#000; --bg-raised:#0a0a0a; --bg-card:#111; --bg-elev:#161616; --bg-code:#1a1a1a;
   --border:#262626; --border-hl:#3d3d3d;
   --text:#fff; --text-muted:#999; --text-dim:#666;
-  --pillar-1:#6ee7ff; --pillar-2:#ffb86b; --pillar-3:#c8a2ff; --good:#6ee7ff; --warn:#ffb86b; --bad:#ff6b9d;
-  --read:#6ee7ff;       /* cyan — reads */
+  --pillar-1:#b07d10; --pillar-2:#ffb86b; --pillar-3:#c8a2ff; --good:#b07d10; --warn:#ffb86b; --bad:#ff6b9d;
+  --read:#b07d10;       /* cyan — reads */
   --write:#ffb86b;      /* orange — writes */
   --admin:#c8a2ff;      /* purple — admin/system */
   --kg:#ff79c6;         /* pink — knowledge graph */
@@ -55,7 +55,7 @@ p{color:var(--text-muted)}
 @media(max-width:800px){.topnav .right{display:none}}
 
 /* HERO */
-.hero{padding:5rem 1.5rem 3rem;text-align:center;background:radial-gradient(ellipse at center,rgba(110,231,255,0.06),transparent 60%);border-bottom:1px solid var(--border)}
+.hero{padding:5rem 1.5rem 3rem;text-align:center;background:radial-gradient(ellipse at center,rgba(176,125,16,0.06),transparent 60%);border-bottom:1px solid var(--border)}
 .hero h1{font-size:clamp(2rem,4.5vw,3.5rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
 .hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:680px;margin:0 auto 1.5rem}
 .hero .pill-row{display:flex;justify-content:center;gap:1rem;flex-wrap:wrap;margin-top:1.5rem}
@@ -105,7 +105,7 @@ section .lede{color:var(--text-muted);font-size:1rem;max-width:780px;margin-bott
 .http-table td{padding:.65rem .85rem;border-bottom:1px solid var(--border)}
 .http-table tr:hover td{background:var(--bg-raised)}
 .method{display:inline-block;padding:.15rem .55rem;border-radius:4px;font-size:.7rem;font-weight:700;letter-spacing:.04em;font-family:var(--font-mono);min-width:54px;text-align:center}
-.method.GET{background:rgba(110,231,255,0.15);color:var(--read);border:1px solid rgba(110,231,255,0.4)}
+.method.GET{background:rgba(176,125,16,0.15);color:var(--read);border:1px solid rgba(176,125,16,0.4)}
 .method.POST{background:rgba(255,184,107,0.15);color:var(--write);border:1px solid rgba(255,184,107,0.4)}
 .method.PUT{background:rgba(255,184,107,0.15);color:var(--write);border:1px solid rgba(255,184,107,0.4)}
 .method.DEL{background:rgba(255,107,157,0.15);color:var(--bad);border:1px solid rgba(255,107,157,0.4)}
@@ -175,6 +175,7 @@ footer a{color:var(--text-muted)}
 .topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
 @media(max-width:800px){.topnav .mnav{display:block}}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -182,7 +183,7 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Feature Matrix</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
       <a href="whats-new-v09.html" style="color:#c8a2ff">v0.9.0</a>
       <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">

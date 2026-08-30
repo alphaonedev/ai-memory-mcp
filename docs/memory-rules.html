@@ -12,7 +12,7 @@
 <meta name="description" content="ai-memory v0.9.0 memory rules. Namespace standards, governance policy, validation, scope visibility, parent-namespace inheritance. The unified per-namespace policy stack that controls who can write what, where, and when.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/memory-rules.html">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
@@ -96,6 +96,7 @@ footer a{color:var(--text-muted)}
 .topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
 @media(max-width:800px){.topnav .mnav{display:block}}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -103,7 +104,7 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Memory Rules</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
       <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
@@ -267,7 +268,7 @@ footer a{color:var(--text-muted)}
         .b{stroke-width:2;rx:10;ry:10}
         .b.l1{fill:rgba(255,184,107,0.15);stroke:#ffb86b}
         .b.l2{fill:rgba(200,162,255,0.15);stroke:#c8a2ff}
-        .b.l3{fill:rgba(110,231,255,0.15);stroke:#6ee7ff}
+        .b.l3{fill:rgba(176,125,16,0.15);stroke:#b07d10}
         .b.l4{fill:rgba(165,214,167,0.15);stroke:#a5d6a7}
         .b.l5{fill:rgba(255,215,0,0.15);stroke:#ffd700}
         .ll{stroke:#666;stroke-width:1.5;fill:none;marker-end:url(#arr)}
@@ -333,7 +334,7 @@ footer a{color:var(--text-muted)}
       <text class="s" x="590" y="278" text-anchor="middle">approver gates the write</text>
       <text class="s" x="590" y="295" text-anchor="middle">queue + replay on approve</text>
 
-      <rect class="b" x="450" y="325" width="280" height="80" fill="rgba(110,231,255,0.1)" stroke="#6ee7ff"/>
+      <rect class="b" x="450" y="325" width="280" height="80" fill="rgba(176,125,16,0.1)" stroke="#b07d10"/>
       <text class="h" x="590" y="353" text-anchor="middle">Standard's rules apply</text>
       <text class="s" x="590" y="373" text-anchor="middle">metadata.governance · metadata.scope</text>
       <text class="s" x="590" y="390" text-anchor="middle">tier overrides · TTL overrides</text>
@@ -348,7 +349,7 @@ footer a{color:var(--text-muted)}
       <line class="ll" x1="380" y1="437" x2="450" y2="437"/>
 
       <!-- Allow path -->
-      <rect class="b" x="800" y="200" width="220" height="60" fill="rgba(110,231,255,0.15)" stroke="#6ee7ff"/>
+      <rect class="b" x="800" y="200" width="220" height="60" fill="rgba(176,125,16,0.15)" stroke="#b07d10"/>
       <text class="h" x="910" y="225" text-anchor="middle">Allow → persist</text>
       <text class="s" x="910" y="245" text-anchor="middle">all 5 layers passed</text>
 

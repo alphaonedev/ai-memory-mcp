@@ -12,7 +12,7 @@
 <meta name="description" content="ai-memory v0.9.0 governance reference. Allow / Deny / Pending decision tree, GovernanceLevel × GovernedAction matrix, ApproverType (Human / Agent / Consensus), pending-action lifecycle.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/governance.html">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
@@ -122,6 +122,7 @@ footer a{color:var(--text-muted)}
 .topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
 @media(max-width:800px){.topnav .mnav{display:block}}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -129,7 +130,7 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Governance</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
       <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
@@ -455,7 +456,7 @@ footer a{color:var(--text-muted)}
     <svg class="tree-svg" viewBox="0 0 1180 540" xmlns="http://www.w3.org/2000/svg">
       <style>
         .tn{fill:#161616;stroke:#3d3d3d;stroke-width:1.5;rx:8;ry:8}
-        .tn-allow{stroke:#6ee7ff;stroke-width:2}
+        .tn-allow{stroke:#b07d10;stroke-width:2}
         .tn-deny{stroke:#ff6b9d;stroke-width:2}
         .tn-pend{stroke:#ffd700;stroke-width:2}
         .tt{fill:#fff;font-family:monospace;font-size:13px;font-weight:700}
@@ -463,7 +464,7 @@ footer a{color:var(--text-muted)}
         .ll{stroke:#666;stroke-width:1.5;fill:none}
         .lcap{fill:#999;font-family:monospace;font-size:10px}
         .start{fill:#0a0a0a;stroke:#c8a2ff;stroke-width:2;rx:8;ry:8}
-        .leaf-allow{fill:rgba(110,231,255,0.12);stroke:#6ee7ff}
+        .leaf-allow{fill:rgba(176,125,16,0.12);stroke:#b07d10}
         .leaf-deny{fill:rgba(255,107,157,0.12);stroke:#ff6b9d}
         .leaf-pend{fill:rgba(255,215,0,0.12);stroke:#ffd700}
       </style>

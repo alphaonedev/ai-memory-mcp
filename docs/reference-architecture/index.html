@@ -14,11 +14,11 @@
 <meta name="description" content="ai-memory v0.9.0 Secure Enterprise Federated Reference Architecture (do-1461): a 3-region (nyc3 / fra1 / sgp1) Batman-active AI Agent Hive. 15 nodes (9 peers + 3 regional PG + 3 NHI agents), 9 federated peers in one W=2-synchronous-quorum mesh with eventual cross-region convergence, three distinct encryption legs (API mTLS, federation/quorum mTLS, daemon→Postgres verify-full TLS), each proven with a positive and a negative test. PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reference-architecture/">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
 /* three-leg accents (centerpiece) */
---leg1:#6ee7ff;--leg2:#c8a2ff;--leg3:#ffb86b;
+--leg1:#b07d10;--leg2:#c8a2ff;--leg3:#ffb86b;
 /* three regions */
---rg-nyc:#6ee7ff;--rg-fra:#c8a2ff;--rg-sgp:#ffb86b;
+--rg-nyc:#b07d10;--rg-fra:#c8a2ff;--rg-sgp:#ffb86b;
 --font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
@@ -124,7 +124,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 @keyframes march{to{stroke-dashoffset:-32}}
 @keyframes pulse-glow{0%,100%{opacity:.55}50%{opacity:1}}
 @keyframes shimmer{0%,100%{stroke-opacity:.35}50%{stroke-opacity:.9}}
-@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px rgba(110,231,255,0.25))}50%{filter:drop-shadow(0 0 7px rgba(110,231,255,0.55))}}
+@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px rgba(176,125,16,0.25))}50%{filter:drop-shadow(0 0 7px rgba(176,125,16,0.55))}}
 @keyframes shield-flicker{0%,100%{opacity:.85}50%{opacity:1}}
 
 .flow{stroke-width:2.4;fill:none;stroke-linecap:round;stroke-dasharray:9 7}
@@ -146,6 +146,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 }
 @media(max-width:560px){.diagram-wrap{padding:.4rem}}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -153,8 +154,8 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
   <div class="inner">
     <a class="home-link" href="../">ai-memory <span style="opacity:.5">▸ Reference Architecture</span></a>
     <div class="right">
-      <a href="../at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="../whats-new-v09.html" style="color:#6ee7ff">v0.9.0</a>
+      <a href="../at-a-glance.html" style="color:#b07d10">Atlas</a>
+      <a href="../whats-new-v09.html" style="color:#b07d10">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -238,8 +239,8 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
         <defs>
           <radialGradient id="rgGlow" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stop-color="#6ee7ff" stop-opacity="0.10"/>
-            <stop offset="100%" stop-color="#6ee7ff" stop-opacity="0"/>
+            <stop offset="0%" stop-color="#b07d10" stop-opacity="0.10"/>
+            <stop offset="100%" stop-color="#b07d10" stop-opacity="0"/>
           </radialGradient>
           <linearGradient id="pgGrad" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stop-color="#1c160c"/><stop offset="100%" stop-color="#120d06"/>
@@ -276,7 +277,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <!-- nyc3 cluster (top-left) -->
         <g>
           <rect x="40" y="60" width="420" height="300" rx="16" fill="#070b0d" stroke="#13343d" stroke-width="1.4"/>
-          <text x="60" y="92" class="svg-title" font-size="15" font-weight="700" fill="#6ee7ff">nyc3 · US-East</text>
+          <text x="60" y="92" class="svg-title" font-size="15" font-weight="700" fill="#b07d10">nyc3 · US-East</text>
           <text x="60" y="110" class="svg-label" font-size="10">private VPC · regional substrate</text>
 
           <!-- regional postgres -->
@@ -290,14 +291,14 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
           <!-- 3 peers -->
           <g transform="translate(245,132)">
-            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#6ee7ff" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#6ee7ff">peer-nyc3-01</text>
+            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#b07d10" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#b07d10">peer-nyc3-01</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
-            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#6ee7ff" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#6ee7ff">peer-nyc3-02</text>
+            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#b07d10" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#b07d10">peer-nyc3-02</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
-            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#6ee7ff" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#6ee7ff">peer-nyc3-03</text>
+            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#b07d10" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#b07d10">peer-nyc3-03</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
           </g>
           <!-- leg 3: peers -> regional pg (private VPC, verify-full) -->
@@ -308,9 +309,9 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           </g>
           <!-- NHI agent (xAI grok-4.3 mTLS client) -->
           <g transform="translate(60,300)">
-            <rect x="0" y="0" width="150" height="42" rx="8" fill="#08161a" stroke="#6ee7ff" stroke-width="1.2" stroke-dasharray="4 3"/>
-            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" fill="#6ee7ff" font-weight="700">agent-nyc3-01</text>
-            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" fill="#6ee7ff">NHI · grok-4.3 mTLS client</text>
+            <rect x="0" y="0" width="150" height="42" rx="8" fill="#08161a" stroke="#b07d10" stroke-width="1.2" stroke-dasharray="4 3"/>
+            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" fill="#b07d10" font-weight="700">agent-nyc3-01</text>
+            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" fill="#b07d10">NHI · grok-4.3 mTLS client</text>
           </g>
           <!-- leg 1 client link: agent -> regional peer (thinner, not the quorum mesh) -->
           <path class="flow agentlink" d="M210 321 C235 321 245 280 245 252" aria-hidden="true"/>
@@ -394,13 +395,13 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
         <!-- ====== external client over leg 1 (API mTLS) ====== -->
         <g transform="translate(40,610)">
-          <rect x="0" y="0" width="190" height="62" rx="10" fill="#08161a" stroke="#6ee7ff" stroke-width="1.4" stroke-dasharray="4 3"/>
-          <text x="95" y="26" text-anchor="middle" class="svg-title" font-size="11.5" fill="#6ee7ff" font-weight="700">External client</text>
+          <rect x="0" y="0" width="190" height="62" rx="10" fill="#08161a" stroke="#b07d10" stroke-width="1.4" stroke-dasharray="4 3"/>
+          <text x="95" y="26" text-anchor="middle" class="svg-title" font-size="11.5" fill="#b07d10" font-weight="700">External client</text>
           <text x="95" y="44" text-anchor="middle" class="svg-label" font-size="9">mTLS client-cert + x-api-key</text>
         </g>
         <!-- leg 1: client -> nyc3 peer -->
         <path class="flow leg1 shim" d="M150 610 C160 480 200 360 245 230" aria-hidden="true"/>
-        <text x="120" y="540" class="svg-label" font-size="9" fill="#6ee7ff" transform="rotate(-62 120 540)">leg 1 · API mTLS :9077</text>
+        <text x="120" y="540" class="svg-label" font-size="9" fill="#b07d10" transform="rotate(-62 120 540)">leg 1 · API mTLS :9077</text>
       </svg>
     </div>
 
@@ -443,8 +444,8 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
         <!-- client -->
         <g transform="translate(30,108)">
-          <rect width="150" height="64" rx="10" fill="#08161a" stroke="#6ee7ff" stroke-width="1.4"/>
-          <text x="75" y="28" text-anchor="middle" class="svg-title" font-size="11.5" fill="#6ee7ff" font-weight="700">Client</text>
+          <rect width="150" height="64" rx="10" fill="#08161a" stroke="#b07d10" stroke-width="1.4"/>
+          <text x="75" y="28" text-anchor="middle" class="svg-title" font-size="11.5" fill="#b07d10" font-weight="700">Client</text>
           <text x="75" y="46" text-anchor="middle" class="svg-label" font-size="9">cert + api-key</text>
         </g>
         <!-- peer A -->
@@ -472,7 +473,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
         <!-- leg 1 flow -->
         <path class="flow leg1 shim" d="M180 140 L360 140" aria-hidden="true"/>
-        <text x="270" y="128" text-anchor="middle" class="svg-label" font-size="9.5" fill="#6ee7ff">leg 1 · API mTLS</text>
+        <text x="270" y="128" text-anchor="middle" class="svg-label" font-size="9.5" fill="#b07d10">leg 1 · API mTLS</text>
         <!-- leg 2 flow (peer A up to peer B) -->
         <path class="flow leg2 shim" d="M530 120 C620 120 660 72 720 72" aria-hidden="true"/>
         <text x="625" y="86" text-anchor="middle" class="svg-label" font-size="9.5" fill="#c8a2ff">leg 2 · quorum mTLS + Ed25519</text>

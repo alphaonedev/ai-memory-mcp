@@ -12,7 +12,7 @@
 <meta name="description" content="ai-memory v0.9.0 type reference. Every public Rust struct and enum exposed at the API/MCP/CLI boundaries. Tier, Memory, MemoryLink, GovernancePolicy, ApproverType, VectorClock, and 21 more.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/types.html">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
@@ -26,7 +26,7 @@ p{color:var(--text-muted)}
 .topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
 .topnav .home-link{color:var(--text);font-weight:600}
 .topnav .right{display:flex;gap:1.25rem}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(110,231,255,0.06),transparent 60%);border-bottom:1px solid var(--border)}
+.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(176,125,16,0.06),transparent 60%);border-bottom:1px solid var(--border)}
 .hero h1{font-size:clamp(2rem,4.5vw,3.25rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
 .hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:760px;margin:0 auto 1rem}
 .hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
@@ -46,7 +46,7 @@ section{padding:3.5rem 0;border-bottom:1px solid var(--border)}
 .ty-head{display:flex;align-items:baseline;gap:1rem;flex-wrap:wrap;margin-bottom:.5rem}
 .ty-name{font-family:var(--font-mono);font-size:1.15rem;font-weight:700;color:var(--text)}
 .ty-kind{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);padding:.15em .55em;border:1px solid var(--border-hl);border-radius:4px}
-.ty-kind.struct{color:var(--p1);border-color:rgba(110,231,255,0.4)}
+.ty-kind.struct{color:var(--p1);border-color:rgba(176,125,16,0.4)}
 .ty-kind.enum{color:var(--p3);border-color:rgba(200,162,255,0.4)}
 .ty-kind.const{color:var(--p2);border-color:rgba(255,184,107,0.4)}
 .ty-since{font-family:var(--font-mono);font-size:.7rem;color:var(--text-dim)}
@@ -61,7 +61,7 @@ section{padding:3.5rem 0;border-bottom:1px solid var(--border)}
 .fld td.fnote{color:var(--text-muted);font-family:var(--font-sans);font-size:.85rem;line-height:1.5}
 .flag{display:inline-block;font-family:var(--font-mono);font-size:.65rem;padding:.1em .45em;border-radius:3px;letter-spacing:.05em;margin-right:.25em;vertical-align:middle}
 .flag.opt{background:rgba(102,102,102,0.15);color:var(--text-dim);border:1px solid rgba(102,102,102,0.4)}
-.flag.req{background:rgba(110,231,255,0.12);color:var(--p1);border:1px solid rgba(110,231,255,0.4)}
+.flag.req{background:rgba(176,125,16,0.12);color:var(--p1);border:1px solid rgba(176,125,16,0.4)}
 .flag.def{background:rgba(255,184,107,0.12);color:var(--p2);border:1px solid rgba(255,184,107,0.4)}
 .flag.serde{background:rgba(200,162,255,0.12);color:var(--p3);border:1px solid rgba(200,162,255,0.4)}
 .flag.skip{background:rgba(102,102,102,0.15);color:var(--text-dim);border:1px solid rgba(102,102,102,0.4)}
@@ -101,6 +101,7 @@ footer a{color:var(--text-muted)}
 .topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
 @media(max-width:800px){.topnav .mnav{display:block}}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -108,7 +109,7 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Types</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
       <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>

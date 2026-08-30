@@ -12,7 +12,7 @@
 <meta name="description" content="ai-memory v0.9.0 memory lifecycle. The full journey of a memory from store → tier → access → promote → link → consolidate → expire → archive → restore or purge. With timeline visualization.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/lifecycle.html">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
@@ -87,6 +87,7 @@ footer a{color:var(--text-muted)}
 .topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
 @media(max-width:800px){.topnav .mnav{display:block}}
 </style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
 <body>
 
@@ -94,7 +95,7 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Lifecycle</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
       <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
@@ -260,14 +261,14 @@ footer a{color:var(--text-muted)}
         .lab{fill:#999;font-family:monospace;font-size:11px}
         .lab.big{fill:#fff;font-size:13px;font-weight:700}
         .ev{font-family:monospace;font-size:10px}
-        .ev.t1{fill:#6ee7ff}
+        .ev.t1{fill:#b07d10}
         .ev.t2{fill:#c8a2ff}
         .ev.t3{fill:#ffb86b}
         .ev.t4{fill:#ffd700}
         .ev.t5{fill:#a5d6a7}
         .ev.t6{fill:#ff6b9d}
         .pt{stroke-width:0}
-        .pt.t1{fill:#6ee7ff}
+        .pt.t1{fill:#b07d10}
         .pt.t2{fill:#c8a2ff}
         .pt.t3{fill:#ffb86b}
         .pt.t4{fill:#ffd700}
@@ -287,7 +288,7 @@ footer a{color:var(--text-muted)}
       <text class="lab big" x="600" y="290" text-anchor="middle">elapsed time →</text>
 
       <!-- Lifeline -->
-      <line class="lifeline" x1="100" y1="240" x2="950" y2="240" stroke="#6ee7ff"/>
+      <line class="lifeline" x1="100" y1="240" x2="950" y2="240" stroke="#b07d10"/>
       <line class="lifeline" x1="950" y1="240" x2="1000" y2="240" stroke="#ffb86b"/>
       <line class="lifeline" x1="1000" y1="240" x2="1100" y2="240" stroke="#ff6b9d" stroke-dasharray="6 6"/>
 
@@ -330,7 +331,7 @@ footer a{color:var(--text-muted)}
 
       <!-- Status legend -->
       <text class="lab big" x="60" y="40">Live</text>
-      <rect x="100" y="32" width="20" height="12" fill="#6ee7ff"/>
+      <rect x="100" y="32" width="20" height="12" fill="#b07d10"/>
       <text class="lab big" x="200" y="40">Archived</text>
       <rect x="270" y="32" width="20" height="12" fill="#ffb86b"/>
       <text class="lab big" x="370" y="40">Gone</text>
