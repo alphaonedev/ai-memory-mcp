@@ -11679,11 +11679,15 @@ legacy_scoring = false
     }
 
     #[test]
-    fn r9_default_on_is_additive_owner_token_widens_but_adds_no_denial() {
-        // #1960 R9 — with capabilities ON and the zero-config owner enrolled:
-        // (1) a valid owner token WIDENS a Deny → Allow (attenuation grant);
+    fn r9_default_on_is_additive_deny_terminal_pending_widens_adds_no_denial() {
+        // #1960 R9 + #3111 — with capabilities ON and the zero-config owner
+        // enrolled:
+        // (1) a valid owner token does NOT widen an operator/rule-derived
+        //     Deny — the Deny is TERMINAL (#3111): base unchanged, NoOp;
         // (2) a capability-LESS caller's Deny is UNCHANGED (zero new denial);
-        // (3) an owner token attenuated to Read cannot widen a Write.
+        // (3) a valid owner token WIDENS a Pending (human court) → Allow —
+        //     the legitimate delegated power the feature still provides;
+        // (4) an owner token attenuated to Read cannot cover a Write Pending.
         use crate::governance::capability as cap;
         use crate::models::{GovernanceDecision, GovernanceLevel, GovernedAction};
         let tmp = tempfile::tempdir().unwrap();
@@ -11728,22 +11732,30 @@ legacy_scoring = false
                 "nope",
             ))
         };
+        let pending = || GovernanceDecision::Pending("court-1".to_string());
 
-        // (1) owner token widens Deny → Allow.
+        // (1) #3111 — owner token does NOT widen an operator Deny; it is
+        //     terminal (base unchanged, NoOp — the token is never consulted).
         let (d1, o1) = cap::apply_capability_grant_gov(deny(), &cfg, true, Some(&tok), &req);
-        assert_eq!(d1, GovernanceDecision::Allow);
-        assert!(matches!(o1, cap::GrantOutcome::Granted { .. }));
+        assert_eq!(d1, deny(), "operator Deny must be terminal (#3111)");
+        assert_eq!(o1, cap::GrantOutcome::NoOp);
 
         // (2) capability-LESS caller: Deny is unchanged, NoOp (no new denial).
         let (d2, o2) = cap::apply_capability_grant_gov(deny(), &cfg, true, None, &req);
         assert!(matches!(d2, GovernanceDecision::Deny(_)));
         assert_eq!(o2, cap::GrantOutcome::NoOp);
 
-        // (3) attenuated-to-Read owner token cannot cover a Write.
+        // (3) owner token WIDENS a Pending (human court) → Allow.
+        let (d3, o3) = cap::apply_capability_grant_gov(pending(), &cfg, true, Some(&tok), &req);
+        assert_eq!(d3, GovernanceDecision::Allow);
+        assert!(matches!(o3, cap::GrantOutcome::Granted { .. }));
+
+        // (4) attenuated-to-Read owner token cannot cover a Write Pending.
         let narrowed = cap::attenuate(&tok, cap::Caveat::OpCeiling(cap::OpLevel::Read)).unwrap();
-        let (d3, o3) = cap::apply_capability_grant_gov(deny(), &cfg, true, Some(&narrowed), &req);
-        assert!(matches!(d3, GovernanceDecision::Deny(_)));
-        assert!(matches!(o3, cap::GrantOutcome::Rejected(_)));
+        let (d4, o4) =
+            cap::apply_capability_grant_gov(pending(), &cfg, true, Some(&narrowed), &req);
+        assert!(matches!(d4, GovernanceDecision::Pending(_)));
+        assert!(matches!(o4, cap::GrantOutcome::Rejected(_)));
     }
 
     #[test]

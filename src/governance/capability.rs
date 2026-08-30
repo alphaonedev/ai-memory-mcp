@@ -90,9 +90,10 @@ pub const ENV_CAPABILITIES: &str = "AI_MEMORY_CAPABILITIES";
 ///   *actively presents* a token (an opt-in act); an invalid token is a
 ///   typed `Err(CapReject)` that REFUSES the request (fail-closed), while
 ///   an ABSENT token still yields `Ok(None)` and the bare ACL decides.
-/// - The grant path ([`apply_capability_grant`]) only ever flips a
-///   `Deny`/`Ask` base to `Allow` (attenuation-only widening); it can
-///   never turn an `Allow` into a denial.
+/// - The grant path ([`apply_capability_grant`]) only ever flips an `Ask`
+///   (pending human-court) base to `Allow` (attenuation-only widening); it
+///   never overrides an operator/rule-derived `Deny` (terminal, #3111) and
+///   never turns an `Allow` into a denial.
 ///
 /// So default-on WIDENS what a capability-bearing owner can delegate (via
 /// attenuated tokens) and adds no new denial to any pre-capability flow.
@@ -793,7 +794,7 @@ fn namespace_under(namespace: &str, prefix: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// apply_capability_grant — the Deny/Pending→Allow joiner (T4)
+// apply_capability_grant — the Ask/Pending→Allow joiner (T4)
 // ---------------------------------------------------------------------------
 
 /// The audit-relevant outcome of [`apply_capability_grant`]. The joiner is
@@ -802,11 +803,12 @@ fn namespace_under(namespace: &str, prefix: &str) -> bool {
 /// to emit via the existing `append_signed_event`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantOutcome {
-    /// No capability logic ran (base was Allow, feature off/not-enforce, or no
-    /// token / non-flippable base). Emit ZERO new audit bytes.
+    /// No capability logic ran (base was Allow, feature off/not-enforce, no
+    /// token, or a non-flippable base — a terminal `Deny` (#3111) or a
+    /// `Modify`). Emit ZERO new audit bytes.
     NoOp,
-    /// A verified grant flipped a `Deny`/`Ask` base to `Allow`. Audit a
-    /// capability-grant event naming the token.
+    /// A verified grant flipped an `Ask` (pending human-court) base to
+    /// `Allow`. Audit a capability-grant event naming the token.
     Granted {
         /// The authorising root id.
         root_id: String,
@@ -824,9 +826,17 @@ pub enum GrantOutcome {
 ///
 /// Pure identity when: `base == Allow`, capabilities disabled, `mode` is not
 /// Enforce, or no token is presented. Otherwise a token that [`verify`]s and
-/// covers the request flips a `Deny`/`Ask` (pending/approve) base to `Allow`
-/// (audited grant); a token that fails to verify leaves the base UNCHANGED
-/// (audited reject). `Modify`/`Allow` bases are never touched.
+/// covers the request flips ONLY an `Ask` (pending/approve human-court) base
+/// to `Allow` (audited grant); a token that fails to verify leaves the base
+/// UNCHANGED (audited reject).
+///
+/// A `Deny` is TERMINAL and is never token-flippable (#3111): it is an
+/// explicit operator/rule-derived refusal (a `[permissions]` rule, a
+/// `HookDecision::Deny`, an Enforce-mode `Ask` promotion, or a substrate
+/// `GovernanceRefusal`), and [`verify`] does not consult those permission
+/// rules — so a covering delegated token must not override it. A `Deny` (like
+/// `Modify`/`Allow`) is returned untouched as [`GrantOutcome::NoOp`] BEFORE
+/// [`verify`] runs, so no path from a `Deny` base can reach `Allow`.
 ///
 /// The `Ask`→`Allow` flip is only reachable when [`verify`] succeeds, which
 /// already requires the request op to fit under the issuer ceiling — so a
@@ -847,8 +857,22 @@ pub fn apply_capability_grant(
     let Some(tok) = token else {
         return (base, GrantOutcome::NoOp);
     };
-    // Only Deny / Ask(pending) are flippable.
-    if !matches!(base, Decision::Deny(_) | Decision::Ask(_)) {
+    // #3111 — an operator/rule-derived Deny is TERMINAL; only an `Ask`
+    // (a pending human court) base is flippable. Every `Deny` that reaches
+    // this joiner is an explicit refusal authored by the operator's
+    // permission surface — a `[permissions]` rule, a `HookDecision::Deny`,
+    // an Enforce-mode promotion of an unwired `Ask`, or a substrate
+    // `GovernanceRefusal` shadowed in via `apply_capability_grant_gov`.
+    // `verify` checks only the token's version / issuer / HMAC chain /
+    // caveats / issuer ceiling — it NEVER consults the permission rules that
+    // produced the Deny — so letting a covering token flip a Deny would let a
+    // delegated (possibly attenuated, AI-held) token silently bypass a
+    // standing operator refusal. Delegation-over-deny is not the trust model
+    // on the certified path: a token may satisfy a pending court, never
+    // override a Deny. Returning here BEFORE `verify` makes the property
+    // STRUCTURAL — no code path from a `Deny` (or `Modify`) base can reach
+    // `Decision::Allow`.
+    if !matches!(base, Decision::Ask(_)) {
         return (base, GrantOutcome::NoOp);
     }
     match verify(tok, cfg, req) {
@@ -973,8 +997,9 @@ pub fn governed_action_name(action: crate::models::GovernedAction) -> &'static s
 
 /// Join a capability grant onto the gate-level
 /// [`crate::models::GovernanceDecision`]. Delegates the decision algebra to
-/// the pure [`apply_capability_grant`] (mapping `Deny(refusal)`→`Deny` and
-/// `Pending(id)`→`Ask` for the flippability check) and — critically —
+/// the pure [`apply_capability_grant`] (mapping `Deny(refusal)`→`Deny`
+/// (terminal, #3111) and `Pending(id)`→`Ask` (the only flippable base) for
+/// the flippability check) and — critically —
 /// returns the ORIGINAL `base` value untouched on every non-granted
 /// outcome, so a reject is byte-identical to the legacy decision including
 /// the typed refusal envelope.
@@ -1803,18 +1828,26 @@ mod tests {
     }
 
     #[test]
-    fn apply_grant_flips_deny_and_ask_on_valid_token() {
+    fn apply_grant_deny_is_terminal_ask_flips_on_valid_token() {
+        // #3111 — a token that fully verifies AND covers the tuple must NOT
+        // flip an operator/rule-derived Deny; only an Ask (pending court) is
+        // liftable.
         let (tok, cfg, _, _) = mint_fixture(vec![
             Caveat::OpCeiling(OpLevel::Write),
             Caveat::ExpiresAt(9_999_999_999),
         ]);
         let r = req("Store", "n", "a", 1);
-        // Deny → Allow
+        // Deny is TERMINAL: base unchanged, and the token is never even
+        // consulted (NoOp, not Granted/Rejected).
         let (d, out) =
             apply_capability_grant(Decision::Deny("nope".into()), &cfg, true, Some(&tok), &r);
-        assert_eq!(d, Decision::Allow);
-        assert!(matches!(out, GrantOutcome::Granted { .. }));
-        // Ask(pending) → Allow
+        assert_eq!(d, Decision::Deny("nope".into()), "operator Deny must stand");
+        assert_eq!(
+            out,
+            GrantOutcome::NoOp,
+            "a covering token must not turn a Deny into a grant/reject"
+        );
+        // Ask(pending) → Allow (no regression: the legitimate court lift).
         let (d2, out2) =
             apply_capability_grant(Decision::Ask("court".into()), &cfg, true, Some(&tok), &r);
         assert_eq!(d2, Decision::Allow);
@@ -1850,10 +1883,19 @@ mod tests {
     fn apply_grant_reject_leaves_base_unchanged() {
         let (tok, cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(100)]);
         let r = req("Store", "n", "a", 500); // expired
+        // An Ask base DOES reach `verify`; a failed verify leaves it unchanged
+        // and audits a reject.
         let (d, out) =
-            apply_capability_grant(Decision::Deny("orig".into()), &cfg, true, Some(&tok), &r);
-        assert_eq!(d, Decision::Deny("orig".into()));
+            apply_capability_grant(Decision::Ask("court".into()), &cfg, true, Some(&tok), &r);
+        assert_eq!(d, Decision::Ask("court".into()));
         assert_eq!(out, GrantOutcome::Rejected(CapReject::Expired));
+        // #3111 — a Deny base short-circuits to NoOp BEFORE `verify`, so an
+        // expired (or any) token never produces a Rejected outcome from a
+        // Deny: the terminal-Deny property holds structurally.
+        let (d2, out2) =
+            apply_capability_grant(Decision::Deny("orig".into()), &cfg, true, Some(&tok), &r);
+        assert_eq!(d2, Decision::Deny("orig".into()));
+        assert_eq!(out2, GrantOutcome::NoOp);
     }
 
     #[test]

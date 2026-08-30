@@ -110,7 +110,11 @@ fn attenuation_cannot_escalate_forge_by_removal_is_bad_chain() {
 #[test]
 fn every_reject_leaves_base_unchanged_and_audits_reject() {
     let cfg = config(OpLevel::Write, true);
-    let base = Decision::Deny("policy".to_string());
+    // #3111 — the reject path is exercised from an `Ask` (pending court)
+    // base, the only flippable base; a `Deny` short-circuits to NoOp before
+    // `verify` and so never produces a Rejected outcome (see
+    // `deny_base_is_terminal_before_verify`).
+    let base = Decision::Ask("court".to_string());
 
     // Build one representative token for each reject class.
     let good = token(vec![Caveat::ExpiresAt(9_999_999_999)]);
@@ -193,7 +197,10 @@ fn every_reject_leaves_base_unchanged_and_audits_reject() {
 }
 
 #[test]
-fn valid_token_flips_deny_and_ask() {
+fn valid_token_lifts_ask_only_deny_is_terminal() {
+    // #3111 — a token that verifies AND covers the tuple lifts only an `Ask`
+    // (pending human court). An operator/rule-derived `Deny` is terminal and
+    // is NEVER flipped by any token.
     let cfg = config(OpLevel::Write, true);
     let t = token(vec![
         Caveat::OpCeiling(OpLevel::Write),
@@ -201,13 +208,42 @@ fn valid_token_flips_deny_and_ask() {
     ]);
     let r = request("Store", "n", 1);
 
+    // Deny stays Deny — the covering token is not even consulted (NoOp).
     let (d, o) = apply_capability_grant(Decision::Deny("x".into()), &cfg, true, Some(&t), &r);
-    assert_eq!(d, Decision::Allow);
-    assert!(matches!(o, GrantOutcome::Granted { .. }));
+    assert_eq!(d, Decision::Deny("x".into()));
+    assert_eq!(o, GrantOutcome::NoOp);
 
+    // Ask lifts to Allow (no regression).
     let (d2, o2) = apply_capability_grant(Decision::Ask("court".into()), &cfg, true, Some(&t), &r);
     assert_eq!(d2, Decision::Allow);
     assert!(matches!(o2, GrantOutcome::Granted { .. }));
+}
+
+#[test]
+fn deny_base_is_terminal_before_verify() {
+    // #3111 — regardless of the token's validity (a perfect covering token,
+    // an expired one, or a forged one), a `Deny` base returns NoOp with the
+    // base byte-identical: the joiner short-circuits before `verify`, so no
+    // token class can ever turn a `Deny` into `Allow` or even a `Rejected`.
+    let cfg = config(OpLevel::Write, true);
+    let r = request("Store", "n", 1);
+    let good = token(vec![
+        Caveat::OpCeiling(OpLevel::Write),
+        Caveat::ExpiresAt(9_999_999_999),
+    ]);
+    let expired = token(vec![Caveat::ExpiresAt(10)]);
+    let mut forged = good.clone();
+    forged.root_sig[0] ^= 0xFF;
+    for (name, tok) in [("good", &good), ("expired", &expired), ("forged", &forged)] {
+        let (d, o) =
+            apply_capability_grant(Decision::Deny("secrets".into()), &cfg, true, Some(tok), &r);
+        assert_eq!(
+            d,
+            Decision::Deny("secrets".into()),
+            "{name}: Deny must stand"
+        );
+        assert_eq!(o, GrantOutcome::NoOp, "{name}: Deny must not reach verify");
+    }
 }
 
 #[test]
@@ -357,11 +393,13 @@ mod gate_wiring {
         .expect("count pending")
     }
 
-    /// A valid, in-caveat token flips the owner-policy Deny to Allow at
-    /// the WIRED sqlite gate; every reject class leaves the base Deny
-    /// byte-identical to the no-token decision.
+    /// #3111 — an operator/rule-derived owner-policy Deny is TERMINAL at the
+    /// WIRED sqlite gate: NEITHER a valid, in-caveat covering token NOR any
+    /// reject-class token flips it; the base Deny stays byte-identical to the
+    /// no-token decision. (The legitimate `Pending→Allow` court lift is
+    /// covered by `sqlite_gate_pending_flip_and_ceiling_court_guard`.)
     #[test]
-    fn sqlite_gate_valid_token_flips_deny_rejects_leave_base() {
+    fn sqlite_gate_operator_deny_is_terminal_even_with_valid_token() {
         let (_perm, _cap) = pin_gates(config(OpLevel::Admin, true));
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let ns = "g10gate/owner";
@@ -385,12 +423,14 @@ mod gate_wiring {
             other => panic!("owner policy must deny a non-owner store, got {other:?}"),
         };
 
-        // Valid token ⇒ Allow.
+        // #3111 — a valid, fully in-caveat covering token must NOT flip the
+        // operator Deny: it is terminal, so the base refusal stands
+        // byte-identical (same reason) as with no token at all.
         let good = token(vec![
             Caveat::OpCeiling(OpLevel::Write),
             Caveat::ExpiresAt(9_999_999_999),
         ]);
-        let flipped = db::enforce_governance(
+        let with_good = db::enforce_governance(
             &conn,
             GovernedAction::Store,
             ns,
@@ -401,10 +441,13 @@ mod gate_wiring {
             Some(&good),
         )
         .unwrap();
-        assert!(
-            matches!(flipped, GovernanceDecision::Allow),
-            "valid in-caveat token must flip Deny→Allow at the wired gate, got {flipped:?}"
-        );
+        match with_good {
+            GovernanceDecision::Deny(refusal) => assert_eq!(
+                refusal.reason, base_reason,
+                "a valid covering token must leave the operator Deny byte-identical (#3111)"
+            ),
+            other => panic!("operator Deny must be terminal, got {other:?}"),
+        }
 
         // Reject classes ⇒ base decision UNCHANGED (same refusal reason).
         let expired = token(vec![Caveat::ExpiresAt(10)]);
@@ -602,11 +645,14 @@ mod gate_wiring {
         clear_capability_config_for_test();
     }
 
-    /// Every grant and every reject at the wired gate lands a forensic
-    /// audit row (capability-grant / capability-reject), and a malformed
+    /// A grant and a reject at the wired gate each land a forensic audit row
+    /// (capability-grant / capability-reject) — both from an `Approve`
+    /// (pending court) base, the only flippable base (#3111). A malformed
     /// edge presentation (feature ON) lands a DENY capability-reject
     /// (fail-closed fix: the edge parse now refuses the request, so the
-    /// forensic decision is `deny`, not the pre-fix advisory `warn`).
+    /// forensic decision is `deny`, not the pre-fix advisory `warn`). And a
+    /// terminal operator `Deny` (owner policy) emits ZERO capability rows even
+    /// with a perfect covering token.
     #[test]
     fn audit_rows_for_grant_reject_and_edge_parse() {
         let (_perm, _cap) = pin_gates(config(OpLevel::Admin, true));
@@ -614,8 +660,12 @@ mod gate_wiring {
         ai_memory::governance::audit::init(audit_dir.path(), None).expect("init forensic sink");
 
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let ns = "g10audit/owner";
-        seed_policy(&conn, ns, &policy(GovernanceLevel::Owner), "ai:alice");
+        // Grant / reject rows come from a pending (approve) base.
+        let ns = "g10audit/approve";
+        seed_policy(&conn, ns, &policy(GovernanceLevel::Approve), "ai:alice");
+        // Terminal-Deny namespace: an owner policy that must emit NO cap rows.
+        let deny_ns = "g10audit/owner";
+        seed_policy(&conn, deny_ns, &policy(GovernanceLevel::Owner), "ai:alice");
         let payload = serde_json::json!({"title": "x"});
 
         let good = token(vec![
@@ -623,6 +673,7 @@ mod gate_wiring {
             Caveat::ExpiresAt(9_999_999_999),
         ]);
         let expired = token(vec![Caveat::ExpiresAt(10)]);
+        // Grant: good token lifts the pending court → capability-grant row.
         let _ = db::enforce_governance(
             &conn,
             GovernedAction::Store,
@@ -634,6 +685,7 @@ mod gate_wiring {
             Some(&good),
         )
         .unwrap();
+        // Reject: expired token against the pending base → capability-reject.
         let _ = db::enforce_governance(
             &conn,
             GovernedAction::Store,
@@ -643,6 +695,19 @@ mod gate_wiring {
             None,
             &payload,
             Some(&expired),
+        )
+        .unwrap();
+        // Terminal Deny: even a perfect covering token emits NO capability
+        // row (the joiner short-circuits to NoOp before any audit).
+        let _ = db::enforce_governance(
+            &conn,
+            GovernedAction::Store,
+            deny_ns,
+            "ai:mallory",
+            None,
+            None,
+            &payload,
+            Some(&good),
         )
         .unwrap();
         // Malformed edge presentation with the feature ON is now a TYPED
@@ -662,7 +727,7 @@ mod gate_wiring {
         });
         let grant = grant.expect("a capability-grant row must land");
         assert_eq!(grant["decision"], "allow");
-        assert_eq!(grant["payload"]["flipped_from"], "deny");
+        assert_eq!(grant["payload"]["flipped_from"], "pending");
         assert_eq!(grant["payload"]["issuer"], ISSUER);
         assert_eq!(grant["actor"], "ai:mallory");
 
@@ -672,6 +737,21 @@ mod gate_wiring {
                 && r["rule_id"] == "expired"
         });
         assert!(reject.is_some(), "a capability-reject row must land");
+
+        // #3111 — the terminal-Deny namespace emitted ZERO capability rows.
+        let deny_cap_rows: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| {
+                r["payload"]["namespace"] == deny_ns
+                    && r["kind"]
+                        .as_str()
+                        .is_some_and(|k| k.starts_with("capability-"))
+            })
+            .collect();
+        assert!(
+            deny_cap_rows.is_empty(),
+            "a terminal operator Deny must emit ZERO capability rows, got {deny_cap_rows:?}"
+        );
 
         let parse_deny = rows.iter().find(|r| {
             r["kind"].as_str() == Some("capability-reject")
@@ -916,7 +996,9 @@ mod pg_parity {
         let payload = serde_json::json!({"title": "parity"});
         let cases: Vec<(&str, Option<&CapabilityToken>, &str, &str)> = vec![
             ("no_token", None, intruder, "deny"),
-            ("valid", Some(&good), intruder, "allow"),
+            // #3111 — the owner-policy Deny is a terminal operator refusal; a
+            // valid, fully covering token must NOT flip it on EITHER backend.
+            ("valid", Some(&good), intruder, "deny"),
             ("expired", Some(&expired), intruder, "deny"),
             ("wrong_ns", Some(&wrong_ns), intruder, "deny"),
             ("tampered", Some(&tampered), intruder, "deny"),
