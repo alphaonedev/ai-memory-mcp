@@ -557,19 +557,32 @@ pub fn handle_reflect(
         h.active_keypair = active_keypair;
         h
     };
-    // #3176 / Fable #3237 item 4 — MCP is a TENANT write. The unscoped
-    // `reflect_with_hooks` (caller=None) let a tenant pull another
-    // agent's private source into a reflection. Scope the source read
-    // to the enforced governance subject (already bound above).
-    let outcome = match db::reflect_with_hooks_for_caller(
-        conn,
-        &input,
-        &hooks,
-        Some(input.agent_id.as_str()),
-    ) {
-        Ok(o) => o,
-        Err(e) => return Err(map_reflect_error_to_wire_string(e)),
-    };
+    // #3282 — the SOURCE READ is a READ, so it must be scoped by the
+    // read-visibility caller (`resolve_read_visibility_caller` — the same
+    // resolver recall/list/search/get and the #2988 recall ledger use),
+    // NOT the write-ladder governance subject `input.agent_id`. The prior
+    // #3176 / #3237-item-4 wiring bound this READ to the WRITE subject,
+    // which mis-gated it: in the default single-operator config
+    // (`AI_MEMORY_AGENT_ID` unset) the write subject resolves to a
+    // synthesized `ai:<client>@<host>:pid-<pid>` principal, so a source
+    // written by ANY other principal (CLI, HTTP, curator, federation, a
+    // second MCP client) folded to `SourceNotFound` even though
+    // recall/list/search/get on the same session apply no filter and SHOW
+    // it — a read gated as if it were a write (the #3282 default-config
+    // regression). `resolve_read_visibility_caller()` is `None` when
+    // `AI_MEMORY_AGENT_ID` is unset (trust-all read, byte-identical to
+    // every other read surface) and `Some(enforced)` under the
+    // multi-tenant opt-in, where it gates each source through
+    // `is_visible_to_caller` exactly like the recall path — so a tenant
+    // still cannot pull another agent's private source into a reflection.
+    // The WRITE owner stays `input.agent_id` (bound above via
+    // `resolve_governance_subject`): writes remain on the write ladder.
+    let read_caller = crate::identity::resolve_read_visibility_caller();
+    let outcome =
+        match db::reflect_with_hooks_for_caller(conn, &input, &hooks, read_caller.as_deref()) {
+            Ok(o) => o,
+            Err(e) => return Err(map_reflect_error_to_wire_string(e)),
+        };
 
     // ─── Best-effort post-write side effects ────────────────────────
     // Generate + persist an embedding for the new reflection memory so
