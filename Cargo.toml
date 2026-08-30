@@ -406,6 +406,17 @@ libc = "0.2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# CONFIG-1 full-spectrum AI-NHI acceptance harness (sqlite-bundled build).
+# Declared explicitly because it lives in the tests/acceptance/ subdirectory
+# (cargo only auto-discovers tests/*.rs at the TOP level, not subdirectories).
+# Drives the compiled `ai-memory serve` sqlite daemon end-to-end as ONE
+# attested NHI identity (X-Agent-Id + Ed25519 write-attestation) across the
+# full tool surface, plus durability-across-restart, at-rest encryption, and
+# crypto-erase invariants — see the module docs in the file.
+[[test]]
+name = "acceptance_nhi_sqlite"
+path = "tests/acceptance/acceptance_nhi_sqlite.rs"
+
 [[bench]]
 name = "recall"
 harness = false
