@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (conformance export golden schema-version drift)
+
+- `conformance/vectors/export/round_trip_l3.json` pinned
+  `db_schema_version: 90` while the exporter emits the live migration
+  ledger `MAX(version)` (now 91 after #3250), so
+  `fixture_matches_pinned_exporter` failed in the serial coverage run.
+  Regenerated the golden (single-line `db_schema_version` 90->91; no
+  other drift). Same #3250 SSOT-parity gap as the corpus manifest.
+
 ### Fixed (conformance corpus schema-version SSOT drift)
 
 - `tests/conformance_corpus.rs` `CORPUS_SCHEMA_VERSION` and
