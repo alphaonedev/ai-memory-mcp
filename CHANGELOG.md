@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (B7 structural gate — pg transcript-write twins allowlisted)
+
+- The #3064 batch D merge added two write-SQL functions in
+  `src/store/postgres_parity.rs` (`store_transcript`, `link_memory_transcript`)
+  that the B7 structural-completeness test (`record_stop_structural_b7`)
+  requires to be record-stop-gated or on the reviewed allowlist. Neither the
+  batch-D branch's own proof set nor impact-aware CI ran B7; the serial
+  coverage sweep caught it (a test panic there aborts `Generate coverage JSON`
+  before threshold enforcement). Fable review: both fns write ONLY the
+  content-addressed transcript tables (`memory_transcripts` /
+  `memory_transcript_links`), never the record-stop memory-record plane, and
+  their sqlite twins (`transcripts::storage::store`/`link`) sit under
+  `src/transcripts/` which `skip_path()` already exempts. Added the two
+  reviewed rows to `tests/record_stop_b7_allowlist.txt` to preserve that
+  backend parity (an exemption, not a gate bypass). Test-config only; no
+  product change. Verified: B7 + the source-scanning structural/ceiling suite
+  (append-only spine, write-verb ceiling, db-open funnel, qual-6/7,
+  expiry-floor funnel, mcp-param/attest invariants, todo-tracker) all pass.
+
 ### Fixed (Per-Module Coverage — power_consolidation.rs federated consolidate arms)
 
 - Backfilled coverage for the FEDERATED `POST /api/v1/consolidate` arms of
