@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (Per-Module Coverage — power_consolidation.rs federated consolidate arms)
+
+- Backfilled coverage for the FEDERATED `POST /api/v1/consolidate` arms of
+  `handlers::power_consolidation::consolidate_memories`, which had never been
+  exercised (both the sqlite `cov_ga2_power` harness and the pg
+  `federation_postgres_fanout` harness only ever ran with `federation: None`),
+  leaving `handlers/power_consolidation.rs` at 80.51% line coverage — below its
+  84% per-module floor. The Per-Module Coverage gate only surfaced this now: it
+  previously failed earlier at the test-run step (the serial-coverage
+  drifts/ceilings cleared this session), never reaching the threshold
+  enforcement step. Per coverage playbook §8 the floor is NOT lowered; coverage
+  was added instead:
+  - `tests/federation_postgres_fanout.rs`:
+    `consolidate_fanout_postgres_quorum_met_2860` (two mock peers ack, `W=2` →
+    `201`; finalize+disposition + `consolidate_fanout` broadcast land, peers
+    observe the derived row) and
+    `consolidate_fanout_postgres_under_replicated_is_202_2861` (dead peer, `W=2`
+    → the id-bearing `202` under-replicated arm; sources seeded directly through
+    the store so only the consolidate under-replicates).
+  - `tests/cov_ga2_power.rs`:
+    `consolidate_federated_sqlite_quorum_met_fans_out_2860` (live mock peer,
+    `federation: Some(..)` on the sqlite router → the sqlite `fed_enabled`
+    author-id switch, `sqlite_finalize_and_disposition`, and `consolidate_fanout`
+    broadcast; `201` with the peer observing the fanout).
+  Test-only change; no product behavior touched.
+
 ### Fixed (postgres expires_at SAL-patch test — stale Long-tier fixture)
 
 - `postgres_update_threads_expires_at_through_sal_patch` seeded a

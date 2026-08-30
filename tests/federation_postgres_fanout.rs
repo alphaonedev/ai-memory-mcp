@@ -10,8 +10,10 @@
 )]
 //! v0.7.0 fold-A2A1.1 (#700, F-A2A1.1) — postgres federation fanout.
 //!
-//! Three regression tests that pin the behaviour landed by the
-//! postgres-branch fanout patch in `handlers::hook_subscribers`:
+//! Regression tests that pin the behaviour landed by the postgres-branch
+//! fanout patch in `handlers::hook_subscribers` (S32/S33/S58 below), plus
+//! coverage for the federated `POST /api/v1/consolidate` postgres arms
+//! (`consolidate_fanout_postgres_*`, #2860/#2861):
 //!
 //! 1. `notify_fanout_postgres_reaches_W_of_N_peers` (S32 equivalent) —
 //!    a postgres-backed daemon configured with three in-process mock
@@ -50,8 +52,9 @@ use std::time::Duration;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::federation::{FederationConfig, PeerEndpoint};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
-use ai_memory::store::MemoryStore;
+use ai_memory::models::{Memory, Tier};
 use ai_memory::store::postgres::PostgresStore;
+use ai_memory::store::{CallerContext, MemoryStore};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
@@ -247,6 +250,35 @@ async fn wait_for_counter(counter: &AtomicUsize, min: usize, timeout: Duration) 
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     counter.load(Ordering::Relaxed) >= min
+}
+
+/// Seed a source row DIRECTLY through a postgres store handle (no HTTP) so a
+/// consolidate-under-replication test can assemble its N sources WITHOUT each
+/// HTTP create's own fanout under-replicating on the dead-peer daemon (which
+/// would 202 the create and leave the test with no id to consolidate). The
+/// row is authored as `agent` in `namespace` so the tenant `ctx` the
+/// consolidate handler uses to read sources can see it.
+async fn seed_source_row(url: &str, agent: &str, namespace: &str, title: &str) -> String {
+    let store = PostgresStore::connect(url)
+        .await
+        .expect("seed store connect");
+    let ctx = CallerContext::for_agent(agent);
+    let now = chrono::Utc::now().to_rfc3339();
+    let mem = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Mid,
+        namespace: namespace.to_string(),
+        title: title.to_string(),
+        content: "seeded source row with enough body length to consolidate".to_string(),
+        priority: 5,
+        confidence: 1.0,
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: json!({ "agent_id": agent }),
+        version: 1,
+        ..Memory::default()
+    };
+    store.store(&ctx, &mem).await.expect("seed source store")
 }
 
 // ===================================================================
@@ -844,6 +876,212 @@ async fn bulk_create_postgres_fans_out_to_peers_2724() {
             "peer-1 must have received bulk row `{t}` in a sync_push body"
         );
     }
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+// ===================================================================
+// #2860 / #1552 (CB-2860): POST /api/v1/consolidate fans out on postgres
+// ===================================================================
+
+/// PARENT (`handlers::power_consolidation::consolidate_memories`, the
+/// postgres branch, lines ~466-527): the SAL-ported postgres consolidate
+/// arm minted the substrate-derived row and returned WITHOUT broadcasting
+/// — a `POST /api/v1/consolidate` against a federated postgres daemon
+/// landed the consolidation only locally, so peers never converged the new
+/// row or the tombstoned sources.
+///
+/// Post-#2860 the postgres branch authors the derived row as the daemon's
+/// federation identity (`fed.sender_agent_id`, self-relay past strict
+/// write-sig), reads it back AS that author, runs the shared
+/// `store_finalize_and_disposition` (postgres twin of the sqlite
+/// finalize+disposition), and broadcasts it + its source disposition +
+/// `derived_from` lineage through `consolidate_fanout`. This test pins the
+/// quorum-MET arm: two mock peers ack (`W=2`, `record_local` + two peer
+/// acks), so `finalise_quorum` succeeds, the handler returns `201 CREATED`,
+/// and every peer's `sync_push` counter bumps for the consolidated row.
+#[tokio::test(flavor = "multi_thread")]
+async fn consolidate_fanout_postgres_quorum_met_2860() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    common::permissive_attestation_for_tests();
+
+    let peer1 = spawn_inproc_mock_peer().await;
+    let peer2 = spawn_inproc_mock_peer().await;
+    let peer_urls = vec![peer1.url.clone(), peer2.url.clone()];
+    let cfg = federation_cfg_for_test(&peer_urls, 2);
+
+    let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;
+    let client = common::bounded_test_client();
+
+    let agent = "ai:alice-consolidate-fanout";
+    let ns = format!("consol-2860-{}", uuid::Uuid::new_v4());
+    let mut ids = Vec::new();
+    for i in 0..2 {
+        let body = json!({
+            "title": format!("consol-src-{i}-{}", uuid::Uuid::new_v4()),
+            "content": format!("source row {i} with enough body length to consolidate"),
+            "namespace": ns,
+            "tier": "mid",
+            "priority": 5,
+        });
+        let resp = client
+            .post(format!("{base}/api/v1/memories"))
+            .header("x-agent-id", agent)
+            .json(&body)
+            .send()
+            .await
+            .expect("create source post");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::CREATED,
+            "source create must 201: {resp:?}"
+        );
+        let rb: Value = resp.json().await.expect("create body");
+        ids.push(
+            rb["id"]
+                .as_str()
+                .expect("create must return id")
+                .to_string(),
+        );
+    }
+    // Drain the per-create broadcasts so the counter assertion below is
+    // unambiguously attributable to the consolidate fanout.
+    let create_timeout = FANOUT_OBSERVED_TIMEOUT;
+    assert!(
+        wait_for_counter(&peer1.count, 1, create_timeout).await,
+        "peer-1 should have observed the source-create fanout first"
+    );
+    let p1_after_creates = peer1.count.load(Ordering::Relaxed);
+    let p2_after_creates = peer2.count.load(Ordering::Relaxed);
+
+    let resp = client
+        .post(format!("{base}/api/v1/consolidate"))
+        .header("x-agent-id", agent)
+        .json(&json!({
+            "ids": ids,
+            "title": "Consolidated postgres-federated facts",
+            "summary": "operator-supplied consolidation summary of sufficient length",
+            "namespace": ns,
+            "tier": "long",
+        }))
+        .send()
+        .await
+        .expect("consolidate post");
+    // Quorum met (record_local + two peer acks >= W=2) → 201 CREATED.
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "federated postgres consolidate with quorum met must 201: {resp:?}"
+    );
+    let cbody: Value = resp.json().await.expect("consolidate body");
+    assert!(
+        cbody["id"].is_string(),
+        "consolidate must return the derived row id: {cbody}"
+    );
+    assert_eq!(
+        cbody["consolidated"], 2,
+        "two sources consolidated: {cbody}"
+    );
+    let derived_id = cbody["id"].as_str().unwrap().to_string();
+
+    // The consolidated row (and its source disposition) fanned out: each
+    // peer observed at least one MORE sync_push after the create drain.
+    let timeout = FANOUT_OBSERVED_TIMEOUT;
+    assert!(
+        wait_for_counter(&peer1.count, p1_after_creates + 1, timeout).await
+            && wait_for_counter(&peer2.count, p2_after_creates + 1, timeout).await,
+        "both peers must observe the consolidate fanout: p1={} (was {p1_after_creates}) p2={} (was {p2_after_creates})",
+        peer1.count.load(Ordering::Relaxed),
+        peer2.count.load(Ordering::Relaxed),
+    );
+
+    // Wire-shape: peer-1 received the derived consolidation row by id.
+    let recorded = peer1.recorded.lock().await;
+    let saw_derived = recorded.iter().any(|p| {
+        p.get("memories")
+            .and_then(|m| m.as_array())
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|m| m.get("id").and_then(|i| i.as_str()) == Some(derived_id.as_str()))
+            })
+    });
+    assert!(
+        saw_derived,
+        "peer-1 must have received the derived consolidation row (id={derived_id}) in a sync_push body"
+    );
+    drop(recorded);
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// PARENT (`consolidate_fanout` -> `finalise_quorum` miss arm, and the
+/// postgres branch that returns it): when a federated postgres consolidate
+/// CANNOT reach quorum (peer down / partition), the handler must not shape
+/// the local-only write as a success. Post-#2861/#2860 it returns the
+/// id-bearing `202` `under_replicated_consolidate_response` so the caller
+/// can DISCOVER and reconcile the local row, rather than a success-shaped
+/// 2xx with nothing to act on.
+///
+/// One unreachable peer (bound to a free port with no listener) with `W=2`
+/// makes quorum unreachable (`record_local` = 1 < 2), so `finalise_quorum`
+/// returns the quorum-not-met error and the handler emits the 202.
+#[tokio::test(flavor = "multi_thread")]
+async fn consolidate_fanout_postgres_under_replicated_is_202_2861() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    common::permissive_attestation_for_tests();
+
+    // A dead peer: a free port with nothing listening → connection refused
+    // → AckOutcome::Fail, so W=2 is never reached.
+    let dead_url = format!("http://127.0.0.1:{}", free_port());
+    let cfg = federation_cfg_for_test(&[dead_url], 2);
+
+    let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;
+    let client = common::bounded_test_client();
+
+    let agent = "ai:alice-consolidate-underrep";
+    let ns = format!("consol-2861-{}", uuid::Uuid::new_v4());
+    // Seed the sources DIRECTLY (not via HTTP): on this dead-peer / W=2 daemon
+    // an HTTP create would ITSELF under-replicate (202, no top-level id), so we
+    // bypass the create-fanout and drive ONLY the consolidate through the
+    // quorum-miss arm under test.
+    let mut ids = Vec::new();
+    for i in 0..2 {
+        let title = format!("underrep-src-{i}-{}", uuid::Uuid::new_v4());
+        ids.push(seed_source_row(&url, agent, &ns, &title).await);
+    }
+
+    let resp = client
+        .post(format!("{base}/api/v1/consolidate"))
+        .header("x-agent-id", agent)
+        .json(&json!({
+            "ids": ids,
+            "title": "Under-replicated consolidation",
+            "summary": "operator-supplied summary of sufficient length for the row",
+            "namespace": ns,
+            "tier": "long",
+        }))
+        .send()
+        .await
+        .expect("consolidate post");
+    // Quorum unreachable → id-bearing 202 ACCEPTED (not a success 2xx).
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::ACCEPTED,
+        "under-replicated federated postgres consolidate must 202: {resp:?}"
+    );
+    let cbody: Value = resp.json().await.expect("consolidate body");
+    assert!(
+        cbody["id"].is_string(),
+        "the 202 must still carry the created row id for reconciliation: {cbody}"
+    );
 
     shutdown.notify_one();
     let _ = handle.await;

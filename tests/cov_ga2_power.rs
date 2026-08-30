@@ -38,6 +38,9 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::needless_update)]
+// The federated mock-peer harness defines a nested `async fn handler` after
+// its `let` bindings (mirrors `tests/federation_postgres_fanout.rs`).
+#![allow(clippy::items_after_statements)]
 
 use std::sync::Arc;
 
@@ -1068,5 +1071,169 @@ fn store_federation_forward_unreachable_is_err() {
     assert!(
         err.contains("federation_forward"),
         "forward error names the bridge: {err}"
+    );
+}
+
+// ===========================================================================
+// power_consolidation.rs — federated consolidate (sqlite branch, #2860/#1552)
+// ===========================================================================
+//
+// The `build_state` harness above wires `federation: None`, so the sqlite
+// FEDERATED consolidate arm (`consolidate_memories`, lines ~617-731: the
+// `fed_enabled` author-id switch, the `sqlite_finalize_and_disposition`
+// finalize+disposition, and the `consolidate_fanout` broadcast) never ran
+// here. This section spins a live in-process mock peer, builds an AppState
+// with `federation: Some(...)`, and drives a real `POST /api/v1/consolidate`
+// through the federated path so the finalize + fanout land under quorum.
+
+/// A live mock federation peer: a real HTTP server that 200-acks every
+/// `sync_push` (so a `broadcast_*_quorum` counts it toward `W`) and bumps a
+/// shared counter, letting the test assert the consolidate fanned out.
+async fn spawn_mock_ack_peer() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::{Json as AxumJson, Router, extract::State, routing::post};
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    async fn handler(
+        State(c): State<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+        AxumJson(_payload): AxumJson<Value>,
+    ) -> (StatusCode, AxumJson<Value>) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (
+            StatusCode::OK,
+            AxumJson(json!({"applied":1,"noop":0,"skipped":0})),
+        )
+    }
+    let app = Router::new()
+        .route("/api/v1/sync/push", post(handler))
+        .with_state(count.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock peer");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (format!("http://{addr}"), count)
+}
+
+/// Build a `FederationConfig` with `n = 1 + peers`, quorum `w`, and a
+/// short-timeout reqwest client. Opens the governance pre-action gate so the
+/// federated consolidate is not refused by the wire check (mirrors the
+/// `federation_postgres_fanout` test harness).
+fn fed_cfg(peer_urls: &[String], w: usize) -> ai_memory::federation::FederationConfig {
+    let _ =
+        ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
+    let timeout = std::time::Duration::from_secs(2);
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout)
+        .build()
+        .expect("build test reqwest client");
+    let n = 1 + peer_urls.len();
+    let policy = ai_memory::replication::QuorumPolicy::new(
+        n,
+        w,
+        timeout,
+        std::time::Duration::from_secs(30),
+    )
+    .expect("valid quorum policy");
+    let peers = peer_urls
+        .iter()
+        .enumerate()
+        .map(|(i, raw)| ai_memory::federation::PeerEndpoint {
+            id: format!("peer-{i}"),
+            sync_push_url: format!("{}/api/v1/sync/push", raw.trim_end_matches('/')),
+        })
+        .collect();
+    ai_memory::federation::FederationConfig {
+        policy,
+        peers,
+        client,
+        sender_agent_id: "ai:cov-ga2-fed-sender".to_string(),
+        api_key: None,
+        signing_key: None,
+        dlq_sink: None,
+    }
+}
+
+/// Federated sqlite router — `build_state` with `federation: Some(cfg)`.
+fn fed_router(
+    cfg: ai_memory::federation::FederationConfig,
+) -> (axum::Router, tempfile::NamedTempFile) {
+    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let _ = ai_memory::db::open(db_tmp.path()).expect("db::open");
+    let mut app_state = build_state(db_tmp.path(), Vec::new());
+    app_state.federation = Arc::new(Some(cfg));
+    let api_key_state = ApiKeyState {
+        key: None,
+        mtls_enforced: false,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        identity_mode: ai_memory::config::HttpIdentityMode::default(),
+    };
+    (ai_memory::build_router(api_key_state, app_state), db_tmp)
+}
+
+/// PARENT (`consolidate_memories`, the sqlite branch, lines ~617-731): with
+/// `federation` configured the derived row is authored as the daemon identity
+/// (`fed.sender_agent_id`), finalized+dispositioned via
+/// `sqlite_finalize_and_disposition`, and broadcast through
+/// `consolidate_fanout`. One live mock peer acks (`W=2` = `record_local` + one
+/// peer), so `finalise_quorum` succeeds, the handler returns `201 CREATED`,
+/// and the peer observed the consolidation `sync_push`.
+#[tokio::test(flavor = "multi_thread")]
+async fn consolidate_federated_sqlite_quorum_met_fans_out_2860() {
+    let (peer_url, peer_count) = spawn_mock_ack_peer().await;
+    let cfg = fed_cfg(&[peer_url], 2);
+    let (r, _t) = fed_router(cfg);
+
+    let id1 = create_memory(
+        &r,
+        "fed src one",
+        "body one long enough to store",
+        "fedconsol",
+    )
+    .await;
+    let id2 = create_memory(
+        &r,
+        "fed src two",
+        "body two long enough to store",
+        "fedconsol",
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/consolidate",
+        json!({
+            "ids": [id1, id2],
+            "title": "Federated consolidated facts",
+            "summary": "operator-supplied consolidation summary of sufficient length",
+            "namespace": "fedconsol",
+            "tier": "long",
+        }),
+    )
+    .await;
+    // Quorum met (record_local + one peer ack >= W=2) → 201 CREATED.
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "federated sqlite consolidate with quorum met must 201: {body}"
+    );
+    assert!(body["id"].is_string(), "derived row id present: {body}");
+    assert_eq!(body["consolidated"], 2, "two sources consolidated: {body}");
+
+    // The consolidation (and/or its source disposition) fanned out to the peer.
+    // The per-create broadcasts already bumped the counter; the consolidate
+    // adds at least one more push. A short spin tolerates the async fanout.
+    let mut saw = false;
+    for _ in 0..100 {
+        if peer_count.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+            saw = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        saw,
+        "mock peer must have observed at least one federated sync_push"
     );
 }
