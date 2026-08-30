@@ -51,6 +51,23 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 
 -- ─────────────────────────────────────────────────────────────────────
+-- lineage_integrity_watermark — v1.0.0 (#3172) durable high-water marks
+-- for the SCHEMA-masks-DATA-LOSS gate. Postgres replays this bootstrap DDL
+-- (CREATE TABLE IF NOT EXISTS) on EVERY connect, which silently re-creates a
+-- DROPPED append-only relation (e.g. `agent_lineage`) EMPTY. This side table
+-- records the max row count ever observed for each such relation so
+-- `PostgresStore::enforce_lineage_watermarks` can FAIL CLOSED on a regression
+-- instead of proceeding over an empty chain. A DERIVED integrity artifact
+-- (regenerable by re-observation), never the durable truth. SQLite twin:
+-- src/storage/migrations.rs SCHEMA const + schema_integrity.rs.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS lineage_integrity_watermark (
+    relation    TEXT   PRIMARY KEY,
+    high_water  BIGINT NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ─────────────────────────────────────────────────────────────────────
 -- memories — the core memory table.
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS memories (

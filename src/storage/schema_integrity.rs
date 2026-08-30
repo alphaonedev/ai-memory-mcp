@@ -385,6 +385,264 @@ pub fn refusal_message(missing: &[CoreTable], effective_version: i64) -> String 
     )
 }
 
+// ---------------------------------------------------------------------------
+// v1.0.0 (#3172) — SCHEMA-masked data-loss gate for APPEND-ONLY bootstrap
+// relations.
+//
+// The [`CORE_TABLES`] gate above covers relations that are LADDER-ONLY (absent
+// from the bootstrap `SCHEMA` constant), so their disappearance is directly
+// observable as a missing relation. This section covers the OTHER, strictly
+// harder class the same north star demands: relations that DO ship in the
+// bootstrap `SCHEMA` and are therefore re-created (EMPTY) by `db::open`'s
+// `execute_batch(SCHEMA)` replay on EVERY open, BEFORE the ladder runs. A
+// table-existence probe can never see the loss — the table always exists again
+// by the time anything looks. `agent_lineage` (the identity-succession chain)
+// is the load-bearing member: dropped by an operator, zeroed by a corrupt
+// page, or omitted by a partial restore, it is silently re-created empty and
+// the v80 rebuild arm then "succeeds" over zero rows, erasing the whole
+// lineage chain with NO skip logged (issue #3172, the SCHEMA-masks-data-loss
+// class distinct from #3113/#3159's ladder-only probe-skip class).
+//
+// The discriminator here is a persisted HIGH-WATER MARK. `agent_lineage` is
+// APPEND-ONLY (a succession record is never deleted; the chain only grows), so
+// a live row count BELOW a count this database has previously observed is
+// unambiguous loss — there is no benign "empty fixture" reading of a COUNT
+// that went DOWN. That sharper discriminator is why this gate FAILS CLOSED by
+// DEFAULT (refuses), where the ambiguous #3113 core-relation gate must default
+// to warn-only: a recorded mark of N>0 is proof THIS database once held N rows,
+// so refusing a drop below it can never brick a genuinely fresh or
+// archive-less deployment (their mark is absent / zero). The mark itself is a
+// DERIVED integrity artifact — regenerable purely by re-observation, never the
+// durable truth — so recording it can neither corrupt nor lose data.
+
+/// The append-only, bootstrap-`SCHEMA` relation whose identity-lineage chain is
+/// the load-bearing member of the SCHEMA-masks-loss class (#3172).
+pub const TABLE_AGENT_LINEAGE: &str = "agent_lineage";
+
+/// The durable high-water-mark side table (bootstrap-`SCHEMA`, both backends).
+/// One row per watermarked relation: the max live row count ever observed.
+pub const TABLE_LINEAGE_WATERMARK: &str = "lineage_integrity_watermark";
+
+/// One append-only bootstrap-`SCHEMA` relation guarded by a high-water mark.
+///
+/// A relation qualifies only when ALL hold: (1) it ships in the bootstrap
+/// `SCHEMA` (so `db::open` re-creates it empty before the ladder — [`CORE_TABLES`]
+/// cannot cover it); (2) it is APPEND-ONLY in normal operation (a live count
+/// below a recorded mark is therefore always loss, never a legitimate delete);
+/// and (3) its loss is silent and integrity-critical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WatermarkedRelation {
+    /// The sqlite/postgres relation name.
+    pub name: &'static str,
+    /// The integrity control lost when its rows vanish. Quoted verbatim into
+    /// the operator-facing refusal.
+    pub integrity_note: &'static str,
+}
+
+/// SSOT of watermarked append-only bootstrap relations.
+///
+/// When a future append-only bootstrap-`SCHEMA` relation joins this class, add
+/// it here in the same commit — that is what keeps the guard honest across the
+/// whole class rather than one hand-picked table.
+pub const WATERMARKED_RELATIONS: &[WatermarkedRelation] = &[WatermarkedRelation {
+    name: TABLE_AGENT_LINEAGE,
+    integrity_note: "the identity-succession lineage chain (genesis → rotation → recovery → \
+                     revocation records keyed by (agent_id, epoch)) is gone — every agent's \
+                     cryptographic provenance back to genesis, and the v80 custody/revocation \
+                     history, cannot be verified",
+}];
+
+/// The verdict of comparing a watermarked relation's live row count against its
+/// stored high-water mark. Modelled as a total enum so the caller MUST handle
+/// the loss arm — it cannot be dropped by an omitted branch (ERRORS-09,
+/// make-illegal-states-unrepresentable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatermarkVerdict {
+    /// Live count is at or above the recorded mark. `advance_to` is `Some(n)`
+    /// when the mark must move UP to the new live count `n`; `None` when the
+    /// mark is already current (no write needed).
+    Intact { advance_to: Option<i64> },
+    /// The stored mark strictly EXCEEDS the live count: an append-only relation
+    /// has LOST rows. `high_water` were once observed; only `current` remain.
+    /// This is schema-masked data loss and, absent an operator override, refuses.
+    Regressed { high_water: i64, current: i64 },
+}
+
+/// Pure classification of a live count against a stored mark. No I/O, no env —
+/// fully testable in isolation. A `None` stored mark reads as 0 (never
+/// observed → nothing to have lost), so a fresh/upgrade database is always
+/// [`WatermarkVerdict::Intact`] and can never be bricked by this gate.
+#[must_use]
+pub fn classify_watermark(stored: Option<i64>, current: i64) -> WatermarkVerdict {
+    let high_water = stored.unwrap_or(0);
+    if high_water > current {
+        WatermarkVerdict::Regressed {
+            high_water,
+            current,
+        }
+    } else if current > high_water {
+        WatermarkVerdict::Intact {
+            advance_to: Some(current),
+        }
+    } else {
+        WatermarkVerdict::Intact { advance_to: None }
+    }
+}
+
+/// The operator-facing refusal raised when a watermarked relation regressed and
+/// the override is NOT set. One definition, shared by the sqlite migrate gate
+/// and the postgres connect gate, so both backends refuse with the same words.
+#[must_use]
+pub fn lineage_loss_message(
+    relation: &str,
+    integrity_note: &str,
+    high_water: i64,
+    current: i64,
+) -> String {
+    format!(
+        "refusing to open: the append-only relation `{relation}` REGRESSED from a \
+         previously-recorded high-water mark of {high_water} row(s) to {current} — {integrity_note}. \
+         This is schema-masked data loss: the bootstrap schema re-creates `{relation}` EMPTY on \
+         every open, so the drop is invisible to table-existence checks and would otherwise be \
+         rebuilt over zero rows and stamped as success. The database is UNCHANGED and remains \
+         readable at its current version. Restore `{relation}` from a backup that contains its \
+         rows, or set {env}=1 to ACKNOWLEDGE the loss and proceed — which RESETS the high-water \
+         mark to {current} and is not reversible.",
+        env = crate::config::ENV_ALLOW_LINEAGE_REGRESSION,
+    )
+}
+
+/// Live row count for a bootstrap-`SCHEMA` relation.
+///
+/// A relation that is ABSENT counts as a clean `Ok(0)`: the bootstrap replay
+/// would re-create it empty, so "no live rows" is the true, non-erroneous fact,
+/// and it still trips the regression arm when a positive mark was recorded. A
+/// failed `COUNT(*)` on a PRESENT relation is unreadability (corruption / I/O /
+/// `BUSY`) and stays `Err` — never coerced to 0 (the #2445/#3246 unknown-as-a-
+/// value discipline, ERRORS-19). The relation name comes from the
+/// [`WATERMARKED_RELATIONS`] compile-time SSOT, never caller input, so
+/// interpolating it into the `COUNT` is not an injection surface (identifiers
+/// cannot be bound parameters in sqlite).
+///
+/// # Errors
+///
+/// Propagates the `sqlite_master` probe failure or a failed `COUNT(*)`.
+pub fn live_relation_count(conn: &Connection, relation: &str) -> Result<i64> {
+    if !table_present(conn, relation)? {
+        return Ok(0);
+    }
+    conn.query_row(&format!("SELECT COUNT(*) FROM {relation}"), [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .with_context(|| format!("count rows in the {relation} watermarked relation"))
+}
+
+/// Read the stored high-water mark for `relation`, or `None` when no mark has
+/// been recorded yet. Callers MUST ensure [`TABLE_LINEAGE_WATERMARK`] exists
+/// (see [`enforce_lineage_watermarks`]) — a missing mark ROW is `None`, but a
+/// missing mark TABLE is a caller error, not silently `None`.
+///
+/// # Errors
+///
+/// Propagates the read failure. A failed read is unreadability, not "no mark".
+pub fn read_lineage_watermark(conn: &Connection, relation: &str) -> Result<Option<i64>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT high_water FROM lineage_integrity_watermark WHERE relation = ?1",
+        [relation],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .with_context(|| format!("read the recorded high-water mark for {relation}"))
+}
+
+/// Upsert the high-water mark for `relation` to `value`. Used both to ADVANCE
+/// the mark on growth and to RESET it downward under an explicit operator
+/// override.
+///
+/// # Errors
+///
+/// Propagates the write failure.
+pub fn record_lineage_watermark(conn: &Connection, relation: &str, value: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO lineage_integrity_watermark (relation, high_water, observed_at) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(relation) DO UPDATE SET high_water = excluded.high_water, \
+                                             observed_at = excluded.observed_at",
+        rusqlite::params![relation, value, chrono::Utc::now().to_rfc3339()],
+    )
+    .with_context(|| format!("record the high-water mark for {relation}"))?;
+    Ok(())
+}
+
+/// Enforce the append-only high-water invariant for every
+/// [`WATERMARKED_RELATIONS`] entry.
+///
+/// For each relation: on GROWTH, advance the mark; on a match, do nothing; on a
+/// REGRESSION (live count below the recorded mark), emit a loud structured WARN
+/// and REFUSE — unless the operator override
+/// ([`crate::config::allow_lineage_regression`]) is set, in which case it WARNs,
+/// resets the mark to the current count (explicit acknowledgement), and
+/// proceeds. No-op when [`TABLE_LINEAGE_WATERMARK`] is absent (a partial test
+/// fixture that never carried the meta relation — mirrors the ladder arms'
+/// tolerance of synthetic fixtures).
+///
+/// Called INSIDE the migrate transaction and BEFORE the `schema_version` stamp,
+/// so a refusal rolls the whole ladder back and leaves the database exactly as
+/// found — still readable at its current version, with no empty relation
+/// masquerading as intact.
+///
+/// # Errors
+///
+/// Returns the [`lineage_loss_message`] error on a detected regression without
+/// the override, or propagates any probe/count/read/write failure (all of which
+/// abort the stamp — fail closed).
+pub fn enforce_lineage_watermarks(conn: &Connection) -> Result<()> {
+    if !table_present(conn, TABLE_LINEAGE_WATERMARK)? {
+        return Ok(());
+    }
+    for relation in WATERMARKED_RELATIONS {
+        let current = live_relation_count(conn, relation.name)?;
+        let stored = read_lineage_watermark(conn, relation.name)?;
+        match classify_watermark(stored, current) {
+            WatermarkVerdict::Regressed {
+                high_water,
+                current,
+            } => {
+                let acknowledged = crate::config::allow_lineage_regression();
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    relation = relation.name,
+                    high_water,
+                    current,
+                    acknowledged,
+                    override_env = crate::config::ENV_ALLOW_LINEAGE_REGRESSION,
+                    "APPEND-ONLY RELATION REGRESSED — schema-masked data loss: the bootstrap \
+                     schema re-created this relation with FEWER rows than were previously \
+                     observed. This is silent identity-lineage loss unless restored from backup. \
+                     Set the `override_env` knob to 1 to acknowledge the loss and proceed \
+                     (resets the mark)."
+                );
+                if acknowledged {
+                    record_lineage_watermark(conn, relation.name, current)?;
+                } else {
+                    return Err(anyhow::anyhow!(lineage_loss_message(
+                        relation.name,
+                        relation.integrity_note,
+                        high_water,
+                        current,
+                    )));
+                }
+            }
+            WatermarkVerdict::Intact {
+                advance_to: Some(n),
+            } => record_lineage_watermark(conn, relation.name, n)?,
+            WatermarkVerdict::Intact { advance_to: None } => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +891,153 @@ mod tests {
         let missing = report(&conn, 89).expect("report");
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].name, TABLE_GOVERNANCE_RULES);
+    }
+
+    // --- #3172: append-only high-water-mark gate ---------------------------
+
+    /// Build a connection carrying `agent_lineage` (append-only shape) and the
+    /// watermark meta relation, plus `memories`, mirroring the bootstrap set.
+    fn conn_with_lineage() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE agent_lineage (agent_id TEXT NOT NULL, epoch INTEGER NOT NULL, \
+                 PRIMARY KEY (agent_id, epoch)); \
+             CREATE TABLE lineage_integrity_watermark (relation TEXT NOT NULL PRIMARY KEY, \
+                 high_water INTEGER NOT NULL, observed_at TEXT NOT NULL);",
+        )
+        .expect("create lineage + watermark fixtures");
+        conn
+    }
+
+    fn seed_lineage_rows(conn: &Connection, n: i64) {
+        for epoch in 0..n {
+            conn.execute(
+                "INSERT INTO agent_lineage (agent_id, epoch) VALUES ('ai:x', ?1)",
+                [epoch],
+            )
+            .expect("seed lineage row");
+        }
+    }
+
+    #[test]
+    fn classify_none_mark_is_always_intact() {
+        // A never-observed relation (fresh / upgrade) can NEVER be classified
+        // as loss — this is the anti-brick invariant of the whole gate.
+        assert_eq!(
+            classify_watermark(None, 0),
+            WatermarkVerdict::Intact { advance_to: None }
+        );
+        assert_eq!(
+            classify_watermark(None, 5),
+            WatermarkVerdict::Intact {
+                advance_to: Some(5)
+            }
+        );
+    }
+
+    #[test]
+    fn classify_growth_advances_and_match_is_noop() {
+        assert_eq!(
+            classify_watermark(Some(3), 7),
+            WatermarkVerdict::Intact {
+                advance_to: Some(7)
+            }
+        );
+        assert_eq!(
+            classify_watermark(Some(4), 4),
+            WatermarkVerdict::Intact { advance_to: None }
+        );
+    }
+
+    #[test]
+    fn classify_regression_including_drop_to_zero_is_loss() {
+        // The exact #3172 signal: a recorded mark of N>0 and a live count that
+        // fell below it — including the schema-mask's drop-to-EMPTY.
+        assert_eq!(
+            classify_watermark(Some(5), 0),
+            WatermarkVerdict::Regressed {
+                high_water: 5,
+                current: 0
+            }
+        );
+        assert_eq!(
+            classify_watermark(Some(9), 4),
+            WatermarkVerdict::Regressed {
+                high_water: 9,
+                current: 4
+            }
+        );
+    }
+
+    #[test]
+    fn live_relation_count_reads_zero_for_absent_relation() {
+        // A DROPPED bootstrap relation counts as 0 live rows (it would be
+        // re-created empty), not an error — so a recorded mark still trips.
+        let conn = conn_with(&[]);
+        assert_eq!(
+            live_relation_count(&conn, TABLE_AGENT_LINEAGE).expect("absent => 0"),
+            0
+        );
+    }
+
+    #[test]
+    fn enforce_is_a_noop_without_the_watermark_table() {
+        // A partial fixture without the meta relation must not brick.
+        let conn = conn_with(&[TABLE_AGENT_LINEAGE]);
+        enforce_lineage_watermarks(&conn).expect("no watermark table => no-op");
+    }
+
+    #[test]
+    fn enforce_advances_then_holds_the_mark() {
+        let conn = conn_with_lineage();
+        seed_lineage_rows(&conn, 3); // epochs 0..3
+        enforce_lineage_watermarks(&conn).expect("first pass records the mark");
+        assert_eq!(
+            read_lineage_watermark(&conn, TABLE_AGENT_LINEAGE).expect("read"),
+            Some(3)
+        );
+        // Append two more distinct epochs → the mark advances to 5.
+        for epoch in 3..5 {
+            conn.execute(
+                "INSERT INTO agent_lineage (agent_id, epoch) VALUES ('ai:x', ?1)",
+                [epoch],
+            )
+            .expect("append epoch");
+        }
+        enforce_lineage_watermarks(&conn).expect("second pass advances");
+        assert_eq!(
+            read_lineage_watermark(&conn, TABLE_AGENT_LINEAGE).expect("read"),
+            Some(5)
+        );
+        // A no-op re-run holds the mark steady.
+        enforce_lineage_watermarks(&conn).expect("third pass holds");
+        assert_eq!(
+            read_lineage_watermark(&conn, TABLE_AGENT_LINEAGE).expect("read"),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn enforce_refuses_on_a_drop_to_zero() {
+        // Seed rows, record the mark, then EMPTY the relation (the schema-mask
+        // outcome) and assert the gate refuses with the operator-facing message.
+        let conn = conn_with_lineage();
+        seed_lineage_rows(&conn, 4);
+        enforce_lineage_watermarks(&conn).expect("record mark = 4");
+        conn.execute("DELETE FROM agent_lineage", [])
+            .expect("simulate schema-masked drop-to-empty");
+        let err = enforce_lineage_watermarks(&conn).expect_err("must refuse the emptied relation");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(TABLE_AGENT_LINEAGE), "{msg}");
+        assert!(msg.contains("UNCHANGED"), "{msg}");
+        assert!(
+            msg.contains(crate::config::ENV_ALLOW_LINEAGE_REGRESSION),
+            "{msg}"
+        );
+        // Refusal is not a mutation: the mark is untouched at its prior value.
+        assert_eq!(
+            read_lineage_watermark(&conn, TABLE_AGENT_LINEAGE).expect("read"),
+            Some(4)
+        );
     }
 }

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3172 — agent_lineage SCHEMA-masks-data-loss, GA data-integrity blocker)
+
+- `agent_lineage` (the identity-succession lineage chain) ships in the bootstrap
+  `SCHEMA` const, which `db::open` replays on EVERY open BEFORE the migration
+  ladder. A dropped table (operator `DROP`, partial restore, corrupt page) was
+  silently re-created EMPTY, the v80 rebuild arm then "succeeded" over zero rows,
+  and the entire lineage chain was lost with NO skip logged — undetectable by
+  the #3113 table-existence probe (the relation always exists again after the
+  replay). This is the SCHEMA-masks-data-loss class, distinct from #3113/#3159's
+  ladder-only probe-skip class.
+- Fix: a durable `lineage_integrity_watermark` side table (shipped inline in the
+  bootstrap `SCHEMA` on both backends) records the max row count ever observed
+  for each append-only bootstrap relation. A new
+  `schema_integrity::enforce_lineage_watermarks` gate — run inside the sqlite
+  migrate transaction before the `schema_version` stamp, and on every postgres
+  connect after the ladder — compares the live count against the recorded mark.
+  Because `agent_lineage` is append-only, a live count BELOW the mark is
+  unambiguous loss, so the gate FAILS CLOSED by default (refuses, rolling the
+  ladder back and leaving the database UNCHANGED and readable), emitting a loud
+  structured WARN naming the relation, the mark, and the live count.
+  `AI_MEMORY_ALLOW_LINEAGE_REGRESSION=1` is the explicit-intent operator
+  override that acknowledges a real loss, resets the mark, and proceeds. A
+  never-observed relation (absent/zero mark) can never trip the gate, so fresh
+  and archive-less deployments cannot be bricked.
+- Applies ERRORS-19 (never silently drop a failure) and
+  make-illegal-states-unrepresentable (the `WatermarkVerdict` total enum forces
+  the loss arm to be handled). Both backends refuse with the identical
+  operator-facing message via the shared pure `classify_watermark` /
+  `lineage_loss_message`. Audit note: every table present in BOTH the bootstrap
+  `SCHEMA` and a ladder rebuild arm shares this exposure class; only
+  `agent_lineage` carries a silent-loss-critical, append-only invariant and is
+  fixed here (see the PR report for the full enumeration).
+
 ### Fixed (B7 structural gate — pg transcript-write twins allowlisted)
 
 - The #3064 batch D merge added two write-SQL functions in

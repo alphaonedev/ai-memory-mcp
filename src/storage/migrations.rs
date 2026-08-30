@@ -502,6 +502,24 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
 
+-- v1.0.0 (#3172) — durable high-water marks for the SCHEMA-masks-data-loss
+-- gate. db::open replays this bootstrap SCHEMA on EVERY open, which silently
+-- re-creates a DROPPED append-only relation (e.g. agent_lineage) EMPTY before
+-- the ladder runs; the v80 rebuild then succeeds over zero rows and the whole
+-- identity-lineage chain is lost with no skip logged. This side table records
+-- the max row count ever observed for each such relation so
+-- schema_integrity::enforce_lineage_watermarks can FAIL CLOSED on a regression
+-- instead of stamping loss as success. It is a DERIVED integrity artifact
+-- (regenerable purely by re-observation), never the durable truth, so
+-- recording it can neither corrupt nor lose data. Shipped inline here (not a
+-- ladder arm) precisely because the every-open replay is what must create it
+-- on an upgrading database too. Postgres twin: src/store/postgres_schema.sql.
+CREATE TABLE IF NOT EXISTS lineage_integrity_watermark (
+    relation     TEXT    NOT NULL PRIMARY KEY,
+    high_water   INTEGER NOT NULL,
+    observed_at  TEXT    NOT NULL
+);
+
 -- v0.6.4-009 — capability-expansion audit log (NHI guardrails phase 1).
 -- Mirrors migrations/sqlite/0014_v064_audit_log.sql so a fresh DB
 -- bootstrap that bypasses the migration ladder still ends up with the

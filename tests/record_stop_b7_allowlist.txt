@@ -80,3 +80,10 @@ src/store/postgres_parity.rs	archive_links_for_memory_in_tx
 # skip_path() exempts — these rows preserve that backend parity.
 src/store/postgres_parity.rs	store_transcript
 src/store/postgres_parity.rs	link_memory_transcript
+# v1.0.0 (#3172) — the agent_lineage SCHEMA-masks-data-loss high-water gate.
+# These upsert ONLY the DERIVED `lineage_integrity_watermark` meta table (a
+# regenerable integrity artifact, never the record plane), and they run at
+# db::open / connect BEFORE any record-plane traffic — they are NOT
+# record-stoppable writes. Fable review: bootstrap-time integrity bookkeeping.
+src/storage/schema_integrity.rs	record_lineage_watermark
+src/store/postgres.rs	record_lineage_watermark_pg
