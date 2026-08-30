@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (CI — `cargo test --lib` RED: two inline capability tests still asserted pre-#3111 flip-Deny, #3111 follow-up)
+
+- **#3111 follow-up (CI / test-only) — the Per-Module Coverage `cargo test
+  --lib` job was RED because two inline `#[cfg(test)]` unit tests in
+  `src/governance/capability.rs` still asserted the OLD "a covering token flips
+  a Deny to Allow" behavior that #3111 removed.** #3111 made a rule-derived
+  (operator) `Deny` TERMINAL in the capability-token grant joiner:
+  `apply_capability_grant`/`apply_capability_grant_gov` return the `Deny` base
+  UNCHANGED with `GrantOutcome::NoOp` BEFORE `verify()` runs, and `apply_at_gate`
+  likewise leaves an operator `Deny` in place — only an `Ask`/`Pending` (a
+  pending human court) base lifts to `Allow` on a valid covering token. The
+  crown-jewel authz invariant is that an operator permission rule can never be
+  bypassed by an AI-held (possibly attenuated) token. The g10 integration tests
+  were updated with #3111 but these two inline unit tests were missed:
+  `gov_joiner_flips_deny_and_pending_and_preserves_base_on_reject` (renamed to
+  `gov_joiner_deny_terminal_pending_flips_preserves_base_on_reject`) asserted
+  `Deny("nope") → Allow`+`Granted`, and
+  `apply_at_gate_flips_when_enabled_and_verified` (renamed to
+  `apply_at_gate_operator_deny_terminal_pending_flips`) asserted
+  `Deny("deny") → Allow` at the gate. Both now assert the terminal-Deny
+  invariant (the original refusal envelope stands, `NoOp` at the joiner) while
+  keeping — and, at the gate, strengthening with an explicit `Pending → Allow`
+  case — the legitimate pending-court lift path. Test-only: no production code
+  changed, no `src/federation`/`src/identity` touched, so the §7 re-cert
+  trigger does not fire.
+
 ### Fixed (CI — certified-postgres cert gate RED since the #3198 key-dir hardening, #3117 SHIP-BLOCKER)
 
 - **#3117 (CI / GA ship-blocker) — the `cert-postgres-age.yml` "Cluster-A

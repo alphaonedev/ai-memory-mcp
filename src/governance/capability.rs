@@ -1984,17 +1984,31 @@ mod tests {
     }
 
     #[test]
-    fn gov_joiner_flips_deny_and_pending_and_preserves_base_on_reject() {
+    fn gov_joiner_deny_terminal_pending_flips_preserves_base_on_reject() {
         use crate::models::GovernanceDecision;
         let (tok, cfg, _, _) = mint_fixture(vec![
             Caveat::OpCeiling(OpLevel::Write),
             Caveat::ExpiresAt(9_999_999_999),
         ]);
         let r = req("Store", "n", "a", 1);
-        // Deny → Allow on a valid token.
+        // #3111 — an operator/rule-derived Deny is TERMINAL: even a fully
+        // covering token must NOT flip it. The token is never consulted
+        // (NoOp, not Granted), and the ORIGINAL refusal envelope stands.
         let (d, out) = apply_capability_grant_gov(refusal("nope"), &cfg, true, Some(&tok), &r);
-        assert_eq!(d, GovernanceDecision::Allow);
-        assert!(matches!(out, GrantOutcome::Granted { .. }));
+        match d {
+            GovernanceDecision::Deny(refu) => {
+                assert_eq!(
+                    refu.reason, "nope",
+                    "the operator Deny must stand unchanged"
+                );
+            }
+            other => panic!("operator Deny must stay terminal, got {other:?}"),
+        }
+        assert_eq!(
+            out,
+            GrantOutcome::NoOp,
+            "a covering token must not turn a Deny into a grant/reject"
+        );
         // Pending → Allow on a valid token.
         let (d2, out2) = apply_capability_grant_gov(
             GovernanceDecision::Pending(String::new()),
@@ -2005,15 +2019,32 @@ mod tests {
         );
         assert_eq!(d2, GovernanceDecision::Allow);
         assert!(matches!(out2, GrantOutcome::Granted { .. }));
-        // Reject (expired) → the ORIGINAL refusal envelope is returned.
+        // Reject (expired) on the only base that reaches `verify` — a
+        // Pending court — returns the ORIGINAL base byte-identical with a
+        // Rejected outcome (reject preserves the base envelope).
         let expired = req("Store", "n", "a", 99_999_999_999);
-        let (d3, out3) =
-            apply_capability_grant_gov(refusal("original"), &cfg, true, Some(&tok), &expired);
+        let (d3, out3) = apply_capability_grant_gov(
+            GovernanceDecision::Pending("court-7".into()),
+            &cfg,
+            true,
+            Some(&tok),
+            &expired,
+        );
         match d3 {
-            GovernanceDecision::Deny(refu) => assert_eq!(refu.reason, "original"),
+            GovernanceDecision::Pending(id) => assert_eq!(id, "court-7"),
             other => panic!("base must be unchanged on reject, got {other:?}"),
         }
         assert_eq!(out3, GrantOutcome::Rejected(CapReject::Expired));
+        // #3111 — a Deny base short-circuits to NoOp BEFORE `verify`, so even
+        // an expired (would-reject) token never turns that Deny into a
+        // Rejected outcome: the terminal-Deny envelope is returned verbatim.
+        let (dd, outd) =
+            apply_capability_grant_gov(refusal("original"), &cfg, true, Some(&tok), &expired);
+        match dd {
+            GovernanceDecision::Deny(refu) => assert_eq!(refu.reason, "original"),
+            other => panic!("operator Deny must stay terminal, got {other:?}"),
+        }
+        assert_eq!(outd, GrantOutcome::NoOp);
         // Allow base → identity NoOp.
         let (d4, out4) =
             apply_capability_grant_gov(GovernanceDecision::Allow, &cfg, true, Some(&tok), &r);
@@ -2050,7 +2081,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_at_gate_flips_when_enabled_and_verified() {
+    fn apply_at_gate_operator_deny_terminal_pending_flips() {
         use crate::models::{GovernanceDecision, GovernedAction};
         let _cap = crate::config::lock_capability_config_for_test();
         let (tok, cfg, _, _) = mint_fixture(vec![
@@ -2058,6 +2089,8 @@ mod tests {
             Caveat::ExpiresAt(9_999_999_999),
         ]);
         crate::config::set_active_capability_config(cfg);
+        // #3111 — an operator Deny is TERMINAL at the gate: a fully covering
+        // token confers nothing, the refusal envelope is returned verbatim.
         let d = apply_at_gate(
             refusal("deny"),
             GovernedAction::Store,
@@ -2065,7 +2098,27 @@ mod tests {
             "ai:x",
             Some(&tok),
         );
-        assert_eq!(d, GovernanceDecision::Allow);
+        match d {
+            GovernanceDecision::Deny(r) => {
+                assert_eq!(r.reason, "deny", "operator Deny is terminal at the gate");
+            }
+            other => panic!("operator Deny must stand at the gate, got {other:?}"),
+        }
+        // Positive path still works: a legitimate pending court IS liftable at
+        // the gate by the same covering token (the gate is not a blanket
+        // no-op — only Deny is terminal).
+        let dp = apply_at_gate(
+            GovernanceDecision::Pending(String::new()),
+            GovernedAction::Store,
+            "ns",
+            "ai:x",
+            Some(&tok),
+        );
+        assert_eq!(
+            dp,
+            GovernanceDecision::Allow,
+            "a pending court must lift on a covering token"
+        );
         // An expired presentation leaves the base unchanged.
         let (past, cfg2, _, _) = mint_fixture(vec![Caveat::ExpiresAt(1)]);
         crate::config::set_active_capability_config(cfg2);
