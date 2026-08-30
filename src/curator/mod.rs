@@ -697,7 +697,43 @@ fn run_consolidation_pass(
     // worker, spawn_blocking, no runtime): `block_in_place` is a no-op
     // when not entered and parks a multi-thread worker so nested block_on
     // is legal. CONCURRENCY-22.
-    let outcome = tokio::task::block_in_place(drive_pass);
+    //
+    // #3283 — PANIC CONTAINMENT (North Star: degrade, never die). The pass
+    // drives an LLM clusterer plus a nested current-thread runtime; a panic in
+    // either (or any callee) would otherwise unwind out of `run_once`, out of
+    // `run_daemon`'s cycle loop, and out of the `spawn_blocking` closure both
+    // daemon drivers await (`daemon_runtime::run_curator_daemon_with_shutdown`
+    // / `_with_primitives`) — where the resulting `JoinError` is converted into
+    // a hard error that TERMINATES the curator daemon. `catch_unwind` contains
+    // the pass so one bad cycle degrades to a logged, reported failure, not a
+    // dead daemon (`panic = "unwind"` is deliberately retained in Cargo.toml
+    // precisely so this boundary works; `catch_unwind` is inert under
+    // `panic = "abort"`). `AssertUnwindSafe` is sound here: on a caught panic we
+    // observe NONE of the state reachable through the closure — we only record
+    // an error string and return; `report` is mutated only AFTER the boundary,
+    // never inside it. The `catch_unwind` `Result` is handled explicitly,
+    // never dropped (ERRORS-19). Dropping the pass's inner current-thread
+    // runtime while unwinding is safe on every remaining case (no-runtime test
+    // thread, spawn_blocking pool thread — both permit blocking); the
+    // would-double-panic current-thread-worker case is already skipped above.
+    let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tokio::task::block_in_place(drive_pass)
+    }));
+    let outcome = match driven {
+        Ok(result) => result,
+        Err(panic) => {
+            let detail = panic_payload_message(panic.as_ref());
+            tracing::error!(
+                slug = CONSOLIDATION_PASS_PANIC_CONTAINED,
+                detail = %detail,
+                "consolidation pass PANIC contained — cycle degraded, curator daemon preserved (#3283)"
+            );
+            report
+                .errors
+                .push(format!("{CONSOLIDATION_PASS_PANIC_CONTAINED}: {detail}"));
+            return;
+        }
+    };
     match outcome {
         Ok(out) => {
             // Fold the SAL consolidator's outcome into the autonomy report so
@@ -747,6 +783,35 @@ fn tokio_current_thread_handle_present() -> bool {
             tokio::runtime::RuntimeFlavor::MultiThread
         ),
     }
+}
+
+/// #3283 — stable, greppable marker for a CONTAINED `ConsolidationPass` panic.
+///
+/// A panic in the SAL consolidation pass (LLM clustering, nested runtime, or
+/// any callee) is caught at the `run_consolidation_pass` boundary and recorded
+/// under this prefix instead of unwinding out of the `spawn_blocking` closure
+/// the daemon drivers await — where the `JoinError` would TERMINATE the curator
+/// daemon. One bad cycle degrades to this reported failure, not a dead daemon.
+/// One named const so the production log and the regression assertion share a
+/// single spelling (pm-v3.1 lint-gate).
+#[cfg(feature = "sal")]
+pub(crate) const CONSOLIDATION_PASS_PANIC_CONTAINED: &str =
+    "consolidation pass: PANIC contained (cycle degraded, curator daemon preserved)";
+
+/// Extract a human-readable message from a `catch_unwind` panic payload.
+///
+/// Rust panic payloads are `&str` (from `panic!("literal")`) or `String` (from
+/// `panic!("{}", x)`); anything else is opaque and reported as such. Kept as a
+/// named helper so the `#3283` containment site stays readable and the
+/// downcast logic is unit-reachable.
+#[cfg(feature = "sal")]
+#[must_use]
+fn panic_payload_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 /// Non-`sal` builds carry no SAL `ConsolidationPass`; the consolidation pass is
@@ -3444,6 +3509,84 @@ mod consolidation_pass_tests_1746 {
         assert!(
             !tokio_current_thread_handle_present(),
             "a plain #[test] thread has no tokio Handle"
+        );
+    }
+
+    /// #3283 REGRESSION — a panic inside the SAL `ConsolidationPass` must be
+    /// CONTAINED at the `run_consolidation_pass` boundary, not unwind out and
+    /// (via the daemon drivers' `spawn_blocking` → `JoinError` → hard error)
+    /// kill the curator daemon. Pre-fix `run_consolidation_pass` had no
+    /// `catch_unwind`, so a panicking clusterer/summariser took the caller's
+    /// thread with it. Now the call returns normally, the panic is reported
+    /// under [`CONSOLIDATION_PASS_PANIC_CONTAINED`], the corpus is untouched
+    /// (summarise panics BEFORE any destructive persist), and a subsequent
+    /// pass still consolidates — the stand-in for `run_daemon` proceeding to
+    /// its next cycle rather than dying on the bad one.
+    #[test]
+    fn consolidation_pass_contains_panic_and_survives_3283() {
+        struct PanicSummarizeLlm;
+        impl AutonomyLlm for PanicSummarizeLlm {
+            fn auto_tag(&self, _t: &str, _c: &str) -> anyhow::Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn detect_contradiction(&self, _a: &str, _b: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            fn summarize_memories(&self, _m: &[(String, String)]) -> anyhow::Result<String> {
+                panic!("injected clustering/summarise panic (#3283 regression)")
+            }
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let cfg = CuratorConfig {
+            compaction: CompactionConfig {
+                enabled: true,
+                ..CompactionConfig::default()
+            },
+            ..CuratorConfig::default()
+        };
+
+        // The pass panics in `summarize_memories`. Pre-fix this unwound and
+        // took the test thread down; reaching the asserts below AT ALL proves
+        // the panic was contained (the process survived).
+        let panic_llm = PanicSummarizeLlm;
+        let mut report = CuratorReport::new(false);
+        run_consolidation_pass(&conn, &candidates, &cfg, &panic_llm, &mut report);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains(CONSOLIDATION_PASS_PANIC_CONTAINED)),
+            "the contained panic must be surfaced to the operator, got {:?}",
+            report.errors
+        );
+        // Data integrity: summarise panics BEFORE persist, so both sources
+        // survive untouched — a contained panic never corrupts the corpus.
+        assert_eq!(report.autonomy.memories_consolidated, 0);
+        for m in &candidates {
+            assert!(
+                db::get(&conn, &m.id).unwrap().is_some(),
+                "a contained-panic cycle must leave every source row intact"
+            );
+        }
+
+        // Daemon survival: a SUBSEQUENT healthy pass still runs to completion
+        // on the same process + db.
+        let good_llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report2 = CuratorReport::new(false);
+        run_consolidation_pass(&conn, &candidates, &cfg, &good_llm, &mut report2);
+        assert_eq!(
+            report2.autonomy.memories_consolidated, 2,
+            "the daemon survives: the next pass consolidates normally"
+        );
+        assert!(
+            *good_llm.summarize_calls.lock().unwrap() >= 1,
+            "the recovery pass invoked the LLM"
         );
     }
 
