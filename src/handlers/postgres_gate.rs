@@ -806,6 +806,14 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         // reads are unaffected. The message is caller-safe (no adapter
         // internals) so no sanitisation is needed.
         StoreError::Stopped { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        // v1.0.0 #3196 — a find_paths traversal-budget refusal. 400, not 503:
+        // the caller asked for a traversal too broad to serve within the
+        // materialised-prefix budget, and the actionable fix is on the
+        // caller's side (lower max_depth, or a less-connected pair). The
+        // message is caller-safe (it names only the budget constant, no
+        // adapter internals) so it is emitted unsanitised, matching the
+        // depth-ceiling InvalidInput refusal it sits beside.
+        StoreError::TraversalBudgetExceeded { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
         // v1.0.0 #2445 — the database is newer than this binary. 503, not 500:
         // this is not OUR fault and not a transient backend fault, it is a
         // deliberate refusal that persists until an operator upgrades the
@@ -1845,6 +1853,12 @@ mod transport_postgres_gate_tests {
             detail: "d".to_string(),
         });
         assert_eq!(r.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+        // #3196 — a find_paths traversal-budget refusal maps to 400 BAD_REQUEST.
+        let r = store_err_to_response(StoreError::TraversalBudgetExceeded {
+            detail: crate::storage::find_paths_budget_exceeded_message(),
+        });
+        assert_eq!(r.status(), axum::http::StatusCode::BAD_REQUEST);
 
         let r = store_err_to_response(StoreError::Backend(crate::store::BoxBackendError::new(
             "raw",

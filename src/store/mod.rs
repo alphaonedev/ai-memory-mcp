@@ -365,6 +365,25 @@ pub enum StoreError {
     #[error("{detail}")]
     SchemaStampInvalid { detail: String },
 
+    /// v1.0.0 #3196 — a `find_paths` traversal was refused because it would
+    /// materialise more than [`crate::storage::FIND_PATHS_MAX_PREFIXES`]
+    /// path-prefixes. Carries a rendered `detail` (following the
+    /// [`Self::LinkRefused`] / [`Self::InvalidTransition`] convention): both
+    /// backends produce the SAME string via
+    /// [`crate::storage::find_paths_budget_exceeded_message`] — the sqlite
+    /// SAL path lifts it from
+    /// [`crate::storage::StorageError::TraversalBudgetExceeded`] and the
+    /// postgres path constructs it inline — so cross-backend parity is
+    /// provable by assertion. Fail-closed: a crafted hub graph is refused
+    /// rather than allowed to stall the traversal (and, on sqlite, the write
+    /// plane it would otherwise contend with).
+    ///
+    /// Wire shape (HTTP): `400 BAD_REQUEST` with code
+    /// `TRAVERSAL_BUDGET_EXCEEDED` — the caller can narrow the request
+    /// (lower `max_depth`, or pick a less-connected pair) and retry.
+    #[error("{detail}")]
+    TraversalBudgetExceeded { detail: String },
+
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
 }
@@ -429,6 +448,10 @@ impl StoreError {
             // DATABASE's version stamp is the thing that is wrong, and the
             // operator action differs from the schema-ahead one.
             Self::SchemaStampInvalid { .. } => error_codes::SCHEMA_STAMP_INVALID,
+            // #3196 — a traversal-budget refusal is caller-triggerable and
+            // backend-blind (the same budget on both adapters); it carries its
+            // own slug rather than a generic backend fault.
+            Self::TraversalBudgetExceeded { .. } => error_codes::TRAVERSAL_BUDGET_EXCEEDED,
             Self::Backend(_) => error_codes::DATABASE_ERROR,
         }
     }

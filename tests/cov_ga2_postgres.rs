@@ -493,6 +493,68 @@ async fn find_paths_rejects_zero_and_oversized_depth() {
     assert!(matches!(trait_zero, Err(StoreError::InvalidInput { .. })));
 }
 
+/// v1.0.0 #3196 — a dense clique explodes the path-prefix count past the
+/// materialised-prefix budget inside the depth ceiling, so both the inherent
+/// `find_paths_cte` and the trait-level `find_paths` must REFUSE with the
+/// typed `TraversalBudgetExceeded` (byte-parity with the sqlite twin) rather
+/// than run an unbounded traversal. This is the Postgres half of the #3196
+/// cross-backend budget guarantee (the sqlite half lives in
+/// `src/storage/mod.rs::find_paths_dense_clique_refuses_with_typed_budget_error_3196`).
+#[tokio::test]
+async fn find_paths_dense_clique_refuses_with_budget_3196() {
+    let Some(store) = connect().await else {
+        return;
+    };
+    let ctx = CallerContext::for_agent("ai:ga2");
+    let ns = uid("ga2-fpbudget");
+    let n = 14usize;
+    let ids: Vec<String> = (0..n).map(|i| uid(&format!("bud{i}"))).collect();
+    for (i, id) in ids.iter().enumerate() {
+        store
+            .store(&ctx, &mem(id, &ns, &format!("clique {i}"), "body"))
+            .await
+            .unwrap();
+    }
+    // Complete graph: every distinct pair linked once.
+    for i in 0..n {
+        for j in (i + 1)..n {
+            store.link(&ctx, &link(&ids[i], &ids[j])).await.unwrap();
+        }
+    }
+
+    // Inherent relational path (the universal fallback, CTE-served name).
+    let via_cte = store
+        .find_paths_cte(&ids[0], &ids[n - 1], Some(7), Some(50))
+        .await;
+    assert!(
+        matches!(via_cte, Err(StoreError::TraversalBudgetExceeded { .. })),
+        "dense clique at depth 7 must trip the prefix budget on find_paths_cte, got: {via_cte:?}"
+    );
+
+    // Trait-level dispatcher — the surface the HTTP `kg_find_paths` route
+    // drives — must refuse identically.
+    let via_trait =
+        MemoryStore::find_paths(&store, &ctx, &ids[0], &ids[n - 1], Some(7), Some(50)).await;
+    assert!(
+        matches!(via_trait, Err(StoreError::TraversalBudgetExceeded { .. })),
+        "trait find_paths must also trip the budget, got: {via_trait:?}"
+    );
+
+    // Within budget: a trivial 2-node lookup on the SAME dense fixture still
+    // succeeds (the budget refuses only the explosive traversal, and the
+    // fix does not break ordinary queries).
+    let shallow = store
+        .find_paths_cte(&ids[0], &ids[1], Some(1), Some(5))
+        .await
+        .expect("depth-1 lookup stays within budget");
+    assert!(
+        shallow
+            .iter()
+            .any(|p| p == &vec![ids[0].clone(), ids[1].clone()]),
+        "direct edge must be enumerated within budget"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────
 // kg_query_with_history — include_invalidated arm
 // ───────────────────────────────────────────────────────────────────
