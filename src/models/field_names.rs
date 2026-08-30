@@ -149,6 +149,8 @@ pub const CANONICAL_NAME: &str = "canonical_name";
 pub const CAPABILITIES: &str = "capabilities";
 /// `compatibility` — wire/row field name.
 pub const COMPATIBILITY: &str = "compatibility";
+/// `compressed_size` — I4 transcript metadata / MCP-HTTP replay envelope.
+pub const COMPRESSED_SIZE: &str = "compressed_size";
 /// `confidence` — wire/row field name.
 pub const CONFIDENCE: &str = "confidence";
 /// `confidence_decayed_at` — wire/row field name.
@@ -348,6 +350,8 @@ pub const OBSERVED_BY: &str = "observed_by";
 pub const OLDER_THAN_DAYS: &str = "older_than_days";
 /// `original_depth` — wire/row field name.
 pub const ORIGINAL_DEPTH: &str = "original_depth";
+/// `original_size` — I4 transcript metadata / MCP-HTTP replay envelope.
+pub const ORIGINAL_SIZE: &str = "original_size";
 /// `owner_scope` — wire/row field name.
 pub const OWNER_SCOPE: &str = "owner_scope";
 /// `parameters_schema` — wire/row field name.
@@ -422,6 +426,10 @@ pub const SOURCE_MEMORY_ID: &str = "source_memory_id";
 pub const SOURCE_SPAN: &str = "source_span";
 /// `source_uri` — wire/row field name.
 pub const SOURCE_URI: &str = "source_uri";
+/// `span_end` — I4 transcript link offset (half-open).
+pub const SPAN_END: &str = "span_end";
+/// `span_start` — I4 transcript link offset (half-open).
+pub const SPAN_START: &str = "span_start";
 /// `standard_id` — wire/row field name.
 pub const STANDARD_ID: &str = "standard_id";
 /// `standards_withheld` — wire field name (#2537). Count-only disclosure of
@@ -466,6 +474,8 @@ pub const TOTAL_LINES: &str = "total_lines";
 pub const TOTAL_MEMORIES: &str = "total_memories";
 /// `to_namespace` — wire/row field name.
 pub const TO_NAMESPACE: &str = "to_namespace";
+/// `transcript_id` — I2 link / I4 replay envelope.
+pub const TRANSCRIPT_ID: &str = "transcript_id";
 /// `transcripts` — wire/row field name.
 pub const TRANSCRIPTS: &str = "transcripts";
 /// `transitive_count` — MCP/HTTP `memory_dependents_of_invalidated`.

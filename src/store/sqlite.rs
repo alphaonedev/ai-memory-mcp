@@ -20,8 +20,8 @@ use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 
 use super::{
     BoxBackendError, CallerContext, Capabilities, CaptureTurnResult, CaptureTurnWrite, Filter,
-    MemoryStore, StoreError, StoreResult, UpdatePatch, VerifyFilter, VerifyLinkReport,
-    VerifyReport, is_visible_to_caller,
+    MemoryStore, ReplayTranscriptEntry, StoreError, StoreResult, UpdatePatch, VerifyFilter,
+    VerifyLinkReport, VerifyReport, is_visible_to_caller,
 };
 use crate::quotas::{self, QuotaStatus};
 
@@ -1022,6 +1022,63 @@ impl MemoryStore for SqliteStore {
             )
             .map_err(box_err)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(box_err)
+    }
+
+    async fn replay_transcript_union(
+        &self,
+        memory_id: &str,
+        depth: Option<u32>,
+    ) -> StoreResult<Vec<ReplayTranscriptEntry>> {
+        let conn = self.state.lock().await;
+        crate::transcripts::replay::replay_transcript_union(&conn, memory_id, depth)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|e| ReplayTranscriptEntry {
+                        memory_id: e.memory_id,
+                        transcript_id: e.meta.id,
+                        namespace: e.meta.namespace,
+                        created_at: e.meta.created_at,
+                        compressed_size: e.meta.compressed_size,
+                        original_size: e.meta.original_size,
+                        span_start: e.link.span_start,
+                        span_end: e.link.span_end,
+                    })
+                    .collect()
+            })
+            .map_err(box_err)
+    }
+
+    async fn fetch_transcript_content(&self, transcript_id: &str) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        crate::transcripts::storage::fetch(&conn, transcript_id).map_err(box_err)
+    }
+
+    async fn store_transcript(
+        &self,
+        namespace: &str,
+        content: &str,
+    ) -> StoreResult<crate::transcripts::storage::Transcript> {
+        let conn = self.state.lock().await;
+        crate::transcripts::storage::store(&conn, namespace, content, None).map_err(box_err)
+    }
+
+    async fn link_memory_transcript(
+        &self,
+        memory_id: &str,
+        transcript_id: &str,
+        span_start: Option<i64>,
+        span_end: Option<i64>,
+    ) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        crate::transcripts::storage::link_transcript(
+            &conn,
+            memory_id,
+            transcript_id,
+            span_start,
+            span_end,
+        )
+        .map_err(box_err)
     }
 
     async fn link_signed(

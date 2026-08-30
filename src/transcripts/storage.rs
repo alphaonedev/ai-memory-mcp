@@ -19,7 +19,7 @@ const LIFECYCLE_TRACE_TARGET: &str = "transcripts.lifecycle";
 
 /// Default zstd compression level. Matches `cli::logs::zstd_compress`
 /// for cross-codebase consistency.
-const ZSTD_LEVEL: i32 = 3;
+pub(crate) const ZSTD_LEVEL: i32 = 3;
 
 /// v0.7.0 I1 hardening — hard cap on the size of a single decompressed
 /// transcript. A pathological zstd blob (e.g. 1 KB compressed → 1 GB
@@ -549,7 +549,7 @@ fn should_archive(
     Ok(alive == 0)
 }
 
-fn zstd_compress(input: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn zstd_compress(input: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() / 4 + 64);
     {
         let mut encoder = zstd::stream::write::Encoder::new(&mut out, ZSTD_LEVEL)?;
@@ -572,7 +572,7 @@ fn zstd_compress(input: &[u8]) -> Result<Vec<u8>> {
 /// downstream audit log captures the rejection without the SQLite
 /// row id (the caller does not pass it in here — the surrounding
 /// [`fetch`] caller logs the id alongside the bubbled error).
-fn zstd_decompress(input: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn zstd_decompress(input: &[u8]) -> Result<Vec<u8>> {
     // Cap the initial allocation too — a blob whose compressed size
     // alone is enormous is itself a smell, but `with_capacity` on a
     // hostile input shouldn't reserve gigabytes upfront either.

@@ -31,16 +31,18 @@
 //!   CBOR payload so the two backends commit the same `payload_hash` for
 //!   the same decision.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
-use sqlx::Row;
+use chrono::{DateTime, Utc};
+use sqlx::{PgPool, Row};
 
-use crate::models::Memory;
+use crate::models::{Memory, MemoryKind, MemoryLinkRelation};
 use crate::store::postgres::{
     MEMORY_READ_COLUMNS, PgSignedEventInsert, pg_append_signed_event_with_chain_in_tx,
     pg_purge_dlq_dedup_in_tx, to_store_err,
 };
-use crate::store::{StoreError, StoreResult};
+use crate::store::{BoxBackendError, ReplayTranscriptEntry, StoreError, StoreResult};
+use crate::transcripts::storage::{Transcript, ZSTD_LEVEL, zstd_compress, zstd_decompress};
 
 type PgTx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
@@ -474,5 +476,208 @@ pub(crate) async fn emit_pending_action_event_in_tx(
     )
     .await
     .map_err(|e| to_store_err("append pending_action audit row", e))?;
+    Ok(())
+}
+
+/// #3064 batch D — postgres twin of sqlite
+/// [`crate::transcripts::replay::replay_transcript_union`]. Same BFS
+/// over `reflects_on`, first-seen transcript-id wins, chronological
+/// sort. Missing root → empty vec (I4 handler decides not-found).
+pub(crate) async fn replay_transcript_union(
+    pool: &PgPool,
+    memory_id: &str,
+    depth: Option<u32>,
+) -> StoreResult<Vec<ReplayTranscriptEntry>> {
+    let kind: Option<String> = sqlx::query_scalar("SELECT memory_kind FROM memories WHERE id = $1")
+        .bind(memory_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| to_store_err("replay root memory_kind", e))?;
+    let Some(kind) = kind else {
+        return Ok(Vec::new());
+    };
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut frontier: VecDeque<(String, u32)> = VecDeque::new();
+    let mut union_memory_ids: Vec<String> = Vec::new();
+    visited.insert(memory_id.to_string());
+    union_memory_ids.push(memory_id.to_string());
+    frontier.push_back((memory_id.to_string(), 0));
+
+    let walk = kind == MemoryKind::Reflection.as_str() && depth.is_none_or(|d| d >= 1);
+    if walk {
+        while let Some((current, hop)) = frontier.pop_front() {
+            if depth.is_some_and(|cap| hop >= cap) {
+                continue;
+            }
+            for next in fetch_reflects_on_targets(pool, &current).await? {
+                if visited.insert(next.clone()) {
+                    union_memory_ids.push(next.clone());
+                    frontier.push_back((next, hop + 1));
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<ReplayTranscriptEntry> = Vec::new();
+    let mut seen_transcripts: HashSet<String> = HashSet::new();
+    for mid in &union_memory_ids {
+        let rows = sqlx::query(
+            "SELECT l.transcript_id, l.span_start, l.span_end, \
+                    t.namespace, t.created_at, t.compressed_size, t.original_size \
+             FROM memory_transcript_links l \
+             JOIN memory_transcripts t ON t.id = l.transcript_id \
+             WHERE l.memory_id = $1 \
+             ORDER BY l.transcript_id",
+        )
+        .bind(mid)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| to_store_err("replay transcripts_for_memory", e))?;
+        for row in rows {
+            let transcript_id: String = row
+                .try_get(crate::models::field_names::TRANSCRIPT_ID)
+                .map_err(|e| to_store_err("read transcript_id", e))?;
+            if !seen_transcripts.insert(transcript_id.clone()) {
+                continue;
+            }
+            let created_at: DateTime<Utc> = row
+                .try_get(crate::models::field_names::CREATED_AT)
+                .map_err(|e| to_store_err("read transcript created_at", e))?;
+            entries.push(ReplayTranscriptEntry {
+                memory_id: mid.clone(),
+                transcript_id,
+                namespace: row
+                    .try_get("namespace")
+                    .map_err(|e| to_store_err("read transcript namespace", e))?,
+                // sqlite `transcripts::store` writes `DateTime::to_rfc3339`
+                // (`+00:00`). Match that encoding; do not use
+                // `render_canonical_utc` (Z) here — created_at is
+                // intentionally non-canonical on both backends (#2515).
+                created_at: created_at.to_rfc3339(),
+                compressed_size: row
+                    .try_get(crate::models::field_names::COMPRESSED_SIZE)
+                    .map_err(|e| to_store_err("read compressed_size", e))?,
+                original_size: row
+                    .try_get(crate::models::field_names::ORIGINAL_SIZE)
+                    .map_err(|e| to_store_err("read original_size", e))?,
+                span_start: row
+                    .try_get(crate::models::field_names::SPAN_START)
+                    .map_err(|e| to_store_err("read span_start", e))?,
+                span_end: row
+                    .try_get(crate::models::field_names::SPAN_END)
+                    .map_err(|e| to_store_err("read span_end", e))?,
+            });
+        }
+    }
+    entries.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.transcript_id.cmp(&b.transcript_id))
+    });
+    Ok(entries)
+}
+
+async fn fetch_reflects_on_targets(pool: &PgPool, source_id: &str) -> StoreResult<Vec<String>> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT target_id FROM memory_links \
+         WHERE source_id = $1 AND relation = $2 \
+         ORDER BY target_id",
+    )
+    .bind(source_id)
+    .bind(MemoryLinkRelation::ReflectsOn.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| to_store_err("replay reflects_on targets", e))?;
+    Ok(rows)
+}
+
+/// Postgres twin of [`crate::transcripts::storage::fetch`].
+pub(crate) async fn fetch_transcript_content(
+    pool: &PgPool,
+    transcript_id: &str,
+) -> StoreResult<Option<String>> {
+    let blob: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT content_blob FROM memory_transcripts WHERE id = $1")
+            .bind(transcript_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| to_store_err("fetch transcript blob", e))?;
+    let Some(blob) = blob else {
+        return Ok(None);
+    };
+    let bytes = zstd_decompress(&blob)
+        .map_err(|e| StoreError::Backend(BoxBackendError::new(e.to_string())))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|e| StoreError::Backend(BoxBackendError::new(e.to_string())))?;
+    Ok(Some(text))
+}
+
+/// Postgres twin of [`crate::transcripts::storage::store`] (`ttl = None`).
+pub(crate) async fn store_transcript(
+    pool: &PgPool,
+    namespace: &str,
+    content: &str,
+) -> StoreResult<Transcript> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now();
+    let created_at = now.to_rfc3339();
+    let original_size = i64::try_from(content.len()).map_err(|e| StoreError::InvalidInput {
+        detail: format!("transcript content length overflows i64: {e}"),
+    })?;
+    let blob = zstd_compress(content.as_bytes())
+        .map_err(|e| StoreError::Backend(BoxBackendError::new(e.to_string())))?;
+    let compressed_size = i64::try_from(blob.len()).map_err(|e| StoreError::InvalidInput {
+        detail: format!("compressed transcript length overflows i64: {e}"),
+    })?;
+    sqlx::query(
+        "INSERT INTO memory_transcripts (
+            id, namespace, created_at, expires_at,
+            compressed_size, original_size, zstd_level, content_blob
+         ) VALUES ($1, $2, $3, NULL, $4, $5, $6, $7)",
+    )
+    .bind(&id)
+    .bind(namespace)
+    .bind(now)
+    .bind(compressed_size)
+    .bind(original_size)
+    .bind(ZSTD_LEVEL)
+    .bind(&blob)
+    .execute(pool)
+    .await
+    .map_err(|e| to_store_err("insert memory_transcripts", e))?;
+    Ok(Transcript {
+        id,
+        namespace: namespace.to_string(),
+        created_at,
+        expires_at: None,
+        compressed_size,
+        original_size,
+    })
+}
+
+/// Postgres twin of [`crate::transcripts::storage::link_transcript`].
+pub(crate) async fn link_memory_transcript(
+    pool: &PgPool,
+    memory_id: &str,
+    transcript_id: &str,
+    span_start: Option<i64>,
+    span_end: Option<i64>,
+) -> StoreResult<()> {
+    sqlx::query(
+        "INSERT INTO memory_transcript_links (
+            memory_id, transcript_id, span_start, span_end
+         ) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (memory_id, transcript_id) DO UPDATE SET
+            span_start = EXCLUDED.span_start,
+            span_end = EXCLUDED.span_end",
+    )
+    .bind(memory_id)
+    .bind(transcript_id)
+    .bind(span_start)
+    .bind(span_end)
+    .execute(pool)
+    .await
+    .map_err(|e| to_store_err("insert memory_transcript_links", e))?;
     Ok(())
 }

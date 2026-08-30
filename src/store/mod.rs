@@ -3881,6 +3881,52 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #3064 batch D — I4 transcript-union walk (`memory_replay`).
+    /// Read-only. Default returns `UnsupportedCapability`.
+    async fn replay_transcript_union(
+        &self,
+        _memory_id: &str,
+        _depth: Option<u32>,
+    ) -> StoreResult<Vec<ReplayTranscriptEntry>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REPLAY_TRANSCRIPT_UNION".to_string(),
+        })
+    }
+
+    /// #3064 batch D — decompress one `memory_transcripts` blob.
+    /// Read-only. Default returns `UnsupportedCapability`.
+    async fn fetch_transcript_content(&self, _transcript_id: &str) -> StoreResult<Option<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FETCH_TRANSCRIPT_CONTENT".to_string(),
+        })
+    }
+
+    /// #3064 batch D — persist a zstd-3 transcript blob. Default
+    /// returns `UnsupportedCapability`.
+    async fn store_transcript(
+        &self,
+        _namespace: &str,
+        _content: &str,
+    ) -> StoreResult<crate::transcripts::storage::Transcript> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "STORE_TRANSCRIPT".to_string(),
+        })
+    }
+
+    /// #3064 batch D — I2 `memory_transcript_links` edge. Default
+    /// returns `UnsupportedCapability`.
+    async fn link_memory_transcript(
+        &self,
+        _memory_id: &str,
+        _transcript_id: &str,
+        _span_start: Option<i64>,
+        _span_end: Option<i64>,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LINK_MEMORY_TRANSCRIPT".to_string(),
+        })
+    }
+
     /// v0.7 J7 / Continuation 6 — enumerate up to `max_results` paths
     /// between two memories, bounded by `max_depth`. Mirrors the
     /// adapter-specific `find_paths` call but lifted to the trait
@@ -4763,6 +4809,31 @@ pub struct OutboundReflectsOn {
     pub attest_level: String,
     /// Edge `created_at` (canonical micros+Z on postgres).
     pub created_at: String,
+}
+
+/// #3064 batch D — one I4 replay union row (link + transcript
+/// metadata, no decompressed blob). HTTP fetches content via
+/// [`MemoryStore::fetch_transcript_content`] under the verbose rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayTranscriptEntry {
+    /// Memory id the I2 link was discovered through.
+    pub memory_id: String,
+    /// Transcript row id.
+    pub transcript_id: String,
+    /// Transcript namespace (K9 permission scope).
+    pub namespace: String,
+    /// Transcript `created_at` (sqlite TEXT rfc3339; postgres
+    /// TIMESTAMPTZ rendered with `DateTime::to_rfc3339`, matching
+    /// sqlite `transcripts::store` — not `render_canonical_utc`).
+    pub created_at: String,
+    /// Compressed blob size in bytes.
+    pub compressed_size: i64,
+    /// Decompressed size in bytes.
+    pub original_size: i64,
+    /// Optional span start into the decompressed transcript.
+    pub span_start: Option<i64>,
+    /// Optional span end into the decompressed transcript.
+    pub span_end: Option<i64>,
 }
 
 /// #1579 A4 — SAL-level embedding-backfill sweep. Drains every row the

@@ -909,3 +909,126 @@ pg_test!(pg_memory_export_reflection_not_501_3064, url, {
         "suggested_filename; body={body}"
     );
 });
+
+pg_test!(pg_memory_replay_not_501_3064, url, {
+    // #3064 batch D — pre-fix 501. Seed a memory + transcript on pg
+    // (SAL store_transcript + link_memory_transcript), then HTTP
+    // replay must return that content — proving SAL dispatch, not the
+    // empty scratch sqlite.
+    let r = pg_router(&url).await;
+    let ns = uniq_ns();
+    let mid = seed_memory(&r, &ns, "replay-src-3064", "src body").await;
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres for transcript seed");
+    let body_text = format!("replay transcript body {ns}");
+    let meta = store
+        .store_transcript(&ns, &body_text)
+        .await
+        .expect("store transcript on pg");
+    store
+        .link_memory_transcript(&mid, &meta.id, None, None)
+        .await
+        .expect("link transcript on pg");
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/memory_replay",
+        json!({"memory_id": mid, "verbose": true}),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "pre-#3064d 501; body={body}"
+    );
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body.get("memory_id"), Some(&json!(mid)), "body={body}");
+    assert_eq!(body.get("count"), Some(&json!(1)), "body={body}");
+    let transcripts = body["transcripts"].as_array().expect("transcripts array");
+    assert_eq!(transcripts.len(), 1, "body={body}");
+    assert_eq!(
+        transcripts[0].get("content"),
+        Some(&json!(body_text)),
+        "SAL-written pg blob must round-trip; body={body}"
+    );
+    assert_eq!(
+        transcripts[0].get("id"),
+        Some(&json!(meta.id)),
+        "body={body}"
+    );
+});
+
+pg_test!(pg_memory_replay_missing_memory_id_400_3064, url, {
+    // #3064 batch D self-coverage — MEMORY_ID_REQUIRED arm.
+    let r = pg_router(&url).await;
+    let (status, body) = post_json(&r, "/api/v1/memory_replay", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(
+        body.get("error").and_then(Value::as_str).is_some(),
+        "missing memory_id must be a 400 with an error body; body={body}"
+    );
+});
+
+pg_test!(pg_memory_replay_empty_memory_id_400_3064, url, {
+    // #3064 batch D self-coverage — MEMORY_ID_EMPTY arm.
+    let r = pg_router(&url).await;
+    let (status, body) = post_json(&r, "/api/v1/memory_replay", json!({"memory_id": ""})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(
+        body.get("error").and_then(Value::as_str).is_some(),
+        "empty memory_id must be a 400 with an error body; body={body}"
+    );
+});
+
+pg_test!(pg_memory_replay_invalid_depth_400_3064, url, {
+    // #3064 batch D self-coverage — non-integer `depth` arm.
+    let r = pg_router(&url).await;
+    let ns = uniq_ns();
+    let mid = seed_memory(&r, &ns, "replay-depth-3064", "src body").await;
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/memory_replay",
+        json!({"memory_id": mid, "depth": "not-an-int"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("depth"),
+        "non-integer depth must surface a depth error; body={body}"
+    );
+});
+
+pg_test!(
+    pg_memory_replay_default_verbose_includes_small_content_3064,
+    url,
+    {
+        // #3064 batch D self-coverage — default (verbose omitted) with a
+        // sub-threshold transcript takes the truncate=false include-content arm
+        // (original_size < REPLAY_VERBOSE_THRESHOLD_BYTES = 100 KiB).
+        let r = pg_router(&url).await;
+        let ns = uniq_ns();
+        let mid = seed_memory(&r, &ns, "replay-default-3064", "src body").await;
+        let store = PostgresStore::connect(&url)
+            .await
+            .expect("connect postgres for transcript seed");
+        let body_text = format!("small replay body {ns}");
+        let meta = store
+            .store_transcript(&ns, &body_text)
+            .await
+            .expect("store transcript on pg");
+        store
+            .link_memory_transcript(&mid, &meta.id, None, None)
+            .await
+            .expect("link transcript on pg");
+        let (status, body) =
+            post_json(&r, "/api/v1/memory_replay", json!({"memory_id": mid})).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body.get("count"), Some(&json!(1)), "body={body}");
+        let transcripts = body["transcripts"].as_array().expect("transcripts array");
+        assert_eq!(
+            transcripts[0].get("content"),
+            Some(&json!(body_text)),
+            "sub-threshold content must be included even when verbose is omitted; body={body}"
+        );
+    }
+);

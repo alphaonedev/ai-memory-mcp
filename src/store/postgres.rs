@@ -55,8 +55,8 @@ use sqlx::{PgPool, Row};
 
 use super::{
     CallerContext, Capabilities, CaptureTurnResult, CaptureTurnWrite, Filter, KgBackend,
-    KgInvalidateRow, KgQueryRow, KgTimelineRow, MemoryStore, StoreError, StoreResult, UpdatePatch,
-    VerifyFilter, VerifyLinkReport, VerifyReport, is_visible_to_caller,
+    KgInvalidateRow, KgQueryRow, KgTimelineRow, MemoryStore, ReplayTranscriptEntry, StoreError,
+    StoreResult, UpdatePatch, VerifyFilter, VerifyLinkReport, VerifyReport, is_visible_to_caller,
 };
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 
@@ -25279,6 +25279,43 @@ impl MemoryStore for PostgresStore {
             });
         }
         Ok(out)
+    }
+
+    async fn replay_transcript_union(
+        &self,
+        memory_id: &str,
+        depth: Option<u32>,
+    ) -> StoreResult<Vec<ReplayTranscriptEntry>> {
+        crate::store::postgres_parity::replay_transcript_union(&self.pool, memory_id, depth).await
+    }
+
+    async fn fetch_transcript_content(&self, transcript_id: &str) -> StoreResult<Option<String>> {
+        crate::store::postgres_parity::fetch_transcript_content(&self.pool, transcript_id).await
+    }
+
+    async fn store_transcript(
+        &self,
+        namespace: &str,
+        content: &str,
+    ) -> StoreResult<crate::transcripts::storage::Transcript> {
+        crate::store::postgres_parity::store_transcript(&self.pool, namespace, content).await
+    }
+
+    async fn link_memory_transcript(
+        &self,
+        memory_id: &str,
+        transcript_id: &str,
+        span_start: Option<i64>,
+        span_end: Option<i64>,
+    ) -> StoreResult<()> {
+        crate::store::postgres_parity::link_memory_transcript(
+            &self.pool,
+            memory_id,
+            transcript_id,
+            span_start,
+            span_end,
+        )
+        .await
     }
 
     async fn consolidate(
