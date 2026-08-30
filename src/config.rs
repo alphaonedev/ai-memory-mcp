@@ -4673,6 +4673,36 @@ pub fn migration_require_core_tables() -> bool {
     crate::governance::audit::env_flag_enabled(ENV_MIGRATION_REQUIRE_CORE_TABLES)
 }
 
+/// v1.0.0 (#3172) — operator ACKNOWLEDGEMENT for a detected append-only
+/// lineage-relation regression (the SCHEMA-masks-data-loss class).
+///
+/// Unlike [`ENV_MIGRATION_REQUIRE_CORE_TABLES`] (which is opt-IN to REFUSE,
+/// because a missing ladder-only relation is AMBIGUOUS with a benign empty
+/// fixture), the lineage high-water gate FAILS CLOSED by DEFAULT: a live
+/// `agent_lineage` count that fell BELOW a mark this database previously
+/// recorded is unambiguous loss (the relation is append-only), so refusing it
+/// can never brick a genuinely fresh or archive-less deployment — their mark is
+/// absent or zero. This knob is therefore the reverse polarity: it is the
+/// explicit-intent OVERRIDE an operator sets to acknowledge a real loss (e.g. a
+/// deliberate purge) and proceed, which RESETS the high-water mark to the
+/// current count and is not reversible. See
+/// [`crate::storage::schema_integrity::enforce_lineage_watermarks`].
+pub const ENV_ALLOW_LINEAGE_REGRESSION: &str = "AI_MEMORY_ALLOW_LINEAGE_REGRESSION";
+
+/// v1.0.0 (#3172) — whether the operator has acknowledged an append-only
+/// lineage regression and authorised the open to proceed (resetting the mark).
+///
+/// Read directly through the shared
+/// [`crate::governance::audit::env_flag_enabled`] truthy grammar rather than a
+/// boot-seeded global for the same reason as
+/// [`migration_require_core_tables`]: the migration ladder and the postgres
+/// connect bootstrap both run BEFORE the boot-seeded config globals exist, so a
+/// seeded atomic would always read its compile-time default at the gate.
+#[must_use]
+pub fn allow_lineage_regression() -> bool {
+    crate::governance::audit::env_flag_enabled(ENV_ALLOW_LINEAGE_REGRESSION)
+}
+
 /// v0.8.1 W1 (#1821 / gap G29) — the `[security]` config block.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {

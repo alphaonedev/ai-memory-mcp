@@ -774,6 +774,24 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA)
         .context("failed to initialize schema")?;
     migrate(&conn)?;
+    // v1.0.0 (#3172) — SCHEMA-masks-DATA-LOSS gate for APPEND-ONLY bootstrap
+    // relations (`agent_lineage`), placed HERE in the open funnel rather than
+    // inside `migrate`, and deliberately AFTER `execute_batch(SCHEMA)`. The
+    // bug is steady-state: on a database already at `CURRENT_SCHEMA_VERSION`,
+    // `migrate` early-returns before its tail, yet `execute_batch(SCHEMA)` just
+    // re-created a DROPPED `agent_lineage` EMPTY — so a table-existence probe
+    // (the #3113 core-relation gate) cannot see the loss and the gate must run
+    // on EVERY open, not only on a version transition. A persisted high-water
+    // mark makes an append-only regression unambiguous, so this FAILS CLOSED by
+    // default (no empty-fixture brick risk — a never-observed relation has no
+    // mark); `AI_MEMORY_ALLOW_LINEAGE_REGRESSION` is the explicit-intent
+    // override. It reads `sqlite_master`/`COUNT(*)` and writes only the derived
+    // watermark side table, so it can neither lose nor corrupt durable data.
+    // `open_unmigrated` (backup egress) and `open_read_only` are exempt for the
+    // same reason they skip `migrate`: a backup must always be takeable, and a
+    // reader cannot issue the DDL/DML this records.
+    crate::storage::schema_integrity::enforce_lineage_watermarks(&conn)
+        .context("agent_lineage schema-masked data-loss gate (#3172)")?;
     apply_check_constraint_triggers(&conn)
         .context("failed to apply R1-M2 CHECK-constraint triggers")?;
     // v1.0.0 #1946 (A1) — OPEN-TIME rollback-evidence head check. `db::open`

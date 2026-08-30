@@ -2678,6 +2678,16 @@ impl PostgresStore {
                 // `Self::migrate` would cover the `ai-memory migrate` CLI and
                 // miss the daemon boot this issue is about.
                 store.migrate_locked_with_contention_retry().await?;
+                // v1.0.0 (#3172) — SCHEMA-masks-DATA-LOSS gate for append-only
+                // bootstrap relations (`agent_lineage`). Postgres re-creates a
+                // DROPPED bootstrap relation EMPTY via `INIT_SCHEMA`'s CREATE
+                // TABLE IF NOT EXISTS on every connect, exactly as sqlite's
+                // SCHEMA replay does, so the same fail-closed high-water gate
+                // must run here. Sited AFTER the ladder and under the bootstrap
+                // advisory lock (concurrent daemons cannot race the mark); a
+                // regression refuses the connect (fail closed) unless the
+                // operator override acknowledges it.
+                store.enforce_lineage_watermarks().await?;
                 // v1.0.0 #2578 — self-heal the v88 composite ordering
                 // indexes on EVERY connect, not only inside the v88 arm.
                 // The arm is FAIL-OPEN (an index is derived, disposable
@@ -3089,6 +3099,115 @@ impl PostgresStore {
                 tracing::warn!(err = %e, "#2167 (pg): embedding-space boot census query failed");
             }
         }
+    }
+
+    /// v1.0.0 (#3172) — postgres twin of
+    /// [`crate::storage::schema_integrity::enforce_lineage_watermarks`]. The
+    /// SCHEMA-masks-DATA-LOSS gate for APPEND-ONLY bootstrap relations
+    /// (`agent_lineage`): postgres replays `INIT_SCHEMA`'s `CREATE TABLE IF NOT
+    /// EXISTS` on EVERY connect, so a DROPPED lineage relation is silently
+    /// re-created EMPTY exactly as on sqlite. Runs AFTER the bootstrap DDL +
+    /// ladder on every non-hatched connect, under the bootstrap advisory lock
+    /// (so concurrent daemons cannot race the mark), reusing the SAME pure
+    /// classifier + refusal message so both backends fail closed identically.
+    ///
+    /// A live count below a previously-recorded mark is unambiguous append-only
+    /// loss → refuse (fail closed by default);
+    /// `AI_MEMORY_ALLOW_LINEAGE_REGRESSION` is the explicit-intent override that
+    /// acknowledges the loss, resets the mark, and proceeds. `to_regclass` NULL
+    /// (relation absent) reads as 0 live rows — the empty-recreate outcome —
+    /// never coerced from a failed read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::IntegrityFailed` on a detected regression without
+    /// the override, or `StoreError::BackendUnavailable` on any probe / count /
+    /// read / write failure (fail closed — unreadable is never coerced to 0).
+    async fn enforce_lineage_watermarks(&self) -> StoreResult<()> {
+        use crate::storage::schema_integrity::{
+            WATERMARKED_RELATIONS, WatermarkVerdict, classify_watermark, lineage_loss_message,
+        };
+        for relation in WATERMARKED_RELATIONS {
+            let regclass: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+                .bind(relation.name)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| to_store_err("probe watermarked relation presence", e))?;
+            // The relation name is a compile-time SSOT const, never caller
+            // input; postgres cannot bind an identifier, so interpolation here
+            // is not an injection surface.
+            let current: i64 = if regclass.is_some() {
+                sqlx::query_scalar(&format!("SELECT COUNT(*)::bigint FROM {}", relation.name))
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("count watermarked relation rows", e))?
+            } else {
+                0
+            };
+            let stored: Option<i64> = sqlx::query_scalar(
+                "SELECT high_water FROM lineage_integrity_watermark WHERE relation = $1",
+            )
+            .bind(relation.name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("read lineage high-water mark", e))?;
+            match classify_watermark(stored, current) {
+                WatermarkVerdict::Regressed {
+                    high_water,
+                    current,
+                } => {
+                    let acknowledged = crate::config::allow_lineage_regression();
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        relation = relation.name,
+                        high_water,
+                        current,
+                        acknowledged,
+                        override_env = crate::config::ENV_ALLOW_LINEAGE_REGRESSION,
+                        "APPEND-ONLY RELATION REGRESSED — schema-masked data loss on postgres: \
+                         the bootstrap DDL re-created this relation with FEWER rows than were \
+                         previously observed. Silent identity-lineage loss unless restored from \
+                         backup. Set the `override_env` knob to 1 to acknowledge and proceed \
+                         (resets the mark)."
+                    );
+                    if acknowledged {
+                        self.record_lineage_watermark_pg(relation.name, current)
+                            .await?;
+                    } else {
+                        return Err(StoreError::IntegrityFailed {
+                            detail: lineage_loss_message(
+                                relation.name,
+                                relation.integrity_note,
+                                high_water,
+                                current,
+                            ),
+                        });
+                    }
+                }
+                WatermarkVerdict::Intact {
+                    advance_to: Some(n),
+                } => self.record_lineage_watermark_pg(relation.name, n).await?,
+                WatermarkVerdict::Intact { advance_to: None } => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert a lineage high-water mark (advance on growth, or reset under an
+    /// acknowledged regression). See [`Self::enforce_lineage_watermarks`].
+    async fn record_lineage_watermark_pg(&self, relation: &str, value: i64) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO lineage_integrity_watermark (relation, high_water, observed_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (relation) DO UPDATE SET high_water = EXCLUDED.high_water, \
+                                                  observed_at = EXCLUDED.observed_at",
+        )
+        .bind(relation)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("record lineage high-water mark", e))?;
+        Ok(())
     }
 
     /// Run schema migrations on the connection. Called after bootstrap schema
