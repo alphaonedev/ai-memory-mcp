@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (CONFIG-1 full-spectrum AI-NHI acceptance harness — sqlite)
+
+- **A CONFIG-1 acceptance harness that boots the COMPILED `ai-memory serve`
+  sqlite daemon and drives the full tool surface end-to-end as ONE attested NHI
+  identity** (`tests/acceptance/acceptance_nhi_sqlite.rs`, run via
+  `scripts/acceptance/run_sqlite.sh`; declared as an explicit `[[test]]` target
+  because it lives in a `tests/` subdirectory). The harness exercises store
+  (Long/Mid/Short tiers × multiple `MemoryKind`s: decision/observation/claim) /
+  get / update / recall (keyword) / search / link / get_links / consolidate /
+  reflect / lineage / promote / forget / delete / stats / health as a single
+  `X-Agent-Id` + Ed25519 write-attested principal, and asserts: result
+  correctness; the `agent_attested` attest-level on a verified write; tier/TTL
+  semantics (Long is PERMANENT with no expiry even when a `ttl_secs` is supplied
+  — #3230; Mid/Short honour a TTL); and that the write-attestation gate FAILS
+  CLOSED on the network surface (an unsigned HTTP-direct write is rejected
+  `403` with the `ATTESTATION_FAILED` code). Three further tests pin the
+  data-integrity North Star invariants: durability across a full daemon restart
+  on the same on-disk DB (TEXT-is-truth); at-rest envelope encryption
+  (`AI_MEMORY_ENCRYPT_AT_REST=1`) — the live daemon transparently decrypts on
+  read while the raw on-disk row carries an empty `content` column + a non-NULL
+  `encrypted_envelope`; and crypto-erase (reusing the #1956 patterns) — a forget
+  destroys the per-record wrapped DEK, emits a mandatory tombstone + a signed
+  `substrate.crypto_erase` on the append-only chain, the audit chain still
+  verifies, and the erasure survives a DB reopen. A thin `ai-memory mcp
+  --profile full` stdio smoke proves JSON-RPC 2.0 framing + the tool surface.
+  Every spawned daemon is behind an RAII kill guard and every wait is bounded
+  (no unbounded recv), so a hung daemon fails the test rather than hanging CI.
+  Test-only; no product-code, route, tool, CLI, or schema surface changes.
+  CONFIG-1 is the sqlite half; CONFIG-2 (federated pg + at-rest mesh) is a
+  separate harness.
+
 ### Fixed (B7 structural gate — pg transcript-write twins allowlisted)
 
 - The #3064 batch D merge added two write-SQL functions in
