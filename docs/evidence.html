@@ -34,7 +34,7 @@ h1,h2,h3{font-weight:700;letter-spacing:-0.02em}
 h2{font-size:1.6rem;margin:2rem 0 .5rem;font-family:var(--font-mono)}
 h3{font-size:1.05rem;margin:1.25rem 0 .35rem}
 p{color:var(--text-muted);margin-bottom:.85rem}
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav{position:sticky;top:0;z-index:50;background:var(--bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
 .topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:1280px;margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
 .topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
 .topnav .home-link{color:var(--text);font-weight:600}
@@ -74,7 +74,7 @@ section{padding:2.5rem 0;border-bottom:1px solid var(--border)}
 .status-card.unsupported{border-left-color:var(--bad)}
 .status-card h3{font-family:var(--font-mono);font-size:.95rem;margin-bottom:.4rem;color:var(--text)}
 .status-card .tag{display:inline-block;font-family:var(--font-mono);font-size:.7rem;padding:.15em .55em;border-radius:4px;margin-right:.4em;letter-spacing:.05em;text-transform:uppercase}
-.status-card.production .tag{background:rgba(176,125,16,.12);color:var(--p1);border:1px solid #2a6571}
+.status-card.production .tag{background:rgba(176,125,16,.12);color:var(--p1);border:1px solid var(--p1)}
 .status-card.beta .tag{background:rgba(255,184,107,.12);color:var(--p2);border:1px solid #7a5328}
 .status-card.experimental .tag{background:rgba(255,215,0,.12);color:var(--gold);border:1px solid #6a5e10}
 .status-card.unsupported .tag{background:rgba(255,107,157,.12);color:var(--bad);border:1px solid #7a3251}
@@ -94,8 +94,8 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Evidence</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
+      <a href="at-a-glance.html" style="color:var(--accent)">Atlas</a>
+      <a href="whats-new-v09.html" style="color:var(--accent-ink)">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">

@@ -13,7 +13,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>ai-memory for Enterprise &mdash; self-improving, governed, bias-resistant AI memory</title>
 <meta name="description" content="ai-memory turns AI agents from amnesiac chatbots into a coordinated workforce with a shared, governed, auditable institutional memory: cryptographic audit trail, fail-closed governance, attested NHI identity, recursive self-improvement, and anti-echo-chamber decorrelation. Apache-2.0.">
-<meta name="theme-color" content="#000">
+<meta name="theme-color" content="#f4f0e8">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/enterprise.html">
 <style>
 :root{
@@ -32,10 +32,10 @@ html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
 a{color:var(--accent);text-decoration:none;transition:filter .15s}
 a:hover{filter:brightness(1.25)}
-code{font-family:var(--font-mono);font-size:.85em;background:var(--bg-code);padding:.1em .35em;border-radius:4px;color:#d4d4d4}
+code{font-family:var(--font-mono);font-size:.85em;background:var(--bg-code);padding:.1em .35em;border-radius:4px;color:var(--ink)}
 .container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
 .container-narrow{max-width:var(--max-w-narrow);margin:0 auto;padding:0 1.5rem}
-h1,h2,h3,h4{font-weight:700;letter-spacing:-.02em;color:#fff}
+h1,h2,h3,h4{font-weight:700;letter-spacing:-.02em;color:var(--ink)}
 h1{font-size:clamp(2.2rem,5.5vw,3.8rem);line-height:1.05;letter-spacing:-.04em;margin-bottom:1.25rem}
 h2{font-size:clamp(1.6rem,3vw,2.1rem);margin-bottom:.6rem;letter-spacing:-.025em}
 h3{font-size:1.15rem;margin-bottom:.5rem}
@@ -43,7 +43,7 @@ p{color:var(--text-muted);margin-bottom:1rem}
 p.lede{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin-bottom:2rem}
 .eyebrow{font-family:var(--font-mono);font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;color:var(--p1);margin-bottom:1rem}
 /* topnav */
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,.88);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav{position:sticky;top:0;z-index:50;background:var(--bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
 .topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
 .topnav .left{display:flex;align-items:center;gap:1.5rem}
 .topnav a{color:var(--text-muted)}
@@ -54,8 +54,8 @@ p.lede{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin-bottom:2
 /* hero */
 .hero{padding:5rem 0 3.5rem;border-bottom:1px solid var(--border);background:radial-gradient(120% 80% at 50% -10%,rgba(176,125,16,.08),transparent 60%)}
 .hero .badge{display:inline-block;font-family:var(--font-mono);font-size:.74rem;letter-spacing:.08em;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:999px;padding:.3rem .8rem;margin-bottom:1.5rem}
-.oneliner{font-size:1.2rem;color:#cfcfcf;max-width:820px;margin:1.5rem 0 0}
-.oneliner strong{color:#fff}
+.oneliner{font-size:1.2rem;color:var(--ink-mid);max-width:820px;margin:1.5rem 0 0}
+.oneliner strong{color:var(--ink)}
 /* sections */
 section{padding:4rem 0;border-bottom:1px solid var(--border)}
 .section-head{max-width:820px;margin-bottom:2.25rem}
@@ -82,9 +82,9 @@ section{padding:4rem 0;border-bottom:1px solid var(--border)}
 .wband ul{list-style:none;margin:.4rem 0 0}
 .wband li{position:relative;padding-left:1.3rem;color:var(--text-muted);font-size:.94rem;margin-bottom:.55rem}
 .wband li::before{content:"▸";position:absolute;left:0;color:var(--p1)}
-.wband li strong{color:#e8e8e8}
+.wband li strong{color:var(--ink)}
 .pill{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.06em;color:var(--p3);border:1px solid var(--border-hl);border-radius:999px;padding:.15rem .55rem;vertical-align:middle}
-.flow{font-family:var(--font-mono);font-size:.82rem;color:#cfcfcf;background:var(--bg-code);border:1px solid var(--border);border-radius:8px;padding:.9rem 1rem;margin-top:.8rem;overflow-x:auto}
+.flow{font-family:var(--font-mono);font-size:.82rem;color:var(--ink-mid);background:var(--bg-code);border:1px solid var(--border);border-radius:8px;padding:.9rem 1rem;margin-top:.8rem;overflow-x:auto}
 .flow b{color:var(--p1)}
 /* sharpest 3 */
 .sharp{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-top:1.5rem}

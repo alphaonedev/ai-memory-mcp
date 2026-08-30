@@ -21,7 +21,7 @@ code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);pad
 .container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
 h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem}
 p{color:var(--text-muted)}
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav{position:sticky;top:0;z-index:50;background:var(--bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
 .topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
 .topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
 .topnav .home-link{color:var(--text);font-weight:600}
@@ -106,8 +106,8 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Knowledge Graph</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
+      <a href="at-a-glance.html" style="color:var(--accent-ink)">Atlas</a>
+      <a href="whats-new-v09.html" style="color:var(--accent-ink)">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -270,7 +270,7 @@ footer a{color:var(--text-muted)}
     <svg class="kg-svg" viewBox="0 0 1180 420" xmlns="http://www.w3.org/2000/svg">
       <style>
         .nb{stroke-width:2;rx:8;ry:8}
-        .nb.m{fill:#0a0a0a;stroke:#b07d10}
+        .nb.m{fill:rgba(176,125,16,0.12);stroke:#b07d10}
         .nb.e{fill:rgba(255,184,107,0.12);stroke:#ffb86b}
         .nb.s{fill:rgba(255,107,157,0.10);stroke:#ff6b9d}
         .ll{stroke-width:1.8;fill:none}
@@ -278,9 +278,9 @@ footer a{color:var(--text-muted)}
         .ll.r2{stroke:#b07d10}
         .ll.r3{stroke:#ff6b9d}
         .ll.r4{stroke:#c8a2ff;stroke-dasharray:4 4}
-        .h{fill:#fff;font-family:monospace;font-size:11px;font-weight:700}
-        .s{fill:#999;font-family:monospace;font-size:9px}
-        .lab{fill:#999;font-family:monospace;font-size:10px;font-weight:700}
+        .h{fill:var(--ink);font-family:monospace;font-size:11px;font-weight:700}
+        .s{fill:var(--ink-mid);font-family:monospace;font-size:9px}
+        .lab{fill:var(--ink-mid);font-family:monospace;font-size:10px;font-weight:700}
       </style>
       <defs>
         <marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#999"/></marker>

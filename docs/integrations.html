@@ -23,7 +23,7 @@ code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);pad
 .container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
 h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:2rem;margin-bottom:.5rem}h3{font-size:1.05rem;margin-bottom:.5rem}
 p{color:var(--text-muted)}
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav{position:sticky;top:0;z-index:50;background:var(--bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
 .topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
 .topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
 .topnav .home-link{color:var(--text);font-weight:600}
@@ -44,7 +44,7 @@ section{padding:4.5rem 0;border-bottom:1px solid var(--border)}
 .client.tier2::before{background:var(--p2)}
 .client.tier3::before{background:var(--p3)}
 .client .client-head{display:flex;align-items:center;gap:1rem}
-.client .client-icon{width:48px;height:48px;border-radius:10px;background:rgba(255,255,255,0.04);display:flex;align-items:center;justify-content:center;font-size:1.5rem;flex-shrink:0}
+.client .client-icon{width:48px;height:48px;border-radius:10px;background:var(--bg2);display:flex;align-items:center;justify-content:center;font-size:1.5rem;flex-shrink:0}
 .client .client-meta{display:flex;flex-direction:column}
 .client .client-name{font-size:1.1rem;font-weight:700;color:var(--text)}
 .client .client-tier{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim)}
@@ -52,7 +52,7 @@ section{padding:4.5rem 0;border-bottom:1px solid var(--border)}
 .client .client-desc{font-size:.85rem;color:var(--text-muted);line-height:1.55}
 .client .client-config{background:var(--bg-code);border:1px solid var(--border);border-radius:8px;padding:.85rem 1rem;font-family:var(--font-mono);font-size:.72rem;color:var(--text-muted);overflow-x:auto;white-space:pre-wrap;line-height:1.5}
 .client .client-config .key{color:var(--p1)}
-.client .client-config .str{color:#a5d6ff}
+.client .client-config .str{color:#2166ab}
 .client .client-config .cmt{color:var(--text-dim);font-style:italic}
 .client .client-meta-row{display:flex;gap:1.25rem;font-size:.75rem;color:var(--text-muted);margin-top:.4rem;flex-wrap:wrap}
 .client .client-meta-row span{display:flex;align-items:center;gap:.4rem}
@@ -98,9 +98,9 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Integrations</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#c8a2ff">v0.9.0</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
+      <a href="at-a-glance.html" style="color:var(--accent-ink)">Atlas</a>
+      <a href="whats-new-v09.html" style="color:var(--accent-ink)">v0.9.0</a>
+      <a href="whats-new-v09.html" style="color:var(--accent-ink)">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn active">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">

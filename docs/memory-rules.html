@@ -21,7 +21,7 @@ code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);pad
 .container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
 h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem}
 p{color:var(--text-muted)}
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav{position:sticky;top:0;z-index:50;background:var(--bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
 .topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
 .topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
 .topnav .home-link{color:var(--text);font-weight:600}
@@ -104,8 +104,8 @@ footer a{color:var(--text-muted)}
   <div class="inner">
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Memory Rules</span></a>
     <div class="right">
-      <a href="at-a-glance.html" style="color:#b07d10">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
+      <a href="at-a-glance.html" style="color:var(--accent-ink)">Atlas</a>
+      <a href="whats-new-v09.html" style="color:var(--accent-ink)">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -272,14 +272,14 @@ footer a{color:var(--text-muted)}
         .b.l4{fill:rgba(165,214,167,0.15);stroke:#a5d6a7}
         .b.l5{fill:rgba(255,215,0,0.15);stroke:#ffd700}
         .ll{stroke:#666;stroke-width:1.5;fill:none;marker-end:url(#arr)}
-        .h{fill:#fff;font-family:monospace;font-size:14px;font-weight:700}
-        .s{fill:#999;font-family:monospace;font-size:11px}
-        .cap{fill:#999;font-family:monospace;font-size:10px}
+        .h{fill:var(--ink);font-family:monospace;font-size:14px;font-weight:700}
+        .s{fill:var(--ink-mid);font-family:monospace;font-size:11px}
+        .cap{fill:var(--ink-mid);font-family:monospace;font-size:10px}
       </style>
       <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#666"/></marker></defs>
 
       <!-- Incoming write -->
-      <rect class="b" x="20" y="200" width="140" height="60" fill="#0a0a0a" stroke="#3d3d3d"/>
+      <rect class="b" x="20" y="200" width="140" height="60" fill="var(--bg-raised)" stroke="var(--border-hl)"/>
       <text class="h" x="90" y="225" text-anchor="middle">memory_store</text>
       <text class="s" x="90" y="245" text-anchor="middle">incoming write</text>
 
@@ -357,7 +357,7 @@ footer a{color:var(--text-muted)}
       <text class="cap" x="765" y="200" text-anchor="middle">all green →</text>
 
       <!-- Final: federated -->
-      <rect class="b" x="1050" y="200" width="120" height="60" fill="#0a0a0a" stroke="#3d3d3d"/>
+      <rect class="b" x="1050" y="200" width="120" height="60" fill="var(--bg-raised)" stroke="var(--border-hl)"/>
       <text class="h" x="1110" y="225" text-anchor="middle">DB + KG</text>
       <text class="s" x="1110" y="245" text-anchor="middle">+ federation</text>
       <line class="ll" x1="1020" y1="230" x2="1050" y2="230"/>
