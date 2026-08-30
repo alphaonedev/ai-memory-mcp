@@ -87,25 +87,30 @@ async fn postgres_update_threads_expires_at_through_sal_patch() {
     let owner = "ai:1423-expires-at-roundtrip";
     let ctx = CallerContext::for_agent(owner);
     // #3230 CRITICAL: a `Long` (permanent) row must NOT carry expiry —
-    // the pg UPDATE nulls `expires_at` when `tier='long'` so GC cannot
-    // reap a documented-permanent row. `seed_mem` defaults to `Tier::Long`,
-    // so to exercise #1423 (expires_at THREADS through the SAL patch) we
-    // must seed a tier that PERMITS expiry.
+    // the pg UPDATE nulls `expires_at` when `tier='long'`. And a fresh
+    // `Short`/`Mid` store assigns a default TTL, so an observable
+    // `None`->`Some` seed transition is impossible on any *patchable*
+    // tier. So (mirroring the sibling coalesce test) seed a `Mid` row
+    // with an EXPLICIT expiry and verify #1423 threads a *new* value
+    // OVER it through the SAL patch.
     let mut mem = seed_mem(owner, "ns-1423-set", "expires-at-set");
-    mem.tier = Tier::Short;
+    mem.tier = Tier::Mid;
+    let seeded_expiry = "2028-01-01T00:00:00+00:00";
+    mem.expires_at = Some(seeded_expiry.to_string());
     let inserted_id = store.store(&ctx, &mem).await.expect("seed insert");
 
-    // Round-trip 1 — verify the seed row landed with expires_at = NULL.
+    // Round-trip 1 — the seed row carries its explicit expiry.
     let pre = store.get(&ctx, &inserted_id).await.expect("get post-seed");
     assert!(
-        pre.expires_at.is_none(),
-        "seed row has no expires_at; got: {:?}",
+        pre.expires_at.is_some(),
+        "seed row carries its explicit expiry; got: {:?}",
         pre.expires_at
     );
 
-    // PUT-equivalent: SAL update with expires_at set to a future
-    // RFC3339 timestamp. Pre-#1423 the patch had no expires_at field
-    // so this was structurally impossible to express.
+    // PUT-equivalent: SAL update with expires_at set to a DIFFERENT
+    // future RFC3339 timestamp; the pg COALESCE arm threads it over the
+    // seeded value (pre-#1423 the patch had no expires_at field so this
+    // was structurally impossible to express).
     let future = "2030-01-01T00:00:00+00:00";
     let patch = UpdatePatch {
         expires_at: Some(future.to_string()),

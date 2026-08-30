@@ -14,9 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but the pg UPDATE correctly nulls expiry for `tier='long'` (#3230
   CRITICAL: a permanent row must not carry an expiry GC would reap). The
   #1423 intent (verify `expires_at` threads through the SAL patch) needs
-  a tier that permits expiry — the test now seeds `Tier::Short`. pg
-  behaviour is correct; this was a stale test (same #2399-permanence
-  posture as #2384). Was the last failure in the serial coverage sweep.
+  a tier that permits expiry. Since a fresh `Short`/`Mid` store assigns a
+  default TTL (so a `None`→`Some` transition is unobservable on a
+  patchable tier), the test now — mirroring the sibling coalesce test —
+  seeds a `Tier::Mid` row with an EXPLICIT expiry and verifies the patch
+  threads a *new* value over it. pg behaviour is correct; this was a
+  stale test (same #2399-permanence posture as #2384). Verified vs real
+  postgres (both `postgres_update_expires_at_1423` tests pass).
 
 ### Fixed (conformance export golden schema-version drift)
 
