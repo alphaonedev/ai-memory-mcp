@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (curator data-integrity + availability — #3190, #3283)
+
+- **#3190 (data-integrity, GA-blocker) — curator consolidation now FAILS CLOSED
+  when a Stage-6 auto-rollback itself fails.** `ConsolidationPass::run`
+  (`src/curator/compaction.rs`) previously treated a failed rollback as a
+  per-cluster hiccup: it set `restored = 0`, pushed a note into
+  `report.errors`, and `continue`d — even though `persist` had already removed
+  the pre-merge sources and the unverifiable summary was still live. That is a
+  fail-OPEN continuation over a data-loss-shaped state (an unverifiable summary
+  served as truth while sources are silently lost). The pass now HALTS the
+  sweep with a typed, greppable error (`ROLLBACK_FAILED_FAILCLOSED_SLUG`) and
+  DELIBERATELY retains the unverifiable summary — because a partially-failed
+  rollback can leave that summary as the only surviving copy of a source that
+  did not restore, and `db::delete` is a hard row delete. North Star: fail
+  closed; never cause unintentional data loss. New regression test
+  (`rollback_failure_halts_sweep_fail_closed_and_retains_summary_3190`).
+- **#3283 (curator availability, GA-blocker) — the SAL `ConsolidationPass` is
+  now panic-contained.** `run_consolidation_pass` (`src/curator/mod.rs`) had no
+  `catch_unwind`; an LLM-clustering or nested-runtime panic escaped the pass,
+  unwound out of `run_once` and `run_daemon`'s loop, and out of the
+  `spawn_blocking` closure both daemon drivers await — where the `JoinError`
+  was converted into a hard error that TERMINATED the curator daemon. The pass
+  drive is now wrapped in `std::panic::catch_unwind`, so one bad cycle degrades
+  to a logged, reported failure (`CONSOLIDATION_PASS_PANIC_CONTAINED`) with the
+  corpus untouched, and the daemon proceeds to its next cycle. North Star:
+  degrade, never die. New regression test
+  (`consolidation_pass_contains_panic_and_survives_3283`). No product/API/SSOT
+  surface change (no new MCP tools, routes, CLI verbs, or schema versions).
+
 ### Fixed (B7 structural gate — pg transcript-write twins allowlisted)
 
 - The #3064 batch D merge added two write-SQL functions in

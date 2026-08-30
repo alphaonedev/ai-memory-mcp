@@ -87,6 +87,22 @@ const CONSOLIDATOR_AGENT_ID: &str = crate::identity::sentinels::AI_CURATOR;
 #[cfg(feature = "sal")]
 pub(crate) const COMPACTION_TRACE_TARGET: &str = "curator::compaction";
 
+/// #3190 (data-integrity, GA-blocker) — stable, greppable prefix for the
+/// FAIL-CLOSED sweep halt raised when a Stage-6 auto-rollback ITSELF fails.
+///
+/// Pre-fix the sweep treated a failed rollback as a per-cluster hiccup: it set
+/// `restored = 0`, pushed a note into `report.errors`, and `continue`d — even
+/// though the pre-merge sources had already been removed by `persist` and the
+/// unverifiable summary was still live. That is a fail-OPEN continuation over a
+/// data-loss-shaped state (an unverifiable summary served as truth while
+/// sources are silently lost). Now a failed rollback returns this typed error
+/// from [`ConsolidationPass::run`], HALTING the sweep loudly (North Star: fail
+/// closed; never cause unintentional data loss). One named const so the
+/// production halt and the regression assertion share a single spelling
+/// (pm-v3.1 lint-gate).
+#[cfg(feature = "sal")]
+pub(crate) const ROLLBACK_FAILED_FAILCLOSED_SLUG: &str = "consolidation rollback FAILED — sweep halted fail-closed (sources may be un-restored; unverifiable summary retained for recovery)";
+
 /// #2637 — injection seam for the `PreCompaction` decision gate.
 ///
 /// A `pre_compaction` hook gates the curator's autonomous, hard-DELETE
@@ -460,8 +476,10 @@ impl<'a> ConsolidationPass<'a> {
 
     /// Drive the full six-step compaction lifecycle over `candidates`:
     /// `cluster` → resolve members → `eligible` → `summarize` → `persist`
-    /// → `verify`. Returns a [`ConsolidationRunReport`]; per-cluster
-    /// failures are recorded in `report.errors` and never abort the sweep.
+    /// → `verify`. Returns a [`ConsolidationRunReport`]; ordinary per-cluster
+    /// failures (summarise / persist / a verify that rolls back cleanly) are
+    /// recorded in `report.errors` and never abort the sweep. The ONE
+    /// exception is a Stage-6 rollback that itself fails — see below.
     ///
     /// **Dry-run (`self.dry_run`, a `--dry-run` curator cycle):** the sweep
     /// stops after `eligible` — it counts what it *would* consolidate
@@ -473,7 +491,17 @@ impl<'a> ConsolidationPass<'a> {
     /// the unverifiable summary, and the sweep continues (no rollback entry
     /// is left for that cluster). Note the notify-only
     /// `OnCompactionRollback` hook event is NOT fired — it has no fire site
-    /// at v1.0.0; the failure is reported via the WARN line only.
+    /// at v1.0.0; the clean-rollback failure is reported via the WARN line only.
+    ///
+    /// **FAIL-CLOSED on a failed rollback (#3190, data-integrity GA-blocker):**
+    /// if the Stage-6 auto-rollback ITSELF returns `Err`, the sources are not
+    /// known to be restored and the unverifiable summary is still live.
+    /// [`Self::run`] does NOT continue past that data-loss-shaped state: it
+    /// returns `Err` prefixed with [`ROLLBACK_FAILED_FAILCLOSED_SLUG`],
+    /// halting the sweep, and deliberately RETAINS the unverifiable summary
+    /// (it may be the only surviving copy of a source that failed to restore;
+    /// see the inline rationale). North Star: fail closed, never cause
+    /// unintentional data loss.
     pub(crate) async fn run(&self, candidates: &[Memory]) -> Result<ConsolidationRunReport> {
         let mut report = ConsolidationRunReport::default();
 
@@ -557,31 +585,66 @@ impl<'a> ConsolidationPass<'a> {
                 // v1.0.0 (claims audit 2026-08-22). The operator-visible
                 // signals are the WARN below AND `report.errors` (the
                 // verify-failed string is pushed onto the pass report).
-                let restored = match self.rollback_consolidation(&members, &new_id).await {
-                    Ok(n) => n,
-                    Err(re) => {
-                        report
-                            .errors
-                            .push(format!("{}: rollback failed: {re}", self.name()));
-                        0
+                match self.rollback_consolidation(&members, &new_id).await {
+                    Ok(restored) => {
+                        if restored > 0 {
+                            report.rolled_back += 1;
+                        }
+                        tracing::warn!(
+                            target: COMPACTION_TRACE_TARGET,
+                            pass = self.name(),
+                            summary_id = %new_id,
+                            restored,
+                            error = %e,
+                            "consolidation verify failed — rolled back (Stage-6, #664)"
+                        );
+                        report.errors.push(format!(
+                            "{}: verify failed (rolled back {restored}): {e}",
+                            self.name()
+                        ));
+                        continue;
                     }
-                };
-                if restored > 0 {
-                    report.rolled_back += 1;
+                    Err(re) => {
+                        // #3190 FAIL-CLOSED (data-integrity, GA-blocker). The
+                        // Stage-6 auto-rollback itself failed, so the pre-merge
+                        // sources are NOT known to be restored (some may already
+                        // have been hard-DELETEd by `persist`) and the
+                        // unverifiable summary is still live. The pre-fix code
+                        // `continue`d here — a fail-OPEN continuation that serves
+                        // an unverifiable summary as truth while sources are
+                        // silently lost. Two invariants now hold (North Star:
+                        // fail closed; never cause unintentional data loss):
+                        //
+                        //   1. HALT the sweep loudly — return a typed, greppable
+                        //      error instead of proceeding to the next cluster.
+                        //      The caller (`curator::run_consolidation_pass`)
+                        //      surfaces it as a hard cycle error, not a buried
+                        //      WARN.
+                        //   2. DELIBERATELY do NOT delete the unverifiable
+                        //      summary. `rollback_consolidation` restores sources
+                        //      FIRST and only then deletes the summary, so a
+                        //      failure leaves the summary as potentially the ONLY
+                        //      surviving representation of any source that did not
+                        //      restore. `db::delete` is a HARD row delete;
+                        //      removing it here could destroy that last copy.
+                        //      Retaining it keeps the merged content recoverable
+                        //      (operator `curator --rollback` / manual repair).
+                        tracing::error!(
+                            target: COMPACTION_TRACE_TARGET,
+                            pass = self.name(),
+                            summary_id = %new_id,
+                            verify_error = %e,
+                            rollback_error = %re,
+                            slug = ROLLBACK_FAILED_FAILCLOSED_SLUG,
+                            "consolidation rollback FAILED — sweep halted fail-closed; unverifiable summary RETAINED for recovery"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "{slug}: pass={pass}: summary_id={new_id}: verify_error={e}: rollback_error={re}",
+                            slug = ROLLBACK_FAILED_FAILCLOSED_SLUG,
+                            pass = self.name(),
+                        ));
+                    }
                 }
-                tracing::warn!(
-                    target: COMPACTION_TRACE_TARGET,
-                    pass = self.name(),
-                    summary_id = %new_id,
-                    restored,
-                    error = %e,
-                    "consolidation verify failed — rolled back (Stage-6, #664)"
-                );
-                report.errors.push(format!(
-                    "{}: verify failed (rolled back {restored}): {e}",
-                    self.name()
-                ));
-                continue;
             }
 
             // Happy path — the consolidation verified and sticks. Persist an
@@ -1692,6 +1755,204 @@ mod tests {
                 "squatter not clobbered"
             );
             assert!(crate::db::get(&conn, &result_id).unwrap().is_none());
+        }
+
+        // ---- #3190 fail-closed on a failed rollback -------------------------
+
+        /// #3190 test double — wraps a real `SqliteStore`, delegating every op
+        /// EXCEPT the two failure injections the fail-closed halt needs:
+        ///   * `fail_verify` → `get` returns `NotFound`, so
+        ///     [`ConsolidationPass::verify`] fails and `run` enters the Stage-6
+        ///     auto-rollback branch;
+        ///   * `fail_restore` → `restore_or_conflict` returns a non-`Conflict`
+        ///     backend error, so `rollback_consolidation` itself returns `Err`
+        ///     (the data-loss-shaped state #3190 must fail closed on).
+        ///
+        /// Clustering (`get_embedding_with_space`) and the destructive merge
+        /// (`consolidate`) delegate to the inner store so the pass reaches the
+        /// rollback branch against real data.
+        struct RollbackFailStore {
+            inner: SqliteStore,
+            fail_verify: std::sync::atomic::AtomicBool,
+            fail_restore: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl MemoryStore for RollbackFailStore {
+            fn capabilities(&self) -> crate::store::Capabilities {
+                self.inner.capabilities()
+            }
+            async fn store(
+                &self,
+                ctx: &CallerContext,
+                memory: &Memory,
+            ) -> crate::store::StoreResult<String> {
+                self.inner.store(ctx, memory).await
+            }
+            async fn get(
+                &self,
+                ctx: &CallerContext,
+                id: &str,
+            ) -> crate::store::StoreResult<Memory> {
+                if self.fail_verify.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(StoreError::NotFound { id: id.to_string() });
+                }
+                self.inner.get(ctx, id).await
+            }
+            async fn update(
+                &self,
+                ctx: &CallerContext,
+                id: &str,
+                patch: crate::store::UpdatePatch,
+            ) -> crate::store::StoreResult<()> {
+                self.inner.update(ctx, id, patch).await
+            }
+            async fn delete(&self, ctx: &CallerContext, id: &str) -> crate::store::StoreResult<()> {
+                self.inner.delete(ctx, id).await
+            }
+            async fn list(
+                &self,
+                ctx: &CallerContext,
+                filter: &crate::store::Filter,
+            ) -> crate::store::StoreResult<Vec<Memory>> {
+                self.inner.list(ctx, filter).await
+            }
+            async fn search(
+                &self,
+                ctx: &CallerContext,
+                query: &str,
+                filter: &crate::store::Filter,
+            ) -> crate::store::StoreResult<Vec<Memory>> {
+                self.inner.search(ctx, query, filter).await
+            }
+            async fn verify(
+                &self,
+                ctx: &CallerContext,
+                id: &str,
+            ) -> crate::store::StoreResult<crate::store::VerifyReport> {
+                self.inner.verify(ctx, id).await
+            }
+            async fn link(
+                &self,
+                ctx: &CallerContext,
+                link: &crate::models::MemoryLink,
+            ) -> crate::store::StoreResult<()> {
+                self.inner.link(ctx, link).await
+            }
+            async fn list_links(
+                &self,
+                namespace: Option<&str>,
+            ) -> crate::store::StoreResult<Vec<crate::models::MemoryLink>> {
+                self.inner.list_links(namespace).await
+            }
+            async fn register_agent(
+                &self,
+                ctx: &CallerContext,
+                agent: &crate::models::AgentRegistration,
+            ) -> crate::store::StoreResult<()> {
+                self.inner.register_agent(ctx, agent).await
+            }
+            async fn get_embedding_with_space(
+                &self,
+                ctx: &CallerContext,
+                id: &str,
+            ) -> crate::store::StoreResult<Option<(Vec<f32>, Option<String>)>> {
+                self.inner.get_embedding_with_space(ctx, id).await
+            }
+            async fn consolidate(
+                &self,
+                ctx: &CallerContext,
+                ids: &[String],
+                title: &str,
+                summary: &str,
+                namespace: &str,
+                tier: &Tier,
+                source: &str,
+                consolidator_agent_id: &str,
+            ) -> crate::store::StoreResult<String> {
+                self.inner
+                    .consolidate(
+                        ctx,
+                        ids,
+                        title,
+                        summary,
+                        namespace,
+                        tier,
+                        source,
+                        consolidator_agent_id,
+                    )
+                    .await
+            }
+            async fn restore_or_conflict(
+                &self,
+                ctx: &CallerContext,
+                memory: &Memory,
+            ) -> crate::store::StoreResult<String> {
+                if self.fail_restore.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(StoreError::Backend(crate::store::BoxBackendError::new(
+                        "injected rollback restore failure (#3190 fail-closed test)",
+                    )));
+                }
+                self.inner.restore_or_conflict(ctx, memory).await
+            }
+        }
+
+        #[tokio::test]
+        async fn rollback_failure_halts_sweep_fail_closed_and_retains_summary_3190() {
+            // #3190 (data-integrity, GA-blocker): when a Stage-6 auto-rollback
+            // ITSELF fails, the sweep must FAIL CLOSED — halt loudly rather than
+            // `continue` past an unverifiable-summary-served-as-truth /
+            // sources-silently-lost state, and RETAIN the summary (it may be the
+            // only surviving copy of a source that did not restore).
+            //
+            // At the parent commit this FAILS: `run` swallowed the rollback
+            // error and returned `Ok`, continuing the sweep.
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("synth");
+
+            let fail_store = RollbackFailStore {
+                inner: store,
+                fail_verify: std::sync::atomic::AtomicBool::new(true),
+                fail_restore: std::sync::atomic::AtomicBool::new(true),
+            };
+            let pass = ConsolidationPass::new(&fail_store, &llm, false /* real */);
+
+            let result = pass.run(&candidates).await;
+
+            // FAIL-CLOSED: the sweep HALTS with a typed, greppable error rather
+            // than continuing past the data-loss-shaped state.
+            let err = result.expect_err("a failed rollback must abort the sweep fail-closed");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(super::super::ROLLBACK_FAILED_FAILCLOSED_SLUG),
+                "halt error must carry the fail-closed slug, got: {msg}"
+            );
+
+            // NO DATA LOSS: the unverifiable summary is RETAINED. A naive
+            // delete-the-summary fail-closed would have destroyed the only
+            // surviving copy of any source that did not restore; the
+            // [consolidated] row must still be present in the backing DB.
+            let rows = crate::db::list(
+                &conn,
+                Some("ns"),
+                None,
+                16,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+                "the unverifiable summary must be retained for recovery, titles: {:?}",
+                rows.iter().map(|m| m.title.clone()).collect::<Vec<_>>()
+            );
         }
     } // mod sal_pass_tests
 }
