@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (postgres expires_at SAL-patch test — stale Long-tier fixture)
+
+- `postgres_update_threads_expires_at_through_sal_patch` seeded a
+  `Tier::Long` memory then expected a patched `expires_at` to persist,
+  but the pg UPDATE correctly nulls expiry for `tier='long'` (#3230
+  CRITICAL: a permanent row must not carry an expiry GC would reap). The
+  #1423 intent (verify `expires_at` threads through the SAL patch) needs
+  a tier that permits expiry — the test now seeds `Tier::Short`. pg
+  behaviour is correct; this was a stale test (same #2399-permanence
+  posture as #2384). Was the last failure in the serial coverage sweep.
+
 ### Fixed (conformance export golden schema-version drift)
 
 - `conformance/vectors/export/round_trip_l3.json` pinned

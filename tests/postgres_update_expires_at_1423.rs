@@ -86,7 +86,13 @@ async fn postgres_update_threads_expires_at_through_sal_patch() {
     };
     let owner = "ai:1423-expires-at-roundtrip";
     let ctx = CallerContext::for_agent(owner);
-    let mem = seed_mem(owner, "ns-1423-set", "expires-at-set");
+    // #3230 CRITICAL: a `Long` (permanent) row must NOT carry expiry —
+    // the pg UPDATE nulls `expires_at` when `tier='long'` so GC cannot
+    // reap a documented-permanent row. `seed_mem` defaults to `Tier::Long`,
+    // so to exercise #1423 (expires_at THREADS through the SAL patch) we
+    // must seed a tier that PERMITS expiry.
+    let mut mem = seed_mem(owner, "ns-1423-set", "expires-at-set");
+    mem.tier = Tier::Short;
     let inserted_id = store.store(&ctx, &mem).await.expect("seed insert");
 
     // Round-trip 1 — verify the seed row landed with expires_at = NULL.
