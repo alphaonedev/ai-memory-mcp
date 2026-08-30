@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (CLI-surface parity — bind the recall ledger to the CALLER, not a namespace #2988)
+
+- **#2988 — the recall ledger bound a NAMESPACE into the identity column.**
+  Both CLI recall paths wrote `--as-agent` (a namespace) into
+  `recall_observations.agent_id`: `src/cli/recall.rs` passed
+  `args.as_agent`, and the interactive shell passed `None`. The #1705
+  cross-agent replay guard keys on that column (`agent_id IS NULL OR agent_id
+  = ?`), so it was inert on both paths — a namespace cannot gate an identity,
+  and a WRONG identity in that column is worse than NULL. Both now bind
+  `resolve_read_visibility_caller()`, the same value the MCP/HTTP writer
+  stamps (`mcp::tools::recall::record_recall_observations`). `--as-agent`
+  remains the namespace-scope visibility knob. Precedent-copy — the
+  fail-closed posture was already decided on the MCP/HTTP reference surface,
+  and this does not tighten behaviour beyond that precedent. Pinned by
+  `recall_ledger_binds_caller_identity_not_as_agent_2988` (a CLI-surface
+  replay-guard regression test the original coverage lacked).
+
 ### Fixed (B7 structural gate — pg transcript-write twins allowlisted)
 
 - The #3064 batch D merge added two write-SQL functions in
