@@ -15845,10 +15845,13 @@ async fn http_capture_turn_respects_namespace_deny() {
         PermissionRule, RuleDecision, clear_active_permission_rules_for_test,
         set_active_permission_rules,
     };
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Hold the process-wide gate-mode lock (which serializes the shared
+    // ACTIVE_PERMISSIONS_MODE atomic AND the active permission-rules slot
+    // by convention — see `chunkc_lock_perms`) rather than a fn-local
+    // mutex, so a sibling gate test cannot reset the mode/rules mid-request
+    // and drop this Deny to an ungated 201 (cross-test isolation flake,
+    // same class as the capabilities-v2 mode leak).
+    let _mode = crate::config::lock_permissions_mode_for_test();
     clear_active_permission_rules_for_test();
     crate::config::override_active_permissions_mode_for_test(
         crate::config::PermissionsMode::Enforce,

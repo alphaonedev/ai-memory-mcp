@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (capture_turn K9 governance test — cross-test isolation)
+
+- `http_capture_turn_respects_namespace_deny` held only a fn-local mutex
+  while mutating the process-wide `ACTIVE_PERMISSIONS_MODE` +
+  permission-rules slot, so a sibling gate test could reset mode/rules
+  mid-request and drop the K9 Deny/Ask to an ungated 201 (reddening the
+  impact-aware `CI` sqlite job). It now holds the global
+  `lock_permissions_mode_for_test()` gate lock (which serializes both,
+  per the `chunkc_lock_perms` convention), matching the sibling Ask test.
+
 ### Fixed (capabilities v2 schema test — cross-test isolation flake)
 
 - `http_capabilities_v2_schema_includes_all_blocks` asserted an exact
