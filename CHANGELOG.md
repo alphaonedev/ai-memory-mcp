@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (capabilities v2 schema test — cross-test isolation flake)
+
+- `http_capabilities_v2_schema_includes_all_blocks` asserted an exact
+  `permissions.mode` value (`advisory`), but that mode is process-wide
+  governance state (`ACTIVE_PERMISSIONS_MODE`) that sibling gate tests
+  mutate under parallel execution, so the value leaked (`enforce`) into
+  this schema test and reddened the impact-aware `CI` (sqlite) +
+  coverage jobs whenever a handlers change pulled it into the run. This
+  is a SCHEMA-structure test, so it now asserts a *valid* mode
+  (`advisory`|`enforce`) rather than a specific one; the zero-state
+  fallback value stays pinned deterministically by the config unit
+  tests (`UNINITIALIZED_PERMISSIONS_MODE_FALLBACK` == `Advisory`).
+
 ### Fixed (C8 allowlist — export_reflection for_admin)
 
 - Allowlist `CallerContext::for_admin("http:export-reflection")` on the

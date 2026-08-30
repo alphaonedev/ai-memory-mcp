@@ -10648,9 +10648,22 @@ async fn http_capabilities_v2_schema_includes_all_blocks() {
 
     assert_eq!(v["schema_version"], "2");
 
-    // permissions: mode=advisory (P1), active_rules live, no rule_summary
+    // permissions block present with a well-formed `mode`; active_rules
+    // live, no rule_summary. NB: this is a SCHEMA-structure test. The
+    // exact zero-state mode is process-wide governance state
+    // (`ACTIVE_PERMISSIONS_MODE`) that sibling gate tests mutate under
+    // parallel execution, so we assert a VALID mode value rather than a
+    // specific one to avoid cross-test isolation flake. The zero-state
+    // fallback value itself is pinned deterministically by the config
+    // unit tests (`UNINITIALIZED_PERMISSIONS_MODE_FALLBACK` == Advisory).
     assert!(v["permissions"].is_object());
-    assert_eq!(v["permissions"]["mode"], "advisory");
+    let permissions_mode = v["permissions"]["mode"]
+        .as_str()
+        .expect("permissions.mode must be a string");
+    assert!(
+        matches!(permissions_mode, "advisory" | "enforce"),
+        "permissions.mode must be a valid gate mode, got {permissions_mode:?}"
+    );
     assert!(v["permissions"]["active_rules"].is_number());
     assert!(v["permissions"].get("rule_summary").is_none());
     // v0.6.3.1 (P4, audit G1): inheritance posture surfaced.
