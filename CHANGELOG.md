@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3142 — `--db` / AI_MEMORY_DB silently accepted a URL-shaped value)
+
+- **#3142 (data-integrity footgun) — a URL-shaped `--db` / `AI_MEMORY_DB`
+  value (e.g. `postgres://…`) was taken verbatim as a SQLite filesystem
+  path.** The daemon silently created a SQLite file literally named
+  `postgres://…` and ran on SQLite while the operator believed they had
+  pointed it at Postgres (Postgres is selected only via `--store-url` /
+  `AI_MEMORY_STORE_URL` / `AI_MEMORY_STORE_URL_FILE`) — a silent
+  wrong-backend run. The `run` dispatch funnel now refuses any `--db` value
+  containing a `://` scheme separator **fail-closed**, before `effective_db`
+  resolves it or any store is opened, with an actionable message naming
+  `--store-url`. The credential is redacted from the refusal (#1579 A3) so a
+  mis-pasted `postgres://user:pass@…` never echoes its password — the guard
+  lives in the funnel rather than a clap `value_parser` precisely because
+  clap would otherwise prefix the failure with `invalid value '<raw>'` and
+  leak the credential verbatim. Plain filesystem paths are unaffected.
+
 ### Fixed (identity read-visibility — reflect source read gated as a write #3282)
 
 - **#3282 (default-config functional regression, GA-blocker) — MCP
