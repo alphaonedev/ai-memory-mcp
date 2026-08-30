@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (identity read-visibility — reflect source read gated as a write #3282)
+
+- **#3282 (default-config functional regression, GA-blocker) — MCP
+  `handle_reflect` scoped its SOURCE READ with the WRITE-ladder subject
+  instead of the read-visibility caller.** The #3176 / #3237-item-4 wiring
+  threaded `Some(input.agent_id.as_str())` — the value from
+  `resolve_governance_subject` (the write ladder) — into
+  `db::reflect_with_hooks_for_caller`'s source-read visibility gate. In the
+  DEFAULT single-operator config (`AI_MEMORY_AGENT_ID` unset) that subject
+  resolves to a synthesized `host:<hostname>` / `ai:<client>@<host>`
+  principal, so `memory_reflect` began folding any source WRITTEN BY A
+  DIFFERENT principal (CLI, HTTP, curator, federation, a second MCP client)
+  to `source memory not found` — even though recall / list / search / get on
+  the same session apply no filter and still show the row. A read was being
+  gated as if it were a write. The source read now resolves
+  `resolve_read_visibility_caller()` — the same resolver
+  recall/list/search/get and the #2988 recall ledger use: `None` (trust-all)
+  when `AI_MEMORY_AGENT_ID` is unset, `Some(enforced)` under the multi-tenant
+  opt-in, where it gates each source through `is_visible_to_caller` exactly
+  like the recall path (a tenant still cannot pull another agent's private
+  source into a reflection). The WRITE owner stays `input.agent_id` — writes
+  remain on the write ladder. Identity read-visibility semantics only
+  (`src/mcp/tools/reflect.rs`); no `src/identity/*` change, so cert §7 is
+  unaffected. New regression suite
+  `tests/reflect_read_visibility_caller_3282.rs` pins the default-config
+  success plus the enforced non-owner refusal and enforced-owner success
+  controls.
+
 ### Security (CLI-surface parity — bind the recall ledger to the CALLER, not a namespace #2988)
 
 - **#2988 — the recall ledger bound a NAMESPACE into the identity column.**
