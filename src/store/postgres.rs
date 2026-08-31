@@ -24114,11 +24114,13 @@ impl MemoryStore for PostgresStore {
                 }
             }
         }
-        // #3323 — advisory per-lineage + per-namespace token/cost accounting on
-        // the RECALL funnel, the postgres twin of the `SqliteStore::recall_hybrid`
-        // hook. Best-effort on the shared pool; a metering failure never blocks
-        // the recall.
-        crate::cost::postgres::record_recall_pg(&self.pool, &results).await;
+        // #3323 + #1953 recall-purity — recall is PURE: it may append only to
+        // the append-only `recall_observations` ledger (above), never mutate
+        // `token_cost_counters`. The prior in-line `record_recall_pg` call here
+        // wrote the counter table on the recall path, which violated the
+        // recall-purity invariant (#1953). RECALL token/cost is now DERIVED
+        // from that ledger at rollup time (see the `crate::cost::postgres`
+        // rollups), the postgres twin of the SQLite change.
         Ok(results)
     }
 

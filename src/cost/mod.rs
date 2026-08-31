@@ -34,12 +34,24 @@
 //! WRITE metering is universal for the SQLite/default path: it rides
 //! `storage::insert_inner`, the single LOCAL-authorship write chokepoint
 //! (federation/import admission is excluded — those tokens were spent on
-//! the authoring node), plus `PostgresStore::store`. RECALL metering
-//! rides the SAL store funnels (`SqliteStore::recall_hybrid` /
-//! `PostgresStore::recall_hybrid`) where a WRITABLE connection exists;
-//! the read-only HTTP recall fast-path defers, consistent with recall
-//! staying pure (#1953). A build/config that never routes through those
-//! funnels simply reports fewer numbers — never wrong ones.
+//! the authoring node), plus `PostgresStore::store`. The write counters in
+//! [`TABLE`] are cumulative and exact.
+//!
+//! RECALL metering is DIFFERENT: a recall is PURE (#1953) — it may append
+//! only to the `recall_observations` ledger, never mutate a durable table
+//! such as [`TABLE`]. So recall token/cost is NOT written on the recall
+//! path; it is DERIVED from that ledger at rollup time — one ledger row is
+//! one served result, and the served memory's content is tokenized (cl100k)
+//! on demand in the rollup functions below (a token count is not expressible
+//! in SQL). This keeps this advisory module entirely OFF every
+//! integrity-critical path (both recall AND the fold). One consequence: the
+//! ledger is pruned to `AI_MEMORY_OBSERVATIONS_TTL_DAYS`, so the derived
+//! recalled figure reflects the ledger-retention WINDOW, not all-time — an
+//! intentional trade for recall purity, consistent with this module being
+//! advisory and disposable (a report of fewer numbers, never wrong ones).
+//! The [`record_recall_sqlite`] / `postgres::record_recall_pg` UPSERT
+//! funnels remain as a direct-accrual API (exercised by the cost tests) and
+//! their stored deltas, when present, are ADDED to the derived figure.
 
 use rusqlite::{Connection, params, params_from_iter};
 
@@ -237,6 +249,99 @@ fn accumulate<'a>(
 // SQLite rollup queries (report path — cost model applied here).
 // ---------------------------------------------------------------------------
 
+// v1.0.0 #3323 hotfix (#1953 recall-purity) — RECALL cost is DERIVED from the
+// append-only `recall_observations` ledger at rollup time, never written on
+// the (pure) recall path. One ledger row is one served result; the served
+// memory's content is tokenized (cl100k) here because a token count is not
+// expressible in SQL. Every derive is BEST-EFFORT: an absent ledger/join
+// (e.g. a counter-only fixture, or a memory since deleted) contributes zero
+// rather than failing the rollup — advisory, disposable (degrade, never
+// corrupt). The ledger is pruned to `AI_MEMORY_OBSERVATIONS_TTL_DAYS`, so the
+// derived recall figure reflects the retention window, not all-time.
+
+/// Ledger-derived recalled `(tokens, events)` for one namespace.
+fn derive_namespace_recall(conn: &Connection, namespace: &str) -> (i64, i64) {
+    (|| -> rusqlite::Result<(i64, i64)> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT m.content FROM recall_observations ro \
+             JOIN memories m ON m.id = ro.memory_id WHERE m.namespace = ?1",
+        )?;
+        let mut acc = (0_i64, 0_i64);
+        let rows = stmt.query_map(params![namespace], |r| r.get::<_, String>(0))?;
+        for content in rows {
+            acc.0 = acc
+                .0
+                .saturating_add(clamp_tokens(crate::storage::count_tokens_cl100k(&content?)));
+            acc.1 = acc.1.saturating_add(1);
+        }
+        Ok(acc)
+    })()
+    .unwrap_or_else(|e| {
+        tracing::debug!(target: "cost", "recall-ledger derive (namespace) skipped (non-fatal): {e}");
+        (0, 0)
+    })
+}
+
+/// Ledger-derived recalled `(tokens, events)` over an explicit memory-id set
+/// (the lineage node set: a root plus its provenance descendants).
+fn derive_ids_recall(conn: &Connection, ids: &std::collections::BTreeSet<String>) -> (i64, i64) {
+    if ids.is_empty() {
+        return (0, 0);
+    }
+    (|| -> rusqlite::Result<(i64, i64)> {
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT m.content FROM recall_observations ro \
+             JOIN memories m ON m.id = ro.memory_id WHERE m.id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut acc = (0_i64, 0_i64);
+        let rows = stmt.query_map(params_from_iter(ids.iter()), |r| r.get::<_, String>(0))?;
+        for content in rows {
+            acc.0 = acc
+                .0
+                .saturating_add(clamp_tokens(crate::storage::count_tokens_cl100k(&content?)));
+            acc.1 = acc.1.saturating_add(1);
+        }
+        Ok(acc)
+    })()
+    .unwrap_or_else(|e| {
+        tracing::debug!(target: "cost", "recall-ledger derive (lineage) skipped (non-fatal): {e}");
+        (0, 0)
+    })
+}
+
+/// Ledger-derived recalled `(tokens, events)` per namespace, for the
+/// fleet-wide report. One pass over the ledger, aggregated in-process.
+fn derive_all_namespace_recall(
+    conn: &Connection,
+) -> std::collections::BTreeMap<String, (i64, i64)> {
+    (|| -> rusqlite::Result<std::collections::BTreeMap<String, (i64, i64)>> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT m.namespace, m.content FROM recall_observations ro \
+             JOIN memories m ON m.id = ro.memory_id",
+        )?;
+        let mut map: std::collections::BTreeMap<String, (i64, i64)> =
+            std::collections::BTreeMap::new();
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (ns, content) = row?;
+            let entry = map.entry(ns).or_insert((0_i64, 0_i64));
+            entry.0 = entry
+                .0
+                .saturating_add(clamp_tokens(crate::storage::count_tokens_cl100k(&content)));
+            entry.1 = entry.1.saturating_add(1);
+        }
+        Ok(map)
+    })()
+    .unwrap_or_else(|e| {
+        tracing::debug!(target: "cost", "recall-ledger derive (all-namespace) skipped (non-fatal): {e}");
+        std::collections::BTreeMap::new()
+    })
+}
+
 /// The per-namespace rollup for one namespace, or `None` if the namespace
 /// has never been metered.
 ///
@@ -247,26 +352,46 @@ pub fn namespace_rollup(
     conn: &Connection,
     namespace: &str,
 ) -> rusqlite::Result<Option<CostRollup>> {
-    conn.query_row(
-        "SELECT scope_key, tokens_written, tokens_recalled, write_events, recall_events \
-         FROM token_cost_counters WHERE scope_kind = ?1 AND scope_key = ?2",
-        params![SCOPE_NAMESPACE, namespace],
-        |row| {
-            Ok(CostRollup {
-                scope_kind: SCOPE_NAMESPACE.to_string(),
-                scope_key: row.get(0)?,
-                tokens_written: row.get(1)?,
-                tokens_recalled: row.get(2)?,
-                write_events: row.get(3)?,
-                recall_events: row.get(4)?,
-            })
-        },
-    )
-    .map(Some)
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        other => Err(other),
-    })
+    let stored: Option<CostRollup> = conn
+        .query_row(
+            "SELECT scope_key, tokens_written, tokens_recalled, write_events, recall_events \
+             FROM token_cost_counters WHERE scope_kind = ?1 AND scope_key = ?2",
+            params![SCOPE_NAMESPACE, namespace],
+            |row| {
+                Ok(CostRollup {
+                    scope_kind: SCOPE_NAMESPACE.to_string(),
+                    scope_key: row.get(0)?,
+                    tokens_written: row.get(1)?,
+                    tokens_recalled: row.get(2)?,
+                    write_events: row.get(3)?,
+                    recall_events: row.get(4)?,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    // #1953 recall-purity — fold the ledger-derived recall figure onto the
+    // stored write counters (recall no longer writes the counter table).
+    let (dr_tokens, dr_events) = derive_namespace_recall(conn, namespace);
+    match stored {
+        Some(mut r) => {
+            r.tokens_recalled = r.tokens_recalled.saturating_add(dr_tokens);
+            r.recall_events = r.recall_events.saturating_add(dr_events);
+            Ok(Some(r))
+        }
+        None if dr_events == 0 => Ok(None),
+        None => Ok(Some(CostRollup {
+            scope_kind: SCOPE_NAMESPACE.to_string(),
+            scope_key: namespace.to_string(),
+            tokens_written: 0,
+            tokens_recalled: dr_tokens,
+            write_events: 0,
+            recall_events: dr_events,
+        })),
+    }
 }
 
 /// Every per-namespace rollup, most-expensive first. The fleet-wide "where
@@ -278,20 +403,49 @@ pub fn namespace_rollup(
 pub fn all_namespace_rollups(conn: &Connection) -> rusqlite::Result<Vec<CostRollup>> {
     let mut stmt = conn.prepare(
         "SELECT scope_key, tokens_written, tokens_recalled, write_events, recall_events \
-         FROM token_cost_counters WHERE scope_kind = ?1 \
-         ORDER BY (tokens_written + tokens_recalled) DESC, scope_key ASC",
+         FROM token_cost_counters WHERE scope_kind = ?1",
     )?;
-    let rows = stmt.query_map(params![SCOPE_NAMESPACE], |row| {
-        Ok(CostRollup {
+    let stored: Vec<CostRollup> = stmt
+        .query_map(params![SCOPE_NAMESPACE], |row| {
+            Ok(CostRollup {
+                scope_kind: SCOPE_NAMESPACE.to_string(),
+                scope_key: row.get(0)?,
+                tokens_written: row.get(1)?,
+                tokens_recalled: row.get(2)?,
+                write_events: row.get(3)?,
+                recall_events: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    // #1953 recall-purity — recall no longer writes the counter table, so
+    // merge the stored write counters with the ledger-derived recall figures
+    // (including namespaces that have only been recalled, never written) and
+    // rank by total spend in-process.
+    let mut by_ns: std::collections::BTreeMap<String, CostRollup> = stored
+        .into_iter()
+        .map(|r| (r.scope_key.clone(), r))
+        .collect();
+    for (ns, (dr_tokens, dr_events)) in derive_all_namespace_recall(conn) {
+        let entry = by_ns.entry(ns.clone()).or_insert_with(|| CostRollup {
             scope_kind: SCOPE_NAMESPACE.to_string(),
-            scope_key: row.get(0)?,
-            tokens_written: row.get(1)?,
-            tokens_recalled: row.get(2)?,
-            write_events: row.get(3)?,
-            recall_events: row.get(4)?,
-        })
-    })?;
-    rows.collect()
+            scope_key: ns,
+            tokens_written: 0,
+            tokens_recalled: 0,
+            write_events: 0,
+            recall_events: 0,
+        });
+        entry.tokens_recalled = entry.tokens_recalled.saturating_add(dr_tokens);
+        entry.recall_events = entry.recall_events.saturating_add(dr_events);
+    }
+    let mut out: Vec<CostRollup> = by_ns.into_values().collect();
+    // Most-expensive first (total tokens), ties broken by scope_key — the
+    // same order the previous SQL `ORDER BY` produced.
+    out.sort_by(|a, b| {
+        b.tokens_total()
+            .cmp(&a.tokens_total())
+            .then_with(|| a.scope_key.cmp(&b.scope_key))
+    });
+    Ok(out)
 }
 
 /// The per-lineage-ROOT rollup: the summed token/cost of `root_id` plus
@@ -350,6 +504,12 @@ pub fn lineage_rollup(
     rollup.tokens_recalled = r;
     rollup.write_events = we;
     rollup.recall_events = re;
+    // #1953 recall-purity — add the ledger-derived recall for the node set
+    // (recall no longer writes the counter table). `ids` is the deduped root
+    // + provenance-descendant set already computed above.
+    let (dr_tokens, dr_events) = derive_ids_recall(conn, &ids);
+    rollup.tokens_recalled = rollup.tokens_recalled.saturating_add(dr_tokens);
+    rollup.recall_events = rollup.recall_events.saturating_add(dr_events);
     Ok(rollup)
 }
 
