@@ -489,10 +489,14 @@ async fn set_namespace_standard_inner(
         // so a foreign `scope=private` parent standard is RESOLVED for the
         // ownership check rather than folded into NotFound → skip-authz (the
         // #2709 hole). `None` = no parent declared / parent has no standard /
-        // severed pointer → UNOWNED → allowed. Postgres `set_namespace_standard`
-        // never `-`-auto-detects a parent, so this authorizes only an EXPLICITLY
-        // declared graft; the federation edge and Route 2 governance filter are
-        // the backstops for an inferred parent that reached pg via replication.
+        // severed pointer → UNOWNED → allowed. This gate authorizes only an
+        // EXPLICITLY declared graft (`body.parent`). #3188 — `set_namespace_standard`
+        // now `-`-auto-detects an inferred parent when `body.parent` is None on
+        // BOTH backends (postgres reached sqlite parity), and — as has always
+        // been the case for sqlite's native auto-detect — that INFERRED parent is
+        // not bind-gated here; the federation edge and Route 2 governance filter
+        // are the backstops for an inferred parent (whether locally auto-detected
+        // or replicated in). The bind gate's scope is unchanged by #3188.
         let parent_standard: Option<Memory> = if let Some(p) = body.parent.as_deref() {
             match app
                 .store
