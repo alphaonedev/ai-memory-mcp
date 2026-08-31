@@ -1247,7 +1247,7 @@ twin (byte-equal envelopes; `--json` for the raw envelope):
 | `dependents-of-invalidated` | `memory_dependents_of_invalidated` | Memories citing invalidated KG edges. |
 | `reflection-origin` | `memory_reflection_origin` | Walk a reflection back to its origin chain. |
 | `quota-status` | `memory_quota_status` | K8 per-agent quota row. |
-| `swarm-rewind` | `memory_swarm_rewind` | #3322 (#3266 MVG) — atomic, resumable one-command cascade rewind: `--to <checkpoint\|claim-id>` invalidates the root, contaminates its derived swarm (hidden, reversibly — never deleted), freezes operator-named routines (`--freeze-routine`), emits a signed `swarm.rewind` audit event, and reports the #3323 lineage token/cost. `--dry-run` previews with zero writes. Idempotent; fail-closed. |
+| `swarm-rewind` | `memory_swarm_rewind` | #3322 (#3266 MVG) — atomic, resumable one-command cascade rewind: `--to <checkpoint\|claim-id>` invalidates the root, contaminates its derived swarm (hidden, reversibly — never deleted) down to `--max-depth <N>` (clamped to the server lineage ceiling), freezes operator-named routines (`--freeze-routine`), emits a signed `swarm.rewind` audit event, and reports the #3323 lineage token/cost. `--dry-run` previews with zero writes; `--agent-id <AGENT_ID>` overrides the recorded rewind issuer. Idempotent; fail-closed. |
 
 ### `recover-previous-session` — #1389 L2
 
