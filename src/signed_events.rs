@@ -322,6 +322,18 @@ pub mod event_types {
     /// crypto-erase-vs-delete boundary lives in the erasure-kind field.
     pub const SUBSTRATE_CRYPTO_ERASE: &str = "substrate.crypto_erase";
 
+    /// v1.0.0 #3322 (#3266 MVG) — `signed_events.event_type` for a
+    /// `memory_swarm_rewind`: ONE atomic, resumable operator command that
+    /// intercepts and unwinds a memory cascade (invalidate root + contaminate
+    /// the derived swarm + freeze affected routines). The append-only chain IS
+    /// the tamper-evident record of the rewind; `agent_id` = the issuer,
+    /// `payload_hash` commits `{action, root_id, target_kind, contaminated,
+    /// routines_frozen, issued_by, timestamp}`. Emitted ONCE per committed
+    /// rewind (an idempotent re-run of an already-rewound root appends
+    /// nothing). The dotted slug keeps the value clear of the underscore-joined
+    /// L3-boundary lexical gate (mirrors [`EPOCH_APPLIED`]).
+    pub const SWARM_REWIND: &str = "swarm.rewind";
+
     /// #2503 — `signed_events.event_type` for a GOVERNANCE-BINDING SEVERANCE:
     /// a memory reap (delete / archive / size-gc eviction) that severed one or
     /// more `namespace_meta.standard_id` bindings, or a gc sweep that healed a

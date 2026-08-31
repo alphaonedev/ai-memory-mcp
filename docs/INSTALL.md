@@ -16,7 +16,7 @@ layout: doc
 >
 > This file (`INSTALL.md`) is the **SME singleton + single-node reference.** Path-A non-technical readers should use [`install-quickstart.md`](install-quickstart.html) instead — it covers configuration end-to-end without exposing every flag.
 
-> **BLUF (Bottom Line Up Front):** `ai-memory` is an AI-agnostic memory management system that works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others. Install the binary, configure your AI client's MCP settings, and you get **7 MCP memory tools at the default `--profile core`** (or 103 advertised entries at `--profile full` — 102 callable memory tools + the always-on `memory_capabilities` bootstrap). The default `semantic` tier includes embedding-based hybrid recall out of the box. Total time: ~60 seconds (pre-built binary + fast internet; first semantic-tier run also downloads a ~100MB embedding model).
+> **BLUF (Bottom Line Up Front):** `ai-memory` is an AI-agnostic memory management system that works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others. Install the binary, configure your AI client's MCP settings, and you get **7 MCP memory tools at the default `--profile core`** (or 104 advertised entries at `--profile full` — 103 callable memory tools + the always-on `memory_capabilities` bootstrap). The default `semantic` tier includes embedding-based hybrid recall out of the box. Total time: ~60 seconds (pre-built binary + fast internet; first semantic-tier run also downloads a ~100MB embedding model).
 
 ## Install in 60 Seconds (pre-built binary + fast internet)
 
@@ -90,7 +90,7 @@ layout: doc
    honours semver discipline within a minor series; `0.8.0` (released
    2026-06-25) and `0.8.1` (released 2026-06-29) already shipped their
    schema bumps and new tools, and the current release is `0.9.0`
-   (schema v90, 103 MCP tools at `--profile full`). The supported pin
+   (schema v90, 104 MCP tools at `--profile full`). The supported pin
    syntax per channel:
 
    | Channel       | Pin syntax                                                          |

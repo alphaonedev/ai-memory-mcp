@@ -1392,6 +1392,49 @@
       "name": "memory_dependents_of_invalidated"
     },
     {
+      "description": "Atomically intercept and unwind",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "title": "3171 — operator-as-actor: the id recorded as the ISSUER of the signed",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "freeze_routines": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "max_depth": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "to"
+        ],
+        "type": "object"
+      },
+      "name": "memory_swarm_rewind"
+    },
+    {
       "description": "Consolidate multiple memories",
       "inputSchema": {
         "properties": {

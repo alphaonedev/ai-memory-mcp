@@ -159,6 +159,10 @@ pub mod tool_names {
     pub const MEMORY_SUBSCRIBE: &str = "memory_subscribe";
     pub const MEMORY_SUBSCRIPTION_DLQ_LIST: &str = "memory_subscription_dlq_list";
     pub const MEMORY_SUBSCRIPTION_REPLAY: &str = "memory_subscription_replay";
+    /// v1.0.0 #3322 (#3266 MVG) — atomic, resumable cascade-rewind
+    /// (invalidate root + contaminate derived swarm + freeze routines + signed
+    /// rewind event + lineage cost report).
+    pub const MEMORY_SWARM_REWIND: &str = "memory_swarm_rewind";
     pub const MEMORY_UNSUBSCRIBE: &str = "memory_unsubscribe";
     pub const MEMORY_UPDATE: &str = "memory_update";
     pub const MEMORY_VERIFY: &str = "memory_verify";
@@ -277,6 +281,7 @@ pub mod tool_names {
         MEMORY_SUBSCRIBE,
         MEMORY_SUBSCRIPTION_DLQ_LIST,
         MEMORY_SUBSCRIPTION_REPLAY,
+        MEMORY_SWARM_REWIND,
         MEMORY_UNSUBSCRIBE,
         MEMORY_UPDATE,
         MEMORY_VERIFY,
@@ -469,6 +474,7 @@ pub mod tool_names {
             assert_eq!(MEMORY_SUBSCRIBE, "memory_subscribe");
             assert_eq!(MEMORY_SUBSCRIPTION_DLQ_LIST, "memory_subscription_dlq_list");
             assert_eq!(MEMORY_SUBSCRIPTION_REPLAY, "memory_subscription_replay");
+            assert_eq!(MEMORY_SWARM_REWIND, "memory_swarm_rewind");
             assert_eq!(MEMORY_UNSUBSCRIBE, "memory_unsubscribe");
             assert_eq!(MEMORY_UPDATE, "memory_update");
             assert_eq!(MEMORY_VERIFY, "memory_verify");
@@ -737,6 +743,8 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::persona::PersonaGenerateTool>(),
         RegisteredTool::of::<crate::mcp::reflection_origin::ReflectionOriginTool>(),
         RegisteredTool::of::<crate::mcp::dependents_of_invalidated::DependentsOfInvalidatedTool>(),
+        // v1.0.0 #3322 (#3266 MVG) — atomic, resumable cascade rewind.
+        RegisteredTool::of::<crate::mcp::swarm_rewind::SwarmRewindTool>(),
         RegisteredTool::of::<crate::mcp::consolidate::ConsolidateTool>(),
         RegisteredTool::of::<crate::mcp::ingest_multistep::IngestMultistepTool>(),
         RegisteredTool::of::<crate::mcp::atomise::AtomiseTool>(),

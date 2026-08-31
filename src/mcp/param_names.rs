@@ -98,6 +98,9 @@ pub const FOLDER_PATH: &str = "folder_path";
 pub const FORCE: &str = "force";
 pub const FORCE_RE_ATOMISE: &str = "force_re_atomise";
 pub const FORMAT: &str = "format";
+/// v1.0.0 #3322 (#3266 MVG) — `memory_swarm_rewind` operator-supplied list of
+/// routine ids to FREEZE (regulatory hold) as part of unwinding a cascade.
+pub const FREEZE_ROUTINES: &str = "freeze_routines";
 pub const FROM_ACTION: &str = "from_action";
 pub const FROM_AGENT: &str = "from_agent";
 pub const GOVERNANCE: &str = crate::models::field_names::GOVERNANCE;
@@ -269,6 +272,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     FORCE,
     FORCE_RE_ATOMISE,
     FORMAT,
+    FREEZE_ROUTINES,
     FROM_ACTION,
     GOVERNANCE,
     HOLDER,
@@ -394,9 +398,11 @@ mod tests {
         //   read as a bare literal until the tool-contract audit) and
         //   PIPELINE_VARIANT (the memory_ingest_multistep pipeline selector,
         //   likewise read as a bare literal).
+        // v1.0.0 #3322 (2026-08-31) — 135 -> 136: FREEZE_ROUTINES (the
+        //   memory_swarm_rewind operator-supplied routine-freeze set).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            135,
+            136,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

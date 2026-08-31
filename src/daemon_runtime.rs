@@ -228,14 +228,14 @@ pub enum Command {
         /// the original 5 + `memory_load_family` + `memory_smart_load`).
         /// Resolution order: this CLI flag > `AI_MEMORY_PROFILE` env >
         /// `[mcp].profile` in config.toml > `core`. Set `--profile full`
-        /// to expose every family — at v0.9.0,
-        /// `Profile::full().expected_tool_count()` returns 103 (canonical
+        /// to expose every family —
+        /// `Profile::full().expected_tool_count()` returns 104 (canonical
         /// SSOT; pinned by `profile_full_matches_registry_all` against
-        /// `crate::mcp::registry::tool_names::ALL.len()`). The 103
-        /// advertised entries decompose as 102 callable "memory tools"
+        /// `crate::mcp::registry::tool_names::ALL.len()`). The 104
+        /// advertised entries decompose as 103 callable "memory tools"
         /// plus the always-on `memory_capabilities` bootstrap; the
         /// `build_capabilities_summary` "{n} memory tools" phrasing
-        /// reports the 102 memory-tool count to reconcile with the
+        /// reports the 103 memory-tool count to reconcile with the
         /// user-facing summary (see issue #862 for the disambiguation).
         #[arg(long, env = "AI_MEMORY_PROFILE")]
         profile: Option<String>,
@@ -682,6 +682,11 @@ pub enum Command {
     DependentsOfInvalidated(
         crate::cli::commands::dependents_of_invalidated::DependentsOfInvalidatedArgs,
     ),
+    /// v1.0.0 #3322 (#3266 MVG) — `ai-memory swarm-rewind`. CLI parity for
+    /// `memory_swarm_rewind`: atomic, resumable cascade rewind (invalidate
+    /// root + contaminate derived swarm + freeze routines + signed rewind
+    /// event + lineage cost report).
+    SwarmRewind(crate::cli::commands::swarm_rewind::SwarmRewindArgs),
     /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory reflection-origin`.
     /// CLI parity for `memory_reflection_origin`.
     ReflectionOrigin(crate::cli::commands::reflection_origin::ReflectionOriginArgs),
@@ -2795,6 +2800,14 @@ pub async fn run(
                 &db_path, &a, &mut out,
             )
         }
+        Command::SwarmRewind(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::swarm_rewind::cmd_swarm_rewind(&db_path, &a, &mut out)
+        }
         Command::ReflectionOrigin(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
@@ -2883,6 +2896,10 @@ pub fn is_write_command(cmd: &Command) -> bool {
             | Command::IngestMultistep(_)
             | Command::KgInvalidate(_)
             | Command::EntityRegister(_)
+            // v1.0.0 #3322 (#3266 MVG) — `swarm-rewind` writes `memories`
+            // (lifecycle taint), `routines` (freeze), and `signed_events`
+            // (the rewind attestation), so it is write-class.
+            | Command::SwarmRewind(_)
     )
 }
 

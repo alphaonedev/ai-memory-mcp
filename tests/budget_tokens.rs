@@ -112,7 +112,14 @@ use serde_json::json;
 // cl100k_base on the trimmed full-profile tools/list. Structural keys,
 // not prose (trim already strips per-property descriptions). 7650 =
 // 7567 + 83 margin; still 3350 below the 11000 structural backstop.
-const FULL_PROFILE_TOKEN_CEILING: usize = 7_650;
+// 2026-08-31 — raised 7650 -> 7760: #3322 (#3266 MVG) added the
+// `memory_swarm_rewind` tool (104th advertised entry) with a 5-property
+// inputSchema (`to`, `max_depth`, `freeze_routines`, `dry_run`, `agent_id`).
+// CI measured 7684 cl100k_base on the trimmed full-profile tools/list —
+// structural (the new tool's name/description + property KEYS + type
+// shapes), not prose (the trim already strips per-property descriptions).
+// 7760 = 7684 + 76 margin; still 3240 below the 11000 structural backstop.
+const FULL_PROFILE_TOKEN_CEILING: usize = 7_760;
 
 fn mem_with_content(id: &str, content: &str) -> Memory {
     Memory {

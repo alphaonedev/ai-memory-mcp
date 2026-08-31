@@ -236,14 +236,15 @@ stripping, returning the un-trimmed schemars schema with every
 
 ## Counts at v0.9.0
 
-- 103 per-tool `McpTool` impls (102 under `src/mcp/tools/*.rs` +
-  `StoreTool` under `src/mcp/tools/store/mod.rs`).
-- 103 entries in `registered_tools()`
-  (`Profile::full().expected_tool_count() == 103 ==
-  crate::mcp::registry::tool_names::ALL.len()`). 102 of these are
-  callable memory tools; the 103rd is the always-on
+- 104 per-tool `McpTool` impls (102 under `src/mcp/tools/*.rs` +
+  `StoreTool` under `src/mcp/tools/store/mod.rs` + `SwarmRewindTool`
+  under `src/mcp/tools/swarm_rewind.rs`).
+- 104 entries in `registered_tools()`
+  (`Profile::full().expected_tool_count() == 104 ==
+  crate::mcp::registry::tool_names::ALL.len()`). 103 of these are
+  callable memory tools; the 104th is the always-on
   `memory_capabilities` bootstrap — see issue #862 for the canonical
-  102-callable / 103-advertised disambiguation.
+  103-callable / 104-advertised disambiguation.
 - 4-line iteration over `registered_tools()` is the entire body of
   `tool_definitions()` post-D1.6.
 - 7 always-on tools at the v0.9.0 default `--profile core` (plus the
