@@ -48,6 +48,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (F3). `qual_10_module_size_ceiling` bumped `src/storage/mod.rs` 32_685 → 32_790
   in lockstep.
 
+### Fixed (CI — `token-budget` workflow full-profile ceiling was a lockstep miss behind `tests/budget_tokens.rs`, #3266/#3322)
+
+- **`.github/workflows/token-budget.yml` still hard-coded the pre-#3322 **7650**
+  full-profile token ceiling while `tests/budget_tokens.rs` had already been
+  raised to **7760** for the #3266/#3322 `memory_swarm_rewind` (MVG) tool — so
+  the workflow's `doctor --tokens --json` gate reddened `release/v1.0.0` while
+  the in-tree test passed.** The new 104th advertised tool grew the trimmed
+  `tools/list` structural surface to **7,684** cl100k_base tokens (measured;
+  structural — the new tool name/description + property KEYS + `inputSchema`
+  type shapes, not prose, since the trim already strips per-property
+  descriptions). Both the `-gt` gate and the `<= 7650` step/error-message
+  ceilings are raised to **7760** (= 7684 + 76 margin), matching the test pin in
+  lockstep, and the raise is documented in the workflow's existing dated-bump
+  provenance chain (6500 → 6650 → 6750 → 7650 → 7760). `README.md`'s
+  binding-ceiling mention is reconciled to 7,760. No src/ logic, schema, or
+  tool-count change. `tests/token_budget_guard.rs`'s deliberately looser 11,000
+  structural backstop is untouched.
+
 ### Fixed (#3324 — postgres `migrate_v93` stamped `CURRENT_SCHEMA_VERSION` (94) instead of the literal 93, a crash-consistency ladder-integrity hazard)
 
 - **The postgres v93 migration arm stamped `CURRENT_SCHEMA_VERSION` instead of
