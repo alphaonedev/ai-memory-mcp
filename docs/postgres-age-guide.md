@@ -937,6 +937,53 @@ score = semantic_weight * cosine
 contract — same query, same top-K, same per-factor breakdown
 within FP tolerance.)
 
+### Federation lanes: sqlite-only on a PostgreSQL receiver (v1.0.0)
+
+When a PostgreSQL-backed daemon is the **receiver** on a federated
+`/sync/push`, a fixed set of subcollections is not yet trait-covered for
+a verbatim inbound write against the postgres store. On that receiver
+they are bucketed as **honest, sender-visible non-ack**
+(`unsupported_on_postgres` in the push response) — never a silent drop.
+The affected subcollections are:
+
+| Subcollection | Federated lane | Tracked |
+|---|---|---|
+| `checkpoints` | Federated commit-checkpoint RESOLUTION (the separation-of-duties freeze anchor) | [#125](https://github.com/alphaonedev/ai-memory-mcp/issues/125) / FED-RQ-01 [#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936) |
+| `pendings` | Governance PENDING-action broadcast | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) |
+| `pending_decisions` | Governance pending-DECISION broadcast | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) |
+| `namespace_meta` | Governance-STANDARD (namespace-standard rebind) | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
+| `namespace_meta_clears` | Governance-STANDARD clear | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
+| `archives` | Archive fanout | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) |
+| `restores` | Restore fanout | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) |
+
+What this means for an operator:
+
+- **A postgres receiver reports non-ack; it does NOT silently drop.**
+  The disposition is **refuse-to-apply and honest** — the sender sees a
+  non-zero `unsupported_on_postgres` count for the batch, so a
+  heterogeneous federation never mistakes "not applied" for "applied"
+  (data-integrity North Star: fail closed, disclose, never corrupt).
+  This is not bypassable by an inbound peer.
+- **Single-node deployments and sqlite-receiver deployments are
+  unaffected.** These lanes apply fully on a sqlite-backed receiver and
+  on the MCP / epoch-apply-native local paths. The gap is the
+  postgres-*receiver* federation lane ONLY — the same governance and
+  checkpoint operations remain fully reachable on a postgres daemon
+  through its LOCAL surfaces (governed by local authz rather than peer
+  scope).
+- **The receive-side signature/authority gates still hold.** Because
+  these lanes refuse-to-apply rather than write, no unverified inbound
+  checkpoint resolution, pending execution, or namespace-standard rebind
+  can land on a postgres receiver — a safe coverage gap, not a security
+  regression.
+
+Full postgres-receiver replication of these lanes (a
+trait-covered `apply_remote_*` write for each) is tracked for **v1.1**
+under [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075).
+Operators who need multi-node federated replication of these
+subcollections today should pin a sqlite-backed receiver for the
+affected namespaces until v1.1.
+
 ## Performance notes
 
 ### pgvector HNSW
