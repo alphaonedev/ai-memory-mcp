@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3324 — postgres `migrate_v93` stamped `CURRENT_SCHEMA_VERSION` (94) instead of the literal 93, a crash-consistency ladder-integrity hazard)
+
+- **The postgres v93 migration arm stamped `CURRENT_SCHEMA_VERSION` instead of
+  its literal version, so a node that crashed between the v93 and v94 commits
+  would restart stamped-past-v94 and never run `migrate_v94`** (HIGH;
+  crash-consistency / ladder-integrity; North Star "fail closed, degrade never
+  corrupt"). #3323 landed `migrate_v93` as the ladder tip stamping
+  `CURRENT_SCHEMA_VERSION` (then 93); #3324 bumped the constant to 94 and added
+  `migrate_v94` (which creates `idx_memories_lifecycle_state`) but left the v93
+  stamp reading the constant, so `migrate_v93` silently stamped **94**. Because
+  postgres commits each ladder arm in its OWN transaction and the migrate loop
+  early-exits at `if current_version == CURRENT_SCHEMA_VERSION`, a node that
+  crashed/OOMed/lost its connection between the v93 and v94 commits restarted
+  with `MAX(version) = 94`, believed itself fully migrated, and never ran
+  `migrate_v94` — leaving `idx_memories_lifecycle_state` uncreated while the DB
+  reported `db_schema_version = 94` (fail-open partial-apply divergence). The
+  v93 arm now stamps the LITERAL `93`, matching the settled-arm convention every
+  other non-tip arm already follows (`migrate_v94`, the true tip, remains the
+  ONLY arm that stamps `CURRENT_SCHEMA_VERSION`). SQLite was never affected
+  (single terminal stamp). No schema change (v94 unchanged). Covered by the
+  live-postgres crash-recovery regression pin
+  `v93_arm_stamps_literal_93_not_current_on_crash_recovery` in
+  `tests/perf_1579_postgres_backfill_tsv.rs`, which simulates a crash right after
+  the v93 commit and asserts `MAX(version) == 93` (not 94), then that replay
+  advances to v94 and creates `idx_memories_lifecycle_state`.
+
 ### Security (#3281 — `invalidate_link`'s audit `payload_hash` diverged between sqlite and postgres for a caller-supplied `valid_until`)
 
 - **A `memory_kg_invalidate` with an explicit `valid_until` produced a DIFFERENT

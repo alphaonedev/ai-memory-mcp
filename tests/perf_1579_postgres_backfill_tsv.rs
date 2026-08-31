@@ -503,3 +503,111 @@ async fn v55_arm_stamps_literal_55_on_ladder_replay() {
         "v57 tail arm must stamp the tip 57 on replay (got {versions:?})"
     );
 }
+
+/// #3324 crash-consistency pin — the v93 ladder arm stamps the LITERAL
+/// 93, never `CURRENT_SCHEMA_VERSION`.
+///
+/// Background: #3323 landed `migrate_v93` as the ladder TIP, stamping
+/// `CURRENT_SCHEMA_VERSION` (then 93). #3324 bumped the constant to 94
+/// and added `migrate_v94` (creating `idx_memories_lifecycle_state`) but
+/// left the v93 stamp reading the constant — so the v93 arm silently
+/// stamped 94. Because postgres commits each arm in its OWN transaction
+/// and the migrate loop early-exits at
+/// `if current_version == CURRENT_SCHEMA_VERSION { return Ok(()) }`, a
+/// node that crashes/OOMs/loses its connection BETWEEN the v93 and v94
+/// commits would restart with `MAX(version) = 94`, believe itself fully
+/// migrated, and NEVER run `migrate_v94` — leaving
+/// `idx_memories_lifecycle_state` uncreated while the DB reports schema
+/// v94. Fail-open partial-apply / ladder-integrity divergence (the North
+/// Star's "fail closed, degrade never corrupt" constraint). SQLite is
+/// immune (single terminal stamp).
+///
+/// Pin shape (simulates the partial-apply/crash-recovery): run the full
+/// ladder once (fresh per-test schema), rewind the version history to 92
+/// (delete every stamp above it) AND drop the v94 index, then delete the
+/// stamps above 93 to leave the ledger stopped EXACTLY at 93 — the state
+/// a crash right after the v93 commit produces. Assert (a) `MAX(version)`
+/// is exactly 93 (NOT 94 — the regression would land 94 here, tripping
+/// the early-exit); then reconnect so the ladder replays from 93, and
+/// assert (b) it advances to the tip 94 AND (c) `idx_memories_lifecycle_state`
+/// now exists. If the v93 arm regressed to stamping the constant, step (a)
+/// reads 94 and the assertion fails. `>=` / `contains` / exact-max
+/// assertions only — sibling lanes may add later intermediate stamps
+/// without invalidating this test.
+#[tokio::test(flavor = "multi_thread")]
+async fn v93_arm_stamps_literal_93_not_current_on_crash_recovery() {
+    let Some(env) = PostgresTestEnv::new("v93_stamp_pin").await else {
+        eprintln!(
+            "skip v93_arm_stamps_literal_93_not_current_on_crash_recovery: \
+             AI_MEMORY_TEST_POSTGRES_URL not set"
+        );
+        return;
+    };
+    let _store = PostgresStore::connect(env.url())
+        .await
+        .expect("first connect runs the full ladder");
+    let pool = inspection_pool(env.url()).await;
+
+    // Reconstruct the exact on-disk state a crash BETWEEN the v93 and v94
+    // commits leaves: the v93 arm has committed (schema_version = 93) but
+    // the v94 arm never ran, so its index does not exist and no stamp
+    // above 93 is present.
+    sqlx::query("DROP INDEX IF EXISTS idx_memories_lifecycle_state")
+        .execute(&pool)
+        .await
+        .expect("drop the v94 index to simulate the pre-v94 crash state");
+    sqlx::query("DELETE FROM schema_version WHERE version > 93")
+        .execute(&pool)
+        .await
+        .expect("rewind version history to 93 (post-v93-commit, pre-v94 crash)");
+
+    // (a) The ledger must sit at EXACTLY 93. The pre-fix v93 arm stamped
+    // CURRENT_SCHEMA_VERSION (94), which would make MAX(version) == 94
+    // here — the early-exit then skips migrate_v94 forever.
+    let max_after_v93: i32 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .expect("read max stamp after simulated v93-only apply");
+    assert_eq!(
+        max_after_v93, 93,
+        "v93 arm must stamp the LITERAL 93, not CURRENT_SCHEMA_VERSION (94); \
+         a node crashing between the v93 and v94 commits would otherwise \
+         restart stamped-past-v94 and skip migrate_v94 forever (#3324)"
+    );
+
+    // (b) Replaying the ladder from 93 must run migrate_v94 and advance the
+    // tip to 94.
+    let _store2 = PostgresStore::connect(env.url())
+        .await
+        .expect("replay connect re-runs the ladder from 93");
+    let max_after_replay: i32 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .expect("read max stamp after replay from 93");
+    assert!(
+        max_after_replay >= 94,
+        "replay from 93 must advance the ledger to the tip (>= 94), got {max_after_replay}"
+    );
+
+    // (c) migrate_v94's durable effect must be present: the index it
+    // creates now exists. This is the concrete artifact the crash-recovery
+    // bug stranded uncreated while the DB reported schema v94.
+    let index_present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_indexes
+              WHERE indexname = 'idx_memories_lifecycle_state'
+                AND schemaname = current_schema()
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("probe for the v94 lifecycle-state index");
+    assert!(
+        index_present,
+        "migrate_v94 must have created idx_memories_lifecycle_state on replay; \
+         if the v93 arm had stamped 94 the early-exit would have skipped v94 \
+         and this index would be permanently absent (#3324)"
+    );
+}
