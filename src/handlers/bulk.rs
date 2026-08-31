@@ -865,7 +865,7 @@ pub async fn bulk_create(
                 "create",
                 BulkRowErrorClass {
                     code: crate::errors::error_codes::VALIDATION_FAILED,
-                    label: "validation failed",
+                    label: crate::handlers::errors::VALIDATION_FAILED_LABEL,
                     status: StatusCode::BAD_REQUEST,
                     retryable: false,
                 },

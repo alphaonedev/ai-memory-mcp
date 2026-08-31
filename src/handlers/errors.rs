@@ -37,6 +37,14 @@
 use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde_json::json;
 
+/// The #851 sanitized, allowlisted wire label for a validation failure
+/// (the `VALIDATION_FAILED` / HTTP 400 class). Defined once and referenced
+/// by name at every classification site so the label cannot drift between
+/// the bulk-row classifier, the identity/create funnel, and the
+/// `StoreError` mapping — the canonical mapping being
+/// `VALIDATION_FAILED => (VALIDATION_FAILED_LABEL, 400, non-retryable)`.
+pub(crate) const VALIDATION_FAILED_LABEL: &str = "validation failed";
+
 /// Sanitize a per-row error message that originated in a bulk endpoint
 /// (`bulk_create`, `import_memories`, federation fanout). Returns a short
 /// classification string safe to echo to an unauthenticated caller.
@@ -121,7 +129,7 @@ pub fn classify_bulk_row_error(raw: &str) -> BulkRowErrorClass {
     {
         return BulkRowErrorClass {
             code: crate::errors::error_codes::VALIDATION_FAILED,
-            label: "validation failed",
+            label: VALIDATION_FAILED_LABEL,
             status: StatusCode::BAD_REQUEST,
             retryable: false,
         };
@@ -302,8 +310,8 @@ mod tests {
     //! error string).
 
     use super::{
-        bad_request_opaque, governance_error_500, handler_error_500, internal_error_response,
-        sanitize_bulk_row_error, to_value_or_500,
+        VALIDATION_FAILED_LABEL, bad_request_opaque, governance_error_500, handler_error_500,
+        internal_error_response, sanitize_bulk_row_error, to_value_or_500,
     };
     use axum::http::StatusCode;
 
@@ -328,7 +336,7 @@ mod tests {
         ] {
             assert_eq!(
                 sanitize_bulk_row_error(raw),
-                "validation failed",
+                VALIDATION_FAILED_LABEL,
                 "validation trigger {raw:?} must classify as validation failed"
             );
         }
@@ -456,7 +464,7 @@ pub fn classify_store_err(e: &crate::store::StoreError) -> BulkRowErrorClass {
     } else if code == codes::GOVERNANCE_REFUSED {
         ("forbidden", StatusCode::FORBIDDEN, false)
     } else if code == codes::VALIDATION_FAILED {
-        ("validation failed", StatusCode::BAD_REQUEST, false)
+        (VALIDATION_FAILED_LABEL, StatusCode::BAD_REQUEST, false)
     } else if code == codes::STORE_BACKEND_UNAVAILABLE
         || code == codes::RECORD_STOPPED
         || code == codes::SCHEMA_AHEAD_OF_BINARY
