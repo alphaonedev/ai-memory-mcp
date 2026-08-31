@@ -1879,7 +1879,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 92;
+const CURRENT_SCHEMA_VERSION: i32 = 93;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -3689,8 +3689,11 @@ impl PostgresStore {
         if current_version < 91 {
             self.migrate_v91().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 92 {
             self.migrate_v92().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v93().await?;
         }
 
         Ok(())
@@ -3754,7 +3757,9 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("add schema_version_bounded check", e))?;
         }
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // #3323 — settled arm: stamp the LITERAL 92, not CURRENT_SCHEMA_VERSION
+        // (now 93). See the v91 stamp note for the crash-consistency rationale.
+        record_schema_version(&mut tx, 92).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v92 migration", e))?;
@@ -3763,6 +3768,44 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v92 applied (#2555: schema_version CHECK (version <= {max}) — the unconstrained-integer fleet kill-switch is now \
              rejected at the boundary)"
+        );
+        Ok(())
+    }
+
+    /// v93 (#3323, v1.0.0) — PER-LINEAGE + PER-NAMESPACE TOKEN/COST
+    /// ACCOUNTING. Additive standalone advisory `token_cost_counters`
+    /// relation (`CREATE TABLE IF NOT EXISTS`), the postgres twin of the
+    /// SQLite v93 arm. Idempotent: a fresh cluster inherits the table inline
+    /// from `postgres_schema.sql`, so the DDL is a no-op there; an existing
+    /// cluster gains it here. NO rewrite, no reindex. Tip arm — stamps
+    /// [`CURRENT_SCHEMA_VERSION`]. This table holds NO durable memory truth
+    /// (advisory, disposable derived data — North Star), so unlike the
+    /// integrity-critical arms this one needs no pre-flight/guard.
+    async fn migrate_v93(&self) -> StoreResult<()> {
+        debug_assert!(
+            crate::cost::postgres::MIGRATION_V93_POSTGRES.contains("token_cost_counters"),
+            "#3323: the v93 DDL doc twin must ship with the binary"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v93 token-cost-counters ddl tx", e))?;
+
+        sqlx::raw_sql(crate::cost::postgres::MIGRATION_V93_POSTGRES)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v93 token-cost-counters ddl", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v93 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v93 applied (#3323: token_cost_counters — per-lineage + \
+             per-namespace token/cost accounting, advisory)"
         );
         Ok(())
     }
@@ -6625,7 +6668,12 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v91 archived-links-cid ddl", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // #3323 — settled arm: stamp the LITERAL arm version, not
+        // CURRENT_SCHEMA_VERSION. With v93 added above, a bare
+        // CURRENT_SCHEMA_VERSION here would stamp 93 after applying only v91's
+        // DDL, and a crash before v92/v93 would strand the schema claiming a
+        // tip it does not have (the sqlite settled-arm convention).
+        record_schema_version(&mut tx, 91).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v91 migration", e))?;
@@ -19807,6 +19855,13 @@ impl MemoryStore for PostgresStore {
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit store tx", e))?;
+        // #3323 — advisory per-lineage + per-namespace token/cost accounting,
+        // the postgres twin of the sqlite `insert_inner` write hook. Metered
+        // AFTER commit on the shared pool (never inside the store tx) so a
+        // metering failure can neither roll the durable write back nor extend
+        // its lock window. Best-effort — the counter is disposable derived
+        // data, never the memory truth (North Star).
+        crate::cost::postgres::record_write_pg(&self.pool, memory, &id).await;
         Ok(id)
     }
 
@@ -24001,6 +24056,11 @@ impl MemoryStore for PostgresStore {
                 }
             }
         }
+        // #3323 — advisory per-lineage + per-namespace token/cost accounting on
+        // the RECALL funnel, the postgres twin of the `SqliteStore::recall_hybrid`
+        // hook. Best-effort on the shared pool; a metering failure never blocks
+        // the recall.
+        crate::cost::postgres::record_recall_pg(&self.pool, &results).await;
         Ok(results)
     }
 
@@ -32534,6 +32594,13 @@ impl PostgresStore {
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit store tx", e))?;
+        // #3323 — advisory per-lineage + per-namespace token/cost accounting,
+        // the postgres twin of the sqlite `insert_inner` write hook. Metered
+        // AFTER commit on the shared pool (never inside the store tx) so a
+        // metering failure can neither roll the durable write back nor extend
+        // its lock window. Best-effort — the counter is disposable derived
+        // data, never the memory truth (North Star).
+        crate::cost::postgres::record_write_pg(&self.pool, memory, &id).await;
         Ok(id)
     }
 }

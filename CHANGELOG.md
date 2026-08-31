@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (#3323 — per-lineage + per-namespace token/cost accounting, the "$50k on the screen")
+
+- **New advisory `token_cost_counters` relation (schema v93, both backends).** A
+  runaway atomisation/reflection cascade now shows a DOLLAR FIGURE, not a
+  discovery. One counter table keyed by `(scope_kind, scope_key)`: `'namespace'`
+  rows carry per-namespace token spend; `'lineage'` rows carry each memory
+  node's own tokens so a per-lineage-**root** rollup sums a root plus its
+  `derives_from` descendants at report time (no DAG walk on the hot write path —
+  the #3196 "writes must not stall" property). New `cost` module: the counter
+  funnels, a configurable tokens→cost model (`AI_MEMORY_COST_MICRO_USD_PER_1K_TOKENS`,
+  default $10/1M tokens; integer micro-USD only — no float ever touches a
+  currency value), and namespace + lineage rollup queries. SQLite and Postgres
+  twins with counter parity.
+- **Increment hooks** on the LOCAL-authorship write funnel (`storage::insert_inner`
+  + `PostgresStore::store`; federation/import admission excluded) and the SAL
+  recall funnels (`SqliteStore`/`PostgresStore::recall_hybrid`). Every increment
+  is **best-effort** — a metering failure can never fail or roll back a memory
+  write or recall. This table holds no durable memory truth; it is disposable,
+  regenerable, advisory data (North Star: degrade, never corrupt).
+
 ### Fixed (CI — `cargo test --lib` RED: two inline capability tests still asserted pre-#3111 flip-Deny, #3111 follow-up)
 
 - **#3111 follow-up (CI / test-only) — the Per-Module Coverage `cargo test

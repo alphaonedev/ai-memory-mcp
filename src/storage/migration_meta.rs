@@ -3,7 +3,7 @@
 
 //! ARCH-8 (FX-C4-batch2, 2026-05-26) — per-migration metadata matrix.
 //!
-//! The substrate ships a 91-step migration ladder (v2 → v92) whose
+//! The substrate ships a 92-step migration ladder (v2 → v93) whose
 //! "reversible? data-loss-risk? idempotent?" contract an operator needs
 //! BEFORE they plan a rollback — restore-from-backup is the only
 //! fallback for an irreversible arm, and they must know which arms
@@ -392,6 +392,12 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // equal CURRENT_SCHEMA_VERSION. Postgres twin is
     // `PostgresStore::migrate_v92` (ADD CONSTRAINT).
     meta(92, "SCHEMA_VERSION_BOUND", true, true, NoLoss, Sqlite),
+    // v93 (#3323, v1.0.0) — PER-LINEAGE + PER-NAMESPACE TOKEN/COST
+    // ACCOUNTING. Additive standalone advisory `token_cost_counters` table
+    // (`CREATE TABLE IF NOT EXISTS`), idempotent, revert = lower the stamp
+    // (no pre-existing row is rewritten), no data loss. Postgres twin is
+    // `PostgresStore::migrate_v93`.
+    meta(93, "TOKEN_COST_COUNTERS", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.
