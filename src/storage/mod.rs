@@ -143,6 +143,43 @@ pub fn truncate_to_microseconds(t: DateTime<Utc>) -> DateTime<Utc> {
     t.with_nanosecond(micros * 1_000).unwrap_or(t)
 }
 
+/// #3281 (audit-integrity, tamper-evident chain byte-parity) — canonicalize a
+/// caller-supplied `valid_until` into the ONE byte-form BOTH the sqlite and
+/// postgres invalidation paths stamp into `memory_links.valid_until` AND hash
+/// into the `memory_link.invalidated` audit-leaf pre-image
+/// ([`crate::identity::sign::SignableLink`]).
+///
+/// The divergence this closes: a caller supplies `valid_until` on the wire
+/// (e.g. `"2026-05-06T12:00:00Z"`). The sqlite path used to hash the RAW wire
+/// string, while the postgres path bound it as `TIMESTAMPTZ` and re-rendered
+/// the DB readback through chrono `to_rfc3339()` (`+00:00`, fractional-second
+/// normalization). Different bytes → different canonical CBOR → a DIFFERENT
+/// audit-leaf hash for the SAME logical invalidation — which breaks
+/// cross-backend verifiability of the hash-chained audit trail.
+///
+/// The canonical form is `parse-as-RFC3339 → UTC → truncate to microseconds →
+/// `to_rfc3339()``, identical to the `None → now` default below and to the
+/// microsecond precision postgres durably stores in `TIMESTAMPTZ`. Both
+/// backends now derive the pre-image `valid_until` from this same string, so
+/// the leaf hash matches by construction rather than by a fragile
+/// parse/re-render round-trip agreeing on both sides.
+///
+/// An UNPARSEABLE `valid_until` is returned verbatim — postgres already
+/// rejects such a value at its `::TIMESTAMPTZ` bind (so no cross-backend hash
+/// exists to diverge), and sqlite's pre-#3281 lenient passthrough is preserved
+/// for sqlite-only deployments. `None` substitutes a microsecond-truncated
+/// `now`, matching the outbound signers and the postgres `TIMESTAMPTZ` twin.
+#[must_use]
+pub(crate) fn canonicalize_valid_until_stamp(valid_until: Option<&str>) -> String {
+    match valid_until {
+        Some(raw) => chrono::DateTime::parse_from_rfc3339(raw).map_or_else(
+            |_| raw.to_string(),
+            |dt| truncate_to_microseconds(dt.with_timezone(&Utc)).to_rfc3339(),
+        ),
+        None => truncate_to_microseconds(Utc::now()).to_rfc3339(),
+    }
+}
+
 use crate::models::{
     AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, ConfidenceSource, DuplicateCheck,
     DuplicateMatch, GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction,
@@ -11778,10 +11815,11 @@ pub fn invalidate_link(
     // substitute a microsecond-truncated `now`, matching outbound
     // signers and postgres TIMESTAMPTZ. Nanosecond `to_rfc3339()`
     // made a later verify re-derive a different pre-image.
-    let stamp = valid_until.map_or_else(
-        || truncate_to_microseconds(Utc::now()).to_rfc3339(),
-        str::to_string,
-    );
+    // #3281 — canonicalize a caller-supplied `valid_until` IDENTICALLY to the
+    // postgres twin BEFORE it is stored and hashed, so the same logical
+    // invalidation yields the same `memory_link.invalidated` audit-leaf hash on
+    // both backends (was: raw wire string here vs a chrono re-render on pg).
+    let stamp = canonicalize_valid_until_stamp(valid_until);
 
     // P2 (#628 agent-3 follow-up): wrap the SELECT-then-UPDATE-then-
     // audit-INSERT in a single `BEGIN IMMEDIATE` transaction. Without

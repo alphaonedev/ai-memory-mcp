@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#3281 — `invalidate_link`'s audit `payload_hash` diverged between sqlite and postgres for a caller-supplied `valid_until`)
+
+- **A `memory_kg_invalidate` with an explicit `valid_until` produced a DIFFERENT
+  `memory_link.invalidated` audit-leaf hash on each backend for the SAME logical
+  supersession** (refs
+  [#3281](https://github.com/alphaonedev/ai-memory-mcp/issues/3281); SECURITY /
+  audit-integrity, tamper-evident chain byte-parity). The caller supplies
+  `valid_until` on the wire (e.g. `"2026-05-06T12:00:00Z"`); the sqlite path
+  hashed the RAW wire string into the `SignableLink` pre-image, while the
+  postgres path bound it as `TIMESTAMPTZ` and re-rendered the DB readback through
+  chrono `to_rfc3339()` (`+00:00`, fractional-second normalization). Different
+  bytes → different canonical CBOR → a different audit-leaf `payload_hash` for the
+  same event, breaking cross-backend verifiability of the hash-chained audit
+  trail. Both backends now canonicalize `valid_until` through ONE shared helper,
+  `storage::canonicalize_valid_until_stamp` (`parse-as-RFC3339 → UTC → truncate
+  to microseconds → to_rfc3339()`, identical to the pre-existing `None → now`
+  default and to the microsecond precision postgres durably stores), BEFORE the
+  stamp is written to `memory_links.valid_until` AND hashed into the pre-image —
+  and the postgres leaf now commits to that canonical stamp directly rather than
+  a `TIMESTAMPTZ` parse/re-render round-trip. A caller-supplied `valid_until` in
+  any accepted RFC3339 form now yields a byte-identical `payload_hash` on both
+  backends. No schema change (v94 unchanged). Covered by the live-postgres
+  cross-backend parity test
+  `tests/link_invalidate_payload_hash_parity_3281.rs` (the sqlite leaf commits to
+  the canonical `valid_until`, and the postgres leaf's `payload_hash` is
+  byte-identical to sqlite's for the same invalidation).
+
 ### Fixed (#3290 — postgres namespace-standard SEVER emitted NO WARN and NO signed audit event, unlike the sqlite twin)
 
 - **On postgres, reaping/archiving a memory that served as a namespace

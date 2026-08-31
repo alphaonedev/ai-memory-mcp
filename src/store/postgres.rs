@@ -11328,10 +11328,11 @@ impl PostgresStore {
         actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
         self.gate_record_stop().await?;
-        let stamp = valid_until.map_or_else(
-            || truncate_to_microseconds(Utc::now()).to_rfc3339(),
-            str::to_string,
-        );
+        // #3281 — canonicalize `valid_until` IDENTICALLY to the sqlite twin
+        // (`crate::storage::canonicalize_valid_until_stamp`) so the stored
+        // stamp AND the `memory_link.invalidated` audit-leaf pre-image are
+        // byte-identical across backends for the same logical invalidation.
+        let stamp = crate::storage::canonicalize_valid_until_stamp(valid_until);
 
         // AGE requires `ag_catalog` on the search path and the
         // extension loaded into the session. Both are session-local
@@ -11533,10 +11534,9 @@ impl PostgresStore {
         actor: Option<&str>,
     ) -> StoreResult<KgInvalidateRow> {
         self.gate_record_stop().await?;
-        let stamp = valid_until.map_or_else(
-            || truncate_to_microseconds(Utc::now()).to_rfc3339(),
-            str::to_string,
-        );
+        // #3281 — canonicalize `valid_until` IDENTICALLY to the sqlite twin so
+        // the audit-leaf hash matches cross-backend (see the AGE branch above).
+        let stamp = crate::storage::canonicalize_valid_until_stamp(valid_until);
         let mut tx = self
             .pool
             .begin()
@@ -14372,8 +14372,15 @@ async fn pg_invalidate_link_relational_in_tx(
 
     if was_signed {
         let valid_from_str = prior_valid_from.map(|t| t.to_rfc3339());
-        let valid_until_str = now_until.map(|t| t.to_rfc3339());
         let created_at_str = truncate_to_microseconds(prior_created_at).to_rfc3339();
+        // #3281 — hash the CANONICAL `stamp` (already
+        // `crate::storage::canonicalize_valid_until_stamp`-normalized by the
+        // caller), NOT `now_until.to_rfc3339()` re-rendered from the DB
+        // readback. This is the exact byte the sqlite twin stamps and hashes,
+        // so the `memory_link.invalidated` audit leaf is identical across
+        // backends by construction — no dependence on the `TIMESTAMPTZ`
+        // parse/re-render round-trip reproducing the wire form. `now_until` is
+        // still used verbatim for the returned `previous`/`new` pair below.
         let signable = crate::identity::sign::SignableLink {
             src_id: source_id,
             dst_id: target_id,
@@ -14381,7 +14388,7 @@ async fn pg_invalidate_link_relational_in_tx(
             observed_by: observed_by.as_deref(),
             created_at: Some(created_at_str.as_str()),
             valid_from: valid_from_str.as_deref(),
-            valid_until: valid_until_str.as_deref(),
+            valid_until: Some(stamp),
         };
         let cbor = crate::identity::sign::canonical_cbor(&signable).map_err(|e| {
             StoreError::IntegrityFailed {
