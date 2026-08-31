@@ -137,6 +137,14 @@ const SQL_ARCHIVE_ON_CONFLICT_LAST_WINS: &str = "ON CONFLICT (id) DO UPDATE SET 
 /// `storage::sever_namespace_standards`.
 const SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID: &str =
     "UPDATE namespace_meta SET standard_id = NULL, updated_at = NOW() WHERE standard_id = $1";
+/// #3290 — the namespaces whose governance binding a reap/archive is about to
+/// sever, read BEFORE the UPDATE (parity with the sqlite twin
+/// `storage::SQL_SELECT_NAMESPACES_BY_STANDARD_ID`) so the
+/// `TRACE_TARGET_STANDARD_SEVERED` WARN and the signed
+/// `SUBSTRATE_NAMESPACE_STANDARD_SEVERED` audit event can name them — afterwards
+/// the `standard_id = $1` predicate matches nothing and the evidence is gone.
+const SQL_SELECT_NAMESPACES_BY_STANDARD_ID: &str =
+    "SELECT namespace FROM namespace_meta WHERE standard_id = $1";
 /// #2503 — HEAL a legacy DANGLING pointer into the SEVERED state, replacing
 /// the gc sweeps' former `DELETE … WHERE standard_id NOT IN (SELECT id FROM
 /// memories)`. The explicit `IS NOT NULL` guard is redundant on postgres (a
@@ -15521,6 +15529,107 @@ async fn pg_append_revision_leaf_in_tx(
     Ok(())
 }
 
+/// #3290 — postgres twin of the sqlite [`crate::storage::sever_namespace_standards`]:
+/// SEVER (`standard_id = NULL`) every `namespace_meta` binding that points at
+/// the memory `id` being reaped/archived, and emit the SAME governance-visible
+/// evidence the sqlite funnel does — a `TRACE_TARGET_STANDARD_SEVERED` WARN and
+/// a signed `SUBSTRATE_NAMESPACE_STANDARD_SEVERED` audit-chain event.
+///
+/// Before #3290 both postgres sever sites (`pg_hard_delete_in_tx` and the
+/// `archive_by_ids` per-batch loop) ran a bare UPDATE with NO pre-read, NO WARN,
+/// and NO signed event, so a governance-significant sever left no operator
+/// signal and no tamper-evident record on a pg deployment — a silent parity gap
+/// with the sqlite twin.
+///
+/// Semantics mirror the sqlite twin exactly:
+/// - the affected namespaces are read BEFORE the UPDATE (afterwards the
+///   `standard_id = $1` predicate matches nothing);
+/// - when nothing points here it is a pure no-op — no UPDATE, no WARN, no event
+///   — byte-identical to the pre-#2503 delete-of-a-non-standard-memory;
+/// - the payload is hashed from the SHARED
+///   [`crate::storage::namespace_standard_severed_signable_bytes`] so the event
+///   verifies identically to a sqlite-emitted one, and it is composed through
+///   the SAME [`crate::signed_events::SignedEvent::with_daemon_signature`] +
+///   chain-append path every other pg audit event uses (no re-implemented
+///   signing).
+///
+/// Runs INSIDE the caller's transaction so the sever, its audit event, and the
+/// reap/archive it accompanies commit or roll back atomically. Unlike the
+/// sqlite twin — where a best-effort swallow is safe because sqlite leaves the
+/// connection usable after a failed statement — the append propagates here: a
+/// failed statement poisons a postgres transaction (25P02), so swallowing would
+/// only fail the tx's next statement or its commit anyway. Propagating is
+/// fail-closed (the reap will not commit without its tamper-evident record) and
+/// matches the established pg convention in `pg_tombstone_and_erase_in_tx`. The
+/// WARN is logged before the append, so the operator signal survives even when
+/// the append aborts the tx. Returns the UPDATE's `rows_affected`.
+async fn pg_sever_namespace_standards_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<u64, sqlx::Error> {
+    // Name the affected namespaces BEFORE the UPDATE — afterwards the
+    // `standard_id = $1` predicate matches nothing and the evidence is gone.
+    let severed: Vec<String> = sqlx::query_scalar(SQL_SELECT_NAMESPACES_BY_STANDARD_ID)
+        .bind(id)
+        .fetch_all(&mut **tx)
+        .await?;
+    if severed.is_empty() {
+        // The overwhelmingly common case: the reaped memory is nobody's
+        // standard. Byte-identical to the pre-#2503 no-op DELETE — no UPDATE,
+        // no WARN, no signed event, no extra write.
+        return Ok(0);
+    }
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+    let changed = sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+
+    tracing::warn!(
+        target: crate::storage::TRACE_TARGET_STANDARD_SEVERED,
+        standard_id = %id,
+        namespaces = %severed.join(","),
+        count = changed,
+        "reaping this memory SEVERED the governance-standard binding of the \
+         listed namespace(s); their policy is unrecoverable and they now \
+         resolve to the severed floor (write/promote/delete >= owner) instead \
+         of allow-on-silence. Re-point with `memory_namespace_set_standard`, \
+         or clear deliberately with `memory_namespace_clear_standard`."
+    );
+
+    // Signed, tamper-evident audit row. The payload is the SHARED canonical
+    // bytes (sorted namespaces) so a pg-emitted event hashes identically to a
+    // sqlite-emitted one, and it is composed through the same daemon-signature
+    // + chain-append path every other pg audit event uses.
+    let signable =
+        crate::storage::namespace_standard_severed_signable_bytes(id, &severed, &now_str);
+    let payload_hash = crate::signed_events::payload_hash(&signable);
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        payload_hash,
+        crate::identity::sentinels::DAEMON_PRINCIPAL.to_string(),
+        crate::signed_events::event_types::SUBSTRATE_NAMESPACE_STANDARD_SEVERED.to_string(),
+        now_str,
+        None,
+    );
+    pg_append_signed_event_with_chain_in_tx(
+        tx,
+        PgSignedEventInsert {
+            id: &event.id,
+            agent_id: &event.agent_id,
+            event_type: &event.event_type,
+            payload_hash: &event.payload_hash,
+            signature: event.signature.as_deref(),
+            attest_level: &event.attest_level,
+            timestamp: now,
+            cause_hash: None,
+        },
+    )
+    .await?;
+    Ok(changed)
+}
+
 /// #3192 — sqlite [`crate::storage::evict_tombstone_and_erase`] /
 /// `delete_inner` parity: namespace-meta SEVER + forget-tombstone +
 /// crypto-erase + optional G6 TOMBSTONE leaf + DELETE, inside the
@@ -15545,10 +15654,12 @@ async fn pg_hard_delete_in_tx(
     // Pre-#3253 this sever ran pool-direct before the existence check; #3253
     // regressed it behind the leaf probe, contradicting the contract
     // `apply_remote_deletion` still documents — the #3272 audit reinstates it.
-    sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
-        .bind(id)
-        .execute(&mut **tx)
-        .await?;
+    //
+    // #3290 — route through the shared helper so this reap funnel emits the
+    // WARN + signed `SUBSTRATE_NAMESPACE_STANDARD_SEVERED` event, at parity with
+    // the sqlite `sever_namespace_standards` twin (previously a bare, silent
+    // UPDATE).
+    pg_sever_namespace_standards_in_tx(tx, id).await?;
     let leaf = pg_tombstone_and_erase_in_tx(tx, id).await?;
     let Some((ref ns, ver)) = leaf else {
         return Ok(0);
@@ -29223,9 +29334,14 @@ impl MemoryStore for PostgresStore {
             // class, in the same direction as `apply_remote_deletion`. Runs
             // INSIDE the per-batch tx so the sever commits atomically with the
             // archive+delete it accompanies.
-            sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
-                .bind(id)
-                .execute(&mut *tx)
+            //
+            // #3290 — route through the shared helper so this archive funnel
+            // emits the WARN + signed `SUBSTRATE_NAMESPACE_STANDARD_SEVERED`
+            // event, at parity with the sqlite archive twins
+            // (`archive_memory_no_tx` / `archive_memory_for_caller`, which both
+            // call `sever_namespace_standards`) — previously a bare, silent
+            // UPDATE.
+            pg_sever_namespace_standards_in_tx(&mut tx, id)
                 .await
                 .map_err(|e| to_store_err("archive_by_ids: namespace_meta sever", e))?;
             // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:

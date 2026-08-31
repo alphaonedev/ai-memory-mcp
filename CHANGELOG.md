@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3290 — postgres namespace-standard SEVER emitted NO WARN and NO signed audit event, unlike the sqlite twin)
+
+- **On postgres, reaping/archiving a memory that served as a namespace
+  governance standard SEVERED the binding with a bare, SILENT `UPDATE`** — no
+  pre-read, no `TRACE_TARGET_STANDARD_SEVERED` operator WARN, and no signed
+  `substrate.namespace_standard_severed` audit-chain event
+  (refs [#3290](https://github.com/alphaonedev/ai-memory-mcp/issues/3290);
+  SECURITY / audit-integrity North Star). The sqlite
+  `storage::sever_namespace_standards` twin does all three, so a
+  governance-significant sever on a pg deployment left NO operator signal and NO
+  tamper-evident record — a silent, backend-specific integrity gap. Both pg
+  sever sites (`pg_hard_delete_in_tx`, reached by `PostgresStore::delete` /
+  `apply_remote_deletion`, and the `archive_by_ids` per-batch loop) now route
+  through one shared helper, `pg_sever_namespace_standards_in_tx`, that mirrors
+  the sqlite semantics exactly: it pre-reads the affected namespaces BEFORE the
+  UPDATE, emits the same WARN, and appends a signed
+  `substrate.namespace_standard_severed` event composed through the SAME
+  `SignedEvent::with_daemon_signature` + chain-append path every other pg audit
+  event uses. The payload is hashed from the SHARED
+  `storage::namespace_standard_severed_signable_bytes` (now `pub(crate)`) so a
+  pg-emitted event verifies byte-identically to a sqlite-emitted one, and the
+  common-case reap of a non-standard memory stays a pure no-op (no UPDATE, no
+  WARN, no event). The append runs inside the caller's transaction and
+  propagates (fail-closed — the reap will not commit without its tamper-evident
+  record), matching the established pg convention in
+  `pg_tombstone_and_erase_in_tx`; the WARN is logged before the append, so the
+  operator signal survives even if the append aborts the tx. No schema change
+  (v94 unchanged). Covered by the live-postgres parity test
+  `tests/pg_sever_audit_event_3290.rs` (delete and `archive_by_ids` each append
+  exactly one daemon-authored, chained severance event; a non-standard delete
+  appends none).
+
 ### Fixed (#3259 — postgres `execute_pending_action` "promote" ignored `to_namespace`, silently dropping the clone)
 
 - **On postgres, an APPROVED cross-namespace ("vertical") promote silently

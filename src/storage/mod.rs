@@ -4423,7 +4423,13 @@ pub(crate) fn sever_namespace_standards(conn: &Connection, id: &str) -> Result<u
 /// `standard_id \0 ns1 \0 ns2 ... \0 timestamp`. The namespace list is SORTED
 /// so the digest is independent of SQL row order (an unordered `SELECT` must
 /// not make the same severance hash differently on two nodes).
-fn namespace_standard_severed_signable_bytes(
+///
+/// #3290 — `pub(crate)` so the postgres reap/archive sever twin
+/// (`store::postgres::pg_sever_namespace_standards_in_tx`) hashes the SAME
+/// canonical bytes as this sqlite funnel; a byte-for-byte identical payload is
+/// what lets a `SUBSTRATE_NAMESPACE_STANDARD_SEVERED` event verify the same way
+/// regardless of which backend emitted it.
+pub(crate) fn namespace_standard_severed_signable_bytes(
     standard_id: &str,
     namespaces: &[String],
     severed_at: &str,
