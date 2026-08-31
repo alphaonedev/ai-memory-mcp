@@ -1537,6 +1537,24 @@ mod d1_6_987_tests {
         ("memory_update", &["agent_id"]),
     ];
 
+    /// Whole TOOLS added to `tool_definitions()` since the immutable pre-D1.6
+    /// snapshot was frozen. The snapshot itself is NEVER rewritten (it is the
+    /// frozen v0.7.0 byte-shape baseline); a genuinely new tool is blessed here
+    /// instead, mirroring how [`PROPERTY_ADDITIONS`] blesses new per-tool
+    /// properties. The count/names pins allow EXACTLY this set of additions and
+    /// still forbid any removal.
+    ///
+    /// Adding a row here is a WIRE-CONTRACT change: the tool appears in
+    /// `tools/list`, counts against the token budget (`tests/budget_tokens.rs`)
+    /// and must be re-blessed into the five `tests/snapshots/tools_list_*.json`
+    /// profiles.
+    const TOOL_ADDITIONS: &[&str] = &[
+        // #3322 (2026-08-31) — memory_swarm_rewind: atomic, resumable
+        // one-command cascade rewind (#3266 MVG). The first whole tool added
+        // since the pre-D1.6 baseline was frozen.
+        "memory_swarm_rewind",
+    ];
+
     /// Per-tool `inputSchema.properties` REMOVALS allowed against the
     /// immutable pre-D1.6 snapshot.
     ///
@@ -1656,9 +1674,12 @@ mod d1_6_987_tests {
         let pre_count = pre["tools"].as_array().map_or(0, Vec::len);
         let post_count = post["tools"].as_array().map_or(0, Vec::len);
         assert_eq!(
-            pre_count, post_count,
-            "post-D1.6 tool count must match pre-D1.6 snapshot ({pre_count}); \
-             a tool was added or removed."
+            pre_count + TOOL_ADDITIONS.len(),
+            post_count,
+            "post-D1.6 tool count must equal the pre-D1.6 snapshot ({pre_count}) \
+             plus the {} blessed addition(s) in TOOL_ADDITIONS; a tool was added \
+             or removed without updating the pin.",
+            TOOL_ADDITIONS.len()
         );
     }
 
@@ -1679,11 +1700,13 @@ mod d1_6_987_tests {
         };
         let pre_names = names(&pre);
         let post_names = names(&post);
-        let added: Vec<&String> = post_names.difference(&pre_names).collect();
+        let allowed: BTreeSet<String> = TOOL_ADDITIONS.iter().map(|s| (*s).to_string()).collect();
+        let added: BTreeSet<String> = post_names.difference(&pre_names).cloned().collect();
         let removed: Vec<&String> = pre_names.difference(&post_names).collect();
         assert!(
-            added.is_empty() && removed.is_empty(),
-            "post-D1.6 tool name set drifted: added = {added:?}, removed = {removed:?}"
+            added == allowed && removed.is_empty(),
+            "post-D1.6 tool name set drifted: added = {added:?} \
+             (allowed additions = {allowed:?}), removed = {removed:?}"
         );
     }
 

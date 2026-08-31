@@ -24,7 +24,8 @@
 //!
 //! The fix canonicalizes `valid_until` IDENTICALLY on both backends
 //! (`crate::storage::canonicalize_valid_until_stamp`) BEFORE it is stored and
-//! hashed. Both now commit to `parse → UTC → truncate-to-µs → to_rfc3339()`.
+//! hashed. Both now commit to `parse → UTC → truncate-to-µs →
+//! to_rfc3339_opts(AutoSi, use_z = true)` (the `Z` zulu suffix, #3322).
 //!
 //! ## Coverage
 //!
@@ -53,8 +54,12 @@ const VALID_FROM: &str = "2026-02-03T04:05:06.654321+00:00";
 /// The caller supplies `valid_until` in `Z` form — the exact shape that
 /// diverged pre-fix (`...Z` on sqlite vs `...+00:00` re-render on pg).
 const VALID_UNTIL_WIRE: &str = "2026-05-06T12:00:00Z";
-/// The canonical form both backends must converge on.
-const VALID_UNTIL_CANONICAL: &str = "2026-05-06T12:00:00+00:00";
+/// The canonical form both backends must converge on. #3322 (2026-08-31)
+/// renders UTC with the RFC3339 `Z` suffix (not `+00:00`) so the canonical
+/// wire form matches the caller's `...Z` and the export golden's `Z`
+/// convention; the expected `payload_hash` below is recomputed from this
+/// string, so both backends still agree by construction.
+const VALID_UNTIL_CANONICAL: &str = "2026-05-06T12:00:00Z";
 const REL_STR: &str = "related_to";
 const ACTOR: &str = "ai:invalidator-3281";
 
