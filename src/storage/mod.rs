@@ -11891,10 +11891,24 @@ pub fn invalidate_link(
     // signers and postgres TIMESTAMPTZ. Nanosecond `to_rfc3339()`
     // made a later verify re-derive a different pre-image.
     // #3281 — canonicalize a caller-supplied `valid_until` IDENTICALLY to the
-    // postgres twin BEFORE it is stored and hashed, so the same logical
-    // invalidation yields the same `memory_link.invalidated` audit-leaf hash on
-    // both backends (was: raw wire string here vs a chrono re-render on pg).
+    // postgres twin so the same logical invalidation yields the same
+    // `memory_link.invalidated` audit-leaf hash on both backends (was: raw wire
+    // string here vs a chrono re-render on pg). #3322 (2026-08-31) — the
+    // canonical form is used ONLY for the signable-bytes / audit-hash pre-image
+    // below; it MUST NOT be what lands in the column or is returned. Folding the
+    // canonical stamp into storage broke the `invalidate_link` round-trip
+    // contract (the caller's EXACT provided timestamp is stored and returned):
+    // a caller passing `...+00:00` got `...Z` back, red-ing the storage +
+    // integration round-trip tests. `stored` therefore keeps the RAW caller
+    // string verbatim (pre-#3281 behaviour), while `stamp` stays canonical for
+    // hashing — so verbatim round-trip AND cross-backend hash parity both hold.
     let stamp = canonicalize_valid_until_stamp(valid_until);
+    // The value written to `memory_links.valid_until` and surfaced in the
+    // returned `InvalidateResult`: the caller's provided string VERBATIM, or —
+    // when absent — the same microsecond-truncated canonical `now` the pre-#3281
+    // default already substituted (`canonicalize_valid_until_stamp(None)`), so
+    // the `None`-defaults-to-now contract is unchanged.
+    let stored = valid_until.map_or_else(|| stamp.clone(), str::to_string);
 
     // P2 (#628 agent-3 follow-up): wrap the SELECT-then-UPDATE-then-
     // audit-INSERT in a single `BEGIN IMMEDIATE` transaction. Without
@@ -11962,13 +11976,13 @@ pub fn invalidate_link(
             "UPDATE memory_links \
                 SET valid_until = ?4, signature = NULL, attest_level = 'unsigned' \
               WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
-            params![source_id, target_id, relation, &stamp],
+            params![source_id, target_id, relation, &stored],
         )
     } else {
         conn.execute(
             "UPDATE memory_links SET valid_until = ?4 \
              WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
-            params![source_id, target_id, relation, &stamp],
+            params![source_id, target_id, relation, &stored],
         )
     };
     if let Err(e) = update_result {
@@ -11997,6 +12011,12 @@ pub fn invalidate_link(
             observed_by: observed_by.as_deref(),
             created_at: created_at.as_deref(),
             valid_from: valid_from.as_deref(),
+            // #3281 / #3322 — the audit-leaf pre-image hashes the CANONICAL
+            // `stamp`, NOT the raw `stored` value, so the
+            // `memory_link.invalidated` leaf hash is byte-identical to the
+            // postgres twin (which likewise hashes the canonical stamp in
+            // `pg_invalidate_link_relational_in_tx`). This is the ONLY place the
+            // canonical form is consumed; storage + the return use `stored`.
             valid_until: Some(stamp.as_str()),
         };
         match crate::identity::sign::canonical_cbor(&signable) {
@@ -12054,7 +12074,10 @@ pub fn invalidate_link(
 
     write_txn.commit()?;
     Ok(Some(InvalidateResult {
-        valid_until: stamp,
+        // Verbatim round-trip: return exactly what landed in the column — the
+        // caller's provided string (or the canonical `now` default). NOT the
+        // canonical `stamp`, which is an audit-hash-only pre-image (#3322).
+        valid_until: stored,
         previous_valid_until: prior,
     }))
 }
