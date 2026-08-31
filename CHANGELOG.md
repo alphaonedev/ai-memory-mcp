@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (#3322 #3266 MVG — `memory_swarm_rewind`: one-command atomic, resumable intercept + rewind of a memory cascade)
+
+- **New `memory_swarm_rewind` MCP tool + `ai-memory swarm-rewind` CLI verb.**
+  ONE atomic, resumable operator command that intercepts and UNWINDS a memory
+  cascade rooted at `--to <checkpoint|claim-id>` without data loss, and reports
+  the lineage token/cost. It composes the three #3266 MVG pieces: (1) invalidate
+  the root + contaminate its entire derived swarm — the root AND every record
+  transitively derived from it over the provenance subset P
+  (`derived_from`/`reflects_on`/`derives_from`) are stamped `contaminated`
+  (hidden from ordinary recall via the shared, fail-closed
+  `lifecycle_visible_clause` — the SQLite↔Postgres parity guarantee — never
+  deleted); (2) freeze the operator-supplied affected routines (`Draft →
+  Frozen`, idempotent); (3) emit ONE signed `swarm.rewind` event into the
+  append-only, Ed25519-chained `signed_events` ledger. The #3323 lineage cost
+  rollup (tokens + micro-USD) for the rewound subtree is returned in the report.
+- **Atomic, resumable, reversible (North Star).** The root taint, every
+  descendant taint, the routine freezes, and the signed audit append run under
+  ONE `IMMEDIATE` transaction — all-or-nothing (a partial rewind is
+  structurally impossible). Idempotent: the root carries a `rewind: true`
+  contamination marker set iff the transaction committed, so a re-run of an
+  already-rewound root is a no-op that appends NO duplicate audit row.
+  Reversible: every stamped row records its pre-taint `lifecycle_state` in
+  `metadata.contamination.prior_lifecycle_state`; the durable memory TEXT is
+  never touched. Fail-closed: refused while the record plane is stopped, a
+  root already `tombstoned`/`quarantined` (already contained) is refused, and a
+  stronger system-only descendant state is never downgraded. `dry_run` projects
+  the effect (contaminated count + lineage cost) with ZERO writes. **No schema
+  change** — reuses the v94 `Contaminated` lifecycle, the existing
+  `signed_events` chain (a new dotted `swarm.rewind` event kind, no DDL), and
+  the `routines`/`checkpoints` tables.
+
 ### Added (#3323 — per-lineage + per-namespace token/cost accounting, the "$50k on the screen")
 
 - **New advisory `token_cost_counters` relation (schema v93, both backends).** A

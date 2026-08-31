@@ -542,7 +542,7 @@ pub fn build_capabilities_summary(profile: &crate::profile::Profile) -> String {
     // `Profile::full().expected_tool_count() - ALWAYS_ON_TOOLS.len()`
     // callable memory tools, one fewer than the advertised-entry count
     // `crate::mcp::registry::tool_names::ALL.len()`. At v1.0.0 that is
-    // 102 callable / 103 advertised (#2782 corrected the stale "73 /
+    // 103 callable / 104 advertised (#2782 corrected the stale "73 /
     // 74 at v0.7.0" literals this comment used to carry). The F13 pin
     // guards against the off-by-one where the summary count would
     // collide with the advertised-entries count; see issue #862 for

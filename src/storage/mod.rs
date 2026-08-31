@@ -12313,6 +12313,108 @@ pub struct ContaminationStampReport {
     pub skipped_system_only: usize,
 }
 
+/// Outcome of one [`contaminate_row`] stamp attempt on a single memory row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContaminateOutcome {
+    /// The row moved from a recall-visible state INTO `Contaminated` by this
+    /// call (CAS matched exactly one row).
+    Stamped,
+    /// The row was ALREADY `Contaminated` — left untouched (idempotency).
+    AlreadyContaminated,
+    /// The row is in a stronger system-only state (`Tombstoned` /
+    /// `Quarantined`) — deliberately left as-is (fail-closed, non-destructive).
+    SkippedSystemOnly,
+    /// The row vanished between the read and the CAS write (0 rows affected) —
+    /// nothing was stamped.
+    Vanished,
+}
+
+/// v1.0.0 #3324 / #3322 (#3266 MVG) — stamp ONE memory row `Contaminated`
+/// under the shared reversibility + compare-and-set contract used by BOTH the
+/// auto-stamp ([`stamp_contaminated_descendants`], #3324) and the
+/// `memory_swarm_rewind` orchestration (#3322).
+///
+/// The row's pre-taint `lifecycle_state` is recorded in
+/// `metadata.<CONTAMINATION_METADATA_KEY>.prior_lifecycle_state` (the
+/// REVERSIBILITY anchor), alongside `contaminated_from` + `stamped_at`. Any
+/// `extra_marker` entries are merged into the `contamination` object AFTER
+/// those three base keys, so a caller passing an EMPTY slice reproduces the
+/// #3324 marker byte-for-byte (the `contaminated_lifecycle_3324` suite pins
+/// that shape).
+///
+/// Fail-closed / non-destructive: an already-`Contaminated` row is a no-op
+/// (`AlreadyContaminated`); a stronger `Tombstoned`/`Quarantined` row is never
+/// downgraded (`SkippedSystemOnly`). The `AND lifecycle_state = <observed>`
+/// CAS makes the write a no-op (`Vanished`) if the row changed between the read
+/// and the write (TOCTOU-safe). The durable memory TEXT is never touched.
+///
+/// `read` selects `(lifecycle_state, metadata)` for `?1`; `upd` is the
+/// `SET lifecycle_state = ?1, metadata = ?2, updated_at = ?3, version =
+/// version + 1 WHERE id = ?4 AND lifecycle_state = ?5` statement — both are
+/// prepared once by the caller and reused across the sweep.
+fn contaminate_row(
+    read: &mut rusqlite::Statement<'_>,
+    upd: &mut rusqlite::Statement<'_>,
+    id: &str,
+    contaminated_from: &str,
+    now: &str,
+    extra_marker: &[(&str, serde_json::Value)],
+) -> Result<ContaminateOutcome> {
+    use rusqlite::OptionalExtension;
+    let contaminated = crate::models::LifecycleState::Contaminated.as_str();
+    let row: Option<(String, Option<String>)> = read
+        .query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((cur_str, meta_str)) = row else {
+        return Ok(ContaminateOutcome::Vanished);
+    };
+    let cur = crate::models::LifecycleState::from_str(&cur_str).unwrap_or_default();
+    if cur == crate::models::LifecycleState::Contaminated {
+        return Ok(ContaminateOutcome::AlreadyContaminated);
+    }
+    if cur.is_system_only() {
+        return Ok(ContaminateOutcome::SkippedSystemOnly);
+    }
+
+    // Record the pre-taint state for reversibility. A malformed / absent
+    // metadata blob is treated as an empty object rather than failing (the
+    // marker is additive, never destructive).
+    let mut meta = meta_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(map) = meta.as_object_mut() {
+        // Base marker keys in the historical (#3324) order; `extra_marker`
+        // appends provenance (e.g. `via`, `rewind`) without disturbing them.
+        let mut marker = serde_json::Map::new();
+        marker.insert(
+            "prior_lifecycle_state".to_string(),
+            serde_json::json!(cur.as_str()),
+        );
+        marker.insert(
+            "contaminated_from".to_string(),
+            serde_json::json!(contaminated_from),
+        );
+        marker.insert("stamped_at".to_string(), serde_json::json!(now));
+        for (k, v) in extra_marker {
+            marker.insert((*k).to_string(), v.clone());
+        }
+        map.insert(
+            CONTAMINATION_METADATA_KEY.to_string(),
+            serde_json::Value::Object(marker),
+        );
+    }
+    let meta_ser = serde_json::to_string(&meta)?;
+    // `id` is the PK, so the CAS matches at most one row (0 or 1).
+    let n = upd.execute(params![contaminated, meta_ser, now, id, cur_str])?;
+    Ok(if n == 1 {
+        ContaminateOutcome::Stamped
+    } else {
+        ContaminateOutcome::Vanished
+    })
+}
+
 /// v1.0.0 #3324 (#3266 MVG) — AUTO-PROPAGATE the
 /// [`crate::models::LifecycleState::Contaminated`] taint DOWNSTREAM from an
 /// invalidated root: every record transitively derived from `root_id` over the
@@ -12371,7 +12473,6 @@ pub fn stamp_contaminated_descendants(
     // Bounded, cycle-safe downstream lineage set (the read-only suspect walk).
     let descendants = lineage_descendants(conn, root_id, max_depth)?;
 
-    let contaminated = crate::models::LifecycleState::Contaminated.as_str();
     let now = Utc::now().to_rfc3339();
 
     let mut report = ContaminationStampReport {
@@ -12381,11 +12482,11 @@ pub fn stamp_contaminated_descendants(
 
     // ONE transaction over the whole sweep so the taint lands all-or-nothing
     // (atomicity). `unchecked_transaction` shares the caller's `&Connection`
-    // (the MCP link path holds a shared borrow); the per-row CAS guard below
-    // keeps every UPDATE correct even under the DEFERRED lock upgrade.
+    // (the MCP link path holds a shared borrow); the per-row CAS guard in
+    // `contaminate_row` keeps every UPDATE correct even under the DEFERRED
+    // lock upgrade.
     let tx = conn.unchecked_transaction()?;
     {
-        use rusqlite::OptionalExtension;
         let mut read =
             tx.prepare("SELECT lifecycle_state, metadata FROM memories WHERE id = ?1")?;
         let mut upd = tx.prepare(
@@ -12394,53 +12495,402 @@ pub fn stamp_contaminated_descendants(
               WHERE id = ?4 AND lifecycle_state = ?5",
         )?;
         for node in &descendants {
-            let row: Option<(String, Option<String>)> = read
-                .query_row(params![node.id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            let Some((cur_str, meta_str)) = row else {
-                continue; // descendant vanished mid-sweep — nothing to stamp.
-            };
-            let cur = crate::models::LifecycleState::from_str(&cur_str).unwrap_or_default();
-            if cur == crate::models::LifecycleState::Contaminated {
-                report.already_contaminated += 1;
-                continue; // idempotent no-op.
+            // Empty `extra_marker` reproduces the historical #3324 contamination
+            // marker byte-for-byte.
+            match contaminate_row(&mut read, &mut upd, &node.id, root_id, &now, &[])? {
+                ContaminateOutcome::Stamped => report.stamped += 1,
+                ContaminateOutcome::AlreadyContaminated => report.already_contaminated += 1,
+                ContaminateOutcome::SkippedSystemOnly => report.skipped_system_only += 1,
+                ContaminateOutcome::Vanished => {}
             }
-            if cur.is_system_only() {
-                // Tombstoned / Quarantined — a stronger, already-hidden system
-                // posture. Never downgrade it to a taint (fail-closed,
-                // non-destructive).
-                report.skipped_system_only += 1;
-                continue;
-            }
-
-            // Record the pre-taint state for reversibility. A malformed /
-            // absent metadata blob is treated as an empty object rather than
-            // failing the sweep (the marker is additive, never destructive).
-            let mut meta = meta_str
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .filter(serde_json::Value::is_object)
-                .unwrap_or_else(|| serde_json::json!({}));
-            if let Some(map) = meta.as_object_mut() {
-                map.insert(
-                    CONTAMINATION_METADATA_KEY.to_string(),
-                    serde_json::json!({
-                        "prior_lifecycle_state": cur.as_str(),
-                        "contaminated_from": root_id,
-                        "stamped_at": now,
-                    }),
-                );
-            }
-            let meta_ser = serde_json::to_string(&meta)?;
-            // The `AND lifecycle_state = ?5` CAS makes the write a no-op if the
-            // row changed between the read and the write (TOCTOU-safe). `id` is
-            // the PK, so this matches at most one row (0 or 1).
-            report.stamped +=
-                upd.execute(params![contaminated, meta_ser, now, node.id, cur_str])?;
         }
     }
     tx.commit()?;
     Ok(report)
+}
+
+/// v1.0.0 #3322 (#3266 MVG) — the lineage token/cost summary reported by a
+/// [`swarm_rewind`], derived from the #3323 [`crate::cost::lineage_rollup`]
+/// over the rewound root's provenance subtree. Integer-exact token counts;
+/// cost is the on-demand micro-USD derivation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SwarmRewindCost {
+    /// The lineage root the rollup is scoped to (the rewound root id).
+    pub scope_key: String,
+    /// Cumulative tokens authored under the subtree.
+    pub tokens_written: i64,
+    /// Cumulative tokens served (recalled) under the subtree.
+    pub tokens_recalled: i64,
+    /// `tokens_written + tokens_recalled` (saturating).
+    pub tokens_total: i64,
+    /// Total cost in micro-USD over `tokens_total`.
+    pub micro_usd: u64,
+    /// `micro_usd` rendered as `"$D.CC"`.
+    pub usd: String,
+    /// Number of write events attributed to the subtree.
+    pub write_events: i64,
+    /// Number of recall hits attributed to the subtree.
+    pub recall_events: i64,
+}
+
+impl SwarmRewindCost {
+    fn from_rollup(r: &crate::cost::CostRollup) -> Self {
+        Self {
+            scope_key: r.scope_key.clone(),
+            tokens_written: r.tokens_written,
+            tokens_recalled: r.tokens_recalled,
+            tokens_total: r.tokens_total(),
+            micro_usd: r.micro_usd(),
+            usd: r.usd_string(),
+            write_events: r.write_events,
+            recall_events: r.recall_events,
+        }
+    }
+}
+
+/// v1.0.0 #3322 (#3266 MVG) — outcome of one [`swarm_rewind`] orchestration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SwarmRewindReport {
+    /// The resolved cascade root the rewind targeted.
+    pub root_id: String,
+    /// How `--to` resolved: `"memory"` (claim-id / memory id) or
+    /// `"checkpoint"`.
+    pub target_kind: String,
+    /// `true` when this call performed NO writes (a preview) — the counts are
+    /// the PROJECTED effect of a real run.
+    pub dry_run: bool,
+    /// `true` when the root was ALREADY rewound (the idempotency marker was
+    /// present) — the call was a no-op and appended NO new audit row.
+    pub already_rewound: bool,
+    /// `true` when THIS call moved the root from a recall-visible state into
+    /// `Contaminated` (the "invalidate root" step). `false` when the root was
+    /// already `Contaminated` (its marker was upgraded in place) or on a
+    /// dry-run.
+    pub root_contaminated: bool,
+    /// Downstream descendants newly moved into `Contaminated` by this call
+    /// (0 on a re-run whose subtree was already tainted).
+    pub descendants_stamped: usize,
+    /// Descendants already `Contaminated` — left untouched (idempotency).
+    pub descendants_already_contaminated: usize,
+    /// Descendants in a stronger system-only state — left as-is (fail-closed).
+    pub descendants_skipped_system_only: usize,
+    /// Size of the bounded downstream lineage set that was swept.
+    pub descendants_total: usize,
+    /// Number of routine ids the caller asked to freeze.
+    pub routines_requested: usize,
+    /// Number of those routines now in the `Frozen` regulatory-hold state.
+    pub routines_frozen: usize,
+    /// The `swarm.rewind` signed audit event appended by this call
+    /// (`None` on a dry-run or an already-rewound no-op).
+    pub signed_event_id: Option<String>,
+    /// The lineage token/cost report (#3323) for the rewound subtree.
+    pub cost: SwarmRewindCost,
+}
+
+/// v1.0.0 #3322 (#3266 MVG) — metadata sub-key set on the ROOT's contamination
+/// marker to make a `swarm_rewind` IDEMPOTENT: a re-run detects an already-set
+/// `rewind: true` marker and short-circuits without re-stamping or appending a
+/// duplicate audit row.
+const SWARM_REWIND_MARKER_KEY: &str = "rewind";
+
+/// v1.0.0 #3322 (#3266 MVG) — ONE atomic, resumable operation that intercepts
+/// and UNWINDS a memory cascade rooted at `root_id` without data loss, and
+/// reports its lineage token/cost.
+///
+/// It composes the three #3266 MVG pieces into a single command:
+///
+/// 1. **Invalidate the root + contaminate the cascade.** The root AND every
+///    record transitively derived from it over the provenance subset P
+///    ([`crate::models::MemoryLinkRelation::LINEAGE`]) are stamped
+///    [`crate::models::LifecycleState::Contaminated`] — structurally hidden
+///    from every ordinary recall/egress lane by the shared, fail-closed
+///    [`crate::models::lifecycle_visible_clause`] (the SQLite↔Postgres parity
+///    guarantee: the clause binds nothing and is used verbatim by both
+///    backends). Unlike the auto-stamp [`stamp_contaminated_descendants`]
+///    (which leaves the root, invalidated by its own edge), a deliberate
+///    operator rewind contaminates the root itself.
+/// 2. **Freeze affected routines.** Each operator-supplied routine id is moved
+///    to the `Frozen` regulatory-hold state via
+///    [`crate::routines::routine_freeze`] (idempotent).
+/// 3. **Emit a signed rewind event.** ONE [`crate::signed_events::event_types::SWARM_REWIND`]
+///    row is appended to the append-only, Ed25519-chained `signed_events`
+///    ledger, committing `{action, root, target_kind, contaminated,
+///    routines_frozen, issued_by, timestamp}`.
+///
+/// The lineage token/cost report (#3323 [`crate::cost::lineage_rollup`]) for
+/// the rewound subtree is returned alongside the effect counts.
+///
+/// # Data-integrity properties (North Star)
+///
+/// * **Atomic** — the root stamp, every descendant stamp, every routine
+///   freeze, and the signed audit append run under ONE `IMMEDIATE`
+///   transaction: either the whole rewind commits or none of it does. A
+///   partial rewind can never be observed (the fail-closed bar: a partial
+///   rewind = corruption).
+/// * **Resumable / idempotent** — the root carries a `rewind: true`
+///   contamination marker that is set iff the transaction committed, so a
+///   re-run of a completed rewind is a no-op (`already_rewound`) that appends
+///   NO duplicate audit row; a rewind that rolled back (crash before commit)
+///   left no marker, so a re-run performs the full rewind.
+/// * **Reversible** — every stamped row records its pre-taint `lifecycle_state`
+///   in `metadata.contamination.prior_lifecycle_state`, so the exact prior
+///   state can be restored. The durable memory TEXT is never touched.
+/// * **Fail-closed / non-destructive** — refused while the record plane is
+///   stopped; a descendant (or root) already in a stronger system-only state
+///   (`Tombstoned`/`Quarantined`) is never downgraded; a root that is itself
+///   `Tombstoned`/`Quarantined` (already contained) is refused rather than
+///   re-contained; routine freeze is a protective hold, never a delete.
+/// * **Manageable** — `dry_run` returns the PROJECTED effect (counts + cost)
+///   with zero writes, so a fleet operator can preview a cascade before
+///   committing to unwinding it.
+///
+/// `issued_by` is the audit ISSUER label recorded on the signed event (the
+/// daemon audit key is the cryptographic signer). `target_kind` is carried
+/// into the audit payload for provenance. `root_id` MUST already be resolved
+/// (the MCP/CLI surface resolves `--to <checkpoint|claim-id>` before calling).
+///
+/// # Errors
+///
+/// * The root memory does not exist.
+/// * The root is itself in a system-only terminal state
+///   (`Tombstoned`/`Quarantined`) — already contained; nothing to rewind.
+/// * The record plane is stopped ([`crate::storage::StorageError`]).
+/// * Propagates lineage-traversal, `rusqlite`, JSON, routine-freeze, signed-
+///   event append, and cost-rollup errors.
+pub fn swarm_rewind(
+    conn: &Connection,
+    root_id: &str,
+    max_depth: usize,
+    issued_by: &str,
+    target_kind: &str,
+    freeze_routine_ids: &[String],
+    dry_run: bool,
+) -> Result<SwarmRewindReport> {
+    use rusqlite::OptionalExtension;
+
+    // Read the root's current state + metadata (also proves it exists).
+    let root_row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT lifecycle_state, metadata FROM memories WHERE id = ?1",
+            params![root_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((root_state_str, root_meta_str)) = root_row else {
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: format!("swarm_rewind: root memory {root_id} not found"),
+        }));
+    };
+    let root_state = crate::models::LifecycleState::from_str(&root_state_str).unwrap_or_default();
+    let root_meta: serde_json::Value = root_meta_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // Idempotency: a root already carrying the rewind marker means a prior
+    // rewind committed — this call is a no-op (no writes, no duplicate audit).
+    let already_rewound = root_state == crate::models::LifecycleState::Contaminated
+        && root_meta[CONTAMINATION_METADATA_KEY][SWARM_REWIND_MARKER_KEY].as_bool() == Some(true);
+
+    // Bounded, cycle-safe downstream lineage set (computed BEFORE any write; a
+    // Contaminated node stays traversable as provenance, so ordering is safe).
+    let descendants = lineage_descendants(conn, root_id, max_depth)?;
+
+    // Cost report (read-only) — always reflects the rewound subtree.
+    let rollup = crate::cost::lineage_rollup(conn, root_id, max_depth)?;
+    let cost = SwarmRewindCost::from_rollup(&rollup);
+
+    let mut report = SwarmRewindReport {
+        root_id: root_id.to_string(),
+        target_kind: target_kind.to_string(),
+        dry_run,
+        descendants_total: descendants.len(),
+        routines_requested: freeze_routine_ids.len(),
+        cost,
+        ..SwarmRewindReport::default()
+    };
+
+    if already_rewound {
+        report.already_rewound = true;
+        return Ok(report);
+    }
+
+    // Fail-closed: a root already in a STRONGER system-only terminal state
+    // (Tombstoned/Quarantined, but NOT this rewind's own Contaminated taint) is
+    // already contained — never re-contain or downgrade it.
+    if root_state.is_system_only() && root_state != crate::models::LifecycleState::Contaminated {
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: format!(
+                "swarm_rewind: root memory {root_id} is in a system-only terminal state \
+                 ({}); already contained, nothing to rewind",
+                root_state.as_str()
+            ),
+        }));
+    }
+
+    // Read-only preview: classify the projected effect with zero writes.
+    if dry_run {
+        report.root_contaminated = root_state != crate::models::LifecycleState::Contaminated;
+        for node in &descendants {
+            let st: Option<String> = conn
+                .query_row(
+                    "SELECT lifecycle_state FROM memories WHERE id = ?1",
+                    params![node.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match st
+                .as_deref()
+                .and_then(crate::models::LifecycleState::from_str)
+            {
+                Some(crate::models::LifecycleState::Contaminated) => {
+                    report.descendants_already_contaminated += 1;
+                }
+                Some(s) if s.is_system_only() => report.descendants_skipped_system_only += 1,
+                Some(_) => report.descendants_stamped += 1,
+                None => {}
+            }
+        }
+        return Ok(report);
+    }
+
+    // Real run: fail-closed record-plane fence, then ONE atomic transaction.
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+
+    let now = Utc::now().to_rfc3339();
+    let now_epoch = Utc::now().timestamp();
+    let contaminated = crate::models::LifecycleState::Contaminated.as_str();
+
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    {
+        let mut read =
+            tx.prepare("SELECT lifecycle_state, metadata FROM memories WHERE id = ?1")?;
+        let mut upd = tx.prepare(
+            "UPDATE memories \
+                SET lifecycle_state = ?1, metadata = ?2, updated_at = ?3, version = version + 1 \
+              WHERE id = ?4 AND lifecycle_state = ?5",
+        )?;
+
+        // 1a. Contaminate the downstream cascade. `via` records the taint
+        // provenance; the base marker (prior_lifecycle_state/...) is identical
+        // to the auto-stamp so a future restore reads it uniformly.
+        let via = [("via", serde_json::json!("swarm_rewind"))];
+        for node in &descendants {
+            match contaminate_row(&mut read, &mut upd, &node.id, root_id, &now, &via)? {
+                ContaminateOutcome::Stamped => report.descendants_stamped += 1,
+                ContaminateOutcome::AlreadyContaminated => {
+                    report.descendants_already_contaminated += 1;
+                }
+                ContaminateOutcome::SkippedSystemOnly => {
+                    report.descendants_skipped_system_only += 1;
+                }
+                ContaminateOutcome::Vanished => {}
+            }
+        }
+
+        // 1b. Invalidate the ROOT itself, carrying the `rewind: true`
+        // idempotency marker.
+        if root_state == crate::models::LifecycleState::Contaminated {
+            // Already tainted (e.g. by a prior #3324 auto-stamp as some other
+            // root's descendant): UPGRADE its marker in place to record the
+            // deliberate rewind, preserving the existing prior-state anchor.
+            let mut meta = root_meta.clone();
+            if let Some(obj) = meta.as_object_mut() {
+                let mut cont = obj
+                    .get(CONTAMINATION_METADATA_KEY)
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                cont.insert(SWARM_REWIND_MARKER_KEY.to_string(), serde_json::json!(true));
+                cont.insert("via".to_string(), serde_json::json!("swarm_rewind"));
+                cont.insert("rewound_at".to_string(), serde_json::json!(now));
+                obj.insert(
+                    CONTAMINATION_METADATA_KEY.to_string(),
+                    serde_json::Value::Object(cont),
+                );
+            }
+            let meta_ser = serde_json::to_string(&meta)?;
+            // CAS on the observed `contaminated` state (metadata-only change).
+            upd.execute(params![contaminated, meta_ser, now, root_id, contaminated])?;
+            report.root_contaminated = false;
+        } else {
+            let root_marker = [
+                (SWARM_REWIND_MARKER_KEY, serde_json::json!(true)),
+                ("via", serde_json::json!("swarm_rewind")),
+            ];
+            match contaminate_row(&mut read, &mut upd, root_id, root_id, &now, &root_marker)? {
+                ContaminateOutcome::Stamped => report.root_contaminated = true,
+                // The pre-tx checks ruled out already-contaminated / system-only
+                // / missing; a Vanished here means the root changed under us —
+                // fail closed by rolling back.
+                other => {
+                    return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                        reason: format!(
+                            "swarm_rewind: root {root_id} changed during rewind ({other:?}); \
+                             transaction rolled back"
+                        ),
+                    }));
+                }
+            }
+        }
+
+        // 2. Freeze the operator-supplied affected routines (idempotent).
+        for rid in freeze_routine_ids {
+            if let Some(routine) = crate::routines::routine_freeze(&tx, rid, now_epoch, None)?
+                && routine.state == crate::models::RoutineState::Frozen
+            {
+                report.routines_frozen += 1;
+            }
+        }
+
+        // 3. Emit the signed rewind event into the append-only chain, inside
+        // the same transaction (no nested tx: the `_no_tx` variant).
+        let payload = swarm_rewind_audit_payload(
+            root_id,
+            target_kind,
+            report.descendants_stamped,
+            report.routines_frozen,
+            issued_by,
+            &now,
+        );
+        let hash = crate::signed_events::payload_hash(&payload);
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            hash,
+            issued_by.to_string(),
+            crate::signed_events::event_types::SWARM_REWIND.to_string(),
+            now.clone(),
+            None,
+        );
+        crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
+        report.signed_event_id = Some(event.id.clone());
+    }
+    tx.commit()?;
+
+    Ok(report)
+}
+
+/// v1.0.0 #3322 — canonical bytes committed by a `swarm.rewind` signed event.
+/// The event's `payload_hash` is `SHA-256` over this, binding the rewind's
+/// identity into the tamper-evident chain.
+fn swarm_rewind_audit_payload(
+    root_id: &str,
+    target_kind: &str,
+    contaminated: usize,
+    routines_frozen: usize,
+    issued_by: &str,
+    timestamp: &str,
+) -> Vec<u8> {
+    let canonical = serde_json::json!({
+        "action": "swarm_rewind",
+        "root_id": root_id,
+        "target_kind": target_kind,
+        "contaminated": contaminated,
+        "routines_frozen": routines_frozen,
+        "issued_by": issued_by,
+        "timestamp": timestamp,
+    });
+    serde_json::to_vec(&canonical).unwrap_or_default()
 }
 
 /// Default cap on paths returned by [`find_paths`] when the caller does

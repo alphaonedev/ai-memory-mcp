@@ -559,6 +559,8 @@ pub mod share;
 mod store;
 #[path = "tools/subscribe.rs"]
 mod subscribe;
+#[path = "tools/swarm_rewind.rs"]
+mod swarm_rewind;
 #[path = "tools/update.rs"]
 mod update;
 #[path = "tools/verify.rs"]
@@ -711,6 +713,7 @@ pub use ingest_multistep::{IngestMultistepHandler, handle_ingest_multistep};
 pub use kg_invalidate::handle_kg_invalidate;
 pub use kg_timeline::handle_kg_timeline;
 pub use subscribe::{handle_list_subscriptions, handle_subscribe};
+pub use swarm_rewind::handle_swarm_rewind;
 pub use verify::handle_verify;
 // v0.7.0 L1-5 / L2-6 — test-and-integration access to the skill
 // substrate handlers. These are public so the L2-6 regression suite
@@ -2266,6 +2269,10 @@ fn dispatch_memory_kg_invalidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Str
     handle_kg_invalidate(ctx.conn, ctx.db_path, ctx.arguments)
 }
 
+fn dispatch_memory_swarm_rewind(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_swarm_rewind(ctx.conn, ctx.arguments)
+}
+
 fn dispatch_memory_kg_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_kg_query(ctx.conn, ctx.arguments)
 }
@@ -2932,6 +2939,10 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
         register_mcp_tool!(
             tool_names::MEMORY_KG_INVALIDATE,
             dispatch_memory_kg_invalidate
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SWARM_REWIND,
+            dispatch_memory_swarm_rewind
         ),
         register_mcp_tool!(tool_names::MEMORY_KG_QUERY, dispatch_memory_kg_query),
         register_mcp_tool!(tool_names::MEMORY_FIND_PATHS, dispatch_memory_find_paths),

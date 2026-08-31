@@ -91,7 +91,7 @@ spec already carried. They are recorded here as first-class threats
 with the substrate's current posture against each:
 
 - **M2 — complexity tax / core-profile ceiling.** A large advertised
-  surface (103 MCP tools at `--profile full`) is itself an
+  surface (104 MCP tools at `--profile full`) is itself an
   attack-surface and audit-cost risk. Posture: the DEFAULT profile is
   `core` (7 tools) — the full surface is opt-in per deployment, new
   tools default off, and the core profile is held minimal as GA

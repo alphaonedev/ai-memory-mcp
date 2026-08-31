@@ -173,6 +173,11 @@ pub mod action_labels {
     /// KG edge-invalidation action (MCP `memory_kg_invalidate` deny
     /// label + the postgres AGE-fallback warn label).
     pub const KG_INVALIDATE: &str = "kg_invalidate";
+    /// v1.0.0 #3322 (#3266 MVG) — cascade-rewind action (MCP/CLI
+    /// `memory_swarm_rewind` / `swarm-rewind` deny label). Gated symmetrically
+    /// with [`KG_INVALIDATE`] because the rewind's core primitive is
+    /// invalidation/contamination of the root's lineage.
+    pub const SWARM_REWIND: &str = "swarm_rewind";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

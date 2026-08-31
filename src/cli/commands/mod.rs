@@ -71,6 +71,7 @@ pub mod reflection_origin;
 pub mod subscribe;
 pub mod subscription_dlq_list;
 pub mod subscription_replay;
+pub mod swarm_rewind;
 pub mod unsubscribe;
 // v0.7.0 (issue #1389) — recover-on-boot fail-safe for the #1388
 // substrate failure mode. CLI-only surface: chains after `ai-memory

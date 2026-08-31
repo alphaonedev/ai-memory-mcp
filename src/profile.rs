@@ -44,7 +44,7 @@
 //! `Profile::<name>().expected_tool_count()` is the only count that
 //! cannot drift. (The pre-#2782 form hardcoded `~18` / `~21` / `~15`
 //! and `74 advertised entries at v0.7.0`; by v1.0.0 the live values
-//! were 19 / 21 / 56 and 103 — the literals rotted, the accessor did
+//! were 19 / 21 / 57 and 104 — the literals rotted, the accessor did
 //! not.)
 //! - `custom` — comma-separated family list (`core,graph,archive` …).
 //!   `core` is implicitly added if missing — there's no profile that
@@ -240,6 +240,9 @@ impl Family {
             // facing inspector for the per-reflection dependent set
             // that gets notified on Reflection→Reflection supersedes.
             | tn::MEMORY_DEPENDENTS_OF_INVALIDATED
+            // v1.0.0 #3322 (#3266 MVG) — atomic, resumable cascade rewind
+            // (operator-facing governance op, Family::Power).
+            | tn::MEMORY_SWARM_REWIND
             // v0.7.0 (issue #691) — substrate-level agent-action rules
             // engine. Both tools live in Family::Power (governance /
             // operator-facing, not data-plane). Mutation tools are
@@ -497,6 +500,10 @@ impl Family {
                 // read-side inspector. Lists dependents flagged by
                 // the walker on Reflection→Reflection supersedes.
                 tn::MEMORY_DEPENDENTS_OF_INVALIDATED,
+                // v1.0.0 #3322 (#3266 MVG) — atomic, resumable cascade rewind:
+                // invalidate root + contaminate the derived swarm + freeze
+                // affected routines + signed rewind event + lineage cost.
+                tn::MEMORY_SWARM_REWIND,
                 // v0.7.0 (issue #691) — substrate-level agent-action
                 // rules engine. Read-side surface; mutation tools are
                 // NOT registered over MCP (operator uses CLI / HTTP).
@@ -696,7 +703,7 @@ impl Profile {
     /// `Profile::power().expected_tool_count()` — the SSOT, derived from
     /// `Family::Core.tool_names()` + `Family::Power.tool_names()` and
     /// pinned by `profile_power_loads_core_plus_power`. At v1.0.0 that
-    /// is **56** (core 7 + the 49-entry `Family::Power` slice); the
+    /// is **57** (core 7 + the 50-entry `Family::Power` slice); the
     /// figure is stated with its release anchor because the slice keeps
     /// growing (v0.7 K7 added the two subscription-reliability tools,
     /// v0.8.0 #1709 added the action / lease / signal / checkpoint /

@@ -497,8 +497,10 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 82;
 /// added `Features` for the `ai-memory features` build-feature
 /// self-report, bumping 89 → 90; v1.0.0 #2402 added `Quarantine` for
 /// the `ai-memory quarantine list|release <id>` operator route-OUT of the
-/// #1948 federation quarantine, bumping 90 → 91.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 91;
+/// #1948 federation quarantine, bumping 90 → 91; v1.0.0 #3322 (#3266 MVG)
+/// added `SwarmRewind` for the `ai-memory swarm-rewind` atomic cascade-rewind
+/// operator command, bumping 91 → 92.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 92;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -518,8 +520,10 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 91;
 /// added `Watch` (L3 substrate poll-based filesystem-watcher capture
 /// daemon), bumping 90 → 91; v1.0.0 #2676 added `Features` (build-feature
 /// self-report), bumping 91 → 92; v1.0.0 #2402 added `Quarantine` (operator
-/// route-OUT of the #1948 federation quarantine), bumping 92 → 93.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 93;
+/// route-OUT of the #1948 federation quarantine), bumping 92 → 93; v1.0.0
+/// #3322 (#3266 MVG) added `SwarmRewind` (atomic cascade-rewind operator
+/// command), bumping 93 → 94.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 94;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
