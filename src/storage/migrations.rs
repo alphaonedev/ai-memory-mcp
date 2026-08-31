@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 92).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 93).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -894,7 +894,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 92;
+const CURRENT_SCHEMA_VERSION: i64 = 93;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -919,7 +919,7 @@ const CURRENT_SCHEMA_VERSION: i64 = 92;
 ///
 /// # Why 100_000
 ///
-/// The ladder tip is `92` after the ENTIRE project history (single-digit
+/// The ladder tip is `93` after the ENTIRE project history (single-digit
 /// growth per release), so 100,000 is on the order of a thousand
 /// product-lifetimes of schema evolution — permanently unreachable by a real
 /// ladder, which keeps the ceiling from ever rejecting a legitimate future
@@ -4105,7 +4105,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 92 {
             // v92 (#2555, v1.0.0) — BOUND schema_version with the
             // `version <= MAX_SCHEMA_VERSION` upper CHECK so an unconstrained
             // fleet kill-switch write (`INSERT ... VALUES (2147483647)`) is
@@ -4136,6 +4136,28 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             if !ddl.contains("CHECK") {
                 conn.execute_batch(MIGRATION_V92_SQLITE)?;
             }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v93 (#3323, v1.0.0) — PER-LINEAGE + PER-NAMESPACE TOKEN/COST
+            // ACCOUNTING. Adds the standalone advisory `token_cost_counters`
+            // relation so a runaway atomisation/reflection cascade shows a
+            // DOLLAR FIGURE, not a discovery. Purely additive `CREATE TABLE IF
+            // NOT EXISTS` (no probe needed, no full-table rebuild, no trigger
+            // to recreate — the v63/v65 hazard does not arise), so it is
+            // idempotent and a no-op on a database already carrying the table.
+            // The DDL is the SSOT doc twin embedded in the `cost` module
+            // (`crate::cost::MIGRATION_V93_SQLITE`), the postgres twin is
+            // `PostgresStore::migrate_v93`. This table holds NO durable memory
+            // truth — it is disposable, regenerable advisory data, and every
+            // increment on the write/recall funnels is best-effort.
+            // Canonical DDL: migrations/sqlite/0077_v93_token_cost_counters.sql.
+            debug_assert!(
+                crate::cost::MIGRATION_V93_SQLITE
+                    .contains("CREATE TABLE IF NOT EXISTS token_cost_counters"),
+                "v93 doc twin must ship the token_cost_counters DDL"
+            );
+            conn.execute_batch(crate::cost::MIGRATION_V93_SQLITE)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on

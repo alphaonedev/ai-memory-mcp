@@ -2310,6 +2310,17 @@ fn insert_inner(
         if matches!(conflict_arm, InsertConflictArm::RestoreSameId) {
             conn.execute(SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID, params![actual_id])?;
         }
+        // #3323 — advisory per-lineage + per-namespace token/cost accounting.
+        // Metered ONLY on LOCAL authorship (`stamp_local_clock`): a
+        // remote-admission `insert_imported*` carries tokens spent on the
+        // AUTHORING node, not here, so it is excluded. Best-effort inside this
+        // same tx: `record_write_sqlite` swallows + debug-logs any failure so a
+        // metering error can NEVER fail or roll back the durable write (the
+        // memory text is the source of truth; the cost counter is disposable
+        // derived data — North Star).
+        if stamp_local_clock {
+            crate::cost::record_write_sqlite(conn, mem, &actual_id);
+        }
         Ok(actual_id)
     })();
     if let Some(write_txn) = write_txn {

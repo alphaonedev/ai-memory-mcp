@@ -1458,3 +1458,26 @@ CREATE TABLE IF NOT EXISTS agent_api_keys (
     bound_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
+
+-- v93 (#3323, v1.0.0) — PER-LINEAGE + PER-NAMESPACE TOKEN/COST ACCOUNTING.
+-- Advisory, disposable, best-effort counter relation so a runaway
+-- atomisation/reflection cascade shows a dollar figure. 'namespace' rows
+-- hold per-namespace token spend; 'lineage' rows hold each memory node's own
+-- tokens so a per-lineage-root rollup sums a root plus its derives_from
+-- descendants at report time. Mirrors migrations/postgres/0050_v93_token_cost_counters.sql.
+CREATE TABLE IF NOT EXISTS token_cost_counters (
+    scope_kind      TEXT        NOT NULL,
+    scope_key       TEXT        NOT NULL,
+    tokens_written  BIGINT      NOT NULL DEFAULT 0,
+    tokens_recalled BIGINT      NOT NULL DEFAULT 0,
+    write_events    BIGINT      NOT NULL DEFAULT 0,
+    recall_events   BIGINT      NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (scope_kind, scope_key),
+    CONSTRAINT token_cost_counters_scope_kind_ck
+        CHECK (scope_kind IN ('namespace', 'lineage')),
+    CONSTRAINT token_cost_counters_tokens_written_ck  CHECK (tokens_written  >= 0),
+    CONSTRAINT token_cost_counters_tokens_recalled_ck CHECK (tokens_recalled >= 0),
+    CONSTRAINT token_cost_counters_write_events_ck    CHECK (write_events    >= 0),
+    CONSTRAINT token_cost_counters_recall_events_ck   CHECK (recall_events   >= 0)
+);

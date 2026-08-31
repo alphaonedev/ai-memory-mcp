@@ -694,6 +694,9 @@ pub mod coordination_audit;
 /// text / payload length caps, and ambient-actor resolution so every create
 /// surface enforces one set of bounds and is always attributed + quota-charged.
 pub mod coordination_guard;
+/// v1.0.0 #3323 — per-lineage + per-namespace token/cost accounting
+/// (advisory, self-contained; gives a runaway cascade a dollar figure).
+pub mod cost;
 pub mod curator;
 pub mod daemon_runtime;
 pub mod durability;
