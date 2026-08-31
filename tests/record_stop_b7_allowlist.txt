@@ -91,3 +91,8 @@ src/store/postgres.rs	record_lineage_watermark_pg
 # `DELETE FROM schema_version ...` for the postgres admin recovery; it EXECUTES
 # no SQL (pure string formatting). Reviewed false positive.
 src/storage/schema_guard.rs	render_poisoned
+# #3323 (2026-08-31, Fable GA g4 CI-debt sweep) — usd_string renders a
+# CostRollup micro-USD total as "$D.CC" (pure formatting via format_usd); it
+# EXECUTES no SQL. The B7 boundary heuristic mis-attributes the adjacent
+# module-scope WRITE_UPSERT_SQL const. Reviewed false positive.
+src/cost/mod.rs	usd_string
