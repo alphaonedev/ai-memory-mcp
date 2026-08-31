@@ -493,7 +493,7 @@ table tr:last-child td{border-bottom:none}
       </thead>
       <tbody>
         <tr><td>Quorum-write contract</td><td>shipped</td><td>Track C ✓</td><td>—</td></tr>
-        <tr><td>Postgres + pgvector backbone</td><td>shipped (<code>sal-postgres</code>)</td><td>Track B ✓</td><td>—</td></tr>
+        <tr><td>Postgres + pgvector backbone</td><td>shipped as a store (<code>sal-postgres</code>)</td><td>Track B ✓</td><td>full federation-<em>receiver</em> parity (#3075)</td></tr>
         <tr><td>Cryptographic agent attestation</td><td>wired (Ed25519, #626)</td><td>✓</td><td>full chain</td></tr>
         <tr><td>Distributed consensus (governance plane)</td><td>—</td><td>—</td><td>designed</td></tr>
         <tr><td>Gossip / DHT (many-node discovery)</td><td>—</td><td>—</td><td>designed</td></tr>
@@ -503,7 +503,7 @@ table tr:last-child td{border-bottom:none}
         <tr><td>Multi-tenant policy-as-code DSL</td><td>partial (JSON policies)</td><td>enriched</td><td>full DSL</td></tr>
       </tbody>
     </table>
-    <p>This is the honest road. Each row that flips toward shipping is a discrete piece of engineering with a tracked owner and an ADR.</p>
+    <p>This is the honest road. Each row that flips toward shipping is a discrete piece of engineering with a tracked owner and an ADR. <strong>Postgres-backbone scope (#3075):</strong> PostgreSQL is a shipped, first-class <em>store</em> backend, but as a federation <em>receiver</em> it replicates only the <code>memories[]</code> lane in v1.0.0 — the federated-governance lanes (<code>checkpoints</code>, <code>pendings</code>, <code>pending_decisions</code>, <code>namespace_meta</code>, <code>namespace_meta_clears</code>, <code>archives</code>, <code>restores</code>) return an honest <code>unsupported_on_postgres</code> non-ack and are SQLite-receiver-only until full Postgres-receiver parity lands in v1.1. Keep governance-quorum receivers on the SQLite backend.</p>
   </div>
 </section>
 

@@ -459,7 +459,7 @@ table tr:last-child td{border-bottom:none}
     <p class="lede">The topology just gets denser.</p>
     <ul>
       <li><strong>Rack-to-rack peer mesh</strong> — <code>sync_push</code> works the same whether you have 4 nodes or 40. The number of edges is <code>n*(n-1)/2</code> for full mesh, which is a gossip cost the operator should plan for. Most T4 deployments will use a <strong>partial mesh</strong> with a few designated bridge nodes per rack.</li>
-      <li><strong>Federated governance plane</strong> — <code>broadcast_namespace_meta_quorum</code> and <code>broadcast_pending_decision_quorum</code> mean a tightening of policy on <code>org/eu/finance</code> propagates to every rack, every node. v0.6.3 capabilities introspection lets every agent and operator confirm that the policy version they're seeing matches the published version.</li>
+      <li><strong>Federated governance plane</strong> — <code>broadcast_namespace_meta_quorum</code> and <code>broadcast_pending_decision_quorum</code> propagate a tightening of policy on <code>org/eu/finance</code> across the mesh, but <strong>only to SQLite-backed receivers</strong>. <strong>Scope caveat (#3075):</strong> a receiver running the PostgreSQL store replicates only the <code>memories[]</code> lane; the federated-governance lanes — <code>checkpoints</code>, <code>pendings</code>, <code>pending_decisions</code>, <code>namespace_meta</code>, <code>namespace_meta_clears</code>, <code>archives</code>, <code>restores</code> — return an honest <code>unsupported_on_postgres</code> non-ack and are <strong>SQLite-receiver-only in v1.0.0</strong> (full PostgreSQL-receiver replication of these lanes is tracked for v1.1). So a policy quorum does <em>not</em> propagate to a Postgres-backed node; keep governance-quorum peers on the SQLite backend. v0.6.3 capabilities introspection lets every agent and operator confirm that the policy version they're seeing matches the published version.</li>
       <li><strong>Per-rack pending queues</strong> — Approval workflows can be scoped to a rack (<code>rack-a/approvers</code>) so on-call shifts work cleanly even at fleet scale.</li>
       <li><strong>mTLS</strong> — <code>rustls</code> is already wired in the peer transport. Enforcement is opt-in today; it's the obvious default at T4.</li>
       <li><strong>Capabilities introspection v2</strong> — Operators can fleet-scan <code>/api/v1/capabilities</code> to confirm every node is on the same schema version and feature tier. Drift is an alerting condition, not a surprise.</li>
@@ -492,6 +492,9 @@ table tr:last-child td{border-bottom:none}
   <div class="container">
     <span class="eyebrow">Deployment recipe</span>
     <h2>Today: quorum + mTLS allowlist.</h2>
+    <p>Both recipes bind <code>--host 0.0.0.0</code> (non-loopback). A non-loopback <code>serve</code> <strong>refuses to boot unless <code>api_key</code> is set in config</strong> (S5-C1, <code>daemon_runtime</code> bind guard) — this is independent of mTLS. There is no <code>--api-key</code> serve flag; set it in <code>~/.config/ai-memory/config.toml</code>:</p>
+<pre><code># ~/.config/ai-memory/config.toml — required for any non-loopback bind
+api_key = "REPLACE_WITH_A_LONG_RANDOM_SECRET"</code></pre>
 <pre><code># rack-a/node-2 — quorum 3-of-5 across the rack, mTLS enforced
 ai-memory --db /var/lib/ai-memory/store.db serve \
   --host 0.0.0.0 --port 9077 \
@@ -506,12 +509,13 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
   --quorum-ca-cert /etc/ai-memory/ca.crt \
   --catchup-interval-secs 15</code></pre>
 
-    <p>v0.8.0 — same node, swap to Postgres-backed store:</p>
+    <p>Same node, swap to a Postgres-backed store:</p>
 <pre><code>ai-memory serve \
   --store-url postgres://ai-memory@pg-cluster.svc.cluster.local:5432/store \
   --host 0.0.0.0 --port 9077 \
   --quorum-writes 3 \
   --quorum-peers https://rack-a-1:9077,https://rack-a-3:9077,https://rack-b-1:9077</code></pre>
+    <p><strong>Scope caveat (#3075):</strong> quorum writes to a Postgres-backed receiver replicate the <code>memories[]</code> lane only. A Postgres receiver honestly non-acks (<code>unsupported_on_postgres</code>) the federated-governance lanes — <code>checkpoints</code>, <code>pendings</code>, <code>pending_decisions</code>, <code>namespace_meta</code>, <code>namespace_meta_clears</code>, <code>archives</code>, <code>restores</code> — which are <strong>SQLite-receiver-only in v1.0.0</strong> (full Postgres-receiver replication tracked for v1.1). Do not rely on <code>namespace_meta</code>/<code>pending_decision</code> quorum reaching a Postgres node; keep governance-quorum peers on the SQLite backend and use Postgres for the memory-store and vector-index scale-out.</p>
 
     <p>The <code>peer-fingerprints.txt</code> file lists trusted SHA-256 fingerprints (one per line, optional <code>:</code> separators, <code>#</code> comments). The <code>--mtls-allowlist</code> flag's presence is what makes mTLS enforcement <em>required</em> — if a peer's cert isn't on the list, the connection is refused at TLS handshake.</p>
   </div>
@@ -522,7 +526,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
     <span class="eyebrow">Wiring</span>
     <h2>Governance, skills, and attestations at T4.</h2>
     <ul>
-      <li><strong>Governance</strong> — Same machinery as T2/T3, just at scale. The federated control plane is the central nervous system: a single policy update on <code>org/eu/finance</code> reaches every node within seconds. Pending-action queues are visible per-rack for on-call routing.</li>
+      <li><strong>Governance</strong> — Same machinery as T2/T3, just at scale. The federated control plane is the central nervous system: a single policy update on <code>org/eu/finance</code> reaches every <strong>SQLite-backed</strong> node within seconds. Pending-action queues are visible per-rack for on-call routing. Per #3075, the governance lanes (<code>namespace_meta</code>, <code>pending_decisions</code>, and the rest) do not yet replicate to a Postgres-backed receiver in v1.0.0 — see the deployment-recipe scope caveat above.</li>
       <li><strong>Skills</strong> — Skills register as agents and get the same scope visibility. At T4, skills are typically pinned to specific racks (latency, data-residency) but their outputs (tags, contradictions, consolidations) propagate fleet-wide via <code>sync_push</code>.</li>
       <li><strong>Attestations</strong> — Attested identity (#626 Layer-3 Ed25519 store-surface signatures) is the gating capability for trustworthy multi-tenant T4. Since v1.0.0 (#1985, correcting #1751) attestation is required by default on the <strong>HTTP direct-write surface only</strong>: unsigned <code>POST /api/v1/memories</code>(+<code>/bulk</code>) writes are rejected (<code>403 ATTESTATION_FAILED</code>) while MCP/CLI stay permissive, and they land <code>attest_level = "claimed"</code> only under the explicit opt-out <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code> — the default posture is now fail-closed. Restoring the permissive "trust-the-network" behavior (unsigned writes accepted as <code>claimed</code>) is operationally fine inside a controlled VPC, not fine for cross-tenant or cross-organization deployments.</li>
     </ul>
