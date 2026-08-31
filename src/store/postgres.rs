@@ -11669,6 +11669,77 @@ impl PostgresStore {
             .collect()
     }
 
+    /// #3041 pg-twin — would adding the lineage edge `source_id` ->
+    /// `target_id` (child -> parent) close a cycle in the provenance graph
+    /// P = {`derived_from`, `reflects_on`, `derives_from`}? Returns `true`
+    /// (REFUSE) iff `source_id` is ALREADY a lineage ancestor of `target_id`
+    /// — i.e. a path `target -> … -> source` over P edges already exists — so
+    /// the new edge would complete `source -> target -> … -> source`.
+    ///
+    /// This is the postgres structural twin of the sqlite
+    /// `db::lineage_would_close_cycle`, backing the EQUAL-instant arm of
+    /// [`Self::validate_link_pre_create_pg`] Pass 0. Before #3041 that pass
+    /// used a bare `target_at > source_at`, which on an EXACT tie was `false`
+    /// and ADMITTED the edge with NO structural check — while Pass 1 (the
+    /// `reflects_on` cycle gate) runs only for `reflects_on`, so
+    /// `derived_from` / `derives_from` equal-instant edges had NO backstop and
+    /// a 2-cycle (that sqlite structurally refuses) could form on postgres.
+    ///
+    /// COMPLETENESS + fail-CLOSED (parity with sqlite): the recursive-CTE walk
+    /// runs to [`crate::storage::LINEAGE_CYCLE_CHECK_MAX_DEPTH`] (far above the
+    /// read budget, so a pathologically deep equal-instant clique is still
+    /// resolved) and the `path` visited-set guarantees termination. Any sqlx
+    /// error OR a ceiling-truncated walk (which could hide a deeper cycle)
+    /// returns `true`: admitting a cycle-forming edge would corrupt the
+    /// single-node acyclicity invariant, whereas refusing merely reduces
+    /// function (North Star: degrade, never corrupt). The walk is purely
+    /// STRUCTURAL (follows edge ids, never re-compares `created_at`).
+    async fn lineage_would_close_cycle_pg(&self, source_id: &str, target_id: &str) -> bool {
+        let p_in_list = lineage_relation_in_list();
+        let ceiling = crate::storage::LINEAGE_CYCLE_CHECK_MAX_DEPTH;
+        let ceiling_i32 = i32::try_from(ceiling).unwrap_or(i32::MAX);
+        // Lean id-only twin of `lineage_cte` (ancestors direction: anchor =
+        // source_id, node = target_id). Same per-hop P filter and same
+        // `= ANY(path)` visited-set guard; aggregates to (found, max_depth).
+        let sql = format!(
+            "WITH RECURSIVE walk(node_id, depth, path) AS (
+                 SELECT ml.target_id, 1, ARRAY[ml.source_id, ml.target_id]::TEXT[]
+                 FROM memory_links ml
+                 WHERE ml.source_id = $1 AND ml.relation IN ({p_in_list})
+               UNION ALL
+                 SELECT ml.target_id, w.depth + 1, w.path || ml.target_id
+                 FROM memory_links ml
+                 JOIN walk w ON ml.source_id = w.node_id
+                 WHERE w.depth < $2 AND ml.relation IN ({p_in_list})
+                   AND NOT (ml.target_id = ANY(w.path))
+             )
+             SELECT COALESCE(bool_or(node_id = $3), false) AS found,
+                    COALESCE(max(depth), 0) AS max_depth
+             FROM walk"
+        );
+        match sqlx::query_as::<_, (bool, i32)>(&sql)
+            .bind(target_id)
+            .bind(ceiling_i32)
+            .bind(source_id)
+            .fetch_one(&self.pool)
+            .await
+        {
+            // Refuse on a hit OR on truncation: the CTE caps `depth < $2`, so
+            // a reached depth == the ceiling means the walk may have stopped
+            // short of a deeper `source` — treat as a positive (fail CLOSED).
+            Ok((found, max_depth)) => found || max_depth >= ceiling_i32,
+            Err(e) => {
+                // Fail CLOSED — a traversal error must never let a
+                // cycle-forming edge through (the #3041 pg fail-open class).
+                tracing::warn!(
+                    "lineage cycle-check walk failed; refusing edge \
+                     {source_id} -> {target_id}: {e}"
+                );
+                true
+            }
+        }
+    }
+
     /// v0.9.0 G13-mem (#1859) — Cypher (Apache AGE) lineage walk over the
     /// `memory_graph` projection. COND 5: the relation is peeled from the
     /// path's RELATIONSHIPS (`last(r).relation`, the `kg_query_cypher`
@@ -12165,11 +12236,18 @@ impl PostgresStore {
         // (postgres twin of the sqlite `validate_link_pre_create` Pass 0).
         // When the master flag is on and the relation is in the provenance
         // set P, reject a FORWARD (older -> newer) edge on a STRICT chrono
-        // `>` compare of the endpoints' `created_at` (COND 4: equal
-        // instants — a same-batch pair — are ALLOWED; an absent endpoint
-        // defers to `link_internal`'s FK pre-flight). Federation inbound
-        // (`apply_remote_link`) does not route through this gate, matching
-        // the sqlite `is_federation_import` bypass (clock skew).
+        // `>` compare of the endpoints' `created_at` (COND 4). An absent
+        // endpoint defers to `link_internal`'s FK pre-flight; federation
+        // inbound (`apply_remote_link`) does not route through this gate,
+        // matching the sqlite `is_federation_import` bypass (clock skew).
+        //
+        // #3041 pg-twin — on an EXACT tie (equal instant) wall-clock cannot
+        // order a same-batch pair, so a bare `target_at > source_at` was
+        // `false` and SILENTLY ADMITTED the edge with NO structural check —
+        // the fail-open twin of the sqlite #3041 fix. The EQUAL case now
+        // falls back to the bounded, fail-CLOSED structural ancestor walk
+        // (`lineage_would_close_cycle_pg`) and refuses ONLY the cycle-closing
+        // edge; a clean same-batch DAG edge is still admitted.
         if crate::config::lineage_dag_enabled() && link.relation.is_lineage() {
             let stamps: Vec<(String, chrono::DateTime<chrono::Utc>)> =
                 sqlx::query_as("SELECT id, created_at FROM memories WHERE id = $1 OR id = $2")
@@ -12186,18 +12264,30 @@ impl PostgresStore {
                 .iter()
                 .find(|(id, _)| *id == link.target_id)
                 .map(|(_, at)| *at);
-            if let (Some(source_at), Some(target_at)) = (source_at, target_at)
-                && target_at > source_at
-            {
-                return Err(StoreError::LinkRefused {
-                    // Byte-identical wire body to the sqlite guard (the
-                    // LINK_CYCLE_ERR_PREFIX envelope, HTTP 409).
-                    detail: crate::storage::StorageError::LinkReflectionCycle {
-                        source_id: link.source_id.clone(),
-                        target_id: link.target_id.clone(),
+            if let (Some(source_at), Some(target_at)) = (source_at, target_at) {
+                // Mirror the sqlite three-arm decision. The O(1) strict-instant
+                // fast paths are UNCHANGED: Greater -> reject the forward
+                // (older -> newer) edge; Less -> admit the proper child ->
+                // parent edge. Only the EQUAL-instant case changes (#3041).
+                let refuse = match target_at.cmp(&source_at) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Equal => {
+                        self.lineage_would_close_cycle_pg(&link.source_id, &link.target_id)
+                            .await
                     }
-                    .to_string(),
-                });
+                };
+                if refuse {
+                    return Err(StoreError::LinkRefused {
+                        // Byte-identical wire body to the sqlite guard (the
+                        // LINK_CYCLE_ERR_PREFIX envelope, HTTP 409).
+                        detail: crate::storage::StorageError::LinkReflectionCycle {
+                            source_id: link.source_id.clone(),
+                            target_id: link.target_id.clone(),
+                        }
+                        .to_string(),
+                    });
+                }
             }
         }
 
