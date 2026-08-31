@@ -256,7 +256,7 @@ impl CreateFieldError {
             label: if self.status == StatusCode::FORBIDDEN {
                 "forbidden"
             } else {
-                "validation failed"
+                crate::handlers::errors::VALIDATION_FAILED_LABEL
             },
             status: self.status,
             retryable: false,
