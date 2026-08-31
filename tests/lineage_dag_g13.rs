@@ -429,20 +429,20 @@ fn equal_instant_two_cycle_is_refused() {
     let conn = open_mem_db();
 
     let same = "2026-06-06T06:06:06+00:00";
-    let p = "00000000-0000-0000-0000-0000000003a1";
-    let q = "00000000-0000-0000-0000-0000000003a2";
-    db::insert(&conn, &make_mem(p, "p", "p", same)).unwrap();
-    db::insert(&conn, &make_mem(q, "q", "q", same)).unwrap();
+    let id_p = "00000000-0000-0000-0000-0000000003a1";
+    let id_q = "00000000-0000-0000-0000-0000000003a2";
+    db::insert(&conn, &make_mem(id_p, "p", "p", same)).unwrap();
+    db::insert(&conn, &make_mem(id_q, "q", "q", same)).unwrap();
 
     // First equal-instant edge is a legitimate same-batch DAG edge (child q
     // -> parent p); it must NOT be false-rejected.
-    db::create_link(&conn, q, p, "derived_from")
+    db::create_link(&conn, id_q, id_p, "derived_from")
         .expect("first equal-instant lineage edge must be admitted");
 
     // The REVERSE edge would close a 2-cycle p -> q -> p. Before #3041 the
     // strict `>` admitted it (equal instants => not "forward"); it must now
     // be refused with the cycle envelope.
-    let cycle_err = db::create_link(&conn, p, q, "derived_from")
+    let cycle_err = db::create_link(&conn, id_p, id_q, "derived_from")
         .expect_err("equal-instant reverse edge closes a 2-cycle and must be refused");
     assert!(
         cycle_err.to_string().starts_with(db::LINK_CYCLE_ERR_PREFIX),
@@ -458,7 +458,7 @@ fn equal_instant_two_cycle_is_refused() {
              WHERE relation = 'derived_from' \
                AND ((source_id = ?1 AND target_id = ?2) \
                  OR (source_id = ?2 AND target_id = ?1))",
-            [p, q],
+            [id_p, id_q],
             |r| r.get(0),
         )
         .expect("count pair edges");
@@ -467,20 +467,20 @@ fn equal_instant_two_cycle_is_refused() {
     // Legitimate same-instant DAG construction is preserved: a fan-out from
     // one child to two parents (all sharing the instant) forms no cycle and
     // must be admitted, and a non-cycle-closing chain edge likewise.
-    let a = "00000000-0000-0000-0000-0000000003b1";
-    let b = "00000000-0000-0000-0000-0000000003b2";
-    let c = "00000000-0000-0000-0000-0000000003b3";
-    db::insert(&conn, &make_mem(a, "a", "a", same)).unwrap();
-    db::insert(&conn, &make_mem(b, "b", "b", same)).unwrap();
-    db::insert(&conn, &make_mem(c, "c", "c", same)).unwrap();
-    db::create_link(&conn, a, b, "derived_from")
+    let id_a = "00000000-0000-0000-0000-0000000003b1";
+    let id_b = "00000000-0000-0000-0000-0000000003b2";
+    let id_c = "00000000-0000-0000-0000-0000000003b3";
+    db::insert(&conn, &make_mem(id_a, "a", "a", same)).unwrap();
+    db::insert(&conn, &make_mem(id_b, "b", "b", same)).unwrap();
+    db::insert(&conn, &make_mem(id_c, "c", "c", same)).unwrap();
+    db::create_link(&conn, id_a, id_b, "derived_from")
         .expect("same-instant fan-out edge a -> b is a valid DAG edge");
-    db::create_link(&conn, a, c, "derived_from")
+    db::create_link(&conn, id_a, id_c, "derived_from")
         .expect("same-instant fan-out edge a -> c is a valid DAG edge");
-    db::create_link(&conn, b, c, "derived_from")
+    db::create_link(&conn, id_b, id_c, "derived_from")
         .expect("same-instant chain edge b -> c is a valid DAG edge (no back-edge)");
     // But closing the a -> b -> c -> a triangle is refused.
-    let tri_err = db::create_link(&conn, c, a, "derived_from")
+    let tri_err = db::create_link(&conn, id_c, id_a, "derived_from")
         .expect_err("closing the same-instant a -> b -> c -> a cycle must be refused");
     assert!(tri_err.to_string().starts_with(db::LINK_CYCLE_ERR_PREFIX));
 }

@@ -219,7 +219,7 @@ async fn pg_archive_by_ids_sever_emits_signed_severed_event_3290() {
     cleanup(&store, &[&victim_ns]).await;
 }
 
-/// Parity of the NO-OP path: deleting a memory that is NObody's standard must
+/// Parity of the NO-OP path: deleting a memory that is nobody's standard must
 /// emit NO severance event — byte-identical to the pre-#2503 no-op and to the
 /// sqlite twin's early `Ok(0)` return.
 #[tokio::test]
