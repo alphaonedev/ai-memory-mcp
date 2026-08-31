@@ -19636,7 +19636,11 @@ pub fn set_namespace_standard(
             }
             Some(p.to_string())
         }
-        None => auto_detect_parent(conn, namespace),
+        // #3188 — a DB fault mid-walk now PROPAGATES (fail-closed) instead of
+        // being swallowed into "no parent": binding a rootless (ungoverned)
+        // namespace on a transient fault would silently drop governance
+        // inheritance. Refuse the write rather than persist a wrong chain.
+        None => auto_detect_parent(conn, namespace)?,
     };
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
@@ -19650,23 +19654,44 @@ pub fn set_namespace_standard(
 
 /// Auto-detect parent namespace by `-` prefix.
 /// "ai-memory-tests" → checks "ai-memory" → checks "ai" → first match wins.
-fn auto_detect_parent(conn: &Connection, namespace: &str) -> Option<String> {
+///
+/// # Errors
+///
+/// #3188 — FAIL-CLOSED. A genuine DB/IO fault while probing a candidate
+/// PROPAGATES rather than being swallowed into "this candidate has no
+/// standard". The old `get_namespace_standard(..).ok().flatten()` conflated
+/// three outcomes — no row, a severed (NULL `standard_id`) row, and a DB
+/// fault — all into `None`, so a transient `SQLITE_BUSY`/IO error would make
+/// the walk skip a governing ancestor and bind the namespace as an
+/// ungoverned ROOT (a fail-OPEN governance hole). A missing/severed row still
+/// means "no standard here → keep walking"; only a real fault errors, which
+/// makes [`set_namespace_standard`] refuse the write (fail-closed) instead of
+/// persisting a wrong inheritance chain. The postgres twin
+/// (`pg_auto_detect_parent` in `src/store/postgres.rs`) uses the identical
+/// probe so both backends resolve the SAME parent for `parent = None`.
+fn auto_detect_parent(conn: &Connection, namespace: &str) -> Result<Option<String>> {
     let mut candidate = namespace.to_string();
     while let Some(pos) = candidate.rfind('-') {
         candidate.truncate(pos);
         if candidate.is_empty() {
             break;
         }
-        // Check if this candidate has a standard set
-        if get_namespace_standard(conn, &candidate)
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            return Some(candidate);
+        // Does this candidate have a standard bound? A present row with a
+        // non-NULL `standard_id` is a match (keep semantics identical to the
+        // former `get_namespace_standard(..).is_some()` probe: a severed NULL
+        // row is NOT a standard). `QueryReturnedNoRows` → keep walking; any
+        // other rusqlite error is a genuine fault and PROPAGATES (fail-closed).
+        match conn.query_row(
+            "SELECT 1 FROM namespace_meta WHERE namespace = ?1 AND standard_id IS NOT NULL",
+            params![candidate],
+            |_| Ok(()),
+        ) {
+            Ok(()) => return Ok(Some(candidate)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(anyhow::Error::new(e)),
         }
     }
-    None
+    Ok(None)
 }
 
 /// Get the standard memory ID for a namespace.
@@ -21729,6 +21754,98 @@ mod tests {
 
     fn test_db() -> Connection {
         open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    /// #3188 — minimal standard memory for the namespace parent-detection tests.
+    fn std_memory_3188(id: &str, namespace: &str) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        Memory {
+            id: id.to_string(),
+            tier: Tier::Long,
+            namespace: namespace.to_string(),
+            title: format!("std-{id}"),
+            content: "policy".to_string(),
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            ..Memory::default()
+        }
+    }
+
+    /// #3188 — `auto_detect_parent` walks the `-`-prefix ancestors and returns
+    /// the first that has a standard bound: `ai-memory-tests` auto-detects
+    /// `ai-memory` once `ai-memory` has a standard.
+    #[test]
+    fn auto_detect_parent_finds_prefix_ancestor_3188() {
+        let conn = test_db();
+        let sid = "std-ai-memory-3188";
+        insert(&conn, &std_memory_3188(sid, "ai-memory")).unwrap();
+        set_namespace_standard(&conn, "ai-memory", sid, None).unwrap();
+
+        let detected = auto_detect_parent(&conn, "ai-memory-tests")
+            .expect("probe must not fault on a healthy DB");
+        assert_eq!(
+            detected.as_deref(),
+            Some("ai-memory"),
+            "the `-`-prefix ancestor with a bound standard must be detected"
+        );
+    }
+
+    /// #3188 — no ancestor has a standard → `Ok(None)` (a genuine no-parent
+    /// result, DISTINCT from a fault; the walk must not fabricate a parent).
+    #[test]
+    fn auto_detect_parent_none_when_no_ancestor_bound_3188() {
+        let conn = test_db();
+        let detected = auto_detect_parent(&conn, "orphan-child")
+            .expect("a healthy DB with no matching ancestor is Ok(None), not Err");
+        assert!(
+            detected.is_none(),
+            "no bound ancestor → no inferred parent, got {detected:?}"
+        );
+    }
+
+    /// #3188 (FAIL-CLOSED, North-Star) — a DB fault during the parent probe
+    /// must PROPAGATE, not be swallowed into "no parent". Pre-fix the
+    /// `get_namespace_standard(..).ok().flatten()` shape turned any rusqlite
+    /// fault into `None`, so the walk skipped a governing ancestor and the
+    /// namespace was bound as an ungoverned ROOT (a fail-OPEN governance hole,
+    /// ERRORS-19). Simulate a substrate fault by removing the table the walk
+    /// probes: old code returned `Ok(None)`; the fixed code returns `Err`.
+    #[test]
+    fn auto_detect_parent_fails_closed_on_db_fault_3188() {
+        let conn = test_db();
+        conn.execute_batch("DROP TABLE namespace_meta;").unwrap();
+        let result = auto_detect_parent(&conn, "ai-memory-tests");
+        assert!(
+            result.is_err(),
+            "a DB fault in the parent probe must fail closed (Err), got {result:?}"
+        );
+    }
+
+    /// #3188 (cross-backend parity — sqlite half) — `set_namespace_standard`
+    /// with `parent = None` on a `-`-prefixed child binds the INFERRED parent
+    /// into `namespace_meta.parent_namespace`. The postgres twin
+    /// (`tests/ns_standard_parent_parity_3188_pg.rs`) asserts the identical
+    /// bind, so both backends resolve the SAME governance-inheritance chain.
+    #[test]
+    fn set_standard_parent_none_binds_inferred_parent_3188() {
+        let conn = test_db();
+        let parent_sid = "std-team-3188";
+        let child_sid = "std-team-eng-3188";
+        insert(&conn, &std_memory_3188(parent_sid, "team")).unwrap();
+        insert(&conn, &std_memory_3188(child_sid, "team-eng")).unwrap();
+
+        set_namespace_standard(&conn, "team", parent_sid, None).unwrap();
+        // No explicit parent — must auto-detect `team`.
+        set_namespace_standard(&conn, "team-eng", child_sid, None).unwrap();
+
+        assert_eq!(
+            get_namespace_parent(&conn, "team-eng").as_deref(),
+            Some("team"),
+            "parent=None must bind the inferred `-`-prefix parent, not a NULL root"
+        );
     }
 
     #[test]

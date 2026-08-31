@@ -17069,6 +17069,48 @@ async fn record_schema_version(
     Ok(())
 }
 
+/// #3188 — postgres twin of `crate::storage::auto_detect_parent`. Walks the
+/// `-`-truncated ancestors of `namespace` ("ai-memory-tests" → "ai-memory" →
+/// "ai") and returns the FIRST ancestor that has a namespace standard bound (a
+/// `namespace_meta` row with a non-NULL `standard_id`), or `None` when none do.
+/// Both backends run the byte-identical prefix walk and the identical
+/// "row exists with non-NULL `standard_id`" match predicate, so
+/// `set_namespace_standard(.., parent = None)` binds the SAME
+/// `parent_namespace` on sqlite and postgres.
+///
+/// # Errors
+///
+/// FAIL-CLOSED (parity with the sqlite twin): a genuine DB fault while probing
+/// a candidate PROPAGATES as [`StoreError`] rather than being swallowed into
+/// "this candidate has no standard". Swallowing a transient fault would skip a
+/// governing ancestor and bind the namespace as an ungoverned ROOT — a
+/// fail-OPEN governance hole. A candidate with no row (or a severed NULL row)
+/// is simply "no standard here → keep walking".
+async fn pg_auto_detect_parent(
+    pool: &sqlx::PgPool,
+    namespace: &str,
+) -> StoreResult<Option<String>> {
+    let mut candidate = namespace.to_string();
+    while let Some(pos) = candidate.rfind('-') {
+        candidate.truncate(pos);
+        if candidate.is_empty() {
+            break;
+        }
+        let found = sqlx::query(
+            "SELECT 1 FROM namespace_meta WHERE namespace = $1 AND standard_id IS NOT NULL",
+        )
+        .bind(candidate.as_str())
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| to_store_err("set_namespace_standard auto_detect_parent", e))?
+        .is_some();
+        if found {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
 /// v0.7.0 H10 — transaction-bound twin of
 /// [`PostgresStore::build_namespace_chain`]. Reads every
 /// `namespace_meta.parent_namespace` lookup through the supplied tx so
@@ -24072,6 +24114,21 @@ impl MemoryStore for PostgresStore {
                 detail: "namespace cannot be its own parent".to_string(),
             });
         }
+        // #3188 — CROSS-BACKEND PARITY. When the caller declares no parent,
+        // resolve the '-'-prefix ancestor EXACTLY as the sqlite twin
+        // (`db::set_namespace_standard` → `db::auto_detect_parent`) so both
+        // backends bind the SAME `parent_namespace`. Governance inheritance is
+        // resolved by walking `namespace_meta.parent_namespace`
+        // (`build_namespace_chain` / `pg_namespace_standard_owner_in_tx`), so a
+        // divergent bound parent means divergent governance: pre-#3188 pg bound
+        // NULL here, making e.g. `team-eng` an ungoverned ROOT on postgres while
+        // the sqlite twin inherited `team`'s standard. `pg_auto_detect_parent`
+        // FAILS CLOSED on a DB fault (it does not swallow the error into "no
+        // parent"), matching the sqlite `auto_detect_parent` contract.
+        let resolved_parent: Option<String> = match parent {
+            Some(p) => Some(p.to_string()),
+            None => pg_auto_detect_parent(&self.pool, namespace).await?,
+        };
         sqlx::query(
             "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
              VALUES ($1, $2, NOW(), $3)
@@ -24082,7 +24139,7 @@ impl MemoryStore for PostgresStore {
         )
         .bind(namespace)
         .bind(standard_id)
-        .bind(parent)
+        .bind(resolved_parent.as_deref())
         .execute(&self.pool)
         .await
         .map_err(|e| to_store_err("set_namespace_standard", e))?;
