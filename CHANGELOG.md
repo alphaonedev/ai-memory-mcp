@@ -122,6 +122,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `migrations/sqlite/0078_v94_lifecycle_state_index.sql`; Postgres twin:
   `PostgresStore::migrate_v94` / `migrations/postgres/0051_v94_lifecycle_state_index.sql`.
 
+### Fixed (#3071 — `/memories/bulk` returned 403 ATTESTATION_FAILED for a secret single-create refuses as 400)
+
+- **Secret-in-content now yields the SAME refusal class on `/memories/bulk` as
+  on single-create.** Single-create runs the caller-origin secret screen
+  (`validate_content` → `screen_for_caller`) BEFORE the agent-attestation gate,
+  so a row carrying credential material is refused `400` (secret-screen).
+  `bulk_create` consulted the whole-batch attestation presence gate FIRST, so
+  the SAME secret in an UNSIGNED row (under required-attestation) was refused
+  `403 ATTESTATION_FAILED` purely because the write arrived in a batch. The
+  bulk path now screens every row for credential material AHEAD of the
+  attestation gate: a secret-bearing row is refused with the `400` secret-screen
+  class (signed or not), is excluded from the whole-batch attestation gate, and
+  is skipped in the Stage-1 revalidation loop (never double-counted). Fail-closed
+  is preserved — the row is refused and never persisted — and a NON-secret
+  unsigned row still fails the attestation gate (`403`). Inert when the secret
+  screen is not in `refuse` mode. Regression coverage:
+  `tests/bulk_secret_screen_order_3071.rs`.
+
 ### Fixed (CI — `cargo test --lib` RED: two inline capability tests still asserted pre-#3111 flip-Deny, #3111 follow-up)
 
 - **#3111 follow-up (CI / test-only) — the Per-Module Coverage `cargo test
