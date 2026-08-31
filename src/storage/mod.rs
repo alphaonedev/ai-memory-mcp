@@ -8708,19 +8708,85 @@ fn lineage_edge_is_forward(conn: &Connection, source_id: &str, target_id: &str) 
 /// Because every cross-instant P edge strictly decreases `created_at`
 /// (enforced by [`lineage_edge_is_forward`]'s wall-clock arms), any such
 /// pre-existing path from an equal-instant `target` back to an equal-instant
-/// `source` is confined to that one instant's clique; a bounded ancestor walk
-/// to [`LINEAGE_MAX_DEPTH`] is therefore both sufficient and complete for the
-/// equal-instant case this backs.
+/// `source` is CONFINED to that one instant's clique.
 ///
-/// Fails CLOSED: any traversal error returns `true` (refuse the edge), since
-/// admitting a cycle-forming edge would corrupt the single-node acyclicity
-/// invariant whereas refusing merely reduces function (North Star: degrade,
-/// never corrupt).
+/// #3041 completeness — confinement is NOT diameter. An equal-instant clique
+/// can pathologically hold a chain longer than [`LINEAGE_MAX_DEPTH`] (= 5)
+/// hops, so the earlier walk to that read budget could TRUNCATE before
+/// reaching `source` and read "no cycle", silently admitting a >5-hop
+/// equal-instant cycle (the fail-open this closes). The walk now runs to the
+/// dedicated [`LINEAGE_CYCLE_CHECK_MAX_DEPTH`] safety ceiling (far above any
+/// real chain) and, critically, treats a ceiling-truncated walk as a
+/// POSITIVE — see [`lineage_ancestor_reachable`].
+///
+/// Fails CLOSED: any traversal error OR a truncated walk returns `true`
+/// (refuse the edge), since admitting a cycle-forming edge would corrupt the
+/// single-node acyclicity invariant whereas refusing merely reduces function
+/// (North Star: degrade, never corrupt).
 fn lineage_would_close_cycle(conn: &Connection, source_id: &str, target_id: &str) -> bool {
-    match lineage_ancestors(conn, target_id, LINEAGE_MAX_DEPTH) {
-        Ok(ancestors) => ancestors.iter().any(|node| node.id == source_id),
+    match lineage_ancestor_reachable(conn, target_id, source_id, LINEAGE_CYCLE_CHECK_MAX_DEPTH) {
+        Ok(refuse) => refuse,
         Err(_) => true,
     }
+}
+
+/// #3041 completeness — is `needle_id` reachable as a lineage ancestor of
+/// `root_id` (a path `root -> … -> needle` over the provenance set P) within
+/// `max_depth` hops? Returns `Ok(true)` to REFUSE the would-be edge — either
+/// because `needle` WAS found, or because the walk hit `max_depth` and could
+/// therefore be hiding a deeper path (fail CLOSED on truncation, so a cycle
+/// can never be admitted on a silently-truncated "not found" read).
+///
+/// This is a lean, id-only twin of [`lineage_traverse`]: same per-hop P
+/// filter and same `json_each(path)` visited-set cycle guard (which alone
+/// guarantees termination — no path revisits a node — so `max_depth` is a
+/// pure safety valve, not a correctness bound), but it resolves no cids and
+/// aggregates to just `(found, max_depth_reached)`. The walk is purely
+/// STRUCTURAL (it follows edge ids, never re-compares `created_at`), so it is
+/// immune to mixed rfc3339 representation of the same instant.
+///
+/// # Errors
+///
+/// Propagates `rusqlite` errors so the caller ([`lineage_would_close_cycle`])
+/// can fail CLOSED.
+fn lineage_ancestor_reachable(
+    conn: &Connection,
+    root_id: &str,
+    needle_id: &str,
+    max_depth: usize,
+) -> rusqlite::Result<bool> {
+    // Per-hop P predicate from the typed SSOT (M-STRONG-TYPES); the values are
+    // compile-time enum strings, so the interpolation carries no injection
+    // surface (identical construction to `lineage_traverse`).
+    let p_in_list = crate::models::MemoryLinkRelation::LINEAGE
+        .iter()
+        .map(|r| format!("'{}'", r.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let max_depth_i64 = i64::try_from(max_depth).unwrap_or(i64::MAX);
+    let sql = format!(
+        "WITH RECURSIVE walk(node_id, depth, path) AS (\
+            SELECT ml.target_id, 1, json_array(ml.source_id, ml.target_id) \
+            FROM memory_links ml \
+            WHERE ml.source_id = ?1 AND ml.relation IN ({p_in_list}) \
+            UNION ALL \
+            SELECT ml.target_id, w.depth + 1, \
+                   json_insert(w.path, '$[' || json_array_length(w.path) || ']', ml.target_id) \
+            FROM memory_links ml \
+            JOIN walk w ON ml.source_id = w.node_id \
+            WHERE w.depth < ?2 AND ml.relation IN ({p_in_list}) \
+              AND NOT EXISTS (SELECT 1 FROM json_each(w.path) WHERE value = ml.target_id)\
+         ) \
+         SELECT COALESCE(MAX(node_id = ?3), 0), COALESCE(MAX(depth), 0) FROM walk",
+    );
+    conn.query_row(&sql, params![root_id, max_depth_i64, needle_id], |r| {
+        let found: i64 = r.get(0)?;
+        let max_depth_reached: i64 = r.get(1)?;
+        // Refuse on a hit OR on truncation: the CTE caps `depth < ?2`, so a
+        // reached depth == the ceiling means the walk may have stopped short
+        // of a deeper `needle` — treat as a positive (fail CLOSED).
+        Ok(found == 1 || max_depth_reached >= max_depth_i64)
+    })
 }
 
 /// v0.7.0 fix-campaign A3 (LINK-PARITY) — shared pre-create validator
@@ -12206,6 +12272,25 @@ pub fn kg_query(
 /// v0.9.0 G13-mem (#1859) — depth ceiling for a lineage-DAG walk. Reuses
 /// the [`kg_query`] reachability budget so both traversals share one bound.
 pub const LINEAGE_MAX_DEPTH: usize = KG_QUERY_MAX_SUPPORTED_DEPTH;
+
+/// #3041 completeness — depth ceiling for the equal-instant lineage cycle
+/// check ([`lineage_would_close_cycle`]), DELIBERATELY much larger than the
+/// general read budget [`LINEAGE_MAX_DEPTH`] (= 5).
+///
+/// The equal-instant cycle proof confines any cycle to one instant's clique,
+/// but that argues CONFINEMENT, not DIAMETER: a pathological equal-instant
+/// provenance chain `a1 -> a2 -> … -> aN` (all sharing the instant) followed
+/// by `aN -> a1` can exceed 5 hops, and a cycle-check walk truncated at
+/// [`LINEAGE_MAX_DEPTH`] would read "no cycle" and SILENTLY ADMIT the
+/// cycle-closing edge — the fail-open this constant closes.
+///
+/// The recursive-CTE `path` visited-set already guarantees termination
+/// independent of depth (no path revisits a node), so this bound is a pure
+/// fail-CLOSED safety valve, NOT a completeness limit: if a walk ever reaches
+/// it, the edge is REFUSED rather than admitted on a truncated read (North
+/// Star: degrade, never corrupt). 256 sits far above any real provenance
+/// chain while keeping the bounded walk trivially cheap.
+pub const LINEAGE_CYCLE_CHECK_MAX_DEPTH: usize = 256;
 
 /// Direction of a [`lineage_traverse`] walk over the provenance subset
 /// P = {`derived_from`, `reflects_on`, `derives_from`}.

@@ -32,6 +32,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/perf_1579_postgres_backfill_tsv.rs`, which simulates a crash right after
   the v93 commit and asserts `MAX(version) == 93` (not 94), then that replay
   advances to v94 and creates `idx_memories_lifecycle_state`.
+### Security (#3041 pg-twin — postgres admitted an EQUAL-`created_at` lineage 2-cycle the sqlite guard structurally refuses; both backends could admit a >5-hop equal-instant cycle)
+
+- **Two linked cross-backend defects in the lineage-DAG (provenance) acyclicity
+  guard let a cycle form in the single-node provenance graph P**
+  (`derived_from` / `derives_from` / `reflects_on`) (refs
+  [#3041](https://github.com/alphaonedev/ai-memory-mcp/issues/3041); SECURITY /
+  data-integrity, GA-blocker). **DEFECT 1 (postgres fail-OPEN):** the postgres
+  Pass-0 guard (`validate_link_pre_create_pg`) compared endpoints with a bare
+  `target_at > source_at`, which on an EXACT tie (a same-batch pair minted under
+  one `Utc::now()`) was `false` and ADMITTED the edge with NO structural check.
+  Pass 1 (the structural cycle gate) runs only for `reflects_on`, so a
+  `derived_from` / `derives_from` equal-instant edge had NO backstop and a
+  2-cycle could form on postgres that the sqlite guard structurally refuses
+  (`promote_to_namespace` mints `derived_from` edges → in scope). **DEFECT 2
+  (completeness gap on BOTH backends):** the equal-instant structural check
+  (`lineage_would_close_cycle`) walked the ancestor set only to
+  `LINEAGE_MAX_DEPTH` (= 5) and read a silently-truncated "no cycle" as admit, so
+  an equal-instant chain longer than 5 hops (`a1 → … → a7`, then `a7 → a1`)
+  escaped the walk and its cycle-closing edge was admitted even on sqlite.
+  **Fix:** the postgres Equal-instant case now runs a structural async
+  ancestor-walk twin (`lineage_would_close_cycle_pg`, a lean id-only recursive
+  CTE mirroring `lineage_cte`) and refuses the edge iff the source is already a
+  lineage ancestor of the target — byte-identical `LinkReflectionCycle` /
+  `LINK_CYCLE_ERR_PREFIX` refusal envelope (HTTP 409) as sqlite; the O(1)
+  strict-instant fast paths (Greater → reject, Less → allow) are unchanged. Both
+  backends' equal-instant walk now runs to the dedicated
+  `LINEAGE_CYCLE_CHECK_MAX_DEPTH` (256) ceiling — far above any real
+  equal-instant clique, and, since the recursive-CTE visited-set already
+  guarantees termination, a pure fail-CLOSED safety valve: a hit OR a
+  ceiling-truncated walk OR any traversal error REFUSES the edge, so a cycle can
+  never be admitted on a truncated read (North Star: degrade, never corrupt). No
+  schema change. Covered by the cross-backend regression
+  `tests/acyclicity_equal_instant_3041.rs` (both backends refuse an equal-instant
+  2-cycle AND a >5-hop equal-instant clique cycle, on sqlite and live postgres).
 
 ### Security (#3281 — `invalidate_link`'s audit `payload_hash` diverged between sqlite and postgres for a caller-supplied `valid_until`)
 
