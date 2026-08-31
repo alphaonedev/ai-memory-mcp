@@ -3,7 +3,7 @@
 
 //! ARCH-8 (FX-C4-batch2, 2026-05-26) — per-migration metadata matrix.
 //!
-//! The substrate ships a 92-step migration ladder (v2 → v93) whose
+//! The substrate ships a 93-step migration ladder (v2 → v94) whose
 //! "reversible? data-loss-risk? idempotent?" contract an operator needs
 //! BEFORE they plan a rollback — restore-from-backup is the only
 //! fallback for an irreversible arm, and they must know which arms
@@ -398,6 +398,15 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // (no pre-existing row is rewritten), no data loss. Postgres twin is
     // `PostgresStore::migrate_v93`.
     meta(93, "TOKEN_COST_COUNTERS", true, true, NoLoss, Sqlite),
+    // v94 (#3324, #3266 MVG, v1.0.0) — LIFECYCLE_STATE INDEX. Additive
+    // `idx_memories_lifecycle_state` supporting the system-only (hidden)
+    // lifecycle-state listings, shipped with the new `contaminated`
+    // auto-propagated invalidation-taint vocabulary (the value itself is
+    // migration-free — no column/CHECK change). `IF NOT EXISTS`-idempotent,
+    // reversible (revert is DROP INDEX), NoLoss. Literal tail: MUST equal
+    // CURRENT_SCHEMA_VERSION. Slots after #3323's settled v93. Postgres twin
+    // is `PostgresStore::migrate_v94`.
+    meta(94, "LIFECYCLE_STATE_INDEX", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

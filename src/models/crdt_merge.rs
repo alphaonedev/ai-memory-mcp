@@ -952,6 +952,42 @@ mod tests {
     }
 
     #[test]
+    fn merge_memory_contaminated_state_participates_in_lww() {
+        // v1.0.0 #3324 — the auto-propagated `Contaminated` taint is carried
+        // by the generic lifecycle_state LWW (like every other state, it is
+        // "not in the design table" — merged last-writer-wins per #224). A
+        // newer contaminated stamp WINS over an older visible state, so the
+        // taint converges across replicas; conversely a genuinely newer
+        // deliberate edit can clear it (the reversibility the North Star
+        // requires). Both directions are pinned here.
+        let mut older_open = base("a", "2026-06-16T00:00:00+00:00");
+        older_open.lifecycle_state = LifecycleState::Open;
+        let mut newer_contaminated = base("a", "2026-06-16T09:00:00+00:00");
+        newer_contaminated.lifecycle_state = LifecycleState::Contaminated;
+
+        // Newer taint wins regardless of argument order (convergence).
+        assert_eq!(
+            merge_memory(&older_open, &newer_contaminated).lifecycle_state,
+            LifecycleState::Contaminated
+        );
+        assert_eq!(
+            merge_memory(&newer_contaminated, &older_open).lifecycle_state,
+            LifecycleState::Contaminated
+        );
+
+        // A strictly-newer deliberate state supersedes an older taint (a taint
+        // is not a permanent sink — it is undoable).
+        let mut older_contaminated = base("a", "2026-06-16T00:00:00+00:00");
+        older_contaminated.lifecycle_state = LifecycleState::Contaminated;
+        let mut newer_open = base("a", "2026-06-16T09:00:00+00:00");
+        newer_open.lifecycle_state = LifecycleState::Open;
+        assert_eq!(
+            merge_memory(&older_contaminated, &newer_open).lifecycle_state,
+            LifecycleState::Open
+        );
+    }
+
+    #[test]
     fn merge_memory_lww_tie_breaks_on_id_deterministically() {
         // Same updated_at; the lexically-greater id wins the tiebreak.
         let mut low = base("a", "2026-06-16T00:00:00+00:00");

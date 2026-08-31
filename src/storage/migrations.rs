@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 93).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 94).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -894,7 +894,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 93;
+const CURRENT_SCHEMA_VERSION: i64 = 94;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -919,7 +919,7 @@ const CURRENT_SCHEMA_VERSION: i64 = 93;
 ///
 /// # Why 100_000
 ///
-/// The ladder tip is `93` after the ENTIRE project history (single-digit
+/// The ladder tip is `94` after the ENTIRE project history (single-digit
 /// growth per release), so 100,000 is on the order of a thousand
 /// product-lifetimes of schema evolution — permanently unreachable by a real
 /// ladder, which keeps the ceiling from ever rejecting a legitimate future
@@ -1657,6 +1657,18 @@ const MIGRATION_V91_SQLITE: &str =
 // `schema_version_ceiling_ssot_2555`).
 const MIGRATION_V92_SQLITE: &str =
     include_str!("../../migrations/sqlite/0076_v92_schema_version_bound.sql");
+
+// v94 (#3324, #3266 MVG, v1.0.0) — LIFECYCLE_STATE INDEX. Additive
+// `idx_memories_lifecycle_state` supporting the system-only (hidden) state
+// listings that filter `WHERE lifecycle_state = ?` (`list_quarantined`, the
+// operator/curator review of contaminated / tombstoned / quarantined rows).
+// Ships with the new `contaminated` lifecycle vocabulary (auto-propagated
+// downstream of an invalidated root); the vocabulary itself is migration-free
+// (no column/CHECK change). `IF NOT EXISTS`-idempotent, additive, reversible.
+// Slots after #3323's settled v93 token-cost arm. The postgres twin is
+// `PostgresStore::migrate_v94`.
+const MIGRATION_V94_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0078_v94_lifecycle_state_index.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -4138,7 +4150,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 93 {
             // v93 (#3323, v1.0.0) — PER-LINEAGE + PER-NAMESPACE TOKEN/COST
             // ACCOUNTING. Adds the standalone advisory `token_cost_counters`
             // relation so a runaway atomisation/reflection cascade shows a
@@ -4158,6 +4170,37 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 "v93 doc twin must ship the token_cost_counters DDL"
             );
             conn.execute_batch(crate::cost::MIGRATION_V93_SQLITE)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v94 (#3324, #3266 MVG, v1.0.0) — LIFECYCLE_STATE INDEX. Ships
+            // alongside the new `contaminated` lifecycle vocabulary (the state
+            // auto-propagated DOWNSTREAM over the provenance DAG when a root
+            // memory is invalidated — see
+            // `crate::storage::stamp_contaminated_descendants`). Slots AFTER
+            // #3323's settled v93 token-cost arm (this MVG piece rebased onto
+            // it; #3323 took v93 first).
+            //
+            // The `contaminated` value itself needs NO column/CHECK change: it
+            // round-trips on the existing `lifecycle_state TEXT NOT NULL
+            // DEFAULT 'open'` column, and transition legality is a SAL-layer
+            // gate (`LifecycleState::can_transition_to` /
+            // `validate_lifecycle_state`), never a SQL CHECK — so a new state
+            // is deliberately migration-free at the column level (the #1709 /
+            // #1948 precedent). What this arm DOES add is the supporting index
+            // for the SYSTEM-ONLY (hidden) state listings: `list_quarantined`
+            // and the operator/curator reviews of contaminated / tombstoned /
+            // quarantined rows filter `WHERE lifecycle_state = ?`, a
+            // high-selectivity lookup that scanned the whole `memories` table
+            // pre-v94. Additive, `IF NOT EXISTS`-idempotent, reversible
+            // (a plain index — revert is DROP INDEX), NoLoss, and no full-table
+            // rebuild (the v63/v65 trigger-recreation lesson does not arise).
+            // Doc twin: migrations/sqlite/0078_v94_lifecycle_state_index.sql.
+            debug_assert!(
+                MIGRATION_V94_SQLITE.contains("idx_memories_lifecycle_state"),
+                "v94 doc twin must ship the lifecycle_state index DDL"
+            );
+            conn.execute_batch(MIGRATION_V94_SQLITE)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on

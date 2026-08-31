@@ -12285,6 +12285,164 @@ pub fn transitive_suspects(
     lineage_descendants(conn, root_id, max_depth)
 }
 
+/// v1.0.0 #3324 (#3266 MVG) — metadata object key under which the
+/// [`stamp_contaminated_descendants`] auto-stamp records the taint provenance
+/// on each stamped row. Its `prior_lifecycle_state` sub-key is the
+/// REVERSIBILITY anchor: a future `swarm_rewind` reads it to restore the exact
+/// state the row held before it was contaminated.
+pub const CONTAMINATION_METADATA_KEY: &str = "contamination";
+
+/// v1.0.0 #3324 — outcome of one [`stamp_contaminated_descendants`] sweep.
+///
+/// `stamped` is the number of rows this call moved INTO
+/// [`crate::models::LifecycleState::Contaminated`]. `already_contaminated` and
+/// `skipped_system_only` are the two idempotent/fail-closed skip classes (a
+/// re-run of an already-stamped subtree reports `stamped == 0`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContaminationStampReport {
+    /// The invalidated root whose downstream lineage was swept.
+    pub root_id: String,
+    /// Rows newly moved into `Contaminated` by THIS call.
+    pub stamped: usize,
+    /// Descendants already `Contaminated` — left untouched (idempotency).
+    pub already_contaminated: usize,
+    /// Descendants in a stronger system-only state (`Tombstoned` /
+    /// `Quarantined`) — deliberately left untouched (fail-closed,
+    /// non-destructive: a logical-delete / quarantine posture is never
+    /// downgraded to a taint).
+    pub skipped_system_only: usize,
+}
+
+/// v1.0.0 #3324 (#3266 MVG) — AUTO-PROPAGATE the
+/// [`crate::models::LifecycleState::Contaminated`] taint DOWNSTREAM from an
+/// invalidated root: every record transitively derived from `root_id` over the
+/// provenance subset P ([`crate::models::MemoryLinkRelation::LINEAGE`] =
+/// `derived_from` / `reflects_on` / `derives_from`) is stamped `Contaminated`
+/// in ONE transaction.
+///
+/// This is the transactional WRITE promotion of the read-only
+/// [`transitive_suspects`] walk (R55 #1959): where that surface only REPORTED
+/// the suspect set for a human to act on, this one STAMPS it so a suspect
+/// source structurally hides every derivation from ordinary recall the moment
+/// the root is invalidated (the #3266 MVG: "not a query the human must
+/// remember to run"). `root_id` itself is NOT stamped — it is invalidated by
+/// its own path (e.g. the `supersedes` edge); only its DESCENDANTS are tainted.
+///
+/// # Data-integrity properties (North Star)
+///
+/// * **Atomic** — the whole sweep runs under one transaction; either every
+///   eligible descendant is stamped or none is. A mid-sweep failure rolls the
+///   entire stamp back, so recall never observes a half-tainted subtree.
+/// * **Bounded + cycle-safe** — the descendant set comes from
+///   [`lineage_descendants`], whose recursive CTE carries a `json_each`
+///   visited-set cycle guard and a `max_depth` ceiling
+///   ([`LINEAGE_MAX_DEPTH`]), so a cyclic or pathologically deep provenance
+///   graph terminates cleanly with no write amplification.
+/// * **Idempotent** — each per-row UPDATE is guarded by
+///   `WHERE lifecycle_state = <observed prior>`, and rows already
+///   `Contaminated` are skipped, so a re-run over the same subtree stamps
+///   nothing (`stamped == 0`).
+/// * **Reversible** — the pre-taint `lifecycle_state` is recorded in
+///   `metadata.<CONTAMINATION_METADATA_KEY>.prior_lifecycle_state`, so a future
+///   `swarm_rewind` can restore the exact prior state. The durable memory TEXT
+///   is never touched; only the derived `lifecycle_state` marker + a metadata
+///   annotation move (DEGRADE, never corrupt).
+/// * **Fail-closed / non-destructive** — a descendant already in a stronger
+///   system-only state (`Tombstoned` / `Quarantined`) is left as-is: those are
+///   already hidden and carry their own irreversible-by-caller semantics, and
+///   overwriting them would lose that posture. The version counter is bumped
+///   monotonically (CRDT PN-counter safe).
+///
+/// # Errors
+///
+/// Propagates the [`lineage_descendants`] traversal error (e.g. `max_depth`
+/// out of range) and any `rusqlite` / JSON error raised while stamping.
+pub fn stamp_contaminated_descendants(
+    conn: &Connection,
+    root_id: &str,
+    max_depth: usize,
+) -> Result<ContaminationStampReport> {
+    // #1955 R45 write-funnel fence — this is a lifecycle-mutating write and is
+    // reachable from the CLI-local and HTTP-sqlite lanes that bypass
+    // `SqliteStore::gate_record_stop`; gate here, where every other sqlite
+    // write funnel gates (mirrors `dequarantine` / `operator_dequarantine`).
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+
+    // Bounded, cycle-safe downstream lineage set (the read-only suspect walk).
+    let descendants = lineage_descendants(conn, root_id, max_depth)?;
+
+    let contaminated = crate::models::LifecycleState::Contaminated.as_str();
+    let now = Utc::now().to_rfc3339();
+
+    let mut report = ContaminationStampReport {
+        root_id: root_id.to_string(),
+        ..ContaminationStampReport::default()
+    };
+
+    // ONE transaction over the whole sweep so the taint lands all-or-nothing
+    // (atomicity). `unchecked_transaction` shares the caller's `&Connection`
+    // (the MCP link path holds a shared borrow); the per-row CAS guard below
+    // keeps every UPDATE correct even under the DEFERRED lock upgrade.
+    let tx = conn.unchecked_transaction()?;
+    {
+        use rusqlite::OptionalExtension;
+        let mut read =
+            tx.prepare("SELECT lifecycle_state, metadata FROM memories WHERE id = ?1")?;
+        let mut upd = tx.prepare(
+            "UPDATE memories \
+                SET lifecycle_state = ?1, metadata = ?2, updated_at = ?3, version = version + 1 \
+              WHERE id = ?4 AND lifecycle_state = ?5",
+        )?;
+        for node in &descendants {
+            let row: Option<(String, Option<String>)> = read
+                .query_row(params![node.id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let Some((cur_str, meta_str)) = row else {
+                continue; // descendant vanished mid-sweep — nothing to stamp.
+            };
+            let cur = crate::models::LifecycleState::from_str(&cur_str).unwrap_or_default();
+            if cur == crate::models::LifecycleState::Contaminated {
+                report.already_contaminated += 1;
+                continue; // idempotent no-op.
+            }
+            if cur.is_system_only() {
+                // Tombstoned / Quarantined — a stronger, already-hidden system
+                // posture. Never downgrade it to a taint (fail-closed,
+                // non-destructive).
+                report.skipped_system_only += 1;
+                continue;
+            }
+
+            // Record the pre-taint state for reversibility. A malformed /
+            // absent metadata blob is treated as an empty object rather than
+            // failing the sweep (the marker is additive, never destructive).
+            let mut meta = meta_str
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(map) = meta.as_object_mut() {
+                map.insert(
+                    CONTAMINATION_METADATA_KEY.to_string(),
+                    serde_json::json!({
+                        "prior_lifecycle_state": cur.as_str(),
+                        "contaminated_from": root_id,
+                        "stamped_at": now,
+                    }),
+                );
+            }
+            let meta_ser = serde_json::to_string(&meta)?;
+            // The `AND lifecycle_state = ?5` CAS makes the write a no-op if the
+            // row changed between the read and the write (TOCTOU-safe). `id` is
+            // the PK, so this matches at most one row (0 or 1).
+            report.stamped +=
+                upd.execute(params![contaminated, meta_ser, now, node.id, cur_str])?;
+        }
+    }
+    tx.commit()?;
+    Ok(report)
+}
+
 /// Default cap on paths returned by [`find_paths`] when the caller does
 /// not specify one. Matches the v0.7 J7 charter.
 pub const FIND_PATHS_DEFAULT_LIMIT: usize = 10;

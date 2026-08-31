@@ -1489,6 +1489,20 @@ const MIGRATION_V91_ARCHIVED_LINKS_CID: &str =
 const MIGRATION_V92_SCHEMA_BOUND: &str =
     include_str!("../../migrations/postgres/0049_v92_schema_version_bound.sql");
 
+/// v1.0.0 #3324 (#3266 MVG) — schema v94 canonical DDL: an additive
+/// `CREATE INDEX IF NOT EXISTS idx_memories_lifecycle_state ON
+/// memories(lifecycle_state)` supporting the system-only (hidden)
+/// lifecycle-state listings. Applied by [`PostgresStore::migrate_v94`]. Ships
+/// with the new `contaminated` lifecycle vocabulary (auto-propagated
+/// downstream of an invalidated root); the vocabulary itself is migration-free
+/// (no CHECK enumerates the states on either backend, and the fail-closed
+/// `lifecycle_visible_clause` allow-list is shared verbatim). Slots after
+/// #3323's settled v93 token-cost migration. The sqlite twin is
+/// `MIGRATION_V94_SQLITE`
+/// (`migrations/sqlite/0078_v94_lifecycle_state_index.sql`).
+const MIGRATION_V94_LIFECYCLE_STATE_INDEX: &str =
+    include_str!("../../migrations/postgres/0051_v94_lifecycle_state_index.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -1879,7 +1893,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 93;
+const CURRENT_SCHEMA_VERSION: i32 = 94;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -3692,8 +3706,11 @@ impl PostgresStore {
         if current_version < 92 {
             self.migrate_v92().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 93 {
             self.migrate_v93().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v94().await?;
         }
 
         Ok(())
@@ -6682,6 +6699,47 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v91 applied (#3250: archived_memory_links.source_cid / \
              target_cid — archive->restore now CARRIES the v75 lineage-DAG pins)"
+        );
+        Ok(())
+    }
+
+    /// v1.0.0 #3324 (#3266 MVG) — schema v94: additive
+    /// `idx_memories_lifecycle_state` supporting the system-only (hidden)
+    /// lifecycle-state listings (`list_quarantined`, operator/curator review of
+    /// contaminated / tombstoned / quarantined rows), the postgres twin of the
+    /// sqlite v94 arm. Slots after #3323's settled v93 token-cost migration.
+    /// Ships with the new `contaminated` auto-propagated invalidation-taint
+    /// vocabulary — which is itself migration-free (no CHECK enumerates the
+    /// states, and the fail-closed `lifecycle_visible_clause` allow-list is
+    /// shared verbatim by both backends, so `contaminated` is hidden
+    /// identically with no schema change). `CREATE INDEX IF NOT EXISTS` is
+    /// idempotent and additive. Tip arm — stamps [`CURRENT_SCHEMA_VERSION`].
+    async fn migrate_v94(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V94_LIFECYCLE_STATE_INDEX.contains("idx_memories_lifecycle_state"),
+            "#3324: the v94 DDL doc twin must ship with the binary"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v94 lifecycle-state-index ddl tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V94_LIFECYCLE_STATE_INDEX)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v94 lifecycle-state-index ddl", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v94 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v94 applied (#3324: idx_memories_lifecycle_state — \
+             backs the system-only hidden-state listings shipped with the new \
+             `contaminated` auto-propagated invalidation-taint lifecycle state)"
         );
         Ok(())
     }

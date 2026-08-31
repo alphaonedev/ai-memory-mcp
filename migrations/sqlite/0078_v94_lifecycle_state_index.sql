@@ -1,0 +1,23 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v94 (#3324, #3266 MVG, v1.0.0) — LIFECYCLE_STATE INDEX (SQLite).
+--
+-- Doc twin of the inline `MIGRATION_V94_SQLITE` arm in
+-- `src/storage/migrations.rs`. Ships alongside the new `contaminated`
+-- lifecycle vocabulary — the state auto-propagated DOWNSTREAM over the
+-- provenance DAG (P = derived_from / reflects_on / derives_from) when a root
+-- memory is invalidated (see `storage::stamp_contaminated_descendants`).
+--
+-- The `contaminated` value needs NO column/CHECK change: it round-trips on the
+-- existing `lifecycle_state TEXT NOT NULL DEFAULT 'open'` column, and
+-- transition legality is a SAL-layer gate, never a SQL CHECK. This migration
+-- adds only the supporting index for the SYSTEM-ONLY (hidden) state listings
+-- that filter `WHERE lifecycle_state = ?` (a high-selectivity lookup:
+-- `list_quarantined`, operator/curator review of contaminated / tombstoned /
+-- quarantined rows), which scanned the whole `memories` table pre-v94.
+--
+-- Additive, `IF NOT EXISTS`-idempotent, reversible (revert is `DROP INDEX`),
+-- no data loss, no full-table rebuild.
+CREATE INDEX IF NOT EXISTS idx_memories_lifecycle_state
+    ON memories(lifecycle_state);

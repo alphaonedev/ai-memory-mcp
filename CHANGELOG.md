@@ -26,6 +26,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is **best-effort** — a metering failure can never fail or roll back a memory
   write or recall. This table holds no durable memory truth; it is disposable,
   regenerable, advisory data (North Star: degrade, never corrupt).
+### Added (#3324 #3266 MVG — auto-propagating `contaminated` lifecycle along `derives_from` on invalidate)
+
+- **New system-only `LifecycleState::Contaminated` state + a transactional
+  auto-stamp that taints every record transitively derived from an invalidated
+  root.** When a root memory is invalidated (a Reflection→Reflection
+  `supersedes` edge lands), `db::stamp_contaminated_descendants` walks the
+  DOWNSTREAM provenance DAG (P = `derived_from` / `reflects_on` / `derives_from`,
+  the same bounded, cycle-safe `lineage_descendants` walk the read-only
+  `transitive_suspects` surface used) and stamps each descendant `Contaminated`
+  in ONE transaction — promoting the read-only suspect walk to a WRITE so a
+  suspect source structurally hides its derivations from ordinary recall the
+  moment it is invalidated, instead of a query the curator must remember to run.
+  - **Fail-closed recall twins.** `Contaminated` is ABSENT from
+    `RECALL_VISIBLE_LIFECYCLE_STATES`, so both the Rust twin
+    (`LifecycleState::is_recall_visible`) and the SQL twin
+    (`lifecycle_visible_clause`, shared verbatim by SQLite and Postgres — it
+    binds nothing) hide it on every read/egress lane. It is `is_system_only`
+    (rejected as caller input by `validate_lifecycle_state`), `is_terminal`, and
+    absent from `can_transition_to` (no caller can self-taint or clear a taint).
+  - **Atomic / idempotent / bounded / cycle-safe / reversible.** The whole sweep
+    is one transaction (all-or-nothing); a re-run stamps nothing (per-row CAS +
+    already-`Contaminated` skip); the walk is depth-bounded (`LINEAGE_MAX_DEPTH`)
+    with a `json_each` visited-set cycle guard; a stronger already-hidden
+    system state (`Tombstoned` / `Quarantined`) is never clobbered; and the
+    pre-taint `lifecycle_state` is recorded in
+    `metadata.contamination.prior_lifecycle_state` so a future `swarm_rewind`
+    can restore the exact prior state. The durable memory TEXT is never touched.
+- **Schema v93 → v94** (`CURRENT_SCHEMA_VERSION`, both backends; slots after
+  #3323's v93 token-cost migration, which merged first and took v93). The
+  `contaminated` value itself is migration-free (no CHECK enumerates lifecycle
+  states on either backend); v94 adds the additive, idempotent
+  `idx_memories_lifecycle_state` index backing the system-only hidden-state
+  listings (`list_quarantined`, operator/curator review) — present in both the
+  migrate arms and the fresh-cluster bootstrap. SQLite doc twin:
+  `migrations/sqlite/0078_v94_lifecycle_state_index.sql`; Postgres twin:
+  `PostgresStore::migrate_v94` / `migrations/postgres/0051_v94_lifecycle_state_index.sql`.
 
 ### Fixed (CI — `cargo test --lib` RED: two inline capability tests still asserted pre-#3111 flip-Deny, #3111 follow-up)
 
