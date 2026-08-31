@@ -158,11 +158,13 @@ pub fn truncate_to_microseconds(t: DateTime<Utc>) -> DateTime<Utc> {
 /// cross-backend verifiability of the hash-chained audit trail.
 ///
 /// The canonical form is `parse-as-RFC3339 → UTC → truncate to microseconds →
-/// `to_rfc3339()``, identical to the `None → now` default below and to the
-/// microsecond precision postgres durably stores in `TIMESTAMPTZ`. Both
-/// backends now derive the pre-image `valid_until` from this same string, so
-/// the leaf hash matches by construction rather than by a fragile
-/// parse/re-render round-trip agreeing on both sides.
+/// `to_rfc3339_opts(AutoSi, use_z = true)`` — i.e. the RFC3339 `Z` (zulu)
+/// suffix, NOT chrono's default `+00:00`. This matches the caller's `...Z` wire
+/// form and the export golden's `Z` convention while staying identical to the
+/// `None → now` default below and to the microsecond precision postgres durably
+/// stores in `TIMESTAMPTZ`. Both backends now derive the pre-image `valid_until`
+/// from this same string, so the leaf hash matches by construction rather than
+/// by a fragile parse/re-render round-trip agreeing on both sides.
 ///
 /// An UNPARSEABLE `valid_until` is returned verbatim — postgres already
 /// rejects such a value at its `::TIMESTAMPTZ` bind (so no cross-backend hash
@@ -172,11 +174,21 @@ pub fn truncate_to_microseconds(t: DateTime<Utc>) -> DateTime<Utc> {
 #[must_use]
 pub(crate) fn canonicalize_valid_until_stamp(valid_until: Option<&str>) -> String {
     match valid_until {
+        // #3281 renders UTC as the RFC3339 `Z` (zulu) suffix, NOT chrono's
+        // default `+00:00`, so the canonical wire form matches the caller's /
+        // export-golden `...Z` convention while staying byte-identical across
+        // backends. `AutoSi` keeps the same fractional-second behaviour as the
+        // former `to_rfc3339()` (0/3/6/9 digits by precision); only the zone
+        // suffix changes (#3322, 2026-08-31).
         Some(raw) => chrono::DateTime::parse_from_rfc3339(raw).map_or_else(
             |_| raw.to_string(),
-            |dt| truncate_to_microseconds(dt.with_timezone(&Utc)).to_rfc3339(),
+            |dt| {
+                truncate_to_microseconds(dt.with_timezone(&Utc))
+                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+            },
         ),
-        None => truncate_to_microseconds(Utc::now()).to_rfc3339(),
+        None => truncate_to_microseconds(Utc::now())
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
     }
 }
 
