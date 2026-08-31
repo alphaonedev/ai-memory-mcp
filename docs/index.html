@@ -256,7 +256,7 @@ section.alt{background:var(--bg2)}
 <section id="bigten"><div class="wrap">
   <div class="sec-h">
     <div class="eyebrow">What it fixes</div>
-    <h2>The 10 ways agent memory <span class="a">quietly betrays a business</span> — each one closed.</h2>
+    <h2>The 11 ways agent memory <span class="a">quietly betrays a business</span> — each one closed.</h2>
     <p>Drawn from 2,200+ real issues and audited against the shipping code: the failures that make an AI agent — one, a cluster, a swarm, or a whole hive — act on <b>wrong, leaked, resurrected, or unauthorized</b> memory as if it were the truth. Each is answered by a real, shipping feature and maps to a North-Star pillar — <b>data integrity · security · performance · reliability</b>.</p>
   </div>
   <div class="grid">
@@ -270,10 +270,32 @@ section.alt{background:var(--bg2)}
     <div class="feat"><div class="fn">◆ Data integrity · ▲ Performance</div><h3>8 · Recall you can trust after a model change</h3><p>You swap or upgrade your AI embedding model and your agents start silently recalling the <i>wrong</i> memories — the scores still look confident, nothing errors, the results are just wrong, and the agents act on them as truth. <b>ai-memory guarantees</b> every memory carries a fingerprint of the exact model space it was built in, and it refuses to compare across incompatible spaces — at worst it falls back to keyword recall, <i>never confidently wrong</i>. <i style="opacity:.7">For engineers: embedding_space_fingerprint + semantic-withheld + recall_index_coverage + opt-in strict dim-match.</i></p></div>
     <div class="feat"><div class="fn">◆ Data integrity</div><h3>9 · A migration can't silently erase you</h3><p>An upgrade or restore quietly rebuilds a table on <i>zero rows</i> and stamps the schema "up to date" — your whole corpus is wiped, with no error, and a basic health check still shows green. <b>ai-memory guarantees</b> it refuses to certify a migration that lost its data: an unexpected drop to zero rows on a core table fails the upgrade <i>closed</i> instead of blessing an empty database as healthy. <i style="opacity:.7">For engineers: zeroed-stamp assertion + core-table coverage + corpus row-count guard + fail-closed migration ladder.</i></p></div>
     <div class="feat"><div class="fn">● Security</div><h3>10 · Sealed means sealed</h3><p>You turn on encryption-at-rest and tell your auditors the corpus is sealed — but a mis-set passphrase quietly falls back to writing plaintext, and hot write paths were never sealing at all. <b>ai-memory guarantees</b> that with encryption on, content is actually sealed to the owning key on every write path — and a requested at-rest passphrase it can't honor <i>refuses</i>, rather than silently persisting plaintext. <i style="opacity:.7">For engineers: seal_content envelope (0x02) + per-record envelope (0x03) + refuse-on-missing-at-rest-passphrase.</i></p></div>
+    <div class="feat"><div class="fn">● Security · ◆ Data integrity</div><h3>11 · A poisoned memory never reaches the fleet</h3><p>A compromised peer, an adversarial input, or a memory with <i>no valid provenance</i> gets written into the shared store — and every agent that reads it is contaminated. <b>ai-memory guarantees</b> any inbound memory that isn't validly signed is <i>quarantined at the door</i>: kept for audit but structurally invisible to recall and to the signed ledger, so it can never be recalled as fact or enter an attested batch — and an operator can inspect and audibly release it. On by default in the certified configuration. <i style="opacity:.7">For engineers: maybe_quarantine_unattributed &rarr; LifecycleState::Quarantined + quarantine tier excluded from recall &amp; the signed ingestion Merkle root + audited /admin/quarantine inspect+release + FED_QUARANTINE_UNATTRIBUTED / CID_ENFORCE certified-profile floors.</i></p></div>
   </div>
   <p style="margin-top:18px;font-family:var(--mono);font-size:12.5px;color:var(--ink-soft)">Every one is backed by shipping code and tracked, fixed issues — proven from a single agent to a cluster, swarm, or hive. Apache-2.0, self-hostable, auditable from <code>git clone</code>.</p>
 </div></section>
 
+
+<!-- SPOTLIGHT: the $50k swarm problem -->
+<section id="swarmcost"><div class="wrap">
+  <div class="sec-h">
+    <div class="eyebrow">The hardest problem</div>
+    <h2>The $50,000 swarm problem &mdash; <span class="a">seen, bounded, and reversible.</span></h2>
+    <p>Run one agent 5,000 times and a single wrong idea can convince all 5,000 &mdash; they burn hours and <b>tens of thousands in tokens</b> before a human notices. Because it spreads through <b>shared memory</b>, it is ai-memory's job to make it survivable. <i>(The internal-groupthink case &mdash; a legitimately-signed but wrong belief. External poison is quarantined outright: see #11.)</i></p>
+  </div>
+  <div class="two">
+    <div class="col"><div class="lbl">Today &middot; v1.0.0</div><h3>Attributable &middot; boundable &middot; reversible</h3><ul>
+      <li><b>Attributable</b> &mdash; "why do 5,000 agents believe X?" resolves to the <b>one signed row</b> that started it (Ed25519 + content CID + lineage DAG)</li>
+      <li><b>Boundable</b> &mdash; namespaces, quotas, enforce-mode &amp; peer-scope cap the blast radius; a claim is never recalled with the weight of a confirmed fact</li>
+      <li><b>Reversible</b> &mdash; a signed <b>fleet record-stop</b>, <b>invalidate-with-dependents</b>, and <b>point-in-time replay</b> unwind the cascade without losing data</li>
+    </ul></div>
+    <div class="col tealed"><div class="lbl">Roadmap &middot; v1.1</div><h3>Un-startable &middot; auto-detected</h3><ul>
+      <li><b>Corroboration before shared truth</b> &mdash; a claim waits for N <i>independent</i> writers (not same-model copies) before it is recalled as fact</li>
+      <li><b>Automatic cascade detection</b> &mdash; same-claim bursts &amp; lineage fan-out arm a record-stop on their own</li>
+      <li><b>One-command rewind</b> with the token cost on screen &mdash; the $50k becomes a number, not a discovery</li>
+    </ul></div>
+  </div>
+</div></section>
 
 <!-- PLATFORM -->
 <section id="platform"><div class="wrap">
