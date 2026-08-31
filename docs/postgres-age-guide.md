@@ -10,11 +10,12 @@ layout: doc
 > is the supported deployment shape.
 >
 > **It is not a parity backend, and this guide does not claim it is.** At
-> v1.0.0 postgres serves **61 of the 82** unique production HTTP paths;
-> the other **21 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
+> v1.0.0 postgres serves **65 of the 82** unique production HTTP paths;
+> the other **17 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
 > is SQLite-only** (`ai-memory mcp` always opens a local rusqlite
 > connection, so a postgres deployment serves MCP clients through the
-> HTTP daemon instead). Read "The 21 fully-501 paths" below and
+> HTTP daemon instead). Read "The 17 fully-501 paths" and
+> "Tools unavailable on the PostgreSQL backend (v1.0.0)" below and
 > [Backend parity](../README.md#backend-parity) before committing to
 > postgres.
 >
@@ -56,10 +57,10 @@ ladder ends at `migrate_v94()`).
 version-stamp no-ops rather than real DDL, so a matching version number
 does not mean a matching set of tables: postgres ships no `skills` table
 (`migrate_v82` is a no-op) and no `governance_rules` table. Concretely,
-**61 of the 82 unique production HTTP paths are served on postgres and
-21 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
+**65 of the 82 unique production HTTP paths are served on postgres and
+17 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
 silent read/write against the wrong database), and the **stdio MCP path
-is SQLite-only**. See "The 21 fully-501 paths" below for the exact
+is SQLite-only**. See "The 17 fully-501 paths" below for the exact
 inventory, which is frozen against regression by
 `tests/pg_supported_route_inventory_gate_2799.rs`.
 
@@ -672,14 +673,14 @@ The eight remaining sqlite-only surfaces land here.
 > on a postgres-backed daemon, with "no residual 501 envelope on
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
-> **RETRACTED**. The measured, gate-pinned inventory is **61
-> pg-supported unique paths, 21 fully-501 paths, 82 unique paths
-> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 61` /
-> `EXPECTED_FULLY_501_PATHS = 21` / `EXPECTED_TOTAL_UNIQUE_PATHS = 82`,
-> `tests/pg_supported_route_inventory_gate_2799.rs:231-233`), and the
+> **RETRACTED**. The measured, gate-pinned inventory is **65
+> pg-supported unique paths, 17 fully-501 paths, 82 unique paths
+> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 65` /
+> `EXPECTED_FULLY_501_PATHS = 17` / `EXPECTED_TOTAL_UNIQUE_PATHS = 82`,
+> `tests/pg_supported_route_inventory_gate_2799.rs`), and the
 > same gate freezes the allow-list membership so a silent match-arm
 > add or remove fails until the SSOT is updated in a reviewed edit. The
-> 501 envelope is therefore a LIVE, load-bearing refusal on 21 standard
+> 501 envelope is therefore a LIVE, load-bearing refusal on 17 standard
 > paths on a postgres-backed daemon — fail-closed, never a silent
 > wrong-answer. Closing the remainder is tracked by
 > [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803).
@@ -799,8 +800,8 @@ tool names is unaffected. On sqlite nothing changes.
 
 Of the **82 unique production URL paths** (over **96 `.route(...)`
 registrations in `src/lib.rs`**, surfaced through
-`/api/v1/capabilities`), **61 are served on a postgres-backed daemon
-and 21 are fully fail-closed** — every HTTP method on those 21 paths
+`/api/v1/capabilities`), **65 are served on a postgres-backed daemon
+and 17 are fully fail-closed** — every HTTP method on those 17 paths
 returns a uniform `501 NOT IMPLEMENTED`. The gate FAILS CLOSED by
 design: an un-migrated handler can never fall through to the empty
 in-memory scratch SQLite database that `bootstrap_serve` opens against
@@ -808,12 +809,22 @@ in-memory scratch SQLite database that `bootstrap_serve` opens against
 read/write against the wrong database (data-integrity North Star:
 degrade, never corrupt). This inventory is pinned against regression by
 `tests/pg_supported_route_inventory_gate_2799.rs`, which freezes the
-exact 61-supported / 21-fully-501 partition and fails CI if the router
+exact 65-supported / 17-fully-501 partition and fails CI if the router
 and the `postgres_endpoint_supported()` allow-list ever drift.
 
-**The 21 fully-501 paths (honest v1.0 gaps — do NOT expect these to
+> **v1.0.0 update ([#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064)).**
+> Four routes that previously 501'd on Postgres now SAL-dispatch and are
+> **supported** — `memory_verify` (`/api/v1/memory_verify`),
+> `memory_dependents_of_invalidated`
+> (`/api/v1/memory_dependents_of_invalidated`), `memory_export_reflection`
+> (`/api/v1/memory_export_reflection`), and `memory_replay`
+> (`/api/v1/memory_replay`). This moved the partition from 61/21 to 65/17.
+> The remaining 17 fully-501 paths below are the accepted v1.0.0 gaps.
+
+**The 17 fully-501 paths (honest v1.0 gaps — do NOT expect these to
 work on Postgres; closing them is tracked under the v1.x Postgres
-surface-parity EPIC [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)):**
+surface-parity EPIC [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)
+and [#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064)):**
 
 - **Agent Skills surface** — `/api/v1/skill/*` (8 paths): postgres ships
   no skills table (`migrate_v82` is a version-stamp no-op). *(v1.x:
@@ -842,16 +853,76 @@ surface-parity EPIC [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/
 - **`/api/v1/share`** — the pg source-read `CallerContext` is a T3
   authorization posture choice deferred to a vote. *(v1.x.)*
 - **`memory_*` MCP-parity routes with no pg SAL method / app.db binding**
-  (11 paths): `memory_atomise`, `memory_smart_load`,
-  `memory_export_reflection`, `memory_replay`,
+  (7 paths): `memory_atomise`, `memory_smart_load`,
   `memory_subscription_replay`, `memory_subscription_dlq_list`,
-  `memory_calibrate_confidence`, `memory_dependents_of_invalidated`,
-  and `memory_verify` (compact link-verify is `app.db`-bound;
-  `/api/v1/links/verify` **is** the pg-supported link-verify surface).
-  `memory_rule_list` + `memory_check_agent_action` 501 only the
-  governance **INSPECTION / read** API because postgres ships no
-  `governance_rules` table — governance **enforcement** itself works on
-  Postgres. *(v1.x: pg SAL methods + governance_rules table.)*
+  `memory_calibrate_confidence`, and `memory_rule_list` +
+  `memory_check_agent_action` — the last two 501 only the governance
+  **INSPECTION / read** API because postgres ships no `governance_rules`
+  table (governance **enforcement** itself works on Postgres).
+  *(v1.x: pg SAL methods + governance_rules table.)* Note `memory_verify`,
+  `memory_replay`, `memory_export_reflection`, and
+  `memory_dependents_of_invalidated` are **no longer** in this set — they
+  SAL-dispatch on Postgres as of #3064 (compact link-verify rides
+  `MemoryStore::verify_link`; `/api/v1/links/verify` is also supported).
+
+### Tools unavailable on the PostgreSQL backend (v1.0.0)
+
+The path table above is REST-centric. The same gaps expressed as **MCP
+tools** are listed here, because that is how most callers reach
+ai-memory. On a **postgres deployment these tools are unreachable via
+any interface**:
+
+- their **REST mirror returns `501 NOT IMPLEMENTED`** (the documented
+  fail-closed envelope) on a postgres-backed daemon, and
+- the **stdio MCP loop is SQLite-only** (`ai-memory mcp` always opens a
+  local rusqlite connection — it never talks to postgres — so a postgres
+  deployment serves MCP clients through the HTTP daemon, where the 501
+  applies).
+
+This is an **accepted v1.0.0 limitation** — a loud, safe 501, never a
+silent write to the wrong database (data-integrity North Star: degrade,
+never corrupt). SAL migration for the remaining tools is tracked for a
+future release under
+[#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064) (the
+v1.x Postgres surface-parity EPIC is
+[#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803);
+postgres skills storage specifically is
+[#2804](https://github.com/alphaonedev/ai-memory-mcp/issues/2804)).
+
+**17 MCP tools are unavailable on a postgres-backed daemon** — the 9
+`memory_skill_*` tools plus 8 others:
+
+| MCP tool | REST mirror (501 on postgres) | Notes |
+|---|---|---|
+| `memory_skill_register` | `POST /api/v1/skill/register` | Skills plane — postgres ships no skills table (`migrate_v82` no-op). |
+| `memory_skill_list` | `GET /api/v1/skill/list` | Skills plane. |
+| `memory_skill_get` | `GET /api/v1/skill/{id}` | Skills plane. |
+| `memory_skill_delete` | `DELETE /api/v1/skill/{id}` | Skills plane. |
+| `memory_skill_resource` | `GET /api/v1/skill/{id}/resource` | Skills plane. |
+| `memory_skill_export` | `POST /api/v1/skill/{id}/export` | Skills plane. |
+| `memory_skill_promote_from_reflection` | `POST /api/v1/skill/{id}/promote` | Skills plane. |
+| `memory_skill_compositional_context` | `POST /api/v1/skill/{id}/compose` | Skills plane. |
+| `memory_skill_retire` | `POST /api/v1/skill/{id}/retire` | Skills plane. |
+| `memory_share` | `POST /api/v1/share` | pg source-read `CallerContext` is a T3 authz posture choice deferred to a vote. |
+| `memory_atomise` | `POST /api/v1/memory_atomise` | No pg SAL method — `app.db`-bound. |
+| `memory_smart_load` | `POST /api/v1/memory_smart_load` | No pg SAL method — `app.db`-bound. |
+| `memory_calibrate_confidence` | `POST /api/v1/memory_calibrate_confidence` | No pg SAL method — `app.db`-bound. |
+| `memory_subscription_replay` | `POST /api/v1/memory_subscription_replay` | No pg SAL method — `app.db`-bound. |
+| `memory_subscription_dlq_list` | `POST /api/v1/memory_subscription_dlq_list` | No pg SAL method — `app.db`-bound. |
+| `memory_rule_list` | `POST /api/v1/memory_rule_list` | Governance **inspection/read** only (no `governance_rules` table); enforcement itself works on postgres. |
+| `memory_check_agent_action` | `POST /api/v1/memory_check_agent_action` | Governance **inspection/read** only; enforcement itself works on postgres. |
+
+The 9 `memory_skill_*` tools map onto **8** `/api/v1/skill/*` paths
+(`/api/v1/skill/{id}` serves both `memory_skill_get` via `GET` and
+`memory_skill_delete` via `DELETE`). `/api/v1/capabilities` discloses
+the same fact at runtime: on postgres, `skills.implemented` is `false`
+with an additive `unsupported_on_postgres: true` /
+`unsupported_reason` (states the hard-501 failure mode).
+
+One additional REST path 501s on postgres but is **not** a distinct MCP
+tool: the bare legacy alias `/api/v1/find_paths` — use the supported
+`/api/v1/kg/find_paths` (the `memory_find_paths` tool already targets
+the supported path). That bare alias is the 17th fully-501 path.
 
 ### SQLite-only substrate planes on a postgres daemon
 
@@ -894,7 +965,9 @@ Conversely, several surfaces that once 501'd on Postgres are now
 supported: `kg_query` / `kg_invalidate` / `kg_timeline` traverse all 9
 relations, `/api/v1/capabilities` reports the `kg_backend` field,
 verbose recall carries `latest_link_attest_level`, and
-`verify-audit-trail --store-url` verifies the postgres audit chain.
+`verify-audit-trail --store-url` verifies the postgres audit chain. As
+of #3064, `memory_verify`, `memory_replay`, `memory_export_reflection`,
+and `memory_dependents_of_invalidated` also SAL-dispatch on Postgres.
 
 The route gate retains its 501 envelope as a safety net for:
 
