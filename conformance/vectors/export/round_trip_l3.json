@@ -1,6 +1,6 @@
 {
   "spec_version": "2",
-  "db_schema_version": 91,
+  "db_schema_version": 92,
   "source": "ai-memory-conformance-2030",
   "exported_at": "2026-07-14T00:00:00Z",
   "memories": [
