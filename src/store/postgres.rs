@@ -19267,6 +19267,225 @@ impl PostgresStore {
             tracing::warn!("charge_update_growth refund failed for agent {owner}: {e}");
         }
     }
+
+    /// v1.0.0 #3259 — pool twin of the in-tx namespace-owner walk in
+    /// [`Self::enforce_governance_action`] (and of the sqlite
+    /// `storage::namespace_owner`): walk the GOVERNANCE chain leaf→root and
+    /// return the `metadata.agent_id` of the first namespace-standard memory
+    /// found. Used by the destination gate below to resolve the `Owner`/
+    /// `Approve` authority for a `Store` into the destination namespace.
+    async fn pg_resolve_namespace_owner(&self, namespace: &str) -> StoreResult<Option<String>> {
+        let chain = pg_namespace_chain(&self.pool, namespace, true).await?;
+        for ns in chain.iter().rev() {
+            let row: Option<(Option<String>,)> = sqlx::query_as(
+                "SELECT m.metadata->>'agent_id' AS agent_id \
+                 FROM namespace_meta nm JOIN memories m ON m.id = nm.standard_id \
+                 WHERE nm.namespace = $1",
+            )
+            .bind(ns)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("pg_resolve_namespace_owner chain lookup", e))?;
+            if let Some((Some(o),)) = row {
+                return Ok(Some(o));
+            }
+        }
+        Ok(None)
+    }
+
+    /// v1.0.0 #3259 — postgres twin of
+    /// `storage::refuse_unapproved_destination_store`. DECIDE-ONLY (it NEVER
+    /// queues a pending row — an `enforce_governance_action` call would insert
+    /// one on `Pending`): re-evaluate the STORE-class write gate into the
+    /// destination namespace at execute time and REFUSE on `Deny` OR
+    /// still-`Pending`, so an approved SOURCE `promote` cannot clone into a
+    /// namespace whose write policy would not admit the requester.
+    ///
+    /// Fail-closed and byte-for-byte with the sqlite helper: the `Off`→allow
+    /// and `Advisory`→allow short-circuits, the level evaluation (mirroring
+    /// `storage::evaluate_level` for `Store`), the ungoverned-destination
+    /// decision (`storage::ungoverned_namespace_decision` twin), and the
+    /// `pending_action.refused_destination_{deny,pending}` audit events all
+    /// match. An audit-append failure is logged but does NOT convert the
+    /// refusal into an allow.
+    async fn pg_refuse_unapproved_destination_store(
+        &self,
+        pa: &crate::models::PendingAction,
+        to_ns: &str,
+    ) -> StoreResult<()> {
+        use crate::config::{PermissionsMode, active_permissions_mode};
+        use crate::governance::GovernanceRefusal;
+        use crate::models::{GovernanceDecision, GovernanceLevel, GovernedAction};
+        let mode = active_permissions_mode();
+        if mode == PermissionsMode::Off {
+            return Ok(());
+        }
+        let requester = pa.requested_by.as_str();
+        let decision = match self.resolve_governance_policy(to_ns).await? {
+            Some(policy) => match &policy.core.write {
+                GovernanceLevel::Any => GovernanceDecision::Allow,
+                GovernanceLevel::Registered => {
+                    if self.is_registered_agent(requester).await? {
+                        GovernanceDecision::Allow
+                    } else {
+                        GovernanceDecision::Deny(
+                            GovernanceRefusal::new(
+                                GovernedAction::Store,
+                                GovernanceLevel::Registered,
+                                requester,
+                                format!("caller '{requester}' is not a registered agent"),
+                            )
+                            .with_namespace(to_ns),
+                        )
+                    }
+                }
+                // #3259 — a `Store` resolves the OWNER authority from the
+                // namespace-standard owner (never a memory owner), matching
+                // `storage::evaluate_level`'s action-keyed selection.
+                GovernanceLevel::Owner => match self.pg_resolve_namespace_owner(to_ns).await? {
+                    Some(o) if o == requester => GovernanceDecision::Allow,
+                    Some(o) => GovernanceDecision::Deny(
+                        GovernanceRefusal::new(
+                            GovernedAction::Store,
+                            GovernanceLevel::Owner,
+                            requester,
+                            format!("caller '{requester}' is not the owner ('{o}')"),
+                        )
+                        .with_namespace(to_ns)
+                        .with_owner(o.as_str()),
+                    ),
+                    None => GovernanceDecision::Deny(
+                        GovernanceRefusal::new(
+                            GovernedAction::Store,
+                            GovernanceLevel::Owner,
+                            requester,
+                            "owner-level action has no resolvable owner",
+                        )
+                        .with_namespace(to_ns),
+                    ),
+                },
+                GovernanceLevel::Approve => {
+                    let ns_owner = self.pg_resolve_namespace_owner(to_ns).await?;
+                    if matches!(ns_owner.as_deref(), Some(o) if o == requester) {
+                        GovernanceDecision::Allow
+                    } else {
+                        GovernanceDecision::Pending(String::new())
+                    }
+                }
+            },
+            // Ungoverned destination — sqlite `ungoverned_namespace_decision`
+            // twin: allow under Advisory or the default (opt-in strict) posture,
+            // else fail-closed refuse.
+            None => {
+                if mode == PermissionsMode::Advisory
+                    || !crate::governance::require_governed_namespace()
+                {
+                    GovernanceDecision::Allow
+                } else {
+                    GovernanceDecision::Deny(crate::governance::ungoverned_namespace_refusal(
+                        GovernedAction::Store,
+                        requester,
+                        to_ns,
+                    ))
+                }
+            }
+        };
+        if mode == PermissionsMode::Advisory {
+            return Ok(());
+        }
+        match decision {
+            GovernanceDecision::Allow => Ok(()),
+            GovernanceDecision::Deny(refusal) => {
+                if let Err(audit_err) = self
+                    .pg_emit_pending_action_event(
+                        pa,
+                        "pending_action.refused_destination_deny",
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                        pending_id = %pa.id,
+                        "failed to append pending_action.refused_destination_deny audit row: {audit_err}"
+                    );
+                }
+                Err(StoreError::InvalidInput {
+                    detail: format!("destination write into {to_ns} denied: {}", refusal.reason),
+                })
+            }
+            GovernanceDecision::Pending(_) => {
+                if let Err(audit_err) = self
+                    .pg_emit_pending_action_event(
+                        pa,
+                        "pending_action.refused_destination_pending",
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                        pending_id = %pa.id,
+                        "failed to append pending_action.refused_destination_pending audit row: {audit_err}"
+                    );
+                }
+                Err(StoreError::InvalidInput {
+                    detail: format!(
+                        "destination write into {to_ns} requires approval that was not granted"
+                    ),
+                })
+            }
+        }
+    }
+
+    /// v1.0.0 #3259 — postgres twin of `storage::promote_to_namespace`. Clones
+    /// `source_id` into `to_namespace` (already validated as a proper ancestor
+    /// by the SHARED [`crate::storage::validate_promotion_target`]), attributing
+    /// the clone to `promoted_by` while preserving the origin under
+    /// `promoted_from*`, then records the clone→source `derived_from` edge. The
+    /// clone's 30+-field shape comes from the SHARED
+    /// [`crate::storage::build_promotion_clone`] so it cannot drift from the
+    /// sqlite primitive. The clone is persisted through the standard
+    /// [`MemoryStore::store`] funnel (fresh embedding re-derived from the
+    /// durable TEXT — the North-Star "derived artifacts are regenerable" rule).
+    async fn pg_promote_to_namespace(
+        &self,
+        ctx: &CallerContext,
+        source_id: &str,
+        to_namespace: &str,
+        promoted_by: Option<&str>,
+    ) -> StoreResult<String> {
+        // `get` returns `StoreError::NotFound` when the source is gone — the
+        // twin of the sqlite `MemoryNotFound` bail.
+        let source = self.get(ctx, source_id).await?;
+        crate::storage::validate_promotion_target(&source, to_namespace).map_err(|e| {
+            StoreError::InvalidInput {
+                detail: e.to_string(),
+            }
+        })?;
+        let clone = crate::storage::build_promotion_clone(&source, to_namespace, promoted_by);
+        let clone_id = self.store(ctx, &clone).await?;
+        // Clone → source: derived_from. Distinct ids (fresh uuid), so the link
+        // layer's self-link short-circuit can never fire.
+        self.link(
+            ctx,
+            &MemoryLink {
+                source_id: clone_id.clone(),
+                target_id: source_id.to_string(),
+                relation: crate::models::MemoryLinkRelation::DerivedFrom,
+                created_at: Utc::now().to_rfc3339(),
+                signature: None,
+                observed_by: None,
+                valid_from: None,
+                valid_until: None,
+                attest_level: None,
+                source_cid: None,
+                target_cid: None,
+            },
+        )
+        .await?;
+        Ok(clone_id)
+    }
 }
 
 #[async_trait]
@@ -29515,12 +29734,46 @@ impl MemoryStore for PostgresStore {
             }
             "promote" => {
                 if let Some(mid) = pa.memory_id.clone() {
-                    let patch = crate::store::UpdatePatch {
-                        tier: Some(Tier::Long),
-                        ..Default::default()
-                    };
-                    self.update(ctx, &mid, patch).await?;
-                    Some(mid)
+                    // v1.0.0 #3259 — honor a CROSS-NAMESPACE promote. When the
+                    // payload carries `to_namespace` this is a VERTICAL
+                    // promotion (clone into an ancestor namespace), not a tier
+                    // bump. Re-evaluate the destination STORE gate at execute
+                    // time (fail-closed, DECIDE-ONLY — the source Promote:Approve
+                    // queued this arm BEFORE the destination gate could run, and
+                    // an Approve here must not insert a second pending), then
+                    // clone — byte-for-byte the sqlite `db::execute_pending_action`
+                    // promote arm. Pre-fix this arm IGNORED `to_namespace` and
+                    // silently degraded every approved cross-namespace promote to
+                    // a tier-only bump: it reported SUCCESS while landing NO
+                    // clone (a silent wrong-result / data-divergence bug, worse
+                    // than a refusal). #3202 destination gate + parity.
+                    if let Some(to_ns) = pa
+                        .payload
+                        .get(crate::models::field_names::TO_NAMESPACE)
+                        .and_then(|v| v.as_str())
+                    {
+                        self.pg_refuse_unapproved_destination_store(&pa, to_ns)
+                            .await?;
+                        let clone_id = self
+                            .pg_promote_to_namespace(
+                                ctx,
+                                &mid,
+                                to_ns,
+                                Some(pa.requested_by.as_str()),
+                            )
+                            .await?;
+                        Some(clone_id)
+                    } else {
+                        // Tier bump to long (historical behavior). The trait
+                        // `update`'s tier→long arm also clears `expires_at` in
+                        // SQL (#1626), matching the sqlite twin's `Some("")`.
+                        let patch = crate::store::UpdatePatch {
+                            tier: Some(Tier::Long),
+                            ..Default::default()
+                        };
+                        self.update(ctx, &mid, patch).await?;
+                        Some(mid)
+                    }
                 } else {
                     None
                 }
