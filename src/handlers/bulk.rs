@@ -827,6 +827,44 @@ pub async fn bulk_create(
     let caller =
         resolve_create_caller(&headers).unwrap_or_else(|_| crate::identity::anonymous_request_id());
 
+    // #3071 — mirror single-create's screen-BEFORE-attest ordering. On
+    // `POST /memories`, `validate_create` runs the caller-origin secret screen
+    // (`validate_content` -> `screen_for_caller`) BEFORE the agent-attestation
+    // gate (`src/handlers/create.rs`), so a row carrying credential material is
+    // refused with the 400 secret-screen class, never 403 ATTESTATION_FAILED.
+    // The bulk path used to consult the whole-batch attestation presence gate
+    // FIRST, so the SAME secret returned a different refusal class (403) purely
+    // because the write arrived in a batch. Screen every row here, AHEAD of the
+    // attestation gate:
+    //   * a secret-bearing row is refused NOW with the 400 secret-screen class
+    //     (signed or not — matching single-create, which never reaches
+    //     attestation once content is refused),
+    //   * it is EXCLUDED from the whole-batch attestation presence gate below so
+    //     it can never be re-refused as 403, and
+    //   * it is SKIPPED in the Stage-1 revalidation loop (it is already
+    //     rejected) so it is never double-counted.
+    // Fail-closed is preserved: the row is refused and never persisted. A
+    // NON-secret unsigned row still fails the attestation gate (403). When the
+    // secret screen is not in `refuse` mode, `screen_for_caller` returns `Ok`
+    // for every row, so this pass is inert and nothing changes.
+    let mut secret_refused: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (index, body) in bodies.iter().enumerate() {
+        if let Err(refusal) = crate::secret_screen::screen_for_caller(&body.content) {
+            ledger.reject_class(
+                index,
+                "create",
+                BulkRowErrorClass {
+                    code: crate::errors::error_codes::VALIDATION_FAILED,
+                    label: "validation failed",
+                    status: StatusCode::BAD_REQUEST,
+                    retryable: false,
+                },
+                &refusal.to_string(),
+            );
+            secret_refused.insert(index);
+        }
+    }
+
     // #1919 (CWE-288 / CWE-345) — bulk_create MUST enforce the SAME
     // required-agent-attestation gate (#1751) that single-create enforces.
     // Fail the WHOLE batch (403 ATTESTATION_FAILED, BEFORE any persistence or
@@ -838,12 +876,17 @@ pub async fn bulk_create(
         crate::identity::attest::WriteSurface::HttpDirect,
     );
     if require_attest
-        && bodies.iter().any(|b| {
-            b.signature
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .is_empty()
+        && bodies.iter().enumerate().any(|(index, b)| {
+            // #3071 — a row already refused by the pre-attestation secret screen
+            // does NOT participate in the whole-batch attestation gate: on
+            // single-create the secret refusal (400) precedes attestation, so a
+            // secret-bearing row must not be re-refused as 403 here.
+            !secret_refused.contains(&index)
+                && b.signature
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
         })
     {
         return (
@@ -900,6 +943,12 @@ pub async fn bulk_create(
     let resolved_ttl = app.db.lock().await.2.clone();
     let mut prepared: Vec<PreparedRow> = Vec::with_capacity(bodies.len());
     for (index, body) in bodies.iter().enumerate() {
+        // #3071 — a row already refused by the pre-attestation secret screen
+        // must not be revalidated: `validate_create` would re-run the same
+        // screen and reject it a second time, double-counting the row.
+        if secret_refused.contains(&index) {
+            continue;
+        }
         if let Err(e) = validate::RequestValidator::validate_create(body) {
             ledger.reject(index, &e.field, &e.to_string());
             continue;
