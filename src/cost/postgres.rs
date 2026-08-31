@@ -113,6 +113,69 @@ fn accumulate(
     entry.1 = entry.1.saturating_add(1);
 }
 
+// v1.0.0 #3323 hotfix (#1953 recall-purity) — postgres twin of the SQLite
+// derive-at-rollup model: RECALL cost is DERIVED from the append-only
+// `recall_observations` ledger (never written on the pure recall path). One
+// ledger row is one served result; the served memory's content is tokenized
+// (cl100k) in-process because a token count is not expressible in SQL. Every
+// derive is BEST-EFFORT: a query error contributes zero rather than failing
+// the rollup (advisory — degrade, never corrupt).
+
+/// Ledger-derived recalled `(tokens, events)` for one namespace.
+async fn derive_namespace_recall_pg(pool: &PgPool, namespace: &str) -> (i64, i64) {
+    async fn inner(pool: &PgPool, namespace: &str) -> Result<(i64, i64), sqlx::Error> {
+        let contents: Vec<(String,)> = sqlx::query_as(
+            "SELECT m.content FROM recall_observations ro \
+             JOIN memories m ON m.id = ro.memory_id WHERE m.namespace = $1",
+        )
+        .bind(namespace)
+        .fetch_all(pool)
+        .await?;
+        let mut acc = (0_i64, 0_i64);
+        for (content,) in contents {
+            acc.0 = acc
+                .0
+                .saturating_add(clamp_tokens(crate::storage::count_tokens_cl100k(&content)));
+            acc.1 = acc.1.saturating_add(1);
+        }
+        Ok(acc)
+    }
+    inner(pool, namespace).await.unwrap_or_else(|e| {
+        tracing::debug!(target: "cost", "recall-ledger derive (namespace, pg) skipped (non-fatal): {e}");
+        (0, 0)
+    })
+}
+
+/// Ledger-derived recalled `(tokens, events)` per namespace, one pass.
+async fn derive_all_namespace_recall_pg(
+    pool: &PgPool,
+) -> std::collections::BTreeMap<String, (i64, i64)> {
+    async fn inner(
+        pool: &PgPool,
+    ) -> Result<std::collections::BTreeMap<String, (i64, i64)>, sqlx::Error> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT m.namespace, m.content FROM recall_observations ro \
+             JOIN memories m ON m.id = ro.memory_id",
+        )
+        .fetch_all(pool)
+        .await?;
+        let mut map: std::collections::BTreeMap<String, (i64, i64)> =
+            std::collections::BTreeMap::new();
+        for (ns, content) in rows {
+            let entry = map.entry(ns).or_insert((0_i64, 0_i64));
+            entry.0 = entry
+                .0
+                .saturating_add(clamp_tokens(crate::storage::count_tokens_cl100k(&content)));
+            entry.1 = entry.1.saturating_add(1);
+        }
+        Ok(map)
+    }
+    inner(pool).await.unwrap_or_else(|e| {
+        tracing::debug!(target: "cost", "recall-ledger derive (all-namespace, pg) skipped (non-fatal): {e}");
+        std::collections::BTreeMap::new()
+    })
+}
+
 /// The per-namespace rollup for one namespace, or `None` if never metered.
 ///
 /// # Errors
@@ -130,14 +193,28 @@ pub async fn namespace_rollup_pg(
     .bind(namespace)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(w, r, we, re)| CostRollup {
-        scope_kind: SCOPE_NAMESPACE.to_string(),
-        scope_key: namespace.to_string(),
-        tokens_written: w,
-        tokens_recalled: r,
-        write_events: we,
-        recall_events: re,
-    }))
+    // #1953 recall-purity — fold the ledger-derived recall onto the stored
+    // write counters (recall no longer writes the counter table).
+    let (dr_tokens, dr_events) = derive_namespace_recall_pg(pool, namespace).await;
+    match row {
+        Some((w, r, we, re)) => Ok(Some(CostRollup {
+            scope_kind: SCOPE_NAMESPACE.to_string(),
+            scope_key: namespace.to_string(),
+            tokens_written: w,
+            tokens_recalled: r.saturating_add(dr_tokens),
+            write_events: we,
+            recall_events: re.saturating_add(dr_events),
+        })),
+        None if dr_events == 0 => Ok(None),
+        None => Ok(Some(CostRollup {
+            scope_kind: SCOPE_NAMESPACE.to_string(),
+            scope_key: namespace.to_string(),
+            tokens_written: 0,
+            tokens_recalled: dr_tokens,
+            write_events: 0,
+            recall_events: dr_events,
+        })),
+    }
 }
 
 /// Every per-namespace rollup, most-expensive first.
@@ -148,23 +225,48 @@ pub async fn namespace_rollup_pg(
 pub async fn all_namespace_rollups_pg(pool: &PgPool) -> Result<Vec<CostRollup>, sqlx::Error> {
     let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT scope_key, tokens_written, tokens_recalled, write_events, recall_events \
-         FROM token_cost_counters WHERE scope_kind = $1 \
-         ORDER BY (tokens_written + tokens_recalled) DESC, scope_key ASC",
+         FROM token_cost_counters WHERE scope_kind = $1",
     )
     .bind(SCOPE_NAMESPACE)
     .fetch_all(pool)
     .await?;
-    Ok(rows
+    // #1953 recall-purity — merge stored write counters with ledger-derived
+    // recall figures (including recall-only namespaces), rank in-process.
+    let mut by_ns: std::collections::BTreeMap<String, CostRollup> = rows
         .into_iter()
-        .map(|(key, w, r, we, re)| CostRollup {
-            scope_kind: SCOPE_NAMESPACE.to_string(),
-            scope_key: key,
-            tokens_written: w,
-            tokens_recalled: r,
-            write_events: we,
-            recall_events: re,
+        .map(|(key, w, r, we, re)| {
+            (
+                key.clone(),
+                CostRollup {
+                    scope_kind: SCOPE_NAMESPACE.to_string(),
+                    scope_key: key,
+                    tokens_written: w,
+                    tokens_recalled: r,
+                    write_events: we,
+                    recall_events: re,
+                },
+            )
         })
-        .collect())
+        .collect();
+    for (ns, (dr_tokens, dr_events)) in derive_all_namespace_recall_pg(pool).await {
+        let entry = by_ns.entry(ns.clone()).or_insert_with(|| CostRollup {
+            scope_kind: SCOPE_NAMESPACE.to_string(),
+            scope_key: ns,
+            tokens_written: 0,
+            tokens_recalled: 0,
+            write_events: 0,
+            recall_events: 0,
+        });
+        entry.tokens_recalled = entry.tokens_recalled.saturating_add(dr_tokens);
+        entry.recall_events = entry.recall_events.saturating_add(dr_events);
+    }
+    let mut out: Vec<CostRollup> = by_ns.into_values().collect();
+    out.sort_by(|a, b| {
+        b.tokens_total()
+            .cmp(&a.tokens_total())
+            .then_with(|| a.scope_key.cmp(&b.scope_key))
+    });
+    Ok(out)
 }
 
 /// The per-lineage-ROOT rollup: `root_id` plus every memory reachable
@@ -191,7 +293,9 @@ pub async fn lineage_rollup_pg(
         .join(", ");
     let max_depth_i64 = i64::try_from(max_depth).unwrap_or(i64::MAX);
 
-    let sql = format!(
+    // The recursive node set (root + provenance descendants), shared by the
+    // stored-counter SUM and the ledger-derived recall query below.
+    let cte = format!(
         "WITH RECURSIVE descendants(node_id, depth, path) AS ( \
             SELECT ml.source_id, 1, ARRAY[ml.target_id, ml.source_id] \
             FROM memory_links ml \
@@ -204,7 +308,11 @@ pub async fn lineage_rollup_pg(
               AND NOT (ml.source_id = ANY(d.path)) \
         ), nodes(id) AS ( \
             SELECT $1 UNION SELECT node_id FROM descendants \
-        ) \
+        )"
+    );
+
+    let sum_sql = format!(
+        "{cte} \
         SELECT COALESCE(SUM(c.tokens_written), 0)::bigint, \
                COALESCE(SUM(c.tokens_recalled), 0)::bigint, \
                COALESCE(SUM(c.write_events), 0)::bigint, \
@@ -214,19 +322,49 @@ pub async fn lineage_rollup_pg(
           ON c.scope_kind = '{SCOPE_LINEAGE}' AND c.scope_key = n.id"
     );
 
-    let (w, r, we, re): (i64, i64, i64, i64) = sqlx::query_as(&sql)
+    let (w, r, we, re): (i64, i64, i64, i64) = sqlx::query_as(&sum_sql)
         .bind(root_id)
         .bind(max_depth_i64)
         .fetch_one(pool)
         .await?;
 
+    // #1953 recall-purity — derive recall from the ledger over the SAME node
+    // set (recall no longer writes the counter table). Best-effort.
+    let contents_sql = format!(
+        "{cte} \
+        SELECT m.content FROM nodes n \
+        JOIN recall_observations ro ON ro.memory_id = n.id \
+        JOIN memories m ON m.id = ro.memory_id"
+    );
+    let (dr_tokens, dr_events) = match sqlx::query_as::<_, (String,)>(&contents_sql)
+        .bind(root_id)
+        .bind(max_depth_i64)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(contents) => {
+            let mut acc = (0_i64, 0_i64);
+            for (content,) in contents {
+                acc.0 = acc
+                    .0
+                    .saturating_add(clamp_tokens(crate::storage::count_tokens_cl100k(&content)));
+                acc.1 = acc.1.saturating_add(1);
+            }
+            acc
+        }
+        Err(e) => {
+            tracing::debug!(target: "cost", "recall-ledger derive (lineage, pg) skipped (non-fatal): {e}");
+            (0, 0)
+        }
+    };
+
     Ok(CostRollup {
         scope_kind: SCOPE_LINEAGE.to_string(),
         scope_key: root_id.to_string(),
         tokens_written: w,
-        tokens_recalled: r,
+        tokens_recalled: r.saturating_add(dr_tokens),
         write_events: we,
-        recall_events: re,
+        recall_events: re.saturating_add(dr_events),
     })
 }
 

@@ -1622,12 +1622,14 @@ impl MemoryStore for SqliteStore {
                 tracing::warn!("recall (SAL-sqlite): ledger append failed (non-fatal): {e}");
             }
         }
-        // #3323 — advisory per-lineage + per-namespace token/cost accounting
-        // on the RECALL funnel. Rides the SAL store's WRITABLE `self.state`
-        // connection (the read-only HTTP fast-path defers, consistent with
-        // recall purity #1953). Best-effort: a metering failure never blocks
-        // the recall.
-        crate::cost::record_recall_sqlite(&conn, &results);
+        // #3323 + #1953 recall-purity — recall is PURE: it may append only to
+        // the append-only `recall_observations` ledger (above), never mutate
+        // `token_cost_counters`. The prior in-line `record_recall_sqlite` call
+        // here wrote the counter table ON the pure recall transaction, which
+        // violated the recall-purity invariant (#1953) — a recall MUST NOT
+        // mutate durable state except the ledger. RECALL token/cost is now
+        // DERIVED from that ledger at rollup time (see the `crate::cost`
+        // rollups), so the read path performs no durable counter write.
         Ok(results)
     }
 
