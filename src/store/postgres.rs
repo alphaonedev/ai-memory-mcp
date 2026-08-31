@@ -3802,8 +3802,11 @@ impl PostgresStore {
     /// relation (`CREATE TABLE IF NOT EXISTS`), the postgres twin of the
     /// SQLite v93 arm. Idempotent: a fresh cluster inherits the table inline
     /// from `postgres_schema.sql`, so the DDL is a no-op there; an existing
-    /// cluster gains it here. NO rewrite, no reindex. Tip arm — stamps
-    /// [`CURRENT_SCHEMA_VERSION`]. This table holds NO durable memory truth
+    /// cluster gains it here. NO rewrite, no reindex. Settled (non-tip)
+    /// arm — stamps the LITERAL 93, NOT [`CURRENT_SCHEMA_VERSION`] (now 94):
+    /// v93 is no longer the ladder tip, so stamping the constant here would
+    /// record 94 and strand a crash-interrupted node past the v94 arm (see
+    /// the stamp note below). This table holds NO durable memory truth
     /// (advisory, disposable derived data — North Star), so unlike the
     /// integrity-critical arms this one needs no pre-flight/guard.
     async fn migrate_v93(&self) -> StoreResult<()> {
@@ -3822,7 +3825,13 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v93 token-cost-counters ddl", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // #3324 — settled arm: stamp the LITERAL 93, not CURRENT_SCHEMA_VERSION
+        // (now 94) — crash-consistency: a crash between the v93 and v94 commits
+        // must not strand the node stamped-past-v94 with the v94 arm unrun.
+        // (#3323 added this arm as the tip stamping the constant, which was 93;
+        // #3324 bumped CURRENT_SCHEMA_VERSION to 94 and added migrate_v94 but
+        // left this line reading the constant, so it silently stamped 94.)
+        record_schema_version(&mut tx, 93).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v93 migration", e))?;
