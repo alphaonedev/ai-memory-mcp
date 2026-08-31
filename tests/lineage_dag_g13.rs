@@ -411,6 +411,81 @@ fn lineage_is_acyclic_guard() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. #3041 — EQUAL-`created_at` 2-cycle is refused, while a legitimate
+//     same-instant DAG (fan-out / chain, no back-edge) is still admitted.
+//
+//     The strict-`>` wall-clock guard (COND 4) orders only DISTINCT instants;
+//     an exact tie made BOTH `q -> p` and `p -> q` admissible, so an
+//     equal-instant pair could close a 2-cycle. The fix keeps the first
+//     same-instant edge legal (that is a valid same-batch DAG edge) but
+//     refuses the reverse edge once it would close a cycle, via a bounded
+//     structural ancestor check confined to the equal-instant clique.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn equal_instant_two_cycle_is_refused() {
+    let _g = flag_guard();
+    lineage_on();
+    let conn = open_mem_db();
+
+    let same = "2026-06-06T06:06:06+00:00";
+    let p = "00000000-0000-0000-0000-0000000003a1";
+    let q = "00000000-0000-0000-0000-0000000003a2";
+    db::insert(&conn, &make_mem(p, "p", "p", same)).unwrap();
+    db::insert(&conn, &make_mem(q, "q", "q", same)).unwrap();
+
+    // First equal-instant edge is a legitimate same-batch DAG edge (child q
+    // -> parent p); it must NOT be false-rejected.
+    db::create_link(&conn, q, p, "derived_from")
+        .expect("first equal-instant lineage edge must be admitted");
+
+    // The REVERSE edge would close a 2-cycle p -> q -> p. Before #3041 the
+    // strict `>` admitted it (equal instants => not "forward"); it must now
+    // be refused with the cycle envelope.
+    let cycle_err = db::create_link(&conn, p, q, "derived_from")
+        .expect_err("equal-instant reverse edge closes a 2-cycle and must be refused");
+    assert!(
+        cycle_err.to_string().starts_with(db::LINK_CYCLE_ERR_PREFIX),
+        "expected {} prefix, got: {cycle_err}",
+        db::LINK_CYCLE_ERR_PREFIX
+    );
+
+    // The refusal must be structural, not a write: exactly ONE lineage edge
+    // between the pair survives (the durable graph is not corrupted).
+    let edges: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_links \
+             WHERE relation = 'derived_from' \
+               AND ((source_id = ?1 AND target_id = ?2) \
+                 OR (source_id = ?2 AND target_id = ?1))",
+            [p, q],
+            |r| r.get(0),
+        )
+        .expect("count pair edges");
+    assert_eq!(edges, 1, "only the first (q -> p) edge may persist");
+
+    // Legitimate same-instant DAG construction is preserved: a fan-out from
+    // one child to two parents (all sharing the instant) forms no cycle and
+    // must be admitted, and a non-cycle-closing chain edge likewise.
+    let a = "00000000-0000-0000-0000-0000000003b1";
+    let b = "00000000-0000-0000-0000-0000000003b2";
+    let c = "00000000-0000-0000-0000-0000000003b3";
+    db::insert(&conn, &make_mem(a, "a", "a", same)).unwrap();
+    db::insert(&conn, &make_mem(b, "b", "b", same)).unwrap();
+    db::insert(&conn, &make_mem(c, "c", "c", same)).unwrap();
+    db::create_link(&conn, a, b, "derived_from")
+        .expect("same-instant fan-out edge a -> b is a valid DAG edge");
+    db::create_link(&conn, a, c, "derived_from")
+        .expect("same-instant fan-out edge a -> c is a valid DAG edge");
+    db::create_link(&conn, b, c, "derived_from")
+        .expect("same-instant chain edge b -> c is a valid DAG edge (no back-edge)");
+    // But closing the a -> b -> c -> a triangle is refused.
+    let tri_err = db::create_link(&conn, c, a, "derived_from")
+        .expect_err("closing the same-instant a -> b -> c -> a cycle must be refused");
+    assert!(tri_err.to_string().starts_with(db::LINK_CYCLE_ERR_PREFIX));
+}
+
+// ---------------------------------------------------------------------------
 // 5. Traversal terminates on a corrupt (directly-injected) cycle.
 // ---------------------------------------------------------------------------
 
