@@ -92,6 +92,19 @@ flag):
 api_key = "…"   # e.g. contents of /etc/ai-memory/api.key
 ```
 
+A non-loopback `serve` bind (any `--host` other than
+`127.0.0.1` / `::1` / `localhost`) **refuses to start unless `api_key`
+is set**. This bind guard (v0.7.0 fix campaign S5-C1,
+[`daemon_runtime::api_key_bind_guard`](../src/daemon_runtime.rs)) is
+**independent of mTLS** and of the stricter `AI_MEMORY_REQUIRE_API_KEY`
+env: even behind an enforced mTLS allowlist, a keyless daemon bound to
+`0.0.0.0` is refused to boot — a reverse proxy, `--network=host`
+container, or socat forward can present loopback to the daemon while
+exposing it off-host, so the loopback default alone is insufficient
+([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)).
+Setting `AI_MEMORY_REQUIRE_API_KEY=1` hardens this further, mandating
+`api_key` on **every** bind including loopback.
+
 When set, every endpoint except `/api/v1/health` requires the
 `X-API-Key` header — the **only** supported credential channel. (The
 `?api_key=` query-parameter form is **no longer accepted** as of
@@ -557,6 +570,14 @@ local namespace cap, even if the sending peer's local cap is higher.
    `import` writes a public-only `<agent_id>.pub` (no private half); the
    receive path resolves it via
    [`identity::verify::lookup_peer_public_key`](../src/identity/verify.rs).
+   **Key-dir privacy ([#3198](https://github.com/alphaonedev/ai-memory-mcp/issues/3198)).**
+   `AI_MEMORY_KEY_DIR` MUST be private: the daemon creates key
+   directories `0700` and **refuses to load or save a keypair from a
+   group- or world-writable key directory** (a `0o775` / `0o777` dir is
+   rejected on the existence gate, on load, and on save; `0o755` is
+   accepted, pinned by [`tests/key_dir_posture_3198.rs`](../tests/key_dir_posture_3198.rs)).
+   Keep the directory owner-only so a private signing key can never sit
+   where another local user can read or replace it (`chmod 700`).
    The claimed `x-peer-id` MUST equal the enrolled `--agent-id`. During
    the key-exchange window the rollout escape hatch
    `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` temporarily accepts

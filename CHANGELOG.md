@@ -139,12 +139,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chrono `to_rfc3339()` (`+00:00`, fractional-second normalization). Different
   bytes → different canonical CBOR → a different audit-leaf `payload_hash` for the
   same event, breaking cross-backend verifiability of the hash-chained audit
-  trail. Both backends now canonicalize `valid_until` through ONE shared helper,
-  `storage::canonicalize_valid_until_stamp` (`parse-as-RFC3339 → UTC → truncate
-  to microseconds → to_rfc3339()`, identical to the pre-existing `None → now`
-  default and to the microsecond precision postgres durably stores), BEFORE the
-  stamp is written to `memory_links.valid_until` AND hashed into the pre-image —
-  and the postgres leaf now commits to that canonical stamp directly rather than
+  trail. Both backends now derive the audit-leaf pre-image through ONE shared
+  helper, `storage::canonicalize_valid_until_stamp` (`parse-as-RFC3339 → UTC →
+  truncate to microseconds → to_rfc3339()`, identical to the pre-existing
+  `None → now` default and to the microsecond precision postgres durably
+  stores). Canonicalization applies ONLY to the value hashed into the
+  `SignableLink` pre-image, so both backends commit the SAME canonical bytes to
+  the audit leaf. The durable `memory_links.valid_until` COLUMN, by contrast,
+  stores the caller-supplied string VERBATIM on both backends (the merged
+  followup c5e4f115/8e7f993d deliberately left the stored value untouched — a
+  caller-supplied `"…Z"` is persisted as `"…Z"`, not re-rendered to `+00:00`);
+  the canonicalization is the audit-hash pre-image, not the column value. The
+  postgres leaf now commits to that canonical stamp directly rather than
   a `TIMESTAMPTZ` parse/re-render round-trip. A caller-supplied `valid_until` in
   any accepted RFC3339 form now yields a byte-identical `payload_hash` on both
   backends. No schema change (v94 unchanged). Covered by the live-postgres
@@ -1967,128 +1973,7 @@ decision to a place both adapters share, not by adding a second copy of it.
   new row", so a transient fault forked a duplicate lineage instead of updating
   the existing memory, and `next_versioned_title` handed back a title that was
   already taken. A genuine miss is still `Ok(None)`; a fault is now an error.
-### Security (SAL parity cluster: the postgres adapter's five sqlite-SSOT gaps; #3174 #3175 #3177 #3179 #3180)
 
-Scout-verified (R-405) findings from the 152-method SAL parity audit. Every one
-is a divergence where the postgres backend behaved differently from the sqlite
-SSOT for the identical wire call — the class the substrate's data-integrity
-guarantee cannot tolerate, because an operator's claim about retention,
-erasure, stoppability, or auditability was true on one backend and false on the
-other with nothing reporting the difference.
-
-- **`GET /api/v1/admin/export` on postgres emitted a bundle marked complete
-  carrying at most 1000 memories (#3174).** `PostgresStore::export_memories`
-  built `Filter { limit: 100_000 }` and delegated to `list`, whose first
-  statement is `filter.limit.clamp(1, LIST_MAX_LIMIT)` with `LIST_MAX_LIMIT =
-  1000` — no error, no warning, no truncation flag. `export_links` was uncapped,
-  so a restored bundle also carried edges pointing at memories it did not
-  contain. Silent backup loss. The export now uses a dedicated **uncapped
-  keyset-paged reader** (`(created_at, id COLLATE "C")` cursor, same expiry +
-  #1948 lifecycle predicates as the sqlite `export_all`, no OFFSET so a
-  concurrent insert cannot make a page skip or duplicate rows). `LIST_MAX_LIMIT`
-  is deliberately **not** raised — it is the tenant page cap — but `list`,
-  `search` and `list_archived` now all WARN through one helper whenever they
-  clamp a caller's limit, so the next oversized reader finds out before
-  shipping a lossy read: applying the cap is correct, applying it in silence is
-  what made a partial answer indistinguishable from a complete one. The same
-  clamp corrupted
-  `entity_register`, which scanned `limit: 10_000` for a prior entity: in any
-  namespace over 1000 rows the prior row fell outside the window and a
-  **duplicate entity** landed on every re-register. That lookup is now the
-  direct indexed probe the sqlite SSOT uses. Also on postgres, the canonical
-  name was never written to `entity_aliases`, so
-  `entity_get_by_alias(canonical_name)` returned `Some` on sqlite and `None` on
-  postgres — an entity registered with no aliases was unreachable by name. The
-  canonical alias row is now written unconditionally, and the returned alias set
-  is the join-table read (the sqlite `list_entity_aliases` shape), which also
-  stops the pg response echoing a raw credential that `secret_screen` redact
-  mode had already masked in storage.
-- **The fleet-wide write kill switch did not cover two postgres write paths
-  (#3175).** `undo_in_place_edit` (a destructive content restore that overwrites
-  the live row and appends a signed audit event) and `recover_turn_idempotent`
-  (L2 transcript recovery, a high-volume durable-row appender) contained **zero**
-  `gate_record_stop` calls while 18 sibling pg methods gated — so both kept
-  writing while the record plane was STOPPED. Both now gate on their first
-  statement, as their sqlite twins do; `execute_pending_action` gains an
-  explicit gate too, so its audit emits cannot land on a stopped plane. A new
-  source-scanning guard
-  (`tests/qual_pg_record_stop_gate_parity_3175.rs`) enumerates every
-  record-stop-gated `SqliteStore` method and requires the `PostgresStore` twin
-  to gate directly or to delegate to a method that does — resolving the callee
-  rather than assuming it — so a future mutating method cannot ship ungated on
-  one backend. Separately, `record_stop_status` on postgres read the
-  **process-local cache** seeded once at `connect`: a stop engaged by another
-  pool (the deployment postgres exists for) left every other daemon confidently
-  reporting RUNNING. It now re-derives from the persisted `signed_events` chain,
-  which also reconciles that pool's hot-path gate — self-healing in the
-  fail-closed direction. Finally, the S5-H4 approver-on-behalf laundering gate
-  (`verify_payload_agent_id` + the
-  `pending_action.refused_agent_id_mismatch` audit row) existed only on sqlite,
-  so it was absent on the multi-tenant HTTP daemon — the one surface with a real
-  adversary. postgres now calls the same storage-layer function.
-- **postgres TTL / byte-cap eviction hard-deleted rows with no tombstone and no
-  crypto-erase (#3177).** `evict_tombstone_and_erase` had sqlite callers only:
-  the pg `run_gc` / `size_gc` twins DELETEd outright. Two consequences — an
-  evicted **encrypted** row left its per-record envelope key intact (the
-  retention/erasure claim held on sqlite and not on postgres), and the eviction
-  left no forget-tombstone, so a federated peer's copy of the evicted row was
-  accepted straight back under LWW where sqlite refuses it. "Evicted" that
-  silently un-evicts is data the operator believes is gone. Both paths now run a
-  postgres twin of the sqlite primitive — crypto-erase, `cid_genesis` scrub,
-  signed `substrate.crypto_erase` attestation, mandatory signed tombstone — in
-  the SAME transaction as the DELETE, ungated by `append_only_enabled()` (the
-  revision leaf is an optional ledger; the tombstone is the retention contract).
-  On the `run_gc` hard-delete path the DELETE is additionally **pinned to the
-  exact id set that was tombstoned**, rather than re-evaluating the expiry
-  predicate a second time: postgres runs that sweep at READ COMMITTED, so an
-  already-expired row committed by a concurrent writer between the `FOR UPDATE`
-  victim read and the DELETE would otherwise be deleted with no tombstone and
-  no erase — the same defect, reintroduced through a race. (The sqlite twin
-  cannot hit it: `BEGIN IMMEDIATE` holds the single writer lock for the whole
-  sweep.) Separately, the pg `size_gc` **archive** branch copied only the memory row, so
-  `archive_restore` returned it isolated with its edge graph reaped by the FK
-  cascade; it now snapshots `memory_links` into `archived_memory_links` first,
-  as `forget` and `archive_by_ids` already did — and `archive_by_ids`' copy of
-  that statement was folded into the same shared helper, so a future archiving
-  path cannot forget the edges the way this one did.
-- **`action_frontier` / `action_next` on postgres dispatched unlocks-gated work
-  (#3179).** `pg_frontier_where_tail` was a hand-copied twin carrying two of the
-  three `NOT EXISTS` clauses: the #3008 `unlocks` clause was never mirrored, so
-  an action whose only dependency was an `EdgeType::Unlocks` edge was served to
-  agents on postgres while sqlite held it back — out-of-order execution — under
-  a doc comment asserting the two were "byte-for-byte the same predicate", which
-  hid the divergence from reviewers. Both backends now format the predicate from
-  **one** fragment (`actions::frontier_where_tail_with`, parameterized only by
-  the bind placeholder), so a future `EdgeType` clause lands on both or neither.
-- **postgres lost three audit/signal writes the sqlite SSOT makes (#3180).**
-  (a) A governance DENY appended nothing to the signed chain on pg
-  (`pending_action.denied` matched `storage/mod.rs` only), leaving refusals
-  unprovable once the mutable `pending_actions` row moved on; the emit now
-  shares the decision's transaction — the postgres chain append must be
-  transactional to compute `sequence`/`prev_hash`, and the resulting disposition
-  is the fail-closed one (no unaudited deny commits). The post-execute
-  `pending_action.approved` emit is added in the same family so the governance
-  transitions are audit-complete together. (b) `recall_hybrid` on pg appended
-  **no** access-ledger rows, so every pg-backed fleet produced zero
-  `recall_observations` — and the memory lifecycle that folds from exactly those
-  rows (TTL extension, mid→long promotion, priority decay) was **frozen**, with
-  nothing reporting it. The ledger is now appended over the post-filter returned
-  set, best-effort with a WARN (a read must not fail because a bookkeeping row
-  could not be written), matching the sqlite twin. (c) `reclassify_memory_kind`
-  bound `cause_hash: None` on pg while sqlite bound
-  `compute_cause_hash(...)`; the cause is now threaded into **both** the
-  signature fold and the stored column, and pinned byte-equal to the sqlite
-  value by test.
-
-Non-trivial postgres helpers landed in a new sibling module
-`src/store/postgres_parity.rs` rather than growing the 34.5k-line
-`src/store/postgres.rs`; the QUAL-10 ceiling for that file moves
-35_200 -> 35_720 for the call sites and their rationale (measured 35_652 on the ae3e0aec rebase).
-
-Known residual, deliberately out of scope and filed as #3207: the pg
-`sweep_pending_action_timeouts` still emits no `pending_action.timed_out` row
-(the sqlite sweeper does). It is the one governance transition of the four that
-this cluster does not close — the three an adversary can drive are covered.
 ### Security
 
 - **#3049 — federation-receive secret screen for inbound coordination rows.**
@@ -2130,7 +2015,7 @@ this cluster does not close — the three an adversary can drive are covered.
   an autonomous mutation the caller never named). No postgres synthesis
   lane exists (`memory_store` is sqlite-native). Source:
   `src/mcp/tools/store/{mod,synthesis}.rs`.
-### Security (HTTP/pg governance skip cluster: #3225 capture_turn K9; #3227 forget probe; #3228 pg delete pre-get)
+### Security (HTTP/pg governance skip cluster: #3227 forget probe; #3228 pg delete pre-get)
 
 - **#3227 — namespace-less bulk forget treated a `resolve_governance_policy` Err as ungoverned.** `#1849` refuses a cross-namespace forget when any matched ns carries a non-`Any` delete level, but the probe used `.ok().flatten()` so a DB fault skipped the gate and the forget proceeded (ERRORS-19). Probe `Err` is now 503; the forget does not run.
 - **#3228 — postgres HTTP DELETE skipped governance when `get()` failed.** `app.store.get(&ctx, &id).await.ok()` collapsed a transport/DB error to `None`, the `if let Some(mem)` consult was skipped, and `delete` still ran. Non-`NotFound` get errors are now 503; the delete does not run. `NotFound` still 404s at delete.
@@ -5255,159 +5140,6 @@ refusal of a `0o775`/`0o777` directory on load / save / the existence gate, and
 the UNCHANGED acceptance of `0o755`; and unit tests in
 `src/identity/keypair.rs` pin the collision-safe archive naming at a fixed
 timestamp, the exhaustion refusal, and staging-file cleanup.
-### Security (sqlite SAL adapter enforced LESS than the postgres twin; #3176)
-
-Four result-changing authorization divergences where the **same** SAL call was
-permitted on sqlite and refused on postgres. All four are closed by moving the
-decision to a place both adapters share, not by adding a second copy of it.
-
-- **`clear_namespace_standard` had NO owner gate and no #2545 severed-standard
-  refusal on sqlite.** The adapter discarded `ctx` and ran a bare `DELETE FROM
-  namespace_meta`, so a trait-routed tenant could DISARM the governance
-  standard protecting every memory in another tenant's namespace — reverting it
-  to permissive allow-on-silence. postgres has enforced both arms since #1777 /
-  #2545, and the sqlite MCP + HTTP surfaces have their own copies, but the SAL
-  layer (CLI, internal surfaces, federation, any future caller) had none. The
-  #1777 owner predicate, the #2545 unresolvable-standard refusal and BOTH
-  wire-pinned refusal strings now live once in
-  `crate::store::authorize_clear_namespace_standard`; each adapter only reads
-  the three-state binding (`NoMetaRow` / `Resolved(owner)` / `Unresolvable`),
-  so the refusals are byte-identical whichever backend serves the request. The
-  #2704-F2 unowned-PASS is preserved explicitly by keeping row-presence and
-  owner-nullness separable.
-- **`verify` discarded `ctx` on sqlite** and read the row through the raw
-  `db::get`, so a caller could confirm the EXISTENCE of another agent's
-  `scope=private` memory and read its integrity findings and CID verdict. It
-  now folds an invisible row to `NotFound`, matching the postgres twin (which
-  routes through the #910-gated `self.get(ctx, id)`).
-- **`reflect` read its SOURCES unscoped on sqlite**, so a tenant could pull
-  another agent's `scope=private` content into its own reflection. The new
-  `storage::reflect::reflect_with_hooks_for_caller` threads the caller's
-  principal into the source load and folds an invisible source to
-  `SourceNotFound` — byte-identical to a genuinely missing id, so the gate
-  leaks no existence signal. `None` (admin / migrate / curator, and the
-  surfaces that gate upstream) keeps the previous unscoped read.
-- **Owner-level governance resolved a different owner per backend.**
-  `storage::evaluate_level` used `memory_owner.or(namespace_owner)` for every
-  action; the postgres twin keys on the action (`Store => ns_owner`). A `Store`
-  with `memory_owner == agent != ns_owner` was therefore ALLOW on sqlite and
-  DENY on postgres. sqlite now uses the action-keyed selection, which is what
-  the function's own docblock has always documented ("`namespace_owner` … used
-  as the 'owner' for store operations") and is the fail-closed direction.
-
-### Fixed (link claim windows discarded on sqlite; postgres supersession left a stale signature and no audit leaf; #3178)
-
-- **`link()` / `link_signed()` discarded the caller's temporal claim on sqlite
-  — and signed a window the caller never supplied (#3178).** The adapter passed
-  only `(source_id, target_id, relation)`; `db::create_link_signed` had no
-  `valid_until` in its INSERT at all and bound `created_at` and `valid_from`
-  through one shared parameter, while the Ed25519 pre-image committed to
-  `valid_from = now, valid_until = None`. The same
-  `MemoryStore::link_signed(link)` therefore produced DIFFERENT durable rows
-  AND different signature pre-images per backend, so a link minted on one
-  backend could not verify on the other. The new
-  `db::create_link_signed_with_window` honours all three fields, adds
-  `valid_until` to the INSERT, signs the window it actually persists, and
-  truncates every stamp to microseconds before both signing and writing (the
-  precision postgres `TIMESTAMPTZ` round-trips) so the CBOR pre-image survives
-  the storage boundary. A malformed timestamp is now a hard error instead of a
-  silent substitution of `now`. `create_link_signed` is retained unchanged as a
-  no-window shim, so existing call sites are untouched.
-- **postgres supersession left a stale signature and no audit leaf (#3178).**
-  `kg_invalidate_cte` stamped `valid_until` only, so a superseded row kept an
-  Ed25519 signature over bytes that had changed — `memory_verify` then reported
-  a misleading "signature mismatch" instead of an honest "unsigned" — and the
-  postgres audit chain carried no `memory_link.invalidated` event at all. The
-  prior-row read (`FOR UPDATE`), the stamp, the signing-surface clear and the
-  audit append now run in ONE transaction, matching the sqlite twin's v0.7.0
-  #628 H5 contract (including its refusal to commit the update when the audit
-  row cannot be appended).
-
-### Fixed (link supersession audit named the wrong actor and had no record-stop fence; #3203, #3204 item 3)
-
-- **The `memory_link.invalidated` audit leaf was attributed to the edge's
-  ORIGINAL ATTESTER (#3203).** Both backends stamped `signed_events.agent_id`
-  from the row's `observed_by` — the agent that signed the edge — so an audit
-  replay showed the original attesting peer as the actor of an invalidation it
-  never performed, on a chain whose whole purpose is establishing who did what.
-  `MemoryStore::invalidate_link` / `db::invalidate_link` /
-  `PostgresStore::kg_invalidate{,_cte,_cypher}` now take the ACTING principal
-  and stamp that; the HTTP handler passes its authenticated caller and the MCP
-  handler passes the ENFORCED read-visibility caller (deliberately not the
-  self-asserted `arguments["agent_id"]` — an audit actor must not be forgeable
-  from the wire), while an unattributed substrate path records the `system`
-  sentinel rather than borrowing an identity. The superseded signer is not
-  lost: its Ed25519 proof stays in the leaf's `signature` column and its
-  identity travels as `observed_by` inside the canonical CBOR that
-  `payload_hash` commits to.
-- **`invalidate_link` had no record-stop fence (#3203).** It mutates
-  `memory_links` and appends to `signed_events`, but unlike its create twin it
-  sat outside the #1955 R45 fence, so a supersession landed while the record
-  plane was STOPPED. `record_stop::gate_storage_conn` now guards it, before the
-  transaction opens so a refusal leaves nothing half-done.
-- **`create_link_inbound` substituted an untruncated receiver-clock stamp
-  (#3204 item 3).** When a peer sent no `valid_from` (or no `created_at`) the
-  receiver wrote `Utc::now().to_rfc3339()` verbatim — nanosecond precision —
-  while every outbound signer truncates to microseconds because postgres
-  `TIMESTAMPTZ` quantises there. A genuinely `peer_attested` edge could
-  therefore never re-verify locally: `memory_verify` re-derives the pre-image
-  from the stored row and reported `Tampered` (fail-closed, but false). The
-  substitute is now truncated. A peer-SUPPLIED value is still stored
-  byte-identical — a receiver must never rewrite an attested claim.
-
-### Fixed (sqlite silently inherited trait defaults that do not meet their documented contracts; #3181)
-
-- **`store_batch` was not atomic on sqlite, despite the trait doc saying it is
-  (#3181).** The docblock states the batch "is atomic (all rows commit or none
-  do)" and that "SQLite inherits it unchanged"; sqlite had no override, so it
-  inherited the per-row `store()` loop in autocommit and a mid-batch failure
-  left a COMMITTED PREFIX durable while returning only `Err`. `SqliteStore` now
-  wraps the loop in one `BEGIN IMMEDIATE`, transaction-aware in the
-  `db::delete` / `archive_by_ids` style so a caller that already holds a
-  transaction is unaffected. The per-row funnel and input order are unchanged,
-  so the #2551 returned-id contract (ids never rewritten by the conflict arm;
-  in-batch duplicates collapse LAST-WINS) holds as before.
-- **`set_embeddings_batch` counted GHOST writes on sqlite (#3181).** The trait
-  default incremented `written` once per ENTRY regardless of whether a row was
-  updated, so an id deleted between the scan and the write was reported as
-  embedded — a number the backfill logs and the caller's progress accounting
-  both consumed. sqlite now delegates to the SSOT `db::set_embeddings_batch`
-  (one transaction per chunk, `changes()`-derived counts, per-namespace dim
-  validation), which the trait doc already named as the shape to mirror.
-- **`check_memory_quota` was a silent no-op on sqlite (#3181).** The trait
-  default returns `Ok(())`, documented as safe because sqlite "enforces at the
-  handler layer" — true of the HTTP/MCP handlers, false of any trait-routed
-  caller, which got no quota gate while the postgres twin enforced one. The new
-  read-only `quotas::check_memory_quota` mirrors the postgres arithmetic
-  (day-rolled daily counter, cumulative storage bytes, compiled defaults when
-  no row exists) and the adapter maps a breach onto the same
-  `StoreError::QuotaExceeded` envelope, so the 429 wire shape is identical
-  across backends. It creates no quota row as a side effect.
-
-### Fixed (sqlite fail-open reads turned substrate faults into benign answers; #3182)
-
-- **Four sqlite reads turned substrate faults into benign answers.**
-  `is_registered_agent` ended in `.is_ok()`, `agent_max_created_at` in
-  `.unwrap_or(None)`, `schema_version` in `.unwrap_or(0)` and
-  `storage::get_embedding` in `.ok()` — each collapsing a dropped table, a lock
-  failure or corruption into a plausible value their postgres twins report as
-  an error. `schema_version` was the most dangerous: `0` is a migration-ladder
-  INPUT, so a populated-but-damaged database presented itself as fresh. All
-  four now propagate. The one remaining best-effort consumer — the recovery
-  fast-path watermark in `recover::run` — keeps its discard EXPLICIT and
-  records the fault on the report, because the watermark is a pure optimisation
-  over idempotent writes. `agent_max_created_at` additionally normalises its
-  RFC3339 string to microsecond precision so the sqlite and postgres watermarks
-  are byte-identical for the same instant (postgres re-renders through a
-  microsecond-quantised `TIMESTAMPTZ`; sqlite returned a nanosecond string).
-- **`db::find_by_title_namespace` swallowed faults on the deduplication
-  probe.** Its `.ok()` answered "no row with this (title, namespace)" for any
-  rusqlite failure, while its own docblock promised it "returns the underlying
-  SQLite error". Every `on_conflict` caller (`db::upsert`, the create and bulk
-  handlers, `cli::io`, `portability::import`) reads `None` as "safe to insert a
-  new row", so a transient fault forked a duplicate lineage instead of updating
-  the existing memory, and `next_versioned_title` handed back a title that was
-  already taken. A genuine miss is still `Ok(None)`; a fault is now an error.
 
 ### Fixed (cert: namespace-standard chain grafting — tenant isolation + approval bypass; #2542)
 
@@ -6218,43 +5950,6 @@ Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
   config, including the fallback-mismatch case) +
   `embeddings::tests::{capability_model_id_reports_constructed_remote_model_3063,
   reconcile_overrides_config_with_constructed_embedder_3063}`.
-### Fixed (Wave-C2 — CLI/MCP correctness parity; #3025 #3040 #3037 #2989)
-
-- **#3025 — CLI `store --json` reported the REQUESTED tier/expiry/version on an
-  upsert, not the persisted row.** On a `(title, namespace)` upsert `db::insert`
-  merges onto the existing row (tier stays monotonic-max, `version` bumps,
-  `expires_at` follows the persisted tier), but the response serialized the
-  in-memory request — so a `--tier short` upsert over a `long` row reported
-  `tier=short`/`version=1`/`exp=+6h` while the DB stayed `long`/`v2`/no-expiry
-  (the #2444 reports-success-doing-nothing / honesty class). The CLI now
-  re-reads the persisted row after the write and echoes it (both `--json` and
-  the text line), matching the MCP `echo_tier` precedent
-  (`src/mcp/tools/store/mod.rs`). Source: `src/cli/store.rs`.
-- **#3040 — MCP `memory_list` ignored `AI_MEMORY_MAX_PAGE_SIZE` while HTTP
-  honored it (asymmetric OOM guard).** The MCP stdio loop carries no `AppState`,
-  so the resolved `[limits].max_page_size` cap is now mirrored into a
-  process-global (`crate::set_max_page_size` / `max_page_size`, the
-  `set_max_inflight_requests` precedent), seeded at boot from
-  `AppConfig::resolve_limits()`, and consulted by the list handler — which caps
-  at the SMALLER of its historical 200-row ceiling and the operator cap, so MCP
-  never exceeds the guard HTTP applies. Source: `src/lib.rs`,
-  `src/daemon_runtime.rs`, `src/mcp/tools/list.rs`.
-- **#3037 — `dependents-of-invalidated --transitive` was unreachable from the
-  CLI (hardcoded non-transitive).** The R55/#1959 transitive taint walk shipped
-  on HTTP + MCP but the CLI subcommand hardcoded `json!({memory_id})`. A
-  `--transitive` flag is added and threaded through to the shared handler, with
-  the downstream suspect set rendered in text output. Source:
-  `src/cli/commands/dependents_of_invalidated.rs`.
-- **#2989 — the `recall_observations` read surface hid `agent_id`/`namespace`/
-  `folded`; the doc claimed a false 1:1 column mirror.** The ledger STORES the
-  v58/#1705 identity binding (`agent_id`, `namespace`) + the v77/#1869 `folded`
-  fold-state, but the `Observation` read struct omitted them, so "who recalled
-  what, in which namespace, folded or not" was unanswerable through the
-  sanctioned MCP/HTTP read surface and the #1705 identity binding was
-  read-invisible. The three columns are now surfaced on the read struct + both
-  backends' `list_recall_observations` SELECT (sqlite + postgres), and the doc
-  now truthfully mirrors the columns. Output-only (no input-schema / tool-count
-  change). Source: `src/observations/mod.rs`, `src/store/postgres.rs`.
 
 ### Fixed (Wave-D2 OPS / config honesty — #2999 #3001 #3002 #3003)
 
