@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3259 — postgres `execute_pending_action` "promote" ignored `to_namespace`, silently dropping the clone)
+
+- **On postgres, an APPROVED cross-namespace ("vertical") promote silently
+  degraded to a tier-only bump: it reported SUCCESS while landing NO clone**
+  (refs [#3259](https://github.com/alphaonedev/ai-memory-mcp/issues/3259);
+  HIGH, data-integrity North Star). `PostgresStore::execute_pending_action`'s
+  `"promote"` arm ignored the pending payload's `to_namespace` entirely — it
+  unconditionally set the source to `tier=long` and returned the SOURCE id,
+  whereas the sqlite `db::execute_pending_action` twin reads `to_namespace` and
+  CLONES the memory into that ancestor namespace. On a mixed fleet (a promote
+  pending queued by the sqlite/MCP enforce path, executed by a postgres daemon)
+  the approved cross-namespace promote produced a silent wrong-result /
+  data-divergence — strictly worse than a refusal. The postgres arm now ports
+  the sqlite semantics exactly: when `to_namespace` is present it re-evaluates
+  the destination STORE gate at execute time (fail-closed, DECIDE-ONLY — it
+  never queues a second pending; refuses on `Deny` OR still-`Pending`, emitting
+  the same `pending_action.refused_destination_{deny,pending}` audit rows) and,
+  if admitted, clones into the destination. The clone's validation and its
+  30+-field construction (fresh id/timestamps, `#3202` provenance re-stamp:
+  acting requester becomes `agent_id`, origin preserved under `promoted_from*`)
+  are now defined ONCE in shared pure helpers
+  (`storage::validate_promotion_target` / `storage::build_promotion_clone`) that
+  BOTH backends call, so the two paths cannot drift again. No schema change
+  (v94 unchanged). Covered by the live-postgres parity test
+  `tests/pg_promote_namespace_clone_3259.rs` (the clone lands in the
+  destination namespace, the source is untouched, the `derived_from` edge is
+  recorded).
+
 ### Added (#3322 #3266 MVG — `memory_swarm_rewind`: one-command atomic, resumable intercept + rewind of a memory cascade)
 
 - **New `memory_swarm_rewind` MCP tool + `ai-memory swarm-rewind` CLI verb.**

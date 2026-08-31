@@ -8148,41 +8148,27 @@ pub fn recall(
     Ok((budgeted, outcome))
 }
 
-/// Task 1.7 — vertical memory promotion.
+/// v1.0.0 #3259 — PURE validation of a vertical-promotion target, SHARED by
+/// the sqlite [`promote_to_namespace`] primitive and the postgres
+/// `execute_pending_action` promote arm so the two backends cannot drift on
+/// which cross-namespace promotions are legal.
 ///
-/// Clones `source_id` into `to_namespace`, which must be a proper `/`-derived
-/// ancestor of the memory's current namespace. The original memory is
-/// **untouched** (vertical promotion is a fan-out, not a move). A
-/// `derived_from` link is created from the new clone back to the source so
-/// the promotion trail is queryable.
+/// `to_namespace` must be a non-empty PROPER ANCESTOR of `source.namespace`
+/// (never empty, never the namespace itself, never a non-ancestor). Takes no
+/// `Connection`: it is a decision over already-loaded state, which is what lets
+/// the postgres (pool-based) path call it verbatim.
 ///
-/// Returns the clone's new ID.
+/// # Errors
 ///
-/// Errors when:
-/// - source doesn't exist
-/// - `to_namespace` is empty, equal to the source namespace, or not an
-///   ancestor of it (see `namespace_ancestors`)
-pub fn promote_to_namespace(
-    conn: &Connection,
-    source_id: &str,
-    to_namespace: &str,
-    promoted_by: Option<&str>,
-) -> Result<String> {
+/// [`StorageError::InvalidArgument`] (as a #962 typed anyhow envelope) when
+/// `to_namespace` is empty, equal to the source namespace, or not an ancestor.
+pub(crate) fn validate_promotion_target(source: &Memory, to_namespace: &str) -> Result<()> {
     if to_namespace.is_empty() {
         // #962 typed envelope.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
             reason: "to_namespace cannot be empty".to_string(),
         }));
     }
-    let source = get(conn, source_id)?.ok_or_else(|| {
-        // #962 typed envelope. `Source` here labels the promotion source,
-        // not a link end, but the user-facing message ("source memory
-        // not found: …") is preserved via the LinkEnd::Source Display arm.
-        anyhow::Error::new(StorageError::MemoryNotFound {
-            id: source_id.to_string(),
-            role: Some(LinkEnd::Source),
-        })
-    })?;
     if to_namespace == source.namespace {
         // #962 typed envelope.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -8202,19 +8188,30 @@ pub fn promote_to_namespace(
             ),
         }));
     }
+    Ok(())
+}
 
+/// v1.0.0 #3259 — PURE construction of a promotion clone, SHARED by both
+/// backends' promote paths so the clone's 30+-field shape and provenance
+/// re-stamp are defined ONCE and cannot diverge between sqlite and postgres
+/// (a field-by-field replica is exactly the drift the North Star forbids).
+///
+/// The caller has already validated the target (see
+/// [`validate_promotion_target`]); this only builds the new `Memory`. The
+/// caller then persists it (sqlite `insert` / postgres `store`) and creates the
+/// clone→source `derived_from` edge.
+///
+/// #3202 — the clone's provenance is RE-STAMPED: the acting caller
+/// (`promoted_by`) becomes the clone's `agent_id`, while the origin is
+/// PRESERVED under `promoted_from*` so the original authorship stays
+/// recoverable — the durable truth is added to, never replaced. A fresh id and
+/// `created_at`/`updated_at` make execution idempotent-safe on replay.
+pub(crate) fn build_promotion_clone(
+    source: &Memory,
+    to_namespace: &str,
+    promoted_by: Option<&str>,
+) -> Memory {
     let now = Utc::now().to_rfc3339();
-    // #3202 — RE-STAMP the clone's provenance. Pre-fix the clone carried
-    // `source.metadata` verbatim, so the new row in the DESTINATION namespace
-    // was owned by the SOURCE's author rather than by the caller that put it
-    // there, and nothing in the row recorded where it came from (only the
-    // out-of-band `derived_from` edge did). Two consequences: a destination
-    // owner gate compared against a principal who never wrote into that
-    // namespace, and an operator auditing the destination could not tell a
-    // promoted row from a natively-authored one. The acting caller becomes the
-    // clone's `agent_id`; the origin is PRESERVED (never overwritten) under
-    // `promoted_from*` so the original authorship is still recoverable — the
-    // durable truth is added to, not replaced.
     let clone_metadata = {
         let mut meta = source.metadata.clone();
         if let Some(obj) = meta.as_object_mut() {
@@ -8236,7 +8233,7 @@ pub fn promote_to_namespace(
             }
             obj.insert(
                 "promoted_from".to_string(),
-                serde_json::Value::String(source_id.to_string()),
+                serde_json::Value::String(source.id.clone()),
             );
             obj.insert(
                 "promoted_from_namespace".to_string(),
@@ -8249,7 +8246,7 @@ pub fn promote_to_namespace(
         }
         meta
     };
-    let clone = Memory {
+    Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         valid_from: source.valid_from.clone(),
         valid_until: source.valid_until.clone(),
@@ -8280,7 +8277,43 @@ pub fn promote_to_namespace(
         confidence_decayed_at: None,
         version: 1,
         lifecycle_state: crate::models::LifecycleState::Open,
-    };
+    }
+}
+
+/// Task 1.7 — vertical memory promotion.
+///
+/// Clones `source_id` into `to_namespace`, which must be a proper `/`-derived
+/// ancestor of the memory's current namespace. The original memory is
+/// **untouched** (vertical promotion is a fan-out, not a move). A
+/// `derived_from` link is created from the new clone back to the source so
+/// the promotion trail is queryable.
+///
+/// Returns the clone's new ID.
+///
+/// Errors when:
+/// - source doesn't exist
+/// - `to_namespace` is empty, equal to the source namespace, or not an
+///   ancestor of it (see `namespace_ancestors`)
+pub fn promote_to_namespace(
+    conn: &Connection,
+    source_id: &str,
+    to_namespace: &str,
+    promoted_by: Option<&str>,
+) -> Result<String> {
+    let source = get(conn, source_id)?.ok_or_else(|| {
+        // #962 typed envelope. `Source` here labels the promotion source,
+        // not a link end, but the user-facing message ("source memory
+        // not found: …") is preserved via the LinkEnd::Source Display arm.
+        anyhow::Error::new(StorageError::MemoryNotFound {
+            id: source_id.to_string(),
+            role: Some(LinkEnd::Source),
+        })
+    })?;
+    // #3259 — validation + clone construction are SHARED (pure) helpers so the
+    // sqlite primitive here and the postgres `execute_pending_action` promote
+    // arm cannot drift on which promotions are legal or on the clone's shape.
+    validate_promotion_target(&source, to_namespace)?;
+    let clone = build_promotion_clone(&source, to_namespace, promoted_by);
     let actual_id = insert(conn, &clone)?;
     // Clone → source: derived_from. Safe to ignore if the link layer
     // short-circuits on self-link (impossible here — distinct IDs).
