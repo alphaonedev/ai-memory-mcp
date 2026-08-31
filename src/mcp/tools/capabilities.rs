@@ -786,7 +786,7 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
             // (`handle_link`), NOT `from_id`/`to_id`; the success
             // envelope carries no `link_id`.
             json!({"source_id": "<uuid-a>", "target_id": "<uuid-b>", "relation": "derives_from"}),
-            "Signed directional edge; returns {linked, source_id, target_id, relation, invalidation_notified, attest_level}.",
+            "Signed directional edge; returns {linked, source_id, target_id, relation, invalidation_notified, contaminated_stamped, attest_level}.",
         )],
         tn::MEMORY_REFLECT => vec![ex(
             // v0.7.0 #1325 — example payload is byte-equal to a valid call.

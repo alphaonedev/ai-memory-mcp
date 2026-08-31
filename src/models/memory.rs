@@ -367,6 +367,25 @@ pub enum LifecycleState {
     /// self-exfiltration, no self-quarantine). Terminal; cleared only via
     /// the route-out dequarantine helpers.
     Quarantined,
+    /// v1.0.0 #3324 (#3266 MVG) — system-only CONTAMINATION taint,
+    /// AUTO-PROPAGATED downstream over the provenance DAG when a root memory
+    /// is invalidated: every record transitively derived from the invalidated
+    /// root (the `derived_from` / `reflects_on` / `derives_from` subset P) is
+    /// stamped `Contaminated` by the transactional auto-stamp
+    /// [`crate::storage::stamp_contaminated_descendants`]. The row is STORED
+    /// (bytes converge, CRDT-safe — the durable memory TEXT is never touched)
+    /// but structurally hidden from every ordinary read/egress lane by the
+    /// fail-CLOSED [`lifecycle_visible_clause`] allow-list (it is ABSENT from
+    /// [`RECALL_VISIBLE_LIFECYCLE_STATES`]).
+    ///
+    /// Set ONLY by the system auto-stamp path via a raw UPDATE — it is ABSENT
+    /// from [`Self::can_transition_to`] and REJECTED by
+    /// [`crate::validate::validate_lifecycle_state`] as caller input (a caller
+    /// can neither self-contaminate nor clear a taint). Terminal for caller
+    /// purposes. The auto-stamp is REVERSIBLE: it records the pre-taint
+    /// `lifecycle_state` in `metadata.contamination.prior_lifecycle_state` so a
+    /// future `swarm_rewind` can restore the exact prior state.
+    Contaminated,
 }
 
 impl LifecycleState {
@@ -381,6 +400,7 @@ impl LifecycleState {
             Self::Abandoned => "abandoned",
             Self::Tombstoned => "tombstoned",
             Self::Quarantined => "quarantined",
+            Self::Contaminated => "contaminated",
         }
     }
 
@@ -397,6 +417,7 @@ impl LifecycleState {
             "abandoned" => Some(Self::Abandoned),
             "tombstoned" => Some(Self::Tombstoned),
             "quarantined" => Some(Self::Quarantined),
+            "contaminated" => Some(Self::Contaminated),
             _ => None,
         }
     }
@@ -413,17 +434,24 @@ impl LifecycleState {
             Self::Abandoned,
             Self::Tombstoned,
             Self::Quarantined,
+            Self::Contaminated,
         ]
     }
 
     /// Terminal states accept no outbound transition. `Tombstoned` (the
-    /// v0.9.0 G13-mem logical-delete state) and `Quarantined` (the v1.0.0
-    /// R19/A3 system-only quarantine) are terminal like `Done` / `Abandoned`.
+    /// v0.9.0 G13-mem logical-delete state), `Quarantined` (the v1.0.0
+    /// R19/A3 system-only quarantine), and `Contaminated` (the v1.0.0 #3324
+    /// auto-propagated invalidation taint) are terminal like `Done` /
+    /// `Abandoned`.
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Done | Self::Abandoned | Self::Tombstoned | Self::Quarantined
+            Self::Done
+                | Self::Abandoned
+                | Self::Tombstoned
+                | Self::Quarantined
+                | Self::Contaminated
         )
     }
 
@@ -431,10 +459,14 @@ impl LifecycleState {
     /// from [`Self::can_transition_to`] (so the `memory_update` transition
     /// path can never reach them) AND rejected by
     /// [`crate::validate::validate_lifecycle_state`] as caller input. Set
-    /// only by the system tombstone / quarantine raw-UPDATE paths.
+    /// only by the system tombstone / quarantine / contamination
+    /// raw-UPDATE paths.
     #[must_use]
     pub fn is_system_only(self) -> bool {
-        matches!(self, Self::Tombstoned | Self::Quarantined)
+        matches!(
+            self,
+            Self::Tombstoned | Self::Quarantined | Self::Contaminated
+        )
     }
 
     /// Whether this state is surfaced on ordinary read/egress lanes
@@ -2944,6 +2976,7 @@ mod tests {
             LifecycleState::Abandoned,
             LifecycleState::Tombstoned,
             LifecycleState::Quarantined,
+            LifecycleState::Contaminated,
         ] {
             assert_eq!(LifecycleState::from_str(s.as_str()), Some(s));
         }
@@ -2973,6 +3006,7 @@ mod tests {
                 LifecycleState::Abandoned,
                 LifecycleState::Tombstoned,
                 LifecycleState::Quarantined,
+                LifecycleState::Contaminated,
             ]
         );
     }
@@ -2986,6 +3020,8 @@ mod tests {
         assert!(LifecycleState::Tombstoned.is_terminal());
         // v1.0.0 R19/A3 (#1948) — the system-only quarantine state is terminal.
         assert!(LifecycleState::Quarantined.is_terminal());
+        // v1.0.0 #3324 — the auto-propagated contamination taint is terminal.
+        assert!(LifecycleState::Contaminated.is_terminal());
         assert!(!LifecycleState::Open.is_terminal());
         assert!(!LifecycleState::Active.is_terminal());
         assert!(!LifecycleState::Blocked.is_terminal());
@@ -3003,6 +3039,8 @@ mod tests {
         }
         assert!(LifecycleState::Quarantined.is_system_only());
         assert!(LifecycleState::Tombstoned.is_system_only());
+        // v1.0.0 #3324 — the auto-propagated contamination taint is system-only.
+        assert!(LifecycleState::Contaminated.is_system_only());
         assert!(!LifecycleState::Open.is_system_only());
         assert!(!LifecycleState::Done.is_system_only());
     }
@@ -3018,6 +3056,8 @@ mod tests {
         assert!(LifecycleState::Abandoned.is_recall_visible());
         assert!(!LifecycleState::Tombstoned.is_recall_visible());
         assert!(!LifecycleState::Quarantined.is_recall_visible());
+        // v1.0.0 #3324 — the contamination taint is hidden (fail-closed).
+        assert!(!LifecycleState::Contaminated.is_recall_visible());
         // Every allow-list member is non-system-only, and vice-versa.
         for st in LifecycleState::all() {
             assert_eq!(st.is_recall_visible(), !st.is_system_only());

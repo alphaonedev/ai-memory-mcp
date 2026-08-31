@@ -391,6 +391,7 @@ pub(super) fn handle_link(
     // block the rest of the fan-out. Test coverage lives in
     // `tests/notification.rs` and the module's `#[cfg(test)]`.
     let mut invalidation_notified: Vec<String> = Vec::new();
+    let mut contaminated_stamped: usize = 0;
     if relation == SUPERSEDES {
         let source_is_reflection = matches!(
             db::get(conn, source_id)
@@ -427,6 +428,34 @@ pub(super) fn handle_link(
                     );
                 }
             }
+
+            // v1.0.0 #3324 (#3266 MVG) — AUTO-PROPAGATE the `contaminated`
+            // lifecycle taint downstream of the now-invalidated root
+            // (`target_id`). Bounded, cycle-safe, idempotent, atomic, and
+            // reversible (see `db::stamp_contaminated_descendants`). This is
+            // the WRITE promotion of the read-only transitive-suspect walk: a
+            // suspect source structurally hides every record derived from it
+            // the moment it is superseded, instead of leaving a query the
+            // curator must remember to run. Best-effort like the notification
+            // walker above — the `supersedes` edge has already committed, and
+            // the stamp is internally atomic, so a failure here logs and does
+            // NOT roll the edge back (the taint self-heals on the next
+            // invalidation of the same root, being idempotent).
+            match crate::db::stamp_contaminated_descendants(
+                conn,
+                target_id,
+                crate::db::LINEAGE_MAX_DEPTH,
+            ) {
+                Ok(report) => contaminated_stamped = report.stamped,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "notification.invalidation",
+                        invalidated_id = target_id,
+                        invalidating_id = source_id,
+                        "contaminated auto-stamp failed: {e}"
+                    );
+                }
+            }
         }
     }
 
@@ -453,6 +482,11 @@ pub(super) fn handle_link(
         // reflection memories. Callers can use this to log/UI the
         // size of the operator-review queue this edge created.
         "invalidation_notified": invalidation_notified,
+        // v1.0.0 #3324 (#3266 MVG) — count of downstream records this edge
+        // auto-stamped `contaminated` (0 for every non-invalidating edge, and
+        // for a re-invalidation whose subtree was already tainted — the stamp
+        // is idempotent). Lets callers log/UI the size of the taint cascade.
+        "contaminated_stamped": contaminated_stamped,
         // v0.7 H2 — wire-level visibility into whether the link was
         // signed by an Ed25519 keypair on this writer. "self_signed"
         // when active_keypair was Some + signing succeeded;

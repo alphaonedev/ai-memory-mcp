@@ -299,6 +299,12 @@ CREATE INDEX IF NOT EXISTS memories_scope_idx_idx ON memories (scope_idx);
 -- v0.6.0 / Ultrareview #342 — agent_id_idx (generated column) + created_at.
 CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories (agent_id_idx);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at);
+-- NB (#3324 v94): `idx_memories_lifecycle_state` is DELIBERATELY NOT created
+-- here. `lifecycle_state` is a ladder-added column (v64), and guardrail-D
+-- rule (f) forbids a bootstrap CREATE INDEX on a ladder-added column: a fresh
+-- install enters the ladder at version 0 and executes every arm, so the v94
+-- `PostgresStore::migrate_v94` arm (CREATE INDEX IF NOT EXISTS) is the single
+-- owner of that index and bootstrap(fresh) stays equivalent to ladder(v0->tip).
 -- #2424 (v1.0.0 GA blocker) — the following `memories` indexes are
 -- DELIBERATELY NOT created here; each references a column the migrate LADDER
 -- adds via `ALTER TABLE memories ADD COLUMN`, and this bootstrap replays over
