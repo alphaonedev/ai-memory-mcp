@@ -849,7 +849,17 @@ pub async fn bulk_create(
     // for every row, so this pass is inert and nothing changes.
     let mut secret_refused: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (index, body) in bodies.iter().enumerate() {
-        if let Err(refusal) = crate::secret_screen::screen_for_caller(&body.content) {
+        // #3327 (Sec-F3) — screen BOTH title and content, matching single-create,
+        // which runs `validate_title` -> `screen_for_caller(trimmed)` AND
+        // `validate_content` -> `screen_for_caller(content)` ahead of the
+        // attestation gate. Screening content only let a TITLE-ONLY secret in an
+        // unsigned row slip past to the 403 ATTESTATION_FAILED class instead of
+        // the 400 secret-screen class it gets on single-create. Title is screened
+        // on its trimmed form, exactly as `validate_title` does; the `SecretRefusal`
+        // Display names only detector kinds, never the secret value.
+        if let Err(refusal) = crate::secret_screen::screen_for_caller(body.title.trim())
+            .and_then(|()| crate::secret_screen::screen_for_caller(&body.content))
+        {
             ledger.reject_class(
                 index,
                 "create",

@@ -148,8 +148,78 @@ fn row(content: &str) -> Value {
     })
 }
 
+/// A row with a secret in the TITLE and CLEAN content (`#3327` Sec-F3).
+fn row_with_title(title: &str, content: &str) -> Value {
+    json!({
+        "tier": "long",
+        "namespace": "bulk-secret-3071",
+        "title": title,
+        "content": content,
+        "tags": [],
+        "priority": 5,
+        "confidence": 1.0,
+        "source": "api",
+        "metadata": {},
+        // deliberately UNSIGNED — no `signature` / `created_at`.
+    })
+}
+
+/// #3327 (Sec-F3) — the bulk pre-attestation secret screen must screen the
+/// TITLE too, matching single-create (`validate_title` -> `screen_for_caller`
+/// AND `validate_content` -> `screen_for_caller`, both AHEAD of the attestation
+/// gate). Before the fix the bulk pre-pass screened content ONLY, so a
+/// TITLE-ONLY secret in an UNSIGNED row slipped past to the whole-batch
+/// attestation gate and came back 403 `ATTESTATION_FAILED` instead of the 400
+/// secret-screen class single-create returns.
+#[tokio::test]
+async fn bulk_title_only_secret_is_400_not_403_3327() {
+    let (router, _tmp) = build_router();
+
+    // Secret in the TITLE, content perfectly clean, row UNSIGNED.
+    let (status, body) = post_bulk(
+        &router,
+        &json!([row_with_title(PEM_SECRET, "ordinary body")]),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "#3327 Sec-F3: a title-only secret in a bulk row must refuse 400 \
+         (secret-screen), not 403 ATTESTATION_FAILED; got {status} body={body}"
+    );
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#3327 Sec-F3: the title secret must not surface the attestation class"
+    );
+    assert_eq!(body["created"], json!(0), "fail-closed: nothing persisted");
+    assert_eq!(
+        body["rejected"],
+        json!(1),
+        "the one secret-title row is rejected"
+    );
+    let code = body["errors"][0]["code"].as_str().unwrap_or_default();
+    assert_eq!(
+        code, "VALIDATION_FAILED",
+        "#3327 Sec-F3: a title-only secret carries the secret-screen (validation) \
+         class, not ATTESTATION_FAILED; body={body}"
+    );
+    assert_ne!(
+        code, "ATTESTATION_FAILED",
+        "#3327 Sec-F3: the title secret must not be classified as an attestation \
+         failure"
+    );
+    // The refusal must NOT leak the secret value itself.
+    let msg = body["errors"][0]["error"].as_str().unwrap_or_default();
+    assert!(
+        !msg.contains("PRIVATE KEY") && !msg.contains("BEGIN"),
+        "#3327 Sec-F3: the refusal must not echo the secret material; body={body}"
+    );
+}
+
 /// #3071 — an UNSIGNED row whose content carries a secret is refused with the
-/// 400 secret-screen class, NOT 403 ATTESTATION_FAILED. Before the fix the
+/// 400 secret-screen class, NOT 403 `ATTESTATION_FAILED`. Before the fix the
 /// whole-batch attestation presence gate fired first and returned 403.
 #[tokio::test]
 async fn bulk_secret_row_is_400_not_403() {
