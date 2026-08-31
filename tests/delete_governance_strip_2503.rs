@@ -513,3 +513,113 @@ fn severed_floor_only_ever_tightens_2503() {
     assert!(GovernanceLevel::Registered.strictness() < GovernanceLevel::Owner.strictness());
     assert!(GovernanceLevel::Owner.strictness() < GovernanceLevel::Approve.strictness());
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// #3327 (Sec-F2) — the sever audit append is FAIL-CLOSED, at parity with the
+// #3290 postgres twin `pg_sever_namespace_standards_in_tx` (which propagates
+// its append error via `?`). A governance-binding SEVER must not commit
+// without its tamper-evident `SUBSTRATE_NAMESPACE_STANDARD_SEVERED` chain row.
+// ─────────────────────────────────────────────────────────────────────
+
+/// RAW count of committed `SUBSTRATE_NAMESPACE_STANDARD_SEVERED` audit rows.
+fn severed_event_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+        rusqlite::params![
+            ai_memory::signed_events::event_types::SUBSTRATE_NAMESPACE_STANDARD_SEVERED
+        ],
+        |r| r.get(0),
+    )
+    .expect("count severed audit events")
+}
+
+/// Happy path: a reap that severs an out-of-scope binding lands the severed row
+/// AND its signed audit event TOGETHER (they commit in one transaction).
+#[test]
+fn sever_and_severed_audit_event_land_together_3327() {
+    let conn = open();
+    let standard_id = seed_standard_memory(&conn, "public/ok", &approve_write_policy());
+    db::set_namespace_standard(&conn, "secure/ops", &standard_id, Some("secure"))
+        .expect("bind victim namespace");
+    assert_eq!(
+        severed_event_count(&conn),
+        0,
+        "precondition: no severed audit event yet"
+    );
+
+    assert!(db::delete(&conn, &standard_id).expect("delete standard memory"));
+
+    // Row severed (survives with a NULL standard_id)...
+    let (row_exists, standard, _parent) = raw_meta_row(&conn, "secure/ops");
+    assert!(row_exists, "the binding row must survive the sever");
+    assert_eq!(standard, None, "standard_id must be severed to NULL");
+    // ...and EXACTLY ONE tamper-evident audit row committed alongside it.
+    assert_eq!(
+        severed_event_count(&conn),
+        1,
+        "the SUBSTRATE_NAMESPACE_STANDARD_SEVERED audit row must commit atomically \
+         with the sever"
+    );
+}
+
+/// Fail-closed (#3327 Sec-F2): when the audit append CANNOT be written, the
+/// sever ROLLS BACK — never a severed binding with no tamper-evident row.
+///
+/// Uses the #1642 dangling-pointer shape: a `namespace_meta` row binds a
+/// `standard_id` whose live memory is ALREADY gone, so the reap's ONLY write is
+/// the sever + its audit append (`delete_inner` calls `sever_namespace_standards`
+/// FIRST, unconditionally, and the row-existence-gated tombstone / crypto-erase /
+/// G6 leaf are all skipped because the row is absent). Dropping `signed_events`
+/// forces that one append to fail. Before the fix the sever swallowed the error
+/// to a WARN and committed the severed row with NO audit event; now it
+/// propagates, rolling back the whole reap transaction.
+#[test]
+fn sever_rolls_back_when_audit_append_fails_3327() {
+    let conn = open();
+    let standard_id = seed_standard_memory(&conn, "public/ok", &approve_write_policy());
+    db::set_namespace_standard(&conn, "secure/ops", &standard_id, Some("secure"))
+        .expect("bind victim namespace");
+
+    // Make the binding a #1642 DANGLE: remove the live memory row directly (raw
+    // SQL, NOT db::delete) so the binding keeps pointing at the now-absent
+    // standard and the reap skips every row-gated write — its ONLY append is the
+    // sever's audit row.
+    conn.execute(
+        "DELETE FROM memories WHERE id = ?1",
+        rusqlite::params![standard_id],
+    )
+    .expect("raw-delete the standard memory row, leaving the binding dangling");
+
+    let (before_exists, before_sid, _) = raw_meta_row(&conn, "secure/ops");
+    assert!(
+        before_exists && before_sid.as_deref() == Some(standard_id.as_str()),
+        "precondition: the dangling binding must still name the standard"
+    );
+
+    // Force the sever's audit append to fail.
+    conn.execute("DROP TABLE signed_events", [])
+        .expect("drop signed_events to force the audit append to fail");
+
+    // FAIL CLOSED: the reap must refuse (propagate the append error), not commit
+    // a silent sever with no tamper-evident row.
+    let result = db::delete(&conn, &standard_id);
+    assert!(
+        result.is_err(),
+        "#3327 Sec-F2: a sever whose audit append fails must PROPAGATE the error \
+         (fail-closed), not swallow it to a WARN — got {result:?}"
+    );
+
+    // The binding is UNCHANGED — still bound, never severed — because the reap
+    // transaction rolled back.
+    let (after_exists, after_sid, _) = raw_meta_row(&conn, "secure/ops");
+    assert!(
+        after_exists,
+        "the binding row must survive the rolled-back reap"
+    );
+    assert_eq!(
+        after_sid.as_deref(),
+        Some(standard_id.as_str()),
+        "#3327 Sec-F2: the standard_id must NOT be severed when the audit row \
+         could not be written — no sever without its tamper-evident chain row"
+    );
+}

@@ -288,6 +288,103 @@ fn swarm_rewind_is_idempotent_no_duplicate_audit() {
 }
 
 // ---------------------------------------------------------------------------
+// #3327 (Sec-F4) — the already-Contaminated root branch's in-place marker CAS
+// must FAIL CLOSED when it matches no row, mirroring the non-contaminated
+// sibling's `Vanished` handling.
+// ---------------------------------------------------------------------------
+
+/// A root that is ALREADY `contaminated` (e.g. tainted earlier as some other
+/// root's #3324 descendant) but NOT yet rewound routes `swarm_rewind` into the
+/// in-place marker-UPGRADE branch. Its CAS is `WHERE id = root AND
+/// lifecycle_state = 'contaminated'`. If a concurrent writer moves the root OFF
+/// `contaminated` between the pre-tx autocommit read and the IMMEDIATE-tx CAS,
+/// the CAS matches 0 rows. Before #3327 that silently no-op'd YET still froze
+/// routines and committed the signed `swarm.rewind` event, while the
+/// `rewind:true` idempotency marker never persisted — so a re-run appended a
+/// DUPLICATE audit event. The fix checks the row count and rolls back.
+///
+/// The race is made deterministic with a TEMP TRIGGER: the moment step-1a's
+/// cascade contamination stamps the child, the trigger flips the
+/// already-contaminated root OFF `contaminated`, so step-1b's root CAS matches
+/// no row. The op must return an error and commit NO `swarm.rewind` event.
+#[test]
+fn swarm_rewind_already_contaminated_root_vanished_mid_op_fails_closed_3327() {
+    let conn = fresh_conn();
+    let (root, child, _gc, _u) = seed_cascade(&conn);
+
+    // Put the root into the already-Contaminated (but NOT yet rewound) state so
+    // swarm_rewind takes the in-place marker-UPGRADE branch (1b).
+    conn.execute(
+        "UPDATE memories SET lifecycle_state = 'contaminated' WHERE id = ?1",
+        [&root.id],
+    )
+    .expect("pre-contaminate root");
+
+    // The concurrent-writer race, made deterministic: when step-1a contaminates
+    // the child, flip the root OFF `contaminated` so the step-1b CAS
+    // (`WHERE lifecycle_state = 'contaminated'`) matches 0 rows. The flip runs
+    // inside swarm_rewind's own transaction, so a correct fail-closed rollback
+    // undoes it too.
+    conn.execute(
+        &format!(
+            "CREATE TEMP TRIGGER flip_root_off_contaminated \
+               AFTER UPDATE OF lifecycle_state ON memories \
+               WHEN NEW.id = '{child}' AND NEW.lifecycle_state = 'contaminated' \
+             BEGIN \
+               UPDATE memories SET lifecycle_state = 'open' WHERE id = '{root}'; \
+             END",
+            child = child.id,
+            root = root.id,
+        ),
+        [],
+    )
+    .expect("install the concurrent-writer race trigger");
+
+    assert_eq!(
+        rewind_event_count(&conn),
+        0,
+        "precondition: no rewind event yet"
+    );
+
+    let err = db::swarm_rewind(
+        &conn,
+        &root.id,
+        db::LINEAGE_MAX_DEPTH,
+        "ai:operator",
+        "memory",
+        &[],
+        false,
+    )
+    .expect_err("a root that vanished off `contaminated` mid-op must FAIL CLOSED");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("changed during rewind"),
+        "#3327 Sec-F4: the CAS-0 rollback must report the root changed during \
+         rewind; got: {msg}"
+    );
+
+    // FAIL CLOSED: the whole transaction rolled back, so NO `swarm.rewind` audit
+    // event was committed — a re-run therefore cannot double-count the chain.
+    assert_eq!(
+        rewind_event_count(&conn),
+        0,
+        "#3327 Sec-F4: a rolled-back rewind must commit NO signed event (else a \
+         re-run appends a DUPLICATE audit row)"
+    );
+    // The rollback also undid the trigger's flip and the child's taint.
+    assert_eq!(
+        raw_state(&conn, &root.id).as_deref(),
+        Some("contaminated"),
+        "the root's pre-op state is restored by the rollback"
+    );
+    assert_eq!(
+        raw_state(&conn, &child.id).as_deref(),
+        Some("open"),
+        "the child's cascade taint is rolled back with the failed rewind"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // dry_run: zero writes, projected effect + cost.
 // ---------------------------------------------------------------------------
 

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#3327 — GA-review fail-closed polish batch: four confirmed storage / handler hardening fixes)
+
+- **Sec-F2 — the sqlite namespace-standard SEVER audit append is now
+  FAIL-CLOSED, at parity with the #3290 postgres twin.**
+  `storage::sever_namespace_standards` swallowed a
+  `SUBSTRATE_NAMESPACE_STANDARD_SEVERED` audit-append failure to a WARN
+  (best-effort), so a governance-binding sever could commit with no
+  tamper-evident chain row. The postgres twin
+  `pg_sever_namespace_standards_in_tx` already propagates that error; the sqlite
+  path now propagates it too. Because the sever runs inside `delete()`'s
+  `BEGIN IMMEDIATE`, propagation rolls back both the sever and the delete — never
+  a severed binding with no audit evidence. The operator WARN is still logged
+  BEFORE the append so that signal survives a rollback.
+- **Sec-F4 — `swarm_rewind`'s already-Contaminated root branch now checks its
+  in-place marker CAS row count and fails closed on 0.** The CAS matched the root
+  on `lifecycle_state = 'contaminated'`; if a concurrent writer moved the root
+  off `Contaminated` in the autocommit-read → IMMEDIATE-tx window it matched 0
+  rows and silently no-op'd — yet routines still froze, the signed `swarm.rewind`
+  event still committed, and the `rewind:true` idempotency marker never persisted
+  (so a re-run appended a DUPLICATE audit event). It now rolls back with a typed
+  error, exactly like the non-contaminated sibling branch does on `Vanished`.
+- **Sec-F3 — the `/memories/bulk` pre-attestation secret screen now screens the
+  TITLE as well as the content.** Single-create screens both title and content
+  ahead of the attestation gate; the bulk pre-pass screened content only, so a
+  title-only secret in an unsigned row returned 403 `ATTESTATION_FAILED` instead
+  of the 400 secret-screen class. Bulk now screens the trimmed title too, so the
+  refusal class matches single-create. Fail-closed is preserved (a clean unsigned
+  row still 403s) and the refusal never echoes the secret value.
+- **Sec-F6 — `swarm_rewind_audit_payload` now propagates a serialization error
+  instead of `.unwrap_or_default()`.** An empty payload would hash
+  `payload_hash([])` — a silently wrong digest — and commit a tamper-evident
+  audit row binding nothing to the rewind. The helper now returns `Result` and
+  fails closed. (Practically unreachable, but per the North-Star fail-closed
+  rule.)
+- Regression tests: `delete_governance_strip_2503::{sever_and_severed_audit_event_land_together_3327,
+  sever_rolls_back_when_audit_append_fails_3327}` (F2),
+  `swarm_rewind_3322::swarm_rewind_already_contaminated_root_vanished_mid_op_fails_closed_3327`
+  (F4), and `bulk_secret_screen_order_3071::bulk_title_only_secret_is_400_not_403_3327`
+  (F3). `qual_10_module_size_ceiling` bumped `src/storage/mod.rs` 32_685 → 32_790
+  in lockstep.
+
 ### Fixed (#3324 — postgres `migrate_v93` stamped `CURRENT_SCHEMA_VERSION` (94) instead of the literal 93, a crash-consistency ladder-integrity hazard)
 
 - **The postgres v93 migration arm stamped `CURRENT_SCHEMA_VERSION` instead of

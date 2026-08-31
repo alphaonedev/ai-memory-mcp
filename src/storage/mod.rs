@@ -4431,11 +4431,15 @@ pub(crate) fn sever_namespace_standards(conn: &Connection, id: &str) -> Result<u
          or clear deliberately with `memory_namespace_clear_standard`."
     );
 
-    // Best-effort audit. A signed-event failure must NOT abort the reap: the
-    // memory delete is the caller's intent and is already fenced by
-    // `record_stop`; losing the audit row degrades observability, whereas
-    // aborting here would leave the caller unable to delete at all. The WARN
-    // above is the non-best-effort record.
+    // #3327 (Sec-F2) — FAIL-CLOSED signed, tamper-evident audit row, at parity
+    // with the #3290 postgres twin `pg_sever_namespace_standards_in_tx` (which
+    // propagates the append error via `?`). A governance-binding SEVER must not
+    // commit without its tamper-evident chain row: if the append fails, PROPAGATE
+    // the error so this funnel's caller (`delete()`, which runs the sever inside
+    // its `BEGIN IMMEDIATE`) rolls back BOTH the namespace-meta sever AND the
+    // memory delete — never a silent sever with no audit evidence. The operator
+    // WARN above is logged BEFORE the append precisely so that signal survives a
+    // rollback (mirrors the #3290 ordering).
     let signable = namespace_standard_severed_signable_bytes(id, &severed, &now);
     let payload_hash = crate::signed_events::payload_hash(&signable);
     let event = crate::signed_events::SignedEvent::with_daemon_signature(
@@ -4445,14 +4449,7 @@ pub(crate) fn sever_namespace_standards(conn: &Connection, id: &str) -> Result<u
         now,
         None,
     );
-    if let Err(e) = crate::signed_events::append_signed_event_no_tx(conn, &event) {
-        tracing::warn!(
-            target: TRACE_TARGET_STANDARD_SEVERED,
-            standard_id = %id,
-            error = %e,
-            "failed to append the namespace-standard severance audit row"
-        );
-    }
+    crate::signed_events::append_signed_event_no_tx(conn, &event)?;
     Ok(changed)
 }
 
@@ -13031,7 +13028,24 @@ pub fn swarm_rewind(
             }
             let meta_ser = serde_json::to_string(&meta)?;
             // CAS on the observed `contaminated` state (metadata-only change).
-            upd.execute(params![contaminated, meta_ser, now, root_id, contaminated])?;
+            // #3327 (Sec-F4) — CHECK the affected row count and FAIL CLOSED on 0,
+            // mirroring the non-contaminated sibling branch's `Vanished` handling.
+            // `root_state`/`root_meta` were read in autocommit BEFORE the IMMEDIATE
+            // tx; if a concurrent writer moves the root OFF `Contaminated` in that
+            // window, this CAS matches 0 rows. Without the check the marker update
+            // silently no-ops YET routines still freeze and the signed swarm.rewind
+            // event still commits — and the `rewind:true` idempotency marker never
+            // persists, so a re-run appends a DUPLICATE audit event. Roll back
+            // instead (`id` is the PK, so the CAS matches at most one row).
+            let n = upd.execute(params![contaminated, meta_ser, now, root_id, contaminated])?;
+            if n != 1 {
+                return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                    reason: format!(
+                        "swarm_rewind: root {root_id} changed during rewind (contaminated \
+                         marker CAS matched no row); transaction rolled back"
+                    ),
+                }));
+            }
             report.root_contaminated = false;
         } else {
             let root_marker = [
@@ -13075,7 +13089,7 @@ pub fn swarm_rewind(
             report.routines_frozen,
             issued_by,
             &now,
-        );
+        )?;
         let hash = crate::signed_events::payload_hash(&payload);
         let event = crate::signed_events::SignedEvent::with_daemon_signature(
             hash,
@@ -13102,7 +13116,7 @@ fn swarm_rewind_audit_payload(
     routines_frozen: usize,
     issued_by: &str,
     timestamp: &str,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let canonical = serde_json::json!({
         "action": crate::governance::action_labels::SWARM_REWIND,
         "root_id": root_id,
@@ -13112,7 +13126,13 @@ fn swarm_rewind_audit_payload(
         "issued_by": issued_by,
         "timestamp": timestamp,
     });
-    serde_json::to_vec(&canonical).unwrap_or_default()
+    // #3327 (Sec-F6) — FAIL CLOSED: propagate a serialization error instead of
+    // `.unwrap_or_default()`. An empty payload would hash `payload_hash([])` — a
+    // silently WRONG digest — and commit a tamper-evident audit row that binds
+    // nothing to the rewind. Practically unreachable (the value is a fixed-shape
+    // object of strings/usize), but per the North-Star fail-closed rule a bad
+    // payload must abort the rewind, never commit a wrong-hash event.
+    Ok(serde_json::to_vec(&canonical)?)
 }
 
 /// Default cap on paths returned by [`find_paths`] when the caller does
