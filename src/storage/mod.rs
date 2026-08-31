@@ -8573,14 +8573,23 @@ pub(crate) fn read_memory_cid(conn: &Connection, id: &str) -> Option<String> {
 ///
 /// COND 4 (#1859): the comparison parses both stamps into chrono
 /// `DateTime` and compares the instants (NOT an rfc3339 string `>=`), so
-/// mixed-offset / mixed-precision timestamps order correctly. On an EXACT
-/// instant tie (a same-batch pair minted under one `Utc::now()`) this
-/// returns `false` (allow) so the write is NOT false-rejected; the
-/// read-side traversal's visited-set cycle guard is the backstop for the
-/// (pathological) equal-stamp mutual pair. An absent endpoint or an
-/// unparseable stamp also returns `false`: the FK existence check
+/// mixed-offset / mixed-precision timestamps order correctly. An absent
+/// endpoint or an unparseable stamp returns `false`: the FK existence check
 /// downstream owns the missing-row error, and an unparseable legacy stamp
 /// cannot PROVE forwardness.
+///
+/// #3041 — EQUAL-instant tie-break. A same-batch pair minted under one
+/// `Utc::now()` shares an EXACT instant, so a strict `>` alone would admit
+/// BOTH `source -> target` and `target -> source` and let the pair form a
+/// 2-cycle. The wall-clock guard's acyclicity proof (following any P edge
+/// strictly decreases `created_at`, a total order on a finite set) holds
+/// only for DISTINCT instants; because every cross-instant P edge strictly
+/// decreases the stamp, any cycle must live ENTIRELY inside one equal-instant
+/// clique. So on an exact tie — and ONLY then, keeping the O(1) fast path for
+/// the common distinct-instant write — this falls back to a bounded structural
+/// check ([`lineage_would_close_cycle`]): the edge is "forward" (rejected) iff
+/// it would close a cycle, and a clean non-cycle same-instant edge is still
+/// admitted, so legitimate same-batch DAG construction is preserved.
 fn lineage_edge_is_forward(conn: &Connection, source_id: &str, target_id: &str) -> bool {
     let read_created_at = |id: &str| -> Option<String> {
         conn.query_row(
@@ -8601,10 +8610,41 @@ fn lineage_edge_is_forward(conn: &Connection, source_id: &str, target_id: &str) 
     ) else {
         return false;
     };
-    // STRICT: only a target genuinely newer than the source is forward.
-    // Equal instants (Ordering::Equal) and proper child->parent
-    // (Ordering::Less) both fall through to `false` (allow).
-    target_t > source_t
+    match target_t.cmp(&source_t) {
+        // Target genuinely newer than source: the forward (older -> newer)
+        // direction that would let the graph cycle. Reject.
+        std::cmp::Ordering::Greater => true,
+        // Proper child -> parent (target older): a legitimate DAG edge.
+        std::cmp::Ordering::Less => false,
+        // #3041 — EQUAL instants: wall-clock cannot order the pair, so the
+        // strict `>` fast path would admit BOTH directions. Refuse only the
+        // cycle-closing edge; a clean non-cycle same-instant edge is allowed.
+        std::cmp::Ordering::Equal => lineage_would_close_cycle(conn, source_id, target_id),
+    }
+}
+
+/// #3041 — would adding the lineage edge `source_id` -> `target_id` (child ->
+/// parent) close a cycle in the provenance graph P? True iff `source_id` is
+/// ALREADY a lineage ancestor of `target_id` — i.e. a path
+/// `target -> ... -> source` following provenance edges already exists — so
+/// the new edge would complete `source -> target -> ... -> source`.
+///
+/// Because every cross-instant P edge strictly decreases `created_at`
+/// (enforced by [`lineage_edge_is_forward`]'s wall-clock arms), any such
+/// pre-existing path from an equal-instant `target` back to an equal-instant
+/// `source` is confined to that one instant's clique; a bounded ancestor walk
+/// to [`LINEAGE_MAX_DEPTH`] is therefore both sufficient and complete for the
+/// equal-instant case this backs.
+///
+/// Fails CLOSED: any traversal error returns `true` (refuse the edge), since
+/// admitting a cycle-forming edge would corrupt the single-node acyclicity
+/// invariant whereas refusing merely reduces function (North Star: degrade,
+/// never corrupt).
+fn lineage_would_close_cycle(conn: &Connection, source_id: &str, target_id: &str) -> bool {
+    match lineage_ancestors(conn, target_id, LINEAGE_MAX_DEPTH) {
+        Ok(ancestors) => ancestors.iter().any(|node| node.id == source_id),
+        Err(_) => true,
+    }
 }
 
 /// v0.7.0 fix-campaign A3 (LINK-PARITY) — shared pre-create validator
