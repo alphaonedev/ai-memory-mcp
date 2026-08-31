@@ -109,7 +109,7 @@ pub fn cmd_swarm_rewind(
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let frozen = envelope
-        .get("routines_frozen")
+        .get(crate::storage::SWARM_REWIND_ROUTINES_FROZEN_KEY)
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let usd = envelope

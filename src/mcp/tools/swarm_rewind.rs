@@ -219,8 +219,8 @@ pub fn handle_swarm_rewind(conn: &rusqlite::Connection, params: &Value) -> Resul
             agent_id,
             payload: json!({
                 "root_id": root_id,
-                "target_kind": target_kind,
-                "operation": "swarm_rewind",
+                (crate::storage::SWARM_REWIND_TARGET_KIND_KEY): target_kind,
+                "operation": crate::governance::action_labels::SWARM_REWIND,
             }),
         };
         match Permissions::evaluate(&ctx, &[]) {
@@ -283,7 +283,7 @@ pub fn handle_swarm_rewind(conn: &rusqlite::Connection, params: &Value) -> Resul
 fn render_report(r: &crate::storage::SwarmRewindReport) -> Value {
     json!({
         "root_id": r.root_id,
-        "target_kind": r.target_kind,
+        (crate::storage::SWARM_REWIND_TARGET_KIND_KEY): r.target_kind,
         "dry_run": r.dry_run,
         "already_rewound": r.already_rewound,
         "root_contaminated": r.root_contaminated,
@@ -292,7 +292,7 @@ fn render_report(r: &crate::storage::SwarmRewindReport) -> Value {
         "descendants_skipped_system_only": r.descendants_skipped_system_only,
         "descendants_total": r.descendants_total,
         "routines_requested": r.routines_requested,
-        "routines_frozen": r.routines_frozen,
+        (crate::storage::SWARM_REWIND_ROUTINES_FROZEN_KEY): r.routines_frozen,
         "signed_event_id": r.signed_event_id,
         "cost": {
             "scope_key": r.cost.scope_key,

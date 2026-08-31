@@ -12487,8 +12487,7 @@ pub fn stamp_contaminated_descendants(
     // lock upgrade.
     let tx = conn.unchecked_transaction()?;
     {
-        let mut read =
-            tx.prepare("SELECT lifecycle_state, metadata FROM memories WHERE id = ?1")?;
+        let mut read = tx.prepare(SELECT_LIFECYCLE_META_BY_ID_SQL)?;
         let mut upd = tx.prepare(
             "UPDATE memories \
                 SET lifecycle_state = ?1, metadata = ?2, updated_at = ?3, version = version + 1 \
@@ -12593,6 +12592,21 @@ pub struct SwarmRewindReport {
 /// duplicate audit row.
 const SWARM_REWIND_MARKER_KEY: &str = "rewind";
 
+/// Shared SELECT of a memory's `(lifecycle_state, metadata)` by id — used by
+/// both the #3324 auto-stamp sweep and the #3322 swarm_rewind orchestration
+/// (single SSOT so the two funnels cannot drift).
+const SELECT_LIFECYCLE_META_BY_ID_SQL: &str =
+    "SELECT lifecycle_state, metadata FROM memories WHERE id = ?1";
+
+/// Wire/report key: the resolved `--to` target kind (`"memory"` / `"checkpoint"`)
+/// on a [`swarm_rewind`] report + its signed-audit payload. Referenced by the
+/// MCP render + the audit payload so the two cannot diverge.
+pub(crate) const SWARM_REWIND_TARGET_KIND_KEY: &str = "target_kind";
+
+/// Wire/report key: the count of routines a [`swarm_rewind`] moved to `Frozen`.
+/// Referenced by the MCP render, the CLI summary, and the audit payload.
+pub(crate) const SWARM_REWIND_ROUTINES_FROZEN_KEY: &str = "routines_frozen";
+
 /// v1.0.0 #3322 (#3266 MVG) — ONE atomic, resumable operation that intercepts
 /// and UNWINDS a memory cascade rooted at `root_id` without data loss, and
 /// reports its lineage token/cost.
@@ -12670,11 +12684,9 @@ pub fn swarm_rewind(
 
     // Read the root's current state + metadata (also proves it exists).
     let root_row: Option<(String, Option<String>)> = conn
-        .query_row(
-            "SELECT lifecycle_state, metadata FROM memories WHERE id = ?1",
-            params![root_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .query_row(SELECT_LIFECYCLE_META_BY_ID_SQL, params![root_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .optional()?;
     let Some((root_state_str, root_meta_str)) = root_row else {
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -12764,8 +12776,7 @@ pub fn swarm_rewind(
 
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     {
-        let mut read =
-            tx.prepare("SELECT lifecycle_state, metadata FROM memories WHERE id = ?1")?;
+        let mut read = tx.prepare(SELECT_LIFECYCLE_META_BY_ID_SQL)?;
         let mut upd = tx.prepare(
             "UPDATE memories \
                 SET lifecycle_state = ?1, metadata = ?2, updated_at = ?3, version = version + 1 \
@@ -12775,7 +12786,10 @@ pub fn swarm_rewind(
         // 1a. Contaminate the downstream cascade. `via` records the taint
         // provenance; the base marker (prior_lifecycle_state/...) is identical
         // to the auto-stamp so a future restore reads it uniformly.
-        let via = [("via", serde_json::json!("swarm_rewind"))];
+        let via = [(
+            "via",
+            serde_json::json!(crate::governance::action_labels::SWARM_REWIND),
+        )];
         for node in &descendants {
             match contaminate_row(&mut read, &mut upd, &node.id, root_id, &now, &via)? {
                 ContaminateOutcome::Stamped => report.descendants_stamped += 1,
@@ -12803,7 +12817,10 @@ pub fn swarm_rewind(
                     .cloned()
                     .unwrap_or_default();
                 cont.insert(SWARM_REWIND_MARKER_KEY.to_string(), serde_json::json!(true));
-                cont.insert("via".to_string(), serde_json::json!("swarm_rewind"));
+                cont.insert(
+                    "via".to_string(),
+                    serde_json::json!(crate::governance::action_labels::SWARM_REWIND),
+                );
                 cont.insert("rewound_at".to_string(), serde_json::json!(now));
                 obj.insert(
                     CONTAMINATION_METADATA_KEY.to_string(),
@@ -12817,7 +12834,10 @@ pub fn swarm_rewind(
         } else {
             let root_marker = [
                 (SWARM_REWIND_MARKER_KEY, serde_json::json!(true)),
-                ("via", serde_json::json!("swarm_rewind")),
+                (
+                    "via",
+                    serde_json::json!(crate::governance::action_labels::SWARM_REWIND),
+                ),
             ];
             match contaminate_row(&mut read, &mut upd, root_id, root_id, &now, &root_marker)? {
                 ContaminateOutcome::Stamped => report.root_contaminated = true,
@@ -12882,11 +12902,11 @@ fn swarm_rewind_audit_payload(
     timestamp: &str,
 ) -> Vec<u8> {
     let canonical = serde_json::json!({
-        "action": "swarm_rewind",
+        "action": crate::governance::action_labels::SWARM_REWIND,
         "root_id": root_id,
-        "target_kind": target_kind,
-        "contaminated": contaminated,
-        "routines_frozen": routines_frozen,
+        (SWARM_REWIND_TARGET_KIND_KEY): target_kind,
+        "contaminated_count": contaminated,
+        (SWARM_REWIND_ROUTINES_FROZEN_KEY): routines_frozen,
         "issued_by": issued_by,
         "timestamp": timestamp,
     });
