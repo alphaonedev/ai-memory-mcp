@@ -13,6 +13,7 @@ The suite is split in two:
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 
@@ -243,6 +244,69 @@ def test_removed_v1_methods_are_gone() -> None:
     for cls in (AiMemoryClient, AsyncAiMemoryClient):
         for name in ("grant", "revoke", "cluster"):
             assert not hasattr(cls, name), f"{cls.__name__}.{name} must not exist"
+
+
+def _wire_memory(memory_id: str = "mem-3331") -> dict[str, object]:
+    return {
+        "id": memory_id, "tier": "mid", "namespace": "global",
+        "title": "wire fixture", "content": "zebra", "tags": [],
+        "priority": 5, "confidence": 1.0, "source": "api", "access_count": 0,
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-01T00:00:00Z", "metadata": {},
+    }
+
+
+def _wire_handler(seen: list[httpx.Request]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        path = request.url.path
+        if path == "/api/v1/search":
+            return httpx.Response(200, json={"count": 1, "query": "zebra", "results": [_wire_memory()]})
+        if path == "/api/v1/memories/mem-3331":
+            return httpx.Response(200, json={"memory": _wire_memory(), "links": []})
+        if path == "/api/v1/notify":
+            return httpx.Response(201, json={"id": "n1", "target_agent_id": "ai:target", "namespace": "global", "storage_backend": "postgres"})
+        if path == "/api/v1/stats":
+            return httpx.Response(200, json={"total_memories": 1, "by_tier": [], "by_namespace": [], "expiring_soon": 0, "links_count": 0, "db_size_bytes": 10, "live": 1, "expired_pending_gc": 0, "storage_backend": "postgres"})
+        if path == "/api/v1/forget":
+            return httpx.Response(200, json={"deleted": 1})
+        raise AssertionError(path)
+    return handler
+
+
+def test_v1_wire_contract_sync() -> None:
+    seen: list[httpx.Request] = []
+    client = AiMemoryClient(base_url=TEST_BASE_URL)
+    client._client = httpx.Client(base_url=TEST_BASE_URL, transport=httpx.MockTransport(_wire_handler(seen)))
+    assert client.search("zebra")[0].id == "mem-3331"
+    assert client.get("mem-3331").title == "wire fixture"
+    client.notify({"target_agent_id": "ai:target", "title": "hello", "payload": "unit-of-work"})
+    assert client.stats().total_memories == 1
+    assert client.forget(namespace="global") == {"deleted": 1}
+    notify = next(r for r in seen if r.url.path.endswith("notify"))
+    forget = next(r for r in seen if r.url.path.endswith("forget"))
+    assert json.loads(notify.read()) == {
+        "target_agent_id": "ai:target", "title": "hello", "payload": "unit-of-work"
+    }
+    assert forget.url.query == b""
+    assert json.loads(forget.read()) == {"namespace": "global"}
+
+
+@pytest.mark.asyncio
+async def test_v1_wire_contract_async() -> None:
+    from ai_memory import AsyncAiMemoryClient
+    seen: list[httpx.Request] = []
+    client = AsyncAiMemoryClient(base_url=TEST_BASE_URL)
+    client._client = httpx.AsyncClient(base_url=TEST_BASE_URL, transport=httpx.MockTransport(_wire_handler(seen)))
+    assert (await client.search("zebra"))[0].id == "mem-3331"
+    assert (await client.get("mem-3331")).title == "wire fixture"
+    await client.notify({"target_agent_id": "ai:target", "title": "hello", "payload": "unit-of-work"})
+    assert (await client.stats()).total_memories == 1
+    assert await client.forget(namespace="global") == {"deleted": 1}
+    forget = next(r for r in seen if r.url.path.endswith("forget"))
+    assert forget.url.query == b""
+    assert json.loads(forget.read()) == {"namespace": "global"}
+    await client.aclose()
 
 
 # The webhook-HMAC tests moved to tests/test_webhooks.py (#2455). The version

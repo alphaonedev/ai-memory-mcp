@@ -224,7 +224,7 @@ const { memories } = await memory.list({
 #### `.get()` / `.delete()`
 
 ```ts
-const m = await memory.get("b4e3…");
+const { memory: m, links } = await memory.get("b4e3…");
 await memory.delete("b4e3…");
 ```
 

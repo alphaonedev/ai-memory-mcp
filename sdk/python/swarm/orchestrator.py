@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -84,7 +85,10 @@ class Swarm:
         self.agents = []
         for ordinal in range(self.config.n_agents):
             namespace = self.config.namespace_for(ordinal)
-            agent_id = f"{self.config.namespace_prefix}-agent-{ordinal:03d}"
+            stable = uuid.uuid5(
+                uuid.NAMESPACE_URL, f"{self.config.namespace_prefix}:agent:{ordinal:03d}"
+            )
+            agent_id = f"ai:{self.config.namespace_prefix}-glm-{stable}"
             key = self._load_or_create_key(agent_id)
             self.agents.append(
                 SwarmAgent.create(
@@ -98,6 +102,15 @@ class Swarm:
                     coverage=self.coverage,
                 )
             )
+        admin_ids = {
+            value.strip()
+            for value in os.environ.get("AI_MEMORY_ADMIN_AGENT_IDS", "").split(",")
+            if value.strip()
+        }
+        if not any(agent.identity.agent_id in admin_ids for agent in self.agents):
+            self.coverage.mark_documented_fail_closed(
+                "stats", "namespaces", "agents", "forget"
+            )
         return self.agents
 
     # -- provisioning ------------------------------------------------------
@@ -109,7 +122,7 @@ class Swarm:
         write tools is recorded as coverage of ``agents``-plane surface.
         """
         for agent in self.agents:
-            await agent.client.register_agent(agent.identity.agent_id, agent_type="glm-swarm")
+            await agent.client.register_agent(agent.identity.agent_id, agent_type="ai:glm-swarm")
             await agent.client.bind_agent_pubkey(
                 agent.identity.agent_id, agent.identity.signing_key.public_key_b64()
             )

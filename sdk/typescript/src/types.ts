@@ -125,6 +125,12 @@ export interface Memory {
   valid_until?: string | null;
 }
 
+/** Envelope returned by `GET /api/v1/memories/:id`. */
+export interface MemoryDetail {
+  memory: Memory;
+  links: MemoryLink[];
+}
+
 /** A scored Memory returned by `/recall` (Memory + `score` field). */
 export interface ScoredMemory extends Memory {
   score: number;
@@ -370,12 +376,16 @@ export interface NamespaceCount {
 }
 
 export interface Stats {
-  total: number;
-  by_tier: TierCount[];
-  by_namespace: NamespaceCount[];
+  total_memories: number;
+  /** sqlite: `TierCount[]`; postgres: `{ [tier]: count }` map (backend divergence, #3331 follow-up). */
+  by_tier: TierCount[] | Record<string, number>;
+  by_namespace: NamespaceCount[] | Record<string, number>;
   expiring_soon: number;
   links_count: number;
   db_size_bytes: number;
+  live: number;
+  expired_pending_gc: number;
+  storage_backend: string;
 }
 
 export interface HealthResponse {
@@ -443,14 +453,18 @@ export interface RevokeRequest {
 
 /** Agent-to-agent notification (inbox). */
 export interface NotifyRequest {
-  /** Target agent_id. */
-  to: string;
-  subject: string;
-  body: string;
-  /** Optional memory_id this notification relates to. */
-  memory_id?: string;
-  /** Arbitrary structured payload. */
-  payload?: Record<string, unknown>;
+  /** Recipient agent_id. */
+  target_agent_id: string;
+  /** Subject (<= 200 chars). */
+  title: string;
+  /** Message body — the daemon takes `payload` OR `content` (strings only; exactly one required). */
+  payload?: string;
+  content?: string;
+  priority?: number;
+  tier?: Tier;
+  /** Optional explicit sender id — must match `X-Agent-Id` when both are present. */
+  agent_id?: string;
+  why_trace?: string;
 }
 
 export interface InboxMessage {

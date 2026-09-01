@@ -305,12 +305,18 @@ class PendingAction(_Base):
 class Stats(_Base):
     """``struct Stats`` — output of ``GET /api/v1/stats``."""
 
-    total: int
-    by_tier: list[dict[str, Any]] = Field(default_factory=list)
-    by_namespace: list[dict[str, Any]] = Field(default_factory=list)
+    total_memories: int
+    #: sqlite returns ``[{"tier","count"}]`` lists; postgres returns
+    #: ``{"<tier>": count}`` maps (``src/handlers/admin.rs`` pg branch).
+    #: Both are accepted verbatim; see #3331 follow-up for daemon parity.
+    by_tier: dict[str, int] | list[dict[str, Any]] = Field(default_factory=list)
+    by_namespace: dict[str, int] | list[dict[str, Any]] = Field(default_factory=list)
     expiring_soon: int = 0
     links_count: int = 0
     db_size_bytes: int = 0
+    live: int = 0
+    expired_pending_gc: int = 0
+    storage_backend: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -350,11 +356,17 @@ class Subscription(_Base):
 class NotifyRequest(_Base):
     """Body for ``POST /api/v1/notify`` — agent-to-agent message."""
 
-    to: str
-    subject: str
-    body: str
-    namespace: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    target_agent_id: str
+    title: str
+    #: Message body. The daemon's ``NotifyBody`` takes ``payload`` OR ``content``
+    #: (both ``Option<String>``); exactly one is required. Strings only — a
+    #: structured object is rejected (422) by the daemon.
+    payload: str | None = None
+    content: str | None = None
+    priority: int | None = None
+    tier: str | None = None
+    agent_id: str | None = None
+    why_trace: str | None = None
 
 
 class InboxMessage(_Base):

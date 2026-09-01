@@ -38,6 +38,7 @@ import type {
   ListQuery,
   ListResponse,
   Memory,
+  MemoryDetail,
   MemoryLink,
   MetricsResponse,
   NotifyRequest,
@@ -339,8 +340,8 @@ export class AiMemoryClient {
   }
 
   /** `GET /api/v1/memories/:id` — fetch by id. */
-  async get(id: string, opts?: RequestOptions): Promise<Memory> {
-    return this.call<Memory>({
+  async get(id: string, opts?: RequestOptions): Promise<MemoryDetail> {
+    return this.call<MemoryDetail>({
       method: "GET",
       path: `/api/v1/memories/${encodeURIComponent(id)}`,
       requestOpts: opts,
@@ -627,8 +628,8 @@ export class AiMemoryClient {
   async notify(
     body: NotifyRequest,
     opts?: RequestOptions,
-  ): Promise<{ id: string; sent: boolean }> {
-    return this.call<{ id: string; sent: boolean }, NotifyRequest>({
+  ): Promise<{ id: string; target_agent_id: string; namespace: string; storage_backend: string }> {
+    return this.call<{ id: string; target_agent_id: string; namespace: string; storage_backend: string }, NotifyRequest>({
       method: "POST",
       path: "/api/v1/notify",
       body,

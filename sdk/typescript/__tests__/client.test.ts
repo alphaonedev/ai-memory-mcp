@@ -120,6 +120,42 @@ describe("AiMemoryClient constructor", () => {
   });
 });
 
+describe("v1.0.0 wire contract (#3331)", () => {
+  const memory = { id: "m1", tier: "mid", namespace: "global", title: "t", content: "c", tags: [], priority: 5, confidence: 1, source: "api", access_count: 0, created_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-01T00:00:00Z", metadata: {} };
+
+  function clientWith(response: unknown, capture?: (url: string, init: any) => void) {
+    const fetchImpl = async (url: any, init: any) => {
+      capture?.(String(url), init);
+      return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => response, text: async () => JSON.stringify(response) } as any;
+    };
+    return new AiMemoryClient({ baseUrl: BASE_URL }, fetchImpl as any);
+  }
+
+  test("get returns the memory-and-links envelope", async () => {
+    const detail = await clientWith({ memory, links: [] }).get("m1");
+    expect(detail.memory.id).toBe("m1");
+    expect(detail.links).toEqual([]);
+  });
+
+  test("notify sends and types daemon field names", async () => {
+    let body = "";
+    const result = await clientWith({ id: "n1", target_agent_id: "ai:b", namespace: "global", storage_backend: "postgres" }, (_url, init) => { body = String(init.body); }).notify({ target_agent_id: "ai:b", title: "hello", payload: "unit-of-work" });
+    expect(JSON.parse(body).target_agent_id).toBe("ai:b");
+    expect(result.storage_backend).toBe("postgres");
+  });
+
+  test("stats exposes total_memories", async () => {
+    const stats = await clientWith({ total_memories: 2, by_tier: [], by_namespace: [], expiring_soon: 0, links_count: 0, db_size_bytes: 1, live: 2, expired_pending_gc: 0, storage_backend: "postgres" }).stats();
+    expect(stats.total_memories).toBe(2);
+  });
+
+  test("forget keeps its JSON body", async () => {
+    let body = "";
+    await clientWith({ deleted: 1 }, (_url, init) => { body = String(init.body); }).forget({ namespace: "global" });
+    expect(JSON.parse(body)).toEqual({ namespace: "global" });
+  });
+});
+
 // ---------------------------------------------------------------------------
 // C-20 (3x7 claims register, 2026-08-01) — the daemon registers `delete` on
 // the COLLECTION path `/api/v1/subscriptions` only; the id rides the query
@@ -309,8 +345,8 @@ describeIntegration("AiMemoryClient (live daemon)", () => {
     createdId = created.id;
 
     const fetched = await client.get(created.id);
-    expect(fetched.id).toBe(created.id);
-    expect(fetched.title).toBe(created.title);
+    expect(fetched.memory.id).toBe(created.id);
+    expect(fetched.memory.title).toBe(created.title);
 
     const del = await client.delete(created.id);
     expect(del.deleted).toBe(true);
@@ -356,7 +392,7 @@ describeIntegration("AiMemoryClient (live daemon)", () => {
 
   test("stats", async () => {
     const s = await client.stats();
-    expect(typeof s.total).toBe("number");
+    expect(typeof s.total_memories).toBe("number");
     expect(Array.isArray(s.by_tier)).toBe(true);
   });
 
