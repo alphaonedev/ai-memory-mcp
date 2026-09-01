@@ -191,11 +191,21 @@ class Swarm:
         set_call_log(None)
 
     def mission_completion(self) -> dict[str, bool]:
-        """Verify the concrete summary plus lineage/consolidation requirement."""
+        """STRICT completion: exactly one shared summary + lineage + every source id cited."""
         return {agent.identity.agent_id:
                 bool(agent.mission_summary_id and agent.mission_summary_count == 1
                      and agent.mission_lineage_proved and agent.mission_summary_cites_sources)
                 for agent in self.agents}
+
+    def mission_progress(self) -> dict[str, dict[str, bool]]:
+        """Per-agent breakdown so a 0% strict rate is explainable, not opaque."""
+        return {agent.identity.agent_id: {
+            "summary_stored": bool(agent.mission_summary_id),
+            "single_summary": agent.mission_summary_count == 1,
+            "lineage_proved": agent.mission_lineage_proved,
+            "cites_all_sources": agent.mission_summary_cites_sources,
+            "facts_stored": len(agent.mission_memory_ids),
+        } for agent in self.agents}
 
 
 async def run_swarm(config: SwarmConfig) -> CoverageTracker:

@@ -234,6 +234,7 @@ async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
     steps = (
         ("link", {"source_id": target_id, "target_id": source_id, "relation": "derives_from"}),
         ("get_links", {"memory_id": target_id}),
+        ("get_memory", {"memory_id": source_id}),
         ("lineage", {"memory_id": target_id, "direction": "ancestors"}),
         ("update", {"memory_id": source_id, "content": "source updated",
                     "expected_version": int(first.result.get("version") or 1)}),
@@ -257,6 +258,16 @@ async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
     return ScenarioResult("full_surface_sweep", True, " -> ".join(completed))
 
 
+#: ~150k tokens at 4 chars/token — safely inside every model we run (GLM 200k, Grok 500k).
+_AUDIT_EVIDENCE_CHARS = 600_000
+
+
+def _budget(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...[evidence truncated: {len(text) - limit} chars omitted; full artifacts on disk]"
+
+
 async def nhi_assessment(
     swarm: Swarm, scenarios: list[ScenarioResult], *, reconcile_result: dict[str, object] | None = None,
     negative_evidence: list[dict[str, object]] | None = None,
@@ -270,14 +281,31 @@ async def nhi_assessment(
     if not swarm.agents:
         return ScenarioResult("nhi_assessment", False, "need >= 1 agent"), None
     agent = swarm.agents[0]
+
+    def _clip(text: object, n: int) -> str:
+        t = str(text)
+        return t if len(t) <= n else t[:n] + f"...[+{len(t) - n} chars]"
+
+    # The auditor's context is finite (Grok 4.6: 500k tokens; run #1 overflowed
+    # it with full call summaries). Journals and call log are CLIPPED per field;
+    # the complete artifacts stay on disk (calls.jsonl, <agent>.jsonl) for humans.
+    entries = getattr(getattr(swarm, "call_log", None), "entries", [])
     evidence = {
         "coverage_matrix": swarm.coverage.matrix(),
         "scenarios": [result.__dict__ for result in scenarios],
         "agent_journals": {
-            item.identity.agent_id: [record.__dict__ for record in item.journal]
+            item.identity.agent_id: [
+                {**record.__dict__, "perceived": _clip(record.perceived, 600),
+                 "outcomes": [_clip(o, 300) for o in record.outcomes]}
+                for record in item.journal
+            ]
             for item in swarm.agents
         },
-        "call_log": getattr(getattr(swarm, "call_log", None), "entries", []),
+        "call_log_size": len(entries),
+        "call_log_clipped": [
+            {k: (_clip(v, 200) if k in ("summary", "args") else v) for k, v in entry.items()}
+            for entry in entries[-400:]
+        ],
         "call_log_reconcile": reconcile_result,
         "negative_evidence": negative_evidence or [],
     }
@@ -286,7 +314,7 @@ async def nhi_assessment(
         try:
             # Intentionally verbatim: the auditor must see the original battery artifact.
             from pathlib import Path
-            evidence["extra_evidence_verbatim"] = Path(extra_path).read_text(encoding="utf-8")
+            evidence["extra_evidence_verbatim"] = Path(extra_path).read_text(encoding="utf-8")[:60000]
         except OSError as exc:
             evidence["extra_evidence_error"] = f"{type(exc).__name__}: {exc}"
     messages = [
@@ -301,11 +329,13 @@ async def nhi_assessment(
         },
         {
             "role": "user",
-            "content": "Audit this completed swarm run:\n" + json.dumps(evidence, default=str),
+            "content": "Audit this completed swarm run:\n"
+            + _budget(json.dumps(evidence, default=str), _AUDIT_EVIDENCE_CHARS),
         },
     ]
     try:
         report = await agent.model.complete(messages=messages)
+        swarm.coverage.record_model_usage(agent.identity.agent_id, getattr(agent.model, "last_usage", None))
     except OpenRouterError as exc:
         # The caller renders this as a failed choreography. No fabricated
         # assessment is stored when OpenRouter fails or returns empty content.
@@ -376,11 +406,12 @@ async def collect_assessments(swarm: Swarm) -> list[AgentAssessment]:
     assessments: list[AgentAssessment] = []
     for agent in swarm.agents:
         messages = [{"role": "system", "content": _RUBRIC_PROMPT},
-                    {"role": "user", "content": json.dumps(
+                    {"role": "user", "content": _budget(json.dumps(
                         {"agent_id": agent.identity.agent_id,
-                         "journal": [record.__dict__ for record in agent.journal]}, default=str)}]
+                         "journal": [record.__dict__ for record in agent.journal]}, default=str), 200_000)}]
         try:
             raw = await agent.model.complete(messages=messages)
+            swarm.coverage.record_model_usage(agent.identity.agent_id, getattr(agent.model, "last_usage", None))
             assessment = parse_assessment(agent.identity.agent_id, raw)
         except OpenRouterError as exc:
             assessment = parse_assessment(agent.identity.agent_id, "")

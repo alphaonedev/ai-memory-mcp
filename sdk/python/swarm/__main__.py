@@ -162,6 +162,13 @@ async def _main() -> int:
                 negative_evidence=negative_evidence,
                 model=config.model_slug, model_override_reason=config.model_override_reason)
             report["call_log_reconcile"] = final_reconcile
+            report["mission_progress"] = swarm.mission_progress()
+            prog = report["mission_progress"].values()
+            report["mission_partial"] = {
+                "summary_stored": sum(p["summary_stored"] for p in prog),
+                "lineage_proved": sum(p["lineage_proved"] for p in prog),
+                "facts_stored_total": sum(p["facts_stored"] for p in prog),
+            }
             print("\n" + render_nhi_report(report))
             journal_dir = os.environ.get("SWARM_JOURNAL_DIR")
             if journal_dir:

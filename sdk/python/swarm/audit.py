@@ -168,6 +168,9 @@ def render_nhi_report(report: dict[str, Any]) -> str:
              f"isolation respected: {report['isolation_respected_count']}",
              f"would rely on it: {report['would_rely_on_it_count']}",
              "top failures: " + ("; ".join(report["top_failures"]) or "none")]
+    if report.get("mission_partial"):
+        mp = report["mission_partial"]
+        lines.append(f"mission partial: summaries {mp['summary_stored']} · lineage {mp['lineage_proved']} · facts {mp['facts_stored_total']}")
     lines.extend(f"quote [{q['agent_id']}]: {q['free_text']}" for q in report["quotes"])
     lines.append("auditor verdict: " + report["auditor_verdict"])
     return "\n".join(lines)
