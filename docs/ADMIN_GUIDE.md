@@ -205,9 +205,25 @@ backend = "ollama"                     # #1598: also any #1067 alias (openrouter
                                        # openai, gemini, ...) or "openai-compatible"
                                        # (self-hosted TEI / vLLM / llama.cpp server)
 url     = "http://localhost:11434"     # synonym of base_url; base_url wins
-model   = "nomic-embed-text-v1.5"      # e.g. "google/gemini-embedding-2" (3072d)
+model   = "nomic-embed-text-v1.5"      # e.g. "google/gemini-embedding-001" on
+                                       # openrouter (native 3072d; honours dim=768)
 # api_key_env  = "OPENROUTER_API_KEY"  # API backends; XOR api_key_file (0400)
-# dim          = 3072                  # only for models outside KNOWN_EMBEDDING_DIMS
+dim     = 768                          # SUPPORTED_EMBEDDING_DIMS = [384, 768].
+                                       # The dim = 768 FLEET PIN (#2626) is the
+                                       # recommended default on any pgvector-backed
+                                       # fleet (pgvector ANN caps at 2000 dims; the
+                                       # fleet schemas template vector(768), so every
+                                       # node MUST agree on 768). Not just for models
+                                       # outside KNOWN_EMBEDDING_DIMS: for OpenAI-
+                                       # compatible backends it is sent as the wire
+                                       # `dimensions` param, so a Matryoshka model
+                                       # (google/gemini-embedding-001, text-embedding-3-*)
+                                       # truncates server-side to 768.
+# backfill_on_boot = "background"      # #3329: WHEN the boot embedding backfill runs
+                                       # vs the MCP `initialize` handshake — background
+                                       # (default) | blocking | off. Env override:
+                                       # AI_MEMORY_EMBED_BACKFILL_ON_BOOT. See
+                                       # "Autonomous tier boots non-blocking" below.
 
 [reranker]
 enabled = true
@@ -351,7 +367,9 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 
 `ai-memory` supports an optional configuration file at `~/.config/ai-memory/config.toml`. This file is read once at process startup and supports the following keys:
 
-> **Config path (#3002):** the file resolves under the platform config dir — `$XDG_CONFIG_HOME/ai-memory/config.toml` when `XDG_CONFIG_HOME` is set, else `~/.config/ai-memory/config.toml` — the SAME root the identity keys (`<config-dir>/ai-memory/keys`) and hooks (`<config-dir>/ai-memory/hooks.toml`) already use, so a certified daemon can no longer load its config from one root and look for its signing keys in another. **Upgrade note:** if `XDG_CONFIG_HOME` is set but carries no `ai-memory/config.toml` while the legacy `~/.config/ai-memory/config.toml` does, the legacy file is still honoured and a one-shot stderr WARN asks you to move it — the move cannot silently drop a config you already have. See [`CONFIG_SCHEMA.md` §Where config.toml is looked for](CONFIG_SCHEMA.html).
+> **Config path (Linux/Windows, #3002):** the file resolves under the platform config dir — `$XDG_CONFIG_HOME/ai-memory/config.toml` when `XDG_CONFIG_HOME` is set, else `~/.config/ai-memory/config.toml` — the SAME root the identity keys (`<config-dir>/ai-memory/keys`) and hooks (`<config-dir>/ai-memory/hooks.toml`) already use, so a certified daemon can no longer load its config from one root and look for its signing keys in another. **Upgrade note:** if `XDG_CONFIG_HOME` is set but carries no `ai-memory/config.toml` while the legacy `~/.config/ai-memory/config.toml` does, the legacy file is still honoured and a one-shot stderr WARN asks you to move it — the move cannot silently drop a config you already have.
+>
+> **Config path (macOS, #3329):** the config file resolves at the DOCUMENTED `~/.config/ai-memory/config.toml`, NOT under `~/Library/Application Support` (where the identity keys and hooks live on macOS — the keys-in-Library / config-in-`~/.config` split). If a `~/.config` config exists it WINS; a `~/Library/Application Support/ai-memory/config.toml` that also exists is shadowed with a loud WARN. If ONLY the Library file exists it is still honoured (a config is never silently dropped) with a move-me WARN. Before #3329 the Library path won unconditionally, so a macOS operator who followed the docs had their `~/.config` config silently ignored and the daemon reverted to compiled defaults (MiniLM-384, no LLM). The boot banner `ai-memory: loaded config from <path>` always prints the resolved path. See [`CONFIG_SCHEMA.md` §Where config.toml is looked for](CONFIG_SCHEMA.html).
 
 > **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
 

@@ -92,9 +92,11 @@ make them permanent.
 - The MCP server launched with `--tier autonomous` and a non-`core`
   profile (`--profile full` exposes all 103 tools; `power` is
   the recommended ceiling for normal operators)
-- `~/.config/ai-memory/config.toml` exists (default location; macOS uses
-  `~/Library/Application Support/ai-memory/` for keys but `~/.config/`
-  for the config file)
+- `~/.config/ai-memory/config.toml` exists (default location on every
+  platform; on macOS the identity **keys** live under
+  `~/Library/Application Support/ai-memory/` but the **config file** resolves at
+  `~/.config/ai-memory/config.toml` — the keys/config split enforced by #3329.
+  See [`CONFIG_SCHEMA.md` §Where config.toml is looked for](CONFIG_SCHEMA.html))
 
 Recommended `config.toml`:
 

@@ -72,8 +72,9 @@ url            = "http://localhost:11434"  # synonym of base_url; base_url
 # base_url     = "https://openrouter.ai/api/v1"  # API backends; vendor
                                            # default when omitted for a
                                            # named alias
-model          = "nomic-embed-text-v1.5"   # e.g. "google/gemini-embedding-2"
-                                           # (3072-dim) on openrouter
+model          = "nomic-embed-text-v1.5"   # e.g. "google/gemini-embedding-001"
+                                           # on openrouter (native 3072-dim;
+                                           # honours dim = 768 — see below)
 
 # Exactly one of api_key_env / api_key_file for API backends (or
 # neither — falls back to the per-vendor env-var chain, highest
@@ -82,23 +83,45 @@ model          = "nomic-embed-text-v1.5"   # e.g. "google/gemini-embedding-2"
 # api_key_env  = "OPENROUTER_API_KEY"
 # api_key_file = "/etc/ai-memory/keys/embed.key"  # mode 0400 enforced
 
-# dim          = 768             # env override: AI_MEMORY_EMBED_DIM (#2626 —
+dim            = 768             # env override: AI_MEMORY_EMBED_DIM (#2626 —
 #                                 # env BEATS this field; a non-positive /
 #                                 # unparseable env value FAILS CLOSED to an
 #                                 # UNKNOWN dim rather than falling through to
 #                                 # the compiled table, which would resolve the
 #                                 # exact width the operator was overriding).
-#                                 # Explicit vector-dim override for models
-#                                 # not in KNOWN_EMBEDDING_DIMS. #1598 fleet
-#                                 # follow-up: for OpenAI-compatible backends an
-#                                 # EXPLICIT dim is also sent as the wire
-#                                 # `dimensions` request param — Matryoshka-capable
-#                                 # models (gemini-embedding-2, text-embedding-3-*)
-#                                 # truncate server-side. Use dim = 768 on
-#                                 # pgvector-backed federated fleets: pgvector ANN
-#                                 # indexes cap at 2000 dims and the fleet schemas
-#                                 # template vector(768).
+#                                 # SUPPORTED_EMBEDDING_DIMS = [384, 768]. The
+#                                 # `dim = 768` FLEET PIN (#2626) is the
+#                                 # recommended default for any pgvector-backed
+#                                 # federated fleet: pgvector ANN indexes cap at
+#                                 # 2000 dims and the fleet schemas template
+#                                 # vector(768), so every node MUST agree on 768.
+#                                 # It is not only for models outside
+#                                 # KNOWN_EMBEDDING_DIMS — it also pins a
+#                                 # Matryoshka-capable API model to the fleet
+#                                 # width: for OpenAI-compatible backends an
+#                                 # EXPLICIT dim is sent as the wire `dimensions`
+#                                 # request param, so models like
+#                                 # google/gemini-embedding-001 (native 3072) and
+#                                 # text-embedding-3-* truncate server-side to 768.
 backfill_batch = 100             # env override: AI_MEMORY_EMBED_BACKFILL_BATCH
+
+# WHEN the boot embedding backfill runs relative to the MCP `initialize`
+# handshake (#3329). Env override: AI_MEMORY_EMBED_BACKFILL_ON_BOOT.
+#   background (DEFAULT) — expose the full MCP tool surface immediately and
+#                          drain the embedding backlog on a background task.
+#                          Semantic recall degrades to keyword for not-yet-
+#                          embedded rows until their vectors exist (the same
+#                          already-supported partial-embed state as a
+#                          federation import / partial reembed). Recommended
+#                          for the autonomous tier against an un-drained corpus.
+#   blocking             — drain the backlog BEFORE completing the handshake
+#                          (the pre-#3329 behaviour), BOUNDED by a ~20 s startup
+#                          budget so it can never block the handshake
+#                          unboundedly — the remainder then drains in the
+#                          background and a WARN is logged.
+#   off                  — skip the boot sweep entirely; heal out-of-band with
+#                          `ai-memory reembed`.
+# backfill_on_boot = "background"
 
 # ---------------------------------------------------------------------
 # [reranker] — cross-encoder rerank configuration.
@@ -743,9 +766,15 @@ silently open a different database than the one configured.*
 
 ### Where `config.toml` is looked for
 
-**[#3002]** The path resolves through the platform config dir — the SAME
-resolver the identity key dir (`<config-dir>/ai-memory/keys`) and the hooks
-file (`<config-dir>/ai-memory/hooks.toml`) use:
+`config.toml` lives at **`~/.config/ai-memory/config.toml`** on every platform —
+this is the single documented location. Resolution differs by OS:
+
+**Linux / Windows [#3002].** The path resolves through the platform config dir
+(`dirs::config_dir()`) — the SAME resolver the identity key dir
+(`<config-dir>/ai-memory/keys`) and the hooks file
+(`<config-dir>/ai-memory/hooks.toml`) use. On Linux that is
+`$XDG_CONFIG_HOME/ai-memory/config.toml` when `XDG_CONFIG_HOME` is set, else
+`~/.config/ai-memory/config.toml`:
 
 | `XDG_CONFIG_HOME` | Resolved path |
 |---|---|
@@ -754,7 +783,32 @@ file (`<config-dir>/ai-memory/hooks.toml`) use:
 | set, empty, but `~/.config/ai-memory/config.toml` exists | **the legacy `~/.config` file, plus a one-shot stderr WARN** |
 | set, and neither file exists | `$XDG_CONFIG_HOME/ai-memory/config.toml` (where a default is written) |
 
-The third row is a deliberate migration guard, not sloppiness. Before #3002
+**macOS [#3329].** `dirs::config_dir()` on macOS is
+`~/Library/Application Support`, which is where the identity **keys** and hooks
+live — but the config file is resolved at the DOCUMENTED
+`~/.config/ai-memory/config.toml`, NOT under `~/Library`. (This is the
+keys-in-Library / config-in-`~/.config` split described in
+[`batman-active-mode.md`](batman-active-mode.md).) Precedence, so a config is
+never silently ignored:
+
+| State | Resolved path |
+|---|---|
+| `~/.config/ai-memory/config.toml` exists | **`~/.config/…` (documented) wins.** If a `~/Library/Application Support/ai-memory/config.toml` also exists it is SHADOWED with a loud stderr WARN — delete or merge it. |
+| only `~/Library/Application Support/ai-memory/config.toml` exists | It is HONOURED (a config is never dropped) with a one-shot WARN asking you to move it to `~/.config`. |
+| neither exists | `~/.config/ai-memory/config.toml` — new installs and `write_default_if_missing` land here. |
+
+> **macOS upgrade note (#3329).** Before this fix the macOS binary preferred the
+> `~/Library/Application Support` path, so an operator who followed the docs and
+> wrote `~/.config/ai-memory/config.toml` had it silently ignored whenever a
+> Library default existed — a dangerous silent revert to compiled defaults
+> (MiniLM-384, no LLM). If your macOS node previously kept its real config at
+> `~/Library/Application Support/ai-memory/config.toml`, it is still honoured
+> (with a WARN); move it to `~/.config/ai-memory/config.toml` to match the docs.
+> The boot banner (`ai-memory: loaded config from <path>`) always prints the
+> resolved path — check it if in doubt.
+
+The XDG "legacy `~/.config`, plus WARN" row above is a deliberate migration
+guard, not sloppiness. Before #3002
 the path was hardcoded to `$HOME/.config`; making it XDG-aware without a
 fallback would mean that on any host setting `XDG_CONFIG_HOME` the operator's
 existing config simply stops being found. An ABSENT config is the documented

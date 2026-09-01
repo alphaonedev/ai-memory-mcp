@@ -59,6 +59,15 @@ relative to the current directory (override with `--db`, the
 `~/.config/ai-memory/config.toml`). Store anything, recall anything,
 no server running.
 
+> **Config file location.** `config.toml` lives at
+> `~/.config/ai-memory/config.toml` on **every** platform, macOS included —
+> NOT under `~/Library/Application Support` (that path holds the identity keys
+> on macOS, but not the config; #3329). On Linux with `XDG_CONFIG_HOME` set it
+> resolves under that root instead. The boot banner
+> `ai-memory: loaded config from <path>` always prints the file actually
+> loaded — check it if a setting seems ignored. Full resolution + precedence:
+> [`CONFIG_SCHEMA.md` §Where config.toml is looked for](CONFIG_SCHEMA.html).
+
 ## Path B — Claude Code / Claude Desktop / Cursor / Codex (MCP)
 
 ai-memory is an MCP server. Wire it into your AI IDE and every
@@ -129,6 +138,28 @@ AI client's parent process inherits it. The MCP config stays minimal:
 Verify: `ai-memory boot --quiet --limit 1` should report
 `llm=xai:grok-4.3`. Full canonical schema:
 [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html).
+
+> **Autonomous tier boots non-blocking (#3329).** As of v1.0.0 the MCP server
+> completes the `initialize` handshake and advertises the FULL tool surface
+> IMMEDIATELY; the boot embedding backfill (filling vectors for memories
+> written before an embedder was configured) now drains on a BACKGROUND task
+> (`[embeddings].backfill_on_boot = "background"`, the default). While the
+> backlog drains, semantic recall degrades to keyword for not-yet-embedded rows
+> — never a wrong result, just fewer semantically-scored rows — and catches up
+> as vectors land. Before this fix that sweep ran synchronously and could time
+> out the client's handshake (Codex CLI: 30 s), so the server came up showing
+> **0 tools**.
+>
+> **Operational ordering for a large existing corpus.** For the fastest, most
+> predictable boot against a big un-embedded corpus: keep the MCP client on the
+> `keyword`/`semantic` tier (or pre-drain the vectors offline with
+> `ai-memory reembed`), and only switch `--tier autonomous` once the corpus is
+> embedded. `backfill_on_boot = "blocking"` reproduces the old drain-first
+> behaviour but is now BOUNDED by a ~20 s startup budget (the remainder still
+> drains in the background); `= "off"` skips the boot sweep entirely (heal with
+> `ai-memory reembed`). As a client-side stopgap for running autonomous against
+> an un-drained corpus, Codex exposes `startup_timeout_sec` in its MCP server
+> config — raise it so the client waits out a slow boot.
 
 > **Override path — `env:` block.** Adding an `env:` block to the MCP
 > config (with `AI_MEMORY_LLM_BACKEND` / `_API_KEY` / `_MODEL`) still

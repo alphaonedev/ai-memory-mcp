@@ -27,7 +27,7 @@ Enterprise embedding-architecture companions (#1598 — which embedder
 shape a federated fleet runs; orthogonal to the topologies above):
 
 - [Enterprise Reference Architecture: CPU + Memory Federated Nodes](reference-architecture/enterprise-cpu-memory.md)
-  — API embeddings (OpenRouter `google/gemini-embedding-2` cloud shape
+  — API embeddings (OpenRouter `google/gemini-embedding-001` cloud shape
   or self-hosted TEI/vLLM airgapped shape); no Ollama anywhere.
 - [Enterprise Reference Architecture: CPU + Memory + GPU Federated Nodes](reference-architecture/enterprise-cpu-memory-gpu.md)
   — local Ollama embeddings on GPU-equipped nodes (operator GPU

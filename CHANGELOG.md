@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3329 — autonomous-tier MCP boot no longer blocks the `initialize` handshake; macOS config-path resolution)
+
+- **#3329 — the boot embedding backfill no longer blocks the MCP `initialize`
+  handshake.** On the `ai-memory mcp` stdio path (semantic/smart/autonomous
+  tiers) the boot sweep that fills vectors for memories written before an
+  embedder was configured ran SYNCHRONOUSLY before the handshake completed, so
+  against a DB with an embedding backlog the client timed out (Codex CLI: 30 s)
+  and the server came up advertising **0 tools** (worse under a concurrent
+  `reembed`). The sweep now runs on a BACKGROUND task by default: the handshake
+  completes and the FULL tool surface is exposed immediately, and semantic
+  recall degrades to keyword for not-yet-embedded rows until their vectors land
+  (an already-supported partial-embed state — never a wrong result). New knob
+  `[embeddings].backfill_on_boot = "background" | "blocking" | "off"` (default
+  `background`; env `AI_MEMORY_EMBED_BACKFILL_ON_BOOT`, env > config > default).
+  `blocking` reproduces the pre-fix drain-first behaviour but is BOUNDED by a
+  ~20 s startup budget (the remainder drains in the background with a WARN) so it
+  can never block the handshake unboundedly. DATA INTEGRITY is unaffected in
+  every mode: the durable memory TEXT is the source of truth and is never
+  touched — only the derived vector is deferred.
+- **#3329 (macOS) — a `config.toml` at the documented `~/.config` path is no
+  longer silently ignored.** On macOS `dirs::config_dir()` is
+  `~/Library/Application Support`, and the config resolver preferred it
+  unconditionally — so a macOS operator who followed the docs and wrote
+  `~/.config/ai-memory/config.toml` had it silently ignored whenever a Library
+  config existed (e.g. a first-boot default), a dangerous silent revert to
+  compiled defaults (MiniLM-384, no LLM). config.toml now resolves at the
+  DOCUMENTED `~/.config/ai-memory/config.toml` on macOS (matching every doc and
+  the keys-in-Library / config-in-`~/.config` split); an existing
+  `~/Library/Application Support` config is still honoured (never dropped) with a
+  loud move-me WARN, and a shadowed Library file also WARNs. Linux/Windows
+  resolution (#3002, XDG) is unchanged. Docs (`CONFIG_SCHEMA.md`,
+  `ADMIN_GUIDE.md`, `QUICKSTART.md`, `batman-active-mode.md`) reconciled; the
+  OpenRouter Google embed slug refreshed to `google/gemini-embedding-001` and
+  the `dim = 768` fleet pin made explicit.
+
 ### Security (#3327 — GA-review fail-closed polish batch: four confirmed storage / handler hardening fixes)
 
 - **Sec-F2 — the sqlite namespace-standard SEVER audit append is now
