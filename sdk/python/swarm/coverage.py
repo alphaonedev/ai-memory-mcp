@@ -21,6 +21,7 @@ was never invoked, or only ever crashed unexpectedly, is a coverage FAILURE.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
 from typing import Any
 
 from swarm.toolset import TOOL_SPECS, ToolOutcome, ToolSpec
@@ -36,6 +37,7 @@ class ToolCoverage:
     fail_closed: int = 0
     unexpected_failures: int = 0
     last_summary: str = ""
+    failure_summaries: deque[str] = field(default_factory=lambda: deque(maxlen=5))
 
     @property
     def covered(self) -> bool:
@@ -76,6 +78,8 @@ class CoverageTracker:
             cov.fail_closed += 1
         else:
             cov.unexpected_failures += 1
+        if not outcome.ok:
+            cov.failure_summaries.append(outcome.summary)
 
     def mark_documented_fail_closed(self, *names: str) -> None:
         """Record that a fail-closed outcome for ``names`` is EXPECTED.
@@ -145,6 +149,11 @@ class CoverageTracker:
         ]
         if not self.is_full():
             lines.append("uncovered: " + ", ".join(self.uncovered()))
+        failures = [(name, summary) for name, cov in self.tools.items()
+                    for summary in cov.failure_summaries]
+        if failures:
+            lines += ["", "FAILURES", "-" * 60]
+            lines.extend(f"{name}: {summary}" for name, summary in failures)
         return "\n".join(lines)
 
 

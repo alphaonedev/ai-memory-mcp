@@ -181,12 +181,56 @@ async def replay_guard(agent: SwarmAgent, namespace: str | None = None) -> Scena
     return ScenarioResult("replay_guard", ok=bool(first_id) and guarded, detail=detail)
 
 
+async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
+    """Exercise the complete memory lifecycle through the dispatcher."""
+    if not swarm.agents:
+        return ScenarioResult("full_surface_sweep", ok=False, detail="need >= 1 agent")
+    agent = swarm.agents[0]
+    pattern = f"full-surface-{_RUN}"
+    completed: list[str] = []
+
+    async def call(tool: str, args: dict[str, object]):
+        outcome = await dispatch(agent.client, agent.identity, tool, args)
+        swarm.coverage.record(outcome)
+        if outcome.ok:
+            completed.append(tool)
+        return outcome
+
+    first = await call("store", {"title": f"{pattern}-source", "content": "source"})
+    second = await call("store", {"title": f"{pattern}-target", "content": "target"})
+    if not first.ok or not second.ok or not isinstance(first.result, dict) or not isinstance(second.result, dict):
+        return ScenarioResult("full_surface_sweep", False, f"stopped after {','.join(completed)}")
+    source_id, target_id = first.result.get("id"), second.result.get("id")
+    if not source_id or not target_id:
+        return ScenarioResult("full_surface_sweep", False, "store response missing id")
+
+    steps = (
+        ("link", {"source_id": source_id, "target_id": target_id, "relation": "derived_from"}),
+        ("get_links", {"memory_id": source_id}),
+        ("lineage", {"memory_id": target_id, "direction": "ancestors"}),
+        ("update", {"memory_id": source_id, "content": "source updated",
+                    "expected_version": int(first.result.get("version") or 1)}),
+        ("promote", {"memory_id": source_id}),
+        ("reflect", {"source_ids": [source_id, target_id],
+                     "title": f"{pattern}-reflection", "content": "reflection"}),
+        ("delete", {"memory_id": target_id}),
+        ("forget", {"pattern": pattern}),
+    )
+    for tool, args in steps:
+        outcome = await call(tool, args)
+        if not outcome.ok:
+            return ScenarioResult("full_surface_sweep", False,
+                                  f"{tool} failed after {','.join(completed)}: {outcome.summary}")
+    return ScenarioResult("full_surface_sweep", True, " -> ".join(completed))
+
+
 async def run_all(swarm: Swarm) -> list[ScenarioResult]:
     """Run every scenario in sequence against the population."""
     results = [
         await producer_consumer(swarm),
         await consensus_quorum(swarm),
         await governance_approval(swarm),
+        await full_surface_sweep(swarm),
     ]
     if swarm.agents:
         results.append(await replay_guard(swarm.agents[0]))
@@ -197,6 +241,7 @@ __all__ = [
     "ScenarioResult",
     "consensus_quorum",
     "governance_approval",
+    "full_surface_sweep",
     "producer_consumer",
     "replay_guard",
     "run_all",
