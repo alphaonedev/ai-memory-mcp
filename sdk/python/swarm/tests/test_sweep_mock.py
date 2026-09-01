@@ -20,6 +20,12 @@ from swarm.tests.test_agent_loop_mock import _FakeModel, _agent
 from swarm.openrouter import AccountSnapshot, Decision
 
 
+def _mem(memory_id: str) -> dict[str, object]:
+    return {"id": memory_id, "tier": "mid", "namespace": "swarm-000", "title": "t", "content": "c", "tags": [],
+            "priority": 5, "confidence": 1.0, "source": "api", "access_count": 0,
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z", "metadata": {}}
+
+
 @pytest.mark.asyncio
 async def test_preflight_dispatches_health_and_capabilities_once_per_agent() -> None:
     seen: list[httpx.Request] = []
@@ -50,6 +56,9 @@ async def test_full_surface_sweep_dispatches_order_and_confines_forget() -> None
         if request.url.path == "/api/v1/memories" and request.method == "POST":
             counter += 1
             return httpx.Response(201, json={"id": f"mem-{counter}", "version": 3})
+        if request.method == "GET" and request.url.path.startswith("/api/v1/memories/mem-") \
+                and not request.url.path.endswith("/lineage"):
+            return httpx.Response(200, json={"memory": _mem(request.url.path.rsplit("/", 1)[-1]), "links": []})
         return httpx.Response(200, json={"ok": True})
 
     await agent.client._client.aclose()  # noqa: SLF001
@@ -65,6 +74,7 @@ async def test_full_surface_sweep_dispatches_order_and_confines_forget() -> None
     expected = [
         ("POST", "/api/v1/memories"), ("POST", "/api/v1/memories"),
         ("POST", "/api/v1/links"), ("GET", "/api/v1/links/mem-2"),
+        ("GET", "/api/v1/memories/mem-1"),
         ("GET", "/api/v1/memories/mem-2/lineage"),
         ("PUT", "/api/v1/memories/mem-1"),
         ("POST", "/api/v1/memories/mem-1/promote"),
@@ -72,10 +82,10 @@ async def test_full_surface_sweep_dispatches_order_and_confines_forget() -> None
         ("DELETE", "/api/v1/memories/mem-2"), ("POST", "/api/v1/forget"),
     ]
     assert [(request.method, request.url.path) for request in seen] == expected
-    assert seen[5].headers["if-match"] == "3"
-    reflect = json.loads(seen[7].content)
+    assert seen[6].headers["if-match"] == "3"
+    reflect = json.loads(seen[8].content)
     assert reflect["source_ids"] == ["mem-1", "mem-2"]
-    forgotten = json.loads(seen[9].content)
+    forgotten = json.loads(seen[10].content)
     assert forgotten["namespace"] == "swarm-000"
     assert forgotten["pattern"].startswith("full-surface-")
 
@@ -100,7 +110,8 @@ def test_write_journals_serializes_each_agent(tmp_path: Path) -> None:
     path = tmp_path / "ai:test-agent.jsonl"
     assert json.loads(path.read_text()) == {
         "decided_tools": ["store"], "outcomes": ["ok"],
-        "perceived": "seen", "step": 1,
+        "perceived": "seen", "step": 1, "started_at": "",
+        "finished_at": "", "latency_ms": 0.0,
     }
 
 

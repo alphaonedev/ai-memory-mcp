@@ -495,22 +495,31 @@ async def dispatch(
     success — this is how the swarm degrades (fewer results) rather than
     silently corrupting or fabricating state.
     """
+    from swarm.audit import record_dispatch
+
+    module = str(getattr(getattr(client, "_client", None), "base_url", "") or "") or None
     spec = SPECS_BY_NAME.get(tool_name)
     if spec is None:
-        return ToolOutcome(tool_name, ok=False, fail_closed=True,
-                           summary=f"unknown tool {tool_name!r}")
+        outcome = ToolOutcome(tool_name, ok=False, fail_closed=True,
+                              summary=f"unknown tool {tool_name!r}")
+        record_dispatch(identity.agent_id, tool_name, args, outcome, module=module)
+        return outcome
     try:
         result = await spec.handler(client, identity, args)
     except Exception as exc:  # noqa: BLE001 - fail-closed boundary, re-surfaced in outcome
-        return ToolOutcome(tool_name, ok=False, fail_closed=True,
-                           summary=f"{type(exc).__name__}: {exc}")
-    return ToolOutcome(tool_name, ok=True, fail_closed=False,
-                       summary=_summarize(result), result=result)
+        outcome = ToolOutcome(tool_name, ok=False, fail_closed=True,
+                              summary=f"{type(exc).__name__}: {exc}")
+    else:
+        outcome = ToolOutcome(tool_name, ok=True, fail_closed=False,
+                              summary=_summarize(result), result=result)
+    record_dispatch(identity.agent_id, tool_name, args, outcome, module=module)
+    return outcome
 
 
 def _summarize(result: Any) -> str:
-    text = repr(result)
-    return text if len(text) <= 160 else text[:157] + "..."
+    # Journals and calls.jsonl retain the complete result. Console renderers
+    # may truncate independently, but audit evidence must not.
+    return repr(result)
 
 
 __all__ = [

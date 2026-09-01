@@ -20,7 +20,9 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from swarm.choreography import nhi_assessment, run_all
+from swarm.audit import build_nhi_report, render_nhi_report, write_audit_artifacts
+from swarm.choreography import (collect_assessments, negative_authorization_evidence,
+                                nhi_assessment, run_all)
 from swarm.config import ConfigError, SwarmConfig
 from swarm.coverage import CoverageTracker
 from swarm.openrouter import AccountSnapshot, OpenRouterClient
@@ -64,6 +66,7 @@ def _write_usage(
     payload = {
         "schema_version": 1,
         "model": model,
+        "model_override_reason": os.environ.get("SWARM_MODEL_OVERRIDE_REASON") or None,
         "account_usd": {"before": before_data, "after": after_data, "delta": delta},
         "decide_latency_ms": coverage.model_latency_summary(),
         "completions": {
@@ -102,6 +105,26 @@ def _usage_block(
              f"usage.json -> {path}"]
     return "\n".join(lines)
 
+def _auditor_verdict(assessment: str | None) -> str:
+    """The auditor's FINAL verdict.
+
+    Prefer an explicit `Verdict: PASS|FAIL` marker (last one wins); otherwise the
+    last PASS/FAIL token. Run #2 on Grok 4.6 ended "Verdict: **FAIL** ... PASS
+    would over-claim" and a last-token parse mis-read it as PASS.
+    """
+    if not assessment:
+        return "UNKNOWN"
+    import re
+    marks = re.findall(r"verdict\W{0,6}(PASS|FAIL)", assessment, flags=re.I)
+    if marks:
+        return marks[-1].upper()
+    text = assessment.upper()
+    last_pass, last_fail = text.rfind("PASS"), text.rfind("FAIL")
+    if last_pass < 0 and last_fail < 0:
+        return "UNKNOWN"
+    return "PASS" if last_pass > last_fail else "FAIL"
+
+
 async def _main() -> int:
     config = SwarmConfig.from_env()
     config.require_live()
@@ -122,13 +145,38 @@ async def _main() -> int:
         try:
             await swarm.provision()
             await swarm.run()
+            negative_evidence = await negative_authorization_evidence(swarm)
             results = await run_all(swarm)
-            assessment_result, assessment = await nhi_assessment(swarm, results)
+            assessments = await collect_assessments(swarm)
+            reconcile_result = swarm.call_log.reconcile(coverage)
+            assessment_result, assessment = await nhi_assessment(
+                swarm, results, reconcile_result=reconcile_result,
+                negative_evidence=negative_evidence)
             results.append(assessment_result)
+            final_reconcile = swarm.call_log.reconcile(coverage)
             _write_journals(swarm, assessment=assessment)
             for result in results:
                 marker = "PASS" if result.ok else "FAIL"
                 print(f"[choreography] {result.name}: {marker} ({result.detail})")
+            completion = swarm.mission_completion()
+            verdict = _auditor_verdict(assessment)
+            report = build_nhi_report(
+                n_agents=len(swarm.agents), completed=sum(completion.values()),
+                assessments=assessments, auditor_verdict=verdict,
+                negative_evidence=negative_evidence,
+                model=config.model_slug, model_override_reason=config.model_override_reason)
+            report["call_log_reconcile"] = final_reconcile
+            report["mission_progress"] = swarm.mission_progress()
+            prog = report["mission_progress"].values()
+            report["mission_partial"] = {
+                "summary_stored": sum(p["summary_stored"] for p in prog),
+                "lineage_proved": sum(p["lineage_proved"] for p in prog),
+                "facts_stored_total": sum(p["facts_stored"] for p in prog),
+            }
+            print("\n" + render_nhi_report(report))
+            journal_dir = os.environ.get("SWARM_JOURNAL_DIR")
+            if journal_dir:
+                write_audit_artifacts(journal_dir, assessments, report)
         finally:
             usage_after = await _snapshot(model)
             usage_path = _write_usage(
@@ -140,7 +188,10 @@ async def _main() -> int:
 
     print()
     print(coverage.matrix())
-    return 0 if coverage.is_full() and all(result.ok for result in results) else 1
+    negative_ok = all(item.get("refused") is True for item in negative_evidence)
+    reconciled = bool(final_reconcile.get("ok"))
+    return 0 if (coverage.is_full() and all(result.ok for result in results)
+                 and negative_ok and reconciled) else 1
 
 
 def main() -> None:

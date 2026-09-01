@@ -30,6 +30,11 @@ OPENROUTER_MODEL_SLUG = "z-ai/glm-5.3-flash"
 
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_DAEMON_BASE_URL = "http://localhost:9077"
+DEFAULT_MISSION = (
+    "Gather three useful facts as memories; link them with derives_from and consolidate them; "
+    "write exactly one mission-summary-<agent> memory in the shared namespace citing the "
+    "memory ids it builds on."
+)
 
 
 class ConfigError(RuntimeError):
@@ -79,11 +84,16 @@ class SwarmConfig:
     request_timeout_secs: float = 30.0
     namespace_prefix: str = "swarm"
     model_slug: str = OPENROUTER_MODEL_SLUG
+    #: Non-empty ONLY when the operator overrode the pinned model for a specific
+    #: test (e.g. the Experiential AI-NHI audit on Grok 4.6). Recorded in every
+    #: artifact so a result can never be misattributed to the pinned model.
+    model_override_reason: str | None = None
     client_cert: str | None = None
     client_key: str | None = None
     ca_cert: str | None = None
     api_key: str | None = None
     admin_agent_id: str = "ai:hive-loadgen-f2"
+    mission: str = DEFAULT_MISSION
 
     def __post_init__(self) -> None:
         if not self.base_urls:
@@ -92,6 +102,12 @@ class SwarmConfig:
             raise ConfigError(f"n_agents must be >= 1, got {self.n_agents}")
         if self.max_steps < 1:
             raise ConfigError(f"max_steps must be >= 1, got {self.max_steps}")
+        if self.model_slug != OPENROUTER_MODEL_SLUG and not self.model_override_reason:
+            raise ConfigError(
+                f"model {self.model_slug!r} is not the pinned acceptance model "
+                f"{OPENROUTER_MODEL_SLUG!r}; set SWARM_MODEL_OVERRIDE_REASON to override "
+                "deliberately (the reason is recorded in every artifact)"
+            )
         tls_values = (self.client_cert, self.client_key, self.ca_cert)
         if any(tls_values) and not all(tls_values):
             raise ConfigError(
@@ -118,6 +134,8 @@ class SwarmConfig:
         ``SWARM_CLIENT_KEY``        loadgen mTLS private-key path
         ``SWARM_CA_CERT``            hive CA certificate path
         ``SWARM_API_KEY``            per-node HTTP request credential
+        ``SWARM_MODEL_SLUG``         OpenRouter model override (audit-only use)
+        ``SWARM_MODEL_OVERRIDE_REASON`` REQUIRED with an override; recorded
         ==========================  ===================================
         """
         env = os.environ if environ is None else environ
@@ -147,6 +165,9 @@ class SwarmConfig:
             ca_cert=env.get("SWARM_CA_CERT") or None,
             api_key=env.get("SWARM_API_KEY") or None,
             admin_agent_id=env.get("SWARM_ADMIN_AGENT_ID", "ai:hive-loadgen-f2"),
+            mission=env.get("SWARM_MISSION", DEFAULT_MISSION),
+            model_slug=env.get("SWARM_MODEL_SLUG") or OPENROUTER_MODEL_SLUG,
+            model_override_reason=env.get("SWARM_MODEL_OVERRIDE_REASON") or None,
         )
 
     def daemon_client_kwargs(self) -> dict[str, object]:

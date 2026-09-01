@@ -32,6 +32,7 @@ daemon response makes the scenario ``ok=False`` rather than passing silently.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -40,6 +41,7 @@ from ai_memory.attestation import attestation_fields
 from ai_memory.errors import AiMemoryError
 
 from swarm.openrouter import OpenRouterError
+from swarm.audit import AgentAssessment, parse_assessment
 from swarm.toolset import dispatch
 
 _RUN = uuid.uuid4().hex[:8]
@@ -232,6 +234,7 @@ async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
     steps = (
         ("link", {"source_id": target_id, "target_id": source_id, "relation": "derives_from"}),
         ("get_links", {"memory_id": target_id}),
+        ("get_memory", {"memory_id": source_id}),
         ("lineage", {"memory_id": target_id, "direction": "ancestors"}),
         ("update", {"memory_id": source_id, "content": "source updated",
                     "expected_version": int(first.result.get("version") or 1)}),
@@ -255,8 +258,19 @@ async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
     return ScenarioResult("full_surface_sweep", True, " -> ".join(completed))
 
 
+#: ~150k tokens at 4 chars/token — safely inside every model we run (GLM 200k, Grok 500k).
+_AUDIT_EVIDENCE_CHARS = 600_000
+
+
+def _budget(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...[evidence truncated: {len(text) - limit} chars omitted; full artifacts on disk]"
+
+
 async def nhi_assessment(
-    swarm: Swarm, scenarios: list[ScenarioResult]
+    swarm: Swarm, scenarios: list[ScenarioResult], *, reconcile_result: dict[str, object] | None = None,
+    negative_evidence: list[dict[str, object]] | None = None,
 ) -> tuple[ScenarioResult, str | None]:
     """Ask one NHI to audit the completed run, then attest its report.
 
@@ -267,14 +281,42 @@ async def nhi_assessment(
     if not swarm.agents:
         return ScenarioResult("nhi_assessment", False, "need >= 1 agent"), None
     agent = swarm.agents[0]
+
+    def _clip(text: object, n: int) -> str:
+        t = str(text)
+        return t if len(t) <= n else t[:n] + f"...[+{len(t) - n} chars]"
+
+    # The auditor's context is finite (Grok 4.6: 500k tokens; run #1 overflowed
+    # it with full call summaries). Journals and call log are CLIPPED per field;
+    # the complete artifacts stay on disk (calls.jsonl, <agent>.jsonl) for humans.
+    entries = getattr(getattr(swarm, "call_log", None), "entries", [])
     evidence = {
         "coverage_matrix": swarm.coverage.matrix(),
         "scenarios": [result.__dict__ for result in scenarios],
         "agent_journals": {
-            item.identity.agent_id: [record.__dict__ for record in item.journal]
+            item.identity.agent_id: [
+                {**record.__dict__, "perceived": _clip(record.perceived, 600),
+                 "outcomes": [_clip(o, 300) for o in record.outcomes]}
+                for record in item.journal
+            ]
             for item in swarm.agents
         },
+        "call_log_size": len(entries),
+        "call_log_clipped": [
+            {k: (_clip(v, 200) if k in ("summary", "args") else v) for k, v in entry.items()}
+            for entry in entries[-400:]
+        ],
+        "call_log_reconcile": reconcile_result,
+        "negative_evidence": negative_evidence or [],
     }
+    extra_path = os.environ.get("SWARM_EXTRA_EVIDENCE")
+    if extra_path:
+        try:
+            # Intentionally verbatim: the auditor must see the original battery artifact.
+            from pathlib import Path
+            evidence["extra_evidence_verbatim"] = Path(extra_path).read_text(encoding="utf-8")[:60000]
+        except OSError as exc:
+            evidence["extra_evidence_error"] = f"{type(exc).__name__}: {exc}"
     messages = [
         {
             "role": "system",
@@ -287,11 +329,13 @@ async def nhi_assessment(
         },
         {
             "role": "user",
-            "content": "Audit this completed swarm run:\n" + json.dumps(evidence, default=str),
+            "content": "Audit this completed swarm run:\n"
+            + _budget(json.dumps(evidence, default=str), _AUDIT_EVIDENCE_CHARS),
         },
     ]
     try:
         report = await agent.model.complete(messages=messages)
+        swarm.coverage.record_model_usage(agent.identity.agent_id, getattr(agent.model, "last_usage", None))
     except OpenRouterError as exc:
         # The caller renders this as a failed choreography. No fabricated
         # assessment is stored when OpenRouter fails or returns empty content.
@@ -318,6 +362,72 @@ async def nhi_assessment(
     return ScenarioResult("nhi_assessment", ok, detail), report
 
 
+async def negative_authorization_evidence(swarm: Swarm) -> list[dict[str, object]]:
+    """Exercise expected isolation/refusal paths, all through logged dispatches."""
+    if len(swarm.agents) < 2:
+        return [{"probe": "authorization", "ok": False, "detail": "need >= 2 agents"}]
+    owner, attacker = swarm.agents[0], swarm.agents[1]
+    title = f"isolation-canary-{_RUN}"
+    created = await dispatch(owner.client, owner.identity, "store",
+                             {"title": title, "content": "owner only"})
+    swarm.coverage.record(created)
+    memory_id = created.result.get("id") if created.ok and isinstance(created.result, dict) else None
+    probes: list[tuple[str, object]] = []
+    if memory_id:
+        probes.extend([
+            ("cross_namespace_read", await dispatch(attacker.client, attacker.identity, "get_memory",
+                                                     {"memory_id": memory_id})),
+            ("unauthorized_update", await dispatch(attacker.client, attacker.identity, "update",
+                                                    {"memory_id": memory_id, "content": "tamper"})),
+            ("unauthorized_delete", await dispatch(attacker.client, attacker.identity, "delete",
+                                                    {"memory_id": memory_id})),
+        ])
+    duplicate = await dispatch(owner.client, owner.identity, "store",
+                               {"title": title, "content": "duplicate"})
+    probes.append(("duplicate_title_conflict", duplicate))
+    evidence = []
+    for name, outcome in probes:
+        swarm.coverage.record(outcome)
+        refused = (not outcome.ok) and "unknown tool" not in outcome.summary
+        evidence.append({"probe": name, "expected_refusal": True,
+                         "refused": refused, "summary": outcome.summary})
+    return evidence
+
+
+_RUBRIC_PROMPT = """Return ONLY one JSON object with exactly these fields:
+{"recall_usefulness":1-5,"latency_acceptable":true|false,
+"failures_encountered":[["tool","what"]],"isolation_respected":true|false,
+"would_rely_on_it":true|false,"free_text":"at most 600 characters"}
+Assess your just-completed mission from the supplied journal. Do not use tools."""
+
+
+async def collect_assessments(swarm: Swarm) -> list[AgentAssessment]:
+    """Run one strict no-tools rubric completion per agent and attest it."""
+    assessments: list[AgentAssessment] = []
+    for agent in swarm.agents:
+        messages = [{"role": "system", "content": _RUBRIC_PROMPT},
+                    {"role": "user", "content": _budget(json.dumps(
+                        {"agent_id": agent.identity.agent_id,
+                         "journal": [record.__dict__ for record in agent.journal]}, default=str), 200_000)}]
+        try:
+            raw = await agent.model.complete(messages=messages)
+            swarm.coverage.record_model_usage(agent.identity.agent_id, getattr(agent.model, "last_usage", None))
+            assessment = parse_assessment(agent.identity.agent_id, raw)
+        except OpenRouterError as exc:
+            assessment = parse_assessment(agent.identity.agent_id, "")
+            assessment = AgentAssessment(**{**assessment.__dict__,
+                                            "error": f"{type(exc).__name__}: {exc}"})
+        assessments.append(assessment)
+        stored = await dispatch(agent.client, agent.identity, "store", {
+            "title": f"nhi-audit-{agent.identity.agent_id}-{_RUN}",
+            "content": json.dumps(assessment.__dict__, sort_keys=True),
+            "namespace": swarm.shared_namespace, "scope": "collective",
+            "tags": ["nhi-audit"],
+        })
+        swarm.coverage.record(stored)
+    return assessments
+
+
 async def run_all(swarm: Swarm) -> list[ScenarioResult]:
     """Run every scenario in sequence against the population."""
     results = [
@@ -336,6 +446,8 @@ __all__ = [
     "consensus_quorum",
     "governance_approval",
     "nhi_assessment",
+    "negative_authorization_evidence",
+    "collect_assessments",
     "full_surface_sweep",
     "producer_consumer",
     "replay_guard",

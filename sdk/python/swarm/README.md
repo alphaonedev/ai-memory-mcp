@@ -119,3 +119,35 @@ hand-built model decision — no network, no API key.
   results) rather than producing wrong ones.
 * **Paced, not blasted.** Launches and provisioning are staggered — no
   synchronized thundering-herd against the daemon or the mesh.
+
+## Model policy (operator, 2026-09-01)
+
+* **GLM-5.3-Flash is the pinned acceptance model** for every V&V test (coverage,
+  choreographies, capacity, continuity, red-team). `config.MODEL_ID` is not
+  env-overridable by accident.
+* **Exception — the Experiential AI-NHI audit runs on Grok 4.6**
+  (`x-ai/grok-4.6`): the agents doing the mission, the per-agent rubric and
+  the final auditor all use Grok 4.6 for that dimension only, and the result
+  is weighted above the GLM-5.3-Flash run of the same audit. A GLM run is
+  still reported when it adds value.
+* An override is only accepted with a recorded reason:
+
+  ```bash
+  export SWARM_MODEL_SLUG=x-ai/grok-4.6
+  export SWARM_MODEL_OVERRIDE_REASON="Experiential AI-NHI audit on Grok 4.6 (operator 2026-09-01)"
+  ```
+
+  Both values are written into `usage.json`, `nhi-audit.json` and the printed
+  `NHI AUDIT` block, so a result can never be mis-attributed to the pinned model.
+  Without the reason the run refuses to start (`ConfigError`).
+
+## Per-run artifacts (`SWARM_JOURNAL_DIR`)
+
+| file | what |
+|---|---|
+| `<agent>.jsonl` | per-step journal: timestamps, latency, decided tools, full outcomes |
+| `calls.jsonl` | every dispatcher call (agent, tool, redacted args, ok, summary, ts) — reconciles 100% against the coverage matrix |
+| `assessments.json` | per-agent rubric (strict JSON; malformed → `assessment_invalid`) |
+| `nhi-audit.json` | mission completion rate, rubric aggregates, quotes, auditor verdict, negative-evidence probes, model + override reason |
+| `nhi-assessment.md` | the independent auditor's report |
+| `usage.json` | OpenRouter per-generation tokens/cost, account delta, decide latency, model |

@@ -64,6 +64,9 @@ class AccountSnapshot:
 class OpenRouterClient:
     """Async client bound to one OpenRouter endpoint + model slug."""
 
+    #: usage block of the most recent plain completion (for accounting).
+    last_usage: dict[str, Any] | None = None
+
     def __init__(
         self,
         *,
@@ -149,6 +152,7 @@ class OpenRouterClient:
             "usage": {"include": True},
         })
         content = message.get("content")
+        self.last_usage = _body.get("usage") if isinstance(_body, dict) else None
         if not isinstance(content, str) or not content.strip():
             raise OpenRouterError("malformed OpenRouter response: missing assessment content")
         return content.strip()
