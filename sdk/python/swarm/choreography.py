@@ -21,6 +21,8 @@ Scenarios
   wrapped by the SDK client).
 * ``replay_guard`` — the SAME signed write envelope is submitted twice; the
   daemon's replay-guard must refuse or dedup the second (no double-apply).
+* ``nhi_assessment`` — a final no-tools model call audits the run evidence and
+  persists the report through the same attested store dispatch as every agent.
 
 Every scenario dispatches through :mod:`swarm.toolset` (so its calls count for
 coverage) or the attested SDK path directly, and FAILS CLOSED: an unexpected
@@ -37,6 +39,7 @@ from typing import TYPE_CHECKING
 from ai_memory.attestation import attestation_fields
 from ai_memory.errors import AiMemoryError
 
+from swarm.openrouter import OpenRouterError
 from swarm.toolset import dispatch
 
 _RUN = uuid.uuid4().hex[:8]
@@ -252,6 +255,69 @@ async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
     return ScenarioResult("full_surface_sweep", True, " -> ".join(completed))
 
 
+async def nhi_assessment(
+    swarm: Swarm, scenarios: list[ScenarioResult]
+) -> tuple[ScenarioResult, str | None]:
+    """Ask one NHI to audit the completed run, then attest its report.
+
+    The assessment completion receives evidence only and has no tools.  Its
+    resulting report is stored by the first agent through ``dispatch`` so the
+    normal namespace confinement and per-agent Ed25519 attestation apply.
+    """
+    if not swarm.agents:
+        return ScenarioResult("nhi_assessment", False, "need >= 1 agent"), None
+    agent = swarm.agents[0]
+    evidence = {
+        "coverage_matrix": swarm.coverage.matrix(),
+        "scenarios": [result.__dict__ for result in scenarios],
+        "agent_journals": {
+            item.identity.agent_id: [record.__dict__ for record in item.journal]
+            for item in swarm.agents
+        },
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the independent AI-NHI auditor for an ai-memory acceptance run. "
+                "Assess only the supplied evidence. Identify failures, coverage gaps, and "
+                "data-integrity concerns; do not claim anything that the evidence does not "
+                "prove. End with an explicit PASS or FAIL verdict and concise rationale."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Audit this completed swarm run:\n" + json.dumps(evidence, default=str),
+        },
+    ]
+    try:
+        report = await agent.model.complete(messages=messages)
+    except OpenRouterError as exc:
+        # The caller renders this as a failed choreography. No fabricated
+        # assessment is stored when OpenRouter fails or returns empty content.
+        return ScenarioResult(
+            "nhi_assessment", False, f"assessment failed closed: {type(exc).__name__}: {exc}"
+        ), None
+
+    stored = await dispatch(
+        agent.client,
+        agent.identity,
+        "store",
+        {
+            "title": f"AI-NHI swarm assessment {_RUN}",
+            "content": report,
+            "namespace": swarm.shared_namespace,
+            "scope": "collective",
+            "tags": ["ai-nhi", "assessment", "audit"],
+        },
+    )
+    swarm.coverage.record(stored)
+    memory_id = stored.result.get("id") if stored.ok and isinstance(stored.result, dict) else None
+    ok = stored.ok and bool(memory_id)
+    detail = f"assessment_memory={memory_id}" if ok else f"assessment store failed: {stored.summary}"
+    return ScenarioResult("nhi_assessment", ok, detail), report
+
+
 async def run_all(swarm: Swarm) -> list[ScenarioResult]:
     """Run every scenario in sequence against the population."""
     results = [
@@ -269,6 +335,7 @@ __all__ = [
     "ScenarioResult",
     "consensus_quorum",
     "governance_approval",
+    "nhi_assessment",
     "full_surface_sweep",
     "producer_consumer",
     "replay_guard",

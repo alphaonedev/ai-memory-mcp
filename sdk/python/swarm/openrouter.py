@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Minimal async OpenRouter chat client for the acceptance swarm.
 
-Exactly one capability: issue ONE ``glm-5.3-flash`` chat-completion call whose
-tool schema IS the ai-memory tool surface, and hand back the model's chosen
-tool call(s). This is the "decide" step of the agent loop.
+Two deliberately small capabilities: issue a tool-selecting completion for an
+agent's "decide" step, or a plain (no-tools) completion for the end-of-run
+AI-NHI assessment.
 
 Kept deliberately thin — stdlib + ``httpx`` (already an SDK dependency), no
 OpenAI/LangChain SDK — because the swarm is test infrastructure, not shipped
@@ -111,6 +111,39 @@ class OpenRouterClient:
             "tool_choice": "auto",
             "temperature": temperature,
         }
+        body, message = await self._chat(payload)
+        return Decision(
+            content=message.get("content"),
+            tool_calls=_parse_tool_calls(message.get("tool_calls") or []),
+            raw=body,
+        )
+
+    async def complete(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        temperature: float = 0.1,
+    ) -> str:
+        """Return one plain chat completion, with no tool surface attached.
+
+        This is intentionally separate from :meth:`decide`: an assessment
+        must describe the evidence it was given, never take another action.
+        Empty or non-text content is malformed and therefore fails closed.
+        """
+        _body, message = await self._chat({
+            "model": self._model,
+            "messages": messages,
+            "temperature": temperature,
+        })
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise OpenRouterError("malformed OpenRouter response: missing assessment content")
+        return content.strip()
+
+    async def _chat(
+        self, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Post and validate the common OpenAI-compatible response envelope."""
         try:
             resp = await self._client.post("/chat/completions", json=payload)
         except httpx.HTTPError as exc:
@@ -122,13 +155,11 @@ class OpenRouterClient:
         try:
             body = resp.json()
             message = body["choices"][0]["message"]
-        except (ValueError, KeyError, IndexError) as exc:
+            if not isinstance(body, dict) or not isinstance(message, dict):
+                raise TypeError("response body/message is not an object")
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise OpenRouterError(f"malformed OpenRouter response: {exc}") from exc
-        return Decision(
-            content=message.get("content"),
-            tool_calls=_parse_tool_calls(message.get("tool_calls") or []),
-            raw=body,
-        )
+        return body, message
 
 
 def _parse_tool_calls(raw_calls: list[dict[str, Any]]) -> list[ToolCall]:

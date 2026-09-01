@@ -13,7 +13,7 @@ import pytest
 
 from swarm.__main__ import _write_journals
 from swarm.agent import StepRecord
-from swarm.choreography import full_surface_sweep, run_all
+from swarm.choreography import ScenarioResult, full_surface_sweep, nhi_assessment, run_all
 from swarm.coverage import CoverageTracker
 from swarm.orchestrator import Swarm
 from swarm.tests.test_agent_loop_mock import _FakeModel, _agent
@@ -102,3 +102,41 @@ def test_write_journals_serializes_each_agent(tmp_path: Path) -> None:
         "decided_tools": ["store"], "outcomes": ["ok"],
         "perceived": "seen", "step": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_nhi_assessment_is_plain_completion_and_attested_store() -> None:
+    seen: list[httpx.Request] = []
+    agent = _agent(_FakeModel(Decision(None, [], {})), seen)
+    calls: list[dict[str, object]] = []
+
+    async def complete(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return "Evidence is complete. Verdict: PASS"
+
+    agent.model.complete = complete  # type: ignore[attr-defined,method-assign]
+    swarm = SimpleNamespace(
+        agents=[agent], coverage=CoverageTracker(), shared_namespace="swarm-shared"
+    )
+    try:
+        result, report = await nhi_assessment(
+            swarm, [ScenarioResult("probe", True, "proved")]
+        )
+    finally:
+        await agent.aclose()
+    assert result.ok, result.detail
+    assert report == "Evidence is complete. Verdict: PASS"
+    assert len(calls) == 1
+    assert set(calls[0]) == {"messages"}
+    request = [r for r in seen if r.url.path == "/api/v1/memories" and r.method == "POST"][-1]
+    body = json.loads(request.content)
+    assert body["content"] == report
+    assert body["namespace"] == "swarm-shared"
+    assert body["scope"] == "collective"
+    assert body["signature"]
+
+
+def test_write_journals_writes_assessment_artifact(tmp_path: Path) -> None:
+    swarm = SimpleNamespace(agents=[])
+    _write_journals(swarm, str(tmp_path), assessment="Verdict: PASS")
+    assert (tmp_path / "nhi-assessment.md").read_text() == "Verdict: PASS\n"
