@@ -2886,9 +2886,15 @@ enum ConfigPathWarning {
     LegacyXdg { legacy: PathBuf, xdg: PathBuf },
     /// macOS — the documented `~/.config` config is loaded while a Library
     /// config also exists and is shadowed.
-    MacosLibraryShadowed { documented: PathBuf, library: PathBuf },
+    MacosLibraryShadowed {
+        documented: PathBuf,
+        library: PathBuf,
+    },
     /// macOS — only the Library config exists; honoured with a move-me WARN.
-    MacosLibraryOnly { documented: PathBuf, library: PathBuf },
+    MacosLibraryOnly {
+        documented: PathBuf,
+        library: PathBuf,
+    },
 }
 
 /// #3329 sibling — the resolved config path plus the WARN (if any) to emit.
@@ -2943,10 +2949,7 @@ fn resolve_config_path_choice(
                     } else {
                         ConfigPathWarning::None
                     };
-                    Some(ConfigPathChoice {
-                        path: doc,
-                        warning,
-                    })
+                    Some(ConfigPathChoice { path: doc, warning })
                 } else if lib != doc && exists(&lib) {
                     Some(ConfigPathChoice {
                         warning: ConfigPathWarning::MacosLibraryOnly {
@@ -3882,7 +3885,7 @@ impl BackfillOnBoot {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "background" | "async" | "deferred" => Some(Self::Background),
-            "blocking" | "sync" | "synchronous" => Some(Self::Blocking),
+            "blocking" | "sync" => Some(Self::Blocking),
             "off" | "none" | "disabled" | "skip" => Some(Self::Off),
             _ => None,
         }
@@ -7881,21 +7884,25 @@ impl AppConfig {
         // #3329 sibling — the platform-parameterised core is unit-tested for
         // BOTH `is_macos` values (macOS resolution can thus be verified on a
         // Linux CI host). See [`resolve_config_path_choice`].
-        let choice = resolve_config_path_choice(
-            platform,
-            dotconfig,
-            cfg!(target_os = "macos"),
-            |p| p.exists(),
-        )?;
+        let choice =
+            resolve_config_path_choice(platform, dotconfig, cfg!(target_os = "macos"), |p| {
+                p.exists()
+            })?;
         match &choice.warning {
             ConfigPathWarning::None => {}
             ConfigPathWarning::LegacyXdg { legacy, xdg } => {
                 warn_legacy_config_root_once(legacy, xdg);
             }
-            ConfigPathWarning::MacosLibraryShadowed { documented, library } => {
+            ConfigPathWarning::MacosLibraryShadowed {
+                documented,
+                library,
+            } => {
                 warn_macos_library_config_shadowed_once(documented, library);
             }
-            ConfigPathWarning::MacosLibraryOnly { documented, library } => {
+            ConfigPathWarning::MacosLibraryOnly {
+                documented,
+                library,
+            } => {
                 warn_macos_library_config_only_once(documented, library);
             }
         }
@@ -11399,7 +11406,11 @@ legacy_scoring = false
             present(&[MAC_DOC, MAC_LIB]),
         )
         .expect("resolves");
-        assert_eq!(choice.path, pb(MAC_DOC), "documented ~/.config must win on macOS");
+        assert_eq!(
+            choice.path,
+            pb(MAC_DOC),
+            "documented ~/.config must win on macOS"
+        );
         assert_eq!(
             choice.warning,
             ConfigPathWarning::MacosLibraryShadowed {
@@ -11412,9 +11423,13 @@ legacy_scoring = false
 
     #[test]
     fn macos_only_documented_exists_no_warn_3329() {
-        let choice =
-            resolve_config_path_choice(Some(pb(MAC_LIB)), Some(pb(MAC_DOC)), true, present(&[MAC_DOC]))
-                .expect("resolves");
+        let choice = resolve_config_path_choice(
+            Some(pb(MAC_LIB)),
+            Some(pb(MAC_DOC)),
+            true,
+            present(&[MAC_DOC]),
+        )
+        .expect("resolves");
         assert_eq!(choice.path, pb(MAC_DOC));
         assert_eq!(choice.warning, ConfigPathWarning::None);
     }
@@ -11423,10 +11438,18 @@ legacy_scoring = false
     fn macos_only_library_exists_is_honoured_with_move_me_warn_3329() {
         // The operator's config must NEVER be silently dropped: an existing
         // Library-only config is honoured, with a WARN telling them to move it.
-        let choice =
-            resolve_config_path_choice(Some(pb(MAC_LIB)), Some(pb(MAC_DOC)), true, present(&[MAC_LIB]))
-                .expect("resolves");
-        assert_eq!(choice.path, pb(MAC_LIB), "an existing Library config must be honoured");
+        let choice = resolve_config_path_choice(
+            Some(pb(MAC_LIB)),
+            Some(pb(MAC_DOC)),
+            true,
+            present(&[MAC_LIB]),
+        )
+        .expect("resolves");
+        assert_eq!(
+            choice.path,
+            pb(MAC_LIB),
+            "an existing Library config must be honoured"
+        );
         assert_eq!(
             choice.warning,
             ConfigPathWarning::MacosLibraryOnly {
@@ -11452,13 +11475,9 @@ legacy_scoring = false
     #[test]
     fn linux_both_exist_platform_xdg_wins_unchanged_3002() {
         let xdg = "/home/x/.config/ai-memory/config.toml";
-        let choice = resolve_config_path_choice(
-            Some(pb(xdg)),
-            Some(pb(xdg)),
-            false,
-            present(&[xdg]),
-        )
-        .expect("resolves");
+        let choice =
+            resolve_config_path_choice(Some(pb(xdg)), Some(pb(xdg)), false, present(&[xdg]))
+                .expect("resolves");
         assert_eq!(choice.path, pb(xdg));
         assert_eq!(choice.warning, ConfigPathWarning::None);
     }
@@ -11467,14 +11486,14 @@ legacy_scoring = false
     fn linux_xdg_absent_legacy_present_falls_back_with_warn_3002() {
         let xdg = "/nonstd/xdg/ai-memory/config.toml";
         let legacy = "/home/x/.config/ai-memory/config.toml";
-        let choice = resolve_config_path_choice(
-            Some(pb(xdg)),
-            Some(pb(legacy)),
-            false,
-            present(&[legacy]),
-        )
-        .expect("resolves");
-        assert_eq!(choice.path, pb(legacy), "an existing legacy config must be honoured (#3002)");
+        let choice =
+            resolve_config_path_choice(Some(pb(xdg)), Some(pb(legacy)), false, present(&[legacy]))
+                .expect("resolves");
+        assert_eq!(
+            choice.path,
+            pb(legacy),
+            "an existing legacy config must be honoured (#3002)"
+        );
         assert_eq!(
             choice.warning,
             ConfigPathWarning::LegacyXdg {
@@ -11504,7 +11523,6 @@ legacy_scoring = false
             ("deferred", Background),
             ("blocking", Blocking),
             ("SYNC", Blocking),
-            ("synchronous", Blocking),
             ("off", Off),
             ("None", Off),
             ("disabled", Off),

@@ -16741,10 +16741,17 @@ mod backfill_resilience_1595_tests {
             seed(&conn, &format!("row-{i}"), "healthy content");
         }
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        let progress = run_embedding_backfill_bounded(&mut conn, &FixedFourDimEmbedder, 2, Some(past))
-            .expect("bounded sweep must not error");
-        assert!(progress.deadline_hit, "a past deadline must report deadline_hit");
-        assert_eq!(progress.ok, 0, "nothing embedded when the budget is already spent");
+        let progress =
+            run_embedding_backfill_bounded(&mut conn, &FixedFourDimEmbedder, 2, Some(past))
+                .expect("bounded sweep must not error");
+        assert!(
+            progress.deadline_hit,
+            "a past deadline must report deadline_hit"
+        );
+        assert_eq!(
+            progress.ok, 0,
+            "nothing embedded when the budget is already spent"
+        );
         assert_eq!(
             db::get_unembedded_ids(&conn).unwrap().len(),
             5,
