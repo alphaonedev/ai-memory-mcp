@@ -2814,6 +2814,26 @@ pub fn skip_config() -> bool {
     false
 }
 
+/// Process-global, boot-time one-way latch for explicit `boot --quiet`
+/// advisory suppression.
+///
+/// Seeded by the binary after CLI parsing and before config resolution. Relaxed
+/// ordering is sufficient: this publishes no data and is written/read on the
+/// same boot thread before any worker thread exists.
+static CONFIG_BOOT_WARN_SUPPRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Suppress config-path boot advisories for an explicitly quiet boot.
+///
+/// This changes only warning emission; config-path selection is unaffected.
+pub fn suppress_config_boot_warnings() {
+    CONFIG_BOOT_WARN_SUPPRESSED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn config_boot_warnings_suppressed() -> bool {
+    CONFIG_BOOT_WARN_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One-shot stderr WARN for the #3002 legacy-config-root fallback.
 ///
 /// Emitted by [`AppConfig::config_path`] when `XDG_CONFIG_HOME` moves the
@@ -2823,6 +2843,9 @@ pub fn skip_config() -> bool {
 /// poll does not spam the log. `eprintln!` rather than `tracing::warn!`
 /// because this fires during boot, BEFORE file logging is initialised.
 fn warn_legacy_config_root_once(legacy: &Path, xdg: &Path) {
+    if config_boot_warnings_suppressed() {
+        return;
+    }
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
         eprintln!(
@@ -2845,6 +2868,9 @@ fn warn_legacy_config_root_once(legacy: &Path, xdg: &Path) {
 /// file over another. `Once`-gated (CONCURRENCY-16); `eprintln!` because this
 /// fires during boot before file logging is initialised.
 fn warn_macos_library_config_shadowed_once(documented: &Path, library: &Path) {
+    if config_boot_warnings_suppressed() {
+        return;
+    }
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
         eprintln!(
@@ -2863,6 +2889,9 @@ fn warn_macos_library_config_shadowed_once(documented: &Path, library: &Path) {
 /// operator's config is never silently dropped) but the operator is told it
 /// sits at the non-documented location and should move it to `~/.config`.
 fn warn_macos_library_config_only_once(documented: &Path, library: &Path) {
+    if config_boot_warnings_suppressed() {
+        return;
+    }
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
         eprintln!(
@@ -11242,7 +11271,7 @@ legacy_scoring = false
             .expect("dirs::config_dir resolves under the sandbox env")
             .join("ai-memory")
             .join("config.toml");
-        let hardcoded_legacy = std::path::Path::new("/some/home")
+        let documented_dotconfig = std::path::Path::new("/some/home")
             .join(".config")
             .join("ai-memory")
             .join("config.toml");
@@ -11258,14 +11287,17 @@ legacy_scoring = false
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+        // #3329 — macOS intentionally prefers the documented `~/.config`
+        // path; Linux/Windows keep the #3002 platform/XDG resolution.
+        let expected = if cfg!(target_os = "macos") {
+            &documented_dotconfig
+        } else {
+            &platform
+        };
         assert_eq!(
-            path, platform,
-            "config.toml must resolve under dirs::config_dir() (keys/hooks root), \
-             not a hardcoded $HOME/.config"
-        );
-        assert_ne!(
-            path, hardcoded_legacy,
-            "pre-#3002 hardcoded $HOME/.config must not win when dirs::config_dir() differs: {path:?}"
+            &path, expected,
+            "config_path must resolve the platform-appropriate root \
+             (macOS -> documented ~/.config; else -> dirs::config_dir())"
         );
     }
 
