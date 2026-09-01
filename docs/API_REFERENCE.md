@@ -484,12 +484,15 @@ last GC). **Admin-gated** (#946 cluster).
 
 ```json
 {
-  "total": 150,
+  "total_memories": 150,
   "by_tier": [{"tier":"short","count":20},{"tier":"mid","count":100},{"tier":"long","count":30}],
   "by_namespace": [{"namespace":"global","count":90}],
   "expiring_soon": 5,
   "links_count": 23,
-  "db_size_bytes": 524288
+  "db_size_bytes": 524288,
+  "live": 145,
+  "expired_pending_gc": 5,
+  "storage_backend": "sqlite"
 }
 ```
 

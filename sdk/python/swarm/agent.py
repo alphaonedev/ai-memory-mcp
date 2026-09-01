@@ -25,6 +25,7 @@ the agent never fabricates a tool call or silently pretends success.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -85,7 +86,8 @@ class SwarmAgent:
         goal: str = "accumulate and organize useful team knowledge",
     ) -> SwarmAgent:
         """Build an agent and its daemon client (no network I/O yet)."""
-        agent_id = f"{config.namespace_prefix}-agent-{ordinal:03d}"
+        stable = uuid.uuid5(uuid.NAMESPACE_URL, f"{config.namespace_prefix}:agent:{ordinal:03d}")
+        agent_id = f"ai:{config.namespace_prefix}-glm-{stable}"
         client = AsyncAiMemoryClient(
             base_url=base_url,
             agent_id=agent_id,

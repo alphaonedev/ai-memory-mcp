@@ -29,6 +29,7 @@ daemon response makes the scenario ``ok=False`` rather than passing silently.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -36,6 +37,8 @@ from ai_memory.attestation import attestation_fields
 from ai_memory.errors import AiMemoryError
 
 from swarm.toolset import dispatch
+
+_RUN = uuid.uuid4().hex[:8]
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from swarm.agent import SwarmAgent
@@ -90,16 +93,16 @@ async def consensus_quorum(swarm: Swarm) -> ScenarioResult:
         return ScenarioResult("consensus_quorum", ok=False, detail="need >= 2 agents")
     fact = "the sky is blue"
     ids: list[str] = []
-    for agent in swarm.agents:
+    for ordinal, agent in enumerate(swarm.agents):
         out = await dispatch(agent.client, agent.identity, "store",
-                             {"title": "consensus-vote", "content": fact,
+                             {"title": f"consensus-vote-{_RUN}-{ordinal}", "content": fact,
                               "namespace": swarm.shared_namespace})
         swarm.coverage.record(out)
         if out.ok and isinstance(out.result, dict) and out.result.get("id"):
             ids.append(str(out.result["id"]))
     consolidator = swarm.agents[0]
     cons = await dispatch(consolidator.client, consolidator.identity, "consolidate",
-                          {"ids": ids, "title": "consensus", "namespace": swarm.shared_namespace})
+                          {"ids": ids, "title": f"consensus-{_RUN}", "namespace": swarm.shared_namespace})
     swarm.coverage.record(cons)
     ok = len(ids) >= 2 and cons.ok
     return ScenarioResult("consensus_quorum", ok=ok,
@@ -117,7 +120,7 @@ async def governance_approval(swarm: Swarm) -> ScenarioResult:
     swarm.coverage.record(ask)
     decision = await dispatch(
         approver.client, approver.identity, "store",
-        {"title": "approval-decision", "content": "APPROVED: publish-report",
+        {"title": f"approval-decision-{_RUN}", "content": "APPROVED: publish-report",
          "namespace": swarm.shared_namespace, "tags": ["governance", "approval"]})
     swarm.coverage.record(decision)
     ack = await dispatch(approver.client, approver.identity, "notify",
@@ -138,7 +141,7 @@ async def replay_guard(agent: SwarmAgent, namespace: str | None = None) -> Scena
     double-applied.
     """
     ns = namespace or agent.identity.namespace
-    title = "replay-probe"
+    title = f"replay-probe-{_RUN}"
     content = "idempotency canary"
     fields = attestation_fields(
         agent.identity.signing_key,

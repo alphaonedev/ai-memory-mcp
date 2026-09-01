@@ -218,7 +218,7 @@ class AiMemoryClient:
     def get(self, memory_id: str) -> Memory:
         """``GET /api/v1/memories/{id}``."""
         raw = self._request("GET", f"/api/v1/memories/{memory_id}")
-        return Memory.model_validate(raw)
+        return Memory.model_validate(raw["memory"])
 
     def update(
         self,
@@ -318,7 +318,7 @@ class AiMemoryClient:
                 "as_agent": as_agent,
             },
         )
-        items = raw.get("memories", raw) if isinstance(raw, dict) else raw
+        items = raw.get("results", raw) if isinstance(raw, dict) else raw
         return [Memory.model_validate(m) for m in items]
 
     def recall(
@@ -367,7 +367,7 @@ class AiMemoryClient:
         return self._request(
             "POST",
             "/api/v1/forget",
-            params={"namespace": namespace, "pattern": pattern, "tier": tier},
+            json_body={"namespace": namespace, "pattern": pattern, "tier": tier},
         )
 
     # -- links / stats / admin ---------------------------------------------

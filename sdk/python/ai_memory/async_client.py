@@ -176,7 +176,7 @@ class AsyncAiMemoryClient:
 
     async def get(self, memory_id: str) -> Memory:
         raw = await self._request("GET", f"/api/v1/memories/{memory_id}")
-        return Memory.model_validate(raw)
+        return Memory.model_validate(raw["memory"])
 
     async def update(
         self,
@@ -265,7 +265,7 @@ class AsyncAiMemoryClient:
                 "as_agent": as_agent,
             },
         )
-        items = raw.get("memories", raw) if isinstance(raw, dict) else raw
+        items = raw.get("results", raw) if isinstance(raw, dict) else raw
         return [Memory.model_validate(m) for m in items]
 
     async def recall(
@@ -303,7 +303,7 @@ class AsyncAiMemoryClient:
         return await self._request(
             "POST",
             "/api/v1/forget",
-            params={"namespace": namespace, "pattern": pattern, "tier": tier},
+            json_body={"namespace": namespace, "pattern": pattern, "tier": tier},
         )
 
     # -- links / stats / admin ---------------------------------------------

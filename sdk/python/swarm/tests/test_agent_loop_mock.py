@@ -58,7 +58,9 @@ def _mock_daemon(
             return httpx.Response(500, json={"error": "induced failure"})
         if path == "/api/v1/recall":
             return httpx.Response(200, json={"count": 0, "memories": []})
-        if path in ("/api/v1/search", "/api/v1/memories") and request.method == "GET":
+        if path == "/api/v1/search" and request.method == "GET":
+            return httpx.Response(200, json={"results": [], "count": 0, "query": ""})
+        if path == "/api/v1/memories" and request.method == "GET":
             return httpx.Response(200, json={"memories": []})
         if path == "/api/v1/inbox":
             return httpx.Response(200, json={"messages": []})

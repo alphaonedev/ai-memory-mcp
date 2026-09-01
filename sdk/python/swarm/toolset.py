@@ -265,10 +265,9 @@ async def _h_notify(
 ) -> Any:
     return await client.notify(
         {
-            "to_agent": _require(args, "to_agent"),
-            "from_agent": ident.agent_id,
-            "subject": args.get("subject", ""),
-            "body": args.get("body", ""),
+            "target_agent_id": _require(args, "to_agent"),
+            "title": args.get("subject", ""),
+            "payload": args.get("body", ""),
         }
     )
 
@@ -351,11 +350,9 @@ async def _h_reflect(
     client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
 ) -> Any:
     """``POST /api/v1/memory_reflect`` — substrate reflection over a set."""
-    body = {
-        "agent_id": ident.agent_id,
-        "namespace": ident.confine(args.get("namespace")),
-        "limit": args.get("limit", 10),
-    }
+    body = {key: args[key] for key in
+            ("source_ids", "title", "content", "tier", "priority", "tags")
+            if key in args}
     return await _post_raw(client, "/api/v1/memory_reflect", body)
 
 
@@ -365,6 +362,7 @@ async def _h_reflect(
 
 _S: dict[str, Any] = {"type": "string"}
 _I: dict[str, Any] = {"type": "integer"}
+_A: dict[str, Any] = {"type": "array", "items": _S}
 
 
 def _schema(props: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -446,7 +444,9 @@ TOOL_SPECS: list[ToolSpec] = [
                      ["ids"]), _h_consolidate),
     ToolSpec("reflect", KIND_WRITE, "POST", "/api/v1/memory_reflect", "driver-local",
              "Reflect over the agent's memory substrate, minting reflection memories.",
-             _schema({"limit": _I}), _h_reflect),
+             _schema({"source_ids": _A, "title": _S, "content": _S,
+                      "tier": _S, "priority": _I, "tags": _A},
+                     ["source_ids", "title", "content"]), _h_reflect),
 ]
 
 SPECS_BY_NAME: dict[str, ToolSpec] = {s.name: s for s in TOOL_SPECS}
