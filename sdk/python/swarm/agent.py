@@ -25,6 +25,7 @@ the agent never fabricates a tool call or silently pretends success.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -160,6 +161,7 @@ class SwarmAgent:
         backoff = self.config.backoff_base_secs
         for step in range(1, self.config.max_steps + 1):
             perceived = await self.perceive()
+            t_decide = time.perf_counter()
             try:
                 decision = await self.decide(perceived)
             except OpenRouterError as exc:
@@ -169,6 +171,10 @@ class SwarmAgent:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self.config.backoff_max_secs)
                 continue
+            self.coverage.record_model_usage(
+                self.identity.agent_id, decision.raw.get("usage"),
+                latency_ms=(time.perf_counter() - t_decide) * 1000,
+            )
             tool_names = [c.name for c in decision.tool_calls]
             if not tool_names:
                 # The model declined to act this step; that is a valid no-op.
@@ -182,6 +188,9 @@ class SwarmAgent:
         """Run exactly one loop step and return its record (used by tests)."""
         perceived = await self.perceive()
         decision = await self.decide(perceived)
+        self.coverage.record_model_usage(
+            self.identity.agent_id, decision.raw.get("usage")
+        )
         tool_names = [c.name for c in decision.tool_calls]
         outcomes = await self.act(decision) if tool_names else ["no-tool"]
         record = StepRecord(1, perceived, tool_names, outcomes)
