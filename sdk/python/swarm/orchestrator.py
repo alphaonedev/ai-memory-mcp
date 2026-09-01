@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 from ai_memory.attestation import AgentSigningKey
 
 from swarm.agent import SwarmAgent
+from swarm.audit import CallLog, set_call_log
 from swarm.coverage import CoverageTracker
 from swarm.openrouter import OpenRouterClient
 
@@ -57,6 +58,8 @@ class Swarm:
         self.shared_namespace = shared_namespace or f"{config.namespace_prefix}-shared"
         self.agents: list[SwarmAgent] = []
         self._model: OpenRouterClient | None = None
+        self.call_log = CallLog(os.environ.get("SWARM_JOURNAL_DIR"))
+        set_call_log(self.call_log)
 
     # -- key handling ------------------------------------------------------
     def _load_or_create_key(self, agent_id: str) -> AgentSigningKey:
@@ -185,6 +188,14 @@ class Swarm:
             await agent.aclose()
         if self._model is not None:
             await self._model.aclose()
+        set_call_log(None)
+
+    def mission_completion(self) -> dict[str, bool]:
+        """Verify the concrete summary plus lineage/consolidation requirement."""
+        return {agent.identity.agent_id:
+                bool(agent.mission_summary_id and agent.mission_summary_count == 1
+                     and agent.mission_lineage_proved and agent.mission_summary_cites_sources)
+                for agent in self.agents}
 
 
 async def run_swarm(config: SwarmConfig) -> CoverageTracker:

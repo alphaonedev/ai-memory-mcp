@@ -100,7 +100,8 @@ def test_write_journals_serializes_each_agent(tmp_path: Path) -> None:
     path = tmp_path / "ai:test-agent.jsonl"
     assert json.loads(path.read_text()) == {
         "decided_tools": ["store"], "outcomes": ["ok"],
-        "perceived": "seen", "step": 1,
+        "perceived": "seen", "step": 1, "started_at": "",
+        "finished_at": "", "latency_ms": 0.0,
     }
 
 
