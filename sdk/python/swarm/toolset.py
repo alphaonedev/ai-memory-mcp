@@ -497,11 +497,12 @@ async def dispatch(
     """
     from swarm.audit import record_dispatch
 
+    module = str(getattr(getattr(client, "_client", None), "base_url", "") or "") or None
     spec = SPECS_BY_NAME.get(tool_name)
     if spec is None:
         outcome = ToolOutcome(tool_name, ok=False, fail_closed=True,
                               summary=f"unknown tool {tool_name!r}")
-        record_dispatch(identity.agent_id, tool_name, args, outcome)
+        record_dispatch(identity.agent_id, tool_name, args, outcome, module=module)
         return outcome
     try:
         result = await spec.handler(client, identity, args)
@@ -511,7 +512,7 @@ async def dispatch(
     else:
         outcome = ToolOutcome(tool_name, ok=True, fail_closed=False,
                               summary=_summarize(result), result=result)
-    record_dispatch(identity.agent_id, tool_name, args, outcome)
+    record_dispatch(identity.agent_id, tool_name, args, outcome, module=module)
     return outcome
 
 

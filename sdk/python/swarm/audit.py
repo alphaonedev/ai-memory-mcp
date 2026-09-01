@@ -42,9 +42,11 @@ class CallLog:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text("", encoding="utf-8")
 
-    def append(self, *, agent_id: str, tool: str, args: dict[str, Any], outcome: Any) -> None:
+    def append(self, *, agent_id: str, tool: str, args: dict[str, Any], outcome: Any,
+               module: str | None = None) -> None:
         entry = {
             "agent_id": agent_id,
+            "module": module,  # daemon base URL the call went to (multi-module runs)
             "tool": tool,
             "args": redact(args),
             "ok": bool(outcome.ok),
@@ -83,9 +85,10 @@ def set_call_log(log: CallLog | None) -> None:
     _active_call_log = log
 
 
-def record_dispatch(agent_id: str, tool: str, args: dict[str, Any], outcome: Any) -> None:
+def record_dispatch(agent_id: str, tool: str, args: dict[str, Any], outcome: Any,
+                    module: str | None = None) -> None:
     if _active_call_log is not None:
-        _active_call_log.append(agent_id=agent_id, tool=tool, args=args, outcome=outcome)
+        _active_call_log.append(agent_id=agent_id, tool=tool, args=args, outcome=outcome, module=module)
 
 
 @dataclass(frozen=True)

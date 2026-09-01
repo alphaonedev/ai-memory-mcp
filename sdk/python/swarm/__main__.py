@@ -106,16 +106,20 @@ def _usage_block(
     return "\n".join(lines)
 
 def _auditor_verdict(assessment: str | None) -> str:
-    """The auditor's FINAL verdict: the last PASS/FAIL token in the report.
+    """The auditor's FINAL verdict.
 
-    Reports routinely contain both words ("end with PASS or FAIL"), so a naive
-    substring test would read every FAIL report as PASS.
+    Prefer an explicit `Verdict: PASS|FAIL` marker (last one wins); otherwise the
+    last PASS/FAIL token. Run #2 on Grok 4.6 ended "Verdict: **FAIL** ... PASS
+    would over-claim" and a last-token parse mis-read it as PASS.
     """
     if not assessment:
         return "UNKNOWN"
+    import re
+    marks = re.findall(r"verdict\W{0,6}(PASS|FAIL)", assessment, flags=re.I)
+    if marks:
+        return marks[-1].upper()
     text = assessment.upper()
-    tail = text[text.rfind("VERDICT"):] if "VERDICT" in text else text
-    last_pass, last_fail = tail.rfind("PASS"), tail.rfind("FAIL")
+    last_pass, last_fail = text.rfind("PASS"), text.rfind("FAIL")
     if last_pass < 0 and last_fail < 0:
         return "UNKNOWN"
     return "PASS" if last_pass > last_fail else "FAIL"

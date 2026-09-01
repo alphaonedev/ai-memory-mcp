@@ -112,3 +112,11 @@ def test_model_override_requires_recorded_reason() -> None:
                               model=cfg.model_slug, model_override_reason=cfg.model_override_reason)
     assert "override: experiential audit" in render_nhi_report(report)
     assert report["model"] == "x-ai/grok-4.6"
+
+
+def test_auditor_verdict_prefers_explicit_marker() -> None:
+    from swarm.__main__ import _auditor_verdict
+    assert _auditor_verdict("... **Verdict: FAIL**\n\nRationale: PASS would over-claim.") == "FAIL"
+    assert _auditor_verdict("VERDICT: PASS — rationale mentions FAIL cases") == "PASS"
+    assert _auditor_verdict("end with PASS or FAIL. Verdict: **PASS**") == "PASS"
+    assert _auditor_verdict("no marker here") == "UNKNOWN"
