@@ -96,6 +96,17 @@ variable "memory_droplet_size" {
   default     = "s-1vcpu-2gb"
 }
 
+variable "loadgen_sources" {
+  description = "Public CIDRs allowed to reach the mTLS-protected ai-memory API on tcp/9077 (for example the off-DO f2 load generator)."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for cidr in var.loadgen_sources : can(cidrhost(cidr, 0))])
+    error_message = "Every loadgen_sources entry must be a valid IPv4 or IPv6 CIDR."
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Track D (v1.0.0 enterprise-cert campaign) — federated multi-node substrate
 // ---------------------------------------------------------------------------
@@ -327,6 +338,16 @@ resource "digitalocean_firewall" "hive" {
     protocol         = "tcp"
     port_range       = "22"
     source_addresses = var.firewall_ssh_sources
+  }
+
+
+  // Off-DO Phase-A load generators. Transport admission remains fail-closed:
+  // the daemon additionally requires a client certificate fingerprint enrolled
+  // by `federate.sh loadgen` (and the API key for request authentication).
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "9077"
+    source_addresses = var.loadgen_sources
   }
 
   // East-west on :9077 (ai-memory HTTP daemon).

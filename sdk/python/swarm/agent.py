@@ -92,6 +92,7 @@ class SwarmAgent:
             base_url=base_url,
             agent_id=agent_id,
             timeout=config.request_timeout_secs,
+            **config.daemon_client_kwargs(),
         )
         identity = AgentIdentity(
             agent_id=agent_id,

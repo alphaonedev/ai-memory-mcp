@@ -79,6 +79,11 @@ class SwarmConfig:
     request_timeout_secs: float = 30.0
     namespace_prefix: str = "swarm"
     model_slug: str = OPENROUTER_MODEL_SLUG
+    client_cert: str | None = None
+    client_key: str | None = None
+    ca_cert: str | None = None
+    api_key: str | None = None
+    admin_agent_id: str = "ai:hive-loadgen-f2"
 
     def __post_init__(self) -> None:
         if not self.base_urls:
@@ -87,6 +92,11 @@ class SwarmConfig:
             raise ConfigError(f"n_agents must be >= 1, got {self.n_agents}")
         if self.max_steps < 1:
             raise ConfigError(f"max_steps must be >= 1, got {self.max_steps}")
+        tls_values = (self.client_cert, self.client_key, self.ca_cert)
+        if any(tls_values) and not all(tls_values):
+            raise ConfigError(
+                "SWARM_CLIENT_CERT, SWARM_CLIENT_KEY, and SWARM_CA_CERT must be set together"
+            )
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> SwarmConfig:
@@ -104,6 +114,10 @@ class SwarmConfig:
         ``SWARM_NAMESPACE_PREFIX``  isolation-namespace prefix
         ``OPENROUTER_API_KEY``      OpenRouter credential (live runs)
         ``OPENROUTER_BASE_URL``     OpenRouter endpoint override
+        ``SWARM_CLIENT_CERT``       loadgen mTLS certificate path
+        ``SWARM_CLIENT_KEY``        loadgen mTLS private-key path
+        ``SWARM_CA_CERT``            hive CA certificate path
+        ``SWARM_API_KEY``            per-node HTTP request credential
         ==========================  ===================================
         """
         env = os.environ if environ is None else environ
@@ -128,7 +142,21 @@ class SwarmConfig:
             ).rstrip("/"),
             request_timeout_secs=_float_env(env, "SWARM_REQUEST_TIMEOUT_SECS", 30.0),
             namespace_prefix=env.get("SWARM_NAMESPACE_PREFIX", "swarm"),
+            client_cert=env.get("SWARM_CLIENT_CERT") or None,
+            client_key=env.get("SWARM_CLIENT_KEY") or None,
+            ca_cert=env.get("SWARM_CA_CERT") or None,
+            api_key=env.get("SWARM_API_KEY") or None,
+            admin_agent_id=env.get("SWARM_ADMIN_AGENT_ID", "ai:hive-loadgen-f2"),
         )
+
+    def daemon_client_kwargs(self) -> dict[str, object]:
+        """SDK auth/TLS kwargs shared by every daemon client."""
+        kwargs: dict[str, object] = {}
+        if self.client_cert and self.client_key and self.ca_cert:
+            kwargs.update(cert=(self.client_cert, self.client_key), verify=self.ca_cert)
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        return kwargs
 
     def require_live(self) -> None:
         """Assert the config can drive a LIVE run; raise otherwise.
