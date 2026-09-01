@@ -7,6 +7,8 @@ ai-memory daemon** over its HTTP tool surface. The swarm's job is to **prove
 100% of ai-memory's drivable feature/tool surface** works end to end —
 attested writes, cross-agent isolation, coordination signals, consolidation,
 reflection, and replay-guard — and to print a **coverage matrix** as evidence.
+After the scripted scenarios, one final no-tools model call audits that evidence;
+the first agent attests the report into shared memory and the journal directory.
 
 > This package is **not shipped in the `ai-memory-mcp` wheel**. It is
 > acceptance-test infrastructure. GLM-5.3-Flash here is the *acceptance-test
@@ -63,6 +65,7 @@ choreography.*  ── scripted A2A scenarios ───────────�
 | `SWARM_KEY_DIR` | Per-agent Ed25519 key directory | `~/.ai-memory-swarm-keys` |
 | `SWARM_NAMESPACE_PREFIX` | Isolation-namespace prefix | `swarm` |
 | `OPENROUTER_BASE_URL` | OpenRouter endpoint override | `https://openrouter.ai/api/v1` |
+| `SWARM_JOURNAL_DIR` | Per-agent JSONL journals plus `nhi-assessment.md` | unset (disabled) |
 
 The model is **pinned** to `glm-5.3-flash` in code (`config.MODEL_ID`); it is
 deliberately not env-overridable so a stray variable cannot swap the attested
@@ -81,6 +84,7 @@ pip install -e ".[swarm]"   # httpx (core) + cryptography (attestation)
 export OPENROUTER_API_KEY=sk-or-...
 export SWARM_BASE_URL=http://localhost:9077
 export SWARM_N=8
+export SWARM_JOURNAL_DIR="$PWD/swarm-journal"
 python -m swarm     # runs the population + choreographies, prints the matrix,
                     # exits non-zero if the manifest was not fully covered
 ```

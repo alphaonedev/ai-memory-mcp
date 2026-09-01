@@ -20,15 +20,17 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from swarm.choreography import run_all
+from swarm.choreography import nhi_assessment, run_all
 from swarm.config import ConfigError, SwarmConfig
 from swarm.coverage import CoverageTracker
 from swarm.openrouter import OpenRouterClient
 from swarm.orchestrator import Swarm
 
 
-def _write_journals(swarm: Swarm, journal_dir: str | None = None) -> None:
-    """Write the current run's per-agent step records as JSON Lines."""
+def _write_journals(
+    swarm: Swarm, journal_dir: str | None = None, *, assessment: str | None = None
+) -> None:
+    """Write per-agent JSONL records and, when present, the NHI assessment."""
     raw_dir = journal_dir if journal_dir is not None else os.environ.get("SWARM_JOURNAL_DIR")
     if not raw_dir:
         return
@@ -39,6 +41,8 @@ def _write_journals(swarm: Swarm, journal_dir: str | None = None) -> None:
         with path.open("w", encoding="utf-8") as stream:
             for record in agent.journal:
                 stream.write(json.dumps(asdict(record), sort_keys=True) + "\n")
+    if assessment is not None:
+        (destination / "nhi-assessment.md").write_text(assessment + "\n", encoding="utf-8")
 
 
 async def _main() -> int:
@@ -59,8 +63,11 @@ async def _main() -> int:
     try:
         await swarm.provision()
         await swarm.run()
-        _write_journals(swarm)
-        for result in await run_all(swarm):
+        results = await run_all(swarm)
+        assessment_result, assessment = await nhi_assessment(swarm, results)
+        results.append(assessment_result)
+        _write_journals(swarm, assessment=assessment)
+        for result in results:
             marker = "PASS" if result.ok else "FAIL"
             print(f"[choreography] {result.name}: {marker} ({result.detail})")
     finally:
@@ -68,7 +75,7 @@ async def _main() -> int:
 
     print()
     print(coverage.matrix())
-    return 0 if coverage.is_full() else 1
+    return 0 if coverage.is_full() and all(result.ok for result in results) else 1
 
 
 def main() -> None:
