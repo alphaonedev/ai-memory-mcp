@@ -132,15 +132,25 @@ def _raw(client: AsyncAiMemoryClient) -> Any:
     return client._client  # noqa: SLF001 - intentional: SDK lacks these routes
 
 
+def _raise_with_body(resp: Any) -> None:
+    """Fail closed with the daemon's error BODY in the message (not just the code).
+
+    ``raise_for_status`` alone loses ``{"error": ...}``, which is exactly the
+    text a triage needs; every driver-local failure surfaces it verbatim.
+    """
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code} {resp.request.method} {resp.request.url.path}: {resp.text[:300]}")
+
+
 async def _post_raw(client: AsyncAiMemoryClient, path: str, body: dict[str, Any]) -> Any:
     resp = await _raw(client).post(path, json=body)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
 async def _get_raw(client: AsyncAiMemoryClient, path: str) -> Any:
     resp = await _raw(client).get(path)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -163,6 +173,9 @@ async def _h_store(
         tier=args.get("tier"),
         tags=args.get("tags"),
         priority=args.get("priority"),
+        # Visibility scope (private default). Shared-namespace consensus writes
+        # use "collective" so peers (and the consolidator) can read them.
+        scope=args.get("scope"),
         agent_id=ident.agent_id,
         signing_key=ident.signing_key,
     )
@@ -353,6 +366,10 @@ async def _h_reflect(
     body = {key: args[key] for key in
             ("source_ids", "title", "content", "tier", "priority", "tags")
             if key in args}
+    # Namespace-CONFINED like every other write: a model-chosen namespace outside
+    # the agent's grant collapses to its private namespace (North Star guardrail).
+    body["namespace"] = ident.confine(args.get("namespace"))
+    body["agent_id"] = ident.agent_id  # must match X-Agent-Id (header-authoritative)
     return await _post_raw(client, "/api/v1/memory_reflect", body)
 
 
@@ -412,7 +429,9 @@ TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("store", KIND_WRITE, "POST", "/api/v1/memories", "sdk",
              "Store a new attested memory in the agent's namespace.",
              _schema({"title": _S, "content": _S, "tier": _S, "priority": _I,
-                      "tags": {"type": "array", "items": _S}}, ["title", "content"]), _h_store),
+                      "tags": {"type": "array", "items": _S},
+                      "scope": {"type": "string", "enum": ["private", "team", "unit", "org", "collective"]}},
+                     ["title", "content"]), _h_store),
     ToolSpec("update", KIND_WRITE, "PUT", "/api/v1/memories/{id}", "sdk",
              "Update an existing memory (optionally version-guarded).",
              _schema({"memory_id": _S, "content": _S, "priority": _I,

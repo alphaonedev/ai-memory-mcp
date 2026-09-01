@@ -377,8 +377,9 @@ export interface NamespaceCount {
 
 export interface Stats {
   total_memories: number;
-  by_tier: TierCount[];
-  by_namespace: NamespaceCount[];
+  /** sqlite: `TierCount[]`; postgres: `{ [tier]: count }` map (backend divergence, #3331 follow-up). */
+  by_tier: TierCount[] | Record<string, number>;
+  by_namespace: NamespaceCount[] | Record<string, number>;
   expiring_soon: number;
   links_count: number;
   db_size_bytes: number;
@@ -452,14 +453,18 @@ export interface RevokeRequest {
 
 /** Agent-to-agent notification (inbox). */
 export interface NotifyRequest {
+  /** Recipient agent_id. */
   target_agent_id: string;
+  /** Subject (<= 200 chars). */
   title: string;
-  payload?: unknown;
+  /** Message body — the daemon takes `payload` OR `content` (strings only; exactly one required). */
+  payload?: string;
   content?: string;
   priority?: number;
   tier?: Tier;
+  /** Optional explicit sender id — must match `X-Agent-Id` when both are present. */
   agent_id?: string;
-  why_trace?: unknown;
+  why_trace?: string;
 }
 
 export interface InboxMessage {

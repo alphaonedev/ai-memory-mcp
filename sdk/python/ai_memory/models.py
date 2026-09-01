@@ -306,8 +306,11 @@ class Stats(_Base):
     """``struct Stats`` — output of ``GET /api/v1/stats``."""
 
     total_memories: int
-    by_tier: list[dict[str, Any]] = Field(default_factory=list)
-    by_namespace: list[dict[str, Any]] = Field(default_factory=list)
+    #: sqlite returns ``[{"tier","count"}]`` lists; postgres returns
+    #: ``{"<tier>": count}`` maps (``src/handlers/admin.rs`` pg branch).
+    #: Both are accepted verbatim; see #3331 follow-up for daemon parity.
+    by_tier: dict[str, int] | list[dict[str, Any]] = Field(default_factory=list)
+    by_namespace: dict[str, int] | list[dict[str, Any]] = Field(default_factory=list)
     expiring_soon: int = 0
     links_count: int = 0
     db_size_bytes: int = 0
@@ -355,12 +358,15 @@ class NotifyRequest(_Base):
 
     target_agent_id: str
     title: str
-    payload: Any | None = None
+    #: Message body. The daemon's ``NotifyBody`` takes ``payload`` OR ``content``
+    #: (both ``Option<String>``); exactly one is required. Strings only — a
+    #: structured object is rejected (422) by the daemon.
+    payload: str | None = None
     content: str | None = None
     priority: int | None = None
     tier: str | None = None
     agent_id: str | None = None
-    why_trace: Any | None = None
+    why_trace: str | None = None
 
 
 class InboxMessage(_Base):

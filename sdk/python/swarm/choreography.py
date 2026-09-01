@@ -29,6 +29,7 @@ daemon response makes the scenario ``ok=False`` rather than passing silently.
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -74,13 +75,15 @@ async def producer_consumer(swarm: Swarm) -> ScenarioResult:
 
     got = await dispatch(b.client, b.identity, "inbox", {"unread_only": True, "limit": 10})
     swarm.coverage.record(got)
-    b_saw = got.ok and subject in got.summary
+    # Inspect the FULL result, never the 160-char display summary (a long
+    # agent_id pushed the subject past the truncation and read as "not seen").
+    b_saw = got.ok and subject in json.dumps(got.result, default=str)
 
     c_isolated = True
     if c is not None:
         c_inbox = await dispatch(c.client, c.identity, "inbox", {"unread_only": True, "limit": 10})
         swarm.coverage.record(c_inbox)
-        c_isolated = not (c_inbox.ok and subject in c_inbox.summary)
+        c_isolated = not (c_inbox.ok and subject in json.dumps(c_inbox.result, default=str))
 
     ok = send.ok and b_saw and c_isolated
     return ScenarioResult("producer_consumer", ok=ok,
@@ -94,9 +97,11 @@ async def consensus_quorum(swarm: Swarm) -> ScenarioResult:
     fact = "the sky is blue"
     ids: list[str] = []
     for ordinal, agent in enumerate(swarm.agents):
+        # Votes are "collective"-scoped: a private-scope row is readable only by
+        # its author, so the consolidator could not read its peers' votes.
         out = await dispatch(agent.client, agent.identity, "store",
                              {"title": f"consensus-vote-{_RUN}-{ordinal}", "content": fact,
-                              "namespace": swarm.shared_namespace})
+                              "namespace": swarm.shared_namespace, "scope": "collective"})
         swarm.coverage.record(out)
         if out.ok and isinstance(out.result, dict) and out.result.get("id"):
             ids.append(str(out.result["id"]))
@@ -121,7 +126,8 @@ async def governance_approval(swarm: Swarm) -> ScenarioResult:
     decision = await dispatch(
         approver.client, approver.identity, "store",
         {"title": f"approval-decision-{_RUN}", "content": "APPROVED: publish-report",
-         "namespace": swarm.shared_namespace, "tags": ["governance", "approval"]})
+         "namespace": swarm.shared_namespace, "scope": "collective",
+         "tags": ["governance", "approval"]})
     swarm.coverage.record(decision)
     ack = await dispatch(approver.client, approver.identity, "notify",
                          {"to_agent": proposer.identity.agent_id,

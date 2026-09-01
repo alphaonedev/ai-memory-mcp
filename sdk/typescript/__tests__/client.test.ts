@@ -139,7 +139,7 @@ describe("v1.0.0 wire contract (#3331)", () => {
 
   test("notify sends and types daemon field names", async () => {
     let body = "";
-    const result = await clientWith({ id: "n1", target_agent_id: "ai:b", namespace: "global", storage_backend: "postgres" }, (_url, init) => { body = String(init.body); }).notify({ target_agent_id: "ai:b", title: "hello", payload: { x: 1 } });
+    const result = await clientWith({ id: "n1", target_agent_id: "ai:b", namespace: "global", storage_backend: "postgres" }, (_url, init) => { body = String(init.body); }).notify({ target_agent_id: "ai:b", title: "hello", payload: "unit-of-work" });
     expect(JSON.parse(body).target_agent_id).toBe("ai:b");
     expect(result.storage_backend).toBe("postgres");
   });

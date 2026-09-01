@@ -280,13 +280,13 @@ def test_v1_wire_contract_sync() -> None:
     client._client = httpx.Client(base_url=TEST_BASE_URL, transport=httpx.MockTransport(_wire_handler(seen)))
     assert client.search("zebra")[0].id == "mem-3331"
     assert client.get("mem-3331").title == "wire fixture"
-    client.notify({"target_agent_id": "ai:target", "title": "hello", "payload": {"x": 1}})
+    client.notify({"target_agent_id": "ai:target", "title": "hello", "payload": "unit-of-work"})
     assert client.stats().total_memories == 1
     assert client.forget(namespace="global") == {"deleted": 1}
     notify = next(r for r in seen if r.url.path.endswith("notify"))
     forget = next(r for r in seen if r.url.path.endswith("forget"))
     assert json.loads(notify.read()) == {
-        "target_agent_id": "ai:target", "title": "hello", "payload": {"x": 1}
+        "target_agent_id": "ai:target", "title": "hello", "payload": "unit-of-work"
     }
     assert forget.url.query == b""
     assert json.loads(forget.read()) == {"namespace": "global"}
@@ -300,7 +300,7 @@ async def test_v1_wire_contract_async() -> None:
     client._client = httpx.AsyncClient(base_url=TEST_BASE_URL, transport=httpx.MockTransport(_wire_handler(seen)))
     assert (await client.search("zebra"))[0].id == "mem-3331"
     assert (await client.get("mem-3331")).title == "wire fixture"
-    await client.notify({"target_agent_id": "ai:target", "title": "hello", "payload": {"x": 1}})
+    await client.notify({"target_agent_id": "ai:target", "title": "hello", "payload": "unit-of-work"})
     assert (await client.stats()).total_memories == 1
     assert await client.forget(namespace="global") == {"deleted": 1}
     forget = next(r for r in seen if r.url.path.endswith("forget"))
