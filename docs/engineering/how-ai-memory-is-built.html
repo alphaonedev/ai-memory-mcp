@@ -1,0 +1,463 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  "How ai-memory Is Built" — engineering methodology.
+  Native docs page. Content ported from the engineering-methodology artifact
+  and re-themed to the landing page (main:/docs/index.html): amber/parchment
+  tokens, Archivo/IBM Plex via the shared assets/site-theme.css, landing-page
+  nav + banner + component language. Self-contained static HTML.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How ai-memory Is Built — engineering methodology</title>
+<meta name="description" content="How ai-memory is built: the AI-agent graph-engineering pipeline, a written Rust standard, the 3x7 adversarial voting scheme, and a testing gauntlet that ends on real certified databases and a cloud agent swarm. Adversarially engineered, not vibe-coded.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/engineering/how-ai-memory-is-built.html">
+<meta name="theme-color" content="#0c0b08">
+<meta property="og:title" content="How ai-memory Is Built — engineering methodology">
+<meta property="og:description" content="Adversarially engineered, not vibe-coded — the pipeline, standard, adversarial review, and testing gauntlet behind ai-memory v1.0.0.">
+<style>
+:root{
+  /* chrome tokens mirror the landing page (assets/site-theme.css, linked last,
+     re-asserts the shared set; these are the local fallback + page-only tokens) */
+  --bg:#f4f0e8; --panel:#fcf9f3; --panel-2:#ebe4d6; --raise:#f8f4ec;
+  --ink:#1a1712; --ink-soft:#7a7161; --ink-mid:#544b3d; --line:#ddd4c2; --line-soft:#e9e2d4;
+  --accent:#b07d10; --accent-ink:#6e4f0f; --accent-soft:#f2e8cf; --accent-deep:#8a6314; --on-accent:#211a0a;
+  --brass:#8a6314; --brass-soft:#efe6d0;
+  --good:#2f7d5b; --bad:#b3402f; --glow:rgba(176,125,16,.10);
+  --disp:'Archivo',system-ui,sans-serif; --serif:'Archivo',system-ui,sans-serif;
+  --sans:'IBM Plex Sans',system-ui,-apple-system,sans-serif; --mono:'IBM Plex Mono',ui-monospace,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0c0b08; --panel:#15130e; --panel-2:#120f0a; --raise:#191610;
+  --ink:#f3eee3; --ink-soft:#988f7f; --ink-mid:#bdb2a0; --line:#2a2619; --line-soft:#1f1c13;
+  --accent:#e3ad33; --accent-ink:#f2c968; --accent-soft:#241c0c; --accent-deep:#caa02a; --on-accent:#1a1207;
+  --brass:#caa02a; --brass-soft:#241c0c;
+  --good:#4cba86; --bad:#f0607d; --glow:rgba(227,173,51,.13);
+}}
+:root[data-theme="dark"]{
+  --bg:#0c0b08; --panel:#15130e; --panel-2:#120f0a; --raise:#191610;
+  --ink:#f3eee3; --ink-soft:#988f7f; --ink-mid:#bdb2a0; --line:#2a2619; --line-soft:#1f1c13;
+  --accent:#e3ad33; --accent-ink:#f2c968; --accent-soft:#241c0c; --accent-deep:#caa02a; --on-accent:#1a1207;
+  --brass:#caa02a; --brass-soft:#241c0c;
+  --good:#4cba86; --bad:#f0607d; --glow:rgba(227,173,51,.13);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:72px}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.62;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+.wrap{max-width:1100px;margin:0 auto;padding:0 24px}
+h1,h2,h3,h4{font-family:var(--disp);margin:0;line-height:1.08;font-weight:700;letter-spacing:-.015em}
+a{color:var(--accent-ink);text-decoration:none}
+.mono{font-family:var(--mono)}
+.eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.22em;text-transform:uppercase;color:var(--accent);font-weight:600}
+
+/* nav (landing-page component) */
+.nav{position:sticky;top:0;z-index:50;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.nav-in{display:flex;align-items:center;justify-content:space-between;gap:14px;height:64px;max-width:1100px;margin:0 auto;padding:0 24px}
+.brand{display:flex;align-items:center;gap:10px;font-family:var(--disp);font-weight:800;font-size:17px;letter-spacing:-.02em;color:var(--ink)}
+.brand .mk{width:22px;height:22px;flex:none}
+.nav-links{display:flex;gap:22px;align-items:center}
+.nav-links a,.dropdown>button{color:var(--ink-mid);font-size:14px;font-weight:500;background:none;border:0;font-family:var(--sans);cursor:pointer;padding:0;display:inline-flex;align-items:center;gap:5px}
+.nav-links a:hover,.dropdown>button:hover{color:var(--ink)}
+.dropdown{position:relative}
+.dropdown-menu{position:absolute;top:calc(100% + 10px);right:0;min-width:250px;background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:7px;box-shadow:0 18px 44px -18px rgba(0,0,0,.4);opacity:0;visibility:hidden;transform:translateY(6px);transition:.16s;z-index:60}
+.dropdown:hover .dropdown-menu,.dropdown:focus-within .dropdown-menu{opacity:1;visibility:visible;transform:none}
+.dropdown-menu a{display:flex;flex-direction:column;padding:9px 12px;border-radius:9px;font-size:14px;color:var(--ink);font-weight:600}
+.dropdown-menu a span{font-size:11.5px;color:var(--ink-soft);font-weight:400;font-family:var(--mono)}
+.dropdown-menu a:hover{background:var(--panel-2)}
+.dropdown-menu a.current{color:var(--accent-ink);background:var(--panel-2)}
+.nav-cta{font-family:var(--sans);font-size:13.5px;font-weight:700;color:var(--on-accent);background:var(--accent);border:0;border-radius:8px;padding:9px 15px;cursor:pointer}
+.nav-cta:hover{filter:brightness(1.07)}
+@media(max-width:900px){.nav-links a:not(.keep),.dropdown{display:none}}
+
+/* hero */
+.hero{position:relative;padding:74px 0 54px;border-bottom:1px solid var(--line);overflow:hidden}
+.hero::before{content:"";position:absolute;inset:0;background:
+  radial-gradient(120% 80% at 88% -10%,var(--glow),transparent 60%),
+  linear-gradient(transparent 0 calc(100% - 1px),var(--line-soft) 0) 0 0/100% 34px,
+  linear-gradient(90deg,transparent 0 calc(100% - 1px),var(--line-soft) 0) 0 0/34px 100%;
+  opacity:.5;pointer-events:none;mask:linear-gradient(180deg,#000,transparent)}
+.hero-inner{position:relative}
+.h-tag{display:inline-flex;gap:10px;align-items:center;font-family:var(--mono);font-size:12px;color:var(--ink-mid);border:1px solid var(--line);background:var(--panel);padding:6px 13px;border-radius:30px;margin-bottom:26px}
+.h-tag b{color:var(--accent);font-weight:600}
+.h-dot{width:7px;height:7px;border-radius:50%;background:var(--good);box-shadow:0 0 0 3px color-mix(in srgb,var(--good) 22%,transparent)}
+h1.hero-h{font-size:clamp(38px,7.2vw,84px);font-weight:800;letter-spacing:-.03em;text-wrap:balance;line-height:.98}
+h1.hero-h .neg{font-style:italic;color:var(--accent)}
+.hero-sub{margin:26px 0 0;font-size:clamp(16px,2.1vw,20px);color:var(--ink-mid);max-width:64ch;line-height:1.55}
+.hero-sub b{color:var(--ink);font-weight:600}
+.glyphstrip{display:flex;flex-wrap:wrap;gap:10px;margin-top:34px}
+.glyph{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12.5px;color:var(--ink-mid);border:1px solid var(--line);background:var(--panel);padding:8px 14px;border-radius:9px}
+.glyph b{color:var(--ink);font-weight:600}
+.glyph .g{color:var(--accent);font-size:14px}
+
+/* section scaffolding */
+section{padding:66px 0;border-bottom:1px solid var(--line)}
+.sec-head{display:flex;gap:18px;align-items:baseline;margin-bottom:34px}
+.sec-num{font-family:var(--mono);font-size:13px;color:var(--accent);font-weight:600;padding-top:8px;flex:none;letter-spacing:.05em}
+.sec-title{font-size:clamp(26px,3.6vw,40px);font-weight:700;letter-spacing:-.02em;text-wrap:balance}
+.sec-kicker{font-size:15.5px;color:var(--ink-mid);margin-top:12px;max-width:70ch;line-height:1.6}
+.lead{max-width:74ch}
+
+/* north star centerpiece */
+.northstar{background:
+  radial-gradient(100% 120% at 100% 0,var(--glow),transparent 55%),var(--panel);
+  border:1px solid var(--line);border-radius:20px;padding:38px 36px;box-shadow:0 1px 2px rgba(8,12,18,.05),0 24px 60px -30px var(--glow)}
+.ns-eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--brass);font-weight:600}
+.ns-h{font-size:clamp(24px,3.4vw,36px);margin:10px 0 6px;font-weight:700;letter-spacing:-.02em;font-family:var(--disp)}
+.ns-line{color:var(--ink-mid);font-size:16px;margin-bottom:22px}
+.ns-bar{border-left:3px solid var(--brass);background:var(--brass-soft);padding:14px 18px;border-radius:0 10px 10px 0;font-size:14.5px;color:var(--ink-mid);line-height:1.55;margin-bottom:26px}
+.ns-bar b{color:var(--ink);font-weight:600}
+.pillars{display:grid;grid-template-columns:repeat(auto-fit,minmax(228px,1fr));gap:14px}
+.pillar{background:var(--raise);border:1px solid var(--line);border-radius:14px;padding:18px 18px 16px;position:relative;transition:.25s}
+.pillar:hover{border-color:var(--accent);transform:translateY(-2px)}
+.pillar .pg{font-size:20px;color:var(--accent);line-height:1}
+.pillar h4{font-size:17px;margin:11px 0 6px;font-weight:700}
+.pillar p{margin:0;font-size:13px;color:var(--ink-mid);line-height:1.5}
+.ns-mandate{margin-top:24px;padding-top:20px;border-top:1px solid var(--line-soft);font-size:14px;color:var(--ink-mid);line-height:1.6}
+.ns-mandate b{color:var(--ink);font-weight:600}
+.ns-mandate .freeze{color:var(--bad);font-family:var(--mono);font-weight:600;font-size:13px}
+
+/* pipeline */
+.pipe{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0;counter-reset:step;margin-top:8px;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--panel)}
+.step{padding:20px 18px;border-right:1px solid var(--line-soft);position:relative}
+.step:last-child{border-right:none}
+.step .sn{font-family:var(--mono);font-size:11px;color:var(--accent);font-weight:600}
+.step h4{font-size:15px;margin:8px 0 5px;font-weight:700;font-family:var(--sans);letter-spacing:-.01em}
+.step p{margin:0;font-size:12.5px;color:var(--ink-mid);line-height:1.45}
+.step .arr{position:absolute;right:-7px;top:50%;transform:translateY(-50%);color:var(--accent);font-size:13px;background:var(--bg);z-index:2;padding:2px 0}
+@media(max-width:640px){.step .arr{display:none}}
+
+/* two-col */
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:760px){.cols{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 22px}
+.card h4{font-size:18px;font-weight:700;margin-bottom:8px;letter-spacing:-.01em}
+.card h4 .k{font-family:var(--mono);font-size:11px;color:var(--accent);display:block;letter-spacing:.08em;margin-bottom:6px;font-weight:600;text-transform:uppercase}
+.card p{margin:0 0 10px;font-size:14px;color:var(--ink-mid);line-height:1.55}
+.card p:last-child{margin-bottom:0}
+.card b{color:var(--ink);font-weight:600}
+ul.tight{margin:8px 0 0;padding:0;list-style:none}
+ul.tight li{font-size:13.5px;color:var(--ink-mid);padding:6px 0 6px 22px;position:relative;line-height:1.5;border-top:1px solid var(--line-soft)}
+ul.tight li:first-child{border-top:none}
+ul.tight li::before{content:"›";position:absolute;left:4px;color:var(--accent);font-weight:700}
+ul.tight li b{color:var(--ink)}
+code{font-family:var(--mono);font-size:.86em;background:var(--panel-2);padding:1px 6px;border-radius:5px;color:var(--accent-ink)}
+
+/* lenses grid */
+.lenses{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px;margin-top:8px}
+.lens{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px 15px}
+.lens .ln{font-family:var(--mono);font-size:10.5px;color:var(--brass);font-weight:600;letter-spacing:.05em}
+.lens h4{font-size:14.5px;font-family:var(--sans);font-weight:700;margin:5px 0 5px;letter-spacing:-.01em}
+.lens p{margin:0;font-size:12px;color:var(--ink-mid);line-height:1.45}
+.votebox{margin-top:22px;background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.votebox .vh{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:baseline;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--line-soft);background:var(--panel-2)}
+.votebox .vh b{font-size:14px;font-family:var(--disp)}
+.votebox .vh span{font-family:var(--mono);font-size:12px;color:var(--ink-mid)}
+.vrow{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:11px 18px;border-top:1px solid var(--line-soft);font-size:13.5px}
+.vrow:first-child{border-top:none}
+.vrow .vid{font-family:var(--mono);font-weight:600;font-size:13px;min-width:52px;color:var(--ink)}
+.vrow .vt{flex:1;min-width:180px;color:var(--ink-mid)}
+.vrow .vv{font-family:var(--mono);font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px}
+.vv.freeze{background:color-mix(in srgb,var(--bad) 15%,transparent);color:var(--bad)}
+.vv.defer{background:var(--panel-2);color:var(--ink-mid)}
+.vrow .vm{font-family:var(--mono);font-size:11.5px;color:var(--ink-soft);min-width:70px;text-align:right}
+
+/* cascade ladder */
+.cascade{position:relative;margin-top:8px}
+.rung{display:grid;grid-template-columns:64px 1fr;gap:34px;padding:20px 0;border-top:1px solid var(--line-soft)}
+.rung:first-child{border-top:none}
+.rung .lvl{font-family:var(--mono);font-size:12px;color:var(--accent);font-weight:600;text-align:right;padding-top:4px;position:relative}
+.rung .lvl::after{content:"";position:absolute;right:-22px;top:6px;width:11px;height:11px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--bg),0 0 0 5px var(--line)}
+.cascade::before{content:"";position:absolute;left:80px;top:24px;bottom:24px;width:2px;background:linear-gradient(var(--accent),var(--brass));opacity:.4}
+.rung .rc h4{font-size:17px;font-weight:700;margin-bottom:5px;letter-spacing:-.01em}
+.rung .rc p{margin:0;font-size:13.5px;color:var(--ink-mid);line-height:1.55}
+.rung .rc .tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
+.rung .rc .tags span{font-family:var(--mono);font-size:10.5px;color:var(--ink-mid);border:1px solid var(--line);border-radius:6px;padding:2px 8px}
+
+/* guarantees */
+.guars{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:8px}
+.guar{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px}
+.guar .gi{font-size:18px;color:var(--good)}
+.guar h4{font-size:16px;font-weight:700;margin:8px 0 6px;letter-spacing:-.01em}
+.guar p{margin:0;font-size:13px;color:var(--ink-mid);line-height:1.5}
+
+/* pullquote */
+.pull{font-family:var(--disp);font-size:clamp(22px,3.4vw,34px);font-weight:600;line-height:1.28;letter-spacing:-.02em;text-wrap:balance;max-width:20ch;margin:0}
+.pull .em{color:var(--accent);font-style:italic}
+.pullwrap{display:grid;grid-template-columns:1fr 1fr;gap:32px;align-items:center}
+@media(max-width:760px){.pullwrap{grid-template-columns:1fr;gap:18px}}
+.pullwrap .pside{font-size:14.5px;color:var(--ink-mid);line-height:1.65}
+.pullwrap .pside b{color:var(--ink);font-weight:600}
+
+/* closing */
+.close{padding:80px 0 90px;text-align:center;border-bottom:none}
+.close h2{font-size:clamp(28px,5vw,52px);font-weight:800;letter-spacing:-.025em;text-wrap:balance;max-width:18ch;margin:0 auto 20px}
+.close p{max-width:60ch;margin:0 auto;color:var(--ink-mid);font-size:16px}
+.close .sig{font-family:var(--mono);font-size:12px;color:var(--ink-soft);margin-top:34px;letter-spacing:.04em}
+.foot{padding:26px 0 40px;color:var(--ink-soft);font-size:12px;font-family:var(--mono);text-align:center;line-height:1.9}
+
+/* footer + legal (landing-page component) */
+.footbar{padding:22px 0;border-top:1px solid var(--line);display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;color:var(--ink-soft);font-size:12.5px;font-family:var(--mono);max-width:1100px;margin:0 auto;padding-left:24px;padding-right:24px}
+.legal{background:var(--panel-2);border-top:1px solid var(--line);padding:44px 0 40px}
+.legal .lh{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-soft);font-weight:600;margin-bottom:24px}
+.legal-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:22px 34px}
+@media(max-width:820px){.legal-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:560px){.legal-grid{grid-template-columns:1fr}}
+.legal-col h5{font-family:var(--mono);font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--accent-ink);font-weight:600;margin:0 0 7px}
+.legal-col p{margin:0;font-size:11px;color:var(--ink-soft);line-height:1.58}
+.legal-foot{display:flex;flex-wrap:wrap;gap:8px 18px;justify-content:space-between;margin-top:28px;padding-top:18px;border-top:1px solid var(--line);font-family:var(--mono);font-size:10.5px;color:var(--ink-soft)}
+.legal-foot b{color:var(--ink-mid);font-weight:600}
+
+.themetog{position:fixed;right:16px;bottom:16px;font-family:var(--mono);font-size:12px;background:var(--panel);border:1px solid var(--line);color:var(--ink-mid);padding:8px 12px;border-radius:10px;cursor:pointer;z-index:70;box-shadow:0 6px 20px -8px rgba(0,0,0,.3)}
+.reveal{opacity:0;transform:translateY(14px);transition:opacity .6s cubic-bezier(.2,.7,.2,1),transform .6s cubic-bezier(.2,.7,.2,1)}
+.reveal.in{opacity:1;transform:none}
+@media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}html{scroll-behavior:auto}}
+</style>
+  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
+</head>
+<body>
+
+<div style="display:flex;align-items:center;justify-content:center;gap:8px 22px;flex-wrap:wrap;background:linear-gradient(90deg,#0a2233,#0c2119);color:#e8eef6;font:600 13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;padding:9px 16px;border-bottom:1px solid #1e2836;text-align:center">
+  <span style="display:inline-flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:50%;background:#2ee6a0;box-shadow:0 0 8px #2ee6a0;display:inline-block"></span><b style="color:#2ee6a0">LIVE</b> v1.0.0 acceptance testing &rarr; <a href="https://test.agenticmem.co" target="_blank" rel="noopener" style="color:#3fb5ff;text-decoration:none;border-bottom:1px solid #3fb5ff">test.agenticmem.co</a></span>
+  <span style="opacity:.4">|</span>
+  <span>📊 Reproducible results for peer review &rarr; <a href="../testing/" style="color:#3fb5ff;text-decoration:none;border-bottom:1px solid #3fb5ff">testing methodology &amp; outcomes</a></span>
+</div>
+
+<div class="nav"><div class="nav-in">
+  <a class="brand" href="../index.html">
+    <svg class="mk" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2l9 5.2v9.6L12 22 3 16.8V7.2z" stroke="var(--accent)" stroke-width="1.5"/><circle cx="12" cy="12" r="2.4" fill="var(--accent)"/><path d="M12 9.6V4.5M12 14.4v5.1M14.4 12h5M4.9 12h5" stroke="var(--accent)" stroke-width="1.1"/></svg>
+    ai-memory
+  </a>
+  <nav class="nav-links">
+    <a href="../index.html#platform">Platform</a>
+    <a href="../index.html#security">Security</a>
+    <a href="../index.html#deploy">Deploy</a>
+    <a href="../audience/developer.html">Documentation</a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/releases">Releases</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="../testing/">Test Results</a>
+    <div class="dropdown">
+      <button aria-haspopup="true">Engineering ▾</button>
+      <div class="dropdown-menu">
+        <a href="../index.html#engineering">The engineering system<span>How it's built — on the landing page</span></a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub repository<span>github.com/alphaonedev/ai-memory-mcp</span></a>
+        <a class="current" href="./how-ai-memory-is-built.html">How ai-memory is built<span>Engineering methodology</span></a>
+        <a href="../architectures.html">Supported architectures<span>Tiers T1–T5</span></a>
+        <a href="https://claude.ai/code/artifact/ccc0c7fa-e858-48ae-85fa-cb2e23ddeaf0">v1.0.0 GA release plan<span>Gates &amp; sequence</span></a>
+        <a href="https://claude.ai/code/artifact/0ad8271f-db30-496c-9092-766539d09628">Live engineering tracker<span>Real-time GA progress</span></a>
+        <a href="../audience/decision-maker.html">For decision-makers<span>C-level briefing</span></a>
+      </div>
+    </div>
+  </nav>
+  <a class="nav-cta keep" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+</div></div>
+
+<div class="hero"><div class="wrap hero-inner">
+  <div class="h-tag"><span class="h-dot"></span> ai-memory · v1.0.0 · <b>Engineering Methodology</b></div>
+  <h1 class="hero-h">Adversarially engineered.<br><span class="neg">Not vibe-coded.</span></h1>
+  <p class="hero-sub">ai-memory is the endpoint memory substrate for AI agent <b>clusters, swarms, and hives</b>. It is built to a single standard: that a Fortune&nbsp;500 or a Federal, State, County, or Municipal government would stake <b>mission-critical processes</b> on it. This is how that standard is enforced — the AI-agent graph-engineering pipeline, the adversarial review, and the testing gauntlet that stand between a proposed change and the release branch.</p>
+  <div class="glyphstrip">
+    <div class="glyph"><span class="g">◆</span><b>Data integrity</b></div>
+    <div class="glyph"><span class="g">●</span><b>Security</b></div>
+    <div class="glyph"><span class="g">▲</span><b>Performance</b></div>
+    <div class="glyph"><span class="g">■</span><b>Reliability</b></div>
+  </div>
+</div></div>
+
+<div class="wrap">
+
+<!-- NORTH STAR -->
+<section id="northstar">
+  <div class="northstar reveal">
+    <div class="ns-eyebrow">Aggregate North Star · the entire epic</div>
+    <div class="ns-h">Endpoint memory for AI agent clusters, swarms &amp; hives</div>
+    <div class="ns-line">One bar governs every gate, every issue, every test.</div>
+    <div class="ns-bar"><b>Adoption bar:</b> a Fortune&nbsp;500, Federal, State, County, or Municipal government must be willing to stake <b>mission-critical processes</b> on ai-memory v1.0.0 as a reliable endpoint memory substrate. Rock-solid on all four pillars — no exceptions, across every gate, issue, and test.</div>
+    <div class="pillars">
+      <div class="pillar"><div class="pg">◆</div><h4>Data integrity</h4><p>No silent loss, no partial or unsigned commit, no permanently-broken row.</p></div>
+      <div class="pillar"><div class="pg">●</div><h4>Security</h4><p>Operator permission rules never bypassed; no fail-open, no privilege or tenant leak.</p></div>
+      <div class="pillar"><div class="pg">▲</div><h4>Performance</h4><p>Write-plane liveness under contention; bounded, non-DoS-able paths.</p></div>
+      <div class="pillar"><div class="pg">■</div><h4>Reliability</h4><p>Cross-backend parity, recoverability, no fleet kill-switch, no silent-wrong-result.</p></div>
+    </div>
+    <div class="ns-mandate"><b>Binding GA mandate:</b> v1.0.0 ships a <b>100%-certified AI-NHI enterprise-federation configuration</b> — PostgreSQL + Apache AGE + pgvector, encrypted in transit, encrypted attestation, Batman mode. At mission-critical government/enterprise stakes, tolerance for any integrity, security, performance, or reliability defect is <b>effectively zero</b> — the default triage posture across the epic is <span class="freeze">FREEZE</span> unless a defect is strictly fail-closed with the North Star fully intact.</div>
+  </div>
+</section>
+
+<!-- 01 GRAPH ENGINEERING -->
+<section id="graph">
+  <div class="sec-head reveal"><div class="sec-num">§01</div><div><div class="eyebrow">The development organism</div><h2 class="sec-title">AI-agent graph engineering</h2><p class="sec-kicker">ai-memory is built by a structured organization of AI agents with an enforced separation of powers. The agent that writes code is never the agent that reviews it, and never the agent that merges it. No single agent can push an unreviewed change to the release branch.</p></div></div>
+  <div class="cols reveal">
+    <div class="card"><h4><span class="k">Conductor · Gatekeeper</span>The orchestrator writes no production code</h4><p>A single conductor decomposes the epic, dispatches work, performs security &amp; code review, and is the <b>only</b> actor permitted to merge. It holds the release protocol: signed merges, branch-protection lifts that are always re-armed, and the verify-at-tip discipline. Its job is judgment, not authorship.</p></div>
+    <div class="card"><h4><span class="k">Coders · Isolated worktrees</span>Top-tier reasoning models, one problem each</h4><p>Implementation is dispatched to strong coding agents, each in its own <b>isolated git worktree</b> so parallel work never collides. Difficult, security-critical, cross-cutting problems go to the top tier; mechanical work to a lighter tier. Every coder loads the Rust engineering standard and the code graph before writing a line.</p></div>
+    <div class="card"><h4><span class="k">Test swarms · Verification only</span>Cheap agents, massive breadth</h4><p>A swarm of lightweight agents (GLM-5.3-Flash via OpenRouter) is a pure <b>verification workload</b> — never coding. Because they are inexpensive, they scale to dozens or hundreds of concurrent non-human identities (NHIs) to stress agent-to-agent flows, clusters, and hives against the real running system.</p></div>
+    <div class="card"><h4><span class="k">Separation of powers</span>Author ≠ reviewer ≠ merger</h4><p>This is the core anti-vibe-code control. A change is authored by one agent, adversarially reviewed by others, and admitted by a gatekeeper that re-runs the gates itself. Convenient self-approval — the failure mode of most AI-assisted codebases — is structurally impossible.</p></div>
+  </div>
+</section>
+
+<!-- 02 CODEGRAPH -->
+<section id="codegraph">
+  <div class="sec-head reveal"><div class="sec-num">§02</div><div><div class="eyebrow">Navigation as ground truth</div><h2 class="sec-title">CodeGraph</h2><p class="sec-kicker">Every coding agent reasons over a real knowledge graph of the codebase before it touches a file — not a guess, not a grep, a graph.</p></div></div>
+  <div class="cols reveal">
+    <div class="card"><p>CodeGraph is a queryable graph of the codebase's symbols, edges, and files. One call returns the verbatim, line-numbered source of the relevant symbols <b>plus the call paths between them</b> — including dynamic-dispatch hops that a text search can never follow — and a blast-radius summary of what a change touches.</p><p>It is pinned to the live release-development index, mechanically enforced, so an agent can never reason against a stale or wrong-branch view of the code.</p></div>
+    <div class="card"><h4>Why it matters for the pillars</h4><ul class="tight">
+      <li><b>Reliability:</b> a change's blast radius is known <i>before</i> it is written, not discovered in production.</li>
+      <li><b>Security:</b> every caller of a sensitive funnel is enumerable, so an authz gate can be proven to cover all paths.</li>
+      <li><b>Integrity:</b> cross-backend twins (SQLite / PostgreSQL) are located together, so parity gaps surface at design time.</li>
+    </ul></div>
+  </div>
+</section>
+
+<!-- 03 RUST STANDARD -->
+<section id="rust">
+  <div class="sec-head reveal"><div class="sec-num">§03</div><div><div class="eyebrow">A written standard, not taste</div><h2 class="sec-title">The Rust&nbsp;1.98 engineering standard</h2><p class="sec-kicker">Every coding agent works to a prioritized, versioned rulebook — hundreds of rules with stable IDs, each cited by number in review. Correctness and safety are gated before anything else.</p></div></div>
+  <div class="cols reveal">
+    <div class="card"><h4><span class="k">P0 — safety &amp; correctness</span>Gated before any other concern</h4><ul class="tight">
+      <li><b>Ownership &amp; aliasing</b> — single owner; many <code>&amp;T</code> XOR one <code>&amp;mut T</code>; never return a dangling reference.</li>
+      <li><b>Errors as values</b> — recoverable failure returns <code>Result</code>; no <code>unwrap</code> in production; <b>make illegal states unrepresentable</b> and fail closed.</li>
+      <li><b>Concurrency</b> — global lock order; publish with Release/Acquire; never hold a blocking guard across an <code>.await</code>.</li>
+      <li><b>Unsafe</b> — every <code># Safety</code> contract documented; no UB reachable from safe callers.</li>
+      <li><b>Numeric</b> — no implicit overflow; <code>TryFrom</code> for narrowing; never float-compare for logic.</li>
+    </ul></div>
+    <div class="card"><h4><span class="k">The discipline</span>Rules are cited, not vibed</h4><p>A reviewer writes "per <code>ERRORS-09</code>" or "flag <code>OWNERSHIP-10</code>." The standard also encodes the Edition-2024 migration hazards that silently change drop and lock behaviour — the traps that quietly corrupt a less rigorous codebase.</p><p>The result: the fail-closed, make-illegal-states-unrepresentable posture that the North Star demands is not a hope. It is a <b>checklist an agent must satisfy</b> and a reviewer verifies by rule number.</p></div>
+  </div>
+</section>
+
+<!-- 04 ADVERSARIAL VOTE -->
+<section id="vote">
+  <div class="sec-head reveal"><div class="sec-num">§04</div><div><div class="eyebrow">Decisions are earned, not asserted</div><h2 class="sec-title">The 3×7 adversarial voting scheme</h2><p class="sec-kicker">When a judgment call matters — does this defect block the release, or can it wait? — it is not made by one opinion. It is put to a panel of 21 independent jurors: 7 distinct adversarial lenses, 3 rounds each, every one judging on the merits under the North Star.</p></div></div>
+  <div class="lenses reveal">
+    <div class="lens"><div class="ln">LENS 01</div><h4>Data-integrity hawk</h4><p>Hunts silent loss, partial or unsigned commits, permanently-broken rows.</p></div>
+    <div class="lens"><div class="ln">LENS 02</div><h4>Certified-federation guardian</h4><p>Protects the certified pg + AGE + pgvector attestation chain.</p></div>
+    <div class="lens"><div class="ln">LENS 03</div><h4>Security / authz adversary</h4><p>Fail-open gates, privilege bypass, "rules never bypassed by AI."</p></div>
+    <div class="lens"><div class="ln">LENS 04</div><h4>Cross-backend parity auditor</h4><p>SQLite vs PostgreSQL divergence and silent-wrong-result.</p></div>
+    <div class="lens"><div class="ln">LENS 05</div><h4>Availability / DoS engineer</h4><p>Write-plane liveness, fleet kill-switches, recoverability.</p></div>
+    <div class="lens"><div class="ln">LENS 06</div><h4>Scope disciplinarian</h4><p>Argues ruthlessly for defer — resists scope creep, concedes only to the mandate.</p></div>
+    <div class="lens"><div class="ln">LENS 07</div><h4>Operator / upgrade-safety</h4><p>Real blast radius on deployed NHIs, migration &amp; fresh-install safety.</p></div>
+  </div>
+  <div class="votebox reveal">
+    <div class="vh"><b>Worked example — a live 6-issue docket</b><span>21 jurors · verdict + confidence + rationale · aggregated by a panel chair</span></div>
+    <div class="vrow"><span class="vid">#3191</span><span class="vt">Coordination-plane atomicity — unsigned resolve, action TOCTOU</span><span class="vv freeze">FREEZE</span><span class="vm">20–0</span></div>
+    <div class="vrow"><span class="vid">#2555</span><span class="vt">schema_version unconstrained fleet kill-switch</span><span class="vv freeze">FREEZE</span><span class="vm">19–1</span></div>
+    <div class="vrow"><span class="vid">#3111</span><span class="vt">Capability token flips an explicit operator Deny → Allow</span><span class="vv freeze">FREEZE</span><span class="vm">20–0</span></div>
+    <div class="vrow"><span class="vid">#3187</span><span class="vt">Backend-confined metadata validation gap</span><span class="vv defer">DEFER</span><span class="vm">7–13</span></div>
+    <div class="vrow"><span class="vid">#3125</span><span class="vt">Ungoverned-namespace posture — ship as opt-in knob</span><span class="vv defer">DEFER</span><span class="vm">0–20</span></div>
+    <div class="vrow"><span class="vid">#3305</span><span class="vt">Fail-closed read-parity nit, North Star intact</span><span class="vv defer">DEFER</span><span class="vm">0–20</span></div>
+  </div>
+  <p class="sec-kicker reveal" style="margin-top:22px">An issue's own author calling it "deferrable" does not settle it — the panel overruled self-assessments in <i>both</i> directions. A defect that lands on the certified-federation config freezes the release even when it looked minor; a defect that is strictly fail-closed with the North Star intact defers even when it was labeled a blocker.</p>
+</section>
+
+<!-- 05 TESTING CASCADE -->
+<section id="cascade">
+  <div class="sec-head reveal"><div class="sec-num">§05</div><div><div class="eyebrow">Cheap → exhaustive, nothing skipped</div><h2 class="sec-title">The testing gauntlet</h2><p class="sec-kicker">A change earns the release branch by surviving a cascade that widens at every step — from a source-scanning invariant check, to real dual-OS certified database tiers, to a cloud swarm of hundreds of agents on the running system.</p></div></div>
+  <div class="cascade reveal">
+    <div class="rung"><div class="lvl">L1</div><div class="rc"><h4>Continuous integration</h4><p>Self-hosted CI on every push: compile, clippy at pedantic denial, format, and per-module coverage floors that are <b>never lowered</b> — a floor is a ratchet, not a suggestion.</p><div class="tags"><span>clippy -D pedantic</span><span>coverage floors</span><span>fmt</span></div></div></div>
+    <div class="rung"><div class="lvl">L2</div><div class="rc"><h4>Structural invariant suites</h4><p>Source-scanning gates that fail the build on architectural drift: every write-path SQL is record-stop-gated or reviewed-allowlisted; the append-only spine is guarded; module-size and error-funnel ceilings are pinned; MCP parameter names and attestation strings are invariant.</p><div class="tags"><span>record-stop gate</span><span>append-only spine</span><span>funnel ceilings</span></div></div></div>
+    <div class="rung"><div class="lvl">L3</div><div class="rc"><h4>Native dual-OS certified tier</h4><p>The real enterprise data tier — <b>PostgreSQL + Apache AGE + pgvector</b> — exercised natively on both <b>Linux</b> and <b>macOS</b> hosts. Cross-backend parity between SQLite and PostgreSQL is asserted test-by-test, so the two backends can never silently diverge.</p><div class="tags"><span>postgres + AGE + pgvector</span><span>Linux + macOS</span><span>sqlite/pg parity</span></div></div></div>
+    <div class="rung"><div class="lvl">L4</div><div class="rc"><h4>AI-NHI acceptance matrix</h4><p>Five deployment configurations — from a single SQLite node to encrypted certified federation — each run across five architecture tiers (single agent → many agents → multi-node swarm → data-center swarm → global hive), plus full <b>agent-to-agent</b> multi-NHI testing against the live daemon.</p><div class="tags"><span>5 configs × T1–T5</span><span>A2A multi-NHI</span><span>at-rest machine-proof</span></div></div></div>
+    <div class="rung"><div class="lvl">L5</div><div class="rc"><h4>DigitalOcean final-final</h4><p>The whole matrix re-run on cloud infrastructure, with a <b>GLM-5.3-Flash agent swarm</b> scaled to dozens–hundreds of concurrent NHIs to stress the data-center and global-hive tiers. Nothing ships until the entire cloud matrix is green.</p><div class="tags"><span>cloud multi-arch</span><span>swarm at scale</span><span>final gate</span></div></div></div>
+  </div>
+</section>
+
+<!-- 06 MERGE GAUNTLET -->
+<section id="merge">
+  <div class="sec-head reveal"><div class="sec-num">§06</div><div><div class="eyebrow">Trust nothing; prove everything</div><h2 class="sec-title">Verify-at-tip &amp; the signed chain</h2><p class="sec-kicker">The last mile — admitting a verified change to the release branch — is itself a hardened protocol, because "the tests passed on the branch" is not the same as "the fix is present and correct at the tip."</p></div></div>
+  <div class="cols reveal">
+    <div class="card"><h4><span class="k">The verify-at-tip rule</span>Merge ancestry is not trusted</h4><p>A fix that "merged" once was later silently dropped in a rebase. So no issue closes on the claim that a PR merged. The gate is stricter: the fix must be <b>present in the tip's code</b> and demonstrated by a <b>live regression test</b> run against the merged tree — the full structural suite, the affected backend tests, and pedantic lint, re-run at the tip before the merge is admitted.</p></div>
+    <div class="card"><h4><span class="k">The signed spine</span>Every commit &amp; record attested</h4><p>Commits are cryptographically signed. Merges use a controlled admin-lift that is <b>always re-armed and confirmed</b> — branch protection can never be left open. At runtime, the product writes to an <b>append-only, signed event chain</b>; the certified tier machine-verifies its at-rest encryption and signs that proof into the chain. Attestation is proven, not asserted.</p></div>
+  </div>
+  <div class="pipe reveal" style="margin-top:16px">
+    <div class="step"><div class="sn">01</div><h4>Issue</h4><p>Triaged against the four pillars.</p><span class="arr">→</span></div>
+    <div class="step"><div class="sn">02</div><h4>Graph + standard</h4><p>CodeGraph + Rust rulebook loaded.</p><span class="arr">→</span></div>
+    <div class="step"><div class="sn">03</div><h4>Implement</h4><p>Isolated worktree, one problem.</p><span class="arr">→</span></div>
+    <div class="step"><div class="sn">04</div><h4>Adversarial review</h4><p>Independent lenses; vote if contested.</p><span class="arr">→</span></div>
+    <div class="step"><div class="sn">05</div><h4>Verify-at-tip</h4><p>Live regression at the merged tree.</p><span class="arr">→</span></div>
+    <div class="step"><div class="sn">06</div><h4>Signed merge</h4><p>Gatekeeper only; protection re-armed.</p></div>
+  </div>
+</section>
+
+<!-- PULLQUOTE -->
+<section id="thesis">
+  <div class="pullwrap reveal">
+    <p class="pull">Most open-source AI code is written to <span class="em">look</span> right. This is written to <span class="em">be</span> proven right.</p>
+    <div class="pside"><p>The difference is not effort — it is <b>structure</b>. Separation of powers so no agent grades its own work. A written standard so correctness is cited, not felt. An adversarial panel so hard calls are earned. A cascade of tests that ends on real certified databases and a cloud swarm of hundreds of agents. And a merge gate that trusts the tip's code, never the story of how it got there.</p><p>That is the machinery behind a memory substrate an enterprise or a government can stake a mission-critical process on.</p></div>
+  </div>
+</section>
+
+<!-- 07 GUARANTEES -->
+<section id="guarantees">
+  <div class="sec-head reveal"><div class="sec-num">§07</div><div><div class="eyebrow">What the process buys you</div><h2 class="sec-title">The guarantees, tied to the pillars</h2></div></div>
+  <div class="guars reveal">
+    <div class="guar"><div class="gi">◆</div><h4>Integrity, proven</h4><p>Append-only signed chain; fail-closed writes; cross-backend parity asserted per test. No silent loss.</p></div>
+    <div class="guar"><div class="gi">●</div><h4>Security, gated</h4><p>Operator Deny is terminal; authz funnels proven to cover all callers; pedantic lint denies the footguns.</p></div>
+    <div class="guar"><div class="gi">▲</div><h4>Performance, bounded</h4><p>Recursive and bulk paths are budgeted and non-DoS-able; write-plane liveness tested under contention.</p></div>
+    <div class="guar"><div class="gi">■</div><h4>Reliability, machine-checked</h4><p>No fleet kill-switch, recoverable state, at-rest encryption machine-verified and attested on the certified tier.</p></div>
+  </div>
+</section>
+
+<!-- CLOSE -->
+<section class="close reveal">
+  <h2>This is the standard.</h2>
+  <p>ai-memory v1.0.0 is not a demo and not a vibe. It is an endpoint memory substrate engineered — pillar by pillar, gate by gate, vote by vote — to be trusted with the work that cannot fail.</p>
+  <div class="sig">◆ Data integrity &nbsp;·&nbsp; ● Security &nbsp;·&nbsp; ▲ Performance &nbsp;·&nbsp; ■ Reliability</div>
+</section>
+
+<div class="foot">ai-memory · v1.0.0 GA engineering methodology · AI-agent graph engineering · adversarial review · certified enterprise federation</div>
+</div>
+
+<div class="footbar">
+  <span>ai-memory™ · endpoint memory for AI agents · Apache 2.0 · <a href="https://github.com/alphaonedev/ai-memory-mcp">github.com/alphaonedev/ai-memory-mcp</a></span>
+  <span>An open-source project of AlphaOne LLC · © 2026</span>
+</div>
+
+<footer class="legal"><div class="wrap">
+  <div class="lh">Legal &amp; Disclosures</div>
+  <div class="legal-grid">
+    <div class="legal-col">
+      <h5>Trademarks</h5>
+      <p>ai-memory™ is a trademark of AlphaOne LLC, with an application filed with the United States Patent and Trademark Office (USPTO); registration is pending and has not been granted. All other names, logos, and brands — including PostgreSQL®, Apache® and Apache AGE™, pgvector, DigitalOcean®, AWS®, Google Cloud™, Microsoft Azure®, Kubernetes®, OpenShift®, Docker®, OpenRouter, and the Model Context Protocol (MCP) — are the property of their respective owners and are used for identification only. Their use does not imply affiliation with, sponsorship by, or endorsement by their owners.</p>
+    </div>
+    <div class="legal-col">
+      <h5>Copyright &amp; Open-Source License</h5>
+      <p>© 2026 AlphaOne LLC. All rights reserved. ai-memory is an open-source project owned and maintained by AlphaOne LLC, licensed under the Apache License, Version 2.0, and provided "AS IS", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied, including without limitation any warranty of merchantability, fitness for a particular purpose, title, or non-infringement, to the fullest extent permitted by law. The governing terms are the LICENSE and NOTICE files in the repository.</p>
+    </div>
+    <div class="legal-col">
+      <h5>No Warranty · Performance &amp; Security</h5>
+      <p>Capacity, sizing, and performance references (including "up to 500 agents per modular tier") are indicative planning estimates only, not guarantees; actual results depend on workload, configuration, hardware, and network. No security control is impenetrable. Security features are effective only when correctly deployed and configured, and AlphaOne LLC does not warrant that the software or any deployment is free of vulnerabilities or immune to compromise, loss, or misuse.</p>
+    </div>
+    <div class="legal-col">
+      <h5>No Endorsement · References</h5>
+      <p>References to standards, agencies, enterprises, or governments — including any reference to NSA hardening guidance, or to Fortune 500, federal, state, county, or municipal use — describe design goals, engineering standards, or an intended assurance bar. They are not, and must not be construed as, certification, accreditation, authorization, endorsement, affiliation, or an existing customer relationship, unless separately stated in a signed writing and independently verifiable.</p>
+    </div>
+    <div class="legal-col">
+      <h5>Forward-Looking Statements</h5>
+      <p>This site contains forward-looking statements about future features, roadmaps, and release timing (including any "v1.0.0 GA" reference). These are estimates based on current expectations, are subject to risks, uncertainties, and change without notice, and are not commitments, promises, or guarantees of delivery.</p>
+    </div>
+    <div class="legal-col">
+      <h5>Project</h5>
+      <p>ai-memory is free and open-source software under Apache 2.0. Contributions, issues, and security reports are welcome via the GitHub repository. This site and its linked materials are provided for informational purposes only.</p>
+    </div>
+  </div>
+  <div class="legal-foot">
+    <span><b>AlphaOne LLC</b> · alpha-one.mobi · © 2026. All rights reserved.</span>
+    <span>ai-memory™ · Apache License 2.0 · USPTO trademark application pending</span>
+  </div>
+</div></footer>
+
+<button class="themetog" id="themetog">◐ theme</button>
+
+<script>
+var tt=document.getElementById("themetog");
+try{var s=localStorage.getItem("aim-site-theme");if(s)document.documentElement.setAttribute("data-theme",s);}catch(e){}
+tt.addEventListener("click",function(){
+  var c=document.documentElement.getAttribute("data-theme");
+  var n=c==="dark"?"light":c==="light"?"dark":(matchMedia("(prefers-color-scheme:dark)").matches?"light":"dark");
+  document.documentElement.setAttribute("data-theme",n);
+  try{localStorage.setItem("aim-site-theme",n);}catch(e){}
+});
+var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){e.target.classList.add("in");io.unobserve(e.target);}})},{threshold:.12,rootMargin:"0px 0px -8% 0px"});
+document.querySelectorAll(".reveal").forEach(function(el){io.observe(el);});
+</script>
+</body>
+</html>
