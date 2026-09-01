@@ -492,14 +492,12 @@ fn all_sites_share_one_skip_config_helper_3167() {
 // #3002 — the XDG move must not orphan an existing config
 // ---------------------------------------------------------------------------
 
-/// #3002 + #3166 (migration safety) — #3002 moved `config.toml` from the
-/// hardcoded `$HOME/.config` to `dirs::config_dir()`. On a host that sets
-/// `XDG_CONFIG_HOME` elsewhere, the XDG path does not exist, and a MISSING
-/// config is the documented "compiled defaults" arm — so the #3166 boot
-/// refusal does NOT fire and the daemon would silently open the relative
-/// `./ai-memory.db` instead of the configured `db`. That is the corpus
-/// split-brain this whole PR exists to prevent, arriving through the front
-/// door. `config_path()` therefore keeps honouring the legacy file.
+/// #3002 + #3166 (migration safety) — on Linux/Windows, #3002 moved
+/// `config.toml` from the hardcoded `$HOME/.config` to
+/// `dirs::config_dir()`, so an existing legacy file remains a warned fallback.
+/// On macOS, #3329 intentionally makes `$HOME/.config` the documented primary
+/// path instead. Either way, the operator's file must be honoured and the
+/// configured DB must never silently fall back to `./ai-memory.db`.
 #[test]
 fn legacy_home_config_survives_the_xdg_move_3002() {
     let mut sb = Sandbox::new();
@@ -533,8 +531,17 @@ fn legacy_home_config_survives_the_xdg_move_3002() {
         "#3166 PRIME DIRECTIVE: no orphan ./ai-memory.db may be created"
     );
     let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains("LEGACY config path"),
-        "the operator must be told once that the legacy root is in use; stderr={stderr}"
-    );
+    if cfg!(target_os = "macos") {
+        assert!(
+            !stderr.contains("LEGACY config path"),
+            "macOS must not mislabel its documented ~/.config primary as legacy; \
+             stderr={stderr}"
+        );
+    } else {
+        assert!(
+            stderr.contains("LEGACY config path"),
+            "the operator must be told once that the legacy root is in use; \
+             stderr={stderr}"
+        );
+    }
 }

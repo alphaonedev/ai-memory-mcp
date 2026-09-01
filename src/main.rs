@@ -66,6 +66,16 @@ fn main() -> Result<()> {
     // `--db-passphrase-file`.
     let cli = Cli::parse();
 
+    // #3329 / TASK-01 — config-path advisories are emitted before tracing is
+    // initialised, so an explicitly quiet boot seeds the one-way suppression
+    // latch before config resolution. Path selection remains unchanged.
+    if matches!(
+        &cli.command,
+        daemon_runtime::Command::Boot(args) if args.quiet
+    ) {
+        config::suppress_config_boot_warnings();
+    }
+
     // #3166 — FAIL CLOSED on a config that exists but cannot be honoured.
     //
     // The pre-#3166 `AppConfig::load()` swallowed a TOML syntax error, a
