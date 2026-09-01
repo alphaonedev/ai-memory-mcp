@@ -114,6 +114,18 @@ class Swarm:
         return self.agents
 
     # -- provisioning ------------------------------------------------------
+    async def preflight(self) -> None:
+        """Dispatch health and capabilities exactly once for every agent."""
+        from swarm.toolset import dispatch
+
+        # health/capabilities are non-selectable (never model-chosen); the three
+        # admin-gated reads are dispatched once too so a run is a coverage PROOF
+        # (admin agents succeed; non-admin agents record a documented 403).
+        for agent in self.agents:
+            for tool in ("health", "capabilities", "stats", "namespaces", "agents"):
+                outcome = await dispatch(agent.client, agent.identity, tool, {})
+                self.coverage.record(outcome)
+
     async def provision(self) -> None:
         """Register each agent and bind its attestation pubkey on the daemon.
 
@@ -147,6 +159,7 @@ class Swarm:
                     agent.identity.signing_key.public_key_b64(),
                 )
                 await asyncio.sleep(self.config.stagger_secs)
+            await self.preflight()
         finally:
             await asyncio.gather(*(admin.aclose() for admin in admins.values()))
 

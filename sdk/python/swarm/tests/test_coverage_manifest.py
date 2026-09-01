@@ -61,6 +61,20 @@ def test_unexpected_failure_is_not_coverage() -> None:
     assert not tracker.tools["forget"].covered
 
 
+def test_tracker_keeps_last_five_failures_and_renders_them() -> None:
+    tracker = CoverageTracker()
+    for number in range(7):
+        tracker.record(ToolOutcome("forget", ok=False, fail_closed=True,
+                                   summary=f"failure-{number}"))
+    assert list(tracker.tools["forget"].failure_summaries) == [
+        "failure-2", "failure-3", "failure-4", "failure-5", "failure-6"
+    ]
+    matrix = tracker.matrix()
+    assert "FAILURES" in matrix
+    assert "forget: failure-2" in matrix
+    assert "failure-1" not in matrix
+
+
 def test_documented_fail_closed_counts_as_covered() -> None:
     tracker = CoverageTracker()
     tracker.mark_documented_fail_closed("forget")
