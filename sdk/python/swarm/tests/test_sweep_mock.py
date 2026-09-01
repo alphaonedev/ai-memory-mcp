@@ -11,13 +11,13 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from swarm.__main__ import _write_journals
+from swarm.__main__ import _write_journals, _write_usage
 from swarm.agent import StepRecord
 from swarm.choreography import ScenarioResult, full_surface_sweep, nhi_assessment, run_all
 from swarm.coverage import CoverageTracker
 from swarm.orchestrator import Swarm
 from swarm.tests.test_agent_loop_mock import _FakeModel, _agent
-from swarm.openrouter import Decision
+from swarm.openrouter import AccountSnapshot, Decision
 
 
 @pytest.mark.asyncio
@@ -140,3 +140,19 @@ def test_write_journals_writes_assessment_artifact(tmp_path: Path) -> None:
     swarm = SimpleNamespace(agents=[])
     _write_journals(swarm, str(tmp_path), assessment="Verdict: PASS")
     assert (tmp_path / "nhi-assessment.md").read_text() == "Verdict: PASS\n"
+
+
+def test_write_usage_serializes_account_delta_and_agent_totals(tmp_path: Path) -> None:
+    coverage = CoverageTracker()
+    coverage.record_model_usage(
+        "ai:a", {"prompt_tokens": 10, "completion_tokens": 2,
+                  "total_tokens": 12, "cost": 0.003}
+    )
+    before = AccountSnapshot(1.0, 0.1, 0.5, 0.9)
+    after = AccountSnapshot(1.003, 0.103, 0.503, 0.903)
+    path = _write_usage(coverage, before, after, path=str(tmp_path / "usage.json"))
+    payload = json.loads(path.read_text())
+    assert payload["schema_version"] == 1
+    assert payload["account_usd"]["delta"]["usage"] == pytest.approx(0.003)
+    assert payload["completions"]["by_agent"]["ai:a"]["requests"] == 1
+    assert payload["completions"]["total"]["total_tokens"] == 12

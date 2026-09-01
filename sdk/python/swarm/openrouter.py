@@ -51,6 +51,16 @@ class OpenRouterError(RuntimeError):
     """A non-2xx or malformed response from OpenRouter."""
 
 
+@dataclass(frozen=True)
+class AccountSnapshot:
+    """OpenRouter's cumulative USD counters for the authenticated key."""
+
+    usage: float
+    usage_daily: float
+    usage_weekly: float
+    usage_monthly: float
+
+
 class OpenRouterClient:
     """Async client bound to one OpenRouter endpoint + model slug."""
 
@@ -110,6 +120,8 @@ class OpenRouterClient:
             "tools": tools,
             "tool_choice": "auto",
             "temperature": temperature,
+            # OpenRouter returns per-generation `cost` only when asked (#3338).
+            "usage": {"include": True},
         }
         body, message = await self._chat(payload)
         return Decision(
@@ -134,6 +146,7 @@ class OpenRouterClient:
             "model": self._model,
             "messages": messages,
             "temperature": temperature,
+            "usage": {"include": True},
         })
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
@@ -160,6 +173,31 @@ class OpenRouterClient:
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise OpenRouterError(f"malformed OpenRouter response: {exc}") from exc
         return body, message
+
+    async def account_snapshot(self) -> AccountSnapshot:
+        """Read the authenticated key's cumulative USD usage counters."""
+        try:
+            resp = await self._client.get("/auth/key")
+        except httpx.HTTPError as exc:
+            raise OpenRouterError(f"OpenRouter usage transport error: {exc}") from exc
+        if resp.status_code >= 400:
+            raise OpenRouterError(
+                f"OpenRouter usage returned {resp.status_code}: {resp.text[:500]}"
+            )
+        try:
+            data = resp.json()["data"]
+            return AccountSnapshot(
+                **{
+                    name: float(data[name])
+                    for name in (
+                        "usage", "usage_daily", "usage_weekly", "usage_monthly"
+                    )
+                }
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            raise OpenRouterError(
+                f"malformed OpenRouter usage response: {exc}"
+            ) from exc
 
 
 def _parse_tool_calls(raw_calls: list[dict[str, Any]]) -> list[ToolCall]:

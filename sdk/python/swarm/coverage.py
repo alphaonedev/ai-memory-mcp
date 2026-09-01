@@ -58,6 +58,8 @@ class CoverageTracker:
 
     tools: dict[str, ToolCoverage] = field(default_factory=dict)
     documented_fail_closed: set[str] = field(default_factory=set)
+    model_usage: dict[str, dict[str, float | int]] = field(default_factory=dict)
+    model_latencies_ms: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.tools:
@@ -90,6 +92,54 @@ class CoverageTracker:
         safe default.
         """
         self.documented_fail_closed.update(names)
+
+    def record_model_usage(
+        self, agent_id: str, raw_usage: Any, latency_ms: float | None = None
+    ) -> None:
+        """Aggregate one OpenRouter completion's token, USD and latency accounting."""
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
+        if latency_ms is not None:
+            self.model_latencies_ms.append(float(latency_ms))
+        totals = self.model_usage.setdefault(
+            agent_id,
+            {
+                "requests": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+            },
+        )
+        totals["requests"] += 1
+        for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(name, 0)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                totals[name] += int(value)
+        cost = usage.get("cost", 0.0)
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            totals["cost_usd"] += float(cost)
+
+    def model_latency_summary(self) -> dict[str, float | int | None]:
+        """mean/p95 decide latency over the run (None when nothing was timed)."""
+        xs = sorted(self.model_latencies_ms)
+        if not xs:
+            return {"n": 0, "mean_ms": None, "p95_ms": None}
+        p95 = xs[max(0, min(len(xs) - 1, round(0.95 * len(xs)) - 1))]
+        return {"n": len(xs), "mean_ms": round(sum(xs) / len(xs), 1), "p95_ms": round(p95, 1)}
+
+    def model_usage_totals(self) -> dict[str, float | int]:
+        """Sum the per-agent completion counters for the usage artifact."""
+        total: dict[str, float | int] = {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+        }
+        for usage in self.model_usage.values():
+            for name, value in usage.items():
+                total[name] += value
+        return total
 
     # -- verdict -----------------------------------------------------------
     def uncovered(self) -> list[str]:
