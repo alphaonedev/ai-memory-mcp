@@ -459,7 +459,7 @@ write_files:
         cd /opt/age-src
         git checkout release/PG18/1.8.0
         # bison 3.8 flags AGE's %pure-parser as deprecated; under -Werror that is
-        # fatal (same fix as the f1 macOS tier build). Drop -Werror outright —
+        # fatal (same fix as the f1 macOS tier build). Drop -Werror outright -
         # "-Wno-error=other" is not a valid gcc warning name and fails the build.
         sed -i 's/-Werror//g' Makefile
         make PG_CONFIG=/usr/bin/pg_config

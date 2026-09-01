@@ -339,7 +339,7 @@ EOS
     case "$code" in 2*) ok "loadgen admin (ai:hive-loadgen-f2 + API key + mTLS) may bind agent keys ($code)";; *) no "loadgen admin bind got '$code' (expected 2xx)";; esac
     code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:not-an-admin" \
       -d "{\"pubkey\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
-    [ "$code" = 403 ] && ok "non-allowlisted name is refused admin (403) — header trust is off" || no "non-admin bind got '$code' (expected 403)"
+    [ "$code" = 403 ] && ok "non-allowlisted name is refused admin (403) - header trust is off" || no "non-admin bind got '$code' (expected 403)"
   else
     no "could not read the node API key for the admin-admission check"
   fi
