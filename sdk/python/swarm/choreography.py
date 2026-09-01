@@ -106,10 +106,29 @@ async def consensus_quorum(swarm: Swarm) -> ScenarioResult:
         if out.ok and isinstance(out.result, dict) and out.result.get("id"):
             ids.append(str(out.result["id"]))
     consolidator = swarm.agents[0]
-    cons = await dispatch(consolidator.client, consolidator.identity, "consolidate",
-                          {"ids": ids, "title": f"consensus-{_RUN}", "namespace": swarm.shared_namespace})
-    swarm.coverage.record(cons)
-    ok = len(ids) >= 2 and cons.ok
+    # The daemon caps one consolidation at 100 sources ("cannot consolidate
+    # more than 100 memories at once", measured at 128 agents). Fold the votes
+    # in batches of <= 100, then fold the batch results into ONE consensus row.
+    batch_size = 100
+    level: list[str] = ids
+    cons = None
+    while True:
+        next_level: list[str] = []
+        for start in range(0, len(level), batch_size):
+            chunk = level[start:start + batch_size]
+            cons = await dispatch(consolidator.client, consolidator.identity, "consolidate",
+                                  {"ids": chunk, "title": f"consensus-{_RUN}-{start // batch_size}-{len(level)}",
+                                   "namespace": swarm.shared_namespace})
+            swarm.coverage.record(cons)
+            if not cons.ok:
+                break
+            cid = cons.result.get("id") if isinstance(cons.result, dict) else None
+            if cid:
+                next_level.append(str(cid))
+        if cons is None or not cons.ok or len(level) <= batch_size or len(next_level) < 2:
+            break
+        level = next_level
+    ok = len(ids) >= 2 and cons is not None and cons.ok
     return ScenarioResult("consensus_quorum", ok=ok,
                           detail=f"votes={len(ids)} consolidated={cons.ok}")
 
@@ -204,9 +223,12 @@ async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
     if not source_id or not target_id:
         return ScenarioResult("full_surface_sweep", False, "store response missing id")
 
+    # Lineage edges point CHILD -> PARENT: the daemon's temporal lineage guard
+    # (#3041) refuses an edge whose target is NEWER than its source, so the
+    # second (newer) row derives_from the first (older) row.
     steps = (
-        ("link", {"source_id": source_id, "target_id": target_id, "relation": "derived_from"}),
-        ("get_links", {"memory_id": source_id}),
+        ("link", {"source_id": target_id, "target_id": source_id, "relation": "derives_from"}),
+        ("get_links", {"memory_id": target_id}),
         ("lineage", {"memory_id": target_id, "direction": "ancestors"}),
         ("update", {"memory_id": source_id, "content": "source updated",
                     "expected_version": int(first.result.get("version") or 1)}),
@@ -219,6 +241,12 @@ async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
     for tool, args in steps:
         outcome = await call(tool, args)
         if not outcome.ok:
+            # A DOCUMENTED fail-closed refusal (e.g. admin-gated `forget` when
+            # this agent is not an admin) is the expected posture, not a sweep
+            # failure: the tracker already counts it as covered.
+            if tool in swarm.coverage.documented_fail_closed and outcome.fail_closed:
+                completed.append(f"{tool}(fail-closed:documented)")
+                continue
             return ScenarioResult("full_surface_sweep", False,
                                   f"{tool} failed after {','.join(completed)}: {outcome.summary}")
     return ScenarioResult("full_surface_sweep", True, " -> ".join(completed))

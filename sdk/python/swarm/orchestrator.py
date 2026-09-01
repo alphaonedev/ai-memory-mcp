@@ -118,8 +118,11 @@ class Swarm:
         """Dispatch health and capabilities exactly once for every agent."""
         from swarm.toolset import dispatch
 
+        # health/capabilities are non-selectable (never model-chosen); the three
+        # admin-gated reads are dispatched once too so a run is a coverage PROOF
+        # (admin agents succeed; non-admin agents record a documented 403).
         for agent in self.agents:
-            for tool in ("health", "capabilities"):
+            for tool in ("health", "capabilities", "stats", "namespaces", "agents"):
                 outcome = await dispatch(agent.client, agent.identity, tool, {})
                 self.coverage.record(outcome)
 

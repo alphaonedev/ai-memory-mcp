@@ -33,6 +33,7 @@ async def test_preflight_dispatches_health_and_capabilities_once_per_agent() -> 
     paths = [request.url.path for request in seen]
     assert paths.count("/api/v1/health") == 2
     assert paths.count("/api/v1/capabilities") == 2
+    assert paths.count("/api/v1/stats") == 2
     assert swarm.coverage.tools["health"].successes == 2
     assert swarm.coverage.tools["capabilities"].successes == 2
 
@@ -63,7 +64,7 @@ async def test_full_surface_sweep_dispatches_order_and_confines_forget() -> None
     assert result.ok, result.detail
     expected = [
         ("POST", "/api/v1/memories"), ("POST", "/api/v1/memories"),
-        ("POST", "/api/v1/links"), ("GET", "/api/v1/links/mem-1"),
+        ("POST", "/api/v1/links"), ("GET", "/api/v1/links/mem-2"),
         ("GET", "/api/v1/memories/mem-2/lineage"),
         ("PUT", "/api/v1/memories/mem-1"),
         ("POST", "/api/v1/memories/mem-1/promote"),
