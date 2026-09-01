@@ -2040,6 +2040,8 @@ async fn http_get_stats_returns_struct() {
     let (status, payload) = get_uri_as_admin(&router, "/api/v1/stats").await;
     assert_eq!(status, StatusCode::OK);
     assert!(payload.is_object());
+    assert!(payload["by_tier"].is_array());
+    assert!(payload["by_namespace"].is_array());
 }
 
 #[tokio::test]

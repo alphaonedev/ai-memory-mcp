@@ -317,6 +317,75 @@ pub fn resolve_create_expires_at(
     })
 }
 
+/// #3332 — project PostgreSQL SAL statistics into the documented HTTP
+/// envelope. The count collections stay as the shared list structs, matching
+/// SQLite's direct `Stats` serialization and the SDK/API contract.
+#[cfg(feature = "sal-postgres")]
+pub(super) fn postgres_stats_envelope(stats: &crate::models::Stats) -> serde_json::Value {
+    use crate::models::field_names;
+
+    json!({
+        (field_names::TOTAL_MEMORIES): stats.total,
+        // v1.0.0 #2334 (FBL-15) — additive expiry-axis fields
+        // (live = the boot/export definition;
+        // expired_pending_gc = the awaiting-GC remainder).
+        "live": stats.live,
+        "expired_pending_gc": stats.expired_pending_gc,
+        "by_tier": stats.by_tier,
+        (field_names::BY_NAMESPACE): stats.by_namespace,
+        "expiring_soon": stats.expiring_soon,
+        "links_count": stats.links_count,
+        "db_size_bytes": stats.db_size_bytes,
+        (field_names::STORAGE_BACKEND): "postgres",
+    })
+}
+
+#[cfg(all(test, feature = "sal-postgres"))]
+mod stats_envelope_parity_tests {
+    use super::postgres_stats_envelope;
+    use crate::models::{NamespaceCount, Stats, TierCount};
+
+    #[test]
+    fn postgres_count_collections_match_sqlite_list_shape_3332() {
+        let stats = Stats {
+            total: 7,
+            live: 6,
+            expired_pending_gc: 1,
+            by_tier: vec![TierCount {
+                tier: "mid".to_string(),
+                count: 7,
+            }],
+            by_namespace: vec![NamespaceCount {
+                namespace: "global".to_string(),
+                count: 7,
+            }],
+            expiring_soon: 1,
+            links_count: 2,
+            db_size_bytes: 4096,
+            dim_violations: 0,
+            index_evictions_total: 0,
+        };
+
+        // The SQLite handler serializes this shared `Stats` value directly.
+        let sqlite = serde_json::to_value(&stats).expect("serialize SQLite stats envelope");
+        let postgres = postgres_stats_envelope(&stats);
+
+        for field in ["by_tier", "by_namespace"] {
+            assert!(
+                postgres[field].is_array(),
+                "PostgreSQL {field} must use the documented list shape: {postgres}"
+            );
+            assert_eq!(
+                postgres[field], sqlite[field],
+                "PostgreSQL and SQLite {field} values must serialize identically"
+            );
+        }
+        assert_eq!(postgres["live"], 6);
+        assert_eq!(postgres["expired_pending_gc"], 1);
+        assert_eq!(postgres["storage_backend"], "postgres");
+    }
+}
+
 #[cfg(test)]
 mod resolve_create_expires_at_tests {
     use super::resolve_create_expires_at;

@@ -532,35 +532,7 @@ pub async fn get_stats(
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return match app.store.stats().await {
-            Ok(s) => {
-                // Project the SAL Stats shape into the postgres wire
-                // shape: by_tier as a wire-string-keyed map (mirrors
-                // the previous postgres envelope), per-namespace as
-                // a `{namespace: count}` map.
-                let mut by_tier_map = serde_json::Map::new();
-                for tc in &s.by_tier {
-                    by_tier_map.insert(tc.tier.clone(), json!(tc.count));
-                }
-                let mut by_namespace_map = serde_json::Map::new();
-                for nc in &s.by_namespace {
-                    by_namespace_map.insert(nc.namespace.clone(), json!(nc.count));
-                }
-                Json(json!({
-                    (field_names::TOTAL_MEMORIES): s.total,
-                    // v1.0.0 #2334 (FBL-15) — additive expiry-axis fields
-                    // (live = the boot/export definition;
-                    // expired_pending_gc = the awaiting-GC remainder).
-                    "live": s.live,
-                    "expired_pending_gc": s.expired_pending_gc,
-                    "by_tier": by_tier_map,
-                    (field_names::BY_NAMESPACE): by_namespace_map,
-                    "expiring_soon": s.expiring_soon,
-                    "links_count": s.links_count,
-                    "db_size_bytes": s.db_size_bytes,
-                    (field_names::STORAGE_BACKEND): "postgres",
-                }))
-                .into_response()
-            }
+            Ok(s) => Json(super::parity::postgres_stats_envelope(&s)).into_response(),
             Err(e) => store_err_to_response(e),
         };
     }

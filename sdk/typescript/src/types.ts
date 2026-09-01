@@ -377,9 +377,8 @@ export interface NamespaceCount {
 
 export interface Stats {
   total_memories: number;
-  /** sqlite: `TierCount[]`; postgres: `{ [tier]: count }` map (backend divergence, #3331 follow-up). */
-  by_tier: TierCount[] | Record<string, number>;
-  by_namespace: NamespaceCount[] | Record<string, number>;
+  by_tier: TierCount[];
+  by_namespace: NamespaceCount[];
   expiring_soon: number;
   links_count: number;
   db_size_bytes: number;
