@@ -307,7 +307,7 @@ sudo -u postgres psql -d aimemory -Atc "SELECT current_setting('server_version')
 sudo -u postgres psql -d aimemory -Atc "SELECT extname || '=' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
 EOS
 )"
-    echo "$versions" | grep -q '^18\.' && ok "node $((i + 1)) PostgreSQL 18" || no "node $((i + 1)) PostgreSQL is not 18 ($versions)"
+    echo "$versions" | grep -q '^18\.6' && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 ($versions)"
     echo "$versions" | grep -qx 'age=1.8.0' && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 ($versions)"
     echo "$versions" | grep -qx 'vector=0.8.6' && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 ($versions)"
   done
@@ -322,6 +322,26 @@ EOS
     no "public endpoint accepted a client with no certificate"
   else
     ok "public endpoint refuses a client with no certificate"
+  fi
+
+  # Admin admission over the network: allowlisted NAME + request authn (API
+  # key) + enrolled client cert. Header trust is OFF on the droplet, so the
+  # same request under a non-allowlisted name must be refused (403).
+  api_key="$(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' 2>/dev/null || true)"
+  if [ -n "$api_key" ]; then
+    probe="ai:verify-probe-$(date -u +%s)"
+    lg_curl() { curl -sS --max-time 15 --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" -H "X-API-Key: $api_key" "$@"; }
+    lg_curl -o /dev/null -X POST -H 'content-type: application/json' -H "X-Agent-Id: ai:hive-loadgen-f2" \
+      -d "{\"agent_id\":\"$probe\",\"agent_type\":\"ai:verify\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents" 2>/dev/null || true
+    dummy_pub="$(head -c 32 /dev/zero | base64)"
+    code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:hive-loadgen-f2" \
+      -d "{\"pubkey\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
+    case "$code" in 2*) ok "loadgen admin (ai:hive-loadgen-f2 + API key + mTLS) may bind agent keys ($code)";; *) no "loadgen admin bind got '$code' (expected 2xx)";; esac
+    code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:not-an-admin" \
+      -d "{\"pubkey\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
+    [ "$code" = 403 ] && ok "non-allowlisted name is refused admin (403) — header trust is off" || no "non-admin bind got '$code' (expected 403)"
+  else
+    no "could not read the node API key for the admin-admission check"
   fi
 
   # A2 -- CROSS-HOST mTLS: node 1 reaches node 2 on its PRIVATE VPC address

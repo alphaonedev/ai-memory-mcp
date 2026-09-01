@@ -344,10 +344,16 @@ resource "digitalocean_firewall" "hive" {
   // Off-DO Phase-A load generators. Transport admission remains fail-closed:
   // the daemon additionally requires a client certificate fingerprint enrolled
   // by `federate.sh loadgen` (and the API key for request authentication).
-  inbound_rule {
-    protocol         = "tcp"
-    port_range       = "9077"
-    source_addresses = var.loadgen_sources
+  // Rendered ONLY when at least one CIDR is given: the DO API rejects an
+  // inbound rule with an empty source set, which would break the default
+  // (agents-on-droplets) hive that passes no loadgen_sources at all.
+  dynamic "inbound_rule" {
+    for_each = length(var.loadgen_sources) > 0 ? [1] : []
+    content {
+      protocol         = "tcp"
+      port_range       = "9077"
+      source_addresses = var.loadgen_sources
+    }
   }
 
   // East-west on :9077 (ai-memory HTTP daemon).

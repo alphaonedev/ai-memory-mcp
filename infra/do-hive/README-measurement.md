@@ -328,6 +328,8 @@ export SWARM_CLIENT_KEY="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/client.key"
 export SWARM_CA_CERT="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/ca.crt"
 export SWARM_API_KEY="$(ssh root@"$(terraform -chdir=infra/do-hive output -raw memory_public_ip)" cat /etc/ai-memory/api-key)"
 PYTHONPATH=sdk/python python -m swarm
+# (On the f2 METAL tier the admin principal is one of the daemon's
+#  AI_MEMORY_ADMIN_AGENT_IDS instead: export SWARM_ADMIN_AGENT_ID=<that id>.)
 
 infra/do-hive/teardown.sh
 ```
