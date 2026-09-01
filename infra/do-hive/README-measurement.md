@@ -296,3 +296,45 @@ durable memory text.
 - **`memory_count` is capped at 8** so a mistyped value cannot mint a
   50-droplet bill; `docs/enterprise-deployment.md` §8.8's ~50-peer federation
   ceiling is far above anything this money-gated test hive should provision.
+# Phase A (V&V swarm, agents off-DO)
+
+Phase A provisions only the certified data tier. GLM-5.3-Flash calls and the
+swarm driver stay on f2; the public API leg is TLS plus fingerprint-pinned mTLS.
+The daemon also requires its per-node API key. `AI_MEMORY_ADMIN_HEADER_TRUST`
+is never enabled: the unit loads `AI_MEMORY_ADMIN_AGENT_IDS=ai:hive-loadgen-f2`
+from `/etc/ai-memory/fed/runtime.env`, and the loadgen must present both its
+enrolled certificate and `X-API-Key`. The serve flags are always
+`--tls-cert /etc/ai-memory/fed/node.crt --tls-key ... --mtls-allowlist ...`;
+only `--quorum-*` flags are conditional on `memory_count >= 2`.
+
+```bash
+export TF_VAR_ssh_pubkey_fingerprint=b5:bf:33:9d:6f:a7:22:60:87:49:36:0b:7a:fe:ba:e9
+infra/do-hive/spawn.sh plan -var memory_count=1 -var agent_count=0 \
+  -var memory_droplet_size=c-8 -var 'loadgen_sources=["108.45.154.178/32"]'
+
+# Operator only: explicitly approve spend, then use the exact apply command
+AI_MEMORY_OPERATOR_DO_SPEND_APPROVED=1 infra/do-hive/spawn.sh apply \
+  -var memory_count=1 -var agent_count=0 -var memory_droplet_size=c-8 \
+  -var 'loadgen_sources=["108.45.154.178/32"]'
+
+scp target/release/ai-memory root@"$(terraform -chdir=infra/do-hive output -raw memory_public_ip)":/opt/ai-memory/bin/ai-memory
+infra/do-hive/federate.sh wire
+infra/do-hive/federate.sh loadgen
+infra/do-hive/federate.sh verify
+
+export SWARM_BASE_URL="https://$(terraform -chdir=infra/do-hive output -raw memory_public_ip):9077"
+export SWARM_CLIENT_CERT="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/client.crt"
+export SWARM_CLIENT_KEY="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/client.key"
+export SWARM_CA_CERT="$PWD/.local-runs/do-hive-runs/<UTC>/loadgen/ca.crt"
+export SWARM_API_KEY="$(ssh root@"$(terraform -chdir=infra/do-hive output -raw memory_public_ip)" cat /etc/ai-memory/api-key)"
+PYTHONPATH=sdk/python python -m swarm
+# (On the f2 METAL tier the admin principal is one of the daemon's
+#  AI_MEMORY_ADMIN_AGENT_IDS instead: export SWARM_ADMIN_AGENT_ID=<that id>.)
+
+infra/do-hive/teardown.sh
+```
+
+The substrate is PostgreSQL 18.6, AGE 1.8.0, and pgvector 0.8.6. PgBouncer
+listens only on `127.0.0.1:6432`, uses transaction pooling, and admits 2000
+clients; the daemon points its store URL there so Phase A and Phase B share the
+same baseline.

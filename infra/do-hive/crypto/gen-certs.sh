@@ -137,11 +137,18 @@ fp peerA.crt > peerB.allowlist          # peerB trusts peerA's client cert
 # There is deliberately NO separate operator/bastion client cert: nothing needs
 # one, and an unused trust anchor is a liability, not a convenience.
 if [ -n "${HIVE_NODE_IPS:-}" ]; then
+  # The off-DO Phase-A client is minted by the same CA but is admitted only
+  # when `federate.sh loadgen` appends its fingerprint on every node.
+  mint hive-loadgen-f2 "ai:hive-loadgen-f2" "DNS:ai-hive-loadgen-f2"
+  read -r -a hive_public_ips <<< "${HIVE_NODE_PUBLIC_IPS:-}"
   hive_idx=0
   for hive_ip in $HIVE_NODE_IPS; do
     hive_idx=$((hive_idx + 1))
+    hive_public_ip="${hive_public_ips[$((hive_idx - 1))]:-}"
+    hive_sans="DNS:localhost,IP:127.0.0.1,IP:$hive_ip"
+    [ -n "$hive_public_ip" ] && hive_sans="$hive_sans,IP:$hive_public_ip"
     mint "hive-node-$hive_idx" "ai-memory-hive-memory-$hive_idx" \
-      "DNS:localhost,IP:127.0.0.1,IP:$hive_ip"
+      "$hive_sans"
   done
 
   hive_total=$hive_idx

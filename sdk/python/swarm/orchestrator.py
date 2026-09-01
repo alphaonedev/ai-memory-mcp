@@ -121,12 +121,34 @@ class Swarm:
         large fleet is also paced. Registration + pubkey bind for the read/
         write tools is recorded as coverage of ``agents``-plane surface.
         """
-        for agent in self.agents:
-            await agent.client.register_agent(agent.identity.agent_id, agent_type="ai:glm-swarm")
-            await agent.client.bind_agent_pubkey(
-                agent.identity.agent_id, agent.identity.signing_key.public_key_b64()
-            )
-            await asyncio.sleep(self.config.stagger_secs)
+        # Administrative enrollment uses one explicit request principal. On
+        # DO this identity is admitted only when the request also presents the
+        # loadgen mTLS certificate and per-node API key; header trust is off.
+        from ai_memory import AsyncAiMemoryClient
+
+        admins: dict[str, AsyncAiMemoryClient] = {}
+        try:
+            for ordinal, agent in enumerate(self.agents):
+                base_url = self.config.base_url_for(ordinal)
+                admin = admins.get(base_url)
+                if admin is None:
+                    admin = AsyncAiMemoryClient(
+                        base_url=base_url,
+                        agent_id=self.config.admin_agent_id,
+                        timeout=self.config.request_timeout_secs,
+                        **self.config.daemon_client_kwargs(),
+                    )
+                    admins[base_url] = admin
+                await admin.register_agent(
+                    agent.identity.agent_id, agent_type="ai:glm-swarm"
+                )
+                await admin.bind_agent_pubkey(
+                    agent.identity.agent_id,
+                    agent.identity.signing_key.public_key_b64(),
+                )
+                await asyncio.sleep(self.config.stagger_secs)
+        finally:
+            await asyncio.gather(*(admin.aclose() for admin in admins.values()))
 
     # -- run ---------------------------------------------------------------
     async def run(self) -> CoverageTracker:

@@ -85,8 +85,8 @@ read_nodes() {
   [ -n "$NODES_JSON" ] && [ "$NODES_JSON" != "null" ] \
     || die "terraform output memory_nodes is empty"
   NODE_COUNT="$(echo "$NODES_JSON" | jq 'length')"
-  [ "$NODE_COUNT" -ge 2 ] \
-    || die "memory_nodes has $NODE_COUNT entry; Track D needs >= 2. Re-apply with -var memory_count=2"
+  [ "$NODE_COUNT" -ge 1 ] \
+    || die "memory_nodes is empty; apply at least memory_count=1"
   PUBLIC_IPS=($(echo "$NODES_JSON" | jq -r '.[].public_ip'))
   PRIVATE_IPS=($(echo "$NODES_JSON" | jq -r '.[].private_ip'))
   FED_IDS=($(echo "$NODES_JSON" | jq -r '.[].fed_identity'))
@@ -108,7 +108,8 @@ wire() {
   #    HIVE_NODE_IPS mode, so the legacy localhost/peerA/peerB material is
   #    regenerated exactly as before alongside the per-droplet leaves.
   echo "[federate] minting crypto material for ${NODE_COUNT} nodes -> $OUT_DIR"
-  HIVE_NODE_IPS="${PRIVATE_IPS[*]}" PG_HOST=localhost OUT_DIR="$OUT_DIR" \
+  HIVE_NODE_IPS="${PRIVATE_IPS[*]}" HIVE_NODE_PUBLIC_IPS="${PUBLIC_IPS[*]}" \
+    PG_HOST=localhost OUT_DIR="$OUT_DIR" \
     "$HERE/crypto/gen-certs.sh" >/dev/null || die "gen-certs.sh failed"
 
   # 2. Author identity for the CONTENT write-sig lane. The PRIVATE half stays
@@ -211,6 +212,27 @@ wire() {
   done
 }
 
+# Enroll the off-DO Phase-A driver only after wire has minted the shared-CA
+# leaf. The bundle stays outside git and every file is mode 0600.
+loadgen() {
+  [ -s "$OUT_DIR/hive-loadgen-f2.crt" ] || die "run '$0 wire' first"
+  loadgen_fp="$(openssl x509 -in "$OUT_DIR/hive-loadgen-f2.crt" -outform DER | openssl dgst -sha256 | awk '{print $NF}')"
+  for i in $(seq 0 $((NODE_COUNT - 1))); do
+    node_sh "$i" <<EOS || die "node $((i + 1)): loadgen enrollment failed"
+set -e
+grep -qx '$loadgen_fp' '$FED_DIR/peers.allowlist' || printf '%s\n' '$loadgen_fp' >> '$FED_DIR/peers.allowlist'
+systemctl restart ai-memory
+EOS
+  done
+  run_dir="$REPO_ROOT/.local-runs/do-hive-runs/$(date -u +%Y-%m-%dT%H-%M-%SZ)/loadgen"
+  install -d -m 0700 "$run_dir"
+  install -m 0600 "$OUT_DIR/hive-loadgen-f2.crt" "$run_dir/client.crt"
+  install -m 0600 "$OUT_DIR/hive-loadgen-f2.key" "$run_dir/client.key"
+  install -m 0600 "$OUT_DIR/ca.crt" "$run_dir/ca.crt"
+  echo "[federate] loadgen bundle: $run_dir"
+  echo "[federate] Phase A API key: $(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key')"
+}
+
 # --- verify ------------------------------------------------------------------
 #
 # EVERY assertion runs ON a droplet over ssh, never from this host. The peer
@@ -278,9 +300,54 @@ EOS
     fi
   done
 
+  # Certified data-tier pins, asserted from the provisioned hosts.
+  for i in $(seq 0 $((NODE_COUNT - 1))); do
+    versions="$(node_sh "$i" <<'EOS'
+sudo -u postgres psql -d aimemory -Atc "SELECT current_setting('server_version')"
+sudo -u postgres psql -d aimemory -Atc "SELECT extname || '=' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
+EOS
+)"
+    echo "$versions" | grep -q '^18\.6' && ok "node $((i + 1)) PostgreSQL 18.6 (certified)" || no "node $((i + 1)) PostgreSQL is not 18.6 ($versions)"
+    echo "$versions" | grep -qx 'age=1.8.0' && ok "node $((i + 1)) AGE 1.8.0" || no "node $((i + 1)) AGE is not 1.8.0 ($versions)"
+    echo "$versions" | grep -qx 'vector=0.8.6' && ok "node $((i + 1)) pgvector 0.8.6" || no "node $((i + 1)) pgvector is not 0.8.6 ($versions)"
+  done
+
+  # These two assertions intentionally originate on f2/public internet.
+  if [ -s "$OUT_DIR/hive-loadgen-f2.crt" ] && grep -qx "$(openssl x509 -in "$OUT_DIR/hive-loadgen-f2.crt" -outform DER | openssl dgst -sha256 | awk '{print $NF}')" "$OUT_DIR/hive-node-1.allowlist" 2>/dev/null; then
+    : # legacy local allowlist is not authoritative after remote enrollment
+  fi
+  code="$(curl -sS --max-time 15 --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" -o /dev/null -w '%{http_code}' "https://${PUBLIC_IPS[0]}:9077/api/v1/health" 2>/dev/null)"
+  [ "$code" = 200 ] && ok "f2 loadgen reaches public /health over mTLS (200)" || no "f2 public mTLS /health got '$code'"
+  if curl -sS --max-time 10 --cacert "$OUT_DIR/ca.crt" -o /dev/null "https://${PUBLIC_IPS[0]}:9077/api/v1/health" 2>/dev/null; then
+    no "public endpoint accepted a client with no certificate"
+  else
+    ok "public endpoint refuses a client with no certificate"
+  fi
+
+  # Admin admission over the network: allowlisted NAME + request authn (API
+  # key) + enrolled client cert. Header trust is OFF on the droplet, so the
+  # same request under a non-allowlisted name must be refused (403).
+  api_key="$(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' 2>/dev/null || true)"
+  if [ -n "$api_key" ]; then
+    probe="ai:verify-probe-$(date -u +%s)"
+    lg_curl() { curl -sS --max-time 15 --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" -H "X-API-Key: $api_key" "$@"; }
+    lg_curl -o /dev/null -X POST -H 'content-type: application/json' -H "X-Agent-Id: ai:hive-loadgen-f2" \
+      -d "{\"agent_id\":\"$probe\",\"agent_type\":\"ai:verify\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents" 2>/dev/null || true
+    dummy_pub="$(head -c 32 /dev/zero | base64)"
+    code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:hive-loadgen-f2" \
+      -d "{\"pubkey\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
+    case "$code" in 2*) ok "loadgen admin (ai:hive-loadgen-f2 + API key + mTLS) may bind agent keys ($code)";; *) no "loadgen admin bind got '$code' (expected 2xx)";; esac
+    code="$(lg_curl -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' -H "X-Agent-Id: ai:not-an-admin" \
+      -d "{\"pubkey\":\"$dummy_pub\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents/$probe/pubkey" 2>/dev/null)"
+    [ "$code" = 403 ] && ok "non-allowlisted name is refused admin (403) — header trust is off" || no "non-admin bind got '$code' (expected 403)"
+  else
+    no "could not read the node API key for the admin-admission check"
+  fi
+
   # A2 -- CROSS-HOST mTLS: node 1 reaches node 2 on its PRIVATE VPC address
   #       with its own peer cert. This is precisely the assertion the local
   #       2-daemon legs structurally cannot make.
+  if [ "$NODE_COUNT" -ge 2 ]; then
   peerurl="${PEER_URLS[1]}"
   code=$(node_sh 0 <<EOS 2>/dev/null
 curl -sS --max-time 15 --cacert /etc/ai-memory/fed/ca.crt \\
@@ -378,6 +445,7 @@ EOS
       fi
     fi
   fi
+  fi # NODE_COUNT >= 2 federation-only assertions
 
   echo "----"
   echo "federate verify: $pass PASS / $fail FAIL"
@@ -396,13 +464,17 @@ case "${1:-all}" in
     read_nodes
     verify
     ;;
+  loadgen)
+    read_nodes
+    loadgen
+    ;;
   all)
     read_nodes
     wire
     verify
     ;;
   *)
-    echo "usage: federate.sh {wire|verify|all}" >&2
+    echo "usage: federate.sh {wire|loadgen|verify|all}" >&2
     exit 1
     ;;
 esac

@@ -1,5 +1,5 @@
 #cloud-config
-# Track E1 -- ai-memory + PostgreSQL 16 + pgvector + Apache AGE bootstrap on the
+# Track E1 -- ai-memory + PostgreSQL 18 + pgvector + Apache AGE bootstrap on the
 # DO substrate droplet. Templated by `infra/do-hive/main.tf`. Operator-triggered.
 #
 # #1842 fix (v0.8.1): the prior template installed postgresql-16 but never
@@ -17,9 +17,15 @@
 # All provisioning is logged to /var/log/ai-memory-provision.log for SSH triage.
 package_update: true
 package_upgrade: false
+bootcmd:
+  # PG 18 is supplied by PGDG on Ubuntu Noble. Install the signed repository
+  # before cloud-init's packages module runs; never fall back to Ubuntu's PG16.
+  - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"]
+  - [bash, -c, "echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' > /etc/apt/sources.list.d/pgdg.list && apt-get update"]
 packages:
-  - postgresql-16
-  - postgresql-server-dev-16
+  - postgresql-18=18.6-1.pgdg24.04+2
+  - postgresql-server-dev-18=18.6-1.pgdg24.04+2
+  - pgbouncer
   - build-essential
   - flex
   - bison
@@ -50,13 +56,15 @@ write_files:
       Environment=AI_MEMORY_PERMISSIONS_MODE=enforce
       Environment=AI_MEMORY_AUTONOMOUS_HOOKS=0
       Environment=RUST_LOG=ai_memory=info,store::postgres=info
-      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --store-url "postgres://aimemory:${db_password}@localhost/aimemory"
+      # Public binding is permitted only with TLS + fingerprint-pinned mTLS.
+      # Request authn additionally uses the per-node API key; header trust stays off.
+      EnvironmentFile=/etc/ai-memory/fed/runtime.env
+      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --store-url "postgres://aimemory:${db_password}@127.0.0.1:6432/aimemory" --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist
       Restart=on-failure
       RestartSec=5
 
       [Install]
       WantedBy=multi-user.target
-%{~ if federation_enabled }
   # =====================================================================
   # Track D -- REAL federated multi-node ai-memory (v1.0.0 enterprise-cert
   # campaign, docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/PLAN.md
@@ -158,7 +166,7 @@ write_files:
       Environment=HOME=/opt/ai-memory
       EnvironmentFile=/etc/ai-memory/fed/peers.conf
       ExecStart=
-      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --store-url "postgres://aimemory:${db_password}@localhost/aimemory" --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist --quorum-writes ${quorum_writes} --quorum-peers $${AI_MEMORY_QUORUM_PEERS} --quorum-client-cert /etc/ai-memory/fed/node.crt --quorum-client-key /etc/ai-memory/fed/node.key --quorum-ca-cert /etc/ai-memory/fed/ca.crt --quorum-timeout-ms 8000
+      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --store-url "postgres://aimemory:${db_password}@127.0.0.1:6432/aimemory" --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist%{ if federation_enabled } --quorum-writes ${quorum_writes} --quorum-peers $${AI_MEMORY_QUORUM_PEERS} --quorum-client-cert /etc/ai-memory/fed/node.crt --quorum-client-key /etc/ai-memory/fed/node.key --quorum-ca-cert /etc/ai-memory/fed/ca.crt --quorum-timeout-ms 8000%{ endif }
   - path: /etc/systemd/system/ai-memory-fed-bootstrap.service
     permissions: '0644'
     content: |
@@ -290,6 +298,12 @@ write_files:
       ) || fail "could not write the daemon config"
       chown root:aimemory "$DAEMON_CFG_DIR/config.toml"
       chmod 0640 "$DAEMON_CFG_DIR/config.toml"
+      # Unit environment is explicit and auditable. Header trust is
+      # intentionally absent/off: the mTLS-enrolled load generator must also
+      # present this node's API key before its admin agent id is considered.
+      printf 'AI_MEMORY_ADMIN_AGENT_IDS=ai:hive-loadgen-f2\n' > "$FED_DIR/runtime.env"
+      chown root:aimemory "$FED_DIR/runtime.env"
+      chmod 0640 "$FED_DIR/runtime.env"
       # NOTE: tier is left unset, so the daemon keeps its compiled default
       # (semantic). A Track-D-only run that does not need the embedder can
       # add `tier = "keyword"` to that file and restart -- the same
@@ -320,7 +334,9 @@ write_files:
       # script does not need and systemd does not grant -- a needless
       # arbitrary-code surface on an over-the-wire-delivered file.
       PEERS="$(sed -n 's/^AI_MEMORY_QUORUM_PEERS=//p' "$FED_DIR/peers.conf" | tail -1 | tr -d '"\r')"
+%{ if federation_enabled }
       [ -n "$PEERS" ] || fail "peers.conf carries no AI_MEMORY_QUORUM_PEERS; refusing to start a federated node with an empty peer list"
+%{ endif }
       BAD_PEER=0
       OLD_IFS=$IFS
       IFS=,
@@ -335,8 +351,10 @@ write_files:
 
       # --- E. install peer public keys (transport-lane enrollment) -----
       PEER_PUBS=$(ls -1 "$FED_DIR"/peers/*.pub 2>/dev/null | wc -l)
+%{ if federation_enabled }
       [ "$PEER_PUBS" -ge 1 ] || fail "no peer public keys under $FED_DIR/peers"
       cp "$FED_DIR"/peers/*.pub "$KEY_DIR"/ || fail "could not install peer public keys"
+%{ endif }
       chown -R aimemory:aimemory "$KEY_DIR"
       # $FED_DIR stays root-owned (custody split above); the daemon reads it as
       # group aimemory and cannot rewrite its own trust anchors.
@@ -411,7 +429,6 @@ write_files:
 
       : > "$FED_DIR/MESH-READY"
       echo "[fed-bootstrap] MESH READY node ${node_index}/${node_count} identity=$FED_ID peers=$PEERS author=$AUTHOR_ID"
-%{~ endif }
   - path: /opt/ai-memory/provision.sh
     permissions: '0755'
     content: |
@@ -425,40 +442,32 @@ write_files:
       mkdir -p /opt/ai-memory/bin /var/log/ai-memory
       chown -R aimemory:aimemory /opt/ai-memory /var/log/ai-memory
 
-      # --- build + install pgvector from source against pg16 (#2293) ---
-      # The noble apt package pins 0.6.0, below the tested 0.7.x-0.8.x range.
-      # Pin to the v0.9.0 GA-certified v0.8.4 tag instead.
+      # --- build + install certified pgvector 0.8.6 against PG18 ---
+      # Build the exact certified v0.8.6 tag rather than accepting apt drift.
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/vector.so" ]; then
         rm -rf /opt/pgvector-src
-        git clone --branch v0.8.4 --depth 1 https://github.com/pgvector/pgvector.git /opt/pgvector-src
+        git clone --branch v0.8.6 --depth 1 https://github.com/pgvector/pgvector.git /opt/pgvector-src
         cd /opt/pgvector-src
         make PG_CONFIG=/usr/bin/pg_config
         make install PG_CONFIG=/usr/bin/pg_config
       fi
 
-      # --- build + install Apache AGE from source against pg16 ---
-      # AGE is source-only. Pin the EXACT 1.6.0/PG16 release so the DO substrate
-      # is version-identical to infra/lan-parity-test/Dockerfile.pg-age-vector
-      # (FROM apache/age:release_PG16_1.6.0). NOTE the git ref and the docker tag
-      # DIFFER: the apache/age GitHub repo has NO ref named `release_PG16_1.6.0`
-      # (that underscore form is the DOCKER tag). The git branch/tag are
-      # slash-delimited -- `release/PG16/1.6.0` (== tag `PG16/v1.6.0-rc0`,
-      # commit 2db2f060), the same 1.6.0 code the docker image ships. An
-      # unpinned branch (PG16/master) can drift the AGE version between the free
-      # local parity run and the paid DO run, so a cert result proven locally
-      # would not be proven on DO. (#2851 -- the underscore ref failed
-      # `git checkout` under `set -e` and aborted the whole provision.)
+      # --- build + install certified Apache AGE 1.8.0 against PG18 ---
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
         rm -rf /opt/age-src
         git clone https://github.com/apache/age.git /opt/age-src
         cd /opt/age-src
-        git checkout release/PG16/1.6.0
+        git checkout release/PG18/1.8.0
+        # bison 3.8 flags AGE's %pure-parser as deprecated; under -Werror that is
+        # fatal (same fix as the f1 macOS tier build). Drop -Werror outright —
+        # "-Wno-error=other" is not a valid gcc warning name and fails the build.
+        sed -i 's/-Werror//g' Makefile
         make PG_CONFIG=/usr/bin/pg_config
         make install PG_CONFIG=/usr/bin/pg_config
       fi
 
       # --- preload AGE + restart postgres ---
-      PGCONF="/etc/postgresql/16/main/postgresql.conf"
+      PGCONF="/etc/postgresql/18/main/postgresql.conf"
       if ! grep -q "shared_preload_libraries.*age" "$PGCONF"; then
         echo "shared_preload_libraries = 'age'" >> "$PGCONF"
       fi
@@ -476,6 +485,28 @@ write_files:
       sudo -u postgres psql -d aimemory -c "GRANT ALL ON SCHEMA ag_catalog TO aimemory;" || true
       sudo -u postgres psql -d aimemory -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('vector','age');"
 
+      # Transaction pooling is part of the Phase-A baseline so Phase-B results
+      # remain comparable. PostgreSQL stays loopback-only behind PgBouncer.
+      cat > /etc/pgbouncer/pgbouncer.ini <<'PGB'
+      [databases]
+      aimemory = host=127.0.0.1 port=5432 dbname=aimemory
+      [pgbouncer]
+      listen_addr = 127.0.0.1
+      listen_port = 6432
+      auth_type = scram-sha-256
+      auth_file = /etc/pgbouncer/userlist.txt
+      pool_mode = transaction
+      max_client_conn = 2000
+      default_pool_size = 100
+      PGB
+      printf '"aimemory" "${db_password}"\n' > /etc/pgbouncer/userlist.txt
+      chown postgres:postgres /etc/pgbouncer/pgbouncer.ini /etc/pgbouncer/userlist.txt
+      chmod 0600 /etc/pgbouncer/userlist.txt
+      systemctl enable --now pgbouncer
+
+      echo "PostgreSQL: $(sudo -u postgres psql -Atc 'SELECT version()')"
+      sudo -u postgres psql -d aimemory -Atc "SELECT extname || ': ' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
+
       # --- ai-memory binary (operator-published sal-postgres tarball) ---
       # NOTE: the binary MUST be compiled with --features sal-postgres for the
       # postgres+AGE path. For ad-hoc runs the operator scp's a local build over
@@ -488,8 +519,7 @@ write_files:
       chown -R aimemory:aimemory /opt/ai-memory
 
       systemctl daemon-reload
-%{~ if federation_enabled }
-      # Track D: do NOT start serve here. The federated overlay drop-in binds
+      # TLS is universal: do NOT start serve here. The overlay binds
       # an EnvironmentFile that only exists once federate.sh has delivered the
       # peer list, so an early start would just crash-loop. The one-shot
       # bootstrap unit owns the ordering; --no-block keeps cloud-init's runcmd
@@ -499,12 +529,6 @@ write_files:
       fi
       systemctl enable ai-memory-fed-bootstrap || true
       systemctl start --no-block ai-memory-fed-bootstrap || true
-%{~ else }
-      # serve only starts once a sal-postgres binary is present.
-      if [ -x /opt/ai-memory/bin/ai-memory ]; then
-        systemctl enable --now ai-memory || true
-      fi
-%{~ endif }
       echo "=== provision complete $(date -u) ==="
 runcmd:
   - bash /opt/ai-memory/provision.sh
