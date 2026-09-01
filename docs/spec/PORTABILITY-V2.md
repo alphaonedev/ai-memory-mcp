@@ -116,7 +116,7 @@ The v2 envelope keeps v1 §3's JSON object shape with these changes:
 ## V2-5. Embeddings + indexes are disposable, embedder-tagged caches (R72)
 
 Extends v1 §4. **Embeddings and any ANN/vector index are NEVER the record of truth** — they are disposable caches rebuildable from `memories.content` under a named embedder. v2 requires:
-- Every exported embedding carries an **`embedder_tag`** = `{model, dim, backend}` (e.g. `google/gemini-embedding-2 / 768 / openrouter`) so an importer knows whether to reuse or re-embed.
+- Every exported embedding carries an **`embedder_tag`** = `{model, dim, backend}` (e.g. `google/gemini-embedding-001 / 768 / openrouter`) so an importer knows whether to reuse or re-embed.
 - A conforming importer MAY drop all embeddings and rebuild; the acceptance bar (R72) is **recall@10 within 5% absolute of baseline** on a pinned eval set after a different-embedder rebuild.
 - The index itself is never exported as authoritative; only the embedder tag + the source content are.
 

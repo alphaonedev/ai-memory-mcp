@@ -3737,6 +3737,59 @@ fn load_active_keypair_for_mcp_in(
 /// `AI_MEMORY_EMBED_BACKFILL_BATCH` for ops experimentation.
 pub const DEFAULT_EMBED_BACKFILL_BATCH_SIZE: usize = 64;
 
+/// #3329 — startup budget for `backfill_on_boot = "blocking"`.
+///
+/// Even in the opt-in blocking mode the boot backfill must never block the MCP
+/// `initialize` handshake unboundedly. The sweep is cut at the next batch
+/// boundary once this elapses (worst case: budget + one in-flight batch), the
+/// remainder is handed to the background drain, and a WARN is logged. Chosen
+/// below the Codex CLI 30 s client timeout so the rest of boot still fits.
+pub(crate) const BOOT_BACKFILL_BLOCKING_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(20);
+
+/// #3329 — spawn the detached background embedding-backfill drain used by the
+/// `background` boot posture (and by `blocking` for the post-budget remainder).
+///
+/// The thread opens its OWN [`rusqlite::Connection`] — the stdio loop owns the
+/// primary one — and runs the UNBOUNDED sweep, so the MCP tool surface is
+/// available on the stdio loop immediately while the backlog drains. Data
+/// integrity is unaffected: the durable memory TEXT is never touched, only the
+/// derived vector is written (idempotently, per-row-isolated — #1595).
+///
+/// Generic over the embedder (rather than the concrete [`Embedder`]) so the
+/// background drain is unit-testable with a mock `Embed` implementation; the
+/// production call passes a cloned `Embedder` (cheap — every variant is
+/// `Arc`-backed).
+fn spawn_boot_backfill<E: Embed + Send + 'static>(db_path: &Path, emb: E, batch_size: usize) {
+    let db_path = db_path.to_path_buf();
+    std::thread::spawn(move || {
+        let mut conn = match db::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "ai-memory: #3329 background embedding backfill could not open its own \
+                     DB connection ({e}); unembedded rows stay keyword-recallable — run \
+                     `ai-memory reembed` to heal"
+                );
+                return;
+            }
+        };
+        let started = std::time::Instant::now();
+        match run_embedding_backfill_with_batch_size(&mut conn, &emb, batch_size) {
+            Ok(n) if n > 0 => eprintln!(
+                "ai-memory: #3329 background embedding backfill complete \
+                 ({n} vector(s) filled in {:.1}s)",
+                started.elapsed().as_secs_f64()
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "ai-memory: #3329 background embedding backfill failed: {e} — unembedded \
+                 rows stay keyword-recallable; run `ai-memory reembed`"
+            ),
+        }
+    });
+}
+
 /// v0.7.0 Wave-2 A5 (issue #853) — chunked boot embedding backfill.
 ///
 /// Replaces the original per-row `emb.embed()` + `db::set_embedding()`
@@ -3830,6 +3883,48 @@ pub fn run_embedding_backfill_with_batch_size(
     emb: &dyn Embed,
     batch_size: usize,
 ) -> anyhow::Result<usize> {
+    // Unbounded (no deadline) — the historical contract: drain the whole
+    // backlog. The #3329 boot path calls the bounded sibling directly.
+    run_embedding_backfill_bounded(conn, emb, batch_size, None).map(|p| p.ok)
+}
+
+/// #3329 — progress accounting returned by [`run_embedding_backfill_bounded`].
+///
+/// `deadline_hit` is `true` when a caller-supplied startup budget cut the sweep
+/// short with a backlog still remaining, so the boot path can hand the
+/// remainder to a background drain.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackfillProgress {
+    /// Rows whose vector was written this sweep.
+    pub ok: usize,
+    /// Rows skipped (oversize / decrypt-failed / per-row embed failure).
+    pub skipped: usize,
+    /// Rows scanned (embedded + skipped).
+    pub scanned: usize,
+    /// `true` when the `deadline` was reached before the backlog drained.
+    pub deadline_hit: bool,
+}
+
+/// #3329 — deadline-aware core of the boot embedding backfill.
+///
+/// Identical to [`run_embedding_backfill_with_batch_size`] except that when
+/// `deadline` is `Some` and reached, the sweep stops at the NEXT batch boundary
+/// (never mid-batch — a started chunk always finishes so a partial write can
+/// never corrupt the batch transaction) and returns with
+/// [`BackfillProgress::deadline_hit`] set. `deadline = None` reproduces the
+/// historical unbounded drain exactly.
+///
+/// # Errors
+///
+/// Same contract as [`run_embedding_backfill_with_batch_size`] — only the
+/// bounded `get_unembedded_ids_batch_after` scans propagate; per-chunk embedder
+/// / writer faults are logged, counted, and skipped past.
+pub fn run_embedding_backfill_bounded(
+    conn: &mut rusqlite::Connection,
+    emb: &dyn Embed,
+    batch_size: usize,
+    deadline: Option<std::time::Instant>,
+) -> anyhow::Result<BackfillProgress> {
     // Defensive: a zero batch would make the bounded fetch below a
     // no-op-forever. The resolver clamps to 1..=10000 by construction
     // (`AppConfig::resolve_embeddings`), but if a future caller passes
@@ -3854,8 +3949,18 @@ pub fn run_embedding_backfill_with_batch_size(
     let mut skipped = 0usize;
     let mut scanned = 0usize;
     let mut announced = false;
+    let mut deadline_hit = false;
     let mut cursor: Option<String> = None;
     loop {
+        // #3329 — startup-budget check at the BATCH BOUNDARY (never mid-chunk,
+        // so an in-flight `set_embeddings_batch` transaction always completes).
+        // The remainder is handed to a background drain by the boot caller.
+        if let Some(deadline) = deadline
+            && std::time::Instant::now() >= deadline
+        {
+            deadline_hit = true;
+            break;
+        }
         let scan = db::get_unembedded_ids_batch_after(conn, cursor.as_deref(), batch_size)?;
         if scan.raw_last_id.is_none() {
             // Idempotence: the RAW fetch was empty ⇒ end of corpus. v1.0.0
@@ -3929,7 +4034,12 @@ pub fn run_embedding_backfill_with_batch_size(
     if scanned > 0 {
         eprintln!("ai-memory: backfilled {ok}/{scanned} (skipped {skipped})");
     }
-    Ok(ok)
+    Ok(BackfillProgress {
+        ok,
+        skipped,
+        scanned,
+        deadline_hit,
+    })
 }
 
 /// #1595 — vectors-plus-skips outcome of embedding one fetched chunk.
@@ -4415,35 +4525,88 @@ pub fn run_mcp_server(
         match Embedder::from_resolved(&resolved_embeddings, tier_config.embedding_model) {
             Ok(Some(emb)) => {
                 eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
-                // Backfill embeddings for memories that don't have them.
-                // v0.7.0 Wave-2 A5 (issue #853): scan all unembedded rows
-                // in a single query, then chunk into fixed-size batches
-                // and call `embed_batch` + `set_embeddings_batch` per
-                // chunk. This collapses N per-row UPDATE round-trips into
-                // ceil(N/B) transaction commits and creates the surface
-                // for a vectorised embedder backend to land later.
-                //
                 // v0.7.0 issue #1260 — batch size from the canonical #1146
                 // precedence ladder (AI_MEMORY_EMBED_BACKFILL_BATCH env >
-                // [embeddings].backfill_batch config > compiled default
-                // 100), via the same resolver output the embedder was
-                // built from.
+                // [embeddings].backfill_batch config > compiled default 100),
+                // via the same resolver output the embedder was built from.
                 let embed_batch_size = resolved_embeddings.backfill_batch as usize;
-                if let Err(e) =
-                    run_embedding_backfill_with_batch_size(&mut conn, &emb, embed_batch_size)
-                {
-                    eprintln!("ai-memory: backfill failed: {e}");
-                }
-                // v1.0.0 #2167 §5+§6 — boot ORDER: embedder→adopt→census→
-                // index-seed. Runs AFTER backfill (which stamps the active
-                // space on newly-embedded rows) so the census reflects the
-                // fully-stamped corpus; the index seed (below) then filters
-                // to the active space.
-                // v1.0.0 #2167 (S8) — seed the process-wide active-space so
-                // the archive-RESTORE heal classifies restored rows against
-                // this process's live model.
+
+                // v1.0.0 #2167 (S8) — seed the process-wide active-space
+                // BEFORE any backfill (foreground or background) so the
+                // archive-RESTORE heal and the boot adoption below classify
+                // rows against this process's live model.
                 crate::embeddings::set_active_embedding_space(Some(emb.space_fingerprint()));
+                // v1.0.0 #2167 §5+§6 — adopt legacy NULL-space rows + emit the
+                // census WARN. Runs on the quiescent boot corpus, before the
+                // #3329 backfill dispatch: adoption stamps EXISTING-embedded
+                // NULL-space rows (a set disjoint from the UNEMBEDDED rows the
+                // backfill creates), so their order is correctness-independent,
+                // and running it first avoids write contention with a
+                // background drain that opens its own connection.
                 db::embedding_space_boot_maintenance(&conn, &emb.space_fingerprint(), emb.dim());
+
+                // #3329 — WHEN the boot embedding backfill runs relative to the
+                // MCP `initialize` handshake. Pre-#3329 the sweep ran
+                // SYNCHRONOUSLY HERE, before the stdio loop opened, so a DB
+                // with an embedding backlog (or a concurrent `reembed`) timed
+                // out the client's 30 s handshake and the server came up
+                // advertising 0 tools. DATA INTEGRITY is unaffected in every
+                // mode: the durable memory TEXT is the source of truth and is
+                // never touched here — only the derived vector is deferred, and
+                // not-yet-embedded rows stay keyword-recallable, so recall
+                // degrades (fewer semantically-scored rows) rather than ever
+                // returning a wrong result (the same already-supported
+                // partial-embed state as a federation import / partial reembed;
+                // the #1579 B3 HNSW warm build below already serves keyword/FTS
+                // until vectors and the index catch up).
+                match app_config.resolve_embed_backfill_on_boot() {
+                    crate::config::BackfillOnBoot::Off => {
+                        eprintln!(
+                            "ai-memory: [embeddings] backfill_on_boot=off — skipping the boot \
+                             embedding backfill; unembedded rows stay keyword-recallable. Run \
+                             `ai-memory reembed` to fill vectors (#3329)"
+                        );
+                    }
+                    crate::config::BackfillOnBoot::Blocking => {
+                        eprintln!(
+                            "ai-memory: [embeddings] backfill_on_boot=blocking — draining the \
+                             embedding backlog BEFORE completing the MCP initialize handshake; \
+                             bounded to {}s, then the remainder drains in the background. Prefer \
+                             the default `background`, or pre-drain with `ai-memory reembed` (#3329)",
+                            BOOT_BACKFILL_BLOCKING_BUDGET.as_secs()
+                        );
+                        let deadline = std::time::Instant::now() + BOOT_BACKFILL_BLOCKING_BUDGET;
+                        match run_embedding_backfill_bounded(
+                            &mut conn,
+                            &emb,
+                            embed_batch_size,
+                            Some(deadline),
+                        ) {
+                            Ok(progress) if progress.deadline_hit => {
+                                tracing::warn!(
+                                    "boot embedding backfill hit the {}s startup budget with a \
+                                     backlog remaining ({} filled so far) — draining the \
+                                     remainder in the background so the handshake is not blocked \
+                                     (#3329)",
+                                    BOOT_BACKFILL_BLOCKING_BUDGET.as_secs(),
+                                    progress.ok
+                                );
+                                spawn_boot_backfill(db_path, emb.clone(), embed_batch_size);
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("ai-memory: backfill failed: {e}"),
+                        }
+                    }
+                    crate::config::BackfillOnBoot::Background => {
+                        eprintln!(
+                            "ai-memory: [embeddings] backfill_on_boot=background — MCP tools are \
+                             available immediately; the embedding backlog drains in the \
+                             background and semantic recall degrades to keyword until vectors \
+                             exist (#3329)"
+                        );
+                        spawn_boot_backfill(db_path, emb.clone(), embed_batch_size);
+                    }
+                }
                 Some(emb)
             }
             Ok(None) => None,
@@ -16551,6 +16714,96 @@ mod backfill_resilience_1595_tests {
         assert!(
             remaining[0].2.contains(POISON_MARKER),
             "the surviving unembedded row is the poison row"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #3329 — non-blocking boot embedding backfill.
+    // -----------------------------------------------------------------
+
+    /// Healthy embedder: every row → a fixed 4-dim vector. Unit struct so it
+    /// is `Send + 'static` and can move into `spawn_boot_backfill`.
+    struct FixedFourDimEmbedder;
+    impl Embed for FixedFourDimEmbedder {
+        fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.25_f32; 4])
+        }
+    }
+
+    /// A deadline already in the past short-circuits at the FIRST batch
+    /// boundary: nothing is embedded and `deadline_hit` is set, so the boot
+    /// path can hand the whole backlog to the background drain and the MCP
+    /// `initialize` handshake is never blocked (#3329).
+    #[test]
+    fn bounded_backfill_past_deadline_short_circuits_3329() {
+        let mut conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        for i in 0..5 {
+            seed(&conn, &format!("row-{i}"), "healthy content");
+        }
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let progress = run_embedding_backfill_bounded(&mut conn, &FixedFourDimEmbedder, 2, Some(past))
+            .expect("bounded sweep must not error");
+        assert!(progress.deadline_hit, "a past deadline must report deadline_hit");
+        assert_eq!(progress.ok, 0, "nothing embedded when the budget is already spent");
+        assert_eq!(
+            db::get_unembedded_ids(&conn).unwrap().len(),
+            5,
+            "the whole backlog remains for the background drain"
+        );
+    }
+
+    /// `deadline = None` reproduces the historical UNBOUNDED drain: the whole
+    /// backlog is embedded and `deadline_hit` is false.
+    #[test]
+    fn bounded_backfill_none_deadline_drains_all_3329() {
+        let mut conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        for i in 0..5 {
+            seed(&conn, &format!("row-{i}"), "healthy content");
+        }
+        let progress = run_embedding_backfill_bounded(&mut conn, &FixedFourDimEmbedder, 2, None)
+            .expect("unbounded sweep must not error");
+        assert!(!progress.deadline_hit, "no deadline → never deadline_hit");
+        assert_eq!(progress.ok, 5, "every row embedded");
+        assert!(
+            db::get_unembedded_ids(&conn).unwrap().is_empty(),
+            "backlog fully drained"
+        );
+    }
+
+    /// The `background` boot posture: `spawn_boot_backfill` opens its OWN
+    /// connection and EVENTUALLY fills every vector while the caller (the
+    /// stdio loop, here the test thread) is never blocked. Uses a file-backed
+    /// DB because the background thread opens a fresh connection to `db_path`.
+    #[test]
+    fn background_backfill_eventually_fills_vectors_3329() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bf-3329.db");
+        {
+            let conn = db::open(&db_path).expect("open file db");
+            for i in 0..4 {
+                seed(&conn, &format!("bg-row-{i}"), "healthy content");
+            }
+            assert_eq!(
+                db::get_unembedded_ids(&conn).unwrap().len(),
+                4,
+                "precondition: a backlog exists"
+            );
+        }
+        // Spawn the detached drain; the call itself returns immediately.
+        super::spawn_boot_backfill(&db_path, FixedFourDimEmbedder, 2);
+        // Poll (bounded ~5s) until the background drain fills every vector.
+        let probe = db::open(&db_path).expect("reopen file db");
+        let mut drained = false;
+        for _ in 0..50 {
+            if db::get_unembedded_ids(&probe).unwrap().is_empty() {
+                drained = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            drained,
+            "the background backfill must eventually fill every vector (#3329)"
         );
     }
 

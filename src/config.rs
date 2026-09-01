@@ -2838,6 +2838,168 @@ fn warn_legacy_config_root_once(legacy: &Path, xdg: &Path) {
     });
 }
 
+/// macOS config-path (#3329 sibling) — one-shot stderr WARN when the
+/// documented `~/.config/ai-memory/config.toml` is being loaded while a
+/// platform (`~/Library/Application Support/ai-memory/config.toml`) config
+/// ALSO exists and is therefore SHADOWED. Never silently pick one operator
+/// file over another. `Once`-gated (CONCURRENCY-16); `eprintln!` because this
+/// fires during boot before file logging is initialised.
+fn warn_macos_library_config_shadowed_once(documented: &Path, library: &Path) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "ai-memory: loading the DOCUMENTED config {} — a second config exists at the \
+             platform path {} and is being IGNORED (macOS resolves config.toml at \
+             `~/.config`, matching every doc and the identity-keys split). Delete or merge \
+             the shadowed Library file to remove the ambiguity.",
+            documented.display(),
+            library.display()
+        );
+    });
+}
+
+/// macOS config-path (#3329 sibling) — one-shot stderr WARN when ONLY the
+/// platform (`~/Library/Application Support`) config exists: it is honoured (an
+/// operator's config is never silently dropped) but the operator is told it
+/// sits at the non-documented location and should move it to `~/.config`.
+fn warn_macos_library_config_only_once(documented: &Path, library: &Path) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "ai-memory: loading config from the macOS platform path {} — the DOCUMENTED \
+             location is {} (config.toml resolves at `~/.config` on macOS, matching every \
+             doc and the identity-keys split). The Library file is still honoured so nothing \
+             is silently dropped; move it to `~/.config/ai-memory/config.toml` to match the docs.",
+            library.display(),
+            documented.display()
+        );
+    });
+}
+
+/// #3329 sibling — one-shot boot WARN to emit alongside a resolved config path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigPathWarning {
+    /// No warning.
+    None,
+    /// #3002 (Linux/Windows) — the legacy `$HOME/.config` file is being
+    /// honoured because the `XDG_CONFIG_HOME` root carries none.
+    LegacyXdg { legacy: PathBuf, xdg: PathBuf },
+    /// macOS — the documented `~/.config` config is loaded while a Library
+    /// config also exists and is shadowed.
+    MacosLibraryShadowed { documented: PathBuf, library: PathBuf },
+    /// macOS — only the Library config exists; honoured with a move-me WARN.
+    MacosLibraryOnly { documented: PathBuf, library: PathBuf },
+}
+
+/// #3329 sibling — the resolved config path plus the WARN (if any) to emit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigPathChoice {
+    path: PathBuf,
+    warning: ConfigPathWarning,
+}
+
+/// Pure, platform-parameterised core of [`AppConfig::config_path`] (extracted
+/// so the macOS branch is unit-testable ON any host).
+///
+/// - `platform`  — `dirs::config_dir()/ai-memory/config.toml` (XDG on Linux;
+///   `~/Library/Application Support/ai-memory/config.toml` on macOS).
+/// - `dotconfig` — `$HOME/.config/ai-memory/config.toml` (the DOCUMENTED path).
+/// - `is_macos`  — `cfg!(target_os = "macos")` in production; a test knob here.
+/// - `exists`    — filesystem existence predicate (`Path::exists` in prod).
+///
+/// # macOS (#3329 sibling)
+///
+/// On macOS `dirs::config_dir()` is `~/Library/Application Support`, but every
+/// doc — QUICKSTART, CONFIG_SCHEMA, ADMIN_GUIDE, and the explicit
+/// keys-vs-config split in `batman-active-mode.md` — promises config.toml at
+/// the XDG `~/.config/ai-memory/config.toml`. Pre-fix, the platform (Library)
+/// path won unconditionally, so an operator who followed the docs and wrote
+/// `~/.config/ai-memory/config.toml` had it SILENTLY IGNORED whenever a Library
+/// config existed (e.g. a first-boot default) — a dangerous silent degradation
+/// to compiled defaults (MiniLM-384, no LLM). We therefore treat `~/.config` as
+/// the documented PRIMARY on macOS, keeping the Library path as a WARN-on-use
+/// read-side fallback so no existing operator config is ever dropped either.
+///
+/// # Linux / Windows (#3002 — unchanged)
+///
+/// `dirs::config_dir()` IS the documented path (XDG on Linux), so it wins;
+/// the legacy `~/.config` file is honoured only when the XDG root carries none,
+/// with a move-me WARN. This branch is byte-for-byte the pre-#3329 logic.
+fn resolve_config_path_choice(
+    platform: Option<PathBuf>,
+    dotconfig: Option<PathBuf>,
+    is_macos: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<ConfigPathChoice> {
+    if is_macos {
+        match (dotconfig, platform) {
+            (Some(doc), Some(lib)) => {
+                if exists(&doc) {
+                    let warning = if lib != doc && exists(&lib) {
+                        ConfigPathWarning::MacosLibraryShadowed {
+                            documented: doc.clone(),
+                            library: lib,
+                        }
+                    } else {
+                        ConfigPathWarning::None
+                    };
+                    Some(ConfigPathChoice {
+                        path: doc,
+                        warning,
+                    })
+                } else if lib != doc && exists(&lib) {
+                    Some(ConfigPathChoice {
+                        warning: ConfigPathWarning::MacosLibraryOnly {
+                            documented: doc,
+                            library: lib.clone(),
+                        },
+                        path: lib,
+                    })
+                } else {
+                    // Neither exists → new installs land at the DOCUMENTED path
+                    // (matches the docs; `write_default_if_missing` creates it
+                    // there).
+                    Some(ConfigPathChoice {
+                        path: doc,
+                        warning: ConfigPathWarning::None,
+                    })
+                }
+            }
+            (Some(doc), None) => Some(ConfigPathChoice {
+                path: doc,
+                warning: ConfigPathWarning::None,
+            }),
+            (None, Some(lib)) => Some(ConfigPathChoice {
+                path: lib,
+                warning: ConfigPathWarning::None,
+            }),
+            (None, None) => None,
+        }
+    } else {
+        match (platform, dotconfig) {
+            (Some(xdg_path), Some(legacy_path))
+                if xdg_path != legacy_path && !exists(&xdg_path) && exists(&legacy_path) =>
+            {
+                Some(ConfigPathChoice {
+                    warning: ConfigPathWarning::LegacyXdg {
+                        legacy: legacy_path.clone(),
+                        xdg: xdg_path,
+                    },
+                    path: legacy_path,
+                })
+            }
+            (Some(xdg_path), _) => Some(ConfigPathChoice {
+                path: xdg_path,
+                warning: ConfigPathWarning::None,
+            }),
+            (None, legacy_path) => legacy_path.map(|p| ConfigPathChoice {
+                path: p,
+                warning: ConfigPathWarning::None,
+            }),
+        }
+    }
+}
+
 /// Persistent configuration loaded from `~/.config/ai-memory/config.toml`.
 ///
 /// All fields are optional — CLI flags override file values, which override
@@ -3601,7 +3763,8 @@ pub struct LlmAutoTagSection {
 ///                                              # #1067 API alias /
 ///                                              # openai-compatible (#1598)
 /// base_url       = "https://openrouter.ai/api/v1"
-/// model          = "google/gemini-embedding-2"
+/// model          = "google/gemini-embedding-001"  # OpenRouter slug; native
+///                                              # 3072-dim, honours dim=768
 /// api_key_env    = "OPENROUTER_API_KEY"        # mutually exclusive with
 /// # api_key_file = "/etc/ai-memory/keys/embed.key"   # mode 0400 enforced
 /// dim            = 3072                        # only needed for models
@@ -3661,6 +3824,79 @@ pub struct EmbeddingsSection {
     /// fall back to the compiled default (100) with a WARN. Env
     /// override: `AI_MEMORY_EMBED_BACKFILL_BATCH` (#38).
     pub backfill_batch: Option<u32>,
+
+    /// #3329 — WHEN the boot embedding backfill runs relative to the MCP
+    /// `initialize` handshake: `background` (the default — expose the full
+    /// tool surface immediately and drain the backlog on a background task),
+    /// `blocking` (drain first, but BOUNDED by a startup budget so it can
+    /// never block the handshake unboundedly), or `off` (skip the boot sweep;
+    /// heal out-of-band with `ai-memory reembed`). Env override:
+    /// `AI_MEMORY_EMBED_BACKFILL_ON_BOOT`. Parsed via [`BackfillOnBoot::parse`];
+    /// resolved through [`AppConfig::resolve_embed_backfill_on_boot`].
+    pub backfill_on_boot: Option<String>,
+}
+
+/// #3329 — boot embedding-backfill posture for the MCP stdio serve path.
+///
+/// The semantic/smart/autonomous tiers run an embedding backfill sweep at boot
+/// to fill vectors for memories written while no embedder was configured.
+/// Pre-#3329 that sweep ran SYNCHRONOUSLY before the MCP `initialize` handshake
+/// completed, so against a DB with an embedding backlog the client timed out
+/// (Codex CLI: 30 s) and the server came up advertising 0 tools. This knob
+/// controls WHEN the sweep runs relative to the handshake.
+///
+/// Data integrity is unaffected in every mode: the durable memory TEXT is the
+/// source of truth and is never touched here — only the derived vector is
+/// deferred. Not-yet-embedded rows stay keyword-recallable, so recall degrades
+/// (fewer semantically-scored rows) rather than ever returning a wrong result
+/// — the same already-supported partial-embed state as a federation import or
+/// a partial `reembed`.
+///
+/// Precedence: `AI_MEMORY_EMBED_BACKFILL_ON_BOOT` env >
+/// `[embeddings].backfill_on_boot` config > compiled default
+/// [`BackfillOnBoot::Background`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BackfillOnBoot {
+    /// Default. Complete the handshake and expose the FULL tool surface
+    /// immediately; drain the backlog on a detached background task. Semantic
+    /// recall degrades to keyword for not-yet-embedded rows until their vectors
+    /// exist.
+    #[default]
+    Background,
+    /// Pre-#3329 behaviour: drain the backlog BEFORE completing the handshake,
+    /// but BOUNDED by [`BOOT_BACKFILL_BLOCKING_BUDGET`] so it can never block
+    /// the handshake unboundedly — the remainder drains in the background and
+    /// a WARN is logged.
+    Blocking,
+    /// Skip the boot backfill entirely. Unembedded rows stay keyword-recallable;
+    /// fill their vectors out-of-band with `ai-memory reembed`.
+    Off,
+}
+
+impl BackfillOnBoot {
+    /// Parse the wire token (case-insensitive, trimmed). Returns `None` for an
+    /// unrecognised value so the resolver can WARN and fall back to the
+    /// fail-SAFE default (never re-introduce the #3329 handshake block on a
+    /// typo).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "background" | "async" | "deferred" => Some(Self::Background),
+            "blocking" | "sync" | "synchronous" => Some(Self::Blocking),
+            "off" | "none" | "disabled" | "skip" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// Canonical lower-case token for banners / round-tripping.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::Blocking => "blocking",
+            Self::Off => "off",
+        }
+    }
 }
 
 /// v0.7.x (#1146) — `[reranker]` sectioned cross-encoder
@@ -4786,6 +5022,12 @@ pub const ENV_EMBED_API_KEY: &str = "AI_MEMORY_EMBED_API_KEY";
 /// (`[embeddings].backfill_batch`). Hoisted from a raw literal in the
 /// resolver per the no-hardcoded-literals discipline (#1598).
 pub const ENV_EMBED_BACKFILL_BATCH: &str = "AI_MEMORY_EMBED_BACKFILL_BATCH";
+
+/// #3329 — env override for the boot embedding-backfill posture
+/// (`[embeddings].backfill_on_boot`). Values (case-insensitive):
+/// `background` (default) | `blocking` | `off`. See [`BackfillOnBoot`] and
+/// [`AppConfig::resolve_embed_backfill_on_boot`].
+pub const ENV_EMBED_BACKFILL_ON_BOOT: &str = "AI_MEMORY_EMBED_BACKFILL_ON_BOOT";
 
 /// v1.0.0 [#2626] — env override for the embedding vector DIMENSION
 /// (`[embeddings].dim`).
@@ -7633,24 +7875,31 @@ impl AppConfig {
     /// move it. New installs land at the XDG path (it is what is returned
     /// when neither exists, so `write_default_if_missing` creates it there).
     pub fn config_path() -> Option<PathBuf> {
-        let xdg = dirs::config_dir().map(|base| base.join(CONFIG_APP_DIR).join(CONFIG_FILE));
-        let legacy = std::env::var_os("HOME")
+        let platform = dirs::config_dir().map(|base| base.join(CONFIG_APP_DIR).join(CONFIG_FILE));
+        let dotconfig = std::env::var_os("HOME")
             .map(|home| Path::new(&home).join(LEGACY_CONFIG_DIR).join(CONFIG_FILE));
-        match (xdg, legacy) {
-            // The only divergent arm: XDG root differs from `~/.config`, the
-            // operator's config is still at the legacy path, and nothing was
-            // written at the new one. Honour what they actually have.
-            (Some(xdg_path), Some(legacy_path))
-                if xdg_path != legacy_path && !xdg_path.exists() && legacy_path.exists() =>
-            {
-                warn_legacy_config_root_once(&legacy_path, &xdg_path);
-                Some(legacy_path)
+        // #3329 sibling — the platform-parameterised core is unit-tested for
+        // BOTH `is_macos` values (macOS resolution can thus be verified on a
+        // Linux CI host). See [`resolve_config_path_choice`].
+        let choice = resolve_config_path_choice(
+            platform,
+            dotconfig,
+            cfg!(target_os = "macos"),
+            |p| p.exists(),
+        )?;
+        match &choice.warning {
+            ConfigPathWarning::None => {}
+            ConfigPathWarning::LegacyXdg { legacy, xdg } => {
+                warn_legacy_config_root_once(legacy, xdg);
             }
-            (xdg_path @ Some(_), _) => xdg_path,
-            // No platform config dir resolvable (no `$HOME`, no
-            // `XDG_CONFIG_HOME`): nothing to fall back to either.
-            (None, legacy_path) => legacy_path,
+            ConfigPathWarning::MacosLibraryShadowed { documented, library } => {
+                warn_macos_library_config_shadowed_once(documented, library);
+            }
+            ConfigPathWarning::MacosLibraryOnly { documented, library } => {
+                warn_macos_library_config_only_once(documented, library);
+            }
         }
+        Some(choice.path)
     }
 
     /// Load config from disk. Returns `AppConfig::default()` if file is missing.
@@ -8884,6 +9133,49 @@ impl AppConfig {
     ///
     /// DOC-6: reads the legacy `embed_url`/`embedding_model`/
     /// `ollama_url` fields as the lowest-precedence fallback layer.
+    /// #3329 — resolve the boot embedding-backfill posture with the canonical
+    /// env > config > compiled-default precedence.
+    ///
+    /// - env: [`ENV_EMBED_BACKFILL_ON_BOOT`]
+    /// - config: `[embeddings].backfill_on_boot`
+    /// - default: [`BackfillOnBoot::Background`]
+    ///
+    /// A present-but-unrecognised value at either layer WARNs once and falls
+    /// back to the default — fail SAFE, because a typo must never silently
+    /// re-introduce the #3329 handshake block (nor silently disable the sweep).
+    #[must_use]
+    pub fn resolve_embed_backfill_on_boot(&self) -> BackfillOnBoot {
+        if let Some(raw) = std::env::var(ENV_EMBED_BACKFILL_ON_BOOT)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            return BackfillOnBoot::parse(&raw).unwrap_or_else(|| {
+                tracing::warn!(
+                    "{ENV_EMBED_BACKFILL_ON_BOOT}={raw} unrecognised \
+                     (expected background|blocking|off) — using default {}",
+                    BackfillOnBoot::Background.as_str()
+                );
+                BackfillOnBoot::Background
+            });
+        }
+        if let Some(raw) = self
+            .embeddings
+            .as_ref()
+            .and_then(|e| e.backfill_on_boot.as_ref())
+            .filter(|s| !s.trim().is_empty())
+        {
+            return BackfillOnBoot::parse(raw).unwrap_or_else(|| {
+                tracing::warn!(
+                    "[embeddings].backfill_on_boot={raw} unrecognised \
+                     (expected background|blocking|off) — using default {}",
+                    BackfillOnBoot::Background.as_str()
+                );
+                BackfillOnBoot::Background
+            });
+        }
+        BackfillOnBoot::Background
+    }
+
     #[must_use]
     #[allow(deprecated)]
     pub fn resolve_embeddings(&self) -> ResolvedEmbeddings {
@@ -11015,11 +11307,15 @@ legacy_scoring = false
         );
     }
 
-    /// #3002 — when BOTH roots carry a `config.toml`, the `dirs::config_dir()`
-    /// one wins (the `$HOME/.config` path is a fallback, never an override).
-    /// The platform root is `XDG_CONFIG_HOME` on Linux and
-    /// `$HOME/Library/Application Support` on macOS — write the "XDG" file
-    /// at `dirs::config_dir()`, not at the env-var path, so macOS is covered.
+    /// #3002 / #3329 — when BOTH roots carry a `config.toml`:
+    /// * Linux/Windows: the `dirs::config_dir()` (XDG) file wins — `~/.config`
+    ///   is a fallback, never an override (#3002, unchanged).
+    /// * macOS: the DOCUMENTED `~/.config` file wins and the Library file is
+    ///   shadowed-with-WARN (#3329) — every doc promises config.toml at
+    ///   `~/.config` on macOS, so honouring Library over it silently ignored a
+    ///   docs-following operator's config. The macOS "both exist" precedence is
+    ///   exhaustively covered by `resolve_config_path_choice_macos_*` below;
+    ///   here we only pin the platform-appropriate winner.
     #[test]
     fn config_path_prefers_xdg_when_both_exist_3002() {
         // M9 — process-wide serialization via env_var_lock.
@@ -11057,9 +11353,249 @@ legacy_scoring = false
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+        // #3329 — on macOS the documented `~/.config` file wins over Library;
+        // everywhere else the `dirs::config_dir()` (XDG) file wins.
+        let expected = if cfg!(target_os = "macos") {
+            &legacy
+        } else {
+            &platform
+        };
         assert_eq!(
-            path, platform,
-            "the dirs::config_dir() root must win when it carries a config"
+            &path, expected,
+            "config_path must resolve the platform-appropriate winner when both roots \
+             carry a config (macOS → documented ~/.config; else → dirs::config_dir())"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3329 — `resolve_config_path_choice` pure-helper matrix. These verify the
+    // macOS config-path resolution ON ANY HOST (the production `is_macos` comes
+    // from `cfg!(target_os = "macos")`; here it is a parameter), so a Linux CI
+    // leg proves the macOS behaviour that the flaky macOS leg would otherwise
+    // be the only witness to.
+    // -----------------------------------------------------------------------
+
+    fn pb(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// Existence predicate over a fixed set of "present" paths.
+    fn present(set: &[&str]) -> impl Fn(&Path) -> bool {
+        // The returned closure captures only `owned` (by value), so it borrows
+        // nothing from `set` and needs no lifetime tie.
+        let owned: Vec<PathBuf> = set.iter().map(|s| pb(s)).collect();
+        move |p: &Path| owned.iter().any(|q| q == p)
+    }
+
+    const MAC_DOC: &str = "/Users/x/.config/ai-memory/config.toml";
+    const MAC_LIB: &str = "/Users/x/Library/Application Support/ai-memory/config.toml";
+
+    #[test]
+    fn macos_both_exist_documented_dotconfig_wins_library_shadowed_3329() {
+        let choice = resolve_config_path_choice(
+            Some(pb(MAC_LIB)),
+            Some(pb(MAC_DOC)),
+            true,
+            present(&[MAC_DOC, MAC_LIB]),
+        )
+        .expect("resolves");
+        assert_eq!(choice.path, pb(MAC_DOC), "documented ~/.config must win on macOS");
+        assert_eq!(
+            choice.warning,
+            ConfigPathWarning::MacosLibraryShadowed {
+                documented: pb(MAC_DOC),
+                library: pb(MAC_LIB),
+            },
+            "the shadowed Library config must produce a loud WARN, never silence"
+        );
+    }
+
+    #[test]
+    fn macos_only_documented_exists_no_warn_3329() {
+        let choice =
+            resolve_config_path_choice(Some(pb(MAC_LIB)), Some(pb(MAC_DOC)), true, present(&[MAC_DOC]))
+                .expect("resolves");
+        assert_eq!(choice.path, pb(MAC_DOC));
+        assert_eq!(choice.warning, ConfigPathWarning::None);
+    }
+
+    #[test]
+    fn macos_only_library_exists_is_honoured_with_move_me_warn_3329() {
+        // The operator's config must NEVER be silently dropped: an existing
+        // Library-only config is honoured, with a WARN telling them to move it.
+        let choice =
+            resolve_config_path_choice(Some(pb(MAC_LIB)), Some(pb(MAC_DOC)), true, present(&[MAC_LIB]))
+                .expect("resolves");
+        assert_eq!(choice.path, pb(MAC_LIB), "an existing Library config must be honoured");
+        assert_eq!(
+            choice.warning,
+            ConfigPathWarning::MacosLibraryOnly {
+                documented: pb(MAC_DOC),
+                library: pb(MAC_LIB),
+            }
+        );
+    }
+
+    #[test]
+    fn macos_neither_exists_new_install_lands_at_documented_path_3329() {
+        let choice =
+            resolve_config_path_choice(Some(pb(MAC_LIB)), Some(pb(MAC_DOC)), true, present(&[]))
+                .expect("resolves");
+        assert_eq!(
+            choice.path,
+            pb(MAC_DOC),
+            "new macOS installs must land at the DOCUMENTED ~/.config path"
+        );
+        assert_eq!(choice.warning, ConfigPathWarning::None);
+    }
+
+    #[test]
+    fn linux_both_exist_platform_xdg_wins_unchanged_3002() {
+        let xdg = "/home/x/.config/ai-memory/config.toml";
+        let choice = resolve_config_path_choice(
+            Some(pb(xdg)),
+            Some(pb(xdg)),
+            false,
+            present(&[xdg]),
+        )
+        .expect("resolves");
+        assert_eq!(choice.path, pb(xdg));
+        assert_eq!(choice.warning, ConfigPathWarning::None);
+    }
+
+    #[test]
+    fn linux_xdg_absent_legacy_present_falls_back_with_warn_3002() {
+        let xdg = "/nonstd/xdg/ai-memory/config.toml";
+        let legacy = "/home/x/.config/ai-memory/config.toml";
+        let choice = resolve_config_path_choice(
+            Some(pb(xdg)),
+            Some(pb(legacy)),
+            false,
+            present(&[legacy]),
+        )
+        .expect("resolves");
+        assert_eq!(choice.path, pb(legacy), "an existing legacy config must be honoured (#3002)");
+        assert_eq!(
+            choice.warning,
+            ConfigPathWarning::LegacyXdg {
+                legacy: pb(legacy),
+                xdg: pb(xdg),
+            }
+        );
+    }
+
+    #[test]
+    fn no_home_no_platform_resolves_to_none() {
+        assert!(resolve_config_path_choice(None, None, true, present(&[])).is_none());
+        assert!(resolve_config_path_choice(None, None, false, present(&[])).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // #3329 — BackfillOnBoot parsing + resolver.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn backfill_on_boot_parse_grammar_3329() {
+        use BackfillOnBoot::{Background, Blocking, Off};
+        for (raw, want) in [
+            ("background", Background),
+            ("  BACKGROUND ", Background),
+            ("async", Background),
+            ("deferred", Background),
+            ("blocking", Blocking),
+            ("SYNC", Blocking),
+            ("synchronous", Blocking),
+            ("off", Off),
+            ("None", Off),
+            ("disabled", Off),
+            ("skip", Off),
+        ] {
+            assert_eq!(BackfillOnBoot::parse(raw), Some(want), "parse({raw:?})");
+        }
+        // Unknown → None (resolver then fails SAFE to Background).
+        assert_eq!(BackfillOnBoot::parse("nope"), None);
+        assert_eq!(BackfillOnBoot::parse(""), None);
+        // Round-trip of the canonical tokens.
+        for m in [Background, Blocking, Off] {
+            assert_eq!(BackfillOnBoot::parse(m.as_str()), Some(m));
+        }
+    }
+
+    #[test]
+    fn resolve_embed_backfill_on_boot_default_is_background_3329() {
+        let _g = env_var_lock();
+        let prev = std::env::var_os(ENV_EMBED_BACKFILL_ON_BOOT);
+        // SAFETY: env mutation serialised by `_g`; restored below.
+        unsafe {
+            std::env::remove_var(ENV_EMBED_BACKFILL_ON_BOOT);
+        }
+        // No env, no [embeddings] section → compiled default.
+        assert_eq!(
+            AppConfig::default().resolve_embed_backfill_on_boot(),
+            BackfillOnBoot::Background
+        );
+        // Config layer honoured when env is unset.
+        let cfg_off = AppConfig {
+            embeddings: Some(EmbeddingsSection {
+                backfill_on_boot: Some("off".to_string()),
+                ..EmbeddingsSection::default()
+            }),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            cfg_off.resolve_embed_backfill_on_boot(),
+            BackfillOnBoot::Off,
+            "[embeddings].backfill_on_boot must win when env is unset"
+        );
+        // An unrecognised config value fails SAFE to Background.
+        let cfg_bad = AppConfig {
+            embeddings: Some(EmbeddingsSection {
+                backfill_on_boot: Some("whenever".to_string()),
+                ..EmbeddingsSection::default()
+            }),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            cfg_bad.resolve_embed_backfill_on_boot(),
+            BackfillOnBoot::Background,
+            "an unrecognised value must fail SAFE to the non-blocking default"
+        );
+        // SAFETY: restore under the same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_EMBED_BACKFILL_ON_BOOT, v),
+                None => std::env::remove_var(ENV_EMBED_BACKFILL_ON_BOOT),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_embed_backfill_on_boot_env_beats_config_3329() {
+        let _g = env_var_lock();
+        let prev = std::env::var_os(ENV_EMBED_BACKFILL_ON_BOOT);
+        let cfg = AppConfig {
+            embeddings: Some(EmbeddingsSection {
+                backfill_on_boot: Some("off".to_string()),
+                ..EmbeddingsSection::default()
+            }),
+            ..AppConfig::default()
+        };
+        // SAFETY: env mutation serialised by `_g`; restored below.
+        unsafe {
+            std::env::set_var(ENV_EMBED_BACKFILL_ON_BOOT, "blocking");
+        }
+        let resolved = cfg.resolve_embed_backfill_on_boot();
+        // SAFETY: restore under the same lock, BEFORE asserting.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ENV_EMBED_BACKFILL_ON_BOOT, v),
+                None => std::env::remove_var(ENV_EMBED_BACKFILL_ON_BOOT),
+            }
+        }
+        assert_eq!(
+            resolved,
+            BackfillOnBoot::Blocking,
+            "AI_MEMORY_EMBED_BACKFILL_ON_BOOT env MUST beat [embeddings].backfill_on_boot"
         );
     }
 

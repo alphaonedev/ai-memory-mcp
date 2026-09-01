@@ -173,8 +173,8 @@ api_key_file = "~/.config/ai-memory/keys/openrouter.key"
 
 [embeddings]
 backend = "openrouter"
-model = "google/gemini-embedding-2"
-dim = 768
+model = "google/gemini-embedding-001"   # native 3072-dim; dim=768 truncates it
+dim = 768                               # SUPPORTED_EMBEDDING_DIMS=[384,768]; fleet pin (#2626)
 api_key_file = "~/.config/ai-memory/keys/openrouter.key"
 
 [reranker]

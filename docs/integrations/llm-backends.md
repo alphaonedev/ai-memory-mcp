@@ -553,10 +553,13 @@ The embedder is resolved **independently of the chat LLM backend**, through its 
 ```toml
 [embeddings]
 backend     = "openrouter"
-model       = "google/gemini-embedding-2"
+model       = "google/gemini-embedding-001"   # native 3072-dim; honours dim below
 api_key_env = "OPENROUTER_API_KEY"
 # base_url  = "https://openrouter.ai/api/v1"  # optional for a named alias
-# dim       = 3072   # only for models outside the built-in KNOWN_EMBEDDING_DIMS table
+dim         = 768   # SUPPORTED_EMBEDDING_DIMS = [384, 768]; the dim = 768 fleet pin
+                    # (#2626) is the recommended default on pgvector-backed fleets and
+                    # is sent as the wire `dimensions` param, so a Matryoshka model like
+                    # google/gemini-embedding-001 truncates server-side to 768
 ```
 
 Or via the MCP `env:` block: `AI_MEMORY_EMBED_BACKEND`, `AI_MEMORY_EMBED_MODEL`, `AI_MEMORY_EMBED_BASE_URL`, `AI_MEMORY_EMBED_API_KEY`.
