@@ -117,6 +117,16 @@ pub fn handle_inbox(
     mcp_client: Option<&str>,
     caller: Option<&str>,
 ) -> Result<Value, String> {
+    handle_inbox_with_policy(conn, params, mcp_client, caller, true)
+}
+
+pub(crate) fn handle_inbox_with_policy(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+    caller: Option<&str>,
+    single_tenant_trust_all: bool,
+) -> Result<Value, String> {
     // Caller identity is the default inbox owner — agents read their own
     // inbox unless an explicit agent_id is supplied.
     let explicit = params["agent_id"].as_str();
@@ -126,8 +136,8 @@ pub fn handle_inbox(
     // with the HTTP `get_inbox` 403, since inbox rows are scope=private
     // agent-to-agent messages. Without this bind, `resolve_agent_id` returns
     // the caller-supplied value verbatim, letting any caller read any agent's
-    // private inbox. `caller == None` is the single-tenant trust-all posture and
-    // preserves the legacy self-or-explicit resolution unchanged.
+    // private inbox. #3356 makes that legacy trust-all branch an explicit,
+    // default-off single-tenant opt-in.
     let owner = match caller {
         Some(c) => {
             if let Some(requested) = explicit {
@@ -140,6 +150,13 @@ pub fn handle_inbox(
             c.to_string()
         }
         None => {
+            if !single_tenant_trust_all {
+                return Err(
+                    "memory_inbox requires a valid AI_MEMORY_AGENT_ID; cross-agent inbox access \
+                     is disabled unless [mcp] single_tenant_trust_all = true"
+                        .to_string(),
+                );
+            }
             crate::identity::resolve_agent_id(explicit, mcp_client).map_err(|e| e.to_string())?
         }
     };
@@ -397,8 +414,14 @@ mod d1_5_986_tests {
         seed_inbox_message(&conn, owner, sender);
         // Attacker (resolved caller) explicitly asks for the owner's inbox →
         // refused, never returning the owner's private messages.
-        let err =
-            handle_inbox(&conn, &json!({"agent_id": owner}), None, Some(attacker)).unwrap_err();
+        let err = handle_inbox_with_policy(
+            &conn,
+            &json!({"agent_id": owner}),
+            None,
+            Some(attacker),
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("may only read its own inbox"), "got: {err}");
     }
 
@@ -408,28 +431,41 @@ mod d1_5_986_tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         seed_inbox_message(&conn, owner, sender);
         // Owner caller, explicit matching agent_id → sees the message.
-        let explicit = handle_inbox(&conn, &json!({"agent_id": owner}), None, Some(owner)).unwrap();
+        let explicit =
+            handle_inbox_with_policy(&conn, &json!({"agent_id": owner}), None, Some(owner), false)
+                .unwrap();
         assert_eq!(explicit["count"].as_u64(), Some(1));
         assert_eq!(explicit["messages"][0]["from"].as_str(), Some(sender));
         // Owner caller, agent_id omitted → defaults to the caller's own inbox.
-        let implied = handle_inbox(&conn, &json!({}), None, Some(owner)).unwrap();
+        let implied =
+            handle_inbox_with_policy(&conn, &json!({}), None, Some(owner), false).unwrap();
         assert_eq!(implied["agent_id"].as_str(), Some(owner));
         assert_eq!(implied["count"].as_u64(), Some(1));
     }
 
     #[test]
-    fn inbox_none_caller_is_trust_all_unchanged_1557() {
+    fn inbox_none_caller_is_refused_by_default_3356() {
         let (owner, sender) = ("alice", "carol");
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         seed_inbox_message(&conn, owner, sender);
-        // Single-tenant trust-all (no resolved caller) preserves the legacy
-        // self-or-explicit behavior — an explicit agent_id is honored.
-        let resp = handle_inbox(&conn, &json!({"agent_id": owner}), None, None).unwrap();
+        let error = handle_inbox_with_policy(&conn, &json!({"agent_id": owner}), None, None, false)
+            .unwrap_err();
         assert_eq!(
-            resp["count"].as_u64(),
-            Some(1),
-            "None == trust-all (legacy)"
+            error,
+            "memory_inbox requires a valid AI_MEMORY_AGENT_ID; cross-agent inbox access is \
+             disabled unless [mcp] single_tenant_trust_all = true"
         );
+    }
+
+    #[test]
+    fn inbox_none_caller_allows_explicit_single_tenant_opt_in_3356() {
+        let (owner, sender) = ("alice", "carol");
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_inbox_message(&conn, owner, sender);
+        let response =
+            handle_inbox_with_policy(&conn, &json!({"agent_id": owner}), None, None, true).unwrap();
+        assert_eq!(response["count"].as_u64(), Some(1));
+        assert_eq!(response["agent_id"].as_str(), Some(owner));
     }
 }
 

@@ -7144,6 +7144,14 @@ pub struct McpConfig {
     /// family membership in any multi-tenant deployment.
     #[serde(default)]
     pub profile_hint_in_errors: bool,
+
+    /// #3356 — explicitly restore legacy cross-agent `memory_inbox` access
+    /// when no stable `AI_MEMORY_AGENT_ID` is configured. Default `false`:
+    /// an unresolved MCP caller cannot select another agent's private inbox.
+    /// This is only safe for an isolated single-tenant process and emits a
+    /// WARN on every use.
+    #[serde(default)]
+    pub single_tenant_trust_all: bool,
 }
 
 impl McpConfig {
