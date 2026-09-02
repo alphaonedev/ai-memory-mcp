@@ -2710,7 +2710,12 @@ fn dispatch_memory_notify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 /// `crate::mcp::share::handle_share` was complete; only the wire
 /// dispatch was missing.
 fn dispatch_memory_share(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    crate::mcp::share::handle_share(ctx.conn, ctx.arguments)
+    // #3379 — validate the configured principal before reading the source.
+    // Absent identity retains the single-operator posture; malformed identity
+    // must never silently downgrade to it (#3523).
+    let caller =
+        crate::identity::resolve_mcp_read_visibility_caller().map_err(|e| e.to_string())?;
+    crate::mcp::share::handle_share(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_inbox(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

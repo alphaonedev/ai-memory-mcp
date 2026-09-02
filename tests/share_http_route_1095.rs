@@ -167,6 +167,8 @@ async fn share_http_route_copies_memory_into_shared_namespace_1095() {
     let share_req = Request::builder()
         .method("POST")
         .uri("/api/v1/share")
+        // #3379: the successful share must identify the source's owner.
+        .header("x-agent-id", "ai:alice")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&serde_json::json!({
@@ -210,10 +212,9 @@ async fn share_http_route_copies_memory_into_shared_namespace_1095() {
     );
 }
 
-/// v0.7.0 #1095 — Validation errors surface as 400 with the
-/// substrate's error string (e.g. invalid agent_id, missing source).
+/// #3379 — absent sources use the same 404 as sources hidden from the caller.
 #[tokio::test]
-async fn share_http_route_returns_400_on_invalid_input_1095() {
+async fn share_http_route_returns_404_on_missing_source_1095() {
     let _dir = fresh_dir();
     let (router, _f) = build_router_fixture();
 
@@ -232,7 +233,7 @@ async fn share_http_route_returns_400_on_invalid_input_1095() {
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::BAD_REQUEST,
-        "#1095: invalid input (missing source) must surface as 400"
+        StatusCode::NOT_FOUND,
+        "#3379: absent and hidden sources must both surface as 404"
     );
 }
