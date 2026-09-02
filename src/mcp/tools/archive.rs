@@ -7,9 +7,13 @@ use crate::db;
 use crate::mcp::param_names;
 use crate::models::field_names;
 use serde_json::{Value, json};
+/// #3382: query visibility and archive ownership constrain every visible page.
+/// Substrate rows require an explicit namespace even without a caller. The
+/// checked `as_admin` escalation is reserved for #3455; no bypass is added here.
 pub(super) fn handle_archive_list(
     conn: &rusqlite::Connection,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
     let limit = params["limit"]
@@ -18,9 +22,10 @@ pub(super) fn handle_archive_list(
             usize::try_from(v).unwrap_or(usize::MAX)
         });
     let offset = usize::try_from(params["offset"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX);
-    let items = db::list_archived(
+    let items = db::list_archived_scoped(
         conn,
         namespace,
+        caller,
         limit.min(crate::storage::LIST_MAX_LIMIT),
         offset,
     )
@@ -28,15 +33,22 @@ pub(super) fn handle_archive_list(
     Ok(json!({"archived": items, "count": items.len()}))
 }
 
+/// #3382: route restore through the caller-gated storage twin. A refused id
+/// has the same error as an absent one. The single-operator restore is retained.
 pub(super) fn handle_archive_restore(
     conn: &rusqlite::Connection,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let id = params["id"]
         .as_str()
         .ok_or(crate::errors::msg::ID_REQUIRED)?;
     crate::validate::validate_id(id).map_err(|e| e.to_string())?;
-    let restored = db::restore_archived(conn, id).map_err(|e| e.to_string())?;
+    let restored = match caller {
+        Some(c) => db::restore_archived_for_caller(conn, id, c),
+        None => db::restore_archived(conn, id),
+    }
+    .map_err(|e| e.to_string())?;
     if !restored {
         return Err(crate::errors::msg::NOT_FOUND_IN_ARCHIVE.into());
     }
@@ -161,8 +173,20 @@ pub(super) fn handle_archive_purge(
     }))
 }
 
-pub(super) fn handle_archive_stats(conn: &rusqlite::Connection) -> Result<Value, String> {
-    db::archive_stats(conn).map_err(|e| e.to_string())
+/// MCP `memory_archive_stats`.
+///
+/// v1.0.0 #3382 — owner-scoped for the same reason as `memory_archive_list`:
+/// the per-namespace breakdown is corpus-shape metadata that tells any caller
+/// which OTHER tenants hold archived rows and how many. The HTTP twin has been
+/// `require_admin`-gated since #943; this surface had no gate at all.
+///
+/// The `as_admin` escalation is carved out to #3455 for the same reason as
+/// `handle_archive_list` above (it needs #3383's allowlist predicate).
+pub(super) fn handle_archive_stats(
+    conn: &rusqlite::Connection,
+    caller: Option<&str>,
+) -> Result<Value, String> {
+    db::archive_stats_scoped(conn, caller).map_err(|e| e.to_string())
 }
 
 /// #3204 item 7 — the three gates a real `memory_gc` sweep must clear, in the
@@ -465,7 +489,13 @@ impl McpTool for ArchiveRestoreTool {
         "Restore an archived memory back to the active store."
     }
     fn docs() -> &'static str {
-        "Restore archived row; expires_at cleared."
+        // v1.0.0 #3382 truth-fix: restore PRESERVES the archived row's
+        // `original_expires_at` (see `storage::canonical_archived_expiry`); it
+        // has never cleared it. The false claim mattered: an operator reading
+        // it would not expect a TTL-archived row to be re-collected by the very
+        // next gc tick. Say what actually happens.
+        "Restore archived row; expires_at is PRESERVED, not cleared (a TTL-archived row is \
+         reapable again at once — patch it via memory_update)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ArchiveRestoreRequest>()
@@ -642,7 +672,7 @@ mod tests {
     fn handle_archive_restore_missing_id_errors() {
         // Hits the `id is required` branch on line 24.
         let conn = open_conn();
-        let err = handle_archive_restore(&conn, &json!({})).unwrap_err();
+        let err = handle_archive_restore(&conn, &json!({}), None).unwrap_err();
         assert!(err.contains("id"), "got: {err}");
     }
 
@@ -650,7 +680,8 @@ mod tests {
     fn handle_archive_restore_invalid_id_maps_validator_error() {
         // Covers `validate_id(...).map_err(...)` on line 25.
         let conn = open_conn();
-        let err = handle_archive_restore(&conn, &json!({"id": "not-a-valid-uuid"})).unwrap_err();
+        let err =
+            handle_archive_restore(&conn, &json!({"id": "not-a-valid-uuid"}), None).unwrap_err();
         assert!(!err.is_empty(), "expected non-empty validator error");
     }
 
@@ -661,6 +692,7 @@ mod tests {
         let err = handle_archive_restore(
             &conn,
             &json!({"id": "00000000-0000-0000-0000-000000000000"}),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
@@ -671,7 +703,7 @@ mod tests {
         // Exercises `params["limit"].as_u64().unwrap_or(50)` and
         // `params["offset"].as_u64().unwrap_or(0)` defaults on lines 13-14.
         let conn = open_conn();
-        let result = handle_archive_list(&conn, &json!({})).expect("list ok");
+        let result = handle_archive_list(&conn, &json!({}), None).expect("list ok");
         assert_eq!(result["count"], 0);
         assert!(result["archived"].is_array());
     }
@@ -681,11 +713,156 @@ mod tests {
         // Covers the `archive_stats(...).map_err(...)` happy path
         // (line 73) on an empty DB. The stats schema is an object.
         let conn = open_conn();
-        let result = handle_archive_stats(&conn).expect("stats ok");
+        let result = handle_archive_stats(&conn, None).expect("stats ok");
         assert!(
             result.is_object(),
             "archive_stats must return a JSON object on empty DB, got: {result}"
         );
+    }
+
+    /// v1.0.0 #3382 — insert a row owned by `agent_id` and ARCHIVE it,
+    /// returning its id.
+    fn seed_archived(conn: &rusqlite::Connection, ns: &str, title: &str, agent_id: &str) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = crate::models::Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: crate::models::Tier::Mid,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("archived body for {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": agent_id, "scope": "private"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        let id = crate::db::insert(conn, &mem).expect("insert");
+        assert!(
+            crate::db::archive_memory(conn, &id, Some("test")).expect("archive"),
+            "seed row must archive"
+        );
+        id
+    }
+
+    /// v1.0.0 #3382 (DENIED direction) — `memory_archive_list` no longer hands
+    /// one tenant another tenant's archived title, content and
+    /// `metadata.agent_id`.
+    #[test]
+    fn archive_list_is_owner_scoped_3382() {
+        let conn = open_conn();
+        seed_archived(&conn, "alice/notes", "alice-archived-secret", "ai:alice");
+        seed_archived(&conn, "bob/notes", "bob-archived", "ai:bob");
+
+        let out = handle_archive_list(&conn, &json!({}), Some("ai:bob")).expect("list ok");
+        assert_eq!(out["count"], json!(1), "got: {out}");
+        let rendered = out.to_string();
+        assert!(
+            !rendered.contains("alice-archived-secret") && !rendered.contains("ai:alice"),
+            "another owner's archived row leaked: {rendered}"
+        );
+        assert!(rendered.contains("bob-archived"), "own row missing: {out}");
+    }
+
+    /// #3382 — the aggregate is corpus-shape metadata and is scoped the same
+    /// way the listing is.
+    #[test]
+    fn archive_stats_is_owner_scoped_3382() {
+        let conn = open_conn();
+        seed_archived(&conn, "alice/notes", "alice-archived-secret", "ai:alice");
+        seed_archived(&conn, "bob/notes", "bob-archived", "ai:bob");
+
+        let out = handle_archive_stats(&conn, Some("ai:bob")).expect("stats ok");
+        assert_eq!(out["archived_total"], json!(1), "got: {out}");
+        let by_ns = out["by_namespace"].as_array().expect("by_namespace array");
+        assert_eq!(by_ns.len(), 1, "got: {out}");
+        assert_eq!(by_ns[0]["namespace"], json!("bob/notes"), "got: {out}");
+    }
+
+    /// #3382 (DENIED direction) — a non-owner cannot pull another owner's
+    /// archived row back into the live working set, and the refusal is the
+    /// SAME message an absent id produces (no archived-id oracle).
+    #[test]
+    fn archive_restore_refuses_non_owner_3382() {
+        let conn = open_conn();
+        let alice = seed_archived(&conn, "alice/notes", "alice-archived-secret", "ai:alice");
+
+        let err = handle_archive_restore(&conn, &json!({"id": alice.clone()}), Some("ai:bob"))
+            .expect_err("non-owner restore must be refused");
+        assert_eq!(err, crate::errors::msg::NOT_FOUND_IN_ARCHIVE, "got: {err}");
+        // Fail CLOSED: the row stays archived and never becomes live.
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE id = ?1",
+                rusqlite::params![alice],
+                |r| r.get(0),
+            )
+            .expect("count live");
+        assert_eq!(live, 0, "a refused restore must not resurrect the row");
+        let archived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM archived_memories WHERE id = ?1",
+                rusqlite::params![alice],
+                |r| r.get(0),
+            )
+            .expect("count archived");
+        assert_eq!(archived, 1, "a refused restore must not consume the row");
+    }
+
+    /// #3382 (ALLOWED direction) — the OWNER still restores their own archived
+    /// row. The gate must not cost the legitimate path.
+    #[test]
+    fn archive_restore_allows_owner_3382() {
+        let conn = open_conn();
+        let alice = seed_archived(&conn, "alice/notes", "alice-archived-secret", "ai:alice");
+
+        let out = handle_archive_restore(&conn, &json!({"id": alice.clone()}), Some("ai:alice"))
+            .expect("owner restore must succeed");
+        assert_eq!(out["restored"], json!(true));
+        assert!(
+            crate::db::get(&conn, &alice)
+                .expect("get")
+                .is_some_and(|m| m.title == "alice-archived-secret"),
+            "owner restore must put the row back"
+        );
+    }
+
+    /// #3382 — the single-operator default (`caller == None`, no
+    /// `AI_MEMORY_AGENT_ID`) is byte-for-byte unchanged on all three verbs.
+    #[test]
+    fn archive_reads_unscoped_for_single_operator_3382() {
+        let conn = open_conn();
+        let alice = seed_archived(&conn, "alice/notes", "alice-archived-secret", "ai:alice");
+        seed_archived(&conn, "bob/notes", "bob-archived", "ai:bob");
+
+        assert_eq!(
+            handle_archive_list(&conn, &json!({}), None).expect("list ok")["count"],
+            json!(2)
+        );
+        assert_eq!(
+            handle_archive_stats(&conn, None).expect("stats ok")["archived_total"],
+            json!(2)
+        );
+        handle_archive_restore(&conn, &json!({"id": alice}), None).expect("operator restore");
     }
 
     #[test]

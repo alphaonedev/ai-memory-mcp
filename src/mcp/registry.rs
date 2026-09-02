@@ -1604,6 +1604,8 @@ mod d1_6_987_tests {
     /// fails the build rather than silently unpinning a tool.
     const DOCS_CORRECTIONS: &[&str] = &[
         "memory_archive_purge",
+        // #3382: restore preserves original_expires_at; it never cleared expiry.
+        "memory_archive_restore",
         "memory_delete",
         "memory_entity_register",
         "memory_export_reflection",

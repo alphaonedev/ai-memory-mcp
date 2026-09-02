@@ -30559,6 +30559,15 @@ impl MemoryStore for PostgresStore {
                 // Load the archived row shaped as a `Memory` and fire the hook
                 // BEFORE the INSERT lands.
                 let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
+                if !ctx.bypass_visibility
+                    && !crate::visibility::caller_owns_for_mutation(
+                        &candidate,
+                        ctx.effective_principal(),
+                        true,
+                    )
+                {
+                    return Ok(false);
+                }
                 consult_governance_pre_write_pg(&candidate)?;
                 // #2110/#2113 audit — TRACT covenant clause 1 on the archive-RESTORE
                 // funnel. Advisory-only (never refuses): a legacy archived row that
