@@ -78,6 +78,16 @@ type DbInner = tokio::sync::Mutex<(rusqlite::Connection, PathBuf, ResolvedTtl, b
 /// descriptors even when several routers coexist in one process.
 pub const DEFAULT_READ_POOL_SIZE: usize = 8;
 
+/// #3341 — WAL read-pool size. Floor is [`DEFAULT_READ_POOL_SIZE`] (the
+/// #1579 8-reader prototype); scale with cores so sqlite keyword reads
+/// are not capped at 8 concurrent SELECTs on a 14-core box.
+#[must_use]
+pub fn scaled_read_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(2).clamp(DEFAULT_READ_POOL_SIZE, 64))
+        .unwrap_or(DEFAULT_READ_POOL_SIZE)
+}
+
 /// A fixed-size set of read-only SQLite connections to one database.
 ///
 /// Each connection is guarded by its own [`std::sync::Mutex`] (not the
@@ -197,7 +207,7 @@ fn pool_for(db: &Db) -> anyhow::Result<Arc<ReadPool>> {
             "read-pool disabled for in-memory database ({path_str})"
         ));
     }
-    let pool = Arc::new(ReadPool::open(&path, DEFAULT_READ_POOL_SIZE)?);
+    let pool = Arc::new(ReadPool::open(&path, scaled_read_pool_size())?);
     let weak = Arc::downgrade(db);
 
     let mut map = registry()

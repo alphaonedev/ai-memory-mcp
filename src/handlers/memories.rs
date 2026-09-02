@@ -77,18 +77,21 @@ pub async fn get_memory(
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.get(&ctx, &id).await {
             Ok(mem) => {
-                // List_links surfaces the full edge set (no namespace
-                // filter) so the postgres adapter's `list_links` walks
-                // its `memory_links` table and the local-side filter
-                // narrows to edges anchored at this memory id.
-                let edges = match app.store.list_links(None).await {
-                    Ok(rows) => rows
-                        .into_iter()
-                        .filter(|l| l.source_id == mem.id || l.target_id == mem.id)
-                        .collect::<Vec<_>>(),
+                // #3341 / FX-C2 follow-up — GET-by-id used to walk
+                // `list_links(None)` (the FULL `memory_links` table) and
+                // filter client-side. That is a sequential scan + in-process
+                // copy on every GET, and it is the postgres twin of the
+                // pre-FX-C2 `GET /api/v1/links/{id}` path that was already
+                // moved onto `get_links_for_anchor`. Under a keyword-read
+                // mix this serialises concurrent GETs behind one fat query
+                // (measured: ~3.3k ops/s, daemon ~1 core, pg 1 active /
+                // 16 idle, latency linear in N). Ride the per-anchor SAL
+                // surface so the filter lands in SQL.
+                let edges = match app.store.get_links_for_anchor(&mem.id).await {
+                    Ok(rows) => rows,
                     Err(e) => {
                         tracing::warn!(
-                            "store.list_links during get_memory failed: {e}; \
+                            "store.get_links_for_anchor during get_memory failed: {e}; \
                              returning memory with empty links"
                         );
                         Vec::new()

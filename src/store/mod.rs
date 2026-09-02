@@ -92,6 +92,25 @@ use crate::quotas::QuotaStatus;
 /// adapter re-exports it (`pub use crate::store::PoolConfig;`).
 const DEFAULT_MAX_CONNECTIONS: u32 = 16;
 
+/// #3341 — compiled default `max_connections` when the operator has not
+/// set `AI_MEMORY_PG_POOL_MAX` / `postgres_pool_max_connections`.
+///
+/// `PoolConfig::default()` stays at [`DEFAULT_MAX_CONNECTIONS`] (16) so
+/// unit tests and the documented compile-time table remain stable. The
+/// daemon's `AppConfig::resolve_pg_pool` uses this scaled floor so a
+/// 14-core box is not capped at 16 in-flight SQL statements (the pool
+/// size that, together with the GET `list_links(None)` scan, produced
+/// the ~3.3k ops/s keyword-read plateau). Floor 16 (no regression on
+/// small hosts), cap 128 (avoid fd/PG `max_connections` stampedes).
+#[must_use]
+pub fn scaled_default_max_connections() -> u32 {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    let scaled = u32::try_from(cores.saturating_mul(8)).unwrap_or(u32::MAX);
+    scaled.clamp(DEFAULT_MAX_CONNECTIONS, 128)
+}
+
 /// Default floor of always-open connections kept warm in the pool.
 /// Mirrors the long-documented `min=2` posture so a daemon that has
 /// gone idle still answers the next request without paying full TCP +
@@ -5054,6 +5073,21 @@ mod tests {
         assert_eq!(d.max_connections, 16);
         assert_eq!(d.min_connections, 2);
         assert_eq!(d.acquire_timeout_secs, 30);
+    }
+
+    #[test]
+    fn scaled_default_max_connections_is_at_least_the_compiled_floor() {
+        let n = scaled_default_max_connections();
+        assert!(n >= DEFAULT_MAX_CONNECTIONS, "scaled={n}");
+        assert!(n <= 128, "scaled={n}");
+        // 8× cores, clamped. On a 1-core box this is 16; on ≥16 cores, 128.
+        let cores = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4);
+        let expected = u32::try_from(cores.saturating_mul(8))
+            .unwrap_or(u32::MAX)
+            .clamp(DEFAULT_MAX_CONNECTIONS, 128);
+        assert_eq!(n, expected);
     }
 
     #[test]

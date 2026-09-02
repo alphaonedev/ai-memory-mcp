@@ -9920,7 +9920,7 @@ impl AppConfig {
 
         let max_connections = env_pos_u32(ENV_PG_POOL_MAX)
             .or_else(|| self.postgres_pool_max_connections.filter(|n| *n > 0))
-            .unwrap_or(defaults.max_connections);
+            .unwrap_or_else(crate::store::scaled_default_max_connections);
 
         let min_connections = env_pos_u32(ENV_PG_POOL_MIN)
             .or_else(|| self.postgres_pool_min_connections.filter(|n| *n > 0))
@@ -13203,7 +13203,15 @@ max_page_size = 1000000
         scrub_pg_pool_env();
         let cfg = empty_app_config();
         let r = cfg.resolve_pg_pool();
-        assert_eq!(r, crate::store::PoolConfig::default());
+        // #3341 — compiled default max_connections scales with cores
+        // (floor 16); min + acquire-timeout stay on PoolConfig::default().
+        let defaults = crate::store::PoolConfig::default();
+        assert_eq!(
+            r.max_connections,
+            crate::store::scaled_default_max_connections()
+        );
+        assert_eq!(r.min_connections, defaults.min_connections);
+        assert_eq!(r.acquire_timeout_secs, defaults.acquire_timeout_secs);
     }
 
     #[cfg(feature = "sal")]
