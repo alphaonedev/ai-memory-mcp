@@ -12,6 +12,59 @@ use crate::models::field_names;
 use crate::{db, validate};
 use serde_json::{Value, json};
 use std::path::Path;
+/// v1.0.0 #3380 (CWE-863) — resolve every consolidation SOURCE through the
+/// caller-scoped read funnel and the canonical mutation-ownership predicate.
+///
+/// A consolidation is not a read: it mints an LLM summary of the sources'
+/// content and then TOMBSTONES the source rows. Pre-#3380 the handler resolved
+/// sources through the unfiltered `db::get` with no caller threaded at all, so
+/// `ai:bob` naming `ai:alice`'s `scope=private` id got the victim's content
+/// back as `summary_preview` AND had her row tombstoned — on a row
+/// `memory_get` refuses him.
+///
+/// The gate is the single CANONICAL mutation predicate
+/// [`crate::visibility::caller_owns_for_mutation`] (#1786) — the same one
+/// `memory_update` and `memory_delete` gate on, with `allow_inbox = false`
+/// mirroring `memory_update` / `PUT /memories/{id}`.
+///
+/// Consumability, NOT readability, is the right question here, and it is
+/// strictly the stronger one for this surface: a row owned by another agent is
+/// refused even when it is READABLE (a `collective`-scope or inbox row), which
+/// closes the summary leak; and the predicate keeps the #1786 legacy carve-out
+/// so an UNOWNED row — a pre-NHI corpus, or any row written before the caller
+/// stamp existed — stays consolidatable exactly as it stays updatable and
+/// deletable. An earlier draft of this fix ALSO required
+/// `is_visible_to_caller`, which looked safer but was strictly wrong: the
+/// conjunction refused unowned rows that both canonical predicates
+/// deliberately admit, silently stranding legacy corpora.
+///
+/// The refusal renders as the not-found message, identical to an absent id, so
+/// the surface is not a cross-tenant presence oracle (#1553 mask).
+///
+/// `caller == None` is the single-operator trust-all posture and is unchanged.
+fn resolve_consolidate_sources(
+    conn: &rusqlite::Connection,
+    ids: &[String],
+    caller: Option<&str>,
+) -> Result<Vec<crate::models::Memory>, String> {
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let row = db::get(conn, id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| crate::errors::msg::memory_not_found(id))?;
+        // The gate is CONSUMABILITY, and its refusal is rendered as the
+        // not-found message so the surface is not a presence oracle: a caller
+        // learns nothing about a row it may not consume.
+        if let Some(c) = caller
+            && !crate::visibility::caller_owns_for_mutation(&row, c, false)
+        {
+            return Err(crate::errors::msg::memory_not_found(id));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
 pub(super) fn handle_consolidate(
     conn: &rusqlite::Connection,
     db_path: &Path,
@@ -20,6 +73,7 @@ pub(super) fn handle_consolidate(
     embedder: Option<&dyn Embed>,
     vector_index: Option<&dyn VectorSearchIndex>,
     mcp_client: Option<&str>,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let ids_arr = params["ids"]
         .as_array()
@@ -41,19 +95,25 @@ pub(super) fn handle_consolidate(
         .as_str()
         .unwrap_or(crate::DEFAULT_NAMESPACE);
 
+    // #3380 — VALIDATE THE REQUEST SHAPE FIRST. Pre-fix the whole validator
+    // ran AFTER the summary was materialised, so `{"ids": []}` cost a paid LLM
+    // round-trip before being told it needs at least two ids.
+    validate::RequestValidator::validate_consolidate_request(&ids, title, namespace)
+        .map_err(|e| e.to_string())?;
+
+    // #3380 — CALLER-OWNS-SOURCE gate, before any model call and before any
+    // write. Resolved once and reused for the LLM pairs below, so the rows the
+    // gate admitted are exactly the rows the model sees.
+    let sources = resolve_consolidate_sources(conn, &ids, caller)?;
+
     // Auto-generate summary via LLM if not provided
     let summary: String = if let Some(s) = params["summary"].as_str() {
         s.to_string()
     } else if let Some(llm_client) = llm {
-        // Fetch memory contents for LLM summarization
-        let mut memory_pairs: Vec<(String, String)> = Vec::new();
-        for id in &ids {
-            match db::get(conn, id) {
-                Ok(Some(mem)) => memory_pairs.push((mem.title, mem.content)),
-                Ok(None) => return Err(crate::errors::msg::memory_not_found(id)),
-                Err(e) => return Err(e.to_string()),
-            }
-        }
+        let memory_pairs: Vec<(String, String)> = sources
+            .iter()
+            .map(|mem| (mem.title.clone(), mem.content.clone()))
+            .collect();
         llm_client
             .summarize_memories(&memory_pairs)
             .map_err(|e| format!("LLM summarization failed: {e}"))?
@@ -297,12 +357,19 @@ impl McpTool for ConsolidateTool {
         "Consolidate multiple memories into one long-term summary."
     }
     fn docs() -> &'static str {
-        // #1599 — provenance is metadata-only by design: sources are
-        // deleted, so MemoryLink rows would dangle (ON DELETE CASCADE
-        // would reap them immediately). Do NOT claim link rows here.
-        "Merge 2-100 sources into one long-tier memory; deletes sources; provenance recorded in \
-         metadata.derived_from + metadata.consolidated_from_agents (NOT KG-traversable link rows). \
-         LLM auto-generates summary if omitted (smart/autonomous tier)."
+        // #1599 — under the DELETE disposition provenance is metadata-only:
+        // the sources are gone, so MemoryLink rows would dangle (ON DELETE
+        // CASCADE reaps them immediately).
+        // v1.0.0 #3380 — the pre-fix text claimed "NOT KG-traversable link
+        // rows" UNCONDITIONALLY, which is wrong under the tombstone
+        // disposition (`consolidate_tombstone_sources_enabled`): the sources
+        // are RETAINED, so `db::consolidate` writes navigable
+        // `derived_from` edges from the merged row to each source and they
+        // survive. Say which disposition each contract belongs to.
+        "Merge 2-100 sources into one long-tier memory; deletes sources; provenance in \
+         metadata.derived_from + metadata.consolidated_from_agents (plus derived_from link rows \
+         only when sources are tombstoned, not deleted). LLM auto-generates summary if omitted \
+         (smart/autonomous tier)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ConsolidateRequest>()
@@ -404,6 +471,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("ids"), "got: {err}");
@@ -417,6 +485,7 @@ mod tests {
             &conn,
             tmp.path(),
             &json!({"ids": [42], "title": "t", "summary": "s"}),
+            None,
             None,
             None,
             None,
@@ -438,6 +507,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(!err.is_empty());
@@ -455,20 +525,30 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("title"), "got: {err}");
     }
 
     // No summary AND no LLM → refusal.
+    //
+    // v1.0.0 #3380 — this case now uses TWO ids. The request-shape half of the
+    // validator (id count / duplicates / title / namespace) moved AHEAD of the
+    // summary resolution so a malformed request cannot cost a paid LLM
+    // round-trip, so a single-id call is now refused with "need at least 2
+    // memory IDs" before the summary branch is reached. The single-id
+    // precedence is pinned by `under_two_ids_refused_before_llm_3380` below.
     #[test]
     fn no_summary_no_llm_refused() {
         let (conn, tmp) = fresh_db();
         let a = seed_observation(&conn, "cn-ns", "a");
+        let b = seed_observation(&conn, "cn-ns", "b");
         let err = handle_consolidate(
             &conn,
             tmp.path(),
-            &json!({"ids": [a], "title": "consolidated"}),
+            &json!({"ids": [a, b], "title": "consolidated"}),
+            None,
             None,
             None,
             None,
@@ -497,6 +577,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("ok");
         assert!(resp["id"].is_string());
@@ -521,6 +602,7 @@ mod tests {
             }),
             None,
             Some(&emb),
+            None,
             None,
             None,
         )
@@ -573,6 +655,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("ok")
         })
@@ -602,16 +685,20 @@ mod tests {
         let err = tokio::task::spawn_blocking(move || {
             let (conn, tmp) = fresh_db();
             let a = seed_observation(&conn, "cn-llm-err", "a");
+            // #3380 — two ids: the request-shape validator now runs BEFORE the
+            // summary branch, so a single-id call never reaches the LLM.
+            let b = seed_observation(&conn, "cn-llm-err", "b");
             let client = crate::llm::OllamaClient::new_with_url(&uri, "test-model").unwrap();
             handle_consolidate(
                 &conn,
                 tmp.path(),
                 &json!({
-                    "ids": [a],
+                    "ids": [a, b],
                     "title": "consolidated-err",
                     "namespace": "cn-llm-err",
                 }),
                 Some(&client),
+                None,
                 None,
                 None,
                 None,
@@ -638,16 +725,21 @@ mod tests {
         let uri = server.uri();
         let err = tokio::task::spawn_blocking(move || {
             let (conn, tmp) = fresh_db();
+            // #3380 — one real source + one absent id: the shape validator
+            // (>= 2 ids) now runs first, and the caller-scoped source
+            // resolution must still refuse on the absent one.
+            let a = seed_observation(&conn, "cn-llm-miss", "a");
             let client = crate::llm::OllamaClient::new_with_url(&uri, "test-model").unwrap();
             handle_consolidate(
                 &conn,
                 tmp.path(),
                 &json!({
-                    "ids": ["11111111-2222-3333-4444-555555555555"],
+                    "ids": [a, "11111111-2222-3333-4444-555555555555"],
                     "title": "consolidated-missing",
                     "namespace": "cn-llm-miss",
                 }),
                 Some(&client),
+                None,
                 None,
                 None,
                 None,
@@ -692,12 +784,286 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("ok");
         assert!(resp.get("warning").is_none());
     }
 
-    // #1599 — the honest provenance contract the docstring now documents:
+    /// v1.0.0 #3380 — seed a source owned by `agent_id`.
+    fn seed_owned(conn: &rusqlite::Connection, ns: &str, title: &str, agent_id: &str) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("secret body for {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": agent_id, "scope": "private"}),
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        db::insert(conn, &mem).expect("insert")
+    }
+
+    /// v1.0.0 #3380 (DENIED direction) — a caller cannot consolidate a source
+    /// they cannot read. Pre-fix `ai:bob` naming `ai:alice`'s `scope=private`
+    /// id got her content back as the summary AND had her row tombstoned,
+    /// while `memory_get` refused him the same id.
+    #[test]
+    fn consolidate_refuses_non_owner_source_3380() {
+        let (conn, tmp) = fresh_db();
+        let alice = seed_owned(&conn, "cn-3380", "alice-private", "ai:alice");
+        let bob = seed_owned(&conn, "cn-3380", "bob-own", "ai:bob");
+        let err = handle_consolidate(
+            &conn,
+            tmp.path(),
+            &json!({
+                "ids": [alice.clone(), bob.clone()],
+                "title": "stolen consolidation",
+                "summary": "a summary long enough to satisfy content validation",
+                "namespace": "cn-3380",
+            }),
+            None,
+            None,
+            None,
+            None,
+            Some("ai:bob"),
+        )
+        .expect_err("non-owner consolidation must be refused");
+        assert!(err.contains("not found"), "got: {err}");
+        // Fail CLOSED: BOTH source rows survive untouched — the victim's row is
+        // neither consumed nor tombstoned, and no merged row was minted.
+        assert!(db::get(&conn, &alice).expect("get").is_some());
+        assert!(db::get(&conn, &bob).expect("get").is_some());
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(rows, 2, "a refused consolidation must not write anything");
+    }
+
+    /// #3380 — the refusal for a source that EXISTS but is invisible is
+    /// byte-identical to the refusal for an ABSENT id, so the surface is not a
+    /// cross-tenant presence oracle.
+    #[test]
+    fn consolidate_refusal_is_not_a_presence_oracle_3380() {
+        let (conn, tmp) = fresh_db();
+        let alice = seed_owned(&conn, "cn-3380b", "alice-private", "ai:alice");
+        let bob = seed_owned(&conn, "cn-3380b", "bob-own", "ai:bob");
+        let absent = uuid::Uuid::new_v4().to_string();
+        let call = |first: &str| {
+            handle_consolidate(
+                &conn,
+                tmp.path(),
+                &json!({
+                    "ids": [first, bob.clone()],
+                    "title": "probe",
+                    "summary": "a summary long enough to satisfy content validation",
+                    "namespace": "cn-3380b",
+                }),
+                None,
+                None,
+                None,
+                None,
+                Some("ai:bob"),
+            )
+            .expect_err("must refuse")
+        };
+        assert_eq!(
+            call(&alice),
+            crate::errors::msg::memory_not_found(&alice),
+            "hidden source must render the not-found template"
+        );
+        assert_eq!(call(&absent), crate::errors::msg::memory_not_found(&absent));
+    }
+
+    /// v1.0.0 #3380 (ALLOWED direction) — an UNOWNED legacy row stays
+    /// consolidatable. The #1786 mutation predicate deliberately admits rows
+    /// with no `metadata.agent_id` (pre-NHI corpora, and every row written by
+    /// the single-operator default), exactly as `memory_update` and
+    /// `memory_delete` admit them.
+    ///
+    /// This pins the correction to an earlier draft of this fix, which ALSO
+    /// required `is_visible_to_caller`: that conjunction looked safer but
+    /// refused unowned rows both canonical predicates admit, which would have
+    /// silently stranded legacy corpora on every surface — the HTTP webhook
+    /// parity suite seeds exactly such rows (`metadata = '{}'`).
+    #[test]
+    fn consolidate_allows_unowned_legacy_source_3380() {
+        let (conn, tmp) = fresh_db();
+        let a = make_unowned(&conn, "cn-3380f", "legacy-a");
+        let b = make_unowned(&conn, "cn-3380f", "legacy-b");
+        handle_consolidate(
+            &conn,
+            tmp.path(),
+            &json!({
+                "ids": [a, b],
+                "title": "legacy merge",
+                "summary": "a summary long enough to satisfy content validation",
+                "namespace": "cn-3380f",
+            }),
+            None,
+            None,
+            None,
+            None,
+            Some("ai:bob"),
+        )
+        .expect("an unowned legacy row must stay consolidatable");
+    }
+
+    /// #3380 — seed a row with NO `metadata.agent_id` (the legacy/unowned
+    /// shape the #1786 carve-out exists for).
+    fn make_unowned(conn: &rusqlite::Connection, ns: &str, title: &str) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("legacy body for {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}),
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        db::insert(conn, &mem).expect("insert")
+    }
+
+    /// #3380 (ALLOWED direction) — the OWNER still consolidates their own
+    /// sources. The gate must not cost the legitimate path.
+    #[test]
+    fn consolidate_allows_owner_3380() {
+        let (conn, tmp) = fresh_db();
+        let a = seed_owned(&conn, "cn-3380c", "bob-a", "ai:bob");
+        let b = seed_owned(&conn, "cn-3380c", "bob-b", "ai:bob");
+        let resp = handle_consolidate(
+            &conn,
+            tmp.path(),
+            &json!({
+                "ids": [a, b],
+                "title": "bobs consolidation",
+                "summary": "a summary long enough to satisfy content validation",
+                "namespace": "cn-3380c",
+            }),
+            None,
+            None,
+            None,
+            None,
+            Some("ai:bob"),
+        )
+        .expect("owner consolidation must succeed");
+        assert_eq!(resp["consolidated"], json!(2));
+        assert!(resp["id"].as_str().is_some());
+    }
+
+    /// #3380 — an invalid request is refused BEFORE any (paid) LLM call. The
+    /// wiremock server mounts ONLY the `/api/tags` health probe: had the
+    /// handler reached the model, the error would be an upstream failure
+    /// rather than the id-count refusal asserted here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn under_two_ids_refused_before_llm_3380() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+        let err = tokio::task::spawn_blocking(move || {
+            let (conn, tmp) = fresh_db();
+            let client = crate::llm::OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            handle_consolidate(
+                &conn,
+                tmp.path(),
+                &json!({"ids": [], "title": "empty", "namespace": "cn-3380d"}),
+                Some(&client),
+                None,
+                None,
+                None,
+                None,
+            )
+            .err()
+            .unwrap_or_default()
+        })
+        .await
+        .unwrap();
+        assert!(err.contains("at least 2 memory IDs"), "got: {err}");
+    }
+
+    /// #3380 — the single-operator default (`caller == None`, no
+    /// `AI_MEMORY_AGENT_ID`) is byte-for-byte unchanged: cross-owner sources
+    /// still merge, because there is no tenant boundary to enforce.
+    #[test]
+    fn consolidate_single_operator_posture_unchanged_3380() {
+        let (conn, tmp) = fresh_db();
+        let alice = seed_owned(&conn, "cn-3380e", "alice", "ai:alice");
+        let bob = seed_owned(&conn, "cn-3380e", "bob", "ai:bob");
+        handle_consolidate(
+            &conn,
+            tmp.path(),
+            &json!({
+                "ids": [alice, bob],
+                "title": "operator merge",
+                "summary": "a summary long enough to satisfy content validation",
+                "namespace": "cn-3380e",
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("trust-all posture still consolidates");
+    }
+
+    // #1599 — the honest provenance contract the docstring now documents,
+    // under the DELETE disposition (the #3380 doc correction records the
+    // tombstone disposition's navigable `derived_from` edges separately):
     // consolidate records provenance ONLY in metadata
     // (`metadata.derived_from` carries every source id;
     // `metadata.consolidated_from_agents` carries the source authors) and
@@ -719,6 +1085,7 @@ mod tests {
                 "summary": "merged",
                 "namespace": "cn-prov",
             }),
+            None,
             None,
             None,
             None,
