@@ -91,6 +91,146 @@ fn restamp_agent_id(mem: &mut models::Memory, caller_id: &str) {
     }
 }
 
+/// #3457 — the row's ORIGINAL `metadata.agent_id` claim, read BEFORE any
+/// restamp, so the attestation reconcile can apply the re-attribution rule: a
+/// row this sync RE-OWNED can never verify the original author's
+/// `write_signature` against the new attribution, because the signed
+/// `SignableWrite` envelope commits to `agent_id`.
+fn original_agent_claim(mem: &models::Memory) -> Option<String> {
+    mem.metadata
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+/// #3457 — per-leg tally of what the inbound attestation reconcile decided, so
+/// the CLI can report it instead of silently changing rows.
+#[derive(Debug, Default, Clone, Copy)]
+struct InboundAttestTally {
+    /// Rows that asserted `agent_attested` on the wire but landed `claimed`.
+    downgraded: usize,
+    /// Rows SKIPPED because a presented signature was malformed or forged.
+    forged_skipped: usize,
+}
+
+/// #3457 — resolve the DESTINATION-enrolled key for every author this leg could
+/// attribute a row to, BEFORE any row is written.
+///
+/// Taken as a pre-loop snapshot for the same reason the portability import does
+/// (#3150): resolving lazily inside the loop would let an `_agents`
+/// registration row carried by the REMOTE database self-enroll the very key
+/// that then verifies its siblings. Under the default restamp posture every row
+/// is attributed to `caller_id`, so that is the only key consulted; under
+/// `--trust-source` each row keeps its own author, so each distinct author is
+/// resolved once.
+fn resolve_destination_enrolled_keys(
+    dest: &rusqlite::Connection,
+    mems: &[models::Memory],
+    trust_source: bool,
+    caller_id: &str,
+) -> Result<std::collections::HashMap<String, Option<String>>> {
+    use anyhow::Context as _;
+    let mut keys: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for mem in mems {
+        let author = if trust_source {
+            original_agent_claim(mem)
+        } else {
+            Some(caller_id.to_string())
+        };
+        let Some(author) = author.filter(|a| !a.is_empty()) else {
+            continue;
+        };
+        if !keys.contains_key(&author) {
+            let bound = db::agent_pubkey(dest, &author).with_context(|| {
+                format!("sync: resolving the destination-enrolled key for author {author}")
+            })?;
+            keys.insert(author, bound);
+        }
+    }
+    Ok(keys)
+}
+
+/// #3457 — surface the inbound attestation tally on the human-readable output,
+/// but ONLY when it is non-zero, so the ordinary sync's stdout is unchanged.
+/// A row that silently changed attestation level (or was dropped) must not be
+/// invisible to the operator running the command.
+fn write_attestation_tally(out: &mut CliOutput<'_>, tally: &InboundAttestTally) -> Result<()> {
+    if tally.downgraded > 0 {
+        writeln!(
+            out.stdout,
+            "  {} inbound row(s) asserted agent_attested but landed claimed \
+             (wire attestation is never trusted)",
+            tally.downgraded
+        )?;
+    }
+    if tally.forged_skipped > 0 {
+        writeln!(
+            out.stdout,
+            "  {} inbound row(s) SKIPPED: presented write_signature is malformed or forged",
+            tally.forged_skipped
+        )?;
+    }
+    Ok(())
+}
+
+/// #3457 (security-high) — re-derive an INBOUND row's attestation from what the
+/// DESTINATION can verify, never from the remote database.
+///
+/// `ai-memory sync --direction pull|merge` re-owns each remote row to the caller
+/// (`restamp_agent_id`) while carrying the remote row's `metadata.attest_level`
+/// and `metadata.write_signature` through VERBATIM into the local store. The
+/// signed envelope commits to `agent_id`, so after the re-own that signature can
+/// never be re-derived from the row it now describes — a durable
+/// `agent_attested` no principal ever minted, which `row_is_agent_attested`, the
+/// federation relay under `AI_MEMORY_FED_REQUIRE_WRITE_SIG=1` and the
+/// attestation census all believe.
+///
+/// `--trust-source` was never a mitigation: it preserves the ORIGINAL owner
+/// instead of re-owning, but nothing on either branch verified the presented
+/// signature against a destination-enrolled key, so a wire-asserted
+/// `agent_attested` was taken on faith either way. Under `--trust-source` the
+/// re-attribution rule simply does not fire and the signature is actually
+/// VERIFIED — which is strictly more than the pre-#3457 behaviour.
+///
+/// This is a call into the ONE shared funnel
+/// ([`crate::identity::attest::reconcile_imported_attestation`], #3421), not a
+/// fourth hand-rolled copy: the portability v2 route, the CLI L1 route (#2264)
+/// and `POST /api/v1/import` all make the same decision. Returns `true` to keep
+/// the row.
+fn reconcile_inbound_attestation(
+    mem: &mut models::Memory,
+    original_claim: Option<&str>,
+    trust_source: bool,
+    keys: &std::collections::HashMap<String, Option<String>>,
+    tally: &mut InboundAttestTally,
+) -> bool {
+    let outcome = crate::identity::attest::reconcile_imported_attestation(
+        mem,
+        original_claim,
+        !trust_source,
+        keys,
+    );
+    if let Some(cause) = outcome.skipped() {
+        tally.forged_skipped += 1;
+        tracing::warn!(
+            memory_id = %mem.id,
+            "sync: row skipped — {cause} (#3457; a presented-but-bad signature is never \
+             downgraded into storage)"
+        );
+        return false;
+    }
+    if let Some(cause) = outcome.downgraded() {
+        tally.downgraded += 1;
+        tracing::warn!(
+            memory_id = %mem.id,
+            "sync: row asserted attest_level=agent_attested but landed claimed — {cause} \
+             (#3457; wire attestation is never trusted)"
+        );
+    }
+    true
+}
+
 /// #1794 — parse a PEM CA certificate that was already read into memory.
 ///
 /// `reqwest::Certificate::from_pem` accepts a marker-less file as an EMPTY
@@ -202,10 +342,30 @@ pub fn run(
             let mems = db::export_all(&remote_conn)?;
             let links = db::export_links(&remote_conn)?;
             let mut n = 0;
+            // #3457 — pre-loop snapshot of the DESTINATION-enrolled keys.
+            let enrolled = resolve_destination_enrolled_keys(
+                &local_conn,
+                &mems,
+                args.trust_source,
+                &caller_id,
+            )?;
+            let mut tally = InboundAttestTally::default();
             for mem in &mems {
                 let mut owned = mem.clone();
+                let original_claim = original_agent_claim(&owned);
                 if !args.trust_source {
                     restamp_agent_id(&mut owned, &caller_id);
+                }
+                // #3457 — re-derive the attestation from what THIS node can
+                // verify, before the row is validated or stored.
+                if !reconcile_inbound_attestation(
+                    &mut owned,
+                    original_claim.as_deref(),
+                    args.trust_source,
+                    &enrolled,
+                    &mut tally,
+                ) {
+                    continue;
                 }
                 if let Err(e) = validate::validate_memory(&owned) {
                     tracing::warn!("sync: skipping invalid memory {}: {}", owned.id, e);
@@ -232,10 +392,18 @@ pub fn run(
                 writeln!(
                     out.stdout,
                     "{}",
-                    serde_json::json!({"direction": "pull", "imported": n})
+                    serde_json::json!({
+                        "direction": "pull",
+                        "imported": n,
+                        // #3457 — additive: what the inbound attestation
+                        // reconcile decided. Zero on the ordinary path.
+                        "attestation_downgraded": tally.downgraded,
+                        "forged_signature_skipped": tally.forged_skipped,
+                    })
                 )?;
             } else {
                 writeln!(out.stdout, "pulled {n} memories from remote")?;
+                write_attestation_tally(out, &tally)?;
             }
         }
         "push" => {
@@ -280,10 +448,29 @@ pub fn run(
             let l_mems = db::export_all(&local_conn)?;
             let l_links = db::export_links(&local_conn)?;
             let (mut pulled, mut pushed) = (0, 0);
+            // #3457 — same pre-loop key snapshot + same shared funnel as the
+            // `pull` leg; the two inbound legs must not drift.
+            let enrolled = resolve_destination_enrolled_keys(
+                &local_conn,
+                &r_mems,
+                args.trust_source,
+                &caller_id,
+            )?;
+            let mut tally = InboundAttestTally::default();
             for mem in &r_mems {
                 let mut owned = mem.clone();
+                let original_claim = original_agent_claim(&owned);
                 if !args.trust_source {
                     restamp_agent_id(&mut owned, &caller_id);
+                }
+                if !reconcile_inbound_attestation(
+                    &mut owned,
+                    original_claim.as_deref(),
+                    args.trust_source,
+                    &enrolled,
+                    &mut tally,
+                ) {
+                    continue;
                 }
                 if validate::validate_memory(&owned).is_err() {
                     continue;
@@ -330,10 +517,18 @@ pub fn run(
                 writeln!(
                     out.stdout,
                     "{}",
-                    serde_json::json!({"direction": "merge", "pulled": pulled, "pushed": pushed})
+                    serde_json::json!({
+                        "direction": "merge",
+                        "pulled": pulled,
+                        "pushed": pushed,
+                        // #3457 — additive; describes the INBOUND leg only.
+                        "attestation_downgraded": tally.downgraded,
+                        "forged_signature_skipped": tally.forged_skipped,
+                    })
                 )?;
             } else {
                 writeln!(out.stdout, "merged: pulled {pulled}, pushed {pushed}")?;
+                write_attestation_tally(out, &tally)?;
             }
         }
         _ => anyhow::bail!(
