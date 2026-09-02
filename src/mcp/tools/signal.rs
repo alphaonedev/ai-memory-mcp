@@ -431,13 +431,21 @@ pub fn handle_signal_thread(conn: &rusqlite::Connection, params: &Value) -> Resu
 }
 
 /// MCP handler for `memory_signal_ack`. Thin shim over
-/// [`handle_signal_ack_with_hooks`] with an empty hook bundle — preserves
-/// the pre-#1729 signature so every existing caller compiles unchanged.
+/// [`handle_signal_ack_with_hooks`] with an empty hook bundle.
+///
+/// `mcp_client` is the dispatch context's client label, used ONLY to resolve
+/// the caller identity the ack is authorized against (#3364); see
+/// [`handle_signal_ack_with_hooks`].
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on update failure.
-pub fn handle_signal_ack(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    handle_signal_ack_with_hooks(conn, params, &SignalHooks::empty())
+/// Returns the refusal string when the caller is not the signal's addressee
+/// (#3364), or the stringified `rusqlite` error on update failure.
+pub fn handle_signal_ack(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    handle_signal_ack_with_hooks(conn, params, mcp_client, &SignalHooks::empty())
 }
 
 /// v0.8.0 Pillar-1 (#1709 / #1729) — variant of [`handle_signal_ack`] that
@@ -447,53 +455,87 @@ pub fn handle_signal_ack(conn: &rusqlite::Connection, params: &Value) -> Result<
 /// via [`crate::signals::mark_acked`]; returns `acknowledged: <bool>` —
 /// `false` when the signal was already acked or no row matched.
 ///
+/// # Authorization (#3364)
+/// Only the signal's ADDRESSEE may acknowledge it. The caller identity is
+/// RESOLVED from the MCP session ([`crate::identity::resolve_agent_id`] —
+/// `AI_MEMORY_AGENT_ID`, else the `clientInfo`-derived id, else the durable
+/// host id), never taken from a body field: the same reason #2996 bound
+/// `signal_send.from_agent` to the resolved identity instead of the wire
+/// value. A namespace broadcast has no addressee and is refused outright
+/// (see [`crate::signals::AckDenied`]).
+///
 /// # Errors
-/// Returns the stringified `rusqlite` error on update failure.
+/// - `"id is required"` when the schema-required `id` is missing/blank/
+///   non-string — the row must be identified before it can be authorized.
+/// - The [`crate::signals::AckDenied`] refusal when the resolved caller is
+///   not the addressee, or the signal is a broadcast.
+/// - The stringified caller-resolution / `rusqlite` error on failure.
 pub fn handle_signal_ack_with_hooks(
     conn: &rusqlite::Connection,
     params: &Value,
+    mcp_client: Option<&str>,
     hooks: &SignalHooks<'_>,
 ) -> Result<Value, String> {
-    let id = params
-        .get(param_names::ID)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
+    // #3364 — the row has to be IDENTIFIED before it can be authorized, so the
+    // `unwrap_or_default()` read (which acked `""`, i.e. nothing, and reported
+    // a plausible `acknowledged: false`) becomes a refusal.
+    let id = crate::mcp::param_guard::require_str(params, param_names::ID)?;
+    // #3364 — resolve the CALLER. `SignalAckRequest` carries no `agent_id`
+    // and must not grow one: a caller-asserted actor is exactly what an
+    // impersonating agent would set. This mirrors #2996's bind of
+    // `signal_send.from_agent`; it resolves through `resolve_agent_id` rather
+    // than the signing keypair because an ack is not signed — the principal is
+    // the MCP session, not the daemon key (binding to the key would make the
+    // tool unusable by every agent except the key's own label).
+    let caller = crate::identity::resolve_agent_id(None, mcp_client)
+        .map_err(|e| format!("resolve caller agent_id: {e}"))?;
+    crate::validate::validate_agent_id_shape(&caller).map_err(|e| e.to_string())?;
+
+    // #3364 — load BEFORE any write: the ack is authorized against the STORED
+    // addressee, and a refused ack must leave the row byte-identical. Pre-fix
+    // the stamp landed first and the row was re-read only to name an actor in
+    // the audit trail.
+    let Some(signal) = crate::signals::get(conn, id).map_err(|e| e.to_string())? else {
+        // No row: nothing to authorize and nothing to change. Unchanged
+        // pre-#3364 shape — an absent id is not an authorization verdict, and
+        // reporting one would leak which ids exist.
+        return Ok(json!({ "acknowledged": false }));
+    };
+    crate::signals::authorize_ack(&signal, &caller).map_err(|e| e.to_string())?;
+
     let now = chrono::Utc::now().timestamp();
     let acknowledged = crate::signals::mark_acked(conn, id, now).map_err(|e| e.to_string())?;
 
     // #1722 — coordination observability: append a `coordination.signal_ack`
     // audit row ONLY when this call actually flipped the ack (a no-op re-ack
-    // must not write a row). The ack handler has no actor param, so resolve
-    // the principal by loading the signal: the recipient (`to_agent`) is who
-    // acks; fall back to "" for a broadcast (None) or an absent signal.
-    // Best-effort: the ack already committed. The same load feeds the
-    // #1729 PostSignalAck snapshot below.
+    // must not write a row). #3364 — the row now names the RESOLVED CALLER.
+    // Pre-fix it named the signal's `to_agent`, so a wrongful ack by bob was
+    // recorded on the tamper-evident chain as alice's: the audit trail blamed
+    // the victim. The caller is authorized as the addressee above, so the two
+    // agree on the legitimate path — the difference is that the value is now
+    // the acknowledging principal by construction, not by assumption.
+    // Best-effort: the ack already committed.
     if acknowledged {
-        let signal = crate::signals::get(conn, id).ok().flatten();
-        let actor = signal
-            .as_ref()
-            .and_then(|s| s.to_agent.clone())
-            .unwrap_or_default();
         crate::coordination_audit::emit(
             conn,
             crate::coordination_audit::SIGNAL_ACK,
-            &actor,
-            &[id, &actor, "ack"],
+            &caller,
+            &[id, &caller, "ack"],
         );
 
         // v0.8.0 Pillar-1 (#1709 / #1729) — fire PostSignalAck post-commit
-        // (notify-only). Skipped when the signal row could not be re-read.
-        if let (Some(post), Some(s)) = (hooks.post_signal_ack.as_ref(), signal.as_ref()) {
+        // (notify-only). The snapshot comes from the pre-stamp row loaded
+        // above; `acknowledged == true` means THIS call wrote the stamp, so
+        // `now` IS the committed `acknowledged_at`.
+        if let Some(post) = hooks.post_signal_ack.as_ref() {
             let ack = SignalAck {
-                id: s.id.clone(),
-                namespace: s.namespace.clone(),
-                from_agent: s.from_agent.clone(),
-                to_agent: s.to_agent.clone(),
-                subject: s.subject.clone(),
-                signal_type: s.signal_type,
-                acknowledged_at: s.acknowledged_at.unwrap_or(now),
+                id: signal.id.clone(),
+                namespace: signal.namespace.clone(),
+                from_agent: signal.from_agent.clone(),
+                to_agent: signal.to_agent.clone(),
+                subject: signal.subject.clone(),
+                signal_type: signal.signal_type,
+                acknowledged_at: now,
             };
             post(&ack);
         }
@@ -786,16 +828,26 @@ mod handler_tests {
         crate::storage::open(std::path::Path::new(":memory:")).expect("open in-memory db")
     }
 
+    /// #3364 — the identity `handle_signal_ack` resolves for THIS process, so
+    /// a test can address a signal to its own caller and exercise the ALLOWED
+    /// path. Same shape as the `subscribe` handler tests' owner resolution.
+    fn caller_id() -> String {
+        crate::identity::resolve_agent_id(None, None).expect("resolve test caller identity")
+    }
+
     #[test]
     fn send_read_inbox_ack_roundtrips_over_mcp() {
         let conn = fresh();
+        // #3364 — address the signal to THIS caller so the ack at the end of
+        // the roundtrip is the ALLOWED (addressee) path.
+        let me = caller_id();
         // Send with no keypair → unsigned.
         let sent = handle_signal_send(
             &conn,
             &json!({
                 "namespace": "_sig",
                 "from_agent": "agent-from",
-                "to_agent": "agent-to",
+                "to_agent": me,
                 "subject": "hello",
                 "body": {"k": "v"},
                 "signal_type": "request",
@@ -824,11 +876,8 @@ mod handler_tests {
         assert!(reread["signal"]["read_at"].as_i64().is_some());
 
         // Inbox for the recipient finds it.
-        let inbox = handle_signal_inbox(
-            &conn,
-            &json!({ "namespace": "_sig", "to_agent": "agent-to" }),
-        )
-        .expect("inbox ok");
+        let inbox = handle_signal_inbox(&conn, &json!({ "namespace": "_sig", "to_agent": me }))
+            .expect("inbox ok");
         let arr = inbox["signals"].as_array().expect("signals array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"].as_str(), Some(id.as_str()));
@@ -839,9 +888,9 @@ mod handler_tests {
         assert_eq!(thread["signals"].as_array().expect("array").len(), 1);
 
         // Ack flips once, then is a no-op.
-        let acked = handle_signal_ack(&conn, &json!({ "id": id })).expect("ack ok");
+        let acked = handle_signal_ack(&conn, &json!({ "id": id }), None).expect("ack ok");
         assert_eq!(acked["acknowledged"].as_bool(), Some(true));
-        let reacked = handle_signal_ack(&conn, &json!({ "id": id })).expect("ack ok");
+        let reacked = handle_signal_ack(&conn, &json!({ "id": id }), None).expect("ack ok");
         assert_eq!(reacked["acknowledged"].as_bool(), Some(false));
     }
 
@@ -1005,18 +1054,23 @@ mod handler_tests {
     }
 
     /// #1722 — a signal ack that actually flips `acknowledged` appends one
-    /// `coordination.signal_ack` audit row attributed to the recipient
-    /// (`to_agent`), and a no-op re-ack appends NO further row. The
-    /// append-only chain stays intact across both.
+    /// `coordination.signal_ack` audit row, and a no-op re-ack appends NO
+    /// further row. The append-only chain stays intact across both.
+    ///
+    /// #3364 — the row is now attributed to the RESOLVED CALLER. Pre-fix it
+    /// was attributed to the signal's `to_agent` on the assumption that the
+    /// recipient is who acks; nothing enforced that, so the tamper-evident
+    /// record named whoever the signal was addressed to, not whoever acked.
     #[test]
     fn ack_emits_signed_events_audit_row_1722() {
         let conn = fresh();
+        let me = caller_id();
         let sent = handle_signal_send(
             &conn,
             &json!({
                 "namespace": "_sig",
                 "from_agent": "ai:alice",
-                "to_agent": "ai:bob",
+                "to_agent": me,
                 "subject": "coordinate",
             }),
             None,
@@ -1028,8 +1082,8 @@ mod handler_tests {
             .to_string();
 
         // First ack flips it → exactly one signal_ack row, attributed to the
-        // recipient (the agent that acks).
-        let acked = handle_signal_ack(&conn, &json!({ "id": id })).expect("ack ok");
+        // resolved caller (the agent that actually acked).
+        let acked = handle_signal_ack(&conn, &json!({ "id": id }), None).expect("ack ok");
         assert_eq!(acked["acknowledged"].as_bool(), Some(true));
 
         let (count, agent): (i64, String) = conn
@@ -1041,10 +1095,13 @@ mod handler_tests {
             )
             .expect("query audit row");
         assert_eq!(count, 1, "expected one coordination.signal_ack audit row");
-        assert_eq!(agent, "ai:bob", "ack row attributed to the recipient");
+        assert_eq!(
+            agent, me,
+            "#3364: the ack row names the RESOLVED CALLER, not the signal's to_agent"
+        );
 
         // A no-op re-ack writes NO further signal_ack row.
-        let reacked = handle_signal_ack(&conn, &json!({ "id": id })).expect("ack ok");
+        let reacked = handle_signal_ack(&conn, &json!({ "id": id }), None).expect("ack ok");
         assert_eq!(reacked["acknowledged"].as_bool(), Some(false));
         let count2: i64 = conn
             .query_row(
@@ -1151,8 +1208,11 @@ mod handler_tests {
     fn post_signal_ack_fires_post_commit_1729() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let conn = fresh();
-        // Send (no hooks) so there is a signal to ack.
-        let sent = handle_signal_send(&conn, &send_params(), None).expect("send ok");
+        // Send (no hooks) so there is a signal to ack. #3364 — address it to
+        // THIS caller so the ack below takes the ALLOWED (addressee) path.
+        let mut params = send_params();
+        params[param_names::TO_AGENT] = Value::String(caller_id());
+        let sent = handle_signal_send(&conn, &params, None).expect("send ok");
         let id = sent[param_names::ID].as_str().expect("id").to_string();
 
         let fired = AtomicUsize::new(0);
@@ -1168,8 +1228,8 @@ mod handler_tests {
                 );
             })),
         };
-        let acked =
-            handle_signal_ack_with_hooks(&conn, &json!({ "id": id }), &hooks).expect("ack ok");
+        let acked = handle_signal_ack_with_hooks(&conn, &json!({ "id": id }), None, &hooks)
+            .expect("ack ok");
         assert_eq!(acked["acknowledged"].as_bool(), Some(true));
         assert_eq!(
             fired.load(Ordering::SeqCst),
@@ -1179,8 +1239,8 @@ mod handler_tests {
         assert_eq!(*seen_subject.lock().unwrap(), "original-subject");
 
         // A no-op re-ack must NOT fire the post hook again (no state change).
-        let reacked =
-            handle_signal_ack_with_hooks(&conn, &json!({ "id": id }), &hooks).expect("re-ack ok");
+        let reacked = handle_signal_ack_with_hooks(&conn, &json!({ "id": id }), None, &hooks)
+            .expect("re-ack ok");
         assert_eq!(reacked["acknowledged"].as_bool(), Some(false));
         assert_eq!(
             fired.load(Ordering::SeqCst),
@@ -1208,5 +1268,137 @@ mod handler_tests {
         // CONTROL: a well-formed call still succeeds.
         let ok = handle_signal_thread(&conn, &json!({ "correlation_id": "corr-x" })).expect("ok");
         assert_eq!(ok["signals"].as_array().expect("array").len(), 0);
+    }
+
+    // ---- #3364 signal_ack authorization -----------------------------------
+
+    /// Send one signal addressed to `to_agent`, returning its id.
+    fn send_to(conn: &rusqlite::Connection, to_agent: Value) -> String {
+        let sent = handle_signal_send(
+            conn,
+            &json!({
+                "namespace": "_ack",
+                "from_agent": "ai:sender",
+                "to_agent": to_agent,
+                "subject": "coordinate",
+            }),
+            None,
+        )
+        .expect("send ok");
+        sent[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string()
+    }
+
+    /// THE regression, DENIED half (#3364). A signal addressed to somebody
+    /// else must not be acknowledgeable by this caller.
+    ///
+    /// Pre-fix `handle_signal_ack` had no authorization at all: it stamped
+    /// `acknowledged_at` for anyone who knew the id, and — because the handler
+    /// carried no actor — attributed the `coordination.signal_ack` audit row
+    /// to the signal's `to_agent`, i.e. the tamper-evident chain NAMED THE
+    /// VICTIM as the acknowledger. Since `memory_signal_inbox` is
+    /// UNACKED-ONLY (#3171), the wrongful ack also made the message disappear
+    /// from its real addressee's inbox.
+    ///
+    /// Every assertion below FAILS against the unfixed handler: it returned
+    /// `Ok({"acknowledged": true})`, wrote the stamp, and wrote an audit row.
+    #[test]
+    fn ack_refuses_a_caller_that_is_not_the_addressee_3364() {
+        let conn = fresh();
+        // Deterministic: no resolved caller identity can equal this literal.
+        let victim = "ai:alice-not-this-caller";
+        let id = send_to(&conn, json!(victim));
+
+        let err = handle_signal_ack(&conn, &json!({ "id": id }), None)
+            .expect_err("a non-addressee ack must be REFUSED, not answered");
+        assert!(
+            err.contains("is not the addressee of this signal"),
+            "got: {err}"
+        );
+        assert!(
+            !err.contains(victim),
+            "the refusal must not disclose the addressee to a caller that may not ack: {err}"
+        );
+
+        // The signal is UNTOUCHED — a refused ack writes nothing.
+        let stored = crate::signals::get(&conn, &id)
+            .expect("get")
+            .expect("row still present");
+        assert_eq!(
+            stored.acknowledged_at, None,
+            "a refused ack must leave acknowledged_at unset"
+        );
+
+        // ...and no audit row was appended (no state change to observe).
+        let acks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                rusqlite::params![crate::coordination_audit::SIGNAL_ACK],
+                |r| r.get(0),
+            )
+            .expect("query audit rows");
+        assert_eq!(acks, 0, "a refused ack must not write an audit row");
+
+        // The message is still in its real addressee's (unacked-only) inbox.
+        let inbox = handle_signal_inbox(&conn, &json!({ "namespace": "_ack", "to_agent": victim }))
+            .expect("inbox ok");
+        assert_eq!(
+            inbox["signals"].as_array().expect("array").len(),
+            1,
+            "a refused ack must not hide the message from its addressee"
+        );
+    }
+
+    /// #3364 — a namespace BROADCAST has no addressee, and `acknowledged_at`
+    /// is one column on the row, so one agent acking it would hide it from
+    /// every other recipient's unacked-only inbox. Fail closed.
+    #[test]
+    fn ack_refuses_a_namespace_broadcast_3364() {
+        let conn = fresh();
+        for to_agent in [Value::Null, json!("   ")] {
+            let id = send_to(&conn, to_agent.clone());
+            let err = handle_signal_ack(&conn, &json!({ "id": id }), None)
+                .expect_err("a broadcast ack must be REFUSED");
+            assert!(
+                err.contains("a namespace broadcast has no addressee"),
+                "to_agent={to_agent}: {err}"
+            );
+            let stored = crate::signals::get(&conn, &id).expect("get").expect("row");
+            assert_eq!(stored.acknowledged_at, None);
+        }
+    }
+
+    /// THE regression, ALLOWED half (#3364). The addressee itself still acks
+    /// exactly as before — the gate must not be satisfiable by refusing
+    /// everything. Also pins the missing-id refusal and the untouched
+    /// absent-row shape.
+    #[test]
+    fn ack_still_allows_the_addressee_3364() {
+        let conn = fresh();
+        let me = caller_id();
+        let id = send_to(&conn, json!(me));
+
+        let acked = handle_signal_ack(&conn, &json!({ "id": id }), None).expect("addressee ack ok");
+        assert_eq!(acked["acknowledged"].as_bool(), Some(true));
+        let stored = crate::signals::get(&conn, &id).expect("get").expect("row");
+        assert!(stored.acknowledged_at.is_some(), "the stamp landed");
+
+        // A re-ack by the same addressee is still the documented no-op.
+        let reacked = handle_signal_ack(&conn, &json!({ "id": id }), None).expect("re-ack ok");
+        assert_eq!(reacked["acknowledged"].as_bool(), Some(false));
+
+        // The id must be identified before it can be authorized.
+        for bad in [json!({}), json!({ "id": "" }), json!({ "id": 7 })] {
+            let e = handle_signal_ack(&conn, &bad, None).expect_err("refused");
+            assert_eq!(e, "id is required", "{bad}");
+        }
+
+        // An id naming no row is NOT an authorization verdict: reporting one
+        // would leak which signal ids exist. Unchanged pre-#3364 shape.
+        let absent =
+            handle_signal_ack(&conn, &json!({ "id": "sig-nope" }), None).expect("absent is Ok");
+        assert_eq!(absent["acknowledged"].as_bool(), Some(false));
     }
 }

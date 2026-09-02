@@ -111,7 +111,7 @@ Ed25519 `signature` + sender `signer_pubkey`, and threads via
 | `memory_signal_read` | Read one signal by id. |
 | `memory_signal_inbox` | List signals addressed to an agent. |
 | `memory_signal_thread` | Walk a correlation thread (`correlation_id` / `in_reply_to`). |
-| `memory_signal_ack` | Acknowledge a signal. |
+| `memory_signal_ack` | Acknowledge a signal. **Addressee-only (#3364):** the caller identity is resolved from the MCP session (`AI_MEMORY_AGENT_ID`, else the `clientInfo` id, else the durable host id) and must equal the signal's `to_agent`; a namespace broadcast has no addressee and cannot be acknowledged. The `coordination.signal_ack` audit row records the resolved caller. |
 
 **Signal types** (`SignalType`, `src/models/signal.rs`): `authorize`,
 `notify` (default), `request`, `response`, `broadcast`.
