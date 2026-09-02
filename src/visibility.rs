@@ -173,19 +173,48 @@ pub fn is_visible_by_fields(
     // warning and their row's reach — never access to their own data.
     // Fail-closed to `false` would make a misspelled row unreachable by
     // anyone, including the one principal who can fix it.
+    match classify_scope(id, namespace, metadata) {
+        ScopeArm::OwnerPrivate => private_visible(metadata, caller),
+        ScopeArm::Broad => true,
+        ScopeArm::Subtree(ancestor_idx) => scope_subtree_visible(namespace, caller, ancestor_idx),
+    }
+}
+
+/// #3386 — which arm of the visibility rule a row's `metadata.scope` selects.
+///
+/// Extracted so the scope classification lives at exactly ONE site. Before
+/// #3386 the `match` below WAS [`is_visible_by_fields`]'s body, which meant any
+/// surface needing to distinguish "visible because this principal OWNS the row"
+/// from "visible because the row's scope is broad" had to re-derive the
+/// classification — precisely the duplication #951 exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeArm {
+    /// Owner-keyed private: an absent `scope` key, an explicit `private`, or
+    /// (per #2633) any unrecognised token outside [`LEGACY_BROAD_SCOPES`].
+    OwnerPrivate,
+    /// `collective`, or a member of the closed [`LEGACY_BROAD_SCOPES`] set.
+    Broad,
+    /// `team` / `unit` / `org` — #1921 subtree-restricted. The payload is the
+    /// namespace-ancestor index (1 / 2 / 3).
+    Subtree(usize),
+}
+
+/// Classify `metadata.scope` into the arm [`is_visible_by_fields`] dispatches
+/// on. `id` / `namespace` are used only for the #2633 unrecognised-token WARN.
+fn classify_scope(id: &str, namespace: &str, metadata: &serde_json::Value) -> ScopeArm {
     use crate::models::namespace::MemoryScope;
     let scope_str = metadata
         .get(crate::META_KEY_SCOPE)
         .and_then(serde_json::Value::as_str);
     match scope_str.map(MemoryScope::from_str) {
         // Field absent → default private (owner-keyed).
-        None => private_visible(metadata, caller),
+        None => ScopeArm::OwnerPrivate,
         // Present but not a `MemoryScope`: the closed legacy set is honoured
         // broadly; every other token degrades to the absent-key default.
         Some(None) => {
             let raw = scope_str.unwrap_or_default();
             if is_legacy_broad_scope(raw) {
-                true
+                ScopeArm::Broad
             } else {
                 tracing::warn!(
                     target: "visibility.unknown_scope",
@@ -196,20 +225,50 @@ pub fn is_visible_by_fields(
                      Valid scopes: {}",
                     crate::models::namespace::VALID_SCOPES.join(", ")
                 );
-                private_visible(metadata, caller)
+                ScopeArm::OwnerPrivate
             }
         }
-        Some(Some(MemoryScope::Private)) => private_visible(metadata, caller),
+        Some(Some(MemoryScope::Private)) => ScopeArm::OwnerPrivate,
         // Visible to every authenticated caller, regardless of namespace.
-        Some(Some(MemoryScope::Collective)) => true,
+        Some(Some(MemoryScope::Collective)) => ScopeArm::Broad,
         // #1921 — subtree-restricted: the memory's namespace must fall
         // within the caller's team / unit / org ancestor. `caller` is the
         // agent id, which IS the agent's namespace prefix. A missing
         // ancestor (the caller's namespace is too shallow, or `caller` is
         // a synthetic `anonymous:req-…` id with no `/`) → deny.
-        Some(Some(MemoryScope::Team)) => scope_subtree_visible(namespace, caller, 1),
-        Some(Some(MemoryScope::Unit)) => scope_subtree_visible(namespace, caller, 2),
-        Some(Some(MemoryScope::Org)) => scope_subtree_visible(namespace, caller, 3),
+        Some(Some(MemoryScope::Team)) => ScopeArm::Subtree(1),
+        Some(Some(MemoryScope::Unit)) => ScopeArm::Subtree(2),
+        Some(Some(MemoryScope::Org)) => ScopeArm::Subtree(3),
+    }
+}
+
+/// #3386 — visibility for a read surface that carries BOTH an enforced caller
+/// and a caller-supplied **#151 scope agent** (`as_agent`).
+///
+/// This is the in-process twin of what the SQL `visibility_clause`
+/// (`crate::storage::visibility_clause`) already does for `memory_search` and
+/// `db::list_by_source_uri`, and the split is load-bearing:
+///
+/// - the `team` / `unit` / `org` SUBTREE arms are keyed on `as_agent` — that is
+///   what "evaluate scope visibility AS this agent" means, and it is what the
+///   SQL prefixes computed from `as_agent` bind;
+/// - the owner-keyed PRIVATE arm stays keyed on the IDENTIFIED `caller`
+///   (`AI_MEMORY_AGENT_ID`), and FAILS CLOSED when there is none — the SQL arm
+///   binds the caller separately, so `caller IS NULL` yields no private rows.
+///
+/// Keying the private arm on `as_agent` instead would let a self-asserted wire
+/// value unlock another principal's private rows on any surface whose baseline
+/// is fail-closed. Callers combine this with [`is_visible_to_caller`] for the
+/// enforced caller, so the result can only ever be NARROWER than either gate
+/// alone.
+#[must_use]
+pub fn is_visible_to_scope_agent(mem: &Memory, as_agent: &str, caller: Option<&str>) -> bool {
+    match classify_scope(&mem.id, &mem.namespace, &mem.metadata) {
+        ScopeArm::OwnerPrivate => caller.is_some_and(|c| private_visible(&mem.metadata, c)),
+        ScopeArm::Broad => true,
+        ScopeArm::Subtree(ancestor_idx) => {
+            scope_subtree_visible(&mem.namespace, as_agent, ancestor_idx)
+        }
     }
 }
 
@@ -495,5 +554,77 @@ mod tests {
             caller_owns_for_mutation(&inbox, "ai:bob", true),
             "inbox recipient may mutate with allow_inbox"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3386 — `is_visible_to_scope_agent`: the in-process twin of the SQL
+    // `visibility_clause` (subtree arms keyed on `as_agent`, private arm keyed
+    // on the identified caller).
+    // -----------------------------------------------------------------------
+
+    /// A `scope=team` row sitting in `acme/eng/notes`.
+    fn team_scoped_row() -> Memory {
+        let mut m = mem_with_metadata(json!({"agent_id": "acme/eng/alice", "scope": "team"}));
+        m.namespace = "acme/eng/notes".to_string();
+        m
+    }
+
+    #[test]
+    fn scope_agent_subtree_arm_is_keyed_on_as_agent_3386() {
+        let m = team_scoped_row();
+        // ALLOWED — the scope agent is inside the row's team subtree.
+        assert!(is_visible_to_scope_agent(
+            &m,
+            "acme/eng/alice",
+            Some("acme/eng/alice")
+        ));
+        // DENIED — outside it, even though the CALLER can see the row. This is
+        // the narrowing `as_agent` is supposed to perform and did not, pre-#3386.
+        assert!(is_visible_to_caller(&m, "acme/eng/alice"));
+        assert!(!is_visible_to_scope_agent(
+            &m,
+            "other/team/bob",
+            Some("acme/eng/alice")
+        ));
+    }
+
+    #[test]
+    fn scope_agent_private_arm_is_keyed_on_the_caller_3386() {
+        // Owner-keyed private (scope key ABSENT — the NHI default).
+        let m = mem_with_metadata(json!({"agent_id": "ai:alice"}));
+        // ALLOWED — the identified caller owns it; the scope agent is
+        // irrelevant to the private arm, exactly as the SQL clause binds it.
+        assert!(is_visible_to_scope_agent(&m, "ai:bob", Some("ai:alice")));
+        // DENIED — no identified caller: FAIL CLOSED. A self-asserted
+        // `as_agent` naming the owner must NOT unlock the row, or the wire
+        // value would widen a fail-closed baseline.
+        assert!(!is_visible_to_scope_agent(&m, "ai:alice", None));
+        assert!(!is_visible_to_scope_agent(&m, "ai:bob", None));
+        // DENIED — an identified caller who is not the owner.
+        assert!(!is_visible_to_scope_agent(&m, "ai:alice", Some("ai:bob")));
+    }
+
+    #[test]
+    fn scope_agent_broad_arms_need_no_caller_3386() {
+        // `collective` and the closed legacy `shared` token stay broadly
+        // visible with no caller at all — the private-arm tightening above
+        // must not leak into them.
+        let collective = mem_with_metadata(json!({"agent_id": "ai:alice", "scope": "collective"}));
+        assert!(is_visible_to_scope_agent(&collective, "ai:bob", None));
+        let shared = mem_with_metadata(json!({"agent_id": "ai:alice", "scope": "shared"}));
+        assert!(is_visible_to_scope_agent(&shared, "ai:bob", None));
+    }
+
+    #[test]
+    fn scope_agent_unrecognised_token_takes_the_private_arm_3386() {
+        // #2633 — a typo'd token is owner-keyed private, so it also fails
+        // closed without an identified caller. Pins that the extracted
+        // `classify_scope` kept the #2633 narrowing on BOTH predicates.
+        let m = mem_with_metadata(json!({"agent_id": "ai:alice", "scope": "sharedd"}));
+        assert!(!is_visible_to_scope_agent(&m, "ai:alice", None));
+        assert!(is_visible_to_scope_agent(&m, "ai:bob", Some("ai:alice")));
+        // ... and that `is_visible_by_fields` is unchanged by the refactor.
+        assert!(is_visible_to_caller(&m, "ai:alice"));
+        assert!(!is_visible_to_caller(&m, "ai:bob"));
     }
 }

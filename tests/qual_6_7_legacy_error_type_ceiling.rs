@@ -161,7 +161,16 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // `handle_inbox` entry point preserves trusted in-process CLI/hook behaviour.
 // Both feed the established MCP inbox handler family and therefore retain its
 // `Result<Value, String>` boundary. Net acknowledged: +1.
-const QUAL_6_CEILING: usize = 125;
+// 2026-09-02 (#3386 kg-query visibility) — raised 125 -> 127 for the two
+// traversal paths split out of `handle_kg_query`: `kg_query_by_source_uri`
+// and `kg_query_from_source` (`src/mcp/tools/kg_query.rs`). These add NO new
+// legacy-typed surface — they are extractions of that one handler's own body,
+// carrying its existing `Result<Value, String>` MCP envelope so the shared
+// `namespace` / `as_agent` / bounds gate sits visibly above both paths and
+// neither path can drift from it. The handler was 134 code lines after the fix
+// (over `clippy::too_many_lines`); the split is what keeps it at 28. Stacks on
+// the #3356 +1 above rather than replacing it. Never lower.
+const QUAL_6_CEILING: usize = 127;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
