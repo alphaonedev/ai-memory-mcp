@@ -829,11 +829,6 @@ pub fn preserve_update_provenance_keys(
 }
 
 #[cfg(test)]
-pub(crate) fn env_var_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    agent_id_env_test_lock()
-}
-
-#[cfg(test)]
 pub(crate) struct AgentIdEnvSetGuard {
     prev: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
