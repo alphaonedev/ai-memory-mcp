@@ -107,6 +107,31 @@ pub struct BulkRowErrorClass {
 #[must_use]
 pub fn classify_bulk_row_error(raw: &str) -> BulkRowErrorClass {
     let lower = raw.to_ascii_lowercase();
+    // #3419 — the admit-once replay refusal FIRST. It must never fall through
+    // to the retryable INTERNAL_ERROR default at the tail of this function: a
+    // refused REPLAY reported to the fleet as a retryable server fault arms
+    // retry middleware to re-submit exactly the envelope the guard just
+    // rejected. It is a 409 CONFLICT (the signature is valid — it has simply
+    // been spent) and it is NOT retryable; the caller must re-sign.
+    if lower.contains("attested_write_replay") {
+        return BulkRowErrorClass {
+            code: crate::identity::attest::ATTESTED_WRITE_REPLAY_CODE,
+            label: "conflict: signed write envelope already used",
+            status: StatusCode::CONFLICT,
+            retryable: false,
+        };
+    }
+    // #3419 — a ledger fault is a genuine, transient backend condition: the
+    // envelope was NOT admitted (the INSERT failed), so re-submitting the same
+    // signed body is safe and correct once the ledger is reachable again.
+    if lower.contains("attested_write_ledger_unavailable") {
+        return BulkRowErrorClass {
+            code: crate::errors::error_codes::ATTESTATION_FAILED,
+            label: "attestation ledger unavailable",
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retryable: true,
+        };
+    }
     // #2588 — quota FIRST: retryable, typed, and already caller-visible on
     // the single-row surface.
     if lower.contains("quota_exceeded") {
@@ -488,5 +513,53 @@ pub fn classify_store_err(e: &crate::store::StoreError) -> BulkRowErrorClass {
         label,
         status,
         retryable,
+    }
+}
+
+/// #3419 (security-high) — map the admit-once attested-write outcome onto the
+/// wire, returning `None` when the write may proceed.
+///
+/// ONE response shape for every direct signed-write surface
+/// (`POST /api/v1/memories`, `/memories/bulk`), so a client cannot tell the
+/// funnels apart and a future surface cannot invent a softer refusal:
+///
+/// * [`AttestedWriteAdmission::Fresh`] → `None`; the caller stores the row.
+/// * [`AttestedWriteAdmission::Replay`] → `409 CONFLICT` with
+///   `code = "ATTESTED_WRITE_REPLAY"`. A conflict, not a 403: the signature is
+///   perfectly valid — it has simply already been spent.
+/// * ledger fault (`Err`) → `503 SERVICE UNAVAILABLE` with
+///   `code = "ATTESTATION_FAILED"`. Fail CLOSED: an unconsultable ledger cannot
+///   distinguish a first submission from a captured replay, so the write is
+///   refused rather than admitted on trust.
+///
+/// [`AttestedWriteAdmission::Fresh`]: crate::identity::attest::AttestedWriteAdmission::Fresh
+/// [`AttestedWriteAdmission::Replay`]: crate::identity::attest::AttestedWriteAdmission::Replay
+#[must_use]
+pub fn attested_write_admission_response(
+    outcome: &Result<crate::identity::attest::AttestedWriteAdmission, String>,
+) -> Option<axum::response::Response> {
+    use crate::identity::attest::AttestedWriteAdmission;
+    match outcome {
+        Ok(AttestedWriteAdmission::Fresh) => None,
+        Ok(AttestedWriteAdmission::Replay) => Some(
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "code": crate::identity::attest::ATTESTED_WRITE_REPLAY_CODE,
+                    "error": crate::identity::attest::ATTESTED_WRITE_REPLAY_REFUSAL,
+                })),
+            )
+                .into_response(),
+        ),
+        Err(msg) => Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "code": crate::errors::error_codes::ATTESTATION_FAILED,
+                    "error": msg,
+                })),
+            )
+                .into_response(),
+        ),
     }
 }

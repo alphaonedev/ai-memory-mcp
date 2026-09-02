@@ -1487,3 +1487,24 @@ CREATE TABLE IF NOT EXISTS token_cost_counters (
     CONSTRAINT token_cost_counters_write_events_ck    CHECK (write_events    >= 0),
     CONSTRAINT token_cost_counters_recall_events_ck   CHECK (recall_events   >= 0)
 );
+
+-- v95 (#3419, v1.0.0) — ATTESTED-WRITE REPLAY LEDGER. One row per
+-- caller-presented Ed25519 write envelope this node has already accepted, so a
+-- captured `POST /api/v1/memories` body cannot be re-submitted inside the
+-- ±ATTEST_CREATED_AT_SKEW_SECS freshness window to mint duplicate rows or
+-- resurrect a deleted memory as `agent_attested`. `fingerprint` (SHA-256 over
+-- the length-prefixed (agent_id, created_at, signature) triple) is the PRIMARY
+-- KEY, so the admit-once decision IS the uniqueness constraint — two concurrent
+-- submissions of the same body can never both be admitted. `seen_at` is unix
+-- epoch SECONDS so the bounded-retention prune is a numeric comparison
+-- identical on both backends; retention equals the replay window the freshness
+-- gate already enforces, so the table is bounded by the attested-write RATE and
+-- never by history. Mirrors migrations/postgres/0052_v95_attested_write_ledger.sql.
+CREATE TABLE IF NOT EXISTS attested_write_ledger (
+    fingerprint BYTEA  NOT NULL PRIMARY KEY,
+    agent_id    TEXT   NOT NULL,
+    created_at  TEXT   NOT NULL,
+    seen_at     BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attested_write_ledger_seen_at
+    ON attested_write_ledger(seen_at);

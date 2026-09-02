@@ -1511,6 +1511,17 @@ const MIGRATION_V92_SCHEMA_BOUND: &str =
 const MIGRATION_V94_LIFECYCLE_STATE_INDEX: &str =
     include_str!("../../migrations/postgres/0051_v94_lifecycle_state_index.sql");
 
+/// v1.0.0 #3419 — schema v95 canonical DDL: the additive
+/// `attested_write_ledger` table (`CREATE TABLE IF NOT EXISTS`) backing the
+/// admit-once replay guard on the DIRECT attested-write surfaces. Applied by
+/// [`PostgresStore::migrate_v95`]. Deliberately NOT a sqlite-only sidecar (the
+/// v51 `federation_nonce_cache` shape): a postgres-backed daemon serves those
+/// surfaces through the SAL trait, so a sqlite-only ledger would leave every
+/// postgres deployment unguarded. The sqlite twin is `MIGRATION_V95_SQLITE`
+/// (`migrations/sqlite/0079_v95_attested_write_ledger.sql`).
+const MIGRATION_V95_ATTESTED_WRITE_LEDGER: &str =
+    include_str!("../../migrations/postgres/0052_v95_attested_write_ledger.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -1901,7 +1912,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 94;
+const CURRENT_SCHEMA_VERSION: i32 = 95;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -3717,8 +3728,11 @@ impl PostgresStore {
         if current_version < 93 {
             self.migrate_v93().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 94 {
             self.migrate_v94().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v95().await?;
         }
 
         Ok(())
@@ -6747,7 +6761,11 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v94 lifecycle-state-index ddl", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // #3419 — settled arm: stamp the LITERAL 94, not CURRENT_SCHEMA_VERSION
+        // (now 95) — crash-consistency: a crash between the v94 and v95 commits
+        // must not strand the node stamped-past-v95 with the v95 arm unrun.
+        // (Same lockstep the #3324 comment on `migrate_v93` records.)
+        record_schema_version(&mut tx, 94).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v94 migration", e))?;
@@ -6757,6 +6775,51 @@ impl PostgresStore {
             "schema migration v94 applied (#3324: idx_memories_lifecycle_state — \
              backs the system-only hidden-state listings shipped with the new \
              `contaminated` auto-propagated invalidation-taint lifecycle state)"
+        );
+        Ok(())
+    }
+
+    /// v1.0.0 #3419 — schema v95: the additive `attested_write_ledger` table,
+    /// the postgres twin of the sqlite v95 arm.
+    ///
+    /// One row per caller-presented Ed25519 write envelope this node has
+    /// already accepted, keyed on the SHA-256
+    /// `(agent_id, created_at, signature)` fingerprint as the PRIMARY KEY — so
+    /// the admit-once decision IS the uniqueness constraint and two concurrent
+    /// submissions of the same captured body can never both be admitted.
+    /// Retention is exactly the ±`ATTEST_CREATED_AT_SKEW_SECS` replay window
+    /// the freshness gate already enforces, pruned on every admission, so the
+    /// table is bounded by the attested-write RATE and never by history.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS` — additive,
+    /// idempotent, no backfill, no existing row read or rewritten. Tip arm —
+    /// stamps [`CURRENT_SCHEMA_VERSION`].
+    async fn migrate_v95(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V95_ATTESTED_WRITE_LEDGER.contains("attested_write_ledger"),
+            "#3419: the v95 DDL doc twin must ship with the binary"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v95 attested-write-ledger ddl tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V95_ATTESTED_WRITE_LEDGER)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v95 attested-write-ledger ddl", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v95 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v95 applied (#3419: attested_write_ledger — the durable \
+             admit-once replay guard for caller-presented Ed25519 write signatures on \
+             the direct store surfaces)"
         );
         Ok(())
     }
@@ -25115,6 +25178,51 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err(field_names::AGENT_PUBKEY, e))?;
         Ok(row.and_then(|(pk,)| pk))
+    }
+
+    /// #3419 — postgres twin of the durable admit-once attested-write ledger.
+    ///
+    /// The prune and the admit run as two statements on the pool rather than in
+    /// a transaction, deliberately: the ADMIT decision is atomic on its own
+    /// (`INSERT ... ON CONFLICT (fingerprint) DO NOTHING` returns 1 row for
+    /// exactly one of any set of concurrent submissions of the same envelope),
+    /// and the prune only ever removes rows the freshness gate already refuses,
+    /// so it can never race the decision. Keeping them out of a transaction
+    /// avoids holding a write lock across the hot attested-write path.
+    async fn admit_attested_write(
+        &self,
+        fingerprint: &[u8],
+        agent_id: &str,
+        created_at: &str,
+    ) -> StoreResult<bool> {
+        if fingerprint.len() != 32 {
+            return Err(StoreError::IntegrityFailed {
+                detail: format!(
+                    "attested-write fingerprint must be 32 bytes, got {}",
+                    fingerprint.len()
+                ),
+            });
+        }
+        let now = Utc::now().timestamp();
+        sqlx::query("DELETE FROM attested_write_ledger WHERE seen_at < $1")
+            .bind(now - crate::storage::ATTESTED_WRITE_LEDGER_RETAIN_SECS)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("prune attested_write_ledger", e))?;
+        let inserted = sqlx::query(
+            "INSERT INTO attested_write_ledger (fingerprint, agent_id, created_at, seen_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (fingerprint) DO NOTHING",
+        )
+        .bind(fingerprint)
+        .bind(agent_id)
+        .bind(created_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("admit attested write", e))?
+        .rows_affected();
+        Ok(inserted == 1)
     }
 
     async fn revoke_agent_pubkey(&self, _ctx: &CallerContext, agent_id: &str) -> StoreResult<()> {

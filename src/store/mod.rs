@@ -1978,6 +1978,44 @@ pub trait MemoryStore: Send + Sync {
         Ok(None)
     }
 
+    /// #3419 (security-high) — admit ONE attested write envelope, exactly once.
+    ///
+    /// `fingerprint` is
+    /// [`crate::identity::attest::attested_write_fingerprint`] over the
+    /// `(agent_id, created_at, signature)` triple the caller presented.
+    /// Returns `Ok(true)` the first time this backend sees it (the ledger row
+    /// is recorded as a side effect) and `Ok(false)` on every later sighting —
+    /// a REPLAY the write path must refuse.
+    ///
+    /// Adapters MUST make the decision the storage engine's own uniqueness
+    /// constraint (`attested_write_ledger.fingerprint` is the PRIMARY KEY; the
+    /// statement is one `INSERT ... ON CONFLICT DO NOTHING`), never a
+    /// check-then-act read: two concurrent submissions of the same captured
+    /// body must never BOTH observe "fresh". They MUST also prune rows older
+    /// than [`crate::storage::ATTESTED_WRITE_LEDGER_RETAIN_SECS`] on each
+    /// admission, so the ledger stays bounded by the attested-write RATE rather
+    /// than by history and needs no background sweep.
+    ///
+    /// The default REFUSES. A backend that has not implemented the ledger
+    /// cannot tell a first submission from a replay, and the write path treats
+    /// this error as a refusal — degrade (no attested write) rather than
+    /// corrupt (an admitted replay). It must never be softened to `Ok(true)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnsupportedCapability`] by default; adapters propagate
+    /// their backend error. Callers MUST refuse the write on any error.
+    async fn admit_attested_write(
+        &self,
+        _fingerprint: &[u8],
+        _agent_id: &str,
+        _created_at: &str,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ATTESTED_WRITE_REPLAY_LEDGER".to_string(),
+        })
+    }
+
     /// #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — bind a per-agent
     /// api-key to `agent_id` by its `sha256(token)` digest. The RAW token is
     /// NEVER passed here or stored (only its lowercase-hex sha256), so the DB

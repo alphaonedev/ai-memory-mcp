@@ -1124,6 +1124,32 @@ async fn bulk_create_sqlite(
                             ledger.reject(row.index, "signature", &e.to_string());
                             continue;
                         }
+                        // #3419 (security-high) — admit-once replay guard. The
+                        // signature has VERIFIED; consult the durable ledger
+                        // before the row is persisted or fanned out, so a
+                        // captured signed row cannot be re-submitted inside the
+                        // ±300 s freshness window. A ledger fault rejects the
+                        // row (fail-closed) rather than admitting a replay.
+                        match crate::identity::attest::admit_attested_write_sync(
+                            &lock.0,
+                            caller,
+                            &row.mem.created_at,
+                            &sig_bytes,
+                        ) {
+                            Ok(crate::identity::attest::AttestedWriteAdmission::Fresh) => {}
+                            Ok(crate::identity::attest::AttestedWriteAdmission::Replay) => {
+                                ledger.reject(
+                                    row.index,
+                                    "signature",
+                                    crate::identity::attest::ATTESTED_WRITE_REPLAY_REFUSAL,
+                                );
+                                continue;
+                            }
+                            Err(msg) => {
+                                ledger.reject(row.index, "signature", &msg);
+                                continue;
+                            }
+                        }
                         // #1801→#1954 item 2 — sender EMIT so the author's
                         // signature propagates verbatim across relay hops.
                         crate::identity::attest::persist_write_signature(&mut row.mem, &sig_bytes);
@@ -1398,6 +1424,31 @@ async fn bulk_create_postgres(
                     {
                         ledger.reject(row.index, "signature", &e.to_string());
                         continue;
+                    }
+                    // #3419 — admit-once replay guard, SAL twin of the sqlite
+                    // branch above (same ledger contract, same fail-closed
+                    // disposition, same refusal string).
+                    match crate::identity::attest::admit_attested_write_async(
+                        app.store.as_ref(),
+                        caller,
+                        &row.mem.created_at,
+                        &sig_bytes,
+                    )
+                    .await
+                    {
+                        Ok(crate::identity::attest::AttestedWriteAdmission::Fresh) => {}
+                        Ok(crate::identity::attest::AttestedWriteAdmission::Replay) => {
+                            ledger.reject(
+                                row.index,
+                                "signature",
+                                crate::identity::attest::ATTESTED_WRITE_REPLAY_REFUSAL,
+                            );
+                            continue;
+                        }
+                        Err(msg) => {
+                            ledger.reject(row.index, "signature", &msg);
+                            continue;
+                        }
                     }
                     crate::identity::attest::persist_write_signature(&mut row.mem, &sig_bytes);
                 }

@@ -1316,6 +1316,25 @@ impl MemoryStore for SqliteStore {
         db::agent_pubkey(&conn, agent_id).map_err(box_err)
     }
 
+    /// #3419 — sqlite twin of the durable admit-once attested-write ledger.
+    async fn admit_attested_write(
+        &self,
+        fingerprint: &[u8],
+        agent_id: &str,
+        created_at: &str,
+    ) -> StoreResult<bool> {
+        let fp: [u8; 32] = fingerprint
+            .try_into()
+            .map_err(|_| StoreError::IntegrityFailed {
+                detail: format!(
+                    "attested-write fingerprint must be 32 bytes, got {}",
+                    fingerprint.len()
+                ),
+            })?;
+        let conn = self.state.lock().await;
+        db::admit_attested_write(&conn, &fp, agent_id, created_at).map_err(box_err)
+    }
+
     async fn revoke_agent_pubkey(&self, _ctx: &CallerContext, agent_id: &str) -> StoreResult<()> {
         let conn = self.state.lock().await;
         db::revoke_agent_pubkey(&conn, agent_id).map_err(box_err)

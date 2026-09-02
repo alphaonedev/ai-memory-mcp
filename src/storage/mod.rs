@@ -13896,6 +13896,67 @@ pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>>
     Ok(pubkey)
 }
 
+/// #3419 — how long an admitted attested-write fingerprint is retained, in
+/// seconds: exactly the widest window in which a captured envelope could still
+/// pass the freshness gate.
+///
+/// An envelope admitted at `T` carries a `created_at` within
+/// ±[`crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS`] of `T`, and a
+/// replay of it is refused by that same gate once the wall clock leaves
+/// `created_at ± skew`. The worst case (a maximally future-dated stamp) closes
+/// at `T + 2×skew`, so a row older than that carries no information: the
+/// freshness gate refuses the replay before the ledger is ever consulted.
+/// Retention is therefore the SMALLEST value that is still complete — the
+/// table is bounded by the attested-write RATE, never by history.
+pub const ATTESTED_WRITE_LEDGER_RETAIN_SECS: i64 =
+    2 * crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS;
+
+/// #3419 (security-high) — admit an attested write envelope EXACTLY ONCE.
+///
+/// Returns `Ok(true)` the first time this node sees `fingerprint` (the row is
+/// recorded as a side effect) and `Ok(false)` on every later sighting — a
+/// REPLAY the caller must refuse.
+///
+/// The decision is the storage engine's own uniqueness constraint, not a
+/// check-then-act read: `attested_write_ledger.fingerprint` is the PRIMARY KEY
+/// and the statement is a single `INSERT ... ON CONFLICT DO NOTHING`, so two
+/// concurrent submissions of the same captured body can never BOTH observe
+/// "fresh". Fail-closed by construction rather than by convention.
+///
+/// Every admission first prunes rows past
+/// [`ATTESTED_WRITE_LEDGER_RETAIN_SECS`]; at steady state each INSERT retires
+/// roughly one expired row, so the sweep is amortised O(1) and needs no
+/// background job, no operator tuning and no synchronized fleet-wide sweep.
+///
+/// The ledger holds DERIVED replay-protection state, never durable memory
+/// truth: losing it re-opens a bounded replay window (a degradation), it can
+/// never corrupt or destroy a memory.
+///
+/// # Errors
+///
+/// Propagates the underlying rusqlite error. Callers MUST refuse the write on
+/// an error — an unconsultable ledger cannot distinguish a first submission
+/// from a replay.
+pub fn admit_attested_write(
+    conn: &Connection,
+    fingerprint: &[u8; 32],
+    agent_id: &str,
+    created_at: &str,
+) -> Result<bool> {
+    let now = Utc::now().timestamp();
+    conn.execute(
+        "DELETE FROM attested_write_ledger WHERE seen_at < ?1",
+        params![now - ATTESTED_WRITE_LEDGER_RETAIN_SECS],
+    )?;
+    let inserted = conn.execute(
+        "INSERT INTO attested_write_ledger (fingerprint, agent_id, created_at, seen_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(fingerprint) DO NOTHING",
+        params![fingerprint.as_slice(), agent_id, created_at, now],
+    )?;
+    Ok(inserted == 1)
+}
+
 /// #2044 (v1.0.0, #2032-A) — bind a per-agent api-key to `agent_id` by its
 /// `sha256(token)` digest (schema v83 `agent_api_keys`). Idempotent
 /// `INSERT OR REPLACE` on the digest PK. The RAW token is never stored.

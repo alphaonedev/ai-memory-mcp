@@ -3,7 +3,7 @@
 
 //! ARCH-8 (FX-C4-batch2, 2026-05-26) — per-migration metadata matrix.
 //!
-//! The substrate ships a 93-step migration ladder (v2 → v94) whose
+//! The substrate ships a 94-step migration ladder (v2 → v95) whose
 //! "reversible? data-loss-risk? idempotent?" contract an operator needs
 //! BEFORE they plan a rollback — restore-from-backup is the only
 //! fallback for an irreversible arm, and they must know which arms
@@ -407,6 +407,17 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // CURRENT_SCHEMA_VERSION. Slots after #3323's settled v93. Postgres twin
     // is `PostgresStore::migrate_v94`.
     meta(94, "LIFECYCLE_STATE_INDEX", true, true, NoLoss, Sqlite),
+    // v95 (#3419, v1.0.0) — ATTESTED-WRITE REPLAY LEDGER. Additive standalone
+    // `attested_write_ledger` table (`CREATE TABLE IF NOT EXISTS`), one row per
+    // accepted signed-write envelope, keyed on the SHA-256
+    // `(agent_id, created_at, signature)` fingerprint as the PRIMARY KEY so the
+    // admit-once decision is the uniqueness constraint itself. Idempotent; no
+    // backfill and no pre-existing row is read or rewritten, so revert is DROP
+    // TABLE + lowering the stamp (NoLoss — the ledger is derived
+    // replay-protection state, regenerable by simply starting to record again,
+    // never durable memory truth). Literal tail: MUST equal
+    // CURRENT_SCHEMA_VERSION. Postgres twin is `PostgresStore::migrate_v95`.
+    meta(95, "ATTESTED_WRITE_REPLAY_LEDGER", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.
