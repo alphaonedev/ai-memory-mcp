@@ -291,21 +291,22 @@ pub(super) fn handle_promote(
         // P5 (G9): fire `memory_promote` webhook for vertical mode AFTER
         // the clone commits. memory_id = source id (subscribers can
         // distinguish via `mode` and `clone_id` in the details block).
-        let details = serde_json::to_value(crate::subscriptions::PromoteEventDetails {
-            mode: "vertical".to_string(),
-            tier: None,
-            to_namespace: Some(to_ns.to_string()),
-            clone_id: Some(clone_id.clone()),
-        })
-        .ok();
-        crate::subscriptions::dispatch_event_with_details(
+        // #3403 — through the shared write-event funnel. Pre-#3403 this arm
+        // used `tool_names::MEMORY_PROMOTE` while the tier arm below used a
+        // bare `"memory_promote"` literal: the exact per-site drift the
+        // funnel now makes unrepresentable.
+        crate::write_events::promote(
             conn,
-            crate::mcp::registry::tool_names::MEMORY_PROMOTE,
+            db_path,
             &resolved_id,
             &snapshot_namespace,
             snapshot_owner.as_deref(),
-            db_path,
-            details,
+            &crate::subscriptions::PromoteEventDetails {
+                mode: "vertical".to_string(),
+                tier: None,
+                to_namespace: Some(to_ns.to_string()),
+                clone_id: Some(clone_id.clone()),
+            },
         );
         return Ok(json!({
             "promoted": true,
@@ -385,21 +386,22 @@ pub(super) fn handle_promote(
     // the requested target (long by default, or whatever `target_tier`
     // resolved to).
     let tier_str = target_tier.as_str().to_string();
-    let details = serde_json::to_value(crate::subscriptions::PromoteEventDetails {
-        mode: "tier".to_string(),
-        tier: Some(tier_str.clone()),
-        to_namespace: None,
-        clone_id: None,
-    })
-    .ok();
-    crate::subscriptions::dispatch_event_with_details(
+    // #3403 — through the shared write-event funnel. This arm previously
+    // carried a bare `"memory_promote"` string literal while the vertical
+    // arm above used `tool_names::MEMORY_PROMOTE`; the funnel now owns the
+    // single binding.
+    crate::write_events::promote(
         conn,
-        "memory_promote",
+        db_path,
         &resolved_id,
         &snapshot_namespace,
         snapshot_owner.as_deref(),
-        db_path,
-        details,
+        &crate::subscriptions::PromoteEventDetails {
+            mode: "tier".to_string(),
+            tier: Some(tier_str.clone()),
+            to_namespace: None,
+            clone_id: None,
+        },
     );
     Ok(json!({"promoted": true, "mode": "tier", "id": resolved_id, "tier": tier_str}))
 }

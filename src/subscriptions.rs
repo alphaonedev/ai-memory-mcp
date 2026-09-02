@@ -60,6 +60,44 @@ pub(crate) fn dispatch_in_flight() -> usize {
     DISPATCH_IN_FLIGHT.load(Ordering::SeqCst)
 }
 
+/// Poll interval for [`drain_dispatches`]. Short enough that a one-shot
+/// CLI with nothing in flight adds no measurable latency, long enough not
+/// to spin.
+const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Wait for every ADMITTED webhook delivery to finish, up to `timeout`.
+///
+/// Returns `true` when the fan-out drained and `false` when the deadline
+/// was hit with deliveries still in flight. Callers decide the severity:
+/// the long-lived HTTP daemon treats a miss as a fatal shutdown (a late
+/// worker could write after the final audit checkpoint), while a one-shot
+/// CLI treats it as a loud WARN — its write is already durable and the
+/// per-delivery audit row is persisted BEFORE the network send, so a K7
+/// replay-from-cursor can re-deliver what the exit truncated.
+///
+/// v1.0.0 #3403 — extracted so the daemon-shutdown drain and the
+/// one-shot-CLI drain are the SAME wait, not two similar loops. Delivery
+/// is fire-and-forget by design, so a surface that dispatches and then
+/// exits without draining would emit events that reliably die with the
+/// process.
+pub async fn drain_dispatches(timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while dispatch_in_flight() != 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
+    true
+}
+
+/// The graceful-shutdown budget [`drain_dispatches`] callers use. See
+/// `SHUTDOWN_DRAIN_TIMEOUT`.
+#[must_use]
+pub fn shutdown_drain_timeout() -> std::time::Duration {
+    SHUTDOWN_DRAIN_TIMEOUT
+}
+
 /// Public-facing subscription record (no secret plaintext).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {

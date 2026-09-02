@@ -167,6 +167,23 @@ pub fn cmd_promote(
     if let Some(ref to_ns) = args.to_namespace {
         let clone_id =
             db::promote_to_namespace(&conn, &resolved_id, to_ns, Some(&caller_agent_id))?;
+        // v1.0.0 #3403 — subscription/webhook fan-out for a CLI-originated
+        // vertical promote, through the shared funnel the MCP twin calls
+        // (`crate::write_events`). `memory_id` is the SOURCE id and the clone
+        // is named in the details block, exactly as the MCP twin reports it.
+        crate::write_events::promote(
+            &conn,
+            db_path,
+            &resolved_id,
+            &target.namespace,
+            crate::write_events::owner_of(&target).as_deref(),
+            &crate::subscriptions::PromoteEventDetails {
+                mode: "vertical".to_string(),
+                tier: None,
+                to_namespace: Some(to_ns.to_string()),
+                clone_id: Some(clone_id.clone()),
+            },
+        );
         if json_out {
             writeln!(
                 out.stdout,
@@ -225,6 +242,22 @@ pub fn cmd_promote(
         writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     }
+    // v1.0.0 #3403 — subscription/webhook fan-out for a CLI-originated tier
+    // promote, through the shared funnel the MCP twin calls
+    // (`crate::write_events`).
+    crate::write_events::promote(
+        &conn,
+        db_path,
+        &resolved_id,
+        &target.namespace,
+        crate::write_events::owner_of(&target).as_deref(),
+        &crate::subscriptions::PromoteEventDetails {
+            mode: "tier".to_string(),
+            tier: Some(landing.as_str().to_string()),
+            to_namespace: None,
+            clone_id: None,
+        },
+    );
     if json_out {
         writeln!(
             out.stdout,

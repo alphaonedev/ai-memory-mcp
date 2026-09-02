@@ -79,6 +79,22 @@ pub fn run(
         &consolidator_agent_id,
         false,
     )?;
+    // v1.0.0 #3403 — subscription/webhook fan-out for a CLI-originated
+    // consolidation, through the shared funnel the MCP twin calls
+    // (`crate::write_events`). `memory_id` is the NEW row; the merged-away
+    // sources ride in the details block, which is the only record a
+    // subscriber gets of rows that no longer exist.
+    crate::write_events::consolidated(
+        &conn,
+        db_path,
+        &new_id,
+        &namespace,
+        Some(&consolidator_agent_id),
+        &crate::subscriptions::ConsolidatedEventDetails {
+            source_ids: ids.clone(),
+            source_count: ids.len(),
+        },
+    );
     if json_out {
         writeln!(
             out.stdout,
@@ -193,7 +209,7 @@ pub fn run_auto(
                     .join("\n");
                 // #2121 — CLI caller-origin surface (see `run` above):
                 // never substrate-authored.
-                db::consolidate(
+                let new_id = db::consolidate(
                     &conn,
                     &ids,
                     &title,
@@ -204,6 +220,20 @@ pub fn run_auto(
                     &consolidator_agent_id,
                     false,
                 )?;
+                // v1.0.0 #3403 — one event per consolidation the sweep
+                // actually commits, through the shared funnel. `--dry-run`
+                // commits nothing and therefore emits nothing.
+                crate::write_events::consolidated(
+                    &conn,
+                    db_path,
+                    &new_id,
+                    &ns.namespace,
+                    Some(&consolidator_agent_id),
+                    &crate::subscriptions::ConsolidatedEventDetails {
+                        source_count: ids.len(),
+                        source_ids: ids.clone(),
+                    },
+                );
                 consolidated_ids.extend(ids);
                 total += group.len();
             }

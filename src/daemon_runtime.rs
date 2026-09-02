@@ -2834,6 +2834,37 @@ pub async fn run(
         let _ = db::checkpoint(&conn);
     }
 
+    // v1.0.0 #3403 — ONE-SHOT DISPATCH DRAIN.
+    //
+    // Webhook delivery is fire-and-forget: `dispatch_event*` admits each
+    // matching subscriber onto a bounded worker pool and returns. A daemon
+    // drains that pool at shutdown; a one-shot `ai-memory <verb>` exits
+    // milliseconds after the write, so without this the events #3403 added
+    // to the CLI write verbs would be dispatched and then reliably die with
+    // the process — dispatching-into-the-void, not a fix.
+    //
+    // ONE site for every subcommand rather than a drain per verb: nothing
+    // is in flight for a read verb, so `drain_dispatches` returns
+    // immediately and this costs a single atomic load. It also runs on the
+    // error path deliberately — a verb that dispatched and then failed
+    // later still has admitted deliveries to finish. (The verbs that
+    // `std::process::exit` — not-found, governance Deny — do so BEFORE any
+    // dispatch, so no admitted delivery can be stranded by that route.)
+    //
+    // Severity is a WARN, never an error: the durable write already
+    // happened, and the per-delivery audit row is persisted BEFORE the
+    // network send, so a K7 replay-from-cursor can re-deliver whatever the
+    // deadline truncated. Turning a delivery deadline into a non-zero exit
+    // would misreport a committed write as a failure.
+    if !crate::subscriptions::drain_dispatches(crate::subscriptions::shutdown_drain_timeout()).await
+    {
+        tracing::warn!(
+            "webhook fan-out did not drain within the shutdown budget; the write(s) are \
+             durable and every admitted delivery has a persisted audit row — replay from \
+             the subscription cursor to re-deliver"
+        );
+    }
+
     result
 }
 
@@ -7722,15 +7753,15 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let subscription_deadline =
-        tokio::time::Instant::now() + crate::subscriptions::SHUTDOWN_DRAIN_TIMEOUT;
-    while crate::subscriptions::dispatch_in_flight() != 0 {
-        if tokio::time::Instant::now() >= subscription_deadline {
-            return Err(fatal_shutdown(
-                "subscription dispatch shutdown deadline exceeded",
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    // #3403 — the SHARED drain (`subscriptions::drain_dispatches`), also
+    // used by the one-shot CLI epilogue in `run`. The daemon's severity is
+    // FATAL: a late delivery worker could write after the final audit
+    // checkpoint.
+    if !crate::subscriptions::drain_dispatches(crate::subscriptions::shutdown_drain_timeout()).await
+    {
+        return Err(fatal_shutdown(
+            "subscription dispatch shutdown deadline exceeded",
+        ));
     }
 
     // Process-global governance hooks retain sender clones forever. Ask the

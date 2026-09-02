@@ -544,6 +544,21 @@ pub(crate) fn run_with_curator(
         .map(|c| &c.id)
         .collect();
 
+    // v1.0.0 #3403 — subscription/webhook fan-out for a CLI-originated
+    // store. Pre-fix no CLI write verb dispatched anything, so every
+    // subscriber was structurally blind to CLI writes while seeing the
+    // byte-identical MCP write. Same shared funnel the MCP twin calls
+    // (`crate::write_events`), fired on the PERSISTED namespace + the
+    // resolved agent, and placed BEFORE the atomisation pass so the two
+    // surfaces emit in the same order.
+    crate::write_events::store(
+        &conn,
+        db_path,
+        &actual_id,
+        &persisted.namespace,
+        Some(&agent_id),
+    );
+
     // v1.0.0 #3402 — POST-INSERT namespace-policy funnel.
     //
     // Pre-fix this handler called `db::insert` and stopped, so a

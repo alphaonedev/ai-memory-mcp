@@ -310,19 +310,18 @@ pub(super) fn handle_delete(
         ));
         // P5 (G9): fire `memory_delete` webhook AFTER the row is gone
         // (best-effort, fire-and-forget — same pattern as memory_store).
-        let details = serde_json::to_value(crate::subscriptions::DeleteEventDetails {
-            title: snapshot_title,
-            tier: snapshot_tier,
-        })
-        .ok();
-        crate::subscriptions::dispatch_event_with_details(
+        // #3403 — through the shared write-event funnel (see
+        // `crate::write_events`), which owns the event-name/details pairing.
+        crate::write_events::delete(
             conn,
-            crate::mcp::registry::tool_names::MEMORY_DELETE,
+            db_path,
             &target.id,
             &snapshot_namespace,
             snapshot_owner.as_deref(),
-            db_path,
-            details,
+            &crate::subscriptions::DeleteEventDetails {
+                title: snapshot_title,
+                tier: snapshot_tier,
+            },
         );
         Ok(json!({"deleted": true}))
     } else {

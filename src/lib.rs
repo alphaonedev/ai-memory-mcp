@@ -929,6 +929,11 @@ pub mod validate;
 /// flag profiles share the same predicate. See module docstring
 /// for the drift history that motivated the consolidation.
 pub mod visibility;
+/// v1.0.0 #3403 — the shared memory-write EVENT funnel: one typed emitter
+/// per lifecycle event, binding the canonical event name to the canonical
+/// details type in ONE place, so every write surface (MCP, CLI) dispatches
+/// the same event with the same shape instead of re-pairing them per site.
+pub mod write_events;
 
 #[cfg(feature = "sal")]
 pub mod migrate;

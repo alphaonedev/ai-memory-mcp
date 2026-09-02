@@ -1149,14 +1149,9 @@ pub(crate) fn handle_store(
     // v0.6.0.0: fire webhook subscribers on successful store. Best-effort
     // fire-and-forget — each subscriber gets its own OS thread; the
     // response here does not wait on any webhook dispatch.
-    crate::subscriptions::dispatch_event(
-        conn,
-        crate::mcp::registry::tool_names::MEMORY_STORE,
-        &actual_id,
-        &mem.namespace,
-        Some(&agent_id),
-        db_path,
-    );
+    // #3403 — through the shared write-event funnel, so this surface and
+    // the CLI twin cannot drift on the event name or the envelope shape.
+    crate::write_events::store(conn, db_path, &actual_id, &mem.namespace, Some(&agent_id));
 
     // v0.7.0 WT-1-D — auto-atomisation pre_store substrate hook. The
     // call resolves the namespace policy, token-counts the body, and

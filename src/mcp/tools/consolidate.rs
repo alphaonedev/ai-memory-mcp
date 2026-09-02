@@ -236,19 +236,17 @@ pub(super) fn handle_consolidate(
     // P5 (G9): fire `memory_consolidated` webhook AFTER db::consolidate
     // commits the new memory. memory_id = the new consolidated id; the
     // details block carries the source ids that were merged.
-    let details = serde_json::to_value(crate::subscriptions::ConsolidatedEventDetails {
-        source_ids: ids.clone(),
-        source_count: ids.len(),
-    })
-    .ok();
-    crate::subscriptions::dispatch_event_with_details(
+    // #3403 — through the shared write-event funnel (see `crate::write_events`).
+    crate::write_events::consolidated(
         conn,
-        crate::subscriptions::webhook_events::MEMORY_CONSOLIDATED,
+        db_path,
         &new_id,
         namespace,
         Some(&consolidator_agent_id),
-        db_path,
-        details,
+        &crate::subscriptions::ConsolidatedEventDetails {
+            source_ids: ids.clone(),
+            source_count: ids.len(),
+        },
     );
 
     Ok(result)
