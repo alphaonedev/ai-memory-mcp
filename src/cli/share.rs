@@ -113,7 +113,12 @@ pub fn cmd_share(
         params[db::META_KEY_WHY_TRACE] = json!(wt);
     }
 
-    let envelope = crate::mcp::share::handle_share(&conn, &params)
+    // v1.0.0 #3379 — thread the read-visibility principal into the shared
+    // substrate primitive so the CLI inherits the same caller-owns-source gate
+    // the MCP + HTTP surfaces get. `None` (no `AI_MEMORY_AGENT_ID`) keeps the
+    // single-operator posture this verb has always had.
+    let share_caller = crate::identity::resolve_read_visibility_caller();
+    let envelope = crate::mcp::share::handle_share(&conn, &params, share_caller.as_deref())
         .map_err(|e| anyhow::anyhow!("share: {e}"))?;
 
     if args.json {

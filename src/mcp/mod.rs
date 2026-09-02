@@ -2687,7 +2687,12 @@ fn dispatch_memory_notify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 /// `crate::mcp::share::handle_share` was complete; only the wire
 /// dispatch was missing.
 fn dispatch_memory_share(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    crate::mcp::share::handle_share(ctx.conn, ctx.arguments)
+    // v1.0.0 #3379 — resolve the read-visibility principal so the
+    // caller-owns-source gate inside `handle_share` has a subject. Mirrors
+    // `dispatch_memory_get` / `dispatch_memory_detect_contradiction`: `None`
+    // (no `AI_MEMORY_AGENT_ID`) is the single-operator trust-all posture.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    crate::mcp::share::handle_share(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_inbox(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

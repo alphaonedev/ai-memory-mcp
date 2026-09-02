@@ -458,6 +458,7 @@ fn share_inherits_source_why_trace_and_param_override_2122() {
     let resp = ai_memory::mcp::share::handle_share(
         &conn,
         &json!({"source_memory_id": gated, "target_agent_id": "ai:bob"}),
+        None,
     )
     .expect("share of a why_trace-bearing source inherits and clears the gate");
     let shared_id = resp["shared_memory_id"].as_str().unwrap();
@@ -470,6 +471,7 @@ fn share_inherits_source_why_trace_and_param_override_2122() {
     let err = ai_memory::mcp::share::handle_share(
         &conn,
         &json!({"source_memory_id": legacy, "target_agent_id": "ai:bob"}),
+        None,
     )
     .expect_err("share of a legacy why_trace-less source must be refused under enforce");
     assert!(err.contains("why_trace"), "got: {err}");
@@ -482,6 +484,7 @@ fn share_inherits_source_why_trace_and_param_override_2122() {
             "target_agent_id": "ai:bob",
             "why_trace": "sharing legacy note with bob",
         }),
+        None,
     )
     .expect("why_trace override clears the gate for a legacy source");
     let shared2 = resp2["shared_memory_id"].as_str().unwrap();

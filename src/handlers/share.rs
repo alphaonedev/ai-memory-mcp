@@ -52,9 +52,33 @@ pub struct ShareBody {
 /// ```
 pub async fn share_memory(
     State(app): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<ShareBody>,
 ) -> impl IntoResponse {
+    // v1.0.0 #3379 — per-agent-key identity gate BEFORE the caller is resolved
+    // from `X-Agent-Id` for the caller-owns-source check below. Without it a
+    // shared-transport-key caller could forge `X-Agent-Id: <victim>` and share
+    // the victim's `scope=private` rows out to itself. Mirrors the #2044 gate
+    // on `get_memory` / `load_family`; inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "share_memory",
+    ) {
+        return resp;
+    }
+    // #3379 — resolve the caller the same way every other gated HTTP read does
+    // (`handlers::memories::get_memory`): header id, else a per-request
+    // `anonymous:req-…` principal which owns nothing. The substrate primitive
+    // then refuses any source this caller cannot read, with the identical
+    // not-found body an absent id produces.
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let share_caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+
     let mut params: Value = json!({
         (field_names::SOURCE_MEMORY_ID): body.source_memory_id,
         (field_names::TARGET_AGENT_ID): body.target_agent_id,
@@ -69,7 +93,7 @@ pub async fn share_memory(
     // dispatch, release. The MCP path uses the same handler so wire
     // shape parity is guaranteed.
     let lock = app.db.lock().await;
-    let result = crate::mcp::share::handle_share(&lock.0, &params);
+    let result = crate::mcp::share::handle_share(&lock.0, &params, Some(&share_caller));
     drop(lock);
 
     match result {
