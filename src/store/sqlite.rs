@@ -3597,6 +3597,39 @@ impl MemoryStore for SqliteStore {
         Ok(sal)
     }
 
+    /// v1.0.0 #3448 — SAL port of the #3388 approver-gated reject. Delegates
+    /// to `db::reject_with_approver_type` with `ApproveSurface::Http`, exactly
+    /// as the `approve_with_approver_type` override above does: this trait
+    /// surface is the store-backed (multi-tenant) daemon, so the gate is
+    /// enforced UNCONDITIONALLY for parity with the postgres impl. The
+    /// single-operator MCP/CLI opt-in lives on the free-fn direct callers only.
+    ///
+    /// `db::RejectOutcome::NotFound` is carried through as
+    /// [`super::RejectOutcome::NotFound`] rather than mapped to
+    /// `StoreError::NotFound` (which is what the approve override does),
+    /// because the reject surfaces render "not found or already decided" as
+    /// their own 404 envelope and that wire text must stay byte-identical.
+    async fn reject_with_approver_type(
+        &self,
+        _ctx: &CallerContext,
+        pending_id: &str,
+        approver_agent_id: &str,
+    ) -> StoreResult<super::RejectOutcome> {
+        let conn = self.state.lock().await;
+        let outcome = db::reject_with_approver_type(
+            &conn,
+            pending_id,
+            approver_agent_id,
+            db::ApproveSurface::Http,
+        )
+        .map_err(box_err)?;
+        Ok(match outcome {
+            db::RejectOutcome::Rejected => super::RejectOutcome::Rejected,
+            db::RejectOutcome::Refused(reason) => super::RejectOutcome::Refused(reason),
+            db::RejectOutcome::NotFound => super::RejectOutcome::NotFound,
+        })
+    }
+
     /// FX-C2-batch5 — Sqlite override matching the nominal SQLite
     /// primitive name. Delegates to `db::decide_pending_action`.
     async fn decide_pending_action(
@@ -5984,6 +6017,136 @@ mod tests {
             .await
             .expect("approve_with_approver_type");
         assert!(matches!(outcome, crate::store::ApproveOutcome::Approved));
+    }
+
+    // =================================================================
+    // v1.0.0 #3448 — SAL port of the #3388 approver-gated reject.
+    //
+    // The store trait surface is the multi-tenant daemon, so the gate is
+    // UNCONDITIONAL here (`ApproveSurface::Http`), exactly as the
+    // `approve_with_approver_type` override above. These pin sqlite's half
+    // of the backend parity the postgres suite
+    // (`tests/reject_approver_gate_3448_pg.rs`) pins for the other half.
+    // =================================================================
+
+    /// #3448 DENIED — the requester may not veto their own action through the
+    /// store surface, exactly as `approve_with_approver_type` refuses them.
+    #[tokio::test]
+    async fn reject_with_approver_type_refuses_requester_self_veto_3448() {
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice3448");
+        let pid = {
+            let conn = store.state.lock().await;
+            let pid = db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns-reject-self-3448",
+                None,
+                "alice3448",
+                &serde_json::json!({"title":"t","content":"c"}),
+            )
+            .expect("queue");
+            // Registered, so only the separation-of-duties rule can refuse.
+            db::register_agent(&conn, "alice3448", "ai:generic", &[]).ok();
+            pid
+        };
+        let outcome = store
+            .reject_with_approver_type(&ctx, &pid, "alice3448")
+            .await
+            .expect("reject_with_approver_type");
+        match outcome {
+            crate::store::RejectOutcome::Refused(reason) => assert!(
+                reason.contains("self-approval"),
+                "expected the self-veto refusal, got: {reason}"
+            ),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        let conn = store.state.lock().await;
+        let pa = db::get_pending_action(&conn, &pid)
+            .expect("read")
+            .expect("row present");
+        assert_eq!(pa.status, "pending", "a refused veto must not decide");
+        assert!(pa.decided_by.is_none(), "no decider may be recorded");
+    }
+
+    /// #3448 DENIED — an unregistered non-requester may not veto.
+    #[tokio::test]
+    async fn reject_with_approver_type_refuses_unregistered_approver_3448() {
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("mallory3448");
+        let pid = {
+            let conn = store.state.lock().await;
+            db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns-reject-unreg-3448",
+                None,
+                "alice3448",
+                &serde_json::json!({"title":"t","content":"c"}),
+            )
+            .expect("queue")
+        };
+        let outcome = store
+            .reject_with_approver_type(&ctx, &pid, "mallory3448")
+            .await
+            .expect("reject_with_approver_type");
+        match outcome {
+            crate::store::RejectOutcome::Refused(reason) => assert!(
+                reason.contains("is not a registered agent"),
+                "expected the unregistered-approver refusal, got: {reason}"
+            ),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        let conn = store.state.lock().await;
+        let pa = db::get_pending_action(&conn, &pid)
+            .expect("read")
+            .expect("row present");
+        assert_eq!(pa.status, "pending", "a refused veto must not decide");
+    }
+
+    /// #3448 ALLOWED — a registered non-requester approver still vetoes, and
+    /// an absent id stays a `NotFound` no-op rather than becoming a refusal.
+    #[tokio::test]
+    async fn reject_with_approver_type_allows_registered_approver_3448() {
+        use crate::models::GovernedAction;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("bob3448");
+        let pid = {
+            let conn = store.state.lock().await;
+            let pid = db::queue_pending_action(
+                &conn,
+                GovernedAction::Store,
+                "ns-reject-ok-3448",
+                None,
+                "alice3448",
+                &serde_json::json!({"title":"t","content":"c"}),
+            )
+            .expect("queue");
+            db::register_agent(&conn, "bob3448", "ai:generic", &[]).ok();
+            pid
+        };
+        let outcome = store
+            .reject_with_approver_type(&ctx, &pid, "bob3448")
+            .await
+            .expect("reject_with_approver_type");
+        assert_eq!(outcome, crate::store::RejectOutcome::Rejected);
+        {
+            let conn = store.state.lock().await;
+            let pa = db::get_pending_action(&conn, &pid)
+                .expect("read")
+                .expect("row present");
+            assert_eq!(pa.status, "rejected");
+            assert_eq!(pa.decided_by.as_deref(), Some("bob3448"));
+        }
+        // Second call: already decided collapses to NotFound (the handlers'
+        // existing 404 envelope), never to a refusal.
+        let repeat = store
+            .reject_with_approver_type(&ctx, &pid, "bob3448")
+            .await
+            .expect("reject_with_approver_type second");
+        assert_eq!(repeat, crate::store::RejectOutcome::NotFound);
     }
 
     #[tokio::test]

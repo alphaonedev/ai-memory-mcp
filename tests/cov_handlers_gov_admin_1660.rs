@@ -230,7 +230,17 @@ async fn reject_pending_marks_rejected_and_returns_200() {
     let _guard = HMAC_LOCK.lock().unwrap();
     ai_memory::config::set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
     let (router, _f, db) = build_router(StorageBackend::Sqlite);
-    let pending_id = seed_delete_pending(&db, "cov-gov-reject", "rejecter").await;
+    // v1.0.0 #3448 — the HTTP REJECT surface now enforces the SAME approver
+    // eligibility the approve surface does (`ApproveSurface::Http`,
+    // unconditional): the decider must be a REGISTERED agent and must NOT be
+    // the requester. Queue as a distinct "requester-1660" and register the
+    // "rejecter" id the signed POST decides as, mirroring the approve test
+    // above. Pre-#3448 this vetoed as the requester itself.
+    let pending_id = seed_delete_pending(&db, "cov-gov-reject", "requester-1660").await;
+    {
+        let lock = db.lock().await;
+        ai_memory::db::register_agent(&lock.0, "rejecter", "ai:generic", &[]).ok();
+    }
     let (status, v) = signed_post(
         &router,
         &format!("/api/v1/pending/{pending_id}/reject"),

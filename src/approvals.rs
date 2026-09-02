@@ -245,9 +245,210 @@ pub fn subscribe() -> broadcast::Receiver<ApprovalEvent> {
     bus().subscribe()
 }
 
+/// v1.0.0 #3448 — what the PURE approver-eligibility rules decided, before
+/// any agent-registry I/O.
+///
+/// Split out of #3388's `crate::storage::evaluate_approver_eligibility` so the
+/// SQLite substrate and the PostgreSQL adapter share ONE statement of the
+/// rules instead of two hand-maintained copies (the #2538 trap: postgres does
+/// not see `SqliteStore`'s override, so a fix landed on one side alone ships
+/// half-closed). The registry lookup is deliberately NOT performed here —
+/// each backend does its own (sync `rusqlite` vs `async sqlx`), and keeping it
+/// out preserves the pre-existing LAZINESS: an arm that refuses on identity
+/// alone never touches the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApproverEligibilityStep {
+    /// Eligible outright; no registry lookup required.
+    Eligible,
+    /// Refused outright; no registry lookup required.
+    Refused(String),
+    /// Eligible IFF the decider is a REGISTERED agent. When it is not, the
+    /// caller must refuse with `refusal` (already rendered for the arm that
+    /// produced it, so the wire text stays byte-identical per arm).
+    RequiresRegisteredAgent {
+        /// The refusal to return when the registry lookup says "no".
+        refusal: String,
+    },
+}
+
+/// v1.0.0 #3448 — the ONE statement of the approver-eligibility rules, shared
+/// by every backend and every decision (approve AND reject).
+///
+/// `enforce_identity_gate` is the surface posture: the multi-tenant HTTP /
+/// PostgreSQL surfaces pass `true` unconditionally (#1793 / #2538 — per-request
+/// `X-Agent-Id` principals, no single-operator self-lock to avoid), while the
+/// single-operator MCP/CLI surfaces pass
+/// `crate::storage::ApproveSurface::LocalOperator`'s
+/// `AI_MEMORY_AGENT_ID` opt-in (#1796). The `Consensus` registry requirement
+/// (#216) is outside that posture and applies unconditionally.
+///
+/// Arms, in order, with the historical per-arm wire text preserved:
+/// - `Human` (the default when a namespace pins no policy): under the gate,
+///   the requester may not decide their own action, and the decider must be a
+///   registered agent (#1787).
+/// - `Agent(required)`: the named-approver equality is UNCONDITIONAL, then the
+///   same self / registered pair under the gate (#2538).
+/// - `Consensus(_)`: the decider must be a registered agent, unconditionally
+///   (#216). This arm carries no self-refusal on the approve side, and that is
+///   preserved rather than "improved" — eligibility PARITY across decisions
+///   and backends is the contract; changing a rule here changes it everywhere,
+///   which is the point.
+#[must_use]
+pub fn approver_eligibility_step(
+    approver: &crate::models::ApproverType,
+    requested_by: &str,
+    approver_agent_id: &str,
+    enforce_identity_gate: bool,
+) -> ApproverEligibilityStep {
+    use crate::models::ApproverType;
+    match approver {
+        ApproverType::Human => {
+            if enforce_identity_gate {
+                if approver_agent_id == requested_by {
+                    return ApproverEligibilityStep::Refused(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.to_string(),
+                    );
+                }
+                return ApproverEligibilityStep::RequiresRegisteredAgent {
+                    refusal: format!(
+                        "Human approver '{approver_agent_id}' is not a registered agent"
+                    ),
+                };
+            }
+            ApproverEligibilityStep::Eligible
+        }
+        ApproverType::Agent(required) => {
+            if approver_agent_id != required {
+                return ApproverEligibilityStep::Refused(format!(
+                    "designated approver is '{required}'; got '{approver_agent_id}'"
+                ));
+            }
+            if enforce_identity_gate {
+                if approver_agent_id == requested_by {
+                    return ApproverEligibilityStep::Refused(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.to_string(),
+                    );
+                }
+                return ApproverEligibilityStep::RequiresRegisteredAgent {
+                    refusal: format!(
+                        "designated approver '{approver_agent_id}' is not a registered agent"
+                    ),
+                };
+            }
+            ApproverEligibilityStep::Eligible
+        }
+        ApproverType::Consensus(_) => ApproverEligibilityStep::RequiresRegisteredAgent {
+            refusal: format!("consensus voter '{approver_agent_id}' is not a registered agent"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =================================================================
+    // v1.0.0 #3448 — the shared approver-eligibility RULES.
+    //
+    // These pin the rules ONCE, independent of any backend: the SQLite
+    // substrate (`storage::evaluate_approver_eligibility`) and the
+    // PostgreSQL adapter (`PostgresStore::approver_refusal_reason`) are
+    // both thin I/O bindings over `approver_eligibility_step`, so a rule
+    // change that breaks one backend breaks these first. The per-backend
+    // suites then prove each binding actually calls them.
+    // =================================================================
+
+    use crate::models::ApproverType;
+
+    /// Human arm, gate OFF (the single-operator trust-all default): the lone
+    /// operator decides their own queued action, with no registry lookup.
+    #[test]
+    fn human_arm_unarmed_is_eligible_3448() {
+        assert_eq!(
+            approver_eligibility_step(&ApproverType::Human, "ai:alice", "ai:alice", false),
+            ApproverEligibilityStep::Eligible
+        );
+    }
+
+    /// Human arm, gate ON: the requester may not decide their own action, and
+    /// the refusal short-circuits BEFORE any registry lookup is requested.
+    #[test]
+    fn human_arm_armed_refuses_self_3448() {
+        let step = approver_eligibility_step(&ApproverType::Human, "ai:alice", "ai:alice", true);
+        assert_eq!(
+            step,
+            ApproverEligibilityStep::Refused(crate::errors::msg::SELF_APPROVAL_REFUSED.to_string())
+        );
+    }
+
+    /// Human arm, gate ON, distinct decider: eligible ONLY IF registered.
+    #[test]
+    fn human_arm_armed_requires_registration_3448() {
+        let step = approver_eligibility_step(&ApproverType::Human, "ai:alice", "ai:bob", true);
+        match step {
+            ApproverEligibilityStep::RequiresRegisteredAgent { refusal } => {
+                assert!(
+                    refusal.contains("Human approver 'ai:bob'"),
+                    "got: {refusal}"
+                );
+                assert!(
+                    refusal.contains("is not a registered agent"),
+                    "got: {refusal}"
+                );
+            }
+            other => panic!("expected a registration requirement, got {other:?}"),
+        }
+    }
+
+    /// Agent(required) arm: the named-approver equality is UNCONDITIONAL — it
+    /// refuses a non-designated decider even with the gate OFF.
+    #[test]
+    fn agent_arm_named_equality_is_unconditional_3448() {
+        let approver = ApproverType::Agent("ai:carol".to_string());
+        for armed in [false, true] {
+            match approver_eligibility_step(&approver, "ai:alice", "ai:bob", armed) {
+                ApproverEligibilityStep::Refused(reason) => assert!(
+                    reason.contains("designated approver is 'ai:carol'; got 'ai:bob'"),
+                    "armed={armed} got: {reason}"
+                ),
+                other => panic!("armed={armed}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// Agent(required) arm, gate ON, decider IS the designated approver AND
+    /// the requester: separation of duties still refuses (#2538).
+    #[test]
+    fn agent_arm_armed_refuses_designated_self_3448() {
+        let approver = ApproverType::Agent("ai:alice".to_string());
+        assert_eq!(
+            approver_eligibility_step(&approver, "ai:alice", "ai:alice", true),
+            ApproverEligibilityStep::Refused(crate::errors::msg::SELF_APPROVAL_REFUSED.to_string())
+        );
+    }
+
+    /// Consensus arm: the registered-voter requirement is UNCONDITIONAL
+    /// (#216) — it does not depend on the surface posture, and this arm
+    /// carries no self-refusal, matching the approve side exactly.
+    #[test]
+    fn consensus_arm_requires_registration_unconditionally_3448() {
+        for armed in [false, true] {
+            match approver_eligibility_step(
+                &ApproverType::Consensus(2),
+                "ai:alice",
+                "ai:alice",
+                armed,
+            ) {
+                ApproverEligibilityStep::RequiresRegisteredAgent { refusal } => assert!(
+                    refusal.contains("consensus voter 'ai:alice' is not a registered agent"),
+                    "armed={armed} got: {refusal}"
+                ),
+                other => {
+                    panic!("armed={armed}: expected a registration requirement, got {other:?}")
+                }
+            }
+        }
+    }
 
     /// Serialise the unit tests that mutate the global registry —
     /// `cargo test` runs tests in parallel by default and the

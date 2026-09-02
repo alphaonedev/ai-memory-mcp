@@ -2701,6 +2701,40 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 #3448 — approver-gated REJECT (veto) of a pending action: the
+    /// companion of [`MemoryStore::governance_approve_with_consensus`] and the
+    /// SAL port of `db::reject_with_approver_type` (#3388).
+    ///
+    /// **Why this exists rather than another `pending_decide(.., false, ..)`
+    /// call.** `pending_decide` is the raw structural transition — it asks no
+    /// question about WHO is deciding. Every caller-originated reject surface
+    /// (MCP, HTTP `POST /api/v1/pending/{id}/reject`, the K10
+    /// `/approvals/decide` deny arm, the CLI) reached it directly, so any
+    /// principal — including the REQUESTER, whom approve explicitly refuses —
+    /// could veto any other tenant's queued action. This method applies the
+    /// SAME eligibility approve applies
+    /// ([`crate::approvals::approver_eligibility_step`]) before transitioning.
+    /// `pending_decide` remains the correct primitive for the one path that is
+    /// NOT caller-originated: federation replay of a decision a peer already
+    /// gated (`handlers::federation_receive`, which carries its own #2532 peer
+    /// authorization and #2720 decider binding).
+    ///
+    /// Adapters MUST refuse before any state change, and MUST stamp
+    /// `decided_by` / `decided_at` on the allowed path exactly as
+    /// [`MemoryStore::pending_decide`] does.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn reject_with_approver_type(
+        &self,
+        _ctx: &CallerContext,
+        _pending_id: &str,
+        _approver_agent_id: &str,
+    ) -> StoreResult<RejectOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_PENDING_REJECT".to_string(),
+        })
+    }
+
     /// Read a pending action by id. Returns `None` when no row matches.
     /// Default returns `UnsupportedCapability`.
     async fn get_pending(
@@ -4677,6 +4711,25 @@ pub enum ApproveOutcome {
     Pending { votes: usize, quorum: u32 },
     /// The vote was rejected. `reason` is human-readable.
     Rejected(String),
+}
+
+/// v1.0.0 #3448 — outcome of a single governance REJECT (veto) call.
+///
+/// Mirrors [`crate::storage::RejectOutcome`] (#3388) so the trait surface and
+/// the sqlite `db::*` free-function path share a wire shape, exactly as
+/// [`ApproveOutcome`] does for approve. `Refused` is about the CALLER (not an
+/// eligible approver — the row is untouched and still `pending`); `Rejected`
+/// is about the ACTION (vetoed, now `rejected`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectOutcome {
+    /// No `pending` row with this id (absent, or already decided). Surfaces as
+    /// the 404 "not found or already decided" envelope, NOT as a refusal.
+    NotFound,
+    /// The caller is not an eligible approver under this action's namespace
+    /// policy; the pending action is UNCHANGED.
+    Refused(String),
+    /// The pending action was vetoed and is now `rejected`.
+    Rejected,
 }
 
 /// Partial-update payload. `None` means "leave this field alone" —

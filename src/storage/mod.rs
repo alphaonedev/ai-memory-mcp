@@ -22192,17 +22192,11 @@ pub enum ApproverEligibility {
 /// implementation both call. Re-stating the rules on the reject side would
 /// have reproduced exactly the drift #3388 is about.
 ///
-/// The rules are lifted verbatim, arm for arm, in the same order, with the
-/// same messages:
-/// - `Human` (the default when a namespace has no policy): under
-///   [`enforce_approver_identity_gate`], the requester may not decide their
-///   own action and the decider must be a REGISTERED agent (#1787 / #1796).
-/// - `Agent(required)`: the named-approver equality is UNCONDITIONAL, then the
-///   same self / registered pair under the gate (#2538).
-/// - `Consensus(_)`: the decider must be a registered agent, unconditionally
-///   (#216). Note this arm carries no self-refusal on the approve side either
-///   — preserved rather than "improved" here, because eligibility parity with
-///   approve is the entire contract of this function.
+/// v1.0.0 #3448 — the RULES themselves now live once, backend-agnostically, at
+/// [`crate::approvals::approver_eligibility_step`], which the PostgreSQL
+/// adapter calls too; this function is the SQLite binding of them (surface
+/// posture + the lazy agent-registry lookup). See that function for the
+/// arm-by-arm contract.
 ///
 /// Quorum is NOT eligibility and stays where it belongs, in
 /// [`approve_with_approver_type`]'s `Consensus` arm: a veto is the
@@ -22222,49 +22216,29 @@ fn evaluate_approver_eligibility(
     approver_agent_id: &str,
     surface: ApproveSurface,
 ) -> Result<ApproverEligibility> {
-    match approver {
-        ApproverType::Human => {
-            if enforce_approver_identity_gate(surface) {
-                if approver_agent_id == requested_by {
-                    return Ok(ApproverEligibility::Refused(
-                        crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
-                    ));
-                }
-                if !is_registered_agent(conn, approver_agent_id)? {
-                    return Ok(ApproverEligibility::Refused(format!(
-                        "Human approver '{approver_agent_id}' is not a registered agent"
-                    )));
-                }
-            }
-            Ok(ApproverEligibility::Eligible)
+    // v1.0.0 #3448 — the RULES moved to `crate::approvals::approver_eligibility_step`
+    // so this substrate and the PostgreSQL adapter share ONE statement of them
+    // (the #2538 trap: postgres never sees `SqliteStore`'s override, so rules
+    // stated only here would ship half-closed). This function keeps the sqlite
+    // I/O: the surface posture and the agent-registry lookup, which stays LAZY
+    // — an arm that refuses on identity alone never queries the registry, byte
+    // for byte as before.
+    match crate::approvals::approver_eligibility_step(
+        approver,
+        requested_by,
+        approver_agent_id,
+        enforce_approver_identity_gate(surface),
+    ) {
+        crate::approvals::ApproverEligibilityStep::Eligible => Ok(ApproverEligibility::Eligible),
+        crate::approvals::ApproverEligibilityStep::Refused(reason) => {
+            Ok(ApproverEligibility::Refused(reason))
         }
-        ApproverType::Agent(required) => {
-            if approver_agent_id != required {
-                return Ok(ApproverEligibility::Refused(format!(
-                    "designated approver is '{required}'; got '{approver_agent_id}'"
-                )));
+        crate::approvals::ApproverEligibilityStep::RequiresRegisteredAgent { refusal } => {
+            if is_registered_agent(conn, approver_agent_id)? {
+                Ok(ApproverEligibility::Eligible)
+            } else {
+                Ok(ApproverEligibility::Refused(refusal))
             }
-            if enforce_approver_identity_gate(surface) {
-                if approver_agent_id == requested_by {
-                    return Ok(ApproverEligibility::Refused(
-                        crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
-                    ));
-                }
-                if !is_registered_agent(conn, approver_agent_id)? {
-                    return Ok(ApproverEligibility::Refused(format!(
-                        "designated approver '{approver_agent_id}' is not a registered agent"
-                    )));
-                }
-            }
-            Ok(ApproverEligibility::Eligible)
-        }
-        ApproverType::Consensus(_) => {
-            if !is_registered_agent(conn, approver_agent_id)? {
-                return Ok(ApproverEligibility::Refused(format!(
-                    "consensus voter '{approver_agent_id}' is not a registered agent"
-                )));
-            }
-            Ok(ApproverEligibility::Eligible)
         }
     }
 }

@@ -19337,6 +19337,53 @@ async fn record_memory_quota_batch_in_tx(
 }
 
 impl PostgresStore {
+    /// v1.0.0 #3448 — resolve approver eligibility for one pending action.
+    ///
+    /// The RULES are [`crate::approvals::approver_eligibility_step`], the ONE
+    /// backend-agnostic statement shared with the SQLite substrate
+    /// (`storage::evaluate_approver_eligibility`). This method supplies only
+    /// the postgres-side I/O the rules need: the (lazy) agent-registry lookup.
+    ///
+    /// `enforce_identity_gate` is `true` UNCONDITIONALLY here, per #1793 /
+    /// #2538: the postgres SAL is reachable only through the inherently
+    /// multi-tenant HTTP daemon, where the approver is a per-request
+    /// `X-Agent-Id` principal, the sqlite `AI_MEMORY_AGENT_ID` opt-in is unset
+    /// (so an opt-in gate would never fire), and there is no single-operator
+    /// self-lock to avoid.
+    ///
+    /// Returns `Ok(None)` when the caller is eligible, `Ok(Some(reason))` when
+    /// it is refused. Takes the ALREADY-RESOLVED `approver` so the caller can
+    /// reuse it for its own arm dispatch, mirroring the sqlite twin's shape.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a backend failure from the registry lookup, so an unreadable
+    /// registry fails CLOSED at every call site.
+    async fn approver_refusal_reason(
+        &self,
+        approver: &crate::models::ApproverType,
+        requested_by: &str,
+        approver_agent_id: &str,
+    ) -> StoreResult<Option<String>> {
+        use crate::approvals::ApproverEligibilityStep as Step;
+        match crate::approvals::approver_eligibility_step(
+            approver,
+            requested_by,
+            approver_agent_id,
+            true,
+        ) {
+            Step::Eligible => Ok(None),
+            Step::Refused(reason) => Ok(Some(reason)),
+            Step::RequiresRegisteredAgent { refusal } => {
+                if super::MemoryStore::is_registered_agent(self, approver_agent_id).await? {
+                    Ok(None)
+                } else {
+                    Ok(Some(refusal))
+                }
+            }
+        }
+    }
+
     /// #1955 R45 / #3276 — SAL write-funnel gate. Fail-CLOSED fleet-wide
     /// kill switch.
     ///
@@ -29801,6 +29848,56 @@ impl MemoryStore for PostgresStore {
         Ok(None)
     }
 
+    /// v1.0.0 #3448 — approver-gated REJECT (veto), the postgres twin of
+    /// `db::reject_with_approver_type` (#3388) and the companion of
+    /// [`Self::governance_approve_with_consensus`] above.
+    ///
+    /// Pre-#3448 every caller-originated reject surface reached the raw
+    /// `pending_decide(.., false, ..)` transition, which asks nothing about
+    /// WHO is deciding — so on postgres (multi-tenant, per-request
+    /// `X-Agent-Id`) any principal, including the requester whom approve
+    /// refuses, could veto any other tenant's queued action. This method runs
+    /// the SAME shared eligibility predicate approve runs
+    /// ([`Self::approver_refusal_reason`]) BEFORE any state change.
+    ///
+    /// Existence is resolved before eligibility, matching approve, and an
+    /// already-decided row collapses into `NotFound` so the handler renders
+    /// its existing "not found or already decided" 404 envelope byte-identically.
+    async fn reject_with_approver_type(
+        &self,
+        ctx: &CallerContext,
+        pending_id: &str,
+        approver_agent_id: &str,
+    ) -> StoreResult<super::RejectOutcome> {
+        // Wave-2 B7' — sqlite twin `reject_with_approver_type` gates (ERRORS-09).
+        self.gate_record_stop().await?;
+        let Some(pa) = self.get_pending(ctx, pending_id).await? else {
+            return Ok(super::RejectOutcome::NotFound);
+        };
+        if pa.status != "pending" {
+            return Ok(super::RejectOutcome::NotFound);
+        }
+        let approver = self
+            .resolve_governance_policy(&pa.namespace)
+            .await?
+            .map_or(crate::models::ApproverType::Human, |p| p.core.approver);
+        if let Some(reason) = self
+            .approver_refusal_reason(&approver, &pa.requested_by, approver_agent_id)
+            .await?
+        {
+            return Ok(super::RejectOutcome::Refused(reason));
+        }
+        if self
+            .pending_decide(ctx, pending_id, false, approver_agent_id)
+            .await?
+        {
+            Ok(super::RejectOutcome::Rejected)
+        } else {
+            // Lost a race with a concurrent decision — no longer `pending`.
+            Ok(super::RejectOutcome::NotFound)
+        }
+    }
+
     async fn governance_approve_with_consensus(
         &self,
         ctx: &CallerContext,
@@ -29834,6 +29931,20 @@ impl MemoryStore for PostgresStore {
             .await?
             .map_or(crate::models::ApproverType::Human, |p| p.core.approver);
 
+        // v1.0.0 #3448 — the eligibility half is now ONE shared predicate
+        // (`crate::approvals::approver_eligibility_step`, via
+        // `Self::approver_refusal_reason`) that the SQLite substrate and the
+        // reject twin below both call, so no backend and no decision can drift
+        // from the others. Same arms, same order, same messages as the per-arm
+        // blocks this replaced. Quorum bookkeeping stays in the arm below,
+        // because quorum is not eligibility.
+        if let Some(reason) = self
+            .approver_refusal_reason(&approver, &pa.requested_by, approver_agent_id)
+            .await?
+        {
+            return Ok(super::ApproveOutcome::Rejected(reason));
+        }
+
         match approver {
             crate::models::ApproverType::Human => {
                 // #1793 (5-agent vote 4d3ea1c5) — UNCONDITIONALLY harden the
@@ -29847,16 +29958,8 @@ impl MemoryStore for PostgresStore {
                 // keys on is unset (so an opt-in gate would never fire) and the
                 // per-request X-Agent-Id approver is a distinct authenticated
                 // identity — there is no single-operator self-lock to avoid.
-                if approver_agent_id == pa.requested_by {
-                    return Ok(super::ApproveOutcome::Rejected(
-                        crate::errors::msg::SELF_APPROVAL_REFUSED.to_string(),
-                    ));
-                }
-                if !self.is_registered_agent(approver_agent_id).await? {
-                    return Ok(super::ApproveOutcome::Rejected(format!(
-                        "Human approver '{approver_agent_id}' is not a registered agent"
-                    )));
-                }
+                // #3448 — self-approval + registered-approver refusals moved to
+                // the shared `approver_refusal_reason` above (unchanged rules).
                 let ok = self
                     .pending_decide(ctx, pending_id, true, approver_agent_id)
                     .await?;
@@ -29868,12 +29971,9 @@ impl MemoryStore for PostgresStore {
                     ))
                 }
             }
-            crate::models::ApproverType::Agent(required) => {
-                if approver_agent_id != required {
-                    return Ok(super::ApproveOutcome::Rejected(format!(
-                        "designated approver is '{required}'; got '{approver_agent_id}'"
-                    )));
-                }
+            crate::models::ApproverType::Agent(_required) => {
+                // #3448 — named-approver equality moved to the shared
+                // `approver_refusal_reason` above (unchanged rule).
                 // #2538 (CWE-863) — pre-fix this arm was a BARE STRING COMPARE
                 // on BOTH backends: no self-approval refusal, no
                 // registered-agent check, while the Human arm above carries
@@ -29895,16 +29995,8 @@ impl MemoryStore for PostgresStore {
                 // method, so a fix landed in the sqlite override alone would
                 // never execute here. Both paths are pinned by
                 // `tests/authz_named_approver_2538_pg.rs`.
-                if approver_agent_id == pa.requested_by {
-                    return Ok(super::ApproveOutcome::Rejected(
-                        crate::errors::msg::SELF_APPROVAL_REFUSED.to_string(),
-                    ));
-                }
-                if !self.is_registered_agent(approver_agent_id).await? {
-                    return Ok(super::ApproveOutcome::Rejected(format!(
-                        "designated approver '{approver_agent_id}' is not a registered agent"
-                    )));
-                }
+                // #3448 — self-approval + registered-approver refusals moved to
+                // the shared `approver_refusal_reason` above (unchanged rules).
                 let ok = self
                     .pending_decide(ctx, pending_id, true, approver_agent_id)
                     .await?;
@@ -29917,11 +30009,8 @@ impl MemoryStore for PostgresStore {
                 }
             }
             crate::models::ApproverType::Consensus(quorum) => {
-                if !self.is_registered_agent(approver_agent_id).await? {
-                    return Ok(super::ApproveOutcome::Rejected(format!(
-                        "consensus voter '{approver_agent_id}' is not a registered agent"
-                    )));
-                }
+                // #3448 — the registered-voter refusal moved to the shared
+                // `approver_refusal_reason` above (unchanged rule).
                 let canonical_id = approver_agent_id.to_ascii_lowercase();
                 let mut approvals = pa.approvals.clone();
                 if approvals

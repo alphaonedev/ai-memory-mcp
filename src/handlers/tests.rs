@@ -9745,6 +9745,11 @@ async fn http_reject_pending_happy_path_marks_rejected_no_execution() {
     let state = test_state();
     let pid = {
         let lock = state.lock().await;
+        // v1.0.0 #3448 — the HTTP reject surface now enforces the SAME approver
+        // eligibility approve does (`ApproveSurface::Http`, unconditional), so
+        // the decider must be a REGISTERED agent distinct from the requester.
+        // Mirrors `http_approve_pending_happy_path_executes_store` (#1796).
+        db::register_agent(&lock.0, "rejector-alice", "ai:generic", &[]).ok();
         db::queue_pending_action(
             &lock.0,
             GovernedAction::Store,
@@ -9810,6 +9815,153 @@ async fn http_reject_pending_happy_path_marks_rejected_no_execution() {
         rows.is_empty(),
         "rejection must not execute the queued payload"
     );
+}
+
+/// v1.0.0 #3448 DENIED — the REQUESTER may not veto their own queued action
+/// on the HTTP surface. Pre-#3448 `reject_pending` called the raw structural
+/// `decide_pending_action(.., false, ..)`, which asks nothing about who is
+/// deciding, while `approve_pending` refuses exactly this caller (#1796).
+#[tokio::test]
+async fn http_reject_pending_refuses_requester_self_veto_3448() {
+    let _g = APPROVE_HMAC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::config::set_active_hooks_hmac_secret(Some("a1-test-secret".to_string()));
+    use crate::models::GovernedAction;
+    let state = test_state();
+    let pid = {
+        let lock = state.lock().await;
+        // Registered, so the ONLY thing standing between this caller and the
+        // veto is the separation-of-duties rule.
+        db::register_agent(&lock.0, "self-vetoer-3448", "ai:generic", &[]).ok();
+        db::queue_pending_action(
+            &lock.0,
+            GovernedAction::Store,
+            "reject-self-3448",
+            None,
+            "self-vetoer-3448",
+            &serde_json::json!({
+                "tier": Tier::Long.as_str(),
+                "namespace": "reject-self-3448",
+                "title": "own request",
+                "content": "x",
+                "tags": [], "priority": 5, "confidence": 1.0,
+                "source": "api", "metadata": {}
+            }),
+        )
+        .unwrap()
+    };
+    let app = Router::new()
+        .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
+        .with_state(test_app_state(state.clone()));
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, b"");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/pending/{pid}/reject"))
+                .method("POST")
+                .header("x-agent-id", "self-vetoer-3448")
+                .header("x-ai-memory-timestamp", &ts)
+                .header("x-ai-memory-signature", &sig)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    crate::config::set_active_hooks_hmac_secret(None);
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the requester must not be able to veto their own action"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(err.contains("reject refused"), "body={v}");
+    assert!(
+        err.contains(crate::errors::msg::SELF_APPROVAL_REFUSED),
+        "the refusal must carry the shared separation-of-duties reason, body={v}"
+    );
+    // The refusal is INERT: the row is untouched.
+    let lock = state.lock().await;
+    let pa = db::get_pending_action(&lock.0, &pid).unwrap().unwrap();
+    assert_eq!(pa.status, "pending", "a refused veto must not decide");
+    assert!(pa.decided_by.is_none(), "no decider may be recorded");
+}
+
+/// v1.0.0 #3448 DENIED — an UNREGISTERED non-requester may not veto. This is
+/// the cross-tenant sabotage shape: pre-fix any `X-Agent-Id` string with a
+/// valid HMAC could kill any tenant's queue entry.
+#[tokio::test]
+async fn http_reject_pending_refuses_unregistered_approver_3448() {
+    let _g = APPROVE_HMAC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::config::set_active_hooks_hmac_secret(Some("a1-test-secret".to_string()));
+    use crate::models::GovernedAction;
+    let state = test_state();
+    let pid = {
+        let lock = state.lock().await;
+        db::queue_pending_action(
+            &lock.0,
+            GovernedAction::Store,
+            "reject-unreg-3448",
+            None,
+            "requester-3448",
+            &serde_json::json!({
+                "tier": Tier::Long.as_str(),
+                "namespace": "reject-unreg-3448",
+                "title": "victim request",
+                "content": "x",
+                "tags": [], "priority": 5, "confidence": 1.0,
+                "source": "api", "metadata": {}
+            }),
+        )
+        .unwrap()
+    };
+    let app = Router::new()
+        .route("/api/v1/pending/{id}/reject", axum_post(reject_pending))
+        .with_state(test_app_state(state.clone()));
+    let (ts, sig) = sign_approve_body("a1-test-secret", "POST", &pid, b"");
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/pending/{pid}/reject"))
+                .method("POST")
+                // Never registered by the operator.
+                .header("x-agent-id", "mallory-3448")
+                .header("x-ai-memory-timestamp", &ts)
+                .header("x-ai-memory-signature", &sig)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    crate::config::set_active_hooks_hmac_secret(None);
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an unregistered agent must not be able to veto another tenant's action"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is not a registered agent"),
+        "body={v}"
+    );
+    let lock = state.lock().await;
+    let pa = db::get_pending_action(&lock.0, &pid).unwrap().unwrap();
+    assert_eq!(pa.status, "pending", "a refused veto must not decide");
+    assert!(pa.decided_by.is_none(), "no decider may be recorded");
 }
 
 #[tokio::test]
