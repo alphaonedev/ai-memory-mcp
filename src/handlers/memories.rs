@@ -77,18 +77,14 @@ pub async fn get_memory(
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.get(&ctx, &id).await {
             Ok(mem) => {
-                // List_links surfaces the full edge set (no namespace
-                // filter) so the postgres adapter's `list_links` walks
-                // its `memory_links` table and the local-side filter
-                // narrows to edges anchored at this memory id.
-                let edges = match app.store.list_links(None).await {
-                    Ok(rows) => rows
-                        .into_iter()
-                        .filter(|l| l.source_id == mem.id || l.target_id == mem.id)
-                        .collect::<Vec<_>>(),
+                // #3341a — per-anchor SAL surface (same as GET /links/{id}
+                // FX-C2). Pre-fix this walked `list_links(None)` and
+                // filtered client-side: a full-table scan on every GET.
+                let edges = match app.store.get_links_for_anchor(&mem.id).await {
+                    Ok(rows) => rows,
                     Err(e) => {
                         tracing::warn!(
-                            "store.list_links during get_memory failed: {e}; \
+                            "store.get_links_for_anchor during get_memory failed: {e}; \
                              returning memory with empty links"
                         );
                         Vec::new()
