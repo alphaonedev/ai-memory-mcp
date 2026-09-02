@@ -592,12 +592,27 @@ fn fbl24_scan_advances_past_all_decrypt_skipped_batch() {
     assert!(page3.raw_last_id.is_none(), "end of corpus");
     assert!(page3.rows.is_empty());
 
-    // The reembed full-corpus scan exposes the same contract.
-    let texts = db::get_memory_texts_batch(&conn, None, None, 2, None).expect("texts page 1");
+    // The reembed full-corpus scan exposes the same FIRST-DISCOVERY
+    // contract on a fresh database (#3344 persist of skip markers from
+    // the unembedded pages above must not leak into this assertion —
+    // once remembered, the texts scan jumps past the poison window,
+    // which is the #3344 point).
+    let conn2 = fresh_sqlite();
+    for id in ["fbl24-a", "fbl24-b"] {
+        seed(&conn2, id, Tier::Long, None);
+        conn2
+            .execute(
+                "UPDATE memories SET encrypted_envelope = X'DEADBEEF' WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .expect("plant garbage envelope");
+    }
+    seed(&conn2, "fbl24-z", Tier::Long, None);
+    let texts = db::get_memory_texts_batch(&conn2, None, None, 2, None).expect("texts page 1");
     assert!(texts.rows.is_empty());
     assert_eq!(texts.decrypt_skipped, 2);
     assert_eq!(texts.raw_last_id.as_deref(), Some("fbl24-b"));
-    let texts2 = db::get_memory_texts_batch(&conn, None, texts.raw_last_id.as_deref(), 2, None)
+    let texts2 = db::get_memory_texts_batch(&conn2, None, texts.raw_last_id.as_deref(), 2, None)
         .expect("texts page 2");
     assert_eq!(texts2.rows.len(), 1);
     assert_eq!(texts2.rows[0].0, "fbl24-z");

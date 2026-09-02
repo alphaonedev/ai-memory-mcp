@@ -417,6 +417,13 @@ libc = "0.2"
 name = "acceptance_nhi_sqlite"
 path = "tests/acceptance/acceptance_nhi_sqlite.rs"
 
+# #3344 — durable embed-skip DENIED/ALLOWED coverage. The sqlite DENIED
+# gate and (when sal-postgres + AI_MEMORY_TEST_POSTGRES_URL) the pg twin
+# sit on the SAL `MemoryStore` trait, which is `sal`-gated.
+[[test]]
+name = "embed_skip_undecryptable_3344"
+required-features = ["sal"]
+
 [[bench]]
 name = "recall"
 harness = false

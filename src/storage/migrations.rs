@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 95).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 96).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -404,6 +404,35 @@ CREATE TABLE IF NOT EXISTS attested_write_ledger (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_attested_write_ledger_seen_at
     ON attested_write_ledger(seen_at);
+
+-- v1.0.0 #3344 (schema v96) — durable embed skip list. Derived cache of
+-- rows that cannot be embedded under the current key material
+-- (undecryptable envelope) or that exceed the embed byte cap. Boot and
+-- the live backfill worker skip them without a re-read / re-WARN;
+-- restoring the key changes the fingerprint and the next scan retries.
+-- Created by migration v96 for upgrading DBs; inline here so a fresh
+-- bootstrap has it. The index IS inline (same bootstrap-batch table).
+CREATE TABLE IF NOT EXISTS embed_skip (
+    memory_id        TEXT NOT NULL PRIMARY KEY,
+    agent_id         TEXT NOT NULL DEFAULT '',
+    key_fingerprint  TEXT NOT NULL,
+    reason           TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    CHECK (reason IN ('undecryptable', 'oversize'))
+);
+CREATE INDEX IF NOT EXISTS idx_embed_skip_fp
+    ON embed_skip(key_fingerprint);
+CREATE TRIGGER IF NOT EXISTS memories_embed_skip_clear_on_content
+AFTER UPDATE OF content, encrypted_envelope ON memories
+BEGIN
+    DELETE FROM embed_skip WHERE memory_id = NEW.id;
+END;
+CREATE TRIGGER IF NOT EXISTS memories_embed_skip_clear_on_embed
+AFTER UPDATE OF embedding ON memories
+WHEN NEW.embedding IS NOT NULL
+BEGIN
+    DELETE FROM embed_skip WHERE memory_id = NEW.id;
+END;
 
 -- v0.9.0 G13 (#1828, schema v76) — identity-lineage succession chain.
 -- One row per (agent_id, epoch); the composite PK is the DB-enforced
@@ -915,7 +944,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 95;
+const CURRENT_SCHEMA_VERSION: i64 = 96;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -4237,7 +4266,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V94_SQLITE)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 95 {
             // v95 (#3419, v1.0.0) — ATTESTED-WRITE REPLAY LEDGER. The direct
             // signed-write surfaces (`POST /api/v1/memories`, `/memories/bulk`,
             // MCP `memory_store`) validated a caller-presented Ed25519
@@ -4261,13 +4290,30 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             //
             // Additive `CREATE TABLE IF NOT EXISTS`, idempotent, reversible
             // (revert is DROP TABLE + lowering the stamp), NoLoss, no
-            // full-table rebuild. Doc twin:
+            // full-table rebuild. Settled arm: gates on the literal 95, not
+            // CURRENT_SCHEMA_VERSION (now 96). Doc twin:
             // migrations/sqlite/0079_v95_attested_write_ledger.sql.
             debug_assert!(
                 MIGRATION_V95_SQLITE.contains("attested_write_ledger"),
                 "v95 doc twin must ship the attested_write_ledger DDL"
             );
             conn.execute_batch(MIGRATION_V95_SQLITE)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v96 (#3344, v1.0.0) — DURABLE EMBED SKIP LIST. Additive
+            // `embed_skip` table so boot/backfill remember undecryptable
+            // and oversize rows (keyed by id + encryption-key fingerprint)
+            // instead of re-reading and re-WARNing them every pass.
+            // Restoring the key invalidates the skip (healing path).
+            // `CREATE TABLE IF NOT EXISTS` + triggers; no rebuild.
+            // Canonical DDL: migrations/sqlite/0080_v96_embed_skip.sql.
+            debug_assert!(
+                crate::storage::embed_skip::MIGRATION_V96_SQLITE
+                    .contains("CREATE TABLE IF NOT EXISTS embed_skip"),
+                "v96 doc twin must ship the embed_skip DDL"
+            );
+            conn.execute_batch(crate::storage::embed_skip::MIGRATION_V96_SQLITE)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on
