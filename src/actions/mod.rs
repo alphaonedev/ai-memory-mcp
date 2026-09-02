@@ -693,32 +693,59 @@ pub fn lease_get(
         .optional()
 }
 
-/// #3009 / #3226 — shape-validate a caller-supplied `claimed_by` and bind
-/// it to the live lease holder.
+/// #3009 / #3226 / #3360 — shape-validate an OPTIONAL caller-supplied
+/// `claimed_by` and bind it to the live lease holder.
 ///
-/// A `claimed_by` with embedded control characters is refused (audit
-/// log-injection guard). A live (non-expired) lease whose holder is not
-/// `claimed_by` is refused so two agents cannot each believe they own
-/// the action. `lease = None` (or an expired lease) is the unbound /
-/// lease-free flow — leases are the ownership primitive, so this never
-/// blocks a lease-less transition.
+/// This is the ONE shared control every transition funnel consults (the MCP
+/// `memory_action_transition` handler and both HTTP local-write lanes,
+/// sqlite and postgres). It takes `Option<&str>` deliberately: #3360 found
+/// that every funnel called it inside an `if let Some(cb)`, which made the
+/// lease bind **opt-in** — a caller that simply OMITTED `claimed_by` skipped
+/// the holder check entirely, drove another agent's leased action to any
+/// legal state, and (because `transition`'s `SET claimed_by = ?` writes the
+/// literal `NULL`) erased the recorded owner on the way through. Taking the
+/// `Option` here makes the decision structural: a funnel cannot forget to
+/// ask, because there is no longer a shape in which it does not.
+///
+/// Dispositions:
+/// - `claimed_by = Some(cb)`: `cb` is shape-validated (audit log-injection
+///   guard) and must equal the holder of a live (non-expired) lease, so two
+///   agents cannot each believe they own the action.
+/// - `claimed_by = None` with a LIVE lease: REFUSED. Leases are the
+///   ownership primitive, so a transition on a leased action must name its
+///   holder.
+/// - `claimed_by = None` with no lease (or an expired one): allowed — the
+///   unbound / lease-free flow, unchanged. The background lease sweep
+///   reclaims an expired lease and requeues its action through its own
+///   internal path, so a dead holder never wedges the action here.
 ///
 /// # Errors
-/// Returns a caller-facing string on a shape or holder mismatch.
+/// Returns a caller-facing string on a shape mismatch, a holder mismatch, or
+/// an unbound transition attempted against a live lease.
 pub fn authorize_claimed_by(
-    claimed_by: &str,
+    claimed_by: Option<&str>,
     lease: Option<&crate::models::Lease>,
     now: i64,
     action_id: &str,
 ) -> Result<(), String> {
+    let live_holder = lease
+        .filter(|l| l.expires_at > now)
+        .map(|l| l.holder.as_str());
+    let Some(claimed_by) = claimed_by else {
+        return match live_holder {
+            Some(holder) => Err(format!(
+                "action {action_id} is held by lease holder '{holder}': a transition on a leased \
+                 action must supply claimed_by matching the holder"
+            )),
+            None => Ok(()),
+        };
+    };
     crate::validate::validate_agent_id(claimed_by).map_err(|e| e.to_string())?;
-    if let Some(lease) = lease
-        && lease.expires_at > now
-        && lease.holder != claimed_by
+    if let Some(holder) = live_holder
+        && holder != claimed_by
     {
         return Err(format!(
-            "claimed_by '{claimed_by}' is not the live lease holder '{}' on action {action_id}",
-            lease.holder
+            "claimed_by '{claimed_by}' is not the live lease holder '{holder}' on action {action_id}"
         ));
     }
     Ok(())
@@ -1620,8 +1647,8 @@ mod tests {
             expires_at: 1_000,
             heartbeat_at: 1,
         };
-        assert!(authorize_claimed_by("ai:w1", Some(&live), 10, "act-1").is_ok());
-        let err = authorize_claimed_by("ai:w2", Some(&live), 10, "act-1")
+        assert!(authorize_claimed_by(Some("ai:w1"), Some(&live), 10, "act-1").is_ok());
+        let err = authorize_claimed_by(Some("ai:w2"), Some(&live), 10, "act-1")
             .expect_err("non-holder must be refused");
         assert!(
             err.contains("not the live lease holder"),
@@ -1632,10 +1659,53 @@ mod tests {
             expires_at: 5,
             ..live.clone()
         };
-        assert!(authorize_claimed_by("ai:w2", Some(&expired), 10, "act-1").is_ok());
+        assert!(authorize_claimed_by(Some("ai:w2"), Some(&expired), 10, "act-1").is_ok());
         // No lease is unbound.
-        assert!(authorize_claimed_by("ai:w2", None, 10, "act-1").is_ok());
+        assert!(authorize_claimed_by(Some("ai:w2"), None, 10, "act-1").is_ok());
         // Control-char claimed_by is refused even with no lease.
-        assert!(authorize_claimed_by("bad\nid", None, 10, "act-1").is_err());
+        assert!(authorize_claimed_by(Some("bad\nid"), None, 10, "act-1").is_err());
+    }
+
+    /// #3360 — the lease bind must NOT be opt-in. An OMITTED `claimed_by`
+    /// (`None`) on an action carrying a LIVE lease is refused: pre-fix every
+    /// funnel called this helper inside an `if let Some(cb)`, so a second
+    /// agent could transition another agent's leased action simply by not
+    /// naming a claimer — and `transition`'s `SET claimed_by = ?` then wrote
+    /// NULL over the real owner.
+    #[test]
+    fn omitted_claimed_by_is_refused_while_a_lease_is_live_3360() {
+        let live = crate::models::Lease {
+            action_id: "act-2".to_string(),
+            holder: "ai:alice".to_string(),
+            acquired_at: 1,
+            expires_at: 1_000,
+            heartbeat_at: 1,
+        };
+
+        // DENIED: no claimed_by while alice holds a live lease.
+        let err = authorize_claimed_by(None, Some(&live), 10, "act-2")
+            .expect_err("an unbound transition on a leased action must be refused");
+        assert!(
+            err.contains("is held by lease holder 'ai:alice'"),
+            "must name the blocking holder, got {err}"
+        );
+        assert!(
+            err.contains("must supply claimed_by"),
+            "must state the remedy, got {err}"
+        );
+
+        // ALLOWED: the holder itself still transitions its own action.
+        assert!(authorize_claimed_by(Some("ai:alice"), Some(&live), 10, "act-2").is_ok());
+
+        // ALLOWED: once the lease has EXPIRED the action is unbound again, so
+        // a dead holder can never wedge it (the sweep reclaims + requeues).
+        let expired = crate::models::Lease {
+            expires_at: 5,
+            ..live.clone()
+        };
+        assert!(authorize_claimed_by(None, Some(&expired), 10, "act-2").is_ok());
+
+        // ALLOWED: the lease-free flow is untouched.
+        assert!(authorize_claimed_by(None, None, 10, "act-2").is_ok());
     }
 }

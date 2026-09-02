@@ -509,20 +509,23 @@ async fn local_transition_via_db(
     now: i64,
 ) -> Result<(crate::models::Action, crate::models::ActionState, String), Response> {
     let lock = app.db.lock().await;
-    if let Some(cb) = claimed_by {
-        let lease = match crate::actions::lease_get(&lock.0, action_id) {
-            Ok(l) => l,
-            Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("lease_get failed: {e}")})),
-                )
-                    .into_response());
-            }
-        };
-        if let Err(msg) = crate::actions::authorize_claimed_by(cb, lease.as_ref(), now, action_id) {
-            return Err((StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response());
+    // #3360 — the lease is consulted UNCONDITIONALLY (it used to be read only
+    // when the caller supplied `claimed_by`, which made the holder bind
+    // opt-in: omitting the field bypassed it and NULLed the recorded owner).
+    let lease = match crate::actions::lease_get(&lock.0, action_id) {
+        Ok(l) => l,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("lease_get failed: {e}")})),
+            )
+                .into_response());
         }
+    };
+    if let Err(msg) =
+        crate::actions::authorize_claimed_by(claimed_by, lease.as_ref(), now, action_id)
+    {
+        return Err((StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response());
     }
     let current = match crate::actions::get(&lock.0, action_id) {
         Ok(Some(a)) => a,
@@ -575,14 +578,16 @@ async fn local_transition_via_store(
     now: i64,
 ) -> Result<(crate::models::Action, crate::models::ActionState, String), Response> {
     let ctx = crate::store::CallerContext::for_agent(node_agent_id.to_string());
-    if let Some(cb) = claimed_by {
-        let lease = match app.store.lease_get(&ctx, action_id).await {
-            Ok(l) => l,
-            Err(e) => return Err(super::store_err_to_response(e)),
-        };
-        if let Err(msg) = crate::actions::authorize_claimed_by(cb, lease.as_ref(), now, action_id) {
-            return Err((StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response());
-        }
+    // #3360 — unconditional lease read + shared bind, byte-parity with the
+    // sqlite lane above so the two backends cannot drift on ownership.
+    let lease = match app.store.lease_get(&ctx, action_id).await {
+        Ok(l) => l,
+        Err(e) => return Err(super::store_err_to_response(e)),
+    };
+    if let Err(msg) =
+        crate::actions::authorize_claimed_by(claimed_by, lease.as_ref(), now, action_id)
+    {
+        return Err((StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response());
     }
     let current = match app.store.action_get(&ctx, action_id).await {
         Ok(Some(a)) => a,

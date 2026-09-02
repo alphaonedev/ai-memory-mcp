@@ -232,10 +232,16 @@ pub fn handle_action_transition(
     // holder is refused. Actions coordinated without a lease are unbound
     // (leases are the ownership primitive), so this never blocks the
     // lease-free flow.
-    if let Some(cb) = claimed_by.as_deref() {
-        let lease = crate::actions::lease_get(conn, id).map_err(|e| e.to_string())?;
-        crate::actions::authorize_claimed_by(cb, lease.as_ref(), now, id)?;
-    }
+    //
+    // #3360 — the bind was OPT-IN: this consulted the lease only when the
+    // caller supplied `claimed_by`, so simply OMITTING the field skipped the
+    // holder check, let a non-holder drive another agent's leased action to
+    // any legal state, and NULLed `actions.claimed_by` on the way through
+    // (`transition` writes the literal `SET claimed_by = ?`). The lease is now
+    // consulted UNCONDITIONALLY and the shared control decides — it takes
+    // `Option<&str>` precisely so no funnel can forget to ask.
+    let lease = crate::actions::lease_get(conn, id).map_err(|e| e.to_string())?;
+    crate::actions::authorize_claimed_by(claimed_by.as_deref(), lease.as_ref(), now, id)?;
 
     match crate::actions::transition(conn, id, to, claimed_by.as_deref(), now)
         .map_err(|e| e.to_string())?
@@ -1506,6 +1512,112 @@ mod handler_tests {
         let released = handle_lease_release(&conn, &json!({ "action_id": id, "holder": "w1" }))
             .expect("release");
         assert_eq!(released["released"].as_bool(), Some(true));
+    }
+
+    /// #3360 (SECURITY) — the lease bind must not be OPT-IN.
+    ///
+    /// Repro: `ai:alice` holds a live lease on an action; `ai:bob` calls
+    /// `memory_action_transition {id, to}` with NO `claimed_by`. Pre-fix the
+    /// handler consulted the lease only inside `if let Some(cb)`, so the call
+    /// SUCCEEDED, returned `claimed_by: null` (erasing alice's recorded
+    /// ownership) and let bob drive the action onward while alice's lease was
+    /// still live. Both directions are pinned: the unbound transition is
+    /// REFUSED and leaves the row untouched; the holder's own transition
+    /// still succeeds; and once the action is lease-free the unbound flow is
+    /// unchanged.
+    #[test]
+    fn transition_without_claimed_by_is_refused_while_a_lease_is_live_3360() {
+        // #3363 bound `memory_action_create`'s actor to the enforced caller,
+        // so pin the single-operator posture (#1874 fixture) — otherwise a
+        // sibling test that sets AI_MEMORY_AGENT_ID process-wide turns these
+        // self-attributed creates into caller mismatches.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh();
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t", "agent_id": "ai:alice" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+
+        handle_lease_acquire(
+            &conn,
+            &json!({ "action_id": id.clone(), "holder": "ai:alice", "ttl_secs": 600 }),
+        )
+        .expect("alice acquires the lease");
+        handle_action_transition(
+            &conn,
+            &json!({ "id": id.clone(), "to": "claimed", "claimed_by": "ai:alice" }),
+        )
+        .expect("the holder may claim its own action");
+
+        // DENIED: bob omits `claimed_by` entirely.
+        let err =
+            handle_action_transition(&conn, &json!({ "id": id.clone(), "to": "in_progress" }))
+                .expect_err("an unbound transition on a leased action must be refused");
+        assert!(
+            err.contains("is held by lease holder 'ai:alice'"),
+            "must name the blocking holder, got: {err}"
+        );
+
+        // The refusal is inert: state AND the recorded owner are untouched.
+        let after = handle_action_get(&conn, &json!({ "id": id.clone() })).expect("get ok");
+        assert_eq!(after["action"]["state"].as_str(), Some("claimed"));
+        assert_eq!(
+            after["action"][param_names::CLAIMED_BY].as_str(),
+            Some("ai:alice"),
+            "the refused transition must not NULL the recorded owner"
+        );
+
+        // DENIED: naming a non-holder is still refused (the #3009 pin).
+        let err = handle_action_transition(
+            &conn,
+            &json!({ "id": id.clone(), "to": "in_progress", "claimed_by": "ai:bob" }),
+        )
+        .expect_err("a non-holder must be refused");
+        assert!(err.contains("not the live lease holder"), "got: {err}");
+
+        // ALLOWED: the holder drives its own action onward.
+        handle_action_transition(
+            &conn,
+            &json!({ "id": id.clone(), "to": "in_progress", "claimed_by": "ai:alice" }),
+        )
+        .expect("the holder must still transition");
+
+        // ALLOWED: once the lease is released the action is unbound again, so
+        // the lease-free flow (no `claimed_by`) is byte-identical to pre-fix.
+        handle_lease_release(
+            &conn,
+            &json!({ "action_id": id.clone(), "holder": "ai:alice" }),
+        )
+        .expect("release");
+        handle_action_transition(&conn, &json!({ "id": id.clone(), "to": "done" }))
+            .expect("a lease-free transition must still be unbound");
+    }
+
+    /// #3360 — an action that never had a lease keeps the legacy unbound
+    /// behaviour end-to-end (no lease read turns into a refusal).
+    #[test]
+    fn lease_free_transition_remains_unbound_3360() {
+        // #3363 bound `memory_action_create`'s actor to the enforced caller,
+        // so pin the single-operator posture (#1874 fixture) — otherwise a
+        // sibling test that sets AI_MEMORY_AGENT_ID process-wide turns these
+        // self-attributed creates into caller mismatches.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh();
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t", "agent_id": "ai:solo" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID].as_str().expect("id").to_string();
+        handle_action_transition(&conn, &json!({ "id": id.clone(), "to": "claimed" }))
+            .expect("lease-free transition is unbound");
+        handle_action_transition(&conn, &json!({ "id": id, "to": "in_progress" }))
+            .expect("lease-free transition is unbound");
     }
 
     #[test]
