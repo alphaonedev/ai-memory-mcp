@@ -17887,11 +17887,26 @@ pub fn get_unembedded_ids_batch(
     conn: &Connection,
     limit: usize,
 ) -> Result<Vec<(String, String, String)>> {
+    // Free-function path has no store instance: a fresh amort walks
+    // this call (correct isolation; the SAL adapter uses
+    // [`get_unembedded_ids_batch_amortised`] for the O(1) tick).
+    let amort = crate::storage::embed_skip::EmbedSkipAmortisation::new();
+    get_unembedded_ids_batch_amortised(conn, limit, &amort)
+}
+
+/// #3344 — SAL-adapter twin of [`get_unembedded_ids_batch`] that
+/// amortises the stale-marker walk on the **store instance** so two
+/// stores in one process cannot share a timer.
+pub fn get_unembedded_ids_batch_amortised(
+    conn: &Connection,
+    limit: usize,
+    amort: &crate::storage::embed_skip::EmbedSkipAmortisation,
+) -> Result<Vec<(String, String, String)>> {
     // #1779 — pull encrypted_envelope + metadata so encrypted rows are
     // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
     // #3344 — drop stale skip markers BEFORE the NOT IN filter so a restored
     // key is retried this pass, then exclude remembered-unembeddable ids.
-    crate::storage::embed_skip::prepare_scan_sqlite(conn);
+    crate::storage::embed_skip::prepare_scan_sqlite(conn, amort);
     let sql = format!(
         "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
          WHERE embedding IS NULL{} LIMIT ?1",
@@ -17929,7 +17944,8 @@ pub fn get_unembedded_ids_batch_after(
 ) -> Result<EmbeddableScan> {
     // #1779 — pull encrypted_envelope + metadata so encrypted rows are
     // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
-    crate::storage::embed_skip::prepare_scan_sqlite(conn);
+    let amort = crate::storage::embed_skip::EmbedSkipAmortisation::new();
+    crate::storage::embed_skip::prepare_scan_sqlite(conn, &amort);
     let not_skipped = crate::storage::embed_skip::SQL_AND_NOT_SKIPPED;
     let raw = if let Some(after) = after_id {
         let sql = format!(
@@ -18137,7 +18153,8 @@ pub fn get_memory_texts_batch(
         sql.push_str(" AND embedding_space IS NOT ?");
         binds.push(Box::new(space.to_string()));
     }
-    crate::storage::embed_skip::prepare_scan_sqlite(conn);
+    let amort = crate::storage::embed_skip::EmbedSkipAmortisation::new();
+    crate::storage::embed_skip::prepare_scan_sqlite(conn, &amort);
     sql.push_str(crate::storage::embed_skip::SQL_AND_NOT_SKIPPED);
     sql.push_str(" ORDER BY id LIMIT ?");
     binds.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));

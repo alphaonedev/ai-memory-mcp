@@ -2101,6 +2101,12 @@ pub struct PostgresStore {
     /// window where a stop engaged by ANOTHER daemon did not reach this
     /// pool's write gate until it reconnected.
     record_stop_refreshed_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// #3344 amendment 2 — per-store amortisation of the `embed_skip`
+    /// stale-marker walk. Behind `Arc` so [`Clone`] of this store shares
+    /// ONE timer (not process-global; not per-clone-fresh). A key
+    /// rotation is honoured within at most
+    /// [`crate::storage::embed_skip::INVALIDATE_MIN_INTERVAL`].
+    embed_skip_amort: std::sync::Arc<crate::storage::embed_skip::EmbedSkipAmortisation>,
 }
 
 /// #1628 — wire-pinned refusal text for legacy rows with no
@@ -2720,6 +2726,9 @@ impl PostgresStore {
                 // immediately re-read; the next re-check fires one TTL later.
                 record_stop_refreshed_ms: std::sync::Arc::new(
                     std::sync::atomic::AtomicU64::new(record_stop_refresh_now_ms()),
+                ),
+                embed_skip_amort: std::sync::Arc::new(
+                    crate::storage::embed_skip::EmbedSkipAmortisation::new(),
                 ),
             };
             // v1.0.0 #2445 — the ladder is skipped under the operator hatch for
@@ -21969,7 +21978,8 @@ impl MemoryStore for PostgresStore {
             // "nothing to embed". See SqliteStore::list_unembedded.
             return Ok(Vec::new());
         }
-        crate::storage::embed_skip::postgres::prepare_scan(&self.pool).await;
+        crate::storage::embed_skip::postgres::prepare_scan(&self.pool, &self.embed_skip_amort)
+            .await;
         let not_skipped = crate::storage::embed_skip::SQL_AND_NOT_SKIPPED;
         let cap: i64 = i64::try_from(limit).unwrap_or(LIST_FALLBACK_LIMIT_I64);
         // v1.0.0 #2167 (#2183) — the always-on predicate re-embeds
@@ -22053,8 +22063,7 @@ impl MemoryStore for PostgresStore {
             let metadata_json = r
                 .try_get::<String, _>("metadata_json")
                 .map_err(|e| to_store_err("read unembedded metadata", e))?;
-            let agent_id =
-                crate::storage::embed_skip::agent_id_from_metadata_json(&metadata_json);
+            let agent_id = crate::storage::embed_skip::agent_id_from_metadata_json(&metadata_json);
             match crate::storage::resolve_embeddable_content(&id, content, envelope, &metadata_json)
             {
                 Some(plaintext) => {

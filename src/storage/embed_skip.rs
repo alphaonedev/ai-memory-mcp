@@ -22,8 +22,8 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::encryption::agent_encryption_key_fingerprint;
@@ -86,63 +86,80 @@ const SQL_COUNT: &str = "SELECT COUNT(*) FROM embed_skip";
 
 /// Minimum interval between full-table stale-marker walks (#3344
 /// amendment 2). Consecutive backfill ticks with unchanged key material
-/// must be O(1) — not O(n) over `embed_skip`.
-const INVALIDATE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// must be O(1) — not O(n) over `embed_skip`. A key rotation on this
+/// store is honoured within at most this interval (the next successful
+/// walk after the interval elapses drops markers whose stored
+/// fingerprint no longer matches live key material).
+pub const INVALIDATE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
-struct InvalidateAmortisation {
-    last_walk: Option<Instant>,
+/// Per-store amortisation of the `embed_skip` stale-marker walk.
+///
+/// Owned by [`crate::store::sqlite::SqliteStore`] / `PostgresStore`,
+/// never process-global: two stores in one process must not share a
+/// timer (store B's first scan must not skip because store A walked).
+/// `PostgresStore` is `Clone`; hold this behind `Arc` so clones of
+/// ONE store share the timer. CONCURRENCY-18: poison recovers via
+/// `into_inner`. CONCURRENCY-20: the mutex is never held across
+/// `.await` — callers copy the decision out, drop the guard, then
+/// await the walk.
+pub struct EmbedSkipAmortisation {
+    last_walk: Mutex<Option<Instant>>,
+    walk_count: AtomicUsize,
 }
 
-fn invalidate_amortisation() -> &'static Mutex<InvalidateAmortisation> {
-    static GATE: OnceLock<Mutex<InvalidateAmortisation>> = OnceLock::new();
-    GATE.get_or_init(|| Mutex::new(InvalidateAmortisation { last_walk: None }))
-}
-
-/// Full-table `SELECT` count (test pin: two consecutive scans with
-/// unchanged keys must not increment this).
-static TABLE_WALK_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-fn fingerprint_for(agent_id: &str) -> String {
-    agent_encryption_key_fingerprint(agent_id)
-}
-
-/// True when a full-table stale walk should run. False within
-/// [`INVALIDATE_MIN_INTERVAL`] of the last successful walk (steady-state
-/// backfill tick is then O(1)). CONCURRENCY-18: recover a poisoned lock.
-fn should_walk_stale_table() -> bool {
-    let guard = match invalidate_amortisation().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    match guard.last_walk {
-        Some(t) => Instant::now().saturating_duration_since(t) >= INVALIDATE_MIN_INTERVAL,
-        None => true,
+impl Default for EmbedSkipAmortisation {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-fn mark_stale_table_walked() {
-    let mut guard = match invalidate_amortisation().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    guard.last_walk = Some(Instant::now());
+impl EmbedSkipAmortisation {
+    /// Fresh amortisation: the next [`prepare_scan_sqlite`] / postgres
+    /// `prepare_scan` walks. A new store instance is the reset (no
+    /// process-global `reset_amortisation_for_tests`).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            last_walk: Mutex::new(None),
+            walk_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// True when a full-table stale walk should run. False within
+    /// [`INVALIDATE_MIN_INTERVAL`] of the last successful walk on
+    /// **this store**.
+    fn should_walk(&self) -> bool {
+        let guard = match self.last_walk.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match *guard {
+            Some(t) => Instant::now().saturating_duration_since(t) >= INVALIDATE_MIN_INTERVAL,
+            None => true,
+        }
+    }
+
+    fn mark_walked(&self) {
+        let mut guard = match self.last_walk.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard = Some(Instant::now());
+    }
+
+    fn bump_walk(&self) {
+        self.walk_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test pin: number of full-table stale-marker walks on this store.
+    #[must_use]
+    pub fn table_walk_count(&self) -> usize {
+        self.walk_count.load(Ordering::Relaxed)
+    }
 }
 
-/// Test pin: number of full-table stale-marker walks this process.
-#[must_use]
-pub fn table_walk_count() -> usize {
-    TABLE_WALK_COUNT.load(Ordering::Relaxed)
-}
-
-/// Test pin: reset amortisation so the next scan walks (healing tests
-/// that plant a stale stored fingerprint without changing key material).
-pub fn reset_amortisation_for_tests() {
-    TABLE_WALK_COUNT.store(0, Ordering::Relaxed);
-    let mut guard = match invalidate_amortisation().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    guard.last_walk = None;
+fn fingerprint_for(agent_id: &str) -> String {
+    agent_encryption_key_fingerprint(agent_id)
 }
 
 /// Persist a skip marker. Returns `true` when this was a NEW insert
@@ -175,7 +192,6 @@ pub fn record_sqlite(
 /// cleared by the content-update trigger). Returns the number of rows
 /// deleted.
 pub fn invalidate_stale_sqlite(conn: &Connection) -> Result<usize> {
-    TABLE_WALK_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut stmt = conn.prepare(SQL_SELECT_ALL)?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -232,13 +248,17 @@ pub fn log_remembered_once(count: i64) {
     );
 }
 
-/// Invalidate stale markers (amortised: at most once per 60 s), then emit
-/// the once-per-process boot summary. Best-effort: a skip-cache fault is
+/// Invalidate stale markers (amortised: at most once per
+/// [`INVALIDATE_MIN_INTERVAL`] **on this store**), then emit the
+/// once-per-process boot summary. Best-effort: a skip-cache fault is
 /// logged and never fails the scan.
-pub fn prepare_scan_sqlite(conn: &Connection) {
-    if should_walk_stale_table() {
+pub fn prepare_scan_sqlite(conn: &Connection, amort: &EmbedSkipAmortisation) {
+    if amort.should_walk() {
         match invalidate_stale_sqlite(conn) {
-            Ok(_) => mark_stale_table_walked(),
+            Ok(_) => {
+                amort.bump_walk();
+                amort.mark_walked();
+            }
             Err(e) => tracing::warn!(error = %e, "embed skip stale-invalidate failed (#3344)"),
         }
     }
@@ -289,12 +309,10 @@ pub mod postgres {
     //! adapter so default builds do not pull sqlx.
 
     use super::{
-        EmbedSkipReason, TABLE, TABLE_WALK_COUNT, fingerprint_for, log_remembered_once,
-        mark_stale_table_walked, should_walk_stale_table,
+        EmbedSkipAmortisation, EmbedSkipReason, TABLE, fingerprint_for, log_remembered_once,
     };
     use sqlx::{PgPool, Row};
     use std::collections::HashMap;
-    use std::sync::atomic::Ordering;
 
     const SQL_INSERT_IGNORE: &str = "INSERT INTO embed_skip \
         (memory_id, agent_id, key_fingerprint, reason, created_at) \
@@ -308,11 +326,15 @@ pub mod postgres {
 
     const SQL_COUNT: &str = "SELECT COUNT(*) FROM embed_skip";
 
-    /// See [`super::prepare_scan_sqlite`].
-    pub async fn prepare_scan(pool: &PgPool) {
-        if should_walk_stale_table() {
+    /// See [`super::prepare_scan_sqlite`]. The walk decision is taken
+    /// (and the mutex dropped) before the `.await` (CONCURRENCY-20).
+    pub async fn prepare_scan(pool: &PgPool, amort: &EmbedSkipAmortisation) {
+        if amort.should_walk() {
             match invalidate_stale(pool).await {
-                Ok(_) => mark_stale_table_walked(),
+                Ok(_) => {
+                    amort.bump_walk();
+                    amort.mark_walked();
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "embed skip stale-invalidate failed (#3344)");
                 }
@@ -329,7 +351,6 @@ pub mod postgres {
     }
 
     async fn invalidate_stale(pool: &PgPool) -> Result<usize, sqlx::Error> {
-        TABLE_WALK_COUNT.fetch_add(1, Ordering::Relaxed);
         let rows = sqlx::query(SQL_SELECT_ALL).fetch_all(pool).await?;
         let mut fp_by_agent: HashMap<String, String> = HashMap::new();
         let mut n = 0usize;
@@ -465,21 +486,28 @@ mod tests {
     fn consecutive_prepare_scan_does_not_rewalk_when_keys_unchanged() {
         // #3344 amendment 2 — two consecutive scans with unchanged key
         // material must not re-SELECT the whole skip table (O(1) tick).
-        reset_amortisation_for_tests();
+        // Per-store amort: a second store's first scan still walks.
+        let amort = EmbedSkipAmortisation::new();
         let conn = fresh_conn();
         record_sqlite(&conn, "m1", "agent-a", EmbedSkipReason::Undecryptable).expect("record");
-        prepare_scan_sqlite(&conn);
-        let walks_after_first = table_walk_count();
+        prepare_scan_sqlite(&conn, &amort);
+        let walks_after_first = amort.table_walk_count();
         assert!(
             walks_after_first >= 1,
             "first prepare_scan must walk, got {walks_after_first}"
         );
-        prepare_scan_sqlite(&conn);
-        prepare_scan_sqlite(&conn);
+        prepare_scan_sqlite(&conn, &amort);
+        prepare_scan_sqlite(&conn, &amort);
         assert_eq!(
-            table_walk_count(),
+            amort.table_walk_count(),
             walks_after_first,
             "subsequent scans within 60s must not re-walk embed_skip"
+        );
+        let other = EmbedSkipAmortisation::new();
+        prepare_scan_sqlite(&conn, &other);
+        assert!(
+            other.table_walk_count() >= 1,
+            "a different store instance must not inherit the first store's timer"
         );
     }
 

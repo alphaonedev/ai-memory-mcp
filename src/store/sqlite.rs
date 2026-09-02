@@ -63,6 +63,12 @@ pub struct SqliteStore {
     /// the pre-#3196 shared-connection behaviour — correct, just not
     /// de-stalled — which is a fail-SAFE fallback, never a fail-open one.
     read_state: Arc<Mutex<rusqlite::Connection>>,
+    /// #3344 amendment 2 — per-store amortisation of the `embed_skip`
+    /// stale-marker walk. Must NOT be process-global: two SqliteStore
+    /// instances in one process (tests, dual-open) each own a timer.
+    /// A key rotation is honoured within at most
+    /// [`crate::storage::embed_skip::INVALIDATE_MIN_INTERVAL`].
+    embed_skip_amort: Arc<crate::storage::embed_skip::EmbedSkipAmortisation>,
 }
 
 impl SqliteStore {
@@ -93,6 +99,7 @@ impl SqliteStore {
             path,
             record_stop_key,
             read_state,
+            embed_skip_amort: Arc::new(crate::storage::embed_skip::EmbedSkipAmortisation::new()),
         })
     }
 
@@ -3380,7 +3387,8 @@ impl MemoryStore for SqliteStore {
             return Ok(Vec::new());
         }
         let conn = self.state.lock().await;
-        db::get_unembedded_ids_batch(&conn, limit).map_err(box_err)
+        db::get_unembedded_ids_batch_amortised(&conn, limit, &self.embed_skip_amort)
+            .map_err(box_err)
     }
 
     /// #3181 — REAL `set_embeddings_batch`. The trait default loops
@@ -3932,9 +3940,9 @@ mod tests {
     /// stored fingerprint goes stale (healing path).
     #[tokio::test]
     async fn list_unembedded_persists_skip_for_undecryptable_3344() {
-        crate::storage::embed_skip::reset_amortisation_for_tests();
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let store = SqliteStore::open(tmp.path()).expect("open");
+        let path = tmp.path().to_path_buf();
+        let store = SqliteStore::open(&path).expect("open");
         let admin = CallerContext::for_admin("test-3344");
         let unique = uuid::Uuid::new_v4();
         let sealed_id = format!("unemb3344-sealed-{unique}");
@@ -3994,9 +4002,10 @@ mod tests {
             )
             .expect("stale the skip");
         }
-        // Planting a stale stored fingerprint is not a live-key change;
-        // reset the 60 s amortisation so this pass walks and heals.
-        crate::storage::embed_skip::reset_amortisation_for_tests();
+        // Planting a stale stored fingerprint is not a live-key change.
+        // A fresh store instance is the amortisation reset (no process-global).
+        drop(store);
+        let store = SqliteStore::open(&path).expect("reopen");
         let retried = store
             .list_unembedded(&admin, 1_000)
             .await
