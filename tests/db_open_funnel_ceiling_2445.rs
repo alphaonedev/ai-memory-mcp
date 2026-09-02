@@ -54,8 +54,10 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     (
         "src/cli/governance_install_defaults.rs",
         1,
-        "GUARDED via `assert_schema_not_ahead` (#2445). Writes \
-         `UPDATE governance_rules SET enabled = 1`.",
+        "GUARDED via `assert_schema_not_ahead` (#2445). Enables the seeded \
+         governance rules — through `rules_store::set_enabled_signed` for \
+         operator-signed rows (#3430), which also writes `signed_events` and \
+         the policy-version row.",
     ),
     (
         "src/cli/commands/calibrate_confidence.rs",

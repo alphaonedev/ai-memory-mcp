@@ -330,6 +330,10 @@ fn governance_install_defaults_activates_seed_rules() {
         ai_memory::cli::governance_install_defaults::InstallDefaultsArgs {
             yes: true,
             json: false,
+            // #3430 — the seed rows here are attest_level=unsigned and
+            // HOME/XDG are redirected, so no operator key is resolved
+            // and none is needed: the pre-L1-6 plain-flip path applies.
+            key_dir: None,
         },
         &mut out,
     )

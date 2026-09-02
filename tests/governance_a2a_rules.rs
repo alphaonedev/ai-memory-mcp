@@ -144,8 +144,20 @@ fn disabled_rule_at_peer_b_does_not_enforce_even_if_enabled_at_a() {
     rules_store::insert(&peer_a, &r002).unwrap();
 
     // Replicate, then disable on B (peer B's operator opts out).
+    //
+    // v1.0.0 #3430 — `rules_store::set_enabled` now refuses to flip
+    // `enabled` on an operator_signed row without re-signing (the flip
+    // would invalidate the signature). The production opt-out is
+    // `set_enabled_signed` / `ai-memory rules disable --sign`; this
+    // fixture only needs peer B's row to LAND disabled, and peer B has
+    // no signing key in scope, so stage the state with raw SQL.
     replicate_rule(&peer_a, &peer_b, "R002");
-    rules_store::set_enabled(&peer_b, "R002", false).unwrap();
+    peer_b
+        .execute(
+            "UPDATE governance_rules SET enabled = 0 WHERE id = 'R002'",
+            [],
+        )
+        .unwrap();
 
     // Peer B: disabled rule, write allowed.
     let action = AgentAction::FilesystemWrite {

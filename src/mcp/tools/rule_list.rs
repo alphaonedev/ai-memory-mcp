@@ -96,6 +96,8 @@ pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Resul
             .signature
             .as_ref()
             .map(|b| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b));
+        // #3430 — one verify per row, reused by both projected fields.
+        let enforcement = rules_store::enforcement_state(r, operator_pubkey.as_ref());
         out.push(json!({
             "id": r.id,
             "kind": r.kind,
@@ -116,6 +118,15 @@ pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Resul
             // through MCP must not be told a broken rule is healthy while the
             // operator's CLI shows it as inert (the #3027 divergence class).
             "inert": crate::governance::agent_action::rule_matcher_is_inert(r),
+            // v1.0.0 #3430 — the REAL enforcement verdict for this row,
+            // from the SAME predicate the engine applies at load time.
+            // `enabled` alone lies once an operator pubkey is resolved:
+            // a signed row whose signature no longer verifies (the
+            // `install-defaults` raw-UPDATE shape) reads `enabled: true`
+            // while the engine silently drops it. The CLI `rules list`
+            // projects the SAME two fields.
+            "enforced": enforcement.is_enforced(),
+            "enforcement_state": enforcement.as_str(),
         }));
     }
     Ok(json!({

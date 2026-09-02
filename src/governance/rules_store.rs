@@ -195,36 +195,133 @@ pub fn list_enabled_by_kind(conn: &Connection, kind: &str) -> Result<Vec<Rule>> 
     Ok(out)
 }
 
+/// v1.0.0 #3430 — the REAL enforcement state of one `governance_rules`
+/// row, derived from `enabled` AND the L1-6 signature gate.
+///
+/// Before #3430 every status surface (`governance install-defaults`
+/// output, `ai-memory rules list`, MCP `memory_rule_list`, `ai-memory
+/// doctor`) rendered the RAW `enabled` column and told the operator a
+/// rule was on while the engine silently dropped it at load time. This
+/// enum is the single source of truth those surfaces project, computed
+/// by the SAME predicate the engine applies in
+/// [`enforced_rule_passes`] — so "what the CLI says" and "what the
+/// engine enforces" cannot diverge again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleEnforcement {
+    /// `enabled = 0` — the operator has not activated the rule. The
+    /// SQL filter in [`list_enabled_by_kind`] never loads it.
+    Disabled,
+    /// Enabled AND admitted by the L1-6 gate: the engine evaluates it.
+    Enforced,
+    /// Enabled, an operator pubkey is resolved, but `attest_level` is
+    /// not `operator_signed`. Skipped at load time — enforces NOTHING.
+    SkippedUnsigned,
+    /// Enabled and `attest_level = operator_signed`, but the recorded
+    /// signature does NOT verify over the row's canonical bytes. This
+    /// is the #3430 shape: a raw `UPDATE ... SET enabled = 1` after
+    /// `rules sign-seed` mutates a field the signature commits to.
+    /// Skipped at load time — enforces NOTHING.
+    SkippedSignatureInvalid,
+}
+
+impl RuleEnforcement {
+    /// Stable wire token for JSON / doctor projections. Never
+    /// renamed without a lockstep surface sweep.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Enforced => "enforced",
+            Self::SkippedUnsigned => "skipped_unsigned",
+            Self::SkippedSignatureInvalid => "skipped_signature_invalid",
+        }
+    }
+
+    /// `true` only when the engine will actually evaluate this rule.
+    #[must_use]
+    pub fn is_enforced(self) -> bool {
+        matches!(self, Self::Enforced)
+    }
+}
+
+impl std::fmt::Display for RuleEnforcement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// v1.0.0 #3430 — full enforcement verdict for `rule`, including the
+/// `enabled` dimension. Pure: never logs, so status surfaces can call
+/// it per-row without amplifying the load-time diagnostics that
+/// [`enforced_rule_passes`] emits.
+#[must_use]
+pub fn enforcement_state(
+    rule: &Rule,
+    operator_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> RuleEnforcement {
+    if !rule.enabled {
+        return RuleEnforcement::Disabled;
+    }
+    signature_gate(rule, operator_pubkey)
+}
+
+/// The L1-6 signature half of the verdict, evaluated as if the row
+/// were already filtered to `enabled = 1` (which is what
+/// [`list_enabled_by_kind`]'s SQL WHERE clause guarantees). Shared by
+/// [`enforcement_state`] and [`enforced_rule_passes`] so the operator
+/// projection and the engine gate can never drift.
+fn signature_gate(
+    rule: &Rule,
+    operator_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> RuleEnforcement {
+    match (operator_pubkey, rule.attest_level.as_str()) {
+        (Some(pk), ATTEST_OPERATOR_SIGNED) => match verify_rule_signature(rule, pk) {
+            Ok(()) => RuleEnforcement::Enforced,
+            Err(_) => RuleEnforcement::SkippedSignatureInvalid,
+        },
+        // Pubkey is available (operator has activated L1-6) but the
+        // rule is not operator_signed. Refuse to enforce
+        // unsigned-enabled rules as misconfiguration.
+        (Some(_), _) => RuleEnforcement::SkippedUnsigned,
+        // No operator pubkey configured — substrate is in pre-L1-6
+        // mode. Every `enabled = 1` row passes through unchanged
+        // (preserves the pre-L1-6 contract that `check_agent_action`
+        // evaluated rules without any signature pre-check). The
+        // operator activates L1-6 by placing the pubkey at the default
+        // path or setting the env var.
+        (None, _) => RuleEnforcement::Enforced,
+    }
+}
+
 /// L1-6 — decide whether `rule` (already filtered to `enabled = 1`
 /// by the SQL WHERE clause) should pass to the enforcement engine.
 /// See [`list_enabled_by_kind`] for the policy summary. Pulled out so
 /// the L1-6 integration tests can exercise the matrix
 /// (signed/tampered/unsigned-enabled/no-key) directly without driving
 /// SQLite.
+///
+/// Deliberately consults [`signature_gate`], NOT [`enforcement_state`]:
+/// callers hand it rows the SQL already restricted to `enabled = 1`,
+/// and the L1-6 test matrix asserts the signature verdict on rows
+/// whose in-memory `enabled` flag is irrelevant to the question asked.
 #[must_use]
 pub fn enforced_rule_passes(
     rule: &Rule,
     operator_pubkey: Option<&ed25519_dalek::VerifyingKey>,
 ) -> bool {
-    match (operator_pubkey, rule.attest_level.as_str()) {
-        (Some(pk), ATTEST_OPERATOR_SIGNED) => match verify_rule_signature(rule, pk) {
-            Ok(()) => true,
-            Err(_) => {
-                tracing::error!(
-                    rule_id = %rule.id,
-                    "L1-6: operator_signed rule failed signature verification — \
-                     skipping. Tampered row OR rule was directly modified after \
-                     signing (e.g. `UPDATE governance_rules SET enabled = 1`). \
-                     Re-sign with `ai-memory rules sign-seed` after audit."
-                );
-                false
-            }
-        },
-        (Some(_), _) => {
-            // Pubkey is available (operator has activated L1-6) but
-            // the rule is not operator_signed. It has `enabled = 1`
-            // (SQL filter); refuse to enforce unsigned-enabled rules
-            // as misconfiguration.
+    match signature_gate(rule, operator_pubkey) {
+        RuleEnforcement::Enforced => true,
+        RuleEnforcement::SkippedSignatureInvalid => {
+            tracing::error!(
+                rule_id = %rule.id,
+                "L1-6: operator_signed rule failed signature verification — \
+                 skipping. Tampered row OR rule was directly modified after \
+                 signing (e.g. `UPDATE governance_rules SET enabled = 1`). \
+                 Re-sign with `ai-memory rules sign-seed` after audit."
+            );
+            false
+        }
+        RuleEnforcement::SkippedUnsigned => {
             tracing::warn!(
                 rule_id = %rule.id,
                 attest_level = %rule.attest_level,
@@ -233,16 +330,9 @@ pub fn enforced_rule_passes(
             );
             false
         }
-        (None, _) => {
-            // No operator pubkey configured — substrate is in pre-L1-6
-            // mode. Every `enabled = 1` row passes through unchanged
-            // (preserves the pre-L1-6 contract that
-            // `check_agent_action` evaluated rules without any
-            // signature pre-check). The operator activates L1-6 by
-            // placing the pubkey at the default path or setting the
-            // env var.
-            true
-        }
+        // `signature_gate` never returns `Disabled` — it does not look
+        // at `rule.enabled`. Fail closed on any future variant.
+        RuleEnforcement::Disabled => false,
     }
 }
 
@@ -737,10 +827,33 @@ pub fn insert_signed(
 /// is retained ONLY as an internal / test-fixture primitive; no
 /// production `src/` code calls it.
 ///
+/// v1.0.0 #3430: REFUSES to flip `enabled` on an `operator_signed`
+/// row. The operator signature commits to `enabled`
+/// ([`canonical_bytes_for_signing`]), so an unsigned flip silently
+/// invalidates it and leaves the rule INERT at load time — the exact
+/// hole `governance install-defaults` fell into. Signed rows must move
+/// through [`set_enabled_signed`], which re-signs the post-state in the
+/// same transaction. Flipping an unsigned row (the pre-L1-6 posture, and
+/// every test fixture) is unaffected.
+///
 /// # Errors
 ///
-/// Propagates SQLite errors.
+/// Propagates SQLite errors. Refuses (returns `Err`) when `id` names an
+/// `operator_signed` row whose `enabled` value would change.
 pub fn set_enabled(conn: &Connection, id: &str, enabled: bool) -> Result<bool> {
+    if let Some(existing) = get(conn, id)?
+        && existing.attest_level == ATTEST_OPERATOR_SIGNED
+        && existing.enabled != enabled
+    {
+        anyhow::bail!(
+            "rules_store::set_enabled: refusing to flip `enabled` on operator-signed rule \
+             {id} without re-signing (#3430). The operator signature commits to `enabled`, \
+             so this write would invalidate it and the L1-6 load gate would silently DROP \
+             the rule — reported active, enforcing nothing. Route through \
+             `set_enabled_signed` (CLI: `ai-memory rules enable/disable --sign`, or \
+             `ai-memory governance install-defaults`)."
+        );
+    }
     let affected = conn
         .execute(
             "UPDATE governance_rules SET enabled = ?1 WHERE id = ?2",
@@ -1502,6 +1615,106 @@ mod tests {
         let pk = signing.verifying_key();
         let rule = make_rule("R1", "bash", true); // attest_level = unsigned
         assert!(!enforced_rule_passes(&rule, Some(&pk)));
+    }
+
+    // -----------------------------------------------------------------
+    // v1.0.0 #3430 — enforcement_state / set_enabled fail-closed
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn enforcement_state_names_every_reason_a_rule_is_dead_3430() {
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let pk = signing.verifying_key();
+
+        // Disabled dominates: the SQL filter never loads the row.
+        let disabled = signed_rule("R1", false, &signing);
+        assert_eq!(
+            enforcement_state(&disabled, Some(&pk)),
+            RuleEnforcement::Disabled
+        );
+        assert!(!enforcement_state(&disabled, Some(&pk)).is_enforced());
+
+        // Enabled + signature over the post-state: enforced.
+        let enabled = signed_rule("R1", true, &signing);
+        assert_eq!(
+            enforcement_state(&enabled, Some(&pk)),
+            RuleEnforcement::Enforced
+        );
+        assert!(enforcement_state(&enabled, Some(&pk)).is_enforced());
+
+        // THE #3430 SHAPE: signed while disabled, then `enabled` flipped
+        // underneath the signature. The raw column says on; the engine
+        // drops it.
+        let mut flipped = signed_rule("R1", false, &signing);
+        flipped.enabled = true;
+        assert_eq!(
+            enforcement_state(&flipped, Some(&pk)),
+            RuleEnforcement::SkippedSignatureInvalid
+        );
+
+        // Enabled + unsigned under a resolved pubkey.
+        let unsigned = make_rule("R1", "bash", true);
+        assert_eq!(
+            enforcement_state(&unsigned, Some(&pk)),
+            RuleEnforcement::SkippedUnsigned
+        );
+
+        // Pre-L1-6 posture: no pubkey resolved, enabled rows enforce.
+        assert_eq!(
+            enforcement_state(&unsigned, None),
+            RuleEnforcement::Enforced
+        );
+
+        // Stable wire tokens (projected by `rules list`, MCP
+        // `memory_rule_list`, doctor and install-defaults).
+        assert_eq!(RuleEnforcement::Disabled.as_str(), "disabled");
+        assert_eq!(RuleEnforcement::Enforced.as_str(), "enforced");
+        assert_eq!(
+            RuleEnforcement::SkippedUnsigned.as_str(),
+            "skipped_unsigned"
+        );
+        assert_eq!(
+            RuleEnforcement::SkippedSignatureInvalid.as_str(),
+            "skipped_signature_invalid"
+        );
+        assert_eq!(RuleEnforcement::Enforced.to_string(), "enforced");
+    }
+
+    #[test]
+    fn set_enabled_refuses_to_flip_an_operator_signed_row_3430() {
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let pk = signing.verifying_key();
+        let conn = fresh_conn();
+        insert(&conn, &signed_rule("R1", false, &signing)).unwrap();
+
+        // DENIED: the unsigned flip that produced #3430.
+        let err = set_enabled(&conn, "R1", true)
+            .expect_err("#3430: flipping a signed row unsigned must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("#3430") && msg.contains("set_enabled_signed"),
+            "refusal must name the control + the remedy; got: {msg}"
+        );
+        // Fail closed: the row is untouched, so its signature still
+        // verifies against the state it commits to.
+        let after = get(&conn, "R1").unwrap().unwrap();
+        assert!(!after.enabled, "refused write must not land");
+        assert!(verify_rule_signature(&after, &pk).is_ok());
+
+        // ALLOWED: a no-op "flip" to the value already stored is not a
+        // mutation and must not be refused (idempotent callers).
+        assert!(set_enabled(&conn, "R1", false).unwrap());
+
+        // ALLOWED: unsigned rows keep the plain flip (pre-L1-6 posture,
+        // and every fixture that stages rule state).
+        insert(&conn, &make_rule("R2", "bash", false)).unwrap();
+        assert!(set_enabled(&conn, "R2", true).unwrap());
+        assert!(get(&conn, "R2").unwrap().unwrap().enabled);
+
+        // Missing row stays a benign `false`, not a refusal.
+        assert!(!set_enabled(&conn, "nope", true).unwrap());
     }
 
     #[test]
