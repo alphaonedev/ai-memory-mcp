@@ -4284,8 +4284,7 @@ pub fn run_mcp_server(
         .with_writer(std::io::stderr)
         .try_init();
 
-    // #3356 — a configured-but-invalid process identity must abort MCP boot,
-    // never collapse to the unresolved caller posture used by read handlers.
+    // #3356: configured-but-invalid identity aborts boot rather than becoming unresolved.
     let _ = crate::identity::resolve_mcp_read_visibility_caller()?;
 
     let mut conn = db::open(db_path)?;
@@ -6976,21 +6975,13 @@ mod tests {
 
     #[test]
     fn mcp_server_refuses_shape_invalid_agent_identity_before_serving_3356() {
-        let _guard = crate::identity::env_var_test_lock();
-        // SAFETY: process env mutation is serialised by `_guard`.
-        unsafe {
-            std::env::set_var("AI_MEMORY_AGENT_ID", "bad id with spaces");
-        }
+        let _env = crate::identity::agent_id_env_set_guard("bad id with spaces");
         let result = run_mcp_server(
             std::path::Path::new(":memory:"),
             FeatureTier::Keyword,
             &crate::config::AppConfig::default(),
             &crate::profile::Profile::core(),
         );
-        // SAFETY: process env mutation is serialised by `_guard`.
-        unsafe {
-            std::env::remove_var("AI_MEMORY_AGENT_ID");
-        }
         let error = result.unwrap_err().to_string();
         assert!(
             error.starts_with("AI_MEMORY_AGENT_ID is invalid:"),
@@ -11677,18 +11668,13 @@ mod tests {
             }),
         );
         let _ = invoke_handle_request(&conn, &notify);
-        for params in [
-            json!({"limit": 10}),
-            json!({"agent_id": &owner, "limit": 10}),
-        ] {
-            let inbox = make_tools_call("memory_inbox", params);
-            let resp = invoke_handle_request(&conn, &inbox);
+        for params in [json!({}), json!({"agent_id": &owner})] {
+            let resp = invoke_handle_request(&conn, &make_tools_call("memory_inbox", params));
             assert!(resp.error.is_none());
-            let text = resp.result.unwrap()["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .to_string();
-            let value: Value = serde_json::from_str(&text).unwrap();
+            let value: Value = serde_json::from_str(
+                resp.result.unwrap()["content"][0]["text"].as_str().unwrap(),
+            )
+            .unwrap();
             assert_eq!(value["agent_id"].as_str(), Some(owner.as_str()));
             assert_eq!(value["count"].as_u64(), Some(1));
         }
