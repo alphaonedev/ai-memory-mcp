@@ -9861,7 +9861,13 @@ pub fn consolidate(
             crate::identity::attest::ATTESTATION_REFUSED_UNSIGNED_SURFACE
         ));
     }
-    let now = Utc::now().to_rfc3339();
+    // #3422 — microsecond-precision stamp: the consolidated row is read back
+    // and SELF-ATTESTED by `handlers::consolidate_federation` before fan-out,
+    // and that signature commits to `created_at` as TEXT. chrono's nanosecond
+    // rendering cannot survive a postgres `TIMESTAMPTZ` round-trip, so a
+    // nanosecond stamp would make every consolidated row unverifiable at a
+    // postgres peer (and `sign_memory_write` now refuses to sign one).
+    let now = crate::identity::attest::now_attestable_rfc3339();
     let new_id = uuid::Uuid::new_v4().to_string();
 
     let write_txn = connection::WriteTxn::begin(conn)?;

@@ -549,6 +549,15 @@ timestamp that was signed.
   signed `created_at` verbatim**.
 - A `signature` whose `created_at` is outside a **±300 s** freshness
   window is rejected.
+- `created_at` MUST be the **canonical storage-stable rendering**
+  ([#3422](https://github.com/alphaonedev/ai-memory-mcp/issues/3422)): UTC with
+  the `+00:00` offset (never `Z`), microseconds truncated, and 0/3/6 fractional
+  digits — the shortest width that represents the value exactly. It is the only
+  rendering BOTH backends return byte-for-byte (postgres stores `created_at` as
+  `TIMESTAMPTZ` and re-renders the readback), and the signed envelope commits to
+  it as TEXT, so any other rendering would persist a row whose signature could
+  never be re-derived. Anything else is a **400** naming the string to sign.
+  See [`docs/attestation.md`](attestation.md#created_at-must-be-the-canonical-storage-stable-form-3422).
 - As of v0.9.0 ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)), an unsigned write is **rejected** by default
   (`403 ATTESTATION_FAILED`) rather than landing `metadata.attest_level =
   "claimed"`. Only with the explicit opt-out
@@ -562,7 +571,7 @@ This wire is identical across the three store surfaces (MCP
 
 - **201 Created** with `{ "id": "...", "tier": "mid", "namespace": "...", "title": "...", "agent_id": "..." }`.
 - **202 Accepted** (governance pending) with `{ "status": "pending", "pending_id": "...", "action": "store" }`.
-- **400** when `signature` is present but `created_at` is missing or not RFC 3339.
+- **400** when `signature` is present but `created_at` is missing, not RFC 3339, or not the canonical storage-stable rendering (#3422).
 - **403** with `{ "code": "ATTESTATION_FAILED" }` when a signature fails verification, or when an unsigned write is rejected under `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`.
 - **400 / 403 / 500** per validation / governance / server error.
 
@@ -1288,7 +1297,7 @@ authoritative for HTTP.
 | `memory_store` | `ttl_secs` | ✓ | ✗ | HTTP-only (`CreateMemory.ttl_secs`). The MCP `memory_store` tool exposes neither `ttl_secs` nor `expires_at` — set the expiry afterwards with MCP `memory_update` (`expires_at`), or let the tier default apply. |
 | `memory_store` | `expires_at` | ✓ | (via `update`) | HTTP body accepts; documented in the `POST /api/v1/memories` example. On MCP it lives on `memory_update`, not `memory_store`. |
 | `memory_store` | `signature` | ✓ | ✓ | #626 Layer-3 — std-base64 detached Ed25519 over the `SignableWrite` envelope; upgrades `agent_id` claimed→`agent_attested`. Same wire on both transports. |
-| `memory_store` | `created_at` | ✓ | ✓ | #626 Layer-3 — RFC 3339; **required when `signature` is present** (the signed timestamp, adopted verbatim; ±300 s freshness window). |
+| `memory_store` | `created_at` | ✓ | ✓ | #626 Layer-3 — RFC 3339; **required when `signature` is present** (the signed timestamp, adopted verbatim; ±300 s freshness window). #3422 — must be the canonical storage-stable rendering (UTC, `+00:00`, microsecond-truncated). |
 | `memory_recall` | `format` | ✓ | ✓ | Both transports (#1579 B4). `GET`/`POST /api/v1/recall` negotiate `json` (HTTP default) \| `toon` \| `toon_compact` before doing any work; an unrecognised value is a 400. MCP defaults to `toon_compact`. |
 | `memory_recall` | `context_tokens` | ✓ | ✓ | Both transports. The `POST` body takes a JSON array; the `GET` query string takes the comma-separated form `context_tokens=alpha,beta` (#1622). |
 | `memory_search` | `format` | ✓ | ✓ | Both transports (#1579 B4). `GET /api/v1/search` negotiates the same three values with the same 400-on-unknown rule. |

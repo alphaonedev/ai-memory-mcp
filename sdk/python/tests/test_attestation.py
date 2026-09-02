@@ -39,6 +39,7 @@ from ai_memory.attestation import (  # after importorskip, by design
     AgentSigningKey,
     attestation_fields,
     canonical_cbor_write,
+    canonicalize_created_at,
     content_sha256,
     rfc3339_now,
     sign_write,
@@ -211,6 +212,70 @@ def test_attestation_fields_defaults_kind_to_observation(vector: dict[str, Any])
 
 def test_rfc3339_now_is_offset_form() -> None:
     assert rfc3339_now().endswith("+00:00")
+
+
+# ---------------------------------------------------------------------------
+# #3422 - canonical, storage-stable created_at
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # `Z` suffix -> the `+00:00` form postgres returns.
+        ("2026-09-01T12:00:00Z", "2026-09-01T12:00:00+00:00"),
+        # Non-UTC offset -> the same instant, canonically rendered.
+        ("2026-09-01T14:00:00+02:00", "2026-09-01T12:00:00+00:00"),
+        # Already canonical -> unchanged (fixpoint).
+        ("2026-09-01T12:00:00+00:00", "2026-09-01T12:00:00+00:00"),
+        # Sub-microsecond digits cannot survive TIMESTAMPTZ: truncated.
+        ("2026-09-01T12:00:00.123456789Z", "2026-09-01T12:00:00.123456+00:00"),
+        # AutoSi widths: 0, 3 or 6 digits - the shortest exact rendering.
+        ("2026-09-01T12:00:00.000Z", "2026-09-01T12:00:00+00:00"),
+        ("2026-09-01T12:00:00.100000Z", "2026-09-01T12:00:00.100+00:00"),
+        ("2026-09-01T12:00:00.123400Z", "2026-09-01T12:00:00.123400+00:00"),
+    ],
+)
+def test_canonicalize_created_at_matches_the_daemon_form(raw: str, expected: str) -> None:
+    """#3422 - the daemon refuses any rendering it cannot round-trip."""
+    assert canonicalize_created_at(raw) == expected
+    # Idempotent: the canonical form is its own fixpoint.
+    assert canonicalize_created_at(expected) == expected
+
+
+def test_canonicalize_created_at_rejects_non_rfc3339() -> None:
+    with pytest.raises(ValueError):
+        canonicalize_created_at("2026-09-01 noon")
+
+
+def test_attestation_fields_signs_the_canonical_created_at() -> None:
+    """#3422 - a caller-supplied `...Z` stamp is canonicalized BEFORE signing,
+    so the SDK signs and sends exactly what the daemon will store."""
+    key = AgentSigningKey.generate()
+    fields = attestation_fields(
+        key,
+        agent_id="ai:sdk-demo@example",
+        namespace="team/alpha",
+        title="pg upgrade window",
+        content="body",
+        created_at="2026-09-01T12:00:00Z",
+    )
+    assert fields["created_at"] == "2026-09-01T12:00:00+00:00"
+    assert fields["signature"] == sign_write(
+        key,
+        agent_id="ai:sdk-demo@example",
+        namespace="team/alpha",
+        title="pg upgrade window",
+        kind="observation",
+        created_at="2026-09-01T12:00:00+00:00",
+        content="body",
+    )
+
+
+def test_rfc3339_now_is_storage_stable() -> None:
+    """#3422 - the default stamp is already canonical (its own fixpoint)."""
+    now = rfc3339_now()
+    assert canonicalize_created_at(now) == now
 
 
 # ---------------------------------------------------------------------------

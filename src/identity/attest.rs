@@ -63,6 +63,87 @@ use crate::models::Memory;
 /// future timestamp) while leaving room for ordinary clock skew + transit.
 pub const ATTEST_CREATED_AT_SKEW_SECS: i64 = 300;
 
+/// #3422 (data-integrity, cross-backend signature stability) — canonicalize a
+/// `created_at` into the ONE byte-form BOTH storage backends persist and return
+/// verbatim.
+///
+/// The divergence this closes: [`SignableWrite`] commits to `created_at` as
+/// TEXT, and every re-verification (the store gate itself, and
+/// `federation_receive::apply_inbound_write_attestation` on a relayed row)
+/// re-derives the envelope from the PERSISTED row. SQLite stores `created_at`
+/// in a `TEXT` column and returns the attested string byte-for-byte; postgres
+/// stores it in `TIMESTAMPTZ` (microsecond int8) and re-renders the readback
+/// through `chrono::DateTime::<Utc>::to_rfc3339()`. So a write attested with
+/// `"2026-09-01T12:00:00Z"` (or with chrono's 9-digit nanosecond rendering)
+/// comes back out of postgres as `"2026-09-01T12:00:00+00:00"` — different
+/// bytes, a different canonical CBOR pre-image, and an Ed25519 signature that
+/// can never be re-derived from the row again. The receive path then reads the
+/// author's genuine signature as FORGED and SKIPS the row: silent, unrecoverable
+/// data loss on a value the peer sent correctly.
+///
+/// The canonical form is `parse-as-RFC3339 → UTC → truncate to microseconds →
+/// to_rfc3339()`, i.e. chrono's `SecondsFormat::AutoSi` fractional digits with
+/// the `+00:00` offset. That is *exactly* what the postgres readback emits
+/// (`store/postgres.rs` maps every `created_at` column through `to_rfc3339()`),
+/// so a string equal to its own canonical form survives BOTH backends
+/// unchanged: sqlite stores the bytes verbatim, and postgres truncates nothing
+/// it has not already truncated and re-renders identically.
+///
+/// This deliberately differs from #3281's `storage::canonicalize_valid_until_stamp`,
+/// which renders the `Z` (zulu) suffix: `valid_until`'s audit-leaf pre-image is
+/// derived from the canonical STRING on both backends (never from a DB
+/// readback), so #3281 was free to pick the wire-friendlier `Z`. `created_at`
+/// has no such freedom — the postgres readback IS the pre-image, and it emits
+/// `+00:00`. Rendering `Z` here would re-introduce the very divergence this
+/// closes.
+///
+/// Returns `None` for an unparseable timestamp (the caller refuses; a value
+/// postgres would reject at its `::TIMESTAMPTZ` bind must never enter a signed
+/// envelope).
+#[must_use]
+pub fn canonicalize_attested_created_at(raw: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| canonical_created_at_stamp(dt.with_timezone(&chrono::Utc)))
+}
+
+/// #3422 — the ONE rendering of an instant, shared by
+/// [`canonicalize_attested_created_at`], [`now_attestable_rfc3339`] and the
+/// signed-write funnels, so no caller can drift from the storage-stable form.
+///
+/// Microsecond truncation matches what `TIMESTAMPTZ` durably keeps; `to_rfc3339`
+/// (`SecondsFormat::AutoSi`, `+00:00`) matches what the postgres readback
+/// re-renders.
+#[must_use]
+pub(crate) fn canonical_created_at_stamp(instant: chrono::DateTime<chrono::Utc>) -> String {
+    crate::storage::truncate_to_microseconds(instant).to_rfc3339()
+}
+
+/// #3422 — is `raw` byte-identical to its own canonical form, i.e. will BOTH
+/// backends return exactly these bytes after a store/read round-trip?
+///
+/// This is the fail-closed predicate the signing and signature-adoption funnels
+/// gate on: a `created_at` that fails it CANNOT carry a re-derivable signature
+/// on postgres, so no signature is ever minted over it and no presented
+/// signature is ever accepted for it.
+#[must_use]
+pub fn created_at_is_storage_stable(raw: &str) -> bool {
+    canonicalize_attested_created_at(raw).is_some_and(|canonical| canonical == raw)
+}
+
+/// #3422 — `now` in the one storage-stable `created_at` form, for every write
+/// funnel that mints a row which may later be signed (directly, or by the
+/// federated-consolidate self-attestation on the read-back row).
+///
+/// `chrono::Utc::now().to_rfc3339()` renders nanoseconds on Linux; postgres
+/// `TIMESTAMPTZ` cannot store them, so a row stamped that way is unsignable on
+/// a postgres deployment (and a sqlite-authored one becomes unverifiable the
+/// moment it federates to a postgres peer).
+#[must_use]
+pub fn now_attestable_rfc3339() -> String {
+    canonical_created_at_stamp(chrono::Utc::now())
+}
+
 /// The API surface a store-path write arrived on (#1985).
 ///
 /// The compiled default for `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is
@@ -279,11 +360,21 @@ pub(crate) fn permissive_attestation_for_lib_tests() {
 /// bytes plus the verbatim `created_at` the caller must adopt so the
 /// verifier re-derives the identical [`SignableWrite`] envelope.
 ///
+/// #3422 — the accepted set is narrowed to timestamps that are byte-identical
+/// to their own [`canonicalize_attested_created_at`] form, i.e. the ONE
+/// rendering BOTH backends return unchanged. A `…Z`-suffixed or
+/// nanosecond-precision `created_at` is REFUSED with the canonical string to
+/// sign instead: postgres stores `created_at` as `TIMESTAMPTZ` and re-renders
+/// the readback, so adopting such a value persists a row whose genuine
+/// signature can never be re-derived — a silently unverifiable write that the
+/// federation receive path drops as forged.
+///
 /// # Errors
 ///
 /// Returns a human-readable string (suitable for a 4xx wire envelope)
 /// when the signature is not valid base64, `created_at` is absent /
-/// not RFC3339, or the timestamp falls outside the freshness window.
+/// not RFC3339, the timestamp falls outside the freshness window, or (#3422)
+/// it is not the canonical storage-stable rendering of its instant.
 pub fn prepare_signed_store<'a>(
     signature_b64: &str,
     created_at: Option<&'a str>,
@@ -309,6 +400,26 @@ pub fn prepare_signed_store<'a>(
              window (skew {skew}s); refusing to attest a stale or post-dated write"
         ));
     }
+    // #3422 — FAIL CLOSED on a `created_at` the storage layer cannot return
+    // byte-for-byte. The signed envelope commits to this string as TEXT and
+    // every later re-derivation (this gate, and the federation receive path)
+    // rebuilds it from the PERSISTED row: sqlite returns the TEXT verbatim,
+    // postgres round-trips it through `TIMESTAMPTZ` (microseconds) and
+    // re-renders `to_rfc3339()`. Adopting a non-round-trippable string would
+    // persist a row whose genuine signature can never be re-derived again —
+    // which the receive path reads as FORGED and SKIPS, losing the row. Refuse
+    // at the door instead, naming the exact string to sign. Only the CANONICAL
+    // form is echoed back (never the caller's raw bytes) so the 4xx envelope
+    // cannot be used to reflect arbitrary attacker-chosen text.
+    let canonical = canonical_created_at_stamp(parsed.with_timezone(&chrono::Utc));
+    if canonical != created_at {
+        return Err(format!(
+            "`created_at` must be the canonical UTC form both storage backends round-trip \
+             byte-for-byte (`{canonical}`): the signed envelope commits to it as TEXT and \
+             postgres `TIMESTAMPTZ` cannot return any other rendering of the same instant. \
+             Sign and send `{canonical}`"
+        ));
+    }
     Ok((sig_bytes, created_at))
 }
 
@@ -331,15 +442,35 @@ pub fn content_sha256(content: &str) -> [u8; 32] {
 /// caller passes the resolved `agent_id` explicitly (it already has it)
 /// rather than re-reading it from metadata.
 ///
+/// #3422 — FAIL CLOSED: refuses to mint a signature over a `created_at` the
+/// storage layer cannot return byte-for-byte
+/// ([`created_at_is_storage_stable`]). A signature whose pre-image cannot be
+/// re-derived from the persisted row is strictly WORSE than no signature: every
+/// receiver re-derives from its own row and reads the author's genuine
+/// signature as FORGED, which drops the row. Callers that mint a row
+/// themselves must stamp [`now_attestable_rfc3339`] (see `cli::store`,
+/// `storage::consolidate`); a caller signing a row read back from storage
+/// (`handlers::consolidate_federation`) degrades to an UNSIGNED `claimed` row
+/// for a legacy non-canonical timestamp — reduced attestation, never a
+/// forged-looking one.
+///
 /// # Errors
 ///
 /// Surfaces a signing failure (e.g. the keypair is public-only) from
-/// [`crate::identity::sign::sign_write`].
+/// [`crate::identity::sign::sign_write`], or (#3422) a `created_at` that is not
+/// the canonical storage-stable rendering of its instant.
 pub fn sign_memory_write(
     keypair: &crate::identity::keypair::AgentKeypair,
     mem: &Memory,
     agent_id: &str,
 ) -> Result<Vec<u8>> {
+    if !created_at_is_storage_stable(&mem.created_at) {
+        anyhow::bail!(
+            "refusing to sign a write whose `created_at` is not the canonical \
+             storage-stable RFC3339 UTC form (#3422): the signature could never be \
+             re-derived from the persisted row on a postgres backend"
+        );
+    }
     let content_hash = content_sha256(&mem.content);
     let write = SignableWrite {
         agent_id,
@@ -563,6 +694,242 @@ mod tests {
         assert!(arr.is_array());
     }
 
+    // ---- #3422: cross-backend `created_at` byte-stability -------------------
+
+    /// #3422 — the canonical form is EXACTLY what the postgres readback emits:
+    /// `+00:00` offset, `AutoSi` fractional digits, microsecond precision.
+    /// Every non-canonical rendering of the same instant maps onto it.
+    #[test]
+    fn canonicalize_attested_created_at_maps_every_rendering_onto_one_form_3422() {
+        for raw in [
+            // `Z` (zulu) suffix — the shape the HTTP sweep caught.
+            "2026-09-01T12:00:00Z",
+            // Non-UTC offset: the same instant, a different local rendering.
+            "2026-09-01T14:00:00+02:00",
+            // Already canonical.
+            "2026-09-01T12:00:00+00:00",
+        ] {
+            assert_eq!(
+                canonicalize_attested_created_at(raw).as_deref(),
+                Some("2026-09-01T12:00:00+00:00"),
+                "{raw} must canonicalize onto the postgres readback form"
+            );
+        }
+        // Sub-microsecond digits cannot survive `TIMESTAMPTZ`; they truncate.
+        assert_eq!(
+            canonicalize_attested_created_at("2026-09-01T12:00:00.123456789Z").as_deref(),
+            Some("2026-09-01T12:00:00.123456+00:00")
+        );
+        // `AutoSi` renders the shortest exact width (0/3/6 digits).
+        assert_eq!(
+            canonicalize_attested_created_at("2026-09-01T12:00:00.000Z").as_deref(),
+            Some("2026-09-01T12:00:00+00:00")
+        );
+        assert_eq!(
+            canonicalize_attested_created_at("2026-09-01T12:00:00.100000Z").as_deref(),
+            Some("2026-09-01T12:00:00.100+00:00")
+        );
+        // Unparseable → None (postgres would reject it at the bind anyway).
+        assert!(canonicalize_attested_created_at("2026-09-01 noon").is_none());
+        assert!(canonicalize_attested_created_at("").is_none());
+    }
+
+    /// #3422 — canonicalization is IDEMPOTENT, which is what makes
+    /// `created_at_is_storage_stable` a fixpoint test rather than a
+    /// hand-enumerated pattern list.
+    #[test]
+    fn canonicalize_attested_created_at_is_idempotent_3422() {
+        for raw in [
+            "2026-09-01T12:00:00Z",
+            "2026-09-01T14:00:00+02:00",
+            "2026-09-01T12:00:00.123456789Z",
+            "2026-09-01T12:00:00.000Z",
+            "1999-12-31T23:59:59.999999Z",
+        ] {
+            let once = canonicalize_attested_created_at(raw).expect("parses");
+            let twice = canonicalize_attested_created_at(&once).expect("re-parses");
+            assert_eq!(once, twice, "canonicalization must be a fixpoint for {raw}");
+            assert!(
+                created_at_is_storage_stable(&once),
+                "the canonical form must itself be storage-stable"
+            );
+        }
+    }
+
+    /// #3422 — `now_attestable_rfc3339` is storage-stable by construction, so
+    /// every row minted with it is signable on BOTH backends. (The bare
+    /// `chrono::Utc::now().to_rfc3339()` it replaces is NOT: on Linux it
+    /// renders nanoseconds, which postgres `TIMESTAMPTZ` silently drops.)
+    #[test]
+    fn now_attestable_rfc3339_is_storage_stable_3422() {
+        let now = now_attestable_rfc3339();
+        assert!(
+            created_at_is_storage_stable(&now),
+            "minted `now` must round-trip both backends: {now}"
+        );
+        assert!(now.ends_with("+00:00"), "canonical offset rendering: {now}");
+    }
+
+    /// #3422 DENIED path — a caller-signed `created_at` that postgres cannot
+    /// return byte-for-byte is refused at the funnel, and the refusal names the
+    /// canonical string to sign (never echoing the caller's raw bytes back).
+    #[test]
+    fn prepare_signed_store_refuses_non_storage_stable_created_at_3422() {
+        use base64::Engine as _;
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 64]);
+        // A `Z`-suffixed stamp inside the freshness window.
+        let z_form = crate::identity::attest::now_attestable_rfc3339().replace("+00:00", "Z");
+        let err = prepare_signed_store(&sig_b64, Some(&z_form))
+            .expect_err("a non-round-trippable created_at must be refused");
+        assert!(
+            err.contains("canonical UTC form"),
+            "the refusal must state the contract; got: {err}"
+        );
+        assert!(
+            err.contains("+00:00") && !err.contains(&z_form),
+            "the refusal must name the canonical form and NOT reflect the raw input; got: {err}"
+        );
+        // Nanosecond precision is equally refused (chrono's own default
+        // `Utc::now().to_rfc3339()` rendering).
+        let nanos = "2026-09-01T12:00:00.123456789+00:00";
+        let err = prepare_signed_store(&sig_b64, Some(nanos));
+        assert!(
+            err.is_err(),
+            "nanosecond precision cannot survive TIMESTAMPTZ and must be refused"
+        );
+    }
+
+    /// #3422 ALLOWED path — the canonical form is accepted verbatim and adopted
+    /// unchanged, so the persisted row and the signed envelope stay byte-equal.
+    #[test]
+    fn prepare_signed_store_accepts_the_canonical_created_at_3422() {
+        use base64::Engine as _;
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 64]);
+        let canonical = now_attestable_rfc3339();
+        let (_sig, adopted) =
+            prepare_signed_store(&sig_b64, Some(&canonical)).expect("canonical form is accepted");
+        assert_eq!(
+            adopted, canonical,
+            "the canonical timestamp must be adopted verbatim"
+        );
+    }
+
+    /// #3422 DENIED path (signer half) — the daemon REFUSES to mint a signature
+    /// over a `created_at` it could not re-derive from a postgres row. A
+    /// signature that reads FORGED at every receiver is strictly worse than no
+    /// signature: the receive path drops the row instead of landing it
+    /// `claimed`.
+    #[test]
+    fn sign_memory_write_refuses_non_storage_stable_created_at_3422() {
+        let kp = keypair::generate("ai:carol").expect("generate");
+        let mut mem = make_memory("scale the deployment to three replicas");
+        mem.created_at = "2026-09-01T12:00:00.123456789+00:00".to_string();
+        let err = sign_memory_write(&kp, &mem, "ai:carol")
+            .expect_err("a nanosecond created_at must not be signed");
+        assert!(
+            format!("{err:#}").contains("#3422"),
+            "the refusal must cite the control; got: {err:#}"
+        );
+        // ALLOWED: the canonical rendering of the same instant signs, and the
+        // signature re-derives from the (unchanged) row.
+        mem.created_at = "2026-09-01T12:00:00.123456+00:00".to_string();
+        let sig = sign_memory_write(&kp, &mem, "ai:carol").expect("canonical created_at signs");
+        let level = resolve_write_attest_level(
+            &mem,
+            "ai:carol",
+            Some(&kp.public_base64()),
+            Some(&sig),
+            true,
+        )
+        .expect("the minted signature must re-derive from the row");
+        assert_eq!(level, crate::identity::verify::AttestLevel::AgentAttested);
+    }
+
+    /// #3422 — THE BUG, reproduced at the unit level without a database: the
+    /// postgres readback of `created_at` is `TIMESTAMPTZ → to_rfc3339()`. Feed a
+    /// `Z`-attested row through that transformation and the signature no longer
+    /// re-derives; feed the canonical form through it and the row is unchanged,
+    /// so the signature still verifies. This is exactly what
+    /// `federation_receive::apply_inbound_write_attestation` does to a relayed
+    /// row on a postgres node.
+    #[test]
+    fn postgres_readback_breaks_a_z_attested_row_but_not_a_canonical_one_3422() {
+        /// The postgres readback, verbatim: `TIMESTAMPTZ` keeps microseconds
+        /// and `store/postgres.rs` renders `DateTime<Utc>::to_rfc3339()`.
+        fn postgres_round_trip(created_at: &str) -> String {
+            let dt = chrono::DateTime::parse_from_rfc3339(created_at).expect("pg parses");
+            crate::storage::truncate_to_microseconds(dt.with_timezone(&chrono::Utc)).to_rfc3339()
+        }
+
+        let kp = keypair::generate("ai:carol").expect("generate");
+        let mut mem = make_memory("scale the deployment to three replicas");
+
+        // (a) The `Z` form the HTTP sweep attested with. Signing it directly
+        //     bypasses the new guard the way pre-#3422 code did.
+        mem.created_at = "2026-09-01T12:00:00Z".to_string();
+        let content_hash = content_sha256(&mem.content);
+        let legacy_sig = sign::sign_write(
+            &kp,
+            &SignableWrite {
+                agent_id: "ai:carol",
+                namespace: &mem.namespace,
+                title: &mem.title,
+                kind: mem.memory_kind.as_str(),
+                created_at: &mem.created_at,
+                content_sha256: &content_hash,
+            },
+        )
+        .expect("sign");
+        // Verifies against the row as authored…
+        assert!(
+            resolve_write_attest_level(
+                &mem,
+                "ai:carol",
+                Some(&kp.public_base64()),
+                Some(&legacy_sig),
+                true
+            )
+            .is_ok(),
+            "the signature verifies before the storage hop"
+        );
+        // …and is unverifiable the moment postgres has returned the row.
+        let mut from_pg = mem.clone();
+        from_pg.created_at = postgres_round_trip(&mem.created_at);
+        assert_ne!(from_pg.created_at, mem.created_at, "pg re-renders `…Z`");
+        assert!(
+            resolve_write_attest_level(
+                &from_pg,
+                "ai:carol",
+                Some(&kp.public_base64()),
+                Some(&legacy_sig),
+                true
+            )
+            .is_err(),
+            "#3422: the pg readback must break re-derivation of a `…Z` attested row"
+        );
+
+        // (b) The canonical form the funnel now enforces survives the hop.
+        mem.created_at = "2026-09-01T12:00:00+00:00".to_string();
+        let sig = sign_memory_write(&kp, &mem, "ai:carol").expect("canonical signs");
+        let mut from_pg = mem.clone();
+        from_pg.created_at = postgres_round_trip(&mem.created_at);
+        assert_eq!(
+            from_pg.created_at, mem.created_at,
+            "the canonical form is a postgres fixpoint"
+        );
+        assert!(
+            resolve_write_attest_level(
+                &from_pg,
+                "ai:carol",
+                Some(&kp.public_base64()),
+                Some(&sig),
+                true
+            )
+            .is_ok(),
+            "#3422: the canonical form must re-derive after the storage hop"
+        );
+    }
+
     fn make_memory(content: &str) -> Memory {
         Memory {
             cid: None,
@@ -744,7 +1111,10 @@ mod tests {
     fn prepare_signed_store_accepts_fresh_envelope() {
         use base64::Engine as _;
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 64]);
-        let created_at = chrono::Utc::now().to_rfc3339();
+        // #3422 — the freshness window accepts only the canonical
+        // storage-stable rendering; `Utc::now().to_rfc3339()` renders
+        // nanoseconds, which no postgres `TIMESTAMPTZ` round-trip preserves.
+        let created_at = now_attestable_rfc3339();
         let (bytes, ts) =
             prepare_signed_store(&sig_b64, Some(&created_at)).expect("fresh envelope ok");
         assert_eq!(bytes, vec![7u8; 64]);

@@ -51,6 +51,7 @@ export {
   DOMAIN_SEPARATION_TAG,
   attestationFields,
   canonicalCborWrite,
+  canonicalizeCreatedAt,
   contentSha256,
   rfc3339Now,
   signWrite,

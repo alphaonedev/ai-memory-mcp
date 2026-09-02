@@ -4200,6 +4200,91 @@ mod tests {
         assert_eq!(mem.metadata["attest_level"], "agent_attested");
     }
 
+    /// #3422 (data-integrity, HIGH) — a row AUTHORED ON A POSTGRES NODE must
+    /// still re-verify at the receiver after the authoring node's own
+    /// `TIMESTAMPTZ` round-trip.
+    ///
+    /// The author signs, stores, and later RE-EMITS the row it read back out of
+    /// storage; the receiver re-derives the `SignableWrite` envelope from that
+    /// relayed payload. SQLite returns `created_at` from a `TEXT` column
+    /// verbatim, but postgres re-renders it from `TIMESTAMPTZ`
+    /// (microseconds, `to_rfc3339()`), so a `…Z`-attested row leaves the
+    /// authoring node with DIFFERENT `created_at` bytes than were signed and
+    /// every receiver reads the author's genuine signature as FORGED — SKIPPING
+    /// the row (silent loss). The canonical rendering the write funnels now
+    /// enforce is a postgres FIXPOINT, so the same relay survives it.
+    #[test]
+    fn pg_authored_row_reverifies_after_the_timestamptz_round_trip_3422() {
+        /// The postgres readback, verbatim: `TIMESTAMPTZ` keeps microseconds and
+        /// `store/postgres.rs` renders every `created_at` via `to_rfc3339()`.
+        fn postgres_round_trip(created_at: &str) -> String {
+            let dt = chrono::DateTime::parse_from_rfc3339(created_at).expect("pg parses");
+            crate::storage::truncate_to_microseconds(dt.with_timezone(&chrono::Utc)).to_rfc3339()
+        }
+
+        let author = "ai:pg-author";
+        let kp = keypair::generate(author).unwrap();
+
+        // (a) PRE-#3422 shape: attested with `…Z`. The signature is minted
+        //     through the encoder directly, since `sign_memory_write` now
+        //     REFUSES this stamp.
+        let mut mem = wsig_mem(author);
+        mem.created_at = "2026-06-01T12:00:00Z".to_string();
+        let content_hash = attest::content_sha256(&mem.content);
+        let legacy_sig = crate::identity::sign::sign_write(
+            &kp,
+            &crate::identity::sign::SignableWrite {
+                agent_id: author,
+                namespace: &mem.namespace,
+                title: &mem.title,
+                kind: mem.memory_kind.as_str(),
+                created_at: &mem.created_at,
+                content_sha256: &content_hash,
+            },
+        )
+        .expect("mint the legacy signature");
+        let mut relayed = mem.clone();
+        relayed.created_at = postgres_round_trip(&mem.created_at);
+        assert_ne!(relayed.created_at, mem.created_at, "pg re-renders `…Z`");
+        put_write_sig(&mut relayed, &legacy_sig);
+        assert!(
+            apply_inbound_write_attestation(
+                &mut relayed,
+                author,
+                "ai:relay",
+                Some(author),
+                Some(&pk_b64(&kp)),
+                false,
+            )
+            .is_err(),
+            "#3422: a `…Z`-attested pg-authored row is unverifiable at the receiver \
+             (the row is SKIPPED — the loss this control prevents)"
+        );
+
+        // (b) POST-#3422: the canonical rendering the funnels enforce is a
+        //     postgres fixpoint, so the relayed row re-verifies and upgrades.
+        let mut mem = wsig_mem(author);
+        mem.created_at = crate::identity::attest::now_attestable_rfc3339();
+        let sig = attest::sign_memory_write(&kp, &mem, author).expect("canonical row signs");
+        let mut relayed = mem.clone();
+        relayed.created_at = postgres_round_trip(&mem.created_at);
+        assert_eq!(
+            relayed.created_at, mem.created_at,
+            "the canonical form is a postgres fixpoint"
+        );
+        put_write_sig(&mut relayed, &sig);
+        apply_inbound_write_attestation(
+            &mut relayed,
+            author,
+            "ai:relay",
+            Some(author),
+            Some(&pk_b64(&kp)),
+            true,
+        )
+        .expect("#3422: a canonical pg-authored row must re-verify at the receiver");
+        assert_eq!(relayed.metadata["attest_level"], "agent_attested");
+    }
+
     /// A forged/tampered presented signature is rejected unconditionally
     /// (even under the permissive default).
     #[test]

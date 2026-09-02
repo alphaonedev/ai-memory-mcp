@@ -230,7 +230,13 @@ pub(crate) fn run_with_curator(
     validate::validate_expires_at(args.expires_at.as_deref())?;
     validate::validate_ttl_secs(args.ttl_secs)?;
 
-    let now = Utc::now();
+    // #3422 — mint the row's timestamps at MICROSECOND precision, the one
+    // rendering both storage backends round-trip byte-for-byte. `--sign`
+    // commits to `created_at` as TEXT and postgres `TIMESTAMPTZ` cannot store
+    // chrono's nanoseconds, so a nanosecond-precision stamp yields a signature
+    // that can never be re-derived once the row federates to a postgres peer
+    // (`identity::attest::sign_memory_write` now refuses to mint one).
+    let now = crate::storage::truncate_to_microseconds(Utc::now());
     let expires_at = args.expires_at.or_else(|| {
         args.ttl_secs
             .or(resolved_ttl.ttl_for_tier(&tier))

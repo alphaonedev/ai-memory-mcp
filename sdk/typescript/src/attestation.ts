@@ -169,16 +169,70 @@ export function canonicalCborWrite(write: SignableWrite): Buffer {
   return Buffer.concat(parts);
 }
 
+/** RFC3339 date-time, decomposed so the fraction survives `Date`'s millisecond floor. */
+const RFC3339_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?([Zz]|[+-]\d{2}:\d{2})$/;
+
 /**
- * Current UTC time as RFC3339 with a `+00:00` offset.
+ * Canonicalize an RFC3339 timestamp into the ONE `created_at` rendering both
+ * daemon storage backends return byte-for-byte (#3422).
  *
- * Matches the rendering `chrono::Utc::now().to_rfc3339()` produces, which is
- * what the daemon's own signer uses. (`Date#toISOString` emits `Z`; the
- * daemon parses both, but matching the daemon's own form avoids surprises in
- * logs and diffs.)
+ * The daemon REFUSES to attest any other rendering. `created_at` is inside the
+ * signed `SignableWrite` envelope as TEXT, and every re-verification (the store
+ * gate, and the federation receive path on a relayed row) rebuilds the envelope
+ * from the PERSISTED row: SQLite returns the stored TEXT verbatim, while
+ * PostgreSQL stores `TIMESTAMPTZ` (microseconds) and re-renders the readback as
+ * `+00:00`. A signature minted over `"…Z"`, over a non-UTC offset, or over
+ * nanosecond precision could therefore never be re-derived from a Postgres row.
+ *
+ * Canonical form: UTC, `+00:00` offset, microseconds TRUNCATED (never rounded —
+ * that is what `TIMESTAMPTZ` does), and 0, 3 or 6 fractional digits — the
+ * shortest width that represents the value exactly, matching chrono's
+ * `SecondsFormat::AutoSi`.
+ *
+ * @throws {RangeError} if `value` is not an RFC3339 date-time.
+ */
+export function canonicalizeCreatedAt(value: string): string {
+  const m = RFC3339_PATTERN.exec(value.trim());
+  if (m === null) {
+    throw new RangeError(`created_at must be an RFC3339 date-time, got: ${value}`);
+  }
+  const [, year, month, day, hour, minute, second, fraction = "", offset] = m;
+  // TIMESTAMPTZ keeps microseconds and drops the rest — truncate, never round.
+  const micros = Number(`${fraction}000000`.slice(0, 6));
+  let offsetMinutes = 0;
+  if (offset !== "Z" && offset !== "z") {
+    const sign = offset.startsWith("-") ? -1 : 1;
+    offsetMinutes = sign * (Number(offset.slice(1, 3)) * 60 + Number(offset.slice(4, 6)));
+  }
+  // Build via the UTC setters rather than `Date.UTC`, whose two-digit-year
+  // legacy mapping would turn year 0099 into 1999.
+  const moment = new Date(0);
+  moment.setUTCFullYear(Number(year), Number(month) - 1, Number(day));
+  moment.setUTCHours(Number(hour), Number(minute), Number(second), 0);
+  const whole = new Date(moment.getTime() - offsetMinutes * 60_000)
+    .toISOString()
+    .slice(0, 19);
+  let frac = "";
+  if (micros !== 0) {
+    frac =
+      micros % 1000 === 0
+        ? `.${String(micros / 1000).padStart(3, "0")}`
+        : `.${String(micros).padStart(6, "0")}`;
+  }
+  return `${whole}${frac}+00:00`;
+}
+
+/**
+ * Current UTC time in the canonical `created_at` form the daemon persists and
+ * re-derives signatures from (#3422) — UTC, `+00:00`, microsecond-truncated.
+ *
+ * (`Date#toISOString` emits `Z` with a fixed 3-digit fraction; both the suffix
+ * and a `.000` fraction are rejected by the daemon's attestation funnel, since
+ * neither survives a PostgreSQL `TIMESTAMPTZ` round-trip unchanged.)
  */
 export function rfc3339Now(date: Date = new Date()): string {
-  return date.toISOString().replace(/Z$/, "+00:00");
+  return canonicalizeCreatedAt(date.toISOString());
 }
 
 // ---------------------------------------------------------------------------
@@ -302,13 +356,19 @@ export interface AttestationFields {
  * defaults to now — the daemon adopts the value verbatim after checking it
  * against the +/-300s freshness window, so it must be the SAME string that was
  * signed, which is why it is returned rather than left to the caller.
+ *
+ * #3422 — a caller-supplied `createdAt` is folded through
+ * {@link canonicalizeCreatedAt} BEFORE signing, so the SDK always signs (and
+ * sends) the exact string the daemon will store and later re-derive the
+ * signature from on either backend.
  */
 export function attestationFields(
   key: AgentSigningKey,
   input: AttestationInput,
 ): AttestationFields {
   const kind = input.kind ?? "observation";
-  const createdAt = input.createdAt ?? rfc3339Now();
+  const createdAt =
+    input.createdAt === undefined ? rfc3339Now() : canonicalizeCreatedAt(input.createdAt);
   return {
     signature: signWrite(key, {
       agentId: input.agentId,

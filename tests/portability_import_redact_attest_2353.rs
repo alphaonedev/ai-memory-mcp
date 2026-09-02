@@ -53,7 +53,10 @@ fn signed_bundle_memory(
     content: &str,
     kp: &ai_memory::identity::keypair::AgentKeypair,
 ) -> Memory {
-    let now = "2026-07-20T00:00:00Z".to_string();
+    // #3422 — `Z` is not the storage-stable rendering; `sign_memory_write`
+    // refuses to mint a signature over a `created_at` postgres would return
+    // as `+00:00`.
+    let now = "2026-07-20T00:00:00+00:00".to_string();
     let mut mem = Memory {
         id: id.into(),
         namespace: "portability".into(),

@@ -86,6 +86,14 @@ struct Cli {
     /// send this SAME value as the request body `created_at`; the server adopts
     /// it verbatim (within the ±300s freshness window) before re-deriving the
     /// envelope.
+    ///
+    /// #3422 — it must be the CANONICAL storage-stable rendering: UTC with the
+    /// `+00:00` offset (never `Z`), microseconds truncated, 0/3/6 fractional
+    /// digits. That is the only form both storage backends return
+    /// byte-for-byte, so it is the only one whose signature stays re-derivable
+    /// from the persisted row; the daemon answers anything else with a 400
+    /// naming the string to sign. In shell:
+    /// `date -u +%Y-%m-%dT%H:%M:%S+00:00`.
     #[arg(long)]
     created_at: String,
     /// Memory content. Mutually exclusive with `--content-file`.

@@ -403,8 +403,9 @@ impl PresentedWriteV2 {
 ///
 /// # Errors
 ///
-/// When `created_at` is not RFC3339 or is outside the
-/// [`crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS`] window; the
+/// When `created_at` is not RFC3339, is outside the
+/// [`crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS`] window, or (#3422)
+/// is not the canonical storage-stable rendering of its instant; the
 /// message is wire-suitable (QUAL-7: typed `anyhow`, not `String`).
 fn adopt_created_at(
     mem: &mut crate::models::Memory,
@@ -419,6 +420,20 @@ fn adopt_created_at(
         anyhow::bail!(
             "v2 `created_at` is outside the ±{}s attestation freshness window (skew {skew}s)",
             crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS
+        );
+    }
+    // #3422 — FAIL CLOSED, identically to the v1 funnel
+    // (`attest::prepare_signed_store`): the v2 positional envelope commits to
+    // `created_at` as element [5] TEXT and every re-verification rebuilds it
+    // from the PERSISTED row, which postgres returns re-rendered out of
+    // `TIMESTAMPTZ`. Only the canonical storage-stable rendering may be
+    // adopted; anything else would persist an unverifiable row.
+    let canonical =
+        crate::identity::attest::canonical_created_at_stamp(parsed.with_timezone(&chrono::Utc));
+    if canonical != presented.created_at {
+        anyhow::bail!(
+            "v2 `created_at` must be the canonical UTC form both storage backends \
+             round-trip byte-for-byte (`{canonical}`); sign and send that string (#3422)"
         );
     }
     mem.created_at = presented.created_at.clone();
@@ -767,7 +782,10 @@ mod tests {
         let screened_title = screened(TITLE);
         // The wired `stamp_v2_sync` freshness-checks `created_at` against the
         // real clock, so sign over `now` (not a fixed fixture instant).
-        let fresh = chrono::Utc::now().to_rfc3339();
+        // #3422 — and over the CANONICAL storage-stable rendering, the only one
+        // `adopt_created_at` will adopt (chrono's bare `to_rfc3339()` renders
+        // nanoseconds, which no postgres `TIMESTAMPTZ` round-trip preserves).
+        let fresh = crate::identity::attest::now_attestable_rfc3339();
         let write = SignableWriteV2 {
             agent_id: AGENT,
             namespace: NS,

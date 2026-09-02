@@ -28,6 +28,7 @@ import {
   DOMAIN_SEPARATION_TAG,
   attestationFields,
   canonicalCborWrite,
+  canonicalizeCreatedAt,
   contentSha256,
   rfc3339Now,
   signWrite,
@@ -199,6 +200,60 @@ describe("attestationFields", () => {
 
   test("rfc3339Now uses the +00:00 offset form", () => {
     expect(rfc3339Now()).toMatch(/\+00:00$/);
+  });
+
+  // -------------------------------------------------------------------------
+  // #3422 - canonical, storage-stable created_at
+  // -------------------------------------------------------------------------
+
+  test.each([
+    // `Z` suffix -> the `+00:00` form postgres returns.
+    ["2026-09-01T12:00:00Z", "2026-09-01T12:00:00+00:00"],
+    // Non-UTC offset -> the same instant, canonically rendered.
+    ["2026-09-01T14:00:00+02:00", "2026-09-01T12:00:00+00:00"],
+    // Already canonical -> unchanged (fixpoint).
+    ["2026-09-01T12:00:00+00:00", "2026-09-01T12:00:00+00:00"],
+    // Sub-microsecond digits cannot survive TIMESTAMPTZ: truncated.
+    ["2026-09-01T12:00:00.123456789Z", "2026-09-01T12:00:00.123456+00:00"],
+    // AutoSi widths: 0, 3 or 6 digits - the shortest exact rendering.
+    ["2026-09-01T12:00:00.000Z", "2026-09-01T12:00:00+00:00"],
+    ["2026-09-01T12:00:00.100000Z", "2026-09-01T12:00:00.100+00:00"],
+    ["2026-09-01T12:00:00.123400Z", "2026-09-01T12:00:00.123400+00:00"],
+  ])("canonicalizeCreatedAt(%s) === %s", (raw, expected) => {
+    expect(canonicalizeCreatedAt(raw)).toBe(expected);
+    // Idempotent: the canonical form is its own fixpoint.
+    expect(canonicalizeCreatedAt(expected)).toBe(expected);
+  });
+
+  test("canonicalizeCreatedAt rejects a non-RFC3339 stamp", () => {
+    expect(() => canonicalizeCreatedAt("2026-09-01 noon")).toThrow(RangeError);
+  });
+
+  test("rfc3339Now is storage-stable (its own fixpoint)", () => {
+    const now = rfc3339Now();
+    expect(canonicalizeCreatedAt(now)).toBe(now);
+  });
+
+  test("attestationFields signs the canonical created_at (#3422)", () => {
+    const key = AgentSigningKey.generate();
+    const fields = attestationFields(key, {
+      agentId: "ai:sdk-demo@example",
+      namespace: "team/alpha",
+      title: "pg upgrade window",
+      content: "body",
+      createdAt: "2026-09-01T12:00:00Z",
+    });
+    expect(fields.created_at).toBe("2026-09-01T12:00:00+00:00");
+    expect(fields.signature).toBe(
+      signWrite(key, {
+        agentId: "ai:sdk-demo@example",
+        namespace: "team/alpha",
+        title: "pg upgrade window",
+        content: "body",
+        kind: "observation",
+        createdAt: "2026-09-01T12:00:00+00:00",
+      }),
+    );
   });
 });
 

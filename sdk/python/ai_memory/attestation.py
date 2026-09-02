@@ -62,6 +62,11 @@ Known limits (stated rather than hidden)
   anyway. Do not put credentials in memories.
 * ``created_at`` must be within the daemon's ±300s attestation freshness
   window (``ATTEST_CREATED_AT_SKEW_SECS``); sign shortly before sending.
+* ``created_at`` must be the canonical storage-stable rendering (#3422) —
+  UTC, ``+00:00``, microsecond-truncated. :func:`canonicalize_created_at`
+  produces it and :func:`attestation_fields` applies it for you; the daemon
+  refuses anything else, because no other rendering survives a PostgreSQL
+  ``TIMESTAMPTZ`` round-trip byte-for-byte.
 * The signature commits to those six fields ONLY — not tags, priority, or
   metadata.
 
@@ -79,8 +84,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +95,7 @@ __all__ = [
     "AgentSigningKey",
     "attestation_fields",
     "canonical_cbor_write",
+    "canonicalize_created_at",
     "content_sha256",
     "rfc3339_now",
     "sign_write",
@@ -190,13 +197,78 @@ def canonical_cbor_write(
     return bytes(out)
 
 
-def rfc3339_now() -> str:
-    """Current UTC time as RFC3339 with a ``+00:00`` offset.
+#: RFC3339 date-time, decomposed so sub-second digits are handled explicitly.
+_RFC3339_PATTERN = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})"
+    r"(?:\.(\d+))?([Zz]|[+-]\d{2}:\d{2})$"
+)
 
-    Matches the rendering ``chrono::Utc::now().to_rfc3339()`` produces, which
-    is what the daemon's own signer uses.
+
+def canonicalize_created_at(value: str) -> str:
+    """Canonicalize an RFC3339 timestamp into the ONE ``created_at`` rendering
+    both daemon storage backends return byte-for-byte (#3422).
+
+    The daemon REFUSES to attest any other rendering. ``created_at`` sits inside
+    the signed ``SignableWrite`` envelope as TEXT, and every re-verification
+    (the store gate, and the federation receive path on a relayed row) rebuilds
+    the envelope from the *persisted row*: SQLite returns the stored TEXT
+    verbatim, while PostgreSQL stores ``TIMESTAMPTZ`` (microseconds) and
+    re-renders the readback as ``+00:00``. A signature minted over ``"...Z"``,
+    over a non-UTC offset, or over nanosecond precision could therefore never
+    be re-derived from a PostgreSQL row.
+
+    Canonical form: UTC, ``+00:00`` offset, microseconds TRUNCATED (never
+    rounded — that is what ``TIMESTAMPTZ`` does), and 0, 3 or 6 fractional
+    digits, the shortest width that represents the value exactly (chrono's
+    ``SecondsFormat::AutoSi``).
+
+    Raises:
+        ValueError: if ``value`` is not an RFC3339 date-time.
     """
-    return datetime.now(timezone.utc).isoformat()
+    match = _RFC3339_PATTERN.match(value.strip())
+    if match is None:
+        raise ValueError(f"created_at must be an RFC3339 date-time, got: {value!r}")
+    year, month, day, hour, minute, second, fraction, offset = match.groups()
+    # TIMESTAMPTZ keeps microseconds and drops the rest — truncate, never round.
+    micros = int(f"{fraction or ''}000000"[:6])
+    tz = timezone.utc if offset in ("Z", "z") else timezone(_offset_delta(offset))
+    moment = datetime(
+        int(year),
+        int(month),
+        int(day),
+        int(hour),
+        int(minute),
+        int(second),
+        micros,
+        tzinfo=tz,
+    ).astimezone(timezone.utc)
+    # Explicit field formatting rather than strftime: %Y is not guaranteed to
+    # zero-pad (or even accept) years below 1000 across platforms.
+    whole = (
+        f"{moment.year:04d}-{moment.month:02d}-{moment.day:02d}"
+        f"T{moment.hour:02d}:{moment.minute:02d}:{moment.second:02d}"
+    )
+    if moment.microsecond == 0:
+        frac = ""
+    elif moment.microsecond % 1000 == 0:
+        frac = f".{moment.microsecond // 1000:03d}"
+    else:
+        frac = f".{moment.microsecond:06d}"
+    return f"{whole}{frac}+00:00"
+
+
+def _offset_delta(offset: str) -> timedelta:
+    """``+HH:MM`` / ``-HH:MM`` as a :class:`datetime.timedelta`."""
+    sign = -1 if offset.startswith("-") else 1
+    return sign * timedelta(hours=int(offset[1:3]), minutes=int(offset[4:6]))
+
+
+def rfc3339_now() -> str:
+    """Current UTC time in the canonical ``created_at`` form the daemon
+    persists and re-derives signatures from (#3422) — UTC, ``+00:00``,
+    microsecond-truncated.
+    """
+    return canonicalize_created_at(datetime.now(timezone.utc).isoformat())
 
 
 # ---------------------------------------------------------------------------
@@ -326,10 +398,15 @@ def attestation_fields(
     against the ±300s freshness window, so it must be the SAME string that
     was signed, which is why it is returned rather than left to the caller.
 
+    #3422 — a caller-supplied ``created_at`` is folded through
+    :func:`canonicalize_created_at` BEFORE signing, so the SDK always signs
+    (and sends) the exact string the daemon will store and later re-derive the
+    signature from on either backend.
+
     ``kind`` defaults to ``"observation"``, the daemon's own default when the
     field is absent — so an unspecified kind signs what the server will store.
     """
-    ts = created_at or rfc3339_now()
+    ts = rfc3339_now() if created_at is None else canonicalize_created_at(created_at)
     return {
         "signature": sign_write(
             key,

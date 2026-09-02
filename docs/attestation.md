@@ -193,7 +193,7 @@ curl -X POST http://localhost:9077/api/v1/memories \
         "agent_id":   "my-agent",
         "title":      "Deploy runbook",
         "content":    "…",
-        "created_at": "2026-07-08T12:00:00Z",
+        "created_at": "2026-07-08T12:00:00+00:00",
         "signature":  "<base64 Ed25519 signature over the SignableWrite envelope>"
       }'
 ```
@@ -208,7 +208,7 @@ arguments (see the next section for the full MCP story):
     "agent_id":   "my-agent",
     "title":      "Deploy runbook",
     "content":    "…",
-    "created_at": "2026-07-08T12:00:00Z",
+    "created_at": "2026-07-08T12:00:00+00:00",
     "signature":  "<base64 Ed25519 signature>"
   }
 }
@@ -218,6 +218,38 @@ The signed envelope is `SignableWrite = agent_id + namespace + title +
 kind + created_at + sha256(content)`. If you're scripting HTTP/MCP
 signing yourself, that's the byte layout to reproduce; most operators use
 the CLI `--sign` path or Option A for MCP.
+
+### `created_at` must be the canonical storage-stable form (#3422)
+
+The envelope commits to `created_at` as **TEXT**, and every later
+re-verification — the store gate itself, and the federation receive path on a
+relayed row — rebuilds those bytes from the **persisted row**. SQLite keeps
+`created_at` in a `TEXT` column and returns it verbatim; PostgreSQL keeps it in
+`TIMESTAMPTZ` (microseconds) and re-renders the readback. So only ONE rendering
+survives a store/read round-trip on both backends, and the daemon **refuses to
+attest any other**, naming the string to sign (HTTP: `400`; MCP: a tool error;
+bulk: a per-row `signature` rejection):
+
+> UTC, `+00:00` offset (never `Z`), microseconds **truncated**, and 0, 3 or 6
+> fractional digits — the shortest width that represents the value exactly
+> (chrono `SecondsFormat::AutoSi`).
+
+| you send | verdict |
+|---|---|
+| `2026-07-08T12:00:00+00:00` | accepted |
+| `2026-07-08T12:00:00.123456+00:00` | accepted |
+| `2026-07-08T12:00:00.123+00:00` | accepted |
+| `2026-07-08T12:00:00Z` | `400` — send `…+00:00` |
+| `2026-07-08T14:00:00+02:00` | `400` — send the UTC rendering |
+| `2026-07-08T12:00:00.000+00:00` | `400` — a zero fraction is dropped |
+| `2026-07-08T12:00:00.123456789+00:00` | `400` — nanoseconds do not survive `TIMESTAMPTZ` |
+
+Both SDKs produce the canonical form for you —
+`ai_memory.attestation.canonicalize_created_at` / `rfc3339_now` (Python) and
+`canonicalizeCreatedAt` / `rfc3339Now` (TypeScript) — and
+`attestation_fields` / `attestationFields` fold a caller-supplied stamp through
+it before signing. In shell, `date -u +%Y-%m-%dT%H:%M:%S+00:00` is canonical.
+The daemon's own `--sign` / self-attesting paths stamp it too.
 
 ---
 
@@ -382,6 +414,7 @@ column):
 |---|---|---|
 | `403 ATTESTATION_FAILED` on an **unsigned** write | attestation is required on this surface — HTTP direct-write by default, or any surface under global-strict `=1` | sign the write (Option B) **or** set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (Option A). Note MCP/CLI are permissive by default, so this should only appear on HTTP direct-write unless you set `=1` |
 | `403 ATTESTATION_FAILED` on a **signed** write | presented signature didn't verify | the bound public key doesn't match the signing key — re-run `agents bind-key` with the current `pub_b64`; or the `created_at` you signed drifted outside the freshness window (sign with the timestamp you send) |
+| `400 … must be the canonical UTC form both storage backends round-trip` | the `created_at` you signed is a rendering PostgreSQL cannot return byte-for-byte (`…Z`, a non-UTC offset, a `.000` fraction, or nanoseconds) | sign and send the exact string the error names — see [`created_at` must be the canonical storage-stable form](#created_at-must-be-the-canonical-storage-stable-form-3422) |
 | `--sign requires a local keypair for agent '<id>'` | no `<id>.priv` in the key dir | `ai-memory identity generate --agent-id <id>` (check `AI_MEMORY_KEY_DIR`) |
 | MCP writes silently fail / host shows a tool error | MCP server rejecting unsigned writes — only happens if you set global-strict `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` (MCP is permissive by default) | remove the `=1` from the server's `env` block (or set `=0`), or switch to a signing client (see [MCP configuration](#mcp-configuration-crystal-clear)) |
 | Works on CLI, fails under MCP/daemon | env var set in your shell but not in the **server's** environment | set it where the surface runs — the `mcpServers.<name>.env` block, or the systemd/launchd unit for the HTTP daemon |
