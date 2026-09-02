@@ -60,12 +60,55 @@ class ScenarioResult:
     detail: str
 
 
-async def producer_consumer(swarm: Swarm) -> ScenarioResult:
-    """A -> B message lane; C must not see B's mail (isolation)."""
-    if len(swarm.agents) < 2:
-        return ScenarioResult("producer_consumer", ok=False, detail="need >= 2 agents")
-    a, b = swarm.agents[0], swarm.agents[1]
-    c = swarm.agents[2] if len(swarm.agents) > 2 else None
+def module_of(agent: SwarmAgent) -> str:
+    """The daemon (module) base URL this agent's client is bound to."""
+    return str(getattr(getattr(agent.client, "_client", None), "base_url", "") or "")
+
+
+def modules(swarm: Swarm) -> dict[str, list[SwarmAgent]]:
+    """Group the population by module, preserving spawn order inside each.
+
+    With ``SWARM_MODULES>1`` the launcher round-robins agents across several
+    INDEPENDENT data tiers (separate PG+AGE+pgvector stacks). Agent 0 and agent
+    1 then live on different tiers, so an A2A choreography built from
+    ``agents[0]`` and ``agents[1]`` asserts a cross-tier invariant that cannot
+    hold until node-to-node federation is wired (#3441).
+    """
+    grouped: dict[str, list[SwarmAgent]] = {}
+    for agent in swarm.agents:
+        grouped.setdefault(module_of(agent), []).append(agent)
+    return grouped
+
+
+def _slug(module: str | None) -> str:
+    """Short, title-safe module tag; empty for a single-module run."""
+    if not module:
+        return ""
+    return module.split("://", 1)[-1].strip("/").replace("/", "-") + "-"
+
+
+def _named(name: str, module: str | None) -> str:
+    """Scenario name, tagged with its module when the run is multi-module."""
+    return name if module is None else f"{name}@{module}"
+
+
+def _participants(swarm: Swarm, agents: list[SwarmAgent] | None) -> list[SwarmAgent]:
+    return swarm.agents if agents is None else agents
+
+
+async def producer_consumer(swarm: Swarm, agents: list[SwarmAgent] | None = None,
+                            module: str | None = None) -> ScenarioResult:
+    """A -> B message lane; C must not see B's mail (isolation).
+
+    ``agents`` defaults to the whole population; a multi-module run passes ONE
+    module's agents so the lane stays inside a single data tier.
+    """
+    name = _named("producer_consumer", module)
+    population = _participants(swarm, agents)
+    if len(population) < 2:
+        return ScenarioResult(name, ok=False, detail="need >= 2 agents")
+    a, b = population[0], population[1]
+    c = population[2] if len(population) > 2 else None
 
     subject = f"handoff-{a.identity.agent_id}"
     send = await dispatch(
@@ -91,26 +134,35 @@ async def producer_consumer(swarm: Swarm) -> ScenarioResult:
         c_isolated = not (c_inbox.ok and subject in json.dumps(c_inbox.result, default=str))
 
     ok = send.ok and b_saw and c_isolated
-    return ScenarioResult("producer_consumer", ok=ok,
+    return ScenarioResult(name, ok=ok,
                           detail=f"sent={send.ok} b_saw={b_saw} c_isolated={c_isolated}")
 
 
-async def consensus_quorum(swarm: Swarm) -> ScenarioResult:
-    """N agents attest the same fact into the shared ns; one consolidates."""
-    if len(swarm.agents) < 2:
-        return ScenarioResult("consensus_quorum", ok=False, detail="need >= 2 agents")
+async def consensus_quorum(swarm: Swarm, agents: list[SwarmAgent] | None = None,
+                           module: str | None = None) -> ScenarioResult:
+    """N agents attest the same fact into the shared ns; one consolidates.
+
+    The consolidator must be able to READ every vote, so all voters and the
+    consolidator have to sit on the same module (#3441): a vote stored on one
+    tier is "memory not found" to a consolidator on another.
+    """
+    name = _named("consensus_quorum", module)
+    population = _participants(swarm, agents)
+    if len(population) < 2:
+        return ScenarioResult(name, ok=False, detail="need >= 2 agents")
     fact = "the sky is blue"
     ids: list[str] = []
-    for ordinal, agent in enumerate(swarm.agents):
+    for ordinal, agent in enumerate(population):
         # Votes are "collective"-scoped: a private-scope row is readable only by
         # its author, so the consolidator could not read its peers' votes.
         out = await dispatch(agent.client, agent.identity, "store",
-                             {"title": f"consensus-vote-{_RUN}-{ordinal}", "content": fact,
+                             {"title": f"consensus-vote-{_RUN}-{_slug(module)}{ordinal}",
+                              "content": fact,
                               "namespace": swarm.shared_namespace, "scope": "collective"})
         swarm.coverage.record(out)
         if out.ok and isinstance(out.result, dict) and out.result.get("id"):
             ids.append(str(out.result["id"]))
-    consolidator = swarm.agents[0]
+    consolidator = population[0]
     # The daemon caps one consolidation at 100 sources ("cannot consolidate
     # more than 100 memories at once", measured at 128 agents). Fold the votes
     # in batches of <= 100, then fold the batch results into ONE consensus row.
@@ -122,7 +174,8 @@ async def consensus_quorum(swarm: Swarm) -> ScenarioResult:
         for start in range(0, len(level), batch_size):
             chunk = level[start:start + batch_size]
             cons = await dispatch(consolidator.client, consolidator.identity, "consolidate",
-                                  {"ids": chunk, "title": f"consensus-{_RUN}-{start // batch_size}-{len(level)}",
+                                  {"ids": chunk,
+                                   "title": f"consensus-{_RUN}-{_slug(module)}{start // batch_size}-{len(level)}",
                                    "namespace": swarm.shared_namespace})
             swarm.coverage.record(cons)
             if not cons.ok:
@@ -134,22 +187,25 @@ async def consensus_quorum(swarm: Swarm) -> ScenarioResult:
             break
         level = next_level
     ok = len(ids) >= 2 and cons is not None and cons.ok
-    return ScenarioResult("consensus_quorum", ok=ok,
-                          detail=f"votes={len(ids)} consolidated={cons.ok}")
+    return ScenarioResult(name, ok=ok,
+                          detail=f"votes={len(ids)} consolidated={cons is not None and cons.ok}")
 
 
-async def governance_approval(swarm: Swarm) -> ScenarioResult:
+async def governance_approval(swarm: Swarm, agents: list[SwarmAgent] | None = None,
+                              module: str | None = None) -> ScenarioResult:
     """Proposer requests; approver attests an approval decision + notifies back."""
-    if len(swarm.agents) < 2:
-        return ScenarioResult("governance_approval", ok=False, detail="need >= 2 agents")
-    proposer, approver = swarm.agents[0], swarm.agents[1]
+    name = _named("governance_approval", module)
+    population = _participants(swarm, agents)
+    if len(population) < 2:
+        return ScenarioResult(name, ok=False, detail="need >= 2 agents")
+    proposer, approver = population[0], population[1]
     ask = await dispatch(proposer.client, proposer.identity, "notify",
                          {"to_agent": approver.identity.agent_id,
                           "subject": "approve: publish-report", "body": "please approve"})
     swarm.coverage.record(ask)
     decision = await dispatch(
         approver.client, approver.identity, "store",
-        {"title": f"approval-decision-{_RUN}", "content": "APPROVED: publish-report",
+        {"title": f"approval-decision-{_RUN}-{_slug(module)}", "content": "APPROVED: publish-report",
          "namespace": swarm.shared_namespace, "scope": "collective",
          "tags": ["governance", "approval"]})
     swarm.coverage.record(decision)
@@ -158,7 +214,7 @@ async def governance_approval(swarm: Swarm) -> ScenarioResult:
                           "subject": "approved: publish-report", "body": "granted"})
     swarm.coverage.record(ack)
     ok = ask.ok and decision.ok and ack.ok
-    return ScenarioResult("governance_approval", ok=ok,
+    return ScenarioResult(name, ok=ok,
                           detail=f"asked={ask.ok} decided={decision.ok} acked={ack.ok}")
 
 
@@ -205,12 +261,15 @@ async def replay_guard(agent: SwarmAgent, namespace: str | None = None) -> Scena
     return ScenarioResult("replay_guard", ok=bool(first_id) and guarded, detail=detail)
 
 
-async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
+async def full_surface_sweep(swarm: Swarm, agents: list[SwarmAgent] | None = None,
+                             module: str | None = None) -> ScenarioResult:
     """Exercise the complete memory lifecycle through the dispatcher."""
-    if not swarm.agents:
-        return ScenarioResult("full_surface_sweep", ok=False, detail="need >= 1 agent")
-    agent = swarm.agents[0]
-    pattern = f"full-surface-{_RUN}"
+    name = _named("full_surface_sweep", module)
+    population = _participants(swarm, agents)
+    if not population:
+        return ScenarioResult(name, ok=False, detail="need >= 1 agent")
+    agent = population[0]
+    pattern = f"full-surface-{_RUN}-{_slug(module)}"
     completed: list[str] = []
 
     async def call(tool: str, args: dict[str, object]):
@@ -223,10 +282,10 @@ async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
     first = await call("store", {"title": f"{pattern}-source", "content": "source"})
     second = await call("store", {"title": f"{pattern}-target", "content": "target"})
     if not first.ok or not second.ok or not isinstance(first.result, dict) or not isinstance(second.result, dict):
-        return ScenarioResult("full_surface_sweep", False, f"stopped after {','.join(completed)}")
+        return ScenarioResult(name, False, f"stopped after {','.join(completed)}")
     source_id, target_id = first.result.get("id"), second.result.get("id")
     if not source_id or not target_id:
-        return ScenarioResult("full_surface_sweep", False, "store response missing id")
+        return ScenarioResult(name, False, "store response missing id")
 
     # Lineage edges point CHILD -> PARENT: the daemon's temporal lineage guard
     # (#3041) refuses an edge whose target is NEWER than its source, so the
@@ -253,9 +312,9 @@ async def full_surface_sweep(swarm: Swarm) -> ScenarioResult:
             if tool in swarm.coverage.documented_fail_closed and outcome.fail_closed:
                 completed.append(f"{tool}(fail-closed:documented)")
                 continue
-            return ScenarioResult("full_surface_sweep", False,
+            return ScenarioResult(name, False,
                                   f"{tool} failed after {','.join(completed)}: {outcome.summary}")
-    return ScenarioResult("full_surface_sweep", True, " -> ".join(completed))
+    return ScenarioResult(name, True, " -> ".join(completed))
 
 
 #: ~150k tokens at 4 chars/token — safely inside every model we run (GLM 200k, Grok 500k).
@@ -428,22 +487,99 @@ async def collect_assessments(swarm: Swarm) -> list[AgentAssessment]:
     return assessments
 
 
+#: Set to ``1`` once node-to-node federation is configured between the modules.
+#: Until then a cross-module handoff is EXPECTED not to arrive, and the audit
+#: says so explicitly instead of reporting a FAIL it cannot act on (#3441).
+FEDERATED_ENV = "SWARM_FEDERATED"
+
+
+def federation_expected(environ: dict[str, str] | None = None) -> bool:
+    """Whether the operator asserts f1<->f2 federation is wired for this run."""
+    env = os.environ if environ is None else environ
+    return (env.get(FEDERATED_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+async def cross_module_handoff(swarm: Swarm, groups: dict[str, list[SwarmAgent]],
+                               *, federated: bool | None = None) -> ScenarioResult:
+    """A on module 1 notifies B on module 2 — the federation boundary probe.
+
+    This is an ASSERTION in both directions, never a rubber stamp:
+
+    * federation not configured (default): the notify must NOT reach the peer
+      module. It landing there would mean two supposedly independent data tiers
+      are leaking into each other — reported as a FAIL.
+    * ``SWARM_FEDERATED=1``: the operator asserts the tiers are federated, so
+      the message MUST arrive; not arriving is a FAIL.
+    """
+    name = "cross_module_handoff"
+    ordered = sorted(groups)
+    if len(ordered) < 2:
+        return ScenarioResult(name, ok=True, detail="single module: not applicable")
+    expect_federated = federation_expected() if federated is None else federated
+    a = groups[ordered[0]][0]
+    b = next((agent for agent in groups[ordered[1]] if agent is not a), None)
+    if b is None:
+        return ScenarioResult(name, ok=False, detail="need an agent on each module")
+
+    subject = f"cross-module-{_RUN}-{a.identity.agent_id}"
+    send = await dispatch(a.client, a.identity, "notify",
+                          {"to_agent": b.identity.agent_id, "subject": subject,
+                           "body": "cross-module handoff probe"})
+    swarm.coverage.record(send)
+    got = await dispatch(b.client, b.identity, "inbox", {"unread_only": True, "limit": 10})
+    swarm.coverage.record(got)
+    crossed = got.ok and subject in json.dumps(got.result, default=str)
+    where = f"{ordered[0]} -> {ordered[1]}"
+    if expect_federated:
+        return ScenarioResult(name, ok=bool(send.ok and crossed),
+                              detail=f"federated: {where} sent={send.ok} b_saw={crossed}")
+    if crossed:
+        return ScenarioResult(
+            name, ok=False,
+            detail=f"cross-module: {where} message CROSSED an unfederated boundary")
+    return ScenarioResult(name, ok=True,
+                          detail=f"cross-module: not federated (expected) [{where}]")
+
+
 async def run_all(swarm: Swarm) -> list[ScenarioResult]:
-    """Run every scenario in sequence against the population."""
-    results = [
-        await producer_consumer(swarm),
-        await consensus_quorum(swarm),
-        await governance_approval(swarm),
-        await full_surface_sweep(swarm),
-    ]
+    """Run every scenario in sequence against the population.
+
+    A single-module run is unchanged. With several modules every A2A scenario
+    runs ONCE PER MODULE over that module's own agents (#3441) — a producer and
+    consumer split across two unfederated tiers can never see each other's
+    inbox, and a consolidator can never read a vote stored on the other tier —
+    and the boundary itself is probed by :func:`cross_module_handoff`.
+    """
+    groups = modules(swarm)
+    if len(groups) <= 1:
+        results = [
+            await producer_consumer(swarm),
+            await consensus_quorum(swarm),
+            await governance_approval(swarm),
+            await full_surface_sweep(swarm),
+        ]
+    else:
+        results = []
+        for module in sorted(groups):
+            agents = groups[module]
+            results.append(await producer_consumer(swarm, agents, module))
+            results.append(await consensus_quorum(swarm, agents, module))
+            results.append(await governance_approval(swarm, agents, module))
+            results.append(await full_surface_sweep(swarm, agents, module))
+        results.append(await cross_module_handoff(swarm, groups))
     if swarm.agents:
         results.append(await replay_guard(swarm.agents[0]))
     return results
 
 
 __all__ = [
+    "FEDERATED_ENV",
     "ScenarioResult",
     "consensus_quorum",
+    "cross_module_handoff",
+    "federation_expected",
+    "module_of",
+    "modules",
     "governance_approval",
     "nhi_assessment",
     "negative_authorization_evidence",
