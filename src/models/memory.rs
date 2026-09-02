@@ -1677,6 +1677,13 @@ pub struct CreateMemory {
     /// (`memory_update`). Absent ⇒ unbounded end.
     #[serde(default)]
     pub valid_until: Option<String>,
+    /// #3342 — embed timing. `sync` (default) embeds on the write path
+    /// so semantic recall is immediately available. `async` stores the
+    /// durable row first with `embed_status: pending` and lets the
+    /// backfill worker embed it. Unknown values are rejected at the
+    /// handler (400), not silently ignored.
+    #[serde(default)]
+    pub embed_mode: Option<String>,
 }
 
 /// Compiled default `confidence` stamped when a store surface (MCP

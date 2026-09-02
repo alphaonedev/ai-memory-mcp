@@ -533,6 +533,13 @@ is rejected with **400** (#1467 — this endpoint previously coerced an
 unknown `kind` to `observation`; it now rejects to match the CLI and MCP
 surfaces). See `docs/memory-kind-vocab.md`.
 
+Optional `embed_mode` (#3342): `"sync"` (default) embeds on the write
+path so semantic recall is immediately available; `"async"` stores the
+durable row first with `embed_status: "pending"` and lets the existing
+backfill worker embed it (keyword recall until then). Unknown values
+are **400**. The 201 body always includes `embed_status`
+(`indexed` | `pending` | `skipped` | `failed`) and `embed_mode`.
+
 #### Agent attestation (`signature` + `created_at`) — #626 Layer-3
 
 A caller MAY present a detached Ed25519 `signature` to upgrade the write
@@ -655,8 +662,10 @@ reconciliation identity a loader can assert on every batch.
 | `pending` | rows queued for governance approval |
 | `warnings` | post-commit replication problems; the rows ARE durable locally |
 
-Optional `embed_status` / `embed_status_reason` appear only when vectorisation
-degraded — the rows are stored but not yet semantically recallable.
+`embed_status` / `embed_mode` are always present on the single-create
+201 body (#3342). On bulk, optional `embed_status` / `embed_status_reason`
+appear when vectorisation degraded — the rows are stored but not yet
+semantically recallable.
 
 **Status.** `200` only when every submitted row landed as its own distinct
 row. `207 Multi-Status` on any partial application. `202 Accepted` when every

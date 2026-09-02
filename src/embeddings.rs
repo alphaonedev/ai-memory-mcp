@@ -709,6 +709,9 @@ impl EmbedRole {
 /// embedding vector.
 ///
 /// * `Indexed` — vector produced and ready to persist.
+/// * `Pending` — #3342 async-embed: the durable row is stored with no
+///   vector; the existing backfill worker will embed it. Semantic recall
+///   degrades to keyword until then. Never used as the default.
 /// * `Skipped(reason)` — caller-policy skip (e.g. content too long for
 ///   the configured embedder). The row should still be stored without
 ///   an embedding; recall will fall back to keyword for that row.
@@ -719,6 +722,7 @@ impl EmbedRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmbedStatus {
     Indexed,
+    Pending,
     Skipped(String),
     Failed(String),
 }
@@ -729,6 +733,7 @@ impl EmbedStatus {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Indexed => "indexed",
+            Self::Pending => "pending",
             Self::Skipped(_) => "skipped",
             Self::Failed(_) => "failed",
         }
@@ -741,11 +746,11 @@ impl EmbedStatus {
         !matches!(self, Self::Indexed)
     }
 
-    /// Human-readable reason. Empty string for `Indexed`.
+    /// Human-readable reason. Empty string for `Indexed` / `Pending`.
     #[must_use]
     pub fn reason(&self) -> &str {
         match self {
-            Self::Indexed => "",
+            Self::Indexed | Self::Pending => "",
             Self::Skipped(r) | Self::Failed(r) => r.as_str(),
         }
     }
@@ -755,8 +760,58 @@ impl std::fmt::Display for EmbedStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Indexed => write!(f, "indexed"),
+            Self::Pending => write!(f, "pending"),
             Self::Skipped(r) => write!(f, "skipped: {r}"),
             Self::Failed(r) => write!(f, "failed: {r}"),
+        }
+    }
+}
+
+/// #3342 — per-request / config embed timing.
+///
+/// `Sync` (default) runs the embedder on the write path so semantic
+/// recall is immediately available. `Async` acknowledges the durable
+/// row first with [`EmbedStatus::Pending`] and lets the existing
+/// backfill worker embed it. Unknown tokens fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedMode {
+    Sync,
+    Async,
+}
+
+impl EmbedMode {
+    /// Parse a caller token. `None` / empty falls through to
+    /// `AI_MEMORY_EMBED_MODE` (default `sync`).
+    ///
+    /// # Errors
+    /// Unknown non-empty tokens.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(Self::from_env()),
+            Some("sync") => Ok(Self::Sync),
+            Some("async") => Ok(Self::Async),
+            Some(other) => Err(format!(
+                "invalid embed_mode {other:?}; expected \"sync\" or \"async\""
+            )),
+        }
+    }
+
+    fn from_env() -> Self {
+        match std::env::var("AI_MEMORY_EMBED_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("async") => Self::Async,
+            _ => Self::Sync,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Async => "async",
         }
     }
 }
@@ -2715,6 +2770,7 @@ mod tests {
     #[test]
     fn embed_status_as_str_each_variant() {
         assert_eq!(EmbedStatus::Indexed.as_str(), "indexed");
+        assert_eq!(EmbedStatus::Pending.as_str(), "pending");
         assert_eq!(
             EmbedStatus::Skipped("too big".to_string()).as_str(),
             "skipped"
@@ -2746,6 +2802,7 @@ mod tests {
     #[test]
     fn embed_status_is_degraded_only_for_non_indexed() {
         assert!(!EmbedStatus::Indexed.is_degraded());
+        assert!(EmbedStatus::Pending.is_degraded());
         assert!(EmbedStatus::Skipped("x".to_string()).is_degraded());
         assert!(EmbedStatus::Failed("x".to_string()).is_degraded());
     }
@@ -2753,6 +2810,7 @@ mod tests {
     #[test]
     fn embed_status_reason_helper() {
         assert_eq!(EmbedStatus::Indexed.reason(), "");
+        assert_eq!(EmbedStatus::Pending.reason(), "");
         assert_eq!(EmbedStatus::Skipped("r1".to_string()).reason(), "r1");
         assert_eq!(EmbedStatus::Failed("r2".to_string()).reason(), "r2");
     }
@@ -2760,6 +2818,7 @@ mod tests {
     #[test]
     fn embed_status_display_includes_reason() {
         assert_eq!(format!("{}", EmbedStatus::Indexed), "indexed");
+        assert_eq!(format!("{}", EmbedStatus::Pending), "pending");
         assert_eq!(
             format!("{}", EmbedStatus::Skipped("oversize".to_string())),
             "skipped: oversize"
@@ -2768,6 +2827,14 @@ mod tests {
             format!("{}", EmbedStatus::Failed("timeout".to_string())),
             "failed: timeout"
         );
+    }
+
+    #[test]
+    fn embed_mode_parse_sync_async_and_unknown_fail_closed() {
+        assert_eq!(EmbedMode::parse(Some("sync")).unwrap(), EmbedMode::Sync);
+        assert_eq!(EmbedMode::parse(Some("async")).unwrap(), EmbedMode::Async);
+        assert!(EmbedMode::parse(Some("nope")).is_err());
+        assert_eq!(EmbedMode::parse(None).unwrap().as_str(), "sync");
     }
 
     #[test]

@@ -22,7 +22,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::db;
-use crate::embeddings::EmbedStatus;
+use crate::embeddings::{EmbedMode, EmbedStatus};
 #[cfg(test)]
 use crate::models::Tier;
 use crate::models::{CreateMemory, Memory};
@@ -477,15 +477,36 @@ pub(crate) fn build_create_memory(
 /// Keyword-only deployments (embedder=None) report `Indexed` so the
 /// response shape is unchanged on nodes where the semantic layer is
 /// intentionally absent.
-fn embed_create_before_lock(
+/// #3342 — write-path embed with an explicit mode.
+///
+/// * `Sync` (default): run the embedder on a blocking pool worker so
+///   the tokio runtime is not pinned across a ~400 ms remote RTT
+///   (CONCURRENCY-22). Semantic recall is available immediately.
+/// * `Async`: skip the embedder, return [`EmbedStatus::Pending`]. The
+///   durable insert still happens; the existing backfill sweep embeds
+///   the row. Fail-closed: the row is never dropped.
+async fn embed_for_create(
     app: &AppState,
     title: &str,
     content: &str,
+    mode: EmbedMode,
 ) -> (Option<Vec<f32>>, EmbedStatus) {
-    let embedding_text = crate::embeddings::embedding_document(title, content);
-    match app.embedder.as_ref().as_ref() {
-        None => (None, EmbedStatus::Indexed),
-        Some(emb) => emb.embed_with_status(&embedding_text),
+    match mode {
+        EmbedMode::Async => (None, EmbedStatus::Pending),
+        EmbedMode::Sync => {
+            let embedding_text = crate::embeddings::embedding_document(title, content);
+            match app.embedder.as_ref().as_ref() {
+                None => (None, EmbedStatus::Indexed),
+                Some(emb) => {
+                    let emb = emb.clone();
+                    tokio::task::spawn_blocking(move || emb.embed_with_status(&embedding_text))
+                        .await
+                        .unwrap_or_else(|e| {
+                            (None, EmbedStatus::Failed(format!("embed worker join: {e}")))
+                        })
+                }
+            }
+        }
     }
 }
 
@@ -921,6 +942,7 @@ async fn fanout_and_assemble_create_response(
     atomise_disposition: Option<crate::hooks::pre_store::AtomiseDisposition>,
     contradiction_ids: Vec<String>,
     embed_status: EmbedStatus,
+    embed_mode: EmbedMode,
 ) -> axum::response::Response {
     // #1566 / #1579 B1 — embed-once-replicate-vector: capture the
     // just-computed vector for the federation fanout BEFORE the HNSW
@@ -997,14 +1019,14 @@ async fn fanout_and_assemble_create_response(
     if let Some(d) = atomise_disposition {
         d.merge_into_response(&mut response);
     }
-    // v0.7.0 Round-2 F10 — surface embed_status to the caller when α's
-    // `embed_with_status` reported anything other than `Indexed`.
-    if embed_status.is_degraded() {
-        response["embed_status"] = json!(embed_status.as_str());
-        let reason = embed_status.reason();
-        if !reason.is_empty() {
-            response["embed_status_reason"] = json!(reason);
-        }
+    // #3342 — always report embed_status + embed_mode so callers that
+    // opted into async-embed can see `pending` vs `indexed`. Pre-#3342
+    // Indexed was omitted (F10 only surfaced degraded outcomes).
+    response["embed_status"] = json!(embed_status.as_str());
+    response["embed_mode"] = json!(embed_mode.as_str());
+    let reason = embed_status.reason();
+    if !reason.is_empty() {
+        response["embed_status_reason"] = json!(reason);
     }
     // #932 (v0.7.0 Track D, 2026-05-20) — fire `memory_store`
     // webhook subscribers via the canonical sqlite dispatch path.
@@ -1093,6 +1115,7 @@ async fn create_memory_postgres(
     // v0.9.0 G10.1 (#1827) — the edge-parsed capability token (or None),
     // parsed once by `create_memory` from `X-AI-Memory-Capability`.
     capability: Option<&crate::governance::capability::CapabilityToken>,
+    embed_mode: EmbedMode,
 ) -> axum::response::Response {
     let now = Utc::now();
     // #2587 — `auto_tag` no longer fires here. Pre-#2587 this awaited the
@@ -1275,20 +1298,17 @@ async fn create_memory_postgres(
     // before the SAL store so the postgres `embedding` column lands
     // populated; otherwise `recall_hybrid` filters every row out via
     // `WHERE embedding IS NOT NULL`.
-    let embedding_text = crate::embeddings::embedding_document(&mem.title, &mem.content);
-    // #2167 — the vector and its embedding-space fingerprint are computed
-    // together and travel together into `store_with_embedding`, so the
-    // pgvector row's `embedding_space` provenance is stamped atomically with
-    // the vector (never a stale/absent stamp). `None`/`None` when there is no
-    // embedder or the embed call fails — no vector, no stamp.
-    let (embedding, embedding_space): (Option<Vec<f32>>, Option<String>) =
-        match app.embedder.as_ref().as_ref() {
-            None => (None, None),
-            Some(emb) => match emb.embed(&embedding_text) {
-                Ok(v) => (Some(v), Some(emb.space_fingerprint())),
-                Err(_) => (None, None),
-            },
-        };
+    // #3342 — same embed funnel as the sqlite branch: async mode stores
+    // the row with no vector (`pending`); sync mode runs the embedder on
+    // the blocking pool. Fingerprint is stamped only when a vector exists
+    // (#2167).
+    let (embedding, embed_status) =
+        embed_for_create(app, &mem.title, &mem.content, embed_mode).await;
+    let embedding_space: Option<String> = match (embedding.as_ref(), app.embedder.as_ref().as_ref())
+    {
+        (Some(_), Some(emb)) => Some(emb.space_fingerprint()),
+        _ => None,
+    };
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — governance walk on
     // writes. Postgres branch enforces the same inheritance chain +
@@ -1548,6 +1568,12 @@ async fn create_memory_postgres(
     };
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(id));
+        obj.insert("embed_status".to_string(), json!(embed_status.as_str()));
+        obj.insert("embed_mode".to_string(), json!(embed_mode.as_str()));
+        let reason = embed_status.reason();
+        if !reason.is_empty() {
+            obj.insert("embed_status_reason".to_string(), json!(reason));
+        }
         if let Some(field) = auto_tag_outcome.response_field() {
             obj.insert("auto_tagging".to_string(), json!(field));
         }
@@ -1575,6 +1601,12 @@ pub async fn create_memory(
         )
             .into_response();
     }
+    let embed_mode = match EmbedMode::parse(body.embed_mode.as_deref()) {
+        Ok(m) => m,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
+    };
 
     // Stage 1 — agent_id resolution (consumes `body.metadata`, returns
     // canonical metadata). Consumed by the postgres SAL branch and, since
@@ -1620,7 +1652,15 @@ pub async fn create_memory(
     // sqlite stages below stay focused.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return create_memory_postgres(&app, &body, &agent_id, metadata, capability.as_ref()).await;
+        return create_memory_postgres(
+            &app,
+            &body,
+            &agent_id,
+            metadata,
+            capability.as_ref(),
+            embed_mode,
+        )
+        .await;
     }
 
     // #2587 — `auto_tag` no longer fires here (see the comment at the
@@ -1632,7 +1672,8 @@ pub async fn create_memory(
     // Stage 3 — embed-before-lock (issue #219). Computed BEFORE
     // acquiring the DB lock so the 10-200 ms embedder run doesn't
     // hold the single shared `Mutex<Connection>`.
-    let (embedding, embed_status) = embed_create_before_lock(&app, &body.title, &body.content);
+    let (embedding, embed_status) =
+        embed_for_create(&app, &body.title, &body.content, embed_mode).await;
 
     // #1579 A5 — ANN candidate pool for the proactive conflict check
     // (#519). The HNSW search runs BEFORE the DB lock (vector-index
@@ -1921,6 +1962,7 @@ pub async fn create_memory(
         atomise_disposition,
         contradiction_ids,
         embed_status,
+        embed_mode,
     )
     .await
 }
@@ -1965,6 +2007,7 @@ mod tests {
             created_at: None,
             valid_from: None,
             valid_until: None,
+            embed_mode: None,
         }
     }
 
@@ -2139,6 +2182,17 @@ mod tests {
             "Indexed must NOT be classified as degraded by `is_degraded` — the \
              create_memory response branch on `embed_status` keys on this"
         );
+    }
+
+    #[test]
+    fn embed_mode_async_is_pending_without_calling_embedder() {
+        // #3342 — async mode must not touch the embedder; the durable
+        // write still happens and backfill embeds later.
+        assert_eq!(EmbedMode::parse(Some("async")).unwrap(), EmbedMode::Async);
+        let status = EmbedStatus::Pending;
+        assert_eq!(status.as_str(), "pending");
+        assert!(status.is_degraded());
+        assert!(EmbedMode::parse(Some("bogus")).is_err());
     }
 
     // ----- validation early-return ---------------------------------------
