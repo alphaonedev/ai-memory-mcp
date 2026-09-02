@@ -683,6 +683,9 @@ mod tests {
     const S_LLM: &str = "llm-secret-must-not-leak-3432";
     const S_EMBEDDINGS: &str = "embeddings-secret-must-not-leak-3432";
     const S_HMAC: &str = "hmac-secret-must-not-leak-3432";
+    /// #3432 amendment 2 — a NUMERIC secret. Deliberately not
+    /// credential-shaped, so only the message-body masking can stop it.
+    const S_WRONG_TYPED: &str = "987654321321";
 
     /// Legacy (v1 flat-field) layout carrying every inline-secret shape,
     /// including the two (`[llm]` / `[embeddings]` `api_key`) the daemon's
@@ -712,6 +715,20 @@ mod tests {
              api_key = \"{S_LEGACY_TOP}\"\n\
              \n[reranker]\nenabled = true\napi_key = \"{S_RERANKER}\"\n\
              \n[hooks.subscription]\nhmac_secret = \"{S_HMAC}\"\n"
+        )
+    }
+
+    /// A numeric secret in a string-typed field. The migrated text parses as
+    /// TOML but FAILS `toml::from_str::<AppConfig>`, and serde's
+    /// `invalid type: integer \`…\`, expected a string` embeds the VALUE in
+    /// the message BODY — outside any gutter, and not vendor-shaped, so
+    /// neither the gutter filter nor the value-shape screen catches it.
+    /// #3432 amendment 2.
+    fn legacy_body_wrong_typed_secret() -> String {
+        format!(
+            "tier = \"smart\"\n\
+             llm_model = \"gemma\"\n\
+             \n[hooks.subscription]\nhmac_secret = {S_WRONG_TYPED}\n"
         )
     }
 
@@ -786,8 +803,15 @@ mod tests {
     /// stderr.
     #[test]
     fn migrate_never_prints_a_secret_value_3432() {
-        let secrets = [S_LEGACY_TOP, S_RERANKER, S_LLM, S_EMBEDDINGS, S_HMAC];
-        let cases: [(&str, String, bool, i32); 6] = [
+        let secrets = [
+            S_LEGACY_TOP,
+            S_RERANKER,
+            S_LLM,
+            S_EMBEDDINGS,
+            S_HMAC,
+            S_WRONG_TYPED,
+        ];
+        let cases: [(&str, String, bool, i32); 7] = [
             ("legacy/maximal", legacy_body_maximal(), true, 1),
             // The migrated file carries an inline `[llm].api_key`, so the
             // daemon's secret-handling validator refuses the write. The
@@ -797,6 +821,16 @@ mod tests {
             ("legacy/migratable", legacy_body_migratable(), false, 0),
             ("v2/partial", v2_body_partial(), true, 1),
             ("v2/partial", v2_body_partial(), false, 0),
+            // #3432 amendment 2 — the round-trip arm. The migrated text is
+            // valid TOML but does not deserialize into `AppConfig`, so
+            // `migrate` refuses (exit 3) and reports serde's error, which
+            // embeds the offending VALUE in the message BODY.
+            (
+                "legacy/wrong-typed-secret",
+                legacy_body_wrong_typed_secret(),
+                false,
+                3,
+            ),
         ];
         for (layout, body, dry_run, expected_code) in cases {
             let (code, stdout, stderr, on_disk) = run_migrate_capture(&body, dry_run);

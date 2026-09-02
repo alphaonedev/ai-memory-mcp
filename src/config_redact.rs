@@ -57,6 +57,21 @@
 //! base_url) stay verbatim for the same reason: a redactor nobody can
 //! use is a redactor that gets bypassed.
 //!
+//! # One accepted OVER-masking, on purpose
+//!
+//! The bare `key` suffix also matches a PATH-valued field — a TLS
+//! `key = "/etc/ai-memory/server.key"` renders as
+//! `key = "<redacted>"`, hiding a path that is not itself a secret.
+//! That is deliberate and must not be "fixed" by special-casing it:
+//! a field literally named `key` is the single most likely place for an
+//! operator to paste a raw credential, and a rule that tries to tell
+//! "this `key` holds a path" from "this `key` holds a secret" by
+//! inspecting the VALUE is exactly the guess that leaks the one time it
+//! guesses wrong. Masking a path costs an operator one `ls`; masking
+//! nothing costs them a credential. The companion `*_key_file` /
+//! `*_key_env` pointers are unaffected and remain the readable way to
+//! see where key material lives.
+//!
 //! # Display-only
 //!
 //! Nothing here ever touches a durable artifact. `config migrate` writes
@@ -167,43 +182,143 @@ pub fn render_redacted_toml(table: &toml::map::Map<String, toml::Value>) -> Stri
     })
 }
 
+/// Byte spans of every secret-named field's VALUE on one line.
+///
+/// v1.0.0 #3432 amendment 1 — the pre-amendment form split on the FIRST
+/// `=` / `:` only. That is fine for a pretty-printed file, one pair per
+/// line, and wrong for the shape `install`'s diff actually renders: its
+/// `before` side is the operator's file AS WRITTEN, and a minified
+/// client config puts the whole tree on one line —
+/// `{"mcpServers":{"x":{"env":{"ANTHROPIC_API_KEY":"…"}}}}`. There the
+/// first separator sits after `"mcpServers"`, the name layer never fires,
+/// and the credential survived unless it happened to be vendor-shaped.
+/// A TOML inline table (`auth = { token = "…" }`) has the same defect.
+///
+/// So: scan the WHOLE line and return every value span whose key is
+/// secret-named. The scan is quote-aware, which is what keeps a `:`
+/// inside `base_url = "http://127.0.0.1:11434"` from being mistaken for
+/// a separator, and container-aware, so `"env": {` opens a nested object
+/// rather than swallowing the rest of the line as one bare value.
+fn secret_value_spans(line: &str) -> Vec<(usize, usize)> {
+    /// Characters that end an unquoted scalar value.
+    fn ends_bare_value(b: u8) -> bool {
+        matches!(b, b',' | b'}' | b']' | b' ' | b'\t' | b'"' | b'\'')
+    }
+    /// Characters that may appear in an unquoted key token.
+    fn is_key_char(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+    }
+    /// Consume a quoted token starting at `i` (which indexes the opening
+    /// quote); returns the index just past the closing quote.
+    fn skip_quoted(b: &[u8], mut i: usize) -> usize {
+        let quote = b[i];
+        i += 1;
+        while i < b.len() {
+            if b[i] == b'\\' {
+                i = (i + 2).min(b.len());
+                continue;
+            }
+            if b[i] == quote {
+                return i + 1;
+            }
+            i += 1;
+        }
+        b.len()
+    }
+
+    let b = line.as_bytes();
+    let n = b.len();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    // Byte span of the most recent token, which is the candidate KEY when
+    // the next non-space character turns out to be a separator.
+    let mut pending_key: Option<(usize, usize)> = None;
+    let mut i = 0usize;
+
+    while i < n {
+        match b[i] {
+            b'"' | b'\'' => {
+                let start = i;
+                i = skip_quoted(b, i);
+                pending_key = Some((start, i));
+            }
+            b'=' | b':' => {
+                let key_is_secret = pending_key.is_some_and(|(s, e)| {
+                    is_secret_value_key(line[s..e].trim_matches(['"', '\'']))
+                });
+                pending_key = None;
+                i += 1;
+                while i < n && (b[i] == b' ' || b[i] == b'\t') {
+                    i += 1;
+                }
+                if i >= n {
+                    break;
+                }
+                // A container open is not a scalar value: keep scanning
+                // INSIDE it so nested secret keys are still reached.
+                if b[i] == b'{' || b[i] == b'[' {
+                    continue;
+                }
+                let vstart = i;
+                if b[i] == b'"' || b[i] == b'\'' {
+                    i = skip_quoted(b, i);
+                } else {
+                    while i < n && !ends_bare_value(b[i]) {
+                        i += 1;
+                    }
+                }
+                if key_is_secret && i > vstart {
+                    spans.push((vstart, i));
+                }
+            }
+            c if is_key_char(c) => {
+                let start = i;
+                while i < n && is_key_char(b[i]) {
+                    i += 1;
+                }
+                pending_key = Some((start, i));
+            }
+            _ => i += 1,
+        }
+    }
+    spans
+}
+
 /// Redact one line of line-oriented config output (a diff line, a log
 /// line, a rendered `key = value` pair).
 ///
-/// Handles TOML (`api_key = "…"`) and JSON (`"ANTHROPIC_API_KEY": "…"`)
-/// with one rule: everything to the right of the first `=` / `:` is
-/// masked when the left side names a secret. A line with no separator —
-/// a `[section]` header, a brace, a comment — still goes through the
-/// value-shape backstop.
+/// Handles TOML (`api_key = "…"`), TOML inline tables
+/// (`auth = { token = "…" }`), pretty JSON (`"ANTHROPIC_API_KEY": "…"`)
+/// and MINIFIED JSON (a whole client config on one line) with one rule:
+/// EVERY value whose key is secret-named is masked, wherever it sits on
+/// the line. A line with no such pair — a `[section]` header, a brace, a
+/// comment — still goes through the value-shape backstop, and so does the
+/// masked remainder, so a credential in a non-secret-named field on the
+/// same line is still caught.
 #[must_use]
 pub fn redact_config_line(line: &str) -> Cow<'_, str> {
-    if let Some(sep_at) = line.find(['=', ':']) {
-        let (lhs, rhs) = line.split_at(sep_at);
-        let key = lhs
-            .trim()
-            // Tolerate a unified-diff marker and JSON/TOML quoting so the
-            // same rule works on `+  "ANTHROPIC_API_KEY"` and on `api_key`.
-            .trim_start_matches(['+', '-', ' '])
-            .trim()
-            .trim_matches(['"', '\'']);
-        if is_secret_value_key(key) {
-            // Preserve the separator and a trailing JSON comma so the
-            // redacted diff still reads as the shape it replaced.
-            let separator = rhs.chars().next().unwrap_or('=');
-            let trailing = if rhs.trim_end().ends_with(',') {
-                ","
-            } else {
-                ""
-            };
-            return Cow::Owned(format!(
-                "{lhs}{separator} \"{CONFIG_REDACTION_MASK}\"{trailing}"
-            ));
-        }
+    let spans = secret_value_spans(line);
+    if spans.is_empty() {
+        return match crate::secret_screen::redact_for_storage(line) {
+            Some(screened) => Cow::Owned(screened),
+            None => Cow::Borrowed(line),
+        };
     }
-    match crate::secret_screen::redact_for_storage(line) {
-        Some(screened) => Cow::Owned(screened),
-        None => Cow::Borrowed(line),
+    // Replace only the VALUE spans, so the separator, the surrounding
+    // braces and any trailing comma survive and the redacted diff still
+    // reads as the shape it replaced.
+    let mut out = String::with_capacity(line.len());
+    let mut prev = 0usize;
+    for (start, end) in spans {
+        out.push_str(&line[prev..start]);
+        out.push('"');
+        out.push_str(CONFIG_REDACTION_MASK);
+        out.push('"');
+        prev = end;
     }
+    out.push_str(&line[prev..]);
+    // Second layer over the remainder (a credential can still sit in a
+    // field this line's name rule did not match).
+    Cow::Owned(crate::secret_screen::redact_for_storage(&out).unwrap_or(out))
 }
 
 /// Render a parser error WITHOUT its echoed source.
@@ -225,6 +340,34 @@ pub fn redact_config_line(line: &str) -> Cow<'_, str> {
 /// that carries the value, then runs the remainder through the
 /// value-shape backstop — strictly more actionable than #3197's answer
 /// and strictly safer than interpolating the raw `Display`.
+///
+/// # The message BODY carries values too (#3432 amendment 2)
+///
+/// Dropping the gutter is not sufficient. `serde`'s type errors embed the
+/// unexpected VALUE in the message body, OUTSIDE any gutter:
+///
+/// ```text
+/// TOML parse error at line 9, column 15
+///   |
+/// 9 | hmac_secret = 987654321321
+///   |               ^^^^^^^^^^^^
+/// invalid type: integer `987654321321`, expected a string
+/// ```
+///
+/// The last line survives the gutter filter, and the value-shape screen
+/// only catches it if it happens to look like a vendor credential — a
+/// plain high-entropy string or a numeric secret walks straight through.
+/// So every backtick- or double-quote-delimited payload in the kept text
+/// is masked as well. The position, the error CLASS and the `expected …`
+/// tail (unquoted prose) all survive, which is what an operator actually
+/// needs to fix the file.
+///
+/// The cost is real and accepted: `unknown field \`api_key\`, expected one
+/// of \`tier\`, \`db\`` loses the field names too. Naming the offending
+/// field would be nicer, but a rule that keeps SOME quoted payloads needs
+/// to decide which are values and which are identifiers — from a string
+/// the parser has already flattened — and getting that wrong leaks a
+/// credential. The position tells the operator which line it is.
 #[must_use]
 pub fn redact_parse_error<E: std::fmt::Display + ?Sized>(err: &E) -> String {
     let rendered = err.to_string();
@@ -233,8 +376,35 @@ pub fn redact_parse_error<E: std::fmt::Display + ?Sized>(err: &E) -> String {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !is_source_echo_line(line))
         .collect();
-    let joined = kept.join("; ");
+    let joined = mask_quoted_payloads(&kept.join("; "));
     crate::secret_screen::redact_for_storage(&joined).unwrap_or(joined)
+}
+
+/// Replace the contents of every backtick- or double-quote-delimited span
+/// with [`CONFIG_REDACTION_MASK`].
+///
+/// The delimiters are preserved so the message still reads as a message.
+/// An UNTERMINATED delimiter masks to end-of-string rather than being
+/// ignored — fail-closed: a truncated error message must not be the way a
+/// payload survives.
+fn mask_quoted_payloads(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open_at) = rest.find(['`', '"']) {
+        let delim = rest.as_bytes()[open_at];
+        out.push_str(&rest[..open_at]);
+        out.push(delim as char);
+        out.push_str(CONFIG_REDACTION_MASK);
+        out.push(delim as char);
+        let after_open = &rest[open_at + 1..];
+        match after_open.find(delim as char) {
+            Some(close_at) => rest = &after_open[close_at + 1..],
+            // Unterminated: everything after the delimiter is payload.
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Is this a line of the `toml` crate's source-echo gutter?
@@ -374,6 +544,88 @@ hmac_secret = "hmac-secret-must-not-leak"
         assert_eq!(redact_config_line("[reranker]"), "[reranker]");
     }
 
+    /// AMENDMENT 1 (DENIED) — a MINIFIED client config puts the whole tree
+    /// on one line, so the first `:` sits after `"mcpServers"`. The
+    /// pre-amendment first-separator rule never reached the credential, and
+    /// the value here is deliberately NOT vendor-shaped so the value-shape
+    /// backstop cannot rescue it either.
+    #[test]
+    fn minified_single_line_json_masks_every_secret_pair_3432() {
+        let line = concat!(
+            r#"{"theme":"dark","mcpServers":{"x":{"command":"b","env":"#,
+            r#"{"ANTHROPIC_API_KEY":"plain-value-3432","HMAC_SECRET":"other-plain-3432"}}}}"#
+        );
+        let got = redact_config_line(line);
+        assert!(!got.contains("plain-value-3432"), "leaked: {got}");
+        assert!(!got.contains("other-plain-3432"), "leaked: {got}");
+        // ALLOWED: the structure and the non-secret values still read.
+        assert!(got.contains(r#""ANTHROPIC_API_KEY""#), "{got}");
+        assert!(got.contains(r#""HMAC_SECRET""#), "{got}");
+        assert!(got.contains(r#""theme":"dark""#), "{got}");
+        assert!(got.contains(r#""command":"b""#), "{got}");
+        assert_eq!(
+            got.matches(CONFIG_REDACTION_MASK).count(),
+            2,
+            "both pairs must be masked, not just the first: {got}"
+        );
+    }
+
+    /// AMENDMENT 1 (DENIED) — a TOML inline table has the same shape: the
+    /// first `=` belongs to the non-secret outer key.
+    #[test]
+    fn toml_inline_table_masks_the_nested_secret_3432() {
+        let got = redact_config_line(r#"auth = { user = "alice", token = "plain-inline-3432" }"#);
+        assert!(!got.contains("plain-inline-3432"), "leaked: {got}");
+        assert!(got.contains(r#"user = "alice""#), "{got}");
+        assert!(got.contains("token = "), "{got}");
+    }
+
+    /// A `:` inside a quoted value is NOT a separator — the scan is
+    /// quote-aware, so a URL keeps its port.
+    #[test]
+    fn quoted_colon_is_not_a_separator_3432() {
+        assert_eq!(
+            redact_config_line(r#"base_url = "http://127.0.0.1:11434""#),
+            r#"base_url = "http://127.0.0.1:11434""#
+        );
+    }
+
+    /// AMENDMENT 2 (DENIED) — `serde`'s `invalid type` message embeds the
+    /// unexpected VALUE in the body, outside any gutter, and a numeric
+    /// secret is not vendor-shaped so the value-shape screen misses it.
+    #[test]
+    fn parse_error_masks_a_value_embedded_in_the_message_body_3432() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct HasStringSecret {
+            hmac_secret: String,
+        }
+        let err = toml::from_str::<HasStringSecret>("hmac_secret = 987654321321\n")
+            .expect_err("an integer where a string is expected must fail");
+        let raw = err.to_string();
+        assert!(
+            raw.contains("987654321321"),
+            "fixture precondition: the raw Display must embed the value, got: {raw}"
+        );
+        let redacted = redact_parse_error(&err);
+        assert!(
+            !redacted.contains("987654321321"),
+            "the message body leaked the value: {redacted}"
+        );
+        // ALLOWED: the class and the `expected …` tail survive.
+        assert!(redacted.contains("invalid type"), "{redacted}");
+        assert!(redacted.contains("expected"), "{redacted}");
+    }
+
+    /// An UNTERMINATED delimiter must mask to end-of-string, never fall
+    /// through — a truncated message must not be how a payload survives.
+    #[test]
+    fn unterminated_quote_masks_to_end_of_string_3432() {
+        let got = mask_quoted_payloads("invalid value `dangling-secret-3432");
+        assert!(!got.contains("dangling-secret-3432"), "{got}");
+        assert!(got.contains(CONFIG_REDACTION_MASK), "{got}");
+    }
+
     #[test]
     fn parse_error_drops_the_echoed_source_line_3432() {
         let err = toml::from_str::<toml::Value>("api_key = \"sekrit-must-not-leak\"unclosed\n")
@@ -393,10 +645,17 @@ hmac_secret = "hmac-secret-must-not-leak"
 
     #[test]
     fn parse_error_keeps_a_message_containing_a_pipe_3432() {
-        // A diagnosis line that merely contains `|` is not a gutter row.
+        // A diagnosis line that merely contains `|` is not a gutter row, so
+        // the line SURVIVES the gutter filter. Its backticked payloads are
+        // then masked by amendment 2 — the accepted cost of not having to
+        // guess which quoted spans are identifiers and which are values.
+        let got = redact_parse_error("expected one of `a` | `b`");
+        assert!(got.starts_with("expected one of "), "{got}");
+        assert!(got.contains(" | "), "the prose structure survives: {got}");
         assert_eq!(
-            redact_parse_error("expected one of `a` | `b`"),
-            "expected one of `a` | `b`"
+            got.matches(CONFIG_REDACTION_MASK).count(),
+            2,
+            "both backticked payloads must be masked: {got}"
         );
     }
 }
