@@ -754,6 +754,241 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // v1.0.0 #3402 — `build_cli_atomiser` (the CLI-side auto-atomise
+    // curator ladder) + the `run_with_curator` DB / injected-curator
+    // arms. Added for #3458 (per-module coverage floor restoration);
+    // TEST-ONLY, no production change.
+    // -----------------------------------------------------------------
+
+    /// Deterministic in-test [`Curator`]: never touches the network, so
+    /// `run_with_curator`'s injected-curator arm can be driven without
+    /// an Ollama round-trip.
+    struct StubCurator;
+    impl Curator for StubCurator {
+        fn decompose(
+            &self,
+            _body: &str,
+            _max_atom_tokens: u32,
+            _max_retries: u32,
+        ) -> std::result::Result<
+            Vec<crate::atomisation::curator::Atom>,
+            crate::atomisation::curator::CuratorError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Env var naming the LLM backend the #1146 resolver selects.
+    const ENV_LLM_BACKEND: &str = "AI_MEMORY_LLM_BACKEND";
+    /// Env var overriding the resolved LLM base URL.
+    const ENV_LLM_BASE_URL: &str = "AI_MEMORY_LLM_BASE_URL";
+    /// Env var overriding the resolved LLM model id.
+    const ENV_LLM_MODEL: &str = "AI_MEMORY_LLM_MODEL";
+
+    /// Pin every resolver input `build_llm_curator` reads for the
+    /// duration of `body`, restoring each prior value before returning.
+    ///
+    /// The pinned backend is the keyed OpenAI-compatible `vllm` alias
+    /// with an explicit (never-sent) API key: its client constructor is
+    /// PURELY OFFLINE, whereas the `ollama` arm's `new_with_url`
+    /// health-probes `/api/tags` and would make these tests depend on a
+    /// live daemon. Its compiled default base URL is loopback, so the
+    /// N7 posture under test is the only variable. Callers hold
+    /// `crate::config::test_env_lock()`.
+    fn with_pinned_llm_env<T>(egress: &str, body: impl FnOnce() -> T) -> T {
+        let keys = [
+            "AI_MEMORY_NO_CONFIG",
+            crate::egress::ENV_INFERENCE_EGRESS,
+            ENV_LLM_BACKEND,
+            ENV_LLM_BASE_URL,
+            ENV_LLM_MODEL,
+            crate::config::ENV_LLM_API_KEY,
+        ];
+        let prior: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        // SAFETY: serialized by `test_env_lock` held by the caller; every
+        // mutation is restored below before this function returns.
+        unsafe {
+            std::env::set_var("AI_MEMORY_NO_CONFIG", "1");
+            std::env::set_var(crate::egress::ENV_INFERENCE_EGRESS, egress);
+            std::env::set_var(ENV_LLM_BACKEND, crate::llm::BACKEND_VLLM);
+            std::env::set_var(ENV_LLM_MODEL, crate::llm::LOCAL_SERVER_MODEL_PLACEHOLDER);
+            std::env::set_var(crate::config::ENV_LLM_API_KEY, "not-a-real-key");
+            // Clear so the compiled loopback default for the alias wins.
+            std::env::remove_var(ENV_LLM_BASE_URL);
+        }
+        let out = body();
+        // SAFETY: serialized by `test_env_lock` (see above).
+        unsafe {
+            for (k, v) in keys.iter().zip(prior.iter()) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn build_cli_atomiser_keyword_tier_returns_none_3402() {
+        // #3402 — a `keyword`-tier host has no curator LLM at all, so the
+        // implicit auto-atomise ladder DEGRADES to `None` (the write still
+        // lands; the durable text is untouched). It must never error.
+        let cfg = AppConfig {
+            tier: Some("keyword".to_string()),
+            ..AppConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            build_cli_atomiser(&cfg, &dir.path().join("a.db"), "ai:test").is_none(),
+            "keyword tier must yield no curator (degrade, never corrupt)"
+        );
+    }
+
+    #[test]
+    fn build_cli_atomiser_deny_egress_returns_none_3402() {
+        // #3402 x N7 (#2388) — when the inference-plane egress gate refuses
+        // to construct a curator client, the CLI atomiser ladder returns
+        // `None` (the `Err(e)` warn arm), NEVER a heuristic substitute:
+        // `atomise_sync` ARCHIVES the parent, so a non-curator fallback
+        // would be the unintentional-data-loss class.
+        let _guard = crate::config::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.db");
+        let cfg = AppConfig {
+            tier: Some("smart".to_string()),
+            ..AppConfig::default()
+        };
+        let built = with_pinned_llm_env("deny", || build_cli_atomiser(&cfg, &db_path, "ai:test"));
+        assert!(
+            built.is_none(),
+            "a refused egress must degrade to no-curator, not construct one"
+        );
+    }
+
+    #[test]
+    fn build_cli_atomiser_smart_tier_builds_atomiser_3402() {
+        // #3402 — the Ok arm: a smart-tier host whose `[llm]` resolver
+        // yields a client builds the SAME `Atomiser` the explicit
+        // `ai-memory atomise` verb uses. Construction is offline — no
+        // request is issued and the pinned key is never sent.
+        let _guard = crate::config::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.db");
+        let cfg = AppConfig {
+            tier: Some("smart".to_string()),
+            ..AppConfig::default()
+        };
+        let built = with_pinned_llm_env("allow", || build_cli_atomiser(&cfg, &db_path, "ai:test"));
+        assert!(
+            built.is_some(),
+            "smart tier with a resolvable, egress-allowed endpoint must build a curator"
+        );
+    }
+
+    /// `run_with_curator` routes through `cli::backup::refuse_pg_store`,
+    /// which reads the store-URL env pair. Serialise on the SAME lock the
+    /// backup-module tests use (#2146) and clear the keys, so a sibling
+    /// test's `AI_MEMORY_STORE_URL` cannot turn these into flakes.
+    fn clear_store_url_env() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: env mutation serialised by `store_url_env_lock`, held by
+        // the caller for the whole test; these keys are read only by
+        // `resolve_store_url`.
+        unsafe {
+            std::env::remove_var(crate::store_url::STORE_URL_ENV);
+            std::env::remove_var(crate::store_url::STORE_URL_FILE_ENV);
+        }
+        guard
+    }
+
+    #[test]
+    fn run_with_curator_db_open_failure_maps_to_db_error_exit_6() {
+        // The `db::open` failure arm of `run_with_curator`: a directory is
+        // not a database, so the open fails and the CLI reports the stable
+        // db_error exit code (6) instead of panicking.
+        let _guard = clear_store_url_env();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig {
+            tier: Some("smart".to_string()),
+            ..AppConfig::default()
+        };
+        let args = AtomiseArgs {
+            memory_id: "src-id".to_string(),
+            max_atom_tokens: 100,
+            force: false,
+            json: true,
+            quiet: false,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        // `dir.path()` is a directory — sqlite cannot open it as a file.
+        let code = run_with_curator(
+            dir.path(),
+            &args,
+            &cfg,
+            Some("ai:test"),
+            &mut out,
+            Some(Box::new(StubCurator)),
+        )
+        .unwrap();
+        assert_eq!(code, 6, "db open failure maps to the db_error exit code");
+        let s = String::from_utf8(stderr).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["error"], "db_error");
+        assert_eq!(v["exit_code"], 6);
+        assert_eq!(v["source_id"], "src-id");
+    }
+
+    #[test]
+    fn run_with_curator_injected_curator_unknown_id_maps_to_not_found_exit_2() {
+        // The injected-curator arm end-to-end: tier gate passes, the DB
+        // opens, the mock curator is adopted (`curator_model = "unknown"`),
+        // and `atomise_sync` refuses an id that does not exist with the
+        // stable not_found exit code (2). No row is created.
+        let _guard = clear_store_url_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("atomise-run.db");
+        drop(crate::db::open(&db_path).expect("db::open"));
+        let cfg = AppConfig {
+            tier: Some("smart".to_string()),
+            ..AppConfig::default()
+        };
+        let args = AtomiseArgs {
+            memory_id: "00000000-0000-4000-8000-000000000000".to_string(),
+            max_atom_tokens: 10,
+            force: false,
+            json: false,
+            quiet: false,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let code = run_with_curator(
+            &db_path,
+            &args,
+            &cfg,
+            Some("ai:test"),
+            &mut out,
+            Some(Box::new(StubCurator)),
+        )
+        .unwrap();
+        assert_eq!(code, 2, "an unknown source id maps to not_found");
+        assert!(stdout.is_empty());
+        let s = String::from_utf8(stderr).unwrap();
+        assert!(s.contains("not found"), "got stderr: {s}");
+    }
+
     #[test]
     fn error_details_already_atomised_carries_payload() {
         let err = AtomiseError::AlreadyAtomised {

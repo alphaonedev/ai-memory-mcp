@@ -2813,3 +2813,462 @@ fn issue_2878_mcp_store_merge_mode_still_upserts_unchanged() {
         row.version
     );
 }
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #3458 — coverage restoration for `handle_store`'s substrate-refusal
+// and namespace-resolution arms. TEST-ONLY; no production change.
+// ---------------------------------------------------------------------------
+
+/// Set `AI_MEMORY_REQUIRE_WHY_TRACE` for the duration of `body`, restoring
+/// the prior value before returning. Serialised on the crate-wide env lock.
+fn with_require_why_trace<T>(body: impl FnOnce() -> T) -> T {
+    let _guard = crate::config::test_env_lock();
+    let prior = std::env::var(crate::storage::REQUIRE_WHY_TRACE_ENV).ok();
+    // SAFETY: serialised by `test_env_lock`, held for the whole call; the
+    // prior value is restored below before this function returns.
+    unsafe { std::env::set_var(crate::storage::REQUIRE_WHY_TRACE_ENV, "1") };
+    let out = body();
+    // SAFETY: serialised by `test_env_lock` (see above).
+    unsafe {
+        match &prior {
+            Some(v) => std::env::set_var(crate::storage::REQUIRE_WHY_TRACE_ENV, v),
+            None => std::env::remove_var(crate::storage::REQUIRE_WHY_TRACE_ENV),
+        }
+    }
+    out
+}
+
+/// #2059 clause-1 write gate as seen from the MCP store surface: the
+/// substrate refuses the `db::insert` with a typed `GovernanceRefusal`, and
+/// `handle_store` must translate it into the stable `GOVERNANCE_REFUSED:`
+/// wire prefix (NOT an opaque database error), refunding the quota charge it
+/// committed before the insert. Fail-closed: no row lands.
+#[test]
+fn store_substrate_governance_refusal_surfaces_governance_refused_prefix() {
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let params = base_params("why-trace-gated");
+    let err = with_require_why_trace(|| {
+        handle_store(
+            &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+        )
+        .expect_err("the clause-1 write gate must refuse a why_trace-less store")
+    });
+    assert!(
+        err.starts_with("GOVERNANCE_REFUSED:"),
+        "a substrate policy refusal must be distinguishable from a DB fault, got: {err}"
+    );
+    assert!(err.contains("why_trace"), "got: {err}");
+    // Fail-closed: the refused write left nothing behind.
+    let rows = db::find_contradictions(&conn, "why-trace-gated", "test-ns").unwrap_or_default();
+    assert!(rows.is_empty(), "a refused store must not land a row");
+}
+
+/// #2121/#2122 — the tool-layer `(title, namespace)` dedup detour applies the
+/// incoming caller content via `db::update` and returns BEFORE the gated
+/// `db::insert`, so it consults the clause-1 gate itself. Without that
+/// consult, enforce mode could be dodged by re-storing an existing title.
+#[test]
+fn store_exact_dup_merge_detour_consults_the_why_trace_gate() {
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    // First write lands normally (gate is advisory by default).
+    let mut first = base_params("dup-detour");
+    first["metadata"] = json!({"why_trace": "seeded by the fixture"});
+    handle_store(
+        &conn, &db_path, &first, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("seed write");
+
+    // Second write hits the exact-dup merge detour with NO why_trace.
+    let mut second = base_params("dup-detour");
+    second["content"] = json!("A different body that would overwrite the first one.");
+    second["on_conflict"] = json!("merge");
+    let err = with_require_why_trace(|| {
+        handle_store(
+            &conn, &db_path, &second, None, None, None, &ttl, false, None, None, None,
+        )
+        .expect_err("the dedup detour must consult the same gate the insert tail enforces")
+    });
+    assert!(
+        err.contains("why_trace"),
+        "the merge detour must not be a bypass of clause-1, got: {err}"
+    );
+    // The durable text of the first write is untouched.
+    let rows = db::find_contradictions(&conn, "dup-detour", "test-ns").unwrap_or_default();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].content.contains("This is the body of dup-detour"),
+        "the refused merge must not have overwritten the durable content"
+    );
+}
+
+/// #2390 (N9) — a store that omits `namespace` must resolve the SAME #1590
+/// ladder the parser uses (explicit > `[storage].default_namespace` >
+/// compiled default) before the pre_store gate is consulted, so a
+/// default-namespace write is not silently invisible to namespace-scoped
+/// hooks.
+#[test]
+fn store_without_explicit_namespace_lands_in_the_compiled_default() {
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let params = json!({
+        "title": "no-namespace-supplied",
+        "content": "A body long enough to be meaningful prose for the default namespace.",
+        "agent_id": "ai:alice",
+    });
+    let resp = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("a namespace-less store is valid and lands in the default namespace");
+    assert_eq!(
+        resp["namespace"].as_str(),
+        Some(crate::DEFAULT_NAMESPACE),
+        "the omitted namespace must resolve through the #1590 ladder"
+    );
+}
+
+/// A presented `write_v2` that is not an object must be REFUSED at the
+/// envelope edge, never silently ignored — a caller cannot downgrade itself
+/// to the permissive v1/unsigned path by malforming the v2 block.
+#[test]
+fn store_malformed_write_v2_envelope_is_refused_at_the_edge() {
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let mut params = base_params("malformed-v2");
+    params["write_v2"] = json!("not-an-object");
+    let err = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect_err("a malformed write_v2 must refuse, not fall through to the unsigned path");
+    assert!(err.contains("write_v2"), "got: {err}");
+}
+
+/// `StoreTool`'s advertised wire metadata (the `McpTool` surface the
+/// registry publishes) — pinned so a description/docs/schema edit is a
+/// deliberate, reviewed change rather than silent drift.
+#[test]
+fn store_tool_advertises_its_wire_metadata() {
+    assert!(StoreTool::description().contains("Store a memory"));
+    assert!(
+        StoreTool::docs().contains("on_conflict"),
+        "the docs blob must name the conflict modes"
+    );
+    let schema = StoreTool::input_schema();
+    let props = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("the published input schema exposes `properties`");
+    for required in ["title", "content", "namespace", "on_conflict"] {
+        assert!(
+            props.contains_key(required),
+            "input_schema must publish `{required}`"
+        );
+    }
+}
+
+/// #1942/#1941 stage 3 — a `write_v2` envelope that PARSES but cannot be
+/// verified (here: the writing agent has no C3-bound principal-root key) is a
+/// hard REJECT on the MCP surface. It must NEVER fall through to the
+/// permissive unsigned path, and no row may land.
+#[test]
+fn store_presented_but_unverifiable_write_v2_is_rejected_not_downgraded() {
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let stamp = crate::identity::attest::canonical_created_at_stamp(chrono::Utc::now());
+    let b64 = |bytes: &[u8]| {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
+    let mut params = base_params("v2-no-root-key");
+    params["created_at"] = json!(stamp.clone());
+    params["write_v2"] = json!({
+        "cert": {
+            "principal": "ai:alice",
+            "instance_key_id": b64(&[1u8; 32]),
+            "model_version_ref": b64(&[2u8; 32]),
+            "not_before": "2026-01-01T00:00:00Z",
+            "not_after": "2099-01-01T00:00:00Z",
+        },
+        "suite_tag": 1,
+        "cert_signature": b64(&[3u8; 64]),
+        "write_signature": b64(&[4u8; 64]),
+        "created_at": stamp,
+    });
+    let err = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect_err("an unverifiable v2 envelope must be refused");
+    assert!(
+        err.contains("principal-root key"),
+        "the refusal must name the missing trust anchor, got: {err}"
+    );
+    let rows = db::find_contradictions(&conn, "v2-no-root-key", "test-ns").unwrap_or_default();
+    assert!(rows.is_empty(), "a rejected v2 write must not land a row");
+}
+
+/// #1955 R45 — the record-stop fence is the OUTERMOST gate of the write
+/// funnel. A stopped record plane must refuse the MCP store with the
+/// substrate's own error (never a spoofed `CONFLICT:` / `GOVERNANCE_REFUSED:`
+/// classification), and the quota charge committed just before the insert
+/// must be refunded so the counter reflects only successful stores.
+#[test]
+fn store_record_stopped_plane_refuses_and_refunds_the_quota_charge() {
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    // The record-stop flag is keyed per connection for an in-memory DB, so
+    // engaging it here cannot leak into any sibling test.
+    crate::storage::record_stop::actuate_sqlite(&conn, true, "ai:operator", "all")
+        .expect("engage record stop");
+    let err = handle_store(
+        &conn,
+        &db_path,
+        &base_params("record-stopped"),
+        None,
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("a stopped record plane must refuse the write");
+    assert!(
+        !err.starts_with("CONFLICT:") && !err.starts_with("GOVERNANCE_REFUSED:"),
+        "a record-stop is neither a conflict nor a governance refusal, got: {err}"
+    );
+    let rows = db::find_contradictions(&conn, "record-stopped", "test-ns").unwrap_or_default();
+    assert!(rows.is_empty(), "a refused store must not land a row");
+    // Release so the per-connection flag does not outlive the test.
+    crate::storage::record_stop::actuate_sqlite(&conn, false, "ai:operator", "all")
+        .expect("release record stop");
+}
+
+/// The exact-dup merge detour re-embeds on a content change. When the
+/// embedder ERRS the merge must still complete (the durable text is the
+/// source of truth; the vector is disposable and regenerable) and no stale
+/// vector may be left behind for the row.
+#[test]
+fn store_exact_dup_merge_completes_when_the_re_embed_fails() {
+    use crate::embeddings::test_support::FailingEmbedder;
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let embedder = FailingEmbedder;
+    let mut params = base_params("dup-embed-fails");
+    params["on_conflict"] = json!("merge");
+    let first = handle_store(
+        &conn,
+        &db_path,
+        &params,
+        Some(&embedder as &dyn Embed),
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("first store completes despite the embed failure");
+    let id = first["id"].as_str().expect("id present").to_string();
+
+    params["content"] = json!("A different body so the dedup update flips content_changed.");
+    let second = handle_store(
+        &conn,
+        &db_path,
+        &params,
+        Some(&embedder as &dyn Embed),
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("the dedup merge completes despite the embed failure");
+    assert_eq!(second["duplicate"].as_bool(), Some(true));
+    assert_eq!(second["id"].as_str(), Some(id.as_str()));
+    assert!(
+        db::get_embedding(&conn, &id).expect("query ok").is_none(),
+        "a failed re-embed must leave no vector, never a stale one"
+    );
+}
+
+/// #1955 R45 — the record-stop fence also gates the exact-dup MERGE detour,
+/// which mutates an existing row through `db::update` and returns before the
+/// gated `db::insert` tail. A stopped plane must refuse it, and the durable
+/// content of the existing row must be untouched (fail closed, never a
+/// partial merge).
+#[test]
+fn store_record_stopped_plane_refuses_the_exact_dup_merge_detour() {
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let mut params = base_params("dup-record-stopped");
+    params["on_conflict"] = json!("merge");
+    handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("seed write lands while the plane is running");
+
+    crate::storage::record_stop::actuate_sqlite(&conn, true, "ai:operator", "all")
+        .expect("engage record stop");
+    params["content"] = json!("An overwrite that must never reach the durable row.");
+    let err = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect_err("a stopped plane must refuse the merge detour");
+    crate::storage::record_stop::actuate_sqlite(&conn, false, "ai:operator", "all")
+        .expect("release record stop");
+
+    assert!(!err.is_empty(), "the refusal must carry a reason");
+    let rows = db::find_contradictions(&conn, "dup-record-stopped", "test-ns").unwrap_or_default();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0]
+            .content
+            .contains("This is the body of dup-record-stopped"),
+        "a refused merge must leave the durable content byte-identical"
+    );
+}
+
+/// #1955 R45 — a governance decision that must QUEUE a pending action is a
+/// write, so it is fenced too. The store must surface the refusal rather
+/// than return a `pending` envelope naming a row that was never persisted
+/// (which a caller would then poll forever).
+#[test]
+fn store_record_stopped_plane_refuses_the_pending_queue_write() {
+    let _gate = crate::config::lock_permissions_mode_for_test();
+    crate::config::override_active_permissions_mode_for_test(
+        crate::config::PermissionsMode::Enforce,
+    );
+    let conn = fresh_conn();
+    let ns = "gov-pending-record-stopped";
+    install_store_policy(
+        &conn,
+        ns,
+        crate::models::GovernanceLevel::Approve,
+        crate::models::ApproverType::Human,
+        "ai:alice",
+    );
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let mut params = base_params("needs-approval-but-stopped");
+    params["namespace"] = json!(ns);
+    params["agent_id"] = json!("ai:bob");
+
+    crate::storage::record_stop::actuate_sqlite(&conn, true, "ai:operator", "all")
+        .expect("engage record stop");
+    let result = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    );
+    crate::storage::record_stop::actuate_sqlite(&conn, false, "ai:operator", "all")
+        .expect("release record stop");
+    crate::config::clear_permissions_mode_override_for_test();
+
+    let err = result.expect_err("a stopped plane must refuse the pending-queue write");
+    assert!(!err.is_empty(), "the refusal must carry a reason");
+}
+
+/// v0.9.0 G10.1 (#1827) — a presented-but-unparseable `capability` token is
+/// REFUSED at the envelope edge (fail closed: a presented credential is
+/// never downgraded to anonymous). A caller that presents NO capability is
+/// unaffected, which is why the gate keys on presentation, not on config.
+#[test]
+fn store_malformed_capability_token_is_refused_at_the_edge_1827() {
+    use crate::governance::capability::CapabilityConfig;
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    // The compiled default is DISABLED (zero issuers); install the enabled
+    // posture so the edge parse runs, then restore it.
+    crate::config::set_active_capability_config(CapabilityConfig {
+        enabled: true,
+        ..CapabilityConfig::default()
+    });
+    let mut params = base_params("bad-capability");
+    params["capability"] = json!("not-a-capability-token");
+    let refused = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    );
+    // A capability-LESS caller must stay byte-identical to the inert posture.
+    let allowed = handle_store(
+        &conn,
+        &db_path,
+        &base_params("no-capability"),
+        None,
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    );
+    crate::config::clear_capability_config_for_test();
+
+    let err = refused.expect_err("an unparseable capability token must refuse the write");
+    assert!(!err.is_empty(), "the refusal must carry a reason");
+    assert!(allowed.is_ok(), "a capability-less write must still land");
+}
+
+/// #1592 / #2402 — the response echo re-reads the POST-WRITE row so the
+/// envelope reports what actually landed. When that row is not readable on
+/// the ordinary lane (an `on_conflict=merge` upsert whose `(title,
+/// namespace)` slot is held by a QUARANTINED row — hidden from `db::get`,
+/// `list` and `recall` by the containment posture), the echo must fall back
+/// to the request values rather than fail the already-committed write.
+/// Degrade, never corrupt: the durable row is the source of truth and the
+/// caller still gets an honest, complete envelope.
+#[test]
+fn store_upsert_onto_a_quarantined_row_echoes_the_request_fallback_2402() {
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let mut params = base_params("quarantined-slot");
+    params["on_conflict"] = json!("merge");
+    let seeded = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("seed write");
+    let seeded_id = seeded["id"].as_str().expect("id present").to_string();
+
+    // Containment posture: the federation quarantine lane hides the row from
+    // every ordinary read. `set_lifecycle_state` deliberately cannot reach
+    // this state, so drive the column directly (the fixture stands in for the
+    // inbound-quarantine funnel).
+    conn.execute(
+        "UPDATE memories SET lifecycle_state = ?1 WHERE id = ?2",
+        rusqlite::params![
+            crate::models::LifecycleState::Quarantined.as_str(),
+            &seeded_id
+        ],
+    )
+    .expect("quarantine the seeded row");
+    assert!(
+        db::get(&conn, &seeded_id).expect("read ok").is_none(),
+        "a quarantined row must be invisible on the ordinary read lane"
+    );
+
+    params["content"] = json!("A second write into the slot the quarantined row holds.");
+    let resp = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("the write still completes; the echo degrades, it does not fail");
+    assert_eq!(
+        resp["tier"].as_str(),
+        Some(crate::models::Tier::Mid.as_str()),
+        "an unreadable post-write row must echo the REQUESTED tier, not an error"
+    );
+    assert_eq!(resp["title"].as_str(), Some("quarantined-slot"));
+    assert!(resp["id"].is_string());
+}

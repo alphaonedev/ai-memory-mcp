@@ -1030,6 +1030,265 @@ mod tests {
         assert!(missing.iter().any(|x| x == "R004"));
     }
 
+    // -----------------------------------------------------------------
+    // v1.0.0 #3430 — the SIGNED activation path (`--key-dir`, the
+    // re-sign / self-heal arms, and the non-zero exit when a seed row is
+    // left enabled-but-inert). Added for #3458 (per-module coverage floor
+    // restoration); TEST-ONLY, no production change.
+    // -----------------------------------------------------------------
+
+    /// Install `vk` as the resolved operator pubkey for the duration of
+    /// the returned guard. Callers hold [`env_lock`].
+    fn install_pubkey_for(vk: &ed25519_dalek::VerifyingKey) -> TestPubkeyGuard {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(vk.to_bytes());
+        // SAFETY: serialised via `env_lock` held by the caller; the guard's
+        // `Drop` removes the variable again.
+        unsafe { std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", encoded) };
+        TestPubkeyGuard
+    }
+
+    /// Write the `rules keygen` Layout-2 operator key pair
+    /// (`operator.key` at mode 0600 + base64url-no-pad `operator.key.pub`)
+    /// into `key_dir`, creating it if needed.
+    #[cfg(unix)]
+    fn write_operator_key_dir(key_dir: &std::path::Path, signing: &ed25519_dalek::SigningKey) {
+        use base64::Engine;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(key_dir).unwrap();
+        let priv_path = key_dir.join("operator.key");
+        std::fs::write(&priv_path, signing.to_bytes()).unwrap();
+        // The loader refuses anything but 0600 — set it explicitly rather
+        // than depending on the ambient umask (#3439 class).
+        std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(signing.verifying_key().to_bytes());
+        std::fs::write(key_dir.join("operator.key.pub"), pub_b64).unwrap();
+    }
+
+    /// Stamp an operator signature (over the row's CURRENT canonical
+    /// bytes) + `attest_level = operator_signed` on every seed row —
+    /// exactly what `ai-memory rules sign-seed` does, without going
+    /// through the private CLI verb.
+    fn sign_all_seed_rows(db_path: &std::path::Path, signing: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        for id in SEED_RULE_IDS {
+            let row = rules_store::get(&conn, id)
+                .unwrap()
+                .expect("seed row present");
+            let canonical = rules_store::canonical_bytes_for_signing(&row).unwrap();
+            let sig = signing.sign(&canonical);
+            assert!(
+                rules_store::update_signature(
+                    &conn,
+                    id,
+                    sig.to_bytes().as_slice(),
+                    rules_store::OPERATOR_SIGNED_ATTEST_LEVEL,
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    /// A fully migrated DB (seed rows R001-R004 present at `enabled = 0`)
+    /// plus an empty `keys/` directory next to it.
+    fn migrated_db_with_key_dir() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("governance.db");
+        drop(crate::db::open(&db_path).expect("db::open runs the migration ladder"));
+        let key_dir = dir.path().join("keys");
+        (dir, db_path, key_dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_defaults_signed_path_resigns_and_enforces_via_key_dir_3430() {
+        // #3430 — the documented ceremony (`rules sign-seed` →
+        // `governance install-defaults`). Every seed row is
+        // `operator_signed`, so the activation MUST route through
+        // `set_enabled_signed` (flip + re-signature over the POST-state +
+        // signed audit row + policy advance, one transaction) using the
+        // key resolved from `--key-dir`. The REAL post-state — derived
+        // from signature validity, not the `enabled` column — must report
+        // all four enforced.
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        let _lock = env_lock();
+        let (_dir, db_path, key_dir) = migrated_db_with_key_dir();
+        let signing = SigningKey::generate(&mut OsRng);
+        write_operator_key_dir(&key_dir, &signing);
+        let _pubkey = install_pubkey_for(&signing.verifying_key());
+        sign_all_seed_rows(&db_path, &signing);
+
+        let mut so = Vec::<u8>::new();
+        let mut se = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        run(
+            &db_path,
+            InstallDefaultsArgs {
+                yes: true,
+                json: true,
+                key_dir: Some(key_dir),
+            },
+            &mut out,
+        )
+        .expect("signed activation must succeed");
+
+        let envelope: serde_json::Value =
+            serde_json::from_str(String::from_utf8(so).unwrap().trim()).unwrap();
+        let result = &envelope["result"];
+        assert_eq!(result["resigned"].as_array().unwrap().len(), 4);
+        assert_eq!(result["activated"].as_array().unwrap().len(), 4);
+        assert_eq!(result["enforced"].as_array().unwrap().len(), 4);
+        assert!(result["repaired"].as_array().unwrap().is_empty());
+        assert!(
+            result["not_enforced"].as_array().unwrap().is_empty(),
+            "no seed row may be left inert: {envelope}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_defaults_self_heals_enabled_but_inert_rows_3430() {
+        // #3430 — the regression this verb was fixed for: a previous
+        // ceremony flipped `enabled` with a raw UPDATE *after* signing, so
+        // the recorded signature (which commits to `enabled`) no longer
+        // verifies and the L1-6 load gate silently DROPS the row. The run
+        // must report those rows as REPAIRED, not "already-on".
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        let _lock = env_lock();
+        let (_dir, db_path, key_dir) = migrated_db_with_key_dir();
+        let signing = SigningKey::generate(&mut OsRng);
+        write_operator_key_dir(&key_dir, &signing);
+        let _pubkey = install_pubkey_for(&signing.verifying_key());
+        sign_all_seed_rows(&db_path, &signing);
+        {
+            // The raw post-signing flip — the exact bypass shape #3430
+            // closes. Done with direct SQL because `set_enabled` now
+            // refuses it.
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("UPDATE governance_rules SET enabled = 1", [])
+                .unwrap();
+        }
+
+        let mut so = Vec::<u8>::new();
+        let mut se = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        run(
+            &db_path,
+            InstallDefaultsArgs {
+                yes: true,
+                json: false,
+                key_dir: Some(key_dir),
+            },
+            &mut out,
+        )
+        .expect("self-heal must succeed");
+
+        let rendered = String::from_utf8(so).unwrap();
+        assert!(
+            rendered.contains("repaired:"),
+            "the human summary must name the repaired rows, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("re-signed:"),
+            "the human summary must name the re-signed rows, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("4 enforced, 0 inert"),
+            "the honest bottom line must report the REAL state, got: {rendered}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_defaults_refuses_signed_rows_when_no_operator_key_loadable_3430() {
+        // #3430 — refuse BEFORE any write when the signed path is required
+        // but the operator key cannot be loaded. Flipping `enabled` without
+        // re-signing would leave the rules reported-active but inert, so
+        // this must be a refusal, never a best-effort flip.
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        let _lock = env_lock();
+        let (_dir, db_path, key_dir) = migrated_db_with_key_dir();
+        let signing = SigningKey::generate(&mut OsRng);
+        let _pubkey = install_pubkey_for(&signing.verifying_key());
+        sign_all_seed_rows(&db_path, &signing);
+        // `key_dir` exists but holds no operator key pair (and neither does
+        // its parent), so the loader refuses.
+        std::fs::create_dir_all(&key_dir).unwrap();
+
+        let mut so = Vec::<u8>::new();
+        let mut se = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        let err = run(
+            &db_path,
+            InstallDefaultsArgs {
+                yes: true,
+                json: true,
+                key_dir: Some(key_dir),
+            },
+            &mut out,
+        )
+        .expect_err("a missing operator key must refuse the run");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("refused (#3430)"),
+            "expected the #3430 refusal, got: {chain}"
+        );
+        // Fail-closed: nothing was written.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for id in SEED_RULE_IDS {
+            let row = rules_store::get(&conn, id).unwrap().unwrap();
+            assert!(!row.enabled, "{id} must stay disabled after a refusal");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_defaults_exits_non_zero_when_a_seed_row_stays_inert_3430() {
+        // #3430 — the verb refuses to report success over dead rules. Here
+        // the key in `--key-dir` is NOT the key the substrate resolves, so
+        // every re-signature verifies against the wrong public half and the
+        // L1-6 gate would drop all four rows. The run must render the
+        // NOT ENFORCED lines and then return an error.
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        let _lock = env_lock();
+        let (_dir, db_path, key_dir) = migrated_db_with_key_dir();
+        let resolved = SigningKey::generate(&mut OsRng);
+        let other = SigningKey::generate(&mut OsRng);
+        write_operator_key_dir(&key_dir, &other);
+        let _pubkey = install_pubkey_for(&resolved.verifying_key());
+        sign_all_seed_rows(&db_path, &resolved);
+
+        let mut so = Vec::<u8>::new();
+        let mut se = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        let err = run(
+            &db_path,
+            InstallDefaultsArgs {
+                yes: true,
+                json: false,
+                key_dir: Some(key_dir),
+            },
+            &mut out,
+        )
+        .expect_err("inert seed rows must not report success");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("refused to report success (#3430)"),
+            "expected the #3430 inert refusal, got: {chain}"
+        );
+        let rendered = String::from_utf8(so).unwrap();
+        assert!(
+            rendered.contains("NOT ENFORCED: R001 (skipped_signature_invalid)"),
+            "the operator must be told WHICH rows are dead and why, got: {rendered}"
+        );
+    }
+
     #[test]
     fn run_propagates_open_error_for_non_existent_db_with_unwritable_parent() {
         // db path under a non-existent directory cannot be opened —
