@@ -2693,8 +2693,24 @@ fn dispatch_memory_share(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 fn dispatch_memory_inbox(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1557 — bind the inbox owner to the resolved caller so a
     // multi-tenant caller cannot read another agent's private inbox.
-    let caller = crate::identity::resolve_read_visibility_caller();
-    handle_inbox(ctx.conn, ctx.arguments, ctx.mcp_client, caller.as_deref())
+    let caller =
+        crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
+    let single_tenant_trust_all = ctx
+        .mcp_config
+        .is_some_and(|config| config.single_tenant_trust_all);
+    if caller.is_none() && single_tenant_trust_all {
+        tracing::warn!(
+            "memory_inbox is using [mcp] single_tenant_trust_all = true; \
+             caller isolation is disabled for this request (#3356)"
+        );
+    }
+    notify::handle_inbox_with_policy(
+        ctx.conn,
+        ctx.arguments,
+        ctx.mcp_client,
+        caller.as_deref(),
+        single_tenant_trust_all,
+    )
 }
 
 fn dispatch_memory_subscribe(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -4267,6 +4283,9 @@ pub fn run_mcp_server(
         )
         .with_writer(std::io::stderr)
         .try_init();
+
+    // #3356: configured-but-invalid identity aborts boot rather than becoming unresolved.
+    let _ = crate::identity::resolve_mcp_read_visibility_caller()?;
 
     let mut conn = db::open(db_path)?;
 
@@ -6954,6 +6973,22 @@ mod tests {
         )
     }
 
+    #[test]
+    fn mcp_server_refuses_shape_invalid_agent_identity_before_serving_3356() {
+        let _env = crate::identity::agent_id_env_set_guard("bad id with spaces");
+        let result = run_mcp_server(
+            std::path::Path::new(":memory:"),
+            FeatureTier::Keyword,
+            &crate::config::AppConfig::default(),
+            &crate::profile::Profile::core(),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.starts_with("AI_MEMORY_AGENT_ID is invalid:"),
+            "unexpected startup error: {error}"
+        );
+    }
+
     /// Like [`invoke_handle_request`] but threads a live capture-nag
     /// watcher + session id through to the dispatch loop, exercising the
     /// #1389/#1398 L1 wiring end to end.
@@ -9399,6 +9434,7 @@ mod tests {
 
     #[test]
     fn handle_inbox_returns_empty_for_unregistered_caller() {
+        let _env = crate::identity::agent_id_env_set_guard("test-bot");
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let req = make_tools_call("memory_inbox", json!({"agent_id": "test-bot"}));
         let resp = invoke_handle_request(&conn, &req);
@@ -9415,6 +9451,7 @@ mod tests {
 
     #[test]
     fn handle_inbox_with_unread_only_filter() {
+        let _env = crate::identity::agent_id_env_set_guard("test-bot");
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let req = make_tools_call(
             "memory_inbox",
@@ -11617,32 +11654,29 @@ mod tests {
     }
 
     #[test]
-    fn handle_inbox_with_message_seeded() {
-        // Notify alice, then read alice's inbox.
+    fn handle_inbox_without_configured_identity_binds_process_owner_3356() {
+        let _env = crate::identity::agent_id_env_unset_guard();
+        let owner = crate::identity::resolve_agent_id(None, None).unwrap();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let notify = make_tools_call(
             "memory_notify",
             json!({
-                "target_agent_id": "alice-w12",
+                "target_agent_id": &owner,
                 "title": "ping",
                 "payload": "are you there?",
                 "tier": Tier::Short.as_str(),
             }),
         );
         let _ = invoke_handle_request(&conn, &notify);
-        let inbox = make_tools_call(
-            "memory_inbox",
-            json!({"agent_id": "alice-w12", "limit": 10}),
-        );
-        let resp = invoke_handle_request(&conn, &inbox);
-        assert!(resp.error.is_none());
-        let text = resp.result.unwrap()["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let val: Value = serde_json::from_str(&text).unwrap();
-        assert!(val["count"].as_u64().unwrap() >= 1);
-        assert_eq!(val["agent_id"], "alice-w12");
+        for params in [json!({}), json!({"agent_id": &owner})] {
+            let resp = invoke_handle_request(&conn, &make_tools_call("memory_inbox", params));
+            assert!(resp.error.is_none());
+            let value: Value =
+                serde_json::from_str(resp.result.unwrap()["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(value["agent_id"].as_str(), Some(owner.as_str()));
+            assert_eq!(value["count"].as_u64(), Some(1));
+        }
     }
 
     #[test]

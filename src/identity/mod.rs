@@ -31,8 +31,11 @@
 //! restarts**: they intentionally OMIT the live `pid` discriminator. This
 //! is the Op-0 posture — the substrate's default is **single-operator,
 //! trust-all** reads (`resolve_read_visibility_caller` returns `None` when
-//! `AI_MEMORY_AGENT_ID` is unset, so the read-path ownership filter is
-//! skipped entirely). Under that default the host-scoped owner id need not
+//! `AI_MEMORY_AGENT_ID` is unset, so general read-path ownership filters are
+//! skipped). `memory_inbox` is the security-sensitive exception as of #3356:
+//! unresolved callers are refused unless `[mcp] single_tenant_trust_all = true`
+//! explicitly restores that legacy posture. Under the general default the
+//! host-scoped owner id need not
 //! be unique-per-process; it needs to be *durable*, so that a memory written
 //! by one process (e.g. `host:laptop`) is still owned by that same id after
 //! a restart. A pid-suffixed stamp would change every boot, which — the
@@ -342,6 +345,32 @@ pub fn resolve_read_visibility_caller() -> Option<String> {
     // against a value nothing is owned by.
     validate::validate_agent_id_shape(&v).ok()?;
     Some(v)
+}
+
+/// #3356 — resolve the MCP read caller without collapsing a configured but
+/// unusable process identity into the unset/single-tenant posture.
+///
+/// `AI_MEMORY_AGENT_ID` being absent is a legitimate `None`. An empty,
+/// non-Unicode, or shape-invalid value is operator configuration, not absence,
+/// and must fail closed before MCP serves requests.
+///
+/// # Errors
+/// Returns an error when `AI_MEMORY_AGENT_ID` is present but cannot be used as
+/// a stable agent identity.
+pub fn resolve_mcp_read_visibility_caller() -> Result<Option<String>> {
+    let value = match std::env::var(ENV_AGENT_ID) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("AI_MEMORY_AGENT_ID is not valid Unicode")
+        }
+    };
+    if value.is_empty() {
+        anyhow::bail!("AI_MEMORY_AGENT_ID must not be empty");
+    }
+    validate::validate_agent_id_shape(&value)
+        .map_err(|error| anyhow::anyhow!("AI_MEMORY_AGENT_ID is invalid: {error}"))?;
+    Ok(Some(value))
 }
 
 /// #3171 — resolve the SUBJECT of a governance / permission / quota /
@@ -800,6 +829,35 @@ pub fn preserve_update_provenance_keys(
 }
 
 #[cfg(test)]
+pub(crate) struct AgentIdEnvSetGuard {
+    prev: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+#[must_use]
+pub(crate) fn agent_id_env_set_guard(value: &str) -> AgentIdEnvSetGuard {
+    let lock = agent_id_env_test_lock();
+    let prev = std::env::var_os(ENV_AGENT_ID);
+    // SAFETY: process-global env mutation is serialized on the crate-wide
+    // test lock, which remains held by the returned guard.
+    unsafe { std::env::set_var(ENV_AGENT_ID, value) };
+    AgentIdEnvSetGuard { prev, _lock: lock }
+}
+
+#[cfg(test)]
+impl Drop for AgentIdEnvSetGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            // SAFETY: `_lock` still serializes this process-global mutation.
+            Some(value) => unsafe { std::env::set_var(ENV_AGENT_ID, value) },
+            // SAFETY: `_lock` still serializes this process-global mutation.
+            None => unsafe { std::env::remove_var(ENV_AGENT_ID) },
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -995,6 +1053,38 @@ mod tests {
             std::env::set_var(ENV_AGENT_ID, "has space");
         }
         assert_eq!(resolve_read_visibility_caller(), None);
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
+    }
+
+    #[test]
+    fn mcp_read_visibility_caller_refuses_empty_or_shape_invalid_3356() {
+        let _crate_g = agent_id_env_test_lock();
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "");
+        }
+        assert_eq!(
+            resolve_mcp_read_visibility_caller()
+                .unwrap_err()
+                .to_string(),
+            "AI_MEMORY_AGENT_ID must not be empty"
+        );
+
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "has space");
+        }
+        let error = resolve_mcp_read_visibility_caller()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("AI_MEMORY_AGENT_ID is invalid:"),
+            "unexpected error: {error}"
+        );
+        // SAFETY: env mutation serialised by `_g`.
         unsafe {
             std::env::remove_var(ENV_AGENT_ID);
         }

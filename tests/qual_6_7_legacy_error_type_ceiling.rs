@@ -155,7 +155,13 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // `Result<String, String>`). Exact #2721/CB-19 split the SET twin already
 // carries. Measured 123 on the pre-#3040 branch; +1 for handle_list_capped
 // already in 121. Net acknowledged: +3.
-const QUAL_6_CEILING: usize = 124;
+// 2026-09-02 (#3356) — raised 124 -> 125 for
+// `handle_inbox_with_policy` in `src/mcp/tools/notify.rs`. The helper makes the
+// MCP caller-isolation policy explicit and testable while the pre-existing
+// `handle_inbox` entry point preserves trusted in-process CLI/hook behaviour.
+// Both feed the established MCP inbox handler family and therefore retain its
+// `Result<Value, String>` boundary. Net acknowledged: +1.
+const QUAL_6_CEILING: usize = 125;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
