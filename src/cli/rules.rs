@@ -348,7 +348,16 @@ pub fn run(
         }
         RulesAction::List => {
             let rules = rules_store::list(&conn)?;
-            let payload = serde_json::Value::Array(rules.iter().map(rule_to_json).collect());
+            // #3430 — resolve the operator pubkey once for the whole
+            // table; every row's `enforced` / `enforcement_state`
+            // projection is derived from it.
+            let operator_pubkey = rules_store::resolve_operator_pubkey();
+            let payload = serde_json::Value::Array(
+                rules
+                    .iter()
+                    .map(|r| rule_to_json_with_pubkey(r, operator_pubkey.as_ref()))
+                    .collect(),
+            );
             emit_ok(json, out, "rules.list", &payload)?;
             Ok(())
         }
@@ -1171,11 +1180,28 @@ fn build_action(kind: &str, payload_json: &str) -> Result<AgentAction> {
 /// base64-encoded (URL-safe, no padding) so the JSON is operator-
 /// readable. Empty signature ⇒ null.
 fn rule_to_json(rule: &Rule) -> serde_json::Value {
+    rule_to_json_with_pubkey(rule, rules_store::resolve_operator_pubkey().as_ref())
+}
+
+/// v1.0.0 #3430 — [`rule_to_json`] with the operator verifying key
+/// hoisted out, so `rules list` resolves it ONCE for the whole table
+/// instead of per row.
+fn rule_to_json_with_pubkey(
+    rule: &Rule,
+    operator_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> serde_json::Value {
     use base64::Engine;
     let sig_b64 = rule
         .signature
         .as_ref()
         .map(|b| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b));
+    // v1.0.0 #3430 — the REAL enforcement verdict, from the SAME
+    // predicate the engine applies at load time. `enabled` alone is a
+    // lie once an operator pubkey is resolved: a signed row whose
+    // signature no longer verifies (e.g. `enabled` flipped after
+    // `rules sign-seed`) reads `enabled: true` here while the engine
+    // silently drops it.
+    let enforcement = rules_store::enforcement_state(rule, operator_pubkey);
     serde_json::json!({
         "id": rule.id,
         "kind": rule.kind,
@@ -1195,6 +1221,12 @@ fn rule_to_json(rule: &Rule) -> serde_json::Value {
         // not match. `rules add` now refuses to mint one, so a `true` here
         // means a legacy row or an out-of-band DB edit.
         "inert": crate::governance::agent_action::rule_matcher_is_inert(rule),
+        // v1.0.0 #3430 — `enforced` is the only honest answer to "is
+        // this rule live?"; `enforcement_state` names WHY when it is
+        // not. The MCP `memory_rule_list` tool projects the SAME two
+        // fields from the SAME predicate (the #3027 divergence class).
+        "enforced": enforcement.is_enforced(),
+        "enforcement_state": enforcement.as_str(),
     })
 }
 

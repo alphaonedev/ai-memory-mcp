@@ -2176,6 +2176,64 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
     let pending_count = db::count_pending_actions_by_status(conn, "pending").unwrap_or(0);
     facts.push(("pending_actions_total".into(), pending_count.to_string()));
 
+    // v1.0.0 #3430 — the REAL agent-action rule posture. `enabled = 1`
+    // is NOT the enforcement state: once an operator pubkey is resolved
+    // the L1-6 load gate silently drops every enabled row that is not
+    // operator-signed, or whose signature no longer verifies over the
+    // row's canonical bytes (the `install-defaults` raw-UPDATE shape,
+    // which left the documented seed ceremony with four rules reported
+    // active and enforcing nothing). Doctor reports what the ENGINE
+    // does, derived from the same predicate.
+    let operator_pubkey = crate::governance::rules_store::resolve_operator_pubkey();
+    facts.push((
+        "l1_6_attest_active".into(),
+        operator_pubkey.is_some().to_string(),
+    ));
+    match crate::governance::rules_store::list(conn) {
+        Ok(rules) => {
+            let enabled: Vec<_> = rules.iter().filter(|r| r.enabled).collect();
+            let inert: Vec<String> = enabled
+                .iter()
+                .filter_map(|r| {
+                    let state = crate::governance::rules_store::enforcement_state(
+                        r,
+                        operator_pubkey.as_ref(),
+                    );
+                    (!state.is_enforced()).then(|| format!("{}({})", r.id, state.as_str()))
+                })
+                .collect();
+            facts.push(("rules_total".into(), rules.len().to_string()));
+            facts.push(("rules_enabled".into(), enabled.len().to_string()));
+            facts.push((
+                "rules_enforced".into(),
+                (enabled.len() - inert.len()).to_string(),
+            ));
+            if inert.is_empty() {
+                facts.push(("rules_enabled_but_inert".into(), "none".into()));
+            } else {
+                facts.push(("rules_enabled_but_inert".into(), inert.join(",")));
+                if !matches!(severity, Severity::Critical) {
+                    severity = Severity::Warning;
+                }
+                append_note(
+                    &mut note,
+                    &format!(
+                        "{} agent-action rule(s) are enabled but the L1-6 load gate DROPS them \
+                         — they enforce nothing ({}). Re-sign with \
+                         `ai-memory rules sign-seed --key <path>` (or re-run \
+                         `ai-memory governance install-defaults`, which now re-signs the \
+                         post-state) using the key whose public half this node resolves.",
+                        inert.len(),
+                        inert.join(", "),
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            facts.push(("rules_query_error".into(), e.to_string()));
+        }
+    }
+
     // v0.9.0 §25.3 S4 (F-41, #1853) — surface the monotonic policy
     // version + the ADVISORY digest-reconciliation check. A drift (live
     // enabled-rule digest != the digest committed by the last signed
@@ -3662,6 +3720,152 @@ mod tests {
         assert_eq!(fact(gov, "inheritance_depth"), "empty");
         assert_eq!(fact(gov, "oldest_pending_age_secs"), "queue_empty");
         assert_eq!(fact(gov, "pending_actions_total"), "0");
+    }
+
+    /// v1.0.0 #3430 — doctor's Governance section reports the REAL
+    /// agent-action rule posture. A seed row that was signed and then
+    /// had `enabled` flipped beneath the signature (the pre-#3430
+    /// `install-defaults` shape) is enabled on disk yet dropped by the
+    /// L1-6 load gate: doctor must surface it, not count it as live.
+    #[test]
+    fn governance_section_flags_enabled_but_inert_rules_3430() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer;
+        use rand_core::OsRng;
+
+        let env = TestEnv::fresh();
+        let conn = crate::db::open(&env.db_path).expect("open db");
+
+        let mut signing_csprng = OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut signing_csprng);
+        let pk = signing.verifying_key();
+
+        // Sign R001 in its shipped (disabled) state, then raw-flip
+        // `enabled` — the signature now commits to the wrong state.
+        let mut rule = crate::governance::rules_store::get(&conn, "R001")
+            .expect("get R001")
+            .expect("R001 seeded by migration");
+        rule.attest_level = "operator_signed".into();
+        let canonical =
+            crate::governance::rules_store::canonical_bytes_for_signing(&rule).expect("canonical");
+        crate::governance::rules_store::update_signature(
+            &conn,
+            "R001",
+            &signing.sign(&canonical).to_bytes(),
+            "operator_signed",
+        )
+        .expect("update_signature");
+        conn.execute(
+            "UPDATE governance_rules SET enabled = 1 WHERE id = 'R001'",
+            [],
+        )
+        .expect("raw enable");
+
+        // Resolve the pubkey through the env ladder so `section_governance`
+        // sees the L1-6-active posture.
+        let _guard = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("AI_MEMORY_OPERATOR_PUBKEY");
+        // SAFETY: serialised by the process-global env lock held above.
+        unsafe {
+            std::env::set_var(
+                "AI_MEMORY_OPERATOR_PUBKEY",
+                base64::engine::general_purpose::STANDARD.encode(pk.to_bytes()),
+            );
+        }
+        let section = section_governance(&conn);
+        // SAFETY: same lock scope.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", v),
+                None => std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY"),
+            }
+        }
+
+        assert_eq!(fact(&section, "l1_6_attest_active"), "true");
+        assert_eq!(fact(&section, "rules_enabled"), "1");
+        assert_eq!(
+            fact(&section, "rules_enforced"),
+            "0",
+            "#3430: an enabled-but-unverifiable rule enforces nothing"
+        );
+        assert_eq!(
+            fact(&section, "rules_enabled_but_inert"),
+            "R001(skipped_signature_invalid)"
+        );
+        assert_eq!(section.severity, Severity::Warning);
+        assert!(
+            section
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("enforce nothing")),
+            "note must tell the operator the rules are dead: {:?}",
+            section.note
+        );
+    }
+
+    /// v1.0.0 #3430 — the ALLOWED path for the same surface: a
+    /// correctly-signed enabled rule is reported as enforced with no
+    /// warning.
+    #[test]
+    fn governance_section_reports_a_correctly_signed_rule_as_enforced_3430() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer;
+        use rand_core::OsRng;
+
+        let env = TestEnv::fresh();
+        let conn = crate::db::open(&env.db_path).expect("open db");
+
+        let mut signing_csprng = OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut signing_csprng);
+        let pk = signing.verifying_key();
+
+        // Enable FIRST, then sign the post-state — what
+        // `set_enabled_signed` does inside one transaction.
+        conn.execute(
+            "UPDATE governance_rules SET enabled = 1 WHERE id = 'R001'",
+            [],
+        )
+        .expect("enable");
+        let mut rule = crate::governance::rules_store::get(&conn, "R001")
+            .expect("get")
+            .expect("seeded");
+        rule.attest_level = "operator_signed".into();
+        let canonical =
+            crate::governance::rules_store::canonical_bytes_for_signing(&rule).expect("canonical");
+        crate::governance::rules_store::update_signature(
+            &conn,
+            "R001",
+            &signing.sign(&canonical).to_bytes(),
+            "operator_signed",
+        )
+        .expect("update_signature");
+
+        let _guard = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("AI_MEMORY_OPERATOR_PUBKEY");
+        // SAFETY: serialised by the process-global env lock held above.
+        unsafe {
+            std::env::set_var(
+                "AI_MEMORY_OPERATOR_PUBKEY",
+                base64::engine::general_purpose::STANDARD.encode(pk.to_bytes()),
+            );
+        }
+        let section = section_governance(&conn);
+        // SAFETY: same lock scope.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", v),
+                None => std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY"),
+            }
+        }
+
+        assert_eq!(fact(&section, "rules_enabled"), "1");
+        assert_eq!(fact(&section, "rules_enforced"), "1");
+        assert_eq!(fact(&section, "rules_enabled_but_inert"), "none");
+        assert_eq!(section.severity, Severity::Info);
     }
 
     #[test]

@@ -294,8 +294,22 @@ fn sg_co_2_substrate_rule_r001_enforces_when_signed_and_enabled() {
         other => panic!("expected Refuse after sign, got {other:?}"),
     }
 
-    // Disabling the rule via the substrate API removes enforcement.
-    rules_store::set_enabled(&conn, "R001", false).unwrap();
+    // Disabling the rule removes enforcement.
+    //
+    // v1.0.0 #3430 — `rules_store::set_enabled` now REFUSES to flip
+    // `enabled` on an operator_signed row (an unsigned flip invalidates
+    // the signature the L1-6 gate checks). The audited production path
+    // is `set_enabled_signed`, which needs the signed_events +
+    // policy_version tables this minimal rules-only fixture does not
+    // create — so stage the disable/re-enable with raw SQL and re-sign
+    // afterwards, keeping the row's signature consistent with the state
+    // being probed.
+    conn.execute(
+        "UPDATE governance_rules SET enabled = 0 WHERE id = 'R001'",
+        [],
+    )
+    .unwrap();
+    sign_all_rules(&conn, &signing);
     assert_eq!(
         probe_write(&conn, "/tmp/leak"),
         Decision::Allow,
@@ -303,7 +317,12 @@ fn sg_co_2_substrate_rule_r001_enforces_when_signed_and_enabled() {
     );
 
     // Sanity: a path outside /tmp is allowed even when rule is enabled.
-    rules_store::set_enabled(&conn, "R001", true).unwrap();
+    conn.execute(
+        "UPDATE governance_rules SET enabled = 1 WHERE id = 'R001'",
+        [],
+    )
+    .unwrap();
+    sign_all_rules(&conn, &signing);
     let outside_tmp = probe_write(&conn, "/Users/fate/v07/v07-fixes/.local-runs/ok.txt");
     assert_eq!(
         outside_tmp,

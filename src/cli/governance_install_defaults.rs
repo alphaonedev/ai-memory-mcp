@@ -33,10 +33,33 @@
 //! requires the operator's Ed25519 key on disk and re-signs each row.
 //! For the bootstrap step where the operator just wants the seeded
 //! hard rules ON, `install-defaults` is a single confirmed batch.
-//! It does NOT touch the signature column — the seeded rows ship
-//! `attest_level = 'unsigned'` and the operator may pair this verb
-//! with a separate `ai-memory rules sign-seed --key …` to upgrade the
-//! attestation level.
+//!
+//! ## v1.0.0 #3430 — the enable goes through the SIGNED path
+//!
+//! This verb used to issue a raw `UPDATE governance_rules SET
+//! enabled = 1` that "does NOT touch the signature column". That made
+//! the documented seed ceremony
+//! (`rules sign-seed` → `governance install-defaults --yes`) produce
+//! four SILENTLY INERT rules: `sign-seed` commits `enabled` into the
+//! canonical payload
+//! ([`crate::governance::rules_store::canonical_bytes_for_signing`]),
+//! so flipping `enabled` afterwards invalidated every signature and the
+//! #1042 L1-6 load gate dropped all four rows — while this CLI printed
+//! "Activated 4 rule(s)" and `rules check` answered `allow`.
+//!
+//! Now the activation routes through
+//! [`crate::governance::rules_store::set_enabled_signed`] whenever an
+//! `operator_signed` row is involved: the flip, the re-signature over
+//! the POST-state, the operator-signed audit row and the policy-version
+//! advance all land in ONE transaction. When the operator key cannot be
+//! loaded the verb REFUSES before any write rather than neutering the
+//! signature. Rows that are still `unsigned` in the pre-L1-6 posture (no
+//! operator pubkey resolved anywhere) keep the plain flip — they are
+//! enforced without a signature check there.
+//!
+//! Every line this verb prints reports the REAL enforcement state
+//! ([`crate::governance::rules_store::enforcement_state`]), derived from
+//! signature validity — never from the raw `enabled` column.
 //!
 //! ## Audit honesty
 //!
@@ -47,9 +70,9 @@
 
 use anyhow::{Context, Result};
 use clap::Args;
-use rusqlite::params;
 
 use crate::cli::CliOutput;
+use crate::governance::rules_store::{self, Rule, RuleEnforcement};
 
 /// The four seed rule ids defined in migration `0024_v07_governance_rules.sql`.
 /// Kept here as a typed constant so unit tests can iterate without
@@ -66,9 +89,19 @@ pub struct InstallDefaultsArgs {
 
     /// Emit a JSON envelope instead of the human-readable summary.
     /// Stable wire shape: `{ "verb": "governance.install-defaults",
-    /// "result": { "activated": [...], "missing": [...], "already_enabled": [...] } }`.
+    /// "result": { "activated": [...], "missing": [...],
+    /// "already_enabled": [...], "resigned": [...], "enforced": [...],
+    /// "not_enforced": [{ "id": ..., "enforcement_state": ... }] } }`.
     #[arg(long)]
     pub json: bool,
+
+    /// v1.0.0 #3430 — override the operator key directory used to
+    /// re-sign the seed rows. Honors `AI_MEMORY_KEY_DIR` when omitted,
+    /// matching `ai-memory rules --key-dir` so the documented ceremony
+    /// (`rules sign-seed` → `governance install-defaults`) resolves the
+    /// SAME key on both halves.
+    #[arg(long, value_name = "PATH")]
+    pub key_dir: Option<std::path::PathBuf>,
 }
 
 /// Outcome of the install-defaults run; surfaced both to the JSON
@@ -82,6 +115,34 @@ pub struct InstallDefaultsReport {
     /// Rule ids that were not present in the DB (migration skipped or
     /// row hand-deleted). Surfaced so the operator can investigate.
     pub missing: Vec<String>,
+    /// v1.0.0 #3430 — ids whose operator signature was (re-)committed
+    /// over the POST-state during this run, via the audited
+    /// [`rules_store::set_enabled_signed`] transaction.
+    pub resigned: Vec<String>,
+    /// v1.0.0 #3430 — ids that were already enabled but INERT on entry
+    /// (signature no longer verified) and were self-healed by this run.
+    /// A non-empty list means a previous ceremony left dead rules
+    /// behind.
+    pub repaired: Vec<String>,
+    /// v1.0.0 #3430 — the REAL post-state: ids the engine will actually
+    /// evaluate, derived from
+    /// [`rules_store::enforcement_state`], never from the raw `enabled`
+    /// column.
+    pub enforced: Vec<String>,
+    /// v1.0.0 #3430 — seed rows left enabled-but-inert after this run.
+    /// Non-empty is a hard failure: the verb reports it and exits
+    /// non-zero rather than claiming the rules are active.
+    pub not_enforced: Vec<InertSeedRule>,
+}
+
+/// v1.0.0 #3430 — one enabled-but-unenforced seed row, with the reason
+/// the L1-6 gate drops it.
+#[derive(Debug, serde::Serialize)]
+pub struct InertSeedRule {
+    /// The rule id (`R001`..`R004`).
+    pub id: String,
+    /// Stable token from [`RuleEnforcement::as_str`].
+    pub enforcement_state: &'static str,
 }
 
 /// Dispatch entry called from the daemon-runtime `GovernanceAction`
@@ -89,10 +150,12 @@ pub struct InstallDefaultsReport {
 ///
 /// # Errors
 ///
-/// Returns an error if the DB cannot be opened, the SELECT/UPDATE
-/// queries fail, or the operator declines the prompt and the JSON
-/// envelope cannot be serialised. Declining the prompt is NOT an error
-/// — it returns `Ok(())` after writing `aborted: true` to stdout.
+/// Returns an error if the DB cannot be opened, the rule reads/writes
+/// fail, the operator key needed to re-sign a signed seed row cannot be
+/// loaded (#3430 — refused BEFORE any write), any seed row is left
+/// enabled-but-inert after the run (#3430), or the JSON envelope cannot
+/// be serialised. Declining the prompt is NOT an error — it returns
+/// `Ok(())` after writing the abort line to stdout.
 pub fn run(
     db_path: &std::path::Path,
     args: InstallDefaultsArgs,
@@ -104,17 +167,23 @@ pub fn run(
             db_path.display()
         )
     })?;
-    // v1.0.0 #2445 — raw-open WRITE funnel (`UPDATE governance_rules SET
-    // enabled = 1`). Enabling authz rules against a schema this binary does not
+    // v1.0.0 #2445 — raw-open WRITE funnel (the `enabled` activation).
+    // Enabling authz rules against a schema this binary does not
     // understand is an authz-config write on an unknown-shape table.
     crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())?;
 
     // Confirm the four rules exist + grab their current state so we
     // can render the preview block and decide what to activate.
-    let mut preview: Vec<SeedRuleRow> = Vec::with_capacity(SEED_RULE_IDS.len());
+    // v1.0.0 #3430 — read through `rules_store` (which owns the
+    // `governance_rules` SQL) instead of a private SELECT, so the
+    // preview carries the `signature` column the enforcement-state
+    // projection needs.
+    let mut preview: Vec<Rule> = Vec::with_capacity(SEED_RULE_IDS.len());
     let mut missing: Vec<String> = Vec::new();
     for id in SEED_RULE_IDS {
-        match load_seed_row(&conn, id)? {
+        match rules_store::get(&conn, id)
+            .with_context(|| format!("install-defaults: load seed rule {id}"))?
+        {
             Some(row) => preview.push(row),
             None => missing.push((*id).to_string()),
         }
@@ -145,11 +214,11 @@ pub fn run(
     //      treats unsigned-enabled rows as enforceable. (Strongly
     //      discouraged — leaves the L1-6 bypass-impossibility
     //      story broken.)
-    let operator_pubkey = crate::governance::rules_store::resolve_operator_pubkey();
+    let operator_pubkey = rules_store::resolve_operator_pubkey();
     if operator_pubkey.is_some() {
-        let unsigned_seed_rows: Vec<&SeedRuleRow> = preview
+        let unsigned_seed_rows: Vec<&Rule> = preview
             .iter()
-            .filter(|r| r.attest_level != crate::governance::rules_store::ATTEST_OPERATOR_SIGNED)
+            .filter(|r| r.attest_level != rules_store::OPERATOR_SIGNED_ATTEST_LEVEL)
             .collect();
         if !unsigned_seed_rows.is_empty() {
             let unsigned_ids: Vec<&str> =
@@ -167,6 +236,46 @@ pub fn run(
         }
     }
 
+    // v1.0.0 #3430 — decide the write path BEFORE touching anything, and
+    // refuse up front when the signed path is required but unavailable.
+    //
+    // A row carrying `attest_level = operator_signed` has a signature
+    // that COMMITS to `enabled`. Flipping the column beneath it silently
+    // invalidates the signature and the L1-6 load gate then drops the
+    // rule — reported active, enforcing nothing. So the moment any seed
+    // row is operator-signed, the activation MUST go through
+    // `set_enabled_signed` (flip + re-sign of the post-state + signed
+    // audit row + policy-version advance, one transaction), which needs
+    // the operator private key.
+    //
+    // When no seed row is signed the substrate is in the pre-L1-6
+    // bootstrap posture (the #1042 pre-flight above already refused the
+    // pubkey-resolved case), where unsigned-enabled rows ARE enforced —
+    // no key needed, no key loaded, and a fresh install with no operator
+    // keypair still works exactly as documented.
+    let needs_signed_path = preview
+        .iter()
+        .any(|r| r.attest_level == rules_store::OPERATOR_SIGNED_ATTEST_LEVEL);
+    let signing_key = if needs_signed_path {
+        let key_dir = crate::cli::rules::resolve_key_dir(args.key_dir.as_deref())?;
+        Some(
+            crate::cli::rules::load_operator_signing_key_from_dir(&key_dir).with_context(|| {
+                format!(
+                    "governance install-defaults: refused (#3430) — seed rule(s) are \
+                     attest_level=operator_signed, so activating them requires re-signing the \
+                     row with the operator key (the signature commits to `enabled`), but no \
+                     operator key could be loaded from {}. Flipping `enabled` without the key \
+                     would leave the rules reported-active but SILENTLY INERT. Provide the key \
+                     (--key-dir / AI_MEMORY_KEY_DIR), or activate per-rule with \
+                     `ai-memory rules enable --id <id> --sign`.",
+                    key_dir.display()
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+
     // Interactive prompt unless --yes / --json was supplied.
     if !args.yes {
         // JSON-mode callers MUST pass --yes; an interactive prompt on
@@ -174,31 +283,80 @@ pub fn run(
         if args.json {
             anyhow::bail!("governance install-defaults: --json requires --yes (non-interactive)");
         }
-        render_preview(out, &preview, &missing)?;
+        render_preview(out, &preview, &missing, operator_pubkey.as_ref())?;
         if !confirm_proceed(out)? {
             writeln!(out.stdout, "Aborted. No rules were activated.")?;
             return Ok(());
         }
     }
 
-    // Flip enabled = 1 on every row whose enabled = 0.
     let mut report = InstallDefaultsReport {
         missing: missing.clone(),
         ..Default::default()
     };
     for row in &preview {
-        if row.enabled {
-            report.already_enabled.push(row.id.clone());
-            continue;
+        let state = rules_store::enforcement_state(row, operator_pubkey.as_ref());
+        match (signing_key.as_ref(), state.is_enforced()) {
+            // Already enabled AND genuinely enforced — nothing to do.
+            (_, true) => report.already_enabled.push(row.id.clone()),
+            // Signed posture: ONE audited, atomic transaction both
+            // activates a disabled row and self-heals a row that a
+            // previous raw-UPDATE ceremony left enabled-but-inert.
+            (Some(key), false) => {
+                let updated = rules_store::set_enabled_signed(
+                    &conn,
+                    &row.id,
+                    true,
+                    key,
+                    crate::cli::rules::OPERATOR_KEY_ID,
+                )
+                .with_context(|| format!("install-defaults: signed enable for {}", row.id))?;
+                if updated {
+                    report.resigned.push(row.id.clone());
+                    if row.enabled {
+                        report.repaired.push(row.id.clone());
+                    } else {
+                        report.activated.push(row.id.clone());
+                    }
+                }
+            }
+            // Pre-L1-6 posture: no seed row is operator-signed and no
+            // operator pubkey is resolved, so the plain flip is the
+            // honest write — unsigned-enabled rows are enforced here.
+            // `!row.enabled` is structurally guaranteed on this arm (an
+            // enabled row IS enforced in that posture); asserting it
+            // keeps `activated` honest — "flipped 0 -> 1" — if a future
+            // change ever widens the arm, and leaves any such row to the
+            // post-run verification below rather than mis-reporting it.
+            (None, false) if !row.enabled => {
+                if rules_store::set_enabled(&conn, &row.id, true)
+                    .with_context(|| format!("install-defaults: enable {}", row.id))?
+                {
+                    report.activated.push(row.id.clone());
+                }
+            }
+            (None, false) => {}
         }
-        let affected = conn
-            .execute(
-                "UPDATE governance_rules SET enabled = 1 WHERE id = ?1 AND enabled = 0",
-                params![row.id],
-            )
-            .with_context(|| format!("install-defaults: UPDATE enabled=1 for {}", row.id))?;
-        if affected > 0 {
-            report.activated.push(row.id.clone());
+    }
+
+    // v1.0.0 #3430 — report the REAL post-state. Re-read every seed row
+    // and re-derive enforcement from signature validity, so the summary
+    // can never again claim "Activated 4" over four inert rows.
+    for id in SEED_RULE_IDS {
+        let Some(row) = rules_store::get(&conn, id).with_context(|| {
+            format!("install-defaults: re-read seed rule {id} for verification")
+        })?
+        else {
+            continue;
+        };
+        let state = rules_store::enforcement_state(&row, operator_pubkey.as_ref());
+        if state.is_enforced() {
+            report.enforced.push(row.id);
+        } else {
+            report.not_enforced.push(InertSeedRule {
+                id: row.id,
+                enforcement_state: state.as_str(),
+            });
         }
     }
 
@@ -227,60 +385,75 @@ pub fn run(
         if !report.missing.is_empty() {
             writeln!(out.stdout, "  missing:   {}", report.missing.join(", "))?;
         }
+        // v1.0.0 #3430 — the honest bottom line: what the ENGINE will
+        // evaluate, not what the `enabled` column says.
+        writeln!(
+            out.stdout,
+            "Enforcement (real state, verified against the operator signature): \
+             {} enforced, {} inert.",
+            report.enforced.len(),
+            report.not_enforced.len(),
+        )?;
+        if !report.resigned.is_empty() {
+            writeln!(out.stdout, "  re-signed: {}", report.resigned.join(", "))?;
+        }
+        if !report.repaired.is_empty() {
+            writeln!(
+                out.stdout,
+                "  repaired:  {} (were enabled but INERT on entry)",
+                report.repaired.join(", ")
+            )?;
+        }
+        for inert in &report.not_enforced {
+            writeln!(
+                out.stdout,
+                "  NOT ENFORCED: {} ({})",
+                inert.id, inert.enforcement_state
+            )?;
+        }
+    }
+
+    // v1.0.0 #3430 — fail loudly rather than let a script believe the
+    // seed ruleset is live. The report above has already been written
+    // (JSON envelope included) so the operator sees WHICH rows are dead
+    // and why; the non-zero exit is what stops a bootstrap pipeline.
+    if !report.not_enforced.is_empty() {
+        let detail: Vec<String> = report
+            .not_enforced
+            .iter()
+            .map(|r| format!("{} ({})", r.id, r.enforcement_state))
+            .collect();
+        anyhow::bail!(
+            "governance install-defaults: refused to report success (#3430) — the following \
+             seed rule(s) are enabled but the L1-6 load gate will SILENTLY DROP them, so they \
+             enforce nothing: {}. Re-run `ai-memory rules sign-seed --key <path>` with the key \
+             whose public half the substrate resolves, then re-run install-defaults.",
+            detail.join(", "),
+        );
     }
     Ok(())
 }
 
-/// Snapshot of one row from `governance_rules` for the preview block.
-struct SeedRuleRow {
-    id: String,
-    kind: String,
-    matcher: String,
-    severity: String,
-    enabled: bool,
-    /// v0.7.0 #1042 — attest_level needed for the operator-pubkey
-    /// pre-flight check (see `run()` body). When pubkey is
-    /// resolved, only `operator_signed` rows pass
-    /// `enforced_rule_passes()`; activating an unsigned seed row
-    /// would silently fail enforcement.
-    attest_level: String,
-}
-
-fn load_seed_row(conn: &rusqlite::Connection, id: &str) -> Result<Option<SeedRuleRow>> {
-    use rusqlite::OptionalExtension;
-    conn.query_row(
-        "SELECT id, kind, matcher, severity, enabled, attest_level \
-         FROM governance_rules WHERE id = ?1",
-        params![id],
-        |r| {
-            Ok(SeedRuleRow {
-                id: r.get::<_, String>(0)?,
-                kind: r.get::<_, String>(1)?,
-                matcher: r.get::<_, String>(2)?,
-                severity: r.get::<_, String>(3)?,
-                enabled: r.get::<_, i64>(4)? != 0,
-                attest_level: r.get::<_, String>(5)?,
-            })
-        },
-    )
-    .optional()
-    .with_context(|| format!("install-defaults: SELECT governance_rules id={id}"))
-}
-
 fn render_preview(
     out: &mut CliOutput<'_>,
-    preview: &[SeedRuleRow],
+    preview: &[Rule],
     missing: &[String],
+    operator_pubkey: Option<&ed25519_dalek::VerifyingKey>,
 ) -> Result<()> {
     writeln!(
         out.stdout,
         "The following seed rules will be enabled (R001-R004):"
     )?;
     for row in preview {
-        let state = if row.enabled {
-            "already-on"
-        } else {
-            "will-enable"
+        // v1.0.0 #3430 — the preview reports the REAL entry state. An
+        // `already-on` row whose signature no longer verifies is INERT,
+        // not on; saying "already-on" there is the lie this issue is
+        // about.
+        let state = match rules_store::enforcement_state(row, operator_pubkey) {
+            RuleEnforcement::Disabled => "will-enable",
+            RuleEnforcement::Enforced => "already-on",
+            RuleEnforcement::SkippedUnsigned => "inert-unsigned/will-repair",
+            RuleEnforcement::SkippedSignatureInvalid => "inert-badsig/will-repair",
         };
         writeln!(
             out.stdout,
@@ -320,6 +493,7 @@ fn confirm_proceed(out: &mut CliOutput<'_>) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     /// Seed `db_path` with the `governance_rules` table + the four
     /// seeded rows at `enabled = 0`. Avoids pulling in the full
@@ -368,6 +542,7 @@ mod tests {
         InstallDefaultsArgs {
             yes: true,
             json: false,
+            key_dir: None,
         }
     }
 
@@ -530,6 +705,98 @@ mod tests {
         assert!(stdout.contains("4 already-enabled"));
     }
 
+    /// v1.0.0 #3430 — the human summary must state the REAL enforcement
+    /// posture, not just the raw `enabled` counts.
+    #[test]
+    fn install_defaults_human_render_states_real_enforcement_3430() {
+        let _g = env_lock();
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let (_dir, db_path) = fresh_db();
+
+        let mut so = Vec::<u8>::new();
+        let mut se = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        run(&db_path, yes_args(), &mut out).unwrap();
+        drop(out);
+
+        let stdout = String::from_utf8(so).unwrap();
+        assert!(stdout.contains("Activated 4 rule(s)"), "got: {stdout}");
+        assert!(
+            stdout.contains(
+                "Enforcement (real state, verified against the operator signature): \
+                             4 enforced, 0 inert."
+            ),
+            "#3430: the summary must report the engine's verdict; got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("NOT ENFORCED"),
+            "no rule is inert in the pre-L1-6 posture; got: {stdout}"
+        );
+    }
+
+    /// v1.0.0 #3430 — the JSON envelope carries the enforcement lists so
+    /// a bootstrap script can gate on them.
+    #[test]
+    fn install_defaults_json_envelope_carries_enforcement_lists_3430() {
+        let _g = env_lock();
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let (_dir, db_path) = fresh_db();
+        let mut so = Vec::<u8>::new();
+        let mut se = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        run(
+            &db_path,
+            InstallDefaultsArgs {
+                yes: true,
+                json: true,
+                key_dir: None,
+            },
+            &mut out,
+        )
+        .unwrap();
+        drop(out);
+        let v: serde_json::Value =
+            serde_json::from_str(String::from_utf8(so).unwrap().trim()).expect("JSON envelope");
+        let result = &v["result"];
+        assert_eq!(result["enforced"].as_array().unwrap().len(), 4);
+        assert!(result["not_enforced"].as_array().unwrap().is_empty());
+        // Pre-L1-6 posture: no operator key was needed, so nothing was
+        // re-signed and nothing was repaired.
+        assert!(result["resigned"].as_array().unwrap().is_empty());
+        assert!(result["repaired"].as_array().unwrap().is_empty());
+    }
+
+    /// v1.0.0 #3430 — `render_preview` must not call an inert row
+    /// "already-on". Pre-#3430 an enabled row whose signature no longer
+    /// verified rendered exactly like a healthy one.
+    #[test]
+    fn render_preview_flags_an_enabled_but_inert_row_3430() {
+        use ed25519_dalek::Signer;
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let pk = signing.verifying_key();
+
+        // Sign R001 while disabled, then flip `enabled` beneath the
+        // signature — the exact pre-#3430 corruption.
+        let mut row = preview_rule("R001", r#"{"glob":"/tmp/**"}"#, false);
+        row.attest_level = "operator_signed".into();
+        let canonical = rules_store::canonical_bytes_for_signing(&row).unwrap();
+        row.signature = Some(signing.sign(&canonical).to_bytes().to_vec());
+        row.enabled = true;
+
+        let mut so = Vec::<u8>::new();
+        let mut se = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        render_preview(&mut out, std::slice::from_ref(&row), &[], Some(&pk)).unwrap();
+        drop(out);
+        let stdout = String::from_utf8(so).unwrap();
+        assert!(
+            stdout.contains("inert-badsig/will-repair"),
+            "#3430: preview must not claim an inert row is already-on; got: {stdout}"
+        );
+        assert!(!stdout.contains("already-on"), "got: {stdout}");
+    }
+
     #[test]
     fn install_defaults_reports_missing_rows() {
         let _g = env_lock();
@@ -567,6 +834,7 @@ mod tests {
             InstallDefaultsArgs {
                 yes: true,
                 json: true,
+                key_dir: None,
             },
             &mut out,
         )
@@ -590,6 +858,7 @@ mod tests {
             InstallDefaultsArgs {
                 yes: false,
                 json: true,
+                key_dir: None,
             },
             &mut out,
         )
@@ -606,32 +875,37 @@ mod tests {
     // the original 6 tests did not cover.
     // ------------------------------------------------------------------
 
+    /// Build a preview-shaped [`Rule`] without touching SQLite.
+    fn preview_rule(id: &str, matcher: &str, enabled: bool) -> Rule {
+        Rule {
+            id: id.into(),
+            kind: "filesystem_write".into(),
+            matcher: matcher.into(),
+            severity: "refuse".into(),
+            reason: "seed".into(),
+            namespace: "_global".into(),
+            created_by: "system:seed".into(),
+            created_at: 0,
+            enabled,
+            signature: None,
+            attest_level: "unsigned".into(),
+        }
+    }
+
     #[test]
     fn render_preview_emits_one_row_per_seeded_rule() {
         let preview = vec![
-            SeedRuleRow {
-                id: "R001".into(),
-                kind: "filesystem_write".into(),
-                matcher: r#"{"glob":"/tmp/**"}"#.into(),
-                severity: "refuse".into(),
-                enabled: false,
-                attest_level: "unsigned".into(),
-            },
-            SeedRuleRow {
-                id: "R002".into(),
-                kind: "filesystem_write".into(),
-                matcher: r#"{"glob":"/var/tmp/**"}"#.into(),
-                severity: "refuse".into(),
-                enabled: true,
-                attest_level: "unsigned".into(),
-            },
+            preview_rule("R001", r#"{"glob":"/tmp/**"}"#, false),
+            preview_rule("R002", r#"{"glob":"/var/tmp/**"}"#, true),
         ];
         let missing: Vec<String> = vec![];
 
         let mut so = Vec::<u8>::new();
         let mut se = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut so, &mut se);
-        render_preview(&mut out, &preview, &missing).unwrap();
+        // No operator pubkey resolved -> pre-L1-6 posture, so the
+        // enabled row renders `already-on` exactly as before #3430.
+        render_preview(&mut out, &preview, &missing, None).unwrap();
         drop(out);
         let stdout = String::from_utf8(so).unwrap();
         // Header line is present.
@@ -649,13 +923,13 @@ mod tests {
 
     #[test]
     fn render_preview_emits_warning_block_when_missing_present() {
-        let preview: Vec<SeedRuleRow> = vec![];
+        let preview: Vec<Rule> = vec![];
         let missing = vec!["R003".to_string(), "R004".to_string()];
 
         let mut so = Vec::<u8>::new();
         let mut se = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut so, &mut se);
-        render_preview(&mut out, &preview, &missing).unwrap();
+        render_preview(&mut out, &preview, &missing, None).unwrap();
         drop(out);
         let stdout = String::from_utf8(so).unwrap();
         // Warning + remediation lines fire.
@@ -666,23 +940,24 @@ mod tests {
     }
 
     #[test]
-    fn load_seed_row_returns_none_for_unknown_id() {
+    fn seed_row_load_returns_none_for_unknown_id() {
         let (_dir, db_path) = fresh_db();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let row = load_seed_row(&conn, "R999-nonexistent").unwrap();
+        let row = rules_store::get(&conn, "R999-nonexistent").unwrap();
         assert!(row.is_none());
     }
 
     #[test]
-    fn load_seed_row_returns_typed_row_with_disabled_default() {
+    fn seed_row_load_returns_typed_row_with_disabled_default() {
         let (_dir, db_path) = fresh_db();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let row = load_seed_row(&conn, "R001").unwrap();
+        let row = rules_store::get(&conn, "R001").unwrap();
         let row = row.expect("R001 seeded");
         assert_eq!(row.id, "R001");
         assert_eq!(row.kind, "filesystem_write");
         assert_eq!(row.severity, "refuse");
         assert!(!row.enabled, "seeded rows ship at enabled = 0");
+        assert_eq!(row.attest_level, "unsigned");
     }
 
     #[test]
@@ -736,6 +1011,7 @@ mod tests {
             InstallDefaultsArgs {
                 yes: true,
                 json: true,
+                key_dir: None,
             },
             &mut out,
         )

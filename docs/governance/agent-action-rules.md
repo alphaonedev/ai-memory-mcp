@@ -149,6 +149,31 @@ action it was written to block, with nothing in `rules list` to show it.
   through `rules add` in the first place. To disable enforcement, disable the
   rule (`ai-memory rules disable <id> --sign`); never rely on a broken matcher.
 
+### Real enforcement state (#3430)
+
+`enabled` is **not** the enforcement state. Once an operator pubkey is
+resolved, the L1-6 load gate drops every enabled row that is not
+`operator_signed`, or whose signature no longer verifies over the row's
+canonical bytes. Both `ai-memory rules list` and the MCP
+`memory_rule_list` tool therefore project two extra fields, computed by the
+SAME predicate the engine applies at load time:
+
+- **`enforced`** (bool) — the only honest answer to "is this rule live?".
+- **`enforcement_state`** (string) — why, when it is not:
+  - `enforced` — the engine evaluates this rule.
+  - `disabled` — `enabled = 0`; never loaded.
+  - `skipped_unsigned` — enabled, pubkey resolved, `attest_level` is not
+    `operator_signed`. Run `ai-memory rules sign-seed --key <path>`.
+  - `skipped_signature_invalid` — enabled and `operator_signed`, but the
+    signature does not verify: the row was mutated after signing (a
+    direct `UPDATE governance_rules SET enabled = 1`, a tampered row, or
+    the wrong operator key). Re-sign, after audit.
+
+`ai-memory doctor` reports the same posture in its **Governance**
+section — `l1_6_attest_active`, `rules_total`, `rules_enabled`,
+`rules_enforced` and `rules_enabled_but_inert` — and raises a WARNING
+whenever an enabled rule enforces nothing.
+
 ## Seed rules (land at `enabled=0`)
 
 | ID   | Kind               | Matcher                                            | Why                                                              |
@@ -179,9 +204,43 @@ ai-memory governance install-defaults --yes     # for CI / scripts
 ai-memory governance install-defaults --yes --json
 ```
 
-Flips `enabled = 1` on every present seed row; does NOT touch the
-`signature` column. Outputs `activated`, `already_enabled`, and
-`missing` lists so the operator can verify migration 0024 landed.
+Enables every present seed row **through the signed-mutation path**
+([#3430](https://github.com/alphaonedev/ai-memory-mcp/issues/3430)).
+When a seed row is `attest_level = operator_signed` — i.e. the operator
+already ran `rules sign-seed` — the activation goes through
+`rules_store::set_enabled_signed`, which flips `enabled`, re-signs the
+canonical bytes over the POST-state, appends the operator-signed audit
+row and advances the policy version in ONE transaction. If the operator
+key cannot be loaded (`--key-dir` / `AI_MEMORY_KEY_DIR`), the verb
+**refuses before any write** rather than leaving a signature that no
+longer verifies. Rows that are still `unsigned` on a node with no
+operator pubkey resolved (the pre-L1-6 bootstrap posture) keep the plain
+flip — they are enforced there without a signature check.
+
+Before #3430 this verb issued a raw `UPDATE governance_rules SET
+enabled = 1` that did not touch the `signature` column, so the
+documented ceremony `rules sign-seed` → `install-defaults` produced four
+**silently inert** rules: every signature stopped verifying, the L1-6
+load gate dropped all four rows, and `rules check` answered `allow`
+while the CLI reported them active.
+
+Outputs `activated`, `already_enabled` and `missing` lists so the
+operator can verify migration 0024 landed, plus the #3430 enforcement
+lists: `resigned`, `repaired` (rows that were enabled-but-inert on entry
+and were self-healed), `enforced` (what the engine will ACTUALLY
+evaluate, derived from signature validity) and `not_enforced`
+(`[{ "id", "enforcement_state" }]`). A non-empty `not_enforced` is a
+hard failure — the verb prints the report and exits non-zero rather than
+claiming the ruleset is live.
+
+The ceremony order does not matter any more; both of these end with four
+enforcing rules:
+
+```bash
+ai-memory rules keygen
+ai-memory rules sign-seed --key ~/.config/ai-memory/keys/operator.key
+ai-memory governance install-defaults --yes
+```
 
 **Per-rule activation (re-signs the row with the operator key):**
 

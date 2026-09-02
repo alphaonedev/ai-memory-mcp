@@ -5992,6 +5992,53 @@ pub async fn bootstrap_serve(
         }
     }
 
+    // v1.0.0 #3430 — the OTHER half of the SEC-2 story: a pubkey IS
+    // resolved, rules ARE enabled, and yet the L1-6 load gate drops
+    // every one of them (unsigned rows, or — the #3430 shape — signed
+    // rows whose `enabled` was flipped beneath the signature by a raw
+    // `UPDATE`). The block above stays silent there because a pubkey is
+    // present, so the daemon used to boot with a ruleset the operator
+    // believes is live while it enforces NOTHING. Name it at boot.
+    // Diagnostic only: a dead rule is a degraded posture, not a reason
+    // to refuse to start, and `ai-memory doctor` carries the same facts.
+    if enabled_rule_count > 0 && pubkey_resolved {
+        let operator_pubkey = crate::governance::rules_store::resolve_operator_pubkey();
+        match crate::governance::rules_store::list(&conn) {
+            Ok(rules) => {
+                let inert: Vec<String> = rules
+                    .into_iter()
+                    .filter(|r| r.enabled)
+                    .filter_map(|r| {
+                        let state = crate::governance::rules_store::enforcement_state(
+                            &r,
+                            operator_pubkey.as_ref(),
+                        );
+                        (!state.is_enforced()).then(|| format!("{}({})", r.id, state.as_str()))
+                    })
+                    .collect();
+                if !inert.is_empty() {
+                    tracing::warn!(
+                        inert_rules = %inert.join(","),
+                        enabled_rule_count,
+                        "L1-6 #3430: enabled governance rule(s) are DROPPED by the load gate \
+                         and enforce nothing. Re-sign with `ai-memory rules sign-seed --key \
+                         <path>` (or re-run `ai-memory governance install-defaults`, which \
+                         re-signs the post-state) using the key whose public half this node \
+                         resolves. `ai-memory doctor` reports the same posture."
+                    );
+                }
+            }
+            // Never swallow the read failure: a silent `unwrap_or_default`
+            // here would report "no inert rules" for a table we could not
+            // read, which is the exact class of lie #3430 is about.
+            Err(e) => tracing::warn!(
+                error = %e,
+                "L1-6 #3430: could not audit rule enforcement posture at boot; run \
+                 `ai-memory doctor` to check whether any enabled rule is inert"
+            ),
+        }
+    }
+
     // v0.7.0 L1-6 Deliverable E (issue #691) — install the substrate
     // governance pre-write hook BEFORE any write paths come live. The
     // hook consults the operator-signed `governance_rules` table for

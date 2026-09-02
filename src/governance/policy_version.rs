@@ -387,7 +387,20 @@ mod tests {
 
         // Mutate a rule OUTSIDE the signed path — the advisory check must
         // detect the drift (advisory only; returns false, does not error).
-        rules_store::set_enabled(&conn, "R1", true).unwrap();
+        //
+        // v1.0.0 #3430 — `rules_store::set_enabled` now REFUSES to flip
+        // `enabled` on an operator_signed row (the flip would invalidate
+        // the signature and leave the rule silently inert), and the row
+        // is operator_signed after `set_enabled_signed` above. Raw SQL
+        // is the honest way to stage the out-of-band mutation this test
+        // is about: it simulates an attacker / a stray script writing
+        // the table directly, which is exactly what the advisory digest
+        // check exists to detect.
+        conn.execute(
+            "UPDATE governance_rules SET enabled = 1 WHERE id = 'R1'",
+            [],
+        )
+        .unwrap();
         assert!(
             !verify_policy_digest_advisory(&conn).unwrap(),
             "out-of-band mutation must be detected as drift"
