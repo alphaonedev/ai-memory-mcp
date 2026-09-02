@@ -3872,6 +3872,54 @@ pub fn update_with_expected_version(
         metadata,
     )?;
     let metadata = metadata.unwrap_or(&existing.metadata);
+    // #3420 (security-high) — reconcile the row's ATTESTATION with the signed
+    // envelope this update is about to write. `PUT /memories/{id}` (and the MCP
+    // / CLI twins, which all funnel here) can rewrite `title`, `content` and
+    // `namespace` — all INSIDE the signed `SignableWrite` envelope — while
+    // #3015 preserves `metadata.attest_level` / `metadata.write_signature`
+    // across the patch. The combination persisted a row asserting
+    // `agent_attested` beside a signature that can never again be re-derived
+    // from it: unverifiable by construction, yet believed by every trust
+    // surface that reads `attest_level`. The shared entitlement funnel keeps
+    // the stored attestation while the envelope is intact, drops it to
+    // `claimed` (signature removed) when the envelope is rewritten, and never
+    // lets an update MINT one from caller-supplied metadata. `created_at` /
+    // `kind` / `agent_id` are not patchable on this in-place funnel, so they
+    // are the same on both sides — passed explicitly so the envelope field set
+    // is stated in full at the site.
+    let existing_agent_id = metadata_agent_id_slot(&existing.metadata).unwrap_or("");
+    let attest_entitled = crate::identity::attest::entitled_update_attestation(
+        &existing.metadata,
+        crate::identity::attest::SignedEnvelopeFields {
+            agent_id: existing_agent_id,
+            namespace: &existing.namespace,
+            title: &existing.title,
+            kind: existing.memory_kind.as_str(),
+            created_at: &existing.created_at,
+            content: &existing.content,
+        },
+        crate::identity::attest::SignedEnvelopeFields {
+            agent_id: existing_agent_id,
+            namespace,
+            title: new_title,
+            kind: existing.memory_kind.as_str(),
+            created_at: &existing.created_at,
+            content: new_content,
+        },
+    );
+    let attest_reconciled =
+        crate::identity::attest::apply_entitled_attestation(metadata, &attest_entitled);
+    if attest_reconciled.is_some() {
+        tracing::warn!(
+            target: "ai_memory::storage::update",
+            memory_id = %existing.id,
+            downgrade = attest_entitled.is_downgrade_from(&existing.metadata),
+            "update reconciled the row's attestation: the persisted \
+             attest_level/write_signature are the substrate-entitled pair for the \
+             post-update signed envelope, not the caller-supplied or stale ones (#3420)"
+        );
+    }
+    let metadata = attest_reconciled.as_ref().unwrap_or(metadata);
 
     // #1451 (SEC, HIGH) — substrate governance pre-write gate on the
     // optimistic-update path. The insert/supersede/consolidate/restore
@@ -4271,6 +4319,48 @@ pub fn update_with_archive_on_supersede(
             field_names::SUPERSEDED_ID.to_string(),
             serde_json::Value::String(existing.id.clone()),
         );
+    }
+    // #3420 — the SUPERSEDING row is a FRESH row: new id and, below, a fresh
+    // `created_at` (= `now`). `created_at` is inside the signed
+    // `SignableWrite` envelope, so a carried `write_signature` can NEVER
+    // re-derive from it — the entitlement funnel therefore always drops the
+    // attestation to `claimed` here, and never mints one from a caller-supplied
+    // patch. Stated through the SAME shared decision as the in-place funnel so
+    // the two can never drift.
+    {
+        let existing_agent_id = metadata_agent_id_slot(&existing.metadata).unwrap_or("");
+        let entitled = crate::identity::attest::entitled_update_attestation(
+            &existing.metadata,
+            crate::identity::attest::SignedEnvelopeFields {
+                agent_id: existing_agent_id,
+                namespace: &existing.namespace,
+                title: &existing.title,
+                kind: existing.memory_kind.as_str(),
+                created_at: &existing.created_at,
+                content: &existing.content,
+            },
+            crate::identity::attest::SignedEnvelopeFields {
+                agent_id: existing_agent_id,
+                namespace: &new_namespace,
+                title: &new_title,
+                kind: existing.memory_kind.as_str(),
+                created_at: &now,
+                content: &new_content,
+            },
+        );
+        if let Some(reconciled) =
+            crate::identity::attest::apply_entitled_attestation(&new_metadata, &entitled)
+        {
+            tracing::warn!(
+                target: "ai_memory::storage::update",
+                memory_id = %existing.id,
+                superseding_id = %new_id,
+                downgrade = entitled.is_downgrade_from(&existing.metadata),
+                "supersede reconciled the new row's attestation: a fresh created_at puts it \
+                 outside every signature the OLD row carried (#3420)"
+            );
+            new_metadata = reconciled;
+        }
     }
 
     // #1638 — archive + insert run inside ONE BEGIN IMMEDIATE (below),
