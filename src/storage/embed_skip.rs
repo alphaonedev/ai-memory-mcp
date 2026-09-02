@@ -430,8 +430,7 @@ mod tests {
             );",
         )
         .expect("stub memories");
-        conn.execute_batch(MIGRATION_V96_SQLITE)
-            .expect("v96 ddl");
+        conn.execute_batch(MIGRATION_V96_SQLITE).expect("v96 ddl");
         conn
     }
 
