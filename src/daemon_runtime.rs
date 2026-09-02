@@ -169,6 +169,110 @@ fn reject_url_shaped_db_path(db: &Path) -> Result<()> {
     Ok(())
 }
 
+/// v1.0.0 #3431 — resolve the ONE store this process binds to, before any
+/// file is opened or created.
+///
+/// Two defects share this control:
+///
+/// 1. **The mutual-exclusion guard fired on a flag nobody passed.** #3142's
+///    `--db` / `--store-url` refusal derived "the operator typed `--db`" from
+///    the RESOLVED path (`AI_MEMORY_DB is set || resolved != DEFAULT_DB`),
+///    which is also true for a path that came from `config.toml`. Every
+///    deployment whose config sets `db =` therefore could not run
+///    `serve --store-url …` at all: it aborted with
+///    `Got --db=<config path>`, naming a flag that was never on argv. The
+///    signal is now `db_was_explicit`, taken from `Option::is_some` on the
+///    parsed flag, so it is true only for argv / `AI_MEMORY_DB`.
+///
+/// 2. **A `sqlite://` store URL left a second store behind.**
+///    `serve --store-url sqlite://X` bound the SAL handle to `X` while the
+///    rest of the daemon (the boot `db::open`, the deferred-audit journal,
+///    the FTS integrity checker, the spawn-audit sink) kept using the
+///    unrelated default path — materialising and migrating a full
+///    `./ai-memory.db` next to `X`. That is a split-brain store: writes land
+///    in one file and the audit spine in another, which is exactly the
+///    silent wrong-store class the #2679 postgres refusal exists to prevent.
+///    When the operator named a sqlite store and did NOT name a `--db`, the
+///    local path IS that store.
+///
+/// A `postgres://` URL leaves `db_path` alone: a pg daemon deliberately keeps
+/// a local sqlite sidecar (see `bootstrap_serve`), and #2679 already refuses
+/// a pg URL that this binary cannot open.
+///
+/// Commands that do not take `--store-url` pass through untouched.
+///
+/// # Errors
+/// Returns the #3142 mutual-exclusion refusal when `--db` (argv /
+/// `AI_MEMORY_DB`) and `--store-url` (argv) were BOTH supplied, and any
+/// store-URL channel resolution error from [`resolve_store_url`] (e.g. a
+/// lax-permission `AI_MEMORY_STORE_URL_FILE`) — fail-closed, never a silent
+/// fallback to the local path.
+fn resolve_store_binding(
+    db_was_explicit: bool,
+    command: &Command,
+    db_path: PathBuf,
+) -> Result<PathBuf> {
+    if !command.binds_store_url() {
+        return Ok(db_path);
+    }
+    let cli_store_url = command.store_url_arg();
+    if let Some(url) = cli_store_url {
+        if db_was_explicit {
+            // #1579 A3 (SECURITY) — redact the URL credential before it
+            // lands in the error output.
+            anyhow::bail!(
+                "--db and --store-url are mutually exclusive. \
+                 Pass exactly one. Got --db={} and --store-url={}",
+                db_path.display(),
+                crate::logging::redact_url_password(url),
+            );
+        }
+    }
+    // The FULL channel ladder (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL`
+    // > argv), identical to the one `build_store_handle` binds the SAL handle
+    // from — so the local path and the store handle can never disagree.
+    let Some(url) = resolve_store_url(cli_store_url)? else {
+        return Ok(db_path);
+    };
+    if db_was_explicit {
+        // An explicit `--db` alongside a store URL that came from the ENV
+        // channels only (no `--store-url` on argv, so no #3142 refusal above)
+        // keeps its historical meaning: the operator's `--db` wins for the
+        // local path.
+        return Ok(db_path);
+    }
+    Ok(sqlite_store_url_to_path(&url).map_or(db_path, PathBuf::from))
+}
+
+impl Command {
+    /// v1.0.0 #3431 — true for the subcommands whose documented contract is
+    /// "`--db` and `--store-url` are mutually exclusive", i.e. the ones that
+    /// bind the process's whole store from `--store-url`.
+    ///
+    /// `verify-audit-trail` and `audit bootstrap-node` also accept a
+    /// `--store-url`, but theirs is a per-invocation TARGET override that
+    /// coexists with `--db` (the fallback when no URL resolves), so they are
+    /// deliberately NOT here — binding their local path to the URL would
+    /// refuse operator workflows that legitimately pass both.
+    const fn binds_store_url(&self) -> bool {
+        matches!(self, Command::Serve(_) | Command::Curator(_))
+    }
+
+    /// The `--store-url` value as typed on argv, for a command that
+    /// [`Command::binds_store_url`]. `None` on a build without
+    /// `--features sal` (the flag does not exist there) — the environment
+    /// channels are still resolved by [`resolve_store_binding`].
+    fn store_url_arg(&self) -> Option<&str> {
+        match self {
+            #[cfg(feature = "sal")]
+            Command::Serve(a) => a.store_url.as_deref(),
+            #[cfg(feature = "sal")]
+            Command::Curator(a) => a.store_url.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "ai-memory",
@@ -178,8 +282,23 @@ fn reject_url_shaped_db_path(db: &Path) -> Result<()> {
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
-    #[arg(long, env = "AI_MEMORY_DB", default_value = DEFAULT_DB, global = true)]
-    pub db: PathBuf,
+    /// Path to the SQLite database file. Unset means "not explicitly
+    /// chosen": the store then resolves from `[db]` in `config.toml`, and
+    /// failing that the relative `ai-memory.db` ([`DEFAULT_DB`]).
+    ///
+    /// v1.0.0 #3431 — this is deliberately an `Option` with NO clap
+    /// `default_value`. The flag previously defaulted to the `DEFAULT_DB`
+    /// literal, which erased the difference between "the operator typed
+    /// `--db`" and "nobody passed one", so every consumer that needed
+    /// explicit-intent had to guess it back (`AI_MEMORY_DB is set || the
+    /// resolved path != DEFAULT_DB`) — and that guess mistook a
+    /// CONFIG-resolved path for an operator-typed flag, making
+    /// `serve --store-url` unreachable on any deployment whose config.toml
+    /// sets `db =`. `Some` here means the value came from argv or
+    /// `AI_MEMORY_DB` and NOTHING ELSE, so explicitness is structural
+    /// rather than inferred.
+    #[arg(long, env = "AI_MEMORY_DB", global = true)]
+    pub db: Option<PathBuf>,
     /// Output as JSON (machine-parseable)
     #[arg(long, global = true, default_value_t = false)]
     pub json: bool,
@@ -1235,8 +1354,22 @@ pub async fn run(
     // before `effective_db` resolves it or any store is opened, so a
     // `--db postgres://…` never silently creates a SQLite file named after
     // the URL. See [`reject_url_shaped_db_path`].
-    reject_url_shaped_db_path(&cli.db)?;
-    let db_path = app_config.effective_db(&cli.db);
+    // #3431 — explicit operator intent is now STRUCTURAL: `cli.db` is `Some`
+    // if and only if the value came from argv or `AI_MEMORY_DB`. Captured
+    // BEFORE the dispatch match so the `--db` / `--store-url` mutual-exclusion
+    // guard can no longer mistake a config-resolved path for a typed flag.
+    let db_was_explicit = cli.db.is_some();
+    if let Some(db) = cli.db.as_deref() {
+        reject_url_shaped_db_path(db)?;
+    }
+    let db_path = app_config.effective_db_explicit(cli.db.as_deref());
+    // #3431 — bind the ONE store this process runs on, before anything opens
+    // or creates a file. On a `--store-url` command this both enforces the
+    // #3142 mutual exclusion (with the corrected explicitness signal) and
+    // points the local sqlite path AT the store URL when that URL is
+    // `sqlite://…`, so the daemon can never run half on the named store and
+    // half on a second, silently-created `./ai-memory.db`.
+    let db_path = resolve_store_binding(db_was_explicit, &cli.command, db_path)?;
     // #1937 V08-PE-3 — seed the process-wide audit DB path for the best-effort
     // spawn-audit chokepoint (`crate::spawn_audit`). Every serve / mcp / CLI
     // subcommand dispatches through this fn, so every production `Command`
@@ -1555,34 +1688,9 @@ pub async fn run(
 
     let result = match cli.command {
         Command::Serve(a) => {
-            // v0.7.0 Wave-3 — `--db` and `--store-url` are mutually
-            // exclusive when both are explicitly supplied. clap can't
-            // express this conflict cross-struct (the global `--db`
-            // lives on `Cli`, the new `--store-url` lives on
-            // `ServeArgs`), so the check happens here at runtime.
-            //
-            // `--db` carries a non-`None` `default_value`, so we can't
-            // tell from the parsed value alone whether the operator
-            // typed it on the command line. We approximate explicit
-            // intent through the `AI_MEMORY_DB` env var (which clap
-            // resolves into the same field) and a non-default path.
-            // When both signals indicate `--db` was deliberate AND
-            // `--store-url` is set, refuse to start.
-            #[cfg(feature = "sal")]
-            if let Some(ref url) = a.store_url {
-                let db_was_explicit =
-                    std::env::var("AI_MEMORY_DB").is_ok() || db_path != PathBuf::from(DEFAULT_DB);
-                if db_was_explicit {
-                    // #1579 A3 (SECURITY) — redact the URL credential
-                    // before it lands in the error output.
-                    anyhow::bail!(
-                        "--db and --store-url are mutually exclusive. \
-                         Pass exactly one. Got --db={} and --store-url={}",
-                        db_path.display(),
-                        crate::logging::redact_url_password(url),
-                    );
-                }
-            }
+            // #3142's `--db` / `--store-url` mutual exclusion, and the
+            // sqlite store-URL binding, are enforced once for every
+            // store-URL command in `resolve_store_binding` above.
             serve(db_path, a, app_config).await
         }
         Command::Mcp { tier, profile } => {
@@ -2081,27 +2189,9 @@ pub async fn run(
             cli::backup::run_restore(&db_path, &a, j, &mut out)
         }
         Command::Curator(a) => {
-            // v0.7.0 #1548 — `--db` and `--store-url` are mutually
-            // exclusive when both are explicitly supplied, mirroring the
-            // `serve` arm above. The global `--db` carries a non-`None`
-            // `default_value`, so we approximate explicit operator
-            // intent through the `AI_MEMORY_DB` env var (which clap
-            // resolves into the same field) or a non-default path.
-            #[cfg(feature = "sal")]
-            if let Some(ref url) = a.store_url {
-                let db_was_explicit =
-                    std::env::var("AI_MEMORY_DB").is_ok() || db_path != PathBuf::from(DEFAULT_DB);
-                if db_was_explicit {
-                    // #1579 A3 (SECURITY) — redact the URL credential
-                    // before it lands in the error output.
-                    anyhow::bail!(
-                        "--db and --store-url are mutually exclusive. \
-                         Pass exactly one. Got --db={} and --store-url={}",
-                        db_path.display(),
-                        crate::logging::redact_url_password(url),
-                    );
-                }
-            }
+            // v0.7.0 #1548 — the `--db` / `--store-url` mutual exclusion
+            // (and the sqlite store-URL binding) is enforced once for every
+            // store-URL command in `resolve_store_binding` above.
             // Initialize the tracing subscriber so the daemon-start
             // banner and per-cycle `tracing::info!` lines in
             // `curator::run_daemon` actually emit. Previously only the
@@ -13571,6 +13661,164 @@ decision = "allow"
             sqlite_store_url_to_path("sqlite://relative.db"),
             Some("relative.db")
         );
+    }
+
+    // ===========================================================================
+    // v1.0.0 #3431 — one store binding, resolved from PARSER explicitness
+    // ===========================================================================
+
+    /// Clear the store-URL environment channels AND `AI_MEMORY_DB` so the
+    /// argv under test is the only signal. Caller must hold
+    /// `store_url_env_lock`, which serialises every one of these tests
+    /// (`AI_MEMORY_DB` is read by clap through the same `Cli` parse, so it
+    /// rides the same lock rather than a second one that could interleave).
+    fn clear_store_url_env_3431() {
+        // SAFETY: every store-url env test serialises on `store_url_env_lock`,
+        // which the caller holds for the whole test body.
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(STORE_URL_FILE_ENV);
+            std::env::remove_var("AI_MEMORY_DB");
+        }
+    }
+
+    fn command_of_3431(argv: &[&str]) -> (bool, Command) {
+        let cli = Cli::try_parse_from(argv).expect("clap parses the argv under test");
+        (cli.db.is_some(), cli.command)
+    }
+
+    /// The parser is now the SOLE source of `--db` explicitness: absent flag
+    /// and absent env parse to `None`, and a config-resolved path can never
+    /// masquerade as a typed flag because it never reaches `Cli::db`.
+    #[test]
+    fn cli_db_is_none_when_neither_flag_nor_env_supplied_3431() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_store_url_env_3431();
+        let cli = Cli::try_parse_from(["ai-memory", "stats"]).expect("parse");
+        assert_eq!(cli.db, None, "no --db, no AI_MEMORY_DB => None (#3431)");
+        let typed = Cli::try_parse_from(["ai-memory", "--db", "/x.db", "stats"]).expect("parse");
+        assert_eq!(typed.db.as_deref(), Some(Path::new("/x.db")));
+        // SAFETY: serialised by the store-url env lock held above.
+        unsafe { std::env::set_var("AI_MEMORY_DB", "/from/env.db") };
+        let from_env = Cli::try_parse_from(["ai-memory", "stats"]).expect("parse");
+        assert_eq!(
+            from_env.db.as_deref(),
+            Some(Path::new("/from/env.db")),
+            "AI_MEMORY_DB is an EXPLICIT channel and must parse to Some"
+        );
+        clear_store_url_env_3431();
+    }
+
+    /// A command with no `--store-url` surface passes through untouched — the
+    /// binding never rewrites a path it was not asked to.
+    #[test]
+    fn resolve_store_binding_passes_through_non_store_url_commands_3431() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_store_url_env_3431();
+        let (explicit, command) = command_of_3431(&["ai-memory", "--db", "/kept.db", "stats"]);
+        assert!(explicit, "--db on argv is explicit");
+        let out = resolve_store_binding(explicit, &command, PathBuf::from("/kept.db"))
+            .expect("no store-url surface => no binding");
+        assert_eq!(out, PathBuf::from("/kept.db"));
+    }
+
+    /// The #3431 ALLOWED path: no `--db` on argv or in the env (a
+    /// config-resolved `db_path` is the caller's input here, exactly as
+    /// `run` computes it) plus a `sqlite://` store URL binds the LOCAL path to
+    /// that store — so the daemon cannot run half on the named store and half
+    /// on a second, silently created one.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_store_binding_binds_sqlite_store_url_when_db_not_explicit_3431() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_store_url_env_3431();
+        let (explicit, command) = command_of_3431(&[
+            "ai-memory",
+            "serve",
+            "--store-url",
+            "sqlite:///var/lib/ai-memory/named.db",
+        ]);
+        assert!(!explicit, "no --db was typed");
+        let from_config = PathBuf::from("/etc/ai-memory/from-config.db");
+        let out = resolve_store_binding(explicit, &command, from_config)
+            .expect("a config-resolved db must NOT block --store-url");
+        assert_eq!(
+            out,
+            PathBuf::from("/var/lib/ai-memory/named.db"),
+            "the sqlite store URL binds the local path (#3431)"
+        );
+    }
+
+    /// A `postgres://` store URL leaves the local sqlite path alone: a pg
+    /// daemon deliberately keeps a local sidecar, and #2679 already refuses a
+    /// pg URL this binary cannot open.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_store_binding_keeps_local_path_for_postgres_url_3431() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_store_url_env_3431();
+        let (explicit, command) =
+            command_of_3431(&["ai-memory", "serve", "--store-url", "postgres://h/mem"]);
+        let out = resolve_store_binding(explicit, &command, PathBuf::from("/local/sidecar.db"))
+            .expect("pg url leaves the sidecar path alone");
+        assert_eq!(out, PathBuf::from("/local/sidecar.db"));
+    }
+
+    /// The #3431 DENIED path: #3142's refusal survives verbatim for the
+    /// genuinely-both case (a typed `--db` AND a typed `--store-url`), still
+    /// redacting the URL credential (#1579 A3).
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_store_binding_refuses_typed_db_and_typed_store_url_3431() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_store_url_env_3431();
+        let (explicit, command) = command_of_3431(&[
+            "ai-memory",
+            "--db",
+            "/typed.db",
+            "serve",
+            "--store-url",
+            "postgres://operator:secretpw@h/mem",
+        ]);
+        assert!(explicit, "--db on argv is explicit");
+        let err = resolve_store_binding(explicit, &command, PathBuf::from("/typed.db"))
+            .expect_err("both flags must refuse")
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+        assert!(err.contains("/typed.db"), "must name the --db: {err}");
+        assert!(
+            !err.contains("secretpw"),
+            "credential must be redacted: {err}"
+        );
+    }
+
+    /// The env channel is NOT the `--store-url` flag: an explicit `--db`
+    /// alongside `AI_MEMORY_STORE_URL` keeps its historical meaning (the
+    /// typed `--db` wins for the local path) rather than newly refusing a
+    /// working deployment.
+    #[test]
+    fn resolve_store_binding_env_url_with_typed_db_keeps_the_typed_db_3431() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_store_url_env_3431();
+        // SAFETY: serialised by the store-url env lock held above.
+        unsafe { std::env::set_var(STORE_URL_ENV, "sqlite:///from/env.db") };
+        let (explicit, command) = command_of_3431(&["ai-memory", "--db", "/typed.db", "curator"]);
+        let out = resolve_store_binding(explicit, &command, PathBuf::from("/typed.db"))
+            .expect("env url + typed --db is not the #3142 both-flags case");
+        clear_store_url_env_3431();
+        assert_eq!(out, PathBuf::from("/typed.db"));
     }
 
     #[tokio::test]

@@ -150,7 +150,7 @@ fn test_cli_flag_overrides_env() {
 
     assert_eq!(
         cli.db,
-        PathBuf::from("/a.db"),
+        Some(PathBuf::from("/a.db")),
         "CLI flag MUST override AI_MEMORY_DB env var; clap resolved {:?}",
         cli.db,
     );
@@ -163,7 +163,7 @@ fn test_cli_flag_overrides_env() {
         Cli::try_parse_from(["ai-memory", "stats"]).expect("clap parse must succeed (env-only)");
     assert_eq!(
         cli_env_only.db,
-        PathBuf::from("/b.db"),
+        Some(PathBuf::from("/b.db")),
         "env var MUST be honored when --db is absent; clap resolved {:?}",
         cli_env_only.db,
     );
@@ -182,11 +182,18 @@ fn test_env_overrides_config() {
         db: Some("/y.db".to_string()),
         ..AppConfig::default()
     };
-    let default_cli_db = PathBuf::from("ai-memory.db");
 
     // ---- Branch A: env unset → config wins over default ----
+    // #3431 — "the operator did not type --db and set no AI_MEMORY_DB" is now
+    // spelled `None`, not "the value happens to equal the DEFAULT_DB literal".
     let guard_a = EnvVarGuard::remove("AI_MEMORY_DB");
-    let resolved_a = cfg.effective_db(&default_cli_db);
+    let cli_no_db =
+        Cli::try_parse_from(["ai-memory", "stats"]).expect("clap parse must succeed (no db)");
+    assert_eq!(
+        cli_no_db.db, None,
+        "no --db and no AI_MEMORY_DB MUST parse to None (#3431)"
+    );
+    let resolved_a = cfg.effective_db_explicit(cli_no_db.db.as_deref());
     assert_eq!(
         resolved_a,
         PathBuf::from("/y.db"),
@@ -202,7 +209,7 @@ fn test_env_overrides_config() {
     let _guard_b = EnvVarGuard::set("AI_MEMORY_DB", "/x.db".to_string());
     let cli =
         Cli::try_parse_from(["ai-memory", "stats"]).expect("clap parse must succeed (env-only)");
-    let resolved_b = cfg.effective_db(&cli.db);
+    let resolved_b = cfg.effective_db_explicit(cli.db.as_deref());
     assert_eq!(
         resolved_b,
         PathBuf::from("/x.db"),
