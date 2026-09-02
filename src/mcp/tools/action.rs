@@ -449,6 +449,48 @@ pub fn handle_action_next(conn: &rusqlite::Connection, params: &Value) -> Result
     Ok(json!({ "action": action }))
 }
 
+/// #3361 (SECURITY) — resolve the lease `holder` to the AUTHENTICATED caller
+/// principal instead of trusting the wire string.
+///
+/// A lease is the ownership primitive of the coordination substrate, yet
+/// `holder` was a bare, unauthenticated, caller-asserted string read with
+/// `require_str` alone. `memory_lease_get` publishes the current holder, so
+/// any co-located agent could read `ai:alice`, replay it into
+/// `memory_lease_release` / `memory_lease_renew` / `memory_lease_acquire` and
+/// release, extend or steal a lease it never held — and the string was never
+/// run through `validate_agent_id`, so control characters, spaces and
+/// [`crate::validate::RESERVED_AGENT_IDS`] sentinels landed in the
+/// `coordination_audit` identity fields (log injection) and wedged
+/// `claimed_by`-bound transitions.
+///
+/// This routes the wire value through
+/// [`crate::identity::resolve_governance_subject`] — the same control #3171
+/// and #3363 applied to every other caller-asserted principal:
+/// - the value is ALWAYS wire-strict-validated (`validate_agent_id`), in both
+///   postures, so control chars / reserved sentinels are refused outright;
+/// - under the MULTI-TENANT posture (`AI_MEMORY_AGENT_ID` set) the holder is
+///   BOUND to the resolved caller: a `holder` naming anyone else is REFUSED,
+///   so a non-holder can no longer release, renew or steal another agent's
+///   lease;
+/// - under the SINGLE-OPERATOR default (env unset) resolution is unchanged —
+///   the validated wire value is returned, so zero-config coordination (a
+///   worker label such as `w1`) is byte-identical to pre-#3361.
+///
+/// `mcp_client` is deliberately `None`, matching every #3363 call site:
+/// `resolve_agent_id` consults the clientInfo-synthesized id only at step 3,
+/// which is reachable ONLY when the explicit value is absent — and `holder`
+/// is schema-REQUIRED, so [`crate::mcp::param_guard::require_str`] has
+/// already guaranteed a non-empty explicit value here.
+///
+/// # Errors
+/// `"holder is required"` when the field is missing/blank/non-string, the
+/// `validate_agent_id` refusal, or the caller-mismatch refusal.
+fn resolve_lease_holder(params: &Value, op: &str) -> Result<String, String> {
+    let requested = crate::mcp::param_guard::require_str(params, param_names::HOLDER)?;
+    crate::identity::resolve_governance_subject(Some(requested), None, op)
+        .map_err(|e| e.to_string())
+}
+
 /// MCP handler for `memory_lease_acquire`. Acquires a single-holder lease
 /// on an action via [`crate::actions::lease_acquire`]. The `expires_at`
 /// timestamp is computed internally from `ttl_secs` (default 60) so callers
@@ -483,7 +525,10 @@ pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Resu
     // safety violation ("the worst case is a spurious Conflict a caller
     // retries, never two winners"). Refuse instead.
     let action_id = crate::mcp::param_guard::require_str(params, param_names::ACTION_ID)?;
-    let holder = crate::mcp::param_guard::require_str(params, param_names::HOLDER)?;
+    // #3361 — bind `holder` to the authenticated caller principal (and
+    // wire-strict-validate it in every posture). See [`resolve_lease_holder`].
+    let holder = resolve_lease_holder(params, "acquire a lease")?;
+    let holder = holder.as_str();
     let ttl_secs = params
         .get(param_names::TTL_SECS)
         .and_then(Value::as_i64)
@@ -541,7 +586,11 @@ pub fn handle_lease_renew(conn: &rusqlite::Connection, params: &Value) -> Result
     // #3171 — see `handle_lease_acquire`: both are schema-REQUIRED. A blank
     // `holder` renewed whatever an empty-holder acquire had minted.
     let action_id = crate::mcp::param_guard::require_str(params, param_names::ACTION_ID)?;
-    let holder = crate::mcp::param_guard::require_str(params, param_names::HOLDER)?;
+    // #3361 — a renew EXTENDS an existing lease, so an unauthenticated holder
+    // string let any co-located agent keep another agent's lease alive
+    // indefinitely. Bind it to the caller principal.
+    let holder = resolve_lease_holder(params, "renew a lease")?;
+    let holder = holder.as_str();
     let ttl_secs = params
         .get(param_names::TTL_SECS)
         .and_then(Value::as_i64)
@@ -585,7 +634,11 @@ pub fn handle_lease_release(conn: &rusqlite::Connection, params: &Value) -> Resu
     // `("", "")` and answered `released: false`, indistinguishable from "you do
     // not hold that lease" — a worker would conclude it had already released.
     let action_id = crate::mcp::param_guard::require_str(params, param_names::ACTION_ID)?;
-    let holder = crate::mcp::param_guard::require_str(params, param_names::HOLDER)?;
+    // #3361 — release is the sharpest edge: `memory_lease_get` PUBLISHES the
+    // holder, so replaying it here handed any co-located agent another agent's
+    // exclusive lease. Bind it to the caller principal.
+    let holder = resolve_lease_holder(params, "release a lease")?;
+    let holder = holder.as_str();
     let released =
         crate::actions::lease_release(conn, action_id, holder).map_err(|e| e.to_string())?;
 
@@ -994,9 +1047,10 @@ impl McpTool for LeaseRenewTool {
     }
     fn docs() -> &'static str {
         "Pillar 1 (#1709): extend a lease's TTL; errors if no lease matches the supplied \
-         `holder`. #3171: ownership is decided ENTIRELY by the self-asserted `holder` \
-         string — this tool receives no caller identity, so `holder` is a coordination \
-         token, not an authenticated principal; treat it as unguessable. \
+         `holder`. #3361: `holder` is BOUND to the resolved caller — with \
+         AI_MEMORY_AGENT_ID set, a `holder` naming anyone else is refused, so a \
+         non-holder cannot keep another agent's lease alive; unset (single-operator), \
+         the validated value is used as-is. \
          Renew before expiry (#2419): a lapsed lease is reclaimed by the background sweep, which also returns a still-`claimed` action to `pending` for another holder."
     }
     fn input_schema() -> Value {
@@ -1019,10 +1073,10 @@ impl McpTool for LeaseReleaseTool {
         "Release an owned lease on a coordination action (#1709)."
     }
     fn docs() -> &'static str {
-        "Pillar 1 (#1709): release a lease; reports whether a row was removed. #3171: the \
-         lease released is the one matching the self-asserted `holder` — this tool \
-         receives no caller identity, so any caller that knows a holder string can \
-         release that holder's lease."
+        "Pillar 1 (#1709): release a lease; reports whether a row was removed. #3361: \
+         `holder` is BOUND to the resolved caller — with AI_MEMORY_AGENT_ID set, a \
+         `holder` naming anyone else is refused, so publishing the holder via \
+         memory_lease_get no longer lets a non-holder release that lease."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<LeaseReleaseRequest>()
@@ -1225,6 +1279,11 @@ mod handler_tests {
     /// blank at the MCP boundary is what keeps that invariant true.
     #[test]
     fn lease_handlers_refuse_blank_required_args_3171() {
+        // #3361 — the lease handlers now resolve the caller principal from
+        // `AI_MEMORY_AGENT_ID`, so a sibling test that sets it process-wide
+        // would turn these self-asserted holders into caller mismatches.
+        // Pin the single-operator posture for the duration (#1874 fixture).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh();
         let created = handle_action_create(
             &conn,
@@ -1282,6 +1341,165 @@ mod handler_tests {
         assert!(conflict.contains("conflict"), "got: {conflict}");
     }
 
+    /// #3361 (SECURITY) — the lease `holder` must be an AUTHENTICATED caller
+    /// principal, not a caller-asserted string.
+    ///
+    /// Repro: `memory_lease_get` publishes `holder: "ai:alice"`; a co-located
+    /// `ai:bob` replays that string into `memory_lease_release` and gets
+    /// `released: true`. The same trick renews and re-acquires. Both
+    /// directions are pinned under the multi-tenant posture
+    /// (`AI_MEMORY_AGENT_ID` set): DENIED for a forged holder on
+    /// acquire/renew/release, ALLOWED for the real holder.
+    #[test]
+    fn lease_holder_is_bound_to_the_caller_principal_3361() {
+        // #1874 crate-wide lock: this test MUTATES AI_MEMORY_AGENT_ID.
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh();
+        // The caller is ai:alice for the whole setup — #3363 also binds
+        // `memory_action_create`'s actor to the enforced caller, so the env
+        // must be pinned BEFORE the create, not just before the acquire.
+        // SAFETY: process-global env mutation serialized on the crate-wide
+        // `agent_id_env_test_lock` held for this test's whole body.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t", "agent_id": "ai:alice" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID].as_str().expect("id").to_string();
+
+        // ai:alice acquires her own lease.
+        handle_lease_acquire(
+            &conn,
+            &json!({ "action_id": id.clone(), "holder": "ai:alice", "ttl_secs": 600 }),
+        )
+        .expect("the caller may acquire a lease as itself");
+
+        // The holder is discoverable — that is exactly what made the forgery
+        // trivial before this fix.
+        let seen = handle_lease_get(&conn, &json!({ "action_id": id.clone() })).expect("lease_get");
+        assert_eq!(seen["lease"]["holder"].as_str(), Some("ai:alice"));
+
+        // Caller is now ai:bob.
+        // SAFETY: as above — still under the crate-wide lock.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:bob") };
+
+        // DENIED: release someone else's lease.
+        let err = handle_lease_release(
+            &conn,
+            &json!({ "action_id": id.clone(), "holder": "ai:alice" }),
+        )
+        .expect_err("a non-holder must not release another agent's lease");
+        assert!(err.contains("may only"), "caller-bind refusal, got: {err}");
+
+        // DENIED: renew someone else's lease.
+        let err = handle_lease_renew(
+            &conn,
+            &json!({ "action_id": id.clone(), "holder": "ai:alice", "ttl_secs": 600 }),
+        )
+        .expect_err("a non-holder must not renew another agent's lease");
+        assert!(err.contains("may only"), "caller-bind refusal, got: {err}");
+
+        // DENIED: re-acquire under the victim's name.
+        let err = handle_lease_acquire(
+            &conn,
+            &json!({ "action_id": id.clone(), "holder": "ai:alice", "ttl_secs": 600 }),
+        )
+        .expect_err("a non-holder must not acquire under another agent's name");
+        assert!(err.contains("may only"), "caller-bind refusal, got: {err}");
+
+        // The lease is intact: alice still holds it.
+        let still =
+            handle_lease_get(&conn, &json!({ "action_id": id.clone() })).expect("lease_get");
+        assert_eq!(
+            still["lease"]["holder"].as_str(),
+            Some("ai:alice"),
+            "a refused release must leave the lease with its real holder"
+        );
+
+        // ALLOWED: bob may still take a lease as HIMSELF on his own action.
+        let other = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t2", "agent_id": "ai:bob" }),
+        )
+        .expect("create ok");
+        let other_id = other[param_names::ID].as_str().expect("id").to_string();
+        handle_lease_acquire(
+            &conn,
+            &json!({ "action_id": other_id.clone(), "holder": "ai:bob", "ttl_secs": 600 }),
+        )
+        .expect("the caller may acquire a lease as itself");
+        handle_lease_renew(
+            &conn,
+            &json!({ "action_id": other_id.clone(), "holder": "ai:bob", "ttl_secs": 600 }),
+        )
+        .expect("the holder may renew its own lease");
+        let released =
+            handle_lease_release(&conn, &json!({ "action_id": other_id, "holder": "ai:bob" }))
+                .expect("the holder may release its own lease");
+        assert_eq!(released["released"].as_bool(), Some(true));
+
+        // ALLOWED (restore): alice releases her own lease.
+        // SAFETY: as above — still under the crate-wide lock.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+        let released =
+            handle_lease_release(&conn, &json!({ "action_id": id, "holder": "ai:alice" }))
+                .expect("the real holder may release");
+        assert_eq!(released["released"].as_bool(), Some(true));
+
+        // SAFETY: as above — restore the ambient (unset) posture.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+    }
+
+    /// #3361 — a `holder` carrying control characters / spaces / a reserved
+    /// sentinel is refused in EVERY posture, not merely when a caller identity
+    /// happens to be configured. Pre-fix only `require_str` ran, so such a
+    /// value reached `coordination_audit` (log injection) and wedged
+    /// `claimed_by`-bound transitions, which DO validate.
+    #[test]
+    fn lease_holder_shape_is_validated_in_the_single_operator_posture_3361() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh();
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t", "agent_id": "ai:solo" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID].as_str().expect("id").to_string();
+
+        for bad in [
+            "holder with spaces",
+            "bad\nid",
+            "../../etc/passwd",
+            "daemon",
+        ] {
+            let err = handle_lease_acquire(
+                &conn,
+                &json!({ "action_id": id.clone(), "holder": bad, "ttl_secs": 60 }),
+            )
+            .expect_err("a malformed holder must be refused");
+            assert!(!err.is_empty(), "holder {bad:?} must be refused");
+            assert!(
+                handle_lease_get(&conn, &json!({ "action_id": id.clone() }))
+                    .expect("lease_get")["lease"]
+                    .is_null(),
+                "a refused acquire must mint no lease (holder {bad:?})"
+            );
+        }
+
+        // CONTROL: a well-formed coordination label still works with no
+        // AI_MEMORY_AGENT_ID configured — zero-config coordination is
+        // byte-identical to pre-#3361.
+        handle_lease_acquire(
+            &conn,
+            &json!({ "action_id": id.clone(), "holder": "w1", "ttl_secs": 60 }),
+        )
+        .expect("single-operator posture keeps the legacy holder label");
+        let released = handle_lease_release(&conn, &json!({ "action_id": id, "holder": "w1" }))
+            .expect("release");
+        assert_eq!(released["released"].as_bool(), Some(true));
+    }
+
     #[test]
     fn get_absent_returns_null_action() {
         let conn = fresh();
@@ -1294,6 +1512,11 @@ mod handler_tests {
     /// forever-lease starvation), mirroring the memory-write validate path.
     #[test]
     fn lease_acquire_rejects_unbounded_and_negative_ttl_1806() {
+        // #3361 — the lease handlers now resolve the caller principal from
+        // `AI_MEMORY_AGENT_ID`, so a sibling test that sets it process-wide
+        // would turn these self-asserted holders into caller mismatches.
+        // Pin the single-operator posture for the duration (#1874 fixture).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh();
         let created = handle_action_create(
             &conn,
@@ -1462,6 +1685,11 @@ mod handler_tests {
     /// action); a control-char `claimed_by` is refused (log-injection guard).
     #[test]
     fn transition_binds_claimed_by_to_live_lease_holder_3009() {
+        // #3361 — the lease handlers now resolve the caller principal from
+        // `AI_MEMORY_AGENT_ID`, so a sibling test that sets it process-wide
+        // would turn these self-asserted holders into caller mismatches.
+        // Pin the single-operator posture for the duration (#1874 fixture).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh();
         let created = handle_action_create(
             &conn,
@@ -1603,6 +1831,11 @@ mod handler_tests {
     /// not the raw `leases.action_id` FK-constraint error.
     #[test]
     fn lease_acquire_missing_action_is_typed_not_found() {
+        // #3361 — the lease handlers now resolve the caller principal from
+        // `AI_MEMORY_AGENT_ID`, so a sibling test that sets it process-wide
+        // would turn these self-asserted holders into caller mismatches.
+        // Pin the single-operator posture for the duration (#1874 fixture).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh();
         let err = handle_lease_acquire(&conn, &json!({ "action_id": "nope", "holder": "h" }))
             .expect_err("a lease on a missing action must be a typed not-found");
@@ -1611,6 +1844,11 @@ mod handler_tests {
 
     #[test]
     fn lease_acquire_renew_release_get_roundtrip_over_mcp() {
+        // #3361 — the lease handlers now resolve the caller principal from
+        // `AI_MEMORY_AGENT_ID`, so a sibling test that sets it process-wide
+        // would turn these self-asserted holders into caller mismatches.
+        // Pin the single-operator posture for the duration (#1874 fixture).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh();
         // A lease references a real action row, so create one first.
         let created = handle_action_create(
@@ -1847,6 +2085,11 @@ mod handler_tests {
     /// row attributed to the holder; the append-only chain stays intact.
     #[test]
     fn lease_acquire_emits_signed_events_audit_row_1722() {
+        // #3361 — the lease handlers now resolve the caller principal from
+        // `AI_MEMORY_AGENT_ID`, so a sibling test that sets it process-wide
+        // would turn these self-asserted holders into caller mismatches.
+        // Pin the single-operator posture for the duration (#1874 fixture).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh();
         let created = handle_action_create(
             &conn,
