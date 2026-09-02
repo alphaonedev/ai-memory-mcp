@@ -33,6 +33,11 @@ use tower::ServiceExt as _;
 const CALLER: &str = "kw-read-3341a";
 const ANCHOR: &str = "anchor-3341a";
 
+/// Once-gated env write for unsigned test stores. Lives at module scope
+/// so it is not an item-after-statement inside [`build_pg_router`]
+/// (`clippy::items_after_statements`, pedantic — CI Lint).
+static REQUIRE_ATTESTATION_OFF: std::sync::Once = std::sync::Once::new();
+
 fn dummy_memory(id: &str) -> Memory {
     Memory {
         id: id.to_string(),
@@ -168,9 +173,9 @@ impl MemoryStore for ProbeStore {
 
 fn build_pg_router(store: Arc<dyn MemoryStore>) -> (axum::Router, NamedTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: Once-gated process-global env write for unsigned test stores.
-    ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
+    REQUIRE_ATTESTATION_OFF
+        .call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
