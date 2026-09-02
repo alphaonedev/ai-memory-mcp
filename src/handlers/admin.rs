@@ -818,6 +818,19 @@ pub async fn import_memories(
         }),
     );
 
+    // v0.9.0 G10.1 (#1827) — edge-parse the optional
+    // `X-AI-Memory-Capability` header ONCE into the caller context; inert
+    // unless `[capabilities].enabled`. The same token gates every row in the
+    // batch.
+    //
+    // #3456 — hoisted out of the postgres branch so BOTH backends parse the
+    // capability the same way and feed the SAME token to the governance
+    // decision. Pre-#3456 only the postgres branch parsed it, because only the
+    // postgres branch had a governance decision to feed.
+    let capability = match crate::handlers::capability_from_headers(&headers, &caller) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     // #956 provenance restamp closure. Applied per-row on both
     // backends BEFORE validate / governance / store so all downstream
     // consumers (governance enforce, store.store / db::insert) see
@@ -892,16 +905,8 @@ pub async fn import_memories(
         // but the ctx is the auth principal so visibility filters
         // applied INSIDE store_inner (e.g., upsert dedup lookup)
         // see the actual caller.
-        // v0.9.0 G10.1 (#1827) — edge-parse the optional
-        // `X-AI-Memory-Capability` header ONCE into the caller context;
-        // inert unless `[capabilities].enabled`. The same token gates
-        // every row in the batch.
-        let capability = match crate::handlers::capability_from_headers(&headers, &caller) {
-            Ok(c) => c,
-            Err(resp) => return resp,
-        };
-        let ctx =
-            crate::store::CallerContext::for_agent(caller.clone()).with_capability(capability);
+        let ctx = crate::store::CallerContext::for_agent(caller.clone())
+            .with_capability(capability.clone());
         // #3421 — pre-batch snapshot of the importing admin's
         // destination-enrolled key (see the note at the restamp closure).
         match app.store.agent_pubkey(&caller).await {
@@ -1095,6 +1100,7 @@ pub async fn import_memories(
     }
     let mut imported = 0usize;
     let mut errors = Vec::new();
+    let mut pending: Vec<serde_json::Value> = Vec::new();
     for mut mem in body.memories {
         // #956 — restamp before validate / insert.
         let original_claim = restamp_agent_id(&mut mem);
@@ -1132,6 +1138,86 @@ pub async fn import_memories(
             errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
             continue;
         }
+
+        // #3456 (security-high) — namespace-governance enforcement on the
+        // SQLITE import lane. F-A2A1.5 (#705) gated the postgres branch
+        // because an imported row is a Store action and must be gated by the
+        // destination namespace's standard; the sqlite branch was never
+        // followed up, so the SAME admin request against a sqlite-backed
+        // daemon bypassed a `write: Deny` / `write: Approve` standard entirely
+        // while the postgres-backed daemon refused it or parked it pending —
+        // a backend-dependent authorization outcome for one wire call.
+        //
+        // This is import-specific, not a sqlite-wide gap: every sibling sqlite
+        // write funnel already gates (`handlers::create` GovernedAction::Store,
+        // `handlers::bulk`, MCP `memory_store`). `db::insert` does consult the
+        // substrate `GOVERNANCE_PRE_WRITE` hook + the why_trace gate, but that
+        // is the operator-signed SUBSTRATE layer — a different control from the
+        // namespace STANDARD decision restored here.
+        //
+        // Byte-parity with the postgres branch above: the same
+        // `consult_pre_governance_decision_gate` presence consult, the same
+        // `GovernedAction::Store` decision through the sqlite-native
+        // `db::enforce_governance` twin, the same per-row dispositions and the
+        // same refusal strings, so a caller cannot tell the two lanes apart.
+        use crate::models::GovernanceDecision;
+        // Post-#956 restamp, agent_id is always the admin caller.
+        let agent_id = mem
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(caller.as_str());
+        let payload_for_pending = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
+        // #2356 (W1A6-03) — `pre_governance_decision` presence consult BEFORE
+        // the per-row governance decision dispatches. A refusal accumulates as
+        // a row error (mirroring the Deny arm) so the import envelope stays
+        // shape-stable.
+        if let Err(reason) = crate::mcp::consult_pre_governance_decision_gate(
+            &mem.namespace,
+            "store",
+            agent_id,
+            None,
+        ) {
+            errors.push(format!("{}: {reason}", mem.id));
+            continue;
+        }
+        match db::enforce_governance(
+            &lock.0,
+            crate::models::GovernedAction::Store,
+            &mem.namespace,
+            agent_id,
+            None,
+            None,
+            &payload_for_pending,
+            capability.as_ref(),
+        ) {
+            Ok(GovernanceDecision::Allow) => {}
+            Ok(GovernanceDecision::Deny(refusal)) => {
+                let mut msg = String::with_capacity(mem.id.len() + 2 + 50 + refusal.reason.len());
+                msg.push_str(&mem.id);
+                msg.push_str(": ");
+                msg.push_str(&crate::governance::deny_message(
+                    "import",
+                    crate::governance::DenyGate::Governance,
+                    &refusal.reason,
+                ));
+                errors.push(msg);
+                continue;
+            }
+            Ok(GovernanceDecision::Pending(pending_id)) => {
+                pending.push(json!({
+                    "id": mem.id,
+                    "namespace": mem.namespace,
+                    (field_names::PENDING_ID): pending_id,
+                }));
+                continue;
+            }
+            Err(e) => {
+                errors.push(format!("{}: governance error: {e}", mem.id));
+                continue;
+            }
+        }
+
         match db::insert(&lock.0, &mem) {
             Ok(_) => imported += 1,
             Err(e) => {
@@ -1161,7 +1247,12 @@ pub async fn import_memories(
             link.relation.as_str(),
         );
     }
-    Json(json!({"imported": imported, "errors": errors})).into_response()
+    // #3456 — the sqlite envelope now carries `pending`, so an `Approve`
+    // namespace standard is EXPRESSIBLE on this backend: pre-fix a caller had
+    // no way to learn a row was parked awaiting consensus, because the sqlite
+    // lane never produced one. Additive — `imported` / `errors` are unchanged,
+    // and an empty `pending` is the ordinary case.
+    Json(json!({"imported": imported, "errors": errors, "pending": pending})).into_response()
 }
 
 #[derive(serde::Deserialize)]
