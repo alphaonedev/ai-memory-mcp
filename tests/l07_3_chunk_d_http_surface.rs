@@ -1067,12 +1067,21 @@ async fn http_consolidate_with_explicit_summary() {
     let (router, _f) = build_router_fixture();
     let (_s, id1) = create_basic(&router, "chunk-d/cons", "c1").await;
     let (_s2, id2) = create_basic(&router, "chunk-d/cons", "c2").await;
+    // v1.0.0 #3380 — the sources are created by `create_basic` as `ai:test`,
+    // so the consolidate call must present that same principal. Pre-#3380 this
+    // body carried no `agent_id`, so `post_json` sent no `X-Agent-Id` and the
+    // caller resolved to a per-request `anonymous:req-…` id that owns nothing
+    // — it only passed because the consolidate surface had NO ownership gate
+    // at all. The postgres backend has refused this exact shape since the SAL
+    // caller filter landed; the sqlite branch now matches, which is the
+    // cross-backend parity #3380 exists to close.
     let body = json!({
         "ids": [id1, id2],
         "namespace": "chunk-d/cons",
         "title": "consolidated",
         "summary": "preset summary long enough to satisfy validation",
         "tier": "long",
+        "agent_id": "ai:test",
     });
     let (status, _payload) = post_json(&router, "/api/v1/consolidate", body).await;
     assert!(status == StatusCode::CREATED || status == StatusCode::OK);

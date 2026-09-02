@@ -2428,6 +2428,11 @@ fn dispatch_memory_consolidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Strin
         consolidate_pre_event_namespaces(ctx.conn, ctx.arguments),
         ctx.arguments.clone(),
     )?;
+    // v1.0.0 #3380 — resolve the read-visibility principal so the
+    // caller-owns-source gate inside `handle_consolidate` has a subject.
+    // Mirrors `dispatch_memory_get`; `None` (no `AI_MEMORY_AGENT_ID`) is the
+    // single-operator trust-all posture.
+    let caller = crate::identity::resolve_read_visibility_caller();
     handle_consolidate(
         ctx.conn,
         ctx.db_path,
@@ -2436,6 +2441,7 @@ fn dispatch_memory_consolidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Strin
         ctx.embedder,
         ctx.vector_index,
         ctx.mcp_client,
+        caller.as_deref(),
     )
 }
 
@@ -14908,6 +14914,7 @@ mod tests {
             Some(&embedder as &dyn Embed), // embedder DI
             None,                          // vector_index
             Some("test-mcp-client"),       // mcp_client
+            None,                          // caller (single-operator posture)
         )
         .expect("consolidate handler must succeed");
         let new_id = res["id"].as_str().unwrap();
@@ -14940,15 +14947,19 @@ mod tests {
             let llm = crate::llm::OllamaClient::new_with_url(&uri, "test-model").unwrap();
             let conn = db::open(std::path::Path::new(":memory:")).unwrap();
             // Missing source id — handler errors before the LLM call.
+            // #3380 — two ids (the shape validator now runs first), one real
+            // and one absent, so the miss is still what refuses.
+            let id_a = chunkc_seed_memory(&conn, "chunkc-cons-miss", "a", Tier::Mid);
             let res = super::consolidate::handle_consolidate(
                 &conn,
                 std::path::Path::new(":memory:"),
                 &json!({
-                    "ids": ["00000000-0000-0000-0000-000000000000"],
+                    "ids": [id_a, "00000000-0000-0000-0000-000000000000"],
                     "title": "t",
                     "namespace": "chunkc-cons-miss",
                 }),
                 Some(&llm),
+                None,
                 None,
                 None,
                 None,
@@ -15001,6 +15012,7 @@ mod tests {
                     "namespace": "chunkc-cons-llm",
                 }),
                 Some(&llm),
+                None,
                 None,
                 None,
                 None,
@@ -15897,6 +15909,7 @@ mod tests {
             None,
             Some(&embedder as &dyn Embed),
             Some(&index),
+            None,
             None,
         )
         .expect("must succeed");

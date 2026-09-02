@@ -1365,12 +1365,18 @@ pub fn validate_link(source_id: &str, target_id: &str, relation: &str) -> Result
 }
 
 /// Validate consolidation request.
-pub fn validate_consolidate(
-    ids: &[String],
-    title: &str,
-    summary: &str,
-    namespace: &str,
-) -> Result<()> {
+/// v1.0.0 #3380 — the REQUEST-SHAPE half of [`validate_consolidate`]:
+/// everything that does not depend on the summary.
+///
+/// Split out so a handler can refuse a malformed consolidation
+/// (`ids: []`, a duplicate id, a bad namespace) BEFORE paying for the LLM
+/// round-trip that materialises the summary. Pre-#3380 `handle_consolidate`
+/// ran the whole validator AFTER the model call, so `{"ids": []}` still cost a
+/// paid request and still shipped whatever sources were named to the model.
+///
+/// # Errors
+/// Propagates the id-count / duplicate-id / title / namespace failures.
+pub fn validate_consolidate_request(ids: &[String], title: &str, namespace: &str) -> Result<()> {
     if ids.len() < 2 {
         bail!("need at least 2 memory IDs to consolidate");
     }
@@ -1385,8 +1391,24 @@ pub fn validate_consolidate(
         }
     }
     validate_title(title)?;
-    validate_content(summary)?;
     validate_namespace(namespace)?;
+    Ok(())
+}
+
+pub fn validate_consolidate(
+    ids: &[String],
+    title: &str,
+    summary: &str,
+    namespace: &str,
+) -> Result<()> {
+    // #3380 — the shape half is single-sourced in
+    // [`validate_consolidate_request`] so the pre-LLM gate and this full gate
+    // can never drift. NOTE: the summary check now runs AFTER the namespace
+    // check (it ran between title and namespace pre-#3380), so a request that
+    // is invalid in BOTH surfaces its namespace error first. Every individual
+    // rejection is unchanged.
+    validate_consolidate_request(ids, title, namespace)?;
+    validate_content(summary)?;
     Ok(())
 }
 
@@ -1569,6 +1591,22 @@ impl RequestValidator {
     ) -> Result<(), ValidationError> {
         validate_link(source_id, target_id, relation)
             .map_err(|e| ValidationError::from_anyhow("link", e))
+    }
+
+    /// v1.0.0 #3380 — facade for [`validate_consolidate_request`], the
+    /// summary-independent half, for handlers that must refuse a malformed
+    /// consolidation request before paying for an LLM call.
+    ///
+    /// # Errors
+    ///
+    /// Mirrors [`validate_consolidate_request`] exactly.
+    pub fn validate_consolidate_request(
+        ids: &[String],
+        title: &str,
+        namespace: &str,
+    ) -> Result<(), ValidationError> {
+        validate_consolidate_request(ids, title, namespace)
+            .map_err(|e| ValidationError::from_anyhow("consolidate", e))
     }
 
     /// Memory-consolidation request validation. Mirrors

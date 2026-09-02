@@ -88,20 +88,14 @@ fn default_ns() -> String {
 /// `maybe_auto_tag`.
 async fn resolve_consolidate_summary(
     app: &AppState,
-    ids: &[String],
-    caller_principal: &str,
+    pairs: Vec<(String, String)>,
 ) -> Result<String, Response> {
-    // Collect (title, content) pairs from the appropriate backend so
-    // the LLM has the actual source material. SAL on postgres; legacy
-    // db on sqlite. A missing source memory short-circuits to 400 with
-    // the offending id, matching the MCP path.
-    //
-    // Caller is passed as a string (agent id) rather than a typed
-    // `CallerContext` so this helper compiles cleanly under non-sal
-    // feature configurations. The `CallerContext::for_agent(...)`
-    // construction lives inside the sal-gated body of
-    // [`fetch_consolidate_source_pairs`].
-    let pairs = fetch_consolidate_source_pairs(app, ids, caller_principal).await?;
+    // v1.0.0 #3380 — the `(title, content)` pairs are supplied by the CALLER of
+    // this helper, which obtained them from [`gate_consolidate_sources`].
+    // Pre-#3380 this function re-fetched the sources itself through an
+    // ungated read, so the rows the model saw were not necessarily the rows any
+    // gate had admitted. Fetching once and threading the result makes
+    // "gated" and "summarised" the same set by construction.
 
     // No LLM available — deterministic concat fallback. Titles only
     // (not full content) so the result stays a "summary" rather than a
@@ -150,17 +144,42 @@ async fn resolve_consolidate_summary(
     }
 }
 
-/// v0.7.0 L7 — fetch `(title, content)` pairs for each source memory in
-/// a consolidation request, picking the storage backend off `AppState`.
-/// Missing ids surface as a 400 response so the caller's mistake is
-/// distinguishable from a daemon-side LLM failure.
-async fn fetch_consolidate_source_pairs(
+/// v0.7.0 L7 / v1.0.0 #3380 — resolve every source memory of a consolidation
+/// request through the CALLER-SCOPED read, and refuse any the caller does not
+/// own, picking the storage backend off `AppState`.
+///
+/// #3380 (CWE-863) — a consolidation is not a read: it feeds the sources'
+/// content to the LLM (returned to the caller as the summary) and then
+/// hard-DELETE-merges the source rows. Pre-fix the sqlite branch called the
+/// unfiltered `db::get` and DISCARDED the resolved caller entirely, and
+/// neither branch applied an OWNERSHIP gate, so a non-owner consumed a
+/// victim's rows and read their content back through the summary.
+///
+/// The gate is the single canonical mutation predicate
+/// [`crate::visibility::caller_owns_for_mutation`] (#1786), `allow_inbox =
+/// false`, mirroring `PUT /memories/{id}`. Consumability is the right question
+/// and the stronger one: a row owned by another agent is refused even when it
+/// is READABLE (collective scope, an inbox row), which is what closes the
+/// summary leak — while the #1786 legacy carve-out keeps an UNOWNED row
+/// consolidatable, exactly as it stays updatable and deletable. Requiring
+/// `is_visible_to_caller` as well would refuse unowned rows that both
+/// canonical predicates deliberately admit, stranding pre-NHI corpora.
+///
+/// A missing source and a source the caller may not consume BOTH surface as
+/// the same 400 naming the id, so neither backend is a cross-tenant presence
+/// oracle.
+async fn gate_consolidate_sources(
     app: &AppState,
     ids: &[String],
     caller_principal: &str,
-) -> Result<Vec<(String, String)>, Response> {
-    #[cfg(not(feature = "sal"))]
-    let _ = caller_principal;
+) -> Result<Vec<Memory>, Response> {
+    let not_found = |id: &str| -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
+        )
+            .into_response()
+    };
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         // v0.7.0 ship-hardening (QC P1, 2026-05-20): use the resolved
@@ -173,17 +192,20 @@ async fn fetch_consolidate_source_pairs(
         // admin role (a v0.7.1+ feature); for now the consolidation
         // surface is single-owner.
         let caller = crate::store::CallerContext::for_agent(caller_principal.to_string());
-        let mut out: Vec<(String, String)> = Vec::with_capacity(ids.len());
+        let mut out: Vec<Memory> = Vec::with_capacity(ids.len());
         for id in ids {
             match app.store.get(&caller, id).await {
-                Ok(mem) => out.push((mem.title, mem.content)),
-                Err(crate::store::StoreError::NotFound { .. }) => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
-                    )
-                        .into_response());
+                Ok(mem) => {
+                    // #3380 — the SAL `get` filter answers "may I READ it";
+                    // consuming it requires the canonical mutation predicate.
+                    // Rendered as the same 400 an absent id produces so the
+                    // surface is not a presence oracle.
+                    if !crate::visibility::caller_owns_for_mutation(&mem, caller_principal, false) {
+                        return Err(not_found(id));
+                    }
+                    out.push(mem);
                 }
+                Err(crate::store::StoreError::NotFound { .. }) => return Err(not_found(id)),
                 Err(e) => return Err(store_err_to_response(e)),
             }
         }
@@ -201,17 +223,25 @@ async fn fetch_consolidate_source_pairs(
     // refactor needs a test-fixture change tracked under the
     // ARCH-2-followup audit before the sqlite path can converge.
     let lock = app.db.lock().await;
-    let mut out: Vec<(String, String)> = Vec::with_capacity(ids.len());
+    let mut out: Vec<Memory> = Vec::with_capacity(ids.len());
     for id in ids {
         match db::get(&lock.0, id) {
-            Ok(Some(mem)) => out.push((mem.title, mem.content)),
-            Ok(None) => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
-                )
-                    .into_response());
+            // #3380 — caller-scoped read on the sqlite branch (the postgres
+            // branch above rides the SAL #910 filter). A row that exists but
+            // is not visible masks to the SAME 400 an absent id produces.
+            Ok(Some(mem)) => {
+                if !crate::visibility::caller_owns_for_mutation(&mem, caller_principal, false) {
+                    tracing::warn!(
+                        target: "ai_memory::visibility",
+                        "consolidate source 400-masked: caller {caller_principal} may not \
+                         consume it (id={})",
+                        mem.id
+                    );
+                    return Err(not_found(id));
+                }
+                out.push(mem);
             }
+            Ok(None) => return Err(not_found(id)),
             Err(e) => {
                 tracing::error!("consolidate source lookup failed: {e}");
                 return Err((
@@ -341,29 +371,16 @@ pub async fn consolidate_memories(
     let consolidate_caller_principal =
         crate::handlers::parity::resolve_caller_agent_id(None, &headers, None)
             .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
-    let summary = match body.summary.clone() {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            match resolve_consolidate_summary(&app, &body.ids, &consolidate_caller_principal).await
-            {
-                Ok(s) => s,
-                Err(resp) => return resp,
-            }
-        }
-    };
-
-    if let Err(e) = validate::RequestValidator::validate_consolidate(
-        &body.ids,
-        &body.title,
-        &summary,
-        &body.namespace,
-    ) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response();
-    }
+    // v1.0.0 #3380 — the #905 body-vs-header `agent_id` spoof guard is hoisted
+    // to HERE, ahead of the request-shape validation and the source gate below.
+    // It is an AUTHENTICATION check: a caller presenting a body principal that
+    // disagrees with its authenticated header must be refused 403 before the
+    // handler reads any data, and before any refusal that depends on what the
+    // store contains. Pre-#3380 it sat after the summary was materialised, so
+    // once the source gate landed in front of it a spoofed request whose source
+    // ids do not resolve answered 400 (sources) instead of 403 (spoof) — the
+    // wrong reason, and a weaker one. Hoisting it also means a spoofed request
+    // never reaches the substrate at all.
     // #905 (security-high, 2026-05-19) — sibling of #874/#901. The
     // pre-#905 path passed `body.agent_id` as the first arg to
     // `resolve_http_agent_id` which gives caller-controlled body the
@@ -395,6 +412,57 @@ pub async fn consolidate_memories(
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
+        )
+            .into_response();
+    }
+
+    // v1.0.0 #3380 — refuse a malformed REQUEST before any paid model call
+    // (MCP parity: the summary-independent half of the validator).
+    if let Err(e) = validate::RequestValidator::validate_consolidate_request(
+        &body.ids,
+        &body.title,
+        &body.namespace,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    // #3380 — gate EVERY source through the caller-scoped read + ownership
+    // predicate, UNCONDITIONALLY. Pre-fix the sources were only ever fetched
+    // when the caller omitted `summary`, so a caller who SUPPLIED one consumed
+    // the victim's rows having performed no source read at all. Resolved once
+    // here and reused for the model pairs below, so the rows the gate admitted
+    // are exactly the rows the model sees and the merge consumes.
+    let consolidate_sources =
+        match gate_consolidate_sources(&app, &body.ids, &consolidate_caller_principal).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+    let summary = match body.summary.clone() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            let pairs: Vec<(String, String)> = consolidate_sources
+                .iter()
+                .map(|m| (m.title.clone(), m.content.clone()))
+                .collect();
+            match resolve_consolidate_summary(&app, pairs).await {
+                Ok(s) => s,
+                Err(resp) => return resp,
+            }
+        }
+    };
+
+    if let Err(e) = validate::RequestValidator::validate_consolidate(
+        &body.ids,
+        &body.title,
+        &summary,
+        &body.namespace,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
         )
             .into_response();
     }
@@ -1007,7 +1075,7 @@ async fn fetch_memory_for_handler(
         };
     }
 
-    // ARCH-2 keeper: same constraint as `fetch_consolidate_source_pairs`
+    // ARCH-2 keeper: same constraint as `gate_consolidate_sources`
     // — `app.store` and `app.db` are pinned to disjoint files in the
     // test harness, so routing this sqlite read through `app.store.get`
     // breaks tests. ARCH-2-followup must converge the harness before
