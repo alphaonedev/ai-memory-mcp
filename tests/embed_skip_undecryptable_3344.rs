@@ -108,13 +108,12 @@ mod pg {
             "ALLOWED: plain row is returned verbatim"
         );
 
-        let skip_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM embed_skip WHERE memory_id = $1",
-        )
-        .bind(&sealed_id)
-        .fetch_one(store.pool())
-        .await
-        .expect("skip count");
+        let skip_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM embed_skip WHERE memory_id = $1")
+                .bind(&sealed_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("skip count");
         assert_eq!(skip_count, 1, "first scan must persist a skip marker");
 
         let second = store
@@ -131,6 +130,10 @@ mod pg {
             .execute(store.pool())
             .await
             .expect("stale the skip");
+        // Planting a stale fingerprint is not a live-key change. A fresh
+        // store instance is the amortisation reset (no process-global).
+        drop(store);
+        let store = PostgresStore::connect(&url).await.expect("reconnect");
         let retried = store
             .list_unembedded(&admin, 1_000_000)
             .await
@@ -139,14 +142,16 @@ mod pg {
             !retried.iter().any(|(id, _, _)| id == &sealed_id),
             "retry still cannot decrypt, so the row stays omitted"
         );
-        let fp: String = sqlx::query_scalar(
-            "SELECT key_fingerprint FROM embed_skip WHERE memory_id = $1",
-        )
-        .bind(&sealed_id)
-        .fetch_one(store.pool())
-        .await
-        .expect("fp after retry");
-        assert_ne!(fp, "stale-fp", "healing must re-record under the live key fingerprint");
+        let fp: String =
+            sqlx::query_scalar("SELECT key_fingerprint FROM embed_skip WHERE memory_id = $1")
+                .bind(&sealed_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("fp after retry");
+        assert_ne!(
+            fp, "stale-fp",
+            "healing must re-record under the live key fingerprint"
+        );
 
         let _ = sqlx::query("DELETE FROM embed_skip WHERE memory_id = $1")
             .bind(&sealed_id)
