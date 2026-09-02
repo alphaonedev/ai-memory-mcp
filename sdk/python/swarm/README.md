@@ -50,6 +50,12 @@ choreography.*  ── scripted A2A scenarios ───────────�
   namespace assignment, and staggered launch of N asyncio tasks.
 * **`choreography.py`** — deterministic A2A scenarios exercising isolation,
   attestation, quorum, and replay-guard against the live GLM-driven population.
+  With several daemon URLs the agents are round-robined across INDEPENDENT data
+  tiers ("modules"), so every A2A scenario runs **once per module** over that
+  module's own agents; the boundary itself is probed by `cross_module_handoff`,
+  which expects the handoff NOT to arrive (reported as
+  `cross-module: not federated (expected)`) until `SWARM_FEDERATED=1` says
+  federation is wired — and FAILS if a message crosses an unfederated boundary.
 * **`coverage.py`** — the manifest, the tracker, live reconciliation against
   `GET /api/v1/tools/list` + `GET /api/v1/capabilities`, and the matrix.
 
@@ -66,6 +72,7 @@ choreography.*  ── scripted A2A scenarios ───────────�
 | `SWARM_NAMESPACE_PREFIX` | Isolation-namespace prefix | `swarm` |
 | `OPENROUTER_BASE_URL` | OpenRouter endpoint override | `https://openrouter.ai/api/v1` |
 | `SWARM_JOURNAL_DIR` | Per-agent JSONL journals plus `nhi-assessment.md` | unset (disabled) |
+| `SWARM_FEDERATED` | Assert node-to-node federation IS wired between modules | unset (not federated) |
 
 The model is **pinned** to `glm-5.3-flash` in code (`config.MODEL_ID`); it is
 deliberately not env-overridable so a stray variable cannot swap the attested
