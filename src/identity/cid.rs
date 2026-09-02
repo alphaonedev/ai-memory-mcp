@@ -39,6 +39,35 @@
 //! content before the hash ALSO means the stored SHA-256 never carries a
 //! recoverable credential.
 //!
+//! # Backend-independence of `created_at` (#3446, critical)
+//!
+//! `created_at` enters the pre-image as TEXT, and the two storage backends do
+//! NOT return the same text for the same instant: SQLite keeps `created_at` in
+//! a `TEXT` column and hands back the string it was given (chrono renders
+//! nanoseconds on Linux), while PostgreSQL keeps it in `TIMESTAMPTZ`
+//! (microsecond int8) and re-renders the readback as
+//! `DateTime::<Utc>::to_rfc3339()` (`+00:00`, `AutoSi` digits). Any path that
+//! RE-MINTS a cid from a row read back out of storage — the v74
+//! `backfill_memory_cids` migration, a supersede/re-store, a federation
+//! reconciliation, a forensic re-derivation — would therefore mint a DIFFERENT
+//! cid on the two backends for the same logical memory.
+//!
+//! So `created_at` is folded through
+//! [`crate::identity::attest::canonicalize_attested_created_at`] (the #3422
+//! canonicaliser) before it enters the pre-image, exactly as `title` and
+//! `content` are folded through [`crate::secret_screen::screen`] above: one
+//! instant, one rendering, one cid — whichever backend the row is read from and
+//! whichever rendering it was originally stamped with. An UNPARSEABLE value is
+//! used verbatim (there is no instant to canonicalise, and the empty-string
+//! caller in [`crate::approvals`] must keep its historical key).
+//!
+//! This does NOT rewrite any stored cid. `cid_genesis` remains the authoritative
+//! pre-image for an existing row and [`verify_cid`] recomputes the address from
+//! that stored BLOB — never from the row's fields — so every already-minted
+//! `(cid, cid_genesis)` pair keeps verifying byte-for-byte. Only pre-images
+//! minted from here on are canonical, and only for rows whose `created_at` was
+//! not already in the canonical rendering.
+//!
 //! # Claim scope (§26.5 honesty)
 //!
 //! A CID delivers: (1) genesis-identity binding — a stable content-address
@@ -83,6 +112,27 @@ fn screened(field: &str) -> String {
     }
 }
 
+/// #3446 — fold `created_at` to the ONE RFC3339 rendering BOTH storage backends
+/// return verbatim, reusing the #3422 canonicaliser
+/// ([`crate::identity::attest::canonicalize_attested_created_at`]: parse RFC3339
+/// → UTC → truncate to microseconds → `to_rfc3339()`).
+///
+/// SQLite returns the stamped TEXT unchanged (nanoseconds included); postgres
+/// re-renders its `TIMESTAMPTZ` readback at microsecond precision with a
+/// `+00:00` offset. Folding here makes the pre-image — and therefore the cid —
+/// a function of the INSTANT rather than of whichever rendering the row happens
+/// to carry, so a re-mint from a row read back on either backend agrees.
+///
+/// An unparseable value (including the empty string
+/// [`crate::approvals::execution_exemption_cid`] deliberately passes) is
+/// returned verbatim: there is no instant to canonicalise, and that caller's
+/// key must stay byte-stable across this change.
+#[must_use]
+fn backend_stable_created_at(created_at: &str) -> String {
+    crate::identity::attest::canonicalize_attested_created_at(created_at)
+        .unwrap_or_else(|| created_at.to_string())
+}
+
 /// Build the canonical cid PRE-IMAGE (the value stored in the
 /// `cid_genesis` BLOB and hashed by [`compute_cid`]):
 ///
@@ -97,6 +147,9 @@ fn screened(field: &str) -> String {
 /// module docs) so the pre-image never carries a recoverable credential and
 /// federated nodes on different screen modes converge on the same cid. The
 /// raw content NEVER appears — only its (screened) SHA-256 digest does.
+///
+/// `created_at` is folded through [`backend_stable_created_at`] (#3446) so the
+/// pre-image commits to the INSTANT, not to the per-backend rendering of it.
 #[must_use]
 pub fn canonical_cid_preimage(
     agent_id: &str,
@@ -107,6 +160,9 @@ pub fn canonical_cid_preimage(
     content: &str,
 ) -> Vec<u8> {
     let title_s = screened(title);
+    // #3446 — one instant, one rendering: the cid must not depend on whether
+    // the row was read back from a sqlite TEXT column or a postgres TIMESTAMPTZ.
+    let created_s = backend_stable_created_at(created_at);
     let content_digest = Sha256::digest(screened(content).as_bytes());
 
     let mut bytes = Vec::with_capacity(
@@ -115,7 +171,7 @@ pub fn canonical_cid_preimage(
             + namespace.len()
             + title_s.len()
             + kind.len()
-            + created_at.len()
+            + created_s.len()
             + content_digest.len()
             + 5,
     );
@@ -128,7 +184,7 @@ pub fn canonical_cid_preimage(
     bytes.push(FIELD_SEP);
     bytes.extend_from_slice(kind.as_bytes());
     bytes.push(FIELD_SEP);
-    bytes.extend_from_slice(created_at.as_bytes());
+    bytes.extend_from_slice(created_s.as_bytes());
     bytes.push(FIELD_SEP);
     bytes.extend_from_slice(&content_digest);
     bytes
@@ -250,6 +306,9 @@ mod tests {
     const TITLE: &str = "genesis title";
     const KIND: &str = "observation";
     const CREATED: &str = "2026-06-30T00:00:00Z";
+    /// #3446 — the ONE rendering of [`CREATED`] both backends return, and
+    /// therefore the bytes the pre-image commits to.
+    const CREATED_CANONICAL: &str = "2026-06-30T00:00:00+00:00";
     const CONTENT: &str = "the original body of the memory";
 
     fn base_memory() -> Memory {
@@ -311,7 +370,13 @@ mod tests {
         assert!(hay.contains(NS));
         assert!(hay.contains(TITLE));
         assert!(hay.contains(KIND));
-        assert!(hay.contains(CREATED));
+        // #3446 — `created_at` enters the pre-image through
+        // `backend_stable_created_at`, so the CANONICAL rendering of the
+        // fixture instant is what is committed (the `…Z` wire form the fixture
+        // is written in is folded to `…+00:00`). The instant is still pinned —
+        // `created_at_is_pinned_but_rendering_independent_3446` proves a
+        // DIFFERENT instant still changes the cid.
+        assert!(hay.contains(CREATED_CANONICAL));
         // The raw content NEVER appears — only its SHA-256 digest does.
         assert!(
             !hay.contains(CONTENT),
@@ -371,6 +436,152 @@ mod tests {
         let other_ns = stamp_cid(AGENT, "other-ns", TITLE, KIND, CREATED, CONTENT);
         assert_ne!(base.cid, other_kind.cid, "kind is pinned into the cid");
         assert_ne!(base.cid, other_ns.cid, "namespace is pinned into the cid");
+    }
+
+    // ---- #3446: the cid commits to the INSTANT, not to its rendering -------
+
+    /// #3446 — every RFC3339 rendering of ONE instant mints the SAME cid, so a
+    /// re-mint from a row read back out of sqlite (`TEXT`, nanoseconds kept) and
+    /// out of postgres (`TIMESTAMPTZ`, microseconds, `+00:00`) agree.
+    #[test]
+    fn cid_is_stable_across_created_at_renderings_3446() {
+        // The postgres readback rendering is the canonical one.
+        let canonical = stamp_cid(AGENT, NS, TITLE, KIND, "2026-06-30T12:00:00+00:00", CONTENT);
+        for rendering in [
+            // The `…Z` wire form.
+            "2026-06-30T12:00:00Z",
+            // A non-UTC offset: same instant, local rendering.
+            "2026-06-30T14:00:00+02:00",
+            // chrono's own `Utc::now().to_rfc3339()` shape on Linux — the
+            // nanosecond precision postgres `TIMESTAMPTZ` cannot store.
+            "2026-06-30T12:00:00.000000000+00:00",
+            // A fixed-width zero fraction (JS `toISOString`).
+            "2026-06-30T12:00:00.000Z",
+        ] {
+            let s = stamp_cid(AGENT, NS, TITLE, KIND, rendering, CONTENT);
+            assert_eq!(
+                s.cid, canonical.cid,
+                "#3446: {rendering} must mint the canonical instant's cid"
+            );
+            assert_eq!(s.genesis, canonical.genesis, "pre-images must match too");
+        }
+    }
+
+    /// #3446 — sub-microsecond digits are TRUNCATED exactly as `TIMESTAMPTZ`
+    /// drops them, so a sqlite-minted nanosecond stamp and the postgres readback
+    /// of the same row converge.
+    #[test]
+    fn cid_truncates_sub_microsecond_digits_like_timestamptz_3446() {
+        let nanos = stamp_cid(
+            AGENT,
+            NS,
+            TITLE,
+            KIND,
+            "2026-06-30T12:00:00.123456789+00:00",
+            CONTENT,
+        );
+        let pg_readback = stamp_cid(
+            AGENT,
+            NS,
+            TITLE,
+            KIND,
+            "2026-06-30T12:00:00.123456+00:00",
+            CONTENT,
+        );
+        assert_eq!(
+            nanos.cid, pg_readback.cid,
+            "#3446: the µs the backend keeps is what the cid commits to"
+        );
+    }
+
+    /// #3446 (the DENIED direction) — canonicalisation must not FLATTEN
+    /// distinct instants: `created_at` is still pinned into the cid, so a
+    /// back-dated or forward-dated genesis is still a different address.
+    #[test]
+    fn created_at_is_pinned_but_rendering_independent_3446() {
+        let base = stamp_cid(AGENT, NS, TITLE, KIND, "2026-06-30T12:00:00+00:00", CONTENT);
+        for other in [
+            // One microsecond apart — the finest distinction the backends keep.
+            "2026-06-30T12:00:00.000001+00:00",
+            "2026-06-30T12:00:01+00:00",
+            "2026-07-01T12:00:00+00:00",
+        ] {
+            let s = stamp_cid(AGENT, NS, TITLE, KIND, other, CONTENT);
+            assert_ne!(
+                s.cid, base.cid,
+                "#3446: {other} is a DIFFERENT instant and must keep a different cid"
+            );
+        }
+    }
+
+    /// #3446 — an unparseable `created_at` is committed VERBATIM. The empty
+    /// string is the load-bearing case: `approvals::execution_exemption_cid`
+    /// deliberately passes `""`, and that key must stay byte-stable across this
+    /// change or a pending-action replay would lose its single-use exemption.
+    #[test]
+    fn unparseable_created_at_is_committed_verbatim_3446() {
+        for raw in ["", "2026-06-30 noon", "not-a-timestamp"] {
+            let s = stamp_cid(AGENT, NS, TITLE, KIND, raw, CONTENT);
+            let hay = String::from_utf8_lossy(&s.genesis);
+            assert!(
+                hay.contains(&format!("\u{1f}{raw}\u{1f}")),
+                "#3446: {raw:?} must enter the pre-image verbatim"
+            );
+        }
+        // Byte-for-byte identical to the pre-#3446 pre-image for the empty
+        // stamp: domain + agent + ns + title + kind + "" + digest.
+        let empty = canonical_cid_preimage(AGENT, NS, TITLE, KIND, "", CONTENT);
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(CID_DOMAIN);
+        expected.extend_from_slice(AGENT.as_bytes());
+        expected.push(FIELD_SEP);
+        expected.extend_from_slice(NS.as_bytes());
+        expected.push(FIELD_SEP);
+        expected.extend_from_slice(TITLE.as_bytes());
+        expected.push(FIELD_SEP);
+        expected.extend_from_slice(KIND.as_bytes());
+        expected.push(FIELD_SEP);
+        expected.push(FIELD_SEP);
+        expected.extend_from_slice(&Sha256::digest(CONTENT.as_bytes()));
+        assert_eq!(
+            empty, expected,
+            "#3446: the empty-stamp pre-image is unchanged (approvals exemption key)"
+        );
+    }
+
+    /// #3446 — an ALREADY-minted pair keeps verifying: `verify_cid` recomputes
+    /// the address from the stored `cid_genesis` BLOB, never from the row's
+    /// fields, so a pre-#3446 genesis (built over a raw `…Z` rendering) is
+    /// still authoritative and still verifies clean.
+    #[test]
+    fn pre_existing_genesis_stays_authoritative_3446() {
+        // A pre-#3446 pre-image: built by hand over the RAW `…Z` rendering,
+        // exactly as the old builder would have emitted it.
+        let mut legacy: Vec<u8> = Vec::new();
+        legacy.extend_from_slice(CID_DOMAIN);
+        legacy.extend_from_slice(AGENT.as_bytes());
+        legacy.push(FIELD_SEP);
+        legacy.extend_from_slice(NS.as_bytes());
+        legacy.push(FIELD_SEP);
+        legacy.extend_from_slice(TITLE.as_bytes());
+        legacy.push(FIELD_SEP);
+        legacy.extend_from_slice(KIND.as_bytes());
+        legacy.push(FIELD_SEP);
+        legacy.extend_from_slice(CREATED.as_bytes());
+        legacy.push(FIELD_SEP);
+        legacy.extend_from_slice(&Sha256::digest(CONTENT.as_bytes()));
+        let legacy_cid = compute_cid(&legacy);
+
+        verify_cid(&legacy_cid, &legacy).expect("#3446: a stored pair must keep verifying");
+        // And it is genuinely the pre-#3446 shape — the new builder folds the
+        // rendering, so a fresh mint over the same fixture differs.
+        let fresh = stamp_cid(AGENT, NS, TITLE, KIND, CREATED, CONTENT);
+        assert_ne!(
+            fresh.genesis, legacy,
+            "the new pre-image commits the canonical rendering"
+        );
+        // The stored pair is untouched by that: nothing rewrites it.
+        verify_cid(&legacy_cid, &legacy).expect("still verifies after a fresh mint");
     }
 
     #[test]

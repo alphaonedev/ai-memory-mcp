@@ -251,6 +251,36 @@ Both SDKs produce the canonical form for you —
 it before signing. In shell, `date -u +%Y-%m-%dT%H:%M:%S+00:00` is canonical.
 The daemon's own `--sign` / self-attesting paths stamp it too.
 
+#### The same rendering is what the `cid` commits to (#3446)
+
+The content-address (`memories.cid`, `b3:<hex>`) is minted from a genesis
+pre-image that also joins `created_at` in as TEXT
+(`identity::cid::canonical_cid_preimage`: `agent_id | namespace |
+screen(title) | kind | created_at | sha256(screen(content))`). Because SQLite
+returns that column verbatim while PostgreSQL re-renders it out of
+`TIMESTAMPTZ`, a *raw* stamp would make the address depend on **which backend
+the row was read from** — so every path that re-mints a cid from a stored row
+(the v74 `backfill_memory_cids` migration, a supersede/re-store, a federation
+reconciliation, a forensic re-derivation) would disagree across backends for
+the same logical memory.
+
+The pre-image therefore folds `created_at` through the **same canonicaliser**
+(`identity::attest::canonicalize_attested_created_at`) before hashing, exactly
+as it folds `title`/`content` through the secret screen. The rule, stated once:
+
+> **A cid commits to the `created_at` *instant*, never to a particular
+> rendering of it.** All renderings of one instant — `…Z`, a non-UTC offset,
+> nanosecond precision — mint the identical address; a genuinely different
+> instant (down to the microsecond both backends keep) still mints a different
+> one. An unparseable stamp is committed verbatim.
+
+This changes no stored address. `cid_genesis` remains the authoritative
+pre-image for an existing row and `verify_cid` recomputes from that stored
+BLOB — never from the row's fields — so every already-minted
+`(cid, cid_genesis)` pair keeps verifying byte-for-byte. Only pre-images minted
+from here on are canonical, and only for rows whose `created_at` was not
+already in the canonical rendering.
+
 ---
 
 ## MCP configuration (crystal clear)
