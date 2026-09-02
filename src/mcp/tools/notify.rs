@@ -99,7 +99,32 @@ pub fn handle_notify(
         version: 1,
         lifecycle_state: crate::models::LifecycleState::Open,
     };
-    let actual_id = db::insert(conn, &mem).map_err(|e| e.to_string())?;
+    // #3358 — notify is a tenant-authored memory write and must consume the
+    // sender's quota exactly like `memory_store`. Charge the destination
+    // namespace to the authenticated sender (never the recipient), counting
+    // one row plus the caller-controlled title/content/metadata bytes.
+    let payload_bytes =
+        crate::quotas::coordination_payload_bytes(&[&mem.title, &mem.content], &[&mem.metadata]);
+    let quota_op = crate::quotas::QuotaOp::Memory {
+        bytes: payload_bytes,
+    };
+    crate::quotas::check_and_record(conn, &sender, &mem.namespace, quota_op)
+        .map_err(|e| e.to_string())?;
+
+    let actual_id = match db::insert(conn, &mem) {
+        Ok(id) => id,
+        Err(e) => {
+            // The quota increment commits before the insert. Restore it on
+            // every downstream refusal/failure so only durable notifications
+            // remain charged.
+            if let Err(refund_err) =
+                crate::quotas::refund_op(conn, &sender, &mem.namespace, quota_op)
+            {
+                crate::quotas::log_refund_op_failed(&sender, &refund_err);
+            }
+            return Err(e.to_string());
+        }
+    };
 
     Ok(json!({
         "id": actual_id,
@@ -362,6 +387,82 @@ mod d1_5_986_tests {
     fn notify_tool_metadata_986() {
         assert_eq!(NotifyTool::name(), "memory_notify");
         assert_eq!(NotifyTool::family(), "other");
+    }
+
+    #[test]
+    fn notify_charges_sender_rows_and_bytes_3358() {
+        let _env = crate::identity::agent_id_env_unset_guard();
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open database");
+        let ttl = crate::config::ResolvedTtl::default();
+        let client = "quota-sender";
+        let sender = crate::identity::resolve_agent_id(None, Some(client)).unwrap();
+        let target = "ai:quota-recipient";
+        let namespace = super::super::agent::messages_namespace_for(target);
+        for index in 0..3 {
+            let params = json!({
+                "target_agent_id": target,
+                "title": format!("quota accounted notify {index}"),
+                "payload": "caller controlled payload",
+            });
+            handle_notify(&conn, &params, &ttl, Some(client)).expect("notify under quota");
+        }
+
+        let sender_status =
+            crate::quotas::get_status(&conn, &sender, &namespace).expect("sender quota status");
+        assert_eq!(sender_status.current_memories_today, 3);
+        assert!(sender_status.current_storage_bytes > 0);
+        let inbox_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = ?1",
+                [&namespace],
+                |row| row.get(0),
+            )
+            .expect("count inbox rows");
+        assert_eq!(inbox_rows, 3);
+        let recipient_status =
+            crate::quotas::peek_status(&conn, target, &namespace).expect("recipient quota status");
+        assert_eq!(recipient_status.current_memories_today, 0);
+        assert_eq!(recipient_status.current_storage_bytes, 0);
+    }
+
+    #[test]
+    fn notify_refuses_sender_over_quota_without_writing_3358() {
+        let _env = crate::identity::agent_id_env_unset_guard();
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open database");
+        let ttl = crate::config::ResolvedTtl::default();
+        let client = "quota-limited";
+        let sender = crate::identity::resolve_agent_id(None, Some(client)).unwrap();
+        let target = "ai:quota-target";
+        let namespace = super::super::agent::messages_namespace_for(target);
+        crate::quotas::get_status(&conn, &sender, &namespace).expect("seed quota row");
+        conn.execute(
+            "UPDATE agent_quotas SET max_memories_per_day = 0
+             WHERE agent_id = ?1 AND namespace = ?2",
+            rusqlite::params![sender, namespace],
+        )
+        .expect("tighten sender quota");
+        let params = json!({
+            "target_agent_id": target,
+            "title": "must be refused",
+            "payload": "must not reach the inbox",
+        });
+
+        let err = handle_notify(&conn, &params, &ttl, Some(client))
+            .expect_err("notify over quota must fail closed");
+
+        assert!(err.contains("QUOTA_EXCEEDED"), "unexpected error: {err}");
+        let inbox_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = ?1",
+                [&namespace],
+                |row| row.get(0),
+            )
+            .expect("count inbox rows");
+        assert_eq!(inbox_rows, 0, "an over-quota notify must not materialise");
+        let status =
+            crate::quotas::get_status(&conn, &sender, &namespace).expect("sender quota status");
+        assert_eq!(status.current_memories_today, 0);
+        assert_eq!(status.current_storage_bytes, 0);
     }
 
     #[test]
