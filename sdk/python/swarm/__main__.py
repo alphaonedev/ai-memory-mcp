@@ -20,7 +20,8 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from swarm.audit import build_nhi_report, render_nhi_report, write_audit_artifacts
+from swarm.audit import (build_nhi_report, harness_dispatches, render_nhi_report,
+                         write_audit_artifacts)
 from swarm.choreography import (collect_assessments, negative_authorization_evidence,
                                 nhi_assessment, run_all)
 from swarm.config import ConfigError, SwarmConfig
@@ -105,6 +106,25 @@ def _usage_block(
              f"usage.json -> {path}"]
     return "\n".join(lines)
 
+def _mission_partial(progress: dict[str, dict[str, object]]) -> dict[str, int]:
+    """Fleet totals for both mission views: the strict flags and the call-log
+    evidence (#3440). A strict 0 is then always reported next to what the agents
+    actually did — e.g. 61 summaries stored, 0 of them in the shared namespace.
+    """
+    rows = list(progress.values())
+    return {name: sum(int(bool(row[key])) if isinstance(row[key], bool) else int(row[key])
+                      for row in rows)
+            for name, key in (
+                ("summary_stored", "summary_stored"),
+                ("lineage_proved", "lineage_proved"),
+                ("facts_stored_total", "facts_stored"),
+                ("summary_stored_evidence", "summary_stored_evidence"),
+                ("summary_in_shared_namespace", "summary_in_shared_namespace"),
+                ("lineage_proved_evidence", "lineage_proved_evidence"),
+                ("facts_stored_evidence", "facts_stored_evidence"),
+            )}
+
+
 def _auditor_verdict(assessment: str | None) -> str:
     """The auditor's FINAL verdict.
 
@@ -145,13 +165,16 @@ async def _main() -> int:
         try:
             await swarm.provision()
             await swarm.run()
-            negative_evidence = await negative_authorization_evidence(swarm)
-            results = await run_all(swarm)
-            assessments = await collect_assessments(swarm)
-            reconcile_result = swarm.call_log.reconcile(coverage)
-            assessment_result, assessment = await nhi_assessment(
-                swarm, results, reconcile_result=reconcile_result,
-                negative_evidence=negative_evidence)
+            # Everything past the agent run is HARNESS-dispatched: stamped so
+            # the mission evidence never mistakes a probe for an agent's work.
+            with harness_dispatches():
+                negative_evidence = await negative_authorization_evidence(swarm)
+                results = await run_all(swarm)
+                assessments = await collect_assessments(swarm)
+                reconcile_result = swarm.call_log.reconcile(coverage)
+                assessment_result, assessment = await nhi_assessment(
+                    swarm, results, reconcile_result=reconcile_result,
+                    negative_evidence=negative_evidence)
             results.append(assessment_result)
             final_reconcile = swarm.call_log.reconcile(coverage)
             _write_journals(swarm, assessment=assessment)
@@ -167,12 +190,7 @@ async def _main() -> int:
                 model=config.model_slug, model_override_reason=config.model_override_reason)
             report["call_log_reconcile"] = final_reconcile
             report["mission_progress"] = swarm.mission_progress()
-            prog = report["mission_progress"].values()
-            report["mission_partial"] = {
-                "summary_stored": sum(p["summary_stored"] for p in prog),
-                "lineage_proved": sum(p["lineage_proved"] for p in prog),
-                "facts_stored_total": sum(p["facts_stored"] for p in prog),
-            }
+            report["mission_partial"] = _mission_partial(report["mission_progress"])
             print("\n" + render_nhi_report(report))
             journal_dir = os.environ.get("SWARM_JOURNAL_DIR")
             if journal_dir:
