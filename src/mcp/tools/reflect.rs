@@ -153,10 +153,61 @@ fn fold_entity_id_into_metadata(metadata: &mut Value, top_level: Option<&str>) {
 /// or malformed (`source_ids`, `title`, `content`, `tier`, `depth`).
 // Only the postgres SAL HTTP branch (sal-gated) calls this in a non-test
 // build; the unit tests below exercise it in every feature set.
+/// #3171 / #3423 — resolve the OWNER stamped into a reflection's
+/// `metadata.agent_id`, i.e. the principal every later owner gate compares
+/// against. THE one rule, shared by both reflect parsers
+/// ([`parse_reflect_input`], the postgres path) and
+/// ([`handle_reflect_caller`], the sqlite path) so the two backends can never
+/// attribute the same request differently.
+///
+/// - `authenticated_caller` is a TRANSPORT-authenticated principal, not a wire
+///   field: on HTTP it is the `X-Agent-Id` identity resolved through
+///   `handlers::parity::resolve_caller_agent_id` (validated, and under an
+///   enrolled posture bound by the `identity_binding` IDOR gate, with any body
+///   `agent_id` only a refinement that must MATCH). When `Some`, it IS the
+///   owner.
+///
+///   It deliberately BYPASSES the #3171 `resolve_governance_subject` binding.
+///   That binding exists to stop a SELF-ASSERTED wire value from overriding the
+///   process identity (`AI_MEMORY_AGENT_ID`) on the MCP/CLI surfaces, where the
+///   process IS the principal. On HTTP the process is the SERVER and the
+///   principal is per-request, so putting an authenticated tenant through the
+///   wire binding would judge them against the daemon's own env id and refuse
+///   every legitimate reflect on a daemon that sets one.
+///
+/// - `None` is every pre-#3423 caller, byte-for-byte: the #3171 binding runs
+///   exactly as before, so an MCP/CLI wire `agent_id` that disagrees with the
+///   enforced caller is still refused and the single-operator default is
+///   unchanged.
+///
+/// # Errors
+/// An `agent_id` validation failure, or the #3171 mismatch refusal.
+fn resolve_reflect_owner(
+    explicit_agent_id: Option<&str>,
+    mcp_client: Option<&str>,
+    authenticated_caller: Option<&str>,
+) -> Result<String, String> {
+    match authenticated_caller {
+        // Re-validated so an authenticated id still cannot be a reserved
+        // sentinel (#977) or a malformed string.
+        Some(c) => {
+            crate::validate::validate_agent_id(c).map_err(|e| e.to_string())?;
+            Ok(c.to_string())
+        }
+        None => {
+            crate::identity::resolve_governance_subject(explicit_agent_id, mcp_client, "reflect")
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
 #[cfg_attr(not(feature = "sal"), allow(dead_code))]
+/// `authenticated_caller` is the #3423 transport-authenticated principal —
+/// `None` for every wire/MCP caller. See [`resolve_reflect_owner`].
 pub(crate) fn parse_reflect_input(
     params: &Value,
     mcp_client: Option<&str>,
+    authenticated_caller: Option<&str>,
 ) -> Result<(db::ReflectInput, Option<i64>), String> {
     let source_ids_arr = params[param_names::SOURCE_IDS]
         .as_array()
@@ -213,14 +264,7 @@ pub(crate) fn parse_reflect_input(
             .get(param_names::AGENT_ID)
             .and_then(serde_json::Value::as_str)
     });
-    // #3171 — this id becomes the reflection row's `metadata.agent_id`, i.e.
-    // the OWNER every later owner gate compares against. Bind it to the
-    // enforced-read caller so a self-asserted value (top-level or inline
-    // `metadata.agent_id`) cannot mint a row owned by another principal;
-    // single-operator default unchanged. Mirrors the `memory_store` binding.
-    let agent_id =
-        crate::identity::resolve_governance_subject(explicit_agent_id, mcp_client, "reflect")
-            .map_err(|e| e.to_string())?;
+    let agent_id = resolve_reflect_owner(explicit_agent_id, mcp_client, authenticated_caller)?;
     // v0.7.1 #1665 — desugar the top-level `entity_id` convenience param
     // into `metadata.entity_id` before building the input, so the binding
     // is identical across both reflect parsers and the L1-8 round-trip.
@@ -259,6 +303,59 @@ pub fn handle_reflect(
     // surface so the dispatcher in `mcp::mod` can pass through the
     // shared `active_keypair` argument verbatim.
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+) -> Result<Value, String> {
+    handle_reflect_caller(
+        conn,
+        db_path,
+        params,
+        embedder,
+        vector_index,
+        mcp_client,
+        active_keypair,
+        None,
+    )
+}
+
+/// #3423 — [`handle_reflect`] for a surface that has ALREADY AUTHENTICATED its
+/// caller, mirroring the shipped `handle_recall` / `handle_recall_caller` split.
+///
+/// `authenticated_caller` is a TRANSPORT-authenticated principal, not a wire
+/// field: on HTTP it is the `X-Agent-Id` identity resolved through
+/// `handlers::parity::resolve_caller_agent_id` (validated, and under an
+/// enrolled posture bound by the `identity_binding` IDOR gate, with any body
+/// `agent_id` only a refinement that must MATCH). When it is `Some`, it IS the
+/// reflection's owner.
+///
+/// Why it BYPASSES the #3171 `resolve_governance_subject` binding rather than
+/// feeding it: that binding exists to stop a SELF-ASSERTED wire value from
+/// overriding the process identity (`AI_MEMORY_AGENT_ID`) on the MCP/CLI
+/// surfaces, where the process IS the principal. On HTTP the process is the
+/// SERVER and the principal is per-request, so routing an authenticated tenant
+/// through the wire binding would judge them against the daemon's own env id
+/// and refuse every legitimate reflect on a daemon that sets one. The postgres
+/// branch of `POST /api/v1/memory_reflect` has always overridden the parsed id
+/// with the header caller for exactly this reason (#2857); this entry point
+/// gives the sqlite branch the same semantics instead of leaving it to fall
+/// through to `resolve_agent_id`'s `host:<hostname>` default — which is what
+/// #3423 reported: a 200 with an id the caller then could not GET, because the
+/// row was owned by the daemon host principal.
+///
+/// `None` preserves every existing caller byte-for-byte: the #3171 binding runs
+/// exactly as before.
+///
+/// # Errors
+/// Propagates every [`handle_reflect`] refusal, plus an `agent_id` validation
+/// failure when `authenticated_caller` is not a valid wire agent id.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_reflect_caller(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+    params: &Value,
+    embedder: Option<&dyn Embed>,
+    vector_index: Option<&dyn VectorSearchIndex>,
+    mcp_client: Option<&str>,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    authenticated_caller: Option<&str>,
 ) -> Result<Value, String> {
     // ─── Argument parsing ───────────────────────────────────────────
     let source_ids_arr = params[param_names::SOURCE_IDS]
@@ -334,14 +431,7 @@ pub fn handle_reflect(
             .get(param_names::AGENT_ID)
             .and_then(serde_json::Value::as_str)
     });
-    // #3171 — this id becomes the reflection row's `metadata.agent_id`, i.e.
-    // the OWNER every later owner gate compares against. Bind it to the
-    // enforced-read caller so a self-asserted value (top-level or inline
-    // `metadata.agent_id`) cannot mint a row owned by another principal;
-    // single-operator default unchanged. Mirrors the `memory_store` binding.
-    let agent_id =
-        crate::identity::resolve_governance_subject(explicit_agent_id, mcp_client, "reflect")
-            .map_err(|e| e.to_string())?;
+    let agent_id = resolve_reflect_owner(explicit_agent_id, mcp_client, authenticated_caller)?;
 
     // v0.7.1 #1665 — desugar the top-level `entity_id` convenience param
     // into `metadata.entity_id` before building the input, so the binding
@@ -756,6 +846,93 @@ mod tests {
     //! - happy path without embedder (no-op for embedding side effect)
 
     use super::*;
+
+    // ── #3423 — the shared reflection-OWNER rule ────────────────────────
+    //
+    // `resolve_reflect_owner` is now the ONE site both backends reach
+    // (`parse_reflect_input` on the postgres path, `handle_reflect_caller` on
+    // the sqlite path), so these pin the rule itself rather than one backend's
+    // rendition of it.
+
+    #[test]
+    fn reflect_owner_is_the_authenticated_caller_3423() {
+        // ALLOWED — a transport-authenticated principal IS the owner, and it
+        // WINS over a divergent wire value rather than being refused by the
+        // #3171 binding (the HTTP surface has already checked that the body is
+        // only a refinement that agrees).
+        let owner = resolve_reflect_owner(None, None, Some("ai:alice")).expect("authenticated");
+        assert_eq!(owner, "ai:alice");
+        let owner =
+            resolve_reflect_owner(Some("ai:alice"), None, Some("ai:alice")).expect("agreeing");
+        assert_eq!(owner, "ai:alice");
+    }
+
+    #[test]
+    fn reflect_owner_still_validates_an_authenticated_caller_3423() {
+        // DENIED — "authenticated" does not mean "unchecked": a reserved
+        // sentinel (#977) or a malformed principal is still refused, so a
+        // transport bug cannot mint a row owned by an internal identity.
+        let err = resolve_reflect_owner(None, None, Some("daemon"))
+            .expect_err("a reserved sentinel must refuse");
+        assert!(err.contains("agent_id"), "got: {err}");
+        let err = resolve_reflect_owner(None, None, Some("has spaces"))
+            .expect_err("a malformed principal must refuse");
+        assert!(err.contains("agent_id"), "got: {err}");
+    }
+
+    #[test]
+    fn reflect_owner_without_an_authenticated_caller_keeps_the_3171_binding() {
+        // The `None` path — every MCP / CLI caller — must be byte-identical to
+        // pre-#3423: the #3171 wire binding still refuses a self-asserted id
+        // that disagrees with the enforced caller, and honours a matching one.
+        let _envg = crate::identity::agent_id_env_test_lock();
+        // SAFETY: process-global env mutation serialised on the crate-wide test
+        // lock held above; every mutator takes the same lock.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:realcaller") };
+
+        let err = resolve_reflect_owner(Some("ai:forged"), None, None)
+            .expect_err("a forged wire principal must still refuse");
+        assert!(err.contains("agent_id mismatch"), "got: {err}");
+        assert_eq!(
+            resolve_reflect_owner(Some("ai:realcaller"), None, None).expect("self"),
+            "ai:realcaller"
+        );
+        assert_eq!(
+            resolve_reflect_owner(None, None, None).expect("ambient"),
+            "ai:realcaller"
+        );
+
+        // SAFETY: same serialisation as the set above.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+    }
+
+    #[test]
+    fn parse_reflect_input_threads_the_authenticated_caller_3423() {
+        // The postgres path's parser: the authenticated principal reaches
+        // `ReflectInput.agent_id`, which is what the row is owned by. Pre-#3423
+        // the HTTP handler had to OVERRIDE this field after the fact, and only
+        // did so on the postgres branch — which is exactly how the two backends
+        // came to attribute the same request differently.
+        let params = json!({
+            "source_ids": ["a"],
+            "title": "t",
+            "content": "c",
+        });
+        let (input, _) =
+            super::parse_reflect_input(&params, None, Some("ai:alice")).expect("parse ok");
+        assert_eq!(input.agent_id, "ai:alice");
+    }
+
+    /// #3423 — the shipped parser gained a third `authenticated_caller`
+    /// argument (always `None` off the HTTP surface). This 2-arg shim keeps the
+    /// pre-existing coverage below byte-identical instead of threading a
+    /// meaningless `None` through fourteen call sites.
+    fn parse_reflect_input_t(
+        params: &Value,
+        mcp_client: Option<&str>,
+    ) -> Result<(db::ReflectInput, Option<i64>), String> {
+        super::parse_reflect_input(params, mcp_client, None)
+    }
     use crate::embeddings::test_support::MockEmbedder;
     use crate::models::{Memory, MemoryKind};
     use crate::storage as db;
@@ -775,7 +952,7 @@ mod tests {
             "tags": ["x", "y"],
             "agent_id": "ai:tester@host",
         });
-        let (input, caller_depth) = parse_reflect_input(&params, None).expect("parse ok");
+        let (input, caller_depth) = parse_reflect_input_t(&params, None).expect("parse ok");
         assert_eq!(input.source_ids, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(input.title, "t");
         assert_eq!(input.content, "c");
@@ -791,7 +968,7 @@ mod tests {
     #[test]
     fn parse_reflect_input_defaults_when_optional_fields_absent() {
         let params = json!({ "source_ids": ["a"], "title": "t", "content": "c" });
-        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        let (input, _) = parse_reflect_input_t(&params, None).expect("parse ok");
         // tier defaults to Mid; priority 5; confidence 1.0; namespace None.
         assert_eq!(input.tier, Tier::Mid);
         assert_eq!(input.priority, 5);
@@ -802,13 +979,14 @@ mod tests {
 
     #[test]
     fn parse_reflect_input_missing_source_ids_errors() {
-        let err = parse_reflect_input(&json!({ "title": "t", "content": "c" }), None).unwrap_err();
+        let err =
+            parse_reflect_input_t(&json!({ "title": "t", "content": "c" }), None).unwrap_err();
         assert!(err.contains("source_ids is required"), "got: {err}");
     }
 
     #[test]
     fn parse_reflect_input_empty_source_ids_errors() {
-        let err = parse_reflect_input(
+        let err = parse_reflect_input_t(
             &json!({ "source_ids": [], "title": "t", "content": "c" }),
             None,
         )
@@ -818,7 +996,7 @@ mod tests {
 
     #[test]
     fn parse_reflect_input_non_string_source_errors() {
-        let err = parse_reflect_input(
+        let err = parse_reflect_input_t(
             &json!({ "source_ids": [1], "title": "t", "content": "c" }),
             None,
         )
@@ -828,14 +1006,14 @@ mod tests {
 
     #[test]
     fn parse_reflect_input_missing_title_errors() {
-        let err =
-            parse_reflect_input(&json!({ "source_ids": ["a"], "content": "c" }), None).unwrap_err();
+        let err = parse_reflect_input_t(&json!({ "source_ids": ["a"], "content": "c" }), None)
+            .unwrap_err();
         assert!(err.contains("title is required"), "got: {err}");
     }
 
     #[test]
     fn parse_reflect_input_negative_depth_is_caller_depth_mismatch() {
-        let err = parse_reflect_input(
+        let err = parse_reflect_input_t(
             &json!({ "source_ids": ["a"], "title": "t", "content": "c", "depth": -1 }),
             None,
         )
@@ -845,7 +1023,7 @@ mod tests {
 
     #[test]
     fn parse_reflect_input_returns_caller_depth_when_present() {
-        let (_, caller_depth) = parse_reflect_input(
+        let (_, caller_depth) = parse_reflect_input_t(
             &json!({ "source_ids": ["a"], "title": "t", "content": "c", "depth": 3 }),
             None,
         )
@@ -955,7 +1133,7 @@ mod tests {
             "source_ids": ["a"], "title": "t", "content": "c",
             "entity_id": 42,
         });
-        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        let (input, _) = parse_reflect_input_t(&params, None).expect("parse ok");
         assert!(
             input
                 .metadata
@@ -970,7 +1148,7 @@ mod tests {
             "source_ids": ["a"], "title": "t", "content": "c",
             "entity_id": "ent-1",
         });
-        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        let (input, _) = parse_reflect_input_t(&params, None).expect("parse ok");
         assert_eq!(
             input.metadata[crate::models::field_names::ENTITY_ID],
             json!("ent-1")
@@ -984,7 +1162,7 @@ mod tests {
             "entity_id": "alias",
             "metadata": {"entity_id": "real"},
         });
-        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        let (input, _) = parse_reflect_input_t(&params, None).expect("parse ok");
         assert_eq!(
             input.metadata[crate::models::field_names::ENTITY_ID],
             json!("real")
@@ -997,7 +1175,7 @@ mod tests {
             "source_ids": ["a"], "title": "t", "content": "c",
             "entity_id": "   ",
         });
-        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        let (input, _) = parse_reflect_input_t(&params, None).expect("parse ok");
         assert!(
             input
                 .metadata
@@ -1052,7 +1230,7 @@ mod tests {
     #[test]
     fn parse_reflect_input_omitted_entity_id_no_key() {
         let params = json!({ "source_ids": ["a"], "title": "t", "content": "c" });
-        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        let (input, _) = parse_reflect_input_t(&params, None).expect("parse ok");
         assert!(
             input
                 .metadata
