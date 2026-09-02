@@ -13935,6 +13935,35 @@ impl PostgresStore {
         }
 
         // Write each `reflects_on` link inside the same tx.
+        //
+        // #3423 — SIGN the edge when a keypair is available, so the attestation
+        // level of a reflection's provenance edges does not depend on which
+        // backend served the write. Pre-#3423 this INSERT hardcoded
+        // `'unsigned'` and never read `hooks.active_keypair`, while the SQLite
+        // twin (`db::create_link_signed` via `storage::reflect`) signed the same
+        // edges `self_signed` — so the identical `POST /api/v1/memory_reflect`
+        // produced attested provenance on sqlite and unattested provenance on
+        // postgres. The trait impl above has always threaded `signing_key` into
+        // `hooks.active_keypair` and its docstring claimed the edges "land
+        // `self_signed`"; the code simply never used it. A verifier walking a
+        // federated hive saw the same logical edge as attested from one peer and
+        // unattested from another, which is exactly the kind of divergence that
+        // makes an attestation posture unenforceable.
+        //
+        // The pre-image is the SAME `SignableLink` CBOR the sqlite path and this
+        // file's own `link_internal` sign, and the stamp is canonicalised
+        // through #3422's `canonical_created_at_stamp` — the one fixpoint of the
+        // sqlite and postgres `created_at` renderings — so the signature
+        // re-derives from a readback on BOTH backends. Signing happens BEFORE
+        // the INSERT so a CBOR/sign failure surfaces as a clean error instead of
+        // a half-written row (same ordering as `db::create_link_signed`).
+        // Truncate ONCE and use the same instant for the pre-image and the bind,
+        // so the row's `TIMESTAMPTZ` (which keeps microseconds) and the signed
+        // string are the same value rather than relying on the driver to round
+        // the way the signer assumed.
+        let edge_created_at_dt = truncate_to_microseconds(created_at_dt);
+        let edge_created_at_str =
+            crate::identity::attest::canonical_created_at_stamp(edge_created_at_dt);
         for src_id in &input.source_ids {
             validate::validate_link(
                 &actual_id,
@@ -13942,6 +13971,34 @@ impl PostgresStore {
                 crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
             )
             .map_err(|e| ReflectError::Validation(e.to_string()))?;
+            let (signature, attest_level, observed_by_col): (
+                Option<Vec<u8>>,
+                &'static str,
+                Option<String>,
+            ) = match hooks.active_keypair {
+                Some(kp) if kp.can_sign() => {
+                    let signable = crate::identity::sign::SignableLink {
+                        src_id: &actual_id,
+                        dst_id: src_id,
+                        relation: crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
+                        observed_by: Some(kp.agent_id.as_str()),
+                        created_at: Some(edge_created_at_str.as_str()),
+                        // The INSERT binds `created_at` to `valid_from` too, so
+                        // the pre-image commits to the window the row carries.
+                        valid_from: Some(edge_created_at_str.as_str()),
+                        valid_until: None,
+                    };
+                    let sig = crate::identity::sign::sign(kp, &signable).map_err(|e| {
+                        ReflectError::Database(format!("sign reflects_on link: {e}"))
+                    })?;
+                    (
+                        Some(sig),
+                        crate::models::AttestLevel::SelfSigned.as_str(),
+                        Some(kp.agent_id.clone()),
+                    )
+                }
+                _ => (None, crate::models::AttestLevel::Unsigned.as_str(), None),
+            };
             // Inline a minimal `memory_links` INSERT — full
             // `link_internal` runs its own queries on the pool and
             // wouldn't share the tx. SQLite parity calls
@@ -13950,14 +14007,18 @@ impl PostgresStore {
             // failure rolls back the memory insert.
             sqlx::query(
                 "INSERT INTO memory_links \
-                    (source_id, target_id, relation, created_at, valid_from, attest_level) \
-                 VALUES ($1, $2, $3, $4, $4, 'unsigned') \
+                    (source_id, target_id, relation, created_at, valid_from, signature, \
+                     attest_level, observed_by) \
+                 VALUES ($1, $2, $3, $4, $4, $5, $6, $7) \
                  ON CONFLICT (source_id, target_id, relation) DO NOTHING",
             )
             .bind(&actual_id)
             .bind(src_id)
             .bind(crate::models::MemoryLinkRelation::ReflectsOn.as_str())
-            .bind(created_at_dt)
+            .bind(edge_created_at_dt)
+            .bind(signature)
+            .bind(attest_level)
+            .bind(observed_by_col)
             .execute(&mut *tx)
             .await
             .map_err(|e| ReflectError::Database(format!("insert reflects_on link: {e}")))?;

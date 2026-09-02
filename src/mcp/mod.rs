@@ -761,7 +761,7 @@ pub use calibrate_confidence::handle_calibrate_confidence;
 pub use dependents_of_invalidated::handle_dependents_of_invalidated;
 pub use export_reflection::handle_export_reflection;
 pub use pending::handle_subscription_dlq_list;
-pub use reflect::handle_reflect;
+pub use reflect::{handle_reflect, handle_reflect_caller};
 // Consumed only by the postgres SAL HTTP branch in `route_1111`, which is
 // `#[cfg(feature = "sal")]` — gate the re-export so a non-sal build does
 // not flag it unused.

@@ -161,7 +161,14 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // `handle_inbox` entry point preserves trusted in-process CLI/hook behaviour.
 // Both feed the established MCP inbox handler family and therefore retain its
 // `Result<Value, String>` boundary. Net acknowledged: +1.
-const QUAL_6_CEILING: usize = 125;
+// 2026-09-02 (#3423 reflect owner parity) — raised 125 -> 126 for
+// `handle_reflect_caller` (`src/mcp/tools/reflect.rs`), the authenticated-caller
+// entry point the HTTP reflect route uses so SQLite and PostgreSQL attribute a
+// reflection to the same principal. It carries `handle_reflect`'s existing
+// `Result<Value, String>` MCP envelope verbatim — the shipped
+// `handle_recall` / `handle_recall_caller` split, not a new legacy-typed
+// surface. Measured 126. Never lower.
+const QUAL_6_CEILING: usize = 126;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in

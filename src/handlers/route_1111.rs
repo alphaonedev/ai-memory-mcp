@@ -206,6 +206,33 @@ pub async fn handle_reflect_http(
             obj.insert("agent_id".to_string(), Value::String(caller));
         }
     }
+    // #3423 — resolve the AUTHENTICATED caller ONCE, here, for BOTH backends.
+    //
+    // Pre-#3423 this resolution lived only inside the postgres branch (#2857),
+    // so the SQLITE branch handed the raw body to `crate::mcp::handle_reflect`,
+    // whose owner resolution falls through `identity::resolve_agent_id` to
+    // `host:<hostname>` when the body carries no `agent_id`. The reflection was
+    // therefore attributed to the DAEMON HOST principal rather than the caller:
+    // `POST /api/v1/memory_reflect` returned 200 with an id, and the very next
+    // `GET /api/v1/memories/{id}` — which resolves the caller from the header —
+    // 404'd on the owner gate, and the row never listed. Same request, same
+    // build, different owner depending on the backend.
+    //
+    // Header-authoritative, matching how `GET /memories/{id}`, recall and store
+    // resolve identity, and matching the create funnel's #907 rule that the
+    // body is only a REFINEMENT that must agree. When NO `X-Agent-Id` header is
+    // present the shipped #1317 body-only zero-config contract stands: `None`
+    // here leaves both branches on their pre-#3423 body-derived path, so a
+    // legitimate body-only caller is not 403'd.
+    let authenticated_caller: Option<String> = if headers.contains_key(crate::HEADER_AGENT_ID) {
+        let body_agent = body.get("agent_id").and_then(Value::as_str);
+        match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None) {
+            Ok(id) => Some(id),
+            Err(e) => return err_response(e),
+        }
+    } else {
+        None
+    };
     // #1924 (CWE-288) — consult the PRE-REFLECT enforcement gate before the
     // reflection write (HTTP parity with the MCP gate). INERT by default.
     // #2390 (N9) — a reflection lands in `namespace` when supplied, else in the
@@ -253,33 +280,15 @@ pub async fn handle_reflect_http(
     // wire slugs + `{id, reflection_depth, reflects_on, namespace}` shape.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let (mut input, caller_depth) = match crate::mcp::parse_reflect_input(&body, None) {
-            Ok(parsed) => parsed,
-            Err(e) => return err_response(e),
-        };
-        // #2857 — resolve the caller identity HEADER-AUTHORITATIVELY when an
-        // `X-Agent-Id` header is present, matching how GET /memories/{id},
-        // recall, and store resolve it (`resolve_http_agent_id` / the
-        // `resolve_caller_agent_id` parity helper). `parse_reflect_input`
-        // reads the caller id from the request BODY only, so on the postgres
-        // SAL branch — where source existence is checked through the SAL
-        // `MemoryStore::get` scope=private visibility gate keyed on the
-        // `CallerContext` principal — a source written and GET-able under
-        // `X-Agent-Id: <owner>` (no body `agent_id`) was invisible to reflect,
-        // producing a false `400 "source memory not found"` for a memory that
-        // demonstrably exists (the store-vs-lookup owner-scoping mismatch).
-        // The body `agent_id` stays a REFINEMENT that MUST match the header,
-        // so the #2140 forge protection is unchanged. When NO header is present
-        // the shipped #1317 body-only zero-config contract stands (the
-        // body-derived `input.agent_id` is kept verbatim) — resolving
-        // header-authoritatively there would 403 a legitimate body-only caller.
-        if headers.contains_key(crate::HEADER_AGENT_ID) {
-            let body_agent = body.get("agent_id").and_then(Value::as_str);
-            match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None) {
-                Ok(id) => input.agent_id = id,
+        // #3423 — the hoisted `authenticated_caller` replaces the #2857 inline
+        // re-resolution that used to live here; the owner rule now lives at ONE
+        // site (`mcp::tools::reflect::resolve_reflect_owner`) that both backends
+        // reach, instead of postgres overriding the parsed id after the fact.
+        let (input, caller_depth) =
+            match crate::mcp::parse_reflect_input(&body, None, authenticated_caller.as_deref()) {
+                Ok(parsed) => parsed,
                 Err(e) => return err_response(e),
-            }
-        }
+            };
         let caller = crate::store::CallerContext::for_agent(&input.agent_id);
         // #1325 caller-asserted depth pre-check (parity with the sqlite
         // MCP path): compare the asserted `depth` to the substrate-
@@ -345,7 +354,7 @@ pub async fn handle_reflect_http(
     // v0.9 #1005 — deref through the boxed seam to the trait object.
     let vector_index = vec_lock.as_deref();
     let active_keypair = app.active_keypair.as_ref().as_ref();
-    let result = crate::mcp::handle_reflect(
+    let result = crate::mcp::handle_reflect_caller(
         &lock.0,
         &db_path,
         &body,
@@ -355,6 +364,9 @@ pub async fn handle_reflect_http(
         // primitive falls back to the `body.agent_id` / synthesised id.
         None,
         active_keypair,
+        // #3423 — the authenticated principal owns the reflection, exactly as
+        // on the postgres branch above.
+        authenticated_caller.as_deref(),
     );
     drop(vec_lock);
     // #1552 — federation fanout parity for the sqlite reflect path. Capture
