@@ -295,6 +295,10 @@ pub(super) async fn sync_push_via_store(
             &body.sender_agent_id,
             local_cap,
         );
+        // #3464 — sanitize signed identity fields before claim honor and
+        // attestation verification, matching the SQLite push path. Persisted
+        // `agent_attested` bytes must be exactly the bytes verified here.
+        crate::handlers::federation_receive::strip_federated_pubkey_binding_or_warn(&mut to_insert);
         // #1464 — capture the originally-claimed author BEFORE attribution
         // may rewrite it (sqlite-twin parity), so the content-attestation
         // step can skip rows re-attributed to the sender.
@@ -316,22 +320,28 @@ pub(super) async fn sync_push_via_store(
         // relay sender. Reused as the attestation bound key when the claim is
         // honored (attribute == claimed). The enrolled-key lookup resolves
         // through the SAL `agent_pubkey` trait method so both backends match.
-        let claim_bound_key = match original_claim.as_deref() {
-            // #2865 — DB registry FIRST, enrolled key-dir as a MISS-ONLY
-            // fallback (postgres twin of the sqlite path), so a third-party
-            // author whose FEDERATION identity key is cross-enrolled in the
-            // key-dir (not DB-bound) is HONORED rather than re-attributed.
-            Some(c) => crate::handlers::federation_receive::resolve_author_bound_key(
-                app.store.agent_pubkey(c).await.ok().flatten(),
-                c,
-            ),
-            None => None,
-        };
+        let claim_bound_key =
+            match crate::identity::attest::presented_attestation_author_needing_bound_key(
+                &to_insert,
+                original_claim.as_deref(),
+            ) {
+                // #2865 — DB registry FIRST, enrolled key-dir as a MISS-ONLY
+                // fallback (postgres twin of the sqlite path), so a third-party
+                // author whose FEDERATION identity key is cross-enrolled in the
+                // key-dir (not DB-bound) is HONORED rather than re-attributed.
+                Some(c) => crate::handlers::federation_receive::historical_author_key_or_warn(
+                    app.store
+                        .agent_pubkey_for_attestation_at(c, &to_insert.created_at)
+                        .await,
+                    c,
+                ),
+                None => None,
+            };
         let claim_write_attested = original_claim.as_deref().is_some_and(|c| {
             crate::handlers::federation_receive::inbound_claim_is_write_attested(
                 &to_insert,
                 c,
-                claim_bound_key.as_deref(),
+                claim_bound_key.as_ref(),
             )
         });
         let attribute_agent = resolve_inbound_attribution(
@@ -350,26 +360,31 @@ pub(super) async fn sync_push_via_store(
         // looked up above (avoids a second lookup, #2863).
         let bound_pubkey = if Some(attribute_agent.as_str()) == original_claim.as_deref() {
             claim_bound_key.clone()
-        } else {
+        } else if let Some(author) =
+            crate::identity::attest::presented_attestation_author_needing_bound_key(
+                &to_insert,
+                original_claim.as_deref(),
+            )
+        {
             // #2865 — same DB-first, enrolled-key-dir MISS-ONLY fallback as the
             // claim key above (postgres twin), so a peer's cross-enrolled
             // FEDERATION identity key verifies a propagated write_signature and
             // reaches agent_attested out-of-box, backend-uniform with sqlite.
-            crate::handlers::federation_receive::resolve_author_bound_key(
+            crate::handlers::federation_receive::historical_author_key_or_warn(
                 app.store
-                    .agent_pubkey(&attribute_agent)
-                    .await
-                    .ok()
-                    .flatten(),
-                &attribute_agent,
+                    .agent_pubkey_for_attestation_at(author, &to_insert.created_at)
+                    .await,
+                author,
             )
+        } else {
+            None
         };
         if let Err(e) = apply_inbound_write_attestation(
             &mut to_insert,
             &attribute_agent,
             &body.sender_agent_id,
             original_claim.as_deref(),
-            bound_pubkey.as_deref(),
+            bound_pubkey.as_ref(),
             crate::federation::receive_auth::require_write_sig_enabled(),
         ) {
             // #1801→#1954 item 7 (postgres twin of `federation_receive.rs`) —
@@ -382,7 +397,10 @@ pub(super) async fn sync_push_via_store(
                 .get(crate::models::field_names::WRITE_SIGNATURE)
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|s| !s.trim().is_empty());
-            if bound_pubkey.is_none() {
+            if bound_pubkey
+                .as_ref()
+                .is_none_or(|keys| keys.candidate_pubkeys_b64.is_empty())
+            {
                 tracing::warn!(
                     target: ATTESTATION_TRACE_TARGET,
                     memory_id = %to_insert.id,

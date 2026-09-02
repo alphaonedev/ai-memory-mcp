@@ -27,10 +27,12 @@ import {
   AgentSigningKey,
   DOMAIN_SEPARATION_TAG,
   attestationFields,
+  bindChallengeTranscript,
   canonicalCborWrite,
   canonicalizeCreatedAt,
   contentSha256,
   rfc3339Now,
+  signBindChallenge,
   signWrite,
 } from "../src/attestation.js";
 import { AiMemoryClient } from "../src/client.js";
@@ -53,12 +55,29 @@ interface AttestationVector {
   };
 }
 
+interface BindPossessionVector {
+  seed_hex: string;
+  agent_id: string;
+  pubkey_b64: string;
+  nonce: string;
+  expires_at: string;
+  transcript_hex: string;
+  proof_b64url: string;
+}
+
 const vector: AttestationVector = JSON.parse(
   readFileSync(
     resolve(__dirname, "..", "..", "fixtures", "write_attestation_vector.json"),
     "utf8",
   ),
 ) as AttestationVector;
+
+const bindVector: BindPossessionVector = JSON.parse(
+  readFileSync(
+    resolve(__dirname, "..", "..", "fixtures", "bind_pubkey_possession_vector.json"),
+    "utf8",
+  ),
+) as BindPossessionVector;
 
 function envelope(overrides: Partial<{
   agentId: string;
@@ -160,6 +179,27 @@ describe("Ed25519 primitive — RFC 8032 conformance", () => {
       createdAt: vector.created_at,
     });
     expect(Buffer.from(sig, "base64")).toHaveLength(64);
+  });
+});
+
+describe("bind proof-of-possession — Rust conformance (#3464)", () => {
+  test("transcript and deterministic proof match the cross-language vector", () => {
+    const key = AgentSigningKey.fromSeed(Buffer.from(bindVector.seed_hex, "hex"));
+    expect(key.publicKeyBase64()).toBe(bindVector.pubkey_b64);
+    const transcript = bindChallengeTranscript({
+      agentId: bindVector.agent_id,
+      pubkeyB64: bindVector.pubkey_b64,
+      nonce: bindVector.nonce,
+      expiresAt: bindVector.expires_at,
+    });
+    expect(transcript.toString("hex")).toBe(bindVector.transcript_hex);
+    expect(
+      signBindChallenge(key, {
+        agentId: bindVector.agent_id,
+        nonce: bindVector.nonce,
+        expiresAt: bindVector.expires_at,
+      }),
+    ).toBe(bindVector.proof_b64url);
   });
 });
 

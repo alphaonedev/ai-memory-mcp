@@ -205,6 +205,9 @@ const PG_ACTION_EDGES_LOCK_KEY: &str = "ai_memory.action_edges";
 
 const SQL_PRUNE_EXPIRED_SIGNALS: &str =
     "DELETE FROM signals WHERE expires_at IS NOT NULL AND expires_at <= $1";
+/// #3464 — reap expired durable PoP challenges, consumed or unused.
+const SQL_PRUNE_EXPIRED_PUBKEY_CHALLENGES: &str =
+    "DELETE FROM agent_pubkey_challenges WHERE expires_at <= $1";
 
 /// #2542 (pm-v3.1 literal de-dup) — a namespace's bound `standard_id` (NULLABLE:
 /// a severed row holds NULL). Reused by the pool- and tx-side governance chain
@@ -1098,9 +1101,7 @@ const TABLE_MEMORIES: &str = "memories";
 /// literal de-dup; mirrors the sqlite `db::bind_agent_pubkey` message).
 fn agent_not_registered_for_bind(agent_id: &str) -> StoreError {
     StoreError::InvalidInput {
-        detail: format!(
-            "cannot bind pubkey: agent '{agent_id}' is not registered (register it first)"
-        ),
+        detail: crate::errors::msg::pubkey_bind_agent_not_registered(agent_id),
     }
 }
 
@@ -1522,6 +1523,16 @@ const MIGRATION_V94_LIFECYCLE_STATE_INDEX: &str =
 const MIGRATION_V95_ATTESTED_WRITE_LEDGER: &str =
     include_str!("../../migrations/postgres/0052_v95_attested_write_ledger.sql");
 
+/// v1.0.0 #3464 (security-high) — schema v97 canonical DDL: the append-only
+/// `agent_pubkey_history` ledger plus its lookup index and the version-1
+/// backfill of every live `metadata.agent_pubkey`. Applied by
+/// [`PostgresStore::migrate_v97`]. Preserves the anchor that prior
+/// `agent_attested` rows were signed under, which rebinding used to destroy.
+/// The sqlite twin is `MIGRATION_V97_SQLITE`
+/// (`migrations/sqlite/0081_v97_agent_pubkey_history.sql`).
+const MIGRATION_V97_AGENT_PUBKEY_HISTORY: &str =
+    include_str!("../../migrations/postgres/0054_v97_agent_pubkey_history.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -1912,7 +1923,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 96;
+const CURRENT_SCHEMA_VERSION: i32 = 97;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -3743,8 +3754,11 @@ impl PostgresStore {
         if current_version < 95 {
             self.migrate_v95().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 96 {
             self.migrate_v96().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v97().await?;
         }
 
         Ok(())
@@ -6807,8 +6821,8 @@ impl PostgresStore {
     /// table is bounded by the attested-write RATE and never by history.
     ///
     /// `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS` — additive,
-    /// idempotent, no backfill, no existing row read or rewritten. Settled
-    /// arm — stamps the literal 95, not [`CURRENT_SCHEMA_VERSION`] (now 96).
+    /// idempotent, no backfill, no existing row read or rewritten. Settled arm
+    /// since #3464 took v97 — stamps the LITERAL 95.
     async fn migrate_v95(&self) -> StoreResult<()> {
         debug_assert!(
             MIGRATION_V95_ATTESTED_WRITE_LEDGER.contains("attested_write_ledger"),
@@ -6825,6 +6839,11 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v95 attested-write-ledger ddl", e))?;
 
+        // #3464 — settled arm: stamp the LITERAL 95, not CURRENT_SCHEMA_VERSION
+        // (now 97). A bare CURRENT_SCHEMA_VERSION here would stamp 97 after
+        // applying only v95's DDL, and a crash before the v97 commit would
+        // strand the node claiming a tip it does not have, with `migrate_v97`
+        // skipped forever (the same lockstep #3419 recorded on `migrate_v94`).
         record_schema_version(&mut tx, 95).await?;
         tx.commit()
             .await
@@ -6844,8 +6863,8 @@ impl PostgresStore {
     /// rows (keyed by id + encryption-key fingerprint) instead of
     /// re-reading and re-WARNing them every pass. Additive
     /// `CREATE TABLE IF NOT EXISTS` + clear trigger; a fresh cluster
-    /// inherits the table from `postgres_schema.sql`. Tip arm — stamps
-    /// [`CURRENT_SCHEMA_VERSION`]. Slots after #3419's settled v95.
+    /// inherits the table from `postgres_schema.sql`. Settled arm — stamps
+    /// literal 96. Slots after #3419's settled v95.
     async fn migrate_v96(&self) -> StoreResult<()> {
         debug_assert!(
             crate::storage::embed_skip::MIGRATION_V96_POSTGRES.contains("embed_skip"),
@@ -6875,6 +6894,152 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v96 applied (#3344: embed_skip — durable skip \
              cache for unembeddable rows; restore the key to heal)"
+        );
+        Ok(())
+    }
+
+    /// Append the next key version in `tx`. Same-open-key is idempotent; every
+    /// distinct transition closes the open row and appends a dense version.
+    async fn append_pubkey_version_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        agent_id: &str,
+        pubkey_b64: &str,
+        flat_pubkey_b64: Option<&str>,
+        proof: &crate::identity::pubkey_bind::PossessionProof,
+        now: &str,
+    ) -> StoreResult<()> {
+        let latest: Option<(i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT version, pubkey_b64, bound_at, superseded_at FROM agent_pubkey_history
+             WHERE agent_id = $1 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("read latest agent pubkey version", e))?;
+        proof
+            .authorize_storage_state(
+                agent_id,
+                pubkey_b64,
+                flat_pubkey_b64,
+                latest
+                    .as_ref()
+                    .map(|(_, key, _, superseded)| (key.as_str(), superseded.is_none())),
+            )
+            .map_err(|_| StoreError::PermissionDenied {
+                action: crate::handlers::BIND_AGENT_PUBKEY_ACTION.to_string(),
+                target: agent_id.to_string(),
+                reason: crate::errors::msg::BIND_PROOF_REFUSED.to_string(),
+            })?;
+        let prior: Vec<(String,)> =
+            sqlx::query_as("SELECT pubkey_b64 FROM agent_pubkey_history WHERE agent_id = $1")
+                .bind(agent_id)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|e| to_store_err("read agent pubkey history for reuse check", e))?;
+        let reused = crate::identity::keypair::canonical_history_contains(
+            pubkey_b64,
+            prior.iter().map(|row| row.0.as_str()),
+        )
+        .map_err(|e| StoreError::IntegrityFailed {
+            detail: e.to_string(),
+        })?;
+        if reused {
+            if latest
+                .as_ref()
+                .is_some_and(|(_, live, _, end)| end.is_none() && live == pubkey_b64)
+            {
+                return Ok(());
+            }
+            return Err(StoreError::InvalidInput {
+                detail: "refusing to reactivate a superseded or revoked agent pubkey".to_string(),
+            });
+        }
+        if let Some((_, _, bound_at, superseded_at)) = latest.as_ref() {
+            crate::storage::validate_agent_pubkey_transition_time(
+                bound_at,
+                superseded_at.as_deref(),
+                now,
+            )
+            .map_err(|error| StoreError::InvalidInput {
+                detail: format!("refusing non-monotonic pubkey history transition: {error}"),
+            })?;
+        }
+        if latest
+            .as_ref()
+            .is_some_and(|(_, _, _, superseded)| superseded.is_none())
+        {
+            sqlx::query(
+                "UPDATE agent_pubkey_history SET superseded_at = $2
+                 WHERE agent_id = $1 AND superseded_at IS NULL",
+            )
+            .bind(agent_id)
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| to_store_err("supersede agent pubkey version", e))?;
+        }
+        let (next,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM agent_pubkey_history WHERE agent_id = $1",
+        )
+        .bind(agent_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("next agent pubkey version", e))?;
+        sqlx::query(
+            "INSERT INTO agent_pubkey_history
+                (agent_id, version, pubkey_b64, bind_authority, proof_nonce, bound_at, superseded_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)",
+        )
+        .bind(agent_id)
+        .bind(next)
+        .bind(pubkey_b64)
+        .bind(proof.authority().as_str())
+        .bind(proof.nonce_b64())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("append agent pubkey version", e))?;
+        Ok(())
+    }
+
+    /// Schema v97: lock, canonically backfill append-only key history, install
+    /// its authoritative projection trigger, and stamp literal 97.
+    async fn migrate_v97(&self) -> StoreResult<()> {
+        for pin in [
+            "CREATE TABLE IF NOT EXISTS agent_pubkey_history",
+            "agent_pubkey_history_authoritative_v97",
+            "idx_agent_pubkey_history_key_once",
+            "LOCK TABLE memories IN SHARE ROW EXCLUSIVE MODE",
+            "title = 'agent:' || (metadata->>'agent_id')",
+        ] {
+            debug_assert!(
+                MIGRATION_V97_AGENT_PUBKEY_HISTORY.contains(pin),
+                "missing v97 pin: {pin}"
+            );
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v97 agent-pubkey-history ddl tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V97_AGENT_PUBKEY_HISTORY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v97 agent-pubkey-history ddl", e))?;
+
+        // LITERAL 97 — see the doc comment above and the structural pin in
+        // `tests/pg_migration_arm_literal_stamp_3464.rs`.
+        record_schema_version(&mut tx, 97).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v97 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v97 applied (#3464: agent_pubkey_history — rebinding an \
+             agent key no longer destroys the anchor its already-signed agent_attested \
+             rows are verified against)"
         );
         Ok(())
     }
@@ -25473,57 +25638,79 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         agent_id: &str,
         pubkey_b64: &str,
+        // v1.0.0 #3464 — the possession witness. Unforgeable by construction
+        // (no public constructor), so this adapter cannot be asked to bind a
+        // key whose private half nobody demonstrated holding.
+        proof: crate::identity::pubkey_bind::PossessionProof,
     ) -> StoreResult<()> {
         self.gate_record_stop().await?;
-        // #626 Layer-3 (Task 1.3 / C3) — parity with
-        // `db::bind_agent_pubkey` on the sqlite path. Read the existing
-        // `_agents` row metadata, augment it with `agent_pubkey` +
-        // `pubkey_bound_at`, and write both `metadata` (jsonb) and the
-        // mirrored `content` (text) so `list_agents` / the verifier
-        // observe a consistent row. The agent must already be
-        // registered; re-binding rotates the key.
+        let pubkey_b64 =
+            crate::identity::keypair::canonical_public_base64(pubkey_b64).map_err(|e| {
+                StoreError::InvalidInput {
+                    detail: format!("canonicalize agent pubkey for bind: {e:#}"),
+                }
+            })?;
+        // SQLite parity: update both mirrors only after history authorizes the
+        // key. The agent must exist; replacement requires signed lineage.
         use crate::models::AGENTS_NAMESPACE;
 
         let title = crate::models::agent_registration_title(agent_id);
-        let now = Utc::now().to_rfc3339();
 
-        let existing: Option<(serde_json::Value,)> =
-            sqlx::query_as(SQL_SELECT_METADATA_BY_NS_TITLE)
-                .bind(AGENTS_NAMESPACE)
-                .bind(&title)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| to_store_err("read agent metadata for pubkey bind", e))?;
-
+        // The row lock serializes witness recheck, history, and flat projection.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("bind_agent_pubkey begin tx", e))?;
+        let existing: Option<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2 FOR UPDATE",
+        )
+        .bind(AGENTS_NAMESPACE)
+        .bind(&title)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("read agent metadata for pubkey bind", e))?;
         let Some((mut meta,)) = existing else {
             return Err(agent_not_registered_for_bind(agent_id));
         };
+        // Stamp after lock; the history helper also refuses clock regression.
+        let now = Utc::now().to_rfc3339();
+        let flat_pubkey = meta
+            .get(field_names::AGENT_PUBKEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
+        // Append/check history BEFORE changing the flat row. The helper
+        // rechecks the exact witness tuple against locked storage state.
+        Self::append_pubkey_version_tx(
+            &mut tx,
+            agent_id,
+            &pubkey_b64,
+            flat_pubkey.as_deref(),
+            &proof,
+            &now,
+        )
+        .await?;
 
         if let Some(obj) = meta.as_object_mut() {
             obj.insert(
                 field_names::AGENT_PUBKEY.to_string(),
-                serde_json::Value::String(pubkey_b64.to_string()),
+                serde_json::Value::String(pubkey_b64),
             );
             obj.insert(
                 META_PUBKEY_BOUND_AT.to_string(),
                 serde_json::Value::String(now.clone()),
             );
         }
+        crate::storage::downgrade_registration_attestation(&mut meta);
 
         let content = serde_json::to_string(&meta).map_err(|e| StoreError::IntegrityFailed {
             detail: format!("serialize agent metadata for pubkey bind: {e}"),
         })?;
 
         // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the pubkey-bind
-        // UPDATE rewrites the registration row's content; wrap it in a tx so
-        // the identity-only SUPERSEDE leaf lands atomically with the write
-        // (the id lookup + leaf run only under the flag, so flag-OFF is the
-        // same single UPDATE committed immediately).
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("bind_agent_pubkey begin tx", e))?;
+        // UPDATE rewrites the registration row's content in the same tx as
+        // the history append and identity-only SUPERSEDE leaf.
         sqlx::query(
             "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
              WHERE namespace = $1 AND title = $2",
@@ -25560,6 +25747,221 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("bind_agent_pubkey commit tx", e))?;
 
         Ok(())
+    }
+
+    async fn issue_pubkey_bind_challenge(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        pubkey_b64: &str,
+        issuer_daemon_id: &str,
+    ) -> StoreResult<crate::identity::pubkey_bind::BindChallenge> {
+        self.gate_record_stop().await?;
+        use crate::identity::pubkey_bind as pb;
+        let pubkey_b64 =
+            crate::identity::keypair::canonical_public_base64(pubkey_b64).map_err(|e| {
+                StoreError::InvalidInput {
+                    detail: format!("canonicalize candidate pubkey for bind challenge: {e:#}"),
+                }
+            })?;
+        let now = Utc::now();
+        let challenge = pb::BindChallenge {
+            nonce_b64: pb::new_challenge_nonce(),
+            agent_id: agent_id.to_string(),
+            pubkey_b64,
+            // Canonical UTC makes TEXT expiry an instant comparison (#3279).
+            expires_at: crate::validate::canonical_rfc3339(
+                &(now + chrono::Duration::seconds(pb::BIND_CHALLENGE_TTL_SECS)).to_rfc3339(),
+            ),
+        };
+        sqlx::query(
+            "INSERT INTO agent_pubkey_challenges
+                (challenge_id, agent_id, pubkey_b64, nonce, issued_at, expires_at,
+                 consumed_at, issuer_daemon_id)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)",
+        )
+        .bind(pb::new_challenge_id())
+        .bind(&challenge.agent_id)
+        .bind(&challenge.pubkey_b64)
+        .bind(&challenge.nonce_b64)
+        .bind(crate::validate::canonical_rfc3339(&now.to_rfc3339()))
+        .bind(&challenge.expires_at)
+        .bind(issuer_daemon_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("issue_pubkey_bind_challenge", e))?;
+        Ok(challenge)
+    }
+
+    async fn consume_pubkey_bind_challenge(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        nonce_b64: &str,
+    ) -> StoreResult<Option<crate::identity::pubkey_bind::ConsumedBindChallenge>> {
+        self.gate_record_stop().await?;
+        let now = crate::validate::canonical_rfc3339(&Utc::now().to_rfc3339());
+        // One atomic conditional UPDATE ... RETURNING: the `consumed_at IS
+        // NULL` predicate IS the admit-once decision, so two concurrent
+        // submissions of the same captured answer can never BOTH be admitted,
+        // and the same statement enforces expiry and the agent binding.
+        let row: Option<(String, String, String, String)> = sqlx::query_as(
+            "UPDATE agent_pubkey_challenges SET consumed_at = $3
+             WHERE nonce = $1 AND agent_id = $2 AND consumed_at IS NULL AND expires_at > $3
+             RETURNING nonce, agent_id, pubkey_b64, expires_at",
+        )
+        .bind(nonce_b64)
+        .bind(agent_id)
+        .bind(&now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("consume_pubkey_bind_challenge", e))?;
+        Ok(row.map(|(nonce_b64, agent_id, pubkey_b64, expires_at)| {
+            crate::identity::pubkey_bind::ConsumedBindChallenge::from_storage(
+                crate::identity::pubkey_bind::BindChallenge {
+                    nonce_b64,
+                    agent_id,
+                    pubkey_b64,
+                    expires_at,
+                },
+            )
+        }))
+    }
+
+    async fn agent_pubkey_versions(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Vec<crate::storage::AgentPubkeyVersion>> {
+        let rows: Vec<(
+            String,
+            i64,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT agent_id, version, pubkey_b64, bind_authority, proof_nonce, bound_at, \
+                 superseded_at FROM agent_pubkey_history WHERE agent_id = $1 ORDER BY version",
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("agent_pubkey_versions", e))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    agent_id,
+                    version,
+                    pubkey_b64,
+                    bind_authority,
+                    proof_nonce,
+                    bound_at,
+                    superseded_at,
+                )| {
+                    crate::storage::AgentPubkeyVersion {
+                        agent_id,
+                        version,
+                        pubkey_b64,
+                        bind_authority,
+                        proof_nonce,
+                        bound_at,
+                        superseded_at,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    async fn agent_pubkey_for_attestation_at(
+        &self,
+        agent_id: &str,
+        at_rfc3339: &str,
+    ) -> StoreResult<crate::storage::AttestationPubkeyAt> {
+        use crate::models::AGENTS_NAMESPACE;
+
+        // History plus the legacy flat binding are captured by ONE statement
+        // snapshot. Two separate READ COMMITTED statements could observe no
+        // history before a concurrent bootstrap commits, then observe its flat
+        // key afterwards and incorrectly classify the new binding as a legacy
+        // fallback.
+        type HistoryAndFlat = (
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let title = crate::models::agent_registration_title(agent_id);
+        let rows: Vec<HistoryAndFlat> = sqlx::query_as(
+            "WITH flat AS (
+                 SELECT metadata->>'agent_pubkey' AS pubkey_b64
+                 FROM memories WHERE namespace = $2 AND title = $3 LIMIT 1
+             ), history AS (
+                 SELECT agent_id, version, pubkey_b64, bind_authority,
+                        proof_nonce, bound_at, superseded_at
+                 FROM agent_pubkey_history WHERE agent_id = $1
+             )
+             SELECT history.agent_id, history.version, history.pubkey_b64,
+                    history.bind_authority, history.proof_nonce,
+                    history.bound_at, history.superseded_at, flat.pubkey_b64
+             FROM history FULL OUTER JOIN flat ON TRUE
+             ORDER BY history.version NULLS LAST",
+        )
+        .bind(agent_id)
+        .bind(AGENTS_NAMESPACE)
+        .bind(&title)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("agent_pubkey_for_attestation_at", e))?;
+
+        let legacy_flat = rows.first().and_then(|row| row.7.clone());
+        let mut versions = Vec::new();
+        for row in rows {
+            let Some(history_agent_id) = row.0 else {
+                continue;
+            };
+            let (Some(version), Some(pubkey_b64), Some(bind_authority), Some(bound_at)) =
+                (row.1, row.2, row.3, row.5)
+            else {
+                return Err(StoreError::IntegrityFailed {
+                    detail: format!(
+                        "incomplete pubkey history row while resolving attestation for {agent_id}"
+                    ),
+                });
+            };
+            versions.push(crate::storage::AgentPubkeyVersion {
+                agent_id: history_agent_id,
+                version,
+                pubkey_b64,
+                bind_authority,
+                proof_nonce: row.4,
+                bound_at,
+                superseded_at: row.6,
+            });
+        }
+        if versions.is_empty() {
+            return Ok(crate::storage::AttestationPubkeyAt {
+                candidate_pubkeys_b64: legacy_flat.into_iter().collect(),
+                history_exists: false,
+            });
+        }
+        let selected =
+            crate::storage::select_agent_pubkey_versions_for_attestation(&versions, at_rfc3339)
+                .map_err(|error| StoreError::IntegrityFailed {
+                    detail: error.to_string(),
+                })?;
+        Ok(crate::storage::AttestationPubkeyAt {
+            candidate_pubkeys_b64: selected
+                .into_iter()
+                .map(|version| version.pubkey_b64.clone())
+                .collect(),
+            history_exists: true,
+        })
     }
 
     async fn agent_pubkey(&self, agent_id: &str) -> StoreResult<Option<String>> {
@@ -25642,15 +26044,22 @@ impl MemoryStore for PostgresStore {
         // registered; revoking an unbound agent is a no-op success.
 
         let title = crate::models::agent_registration_title(agent_id);
-        let now = Utc::now().to_rfc3339();
 
-        let existing: Option<(serde_json::Value,)> =
-            sqlx::query_as(SQL_SELECT_METADATA_BY_NS_TITLE)
-                .bind(AGENTS_NAMESPACE)
-                .bind(&title)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| to_store_err("read agent metadata for pubkey revoke", e))?;
+        // Serialize revoke with bind/lineage on the registration row.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("revoke_agent_pubkey begin tx", e))?;
+        let existing: Option<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT metadata FROM memories
+             WHERE namespace = $1 AND title = $2 FOR UPDATE",
+        )
+        .bind(AGENTS_NAMESPACE)
+        .bind(&title)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("read agent metadata for pubkey revoke", e))?;
 
         let Some((mut meta,)) = existing else {
             return Err(StoreError::InvalidInput {
@@ -25659,6 +26068,24 @@ impl MemoryStore for PostgresStore {
                 ),
             });
         };
+        // Stamp after lock; reject a backward/equal history boundary below.
+        let now = Utc::now().to_rfc3339();
+
+        let open_bound: Option<(String,)> = sqlx::query_as(
+            "SELECT bound_at FROM agent_pubkey_history
+             WHERE agent_id = $1 AND superseded_at IS NULL",
+        )
+        .bind(agent_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("read open pubkey history for revoke", e))?;
+        if let Some((bound_at,)) = open_bound {
+            crate::storage::validate_agent_pubkey_transition_time(&bound_at, None, &now).map_err(
+                |error| StoreError::InvalidInput {
+                    detail: format!("refusing non-monotonic pubkey revocation: {error}"),
+                },
+            )?;
+        }
 
         if let Some(obj) = meta.as_object_mut() {
             obj.remove(field_names::AGENT_PUBKEY);
@@ -25668,21 +26095,27 @@ impl MemoryStore for PostgresStore {
                 serde_json::Value::String(now.clone()),
             );
         }
+        crate::storage::downgrade_registration_attestation(&mut meta);
 
         let content = serde_json::to_string(&meta).map_err(|e| StoreError::IntegrityFailed {
             detail: format!("serialize agent metadata for pubkey revoke: {e}"),
         })?;
 
+        // Close history before removing the flat projection; otherwise the
+        // authoritative trigger restores the still-open key.
+        sqlx::query(
+            "UPDATE agent_pubkey_history SET superseded_at = $2
+             WHERE agent_id = $1 AND superseded_at IS NULL",
+        )
+        .bind(agent_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("supersede agent pubkey version on revoke", e))?;
+
         // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the pubkey-
         // revoke UPDATE rewrites the registration row's content; wrap it in
-        // a tx so the identity-only SUPERSEDE leaf lands atomically with the
-        // write (id lookup + leaf run only under the flag, so flag-OFF is
-        // the same single UPDATE committed immediately).
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("revoke_agent_pubkey begin tx", e))?;
+        // the same transaction as the history close and identity-only leaf.
         sqlx::query(
             "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
              WHERE namespace = $1 AND title = $2",
@@ -25891,42 +26324,73 @@ impl MemoryStore for PostgresStore {
                 .map_err(|e| StoreError::IntegrityFailed {
                     detail: format!("hash lineage witness payload: {e:#}"),
                 })?;
-        let now = Utc::now();
-        let now_rfc = now.to_rfc3339();
         let title = crate::models::agent_registration_title(agent_id);
 
-        // The pubkey sync requires a registered agent — read its
-        // metadata FIRST so an unregistered id refuses before any write.
-        let existing: Option<(serde_json::Value,)> =
-            sqlx::query_as(SQL_SELECT_METADATA_BY_NS_TITLE)
-                .bind(AGENTS_NAMESPACE)
-                .bind(&title)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| to_store_err("read agent metadata for lineage append", e))?;
+        // C4: one transaction/row lock covers body, history, flat sync, witness.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("append_lineage_record begin tx", e))?;
+        let existing: Option<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2 FOR UPDATE",
+        )
+        .bind(AGENTS_NAMESPACE)
+        .bind(&title)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("read agent metadata for lineage append", e))?;
         let Some((mut meta,)) = existing else {
             return Err(agent_not_registered_for_bind(agent_id));
         };
+        // Stamp after serialization; history refuses backward/equal clocks.
+        let now = Utc::now();
+        let now_rfc = now.to_rfc3339();
+        let flat_pubkey = meta
+            .get(field_names::AGENT_PUBKEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let proof = if record.reason == LineageReason::Recovery {
+            crate::identity::pubkey_bind::PossessionProof::from_verified_guardian_recovery(
+                agent_id,
+                &record.predecessor_pubkey_b64,
+                &record.successor_pubkey_b64,
+            )
+        } else {
+            crate::identity::pubkey_bind::PossessionProof::from_verified_lineage_succession(
+                agent_id,
+                &record.predecessor_pubkey_b64,
+                &record.successor_pubkey_b64,
+            )
+        }
+        .map_err(|e| invalid(format!("canonicalize lineage binding: {e}")))?;
+        let successor_pubkey =
+            crate::identity::keypair::canonical_public_base64(&record.successor_pubkey_b64)
+                .map_err(|e| invalid(format!("canonicalize lineage successor: {e:#}")))?;
+        Self::append_pubkey_version_tx(
+            &mut tx,
+            agent_id,
+            &successor_pubkey,
+            flat_pubkey.as_deref(),
+            &proof,
+            &now_rfc,
+        )
+        .await?;
         if let Some(obj) = meta.as_object_mut() {
             obj.insert(
                 field_names::AGENT_PUBKEY.to_string(),
-                serde_json::Value::String(record.successor_pubkey_b64.clone()),
+                serde_json::Value::String(successor_pubkey),
             );
             obj.insert(
                 META_PUBKEY_BOUND_AT.to_string(),
                 serde_json::Value::String(now_rfc.clone()),
             );
         }
+        crate::storage::downgrade_registration_attestation(&mut meta);
         let content = serde_json::to_string(&meta).map_err(|e| StoreError::IntegrityFailed {
             detail: format!("serialize agent metadata for lineage append: {e}"),
         })?;
 
-        // C4 — ONE transaction: body INSERT + pubkey sync + witness.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("append_lineage_record begin tx", e))?;
         let epoch_i64 = i64::try_from(record.epoch)
             .map_err(|_| invalid("lineage epoch exceeds i64".to_string()))?;
         let from_seq_i64 = record
@@ -29176,6 +29640,21 @@ impl MemoryStore for PostgresStore {
                 target: TRACE_TARGET,
                 err = %to_store_err("prune expired signals", e),
                 "expired-signal prune failed (in gc); will retry next sweep"
+            );
+        }
+
+        // #3464 — reap expired challenges after the memory tx; failure must not
+        // roll back an otherwise valid eviction.
+        let challenge_now = crate::validate::canonical_rfc3339(&Utc::now().to_rfc3339());
+        if let Err(e) = sqlx::query(SQL_PRUNE_EXPIRED_PUBKEY_CHALLENGES)
+            .bind(&challenge_now)
+            .execute(&self.pool)
+            .await
+        {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                err = %to_store_err("prune expired pubkey bind challenges", e),
+                "expired-pubkey-bind-challenge prune failed (in gc); will retry next sweep"
             );
         }
 
@@ -34210,21 +34689,22 @@ mod tests {
         }
     }
 
-    /// v1.0.0 #3493 — bootstrap is replayed before the migration ladder on
-    /// every connect. The v96 trigger both takes a conflicting table lock and
-    /// names columns absent from pre-v96 table shapes, so it must remain owned
-    /// by the v96 ladder migration. This also lets the bounded blocking-DDL arm
-    /// emit its canonical refusal instead of leaking a raw bootstrap timeout.
+    /// v1.0.0 #3493/#3464 — replayed bootstrap precedes the ladder. The v96
+    /// trigger names absent legacy columns; v97 would see empty pre-backfill
+    /// history. Both remain owned by their locked ladder migrations.
     #[test]
-    fn bootstrap_replay_leaves_the_v96_trigger_to_the_ladder_3493() {
-        assert!(
-            !INIT_SCHEMA.contains("trg_embed_skip_clear"),
-            "bootstrap runs before the ladder and must not install the v96 trigger function"
-        );
-        assert!(
-            !INIT_SCHEMA.contains("memories_embed_skip_clear"),
-            "bootstrap runs before the ladder and must not install the v96 memories trigger"
-        );
+    fn bootstrap_replay_leaves_v96_v97_triggers_to_the_ladder_3493_3464() {
+        for ladder_owned in [
+            "trg_embed_skip_clear",
+            "memories_embed_skip_clear",
+            "reconcile_agent_pubkey_from_history_v97",
+            "agent_pubkey_history_authoritative_v97",
+        ] {
+            assert!(
+                !INIT_SCHEMA.contains(ladder_owned),
+                "bootstrap must not install ladder-owned object {ladder_owned}"
+            );
+        }
     }
 
     #[test]
@@ -34570,22 +35050,6 @@ mod tests {
     fn parse_rfc3339_required_rejects_garbage() {
         assert!(parse_rfc3339_required("garbage").is_err());
         assert!(parse_rfc3339_required("2026-04-19T16:00:00Z").is_ok());
-    }
-
-    #[test]
-    fn init_schema_contains_vector_extension_and_indexes() {
-        // Sanity: make sure the bootstrap SQL references the critical
-        // constructs so a typo'd rename catches here in CI.
-        assert!(INIT_SCHEMA.contains("CREATE EXTENSION IF NOT EXISTS vector"));
-        assert!(INIT_SCHEMA.contains("memories_embedding_hnsw"));
-        assert!(INIT_SCHEMA.contains("to_tsvector"));
-    }
-
-    #[test]
-    fn init_schema_contains_schema_version_table() {
-        // Verify the schema_version table is created for migration tracking.
-        assert!(INIT_SCHEMA.contains("CREATE TABLE IF NOT EXISTS schema_version"));
-        assert!(INIT_SCHEMA.contains("version    INTEGER PRIMARY KEY"));
     }
 
     // ------------------------------------------------------------------

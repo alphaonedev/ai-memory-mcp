@@ -157,6 +157,14 @@ pub mod re_anchor;
 // encoder. FORMAT + offline verifier ONLY — no federation/transport (#1936)
 // or eviction-runtime (FED-RQ-02/03) wiring, no schema migration this lane.
 pub mod equivocation;
+// v1.0.0 #3464 (security-high) — proof of possession for agent public-key
+// binding. Pre-#3464 `bind_agent_pubkey` took a SELF-ASSERTED key, so anyone
+// holding the admin role could bind a key they controlled to another agent's
+// id and mint `agent_attested` writes as that agent. This module carries the
+// domain-separated challenge transcript, the bounded partitioned challenge
+// store, and — the actual control — the `PossessionProof` witness type that
+// makes an unproven bind unrepresentable at the storage funnel.
+pub mod pubkey_bind;
 
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).

@@ -561,7 +561,24 @@ pub(super) async fn catchup_once_with_store(
                 // #3233 — skip of a *delivered* attest refusal also halts:
                 // missing-author-key is recoverable after enrollment, and
                 // leaping `next_since` is silent inbound data loss.
-                if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut mem) {
+                crate::handlers::federation_receive::sanitize_inbound_pull_memory(&mut mem);
+                let author_bound_key = if let Some(author) =
+                    crate::identity::attest::presented_attestation_author_needing_bound_key(
+                        &mem, None,
+                    ) {
+                    crate::handlers::federation_receive::historical_author_key_or_warn(
+                        store
+                            .agent_pubkey_for_attestation_at(author, &mem.created_at)
+                            .await,
+                        author,
+                    )
+                } else {
+                    None
+                };
+                if !crate::handlers::federation_receive::attest_inbound_pull_memory(
+                    &mut mem,
+                    author_bound_key.as_ref(),
+                ) {
                     catchup_halted = true;
                     continue;
                 }
@@ -636,7 +653,25 @@ pub(super) async fn catchup_once_with_store(
                 }
                 // #2715 (CB-11 / B-4) — per-write content attestation (see the
                 // SAL branch). #3233 — delivered attest-skip also halts.
-                if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut mem) {
+                crate::handlers::federation_receive::sanitize_inbound_pull_memory(&mut mem);
+                let author_bound_key =
+                    crate::identity::attest::presented_attestation_author_needing_bound_key(
+                        &mem, None,
+                    )
+                    .and_then(|author| {
+                        crate::handlers::federation_receive::historical_author_key_or_warn(
+                            crate::db::agent_pubkey_for_attestation_at(
+                                &lock.0,
+                                author,
+                                &mem.created_at,
+                            ),
+                            author,
+                        )
+                    });
+                if !crate::handlers::federation_receive::attest_inbound_pull_memory(
+                    &mut mem,
+                    author_bound_key.as_ref(),
+                ) {
                     catchup_halted = true;
                     continue;
                 }
@@ -809,7 +844,25 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 }
                 // #2715 (CB-11 / B-4) — per-write content attestation (see the
                 // SAL branch). #3233 — delivered attest-skip also halts.
-                if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut mem) {
+                crate::handlers::federation_receive::sanitize_inbound_pull_memory(&mut mem);
+                let author_bound_key =
+                    crate::identity::attest::presented_attestation_author_needing_bound_key(
+                        &mem, None,
+                    )
+                    .and_then(|author| {
+                        crate::handlers::federation_receive::historical_author_key_or_warn(
+                            crate::db::agent_pubkey_for_attestation_at(
+                                &lock.0,
+                                author,
+                                &mem.created_at,
+                            ),
+                            author,
+                        )
+                    });
+                if !crate::handlers::federation_receive::attest_inbound_pull_memory(
+                    &mut mem,
+                    author_bound_key.as_ref(),
+                ) {
                     catchup_halted = true;
                     continue;
                 }

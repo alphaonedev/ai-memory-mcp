@@ -119,7 +119,8 @@ fn provision_local(env: &Env, agent_id: &str) -> ai_memory::identity::keypair::A
     let kp = ai_memory::identity::keypair::generate(agent_id).expect("keypair");
     let conn = db::open(&env.local).expect("open local");
     ai_memory::storage::register_agent(&conn, agent_id, "nhi", &[]).expect("register");
-    ai_memory::storage::bind_agent_pubkey(&conn, agent_id, &kp.public_base64()).expect("bind");
+    // #3464 — proof of possession; the fixture holds the private half.
+    ai_memory::storage::bind_agent_pubkey_with_keypair(&conn, agent_id, &kp).expect("bind");
     kp
 }
 

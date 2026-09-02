@@ -19,11 +19,13 @@ from ai_memory._common import (
     DEFAULT_TIMEOUT,
     build_create_body,
     build_httpx_kwargs,
+    encode_path_segment,
     handle_response,
     if_match_headers,
     prep_json,
     wrap_transport_error,
 )
+from ai_memory.attestation import sign_bind_challenge
 from ai_memory.models import (
     AgentRegistration,
     BulkCreateResponse,
@@ -412,12 +414,43 @@ class AsyncAiMemoryClient:
             },
         )
 
-    async def bind_agent_pubkey(self, agent_id: str, pubkey_b64: str) -> dict[str, Any]:
+    async def bind_agent_pubkey_challenge(
+        self, agent_id: str, pubkey_b64: str
+    ) -> dict[str, Any]:
+        """``POST /api/v1/agents/{id}/pubkey/challenge``. See
+        :meth:`AiMemoryClient.bind_agent_pubkey_challenge`."""
+        encoded_agent_id = encode_path_segment(agent_id)
+        return await self._request(
+            "POST",
+            f"/api/v1/agents/{encoded_agent_id}/pubkey/challenge",
+            json_body={"pubkey_b64": pubkey_b64},
+        )
+
+    async def bind_agent_pubkey(
+        self, agent_id: str, signing_key: AgentSigningKey
+    ) -> dict[str, Any]:
         """``PUT /api/v1/agents/{id}/pubkey``. See
         :meth:`AiMemoryClient.bind_agent_pubkey` — admin-gated, and required
-        once before a signed :meth:`store` can attest."""
+        once before a signed :meth:`store` can attest.
+
+        v1.0.0 #3464 — takes the PRIVATE key and runs the challenge/response
+        the daemon requires; a bare public key can no longer bind. This is a
+        bootstrap/same-key operation only; distinct replacement requires a
+        current-key-signed lineage succession."""
+        pubkey_b64 = signing_key.public_key_b64()
+        challenge = await self.bind_agent_pubkey_challenge(agent_id, pubkey_b64)
+        proof = sign_bind_challenge(
+            signing_key,
+            agent_id=agent_id,
+            nonce=challenge["nonce"],
+            expires_at=challenge["expires_at"],
+        )
         return await self._request(
             "PUT",
-            f"/api/v1/agents/{agent_id}/pubkey",
-            json_body={"pubkey_b64": pubkey_b64},
+            f"/api/v1/agents/{encode_path_segment(agent_id)}/pubkey",
+            json_body={
+                "pubkey_b64": pubkey_b64,
+                "nonce": challenge["nonce"],
+                "proof_b64": proof,
+            },
         )

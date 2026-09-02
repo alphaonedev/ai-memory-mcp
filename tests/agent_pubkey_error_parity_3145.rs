@@ -41,7 +41,7 @@ async fn sqlite_agent_pubkey_contract_3145() {
     {
         let conn = ai_memory::db::open(&path).expect("db::open");
         ai_memory::db::register_agent(&conn, AGENT, "nhi", &[]).expect("register");
-        ai_memory::db::bind_agent_pubkey(&conn, AGENT, &kp.public_base64()).expect("bind");
+        ai_memory::db::bind_agent_pubkey_with_keypair(&conn, AGENT, &kp).expect("bind");
     }
     let store = ai_memory::store::sqlite::SqliteStore::open(&path).expect("SqliteStore::open");
 
@@ -107,8 +107,16 @@ async fn postgres_agent_pubkey_contract_3145() {
         )
         .await
         .expect("register");
+    let proof = ai_memory::store::prove_possession_via_store(
+        &store,
+        &ctx,
+        &agent,
+        kp.private.as_ref().expect("generated private key"),
+    )
+    .await
+    .expect("prove possession");
     store
-        .bind_agent_pubkey(&ctx, &agent, &kp.public_base64())
+        .bind_agent_pubkey(&ctx, &agent, &kp.public_base64(), proof)
         .await
         .expect("bind");
 

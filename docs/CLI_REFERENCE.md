@@ -499,7 +499,10 @@ ai-memory pending reject pending-id
 
 `agents` also exposes `bind-key` / `revoke-key` — bind (or revoke) an
 agent's Ed25519 public key for #626 Layer-3 store-path attestation
-(pairs with `ai-memory store --sign`).
+(pairs with `ai-memory store --sign`). `bind-key` bootstraps an unanchored
+identity or reasserts its same live key. A distinct replacement uses
+`ai-memory identity succeed`, so the current key cryptographically authorizes
+its successor; candidate possession plus an admin role cannot rotate it.
 
 | Flag | Applies to | Notes |
 |---|---|---|

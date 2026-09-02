@@ -194,6 +194,26 @@ pub mod msg {
     pub const AGENT_ID_QUERY_MISMATCH: &str =
         "agent_id query parameter does not match authenticated caller";
     pub const INVALID_OR_MISSING_SIGNATURE: &str = "invalid or missing X-AI-Memory-Signature";
+    /// v1.0.0 #3464 — the ONE refusal string every proof-of-possession bind
+    /// failure returns. Deliberately opaque and shared across every failure
+    /// mode (unknown / expired / consumed nonce, tuple mismatch, invalid
+    /// signature, or an anchored identity requiring a signed-lineage
+    /// transition): the wire must not report WHICH check failed, or it becomes
+    /// an oracle for challenge or identity state.
+    pub const BIND_PROOF_REFUSED: &str = "pubkey bind refused: binding authorization failed";
+
+    /// Stable detail for a bind attempted before the target identity exists.
+    #[must_use]
+    pub fn pubkey_bind_agent_not_registered(agent_id: impl std::fmt::Display) -> String {
+        format!("cannot bind pubkey: agent '{agent_id}' is not registered (register it first)")
+    }
+
+    /// Stable internal context for a proof or lineage refusal. Public HTTP
+    /// surfaces replace this detail with [`BIND_PROOF_REFUSED`].
+    #[must_use]
+    pub fn pubkey_bind_refused(error: impl std::fmt::Display) -> String {
+        format!("refusing to bind: {error}")
+    }
     /// #1786 — MCP mutation owner-gate refusal (delete / update / promote /
     /// link). The single SSOT so the gate message is one named const across all
     /// four MCP mutation handlers (the HTTP twin lives in
@@ -1481,6 +1501,18 @@ mod tests {
         assert_eq!(
             msg::older_than_days_negative(-3),
             "older_than_days must be non-negative (got -3)"
+        );
+    }
+
+    #[test]
+    fn msg_pubkey_bind_shapes() {
+        assert_eq!(
+            msg::pubkey_bind_agent_not_registered("ai:missing"),
+            "cannot bind pubkey: agent 'ai:missing' is not registered (register it first)"
+        );
+        assert_eq!(
+            msg::pubkey_bind_refused("stale challenge"),
+            "refusing to bind: stale challenge"
         );
     }
 

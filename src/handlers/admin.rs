@@ -233,6 +233,34 @@ pub async fn register_agent(
 /// and the postgres adapter's error label all share this spelling.
 pub const BIND_AGENT_PUBKEY_ACTION: &str = "bind_agent_pubkey";
 
+fn record_pubkey_bind_decision(
+    caller: &str,
+    decision: &str,
+    agent_id: &str,
+    pubkey_b64: &str,
+    reason: &str,
+) {
+    crate::governance::audit::record_decision(
+        caller,
+        decision,
+        BIND_AGENT_PUBKEY_ACTION,
+        "#3464",
+        json!({
+            "agent_id": agent_id,
+            "pubkey_b64": pubkey_b64,
+            "reason": reason,
+        }),
+    );
+}
+
+fn bind_refused_response() -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": crate::errors::msg::BIND_PROOF_REFUSED})),
+    )
+        .into_response()
+}
+
 pub async fn bind_agent_pubkey(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -257,55 +285,292 @@ pub async fn bind_agent_pubkey(
         )
             .into_response();
     }
-    // Admin action audit (the #911 discipline): emitted BEFORE the
-    // store call so the forensic chain pins the attempt even when the
-    // bind later fails. The pubkey itself is public material; logging
-    // it aids enrollment forensics rather than leaking a secret.
-    crate::governance::audit::record_decision(
-        &caller,
-        "allow",
-        BIND_AGENT_PUBKEY_ACTION,
-        "",
-        json!({
-            "agent_id": agent_id,
-            "pubkey_b64": body.pubkey_b64,
-        }),
-    );
+    let pubkey = match crate::identity::keypair::canonical_public_base64(&body.pubkey_b64) {
+        Ok(pubkey) => pubkey,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    // v1.0.0 #3464 (security-high) — PROOF OF POSSESSION. Consume the
+    // single-use challenge this bind answers, then verify that the CANDIDATE
+    // key signed it. Admin authority says the caller may enroll a key; it has
+    // never said WHICH key, and pre-#3464 that gap let anyone holding the admin
+    // role bind a key they controlled to another agent's id and mint
+    // `agent_attested` writes as that agent.
+    //
+    // Consume-then-verify is deliberate: a wrong answer burns the nonce rather
+    // than granting unlimited attempts against it. The refusal is a single
+    // opaque 403 on every failure mode (unknown/expired/consumed nonce, wrong
+    // agent, wrong key, bad signature) — the `SubkeyCertError` precedent: the
+    // wire must not report WHICH check failed.
+    // v1.0.0 #3464 — consume the DURABLE challenge. A backend fault here is NOT
+    // "no such challenge": flattening it would turn a transient error into a
+    // silent enrolment refusal, so it surfaces as a store error instead.
+    let consumed = match consume_bind_challenge(&app, &agent_id, &body.nonce).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let Some(challenge) = consumed else {
+        // The wire stays opaque across every failure mode, but the OPERATOR
+        // gets the distinction in the log (the #2966 observable-black-hole
+        // discipline). No nonce is logged.
+        tracing::warn!(
+            target: "identity.bind.challenge_miss",
+            agent_id = %agent_id,
+            "pubkey bind refused: no live challenge for this agent — the nonce is \
+             unknown, already consumed, expired, or was issued for a different \
+             agent (#3464)."
+        );
+        record_pubkey_bind_decision(
+            &caller,
+            "refuse",
+            &agent_id,
+            &pubkey,
+            "challenge_missing_or_stale",
+        );
+        return bind_refused_response();
+    };
+    let Ok(proof) = crate::identity::pubkey_bind::PossessionProof::verify_challenge_response(
+        challenge,
+        &agent_id,
+        &pubkey,
+        &body.proof_b64,
+    ) else {
+        // The challenge existed and was consumed, but the answer did not verify
+        // under the CANDIDATE key. That is the #3464 attack shape, so it is
+        // worth an audit-grade WARN even though the wire response is the same
+        // opaque refusal.
+        tracing::warn!(
+            target: "identity.bind.proof_invalid",
+            agent_id = %agent_id,
+            "pubkey bind refused: the presented proof did not verify under the \
+             candidate key (#3464)"
+        );
+        record_pubkey_bind_decision(
+            &caller,
+            "refuse",
+            &agent_id,
+            &pubkey,
+            "candidate_proof_invalid",
+        );
+        return bind_refused_response();
+    };
     #[cfg(feature = "sal")]
     {
         let ctx =
             crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
         match app
             .store
-            .bind_agent_pubkey(&ctx, &agent_id, body.pubkey_b64.trim())
+            .bind_agent_pubkey(&ctx, &agent_id, &pubkey, proof)
             .await
         {
-            Ok(()) => (
-                StatusCode::OK,
-                Json(json!({
-                    "bound": true,
-                    "agent_id": agent_id,
-                })),
-            )
-                .into_response(),
-            Err(e) => store_err_to_response(e),
+            Ok(()) => {
+                record_pubkey_bind_decision(
+                    &caller,
+                    "allow",
+                    &agent_id,
+                    &pubkey,
+                    "bootstrap_or_idempotent_reassertion",
+                );
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "bound": true,
+                        "agent_id": agent_id,
+                    })),
+                )
+                    .into_response()
+            }
+            Err(crate::store::StoreError::PermissionDenied { action, .. })
+                if action == BIND_AGENT_PUBKEY_ACTION =>
+            {
+                record_pubkey_bind_decision(
+                    &caller,
+                    "refuse",
+                    &agent_id,
+                    &pubkey,
+                    "existing_identity_requires_lineage",
+                );
+                bind_refused_response()
+            }
+            Err(e) => {
+                record_pubkey_bind_decision(&caller, "warn", &agent_id, &pubkey, "backend_error");
+                store_err_to_response(e)
+            }
         }
     }
     #[cfg(not(feature = "sal"))]
     {
         let lock = app.db.lock().await;
-        match db::bind_agent_pubkey(&lock.0, &agent_id, body.pubkey_b64.trim()) {
-            Ok(()) => (
-                StatusCode::OK,
-                Json(json!({
-                    "bound": true,
-                    "agent_id": agent_id,
-                })),
-            )
-                .into_response(),
-            Err(e) => crate::handlers::errors::handler_error_500(&e),
+        match db::bind_agent_pubkey(&lock.0, &agent_id, &pubkey, proof) {
+            Ok(()) => {
+                record_pubkey_bind_decision(
+                    &caller,
+                    "allow",
+                    &agent_id,
+                    &pubkey,
+                    "bootstrap_or_idempotent_reassertion",
+                );
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "bound": true,
+                        "agent_id": agent_id,
+                    })),
+                )
+                    .into_response()
+            }
+            Err(e)
+                if e.downcast_ref::<crate::identity::pubkey_bind::BindProofError>()
+                    .is_some() =>
+            {
+                record_pubkey_bind_decision(
+                    &caller,
+                    "refuse",
+                    &agent_id,
+                    &pubkey,
+                    "existing_identity_requires_lineage",
+                );
+                bind_refused_response()
+            }
+            Err(e) => {
+                record_pubkey_bind_decision(&caller, "warn", &agent_id, &pubkey, "backend_error");
+                crate::handlers::errors::handler_error_500(&e)
+            }
         }
     }
+}
+
+/// v1.0.0 #3464 — issue a bind challenge through whichever backend this daemon
+/// serves, so the row lands in the SAME store the bind will consume it from.
+///
+/// The challenge is durable precisely because the postgres tier supports
+/// several daemons on one shared store: an in-process cache would make
+/// issue-on-replica-A / bind-on-replica-B fail closed with no in-product
+/// remedy, and would void every outstanding enrolment on a rolling deploy.
+async fn issue_bind_challenge(
+    app: &AppState,
+    agent_id: &str,
+    pubkey_b64: &str,
+) -> Result<crate::identity::pubkey_bind::BindChallenge, axum::response::Response> {
+    let issuer = crate::identity::sentinels::DAEMON_PRINCIPAL;
+    #[cfg(feature = "sal")]
+    {
+        let ctx = crate::store::CallerContext::for_admin(issuer);
+        app.store
+            .issue_pubkey_bind_challenge(&ctx, agent_id, pubkey_b64, issuer)
+            .await
+            .map_err(store_err_to_response)
+    }
+    #[cfg(not(feature = "sal"))]
+    {
+        let lock = app.db.lock().await;
+        db::issue_pubkey_bind_challenge(&lock.0, agent_id, pubkey_b64, issuer)
+            .map_err(|e| crate::handlers::errors::handler_error_500(&e))
+    }
+}
+
+/// v1.0.0 #3464 — atomically consume a bind challenge through this daemon's
+/// backend.
+///
+/// `Ok(None)` is the refusable case (unknown / already consumed / expired /
+/// issued for a different agent), and the caller must treat all four alike.
+/// An `Err` is a genuine backend fault and must NOT be collapsed into it — a
+/// transient error is not a failed proof.
+async fn consume_bind_challenge(
+    app: &AppState,
+    agent_id: &str,
+    nonce_b64: &str,
+) -> Result<Option<crate::identity::pubkey_bind::ConsumedBindChallenge>, axum::response::Response> {
+    #[cfg(feature = "sal")]
+    {
+        let ctx =
+            crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
+        app.store
+            .consume_pubkey_bind_challenge(&ctx, agent_id, nonce_b64)
+            .await
+            .map_err(store_err_to_response)
+    }
+    #[cfg(not(feature = "sal"))]
+    {
+        let lock = app.db.lock().await;
+        db::consume_pubkey_bind_challenge(&lock.0, agent_id, nonce_b64)
+            .map_err(|e| crate::handlers::errors::handler_error_500(&e))
+    }
+}
+
+/// v1.0.0 #3464 (security-high) — issue a single-use bind challenge.
+///
+/// `POST /api/v1/agents/{id}/pubkey/challenge`. Admin-gated exactly like the
+/// bind it precedes: the challenge names the agent and the candidate key, both
+/// of which ride inside the transcript the key must sign, so a challenge minted
+/// for one `(agent, key)` pair can never admit the bind of another.
+///
+/// The response carries the `nonce`, its `expires_at`, and the exact
+/// base64-encoded `transcript` bytes — so an offline signer never has to
+/// re-derive the encoding, and a mismatch between what the client signs and
+/// what the server verifies is impossible.
+// The awaited store call durably records the nonce so issue-on-replica-A and
+// consume-on-replica-B work on the shared PostgreSQL tier.
+pub async fn bind_agent_pubkey_challenge(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(body): Json<crate::models::BindAgentPubkeyChallengeBody>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&app, &headers, BIND_AGENT_PUBKEY_ACTION) {
+        return resp;
+    }
+    if let Err(e) = validate::validate_agent_id(&agent_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    if let Err(e) = validate::validate_agent_pubkey_b64(&body.pubkey_b64) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let pubkey = match crate::identity::keypair::canonical_public_base64(&body.pubkey_b64) {
+        Ok(pubkey) => pubkey,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let challenge = match issue_bind_challenge(&app, &agent_id, &pubkey).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let transcript = crate::identity::pubkey_bind::bind_challenge_transcript(
+        &agent_id,
+        &challenge.pubkey_b64,
+        &challenge.nonce_b64,
+        &challenge.expires_at,
+    );
+    use base64::Engine as _;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "agent_id": agent_id,
+            "pubkey_b64": challenge.pubkey_b64,
+            "nonce": challenge.nonce_b64,
+            (field_names::EXPIRES_AT): challenge.expires_at,
+            "transcript_b64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&transcript),
+        })),
+    )
+        .into_response()
 }
 
 pub async fn list_agents(
@@ -917,15 +1182,11 @@ pub async fn import_memories(
     // from what the DESTINATION can verify; HTTP was the one surface that did
     // neither, so an attacker simply picked it.
     //
-    // Resolve the destination-enrolled key for the importing admin ONCE, up
-    // front, BEFORE any row of this batch is written — an in-batch `_agents`
-    // row must never be able to self-enroll the key that verifies it. Every
-    // row is restamped to `caller`, so the caller's key is the only one that
-    // can ever be consulted. A key-lookup FAILURE is fatal for the batch (500)
-    // rather than silently read as "unenrolled": swallowing it would durably
-    // demote a genuinely signed re-import to `claimed` (#3145 discipline).
-    let mut enrolled_keys: std::collections::HashMap<String, Option<String>> =
-        std::collections::HashMap::new();
+    // Resolve destination key HISTORY per row, after stripping any transported
+    // binding and immediately before verification. The v97 storage trigger
+    // prevents an earlier `_agents` row in this non-transactional batch from
+    // self-authorizing a later row. A lookup failure is fatal (500), never
+    // silently "unenrolled".
     // v0.7.0 Wave-3 Continuation 3 (Phase 18) — postgres-backed daemons
     // route through the SAL trait. We re-use `app.store.store(...)` per
     // memory (the upsert path that preserves agent_id immutability) and
@@ -945,30 +1206,49 @@ pub async fn import_memories(
         // see the actual caller.
         let ctx = crate::store::CallerContext::for_agent(caller.clone())
             .with_capability(capability.clone());
-        // #3421 — pre-batch snapshot of the importing admin's
-        // destination-enrolled key (see the note at the restamp closure).
-        match app.store.agent_pubkey(&caller).await {
-            Ok(bound) => {
-                enrolled_keys.insert(caller.clone(), bound);
-            }
-            Err(e) => {
-                tracing::error!(
-                    "import_memories(postgres): resolving the destination-enrolled key for \
-                     the importing admin failed: {e}"
-                );
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
-                )
-                    .into_response();
-            }
-        }
         let mut imported = 0usize;
+        let mut pubkey_bindings_stripped = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
         for mut mem in body.memories {
             // #956 — restamp before validate / governance / store.
             let original_claim = restamp_agent_id(&mut mem);
+            if crate::storage::strip_unproven_agent_pubkey_binding(&mut mem) {
+                pubkey_bindings_stripped += 1;
+                errors.push(format!(
+                    "{}: warning — imported agent_pubkey binding stripped; admin role is not target-agent key possession",
+                    mem.id
+                ));
+                tracing::warn!(
+                    memory_id = %mem.id,
+                    "import_memories(postgres): _agents public-key binding stripped (#3464)"
+                );
+            }
+            let resolved_pubkeys = if let Some(author) =
+                crate::identity::attest::presented_attestation_author_needing_bound_key(
+                    &mem,
+                    original_claim.as_deref(),
+                ) {
+                match app
+                    .store
+                    .agent_pubkey_for_attestation_at(author, &mem.created_at)
+                    .await
+                {
+                    Ok(bound) => Some(bound),
+                    Err(e) => {
+                        tracing::error!(
+                            memory_id = %mem.id,
+                            "import_memories(postgres): signed row refused because destination key-history resolution failed: {e}"
+                        );
+                        errors.push(
+                            "import refused: destination key history unavailable".to_string(),
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             // #3421 — re-derive the attestation from what THIS node can
             // verify. A presented-but-forged signature skips the row (never
             // downgraded, the #1464 invariant); a re-owned or unverifiable
@@ -977,7 +1257,7 @@ pub async fn import_memories(
                 &mut mem,
                 original_claim.as_deref(),
                 true,
-                &enrolled_keys,
+                resolved_pubkeys.as_ref(),
             );
             if let Some(cause) = attest.skipped() {
                 tracing::warn!(
@@ -1112,43 +1392,57 @@ pub async fn import_memories(
             "imported": imported,
             "errors": errors,
             "pending": pending,
+            (field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
             (field_names::STORAGE_BACKEND): "postgres",
         }))
         .into_response();
     }
 
     let lock = app.db.lock().await;
-    // #3421 — pre-batch snapshot of the importing admin's destination-enrolled
-    // key (sqlite twin of the postgres branch above).
-    match db::agent_pubkey(&lock.0, &caller) {
-        Ok(bound) => {
-            enrolled_keys.insert(caller.clone(), bound);
-        }
-        Err(e) => {
-            tracing::error!(
-                "import_memories: resolving the destination-enrolled key for the importing \
-                 admin failed: {e}"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
-            )
-                .into_response();
-        }
-    }
     let mut imported = 0usize;
+    let mut pubkey_bindings_stripped = 0usize;
     let mut errors = Vec::new();
     let mut pending: Vec<serde_json::Value> = Vec::new();
     for mut mem in body.memories {
         // #956 — restamp before validate / insert.
         let original_claim = restamp_agent_id(&mut mem);
+        if crate::storage::strip_unproven_agent_pubkey_binding(&mut mem) {
+            pubkey_bindings_stripped += 1;
+            errors.push(format!(
+                "{}: warning — imported agent_pubkey binding stripped; admin role is not target-agent key possession",
+                mem.id
+            ));
+            tracing::warn!(
+                memory_id = %mem.id,
+                "import_memories(sqlite): _agents public-key binding stripped (#3464)"
+            );
+        }
+        let resolved_pubkeys = if let Some(author) =
+            crate::identity::attest::presented_attestation_author_needing_bound_key(
+                &mem,
+                original_claim.as_deref(),
+            ) {
+            match db::agent_pubkey_for_attestation_at(&lock.0, author, &mem.created_at) {
+                Ok(bound) => Some(bound),
+                Err(e) => {
+                    tracing::error!(
+                        memory_id = %mem.id,
+                        "import_memories: signed row refused because destination key-history resolution failed: {e}"
+                    );
+                    errors.push("import refused: destination key history unavailable".to_string());
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         // #3421 — sqlite twin of the postgres reconcile above (one shared
         // funnel, `identity::attest::reconcile_imported_attestation`).
         let attest = crate::identity::attest::reconcile_imported_attestation(
             &mut mem,
             original_claim.as_deref(),
             true,
-            &enrolled_keys,
+            resolved_pubkeys.as_ref(),
         );
         if let Some(cause) = attest.skipped() {
             tracing::warn!(
@@ -1290,7 +1584,13 @@ pub async fn import_memories(
     // no way to learn a row was parked awaiting consensus, because the sqlite
     // lane never produced one. Additive — `imported` / `errors` are unchanged,
     // and an empty `pending` is the ordinary case.
-    Json(json!({"imported": imported, "errors": errors, "pending": pending})).into_response()
+    Json(json!({
+        "imported": imported,
+        "errors": errors,
+        "pending": pending,
+        (field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -1438,5 +1738,61 @@ mod g28_export_screen_tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, "x");
         assert_eq!(refusal_count(&conn), 1);
+    }
+}
+
+#[cfg(test)]
+mod pubkey_bind_audit_tests {
+    use super::*;
+
+    #[test]
+    fn refused_hijack_and_successful_bind_emit_distinct_forensic_decisions() {
+        let _guard = crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::TempDir::new().expect("audit tempdir");
+        crate::governance::audit::shutdown();
+        crate::governance::audit::init(dir.path(), None).expect("init audit");
+
+        let actor = "ai:bind-audit-3464";
+        record_pubkey_bind_decision(
+            actor,
+            "refuse",
+            "ai:victim-3464",
+            "attacker-public-key",
+            "existing_identity_requires_lineage",
+        );
+        record_pubkey_bind_decision(
+            actor,
+            "allow",
+            "ai:bootstrap-3464",
+            "bootstrap-public-key",
+            "bootstrap_or_idempotent_reassertion",
+        );
+        crate::governance::audit::shutdown();
+
+        let entries = std::fs::read_dir(dir.path()).expect("read audit dir");
+        let body = entries
+            .filter_map(Result::ok)
+            .map(|entry| std::fs::read_to_string(entry.path()).expect("read audit file"))
+            .collect::<String>();
+        let rows = body
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<crate::governance::audit::ForensicDecision>(line).ok()
+            })
+            .filter(|row| row.actor == actor)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "both security decisions must be auditable");
+        assert_eq!(rows[0].decision, "refuse");
+        assert_eq!(
+            rows[0].payload["reason"],
+            "existing_identity_requires_lineage"
+        );
+        assert_eq!(rows[1].decision, "allow");
+        assert_eq!(
+            rows[1].payload["reason"],
+            "bootstrap_or_idempotent_reassertion"
+        );
     }
 }

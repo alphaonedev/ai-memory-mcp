@@ -218,7 +218,7 @@ fn archived_forged_write_signature_is_skipped_3150() {
     let dst = fresh_db("forged-sig-");
     ai_memory::db::register_agent(&dst, AUTHOR, "ai:generic", &[]).expect("register");
     let kp = ai_memory::identity::keypair::generate(AUTHOR).expect("keypair");
-    ai_memory::db::bind_agent_pubkey(&dst, AUTHOR, &kp.public_base64()).expect("bind");
+    ai_memory::db::bind_agent_pubkey_with_keypair(&dst, AUTHOR, &kp).expect("bind");
 
     let mut mem = archived_memory("arch-forged-3150", "durable archived text");
     let obj = mem.metadata.as_object_mut().expect("object");

@@ -215,6 +215,23 @@ triggers re-cert** (see §7).
 > re-runs on the recompiled binary; until then the Certified Postgres + AGE +
 > pgvector (#2548) workflow is GREEN on `e35ce473` (run 33599061424).
 >
+> **Amendment (2026-09-04, #3464 proof-of-possession hardening).** The
+> §7-watched federation receive paths changed to remove transported agent
+> public keys as an enrollment authority and to re-verify a presented write
+> signature against the bounded historical key candidates for its signed
+> `created_at`. Generic import, sync, and federation traffic can no longer
+> plant or replace an `_agents` trust anchor; an existing identity advances
+> only through predecessor-signed lineage or verified guardian recovery.
+> Candidate selection uses the same inclusive ±300-second skew admitted at
+> live write time and upgrades only when exactly one historical key verifies;
+> missing, ambiguous, malformed, or forged evidence fails closed to the
+> surface's documented refusal/claimed floor. No `AI_MEMORY_FED_*` identifier
+> or certified deployment knob changed, and no private key crosses the wire.
+> SQLite and native PostgreSQL regressions cover forged generic writes,
+> old/new-key skew boundaries, ambiguity, replay, revoked-key reuse, and
+> successful rotation. This additive narrowing discharges the §7 trigger; it
+> does **not** re-mint the certification (the bind remains `e22bc93c`).
+>
 ---
 
 ## 1. The trust boundary (what is certified)

@@ -43,7 +43,7 @@ const memory = new AiMemoryClient({
 
 // Store — signed, because the HTTP write surface fails closed by default.
 const key = AgentSigningKey.generate();          // or .fromSeed(readFileSync("svc.priv"))
-await memory.bindAgentPubkey("svc", key.publicKeyBase64()); // once, admin-gated
+await memory.bindAgentPubkey("svc", key); // PoP bootstrap, once and admin-gated
 
 const m = await memory.store(
   {
@@ -80,7 +80,7 @@ you override `agentId`, pass an `AbortSignal`, or add custom headers.
 | Method | Endpoint | Description |
 | --- | --- | --- |
 | `store(body, opts?)` | `POST /api/v1/memories` | Create a new memory. Pass `opts.signingKey` — unsigned stores are 403. |
-| `bindAgentPubkey(id, b64)` | `PUT /api/v1/agents/{id}/pubkey` | Enroll an attestation key (admin-gated). |
+| `bindAgentPubkey(id, signingKey)` | `PUT /api/v1/agents/{id}/pubkey` | Bootstrap/reassert an attestation key (admin-gated). Takes the private signing key and answers the server's single-use proof-of-possession challenge; candidate proof cannot replace a different anchored key. Use predecessor-signed lineage for rotation. |
 | `storeBulk(memories, opts?)` | `POST /api/v1/memories/bulk` | Batch insert up to 1000. |
 | `get(id, opts?)` | `GET /api/v1/memories/:id` | Fetch by id. |
 | `update(id, body, opts?)` | `PUT /api/v1/memories/:id` | Patch fields. |
@@ -159,8 +159,9 @@ import { readFileSync } from "node:fs";
 // The daemon's own key format: 32 raw bytes at <key_dir>/<agent_id>.priv
 const key = AgentSigningKey.fromSeed(readFileSync("/etc/ai-memory/keys/svc.priv"));
 
-// One-time, admin-gated: bind the PUBLIC half to the agent.
-await memory.bindAgentPubkey("svc", key.publicKeyBase64());
+// One-time, admin-gated bootstrap: prove possession of the private half.
+// A later distinct key requires predecessor-signed lineage rotation.
+await memory.bindAgentPubkey("svc", key);
 
 await memory.store({ title: "t", content: "c", agent_id: "svc" }, { signingKey: key });
 ```

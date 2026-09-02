@@ -190,8 +190,7 @@ fn enroll(db_path: &std::path::Path, agent_id: &str) -> ai_memory::identity::key
     let kp = ai_memory::identity::keypair::generate(agent_id).expect("generate keypair");
     let conn = ai_memory::db::open(db_path).expect("reopen for enroll");
     ai_memory::storage::register_agent(&conn, agent_id, "nhi", &[]).expect("register agent");
-    ai_memory::storage::bind_agent_pubkey(&conn, agent_id, &kp.public_base64())
-        .expect("bind pubkey");
+    ai_memory::storage::bind_agent_pubkey_with_keypair(&conn, agent_id, &kp).expect("bind pubkey");
     kp
 }
 

@@ -415,16 +415,33 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // backfill and no pre-existing row is read or rewritten, so revert is DROP
     // TABLE + lowering the stamp (NoLoss — the ledger is derived
     // replay-protection state, regenerable by simply starting to record again,
-    // never durable memory truth). Postgres twin is `PostgresStore::migrate_v95`.
+    // never durable memory truth). Literal tail: MUST equal
+    // CURRENT_SCHEMA_VERSION at the time it landed; v97 (#3464) is the tail now.
+    // Postgres twin is `PostgresStore::migrate_v95`.
     meta(95, "ATTESTED_WRITE_REPLAY_LEDGER", true, true, NoLoss, Sqlite),
     // v96 (#3344, v1.0.0) — DURABLE EMBED SKIP LIST. Additive standalone
     // `embed_skip` table (CREATE TABLE IF NOT EXISTS + content/embed
     // clear triggers) so boot/backfill remember undecryptable and oversize
     // rows keyed by id + encryption-key fingerprint. Idempotent, revert =
     // DROP TABLE/TRIGGER, NoLoss (derived cache, not durable memory truth).
-    // Literal tail: MUST equal CURRENT_SCHEMA_VERSION. Slots after #3419's
-    // settled v95. Postgres twin is `PostgresStore::migrate_v96`.
+    // Settled literal rung after #3419's v95. Postgres twin is
+    // `PostgresStore::migrate_v96`.
     meta(96, "EMBED_SKIP", true, true, NoLoss, Sqlite),
+    // v97 (#3464, v1.0.0, security-high) — APPEND-ONLY AGENT PUBKEY HISTORY.
+    // Creates `agent_pubkey_history` (composite PK `(agent_id, version)`), the
+    // durable single-use bind-challenge table, their ladder-owned indexes, and
+    // BACKFILLS every live `metadata.agent_pubkey` as version 1 under the
+    // `legacy_unproven` authority. Two triggers then make history authoritative
+    // over the flat key mirrors on every future generic write; explicit bind
+    // and lineage update history first in the same transaction. Reversibility
+    // is drop-trigger then drop-table; the flat mirror an operator rolls back
+    // to remains in `memories` — NoLoss. `CREATE TABLE IF NOT EXISTS` +
+    // `CREATE INDEX IF NOT EXISTS` + `INSERT OR IGNORE` on the composite PK make
+    // the whole batch re-runnable, so a crash mid-arm self-heals on the next
+    // open — idempotent. No full-table rebuild. Literal tail: MUST equal
+    // CURRENT_SCHEMA_VERSION.
+    // Postgres twin is `PostgresStore::migrate_v97`.
+    meta(97, "AGENT_PUBKEY_HISTORY", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

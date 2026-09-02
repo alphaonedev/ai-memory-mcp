@@ -66,6 +66,9 @@ src/store/postgres.rs	pg_append_signed_event_with_chain_in_tx
 src/store/postgres.rs	pg_emit_audit_head_witness_in_tx
 # in-tx free fn; callers: gated store/update/supersede paths
 src/store/postgres.rs	pg_append_revision_leaf_in_tx
+# #3464 (2026-09-04, Codex review): in-tx key-history helper; its only callers
+# are bind_agent_pubkey and append_lineage_record, both gated before begin.
+src/store/postgres.rs	append_pubkey_version_tx
 # in-tx free fn; callers: gated store/update paths
 src/store/postgres.rs	reconcile_envelope_owner_known
 # scanner false-positive: this fn has no write-SQL; the next helper's SQL

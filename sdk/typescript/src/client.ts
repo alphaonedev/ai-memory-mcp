@@ -23,7 +23,11 @@
 import { fetch as undiciFetch, Agent, type RequestInit } from "undici";
 
 import { apiErrorFromResponse, NetworkError } from "./errors.js";
-import { attestationFields, type AgentSigningKey } from "./attestation.js";
+import {
+  attestationFields,
+  signBindChallenge,
+  type AgentSigningKey,
+} from "./attestation.js";
 import type {
   AgentRegistration,
   BulkCreateResponse,
@@ -258,7 +262,7 @@ export class AiMemoryClient {
    * import { AiMemoryClient, AgentSigningKey } from "@alphaone/ai-memory";
    *
    * const key = AgentSigningKey.fromSeed(readFileSync("svc.priv"));
-   * await client.bindAgentPubkey("svc", key.publicKeyBase64()); // once, admin
+   * await client.bindAgentPubkey("svc", key); // once, admin (#3464 proves possession)
    * await client.store(
    *   { title: "t", content: "c", agent_id: "svc" },
    *   { signingKey: key },
@@ -533,25 +537,66 @@ export class AiMemoryClient {
   }
 
   /**
-   * `PUT /api/v1/agents/:id/pubkey` — enroll an attestation public key.
+   * `POST /api/v1/agents/:id/pubkey/challenge` — take a single-use bind nonce.
+   *
+   * ADMIN-GATED (v1.0.0 #3464). The challenge is minted for THIS
+   * `(agentId, pubkeyB64)` pair, both of which ride inside the signed
+   * transcript, so it cannot admit the bind of another agent or another key.
+   */
+  async bindAgentPubkeyChallenge(
+    agentId: string,
+    pubkeyB64: string,
+    opts?: RequestOptions,
+  ): Promise<{ nonce: string; expires_at: string; transcript_b64: string }> {
+    return this.call<
+      { nonce: string; expires_at: string; transcript_b64: string },
+      { pubkey_b64: string }
+    >({
+      method: "POST",
+      path: `/api/v1/agents/${encodeURIComponent(agentId)}/pubkey/challenge`,
+      body: { pubkey_b64: pubkeyB64 },
+      requestOpts: opts,
+    });
+  }
+
+  /**
+   * `PUT /api/v1/agents/:id/pubkey` — bootstrap an attestation public key.
    *
    * ADMIN-GATED. Without a bound key the daemon cannot verify a signed store
    * and still answers `403` — fail-closed by design — so this is the required
    * one-time step before {@link AiMemoryClient.store} with `signingKey` can
    * succeed.
    *
-   * @param pubkeyB64 Base64 32-byte Ed25519 public key; URL-safe unpadded is
-   *   accepted. {@link AgentSigningKey.publicKeyBase64} emits it.
+   * v1.0.0 #3464 — this takes the **private** key, not a bare public one, and
+   * runs the challenge/response the daemon requires: it takes a single-use
+   * nonce, signs the domain-separated transcript, and presents the proof.
+   * Binding a key you cannot sign with is refused by design — an admin who
+   * cannot demonstrate possession must not be able to bind a key to an agent
+   * and then mint `agent_attested` writes as that agent.
+   * Candidate proof permits first bootstrap or same-key reassertion only;
+   * distinct replacement requires the current-key-signed lineage succession.
+   *
+   * @param signingKey The Ed25519 key being enrolled, private half included.
    */
   async bindAgentPubkey(
     agentId: string,
-    pubkeyB64: string,
+    signingKey: AgentSigningKey,
     opts?: RequestOptions,
   ): Promise<{ bound: boolean; agent_id: string }> {
-    return this.call<{ bound: boolean; agent_id: string }, { pubkey_b64: string }>({
+    const pubkeyB64 = signingKey.publicKeyBase64();
+    const challenge = await this.bindAgentPubkeyChallenge(agentId, pubkeyB64, opts);
+    const proofB64 = signBindChallenge(signingKey, {
+      agentId,
+      nonce: challenge.nonce,
+      expiresAt: challenge.expires_at,
+    });
+    return this.call<
+      { bound: boolean; agent_id: string },
+      { pubkey_b64: string; nonce: string; proof_b64: string }
+    >({
       method: "PUT",
       path: `/api/v1/agents/${encodeURIComponent(agentId)}/pubkey`,
-      body: { pubkey_b64: pubkeyB64 },
+      body: { pubkey_b64: pubkeyB64, nonce: challenge.nonce, proof_b64: proofB64 },
       requestOpts: opts,
     });
   }

@@ -23,11 +23,13 @@ from ai_memory._common import (
     DEFAULT_TIMEOUT,
     build_create_body,
     build_httpx_kwargs,
+    encode_path_segment,
     handle_response,
     if_match_headers,
     prep_json,
     wrap_transport_error,
 )
+from ai_memory.attestation import sign_bind_challenge
 from ai_memory.models import (
     AgentRegistration,
     BulkCreateResponse,
@@ -169,7 +171,7 @@ class AiMemoryClient:
 
             key = AgentSigningKey.from_file("~/.config/ai-memory/keys/svc.priv")
             with AiMemoryClient() as c:
-                c.bind_agent_pubkey("svc", key.public_key_b64())  # once, admin
+                c.bind_agent_pubkey("svc", key)  # once, admin
                 c.store(title="t", content="c", agent_id="svc", signing_key=key)
 
         Omitting ``signing_key`` only works where the operator has explicitly
@@ -509,20 +511,64 @@ class AiMemoryClient:
             },
         )
 
-    def bind_agent_pubkey(self, agent_id: str, pubkey_b64: str) -> dict[str, Any]:
-        """``PUT /api/v1/agents/{id}/pubkey`` — enroll an attestation key.
+    def bind_agent_pubkey_challenge(self, agent_id: str, pubkey_b64: str) -> dict[str, Any]:
+        """``POST /api/v1/agents/{id}/pubkey/challenge`` — take a bind nonce.
+
+        ADMIN-GATED. Returns ``{nonce, expires_at, transcript_b64, ...}``. The
+        challenge is single-use and minted for THIS ``(agent_id, pubkey_b64)``
+        pair, both of which ride inside the signed transcript, so it cannot
+        admit the bind of another agent or another key.
+        """
+        encoded_agent_id = encode_path_segment(agent_id)
+        return self._request(
+            "POST",
+            f"/api/v1/agents/{encoded_agent_id}/pubkey/challenge",
+            json_body={"pubkey_b64": pubkey_b64},
+        )
+
+    def bind_agent_pubkey(
+        self,
+        agent_id: str,
+        signing_key: AgentSigningKey,
+    ) -> dict[str, Any]:
+        """``PUT /api/v1/agents/{id}/pubkey`` — bootstrap an attestation key.
 
         ADMIN-GATED. Without a bound key the daemon cannot verify a signed
         store and still answers ``403`` — fail-closed by design — so this is
         the required one-time step before :meth:`store` with ``signing_key``
         can succeed.
 
+        v1.0.0 #3464 — this now takes the **private** key, not a bare public
+        one, and runs the challenge/response the daemon requires: it takes a
+        single-use nonce, signs the domain-separated transcript with
+        ``signing_key``, and presents the proof. Passing only a public key can
+        no longer work by design — an admin who cannot demonstrate possession
+        of a key must not be able to bind it to an agent and then mint
+        ``agent_attested`` writes as that agent.
+
+        Candidate proof permits first bootstrap or same-key reassertion only.
+        A distinct replacement requires the current-key-signed lineage
+        succession (``ai-memory identity succeed``); an admin role cannot
+        substitute for the target agent's existing trust anchor.
+
         Args:
-            pubkey_b64: Base64 32-byte Ed25519 public key; URL-safe unpadded
-                is accepted. :meth:`AgentSigningKey.public_key_b64` emits it.
+            signing_key: The Ed25519 key being enrolled, private half
+                included. See :mod:`ai_memory.attestation`.
         """
+        pubkey_b64 = signing_key.public_key_b64()
+        challenge = self.bind_agent_pubkey_challenge(agent_id, pubkey_b64)
+        proof = sign_bind_challenge(
+            signing_key,
+            agent_id=agent_id,
+            nonce=challenge["nonce"],
+            expires_at=challenge["expires_at"],
+        )
         return self._request(
             "PUT",
-            f"/api/v1/agents/{agent_id}/pubkey",
-            json_body={"pubkey_b64": pubkey_b64},
+            f"/api/v1/agents/{encode_path_segment(agent_id)}/pubkey",
+            json_body={
+                "pubkey_b64": pubkey_b64,
+                "nonce": challenge["nonce"],
+                "proof_b64": proof,
+            },
         )

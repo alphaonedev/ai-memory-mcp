@@ -120,10 +120,16 @@ fn build_fake_pg_router() -> (axum::Router, NamedTempFile, std::path::PathBuf) {
 /// Register `agent_id` and bind `kp`'s public key through a fresh
 /// connection on the daemon's db file so the gate's async
 /// `MemoryStore::agent_pubkey` lookup (sqlite adapter) resolves it.
-fn provision_agent(db_path: &std::path::Path, agent_id: &str, pubkey_b64: &str) {
+fn provision_agent(
+    db_path: &std::path::Path,
+    agent_id: &str,
+    kp: &ai_memory::identity::keypair::AgentKeypair,
+) {
     let conn = ai_memory::db::open(db_path).expect("reopen for provision");
     ai_memory::storage::register_agent(&conn, agent_id, "nhi", &[]).expect("register");
-    ai_memory::storage::bind_agent_pubkey(&conn, agent_id, pubkey_b64).expect("bind");
+    // #3464 — the bind now demands proof of possession; the helper holds the
+    // private half, so it runs the real handshake rather than asserting a key.
+    ai_memory::storage::bind_agent_pubkey_with_keypair(&conn, agent_id, kp).expect("bind");
 }
 
 /// Standard-base64 Ed25519 signature over the canonical store envelope.
@@ -169,7 +175,7 @@ async fn post_memory(router: &axum::Router, agent_id: &str, body: Value) -> (Sta
 async fn pg_signed_store_stamps_agent_attested_and_adopts_created_at() {
     let (router, _f, db_path) = build_fake_pg_router();
     let kp = ai_memory::identity::keypair::generate("ai:alice").expect("keypair");
-    provision_agent(&db_path, "ai:alice", &kp.public_base64());
+    provision_agent(&db_path, "ai:alice", &kp);
 
     let title = "pg-signed";
     let content = "This is the body of pg-signed, long enough to be meaningful prose.";
@@ -218,7 +224,7 @@ async fn pg_forged_signature_is_rejected_403() {
     let (router, _f, db_path) = build_fake_pg_router();
     let bound = ai_memory::identity::keypair::generate("ai:alice").expect("kp1");
     let attacker = ai_memory::identity::keypair::generate("ai:alice").expect("kp2");
-    provision_agent(&db_path, "ai:alice", &bound.public_base64());
+    provision_agent(&db_path, "ai:alice", &bound);
 
     let title = "pg-forged";
     let content = "This is the body of pg-forged, long enough to be meaningful prose.";

@@ -970,6 +970,43 @@ impl MetadataEq {
     }
 }
 
+/// v1.0.0 #3464 — run the full DURABLE bind handshake through a `MemoryStore`
+/// for a caller that HOLDS the candidate private key.
+///
+/// The SAL twin of `storage::prove_possession_with_conn`: issue a challenge,
+/// sign it, consume it, verify. Not a bypass — the public key is DERIVED from
+/// `signing_key`, so it can only mint a proof for a key the caller holds.
+///
+/// # Errors
+///
+/// Propagates the adapter's issue/consume failures, and fails closed if the
+/// freshly-issued challenge cannot be consumed.
+pub async fn prove_possession_via_store(
+    store: &dyn MemoryStore,
+    ctx: &CallerContext,
+    agent_id: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> StoreResult<crate::identity::pubkey_bind::PossessionProof> {
+    use crate::identity::pubkey_bind::{PossessionProof, sign_bind_challenge};
+    let pubkey_b64 = crate::identity::keypair::encode_public_base64(&signing_key.verifying_key());
+    let issuer = crate::identity::sentinels::DAEMON_PRINCIPAL;
+    let issued = store
+        .issue_pubkey_bind_challenge(ctx, agent_id, &pubkey_b64, issuer)
+        .await?;
+    let signature = sign_bind_challenge(signing_key, &issued);
+    let taken = store
+        .consume_pubkey_bind_challenge(ctx, agent_id, &issued.nonce_b64)
+        .await?
+        .ok_or_else(|| StoreError::InvalidInput {
+            detail: "bind challenge expired before it could be answered".to_string(),
+        })?;
+    PossessionProof::verify_challenge_response(taken, agent_id, &pubkey_b64, &signature).map_err(
+        |e| StoreError::InvalidInput {
+            detail: crate::errors::msg::pubkey_bind_refused(e),
+        },
+    )
+}
+
 /// Filter shape passed to `list` / `search` / `recall`. Each field
 /// narrows the result set; `None` / empty means "don't narrow on this
 /// axis".
@@ -1961,13 +1998,27 @@ pub trait MemoryStore: Send + Sync {
         agent: &AgentRegistration,
     ) -> StoreResult<()>;
 
-    /// Bind (or rotate) an agent's Ed25519 public key into its
+    /// Bind an agent's Ed25519 public key into its
     /// registration metadata (#626 Layer-3, Task 1.3 / C3).
     ///
     /// The bound key is the anchor the write-path attestation gate
     /// verifies a signed write against — upgrading the write's
     /// `agent_id` from *claimed* to *attested*. The agent must already
-    /// be registered; re-binding rotates the key.
+    /// be registered. Candidate proof bootstraps or reasserts the live key;
+    /// distinct replacement requires a current-key-authorized lineage
+    /// transition.
+    ///
+    /// v1.0.0 #3464 — `proof` is the control. A
+    /// [`crate::identity::pubkey_bind::PossessionProof`] has no public
+    /// constructor, carries private exact-tuple claims, and is consumed by
+    /// this call. Implementors must atomically compare it to current/history
+    /// state so candidate possession cannot replace an anchored identity.
+    /// Pre-#3464 this took a self-asserted key, which let anyone with the admin
+    /// role bind a key they controlled to another agent's id and then mint
+    /// `agent_attested` writes as that agent.
+    /// Implementors MUST also preserve the append-only key history the
+    /// `agent_pubkey_history` ledger holds — rebinding must never destroy the
+    /// anchor prior attested rows were signed under.
     ///
     /// Default returns `UnsupportedCapability` so an adapter that has
     /// not wired key provisioning fails loudly rather than silently
@@ -1977,9 +2028,103 @@ pub trait MemoryStore: Send + Sync {
         _ctx: &CallerContext,
         _agent_id: &str,
         _pubkey_b64: &str,
+        _proof: crate::identity::pubkey_bind::PossessionProof,
     ) -> StoreResult<()> {
         Err(StoreError::UnsupportedCapability {
             capability: "BIND_AGENT_PUBKEY".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3464 — mint and PERSIST a proof-of-possession bind challenge.
+    ///
+    /// Durable, not in-process: this tier supports several daemons on one
+    /// SHARED store, so issuing the challenge on one replica and answering it
+    /// on another is a supported shape. The candidate key is pinned by the
+    /// issuer here and re-checked at consume time.
+    ///
+    /// Default returns `UnsupportedCapability` (mirrors `bind_agent_pubkey`):
+    /// an adapter without key provisioning must fail loudly rather than hand
+    /// back a challenge no `consume` will ever honour.
+    async fn issue_pubkey_bind_challenge(
+        &self,
+        _ctx: &CallerContext,
+        _agent_id: &str,
+        _pubkey_b64: &str,
+        _issuer_daemon_id: &str,
+    ) -> StoreResult<crate::identity::pubkey_bind::BindChallenge> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ISSUE_PUBKEY_BIND_CHALLENGE".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3464 — atomically CONSUME a bind challenge by its nonce.
+    ///
+    /// Single use is the `consumed_at IS NULL` predicate of one conditional
+    /// `UPDATE`, so the row-level write IS the admit-once decision and two
+    /// concurrent submissions of the same answer can never both be admitted.
+    /// The same statement enforces expiry and binds the row to `agent_id`.
+    ///
+    /// `Ok(None)` means unknown / already consumed / expired / wrong agent —
+    /// the caller MUST treat all four alike and refuse opaquely, so the
+    /// surface is not an oracle.
+    ///
+    /// Default returns `UnsupportedCapability`, never `Ok(None)`: an adapter
+    /// that cannot consume must not look like a legitimately refused bind.
+    async fn consume_pubkey_bind_challenge(
+        &self,
+        _ctx: &CallerContext,
+        _agent_id: &str,
+        _nonce_b64: &str,
+    ) -> StoreResult<Option<crate::identity::pubkey_bind::ConsumedBindChallenge>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "CONSUME_PUBKEY_BIND_CHALLENGE".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3464 — every key `agent_id` has ever been bound to, oldest
+    /// first, from the append-only `agent_pubkey_history` ledger.
+    ///
+    /// The anchor set an `agent_attested` row is re-verified against: a write
+    /// signed under a key that has since been rotated away must still verify
+    /// against the key that actually signed it, not merely against whichever
+    /// key is live today. Each row carries a dense 1-based `version`, which is
+    /// the stable handle a delegation or capability grant cites to say WHICH
+    /// key issued it.
+    ///
+    /// Default returns `UnsupportedCapability` (mirrors `bind_agent_pubkey`):
+    /// an adapter without key provisioning must fail loudly rather than
+    /// report an EMPTY history, which a caller would read as "this agent
+    /// never had a key" — a wrong answer about durable provenance.
+    async fn agent_pubkey_versions(
+        &self,
+        _agent_id: &str,
+    ) -> StoreResult<Vec<crate::storage::AgentPubkeyVersion>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "AGENT_PUBKEY_VERSIONS".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3464 — resolve the key allowed to re-verify a persisted
+    /// attestation at its signed envelope timestamp.
+    ///
+    /// Once history exists, implementations return every key whose strict
+    /// half-open `[bound_at, superseded_at)` window, expanded by the live
+    /// verifier's inclusive ±300-second created-at allowance, contains
+    /// `at_rfc3339`. The signature must select exactly one candidate: no match
+    /// or multiple matches fail closed, and a miss never falls back to the
+    /// current flat key. Only a legacy identity with zero history rows may
+    /// return a flat-key candidate. Missing, overlapping, noncanonical, or
+    /// malformed history also fails closed.
+    ///
+    /// Live admission must call [`Self::agent_pubkey`] instead so a new write
+    /// is authorized only by the current open key.
+    async fn agent_pubkey_for_attestation_at(
+        &self,
+        _agent_id: &str,
+        _at_rfc3339: &str,
+    ) -> StoreResult<crate::storage::AttestationPubkeyAt> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "AGENT_PUBKEY_FOR_ATTESTATION_AT".to_string(),
         })
     }
 
@@ -2110,7 +2255,8 @@ pub trait MemoryStore: Send + Sync {
     /// Task 1.3 / C5).
     ///
     /// Clears the bound key so the agent reverts to the permissive
-    /// *claimed* posture until a fresh key is bound. The agent must
+    /// *claimed* posture. A closed identity can be restored only through its
+    /// signed-lineage recovery path; candidate proof cannot reopen it. The agent must
     /// already be registered; revoking an agent that never bound a key
     /// is a no-op success (idempotent).
     ///
@@ -6614,7 +6760,36 @@ mod tests {
         let store = DefaultImplProbeStore;
         let ctx = CallerContext::for_agent("test-agent");
 
-        match rt.block_on(store.bind_agent_pubkey(&ctx, "alice", "cHVia2V5")) {
+        // #3464 — the two challenge defaults must fail LOUD, never hand back a
+        // challenge no `consume` will honour (or a `None` that looks like a
+        // legitimately refused bind).
+        match rt.block_on(store.issue_pubkey_bind_challenge(&ctx, "alice", "cHVia2V5", "d")) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "ISSUE_PUBKEY_BIND_CHALLENGE");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(_) => panic!("default issue_pubkey_bind_challenge must error"),
+        }
+        match rt.block_on(store.consume_pubkey_bind_challenge(&ctx, "alice", "nonce")) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "CONSUME_PUBKEY_BIND_CHALLENGE");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(_) => panic!("default consume_pubkey_bind_challenge must error"),
+        }
+
+        // A `PossessionProof` cannot be constructed without a store that can
+        // issue and consume a challenge — which is the whole point — so mint a
+        // real one against an in-memory database to drive the default
+        // `bind_agent_pubkey` below.
+        let probe_kp = crate::identity::keypair::generate("alice").expect("gen");
+        let probe_sk = probe_kp.private.as_ref().expect("generated private key");
+        let probe_conn =
+            crate::db::open(std::path::Path::new(":memory:")).expect("in-memory db for proof");
+        let probe_proof =
+            crate::storage::prove_possession_with_conn(&probe_conn, "alice", probe_sk)
+                .expect("prove possession against a real challenge table");
+        match rt.block_on(store.bind_agent_pubkey(&ctx, "alice", "cHVia2V5", probe_proof)) {
             Err(StoreError::UnsupportedCapability { capability }) => {
                 assert_eq!(capability, "BIND_AGENT_PUBKEY");
             }

@@ -38,21 +38,33 @@ from ai_memory.attestation import (  # after importorskip, by design
     DOMAIN_SEPARATION_TAG,
     AgentSigningKey,
     attestation_fields,
+    bind_challenge_transcript,
     canonical_cbor_write,
     canonicalize_created_at,
     content_sha256,
     rfc3339_now,
+    sign_bind_challenge,
     sign_write,
 )
 
 _FIXTURE = (
     Path(__file__).resolve().parents[2] / "fixtures" / "write_attestation_vector.json"
 )
+_BIND_FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "fixtures"
+    / "bind_pubkey_possession_vector.json"
+)
 
 
 @pytest.fixture(scope="module")
 def vector() -> dict[str, Any]:
     return json.loads(_FIXTURE.read_text(encoding="utf-8"))
+
+
+@pytest.fixture(scope="module")
+def bind_vector() -> dict[str, str]:
+    return json.loads(_BIND_FIXTURE.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +224,29 @@ def test_attestation_fields_defaults_kind_to_observation(vector: dict[str, Any])
 
 def test_rfc3339_now_is_offset_form() -> None:
     assert rfc3339_now().endswith("+00:00")
+
+
+def test_bind_possession_vector_matches_rust_bytes_and_signature(
+    bind_vector: dict[str, str],
+) -> None:
+    key = AgentSigningKey(bytes.fromhex(bind_vector["seed_hex"]))
+    assert key.public_key_b64() == bind_vector["pubkey_b64"]
+    transcript = bind_challenge_transcript(
+        agent_id=bind_vector["agent_id"],
+        pubkey_b64=bind_vector["pubkey_b64"],
+        nonce=bind_vector["nonce"],
+        expires_at=bind_vector["expires_at"],
+    )
+    assert transcript.hex() == bind_vector["transcript_hex"]
+    assert (
+        sign_bind_challenge(
+            key,
+            agent_id=bind_vector["agent_id"],
+            nonce=bind_vector["nonce"],
+            expires_at=bind_vector["expires_at"],
+        )
+        == bind_vector["proof_b64url"]
+    )
 
 
 # ---------------------------------------------------------------------------

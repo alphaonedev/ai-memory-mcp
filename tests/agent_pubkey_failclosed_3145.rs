@@ -50,7 +50,7 @@ fn seed(
     {
         let conn = ai_memory::db::open(&path).expect("db::open");
         ai_memory::db::register_agent(&conn, AGENT, "nhi", &[]).expect("register");
-        ai_memory::db::bind_agent_pubkey(&conn, AGENT, &kp.public_base64()).expect("bind");
+        ai_memory::db::bind_agent_pubkey_with_keypair(&conn, AGENT, &kp).expect("bind");
     }
     (path, kp)
 }

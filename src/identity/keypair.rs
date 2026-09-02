@@ -149,7 +149,7 @@ impl AgentKeypair {
     /// Stable wire format for `export-pub` and for peer allowlists.
     #[must_use]
     pub fn public_base64(&self) -> String {
-        URL_SAFE_NO_PAD.encode(self.public.to_bytes())
+        encode_public_base64(&self.public)
     }
 }
 
@@ -830,6 +830,38 @@ pub fn decode_public_base64(s: &str) -> Result<VerifyingKey> {
     //           depends on the dalek 2.x decode policy for specific
     //           inputs. Documented per L0.7 playbook §3c.
     VerifyingKey::from_bytes(&arr).with_context(|| "decoding public key bytes".to_string())
+}
+
+/// Encode a decoded Ed25519 public key in the one canonical persisted/wire
+/// spelling: URL-safe base64 without padding (exactly 43 ASCII characters).
+#[must_use]
+pub fn encode_public_base64(key: &VerifyingKey) -> String {
+    URL_SAFE_NO_PAD.encode(key.to_bytes())
+}
+
+/// Decode either accepted wire spelling and return its canonical form.
+pub fn canonical_public_base64(s: &str) -> Result<String> {
+    decode_public_base64(s).map(|key| encode_public_base64(&key))
+}
+
+/// Compare decoded key identity against a canonical persisted history. Every
+/// stored spelling is re-encoded and must already equal the SSOT form.
+pub(crate) fn canonical_history_contains<I, S>(candidate: &str, history: I) -> Result<bool>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let candidate = decode_public_base64(candidate)?;
+    let mut found = false;
+    for stored in history {
+        let stored = stored.as_ref();
+        let decoded = decode_public_base64(stored).context("decoding persisted pubkey history")?;
+        if encode_public_base64(&decoded) != stored {
+            bail!("noncanonical agent pubkey history; refusing identity mutation");
+        }
+        found |= decoded.to_bytes() == candidate.to_bytes();
+    }
+    Ok(found)
 }
 
 /// Read a 32-byte raw key file and return the bytes. Used by
@@ -2006,6 +2038,40 @@ mod tests {
         let padded = base64::engine::general_purpose::STANDARD.encode(kp.public.to_bytes());
         let decoded = decode_public_base64(&padded).expect("decode padded");
         assert_eq!(decoded.to_bytes(), kp.public.to_bytes());
+        assert_eq!(
+            canonical_public_base64(&padded).expect("canonicalize padded"),
+            kp.public_base64()
+        );
+        assert!(
+            canonical_history_contains(&kp.public_base64(), [&padded]).is_err(),
+            "accepted wire aliases must never survive in persisted history"
+        );
+    }
+
+    #[test]
+    fn url_safe_no_pad_32_byte_tail_set_is_exhaustive() {
+        use std::collections::BTreeSet;
+
+        let expected: BTreeSet<char> = "AEIMQUYcgkosw048".chars().collect();
+        let mut observed = BTreeSet::new();
+        for counter in 0_u32..10_000 {
+            let mut seed = [0_u8; SECRET_KEY_LEN];
+            seed[..4].copy_from_slice(&counter.to_le_bytes());
+            let signing = SigningKey::from_bytes(&seed);
+            let encoded = encode_public_base64(&signing.verifying_key());
+            let tail = encoded.chars().last().expect("43-character encoding");
+            assert!(expected.contains(&tail), "unexpected canonical tail {tail}");
+            let decoded = URL_SAFE_NO_PAD.decode(&encoded).expect("base64 round trip");
+            assert_eq!(URL_SAFE_NO_PAD.encode(decoded), encoded);
+            observed.insert(tail);
+            if observed == expected {
+                break;
+            }
+        }
+        assert_eq!(
+            observed, expected,
+            "all 16 canonical tail sextets are reachable"
+        );
     }
 
     #[test]
