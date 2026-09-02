@@ -2676,7 +2676,8 @@ fn dispatch_memory_agent_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String
 }
 
 fn dispatch_memory_notify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_notify(ctx.conn, ctx.arguments, ctx.resolved_ttl, ctx.mcp_client)
+    let ttl = ctx.resolved_ttl;
+    handle_notify(ctx.conn, ctx.db_path, ctx.arguments, ttl, ctx.mcp_client)
 }
 
 /// #1050 (2026-05-21) — `memory_share` was registered in

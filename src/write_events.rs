@@ -61,8 +61,8 @@ use rusqlite::Connection;
 
 use crate::mcp::registry::tool_names;
 use crate::subscriptions::{
-    self, ConsolidatedEventDetails, DeleteEventDetails, LinkCreatedEventDetails,
-    PromoteEventDetails, webhook_events,
+    self, AgentNotifiedEventDetails, ConsolidatedEventDetails, DeleteEventDetails,
+    LinkCreatedEventDetails, PromoteEventDetails, webhook_events,
 };
 
 /// Serialise a details struct for the dispatch envelope.
@@ -199,6 +199,147 @@ pub fn consolidated(
         db_path,
         details_of(details, webhook_events::MEMORY_CONSOLIDATED),
     );
+}
+
+/// v1.0.0 #3465 — everything the `agent_notified` emitters need.
+///
+/// [`Self::content`] is the notification BODY. It is passed in so the
+/// emitter can DIGEST it, and it is the only place a body is ever
+/// handed to this module: neither the wake frame nor the webhook
+/// details block can carry it, because neither struct has a field for
+/// it. That is the control — "never the body" is a property of the
+/// types, not of every call site remembering.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentNotified<'a> {
+    /// Inbox owner the notification was delivered to.
+    pub recipient_agent_id: &'a str,
+    /// Authenticated sender, as resolved by the originating surface.
+    pub sender_agent_id: &'a str,
+    /// Id of the durable inbox row that was just committed.
+    pub inbox_row_id: &'a str,
+    /// Namespace the row landed in (`_messages/<agent>` on the MCP
+    /// lane, `_inbox/<agent>` on the SAL lane).
+    pub namespace: &'a str,
+    /// The notification body — digested here, never emitted.
+    pub content: &'a str,
+}
+
+/// `sha256:<hex>` over a notification body.
+fn content_digest(content: &str) -> String {
+    format!("sha256:{}", subscriptions::sha256_hex(content))
+}
+
+/// The correlation handle for one notify: `sha256:<hex>` over the
+/// durable inbox row id.
+///
+/// DERIVED rather than minted so that every lane and every hop — the
+/// wake frame, the SSE frame, a wake-hub sink delivery, the webhook
+/// delivery — computes the SAME value from data it already has, with
+/// no cross-lane plumbing and therefore no way for the two lanes to
+/// disagree about which notify they are describing. (Minting a fresh
+/// uuid would have required threading it out of
+/// `MemoryStore::notify`, whose return type is the row id; the
+/// postgres wake fires inside the adapter while its webhook twin fires
+/// at the HTTP funnel, so there is no single place to mint one.)
+///
+/// It is a one-way function of the row id, so it is safe to log and to
+/// hand to an intermediary that has no business reading the row.
+#[must_use]
+pub fn correlation_id_for(inbox_row_id: &str) -> String {
+    format!("sha256:{}", subscriptions::sha256_hex(inbox_row_id))
+}
+
+/// `agent_notified` — publish the low-latency WAKE only.
+///
+/// Backend-blind: no connection, no pool, no webhook lane, so any
+/// notify funnel can fire it the instant its row commits.
+///
+/// Both SAL adapters call this directly, so a direct
+/// `MemoryStore::notify` caller wakes its recipient on either backend.
+/// On sqlite the webhook lane is reachable from the same place, so
+/// [`agent_notified`] fires both halves; on postgres the webhook lane
+/// needs the `AppState`-scoped SAL subscription scan and therefore
+/// lives at the HTTP funnel ([`agent_notified_webhook_postgres`]),
+/// exactly as it does for every other postgres write
+/// (`create_memory_postgres`, the bulk lane).
+pub fn agent_notified_wake(ev: &AgentNotified<'_>) {
+    crate::inbox_wake::publish_agent_notified(
+        ev.recipient_agent_id,
+        &correlation_id_for(ev.inbox_row_id),
+        ev.inbox_row_id,
+        ev.namespace,
+        ev.sender_agent_id,
+        &content_digest(ev.content),
+    );
+}
+
+/// Build the webhook-lane details block for an `agent_notified` event.
+fn agent_notified_details(ev: &AgentNotified<'_>) -> AgentNotifiedEventDetails {
+    AgentNotifiedEventDetails {
+        recipient_agent_id: ev.recipient_agent_id.to_string(),
+        correlation_id: correlation_id_for(ev.inbox_row_id),
+        content_digest: content_digest(ev.content),
+    }
+}
+
+/// `agent_notified` — fires after a `memory_notify` inbox row commits
+/// on a sqlite-backed funnel.
+///
+/// Fans ONE write to TWO independent lanes:
+///
+/// 1. the in-process wake bus ([`crate::inbox_wake`]), which backs
+///    `GET /api/v1/inbox/stream` and the wake-hub sink — the
+///    recipient's latency path; and
+/// 2. the webhook lane, for operator subscribers that opted in to
+///    `agent_notified`.
+///
+/// The wake is published FIRST and never waits on the webhook lane:
+/// the whole point of #3465 is that a slow operator webhook (32-permit
+/// global semaphore, 26.2 s worst case) must not gate an agent's wake.
+///
+/// The envelope `agent_id` is the SENDER, matching [`owner_of`] on
+/// every other write event (`metadata.agent_id` on a notify row is the
+/// sender); the RECIPIENT is carried by the namespace and by the
+/// details block.
+pub fn agent_notified(conn: &Connection, db_path: &Path, ev: &AgentNotified<'_>) {
+    agent_notified_wake(ev);
+    let details = agent_notified_details(ev);
+    subscriptions::dispatch_event_with_details(
+        conn,
+        webhook_events::AGENT_NOTIFIED,
+        ev.inbox_row_id,
+        ev.namespace,
+        Some(ev.sender_agent_id),
+        db_path,
+        details_of(&details, webhook_events::AGENT_NOTIFIED),
+    );
+}
+
+/// `agent_notified` — the WEBHOOK half on a postgres-backed daemon.
+///
+/// The wake half already fired inside `PostgresStore::notify`, so a
+/// direct SAL caller still wakes its recipient; both halves derive the
+/// same correlation id from the row id ([`correlation_id_for`]), so the
+/// two lanes name the same wake without plumbing a value between them.
+/// Postgres subscriptions live as `_subscriptions/<agent>` memory rows
+/// rather than in the sqlite `subscriptions` table, so the fan-out has
+/// to go through the `AppState`-scoped SAL scan — the same split every
+/// other postgres write already has.
+#[cfg(feature = "sal")]
+pub async fn agent_notified_webhook_postgres(
+    app: &crate::handlers::AppState,
+    ev: &AgentNotified<'_>,
+) {
+    let details = agent_notified_details(ev);
+    crate::handlers::dispatch_event_postgres(
+        app,
+        webhook_events::AGENT_NOTIFIED,
+        ev.inbox_row_id,
+        ev.namespace,
+        Some(ev.sender_agent_id),
+        details_of(&details, webhook_events::AGENT_NOTIFIED),
+    )
+    .await;
 }
 
 /// Resolve the owner an event should be attributed to from a memory's

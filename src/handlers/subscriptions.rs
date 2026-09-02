@@ -191,6 +191,25 @@ pub async fn notify(
             Ok(id) => id,
             Err(e) => return store_err_to_response(e),
         };
+        // #3465 — the WAKE half already fired inside
+        // `PostgresStore::notify` (so a direct SAL caller wakes its
+        // recipient too). The WEBHOOK half has to run here: postgres
+        // subscriptions live as `_subscriptions/<agent>` memory rows,
+        // so the fan-out needs the `AppState`-scoped SAL scan — the
+        // same split `create_memory_postgres` and the bulk lane already
+        // have. Both halves derive the same correlation id from the row
+        // id, so the two lanes name the same wake.
+        crate::write_events::agent_notified_webhook_postgres(
+            &app,
+            &crate::write_events::AgentNotified {
+                recipient_agent_id: &body.target_agent_id,
+                sender_agent_id: &sender,
+                inbox_row_id: &new_id,
+                namespace: &crate::inbox_namespace(&body.target_agent_id),
+                content: &payload,
+            },
+        )
+        .await;
         // Re-fetch the just-written inbox memory so we can hand the full
         // wire-shape (id + metadata + namespace + ts) to the peers via
         // `broadcast_store_quorum`. The trait `notify()` returns only
@@ -253,7 +272,14 @@ pub async fn notify(
     // `mcp_client = Some(&sender)` makes `resolve_agent_id(None, _)` return
     // the caller-resolved HTTP id — same effective provenance.
     let mcp_client = sender.clone();
-    let result = crate::mcp::handle_notify(&lock.0, &params, &resolved_ttl, Some(&mcp_client));
+    // #3465 — `handle_notify` emits the `agent_notified` write event
+    // (wake bus + webhook lane) itself, so this surface inherits it by
+    // routing through the MCP handler exactly as it already does for
+    // the wire contract. `lock.1` is the daemon's sqlite path, which
+    // the webhook worker pool re-opens per delivery.
+    let db_path = lock.1.clone();
+    let result =
+        crate::mcp::handle_notify(&lock.0, &db_path, &params, &resolved_ttl, Some(&mcp_client));
 
     // v0.6.2 (S32): capture the just-inserted notify row and fan it out to
     // peers. Without this, alice's notify on node-1 lands in bob's inbox on
