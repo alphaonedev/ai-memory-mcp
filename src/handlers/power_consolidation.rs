@@ -809,6 +809,22 @@ pub async fn auto_tag_handler(
             .into_response();
     }
 
+    // v1.0.0 #3381 (#2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller is resolved from `X-Agent-Id` for the `scope=private` source
+    // read below. Pre-fix `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce`
+    // with per-agent keys enrolled 403'd `POST /api/v1/consolidate` but left
+    // `POST /api/v1/auto_tag` open, so a shared-transport-key caller forging
+    // `X-Agent-Id: <victim>` still read the victim's private content back
+    // through the model. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "auto_tag",
+    ) {
+        return resp;
+    }
+
     // QC P1 fix (2026-05-20): use header-resolved caller principal
     // for the source-memory fetch so the SAL #910 visibility filter
     // applies. Helper takes `&str` so non-sal builds compile.
@@ -988,8 +1004,6 @@ async fn fetch_memory_for_handler(
     id: &str,
     caller_principal: &str,
 ) -> Result<Memory, Response> {
-    #[cfg(not(feature = "sal"))]
-    let _ = caller_principal;
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         // QC P1 fix (2026-05-20): use header-resolved caller so the
@@ -1013,8 +1027,40 @@ async fn fetch_memory_for_handler(
     // breaks tests. ARCH-2-followup must converge the harness before
     // the sqlite path can route through SAL.
     let lock = app.db.lock().await;
-    match db::get(&lock.0, id) {
-        Ok(Some(mem)) => Ok(mem),
+    let fetched = db::get(&lock.0, id);
+    drop(lock);
+    match fetched {
+        // v1.0.0 #3381 (CWE-863) — apply the caller-scoped visibility gate on
+        // the SQLITE branch. The postgres branch above has routed through the
+        // SAL `#910` filter since the 2026-05-20 QC pass, but the sqlite
+        // branch called the unfiltered `db::get` and DISCARDED the resolved
+        // caller entirely — so `POST /api/v1/auto_tag` shipped another
+        // agent's `scope=private` title + content to the external model and
+        // returned tags derived from it, on a row `GET /memories/{id}` masks
+        // as 404 for the same caller. The predicate is the single canonical
+        // [`crate::visibility::is_visible_to_caller`] (#951), and the mask is
+        // the SAME 404 an absent id produces so the surface is not a presence
+        // oracle (#927 / #1553 convention).
+        //
+        // Deliberately the READ predicate, not the sibling MCP tool's
+        // consumability one: this HTTP route only RETURNS the tags, it never
+        // persists them, so "may this caller read the row" is the whole
+        // question and the answer must match `GET /memories/{id}` (#927). The
+        // MCP `memory_auto_tag` gates on `caller_owns_for_mutation` because it
+        // also WRITES the tags back through the governed update funnel.
+        Ok(Some(mem)) if crate::visibility::is_visible_to_caller(&mem, caller_principal) => Ok(mem),
+        Ok(Some(mem)) => {
+            tracing::warn!(
+                target: "ai_memory::visibility",
+                "auto_tag/source fetch 404-masked: not visible to caller {caller_principal} (id={})",
+                mem.id
+            );
+            Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
+            )
+                .into_response())
+        }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
