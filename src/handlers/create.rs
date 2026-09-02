@@ -1541,6 +1541,7 @@ async fn create_memory_postgres(
         }
     }
 
+    #[cfg(feature = "sal")]
     if matches!(embed_status, EmbedStatus::Pending) {
         crate::background::embed_backfill_worker::wake();
     }
@@ -1935,6 +1936,7 @@ pub async fn create_memory(
     // federation fanout (async work).
     drop(lock);
 
+    #[cfg(feature = "sal")]
     if matches!(embed_status, EmbedStatus::Pending) {
         crate::background::embed_backfill_worker::wake();
     }

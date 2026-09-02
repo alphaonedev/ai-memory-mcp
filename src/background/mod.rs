@@ -12,6 +12,8 @@
 pub mod access_fold;
 pub mod atomise_worker;
 pub mod auto_tag_worker;
+/// #3342 live worker; `sal`-gated because it uses [`crate::store`].
+#[cfg(feature = "sal")]
 pub mod embed_backfill_worker;
 pub mod fts_integrity;
 pub mod lease_sweep;
