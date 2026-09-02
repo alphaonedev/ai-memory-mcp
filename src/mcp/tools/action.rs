@@ -168,14 +168,16 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
 /// `memory_get` reports an absent row.
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on query failure.
+/// Returns `"id is required"` when the schema-required `id` is missing,
+/// blank, or not a JSON string (#3365), or the stringified `rusqlite` error
+/// on query failure.
 pub fn handle_action_get(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let id = params
-        .get(param_names::ID)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
+    // #3365 (#3171 residue) — `id` is schema-REQUIRED. Pre-fix a missing /
+    // blank / non-string id degraded to `""`, which matches no row, so the
+    // caller got a plausible `{"action": null}` SUCCESS: "you sent a malformed
+    // id" was indistinguishable from "no such action". Refuse (ERRORS-08); a
+    // well-formed id that names no row still reports `null`.
+    let id = crate::mcp::param_guard::require_str(params, param_names::ID)?;
     let found = crate::actions::get(conn, id).map_err(|e| e.to_string())?;
     let action = match found {
         Some(a) => serde_json::to_value(&a).map_err(|e| e.to_string())?,
@@ -263,26 +265,30 @@ pub fn handle_action_transition(
 /// (default 50).
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on query failure.
+/// Returns `"invalid namespace: .."` / `"invalid state: .."` when a filter is
+/// present but is not a JSON string, or names no known variant (#3365), or
+/// the stringified `rusqlite` error on query failure.
 pub fn handle_action_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let namespace = params
-        .get(param_names::NAMESPACE)
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let state = match params.get(param_names::STATE).and_then(Value::as_str) {
-        Some(s) => Some(
-            crate::models::ActionState::from_str(s).ok_or_else(|| "invalid state".to_string())?,
-        ),
-        None => None,
-    };
+    // #3365 (#3171 residue) — a PRESENT-but-contradictory `namespace` /
+    // `state` used to DROP the filter, so the caller got strictly MORE rows
+    // than it asked for: `{state: 5}` handed back `done` / `failed` actions to
+    // a worker polling for `pending` work, and a non-string `namespace`
+    // widened the query across EVERY namespace. Refuse the contradictory
+    // filter instead (the `checkpoint_query` / `routine_list` shape); an
+    // ABSENT filter still means "all".
+    let namespace = crate::mcp::param_guard::optional_str(params, param_names::NAMESPACE)?;
+    let state = crate::mcp::param_guard::optional_enum(
+        params,
+        param_names::STATE,
+        crate::models::ActionState::from_str,
+    )?;
     let limit = params
         .get(param_names::LIMIT)
         .and_then(Value::as_i64)
         .unwrap_or(50);
     let limit = usize::try_from(limit).unwrap_or(50);
 
-    let actions = crate::actions::list(conn, namespace.as_deref(), state, limit)
-        .map_err(|e| e.to_string())?;
+    let actions = crate::actions::list(conn, namespace, state, limit).map_err(|e| e.to_string())?;
     Ok(json!({
         "actions": serde_json::to_value(&actions).map_err(|e| e.to_string())?,
     }))
@@ -353,14 +359,15 @@ pub fn handle_action_add_edge(
 /// given action via [`crate::actions::edges_for`].
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on query failure.
+/// Returns `"id is required"` when the schema-required `id` is missing,
+/// blank, or not a JSON string (#3365), or the stringified `rusqlite` error
+/// on query failure.
 pub fn handle_action_edges(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let action_id = params
-        .get(param_names::ID)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
+    // #3365 (#3171 residue) — `id` is schema-REQUIRED; the `""` fallback
+    // answered a malformed call with an EMPTY `edges` array, which reads as
+    // "this action has no dependencies" — the one answer a DAG scheduler must
+    // never be given wrongly. Refuse instead.
+    let action_id = crate::mcp::param_guard::require_str(params, param_names::ID)?;
     let edges = crate::actions::edges_for(conn, action_id).map_err(|e| e.to_string())?;
     Ok(json!({
         "edges": serde_json::to_value(&edges).map_err(|e| e.to_string())?,

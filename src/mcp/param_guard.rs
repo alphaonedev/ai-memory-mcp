@@ -84,6 +84,36 @@ pub fn optional_enum<T>(
     }
 }
 
+/// Read an OPTIONAL free-form string FILTER, refusing a present-but-
+/// contradictory value.
+///
+/// The sibling of [`optional_enum`] for the filters that have no closed
+/// variant set (`namespace`, `to_agent`). An ABSENT key (or an explicit
+/// `null`) yields `Ok(None)` — "no filter", the documented default. A
+/// PRESENT key that is not a JSON string, or is a string that trims to
+/// empty, is REFUSED rather than silently dropped: dropping a recipient or
+/// namespace filter WIDENS the result set, so the caller is handed rows it
+/// never asked for (#3365 — `memory_signal_inbox { to_agent: 123 }`
+/// returned every OTHER agent's direct signals).
+///
+/// The returned `&str` is trimmed and guaranteed non-empty, so a caller can
+/// pass it straight into a query predicate without re-checking.
+///
+/// # Errors
+/// `"invalid <key>: expected a non-empty string"` when the key is present
+/// but is not a JSON string, or is a string that trims to the empty string.
+pub fn optional_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Some)
+            .ok_or_else(|| format!("invalid {key}: expected a non-empty string")),
+    }
+}
+
 /// Read an OPTIONAL non-negative integer argument, refusing a negative or
 /// non-integer value.
 ///
@@ -187,6 +217,35 @@ mod tests {
         assert_eq!(err, "invalid state: bogus");
         let err = optional_enum(&json!({ "state": 3 }), "state", parse_state).unwrap_err();
         assert_eq!(err, "invalid state: expected a string");
+    }
+
+    #[test]
+    fn optional_str_absent_is_none_present_is_trimmed() {
+        assert_eq!(optional_str(&json!({}), "to_agent").unwrap(), None);
+        assert_eq!(
+            optional_str(&json!({ "to_agent": Value::Null }), "to_agent").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_str(&json!({ "to_agent": "  ai:alice " }), "to_agent").unwrap(),
+            Some("ai:alice")
+        );
+    }
+
+    #[test]
+    fn optional_str_refuses_non_string_and_blank_instead_of_widening() {
+        for bad in [
+            json!({ "to_agent": 123 }),
+            json!({ "to_agent": true }),
+            json!({ "to_agent": ["ai:alice"] }),
+            json!({ "to_agent": "" }),
+            json!({ "to_agent": "   " }),
+        ] {
+            assert_eq!(
+                optional_str(&bad, "to_agent").unwrap_err(),
+                "invalid to_agent: expected a non-empty string"
+            );
+        }
     }
 
     #[test]
