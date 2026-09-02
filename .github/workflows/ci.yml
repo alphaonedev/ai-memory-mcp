@@ -636,11 +636,38 @@ jobs:
     #                                 this whole 80-min budget (#3140 observed
     #                                 72 wasted minutes on a nondeterministic
     #                                 `Check (macos-fed,sqlite)` hang).
+    #                                 #3461 raised the macos-fed SQLITE
+    #                                 per-invocation cap to 2400s; compile is
+    #                                 hoisted outside it (#2657) and 2400s
+    #                                 (40 min) still sits well inside this 80,
+    #                                 so the named watchdog, not a nameless
+    #                                 job-level cancel, is still what fires.
     timeout-minutes: ${{ matrix.timeout }}
     env:
-      # Keep dev-profile debug at level 1 (line tables) for readable
-      # backtraces without the full-DWARF link cost.
-      CARGO_PROFILE_DEV_DEBUG: '1'
+      # Debuginfo budget for this job — the heaviest compile in CI (~600
+      # integration test binaries per leg).
+      #
+      # #3453/#3461 — `1` is cargo's "limited" level, NOT line tables (the
+      # comment this replaces was wrong: `line-tables-only` is a distinct,
+      # strictly smaller setting). Limited debuginfo produced 100-400 MB test
+      # binaries, which (a) filled the f2 root filesystem — 350 GB of
+      # `target/debug/deps` across two runners, until rust-lld died with
+      # `ld terminated with signal 7 [Bus error]` on a full disk (#3453) — and
+      # (b) charged the link time to the macOS full-suite job that then blew
+      # the #1492 watchdog (#3461). `line-tables-only` keeps file:line in every
+      # backtrace and panic location (the only debuginfo CI actually reads;
+      # nothing here runs a debugger) at roughly a third of the size and link
+      # cost. DECLARED HERE, in the workflow, deliberately: a runner-side
+      # `.env` is per-node operator state that no repo change can preserve or
+      # audit, so a re-imaged or added runner would silently regress.
+      #
+      # TEST is set explicitly alongside DEV because the `test` profile only
+      # INHERITS `dev` while nothing overrides it — a leg that overrides
+      # CARGO_PROFILE_DEV_DEBUG (the hosted low-mem step below) would otherwise
+      # leave the test profile at this value. Both are stated at every point
+      # they are set, so the pair can never drift apart.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
       fail-fast: false
       matrix:
@@ -1012,6 +1039,12 @@ jobs:
           {
             echo "CARGO_BUILD_JOBS=1"
             echo "CARGO_PROFILE_DEV_DEBUG=0"
+            # #3461 — the job-level env now sets CARGO_PROFILE_TEST_DEBUG
+            # explicitly, so the `test` profile no longer inherits the `dev`
+            # override above. State the 0 here too, or this leg would silently
+            # regain debuginfo on exactly the binaries whose link it is
+            # isolating.
+            echo "CARGO_PROFILE_TEST_DEBUG=0"
             echo "RUSTFLAGS=-C debuginfo=0"
           } >> "$GITHUB_ENV"
 
@@ -1020,6 +1053,12 @@ jobs:
         env:
           AI_MEMORY_NO_CONFIG: "1"
           TIER: ${{ matrix.tier }}
+          # #3461 — the watchdog budget is a property of (node, tier), not of
+          # tier alone: the macos-fed sqlite leg runs the same suite as the
+          # hosted ubuntu one on slower, shared hardware. Named CI_NODE rather
+          # than NODE so it cannot collide with the `NODE` variable some
+          # JavaScript tooling reads as a path to the node binary.
+          CI_NODE: ${{ matrix.node }}
           TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}
           TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
           TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
@@ -1036,9 +1075,12 @@ jobs:
           # a single line the #2500 --no-fail-fast invariant gate can see.
           FEAT=""
           TAIL=""
-          # #1492 hung-test watchdog cap (seconds), TIER-AWARE. The `sqlite`
-          # legs run the default suite in PARALLEL and finish fast, so 1500s
-          # is ample hang-detection headroom. The `enterprise-fed` legs run
+          # #1492 hung-test watchdog cap (seconds), TIER- and NODE-AWARE
+          # (#3461 made it node-aware; see the sqlite branch below). The
+          # `sqlite` legs run the default suite in PARALLEL and finish fast, so
+          # 1500s is ample hang-detection headroom on the hosted ubuntu runner
+          # — but NOT on the shared macos-fed node, which gets 2400s below.
+          # The `enterprise-fed` legs run
           # the sal-postgres suite SINGLE-THREADED (`-- --test-threads=1`, to
           # serialise the shared-database DDL) — the exact discipline the
           # release `postgres-feature` job uses, which measured a ~1605s
@@ -1066,7 +1108,35 @@ jobs:
             WATCHDOG_SECS=3300
             echo "::notice::[enterprise-fed] cargo test $FEAT ... $TAIL (watchdog ${WATCHDOG_SECS}s)"
           else
-            echo "::notice::[sqlite] cargo test (default features) (watchdog ${WATCHDOG_SECS}s)"
+            # #3461 — macos-fed sqlite is NODE-aware on top of the tier. On
+            # e06961ca the full suite was terminated at 1500s with ZERO failing
+            # tests: 581 binaries had reported `test result: ok` and the kill
+            # landed mid-`tests/recall_observations.rs`. The same leg on
+            # e35ce473 an hour earlier finished the whole job in 26m48s, i.e.
+            # the RUN was already within a minute or two of the cap and #3364's
+            # new tests tipped it over. That is a suite that grew, not a hang —
+            # and a watchdog that fires on a healthy suite reports a hang that
+            # did not happen, which misdirects triage exactly as #2657
+            # described. 2400s is ~1.6x the measured runtime: real variance
+            # headroom on shared hardware, still far short of the 80-minute
+            # (4800s) job cap, so the watchdog — not a silent, nameless
+            # job-level cancel — remains what fires on a genuine hang.
+            #
+            # RAISED RATHER THAN SPLIT. Splitting the macOS `__ALL__`
+            # invocation in two would mean hand-enumerating ~600 `--test`
+            # names (or a shell-side partition of them) that drifts out of date
+            # the moment a tests/*.rs file is added, and it would break the
+            # single `cargo test --no-fail-fast "$@"` shape the #2500 and #2657
+            # invariant gates pin. Raising one integer keeps the hang-detection
+            # intent intact with nothing new to maintain.
+            #
+            # The linux tiers are UNCHANGED: ubuntu-latest,sqlite keeps 1500s
+            # (a hosted runner that finishes well inside it) and
+            # linux-fed,enterprise-fed keeps its 3300s above.
+            if [ "${CI_NODE:-}" = "macos-fed" ]; then
+              WATCHDOG_SECS=2400
+            fi
+            echo "::notice::[sqlite] cargo test (default features) (watchdog ${WATCHDOG_SECS}s, node=${CI_NODE:-unknown})"
           fi
           # Durable audit artifact (#4): tee ALL test output to a per-leg log
           # that the next step uploads. PIPESTATUS[0] preserves the real test
@@ -1124,6 +1194,14 @@ jobs:
           run_tests() {
             local label="$1"; shift
             local rc=0
+            # #3461 — margin telemetry. The 1500s kill on e06961ca was a
+            # surprise only because no green run had ever printed how close it
+            # came: the step reported the budget and nothing else, so a suite
+            # creeping from 20 to 25 minutes was invisible until it crossed the
+            # line. Time the WATCHDOGGED window only (the `--no-run` prebuild
+            # below is deliberately outside it, #2657) and print elapsed vs
+            # budget on every invocation, pass or fail.
+            local started elapsed
             # #1989: COMPILE the test binaries OUTSIDE the watchdog first, so
             # the $WATCHDOG_SECS per-invocation cap times test RUNTIME (the
             # hang-detection purpose) rather than compile+run wall-time. The
@@ -1146,11 +1224,14 @@ jobs:
             # flag + `-- --test-threads=1` arrive via "$@" from the call sites
             # (folded into $FEAT/$TAIL there), so these two cargo lines stay the
             # exact `... "$@" ...` shape the #2657 / #2500 invariant gates pin.
+            started=$(date +%s)
             if [ -n "$TIMEOUT_BIN" ]; then
               "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --no-fail-fast "$@" || rc=$?
             else
               cargo test --no-fail-fast "$@" || rc=$?
             fi
+            elapsed=$(( $(date +%s) - started ))
+            echo "::notice::[#1492] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget ($((elapsed * 100 / WATCHDOG_SECS))% used, $((WATCHDOG_SECS - elapsed))s margin; tier=${TIER:-sqlite} node=${CI_NODE:-unknown} watchdog=${TIMEOUT_BIN:-disabled})"
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
                 echo "::error::[#1492 watchdog] '${label}' exceeded the ${WATCHDOG_SECS}s per-invocation timeout (tier=${TIER:-sqlite}) and was terminated (previously a silent ~34min hang until the job cap). Reproduce with the impact set logged above; then file a follow-up for the specific flaky test."
