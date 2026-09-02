@@ -518,6 +518,76 @@ impl Drop for AgentIdEnvUnsetGuard {
     }
 }
 
+/// v1.0.0 #3383 — the operator-configured admin allowlist, seeded ONCE at
+/// process boot for the surfaces that have no `AppState` to read it from
+/// (MCP stdio, CLI).
+///
+/// The HTTP surface resolves the same allowlist into
+/// `AppState.admin_agent_ids` at daemon boot and gates on it via
+/// [`crate::handlers::admin_role::is_admin_caller`]. MCP stdio has no
+/// `AppState`, which is precisely why `memory_archive_purge`'s `as_admin`
+/// escalation was never checked against anything (#3383): the parameter was
+/// self-asserted, so a non-admin got `owner_scope: "admin"` and destroyed
+/// every tenant's archive.
+static ADMIN_AGENT_IDS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// v1.0.0 #3383 — seed the process-wide admin allowlist from the resolved
+/// operator configuration. Called once at MCP-server boot; later calls are
+/// no-ops (the allowlist is a boot decision, never a per-request flip, so a
+/// running process cannot have its admin set widened underneath it).
+pub fn set_admin_agent_ids(ids: Vec<String>) {
+    if ADMIN_AGENT_IDS.set(ids).is_err() {
+        tracing::debug!("admin allowlist already seeded; ignoring re-seed (#3383)");
+    }
+}
+
+/// v1.0.0 #3383 — the resolved admin allowlist for this process.
+///
+/// Returns the boot-seeded list when [`set_admin_agent_ids`] ran, else falls
+/// back to the env-only resolution (`AI_MEMORY_ADMIN_AGENT_IDS`) so a CLI or
+/// test process that never booted an MCP server still honours the operator's
+/// environment. Empty in both cases when nothing is configured — which is the
+/// SECURE default: no caller is an admin (the post-#946 posture).
+#[must_use]
+pub fn admin_agent_ids() -> Vec<String> {
+    match ADMIN_AGENT_IDS.get() {
+        Some(ids) => ids.clone(),
+        None => crate::daemon_runtime::resolve_admin_agent_ids(None),
+    }
+}
+
+/// v1.0.0 #3383 — the PURE admin predicate: `true` iff `caller` appears
+/// verbatim in `allowlist`.
+///
+/// Fail-closed by construction:
+/// * an EMPTY allowlist admits nobody (operators must opt callers in via
+///   `[admin] agent_ids = [...]` or `AI_MEMORY_ADMIN_AGENT_IDS`);
+/// * the privileged / anonymous sentinels
+///   ([`crate::validate::RESERVED_AGENT_IDS`], and any `anonymous:` id) can
+///   NEVER be admin, even if an allowlist entry names one — a caller that
+///   failed identity resolution must not be escalated by that failure;
+/// * there is no `*` wildcard (removed in #980; the resolver drops the entry).
+///
+/// Matching is verbatim, mirroring
+/// [`crate::handlers::admin_role::is_admin_caller`] — no glob, no prefix.
+#[must_use]
+pub fn is_admin_agent_in(caller: &str, allowlist: &[String]) -> bool {
+    if caller.is_empty()
+        || caller.starts_with("anonymous:")
+        || validate::RESERVED_AGENT_IDS.contains(&caller)
+    {
+        return false;
+    }
+    allowlist.iter().any(|id| id == caller)
+}
+
+/// v1.0.0 #3383 — `true` iff `caller` is an operator-configured admin for this
+/// process. Thin binding of [`is_admin_agent_in`] to [`admin_agent_ids`].
+#[must_use]
+pub fn is_admin_agent(caller: &str) -> bool {
+    is_admin_agent_in(caller, &admin_agent_ids())
+}
+
 /// #1720 B3 — env flag that turns a detected boot-time owner-lockout into a
 /// hard REFUSAL instead of a WARN. Truthy (`1`/`true`/`yes`/`on`) makes
 /// [`enforce_owner_lockout_guard`] return an error (aborting MCP boot) when
@@ -853,6 +923,46 @@ pub fn preserve_update_provenance_keys(
 
 #[cfg(test)]
 mod tests {
+
+    /// v1.0.0 #3383 — the admin predicate is PURE and fail-closed. These pin
+    /// the three refusal arms that make `as_admin` un-forgeable on a surface
+    /// with no `AppState`.
+    #[test]
+    fn is_admin_agent_in_is_fail_closed_3383() {
+        let allow = vec!["ai:root".to_string(), "ai:ops".to_string()];
+        // ALLOWED: verbatim membership.
+        assert!(super::is_admin_agent_in("ai:root", &allow));
+        assert!(super::is_admin_agent_in("ai:ops", &allow));
+        // DENIED: a non-member, however similar.
+        assert!(!super::is_admin_agent_in("ai:bob", &allow));
+        assert!(!super::is_admin_agent_in("ai:root2", &allow));
+        assert!(!super::is_admin_agent_in("ai:roo", &allow));
+        // DENIED: an EMPTY allowlist admits nobody — the default posture.
+        assert!(!super::is_admin_agent_in("ai:root", &[]));
+        // DENIED: an empty caller can never be admin.
+        assert!(!super::is_admin_agent_in("", &allow));
+        // DENIED: there is no `*` wildcard on this surface (#980).
+        assert!(!super::is_admin_agent_in("ai:bob", &["*".to_string()]));
+        // DENIED: a privileged / anonymous sentinel is never admin, even when
+        // an allowlist entry names it — a caller whose identity resolution
+        // FAILED must not be escalated by that failure.
+        let sentinel_allow = vec![
+            super::sentinels::DAEMON_PRINCIPAL.to_string(),
+            super::sentinels::ANONYMOUS_INVALID.to_string(),
+        ];
+        assert!(!super::is_admin_agent_in(
+            super::sentinels::DAEMON_PRINCIPAL,
+            &sentinel_allow
+        ));
+        assert!(!super::is_admin_agent_in(
+            super::sentinels::ANONYMOUS_INVALID,
+            &sentinel_allow
+        ));
+        assert!(!super::is_admin_agent_in(
+            "anonymous:req-deadbeef",
+            &["anonymous:req-deadbeef".to_string()]
+        ));
+    }
     use super::*;
 
     /// M9 — process-wide guard for every test below that mutates

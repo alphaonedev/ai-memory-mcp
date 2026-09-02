@@ -104,6 +104,48 @@ pub(super) fn handle_archive_purge(
     // take the caller-scoped branch either (fail loudly, the `dry_run` rule).
     let as_admin =
         crate::mcp::param_guard::optional_bool(params, param_names::AS_ADMIN)?.unwrap_or(false);
+    // v1.0.0 #3383 (CWE-863, IRREVERSIBLE cross-tenant destruction) — CHECK the
+    // escalation. #936 introduced `as_admin` as the switch from an owner-scoped
+    // purge to an every-owner wipe, and the comment above it says "no separate
+    // MCP-side admin-config block today" — so the switch was honoured on the
+    // CALLER'S SAY-SO. A non-admin passing `{"as_admin": true}` got
+    // `owner_scope: "admin"` and permanently destroyed every tenant's archived
+    // rows, the one operation in the substrate with no recovery path at all.
+    //
+    // The escalation now requires the RESOLVED caller (never a wire-asserted
+    // `agent_id` — that is already bound above by `resolve_governance_subject`)
+    // to appear in the operator-configured `[admin].agent_ids` allowlist, the
+    // same allowlist and the same verbatim-match rule the HTTP twin
+    // (`handlers::archive::purge_archive` via `is_admin_caller_trusted`) has
+    // gated on since #936. Fail-closed: with no allowlist configured — the
+    // default — NO caller is admin and every `as_admin` purge is refused, so a
+    // deployment that never opted anyone in cannot be cross-tenant wiped.
+    //
+    // The refusal is chained into the forensic trail BEFORE returning (#913
+    // capture-intent), attributed to the resolved caller: an attempt to wipe
+    // every owner's archive must not be the one purge call that leaves no
+    // trace.
+    if as_admin && !crate::identity::is_admin_agent(&caller) {
+        crate::governance::audit::record_decision(
+            &caller,
+            "refuse",
+            crate::governance::action_labels::ARCHIVE_PURGE,
+            "",
+            json!({
+                (field_names::OLDER_THAN_DAYS): older_than_days,
+                (field_names::OWNER_SCOPE): "admin",
+                "reason": "as_admin requires membership of the operator-configured \
+                           [admin].agent_ids allowlist",
+            }),
+        );
+        return Err(crate::governance::deny_message(
+            "archive",
+            crate::governance::DenyGate::Governance,
+            "as_admin purges EVERY owner's archived rows and requires the caller to appear in \
+             the operator-configured [admin].agent_ids allowlist (or \
+             AI_MEMORY_ADMIN_AGENT_IDS); omit as_admin to purge your own archive",
+        ));
+    }
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -204,8 +246,56 @@ pub(super) fn handle_archive_stats(conn: &rusqlite::Connection) -> Result<Value,
 /// is delete-governed, or the stringified storage error on the namespace probe.
 fn gate_gc_sweep(conn: &rusqlite::Connection, archive: bool) -> Result<(), String> {
     use crate::permissions::{Op, PermissionContext, Permissions};
-    let caller = crate::identity::resolve_agent_id(None, None)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    // v1.0.0 #3383 — bind the gate's principal to the ENFORCED-read caller
+    // when the multi-tenant posture is engaged, so the permission decision and
+    // the forensic attribution name the caller rather than the process's
+    // resolution ladder. Falls back to the legacy resolution under the
+    // single-operator default (env unset), which is byte-unchanged.
+    let enforced_caller = crate::identity::resolve_read_visibility_caller();
+    let caller = enforced_caller.clone().unwrap_or_else(|| {
+        crate::identity::resolve_agent_id(None, None)
+            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string())
+    });
+    // #3383 — `memory_gc` is a SUBSTRATE-WIDE destructive sweep across every
+    // namespace AND every owner, and with `archive_on_gc` off it is a
+    // permanent hard-delete + crypto-erase. Its sibling
+    // `handle_archive_purge` is owner-scoped by default and requires the
+    // admin allowlist to go cross-tenant; this verb had NO owner dimension at
+    // all, so any agent's housekeeping call reaped every other tenant's
+    // expired rows.
+    //
+    // Under the multi-tenant posture the sweep is therefore an ADMIN
+    // operation: it is refused unless the resolved caller is in
+    // `[admin].agent_ids`. REFUSING (rather than narrowing the sweep to the
+    // caller's own rows) is the deliberate choice — the eviction chokepoint
+    // archives and deletes through several statements that must address the
+    // IDENTICAL id set, and an ownership predicate that drifted between the
+    // archive INSERT and the DELETE would archive one set and destroy
+    // another. Degrade, never corrupt: a non-admin loses a substrate-wide
+    // convenience verb and keeps every owner-scoped one (`memory_forget`,
+    // `memory_archive_purge`), while automatic TTL collection is unaffected
+    // (the daemon's gc loop calls `db::gc` directly and never routes here).
+    // The single-operator default (env unset) is byte-unchanged.
+    if let Some(ref c) = enforced_caller
+        && !crate::identity::is_admin_agent(c)
+    {
+        crate::governance::audit::record_decision(
+            c,
+            "refuse",
+            crate::mcp::registry::tool_names::MEMORY_GC,
+            "",
+            json!({ "archived": archive, "reason": "substrate-wide sweep requires admin" }),
+        );
+        return Err(crate::governance::deny_message(
+            "gc",
+            crate::governance::DenyGate::Governance,
+            "memory_gc sweeps EVERY namespace and EVERY owner, so under the multi-tenant \
+             posture (AI_MEMORY_AGENT_ID set) it requires the caller to appear in the \
+             operator-configured [admin].agent_ids allowlist; use memory_forget or \
+             memory_archive_purge for owner-scoped collection, or memory_gc with \
+             dry_run:true to preview",
+        ));
+    }
     let op = if archive {
         Op::MemoryArchive
     } else {
@@ -708,6 +798,12 @@ mod tests {
 
     #[test]
     fn handle_gc_2308_folds_pending_extension_before_dry_run_and_real_gc() {
+        // v1.0.0 #3383 — this test drives a REAL substrate-wide sweep, which is
+        // now admin-gated under the multi-tenant posture. Pin the single-operator
+        // posture (env unset) for its lifetime so a sibling test that sets
+        // `AI_MEMORY_AGENT_ID` cannot leak into it (#1874 class).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+
         // #2308 (FBL-04) regression — the MCP `memory_gc` surface must
         // apply pending recall-driven TTL floor-extensions BEFORE both
         // the dry-run count and the real sweep. Two short-tier rows
@@ -779,6 +875,11 @@ mod tests {
     /// stays recoverable via `memory_archive_restore` and is exempt.
     #[test]
     fn gc_destructive_sweep_refuses_delete_governed_namespace_3204() {
+        // v1.0.0 #3383 — this test drives a REAL substrate-wide sweep, which is
+        // now admin-gated under the multi-tenant posture. Pin the single-operator
+        // posture (env unset) for its lifetime so a sibling test that sets
+        // `AI_MEMORY_AGENT_ID` cannot leak into it (#1874 class).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         use crate::models::{
             CorePolicy, GovernanceLevel, GovernancePolicy, Memory, MemoryKind, Tier,
             default_metadata,
@@ -869,6 +970,203 @@ mod tests {
         let archived = handle_gc(&conn, &json!({}), true).expect("archiving sweep exempt");
         assert_eq!(archived["archived"], true);
         assert_eq!(archived["collected"], 1);
+    }
+
+    /// v1.0.0 #3383 — RAII guard over the two env vars the admin gate reads.
+    /// Serialises against every other `AI_MEMORY_AGENT_ID` mutator through the
+    /// crate-wide lock and restores the prior values on drop, so a panicking
+    /// test cannot leak an admin allowlist into a sibling.
+    struct AdminEnvGuard {
+        prev_admin: Option<std::ffi::OsString>,
+        prev_agent: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AdminEnvGuard {
+        fn new(admin_ids: Option<&str>, agent_id: Option<&str>) -> Self {
+            let lock = crate::identity::agent_id_env_test_lock();
+            let prev_admin = std::env::var_os("AI_MEMORY_ADMIN_AGENT_IDS");
+            let prev_agent = std::env::var_os("AI_MEMORY_AGENT_ID");
+            // SAFETY: the crate-wide env lock is held for this guard's whole
+            // lifetime, so no sibling test observes a torn value.
+            unsafe {
+                match admin_ids {
+                    Some(v) => std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", v),
+                    None => std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS"),
+                }
+                match agent_id {
+                    Some(v) => std::env::set_var("AI_MEMORY_AGENT_ID", v),
+                    None => std::env::remove_var("AI_MEMORY_AGENT_ID"),
+                }
+            }
+            Self {
+                prev_admin,
+                prev_agent,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for AdminEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still under the crate-wide env lock (`_lock`).
+            unsafe {
+                match &self.prev_admin {
+                    Some(v) => std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", v),
+                    None => std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS"),
+                }
+                match &self.prev_agent {
+                    Some(v) => std::env::set_var("AI_MEMORY_AGENT_ID", v),
+                    None => std::env::remove_var("AI_MEMORY_AGENT_ID"),
+                }
+            }
+        }
+    }
+
+    /// v1.0.0 #3383 — insert a row owned by `agent_id` and ARCHIVE it.
+    fn seed_archived_owned(conn: &rusqlite::Connection, ns: &str, agent_id: &str) -> String {
+        use crate::models::{ConfidenceSource, LifecycleState, Memory, MemoryKind, Tier};
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: format!("archived row for {agent_id}"),
+            content: "archived body".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": agent_id, "scope": "private"}),
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: LifecycleState::Open,
+        };
+        let id = crate::db::insert(conn, &mem).expect("insert");
+        assert!(
+            crate::db::archive_memory(conn, &id, Some("test")).expect("archive"),
+            "seed row must archive"
+        );
+        id
+    }
+
+    fn archived_count(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM archived_memories", [], |r| r.get(0))
+            .expect("count archived")
+    }
+
+    /// v1.0.0 #3383 (DENIED direction) — `as_admin` is no longer honoured on
+    /// the caller's say-so. Pre-fix a non-admin passing `{"as_admin": true}`
+    /// got `owner_scope: "admin"` and PERMANENTLY destroyed every tenant's
+    /// archived rows.
+    #[test]
+    fn purge_as_admin_refused_for_non_admin_3383() {
+        let _env = AdminEnvGuard::new(Some("ai:root"), Some("ai:bob"));
+        let conn = open_conn();
+        seed_archived_owned(&conn, "alice/notes", "ai:alice");
+        seed_archived_owned(&conn, "bob/notes", "ai:bob");
+
+        let err = handle_archive_purge(&conn, &json!({"as_admin": true, "older_than_days": 0}))
+            .expect_err("non-admin as_admin purge must be refused");
+        assert!(err.contains("allowlist"), "got: {err}");
+        // Fail CLOSED on an IRREVERSIBLE op: nothing was destroyed.
+        assert_eq!(
+            archived_count(&conn),
+            2,
+            "a refused purge must destroy nothing"
+        );
+    }
+
+    /// #3383 — with NO allowlist configured (the default) `as_admin` is
+    /// refused for everyone: a deployment that never opted anyone in cannot be
+    /// cross-tenant wiped through this surface.
+    #[test]
+    fn purge_as_admin_refused_when_no_allowlist_3383() {
+        let _env = AdminEnvGuard::new(None, Some("ai:bob"));
+        let conn = open_conn();
+        seed_archived_owned(&conn, "alice/notes", "ai:alice");
+
+        let err = handle_archive_purge(&conn, &json!({"as_admin": true, "older_than_days": 0}))
+            .expect_err("default-closed allowlist must refuse");
+        assert!(err.contains("allowlist"), "got: {err}");
+        assert_eq!(archived_count(&conn), 1);
+    }
+
+    /// #3383 (ALLOWED direction) — an ALLOWLISTED caller still performs the
+    /// cross-tenant purge. The gate must not cost the legitimate operator path.
+    #[test]
+    fn purge_as_admin_allowed_for_allowlisted_caller_3383() {
+        let _env = AdminEnvGuard::new(Some("ai:root,ai:ops"), Some("ai:root"));
+        let conn = open_conn();
+        seed_archived_owned(&conn, "alice/notes", "ai:alice");
+        seed_archived_owned(&conn, "bob/notes", "ai:bob");
+
+        let out = handle_archive_purge(&conn, &json!({"as_admin": true, "older_than_days": 0}))
+            .expect("allowlisted admin purge must succeed");
+        assert_eq!(out["owner_scope"], json!("admin"), "got: {out}");
+        assert_eq!(out["purged"], json!(2), "got: {out}");
+        assert_eq!(archived_count(&conn), 0);
+    }
+
+    /// #3383 (ALLOWED direction, 2/2) — omitting `as_admin` keeps the #936
+    /// caller-scoped purge working for a non-admin: they reap THEIR OWN
+    /// archive and nobody else's.
+    #[test]
+    fn purge_without_as_admin_stays_caller_scoped_3383() {
+        let _env = AdminEnvGuard::new(Some("ai:root"), Some("ai:bob"));
+        let conn = open_conn();
+        seed_archived_owned(&conn, "alice/notes", "ai:alice");
+        seed_archived_owned(&conn, "bob/notes", "ai:bob");
+
+        let out = handle_archive_purge(&conn, &json!({"older_than_days": 0}))
+            .expect("caller-scoped purge must succeed");
+        assert_eq!(out["owner_scope"], json!("caller"), "got: {out}");
+        assert_eq!(out["purged"], json!(1), "got: {out}");
+        assert_eq!(archived_count(&conn), 1, "the other owner's row survives");
+    }
+
+    /// #3383 (DENIED direction) — a substrate-wide `memory_gc` sweep is an
+    /// admin operation under the multi-tenant posture. Pre-fix any agent's
+    /// housekeeping call reaped every OTHER tenant's expired rows, while the
+    /// sibling `memory_archive_purge` was owner-scoped.
+    #[test]
+    fn gc_real_sweep_refused_for_non_admin_3383() {
+        let _env = AdminEnvGuard::new(Some("ai:root"), Some("ai:bob"));
+        let conn = open_conn();
+        let err = handle_gc(&conn, &json!({}), false).expect_err("non-admin sweep must refuse");
+        assert!(err.contains("allowlist"), "got: {err}");
+    }
+
+    /// #3383 — `dry_run` stays ungated (an operator must always be able to SEE
+    /// what would be reaped), and an ALLOWLISTED caller still sweeps.
+    #[test]
+    fn gc_dry_run_ungated_and_admin_sweep_allowed_3383() {
+        let _env = AdminEnvGuard::new(Some("ai:root"), Some("ai:bob"));
+        let conn = open_conn();
+        let dry = handle_gc(&conn, &json!({"dry_run": true}), false).expect("dry-run ungated");
+        assert_eq!(dry["dry_run"], json!(true));
+
+        drop(_env);
+        let _admin = AdminEnvGuard::new(Some("ai:root"), Some("ai:root"));
+        let real = handle_gc(&conn, &json!({}), false).expect("allowlisted admin sweep");
+        assert_eq!(real["dry_run"], json!(false));
     }
 
     #[test]

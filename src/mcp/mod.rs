@@ -4304,6 +4304,18 @@ pub fn run_mcp_server(
     // abort MCP startup before the stdio loop opens.
     crate::identity::enforce_owner_lockout_guard(&conn)?;
 
+    // v1.0.0 #3383 — seed the process-wide admin allowlist from the resolved
+    // operator configuration. MCP stdio has no `AppState`, so before this the
+    // `memory_archive_purge` `as_admin` escalation had NOTHING to check
+    // against and was honoured on the caller's say-so. Seeding here (a boot
+    // decision, never a per-request flip) gives `crate::identity::is_admin_agent`
+    // the same `[admin].agent_ids` + `AI_MEMORY_ADMIN_AGENT_IDS` ladder the
+    // HTTP daemon resolves into `AppState.admin_agent_ids`. Default-closed:
+    // with nothing configured the allowlist is empty and no caller is admin.
+    crate::identity::set_admin_agent_ids(crate::daemon_runtime::resolve_admin_agent_ids(
+        app_config.admin.as_ref(),
+    ));
+
     // #1583 (SEC, MED) — install the substrate `GOVERNANCE_PRE_WRITE`
     // agent-action gate on the MCP write surface. Pre-#1583 the hook
     // was installed ONLY by the HTTP daemon (`bootstrap_serve`), so an
