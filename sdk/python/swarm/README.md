@@ -73,6 +73,7 @@ choreography.*  ── scripted A2A scenarios ───────────�
 | `OPENROUTER_BASE_URL` | OpenRouter endpoint override | `https://openrouter.ai/api/v1` |
 | `SWARM_JOURNAL_DIR` | Per-agent JSONL journals plus `nhi-assessment.md` | unset (disabled) |
 | `SWARM_FEDERATED` | Assert node-to-node federation IS wired between modules | unset (not federated) |
+| `SWARM_ASSESS_CONCURRENCY` | Rubric completions in flight at once (bounded, never a blast) | `8` |
 
 The model is **pinned** to `glm-5.3-flash` in code (`config.MODEL_ID`); it is
 deliberately not env-overridable so a stray variable cannot swap the attested
@@ -155,6 +156,7 @@ hand-built model decision — no network, no API key.
 | `<agent>.jsonl` | per-step journal: timestamps, latency, decided tools, full outcomes |
 | `calls.jsonl` | every dispatcher call (agent, tool, redacted args, ok, summary, ts) — reconciles 100% against the coverage matrix |
 | `assessments.json` | per-agent rubric (strict JSON; malformed → `assessment_invalid`) |
+| `assessments.partial.jsonl` | each rubric appended as it lands, so a killed run keeps partial evidence |
 | `nhi-audit.json` | mission completion rate, rubric aggregates, quotes, auditor verdict, negative-evidence probes, model + override reason |
 | `nhi-assessment.md` | the independent auditor's report |
-| `usage.json` | OpenRouter per-generation tokens/cost, account delta, decide latency, model |
+| `usage.json` | OpenRouter per-generation tokens/cost, account delta, decide latency, per-phase wall-clock, model |

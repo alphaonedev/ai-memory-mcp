@@ -70,6 +70,9 @@ def _write_usage(
         "model_override_reason": os.environ.get("SWARM_MODEL_OVERRIDE_REASON") or None,
         "account_usd": {"before": before_data, "after": after_data, "delta": delta},
         "decide_latency_ms": coverage.model_latency_summary(),
+        # Wall-clock per run phase — the assessment tail (#3346) is the one
+        # that grows with the fleet, so it is reported, not just felt.
+        "phase_secs": coverage.phase_secs,
         "completions": {
             "by_agent": coverage.model_usage,
             "total": coverage.model_usage_totals(),
@@ -103,6 +106,8 @@ def _usage_block(
              f"completions {t['requests']}  prompt {t['prompt_tokens']}  completion {t['completion_tokens']}  total {t['total_tokens']} tokens",
              f"generation cost ${t['cost_usd']:.4f}  account delta {'$%.4f' % delta if delta is not None else 'n/a'} (includes daemon embed/LLM calls)",
              f"decide latency ms mean {lat['mean_ms']}  p95 {lat['p95_ms']}  n {lat['n']}",
+             "phase wall-clock secs " + (json.dumps(coverage.phase_secs, sort_keys=True)
+                                         if coverage.phase_secs else "n/a"),
              f"usage.json -> {path}"]
     return "\n".join(lines)
 
@@ -189,6 +194,7 @@ async def _main() -> int:
                 negative_evidence=negative_evidence,
                 model=config.model_slug, model_override_reason=config.model_override_reason)
             report["call_log_reconcile"] = final_reconcile
+            report["assessment_phase_secs"] = coverage.phase_secs.get("assessments")
             report["mission_progress"] = swarm.mission_progress()
             report["mission_partial"] = _mission_partial(report["mission_progress"])
             print("\n" + render_nhi_report(report))
