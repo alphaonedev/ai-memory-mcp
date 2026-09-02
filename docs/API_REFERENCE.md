@@ -480,7 +480,8 @@ check on demand.
 ### `GET /api/v1/stats`
 
 Structured database stats (counts by tier/namespace, links, size,
-last GC). **Admin-gated** (#946 cluster).
+last GC). **Admin-gated** (#946 cluster). SQLite and PostgreSQL both emit
+`by_tier` and `by_namespace` as the documented lists below.
 
 ```json
 {

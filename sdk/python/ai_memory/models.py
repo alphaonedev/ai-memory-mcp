@@ -306,11 +306,8 @@ class Stats(_Base):
     """``struct Stats`` — output of ``GET /api/v1/stats``."""
 
     total_memories: int
-    #: sqlite returns ``[{"tier","count"}]`` lists; postgres returns
-    #: ``{"<tier>": count}`` maps (``src/handlers/admin.rs`` pg branch).
-    #: Both are accepted verbatim; see #3331 follow-up for daemon parity.
-    by_tier: dict[str, int] | list[dict[str, Any]] = Field(default_factory=list)
-    by_namespace: dict[str, int] | list[dict[str, Any]] = Field(default_factory=list)
+    by_tier: list[dict[str, Any]] = Field(default_factory=list)
+    by_namespace: list[dict[str, Any]] = Field(default_factory=list)
     expiring_soon: int = 0
     links_count: int = 0
     db_size_bytes: int = 0

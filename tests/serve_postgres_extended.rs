@@ -223,8 +223,8 @@ async fn agents_round_trip_via_sal() {
 }
 
 /// Phase 4 — `GET /api/v1/stats` returns top-level totals projected
-/// from SAL `list`. Verifies the wire-shape (`total_memories`,
-/// `by_tier`, `by_namespace`).
+/// from SAL aggregates. Verifies the canonical list wire-shape
+/// (`total_memories`, `by_tier`, `by_namespace`).
 #[tokio::test(flavor = "multi_thread")]
 async fn stats_round_trip_via_sal() {
     let Some(url) = postgres_url() else {
@@ -263,7 +263,13 @@ async fn stats_round_trip_via_sal() {
         .await
         .expect("stats body");
     assert!(stats["total_memories"].as_u64().unwrap_or(0) >= 3);
-    assert!(stats["by_namespace"][&unique_ns].as_u64().unwrap_or(0) >= 3);
+    assert!(stats["by_tier"].is_array());
+    let by_namespace = stats["by_namespace"].as_array().expect("by_namespace list");
+    assert!(
+        by_namespace.iter().any(|row| {
+            row["namespace"] == unique_ns && row["count"].as_u64().unwrap_or(0) >= 3
+        })
+    );
     assert_eq!(stats["storage_backend"], "postgres");
 
     shutdown.notify_one();
