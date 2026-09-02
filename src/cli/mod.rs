@@ -64,6 +64,11 @@ pub mod namespace;
 /// v0.7.0 QW-3 — `ai-memory offload` / `ai-memory deref` subcommands.
 /// Substrate-only wrappers over `crate::offload::ContextOffloader`.
 pub mod offload;
+/// v1.0.0 #3402 — the CLI store surface's post-insert namespace-policy
+/// wiring. Makes `ai-memory store` a caller of the ONE shared
+/// auto-atomisation funnel the MCP twin uses, instead of a parallel path
+/// that silently dropped the atomisation half of a namespace standard.
+pub mod post_store;
 pub mod promote;
 /// v1.0.0 #2402 — `ai-memory quarantine list | release <id>`: the operator
 /// route OUT of the #1948 federation quarantine, which #1948 advertised and

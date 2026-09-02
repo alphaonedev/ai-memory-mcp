@@ -87,10 +87,20 @@ const FUNNEL_LEDGER: &[(&str, &str, &str)] = &[
     (
         "src/cli/store.rs",
         "pub fn run(",
-        "NOT WIRED, deliberately. `ai-memory store` is the operator-as-actor \
-         one-shot: no daemon, no worker, no LLM lifecycle. Same exemption \
-         principle as the L1-6 governance hook (which CLI binaries do not \
-         install) and the #1621 quota carve-out.",
+        "WIRED (synchronous + deferred), v1.0.0 #3402 — was NOT WIRED. The \
+         pre-#3402 disposition (\"operator-as-actor one-shot: no daemon, no \
+         worker, no LLM lifecycle\") described the WIRING, not a product \
+         decision, and its consequence was that the SAME namespace standard \
+         was half-applied per surface: the ACL half enforced on the CLI, the \
+         `auto_atomise` half silently dropped. A governance policy that means \
+         different things depending on which surface the operator used is not \
+         a policy. The missing lifecycle is now supplied rather than used as \
+         an exemption — `cli::post_store` resolves the curator through the \
+         SAME ladder `ai-memory atomise` uses and, for `deferred`, spawns the \
+         SAME bounded single-consumer worker the daemon runs and JOINS it \
+         before the command exits (a one-shot has no daemon to defer TO). \
+         Sqlite-only by construction: every CLI write verb is refused on a \
+         postgres store at `refuse_pg_store` (#2572).",
     ),
     (
         "src/handlers/federation_receive.rs",
@@ -115,6 +125,15 @@ const CALL_SITE_LEDGER: &[(&str, &str, usize, &str)] = &[
         1,
         "The MCP store funnel. ONE call for all three modes — the pre-v1.0.0 \
          form had a three-arm match whose `Off` arm emitted no telemetry at all.",
+    ),
+    (
+        "src/cli/post_store.rs",
+        "run_auto_atomise(",
+        1,
+        "The CLI store funnel (#3402). ONE call, reached from four wiring arms \
+         (opted-out / no-curator / synchronous / deferred) so the mode, \
+         threshold and disposition stay the SHARED funnel's business on this \
+         surface too — the CLI never fabricates a disposition of its own.",
     ),
     (
         "src/handlers/create.rs",

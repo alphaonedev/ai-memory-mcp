@@ -157,7 +157,11 @@ fn read_stdin_to_string() -> Result<String> {
 /// `store` handler. Mirrors `cmd_store` from main.rs verbatim except
 /// every emit routes through `out.stdout` / `out.stderr` instead of
 /// `println!` / `eprintln!`.
-#[allow(clippy::too_many_lines)]
+///
+/// # Errors
+///
+/// Propagates validation, attestation, substrate and I/O failures. A
+/// governance Deny exits the process; a Pending returns `Ok(())`.
 pub fn run(
     db_path: &Path,
     args: StoreArgs,
@@ -165,6 +169,30 @@ pub fn run(
     app_config: &config::AppConfig,
     cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
+) -> Result<()> {
+    run_with_curator(db_path, args, json_out, app_config, cli_agent_id, out, None)
+}
+
+/// v1.0.0 #3402 — visible-for-test entry point. Production goes through
+/// [`run`], which passes `atomiser_override = None` so the curator is
+/// resolved lazily (and never at all for a namespace that did not opt
+/// in); the unit tests inject a deterministic mock so the CLI-vs-MCP
+/// parity assertions never need a live LLM. Mirrors the
+/// `curator_override` seam `cli::commands::atomise::run_with_curator`
+/// has carried since v0.7.0.
+///
+/// # Errors
+///
+/// See [`run`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) fn run_with_curator(
+    db_path: &Path,
+    args: StoreArgs,
+    json_out: bool,
+    app_config: &config::AppConfig,
+    cli_agent_id: Option<&str>,
+    out: &mut CliOutput<'_>,
+    atomiser_override: Option<&std::sync::Arc<crate::atomisation::Atomiser>>,
 ) -> Result<()> {
     // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "store", out)?;
@@ -515,6 +543,40 @@ pub fn run(
         .filter(|c| c.id != mem.id && c.id != actual_id)
         .map(|c| &c.id)
         .collect();
+
+    // v1.0.0 #3402 — POST-INSERT namespace-policy funnel.
+    //
+    // Pre-fix this handler called `db::insert` and stopped, so a
+    // namespace standard's `auto_atomise` half was silently dropped on
+    // the CLI while its ACL half (the `enforce_governance` gate above)
+    // WAS enforced — one policy meaning two different things depending
+    // on which surface the operator used. The CLI is now a CALLER of the
+    // SAME `hooks::pre_store::run_auto_atomise` funnel the MCP twin
+    // calls (`src/mcp/tools/store/mod.rs`); only the wiring (how a
+    // one-shot process gets a curator and drains a deferred job) is
+    // surface-specific, and it lives in `cli::post_store`.
+    //
+    // Ordering: this runs AFTER the #3025 read-back on purpose. A
+    // synchronous atomise pass ARCHIVES the parent row, so verifying the
+    // durable write FIRST keeps that fail-closed read-back meaningful
+    // instead of tripping on the row the policy legitimately archived.
+    // The echoed values therefore describe the row exactly as it was
+    // persisted, which is what #3025 promises.
+    //
+    // The policy is resolved against the PERSISTED namespace (the DB's
+    // truth), never the requested one.
+    let ns_policy = db::resolve_governance_policy(&conn, &persisted.namespace).unwrap_or_default();
+    let atomise_disposition = crate::cli::post_store::run_auto_atomise_for_cli(
+        &conn,
+        db_path,
+        &persisted,
+        &actual_id,
+        &agent_id,
+        &ns_policy,
+        app_config,
+        atomiser_override,
+    );
+
     if json_out {
         // #3025 — serialize the PERSISTED row so tier/version/expiry are the
         // DB's truth. Unconditional: an unverified write never reaches here.
@@ -528,12 +590,27 @@ pub fn run(
         if !filtered.is_empty() {
             j["potential_contradictions"] = serde_json::json!(filtered);
         }
+        // #3402 — the SAME `atomise_mode` / `atomise_outcome` envelope
+        // keys the MCP twin emits, produced by the SAME merge helper, so
+        // a scripting caller reads one contract on both surfaces.
+        atomise_disposition.merge_into_response(&mut j);
         writeln!(out.stdout, "{}", serde_json::to_string(&j)?)?;
     } else {
         // #3025 — echo the PERSISTED tier/namespace, not the requested ones.
         let tier = &persisted.tier;
         let namespace = persisted.namespace.as_str();
         writeln!(out.stdout, "stored: {actual_id} [{tier}] (ns={namespace})")?;
+        // #3402 — an operator whose namespace standard asked for
+        // atomisation is told what actually happened. Silent only when
+        // the namespace never opted in, so no existing output changes.
+        if atomise_disposition.mode_configured != crate::models::AutoAtomiseMode::Off {
+            writeln!(
+                out.stderr,
+                "auto_atomise: mode={} outcome={}",
+                atomise_disposition.mode_ran.as_str(),
+                atomise_disposition.outcome
+            )?;
+        }
         if !filtered.is_empty() {
             writeln!(
                 out.stderr,
@@ -1237,5 +1314,379 @@ mod tests {
             msg.contains("id-read-fails-3025") && msg.contains("WAS STORED"),
             "the error must name the id and say the write already happened: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #3402 — CLI store honours the namespace `auto_atomise` policy
+    //
+    // Pre-fix `run` called `db::insert` and stopped: the ACL half of a
+    // namespace standard WAS enforced on this surface while its
+    // post-insert half was silently dropped, so the SAME policy meant
+    // two different things depending on whether the operator used the
+    // CLI or MCP. These tests pin BOTH directions — the opted-OUT path
+    // must stay inert (no curator, no atoms, no output change) and the
+    // opted-IN path must produce byte-identical atoms and disposition
+    // tokens to the MCP twin.
+    // -----------------------------------------------------------------
+
+    use crate::atomisation::curator::{Atom, Curator, CuratorError};
+    use crate::atomisation::{Atomiser, AtomiserConfig};
+    use crate::config::FeatureTier;
+    use crate::hooks::pre_store::auto_atomise as atomise_hook;
+    use crate::models::{
+        ApproverType, AtomisationPolicy, AutoAtomiseMode, CorePolicy, GovernanceLevel,
+        GovernancePolicy,
+    };
+    use std::sync::Arc;
+
+    /// Deterministic stand-in for the LLM curator: always two atoms, no
+    /// network, no tokens. Lets the parity assertions below name an EXACT
+    /// atom count instead of hedging on a live model's output.
+    struct TwoAtoms;
+    impl Curator for TwoAtoms {
+        fn decompose(
+            &self,
+            _body: &str,
+            _max_atom_tokens: u32,
+            _max_retries: u32,
+        ) -> std::result::Result<Vec<Atom>, CuratorError> {
+            Ok(vec![
+                Atom {
+                    text: "first atomic proposition".into(),
+                },
+                Atom {
+                    text: "second atomic proposition".into(),
+                },
+            ])
+        }
+    }
+
+    fn two_atom_atomiser() -> Arc<Atomiser> {
+        Arc::new(Atomiser::new(
+            Box::new(TwoAtoms),
+            None,
+            AtomiserConfig::default(),
+            FeatureTier::Smart,
+        ))
+    }
+
+    /// Seed `ns`'s namespace standard with an `auto_atomise` policy —
+    /// the same shape `ai-memory namespace set-standard` writes and the
+    /// same one `db::resolve_governance_policy` walks.
+    fn seed_atomise_policy(conn: &rusqlite::Connection, ns: &str, mode: Option<AutoAtomiseMode>) {
+        let policy = GovernancePolicy {
+            core: CorePolicy {
+                write: GovernanceLevel::Any,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+                required_scope: None,
+            },
+            atomisation: AtomisationPolicy {
+                auto_atomise: Some(true),
+                auto_atomise_threshold_cl100k: Some(50),
+                auto_atomise_max_atom_tokens: Some(20),
+                auto_atomise_max_retries: None,
+                auto_atomise_mode: mode,
+            },
+            ..Default::default()
+        };
+        let now = Utc::now().to_rfc3339();
+        let std_mem = models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: ns.to_string(),
+            title: format!("__standard_{ns}"),
+            content: "standard".into(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({
+                "agent_id": "ai:test",
+                "governance": serde_json::to_value(&policy).unwrap(),
+            }),
+            ..Default::default()
+        };
+        let std_id = db::insert(conn, &std_mem).unwrap();
+        db::set_namespace_standard(conn, ns, &std_id, None).unwrap();
+    }
+
+    /// Comfortably over the seeded 50-token threshold.
+    fn over_threshold_body() -> String {
+        "proposition token padding here. ".repeat(400)
+    }
+
+    fn atom_count(conn: &rusqlite::Connection, source_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
+            rusqlite::params![source_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Store one memory through the CLI handler with an injected curator
+    /// and return the parsed `--json` envelope.
+    fn cli_store_json(
+        db: &Path,
+        env: &mut crate::cli::test_utils::TestEnv,
+        ns: &str,
+        title: &str,
+        content: &str,
+        atomiser: &Arc<Atomiser>,
+    ) -> serde_json::Value {
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.namespace = Some(ns.to_string());
+        args.title = title.to_string();
+        args.content = content.to_string();
+        {
+            let mut out = env.output();
+            run_with_curator(
+                db,
+                args,
+                true,
+                &cfg,
+                Some("test-agent"),
+                &mut out,
+                Some(atomiser),
+            )
+            .expect("cli store must succeed");
+        }
+        serde_json::from_str(env.stdout_str().trim()).expect("cli store must emit JSON")
+    }
+
+    /// ALLOWED path, `synchronous` mode: the CLI now produces the atoms
+    /// the MCP twin has always produced for the same namespace standard.
+    #[test]
+    fn cli_store_atomises_on_a_synchronous_auto_atomise_namespace_3402() {
+        let _lock = locked_env();
+        let mut env = crate::cli::test_utils::TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            seed_atomise_policy(&conn, "sync-ns-3402", Some(AutoAtomiseMode::Synchronous));
+        }
+        let atomiser = two_atom_atomiser();
+        let j = cli_store_json(
+            &db,
+            &mut env,
+            "sync-ns-3402",
+            "cli sync title",
+            &over_threshold_body(),
+            &atomiser,
+        );
+        let id = j["id"].as_str().expect("id").to_string();
+        assert_eq!(j[atomise_hook::FIELD_ATOMISE_MODE], "synchronous");
+        assert_eq!(
+            j[atomise_hook::FIELD_ATOMISE_OUTCOME],
+            atomise_hook::OUTCOME_ATOMISED
+        );
+        let conn = db::open(&db).unwrap();
+        assert_eq!(
+            atom_count(&conn, &id),
+            2,
+            "the CLI must land the curator's atoms, not silently drop the policy"
+        );
+    }
+
+    /// ALLOWED path, `deferred` mode (what a bare `auto_atomise = true`
+    /// resolves to). A one-shot process has no daemon to defer to, so the
+    /// CLI runs the SAME bounded worker in-process and joins it — pre-fix
+    /// this namespace shape produced nothing at all on the CLI.
+    #[test]
+    fn cli_store_drains_deferred_auto_atomise_in_process_3402() {
+        let _lock = locked_env();
+        let mut env = crate::cli::test_utils::TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            seed_atomise_policy(&conn, "defer-ns-3402", None);
+        }
+        let atomiser = two_atom_atomiser();
+        let j = cli_store_json(
+            &db,
+            &mut env,
+            "defer-ns-3402",
+            "cli deferred title",
+            &over_threshold_body(),
+            &atomiser,
+        );
+        let id = j["id"].as_str().expect("id").to_string();
+        assert_eq!(j[atomise_hook::FIELD_ATOMISE_MODE], "deferred");
+        assert_eq!(
+            j[atomise_hook::FIELD_ATOMISE_OUTCOME],
+            atomise_hook::OUTCOME_QUEUED
+        );
+        let conn = db::open(&db).unwrap();
+        assert_eq!(
+            atom_count(&conn, &id),
+            2,
+            "the join must await the in-process drain, not race the process exit"
+        );
+    }
+
+    /// DENIED (opted-out) path: a namespace with no `auto_atomise`
+    /// standard stays exactly as inert as before — `off` /
+    /// `skipped_policy_disabled`, no atoms, and no new stderr line on the
+    /// human-readable output.
+    #[test]
+    fn cli_store_without_the_policy_stays_inert_3402() {
+        let _lock = locked_env();
+        let mut env = crate::cli::test_utils::TestEnv::fresh();
+        let db = env.db_path.clone();
+        let atomiser = two_atom_atomiser();
+        let j = cli_store_json(
+            &db,
+            &mut env,
+            "plain-ns-3402",
+            "cli plain title",
+            &over_threshold_body(),
+            &atomiser,
+        );
+        let id = j["id"].as_str().expect("id").to_string();
+        assert_eq!(j[atomise_hook::FIELD_ATOMISE_MODE], "off");
+        assert_eq!(
+            j[atomise_hook::FIELD_ATOMISE_OUTCOME],
+            atomise_hook::OUTCOME_SKIPPED_POLICY_DISABLED
+        );
+        let conn = db::open(&db).unwrap();
+        assert_eq!(
+            atom_count(&conn, &id),
+            0,
+            "an opted-out namespace must never be atomised"
+        );
+    }
+
+    /// The opted-out human-readable path emits NO `auto_atomise:` note,
+    /// so the pre-#3402 CLI output is byte-identical for every namespace
+    /// that never asked for atomisation.
+    #[test]
+    fn cli_store_text_output_is_unchanged_without_the_policy_3402() {
+        let _lock = locked_env();
+        let mut env = crate::cli::test_utils::TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let atomiser = two_atom_atomiser();
+        {
+            let mut out = env.output();
+            run_with_curator(
+                &db,
+                default_args(),
+                false,
+                &cfg,
+                Some("test-agent"),
+                &mut out,
+                Some(&atomiser),
+            )
+            .unwrap();
+        }
+        assert!(env.stdout_str().starts_with("stored: "));
+        assert!(
+            !env.stderr_str().contains("auto_atomise:"),
+            "an opted-out namespace must not gain a new stderr line: {}",
+            env.stderr_str()
+        );
+    }
+
+    /// The opted-in human-readable path DOES tell the operator what the
+    /// policy did — atomisation archives the source row, so a silent
+    /// `stored: <id>` would leave them hunting for it.
+    #[test]
+    fn cli_store_text_output_reports_the_atomise_outcome_3402() {
+        let _lock = locked_env();
+        let mut env = crate::cli::test_utils::TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            seed_atomise_policy(&conn, "note-ns-3402", Some(AutoAtomiseMode::Synchronous));
+        }
+        let cfg = config::AppConfig::default();
+        let atomiser = two_atom_atomiser();
+        let mut args = default_args();
+        args.namespace = Some("note-ns-3402".to_string());
+        args.content = over_threshold_body();
+        {
+            let mut out = env.output();
+            run_with_curator(
+                &db,
+                args,
+                false,
+                &cfg,
+                Some("test-agent"),
+                &mut out,
+                Some(&atomiser),
+            )
+            .unwrap();
+        }
+        let stderr = env.stderr_str().to_string();
+        assert!(
+            stderr.contains("auto_atomise: mode=synchronous")
+                && stderr.contains(atomise_hook::OUTCOME_ATOMISED),
+            "got: {stderr}"
+        );
+    }
+
+    /// The 1:1 parity assertion the issue asks for: the SAME namespace
+    /// standard, the SAME body, one store through the CLI funnel and one
+    /// through the MCP twin — same atom count, same disposition tokens.
+    /// This is what "one store funnel" has to mean observationally.
+    #[test]
+    fn cli_and_mcp_store_agree_on_an_auto_atomise_namespace_3402() {
+        let _lock = locked_env();
+        let mut env = crate::cli::test_utils::TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            seed_atomise_policy(&conn, "parity-ns-3402", Some(AutoAtomiseMode::Synchronous));
+        }
+        let atomiser = two_atom_atomiser();
+        let body = over_threshold_body();
+
+        let cli = cli_store_json(
+            &db,
+            &mut env,
+            "parity-ns-3402",
+            "parity cli",
+            &body,
+            &atomiser,
+        );
+
+        let cfg = config::AppConfig::default();
+        let conn = db::open(&db).unwrap();
+        let mcp = crate::mcp::tools::handle_store_with_atomise_for_tests(
+            &conn,
+            &db,
+            &serde_json::json!({
+                "title": "parity mcp",
+                "content": body,
+                "namespace": "parity-ns-3402",
+            }),
+            None,
+            None,
+            None,
+            &cfg.effective_ttl(),
+            false,
+            None,
+            None,
+            crate::hooks::pre_store::AtomiseWiring::new(Some(&atomiser), None),
+        )
+        .expect("mcp store must succeed");
+
+        assert_eq!(
+            cli[atomise_hook::FIELD_ATOMISE_MODE],
+            mcp[atomise_hook::FIELD_ATOMISE_MODE],
+            "the two surfaces must report the same mode for one policy"
+        );
+        assert_eq!(
+            cli[atomise_hook::FIELD_ATOMISE_OUTCOME],
+            mcp[atomise_hook::FIELD_ATOMISE_OUTCOME],
+            "the two surfaces must report the same outcome for one policy"
+        );
+        let cli_id = cli["id"].as_str().expect("cli id");
+        let mcp_id = mcp["id"].as_str().expect("mcp id");
+        assert_eq!(atom_count(&conn, cli_id), atom_count(&conn, mcp_id));
+        assert_eq!(atom_count(&conn, cli_id), 2);
     }
 }
