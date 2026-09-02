@@ -298,7 +298,11 @@ fn materialize_template(
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
 
-            let action = Action {
+            // #3359 — placeholder substitution creates fresh caller-controlled
+            // values, so the frozen template's create-time validation is not
+            // sufficient. Route every materialised action through the exact
+            // direct-action guard before charging or inserting it.
+            let action = super::action::guard_action_create(Action {
                 id: uuid::Uuid::new_v4().to_string(),
                 namespace: routine.namespace.clone(),
                 kind,
@@ -312,7 +316,16 @@ fn materialize_template(
                 metadata: json!({}),
                 created_at: now,
                 updated_at: now,
-            };
+            })?;
+            let quota_actor = action.agent_id.as_deref().unwrap_or_default();
+            let bytes = super::action::action_storage_bytes(&action);
+            crate::quotas::check_and_record_storage_only_in_transaction(
+                &tx,
+                quota_actor,
+                &action.namespace,
+                bytes,
+            )
+            .map_err(|e| e.to_string())?;
             crate::actions::create(&tx, &action).map_err(|e| e.to_string())?;
             created_ids.push(action.id);
         }
@@ -342,11 +355,18 @@ fn materialize_template(
             let to_id = created_ids
                 .get(usize::try_from(to_idx).unwrap_or(usize::MAX))
                 .ok_or_else(|| format!("template edge [{i}] `to` index {to_idx} out of range"))?;
-            let edge_type = spec_obj
-                .get("type")
-                .and_then(Value::as_str)
-                .and_then(EdgeType::from_str)
-                .unwrap_or(EdgeType::Sibling);
+            // Keep the documented/default sibling type when `type` is absent,
+            // but reject any explicitly supplied discriminator we do not know.
+            let edge_type = match spec_obj.get("type") {
+                None => EdgeType::Sibling,
+                Some(Value::String(edge_type_name)) => EdgeType::from_str(edge_type_name)
+                    .ok_or_else(|| {
+                        format!("template edge [{i}] has invalid edge type '{edge_type_name}'")
+                    })?,
+                Some(_) => {
+                    return Err(format!("template edge [{i}] has a non-string edge type"));
+                }
+            };
             // #3008 — a self-edge / ordering-cycle template edge fails the run
             // (recorded Failed by the caller) rather than silently wedging the
             // materialised frontier.
@@ -410,11 +430,16 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "routine_id is required".to_string())?;
-    let arguments = params
+    let arguments_value = params
         .get(param_names::ARGUMENTS)
-        .and_then(Value::as_object)
-        .ok_or_else(|| "arguments is required (a JSON object of {{param}} -> value)".to_string())?
-        .clone();
+        .ok_or_else(|| "arguments is required (a JSON object of {{param}} -> value)".to_string())?;
+    let arguments = arguments_value
+        .as_object()
+        .ok_or_else(|| "arguments is required (a JSON object of {{param}} -> value)".to_string())?;
+    // #3359 — bound the caller-controlled substitution map before persisting
+    // it on the run row or expanding placeholders. This is the same 64 KiB
+    // serialized JSON ceiling applied to routine templates and action payloads.
+    crate::coordination_guard::require_payload_size(param_names::ARGUMENTS, arguments_value)?;
 
     // (1) Load the routine; it must exist AND be frozen before a run.
     let routine = crate::routines::routine_get(conn, routine_id)
@@ -454,7 +479,7 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
 
     // (3) Materialise the template — a SINGLE match folds the success /
     // failure paths so the failed run is always recorded, never lost.
-    match materialize_template(conn, &routine, &arguments, now) {
+    match materialize_template(conn, &routine, arguments, now) {
         Err(err) => {
             let failed = crate::routines::run_set_state(
                 conn,
@@ -803,6 +828,239 @@ mod handler_tests {
 
     fn fresh() -> rusqlite::Connection {
         crate::storage::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    fn create_frozen_routine_3359(
+        conn: &rusqlite::Connection,
+        name: &str,
+        template: Value,
+    ) -> String {
+        let created = handle_routine_create(
+            conn,
+            &json!({
+                "namespace": "_rt_3359",
+                "name": name,
+                "template": template,
+                "created_by": "ai:routine-owner",
+            }),
+        )
+        .expect("create routine");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("routine id")
+            .to_string();
+        handle_routine_freeze(conn, &json!({ "id": id }), None).expect("freeze routine");
+        id
+    }
+
+    #[test]
+    fn run_materialized_action_charges_guarded_bytes_3359() {
+        let conn = fresh();
+        let routine_id = create_frozen_routine_3359(
+            &conn,
+            "allowed",
+            json!({
+                "actions": [{
+                    "kind": "{{kind}}",
+                    "title": "deploy {{target}}",
+                    "payload": {"target": "{{target}}"}
+                }]
+            }),
+        );
+        let before =
+            crate::quotas::get_status(&conn, "ai:routine-owner", "_rt_3359").expect("quota before");
+
+        let ran = handle_routine_run(
+            &conn,
+            &json!({
+                "routine_id": routine_id,
+                "arguments": {"kind": "deploy", "target": "prod"}
+            }),
+        )
+        .expect("allowed run");
+
+        assert_eq!(ran[RESP_RUN]["state"].as_str(), Some("completed"));
+        let action_id = ran["created_action_ids"][0].as_str().expect("action id");
+        let action = crate::actions::get(&conn, action_id)
+            .expect("get action")
+            .expect("materialized action");
+        assert_eq!(action.agent_id.as_deref(), Some("ai:routine-owner"));
+        let expected_bytes = super::super::action::action_storage_bytes(&action);
+        let after =
+            crate::quotas::get_status(&conn, "ai:routine-owner", "_rt_3359").expect("quota after");
+        assert_eq!(
+            after.current_storage_bytes - before.current_storage_bytes,
+            expected_bytes,
+            "one materialized action is charged byte-identically to direct create"
+        );
+    }
+
+    #[test]
+    fn run_materialized_action_enforces_direct_create_guards_3359() {
+        let conn = fresh();
+        let routine_id = create_frozen_routine_3359(
+            &conn,
+            "guarded",
+            json!({
+                "actions": [{
+                    "kind": "{{kind}}",
+                    "title": "{{title}}",
+                    "payload": {"a": "{{blob}}", "b": "{{blob}}"}
+                }]
+            }),
+        );
+        let oversized_title = "t".repeat(crate::coordination_guard::MAX_TEXT_FIELD_BYTES + 1);
+        let duplicated_payload = "p".repeat(40_000);
+        let cases = [
+            (
+                "empty kind",
+                json!({"kind": "", "title": "ok", "blob": "ok"}),
+                "kind must not be empty",
+            ),
+            (
+                "empty title",
+                json!({"kind": "task", "title": "", "blob": "ok"}),
+                "title must not be empty",
+            ),
+            (
+                "oversized title",
+                json!({"kind": "task", "title": oversized_title, "blob": "ok"}),
+                "title exceeds",
+            ),
+            (
+                "control character",
+                json!({"kind": "task", "title": "bad\rtitle", "blob": "ok"}),
+                "control characters",
+            ),
+            (
+                "expanded payload",
+                json!({"kind": "task", "title": "ok", "blob": duplicated_payload}),
+                "payload exceeds",
+            ),
+        ];
+
+        for (case, arguments, expected) in cases {
+            let ran = handle_routine_run(
+                &conn,
+                &json!({"routine_id": routine_id, "arguments": arguments}),
+            )
+            .expect("guard refusal is recorded as a failed run");
+            assert_eq!(ran[RESP_RUN]["state"].as_str(), Some("failed"), "{case}");
+            assert!(
+                ran["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(expected)),
+                "{case}: unexpected error {:?}",
+                ran["error"]
+            );
+        }
+
+        assert!(
+            crate::actions::list(&conn, Some("_rt_3359"), None, 16)
+                .expect("list actions")
+                .is_empty(),
+            "guard-refused runs materialize no actions"
+        );
+        let status =
+            crate::quotas::get_status(&conn, "ai:routine-owner", "_rt_3359").expect("quota status");
+        assert_eq!(status.current_storage_bytes, 0);
+    }
+
+    #[test]
+    fn run_materialized_action_refuses_over_quota_3359() {
+        let conn = fresh();
+        let routine_id = create_frozen_routine_3359(
+            &conn,
+            "quota-refusal",
+            json!({"actions": [{"kind": "task", "title": "charged"}]}),
+        );
+        crate::quotas::get_status(&conn, "ai:routine-owner", "_rt_3359").expect("seed quota row");
+        conn.execute(
+            "UPDATE agent_quotas SET max_storage_bytes = 0
+             WHERE agent_id = ?1 AND namespace = ?2",
+            rusqlite::params!["ai:routine-owner", "_rt_3359"],
+        )
+        .expect("tighten quota");
+
+        let ran = handle_routine_run(&conn, &json!({"routine_id": routine_id, "arguments": {}}))
+            .expect("quota refusal is recorded as a failed run");
+
+        assert_eq!(ran[RESP_RUN]["state"].as_str(), Some("failed"));
+        assert!(
+            ran["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("QUOTA_EXCEEDED")),
+            "unexpected error: {:?}",
+            ran["error"]
+        );
+        assert!(
+            crate::actions::list(&conn, Some("_rt_3359"), None, 16)
+                .expect("list actions")
+                .is_empty()
+        );
+        let status =
+            crate::quotas::get_status(&conn, "ai:routine-owner", "_rt_3359").expect("quota status");
+        assert_eq!(status.current_storage_bytes, 0);
+    }
+
+    #[test]
+    fn run_rejects_oversized_arguments_before_recording_a_run_3359() {
+        let conn = fresh();
+        let routine_id = create_frozen_routine_3359(
+            &conn,
+            "arguments-cap",
+            json!({"actions": [{"kind": "task", "title": "{{blob}}"}]}),
+        );
+        let blob = "x".repeat(crate::coordination_guard::MAX_PAYLOAD_BYTES);
+
+        let err = handle_routine_run(
+            &conn,
+            &json!({"routine_id": routine_id, "arguments": {"blob": blob}}),
+        )
+        .expect_err("oversized arguments must be refused before run insertion");
+
+        assert!(err.contains("arguments exceeds"), "unexpected error: {err}");
+        let run_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM routine_runs", [], |row| row.get(0))
+            .expect("count runs");
+        assert_eq!(run_count, 0);
+    }
+
+    #[test]
+    fn run_rejects_unknown_edge_type_and_rolls_back_quota_3359() {
+        let conn = fresh();
+        let routine_id = create_frozen_routine_3359(
+            &conn,
+            "bad-edge-type",
+            json!({
+                "actions": [
+                    {"kind": "task", "title": "a"},
+                    {"kind": "task", "title": "b"}
+                ],
+                "edges": [{"from": 0, "to": 1, "type": "unknown"}]
+            }),
+        );
+
+        let ran = handle_routine_run(&conn, &json!({"routine_id": routine_id, "arguments": {}}))
+            .expect("edge refusal is recorded as a failed run");
+
+        assert_eq!(ran[RESP_RUN]["state"].as_str(), Some("failed"));
+        assert!(
+            ran["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("invalid edge type")),
+            "unexpected error: {:?}",
+            ran["error"]
+        );
+        assert!(
+            crate::actions::list(&conn, Some("_rt_3359"), None, 16)
+                .expect("list actions")
+                .is_empty(),
+            "invalid edges roll back already materialized actions"
+        );
+        let status =
+            crate::quotas::get_status(&conn, "ai:routine-owner", "_rt_3359").expect("quota status");
+        assert_eq!(status.current_storage_bytes, 0);
     }
 
     /// Create -> freeze (unsigned) -> run with arguments {{what}} -> assert the

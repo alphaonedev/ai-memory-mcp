@@ -33,6 +33,49 @@ fn sweep_expired_leases_best_effort(conn: &rusqlite::Connection) {
     }
 }
 
+/// #3359 — apply the canonical direct-action write guards to an action before
+/// any storage or quota mutation. Routine materialisation calls this same
+/// helper after placeholder substitution so injected values cannot bypass the
+/// namespace, text, payload, actor, secret-screen, or metadata controls.
+pub(super) fn guard_action_create(
+    mut action: crate::models::Action,
+) -> Result<crate::models::Action, String> {
+    crate::coordination_guard::require_namespace(&action.namespace)?;
+    crate::coordination_guard::require_text(
+        param_names::TITLE,
+        &action.title,
+        crate::coordination_guard::MAX_TEXT_FIELD_BYTES,
+    )?;
+    crate::coordination_guard::require_text(
+        param_names::KIND,
+        &action.kind,
+        crate::coordination_guard::MAX_KIND_BYTES,
+    )?;
+    crate::coordination_guard::require_payload_size(param_names::PAYLOAD, &action.payload)?;
+    let actor = crate::coordination_guard::resolve_actor(action.agent_id.as_deref())?;
+
+    crate::secret_screen::screen_text_field_for_caller(&mut action.title)
+        .map_err(|r| r.to_string())?;
+    crate::secret_screen::screen_json_field_for_caller(&mut action.payload)
+        .map_err(|r| r.to_string())?;
+    if !action.metadata.is_null() {
+        crate::secret_screen::screen_json_field_for_caller(&mut action.metadata)
+            .map_err(|r| r.to_string())?;
+        crate::validate::validate_metadata(&action.metadata).map_err(|e| e.to_string())?;
+    }
+    action.agent_id = Some(actor);
+    Ok(action)
+}
+
+/// #3359 — canonical storage-byte estimate for one guarded action create.
+#[must_use]
+pub(super) fn action_storage_bytes(action: &crate::models::Action) -> i64 {
+    crate::quotas::coordination_payload_bytes(
+        &[&action.title, &action.kind],
+        &[&action.payload, &action.metadata],
+    )
+}
+
 /// MCP handler for `memory_action_create`. Builds an [`crate::models::Action`]
 /// from the request params and inserts it, returning the created action
 /// as JSON.
@@ -50,12 +93,12 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let mut title = params
+    let title = params
         .get(param_names::TITLE)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let mut payload = params
+    let payload = params
         .get(param_names::PAYLOAD)
         .cloned()
         .unwrap_or(Value::Null);
@@ -70,46 +113,13 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
         .get(param_names::AGENT_ID)
         .and_then(Value::as_str)
         .map(str::to_string);
-    let mut metadata = params
+    let metadata = params
         .get(param_names::METADATA)
         .cloned()
         .unwrap_or(Value::Null);
 
-    // #2998 — validate the coordination create inputs (namespace + text/payload
-    // length caps + a validated, ALWAYS-attributed actor) before building the
-    // row. An omitted `agent_id` resolves to the durable ambient id so the
-    // write is always quota-charged (closing the omit-agent_id uncharged +
-    // unbounded gap); a caller-supplied `agent_id` is shape-validated so
-    // whitespace / control chars cannot be log-injected into the audit trail.
-    crate::coordination_guard::require_namespace(&namespace)?;
-    crate::coordination_guard::require_text(
-        param_names::TITLE,
-        &title,
-        crate::coordination_guard::MAX_TEXT_FIELD_BYTES,
-    )?;
-    crate::coordination_guard::require_text(
-        param_names::KIND,
-        &kind,
-        crate::coordination_guard::MAX_KIND_BYTES,
-    )?;
-    crate::coordination_guard::require_payload_size(param_names::PAYLOAD, &payload)?;
-    let actor = crate::coordination_guard::resolve_actor(agent_id.as_deref())?;
-
-    // #2994 — the coordination write plane bypasses the memory-lane storage
-    // funnel, so screen the caller-origin credential vectors here: refuse under
-    // `SECRET_SCREEN_MODE=refuse`, mask under `redact`, byte-identical under
-    // `off`. Screens the same fields the #2994 evidence stored verbatim
-    // (title / payload) plus metadata; `kind` is a short discriminator and is
-    // left unscreened so a redact never mangles it.
-    crate::secret_screen::screen_text_field_for_caller(&mut title).map_err(|r| r.to_string())?;
-    crate::secret_screen::screen_json_field_for_caller(&mut payload).map_err(|r| r.to_string())?;
-    if !metadata.is_null() {
-        crate::secret_screen::screen_json_field_for_caller(&mut metadata)
-            .map_err(|r| r.to_string())?;
-    }
-
     let now = chrono::Utc::now().timestamp();
-    let action = crate::models::Action {
+    let action = guard_action_create(crate::models::Action {
         id: uuid::Uuid::new_v4().to_string(),
         namespace,
         kind,
@@ -117,13 +127,13 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
         title,
         payload,
         priority,
-        agent_id: Some(actor),
+        agent_id,
         claimed_by: None,
         vector_clock: json!({}),
         metadata,
         created_at: now,
         updated_at: now,
-    };
+    })?;
 
     // #1807 — bound the coordination create-path: validate supplied metadata
     // size (same limit as memory writes) and charge the owning agent's
@@ -134,15 +144,9 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
     // metadata defaults to JSON null, which is not a validatable object, so
     // validation only runs when metadata was actually supplied. T-exempt
     // precedent-copy; 5-agent review (memory `4d3ea1c5`) deemed #1807 legitimate.
-    if !action.metadata.is_null() {
-        crate::validate::validate_metadata(&action.metadata).map_err(|e| e.to_string())?;
-    }
     let quota_actor = action.agent_id.as_deref().unwrap_or_default();
     if !quota_actor.is_empty() {
-        let bytes = crate::quotas::coordination_payload_bytes(
-            &[&action.title, &action.kind],
-            &[&action.payload, &action.metadata],
-        );
+        let bytes = action_storage_bytes(&action);
         crate::quotas::check_and_record_storage_only(conn, quota_actor, &action.namespace, bytes)
             .map_err(|e| e.to_string())?;
     }

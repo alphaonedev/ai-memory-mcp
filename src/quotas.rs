@@ -782,36 +782,7 @@ pub fn check_and_record_storage_only(
     let _ = ensure_row(conn, agent_id, namespace).map_err(QuotaCheckError::Sql)?;
     let write_txn = crate::storage::connection::WriteTxn::begin(conn)
         .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("BEGIN IMMEDIATE failed: {e}")))?;
-    let result: std::result::Result<(), QuotaCheckError> = (|| {
-        let row = load_row(conn, agent_id, namespace)
-            .map_err(QuotaCheckError::Sql)?
-            .ok_or_else(|| {
-                QuotaCheckError::Sql(anyhow::anyhow!(
-                    "quota row vanished mid-transaction for agent {agent_id} namespace {namespace}"
-                ))
-            })?;
-        if row.current_storage_bytes.saturating_add(bytes) > row.max_storage_bytes {
-            return Err(QuotaCheckError::Quota(QuotaError {
-                agent_id: agent_id.to_string(),
-                namespace: namespace.to_string(),
-                limit: QuotaLimit::StorageBytes,
-                current: row.current_storage_bytes,
-                max: row.max_storage_bytes,
-            }));
-        }
-        // Storage bytes are cumulative (never daily-reset), so no
-        // day-roll branch is needed — just accumulate.
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE agent_quotas SET
-               current_storage_bytes = current_storage_bytes + ?1,
-               updated_at = ?2
-             WHERE agent_id = ?3 AND namespace = ?4",
-            params![bytes, now, agent_id, namespace],
-        )
-        .map_err(quota_update_failed)?;
-        Ok(())
-    })();
+    let result = record_storage_only_locked(conn, agent_id, namespace, bytes);
     match result {
         Ok(()) => {
             write_txn
@@ -824,6 +795,63 @@ pub fn check_and_record_storage_only(
             Err(e)
         }
     }
+}
+
+/// #3359 — storage-only quota check+record for a caller that already owns a
+/// [`rusqlite::Transaction`]. This is the routine-materialisation twin of
+/// [`check_and_record_storage_only`]: the quota row, materialised actions, and
+/// their edges commit or roll back as one unit, with no nested transaction.
+///
+/// # Errors
+///
+/// [`QuotaCheckError::Quota`] when the storage ceiling would be exceeded, or
+/// [`QuotaCheckError::Sql`] when the quota row cannot be read or updated.
+pub(crate) fn check_and_record_storage_only_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    agent_id: &str,
+    namespace: &str,
+    bytes: i64,
+) -> std::result::Result<(), QuotaCheckError> {
+    let _ = ensure_row(tx, agent_id, namespace).map_err(QuotaCheckError::Sql)?;
+    record_storage_only_locked(tx, agent_id, namespace, bytes)
+}
+
+/// Check and increment the storage dimension while the caller holds the SQLite
+/// write transaction. The caller owns commit/rollback.
+fn record_storage_only_locked(
+    conn: &Connection,
+    agent_id: &str,
+    namespace: &str,
+    bytes: i64,
+) -> std::result::Result<(), QuotaCheckError> {
+    let row = load_row(conn, agent_id, namespace)
+        .map_err(QuotaCheckError::Sql)?
+        .ok_or_else(|| {
+            QuotaCheckError::Sql(anyhow::anyhow!(
+                "quota row vanished mid-transaction for agent {agent_id} namespace {namespace}"
+            ))
+        })?;
+    if row.current_storage_bytes.saturating_add(bytes) > row.max_storage_bytes {
+        return Err(QuotaCheckError::Quota(QuotaError {
+            agent_id: agent_id.to_string(),
+            namespace: namespace.to_string(),
+            limit: QuotaLimit::StorageBytes,
+            current: row.current_storage_bytes,
+            max: row.max_storage_bytes,
+        }));
+    }
+    // Storage bytes are cumulative (never daily-reset), so no day-roll branch
+    // is needed — just accumulate.
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agent_quotas SET
+           current_storage_bytes = current_storage_bytes + ?1,
+           updated_at = ?2
+         WHERE agent_id = ?3 AND namespace = ?4",
+        params![bytes, now, agent_id, namespace],
+    )
+    .map_err(quota_update_failed)?;
+    Ok(())
 }
 
 /// #1807 — byte estimate for a coordination create (action / signal /
