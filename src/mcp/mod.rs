@@ -2177,9 +2177,9 @@ fn dispatch_memory_signal_ack(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String
     match POST_SIGNAL_ACK_SINK.get().cloned() {
         Some(sink) => {
             let hooks = build_mcp_signal_hooks(Some(sink));
-            handle_signal_ack_with_hooks(ctx.conn, ctx.arguments, &hooks)
+            handle_signal_ack_with_hooks(ctx.conn, ctx.arguments, ctx.mcp_client, &hooks)
         }
-        None => handle_signal_ack(ctx.conn, ctx.arguments),
+        None => handle_signal_ack(ctx.conn, ctx.arguments, ctx.mcp_client),
     }
 }
 

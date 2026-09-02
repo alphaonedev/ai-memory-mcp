@@ -304,8 +304,106 @@ pub fn mark_read(conn: &Connection, id: &str, now: i64) -> rusqlite::Result<bool
     Ok(n > 0)
 }
 
+/// #3364 — why a signal acknowledgement was REFUSED.
+///
+/// `memory_signal_ack` carried NO authorization: any co-located agent could
+/// stamp `acknowledged_at` on a signal addressed to somebody else. Two things
+/// made that worse than a nuisance:
+///
+/// - the `memory_signal_inbox` surface is UNACKED-ONLY (#3171), so a wrongful
+///   ack makes the message VANISH from its real addressee's inbox — silent
+///   coordination-message loss, not merely a wrong flag;
+/// - the handler had no actor, so the `coordination.signal_ack` audit row was
+///   attributed to the signal's `to_agent`. The tamper-evident record NAMED
+///   THE VICTIM as the acknowledger, which is worse than no record at all: an
+///   auditor reading the chain is told alice acked when bob did.
+///
+/// The refusal is a typed error (not a `String`) so the MCP, and any future
+/// HTTP/SAL, lane can render or classify it without re-parsing prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AckDenied {
+    /// The resolved caller is not the signal's addressee. The addressee is
+    /// deliberately NOT echoed back: a refused caller learns only that it may
+    /// not ack this id, never who the message was for.
+    NotAddressee {
+        /// The signal the caller tried to acknowledge.
+        signal_id: String,
+        /// The RESOLVED caller identity (never a caller-asserted body value).
+        caller: String,
+    },
+    /// The signal is a namespace BROADCAST (`to_agent` NULL or blank), so it
+    /// has no addressee to bind an acknowledgement to. `acknowledged_at` is a
+    /// single column on the row, so letting any one recipient ack a broadcast
+    /// would hide it from EVERY other recipient's (unacked-only) inbox.
+    Broadcast {
+        /// The broadcast signal the caller tried to acknowledge.
+        signal_id: String,
+    },
+}
+
+impl std::fmt::Display for AckDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAddressee { signal_id, caller } => write!(
+                f,
+                "refused signal_ack {signal_id}: caller {caller} is not the addressee of this \
+                 signal — only the agent a signal is addressed to may acknowledge it"
+            ),
+            Self::Broadcast { signal_id } => write!(
+                f,
+                "refused signal_ack {signal_id}: a namespace broadcast has no addressee, so no \
+                 single agent may acknowledge it on behalf of the namespace"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AckDenied {}
+
+/// #3364 — THE authorization decision for a signal acknowledgement.
+///
+/// Side-effect-free and backend-agnostic on purpose: it takes the STORED
+/// signal (the durable truth — never a caller-supplied echo of it) and the
+/// RESOLVED caller identity, so the sqlite MCP lane and any future
+/// HTTP/SAL lane can share one verdict instead of re-deriving it. Callers
+/// must load the row and run this BEFORE stamping anything.
+///
+/// Fail-closed: a signal with no addressee (a namespace broadcast, or a blank
+/// `to_agent`) is refused rather than acked by whoever asked first. Both sides
+/// are compared trimmed, so trailing whitespace in a stored `to_agent` cannot
+/// lock its own addressee out.
+///
+/// # Errors
+/// [`AckDenied::NotAddressee`] when the caller is not the addressee;
+/// [`AckDenied::Broadcast`] when the signal has no addressee at all.
+pub fn authorize_ack(signal: &Signal, caller: &str) -> Result<(), AckDenied> {
+    let addressee = signal
+        .to_agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty());
+    let Some(addressee) = addressee else {
+        return Err(AckDenied::Broadcast {
+            signal_id: signal.id.clone(),
+        });
+    };
+    if addressee == caller.trim() {
+        Ok(())
+    } else {
+        Err(AckDenied::NotAddressee {
+            signal_id: signal.id.clone(),
+            caller: caller.to_string(),
+        })
+    }
+}
+
 /// Stamp `acknowledged_at` on a signal once. Returns `true` when this call set
 /// the timestamp, `false` when it was already acked (or no row matched).
+///
+/// **Authorization is NOT enforced here** — this is the raw stamp. Every
+/// caller must first load the row and clear it through [`authorize_ack`]
+/// (#3364); a bare `false` return cannot distinguish "already acked" from
+/// "not yours", which is exactly the silent no-op the refusal must replace.
 ///
 /// # Errors
 /// Propagates the `rusqlite` update error.
@@ -557,5 +655,66 @@ mod tests {
         insert(&conn, &signal).unwrap();
         let got = get(&conn, "signed-db").unwrap().expect("present");
         assert!(verify(&got), "signal read back from the DB must verify");
+    }
+
+    // ---- #3364 authorize_ack ------------------------------------------------
+
+    /// #3364 ALLOWED path — the addressee (and only trivial whitespace
+    /// differences around it) clears the gate.
+    #[test]
+    fn authorize_ack_allows_the_addressee_3364() {
+        let mut s = sample("a1");
+        s.to_agent = Some("ai:alice".to_string());
+        assert_eq!(authorize_ack(&s, "ai:alice"), Ok(()));
+        // Trimmed on both sides so stored/caller whitespace cannot lock the
+        // legitimate addressee out of its own message.
+        assert_eq!(authorize_ack(&s, "  ai:alice  "), Ok(()));
+        s.to_agent = Some(" ai:alice ".to_string());
+        assert_eq!(authorize_ack(&s, "ai:alice"), Ok(()));
+    }
+
+    /// #3364 DENIED path — anyone who is not the addressee is refused, and a
+    /// signal with NO addressee (broadcast, or a blank `to_agent`) is refused
+    /// outright rather than acked by whoever asks first.
+    #[test]
+    fn authorize_ack_refuses_non_addressee_and_broadcast_3364() {
+        let mut s = sample("a2");
+        s.to_agent = Some("ai:alice".to_string());
+        assert_eq!(
+            authorize_ack(&s, "ai:bob"),
+            Err(AckDenied::NotAddressee {
+                signal_id: "a2".to_string(),
+                caller: "ai:bob".to_string(),
+            })
+        );
+        // Case is significant — agent ids are case-sensitive everywhere else.
+        assert!(authorize_ack(&s, "AI:ALICE").is_err());
+        // An empty caller can never be an addressee.
+        assert!(authorize_ack(&s, "").is_err());
+
+        for no_addressee in [None, Some(String::new()), Some("   ".to_string())] {
+            s.to_agent = no_addressee.clone();
+            assert_eq!(
+                authorize_ack(&s, "ai:alice"),
+                Err(AckDenied::Broadcast {
+                    signal_id: "a2".to_string()
+                }),
+                "to_agent={no_addressee:?} has no addressee to bind an ack to"
+            );
+        }
+    }
+
+    /// #3364 — the refusal renders an operator-actionable reason and, for the
+    /// non-addressee case, does NOT disclose who the signal was addressed to.
+    #[test]
+    fn ack_denied_display_does_not_disclose_the_addressee_3364() {
+        let mut s = sample("a3");
+        s.to_agent = Some("ai:alice".to_string());
+        let rendered = authorize_ack(&s, "ai:bob").unwrap_err().to_string();
+        assert!(rendered.contains("ai:bob"), "names the caller: {rendered}");
+        assert!(
+            !rendered.contains("ai:alice"),
+            "must not disclose the addressee: {rendered}"
+        );
     }
 }
