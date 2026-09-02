@@ -113,6 +113,19 @@ pub struct ImportArgs {
     /// no-op under `version`/`error` (kept, never overwritten; #2569).
     #[arg(long, value_enum, default_value_t = OnConflict::Version)]
     pub on_conflict: OnConflict,
+    /// v1.0.0 #3405 — accept a bundle whose `links[]` names an endpoint
+    /// memory the bundle itself does not carry (a DANGLING artifact, e.g. one
+    /// produced before the #3405 exporter fix). Such an edge can NEVER be
+    /// materialised — `memory_links` carries `REFERENCES memories(id)` and
+    /// `db::open` sets `PRAGMA foreign_keys=ON` — so it is always SKIPPED and
+    /// reported per-edge; this flag only decides whether the skip counts
+    /// toward the non-zero exit. Default OFF (fail-closed: a bundle that
+    /// cannot be faithfully reconstructed exits
+    /// [`crate::export_scope::EXIT_EXPORT_INCOMPLETE`]); passing it is the
+    /// operator explicitly accepting the incomplete graph, exactly like
+    /// `export --expect-withheld`. It NEVER relaxes any other refusal.
+    #[arg(long, default_value_t = false)]
+    pub allow_dangling: bool,
 }
 
 #[derive(Args)]
@@ -248,7 +261,20 @@ pub fn export(db_path: &Path, args: &ExportArgs, out: &mut CliOutput<'_>) -> Res
     ledger.quarantined = quarantined;
     ledger.tombstoned = tombstoned;
     ledger.expired = expired;
-    let links = db::export_links(&conn)?;
+    // v1.0.0 #3405 — REFERENTIAL INTEGRITY of the emitted bundle. `memories`
+    // above and `links` here are two INDEPENDENT reads: the lifecycle
+    // allow-list + the confidentiality screen withhold rows that
+    // `export_links` (expiry-filtered only) still names. Pre-fix, `export`
+    // emitted edges pointing at memories the artifact does not contain and
+    // exited 0; `import` then could not materialise them (`memory_links`
+    // carries `REFERENCES memories(id)` FKs) and exited
+    // EXIT_EXPORT_INCOMPLETE on the FIRST run and forever after, with no
+    // operator disposition — `export | import` could not round-trip its own
+    // bundle (#3405). The producer is the funnel: never claim an edge this
+    // artifact cannot carry, and REPORT the ones dropped.
+    let (links, dangling_edges) =
+        export_scope::retain_resolvable_links(&memories, db::export_links(&conn)?);
+    ledger.dangling_link_edges = dangling_edges;
     // In-band, additive, non-breaking scope markers (critical: the stderr
     // WARN below is invisible to a pipe-to-file consumer).
     //
@@ -304,7 +330,10 @@ fn finish_export_report(
     args: &ExportArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
-    if ledger.is_partial() || ledger.redacted_total() > 0 {
+    // #3405 — a dangling-edge withholding is reported on the SAME structured
+    // line even when the export is not partial (the tombstone/expiry case),
+    // so a graph that arrives smaller than the corpus is never silent.
+    if ledger.is_partial() || ledger.redacted_total() > 0 || ledger.dangling_links_total() > 0 {
         writeln!(
             out.stderr,
             "{}",
@@ -473,7 +502,10 @@ pub(crate) fn import_from_str(
         // does not attribute WHICH endpoint went missing, so attribute
         // conservatively rather than manufacture a permanent alarm.
         if covenant == 0 {
-            refused += report.links_skipped_missing_endpoint;
+            // v1.0.0 #3405 — same disposition as the L1 lane: the skip is
+            // always reported per-edge; `--allow-dangling` decides only
+            // whether it counts toward the non-zero exit.
+            refused += account_dangling_links(report.links_skipped_missing_endpoint, args, out)?;
         }
         return import_exit_code(refused, out);
     }
@@ -491,6 +523,26 @@ pub(crate) fn import_from_str(
     // confines the failure to the edge that caused it and lets it be
     // reported like any other refusal.
     let (links, mut malformed_links) = parse_links_leniently(data.get("links"));
+    // v1.0.0 #3405 — the ids the BUNDLE itself carries, borrowed straight off
+    // the parsed payload (never a per-row `String` clone: a restore of 10^6
+    // rows must not pay a second id heap allocation each). This is the
+    // discriminator the pre-fix importer lacked: an edge endpoint that is
+    // absent at the destination AND absent from this bundle is a DANGLING
+    // ARTIFACT (a producer defect — see `export_scope::retain_resolvable_links`),
+    // whereas an endpoint the bundle DID carry but whose row did not land is a
+    // genuine reconstruction FAILURE. Pre-fix both collapsed into
+    // `links_refused`, so `ai-memory export | ai-memory import` exited
+    // EXIT_EXPORT_INCOMPLETE on its own artifact, on the first run and forever,
+    // with no operator disposition.
+    let bundle_memory_ids: std::collections::HashSet<&str> = data
+        .get("memories")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get("id").and_then(serde_json::Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let caller_id = identity::resolve_agent_id(cli_agent_id, None)?;
     let conflict_mode: ConflictMode = args.on_conflict.into();
@@ -679,6 +731,8 @@ pub(crate) fn import_from_str(
     let mut links_imported = 0usize;
     let mut links_refused = 0usize;
     let mut links_skipped_by_covenant = 0usize;
+    // v1.0.0 #3405 — edges the BUNDLE cannot resolve (see `bundle_memory_ids`).
+    let mut links_skipped_dangling = 0usize;
     for reason in malformed_links.drain(..) {
         errors.push(reason);
         links_refused += 1;
@@ -707,6 +761,44 @@ pub(crate) fn import_from_str(
                 link.source_id, link.target_id
             ));
             links_skipped_by_covenant += 1;
+            continue;
+        }
+        // v1.0.0 #3405 — ENDPOINT-PRESENCE gate, split by ATTRIBUTION.
+        //
+        // `create_link` refuses an absent endpoint with `MemoryNotFound`, and
+        // pre-fix every such refusal was counted as a reconstruction failure —
+        // including the ones the exporter itself manufactured by emitting an
+        // edge to a row it withheld. Probe the STAGED state (the memories loop
+        // above already ran on this connection) and attribute:
+        //   * endpoint absent here AND never carried by the bundle → the
+        //     artifact is DANGLING. Skipped + reported; counted toward the exit
+        //     unless the operator passed `--allow-dangling`.
+        //   * endpoint carried by the bundle but not landed → its row was
+        //     refused earlier in THIS import, which IS a reconstruction
+        //     failure. Counted, exactly as before.
+        let source_missing = !db::memory_exists(&conn, &link.source_id)?;
+        let target_missing = !db::memory_exists(&conn, &link.target_id)?;
+        if source_missing || target_missing {
+            let endpoint_was_in_bundle = (source_missing
+                && bundle_memory_ids.contains(link.source_id.as_str()))
+                || (target_missing && bundle_memory_ids.contains(link.target_id.as_str()));
+            if endpoint_was_in_bundle {
+                errors.push(format!(
+                    "link {}->{}: refused — an endpoint memory WAS carried by this bundle but \
+                     did not land at the destination (see its per-row reason above)",
+                    link.source_id, link.target_id
+                ));
+                links_refused += 1;
+            } else {
+                errors.push(format!(
+                    "link {}->{}: skipped — the bundle names an endpoint memory it does not \
+                     itself carry (DANGLING artifact). The destination cannot invent the row; \
+                     re-export from a binary carrying the #3405 producer fix, or pass \
+                     --allow-dangling to accept the incomplete graph",
+                    link.source_id, link.target_id
+                ));
+                links_skipped_dangling += 1;
+            }
             continue;
         }
         match db::create_link(
@@ -739,6 +831,11 @@ pub(crate) fn import_from_str(
                 "links_imported": links_imported,
                 "links_refused": links_refused,
                 "links_skipped_by_covenant": links_skipped_by_covenant,
+                // #3405 — edges the BUNDLE could not resolve. Reported
+                // separately from `links_refused` so an operator can tell a
+                // producer defect (re-export) from a destination refusal.
+                "links_skipped_dangling": links_skipped_dangling,
+                "allow_dangling": args.allow_dangling,
                 "refused": refused,
                 "skipped_by_covenant": covenant_skipped,
                 // v1.0.0 #2569 — rows whose id was ALREADY present (idempotent
@@ -767,7 +864,48 @@ pub(crate) fn import_from_str(
             }
         }
     }
-    import_exit_code(refused + links_refused, out)
+    let dangling_counted = account_dangling_links(links_skipped_dangling, args, out)?;
+    import_exit_code(refused + links_refused + dangling_counted, out)
+}
+
+/// v1.0.0 #3405 — report the edges a bundle named but does not carry, and
+/// return how many of them count toward the non-zero exit.
+///
+/// The skip itself is NOT optional and NOT silenceable: a dangling edge can
+/// never be materialised (`memory_links` carries `REFERENCES memories(id)`
+/// and `db::open` sets `PRAGMA foreign_keys=ON`), and it is always written to
+/// the operator channel. `--allow-dangling` decides ONLY the exit code, the
+/// same ratchet shape as `export --expect-withheld` (#2490): the default is
+/// fail-closed, and the acknowledgement is an explicit operator act recorded
+/// in the report rather than a mute that also hides the NEXT defect.
+fn account_dangling_links(
+    dangling: usize,
+    args: &ImportArgs,
+    out: &mut CliOutput<'_>,
+) -> Result<usize> {
+    if dangling == 0 {
+        return Ok(0);
+    }
+    if args.allow_dangling {
+        writeln!(
+            out.stderr,
+            "note: {dangling} edge(s) in this bundle name an endpoint memory the bundle does \
+             not itself carry; --allow-dangling was passed, so they were SKIPPED and are NOT \
+             counted against the exit code. Every other row and edge was applied. The stored \
+             graph is smaller than the bundle claims (#3405)."
+        )?;
+        return Ok(0);
+    }
+    writeln!(
+        out.stderr,
+        "ERROR: {dangling} edge(s) in this bundle name an endpoint memory the bundle does not \
+         itself carry — a DANGLING artifact. `memory_links` carries `REFERENCES memories(id)`, \
+         so the destination cannot materialise them and cannot invent the missing rows; they \
+         were SKIPPED and every other row and edge was applied. Re-export from a binary \
+         carrying the #3405 producer fix (an export no longer emits edges it withheld the \
+         endpoint of), or pass --allow-dangling to accept the incomplete graph."
+    )?;
+    Ok(dangling)
 }
 
 /// v1.0.0 #2490 — decide the `import` exit code from the count of rows /
@@ -1234,6 +1372,7 @@ mod tests {
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -1286,6 +1425,7 @@ mod tests {
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -1360,6 +1500,7 @@ mod tests {
                 &payload,
                 &default_db,
                 &ImportArgs {
+                    allow_dangling: false,
                     trust_source: false,
                     store_url: None,
                     on_conflict: OnConflict::Version,
@@ -1401,6 +1542,7 @@ mod tests {
                 &payload,
                 &trusted_db,
                 &ImportArgs {
+                    allow_dangling: false,
                     trust_source: true,
                     store_url: None,
                     on_conflict: OnConflict::Version,
@@ -1451,6 +1593,7 @@ mod tests {
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: true,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -1492,6 +1635,7 @@ mod tests {
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -1567,6 +1711,7 @@ mod tests {
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -1620,6 +1765,7 @@ mod tests {
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -1697,6 +1843,7 @@ mod tests {
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -1793,6 +1940,7 @@ mod tests {
                 &v1.to_string(),
                 &v1_db,
                 &ImportArgs {
+                    allow_dangling: false,
                     trust_source: false,
                     store_url: None,
                     on_conflict: OnConflict::Version,
@@ -1835,6 +1983,7 @@ mod tests {
                 &v2.to_string(),
                 &v2_db,
                 &ImportArgs {
+                    allow_dangling: false,
                     trust_source: false,
                     store_url: None,
                     on_conflict: OnConflict::Version,
@@ -1885,6 +2034,7 @@ mod tests {
         })
         .to_string();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -1916,6 +2066,7 @@ mod tests {
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -1967,6 +2118,7 @@ mod tests {
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -2047,6 +2199,7 @@ mod tests {
         })
         .to_string();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: true,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -2080,6 +2233,7 @@ mod tests {
         })
         .to_string();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: true,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -2107,6 +2261,7 @@ mod tests {
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: true,
             store_url: None,
             on_conflict: OnConflict::Merge,
@@ -2171,6 +2326,7 @@ mod tests {
             "INCOMING-content",
         );
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: true,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -2214,6 +2370,7 @@ mod tests {
             "REJECTED-content",
         );
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: true,
             store_url: None,
             on_conflict: OnConflict::Error,
@@ -2545,6 +2702,7 @@ mod tests {
         })
         .to_string();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: true,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -2590,6 +2748,7 @@ mod tests {
         })
         .to_string();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: true,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -2628,6 +2787,7 @@ mod tests {
         })
         .to_string();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: true,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -2674,6 +2834,7 @@ mod tests {
         })
         .to_string();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,
@@ -2719,6 +2880,7 @@ mod tests {
         })
         .to_string();
         let args = ImportArgs {
+            allow_dangling: false,
             trust_source: false,
             store_url: None,
             on_conflict: OnConflict::Version,

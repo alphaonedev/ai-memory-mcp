@@ -682,6 +682,22 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
             Ok(v) => v,
             Err(e) => return store_err_to_response(e),
         };
+        // v1.0.0 #3405 — the HTTP export is the wire sibling of the CLI
+        // bundle and composed `memories` + `links` from two independent
+        // reads, so it emitted edges pointing at rows the screen (or the
+        // backend's own lifecycle allow-list) withheld. `POST /api/v1/import`
+        // and `ai-memory import` both refuse such an edge (the FK cannot
+        // resolve), so the payload could not round-trip. Same shared funnel
+        // as the CLI + `--full` paths — one control, every producer.
+        let (links, dangling) = crate::export_scope::retain_resolvable_links(&mems, links);
+        if !dangling.is_empty() {
+            tracing::warn!(
+                withheld_edges = dangling.len(),
+                "export_memories(postgres): withheld {} graph edge(s) whose endpoint memory is \
+                 not carried by this export (#3405)",
+                dangling.len()
+            );
+        }
         let count = mems.len();
         // #1944 (B_WARN de-silencing) — additive, non-breaking scope
         // markers so the HTTP export is not a silent-lossy sibling of the
@@ -707,6 +723,19 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
             // sqlite path holds the audit connection so a drop emits a signed
             // `export.forbidden_class_refused` row.
             let memories = screen_exported_memories(memories, Some(&lock.0));
+            // v1.0.0 #3405 — sqlite twin of the postgres branch above: an
+            // edge whose endpoint the lifecycle allow-list or the
+            // confidentiality screen withheld is not carryable by this
+            // artifact, so the artifact must not claim it.
+            let (links, dangling) = crate::export_scope::retain_resolvable_links(&memories, links);
+            if !dangling.is_empty() {
+                tracing::warn!(
+                    withheld_edges = dangling.len(),
+                    "export_memories: withheld {} graph edge(s) whose endpoint memory is not \
+                     carried by this export (#3405)",
+                    dangling.len()
+                );
+            }
             let count = memories.len();
             // #1944 (B_WARN de-silencing) — additive scope markers; the
             // pre-existing `{memories, links, count, exported_at}` shape is

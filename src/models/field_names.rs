@@ -273,6 +273,19 @@ pub const TOMBSTONED: &str = "tombstoned";
 /// `expired` — count of live rows excluded because their TTL has passed
 /// (#2490).
 pub const EXPIRED: &str = "expired";
+/// `dangling_links_withheld` — v1.0.0 #3405: count of graph edges the
+/// exporter DROPPED because at least one endpoint memory is not carried by
+/// this artifact (an endpoint withheld by the confidentiality boundary, or
+/// excluded as tombstoned / quarantined / expired). A COUNT only — safe
+/// in-band; the rendered edges ride the operator stderr channel under
+/// [`DANGLING_LINK_EDGES`].
+pub const DANGLING_LINKS_WITHHELD: &str = "dangling_links_withheld";
+/// `dangling_link_edges` — operator-channel-only sibling of
+/// [`DANGLING_LINKS_WITHHELD`] (#3405). NEVER written into the portable
+/// export artifact: an endpoint named here is by construction an id the
+/// export withheld, so publishing it would leak the #2490 objection-O3
+/// index into the source corpus.
+pub const DANGLING_LINK_EDGES: &str = "dangling_link_edges";
 /// `from_agent_id` — wire/row field name.
 pub const FROM_AGENT_ID: &str = "from_agent_id";
 /// `generated_at` — wire/row field name.
