@@ -63,6 +63,15 @@ pub struct ChainVerifyReportJson {
     pub chain_break: Option<i64>,
     pub signature_failures: Vec<i64>,
     pub chain_holds: bool,
+    /// v1.0.0 #3354 — rows that did NOT positively verify against an enrolled
+    /// key. Pre-fix this surface reported only hash linkage, so an entirely
+    /// UNSIGNED ledger printed `chain_holds: true` / exit 0 with nothing in
+    /// the payload capable of expressing that nothing attested it.
+    pub rows_unverified: u64,
+    /// v1.0.0 #3354 — `true` when the ledger carries unverified rows AND
+    /// `AI_MEMORY_REQUIRE_SIGNED_AUDIT` is set (the verdict is then a
+    /// failure, exit 1).
+    pub unsigned_refused: bool,
 }
 
 /// Run the verifier. Returns the desired process exit code (0 on
@@ -87,6 +96,16 @@ pub fn run(
     let report = crate::signed_events::verify_chain(&conn, since, None)
         .context("verify_chain over signed_events")?;
     let holds = report.chain_holds();
+    // v1.0.0 #3354 — this verifier checks HASH LINKAGE ONLY; it takes no pin
+    // argument, so pre-fix it was structurally incapable of noticing that the
+    // whole ledger was unsigned and printed "OK: chain holds" / exit 0 over
+    // 109k unsigned rows. Surface the attestation coverage alongside the
+    // linkage verdict, and let require-mode convict.
+    let rows_unverified = report
+        .rows_checked
+        .saturating_sub(report.rows_positively_verified);
+    let require_signed = crate::governance::audit::require_signed_audit_enabled();
+    let unsigned_refused = require_signed && rows_unverified > 0;
 
     match args.format.as_str() {
         "json" => {
@@ -95,6 +114,8 @@ pub fn run(
                 chain_break: report.chain_break,
                 signature_failures: report.signature_failures.clone(),
                 chain_holds: holds,
+                rows_unverified,
+                unsigned_refused,
             };
             let json = serde_json::to_string_pretty(&wire).context("serialize chain report")?;
             writeln!(out.stdout, "{json}").context(CTX_WRITE_CHAIN_REPORT)?;
@@ -102,9 +123,28 @@ pub fn run(
         _ => {
             // text — one-line summary on stdout.
             if holds {
+                // #3354 — qualify a linkage-only PASS over an unsigned ledger.
+                let note = if rows_unverified == 0 {
+                    String::new()
+                } else if unsigned_refused {
+                    format!(
+                        " \u{2014} UNSIGNED ({} is set; fail-closed): {rows_unverified} \
+                         row(s) carry no verifiable signature",
+                        crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV,
+                    )
+                } else {
+                    format!(
+                        " \u{2014} UNSIGNED: {rows_unverified} row(s) carry no verifiable \
+                         signature; the hash chain holds but NOTHING attests it \
+                         (`ai-memory doctor` names the key to provision; set {} to \
+                         make this a hard failure)",
+                        crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV,
+                    )
+                };
                 writeln!(
                     out.stdout,
-                    "verify-signed-events-chain OK: {} row(s) walked, chain holds",
+                    "verify-signed-events-chain {}: {} row(s) walked, chain holds{note}",
+                    if unsigned_refused { "FAIL" } else { "OK" },
                     report.rows_checked,
                 )
                 .context(CTX_WRITE_CHAIN_REPORT)?;
@@ -123,7 +163,7 @@ pub fn run(
         }
     }
 
-    Ok(if holds { 0 } else { 1 })
+    Ok(if holds && !unsigned_refused { 0 } else { 1 })
 }
 
 #[cfg(test)]

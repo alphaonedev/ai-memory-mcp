@@ -330,6 +330,20 @@ fn init_forensic_audit(app_config: &config::AppConfig) {
         .unwrap_or_else(|_| "ai-memory".to_string());
     let signing_key =
         ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None);
+    // v1.0.0 #3354 — name the unsigned posture at the point it is decided.
+    // `load_daemon_signing_key` logs the absent case at DEBUG (invisible by
+    // default), which is how a whole ledger went unsigned unnoticed. Every
+    // downstream surface (boot WARN, doctor, the verifiers) now reports it too;
+    // this is the earliest and cheapest of them.
+    if signing_key.is_none() {
+        tracing::warn!(
+            agent_id = %agent_id,
+            "#3354: no audit signing key for the resolved identity — signed_events \
+             rows written by this process will be tagged `unsigned`. Run \
+             `ai-memory identity generate --agent-id {agent_id}`; `ai-memory doctor` reports \
+             the same posture."
+        );
+    }
     if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
         eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
     }

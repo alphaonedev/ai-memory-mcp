@@ -1533,6 +1533,70 @@ fn identity_signing_facts(
         (false, false) => "none (first boot will generate)",
     };
     facts.push(("signing".into(), signing.into()));
+    identity_audit_signing_facts_3354(facts, severity, notes);
+}
+
+/// v1.0.0 #3354 — report whether THIS process can actually sign its
+/// `signed_events` ledger rows.
+///
+/// The block above answers "is there a `daemon` keypair on disk?". That is NOT
+/// the question the audit signer asks: `init_forensic_audit` resolves the
+/// process identity via [`crate::identity::resolve_agent_id`] and loads a key
+/// named after THAT id. On the reporting host those two disagreed — `daemon.*`
+/// existed so doctor said `signing: ready`, while the resolved id had no key,
+/// `DAEMON_AUDIT_KEY` was never installed, and 109,396 of 109,552 ledger rows
+/// were tagged `unsigned` with nothing surfacing it.
+fn identity_audit_signing_facts_3354(
+    facts: &mut Vec<(String, String)>,
+    severity: &mut Severity,
+    notes: &mut Vec<String>,
+) {
+    let agent_id = match crate::identity::resolve_agent_id(None, None) {
+        Ok(id) => id,
+        Err(e) => {
+            *severity = severity_max(*severity, Severity::Warning);
+            facts.push((
+                "audit_signing".into(),
+                format!("unresolved identity: {e:#}"),
+            ));
+            return;
+        }
+    };
+    facts.push(("audit_signing_agent_id".into(), agent_id.clone()));
+    let require = crate::governance::audit::require_signed_audit_enabled();
+    if crate::governance::audit::signing_key_present_for(&agent_id) {
+        facts.push(("audit_signing".into(), format!("ready ({agent_id})")));
+        return;
+    }
+    // No key for the identity this process resolves — every ledger row this
+    // process writes is tagged `unsigned`.
+    *severity = severity_max(
+        *severity,
+        if require {
+            // require-mode: an unsigned ledger is a hard posture failure.
+            Severity::Critical
+        } else {
+            Severity::Warning
+        },
+    );
+    facts.push((
+        "audit_signing".into(),
+        format!("UNSIGNED — no key for {agent_id}"),
+    ));
+    notes.push(format!(
+        "#3354: this process resolves its identity as `{agent_id}` and no signing          key for that id is loadable, so the daemon audit key is never installed          and EVERY signed_events row it writes is tagged `unsigned` (a `daemon.*`          keypair on disk does NOT satisfy this — the signer keys on the resolved          id). Run `ai-memory identity generate --agent-id {agent_id}`. {}",
+        if require {
+            format!(
+                "{} is set, so appends are REFUSED until a key exists.",
+                crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV
+            )
+        } else {
+            format!(
+                "Set {} to refuse unsigned appends instead of writing them.",
+                crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV
+            )
+        }
+    ));
 }
 
 /// #3147 / #3155 — Identity section. Read-only: never generates a key,

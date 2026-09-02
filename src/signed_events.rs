@@ -2143,6 +2143,18 @@ pub enum SignatureCheck {
         /// Rows the chain walk visited inside the window.
         checked: u64,
     },
+    /// v1.0.0 #3354 — require-mode (`AI_MEMORY_REQUIRE_SIGNED_AUDIT`) is on
+    /// and the chain carries rows this process could not positively verify
+    /// because NOTHING signed them: the ledger is unsigned, not merely
+    /// unpinned. Dirty (fail-closed). Without require-mode the same facts
+    /// render as [`SignatureCheck::Unenforced`] — informational, never dirty —
+    /// so a deployment that has not opted in is byte-identical to pre-#3354.
+    Unsigned {
+        /// Rows the chain walk visited inside the window.
+        checked: u64,
+        /// Rows that did NOT positively verify (here: unsigned rows).
+        unverified: u64,
+    },
     /// Audit pin enrolled and `unverified` rows did not positively verify.
     Unverified {
         /// Rows the chain walk visited inside the window.
@@ -2169,9 +2181,21 @@ pub fn compute_signature_verdict(
     checked: u64,
     positively_verified: u64,
     pin_enrolled: bool,
+    require_signed: bool,
 ) -> SignatureCheck {
     let unverified = checked.saturating_sub(positively_verified);
     if !pin_enrolled {
+        // v1.0.0 #3354 — with no pin enrolled the coverage facts are the same
+        // either way; what changes is whether the operator has DECLARED that
+        // this ledger must be signed. Under require-mode an unverified row is
+        // a conviction (`Unsigned`, dirty); otherwise it stays the historical
+        // informational `Unenforced` withhold.
+        if require_signed && unverified > 0 {
+            return SignatureCheck::Unsigned {
+                checked,
+                unverified,
+            };
+        }
         return SignatureCheck::Unenforced {
             checked,
             unverified,
@@ -2334,6 +2358,12 @@ impl AuditTrailReport {
             // clean report clean, so a deployment without a pin is byte-identical
             // legacy (rotated / restored / federated nodes do not regress).
             && !matches!(self.signature_check, SignatureCheck::Unverified { .. })
+            // v1.0.0 #3354 — an UNSIGNED ledger is dirty only under
+            // require-mode (`AI_MEMORY_REQUIRE_SIGNED_AUDIT`), the sole
+            // condition under which `compute_signature_verdict` emits
+            // `Unsigned`. Shared by both backends because they both fold
+            // through that one fn (K3 parity).
+            && !matches!(self.signature_check, SignatureCheck::Unsigned { .. })
     }
 }
 
@@ -2733,6 +2763,7 @@ pub fn verify_audit_trail(
             report.rows_checked,
             report.rows_positively_verified,
             audit_pubkey.is_some(),
+            crate::governance::audit::require_signed_audit_enabled(),
         ),
     })
 }
@@ -2903,6 +2934,33 @@ pub fn append_signed_event(conn: &Connection, event: &SignedEvent) -> Result<()>
     Ok(())
 }
 
+/// v1.0.0 #3354 — the fail-closed audit-signing gate shared by every
+/// `signed_events` append funnel (sqlite `append_signed_event_no_tx` and the
+/// postgres twin), so a verdict true on one backend can never be silently
+/// absent on the other.
+///
+/// # Errors
+/// Refuses with a remediation-bearing error when
+/// `AI_MEMORY_REQUIRE_SIGNED_AUDIT` is set truthy and `event` would be
+/// appended with `attest_level == "unsigned"`.
+pub fn refuse_unsigned_append_when_required(event: &SignedEvent) -> Result<()> {
+    if event.attest_level != crate::models::AttestLevel::Unsigned.as_str() {
+        return Ok(());
+    }
+    if !crate::governance::audit::require_signed_audit_enabled() {
+        return Ok(());
+    }
+    let agent = crate::identity::resolve_agent_id(None, None)
+        .unwrap_or_else(|_| "<unresolved>".to_string());
+    anyhow::bail!(
+        "SEC fail-closed (#3354): refusing to append an UNSIGNED signed_events row          (event_type={}, agent_id={}) while {} is set. This process resolved its          identity as `{agent}` and no signing key for that id is loadable, so the          daemon audit key was never installed and every ledger row would be tagged          `unsigned`. Provision a key for `{agent}` (`ai-memory identity generate --agent-id          {agent}`) or unset {} to accept an explicitly-unsigned ledger.",
+        event.event_type,
+        event.agent_id,
+        crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV,
+        crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV,
+    );
+}
+
 /// Append a signed event using the caller's already-open transaction.
 ///
 /// Use this when the caller is mid-transaction (e.g.
@@ -2920,6 +2978,24 @@ pub fn append_signed_event(conn: &Connection, event: &SignedEvent) -> Result<()>
 /// fails or the INSERT itself fails. Callers MUST rollback their
 /// own transaction on error.
 pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Result<()> {
+    // v1.0.0 #3354 — FAIL-CLOSED audit signing. This fn is the ONE sqlite
+    // chokepoint every ledger producer routes through (see the #1925 note
+    // below), so refusing here covers every producer without touching the
+    // decentralised call sites.
+    //
+    // The defect: when no keypair matched the RESOLVED agent id,
+    // `load_daemon_signing_key` returned `Ok(None)` on a debug-level log,
+    // `DAEMON_AUDIT_KEY` was never installed, and `with_daemon_signature`
+    // tagged EVERY row `unsigned` — silently. A store advertising signed
+    // events then accumulated an unsigned ledger with nothing surfacing it.
+    //
+    // Under require-mode the append REFUSES rather than writing an unsigned
+    // row: callers propagate, so the operation does not commit without its
+    // signed audit row (no evidence-free writes). Default mode still writes
+    // the row — DROPPING it would destroy evidence, which is the strictly
+    // worse integrity failure — but the silence is closed by the boot WARN,
+    // `doctor`, and the qualified verifier verdict.
+    refuse_unsigned_append_when_required(event)?;
     let (max_seq, prev_hash) = read_chain_head(conn).context("append signed_event: read head")?;
     let next_seq = max_seq + 1;
 

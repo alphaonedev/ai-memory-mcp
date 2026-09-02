@@ -1545,6 +1545,14 @@ pub async fn run(
     );
     let j = cli.json;
     let cli_agent_id: Option<String> = cli.agent_id.clone();
+    // v1.0.0 #3354 — refuse to START a ledger-writing command that cannot
+    // attest what it writes. This must precede dispatch: the append-funnel gate
+    // alone is swallowed by the best-effort audit producers, which would let the
+    // write commit with NO audit row at all. See `audit_signing_startup_refusal`.
+    if let Some(refusal) = audit_signing_startup_refusal(&cli.command) {
+        anyhow::bail!(refusal);
+    }
+
     // Track whether command writes to DB (for WAL checkpoint)
     let needs_checkpoint = is_write_command(&cli.command);
     let db_path_for_checkpoint = if needs_checkpoint {
@@ -2936,6 +2944,79 @@ pub fn is_write_command(cmd: &Command) -> bool {
             // (the rewind attestation), so it is write-class.
             | Command::SwarmRewind(_)
     )
+}
+
+// ---------------------------------------------------------------------------
+// #3354 — audit-signing startup posture for ledger-writing commands.
+// ---------------------------------------------------------------------------
+
+/// v1.0.0 #3354 — commands that can reach a `signed_events` append: every
+/// write-class verb plus the long-lived servers/workers that write on behalf of
+/// callers.
+///
+/// Fail-closed intent — when a verb is in doubt it belongs HERE. A false
+/// positive costs a refusal under an OPT-IN env flag; a false negative costs a
+/// silently unattested ledger, which is the whole defect #3354 exists to close.
+#[must_use]
+pub fn is_ledger_writing_command(cmd: &Command) -> bool {
+    is_write_command(cmd)
+        || matches!(
+            cmd,
+            Command::Serve(_) | Command::Mcp { .. } | Command::Curator(_)
+        )
+}
+
+/// v1.0.0 #3354 — the refusal for starting a ledger-writing command under
+/// `AI_MEMORY_REQUIRE_SIGNED_AUDIT` in a process that has NO loadable audit
+/// signing key; `None` when the command may proceed.
+///
+/// **Why the append-funnel gate is not sufficient by itself.** The shared
+/// control [`crate::signed_events::refuse_unsigned_append_when_required`] sits
+/// at both append funnels and refuses the ROW. But many producers treat the
+/// append as best-effort (`let _ = append_signed_event(..)` in
+/// `mcp::tools::skill_get` / `skill_export` / `skill_retire`, and the
+/// `spawn_audit` emission on the CLI write path) — deliberately, because an
+/// audit-write failure must never abort a user operation. Under require-mode
+/// those sites SWALLOW the refusal: the user operation commits and the audit row
+/// is simply ABSENT. That is strictly worse than the `unsigned` row it replaced
+/// — require-mode would destroy the very evidence it was switched on to
+/// guarantee.
+///
+/// Measured end-to-end on 2026-09-02 with the funnel gate alone:
+/// `AI_MEMORY_REQUIRE_SIGNED_AUDIT=1 ai-memory store …` wrote the memory
+/// (`memories` 3 -> 4), dropped the `process.spawn_audited` row
+/// (`signed_events` 2 -> 2) and exited 0.
+///
+/// So require-mode is enforced at process START, before any writer can run.
+/// [`is_ledger_writing_command`] refuses outright, naming the key to provision;
+/// the append-funnel gate stays as the structural backstop for embedded/library
+/// callers that build their own dispatch.
+///
+/// Read-only and REMEDIATION verbs (`identity generate`, `doctor`, the
+/// `verify-*` family, `stats`, `recall`, …) are deliberately NOT refused:
+/// refusing them would brick the only paths an operator has to diagnose the
+/// posture and mint the missing key.
+#[must_use]
+pub fn audit_signing_startup_refusal(cmd: &Command) -> Option<String> {
+    if !crate::governance::audit::require_signed_audit_enabled()
+        || !is_ledger_writing_command(cmd)
+        || crate::governance::audit::audit_key_is_installed()
+    {
+        return None;
+    }
+    let agent = crate::identity::resolve_agent_id(None, None)
+        .unwrap_or_else(|_| "<unresolved>".to_string());
+    let env = crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV;
+    Some(format!(
+        "SEC fail-closed (#3354): {env} is set and this process resolves its identity as \
+         `{agent}`, but no signing key for that id is loadable — every signed_events row this \
+         command would write is tagged `unsigned`, and the producers that treat the audit \
+         append as best-effort would DROP the row entirely rather than refuse the operation. \
+         Refusing to start a ledger-writing command rather than write memories with no \
+         attestable audit trail. Provision the key with `ai-memory identity generate \
+         --agent-id {agent}`, or unset {env} to accept an explicitly-unsigned ledger. \
+         `ai-memory doctor` reports this posture under `audit_signing`."
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -6027,6 +6108,45 @@ pub async fn bootstrap_serve(
         }
     }
 
+    // v1.0.0 #3354 — audit-signing posture at boot. `init_forensic_audit`
+    // resolves this process's identity and loads a key named after THAT id;
+    // when none exists the daemon audit key is never installed and EVERY
+    // signed_events row this daemon writes is tagged `unsigned`. Pre-fix that
+    // was a debug-level log, so a store advertising signed events accumulated
+    // an unsigned ledger in silence (#3354: 109,396 of 109,552 rows).
+    //
+    // Two-tier, mirroring the SEC-2 template directly below: hard-refuse under
+    // the explicit require flag, otherwise WARN and keep serving (an unsigned
+    // ledger is a degraded posture, not a reason to refuse to start, and
+    // `ai-memory doctor` carries the same facts).
+    {
+        let audit_agent_id = crate::identity::resolve_agent_id(None, None)
+            .unwrap_or_else(|_| "<unresolved>".to_string());
+        if !crate::governance::audit::audit_key_is_installed() {
+            if crate::governance::audit::require_signed_audit_enabled() {
+                anyhow::bail!(
+                    "SEC fail-closed (#3354): {} is set but this process resolved its \
+                     identity as `{audit_agent_id}` and no signing key for that id is \
+                     loadable, so every signed_events row would be written UNSIGNED. \
+                     Provision it with `ai-memory identity generate --agent-id {audit_agent_id}`, \
+                     or unset {} to accept an explicitly-unsigned ledger.",
+                    crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV,
+                    crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV,
+                );
+            }
+            tracing::warn!(
+                audit_agent_id = %audit_agent_id,
+                "#3354: no audit signing key for the resolved identity — every \
+                 signed_events row this process writes will be tagged `unsigned` and \
+                 verify-audit-trail cannot attest them. Run `ai-memory keygen \
+                 --agent-id <id>` for the id named here (a `daemon.*` keypair does \
+                 NOT satisfy this: the signer keys on the RESOLVED id). \
+                 `ai-memory doctor` reports the same posture; set \
+                 AI_MEMORY_REQUIRE_SIGNED_AUDIT to refuse unsigned appends."
+            );
+        }
+    }
+
     // v1.0.0 #3430 — the OTHER half of the SEC-2 story: a pubkey IS
     // resolved, rules ARE enabled, and yet the L1-6 load gate drops
     // every one of them (unsigned rows, or — the #3430 shape — signed
@@ -8808,6 +8928,143 @@ mod tests {
         assert!(
             !err.contains("secretpw"),
             "password must be redacted from the refusal, got: {err}"
+        );
+    }
+
+    // ---- #3354 — audit-signing STARTUP posture -------------------------
+    //
+    // The append-funnel gate refuses the ROW, but the best-effort audit
+    // producers (`let _ = append_signed_event(..)`) swallow that refusal, so
+    // under require-mode the user write would COMMIT with the audit row simply
+    // ABSENT — strictly worse than the `unsigned` row it replaced. These pin
+    // the process-start refusal that makes that state unreachable via the CLI
+    // and the servers, and pin the remediation verbs staying reachable.
+
+    fn cmd_of(argv: &[&str]) -> Command {
+        Cli::try_parse_from(argv)
+            .unwrap_or_else(|e| panic!("clap parses {argv:?}: {e}"))
+            .command
+    }
+
+    /// Default posture (no `AI_MEMORY_REQUIRE_SIGNED_AUDIT`) never refuses —
+    /// #3354 must not change behaviour for anyone who has not opted in.
+    #[test]
+    fn audit_signing_startup_refusal_is_none_by_default_3354() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::audit_signing_startup_refusal_is_none_by_default_3354",
+        ) {
+            return;
+        }
+        let _g = crate::config::test_env_lock();
+        // SAFETY: isolated child.
+        unsafe {
+            std::env::remove_var(crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV);
+        }
+        for argv in [
+            vec!["ai-memory", "store", "--title", "t", "--content", "c"],
+            vec!["ai-memory", "gc"],
+            vec!["ai-memory", "stats"],
+        ] {
+            assert!(
+                audit_signing_startup_refusal(&cmd_of(&argv)).is_none(),
+                "#3354: {argv:?} must not be refused when the require flag is unset"
+            );
+        }
+    }
+
+    /// Require-mode with no installed audit key refuses every LEDGER-WRITING
+    /// command and leaves the diagnosis/remediation verbs reachable.
+    #[test]
+    fn audit_signing_startup_refusal_refuses_ledger_writers_3354() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::audit_signing_startup_refusal_refuses_ledger_writers_3354",
+        ) {
+            return;
+        }
+        let _g = crate::config::test_env_lock();
+        // SAFETY: isolated child. No `governance::audit::init` runs here, so
+        // `audit_key_is_installed()` is false — the condition under test.
+        unsafe {
+            std::env::set_var(crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV, "1");
+        }
+        assert!(
+            !crate::governance::audit::audit_key_is_installed(),
+            "#3354 precondition: no daemon audit key installed in this child"
+        );
+
+        for argv in [
+            vec!["ai-memory", "store", "--title", "t", "--content", "c"],
+            vec!["ai-memory", "gc"],
+            vec!["ai-memory", "mcp"],
+            vec!["ai-memory", "serve"],
+        ] {
+            let refusal = audit_signing_startup_refusal(&cmd_of(&argv)).unwrap_or_else(|| {
+                panic!(
+                    "#3354: {argv:?} can write signed_events and MUST be refused under \
+                     require-mode with no signing key — pre-fix it ran, wrote the memory, \
+                     and silently dropped the audit row"
+                )
+            });
+            assert!(
+                refusal.contains("#3354")
+                    && refusal.contains("ai-memory identity generate --agent-id"),
+                "#3354: the refusal must name the condition and the REAL remediation verb \
+                 (`identity generate`, not a `keygen` verb that does not exist); got: {refusal}"
+            );
+        }
+
+        for argv in [
+            vec!["ai-memory", "stats"],
+            vec!["ai-memory", "doctor"],
+            vec!["ai-memory", "identity", "generate", "--agent-id", "ai:x"],
+        ] {
+            assert!(
+                audit_signing_startup_refusal(&cmd_of(&argv)).is_none(),
+                "#3354: {argv:?} writes no ledger row and is how an operator DIAGNOSES and \
+                 FIXES the posture — refusing it would brick the remediation path"
+            );
+        }
+    }
+
+    /// WIRING — the refusal is reached from `run()` itself, before dispatch,
+    /// so no writer can run. Pre-#3354 (and with the append gate alone) this
+    /// `store` succeeded and the audit row was silently absent.
+    #[tokio::test]
+    async fn run_refuses_ledger_writer_without_audit_signing_key_3354() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::run_refuses_ledger_writer_without_audit_signing_key_3354",
+        ) {
+            return;
+        }
+        let _g = crate::config::test_env_lock();
+        // SAFETY: isolated child.
+        unsafe {
+            std::env::set_var(crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV, "1");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("m.db");
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            db.to_str().expect("utf-8 db path"),
+            "store",
+            "--title",
+            "t",
+            "--content",
+            "c",
+        ])
+        .expect("clap parses the store command");
+        let err = run(cli, &cfg, None)
+            .await
+            .expect_err(
+                "#3354: run() must refuse a write-class command under require-mode with no \
+                 signing key, instead of writing the memory and dropping the audit row",
+            )
+            .to_string();
+        assert!(
+            err.contains("#3354") && err.contains("ai-memory identity generate --agent-id"),
+            "#3354: the boot refusal must be actionable, got: {err}"
         );
     }
 

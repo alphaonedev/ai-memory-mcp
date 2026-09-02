@@ -14551,6 +14551,25 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
     use crate::signed_events::{ZERO_HASH, canonical_chain_bytes};
     use sha2::{Digest, Sha256};
 
+    // v1.0.0 #3354 — FAIL-CLOSED audit signing, postgres twin of the sqlite
+    // gate in `signed_events::append_signed_event_no_tx` (K3 parity: the two
+    // append funnels share ONE decision fn, so a refusal true on one backend
+    // can never be silently absent on the other). Under require-mode this
+    // refuses to persist a row the process could not sign; default mode is
+    // byte-identical to pre-#3354 and the posture is surfaced by the boot
+    // WARN, `doctor`, and the qualified verifier verdict instead.
+    if attest_level == crate::models::AttestLevel::Unsigned.as_str() {
+        let probe = crate::signed_events::SignedEvent {
+            agent_id: agent_id.to_string(),
+            event_type: event_type.to_string(),
+            attest_level: attest_level.to_string(),
+            ..crate::signed_events::SignedEvent::default()
+        };
+        crate::signed_events::refuse_unsigned_append_when_required(&probe).map_err(|e| {
+            sqlx::Error::Protocol(format!("pg_append_signed_event_with_chain_in_tx: {e}"))
+        })?;
+    }
+
     // v1.0.0 #2203 (CWE-354) — normalize the anchor-side timestamp to the
     // MICROSECOND precision postgres durably stores in TIMESTAMPTZ BEFORE it is
     // hashed into the #1850 watermark / #1822 witness head anchor. The verify-side
@@ -15446,6 +15465,7 @@ impl PostgresStore {
                 u64::try_from(total_events).unwrap_or(u64::MAX),
                 rows_positively_verified,
                 audit_pubkey.is_some(),
+                crate::governance::audit::require_signed_audit_enabled(),
             ),
         })
     }

@@ -131,10 +131,31 @@ pub fn render(
         let json = serde_json::to_string_pretty(&report).context("serialize audit-trail report")?;
         writeln!(out.stdout, "{json}").context(CTX_WRITE_AUDIT_REPORT)?;
     } else if clean {
+        // v1.0.0 #3354 — a clean CHAIN over an UNSIGNED ledger must not print a
+        // bare OK. Pre-fix a 17-row chain with 12 unsigned rows printed
+        // "OK: chain intact" and exited 0, with only the JSON
+        // signature_check{status:unenforced,unverified:17} hinting otherwise —
+        // so the operator-facing verdict laundered an unsigned ledger as
+        // verified. The hash chain DID hold; what is missing is that nothing
+        // attests it. Qualify the verdict loudly (the exit code stays 0 until
+        // AI_MEMORY_REQUIRE_SIGNED_AUDIT is set, which makes the report dirty
+        // via `SignatureCheck::Unsigned`).
+        let unsigned_note = match report.signature_check {
+            crate::signed_events::SignatureCheck::Unenforced {
+                checked,
+                unverified,
+            } if unverified > 0 => Some(format!(
+                " \u{2014} UNSIGNED: {unverified} of {checked} walked row(s) carry no                  verifiable signature; the hash chain holds but NOTHING attests it.                  Provision an audit signing key (`ai-memory doctor` names the                  resolved agent id) and/or set {} to make this a hard failure",
+                crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV,
+            )),
+            _ => None,
+        };
         writeln!(
             out.stdout,
-            "verify-audit-trail OK: chain intact \u{2713} ({} event(s) checked, head sequence={})",
-            report.total_events, report.head_sequence,
+            "verify-audit-trail OK: chain intact \u{2713} ({} event(s) checked, head sequence={}){}",
+            report.total_events,
+            report.head_sequence,
+            unsigned_note.unwrap_or_default(),
         )
         .context(CTX_WRITE_AUDIT_REPORT)?;
     } else {
@@ -186,6 +207,22 @@ pub fn render(
                 "  audit-signature coverage FAIL (AI_MEMORY_AUDIT_PUBKEY pin enrolled): \
                  {unverified} of {checked} walked row(s) did not verify against the pin \
                  (stripped / downgraded / forged / skip-class row)",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?;
+        }
+        // v1.0.0 #3354 — surface a require-mode UNSIGNED-ledger conviction.
+        if let crate::signed_events::SignatureCheck::Unsigned {
+            checked,
+            unverified,
+        } = report.signature_check
+        {
+            writeln!(
+                out.stdout,
+                "  audit ledger is UNSIGNED ({} is set; fail-closed): {unverified} of \
+                 {checked} walked row(s) carry no verifiable signature. This process \
+                 could not sign its own ledger — `ai-memory doctor` names the resolved \
+                 agent id and the key to provision.",
+                crate::governance::audit::REQUIRE_SIGNED_AUDIT_ENV,
             )
             .context(CTX_WRITE_AUDIT_REPORT)?;
         }

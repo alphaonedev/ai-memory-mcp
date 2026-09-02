@@ -1461,6 +1461,17 @@ pub const REQUIRE_WITNESS_ENV: &str = "AI_MEMORY_REQUIRE_WITNESS";
 /// makes `verify_audit_trail` dirty instead of withholding (`Unknown`).
 pub const REQUIRE_CAUSE_BINDING_ENV: &str = "AI_MEMORY_REQUIRE_CAUSE_BINDING";
 
+/// v1.0.0 #3354 — env that flips the audit-SIGNING posture to FAIL-CLOSED
+/// (require-mode, K2): when set truthy, a process that cannot sign its own
+/// ledger rows REFUSES to append them (rather than writing a row tagged
+/// `unsigned`), and `verify_audit_trail` reports an unsigned chain DIRTY
+/// instead of the informational `Unenforced` withhold.
+///
+/// Default `false`, matching the sibling knobs: an unprovisioned deployment
+/// keeps working byte-identically to pre-#3354, but it is now LOUD about it
+/// (boot WARN + `doctor` + a qualified verifier verdict) instead of silent.
+pub const REQUIRE_SIGNED_AUDIT_ENV: &str = "AI_MEMORY_REQUIRE_SIGNED_AUDIT";
+
 /// Process-static "last witnessed `signed_events` head". `0` = none emitted
 /// yet this process. Drives the [`WATERMARK_INTERVAL`] emission throttle,
 /// independent of [`LAST_WATERMARKED_SEQ`].
@@ -1499,6 +1510,39 @@ pub fn require_witness_enabled() -> bool {
 #[must_use]
 pub fn require_cause_binding_enabled() -> bool {
     env_flag_enabled(REQUIRE_CAUSE_BINDING_ENV)
+}
+
+/// v1.0.0 #3354 — `true` when `AI_MEMORY_REQUIRE_SIGNED_AUDIT` is set truthy
+/// (fail-closed: refuse to append an unsigned ledger row, and convict an
+/// unsigned chain at verify time). Default `false` (loud-but-permissive).
+#[must_use]
+pub fn require_signed_audit_enabled() -> bool {
+    env_flag_enabled(REQUIRE_SIGNED_AUDIT_ENV)
+}
+
+/// v1.0.0 #3354 — read-only probe: does a loadable PRIVATE signing key exist
+/// for `agent_id` in the default key dir?
+///
+/// This answers the question `doctor` was NOT asking. The daemon audit signer
+/// is keyed on the RESOLVED agent id
+/// ([`crate::identity::resolve_agent_id`]), but the Identity section only
+/// stat-ed `daemon.pub` / `daemon.priv`, so it reported `signing: ready` on a
+/// host whose resolved identity had no key at all and whose every ledger row
+/// was therefore tagged `unsigned` (#3354).
+///
+/// Deliberately returns a `bool` and drops the key material immediately: a
+/// diagnostic must never hand a private key back to its caller.
+#[must_use]
+pub fn signing_key_present_for(agent_id: &str) -> bool {
+    let Ok(dir) = crate::identity::keypair::default_key_dir() else {
+        return false;
+    };
+    if !dir.exists() {
+        return false;
+    }
+    crate::identity::keypair::load(agent_id, &dir)
+        .ok()
+        .is_some_and(|kp| kp.private.is_some())
 }
 
 /// Resolve the audit-witness PRIVATE-key custody directory: the
