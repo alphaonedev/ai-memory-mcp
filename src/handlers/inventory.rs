@@ -205,7 +205,10 @@ pub(crate) fn overlay_stats_inventory(
             Some(o) => {
                 obj.insert(
                     "others".into(),
-                    json!({"count": o.count, "namespaces": o.namespaces}),
+                    json!({
+                        "count": o.count,
+                        (crate::models::field_names::NAMESPACE_COUNT): o.namespaces,
+                    }),
                 );
                 obj.insert("truncated".into(), json!(true));
             }
@@ -284,6 +287,31 @@ mod tests {
         assert!(!parse_summary_flag(Some("0")).unwrap());
         assert!(!parse_summary_flag(Some("false")).unwrap());
         assert!(parse_summary_flag(Some("maybe")).is_err());
+    }
+
+    #[test]
+    fn overlay_stats_others_uses_namespace_count_wire_key() {
+        let mut v = json!({"total": 4});
+        overlay_stats_inventory(
+            &mut v,
+            vec![ns("a", 10), ns("b", 5)],
+            Some(NamespaceOthers {
+                count: 4,
+                namespaces: 2,
+            }),
+            4,
+            false,
+        );
+        assert_eq!(v["others"][crate::models::field_names::NAMESPACE_COUNT], 2);
+        assert_eq!(v["others"]["count"], 4);
+        assert!(
+            v["others"]
+                .get(crate::models::field_names::NAMESPACES)
+                .is_none(),
+            "others must not reuse the namespaces-list key: {v}"
+        );
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["by_namespace_total"], 4);
     }
 
     #[test]

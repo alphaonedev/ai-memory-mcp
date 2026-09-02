@@ -12947,7 +12947,7 @@ async fn http_get_stats_caps_by_namespace_with_others() {
     assert_eq!(by_ns.len(), 20);
     assert_eq!(v["by_namespace_total"], 25);
     assert_eq!(v["truncated"], true);
-    assert_eq!(v["others"]["namespaces"], 5);
+    assert_eq!(v["others"][crate::models::field_names::NAMESPACE_COUNT], 5);
     assert_eq!(v["others"]["count"], 5);
 }
 

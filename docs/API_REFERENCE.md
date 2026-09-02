@@ -488,7 +488,7 @@ Query:
 - `summary=1` (`true`/`yes` also accepted) — totals + `by_tier` only;
   omits `by_namespace`. Unknown values are **400**.
 - `by_namespace_limit` — top-N namespaces by count (default **20**, max
-  **100**). Remainder folds into `others: {count, namespaces}`. Memory
+  **100**). Remainder folds into `others: {count, namespace_count}`. Memory
   totals (`total` / `total_memories`, `live`, `expired_pending_gc`) are
   unchanged.
 
