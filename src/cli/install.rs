@@ -1456,6 +1456,15 @@ fn is_managed_value(v: &Value) -> bool {
 /// is intentionally simple — line-by-line, no LCS — because the diff is
 /// *advisory* (the caller can still inspect after with `--apply`).
 fn emit_diff(out: &mut CliOutput<'_>, before: &str, after: &str) -> Result<()> {
+    // v1.0.0 #3432 — this diff is CONFIG CONTENT: the MCP client config it
+    // renders carries `mcpServers.<x>.env` blocks holding vendor API keys
+    // (the very blocks `config migrate --also-clean-claude-json` exists to
+    // delete). Every emitted line therefore goes through the shared
+    // redaction funnel, the same one `config migrate --dry-run` renders
+    // through. DISPLAY-ONLY: `after_text` is written to disk unredacted by
+    // the `--apply` path above, because a masked key written back would be
+    // silent credential destruction.
+    use crate::config_redact::redact_config_line;
     let before_lines: Vec<&str> = before.lines().collect();
     let after_lines: Vec<&str> = after.lines().collect();
     let max_len = before_lines.len().max(after_lines.len());
@@ -1463,13 +1472,15 @@ fn emit_diff(out: &mut CliOutput<'_>, before: &str, after: &str) -> Result<()> {
         let b = before_lines.get(i).copied();
         let a = after_lines.get(i).copied();
         match (b, a) {
-            (Some(bl), Some(al)) if bl == al => writeln!(out.stdout, " {bl}")?,
-            (Some(bl), Some(al)) => {
-                writeln!(out.stdout, "-{bl}")?;
-                writeln!(out.stdout, "+{al}")?;
+            (Some(bl), Some(al)) if bl == al => {
+                writeln!(out.stdout, " {}", redact_config_line(bl))?;
             }
-            (Some(bl), None) => writeln!(out.stdout, "-{bl}")?,
-            (None, Some(al)) => writeln!(out.stdout, "+{al}")?,
+            (Some(bl), Some(al)) => {
+                writeln!(out.stdout, "-{}", redact_config_line(bl))?;
+                writeln!(out.stdout, "+{}", redact_config_line(al))?;
+            }
+            (Some(bl), None) => writeln!(out.stdout, "-{}", redact_config_line(bl))?,
+            (None, Some(al)) => writeln!(out.stdout, "+{}", redact_config_line(al))?,
             (None, None) => {}
         }
     }
@@ -3002,6 +3013,87 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("not a JSON object"));
+    }
+
+    // -----------------------------------------------------------------
+    // #3432 — the dry-run diff is CONFIG CONTENT and must not echo secrets
+    //
+    // The MCP client config this verb rewrites carries
+    // `mcpServers.<x>.env` blocks holding vendor API keys — the very
+    // blocks `ai-memory config migrate --also-clean-claude-json` exists to
+    // delete. Printing that diff raw is the same leak `config check`
+    // (#3197) was added to prevent, reached through a different verb.
+    // -----------------------------------------------------------------
+
+    const INSTALL_SECRET_3432: &str = "sk-install-diff-must-not-leak-3432";
+
+    fn seeded_config_with_env_secret_3432() -> String {
+        format!(
+            "{{\n  \"theme\": \"dark\",\n  \"mcpServers\": {{\n    \"other\": {{\n      \"command\": \"other-bin\",\n      \"env\": {{\n        \"ANTHROPIC_API_KEY\": \"{INSTALL_SECRET_3432}\"\n      }}\n    }}\n  }}\n}}\n"
+        )
+    }
+
+    /// DENIED path: the dry-run diff must not print the client config's
+    /// API key on either stream.
+    #[test]
+    fn install_dry_run_diff_redacts_client_config_secrets_3432() {
+        let mut env = TestEnv::fresh();
+        let path = config_path(&env, "with-secret-3432.json");
+        seed(&path, &seeded_config_with_env_secret_3432());
+        run(&args_for(Target::Cursor, path.clone()), &mut env.output()).unwrap();
+        let stdout = env.stdout_str().to_string();
+        let stderr = env.stderr_str().to_string();
+        assert!(
+            !stdout.contains(INSTALL_SECRET_3432),
+            "the client config's API key leaked on STDOUT:\n{stdout}"
+        );
+        assert!(
+            !stderr.contains(INSTALL_SECRET_3432),
+            "the client config's API key leaked on STDERR:\n{stderr}"
+        );
+        // ALLOWED: the diff is still a diff — the structure an operator
+        // reviews survives, only the value is masked.
+        assert!(
+            stdout.contains("ANTHROPIC_API_KEY"),
+            "the field NAME must stay visible so the diff is reviewable:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(crate::config_redact::CONFIG_REDACTION_MASK),
+            "the mask must stand in for the value:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"theme\": \"dark\""),
+            "non-secret values must stay verbatim:\n{stdout}"
+        );
+        // Dry-run writes nothing.
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            seeded_config_with_env_secret_3432()
+        );
+    }
+
+    /// Data integrity: the redaction is DISPLAY-ONLY. `--apply` must write
+    /// the operator's real key back, never the mask — a masked key on disk
+    /// would be silent credential destruction.
+    #[test]
+    fn install_apply_writes_the_real_secret_not_the_mask_3432() {
+        let mut env = TestEnv::fresh();
+        let path = config_path(&env, "apply-secret-3432.json");
+        seed(&path, &seeded_config_with_env_secret_3432());
+        run(
+            &args_for_apply(Target::Cursor, path.clone()),
+            &mut env.output(),
+        )
+        .unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains(INSTALL_SECRET_3432),
+            "install --apply MASKED the operator's key on disk:\n{written}"
+        );
+        assert!(
+            !written.contains(crate::config_redact::CONFIG_REDACTION_MASK),
+            "the mask must never reach the durable file:\n{written}"
+        );
     }
 
     #[test]

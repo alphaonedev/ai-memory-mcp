@@ -684,6 +684,12 @@ pub mod color;
 /// caller-provided `confidence` field.
 pub mod confidence;
 pub mod config;
+/// v1.0.0 #3432 — the shared config-REDACTION funnel. Every surface that
+/// prints config content (`config migrate --dry-run`, `config check`'s
+/// parse error, `install`'s dry-run diff) renders through this module, so
+/// a secret-bearing field can never be echoed by one verb because another
+/// verb was the one that got hardened.
+pub mod config_redact;
 /// #1974 — content patch primitive (append / unique-match replace) for
 /// `memory_update`: pure read-modify-write assembly shared across surfaces.
 pub mod content_patch;
