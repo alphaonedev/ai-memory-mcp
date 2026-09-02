@@ -595,7 +595,8 @@ hmac_secret = "hmac-secret-must-not-leak"
     /// secret is not vendor-shaped so the value-shape screen misses it.
     #[test]
     fn parse_error_masks_a_value_embedded_in_the_message_body_3432() {
-        #[derive(serde::Deserialize)]
+        // `Debug` is required by `expect_err` (it prints the Ok value).
+        #[derive(Debug, serde::Deserialize)]
         #[allow(dead_code)]
         struct HasStringSecret {
             hmac_secret: String,
