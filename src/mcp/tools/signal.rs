@@ -222,7 +222,13 @@ pub fn handle_signal_send_with_hooks(
     // #3011 — wire `signals.expires_at`: an optional `ttl_secs` marks the signal
     // caller-declared-ephemeral, so the gc pruner (`signals::prune_expired`) can
     // reap it. Validated + overflow-checked like the lease ttl.
-    let expires_at = match params.get(param_names::TTL_SECS).and_then(Value::as_i64) {
+    // #3374 — a present-but-non-integer `ttl_secs` (`"3600"`, `3600.5`) read
+    // as ABSENT via `as_i64()`, so the signal was stored with NO `expires_at`
+    // at all: the caller asked for an ephemeral signal and got a PERMANENT one
+    // the gc pruner will never reap. A retention-integrity gap, and exactly the
+    // #3171 class-3 shape. Refuse the wrong TYPE; `validate_ttl_secs` below
+    // still owns the RANGE.
+    let expires_at = match crate::mcp::param_guard::optional_i64(params, param_names::TTL_SECS)? {
         Some(ttl) => {
             crate::validate::validate_ttl_secs(Some(ttl)).map_err(|e| e.to_string())?;
             Some(
@@ -403,11 +409,15 @@ pub fn handle_signal_inbox(conn: &rusqlite::Connection, params: &Value) -> Resul
     // confidentiality leak produced by a wrong TYPE, not by any authz decision.
     // Refuse it; an ABSENT `to_agent` still means the whole namespace.
     let to_agent = crate::mcp::param_guard::optional_str(params, param_names::TO_AGENT)?;
-    let limit = params
-        .get(param_names::LIMIT)
-        .and_then(Value::as_i64)
-        .unwrap_or(50);
-    let limit = usize::try_from(limit).unwrap_or(50);
+    // #3374 — `limit` was read `as_i64().unwrap_or(50)` and then squeezed
+    // through `usize::try_from(..).unwrap_or(50)`, so a NEGATIVE (or a stringy
+    // / fractional) limit failed BOTH conversions and silently became the
+    // server default 50 — the caller asked for a bounded page and got more rows
+    // than it asked for. Refuse a non-integer / negative limit instead; an
+    // ABSENT limit still defaults to 50, and `limit: 0` still honestly means
+    // "no rows".
+    let limit = crate::mcp::param_guard::optional_non_negative_u64(params, param_names::LIMIT)?
+        .map_or(50, |n| usize::try_from(n).unwrap_or(usize::MAX));
 
     let signals =
         crate::signals::list_inbox(conn, namespace, to_agent, limit).map_err(|e| e.to_string())?;

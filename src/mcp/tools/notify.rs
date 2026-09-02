@@ -143,9 +143,18 @@ pub fn handle_inbox(
             crate::identity::resolve_agent_id(explicit, mcp_client).map_err(|e| e.to_string())?
         }
     };
-    let unread_only = params[field_names::UNREAD_ONLY].as_bool().unwrap_or(false);
-    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(50))
-        .unwrap_or(usize::MAX)
+    // #3374 — both were read with a silent fallback. `unread_only: "yes"` (a
+    // string, the shape an LLM caller emits most often) read as `false`, so a
+    // caller asking for its UNREAD messages got its ENTIRE inbox back — more
+    // rows than it asked for, and no signal that the filter was ignored. And
+    // `limit` was read `as_u64()`, for which any NEGATIVE is indistinguishable
+    // from absent, so `limit: -5` silently became the 50-row default. Refuse
+    // the wrong type; ABSENT still takes the documented default, and the 500
+    // cap still applies.
+    let unread_only =
+        crate::mcp::param_guard::optional_bool(params, field_names::UNREAD_ONLY)?.unwrap_or(false);
+    let limit = crate::mcp::param_guard::optional_non_negative_u64(params, param_names::LIMIT)?
+        .map_or(50, |n| usize::try_from(n).unwrap_or(usize::MAX))
         .min(500);
     let namespace = super::agent::messages_namespace_for(&owner);
     let items = db::list(

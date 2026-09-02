@@ -135,6 +135,34 @@ pub fn optional_non_negative_u64(params: &Value, key: &str) -> Result<Option<u64
     }
 }
 
+/// Read an OPTIONAL SIGNED integer argument, refusing a present-but-
+/// non-integer value.
+///
+/// The sibling of [`optional_non_negative_u64`] for the `i64`-declared
+/// arguments whose domain legitimately includes negatives, or whose range is
+/// enforced by a DOMAIN validator further down (`ttl_secs` ->
+/// [`crate::validate::validate_ttl_secs`]). Those readers used
+/// [`Value::as_i64`] with an `unwrap_or(<default>)`, so a JSON value of the
+/// wrong TYPE — a string `"3600"`, a float `7.5`, a bool — read as ABSENT and
+/// silently took the server default (#3374): `ttl_secs: "3600"` minted a
+/// signal that NEVER expires, and `priority: 7.5` stored priority `0`, so the
+/// action sorted last on the frontier the caller had just told it to sort
+/// first. Refuse instead, and let the domain validator own the RANGE so its
+/// message is not shadowed by a type check.
+///
+/// # Errors
+/// `"<key> must be an integer"` when the key is present and is not a JSON
+/// integer.
+pub fn optional_i64(params: &Value, key: &str) -> Result<Option<i64>, String> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be an integer")),
+    }
+}
+
 /// Read an OPTIONAL boolean argument, refusing a present-but-non-boolean
 /// value.
 ///
@@ -266,6 +294,41 @@ mod tests {
             assert_eq!(
                 optional_non_negative_u64(&bad, "ttl_seconds").unwrap_err(),
                 "ttl_seconds must be a non-negative integer"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_i64_absent_is_none_integers_pass_through() {
+        assert_eq!(optional_i64(&json!({}), "ttl_secs").unwrap(), None);
+        assert_eq!(
+            optional_i64(&json!({ "ttl_secs": Value::Null }), "ttl_secs").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_i64(&json!({ "ttl_secs": 3600 }), "ttl_secs").unwrap(),
+            Some(3600)
+        );
+        // NEGATIVES pass the TYPE gate on purpose: the domain validator
+        // (`validate_ttl_secs`) owns the range and its message must not be
+        // shadowed by a type check.
+        assert_eq!(
+            optional_i64(&json!({ "priority": -3 }), "priority").unwrap(),
+            Some(-3)
+        );
+    }
+
+    #[test]
+    fn optional_i64_refuses_stringy_and_fractional_numbers() {
+        for bad in [
+            json!({ "ttl_secs": "3600" }),
+            json!({ "ttl_secs": 7.5 }),
+            json!({ "ttl_secs": true }),
+            json!({ "ttl_secs": [1] }),
+        ] {
+            assert_eq!(
+                optional_i64(&bad, "ttl_secs").unwrap_err(),
+                "ttl_secs must be an integer"
             );
         }
     }

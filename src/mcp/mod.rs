@@ -66,6 +66,15 @@ mod param_shapes_3365_tests;
 // error codes, method names, MCP protocol revision.
 pub mod jsonrpc;
 
+// #3374 — table-driven regression suite for the NUMERIC / BOOLEAN parameter
+// shapes that silently took a server default (`action_create.priority`,
+// `lease_*.ttl_secs`, `signal_send.ttl_secs`, `signal_inbox`/`inbox.limit`,
+// `inbox.unread_only`, `rule_list.kind`/`enabled_only`). Test-only, and a
+// sibling of the handler modules so it can reach them (they are private
+// `mod`s of `mcp`).
+#[cfg(test)]
+mod param_numeric_3374_tests;
+
 // v0.7.0 #972 D1.5 (#986) — shared parity-test helpers for the
 // schemars-derived `McpTool` impls vs. the legacy hand-coded
 // `tool_definitions()` catalog. Each `d1_5_986_tests` mod under
