@@ -307,7 +307,7 @@ pub fn run(
         SkillAction::List(a) => run_list(&conn, a, out),
         SkillAction::Get(a) => run_get(&conn, a, out),
         SkillAction::Resource(a) => run_resource(&conn, a, out),
-        SkillAction::Export(a) => run_export(&conn, a, active_keypair, out),
+        SkillAction::Export(a) => run_export(&conn, db_path, a, active_keypair, out),
         SkillAction::Promote(a) => run_promote(&conn, a, active_keypair, out),
         SkillAction::Compose(a) => run_compose(&conn, a, out),
         SkillAction::Retire(a) => run_retire(&conn, a, active_keypair, out),
@@ -488,6 +488,7 @@ fn run_resource(
 
 fn run_export(
     conn: &rusqlite::Connection,
+    db_path: &Path,
     args: &ExportArgs,
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
     out: &mut CliOutput<'_>,
@@ -496,7 +497,10 @@ fn run_export(
         "skill_id": args.id,
         (field_names::TARGET_FOLDER): args.output.to_string_lossy(),
     });
-    match crate::mcp::handle_skill_export(conn, &params, active_keypair) {
+    // #3357 — the store path anchors the default export jail root
+    // (`<db parent>/skills-export`); an operator exporting elsewhere sets
+    // AI_MEMORY_SKILLS_EXPORT_ROOT.
+    match crate::mcp::handle_skill_export(conn, db_path, &params, active_keypair) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -775,7 +779,14 @@ mod tests {
         let id = reg["id"].as_str().unwrap().to_string();
         drop(conn);
 
-        let target = dir.path().join("export-out");
+        // #3357 — export INTO the default jail root (`<db parent>/skills-export`,
+        // created 0700 on first export). `fresh_db()` puts the store at
+        // `<dir>/ai-memory.db`, so the CLI now exercises the shipped default
+        // with nothing configured.
+        let target = dir
+            .path()
+            .join(crate::mcp::DEFAULT_EXPORT_DIR_NAME)
+            .join("export-out");
 
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
@@ -955,7 +966,11 @@ mod tests {
         let id = reg["id"].as_str().unwrap().to_string();
         drop(conn);
 
-        let target = dir.path().join("export-human-out");
+        // #3357 — see `cli_skill_export_smoke`: the default jail root.
+        let target = dir
+            .path()
+            .join(crate::mcp::DEFAULT_EXPORT_DIR_NAME)
+            .join("export-human-out");
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);

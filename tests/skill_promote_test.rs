@@ -321,13 +321,17 @@ fn round_trip_promote_export_reregister_identical_digest() {
     let digest_original = payload["digest"].as_str().expect("digest").to_string();
 
     let export_dir = dir.path().join("exported");
-    let export_payload = mcp::handle_skill_export(
+    // #3357 — the export jail: pin this test's TempDir as the configured
+    // export root (it lives outside the process working directory, which is
+    // the default root) rather than mutating process-global env.
+    let export_payload = mcp::handle_skill_export_in_root(
         &conn,
         &json!({
             "skill_id": skill_id,
             "target_folder": export_dir.to_string_lossy(),
         }),
         None,
+        dir.path(),
     )
     .expect("export");
     assert_eq!(export_payload["exported"], true);
@@ -528,13 +532,15 @@ fn skills_ref_validates_promoted_skill_if_installed() {
     let skill_id = payload["skill_id"].as_str().unwrap();
 
     let export_dir = dir.path().join("validate-exported");
-    let _ = mcp::handle_skill_export(
+    // #3357 — see above: this test's TempDir is the configured export root.
+    let _ = mcp::handle_skill_export_in_root(
         &conn,
         &json!({
             "skill_id": skill_id,
             "target_folder": export_dir.to_string_lossy(),
         }),
         None,
+        dir.path(),
     )
     .expect("export");
 

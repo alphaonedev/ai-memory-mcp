@@ -209,13 +209,17 @@ fn sg_sk_2_register_export_reregister_identical_digest() {
         .to_string();
 
     let export_dir = dir_a.path().join("exported-skill");
-    let export_payload = mcp::handle_skill_export(
+    // #3357 — the export jail: pin this test's TempDir as the configured
+    // export root (it lives outside the process working directory, which is
+    // the default root) rather than mutating process-global env.
+    let export_payload = mcp::handle_skill_export_in_root(
         &conn_a,
         &json!({
             "skill_id": skill_id,
             "target_folder": export_dir.to_string_lossy(),
         }),
         None,
+        dir_a.path(),
     )
     .expect("export");
     assert_eq!(export_payload["exported"], true);
@@ -285,13 +289,15 @@ fn sg_sk_3_promote_from_reflection_produces_valid_agent_skills_folder() {
         .to_string();
 
     let export_dir = dir.path().join("promoted-folder");
-    let export_payload = mcp::handle_skill_export(
+    // #3357 — see above: this test's TempDir is the configured export root.
+    let export_payload = mcp::handle_skill_export_in_root(
         &conn,
         &json!({
             "skill_id": skill_id,
             "target_folder": export_dir.to_string_lossy(),
         }),
         None,
+        dir.path(),
     )
     .expect("export promoted skill");
     assert_eq!(export_payload["exported"], true);

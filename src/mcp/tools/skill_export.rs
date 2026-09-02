@@ -10,10 +10,25 @@
 //!
 //! A `signed_events` row is appended for the export action (Bucket 1
 //! attestation).
+//!
+//! # Confinement (#3357)
+//!
+//! `memory_skill_export` is an UNPRIVILEGED MCP tool, so the caller-supplied
+//! `target_folder` is CONFINED to an export root before any filesystem I/O —
+//! see [`SKILLS_EXPORT_ROOT_ENV`] and `confine_export_target`. This is the
+//! write-side twin of the #1923 skills-IMPORT jail in
+//! `src/mcp/tools/skill_register.rs`; without it the tool is an
+//! arbitrary-directory create+write primitive on the host.
+//!
+//! The root is [`SKILLS_EXPORT_ROOT_ENV`] when the operator sets one, else
+//! [`DEFAULT_EXPORT_DIR_NAME`] beside the resolved store (`<db parent>/`
+//! `skills-export`), created `0o700` on first export. It is deliberately NOT
+//! the process working directory: a daemon's CWD is arbitrary — frequently `/`
+//! or `$HOME` — which is not a jail.
 
 use crate::mcp::param_names;
 use crate::models::field_names;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -22,10 +37,280 @@ use uuid::Uuid;
 use crate::identity::keypair::AgentKeypair;
 use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
 
+/// #3357 — env naming the operator-configured skills-EXPORT jail root.
+///
+/// `memory_skill_export` is an UNPRIVILEGED MCP tool that writes `SKILL.md`
+/// (plus a `resources/` subtree) under a caller-supplied `target_folder`.
+/// Pre-#3357 that path was used verbatim — `create_dir_all` + `write` on
+/// whatever the caller named — so any co-located agent held an
+/// arbitrary-directory *creation and write* primitive on the host: a relative
+/// `../../` escape left the working root, and an absolute `/etc/...` was
+/// stopped only by filesystem permissions (`EACCES`), not by any guard of
+/// ours. The register side got its jail in #1923
+/// (`AI_MEMORY_SKILLS_IMPORT_ROOT`, in `src/mcp/tools/skill_register.rs`);
+/// this is the write-side twin.
+///
+/// When set, this names the jail root and every export target MUST canonically
+/// resolve INSIDE it, or the export is refused BEFORE any I/O. An operator root
+/// is never CREATED for you — it must already exist, so an env typo refuses
+/// rather than silently minting a jail somewhere nobody meant.
+///
+/// Unset, the root is [`DEFAULT_EXPORT_DIR_NAME`] beside the resolved store
+/// (see [`resolve_export_root`]). The process working directory is
+/// deliberately NOT the fallback: a daemon's CWD is arbitrary — frequently
+/// `/` or `$HOME` — which is not a jail.
+pub const SKILLS_EXPORT_ROOT_ENV: &str = "AI_MEMORY_SKILLS_EXPORT_ROOT";
+
+/// #3357 — directory name of the DEFAULT export root, created beside the
+/// resolved store (the parent of the db path this process opened).
+///
+/// Anchoring on the store — not the process working directory — is what makes
+/// the default a real jail: the store directory is chosen by the operator who
+/// launched the process, is already writable by it, and travels with the
+/// deployment, whereas CWD is whatever the supervisor happened to leave.
+pub const DEFAULT_EXPORT_DIR_NAME: &str = "skills-export";
+
+/// #3357 — mode the default export root is CREATED with. `0o700` is unaffected
+/// by any umask that only clears group/other bits, so the fresh directory is
+/// owner-only even under the `umask 0002` this fleet runs. Same posture and
+/// rationale as the #3198 key-directory mode
+/// (`crate::identity::keypair`): exported skills are executable instructions
+/// for an agent, so a second local UID must not be able to plant or rewrite
+/// them.
+#[cfg(unix)]
+const EXPORT_ROOT_MODE: u32 = 0o700;
+
+/// #3357 — the in-memory sqlite sentinel, which has no directory to anchor a
+/// default export root on.
+const IN_MEMORY_DB: &str = ":memory:";
+
+/// #3357 — `create_dir_all` that gives every directory it CREATES mode
+/// [`EXPORT_ROOT_MODE`].
+///
+/// `DirBuilder::mode` applies at `mkdir(2)` time, so the window in which a
+/// freshly-created export root is group-writable does not exist — unlike a
+/// `create_dir_all` followed by a `chmod`. A pre-existing directory is left
+/// exactly as the operator made it. Mirrors #3198's `create_dir_all_secure`.
+fn create_dir_all_secure(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(EXPORT_ROOT_MODE);
+    }
+    builder.create(dir)
+}
+
+/// #3357 — resolve the export jail root, fail-closed.
+///
+/// Ladder:
+/// 1. `configured_root` — the [`SKILLS_EXPORT_ROOT_ENV`] value when the
+///    operator set one. It must ALREADY resolve to an existing directory; it is
+///    never created here.
+/// 2. Otherwise [`DEFAULT_EXPORT_DIR_NAME`] beside the resolved store — the
+///    parent of `db_path`, the same store path threaded to every other
+///    path-taking handler — created `0o700` on first export.
+///
+/// The result is CANONICAL (every symlink component resolved), so the
+/// containment check in `confine_export_target` compares real paths rather than
+/// spellings. Nothing falls back to an unconfined export: if neither rung
+/// resolves to an existing directory the export is REFUSED.
+///
+/// Split from the env read (mirroring #1923's `resolve_import_root`) so the
+/// ladder is deterministically unit-testable without mutating process env.
+///
+/// # Errors
+/// A configured root that does not resolve to an existing directory; an
+/// in-memory / parentless store with no configured root; a default root that
+/// cannot be created or canonicalized.
+fn resolve_export_root(configured_root: Option<&str>, db_path: &Path) -> Result<PathBuf, String> {
+    if let Some(root) = configured_root.map(str::trim).filter(|s| !s.is_empty()) {
+        let canonical = std::fs::canonicalize(Path::new(root)).map_err(|_| {
+            format!(
+                "{SKILLS_EXPORT_ROOT_ENV} '{root}' is not a directory or does not exist \
+                 (it is never created for you)"
+            )
+        })?;
+        if !canonical.is_dir() {
+            return Err(format!(
+                "{SKILLS_EXPORT_ROOT_ENV} '{root}' is not a directory"
+            ));
+        }
+        return Ok(canonical);
+    }
+
+    if db_path == Path::new(IN_MEMORY_DB) {
+        return Err(format!(
+            "an in-memory store has no directory to anchor the default \
+             '{DEFAULT_EXPORT_DIR_NAME}' export root on; set {SKILLS_EXPORT_ROOT_ENV} to an \
+             existing directory"
+        ));
+    }
+    // A bare filename (`--db ai-memory.db`) yields an EMPTY parent; the store
+    // then genuinely lives in the working directory, so `.` is the store dir
+    // here — not a CWD fallback for a store that lives elsewhere.
+    let store_dir = match db_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let default_root = store_dir.join(DEFAULT_EXPORT_DIR_NAME);
+    if !default_root.exists() {
+        create_dir_all_secure(&default_root).map_err(|e| {
+            format!(
+                "cannot create the default skills-export root '{}': {e}; \
+                 set {SKILLS_EXPORT_ROOT_ENV} to an existing directory",
+                default_root.display()
+            )
+        })?;
+    }
+    let canonical = std::fs::canonicalize(&default_root).map_err(|e| {
+        format!(
+            "cannot resolve the default skills-export root '{}': {e}; \
+             set {SKILLS_EXPORT_ROOT_ENV} to an existing directory",
+            default_root.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "the default skills-export root '{}' is not a directory",
+            default_root.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// #3357 — resolve the deepest EXISTING ancestor of `path` to its canonical
+/// form and re-append the not-yet-existing tail.
+///
+/// `std::fs::canonicalize` refuses a path that does not exist yet, and an
+/// export legitimately names a folder it is about to create. Canonicalizing
+/// the existing prefix still resolves EVERY symlink on the part of the path
+/// that exists — which is the part an attacker can have planted — and the
+/// remaining tail is `..`-free by construction (the caller rejects
+/// `Component::ParentDir` first), so re-appending it cannot climb back
+/// out of the resolved prefix.
+///
+/// # Errors
+/// When the walk runs out of ancestors without finding one that resolves.
+fn resolve_existing_prefix(path: &Path) -> Result<PathBuf, String> {
+    fn unresolvable(path: &Path) -> String {
+        format!(
+            "cannot resolve target_folder '{}': no existing parent directory",
+            path.display()
+        )
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(base) = std::fs::canonicalize(cursor) {
+            let mut resolved = base;
+            for segment in tail.iter().rev() {
+                resolved.push(segment);
+            }
+            return Ok(resolved);
+        }
+        let name = cursor.file_name().ok_or_else(|| unresolvable(path))?;
+        tail.push(name.to_os_string());
+        cursor = cursor.parent().ok_or_else(|| unresolvable(path))?;
+    }
+}
+
+/// #3357 — confine a caller-supplied `target_folder` to `root`, fail-closed
+/// and BEFORE any filesystem mutation.
+///
+/// Order matters, and every step refuses rather than sanitising:
+/// 1. A `Component::ParentDir` (`..`) anywhere in the request is refused
+///    outright — purely lexical, so it costs no I/O and cannot be defeated by
+///    a race. This is the reported #3357 repro
+///    (`<workdir>/../jail-escape-probe`).
+/// 2. A RELATIVE target is anchored at `root`; an ABSOLUTE target is taken as
+///    given (and then has to survive step 4 on its own merits, which
+///    `/etc/cron.d` does not).
+/// 3. The deepest existing ancestor is canonicalized
+///    (`resolve_existing_prefix`), which resolves symlink traversal — a
+///    planted `link -> /etc` inside the root collapses to `/etc` here.
+/// 4. The resolved path must be `root` itself or live under it.
+///
+/// Returns the RESOLVED absolute target the caller must use for every
+/// subsequent path join and write (using the raw string again would re-open
+/// the escape this function just closed).
+///
+/// # Errors
+/// On a `..` component, an unresolvable path, or a resolved location outside
+/// `root`.
+fn confine_export_target(target_str: &str, root: &Path) -> Result<PathBuf, String> {
+    let requested = Path::new(target_str);
+    if requested
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(format!(
+            "refusing target_folder '{target_str}': parent-directory ('..') components are \
+             not allowed (path-escape refused)"
+        ));
+    }
+    let anchored = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let resolved = resolve_existing_prefix(&anchored)?;
+    if !resolved.starts_with(root) {
+        return Err(format!(
+            "refusing target_folder '{target_str}': resolves outside the skills-export root \
+             '{}' (path-escape refused; set {SKILLS_EXPORT_ROOT_ENV} to export elsewhere)",
+            root.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// MCP / HTTP / CLI entry point for `memory_skill_export`.
+///
+/// Resolves the export jail root — [`SKILLS_EXPORT_ROOT_ENV`] when the operator
+/// set one, else [`DEFAULT_EXPORT_DIR_NAME`] beside the store `db_path` names —
+/// and delegates to [`handle_skill_export_in_root`]. Every WIRE surface (the
+/// MCP dispatch, the admin-gated `POST /api/v1/skill/{id}/export` route and the
+/// `ai-memory skill export` CLI) goes through here, so the jail is not a
+/// per-surface habit.
+///
+/// # Errors
+/// A [`resolve_export_root`] refusal, or any error of
+/// [`handle_skill_export_in_root`].
 pub fn handle_skill_export(
+    conn: &Connection,
+    db_path: &Path,
+    params: &Value,
+    active_keypair: Option<&AgentKeypair>,
+) -> Result<Value, String> {
+    let configured_root = std::env::var(SKILLS_EXPORT_ROOT_ENV).ok();
+    let export_root = resolve_export_root(configured_root.as_deref(), db_path)?;
+    handle_skill_export_in_root(conn, params, active_keypair, &export_root)
+}
+
+/// #3357 — the export body, with the jail root supplied explicitly.
+///
+/// Same wire/trusted split #3171 introduced for
+/// `handle_namespace_clear_standard`: [`handle_skill_export`] is the
+/// root-resolving wire entry, this is the in-process entry that takes an
+/// already-chosen root so the confinement can be exercised (and embedders can
+/// pin an export root) without mutating process-global env. `export_root` is
+/// re-canonicalized and must be an existing directory — this is not an escape
+/// hatch, it only names WHICH root applies, and the confinement below is
+/// identical either way.
+///
+/// # Errors
+/// - An `export_root` that does not resolve to an existing directory.
+/// - `memory_skill_export requires 'skill_id'` / `'target_folder'`.
+/// - A `confine_export_target` refusal.
+/// - The skill-not-found / decompress / governance / I/O errors of the export
+///   itself.
+pub fn handle_skill_export_in_root(
     conn: &Connection,
     params: &Value,
     active_keypair: Option<&AgentKeypair>,
+    export_root: &Path,
 ) -> Result<Value, String> {
     let skill_id = params["skill_id"]
         .as_str()
@@ -37,7 +322,28 @@ pub fn handle_skill_export(
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_export requires 'target_folder'")?;
 
-    let target = Path::new(target_str);
+    // #3357 — CONFINE the caller-supplied folder before ANY filesystem I/O.
+    // `target` from here on is the RESOLVED, in-root path; `target_str` is
+    // only ever echoed back to the caller.
+    //
+    // Defensive re-canonicalization: every caller — wire or embedder — gets the
+    // same fail-closed guarantee that the root is a real, symlink-resolved
+    // directory before any containment decision is made against it. Argument
+    // -shape refusals above keep precedence (they are cheaper and more useful
+    // to the caller); the root is still settled before any I/O.
+    let export_root = std::fs::canonicalize(export_root).map_err(|_| {
+        format!(
+            "skills-export root '{}' is not a directory or does not exist",
+            export_root.display()
+        )
+    })?;
+    if !export_root.is_dir() {
+        return Err(format!(
+            "skills-export root '{}' is not a directory",
+            export_root.display()
+        ));
+    }
+    let target = confine_export_target(target_str, &export_root)?;
 
     // -----------------------------------------------------------------------
     // Load skill row
@@ -159,7 +465,10 @@ pub fn handle_skill_export(
     // export cleanly before any directory is created.
     let skill_md_path = target.join("SKILL.md");
     let skill_md_action = crate::governance::agent_action::AgentAction::FilesystemWrite {
-        path: skill_md_path.clone(),
+        // #3357 — moved (not cloned): the post-`create_dir_all` containment
+        // re-check below rebinds `skill_md_path` from the re-canonicalized
+        // target, so this pre-flight value has no further use.
+        path: skill_md_path,
         byte_estimate: Some(skill_md_content.len() as u64),
     };
     // Fable HIGH (#3133): this sink is reachable from the CLI one-shot
@@ -174,7 +483,23 @@ pub fn handle_skill_export(
             refusal.reason
         ));
     }
-    std::fs::create_dir_all(target).map_err(|e| format!("create_dir_all '{target_str}': {e}"))?;
+    std::fs::create_dir_all(&target).map_err(|e| format!("create_dir_all '{target_str}': {e}"))?;
+    // #3357 — re-assert containment AFTER the directory exists. `create_dir_all`
+    // is the first moment the target is a real inode, so this closes the
+    // create-then-swap window in which a co-located attacker replaces a freshly
+    // created component with a symlink out of the root between the pre-flight
+    // check and the write below. Fail closed: the directory is left in place
+    // (creating it is not the dangerous half) but nothing is written.
+    let target = std::fs::canonicalize(&target)
+        .map_err(|e| format!("cannot resolve target_folder '{target_str}' after creation: {e}"))?;
+    if !target.starts_with(&export_root) {
+        return Err(format!(
+            "refusing target_folder '{target_str}': resolves outside the skills-export root \
+             '{}' (path-escape refused; set {SKILLS_EXPORT_ROOT_ENV} to export elsewhere)",
+            export_root.display()
+        ));
+    }
+    let skill_md_path = target.join("SKILL.md");
     std::fs::write(&skill_md_path, skill_md_content.as_bytes())
         .map_err(|e| format!("write SKILL.md: {e}"))?;
 
@@ -397,6 +722,33 @@ mod d1_5_986_tests {
 mod tests {
     use super::*;
     use rusqlite::params;
+
+    /// #3357 — test shim that SHADOWS the wire entry point
+    /// [`super::handle_skill_export`] for this pre-existing behavioural
+    /// suite (an explicit item wins over the `use super::*` glob).
+    ///
+    /// Every test below exports into its own `TempDir`, which lives outside
+    /// the process working directory — the default export root — so under the
+    /// #3357 jail the wire entry would (correctly) refuse them all. Rather
+    /// than mutate process-global `AI_MEMORY_SKILLS_EXPORT_ROOT` from a
+    /// parallel test binary, the shim SELF-JAILS: it pins the requested
+    /// folder's own parent as the configured root, which is the identical
+    /// "unset -> the folder is its own root" shape #1923 chose on the
+    /// register side. The export body under test is therefore unchanged, and
+    /// the jail's OWN denied/allowed pins live in [`jail_3357_tests`].
+    fn handle_skill_export(
+        conn: &rusqlite::Connection,
+        params: &Value,
+        active_keypair: Option<&AgentKeypair>,
+    ) -> Result<Value, String> {
+        let root = params[param_names::TARGET_FOLDER]
+            .as_str()
+            .and_then(|t| Path::new(t).parent().map(Path::to_path_buf))
+            // Unreachable in practice: a missing / blank `target_folder` is
+            // refused by the handler before the root is ever consulted.
+            .unwrap_or_else(|| PathBuf::from("."));
+        super::handle_skill_export_in_root(conn, params, active_keypair, &root)
+    }
 
     fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -914,5 +1266,308 @@ mod tests {
         assert!(md.contains("author: alice"));
         assert!(!md.contains("version_int:")); // integer skipped
         assert!(!md.contains("tags:")); // array skipped
+    }
+}
+
+#[cfg(test)]
+mod jail_3357_tests {
+    //! #3357 — regression pins for the `target_folder` export jail.
+    //!
+    //! `memory_skill_export` is an unprivileged MCP tool; before this the
+    //! caller-supplied `target_folder` reached `create_dir_all` + `write`
+    //! verbatim, so any co-located agent held an arbitrary-directory write
+    //! primitive (the register side got its jail in #1923; the export side
+    //! did not). Both directions are pinned: the DENIED paths (`..` escape,
+    //! absolute `/etc`, symlink traversal, an unresolvable root) and the
+    //! ALLOWED paths (relative + absolute in-root exports still write
+    //! `SKILL.md`), plus the DEFAULT root — `skills-export` beside the
+    //! resolved store, mode `0o700` — which is what makes the jail real for a
+    //! deployment that configures nothing.
+
+    use super::*;
+    use rusqlite::params;
+
+    fn open_db() -> (rusqlite::Connection, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ai-memory.db");
+        let conn = crate::db::open(&path).expect("db::open");
+        (conn, dir, path)
+    }
+
+    fn seed_skill(conn: &rusqlite::Connection, id: &str) {
+        let body_blob = zstd::encode_all("Body.\n".as_bytes(), 3).expect("zstd");
+        let digest = vec![0xcd_u8; 32];
+        conn.execute(
+            "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, created_at) \
+             VALUES (?1, 'ns-jail', 'jailed', 'desc', '{}', ?2, ?3, 0)",
+            params![id, body_blob, digest],
+        )
+        .expect("insert skill");
+    }
+
+    // ---- root resolution (fail-closed) ----------------------------------
+
+    /// LOAD-BEARING (#3357, Fable ruling): with nothing configured the root is
+    /// `skills-export` BESIDE THE RESOLVED STORE — never the process working
+    /// directory, which for a daemon is arbitrary (frequently `/` or `$HOME`)
+    /// and therefore not a jail at all. Created on first use, mode `0o700`.
+    #[test]
+    fn default_root_is_skills_export_beside_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ai-memory.db");
+        let expected = std::fs::canonicalize(dir.path())
+            .expect("canon store dir")
+            .join(DEFAULT_EXPORT_DIR_NAME);
+        assert!(!expected.exists(), "precondition: not created yet");
+
+        let root = resolve_export_root(None, &db_path).expect("default root");
+        assert_eq!(root, expected, "default root must sit beside the store");
+        assert!(root.is_dir(), "the default root is created on first use");
+
+        // A blank env value is the same as unset.
+        assert_eq!(
+            resolve_export_root(Some("   "), &db_path).expect("blank root"),
+            expected
+        );
+
+        // It is NOT the process working directory.
+        let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd")).expect("canon cwd");
+        assert_ne!(root, cwd);
+        assert_ne!(root, cwd.join(DEFAULT_EXPORT_DIR_NAME));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn default_root_is_created_owner_only_0700() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ai-memory.db");
+        let root = resolve_export_root(None, &db_path).expect("default root");
+        let mode = std::fs::metadata(&root)
+            .expect("stat root")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, EXPORT_ROOT_MODE,
+            "the default export root must be born 0700 (mkdir-time, umask-proof)"
+        );
+    }
+
+    #[test]
+    fn configured_root_overrides_the_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ai-memory.db");
+        let configured = dir.path().join("operator-root");
+        std::fs::create_dir_all(&configured).expect("mkdir");
+        let root = resolve_export_root(Some(configured.to_str().expect("utf8")), &db_path)
+            .expect("configured root");
+        assert_eq!(root, std::fs::canonicalize(&configured).expect("canon"));
+        assert!(
+            !dir.path().join(DEFAULT_EXPORT_DIR_NAME).exists(),
+            "a configured root must not also mint the default"
+        );
+    }
+
+    #[test]
+    fn nonexistent_configured_root_is_refused_and_never_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ai-memory.db");
+        let missing = dir.path().join("no-such-root");
+        let err = resolve_export_root(Some(missing.to_str().expect("utf8")), &db_path)
+            .expect_err("a missing export root must fail closed");
+        assert!(
+            err.contains("is not a directory or does not exist"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(SKILLS_EXPORT_ROOT_ENV),
+            "must name the env: {err}"
+        );
+        assert!(
+            !missing.exists(),
+            "an operator root is never created for them (an env typo must refuse)"
+        );
+    }
+
+    #[test]
+    fn a_file_is_not_a_valid_export_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ai-memory.db");
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(resolve_export_root(Some(file.to_str().expect("utf8")), &db_path).is_err());
+    }
+
+    #[test]
+    fn in_memory_store_without_a_configured_root_is_refused() {
+        let err = resolve_export_root(None, Path::new(IN_MEMORY_DB))
+            .expect_err("an in-memory store has no directory to anchor a jail on");
+        assert!(
+            err.contains(SKILLS_EXPORT_ROOT_ENV),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ---- DENIED ----------------------------------------------------------
+
+    #[test]
+    fn parent_dir_escape_is_refused_before_any_io() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        let escape = dir.path().join("jail-escape-probe");
+        let requested = format!("{}/../jail-escape-probe", root.display());
+
+        let err = confine_export_target(&requested, &std::fs::canonicalize(&root).expect("canon"))
+            .expect_err("`..` must be refused");
+        assert!(err.contains("parent-directory"), "unexpected error: {err}");
+        assert!(
+            !escape.exists(),
+            "the refused export must not have created {}",
+            escape.display()
+        );
+    }
+
+    #[test]
+    fn absolute_path_outside_the_root_is_refused_before_any_io() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canon");
+        let err = confine_export_target("/etc/ai-memory-3357-probe", &root)
+            .expect_err("an absolute out-of-root target must be refused");
+        assert!(
+            err.contains("resolves outside the skills-export root"),
+            "unexpected error: {err}"
+        );
+        assert!(!Path::new("/etc/ai-memory-3357-probe").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_component_that_leaves_the_root_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink");
+
+        let canon_root = std::fs::canonicalize(&root).expect("canon");
+        let err = confine_export_target("link/exported", &canon_root)
+            .expect_err("symlink traversal out of the root must be refused");
+        assert!(
+            err.contains("resolves outside the skills-export root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The end-to-end #3357 repro over the DEFAULT (unconfigured) root: an
+    /// agent naming a sibling of the store gets nothing.
+    #[test]
+    fn wire_export_refuses_an_out_of_root_target_and_writes_nothing() {
+        let (conn, dir, db_path) = open_db();
+        let id = "3357aaaa-0000-0000-0000-000000000001";
+        seed_skill(&conn, id);
+        let root = resolve_export_root(None, &db_path).expect("default root");
+        let escape = dir.path().join("escaped");
+
+        let err = handle_skill_export_in_root(
+            &conn,
+            &json!({"skill_id": id, "target_folder": escape.to_str().expect("utf8")}),
+            None,
+            &root,
+        )
+        .expect_err("out-of-root export must be refused");
+        assert!(
+            err.contains("resolves outside the skills-export root"),
+            "unexpected error: {err}"
+        );
+        assert!(!escape.exists(), "refused export must create nothing");
+    }
+
+    #[test]
+    fn an_unresolvable_root_refuses_the_export() {
+        let (conn, dir, _db_path) = open_db();
+        let id = "3357eeee-0000-0000-0000-000000000005";
+        seed_skill(&conn, id);
+        let missing = dir.path().join("no-such-root");
+        let err = handle_skill_export_in_root(
+            &conn,
+            &json!({"skill_id": id, "target_folder": "out"}),
+            None,
+            &missing,
+        )
+        .expect_err("an unresolvable root must fail closed");
+        assert!(
+            err.contains("is not a directory or does not exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ---- ALLOWED ---------------------------------------------------------
+
+    /// The zero-config happy path: a relative `target_folder` lands inside the
+    /// default `skills-export` root beside the store.
+    #[test]
+    fn in_root_relative_export_succeeds_under_the_default_root() {
+        let (conn, _dir, db_path) = open_db();
+        let id = "3357bbbb-0000-0000-0000-000000000002";
+        seed_skill(&conn, id);
+        let root = resolve_export_root(None, &db_path).expect("default root");
+
+        let v = handle_skill_export_in_root(
+            &conn,
+            &json!({"skill_id": id, "target_folder": "nested/exported"}),
+            None,
+            &root,
+        )
+        .expect("in-root relative export must succeed");
+        assert_eq!(v["exported"], json!(true));
+        assert!(root.join("nested/exported/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn in_root_absolute_export_succeeds() {
+        let (conn, dir, _db_path) = open_db();
+        let id = "3357cccc-0000-0000-0000-000000000003";
+        seed_skill(&conn, id);
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        let target = root.join("exported");
+
+        let v = handle_skill_export_in_root(
+            &conn,
+            &json!({"skill_id": id, "target_folder": target.to_str().expect("utf8")}),
+            None,
+            &root,
+        )
+        .expect("in-root absolute export must succeed");
+        assert_eq!(v["exported"], json!(true));
+        assert!(target.join("SKILL.md").is_file());
+        // The echoed `target_folder` stays the caller's spelling so the
+        // documented round-trip response shape is unchanged.
+        assert_eq!(
+            v[field_names::TARGET_FOLDER].as_str().expect("target"),
+            target.to_str().expect("utf8")
+        );
+    }
+
+    #[test]
+    fn export_root_itself_is_a_legal_target() {
+        let (conn, dir, _db_path) = open_db();
+        let id = "3357dddd-0000-0000-0000-000000000004";
+        seed_skill(&conn, id);
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+
+        let v = handle_skill_export_in_root(
+            &conn,
+            &json!({"skill_id": id, "target_folder": root.to_str().expect("utf8")}),
+            None,
+            &root,
+        )
+        .expect("the root itself must be exportable");
+        assert_eq!(v["exported"], json!(true));
+        assert!(root.join("SKILL.md").is_file());
     }
 }

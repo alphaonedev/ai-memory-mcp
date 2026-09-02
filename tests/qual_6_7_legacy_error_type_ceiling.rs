@@ -161,7 +161,22 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // `handle_inbox` entry point preserves trusted in-process CLI/hook behaviour.
 // Both feed the established MCP inbox handler family and therefore retain its
 // `Result<Value, String>` boundary. Net acknowledged: +1.
-const QUAL_6_CEILING: usize = 125;
+// 2026-09-02 (#3357, rebased onto #3356) — raised 125 -> 127 for the
+// `target_folder` export-jail
+// split of `handle_skill_export` into the env-reading WIRE entry
+// (`handle_skill_export`) + the root-taking in-process entry
+// (`handle_skill_export_in_root`). Exact #3171 wire/trusted split precedent
+// recorded immediately above (`handle_namespace_clear_standard` +
+// `_trusted` + `_inner`): the inner entry MUST mirror the existing
+// `Result<Value, String>` MCP-dispatch envelope of the wire handler, so it is
+// that type by construction — no new error contract, and the seam is what lets
+// the confinement be exercised without mutating process-global env.
+// A second occurrence is TEST-ONLY: the `#[cfg(test)] mod tests` shim in
+// `skill_export.rs` that shadows the wire entry for the pre-existing
+// behavioural suite (it self-jails each export at the requested folder's own
+// parent instead of mutating process-global env) MUST mirror the same
+// envelope. Net acknowledged: +2 (one production seam, one test-only shim).
+const QUAL_6_CEILING: usize = 127;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in

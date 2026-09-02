@@ -331,7 +331,9 @@ pub async fn skill_export_route(
     });
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
-    match crate::mcp::handle_skill_export(&lock.0, &params, kp) {
+    // #3357 — `lock.1` is the resolved store path; it anchors the default
+    // export jail root (`<db parent>/skills-export`).
+    match crate::mcp::handle_skill_export(&lock.0, &lock.1, &params, kp) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {

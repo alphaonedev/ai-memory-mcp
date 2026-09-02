@@ -251,7 +251,13 @@ async fn http_skill_get_route_returns_404_on_unknown_id() {
 async fn http_skill_export_route_writes_skill_md() {
     let (dir, db_path) = fresh_db();
     let id = seed_skill(&db_path, "http-export");
-    let target = dir.path().join("export-target");
+    // #3357 — the route resolves the export jail root from the store path it
+    // holds (`AppState.db` tuple slot 1), so export INTO the shipped default
+    // `<db parent>/skills-export` rather than configuring an override.
+    let target = dir
+        .path()
+        .join(ai_memory::mcp::DEFAULT_EXPORT_DIR_NAME)
+        .join("export-target");
     let (router, _db) = build_router_with_db_path(&db_path);
     let body = json!({"target_folder": target.to_string_lossy()});
     let req = Request::builder()
@@ -571,7 +577,14 @@ fn cli_skill_list_with_namespace_filter_smoke() {
 fn cli_skill_export_writes_skill_md() {
     let (dir, db_path) = fresh_db();
     let id = seed_skill(&db_path, "cli-export-md");
-    let target = dir.path().join("cli-export-out");
+    // #3357 — the CLI export resolves its jail root from the store path, so
+    // export INTO the shipped default `<db parent>/skills-export` rather than
+    // configuring an override. `fresh_db()` puts the store at
+    // `<dir>/ai-memory.db`, so a sibling of the store is outside the root.
+    let target = dir
+        .path()
+        .join(ai_memory::mcp::DEFAULT_EXPORT_DIR_NAME)
+        .join("cli-export-out");
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
     let mut out = CliOutput::from_std(&mut stdout, &mut stderr);

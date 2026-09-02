@@ -90,7 +90,7 @@ The 9 MCP tools that make up the Agent Skills wire surface:
 | `memory_skill_list` | `other` | L1-5 | List current (non-superseded) skills with `~100 tokens/skill`. Returns id, name, description, namespace, digest, metadata. **Body is NOT decompressed** — use `memory_skill_get` for activation. |
 | `memory_skill_get` | `other` | L1-5 | Return the full activation payload: metadata + decompressed body. Old version ids remain addressable after supersession (durable history). |
 | `memory_skill_resource` | `other` | L1-5 | Fetch a single resource by `(skill_id, resource_path)`, digest-verified against the row's SHA-256 before return. Errors on digest mismatch. |
-| `memory_skill_export` | `other` | L1-5 | Write SKILL.md + `resources/` to a target folder. Re-registering from the exported folder produces the **identical SHA-256 digest** — the round-trip guarantee. Appends a `skill.exported` row to `signed_events`. |
+| `memory_skill_export` | `other` | L1-5 | Write SKILL.md + `resources/` to a target folder **inside the export root** (#3357 — see *Export root* below). Re-registering from the exported folder produces the **identical SHA-256 digest** — the round-trip guarantee. Appends a `skill.exported` row to `signed_events`. |
 | `memory_skill_promote_from_reflection` | `other` | L2-6 | Promote a `Reflection`-kind memory (depth ≥ 1, default floor `1`) to a SKILL.md-format skill. Each `reflects_on` source becomes a `references/source_{i}.md` resource. Frontmatter records `derived_from_reflection_id` + `original_reflection_depth`. The resulting digest is identical to a hand-authored SKILL.md with the same content. |
 | `memory_skill_compositional_context` | `other` | L2-7 | Return a skill body + reflection memories from the namespaces declared in its `composes_with_reflections` frontmatter list, bounded by `max_reflection_depth` and a caller-supplied token budget (`budget_tokens`, default 4000, max 32000). |
 | `memory_skill_retire` | `other` | #2024 | **Reversible.** Retire (hide + block re-register) or unretire a skill lineage. Default target is the whole `(namespace, name)` lineage; pass `skill_id` to act on a single version. Idempotent (`affected=0` when already in the requested state). Set `unretire=true` to reverse. Backed by the schema-v82 `retired_at` / `retired_by` / `retire_reason` columns — the skill rows are NOT deleted. Admin-gated; HTTP twin `POST /api/v1/skill/{id}/retire`. |
@@ -200,6 +200,32 @@ revisions documented in
 append-only `signed_events` audit table on every export, so a
 downstream auditor can re-derive when and by whom a skill was
 moved off the substrate.
+
+## Export root (#3357)
+
+`memory_skill_export` writes on the host, so its caller-supplied
+`target_folder` is CONFINED to an export root — the write-side twin of the
+`AI_MEMORY_SKILLS_IMPORT_ROOT` register jail (#1923). The root is resolved
+fail-closed, before any filesystem I/O:
+
+- `AI_MEMORY_SKILLS_EXPORT_ROOT`, when the operator sets it. It must already
+  exist — an operator root is never created, so an env typo refuses rather
+  than silently minting a jail nowhere anyone meant.
+- Otherwise a `skills-export` directory **beside the resolved store**: the
+  parent directory of the `--db` path this process opened. It is created on
+  first export with mode `0700`.
+
+If neither resolves to an existing directory the export is REFUSED; there is
+no unconfined fallback, and the process working directory is deliberately not
+one — a daemon's CWD is arbitrary (frequently `/` or `$HOME`), which is not a
+jail.
+
+A `target_folder` must then resolve inside that root. A `..` component is
+rejected lexically, a relative path is anchored at the root, the deepest
+existing ancestor is canonicalized (so a planted `<root>/link -> /etc` is
+caught), and containment is re-asserted after the directory is created and
+before `SKILL.md` is written. The response still echoes the caller's
+`target_folder` spelling, so the round-trip guarantee above is unchanged.
 
 ## Cross-node interchange (export-folder round-trip)
 

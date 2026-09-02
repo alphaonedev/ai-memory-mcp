@@ -45,7 +45,7 @@
 use std::path::PathBuf;
 
 use ai_memory::db;
-use ai_memory::mcp::{handle_skill_export, handle_skill_register, handle_skill_resource};
+use ai_memory::mcp::{handle_skill_export_in_root, handle_skill_register, handle_skill_resource};
 use serde_json::{Value, json};
 
 fn local_runs_root() -> PathBuf {
@@ -142,13 +142,17 @@ fn skill_export_import_roundtrip_resolves_resources_on_peer() {
     // 3. Node A — export to a peer-transport folder (the wire format).
     // -----------------------------------------------------------------
     let exported = workspace.join("exported");
-    let exported_resp = handle_skill_export(
+    // #3357 — the export jail: pin the test workspace as the configured
+    // export root (it lives outside the process working directory, the
+    // default root) rather than mutating process-global env.
+    let exported_resp = handle_skill_export_in_root(
         &conn_a,
         &json!({
             "skill_id": skill_id_a,
             "target_folder": exported.to_str().unwrap(),
         }),
         None,
+        &workspace,
     )
     .expect("node A: export");
     assert_eq!(exported_resp["exported"], json!(true));
@@ -299,13 +303,15 @@ fn skill_export_folder_is_self_contained_for_peer_import() {
     let id_a = resp_a["id"].as_str().unwrap().to_string();
 
     let exported = workspace.join("exported");
-    handle_skill_export(
+    // #3357 — see above: the workspace is the configured export root.
+    handle_skill_export_in_root(
         &conn_a,
         &json!({
             "skill_id": id_a,
             "target_folder": exported.to_str().unwrap(),
         }),
         None,
+        &workspace,
     )
     .expect("export from a");
 

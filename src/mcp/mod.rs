@@ -743,7 +743,10 @@ pub use verify::handle_verify;
 // the same substrate without re-implementing business logic. CLI/HTTP
 // parity with the seven MCP `memory_skill_*` tools is the contract.
 pub use skill_compositional_context::handle_skill_compositional_context;
-pub use skill_export::handle_skill_export;
+pub use skill_export::{
+    DEFAULT_EXPORT_DIR_NAME, SKILLS_EXPORT_ROOT_ENV, handle_skill_export,
+    handle_skill_export_in_root,
+};
 pub use skill_get::handle_skill_get;
 pub use skill_list::handle_skill_list;
 pub use skill_promote::handle_skill_promote_from_reflection;
@@ -2803,7 +2806,7 @@ fn dispatch_memory_skill_resource(ctx: &ToolDispatchCtx<'_>) -> Result<Value, St
 }
 
 fn dispatch_memory_skill_export(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_export(ctx.conn, ctx.arguments, ctx.active_keypair)
+    handle_skill_export(ctx.conn, ctx.db_path, ctx.arguments, ctx.active_keypair)
 }
 
 fn dispatch_memory_skill_promote_from_reflection(

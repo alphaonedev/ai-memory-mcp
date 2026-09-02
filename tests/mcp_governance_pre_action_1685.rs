@@ -280,7 +280,12 @@ fn mcp_skill_export_refused_by_filesystem_write_rule_1685() {
     initialize(stdin, &rx);
     let skill_id = register_skill(stdin, &rx, &db_path);
 
-    let target = local_runs_root().join(format!("export-refused-{}", uuid::Uuid::new_v4()));
+    // #3357 — `unique_db()` puts the store in `local_runs_root()`, so the
+    // default export jail root is `local_runs_root()/skills-export`. Export
+    // INSIDE it, exercising the shipped default with nothing configured.
+    let target = local_runs_root()
+        .join(ai_memory::mcp::DEFAULT_EXPORT_DIR_NAME)
+        .join(format!("export-refused-{}", uuid::Uuid::new_v4()));
     let resp = call_skill_export(stdin, &rx, &skill_id, &target);
     let blob = serde_json::to_string(&resp).unwrap();
 
@@ -323,7 +328,12 @@ fn mcp_skill_export_succeeds_without_rule_1685() {
     initialize(stdin, &rx);
     let skill_id = register_skill(stdin, &rx, &db_path);
 
-    let target = local_runs_root().join(format!("export-ok-{}", uuid::Uuid::new_v4()));
+    // #3357 — `unique_db()` puts the store in `local_runs_root()`, so the
+    // default export jail root is `local_runs_root()/skills-export`. Export
+    // INSIDE it, exercising the shipped default with nothing configured.
+    let target = local_runs_root()
+        .join(ai_memory::mcp::DEFAULT_EXPORT_DIR_NAME)
+        .join(format!("export-ok-{}", uuid::Uuid::new_v4()));
     let resp = call_skill_export(stdin, &rx, &skill_id, &target);
     let blob = serde_json::to_string(&resp).unwrap();
 
