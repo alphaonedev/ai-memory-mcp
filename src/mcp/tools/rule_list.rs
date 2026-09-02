@@ -39,11 +39,27 @@ use crate::mcp::param_names;
 /// }
 /// ```
 pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Result<Value, String> {
-    let kind_filter = arguments.get(param_names::KIND).and_then(Value::as_str);
-    let enabled_only = arguments
-        .get("enabled_only")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // #3374 — both filters FAILED OPEN by widening the result set. A
+    // present-but-non-string `kind` was dropped by `and_then(Value::as_str)`,
+    // and a present-but-non-boolean `enabled_only` (`"true"` — the shape an LLM
+    // caller emits most often) fell back to `false`: BOTH answered "every
+    // governance rule in the substrate" to an operator who had asked for one
+    // kind, or for only the rules the engine actually enforces. On a governance
+    // read surface that is the worst direction to be wrong in. Refuse the
+    // contradictory filter; an ABSENT filter still means "all".
+    //
+    // `kind` is free-form (rule kinds are not a closed set — `matcher_key_schema`
+    // returns `None` for kinds it does not model), so the `optional_enum` parser
+    // here only rejects a blank string; an unknown-but-well-formed kind still
+    // legitimately returns zero rows.
+    let kind_filter: Option<String> =
+        crate::mcp::param_guard::optional_enum(arguments, param_names::KIND, |s| {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        })?;
+    let kind_filter = kind_filter.as_deref();
+    let enabled_only =
+        crate::mcp::param_guard::optional_bool(arguments, "enabled_only")?.unwrap_or(false);
 
     // v0.7.0 #1041 (Agent-6 #4) — `enabled_only=true` previously
     // post-filtered the `list(conn)` result with `r.enabled` only.

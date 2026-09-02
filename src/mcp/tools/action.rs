@@ -59,10 +59,13 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
         .get(param_names::PAYLOAD)
         .cloned()
         .unwrap_or(Value::Null);
-    let priority = params
-        .get(param_names::PRIORITY)
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+    // #3374 — `priority` is an `i64`-declared OPTIONAL read with
+    // `as_i64().unwrap_or(0)`, so a float (`7.5`) or a stringy number read as
+    // ABSENT and silently stored priority `0` — the LOWEST rank. The frontier
+    // orders `priority DESC`, so an action the caller marked urgent sorted
+    // LAST, and nothing in the response said so. Refuse the wrong type.
+    let priority =
+        crate::mcp::param_guard::optional_i64(params, param_names::PRIORITY)?.unwrap_or(0);
     let agent_id = params
         .get(param_names::AGENT_ID)
         .and_then(Value::as_str)
@@ -529,10 +532,14 @@ pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Resu
     // wire-strict-validate it in every posture). See [`resolve_lease_holder`].
     let holder = resolve_lease_holder(params, "acquire a lease")?;
     let holder = holder.as_str();
-    let ttl_secs = params
-        .get(param_names::TTL_SECS)
-        .and_then(Value::as_i64)
-        .unwrap_or(60);
+    // #3374 — `ttl_secs` is an `i64`-declared OPTIONAL. Pre-fix a
+    // present-but-non-integer value (`"60"`, `60.5`, `true`) read as ABSENT via
+    // `as_i64()` and silently took the 60s server default, so a caller that
+    // asked for a long lease got a short one and its work was reclaimed under
+    // it by the expiry sweep. Refuse the wrong TYPE here; `validate_ttl_secs`
+    // below still owns the RANGE (<=0 / >1yr).
+    let ttl_secs =
+        crate::mcp::param_guard::optional_i64(params, param_names::TTL_SECS)?.unwrap_or(60);
 
     // #1806 — clamp the caller-supplied TTL (reject <=0 / >1yr) + checked add,
     // mirroring the memory-write path (validate::validate_ttl_secs). Without it
@@ -591,10 +598,11 @@ pub fn handle_lease_renew(conn: &rusqlite::Connection, params: &Value) -> Result
     // indefinitely. Bind it to the caller principal.
     let holder = resolve_lease_holder(params, "renew a lease")?;
     let holder = holder.as_str();
-    let ttl_secs = params
-        .get(param_names::TTL_SECS)
-        .and_then(Value::as_i64)
-        .unwrap_or(60);
+    // #3374 — `ttl_secs` is an `i64`-declared OPTIONAL; see
+    // `handle_lease_acquire`. Refuse the wrong TYPE; the RANGE stays owned by
+    // `validate_ttl_secs` below.
+    let ttl_secs =
+        crate::mcp::param_guard::optional_i64(params, param_names::TTL_SECS)?.unwrap_or(60);
 
     // #1806 — clamp + checked add (see lease_acquire).
     crate::validate::validate_ttl_secs(Some(ttl_secs)).map_err(|e| e.to_string())?;
