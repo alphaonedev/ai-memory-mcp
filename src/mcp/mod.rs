@@ -2610,11 +2610,18 @@ fn dispatch_memory_detect_contradiction(ctx: &ToolDispatchCtx<'_>) -> Result<Val
 }
 
 fn dispatch_memory_archive_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_archive_list(ctx.conn, ctx.arguments)
+    // v1.0.0 #3382 — resolve the read-visibility principal so the archive
+    // listing is owner-scoped, parity with the `require_admin`-gated HTTP twin.
+    // `None` (no `AI_MEMORY_AGENT_ID`) is the single-operator trust-all posture.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_archive_list(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_archive_restore(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_archive_restore(ctx.conn, ctx.arguments)
+    // #3382 — route through the gated `restore_archived_for_caller` twin the
+    // HTTP route has used since #940 instead of the owner-blind primitive.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_archive_restore(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_archive_purge(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2622,7 +2629,9 @@ fn dispatch_memory_archive_purge(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Str
 }
 
 fn dispatch_memory_archive_stats(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_archive_stats(ctx.conn)
+    // #3382 — owner-scoped aggregate, parity with `memory_archive_list`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_archive_stats(ctx.conn, caller.as_deref())
 }
 
 fn dispatch_memory_gc(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

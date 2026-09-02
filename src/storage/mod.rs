@@ -15666,40 +15666,86 @@ const SQL_SIZE_GC_NEXT_VICTIM: &str = "SELECT id, \
 // Archive operations
 // ---------------------------------------------------------------------------
 
+/// v1.0.0 #3382 — the column projection shared by every `archived_memories`
+/// listing shape. Single-sourced so the caller-scoped and unscoped variants
+/// cannot drift in what they return (the #1637 v49-column carry lives here).
+const SQL_ARCHIVE_LIST_PROJECTION: &str = "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
+     source, access_count, created_at, updated_at, last_accessed_at, \
+     expires_at, archived_at, archive_reason, metadata, \
+     reflection_depth, memory_kind, entity_id, persona_version, \
+     citations, source_uri, source_span, confidence_source, \
+     confidence_signals, confidence_decayed_at, version, \
+     atomised_into, atom_of, mentioned_entity_id \
+     FROM archived_memories";
+
+/// v1.0.0 #3382 — the ONE ownership predicate that scopes an archive READ to
+/// a caller, rendered against positional bind `idx` (bound to the caller id).
+///
+/// Byte-identical to the gate [`restore_archived_for_caller`] (#940) applies,
+/// single-sourced here so "what I can SEE in the archive" and "what I can
+/// RESTORE from it" cannot drift: a caller sees an archived row iff they
+/// authored it, are its inbox target, or it is a legacy/unowned row (the #940
+/// carve-out that keeps pre-NHI corpora restorable).
+///
+/// Pre-#3382 `memory_archive_list` / `memory_archive_stats` had NO caller at
+/// all, so any agent read every other tenant's archived title, content and
+/// `metadata.agent_id` — full-content cross-tenant disclosure of rows those
+/// same agents cannot `memory_get`.
+fn archive_owner_scope_clause(idx: usize) -> String {
+    format!(
+        "(json_extract(metadata, '$.agent_id') = ?{idx} OR \
+          json_extract(metadata, '$.target_agent_id') = ?{idx} OR \
+          json_extract(metadata, '$.agent_id') IS NULL OR \
+          json_extract(metadata, '$.agent_id') = '')"
+    )
+}
+
 pub fn list_archived(
     conn: &Connection,
     namespace: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> Result<Vec<serde_json::Value>> {
-    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match namespace {
-        Some(ns) => (
-            "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
-             source, access_count, created_at, updated_at, last_accessed_at, \
-             expires_at, archived_at, archive_reason, metadata, \
-             reflection_depth, memory_kind, entity_id, persona_version, \
-             citations, source_uri, source_span, confidence_source, \
-             confidence_signals, confidence_decayed_at, version, \
-             atomised_into, atom_of, mentioned_entity_id \
-             FROM archived_memories WHERE namespace = ?1 \
-             ORDER BY archived_at DESC LIMIT ?2 OFFSET ?3"
-                .to_string(),
-            vec![Box::new(ns.to_string()), Box::new(limit), Box::new(offset)],
-        ),
-        None => (
-            "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
-             source, access_count, created_at, updated_at, last_accessed_at, \
-             expires_at, archived_at, archive_reason, metadata, \
-             reflection_depth, memory_kind, entity_id, persona_version, \
-             citations, source_uri, source_span, confidence_source, \
-             confidence_signals, confidence_decayed_at, version, \
-             atomised_into, atom_of, mentioned_entity_id \
-             FROM archived_memories \
-             ORDER BY archived_at DESC LIMIT ?1 OFFSET ?2"
-                .to_string(),
-            vec![Box::new(limit), Box::new(offset)],
-        ),
+    list_archived_scoped(conn, namespace, None, limit, offset)
+}
+
+/// v1.0.0 #3382 — caller-scoped archive listing. `caller == None` is the
+/// unscoped (single-operator / admin) posture and is byte-identical to the
+/// pre-#3382 [`list_archived`]; `Some(caller)` narrows the rows to
+/// `archive_owner_scope_clause`.
+///
+/// # Errors
+/// Propagates any rusqlite prepare / query failure.
+pub fn list_archived_scoped(
+    conn: &Connection,
+    namespace: Option<&str>,
+    caller: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let mut wheres: Vec<String> = Vec::new();
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(ns) = namespace {
+        params_vec.push(Box::new(ns.to_string()));
+        wheres.push(format!("namespace = ?{}", params_vec.len()));
+    }
+    if let Some(c) = caller {
+        params_vec.push(Box::new(c.to_string()));
+        wheres.push(archive_owner_scope_clause(params_vec.len()));
+    }
+    let where_sql = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {} ", wheres.join(" AND "))
     };
+    params_vec.push(Box::new(limit));
+    let limit_idx = params_vec.len();
+    params_vec.push(Box::new(offset));
+    let offset_idx = params_vec.len();
+    let sql = format!(
+        "{SQL_ARCHIVE_LIST_PROJECTION} {where_sql}\
+         ORDER BY archived_at DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    );
     let params_refs: Vec<&dyn rusqlite::types::ToSql> =
         params_vec.iter().map(std::convert::AsRef::as_ref).collect();
     let mut stmt = conn.prepare(&sql)?;
@@ -16095,19 +16141,16 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // inbox-target row whose recipient is the caller, or be a
         // legacy unowned row — see archive_memory_for_caller for the
         // matching SQL + #940 carve-out rationale).
+        // v1.0.0 #3382 — the ownership predicate is single-sourced in
+        // [`archive_owner_scope_clause`] so this restore gate and the archive
+        // LIST / STATS scope are provably the same rule: a caller may restore
+        // exactly the archived rows they can see.
+        let owned_sql = format!(
+            "SELECT COUNT(*) > 0 FROM archived_memories WHERE id = ?1 AND {}",
+            archive_owner_scope_clause(2)
+        );
         let owned: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM archived_memories \
-                 WHERE id = ?1 \
-                   AND ( \
-                     json_extract(metadata, '$.agent_id') = ?2 OR \
-                     json_extract(metadata, '$.target_agent_id') = ?2 OR \
-                     json_extract(metadata, '$.agent_id') IS NULL OR \
-                     json_extract(metadata, '$.agent_id') = '' \
-                   )",
-                params![id, caller],
-                |r| r.get(0),
-            )
+            .query_row(&owned_sql, params![id, caller], |r| r.get(0))
             .unwrap_or(false);
         if !owned {
             // #2064 — reconstruct-on-read (owner-scoped twin). Only when the
@@ -16617,18 +16660,55 @@ pub fn purge_archive_for_caller(
 }
 
 pub fn archive_stats(conn: &Connection) -> Result<serde_json::Value> {
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM archived_memories", [], |r| r.get(0))?;
-    let mut stmt = conn.prepare(
-        "SELECT namespace, COUNT(*) FROM archived_memories GROUP BY namespace ORDER BY COUNT(*) DESC",
-    )?;
-    let by_ns: Vec<serde_json::Value> = stmt
-        .query_map([], |row| {
-            Ok(serde_json::json!({
-                "namespace": row.get::<_, String>(0)?,
-                "count": row.get::<_, i64>(1)?,
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    archive_stats_scoped(conn, None)
+}
+
+/// v1.0.0 #3382 — caller-scoped archive stats. `caller == None` is the
+/// unscoped (single-operator / admin) posture and is byte-identical to the
+/// pre-#3382 [`archive_stats`]; `Some(caller)` narrows the aggregate to the
+/// rows `archive_owner_scope_clause` admits.
+///
+/// The per-namespace breakdown is as disclosive as the listing: an unscoped
+/// aggregate tells any caller which OTHER tenants' namespaces hold archived
+/// rows and how many, which is exactly the corpus-shape metadata the HTTP twin
+/// has gated behind `require_admin` since #943.
+///
+/// # Errors
+/// Propagates any rusqlite prepare / query failure.
+pub fn archive_stats_scoped(conn: &Connection, caller: Option<&str>) -> Result<serde_json::Value> {
+    let where_sql = match caller {
+        Some(_) => format!("WHERE {} ", archive_owner_scope_clause(1)),
+        None => String::new(),
+    };
+    let total_sql = format!("SELECT COUNT(*) FROM archived_memories {where_sql}");
+    let by_ns_sql = format!(
+        "SELECT namespace, COUNT(*) FROM archived_memories {where_sql}\
+         GROUP BY namespace ORDER BY COUNT(*) DESC"
+    );
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "namespace": row.get::<_, String>(0)?,
+            "count": row.get::<_, i64>(1)?,
+        }))
+    };
+    let (total, by_ns): (i64, Vec<serde_json::Value>) = match caller {
+        Some(c) => {
+            let total: i64 = conn.query_row(&total_sql, params![c], |r| r.get(0))?;
+            let mut stmt = conn.prepare(&by_ns_sql)?;
+            let rows = stmt
+                .query_map(params![c], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            (total, rows)
+        }
+        None => {
+            let total: i64 = conn.query_row(&total_sql, [], |r| r.get(0))?;
+            let mut stmt = conn.prepare(&by_ns_sql)?;
+            let rows = stmt
+                .query_map([], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            (total, rows)
+        }
+    };
     Ok(serde_json::json!({
         "archived_total": total,
         (field_names::BY_NAMESPACE): by_ns,
