@@ -1,0 +1,87 @@
+# scripts/qc-allowlists/test-env-mutation-baseline.txt -- issue #3475 ratchet baseline.
+#
+# Format: <AI_MEMORY_AGENT_ID installs> <total env mutations> <path>
+#
+# Regenerate with: scripts/check-test-env-lock.sh --update-baseline
+# A regenerated baseline that RAISES any number is a deliberate,
+# reviewable widening of the #3475 control -- justify it in review.
+# See the arm (d) header in scripts/check-test-env-lock.sh.
+0 6 src/background/atomise_worker.rs
+0 7 src/background/auto_tag_worker.rs
+0 2 src/checkpoints/mod.rs
+0 3 src/cli/agents.rs
+0 12 src/cli/audit.rs
+0 4 src/cli/backup.rs
+0 19 src/cli/boot.rs
+0 6 src/cli/commands/atomise.rs
+0 12 src/cli/commands/config.rs
+0 3 src/cli/curator.rs
+0 24 src/cli/doctor.rs
+0 2 src/cli/governance_install_defaults.rs
+0 6 src/cli/helpers.rs
+0 4 src/cli/identity.rs
+0 7 src/cli/install.rs
+0 6 src/cli/link.rs
+4 6 src/cli/recall.rs
+0 6 src/cli/rules.rs
+0 5 src/cli/store.rs
+0 2 src/cli/test_utils.rs
+0 4 src/cli/verify.rs
+0 3 src/confidence/decay.rs
+0 4 src/confidence/mod.rs
+0 9 src/confidence/shadow.rs
+0 141 src/config.rs
+1 2 src/coordination_guard.rs
+0 67 src/daemon_runtime.rs
+0 5 src/egress.rs
+0 9 src/embeddings.rs
+0 47 src/enterprise_federation_posture.rs
+0 11 src/erasure/mod.rs
+0 1 src/federation/identity/credential.rs
+0 1 src/federation/identity/inventory.rs
+0 4 src/federation/identity/resolver.rs
+0 23 src/federation/peer_attestation.rs
+0 2 src/federation/peer.rs
+0 6 src/federation/push_dlq.rs
+0 28 src/federation/receive_auth.rs
+0 6 src/federation/signing.rs
+0 9 src/governance/audit.rs
+0 17 src/governance/rules_store.rs
+0 3 src/handlers/federation_receive.rs
+0 45 src/handlers/federation_signing_check.rs
+0 5 src/handlers/tests.rs
+0 4 src/hnsw.rs
+0 2 src/hooks/post_reflect/auto_export.rs
+0 4 src/hooks/timeouts.rs
+0 1 src/identity/attest.rs
+0 3 src/identity/keypair.rs
+0 6 src/identity/lineage.rs
+12 45 src/identity/mod.rs
+0 11 src/llm.rs
+0 3 src/main.rs
+0 9 src/mcp/mod.rs
+3 4 src/mcp/tools/action.rs
+0 4 src/mcp/tools/capture_turn.rs
+0 8 src/mcp/tools/checkpoint.rs
+3 5 src/mcp/tools/delete.rs
+4 9 src/mcp/tools/forget.rs
+1 2 src/mcp/tools/kg_query.rs
+2 3 src/mcp/tools/link.rs
+3 4 src/mcp/tools/namespace.rs
+5 10 src/mcp/tools/pending.rs
+5 10 src/mcp/tools/promote.rs
+0 9 src/mcp/tools/recall.rs
+0 2 src/mcp/tools/rule_list.rs
+0 1 src/observations/gc.rs
+0 6 src/recover/durability.rs
+0 11 src/recover/transcript_paths.rs
+0 15 src/reranker.rs
+0 25 src/security_profile.rs
+0 1 src/storage/migrations.rs
+1 9 src/storage/mod.rs
+0 3 src/storage/schema_guard.rs
+0 2 src/store/postgres.rs
+0 10 src/store_url.rs
+0 2 src/subscriptions.rs
+0 4 src/test_support.rs
+0 6 src/tls.rs
