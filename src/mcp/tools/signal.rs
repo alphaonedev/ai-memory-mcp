@@ -360,14 +360,14 @@ pub fn handle_signal_send_with_hooks(
 /// matches, mirroring how `memory_get` reports an absent row.
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on query failure.
+/// Returns `"id is required"` when the schema-required `id` is missing,
+/// blank, or not a JSON string (#3365), or the stringified `rusqlite` error
+/// on query failure.
 pub fn handle_signal_read(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let id = params
-        .get(param_names::ID)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
+    // #3365 (#3171 residue) — `id` is schema-REQUIRED; the `""` fallback
+    // returned `{"signal": null}` for a malformed call, so a caller could not
+    // tell a bad id from a deleted/expired signal. Refuse instead.
+    let id = crate::mcp::param_guard::require_str(params, param_names::ID)?;
     let found = crate::signals::get(conn, id).map_err(|e| e.to_string())?;
     match found {
         None => Ok(json!({ "signal": Value::Null })),
@@ -388,24 +388,29 @@ pub fn handle_signal_read(conn: &rusqlite::Connection, params: &Value) -> Result
 /// broadcasts), newest-first, capped at `limit` (default 50).
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on query failure.
+/// Returns `"namespace is required"` when the schema-required `namespace` is
+/// missing/blank/non-string, `"invalid to_agent: .."` when the recipient
+/// filter is present but is not a non-empty string (#3365), or the
+/// stringified `rusqlite` error on query failure.
 pub fn handle_signal_inbox(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let namespace = params
-        .get(param_names::NAMESPACE)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let to_agent = params
-        .get(param_names::TO_AGENT)
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    // #3365 (#3171 residue) — `namespace` is schema-REQUIRED; the `""`
+    // fallback answered `memory_signal_inbox {}` with an empty `signals` list,
+    // which an agent reads as "no messages for me" and never retries.
+    let namespace = crate::mcp::param_guard::require_str(params, param_names::NAMESPACE)?;
+    // #3365 — a PRESENT-but-non-string `to_agent` DROPPED the recipient
+    // predicate, so the inbox returned every OTHER agent's DIRECT signals
+    // instead of only this recipient's directs plus namespace broadcasts: a
+    // confidentiality leak produced by a wrong TYPE, not by any authz decision.
+    // Refuse it; an ABSENT `to_agent` still means the whole namespace.
+    let to_agent = crate::mcp::param_guard::optional_str(params, param_names::TO_AGENT)?;
     let limit = params
         .get(param_names::LIMIT)
         .and_then(Value::as_i64)
         .unwrap_or(50);
     let limit = usize::try_from(limit).unwrap_or(50);
 
-    let signals = crate::signals::list_inbox(conn, namespace, to_agent.as_deref(), limit)
-        .map_err(|e| e.to_string())?;
+    let signals =
+        crate::signals::list_inbox(conn, namespace, to_agent, limit).map_err(|e| e.to_string())?;
     Ok(json!({
         "signals": serde_json::to_value(&signals).map_err(|e| e.to_string())?,
     }))

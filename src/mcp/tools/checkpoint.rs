@@ -418,17 +418,20 @@ pub fn handle_checkpoint_query(
 /// `memory_signal_read` reports an absent row.
 ///
 /// # Errors
-/// Returns the stringified `rusqlite` error on query failure.
+/// Returns `"id is required"` when the schema-required `id` is missing,
+/// blank, or not a JSON string (#3365), or the stringified `rusqlite` error
+/// on query failure.
 pub fn handle_checkpoint_verify(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
-    let id = params
-        .get(param_names::ID)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
+    // #3365 (#3171 residue) — `id` is schema-REQUIRED. This is the worst of
+    // the family: the `""` fallback made `memory_checkpoint_verify {}` return
+    // `{"checkpoint": null, "verified": false}`, which reads as "the
+    // attestation FAILED VERIFICATION" rather than "you did not name a
+    // checkpoint". Refuse instead — a verification verdict must never be
+    // manufactured from a malformed request.
+    let id = crate::mcp::param_guard::require_str(params, param_names::ID)?;
     let found = crate::checkpoints::get(conn, id).map_err(|e| e.to_string())?;
     match found {
         None => Ok(json!({ (RESP_CHECKPOINT): Value::Null, "verified": false })),

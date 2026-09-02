@@ -54,6 +54,14 @@ pub mod param_names;
 // negative-as-absent / stringy-bool). These helpers refuse instead.
 pub mod param_guard;
 
+// #3365 — table-driven regression suite driving the WHOLE converted
+// coordination-reader family (`action_get`/`_edges`/`_list`,
+// `signal_read`/`_inbox`, `checkpoint_verify`) through one denied-path
+// and one allowed-path table. Test-only, and a sibling of the handler
+// modules so it can reach them (they are private `mod`s of `mcp`).
+#[cfg(test)]
+mod param_shapes_3365_tests;
+
 // #1558 batch 3 — JSON-RPC 2.0 wire-layer SSOT: version tag, reserved
 // error codes, method names, MCP protocol revision.
 pub mod jsonrpc;
