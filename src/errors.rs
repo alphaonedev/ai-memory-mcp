@@ -278,6 +278,18 @@ pub mod msg {
         format!("approve rejected: {reason}")
     }
 
+    /// v1.0.0 #3388 — `"reject refused: {reason}"`.
+    ///
+    /// The CALLER was refused, not the pending action: the row is untouched
+    /// and still `pending`. Deliberately distinct from
+    /// [`approve_rejected`] and from the operational
+    /// "pending action not found or already decided" text, so an operator can
+    /// tell an eligibility refusal from a no-op.
+    #[must_use]
+    pub fn reject_refused(reason: impl std::fmt::Display) -> String {
+        format!("reject refused: {reason}")
+    }
+
     /// `"older_than_days must be non-negative (got {days})"`.
     #[must_use]
     pub fn older_than_days_negative(days: impl std::fmt::Display) -> String {

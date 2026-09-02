@@ -356,6 +356,19 @@ fn audit_pending_verdict(agent_id: &str, id: &str, decision: &str) {
     );
 }
 
+/// v1.0.0 #3388 — the reject twin of [`audit_pending_verdict`]. Same row
+/// shape, `pending_reject` resource. Attributed to the RESOLVED caller, never
+/// to an id the request asserted.
+fn audit_reject_verdict(agent_id: &str, id: &str) {
+    crate::governance::audit::record_decision(
+        agent_id,
+        "refuse",
+        "pending_reject",
+        "",
+        json!({ (field_names::PENDING_ID): id }),
+    );
+}
+
 pub fn handle_pending_approve(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -919,6 +932,152 @@ mod tests {
             "got: {err}"
         );
     }
+
+    // =================================================================
+    // v1.0.0 #3388 — `memory_pending_reject` approver gate.
+    //
+    // Pre-#3388 the reject handler called `db::decide_pending_action(..,
+    // false, ..)` DIRECTLY with no eligibility gate at all, while approve
+    // refuses self-approval and unregistered approvers. Any tenant —
+    // including the REQUESTER — could therefore veto any tenant's queued
+    // action (and with `remember` write a synthetic DENY rule off it).
+    // Reject now runs the SAME `evaluate_approver_eligibility` predicate
+    // approve runs, under the same `LocalOperator` posture.
+    // =================================================================
+
+    /// #3388 DENIED — the requester may not veto their own queued action
+    /// under the multi-agent opt-in, exactly as approve refuses them.
+    #[test]
+    fn pending_reject_refuses_requester_self_veto_3388() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        let id = queue_pending(&conn, "ai:alice");
+        db::register_agent(&conn, "ai:alice", "test", &[]).expect("register alice");
+        // SAFETY: process-global env mutation serialized on the crate-wide
+        // test lock acquired above; restored before return.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+
+        // Capture WITHOUT unwrapping so a failure cannot panic before the
+        // env is restored and poison a sibling test's posture.
+        let out = handle_pending_reject(&conn, &json!({"id": id}), None);
+        let row = db::get_pending_action(&conn, &id)
+            .expect("read")
+            .expect("row present");
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+
+        let err = out.expect_err("the requester must not be able to veto their own action");
+        assert!(err.contains("reject refused"), "got: {err}");
+        assert!(
+            err.contains(crate::errors::msg::SELF_APPROVAL_REFUSED),
+            "the refusal must carry the shared separation-of-duties reason, got: {err}"
+        );
+        assert_eq!(row.status, "pending", "a refused veto must not decide");
+        assert!(row.decided_by.is_none(), "no decider may be recorded");
+    }
+
+    /// #3388 DENIED — a non-requester who is not a REGISTERED agent may not
+    /// veto, exactly as approve refuses an unregistered approver. This is
+    /// the cross-tenant sabotage shape: pre-fix any caller could claim any
+    /// id and kill any queue entry.
+    #[test]
+    fn pending_reject_refuses_unregistered_approver_3388() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        let id = queue_pending(&conn, "ai:alice");
+        // ai:mallory is deliberately NOT registered.
+        // SAFETY: serialized on the crate-wide test lock acquired above.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:mallory") };
+
+        // Capture WITHOUT unwrapping — see the sibling test.
+        let out = handle_pending_reject(&conn, &json!({"id": id}), None);
+        let row = db::get_pending_action(&conn, &id)
+            .expect("read")
+            .expect("row present");
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+
+        let err = out.expect_err("an unregistered agent must not be able to veto");
+        assert!(err.contains("reject refused"), "got: {err}");
+        assert!(err.contains("is not a registered agent"), "got: {err}");
+        assert_eq!(row.status, "pending", "a refused veto must not decide");
+        assert!(row.decided_by.is_none(), "no decider may be recorded");
+    }
+
+    /// #3388 ALLOWED — a REGISTERED, non-requester approver still vetoes.
+    /// The gate must not break the legitimate governance path.
+    #[test]
+    fn pending_reject_allows_registered_non_requester_3388() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        let id = queue_pending(&conn, "ai:alice");
+        db::register_agent(&conn, "ai:bob", "test", &[]).expect("register bob");
+        // SAFETY: serialized on the crate-wide test lock acquired above.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:bob") };
+
+        let out = handle_pending_reject(&conn, &json!({"id": id}), None);
+
+        let row = db::get_pending_action(&conn, &id)
+            .expect("read")
+            .expect("row present");
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+
+        let out = out.expect("a registered non-requester approver must be allowed");
+        assert_eq!(out["rejected"], json!(true));
+        assert_eq!(out["decided_by"], json!("ai:bob"));
+        assert_eq!(row.status, "rejected");
+        assert_eq!(row.decided_by.as_deref(), Some("ai:bob"));
+    }
+
+    /// #3388 ALLOWED — the single-operator trust-all default (no
+    /// `AI_MEMORY_AGENT_ID`) is UNCHANGED: the gate is armed by the
+    /// multi-agent opt-in, so the lone operator is never self-locked out of
+    /// vetoing their own queue. Same posture rule as approve (#1796).
+    #[test]
+    fn pending_reject_default_posture_not_self_locked_3388() {
+        let _envg = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh_conn();
+        let id = queue_pending(&conn, "ai:alice");
+
+        let out = handle_pending_reject(&conn, &json!({"id": id}), None)
+            .expect("the lone operator must still be able to veto");
+        assert_eq!(out["rejected"], json!(true));
+        let row = db::get_pending_action(&conn, &id)
+            .expect("read")
+            .expect("row present");
+        assert_eq!(row.status, "rejected");
+    }
+
+    /// #3388 PARITY — approve and reject must reach the SAME eligibility
+    /// verdict for the SAME caller on the SAME action. Pinning the pair is
+    /// the point of the defect: they were structurally allowed to disagree.
+    #[test]
+    fn pending_reject_eligibility_matches_approve_3388() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        let approve_id = queue_pending(&conn, "ai:alice");
+        let reject_id = queue_pending(&conn, "ai:alice");
+        db::register_agent(&conn, "ai:alice", "test", &[]).expect("register alice");
+        // SAFETY: serialized on the crate-wide test lock acquired above.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+
+        // Capture WITHOUT unwrapping — see the sibling test.
+        let approve_out = handle_pending_approve(&conn, &json!({"id": approve_id}), None);
+        let reject_out = handle_pending_reject(&conn, &json!({"id": reject_id}), None);
+
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+
+        let approve_err = approve_out.expect_err("self-approval is refused");
+        let reject_err = reject_out.expect_err("self-veto must be refused too");
+        let reason = crate::errors::msg::SELF_APPROVAL_REFUSED;
+        assert!(approve_err.contains(reason), "approve: {approve_err}");
+        assert!(
+            reject_err.contains(reason),
+            "reject must refuse for the SAME reason approve does, got: {reject_err}"
+        );
+    }
 }
 
 pub fn handle_pending_reject(
@@ -938,24 +1097,52 @@ pub fn handle_pending_reject(
         mcp_client,
         "reject",
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| {
+        // #3388 — mirror the approve side (#3171): rejecting AS SOMEONE ELSE is
+        // a separation-of-duties attack, not an operational error, so it earns
+        // a `refuse` row attributed to the ENFORCED caller — never to the id
+        // the request asserted. Without it, the one refused veto attempt would
+        // leave no trace in the tamper-evident chain.
+        audit_reject_verdict(
+            &crate::identity::resolve_read_visibility_caller()
+                .unwrap_or_else(|| crate::identity::sentinels::ANONYMOUS_INVALID.to_string()),
+            id,
+        );
+        e.to_string()
+    })?;
     let remember = parse_remember_param(params);
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
     // Reject is the privileged-gate denial; mirror approve so both
     // outcomes appear in the forensic chain BEFORE the storage write.
-    crate::governance::audit::record_decision(
-        &agent_id,
-        "refuse",
-        "pending_reject",
-        "",
-        json!({ "pending_id": id }),
-    );
+    // #3388 — this fires for EVERY reject attempt that got as far as a
+    // resolved caller, so an INELIGIBLE veto attempt is auditable too, keyed
+    // on the resolved governance subject rather than a wire-chosen id.
+    audit_reject_verdict(&agent_id, id);
 
-    let transitioned =
-        db::decide_pending_action(conn, id, false, &agent_id).map_err(|e| e.to_string())?;
-    if !transitioned {
-        return Err(format!("pending action not found or already decided: {id}"));
+    // v1.0.0 #3388 — approver-eligibility gate. Pre-fix this called
+    // `db::decide_pending_action(.., false, ..)` DIRECTLY, with no gate at all:
+    // any tenant — including the requester, whom `memory_pending_approve`
+    // explicitly refuses — could veto any tenant's queued action, and with
+    // `remember` write a synthetic DENY rule off the back of it. Reject now
+    // runs the SAME `evaluate_approver_eligibility` predicate approve runs,
+    // under the SAME `LocalOperator` posture (#1796): armed by the
+    // `AI_MEMORY_AGENT_ID` multi-agent opt-in, inert for the lone operator in
+    // the trust-all default so they are not self-locked out of their own queue.
+    match db::reject_with_approver_type(conn, id, &agent_id, db::ApproveSurface::LocalOperator)
+        .map_err(|e| e.to_string())?
+    {
+        db::RejectOutcome::Rejected => {}
+        // Operational not-found (absent or already decided) — contract text
+        // unchanged from pre-#3388.
+        db::RejectOutcome::NotFound => {
+            return Err(format!("pending action not found or already decided: {id}"));
+        }
+        // The CALLER is not an eligible approver. The pending action is
+        // untouched and still `pending`; no synthetic rule is recorded.
+        db::RejectOutcome::Refused(reason) => {
+            return Err(crate::errors::msg::reject_refused(&reason));
+        }
     }
     record_mcp_decision(conn, id, &agent_id, "deny", remember);
     Ok(json!({

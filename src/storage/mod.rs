@@ -22095,6 +22095,180 @@ fn enforce_approver_identity_gate(surface: ApproveSurface) -> bool {
     }
 }
 
+/// v1.0.0 #3388 — verdict of the shared approver-eligibility predicate
+/// [`evaluate_approver_eligibility`].
+///
+/// `Refused` means the CALLER may not decide this pending action; the row is
+/// left untouched and stays `pending`. It is deliberately distinct from
+/// [`ApproveOutcome::Rejected`] / [`RejectOutcome::Rejected`], which describe
+/// what happened to the ACTION.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApproverEligibility {
+    /// The caller is entitled to decide this pending action.
+    Eligible,
+    /// The caller is not entitled to decide it; carries the operator-facing
+    /// reason (byte-identical to the pre-#3388 approve-side messages).
+    Refused(String),
+}
+
+/// v1.0.0 #3388 — the ONE approver-eligibility predicate, shared by
+/// [`approve_with_approver_type`] and [`reject_with_approver_type`].
+///
+/// **Why this exists.** Pre-#3388 the eligibility rules lived INSIDE the
+/// approve function and reject had none at all: the MCP
+/// `memory_pending_reject` tool called `decide_pending_action(.., false, ..)`
+/// directly, so any tenant — including the REQUESTER, whom approve explicitly
+/// refuses — could veto any tenant's queued action. A veto is a governance
+/// decision with real consequences (the queued write never lands, and with
+/// `remember` it writes a synthetic DENY rule), so both decisions must be
+/// gated by the SAME eligibility, and the only way to guarantee that is one
+/// implementation both call. Re-stating the rules on the reject side would
+/// have reproduced exactly the drift #3388 is about.
+///
+/// The rules are lifted verbatim, arm for arm, in the same order, with the
+/// same messages:
+/// - `Human` (the default when a namespace has no policy): under
+///   [`enforce_approver_identity_gate`], the requester may not decide their
+///   own action and the decider must be a REGISTERED agent (#1787 / #1796).
+/// - `Agent(required)`: the named-approver equality is UNCONDITIONAL, then the
+///   same self / registered pair under the gate (#2538).
+/// - `Consensus(_)`: the decider must be a registered agent, unconditionally
+///   (#216). Note this arm carries no self-refusal on the approve side either
+///   — preserved rather than "improved" here, because eligibility parity with
+///   approve is the entire contract of this function.
+///
+/// Quorum is NOT eligibility and stays where it belongs, in
+/// [`approve_with_approver_type`]'s `Consensus` arm: a veto is the
+/// CONSERVATIVE outcome (nothing executes, no durable text changes, the
+/// request can be re-raised), so requiring n distinct voters in order to
+/// refuse would be a liveness hole, not a safety gain.
+///
+/// # Errors
+///
+/// Propagates a storage failure from the registered-agent lookup, so an
+/// unreadable agent registry fails CLOSED at both call sites rather than
+/// silently granting eligibility.
+fn evaluate_approver_eligibility(
+    conn: &Connection,
+    approver: &ApproverType,
+    requested_by: &str,
+    approver_agent_id: &str,
+    surface: ApproveSurface,
+) -> Result<ApproverEligibility> {
+    match approver {
+        ApproverType::Human => {
+            if enforce_approver_identity_gate(surface) {
+                if approver_agent_id == requested_by {
+                    return Ok(ApproverEligibility::Refused(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
+                    ));
+                }
+                if !is_registered_agent(conn, approver_agent_id)? {
+                    return Ok(ApproverEligibility::Refused(format!(
+                        "Human approver '{approver_agent_id}' is not a registered agent"
+                    )));
+                }
+            }
+            Ok(ApproverEligibility::Eligible)
+        }
+        ApproverType::Agent(required) => {
+            if approver_agent_id != required {
+                return Ok(ApproverEligibility::Refused(format!(
+                    "designated approver is '{required}'; got '{approver_agent_id}'"
+                )));
+            }
+            if enforce_approver_identity_gate(surface) {
+                if approver_agent_id == requested_by {
+                    return Ok(ApproverEligibility::Refused(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
+                    ));
+                }
+                if !is_registered_agent(conn, approver_agent_id)? {
+                    return Ok(ApproverEligibility::Refused(format!(
+                        "designated approver '{approver_agent_id}' is not a registered agent"
+                    )));
+                }
+            }
+            Ok(ApproverEligibility::Eligible)
+        }
+        ApproverType::Consensus(_) => {
+            if !is_registered_agent(conn, approver_agent_id)? {
+                return Ok(ApproverEligibility::Refused(format!(
+                    "consensus voter '{approver_agent_id}' is not a registered agent"
+                )));
+            }
+            Ok(ApproverEligibility::Eligible)
+        }
+    }
+}
+
+/// v1.0.0 #3388 — outcome of an approver-aware REJECT (veto) call.
+///
+/// Mirrors [`ApproveOutcome`]. `Refused` is about the CALLER (not eligible —
+/// the row is untouched and still `pending`); `Rejected` is about the ACTION
+/// (vetoed, now `rejected`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectOutcome {
+    /// No `pending` row with this id exists (absent, or already decided).
+    NotFound,
+    /// The caller is not an eligible approver under this action's namespace
+    /// policy; the pending action is UNCHANGED.
+    Refused(String),
+    /// The pending action was vetoed and is now `rejected`.
+    Rejected,
+}
+
+/// v1.0.0 #3388 — approver-type aware REJECT: the veto twin of
+/// [`approve_with_approver_type`].
+///
+/// Runs the SAME [`evaluate_approver_eligibility`] predicate approve runs,
+/// then performs the deny transition. `surface` selects the same posture (see
+/// [`ApproveSurface`]): the multi-tenant HTTP daemon enforces unconditionally,
+/// the single-operator MCP/CLI surfaces enforce under the `AI_MEMORY_AGENT_ID`
+/// multi-agent opt-in, so the lone operator in the trust-all default is never
+/// self-locked out of vetoing their own queue.
+///
+/// Existence is resolved BEFORE eligibility, matching approve exactly, and an
+/// already-decided row collapses into `NotFound` so the pre-#3388
+/// caller-facing "not found or already decided" contract stays byte-identical.
+///
+/// # Errors
+///
+/// Propagates storage failures from the pending lookup, the eligibility
+/// predicate, and the deny transition.
+pub fn reject_with_approver_type(
+    conn: &Connection,
+    pending_id: &str,
+    approver_agent_id: &str,
+    surface: ApproveSurface,
+) -> Result<RejectOutcome> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    let Some(pa) = get_pending_action(conn, pending_id)? else {
+        return Ok(RejectOutcome::NotFound);
+    };
+    if pa.status != "pending" {
+        return Ok(RejectOutcome::NotFound);
+    }
+    let approver = resolve_governance_policy(conn, &pa.namespace)
+        .map_or(ApproverType::Human, |p| p.core.approver);
+    if let ApproverEligibility::Refused(reason) = evaluate_approver_eligibility(
+        conn,
+        &approver,
+        &pa.requested_by,
+        approver_agent_id,
+        surface,
+    )? {
+        return Ok(RejectOutcome::Refused(reason));
+    }
+    if decide_pending_action(conn, pending_id, false, approver_agent_id)? {
+        Ok(RejectOutcome::Rejected)
+    } else {
+        // Lost a race with a concurrent decision — the row is no longer
+        // `pending`. Same collapse as the status check above.
+        Ok(RejectOutcome::NotFound)
+    }
+}
+
 /// Task 1.10 — approver-type aware approve. Enforces the
 /// `metadata.governance.approver` of the pending action's namespace.
 ///
@@ -22129,6 +22303,20 @@ pub fn approve_with_approver_type(
     let approver = resolve_governance_policy(conn, &pa.namespace)
         .map_or(ApproverType::Human, |p| p.core.approver);
 
+    // v1.0.0 #3388 — the eligibility half of this gate is now ONE predicate
+    // shared with `reject_with_approver_type`, so the veto path cannot drift
+    // away from (or, as it had, simply lack) the rules enforced here. Same
+    // arms, same order, same messages as the per-arm blocks this replaced.
+    if let ApproverEligibility::Refused(reason) = evaluate_approver_eligibility(
+        conn,
+        &approver,
+        &pa.requested_by,
+        approver_agent_id,
+        surface,
+    )? {
+        return Ok(ApproveOutcome::Rejected(reason));
+    }
+
     match approver {
         ApproverType::Human => {
             // #1787 (5-agent vote 4d3ea1c5 → C) — the Human arm (the DEFAULT
@@ -22158,18 +22346,8 @@ pub fn approve_with_approver_type(
             // Human-gated action. The `surface` arg now selects the posture:
             // HTTP enforces UNCONDITIONALLY (matching the #1793 postgres fix);
             // the local single-operator surfaces keep the env opt-in.
-            if enforce_approver_identity_gate(surface) {
-                if approver_agent_id == pa.requested_by {
-                    return Ok(ApproveOutcome::Rejected(
-                        crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
-                    ));
-                }
-                if !is_registered_agent(conn, approver_agent_id)? {
-                    return Ok(ApproveOutcome::Rejected(format!(
-                        "Human approver '{approver_agent_id}' is not a registered agent"
-                    )));
-                }
-            }
+            // #3388 — self-approval + registered-approver refusals moved to the
+            // shared `evaluate_approver_eligibility` above (unchanged rules).
             let ok = decide_pending_action(conn, pending_id, true, approver_agent_id)?;
             if ok {
                 Ok(ApproveOutcome::Approved)
@@ -22179,12 +22357,9 @@ pub fn approve_with_approver_type(
                 ))
             }
         }
-        ApproverType::Agent(required) => {
-            if approver_agent_id != required {
-                return Ok(ApproveOutcome::Rejected(format!(
-                    "designated approver is '{required}'; got '{approver_agent_id}'"
-                )));
-            }
+        ApproverType::Agent(_required) => {
+            // #3388 — named-approver equality moved to the shared
+            // `evaluate_approver_eligibility` above (unchanged rule).
             // #2538 (CWE-863) — pre-fix this arm was a BARE STRING COMPARE:
             // no self-approval refusal and no registered-agent check, while
             // the Human arm above has BOTH and the Consensus arm below has
@@ -22206,18 +22381,8 @@ pub fn approve_with_approver_type(
             // arm names exactly one permitted approver). That is the intended
             // reading of a separation-of-duties control — the action stays
             // `pending` (rejectable / re-policyable), never wrongly approved.
-            if enforce_approver_identity_gate(surface) {
-                if approver_agent_id == pa.requested_by {
-                    return Ok(ApproveOutcome::Rejected(
-                        crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
-                    ));
-                }
-                if !is_registered_agent(conn, approver_agent_id)? {
-                    return Ok(ApproveOutcome::Rejected(format!(
-                        "designated approver '{approver_agent_id}' is not a registered agent"
-                    )));
-                }
-            }
+            // #3388 — self-approval + registered-approver refusals moved to the
+            // shared `evaluate_approver_eligibility` above (unchanged rules).
             let ok = decide_pending_action(conn, pending_id, true, approver_agent_id)?;
             if ok {
                 Ok(ApproveOutcome::Approved)
@@ -22239,11 +22404,8 @@ pub fn approve_with_approver_type(
             //   2. Canonicalize the agent_id to lowercase for both the
             //      duplicate-vote check and storage so case-variants of the
             //      same id collapse to a single vote.
-            if !is_registered_agent(conn, approver_agent_id)? {
-                return Ok(ApproveOutcome::Rejected(format!(
-                    "consensus voter '{approver_agent_id}' is not a registered agent"
-                )));
-            }
+            // #3388 — the registered-voter refusal moved to the shared
+            // `evaluate_approver_eligibility` above (unchanged rule).
             let canonical_id = approver_agent_id.to_ascii_lowercase();
             let mut approvals = pa.approvals.clone();
             if approvals
