@@ -21,7 +21,10 @@
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::encryption::agent_encryption_key_fingerprint;
 
@@ -31,8 +34,7 @@ pub const TABLE: &str = "embed_skip";
 
 /// Predicate excluding remembered-unembeddable rows from an unembedded
 /// scan (#3344). Leading ` AND` so it composes onto an existing WHERE.
-pub const SQL_AND_NOT_SKIPPED: &str =
-    " AND id NOT IN (SELECT memory_id FROM embed_skip)";
+pub const SQL_AND_NOT_SKIPPED: &str = " AND id NOT IN (SELECT memory_id FROM embed_skip)";
 
 /// Embedded SQLite DDL doc twin, applied by the additive v96 migration arm.
 pub const MIGRATION_V96_SQLITE: &str =
@@ -76,12 +78,72 @@ const SQL_INSERT_IGNORE: &str = "INSERT OR IGNORE INTO embed_skip \
     (memory_id, agent_id, key_fingerprint, reason, created_at) \
     VALUES (?1, ?2, ?3, ?4, ?5)";
 
-const SQL_SELECT_ALL: &str =
-    "SELECT memory_id, agent_id, key_fingerprint, reason FROM embed_skip";
+const SQL_SELECT_ALL: &str = "SELECT memory_id, agent_id, key_fingerprint, reason FROM embed_skip";
 
 const SQL_DELETE_BY_ID: &str = "DELETE FROM embed_skip WHERE memory_id = ?1";
 
 const SQL_COUNT: &str = "SELECT COUNT(*) FROM embed_skip";
+
+/// Minimum interval between full-table stale-marker walks (#3344
+/// amendment 2). Consecutive backfill ticks with unchanged key material
+/// must be O(1) — not O(n) over `embed_skip`.
+const INVALIDATE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+struct InvalidateAmortisation {
+    last_walk: Option<Instant>,
+}
+
+fn invalidate_amortisation() -> &'static Mutex<InvalidateAmortisation> {
+    static GATE: OnceLock<Mutex<InvalidateAmortisation>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(InvalidateAmortisation { last_walk: None }))
+}
+
+/// Full-table `SELECT` count (test pin: two consecutive scans with
+/// unchanged keys must not increment this).
+static TABLE_WALK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn fingerprint_for(agent_id: &str) -> String {
+    agent_encryption_key_fingerprint(agent_id)
+}
+
+/// True when a full-table stale walk should run. False within
+/// [`INVALIDATE_MIN_INTERVAL`] of the last successful walk (steady-state
+/// backfill tick is then O(1)). CONCURRENCY-18: recover a poisoned lock.
+fn should_walk_stale_table() -> bool {
+    let guard = match invalidate_amortisation().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match guard.last_walk {
+        Some(t) => Instant::now().saturating_duration_since(t) >= INVALIDATE_MIN_INTERVAL,
+        None => true,
+    }
+}
+
+fn mark_stale_table_walked() {
+    let mut guard = match invalidate_amortisation().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    guard.last_walk = Some(Instant::now());
+}
+
+/// Test pin: number of full-table stale-marker walks this process.
+#[must_use]
+pub fn table_walk_count() -> usize {
+    TABLE_WALK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test pin: reset amortisation so the next scan walks (healing tests
+/// that plant a stale stored fingerprint without changing key material).
+pub fn reset_amortisation_for_tests() {
+    TABLE_WALK_COUNT.store(0, Ordering::Relaxed);
+    let mut guard = match invalidate_amortisation().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    guard.last_walk = None;
+}
 
 /// Persist a skip marker. Returns `true` when this was a NEW insert
 /// (caller should WARN once); `false` when the id was already remembered
@@ -97,7 +159,7 @@ pub fn record_sqlite(
     reason: EmbedSkipReason,
 ) -> Result<bool> {
     let fp = match reason {
-        EmbedSkipReason::Undecryptable => agent_encryption_key_fingerprint(agent_id),
+        EmbedSkipReason::Undecryptable => fingerprint_for(agent_id),
         EmbedSkipReason::Oversize => EmbedSkipReason::Oversize.as_str().to_string(),
     };
     let now = chrono::Utc::now().to_rfc3339();
@@ -113,6 +175,7 @@ pub fn record_sqlite(
 /// cleared by the content-update trigger). Returns the number of rows
 /// deleted.
 pub fn invalidate_stale_sqlite(conn: &Connection) -> Result<usize> {
+    TABLE_WALK_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut stmt = conn.prepare(SQL_SELECT_ALL)?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -122,6 +185,7 @@ pub fn invalidate_stale_sqlite(conn: &Connection) -> Result<usize> {
             row.get::<_, String>(3)?,
         ))
     })?;
+    let mut fp_by_agent: HashMap<String, String> = HashMap::new();
     let mut stale: Vec<String> = Vec::new();
     for row in rows {
         let (id, agent_id, stored_fp, reason) = row?;
@@ -132,7 +196,10 @@ pub fn invalidate_stale_sqlite(conn: &Connection) -> Result<usize> {
         if reason != EmbedSkipReason::Undecryptable {
             continue;
         }
-        if stored_fp != agent_encryption_key_fingerprint(&agent_id) {
+        let live = fp_by_agent
+            .entry(agent_id.clone())
+            .or_insert_with(|| fingerprint_for(&agent_id));
+        if stored_fp != *live {
             stale.push(id);
         }
     }
@@ -165,11 +232,15 @@ pub fn log_remembered_once(count: i64) {
     );
 }
 
-/// Invalidate stale markers, then emit the once-per-process boot summary.
-/// Best-effort: a skip-cache fault is logged and never fails the scan.
+/// Invalidate stale markers (amortised: at most once per 60 s), then emit
+/// the once-per-process boot summary. Best-effort: a skip-cache fault is
+/// logged and never fails the scan.
 pub fn prepare_scan_sqlite(conn: &Connection) {
-    if let Err(e) = invalidate_stale_sqlite(conn) {
-        tracing::warn!(error = %e, "embed skip stale-invalidate failed (#3344)");
+    if should_walk_stale_table() {
+        match invalidate_stale_sqlite(conn) {
+            Ok(_) => mark_stale_table_walked(),
+            Err(e) => tracing::warn!(error = %e, "embed skip stale-invalidate failed (#3344)"),
+        }
     }
     match count_sqlite(conn) {
         Ok(n) => log_remembered_once(n),
@@ -217,9 +288,13 @@ pub mod postgres {
     //! Postgres twins of the sqlite skip-cache helpers. Gated with the
     //! adapter so default builds do not pull sqlx.
 
-    use super::{EmbedSkipReason, TABLE, log_remembered_once};
-    use crate::encryption::agent_encryption_key_fingerprint;
+    use super::{
+        EmbedSkipReason, TABLE, TABLE_WALK_COUNT, fingerprint_for, log_remembered_once,
+        mark_stale_table_walked, should_walk_stale_table,
+    };
     use sqlx::{PgPool, Row};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
 
     const SQL_INSERT_IGNORE: &str = "INSERT INTO embed_skip \
         (memory_id, agent_id, key_fingerprint, reason, created_at) \
@@ -235,8 +310,13 @@ pub mod postgres {
 
     /// See [`super::prepare_scan_sqlite`].
     pub async fn prepare_scan(pool: &PgPool) {
-        if let Err(e) = invalidate_stale(pool).await {
-            tracing::warn!(error = %e, "embed skip stale-invalidate failed (#3344)");
+        if should_walk_stale_table() {
+            match invalidate_stale(pool).await {
+                Ok(_) => mark_stale_table_walked(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "embed skip stale-invalidate failed (#3344)");
+                }
+            }
         }
         match count(pool).await {
             Ok(n) => log_remembered_once(n),
@@ -249,7 +329,9 @@ pub mod postgres {
     }
 
     async fn invalidate_stale(pool: &PgPool) -> Result<usize, sqlx::Error> {
+        TABLE_WALK_COUNT.fetch_add(1, Ordering::Relaxed);
         let rows = sqlx::query(SQL_SELECT_ALL).fetch_all(pool).await?;
+        let mut fp_by_agent: HashMap<String, String> = HashMap::new();
         let mut n = 0usize;
         for row in rows {
             let id: String = row.try_get("memory_id")?;
@@ -258,13 +340,19 @@ pub mod postgres {
             let reason_raw: String = row.try_get("reason")?;
             let stale = match EmbedSkipReason::from_stored(&reason_raw) {
                 Some(EmbedSkipReason::Undecryptable) => {
-                    stored_fp != agent_encryption_key_fingerprint(&agent_id)
+                    let live = fp_by_agent
+                        .entry(agent_id.clone())
+                        .or_insert_with(|| fingerprint_for(&agent_id));
+                    stored_fp != *live
                 }
                 Some(EmbedSkipReason::Oversize) => false,
                 None => true,
             };
             if stale {
-                sqlx::query(SQL_DELETE_BY_ID).bind(&id).execute(pool).await?;
+                sqlx::query(SQL_DELETE_BY_ID)
+                    .bind(&id)
+                    .execute(pool)
+                    .await?;
                 n = n.saturating_add(1);
             }
         }
@@ -279,7 +367,7 @@ pub mod postgres {
         reason: EmbedSkipReason,
     ) -> bool {
         let fp = match reason {
-            EmbedSkipReason::Undecryptable => agent_encryption_key_fingerprint(agent_id),
+            EmbedSkipReason::Undecryptable => fingerprint_for(agent_id),
             EmbedSkipReason::Oversize => EmbedSkipReason::Oversize.as_str().to_string(),
         };
         match sqlx::query(SQL_INSERT_IGNORE)
@@ -329,10 +417,10 @@ mod tests {
     #[test]
     fn record_is_idempotent_no_second_insert() {
         let conn = fresh_conn();
-        let first = record_sqlite(&conn, "m1", "agent-a", EmbedSkipReason::Undecryptable)
-            .expect("first");
-        let second = record_sqlite(&conn, "m1", "agent-a", EmbedSkipReason::Undecryptable)
-            .expect("second");
+        let first =
+            record_sqlite(&conn, "m1", "agent-a", EmbedSkipReason::Undecryptable).expect("first");
+        let second =
+            record_sqlite(&conn, "m1", "agent-a", EmbedSkipReason::Undecryptable).expect("second");
         assert!(first, "first persist is a new insert");
         assert!(!second, "second persist of the same id is a no-op");
         assert_eq!(count_sqlite(&conn).expect("count"), 1);
@@ -357,11 +445,7 @@ mod tests {
         assert_eq!(dropped, 1, "only the stale undecryptable row is dropped");
         assert_eq!(count_sqlite(&conn).expect("count"), 1);
         let remaining: String = conn
-            .query_row(
-                "SELECT memory_id FROM embed_skip",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT memory_id FROM embed_skip", [], |r| r.get(0))
             .expect("remaining");
         assert_eq!(remaining, "m2");
     }
@@ -375,6 +459,28 @@ mod tests {
             Some(EmbedSkipReason::Undecryptable)
         );
         assert_eq!(EmbedSkipReason::from_stored("nope"), None);
+    }
+
+    #[test]
+    fn consecutive_prepare_scan_does_not_rewalk_when_keys_unchanged() {
+        // #3344 amendment 2 — two consecutive scans with unchanged key
+        // material must not re-SELECT the whole skip table (O(1) tick).
+        reset_amortisation_for_tests();
+        let conn = fresh_conn();
+        record_sqlite(&conn, "m1", "agent-a", EmbedSkipReason::Undecryptable).expect("record");
+        prepare_scan_sqlite(&conn);
+        let walks_after_first = table_walk_count();
+        assert!(
+            walks_after_first >= 1,
+            "first prepare_scan must walk, got {walks_after_first}"
+        );
+        prepare_scan_sqlite(&conn);
+        prepare_scan_sqlite(&conn);
+        assert_eq!(
+            table_walk_count(),
+            walks_after_first,
+            "subsequent scans within 60s must not re-walk embed_skip"
+        );
     }
 
     #[test]

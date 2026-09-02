@@ -3932,6 +3932,7 @@ mod tests {
     /// stored fingerprint goes stale (healing path).
     #[tokio::test]
     async fn list_unembedded_persists_skip_for_undecryptable_3344() {
+        crate::storage::embed_skip::reset_amortisation_for_tests();
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let admin = CallerContext::for_admin("test-3344");
@@ -3993,6 +3994,9 @@ mod tests {
             )
             .expect("stale the skip");
         }
+        // Planting a stale stored fingerprint is not a live-key change;
+        // reset the 60 s amortisation so this pass walks and heals.
+        crate::storage::embed_skip::reset_amortisation_for_tests();
         let retried = store
             .list_unembedded(&admin, 1_000)
             .await
