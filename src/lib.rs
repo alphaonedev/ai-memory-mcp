@@ -663,6 +663,10 @@ pub mod bench;
 /// configurable scale. Additive measurement apparatus; never touches
 /// production recall scoring.
 pub mod bench_relevance;
+/// #3352 — cluster near-duplicate rows in `boot` / `session_start`
+/// payloads so a slot budget prefers distinct facts. Display-only
+/// (never deletes or merges stored rows).
+pub mod boot_cluster;
 // v0.7.0 QW-3 — daemon-side background tasks. Carries the TTL sweep
 // loop for `offloaded_blobs`; future v0.8.0 substrate tasks land
 // here without churning `daemon_runtime`.

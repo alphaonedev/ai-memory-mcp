@@ -425,6 +425,10 @@ pub const SENDER_POLICY_DIGEST_HEX: &str = "sender_policy_digest_hex";
 pub const SENDER_POLICY_SEQ: &str = "sender_policy_seq";
 /// `signing_agent` — wire/row field name.
 pub const SIGNING_AGENT: &str = "signing_agent";
+/// `similar_count` — boot / session_start payload annotation (#3352): how
+/// many other near-duplicate rows were collapsed into this representative.
+/// Absent when the cluster is a singleton (no wire noise on the common path).
+pub const SIMILAR_COUNT: &str = "similar_count";
 /// `similarity` — wire/row field name.
 pub const SIMILARITY: &str = "similarity";
 /// `skill_description` — wire/row field name.

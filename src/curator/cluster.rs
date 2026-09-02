@@ -230,8 +230,9 @@ impl ConsolidationClustering {
 ///
 /// Tokens are runs of ≥ 3 alphanumeric characters, lowercased.
 /// Identical to the implementation extracted from `crate::autonomy`. Also used
-/// by `crate::curator::reflection_pass`.
-pub(super) fn jaccard_similarity(a: &str, b: &str) -> f64 {
+/// by `crate::curator::reflection_pass` and `crate::boot_cluster` (#3352
+/// display-side near-duplicate clustering — not a destructive merge).
+pub(crate) fn jaccard_similarity(a: &str, b: &str) -> f64 {
     let tokens = |s: &str| -> HashSet<String> {
         s.split(|c: char| !c.is_alphanumeric())
             .filter(|t| t.len() >= 3)
