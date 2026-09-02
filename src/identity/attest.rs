@@ -1091,6 +1091,194 @@ pub async fn admit_attested_write_async(
     }
 }
 
+// ---------------------------------------------------------------------------
+// #3420 — attestation reconciliation across an UPDATE
+// ---------------------------------------------------------------------------
+
+/// #3420 — the exact field set the signed [`SignableWrite`] envelope commits
+/// to, captured BEFORE and AFTER an update so a funnel can decide whether a
+/// carried `write_signature` can still be re-derived from the row it now
+/// describes.
+///
+/// The envelope commits to
+/// `agent_id + namespace + title + kind + created_at + sha256(content)`
+/// (see [`sign_memory_write`] / [`resolve_write_attest_level`]);
+/// `content` is compared verbatim here rather than by digest because equal
+/// bytes trivially imply an equal digest and an unequal one is what matters.
+/// Every update funnel supplies both snapshots so no site can silently forget
+/// a field the envelope covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedEnvelopeFields<'a> {
+    /// `metadata.agent_id` — the row's immutable author.
+    pub agent_id: &'a str,
+    /// The row's namespace.
+    pub namespace: &'a str,
+    /// The row's title.
+    pub title: &'a str,
+    /// [`crate::models::MemoryKind::as_str`] for the row.
+    pub kind: &'a str,
+    /// The row's `created_at` (RFC3339, as persisted).
+    pub created_at: &'a str,
+    /// The row's persisted content bytes.
+    pub content: &'a str,
+}
+
+/// #3420 — the attestation an updated row is ENTITLED to carry.
+///
+/// The substrate — never the caller — decides this. An update can only ever
+/// PRESERVE the attestation the stored row already had (when the signed
+/// envelope is untouched) or LOSE it (when the envelope is rewritten). It can
+/// never mint one: a caller-supplied `attest_level` / `write_signature` in an
+/// update patch is not evidence of anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntitledAttestation {
+    /// The `metadata.attest_level` the row may carry, if any.
+    pub attest_level: Option<String>,
+    /// The `metadata.write_signature` the row may carry, if any.
+    pub write_signature: Option<String>,
+}
+
+impl EntitledAttestation {
+    /// The JSON object to overlay onto a row's metadata after the update's own
+    /// attestation keys have been removed. `{}` when the row is entitled to no
+    /// attestation at all.
+    #[must_use]
+    pub fn as_overlay(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        if let Some(level) = &self.attest_level {
+            obj.insert(
+                crate::models::field_names::ATTEST_LEVEL.to_string(),
+                serde_json::Value::String(level.clone()),
+            );
+        }
+        if let Some(sig) = &self.write_signature {
+            obj.insert(
+                crate::models::field_names::WRITE_SIGNATURE.to_string(),
+                serde_json::Value::String(sig.clone()),
+            );
+        }
+        serde_json::Value::Object(obj)
+    }
+
+    /// `true` when the stored row carried an attestation that this update
+    /// DROPS — the warn-worthy, audit-worthy transition.
+    #[must_use]
+    pub fn is_downgrade_from(&self, existing_metadata: &serde_json::Value) -> bool {
+        let had_attested = existing_metadata
+            .get(crate::models::field_names::ATTEST_LEVEL)
+            .and_then(serde_json::Value::as_str)
+            == Some(AttestLevel::AgentAttested.as_str());
+        had_attested && self.attest_level.as_deref() != Some(AttestLevel::AgentAttested.as_str())
+    }
+}
+
+/// #3420 — decide the attestation an updated row is entitled to.
+///
+/// `PUT /api/v1/memories/{id}` (and its MCP / CLI twins) can rewrite `title`,
+/// `content` and `namespace` — all of which sit INSIDE the signed
+/// [`SignableWrite`] envelope — while #3015 deliberately preserves
+/// `metadata.attest_level` / `metadata.write_signature` across the patch. The
+/// combination stored a row asserting `agent_attested` beside a signature that
+/// can never again be re-derived from it: unverifiable-by-construction, yet
+/// believed by every trust surface that reads `attest_level`
+/// (`row_is_agent_attested`, federation relay under
+/// `AI_MEMORY_FED_REQUIRE_WRITE_SIG=1`, the attestation census).
+///
+/// The rule, in one line: **an update preserves the stored row's attestation
+/// while the signed envelope is intact, drops it to `claimed` when the
+/// envelope is rewritten, and can never mint one.**
+///
+/// * envelope intact → the STORED row's `(attest_level, write_signature)`,
+///   verbatim (this is the #3015 preservation, now stated as an entitlement so
+///   a caller-supplied value can never stand in for it);
+/// * envelope rewritten and the stored row carried an attestation → `claimed`
+///   with NO signature (degrade, never corrupt: attestation is only ever lost
+///   across a caller mutation, exactly like
+///   [`crate::identity::downgrade_loader_attest_on_caller_mutation`]);
+/// * envelope rewritten and the stored row carried nothing → nothing.
+///
+/// The caller re-attests a rewritten row by re-storing it through a signed
+/// write funnel; an update surface has no signature channel and must never
+/// pretend otherwise.
+#[must_use]
+pub fn entitled_update_attestation(
+    existing_metadata: &serde_json::Value,
+    before: SignedEnvelopeFields<'_>,
+    after: SignedEnvelopeFields<'_>,
+) -> EntitledAttestation {
+    let stored_level = existing_metadata
+        .get(crate::models::field_names::ATTEST_LEVEL)
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let stored_sig = existing_metadata
+        .get(crate::models::field_names::WRITE_SIGNATURE)
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    if before == after {
+        return EntitledAttestation {
+            attest_level: stored_level,
+            write_signature: stored_sig,
+        };
+    }
+    if stored_level.is_none() && stored_sig.is_none() {
+        return EntitledAttestation::default();
+    }
+    EntitledAttestation {
+        attest_level: Some(AttestLevel::Claimed.as_str().to_string()),
+        write_signature: None,
+    }
+}
+
+/// #3420 — force `metadata`'s attestation keys to `entitled`.
+///
+/// Returns `None` when `metadata` already carries EXACTLY the entitled pair —
+/// the overwhelmingly common path, kept zero-copy (the
+/// [`redact_before_sign`] idiom). Otherwise returns the corrected clone the
+/// update funnel must persist instead.
+///
+/// A non-object `metadata` that is entitled to nothing is left alone; one that
+/// is entitled to an attestation is promoted to an object carrying it, so the
+/// entitlement can never be silently dropped by a malformed patch.
+#[must_use]
+pub fn apply_entitled_attestation(
+    metadata: &serde_json::Value,
+    entitled: &EntitledAttestation,
+) -> Option<serde_json::Value> {
+    use crate::models::field_names;
+    let current_level = metadata
+        .get(field_names::ATTEST_LEVEL)
+        .and_then(serde_json::Value::as_str);
+    let current_sig = metadata
+        .get(field_names::WRITE_SIGNATURE)
+        .and_then(serde_json::Value::as_str);
+    if current_level == entitled.attest_level.as_deref()
+        && current_sig == entitled.write_signature.as_deref()
+    {
+        return None;
+    }
+    let mut corrected = if metadata.is_object() {
+        metadata.clone()
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+    let obj = corrected.as_object_mut()?;
+    obj.remove(field_names::ATTEST_LEVEL);
+    obj.remove(field_names::WRITE_SIGNATURE);
+    if let Some(level) = &entitled.attest_level {
+        obj.insert(
+            field_names::ATTEST_LEVEL.to_string(),
+            serde_json::Value::String(level.clone()),
+        );
+    }
+    if let Some(sig) = &entitled.write_signature {
+        obj.insert(
+            field_names::WRITE_SIGNATURE.to_string(),
+            serde_json::Value::String(sig.clone()),
+        );
+    }
+    Some(corrected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1843,5 +2031,146 @@ mod tests {
             ImportAttestDisposition::Claimed(ImportClaimedCause::NoAttributedAuthor)
         );
         assert_eq!(mem.metadata["attest_level"].as_str(), Some("claimed"));
+    }
+
+    // -- #3420: attestation entitlement across an UPDATE --------------------
+
+    fn envelope<'a>(
+        namespace: &'a str,
+        title: &'a str,
+        content: &'a str,
+    ) -> SignedEnvelopeFields<'a> {
+        SignedEnvelopeFields {
+            agent_id: "ai:alice",
+            namespace,
+            title,
+            kind: "observation",
+            created_at: "2026-06-01T12:00:00+00:00",
+            content,
+        }
+    }
+
+    fn attested_meta() -> serde_json::Value {
+        serde_json::json!({
+            "agent_id": "ai:alice",
+            "attest_level": "agent_attested",
+            "write_signature": "c2ln",
+        })
+    }
+
+    /// ALLOWED — an update that touches nothing inside the signed envelope
+    /// preserves the STORED attestation verbatim (the #3015 contract).
+    #[test]
+    fn entitled_update_attestation_preserves_an_intact_envelope_3420() {
+        let existing = attested_meta();
+        let e = entitled_update_attestation(
+            &existing,
+            envelope("ns", "title", "body"),
+            envelope("ns", "title", "body"),
+        );
+        assert_eq!(e.attest_level.as_deref(), Some("agent_attested"));
+        assert_eq!(e.write_signature.as_deref(), Some("c2ln"));
+        assert!(!e.is_downgrade_from(&existing));
+        assert_eq!(
+            apply_entitled_attestation(&existing, &e),
+            None,
+            "already entitled — the common path must stay zero-copy"
+        );
+    }
+
+    /// DENIED — rewriting ANY envelope field drops the attestation to
+    /// `claimed` and removes the signature it invalidated.
+    #[test]
+    fn entitled_update_attestation_drops_on_a_rewritten_envelope_3420() {
+        let existing = attested_meta();
+        for after in [
+            envelope("ns", "title", "REWRITTEN body"),
+            envelope("ns", "REWRITTEN title", "body"),
+            envelope("REWRITTEN-ns", "title", "body"),
+            SignedEnvelopeFields {
+                created_at: "2026-06-01T12:00:01+00:00",
+                ..envelope("ns", "title", "body")
+            },
+            SignedEnvelopeFields {
+                kind: "decision",
+                ..envelope("ns", "title", "body")
+            },
+            SignedEnvelopeFields {
+                agent_id: "ai:mallory",
+                ..envelope("ns", "title", "body")
+            },
+        ] {
+            let e = entitled_update_attestation(&existing, envelope("ns", "title", "body"), after);
+            assert_eq!(e.attest_level.as_deref(), Some("claimed"), "{after:?}");
+            assert_eq!(e.write_signature, None, "{after:?}");
+            assert!(e.is_downgrade_from(&existing), "{after:?}");
+            let corrected =
+                apply_entitled_attestation(&existing, &e).expect("must correct the metadata");
+            assert_eq!(corrected["attest_level"].as_str(), Some("claimed"));
+            assert!(corrected.get("write_signature").is_none());
+            assert_eq!(
+                corrected["agent_id"].as_str(),
+                Some("ai:alice"),
+                "only the attestation keys are touched"
+            );
+        }
+    }
+
+    /// DENIED — an update can never MINT an attestation: a row that stored
+    /// none is entitled to none, whatever the caller's patch asserts.
+    #[test]
+    fn entitled_update_attestation_never_mints_3420() {
+        let existing = serde_json::json!({ "agent_id": "ai:alice" });
+        // Intact envelope, forged patch.
+        let e = entitled_update_attestation(
+            &existing,
+            envelope("ns", "title", "body"),
+            envelope("ns", "title", "body"),
+        );
+        assert_eq!(e, EntitledAttestation::default());
+        let forged = serde_json::json!({
+            "agent_id": "ai:alice",
+            "attest_level": "agent_attested",
+            "write_signature": "c2ln",
+        });
+        let corrected = apply_entitled_attestation(&forged, &e).expect("must scrub");
+        assert!(corrected.get("attest_level").is_none());
+        assert!(corrected.get("write_signature").is_none());
+
+        // Rewritten envelope on an unattested row stays unattested — no
+        // spurious `claimed` stamp appears where nothing was asserted.
+        let e = entitled_update_attestation(
+            &existing,
+            envelope("ns", "title", "body"),
+            envelope("ns", "title", "REWRITTEN"),
+        );
+        assert_eq!(e, EntitledAttestation::default());
+        assert!(!e.is_downgrade_from(&existing));
+    }
+
+    /// The overlay the postgres funnels bind is exactly the entitled pair.
+    #[test]
+    fn entitled_attestation_overlay_matches_the_pair_3420() {
+        let none = EntitledAttestation::default();
+        assert_eq!(none.as_overlay(), serde_json::json!({}));
+        let claimed = EntitledAttestation {
+            attest_level: Some("claimed".to_string()),
+            write_signature: None,
+        };
+        assert_eq!(
+            claimed.as_overlay(),
+            serde_json::json!({ "attest_level": "claimed" })
+        );
+        let kept = EntitledAttestation {
+            attest_level: Some("agent_attested".to_string()),
+            write_signature: Some("c2ln".to_string()),
+        };
+        assert_eq!(
+            kept.as_overlay(),
+            serde_json::json!({
+                "attest_level": "agent_attested",
+                "write_signature": "c2ln",
+            })
+        );
     }
 }
