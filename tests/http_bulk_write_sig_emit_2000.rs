@@ -173,7 +173,11 @@ async fn assert_signed_bulk_row_emits_write_signature(backend: StorageBackend, n
 
     let title = "bulk-2000-signed";
     let content = "This is the body of bulk-2000-signed, long enough to be meaningful prose.";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     let sig_b64 = sign_envelope(&kp, agent, namespace, title, content, &created_at);
 
     // bulk_create accepts a bare JSON array (Vec<CreateMemory>); the per-row

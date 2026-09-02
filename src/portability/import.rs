@@ -2205,7 +2205,9 @@ mod tests {
 
     /// A minimal durable memory fixture carrying a (claimed) author id.
     fn memory_fixture(id: &str, title: &str, agent_id: &str) -> crate::models::Memory {
-        let now = "2026-07-14T00:00:00Z".to_string();
+        // #3422 — canonical storage-stable `created_at` (a `…Z` rendering is
+        // refused by `attest::sign_memory_write`).
+        let now = "2026-07-14T00:00:00+00:00".to_string();
         crate::models::Memory {
             id: id.into(),
             namespace: "portability".into(),

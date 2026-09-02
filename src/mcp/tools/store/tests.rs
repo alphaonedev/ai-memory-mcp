@@ -2315,7 +2315,9 @@ fn mcp_store_signed_with_bound_key_stamps_agent_attested() {
 
     let title = "signed-mem";
     let content = "This is the body of signed-mem, long enough to be meaningful prose.";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated).
+    let created_at = crate::identity::attest::now_attestable_rfc3339();
     let sig_b64 = sign_store_envelope(&kp, "ai:alice", title, content, &created_at);
 
     let params = json!({
@@ -2366,7 +2368,9 @@ fn mcp_store_forged_signature_is_rejected() {
 
     let title = "forged-mem";
     let content = "This is the body of forged-mem, long enough to be meaningful prose.";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated).
+    let created_at = crate::identity::attest::now_attestable_rfc3339();
     let sig_b64 = sign_store_envelope(&attacker, "ai:alice", title, content, &created_at);
 
     let params = json!({

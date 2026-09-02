@@ -173,7 +173,11 @@ async fn write_attestation_claimed_vs_agent_attested() {
     }
 
     let ns = "f53-write";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     let content = "F-53 write-attestation body, long enough to be meaningful prose.";
     let title = "f53 attested write";
 

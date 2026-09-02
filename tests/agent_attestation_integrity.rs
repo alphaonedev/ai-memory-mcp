@@ -186,7 +186,11 @@ async fn http_metadata_update_does_not_downgrade_agent_attested_3015() {
 
     let title = "downgrade-guard";
     let content = "Body prose for the attestation-downgrade regression, sufficiently long.";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     let sig_b64 = sign_envelope(&kp, "ai:carol", "attest-it", title, content, &created_at);
 
     let (status, resp) = post_memory(
@@ -247,7 +251,11 @@ async fn http_signed_store_stamps_agent_attested_and_adopts_created_at() {
 
     let title = "http-signed";
     let content = "This is the body of http-signed, long enough to be meaningful prose.";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     let sig_b64 = sign_envelope(&kp, "ai:alice", "attest-it", title, content, &created_at);
 
     let (status, resp) = post_memory(
@@ -292,7 +300,11 @@ async fn http_forged_signature_is_rejected_403() {
 
     let title = "http-forged";
     let content = "This is the body of http-forged, long enough to be meaningful prose.";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     // Sign with the attacker key — does NOT match the bound key.
     let sig_b64 = sign_envelope(
         &attacker,
@@ -661,7 +673,11 @@ fn mcp_forged_signature_rejected_under_permissive_default_1985() {
     let title = "mcp-forged";
     let content = "Body of the forged MCP write, long enough to read as real prose.";
     let namespace = "attest-mcp-forged";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     // Sign with the attacker key — does NOT match the bound key.
     let sig_b64 = sign_envelope(
         &attacker,
@@ -767,7 +783,11 @@ fn mcp_signed_store_upgrades_to_agent_attested() {
     let title = "mcp-signed";
     let content = "Body of the signed MCP write, long enough to read as real prose.";
     let namespace = "attest-mcp-signed";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     let sig_b64 = sign_envelope(&kp, "ai:alice", namespace, title, content, &created_at);
 
     let ttl = ResolvedTtl::default();

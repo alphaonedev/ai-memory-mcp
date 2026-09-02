@@ -244,7 +244,11 @@ fn reregister_preserves_bound_pubkey_and_signed_store_stays_agent_attested() {
     let title = "post-rereg-signed";
     let content = "Body of the signed write issued after an idempotent re-register.";
     let namespace = "attest-rereg";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     let sig_b64 = sign_envelope(&kp, agent_id, namespace, title, content, &created_at);
     let ttl = ResolvedTtl::default();
     let params = json!({

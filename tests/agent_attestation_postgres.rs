@@ -169,7 +169,11 @@ async fn pg_signed_store_stamps_agent_attested_and_adopts_created_at() {
 
     let title = "pg-signed";
     let content = "This is the body of pg-signed, long enough to be meaningful prose.";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     let sig_b64 = sign_envelope(&kp, "ai:alice", "attest-pg", title, content, &created_at);
 
     let (status, resp) = post_memory(
@@ -214,7 +218,11 @@ async fn pg_forged_signature_is_rejected_403() {
 
     let title = "pg-forged";
     let content = "This is the body of pg-forged, long enough to be meaningful prose.";
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     // Sign with the attacker key — does NOT match the bound key.
     let sig_b64 = sign_envelope(
         &attacker,

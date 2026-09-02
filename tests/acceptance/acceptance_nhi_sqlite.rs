@@ -290,7 +290,11 @@ fn signed_store_body(
     tier: &str,
     ttl_secs: Option<i64>,
 ) -> Value {
-    let created_at = chrono::Utc::now().to_rfc3339();
+    // #3422 — the attestation funnel accepts ONLY the canonical
+    // storage-stable rendering (UTC, `+00:00`, microsecond-truncated):
+    // it is the one form both backends return byte-for-byte, so the
+    // signature stays re-derivable from the persisted row.
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
     let content_hash = ai_memory::identity::attest::content_sha256(content);
     let write = ai_memory::identity::sign::SignableWrite {
         agent_id: NHI_AGENT,
