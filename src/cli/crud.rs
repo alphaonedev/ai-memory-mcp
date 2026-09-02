@@ -307,6 +307,22 @@ pub fn cmd_delete(
                 None,
             ),
         ));
+        // v1.0.0 #3403 — subscription/webhook fan-out for a CLI-originated
+        // delete, through the shared funnel the MCP twin calls
+        // (`crate::write_events`). Fired AFTER the row is gone, carrying the
+        // PRE-delete snapshot: there is no row left to read `title`/`tier`
+        // from, which is why the details block is built from `target`.
+        crate::write_events::delete(
+            &conn,
+            db_path,
+            &target.id,
+            &target.namespace,
+            crate::write_events::owner_of(&target).as_deref(),
+            &crate::subscriptions::DeleteEventDetails {
+                title: target.title.clone(),
+                tier: target.tier.to_string(),
+            },
+        );
         if json_out {
             writeln!(
                 out.stdout,

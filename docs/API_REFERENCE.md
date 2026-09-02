@@ -1197,6 +1197,17 @@ Three endpoints under `/api/v1/subscriptions` — create them via MCP
 tools or the REST surface. Dispatch is SSRF-hardened (rejects
 private-range IPs; requires `https://` unless loopback).
 
+Every write surface emits the same events (v1.0.0 #3403): the MCP tools,
+the HTTP handlers, and the `ai-memory` CLI write verbs (`store`,
+`delete`, `promote`, `link`, `resolve`, `consolidate`) all dispatch
+through one shared funnel (`src/write_events.rs`), so the event stream is
+a complete record of writes regardless of which surface made them. Before
+#3403 no CLI verb dispatched anything, and subscribers were silently
+blind to CLI-originated writes. Delivery is fire-and-forget, so a one-shot
+CLI invocation drains the fan-out before exiting; if that drain hits its
+budget the write is still durable and each admitted delivery has a
+persisted audit row for replay-from-cursor.
+
 ### `POST /api/v1/subscriptions` — register webhook
 
 Body: `{ "url": "https://…", "events": "memory_store,memory_delete", "secret": "<shared-secret>", "namespace_filter": "…", "agent_filter": "…" }`.

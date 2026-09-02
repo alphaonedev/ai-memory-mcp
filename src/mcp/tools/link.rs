@@ -347,30 +347,20 @@ pub(super) fn handle_link(
     // `agent_id` for the dispatch envelope; if it's somehow gone (race
     // with delete) fall back to "global"/None and let the webhook
     // reflect the link metadata only.
-    let (event_namespace, event_agent_id) = match db::get(conn, source_id) {
-        Ok(Some(mem)) => {
-            let owner = mem
-                .metadata
-                .get(param_names::AGENT_ID)
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            (mem.namespace, owner)
-        }
-        _ => (crate::DEFAULT_NAMESPACE.to_string(), None),
-    };
-    let details = serde_json::to_value(crate::subscriptions::LinkCreatedEventDetails {
-        target_id: target_id.to_string(),
-        relation: relation.to_string(),
-    })
-    .ok();
-    crate::subscriptions::dispatch_event_with_details(
+    // #3403 — the SHARED source-origin resolver, so the CLI link path
+    // attributes the event to the same namespace/owner this one does.
+    let (event_namespace, event_agent_id) = crate::write_events::link_event_origin(conn, source_id);
+    // #3403 — through the shared write-event funnel (see `crate::write_events`).
+    crate::write_events::link_created(
         conn,
-        crate::subscriptions::webhook_events::MEMORY_LINK_CREATED,
+        db_path,
         source_id,
         &event_namespace,
         event_agent_id.as_deref(),
-        db_path,
-        details,
+        &crate::subscriptions::LinkCreatedEventDetails {
+            target_id: target_id.to_string(),
+            relation: relation.to_string(),
+        },
     );
 
     // v0.7.0 L2-3 (#668) — Reflection invalidation propagation

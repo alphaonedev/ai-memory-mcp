@@ -113,6 +113,24 @@ pub fn cmd_link(
         &args.relation,
         keypair.as_ref(),
     )?;
+    // v1.0.0 #3403 — subscription/webhook fan-out for a CLI-originated
+    // edge, through the shared funnel the MCP twin calls
+    // (`crate::write_events`), with the same source-origin resolution.
+    {
+        let (event_namespace, event_agent_id) =
+            crate::write_events::link_event_origin(&conn, &args.source_id);
+        crate::write_events::link_created(
+            &conn,
+            db_path,
+            &args.source_id,
+            &event_namespace,
+            event_agent_id.as_deref(),
+            &crate::subscriptions::LinkCreatedEventDetails {
+                target_id: args.target_id.clone(),
+                relation: args.relation.clone(),
+            },
+        );
+    }
     if json_out {
         writeln!(
             out.stdout,
@@ -152,6 +170,28 @@ pub fn cmd_resolve(
         &args.loser_id,
         crate::models::MemoryLinkRelation::Supersedes.as_str(),
     )?;
+    // v1.0.0 #3403 — `resolve` is a link write like `link` is, so it fires
+    // the same `memory_link_created` event through the same shared funnel.
+    // The funnel belongs at the WRITE, not at the verb name: a subscriber
+    // watching edges must not miss one because the operator reached for a
+    // differently-named CLI verb.
+    {
+        let (event_namespace, event_agent_id) =
+            crate::write_events::link_event_origin(&conn, &args.winner_id);
+        crate::write_events::link_created(
+            &conn,
+            db_path,
+            &args.winner_id,
+            &event_namespace,
+            event_agent_id.as_deref(),
+            &crate::subscriptions::LinkCreatedEventDetails {
+                target_id: args.loser_id.clone(),
+                relation: crate::models::MemoryLinkRelation::Supersedes
+                    .as_str()
+                    .to_string(),
+            },
+        );
+    }
     let _ = db::update(
         &conn,
         &args.loser_id,
