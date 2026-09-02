@@ -4532,9 +4532,13 @@ pub fn run_mcp_server(
                     "ai-memory: embedder DISABLED by inference-plane egress gate \
                      (target={target}); {reason} — semantic recall degrades to keyword (#1963)"
                 );
-                let db_path = app_config
-                    .effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
-                crate::egress::refuse_inference_egress_audited(&db_path, class, &target, &reason);
+                // #3429 (sibling of #1991) — audit the refusal into the store
+                // this MCP process actually opened (`db_path`, resolved once by
+                // the top-level parser), NOT a recomputed
+                // `effective_db(DEFAULT_DB)`, which discards a non-default
+                // `--db`/`AI_MEMORY_DB` and misfiles the signed row into CWD
+                // `ai-memory.db` / the config store.
+                crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
                 true
             }
             crate::egress::EgressDecision::Allow => false,

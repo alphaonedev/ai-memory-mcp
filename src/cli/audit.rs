@@ -15,7 +15,6 @@
 use crate::models::field_names;
 use std::fs;
 use std::io::{BufRead, BufReader};
-#[cfg(test)]
 use std::path::Path;
 
 use anyhow::Result;
@@ -221,16 +220,33 @@ pub struct BootstrapNodeArgs {
 /// `ai-memory audit` entry point. Returns the desired process exit
 /// code so the caller can surface a non-zero status from the top-level
 /// dispatch without panicking.
-pub fn run(args: AuditArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> Result<i32> {
+///
+/// v1.0.0 #3429 — `db_path` is the ONE store path the top-level parser
+/// already resolved (`app_config.effective_db(&cli.db)` in
+/// `daemon_runtime::run`), threaded in from the caller exactly like every
+/// other subcommand (`wrap`, `governance`, …). The store-touching verbs
+/// (`show`, `restore-attest`, `re-anchor`, `bootstrap-node`) take that
+/// `&Path` and NOT an `&AppConfig`, so they structurally CANNOT re-resolve
+/// a store of their own: the pre-fix `effective_db(DEFAULT_DB)` recompute
+/// discarded a non-default `--db` / `AI_MEMORY_DB` (that helper only honours
+/// a `cli_db` differing from the `"ai-memory.db"` literal) and both READ and
+/// WROTE the config-resolved database instead — the same misfiling class
+/// #1991 closed in `build_embedder` / `build_llm_client`.
+pub fn run(
+    db_path: &Path,
+    args: AuditArgs,
+    app_config: &AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
     let audit_dir = args.audit_dir.clone();
     match args.action {
         AuditAction::Verify(v) => run_verify(&v, audit_dir.as_deref(), app_config, out),
         AuditAction::Tail(t) => run_tail(&t, audit_dir.as_deref(), app_config, out),
         AuditAction::Path => run_path(audit_dir.as_deref(), app_config, out),
-        AuditAction::Show(s) => run_show(&s, app_config, out),
-        AuditAction::RestoreAttest(r) => run_restore_attest(&r, app_config, out),
-        AuditAction::ReAnchor(r) => run_re_anchor(&r, app_config, out),
-        AuditAction::BootstrapNode(b) => run_bootstrap_node(&b, app_config, out),
+        AuditAction::Show(s) => run_show(&s, db_path, out),
+        AuditAction::RestoreAttest(r) => run_restore_attest(&r, db_path, out),
+        AuditAction::ReAnchor(r) => run_re_anchor(&r, db_path, out),
+        AuditAction::BootstrapNode(b) => run_bootstrap_node(&b, db_path, out),
     }
 }
 
@@ -242,7 +258,7 @@ pub fn run(args: AuditArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> 
 /// enrollment failure) propagates as `Err`.
 fn run_bootstrap_node(
     args: &BootstrapNodeArgs,
-    app_config: &AppConfig,
+    db_path: &Path,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     use anyhow::Context;
@@ -301,8 +317,7 @@ fn run_bootstrap_node(
         Ok(_) => {} // sqlite:// URL or no URL — proceed with local sqlite bring-up.
     }
 
-    let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
-    let conn = crate::db::open(&db_path)
+    let conn = crate::db::open(db_path)
         .with_context(|| format!("bootstrap-node: open db at {}", db_path.display()))?;
 
     let agent_id = crate::identity::resolve_agent_id(args.agent_id.as_deref(), None)
@@ -699,15 +714,10 @@ const REANCHOR_CHAIN_LABEL: &str = "sqlite:signed_events";
 /// #2214 audit F3 — the persisted row, never the in-memory copy) and
 /// self-verified via the read-back path (K1-pinned to the enrolled witness
 /// pubkey) so the operator sees the true ceremony round-trip.
-fn run_re_anchor(
-    args: &ReAnchorArgs,
-    app_config: &AppConfig,
-    out: &mut CliOutput<'_>,
-) -> Result<i32> {
+fn run_re_anchor(args: &ReAnchorArgs, db_path: &Path, out: &mut CliOutput<'_>) -> Result<i32> {
     use crate::signed_events::ReAnchorOutcome;
     use anyhow::Context;
-    let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
-    let conn = crate::db::open(&db_path)
+    let conn = crate::db::open(db_path)
         .with_context(|| format!("audit re-anchor: open db at {}", db_path.display()))?;
     let outcome =
         crate::signed_events::emit_reanchor_ceremony(&conn).context("emit re-anchor ceremony")?;
@@ -901,12 +911,11 @@ impl ReadBack {
 /// evidence for that DR window.
 fn run_restore_attest(
     args: &RestoreAttestArgs,
-    app_config: &AppConfig,
+    db_path: &Path,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     use anyhow::{Context, bail};
-    let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
-    let conn = crate::db::open(&db_path)
+    let conn = crate::db::open(db_path)
         .with_context(|| format!("audit restore-attest: open db at {}", db_path.display()))?;
     let db_head: i64 = conn
         .query_row(crate::signed_events::CHAIN_HEAD_SQL, [], |row| row.get(0))
@@ -994,9 +1003,8 @@ fn run_restore_attest(
 }
 
 /// v0.6.4-009 — print rows from the `audit_log` SQLite table.
-fn run_show(args: &ShowArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> Result<i32> {
-    let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
-    let conn = crate::db::open(&db_path)?;
+fn run_show(args: &ShowArgs, db_path: &Path, out: &mut CliOutput<'_>) -> Result<i32> {
+    let conn = crate::db::open(db_path)?;
     let rows = crate::db::list_capability_expansions(&conn, args.limit, args.principal.as_deref())?;
     if args.json {
         let payload: Vec<serde_json::Value> = rows
@@ -1560,8 +1568,13 @@ mod tests {
             }),
             audit_dir: None,
         };
-        let exit = run(args, &cfg, &mut out).unwrap();
+        // #3429 — the log-only verbs must not open ANY store: point the
+        // threaded db path at a file that does not exist and assert it is
+        // still absent afterwards.
+        let never = tmp.path().join("must-not-open.db");
+        let exit = run(&never, args, &cfg, &mut out).unwrap();
         assert_eq!(exit, 0);
+        assert!(!never.exists(), "verify must not open a store");
         let s = std::str::from_utf8(&stdout).unwrap();
         assert!(s.contains("\"status\":\"ok\""), "got: {s}");
     }
@@ -1585,8 +1598,10 @@ mod tests {
             }),
             audit_dir: None,
         };
-        let exit = run(args, &cfg, &mut out).unwrap();
+        let never = tmp.path().join("must-not-open.db");
+        let exit = run(&never, args, &cfg, &mut out).unwrap();
         assert_eq!(exit, 0);
+        assert!(!never.exists(), "tail must not open a store");
         let s = std::str::from_utf8(&stdout).unwrap();
         let count = s.lines().filter(|l| !l.is_empty()).count();
         assert_eq!(count, 3, "expected 3 events from chain, got {count}: {s}");
@@ -1608,8 +1623,11 @@ mod tests {
             action: AuditAction::Path,
             audit_dir: None,
         };
-        let exit = run(args, &cfg, &mut out).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let never = tmp.path().join("must-not-open.db");
+        let exit = run(&never, args, &cfg, &mut out).unwrap();
         assert_eq!(exit, 0);
+        assert!(!never.exists(), "path must not open a store");
         let s = std::str::from_utf8(&stdout).unwrap();
         assert!(s.contains("from-run.log"), "got: {s}");
     }
@@ -1937,11 +1955,10 @@ mod tests {
     #[test]
     fn audit_show_emits_no_rows_message_on_empty_table() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let cfg = cfg_for_db(tmp.path());
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-        let exit = run_show(&show_args(false, None), &cfg, &mut out).unwrap();
+        let exit = run_show(&show_args(false, None), tmp.path(), &mut out).unwrap();
         assert_eq!(exit, 0);
         let s = std::str::from_utf8(&stdout).unwrap();
         assert!(s.contains("audit_log: no rows"), "got: {s}");
@@ -1950,7 +1967,6 @@ mod tests {
     #[test]
     fn audit_show_renders_grant_and_deny_rows_in_text_format() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let cfg = cfg_for_db(tmp.path());
         let conn = crate::db::open(tmp.path()).unwrap();
         crate::db::record_capability_expansion(&conn, Some("alice"), "graph", true, None);
         crate::db::record_capability_expansion(&conn, Some("bob"), "power", false, None);
@@ -1959,7 +1975,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-        let exit = run_show(&show_args(false, None), &cfg, &mut out).unwrap();
+        let exit = run_show(&show_args(false, None), tmp.path(), &mut out).unwrap();
         assert_eq!(exit, 0);
         let s = std::str::from_utf8(&stdout).unwrap();
         assert!(s.contains("ALLOW"), "missing ALLOW header in: {s}");
@@ -1973,7 +1989,6 @@ mod tests {
     #[test]
     fn audit_show_emits_valid_json_when_flag_set() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let cfg = cfg_for_db(tmp.path());
         let conn = crate::db::open(tmp.path()).unwrap();
         crate::db::record_capability_expansion(&conn, Some("alice"), "graph", true, None);
         drop(conn);
@@ -1981,7 +1996,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-        let exit = run_show(&show_args(true, None), &cfg, &mut out).unwrap();
+        let exit = run_show(&show_args(true, None), tmp.path(), &mut out).unwrap();
         assert_eq!(exit, 0);
         let s = std::str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(s).expect("--json must emit valid JSON");
@@ -1996,7 +2011,6 @@ mod tests {
     #[test]
     fn audit_show_filters_by_agent_id() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let cfg = cfg_for_db(tmp.path());
         let conn = crate::db::open(tmp.path()).unwrap();
         crate::db::record_capability_expansion(&conn, Some("alice"), "graph", true, None);
         crate::db::record_capability_expansion(&conn, Some("bob"), "power", false, None);
@@ -2005,7 +2019,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-        let exit = run_show(&show_args(true, Some("alice")), &cfg, &mut out).unwrap();
+        let exit = run_show(&show_args(true, Some("alice")), tmp.path(), &mut out).unwrap();
         assert_eq!(exit, 0);
         let s = std::str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(s).unwrap();
@@ -2014,10 +2028,22 @@ mod tests {
         assert_eq!(arr[0]["agent_id"], "alice");
     }
 
+    /// #3429 — the ALLOWED path: `run` dispatches `show` against the store
+    /// path threaded in from the top-level parser, EVEN WHEN the `AppConfig`
+    /// in scope names a different one. Pre-fix `run_show` recomputed
+    /// `effective_db(DEFAULT_DB)` and read `cfg`'s store instead.
     #[test]
     fn audit_run_dispatches_to_show_arm() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let cfg = cfg_for_db(tmp.path());
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = dir.path().join("resolved.db");
+        let from_config = dir.path().join("from-config.db");
+        // Seed a row ONLY in the config-named store: if `show` read that one
+        // it would render `alice`, and the resolved store would stay absent.
+        {
+            let conn = crate::db::open(&from_config).unwrap();
+            crate::db::record_capability_expansion(&conn, Some("alice"), "graph", true, None);
+        }
+        let cfg = cfg_for_db(&from_config);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
@@ -2025,10 +2051,18 @@ mod tests {
             action: AuditAction::Show(show_args(false, None)),
             audit_dir: None,
         };
-        let exit = run(args, &cfg, &mut out).unwrap();
+        let exit = run(&resolved, args, &cfg, &mut out).unwrap();
         assert_eq!(exit, 0);
         let s = std::str::from_utf8(&stdout).unwrap();
         assert!(s.contains("audit_log"), "got: {s}");
+        assert!(
+            !s.contains("alice"),
+            "#3429: show must read the RESOLVED --db, not the config store: {s}"
+        );
+        assert!(
+            resolved.exists(),
+            "#3429: show must have opened the resolved --db"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2144,13 +2178,6 @@ mod restore_attest_1946_tests {
     use crate::cli::test_utils::TestEnv;
     use crate::governance::audit as witness;
 
-    fn cfg_for(env: &TestEnv) -> AppConfig {
-        AppConfig {
-            db: Some(env.db_path.display().to_string()),
-            ..Default::default()
-        }
-    }
-
     fn args(sign: bool, json: bool, key_dir: Option<std::path::PathBuf>) -> RestoreAttestArgs {
         RestoreAttestArgs {
             sign,
@@ -2203,9 +2230,9 @@ mod restore_attest_1946_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_witness_env();
         let mut env = TestEnv::fresh();
-        let cfg = cfg_for(&env);
+        let db_path = env.db_path.clone();
         let mut out = env.output();
-        let err = run_restore_attest(&args(false, false, None), &cfg, &mut out)
+        let err = run_restore_attest(&args(false, false, None), &db_path, &mut out)
             .expect_err("must bail without an anchor");
         assert!(
             err.to_string()
@@ -2244,9 +2271,9 @@ mod restore_attest_1946_tests {
             crate::signed_events::append_signed_event(&conn, &ev).expect("append");
             crate::signed_events::force_emit_audit_head_witness(&conn);
         }
-        let cfg = cfg_for(&env);
+        let db_path = env.db_path.clone();
         let mut out = env.output();
-        let code = run_restore_attest(&args(false, false, None), &cfg, &mut out).expect("ok");
+        let code = run_restore_attest(&args(false, false, None), &db_path, &mut out).expect("ok");
         assert_eq!(code, 0);
         drop(out);
         assert!(
@@ -2266,10 +2293,11 @@ mod restore_attest_1946_tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let mut env = TestEnv::fresh();
         seed_anchor_above_head(&env, tmp.path());
-        let cfg = cfg_for(&env);
+        let db_path = env.db_path.clone();
         {
             let mut out = env.output();
-            let code = run_restore_attest(&args(false, false, None), &cfg, &mut out).expect("ok");
+            let code =
+                run_restore_attest(&args(false, false, None), &db_path, &mut out).expect("ok");
             assert_eq!(code, 0);
         }
         assert!(
@@ -2280,7 +2308,8 @@ mod restore_attest_1946_tests {
         env.stdout.clear();
         {
             let mut out = env.output();
-            let code = run_restore_attest(&args(false, true, None), &cfg, &mut out).expect("ok");
+            let code =
+                run_restore_attest(&args(false, true, None), &db_path, &mut out).expect("ok");
             assert_eq!(code, 0);
         }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
@@ -2308,12 +2337,12 @@ mod restore_attest_1946_tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let mut env = TestEnv::fresh();
         seed_anchor_above_head(&env, tmp.path());
-        let cfg = cfg_for(&env);
+        let db_path = env.db_path.clone();
         let empty_keys = tempfile::tempdir().expect("tmp2");
         let mut out = env.output();
         let err = run_restore_attest(
             &args(true, false, Some(empty_keys.path().to_path_buf())),
-            &cfg,
+            &db_path,
             &mut out,
         )
         .expect_err("must fail without operator key");
@@ -2334,12 +2363,12 @@ mod restore_attest_1946_tests {
         let op = crate::identity::keypair::generate(crate::cli::rules::OPERATOR_KEY_ID)
             .expect("gen operator");
         crate::identity::keypair::save(&op, op_dir.path()).expect("save operator");
-        let cfg = cfg_for(&env);
+        let db_path = env.db_path.clone();
         {
             let mut out = env.output();
             let code = run_restore_attest(
                 &args(true, false, Some(op_dir.path().to_path_buf())),
-                &cfg,
+                &db_path,
                 &mut out,
             )
             .expect("sign ok");
@@ -2355,7 +2384,7 @@ mod restore_attest_1946_tests {
             let mut out = env.output();
             let code = run_restore_attest(
                 &args(true, true, Some(op_dir.path().to_path_buf())),
-                &cfg,
+                &db_path,
                 &mut out,
             )
             .expect("sign ok json");
@@ -2380,13 +2409,6 @@ mod reanchor_ceremony_2004_cli_tests {
     use super::*;
     use crate::cli::test_utils::TestEnv;
     use crate::governance::audit as witness;
-
-    fn cfg_for(env: &TestEnv) -> AppConfig {
-        AppConfig {
-            db: Some(env.db_path.display().to_string()),
-            ..Default::default()
-        }
-    }
 
     fn clear_witness_env() {
         unsafe {
@@ -2440,10 +2462,10 @@ mod reanchor_ceremony_2004_cli_tests {
         unsafe {
             std::env::set_var(witness::WITNESS_PUBKEY_ENV, kp.public_base64());
         }
-        let cfg = cfg_for(&env);
+        let db_path = env.db_path.clone();
         let code = {
             let mut out = env.output();
-            run_re_anchor(&ReAnchorArgs { json: false }, &cfg, &mut out).expect("run")
+            run_re_anchor(&ReAnchorArgs { json: false }, &db_path, &mut out).expect("run")
         };
         assert_eq!(code, 0, "PASS read-back must exit 0: {}", env.stdout_str());
         assert!(
@@ -2471,10 +2493,10 @@ mod reanchor_ceremony_2004_cli_tests {
         unsafe {
             std::env::set_var(witness::WITNESS_PUBKEY_ENV, other.public_base64());
         }
-        let cfg = cfg_for(&env);
+        let db_path = env.db_path.clone();
         let code = {
             let mut out = env.output();
-            run_re_anchor(&ReAnchorArgs { json: true }, &cfg, &mut out).expect("run")
+            run_re_anchor(&ReAnchorArgs { json: true }, &db_path, &mut out).expect("run")
         };
         assert_eq!(
             code,
@@ -2526,10 +2548,10 @@ mod reanchor_ceremony_2004_cli_tests {
                 .join(format!("{}.pub", witness::WITNESS_KEY_LABEL)),
         )
         .expect("remove pub");
-        let cfg = cfg_for(&env);
+        let db_path = env.db_path.clone();
         let code = {
             let mut out = env.output();
-            run_re_anchor(&ReAnchorArgs { json: true }, &cfg, &mut out).expect("run")
+            run_re_anchor(&ReAnchorArgs { json: true }, &db_path, &mut out).expect("run")
         };
         assert_eq!(
             code,
@@ -2575,10 +2597,10 @@ mod reanchor_ceremony_2004_cli_tests {
                 kdir.path().join("does-not-exist"),
             );
         }
-        let cfg = cfg_for(&env);
+        let db_path = env.db_path.clone();
         let code = {
             let mut out = env.output();
-            run_re_anchor(&ReAnchorArgs { json: true }, &cfg, &mut out).expect("run")
+            run_re_anchor(&ReAnchorArgs { json: true }, &db_path, &mut out).expect("run")
         };
         assert_eq!(
             code,
