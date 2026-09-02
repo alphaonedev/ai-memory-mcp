@@ -1813,23 +1813,14 @@ fn snapshot_dest_enrolled_keys(
 /// discipline, reused through the same
 /// [`crate::identity::attest::stamp_attestation`] gate).
 ///
-/// Behaviour, in order:
-/// 1. Under the default restamp posture the wire `metadata.agent_pubkey`
-///    identity-key claim is STRIPPED (unauthenticated input must not seed
-///    the destination's enrolled-key lookup surface).
-/// 2. A byte-preserving fast path: a row that neither asserts an
-///    `attest_level` nor presents a `write_signature` is left untouched
-///    (absent reads as `claimed` on every trust surface).
-/// 3. The re-attribution rule: a row whose identity was restamped
-///    (`original_claim != attributed`) can never verify the ORIGINAL
-///    claimant's signature against the new attribution — land `claimed`,
-///    skip verification (mirrors `apply_inbound_write_attestation`).
-/// 4. Otherwise verify any presented `metadata.write_signature` against the
-///    pre-transaction snapshot of the author's DESTINATION-enrolled key:
-///    valid → `agent_attested`; absent signature or unenrolled author →
-///    `claimed`; presented-but-FORGED → the row is SKIPPED (`Ok(false)`),
-///    never downgraded — the #1464 invariant that a deliberately bad
-///    signature cannot launder into a stored row.
+/// #3421 — the DECISION now lives in the shared funnel
+/// [`crate::identity::attest::reconcile_imported_attestation`], which the HTTP
+/// `POST /api/v1/import` admin route calls too; this function is the
+/// bundle-import ADAPTER that maps the shared disposition onto this module's
+/// [`ImportReport`] counters + warnings. Behaviour is unchanged — see the
+/// funnel's doc comment for the ordered rules (strip wire identity key,
+/// byte-preserving fast path, malformed-signature skip, re-attribution rule,
+/// verify-against-destination-enrolled-key).
 ///
 /// Returns `Ok(true)` to keep the row, `Ok(false)` to skip it (forged).
 ///
@@ -1844,126 +1835,83 @@ fn apply_import_attestation(
     enrolled_keys: &std::collections::HashMap<String, Option<String>>,
     report: &mut ImportReport,
 ) -> Result<bool> {
-    use crate::models::field_names;
+    use crate::identity::attest::{ImportClaimedCause, ImportSkipCause};
 
-    let wire_asserted_attested = staged
-        .metadata
-        .get(field_names::ATTEST_LEVEL)
-        .and_then(serde_json::Value::as_str)
-        == Some(crate::identity::verify::AttestLevel::AgentAttested.as_str());
-    let wire_has_attest_level = staged.metadata.get(field_names::ATTEST_LEVEL).is_some();
-    // (1) Strip the wire identity-key claim under the restamp posture.
-    if !trust_source
-        && let Some(obj) = staged.metadata.as_object_mut()
-        && obj.remove(field_names::AGENT_PUBKEY).is_some()
-    {
-        tracing::warn!(
-            target: IMPORT_TRACE_TARGET,
-            memory_id = %staged.id,
-            "bundle memory carried a wire agent_pubkey identity-key claim — stripped \
-             (unauthenticated input must not seed the enrolled-key surface; pre-ship 3x7)"
-        );
-    }
-    let wire_signature = staged.metadata.get(field_names::WRITE_SIGNATURE);
-    let presented_sig: Option<Vec<u8>> = match wire_signature {
-        None => None,
-        Some(serde_json::Value::String(encoded)) => {
-            use base64::Engine;
-            match base64::engine::general_purpose::STANDARD.decode(encoded.trim()) {
-                Ok(signature) if signature.len() == crate::identity::verify::SIGNATURE_LEN => {
-                    Some(signature)
-                }
-                Ok(_) | Err(_) => {
-                    report.forged_signature_skipped += 1;
-                    report.warnings.push(format!(
-                        "memory {} skipped: presented write_signature is malformed",
-                        staged.id
-                    ));
-                    tracing::warn!(
-                        target: IMPORT_TRACE_TARGET,
-                        memory_id = %staged.id,
-                        "bundle memory skipped: presented write_signature is malformed \
-                         (invalid base64 or not exactly 64 bytes; never treated as absent)"
-                    );
-                    return Ok(false);
-                }
-            }
-        }
-        Some(_) => {
-            report.forged_signature_skipped += 1;
-            report.warnings.push(format!(
-                "memory {} skipped: presented write_signature has a non-string shape",
-                staged.id
-            ));
-            tracing::warn!(
-                target: IMPORT_TRACE_TARGET,
-                memory_id = %staged.id,
-                "bundle memory skipped: presented write_signature has a non-string shape \
-                 (never treated as absent)"
-            );
-            return Ok(false);
-        }
-    };
-    // (2) Byte-preserving fast path: nothing asserted, nothing presented.
-    if !wire_has_attest_level && presented_sig.is_none() {
-        return Ok(true);
-    }
-    let land_claimed = |staged: &mut crate::models::Memory, report: &mut ImportReport| {
-        if let Some(obj) = staged.metadata.as_object_mut() {
-            obj.remove(field_names::WRITE_SIGNATURE);
-            obj.insert(
-                field_names::ATTEST_LEVEL.to_string(),
-                serde_json::Value::String(
-                    crate::identity::verify::AttestLevel::Claimed
-                        .as_str()
-                        .to_string(),
-                ),
-            );
-        }
-        if wire_asserted_attested {
-            report.attestation_downgraded += 1;
-            tracing::warn!(
-                target: IMPORT_TRACE_TARGET,
-                memory_id = %staged.id,
-                "bundle memory asserted attest_level=agent_attested but the destination \
-                 could not verify it — landed claimed (wire attestation is never trusted; \
-                 pre-ship 3x7)"
-            );
-        }
-    };
-    let attributed = staged
-        .metadata
-        .get(crate::META_KEY_AGENT_ID)
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string);
-    let Some(attributed) = attributed.filter(|a| !a.is_empty()) else {
-        land_claimed(staged, report);
-        return Ok(true);
-    };
-    // (3) The re-attribution rule.
-    if original_claim.is_some_and(|c| c != attributed) {
-        land_claimed(staged, report);
-        return Ok(true);
-    }
-    // (4) Verify against the pre-transaction DESTINATION-enrolled key.
-    let bound: Option<&str> = enrolled_keys.get(&attributed).and_then(|k| k.as_deref());
-    match crate::identity::attest::stamp_attestation(
+    let outcome = crate::identity::attest::reconcile_imported_attestation(
         staged,
-        &attributed,
-        bound,
-        presented_sig.as_deref(),
-        false,
-    ) {
-        Ok(level) => {
-            if level != crate::identity::verify::AttestLevel::AgentAttested
-                && let Some(obj) = staged.metadata.as_object_mut()
-            {
-                obj.remove(field_names::WRITE_SIGNATURE);
+        original_claim,
+        !trust_source,
+        enrolled_keys,
+    );
+
+    if let Some(cause) = outcome.skipped() {
+        report.forged_signature_skipped += 1;
+        match cause {
+            ImportSkipCause::NonStringSignature => {
+                report.warnings.push(format!(
+                    "memory {} skipped: presented write_signature has a non-string shape",
+                    staged.id
+                ));
+                tracing::warn!(
+                    target: IMPORT_TRACE_TARGET,
+                    memory_id = %staged.id,
+                    "bundle memory skipped: presented write_signature has a non-string shape \
+                     (never treated as absent)"
+                );
             }
-            if wire_asserted_attested
-                && level != crate::identity::verify::AttestLevel::AgentAttested
-            {
-                report.attestation_downgraded += 1;
+            ImportSkipCause::MalformedSignature => {
+                report.warnings.push(format!(
+                    "memory {} skipped: presented write_signature is malformed",
+                    staged.id
+                ));
+                tracing::warn!(
+                    target: IMPORT_TRACE_TARGET,
+                    memory_id = %staged.id,
+                    "bundle memory skipped: presented write_signature is malformed \
+                     (invalid base64 or not exactly 64 bytes; never treated as absent)"
+                );
+            }
+            ImportSkipCause::ForgedSignature => {
+                let attributed = staged
+                    .metadata
+                    .get(crate::META_KEY_AGENT_ID)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                report.warnings.push(format!(
+                    "memory {} skipped: presented write_signature failed verification against \
+                     the destination-enrolled key for {attributed} (forged; never downgraded)",
+                    staged.id
+                ));
+                tracing::warn!(
+                    target: IMPORT_TRACE_TARGET,
+                    memory_id = %staged.id,
+                    author = %attributed,
+                    "bundle memory skipped: presented write_signature is FORGED against the \
+                     destination-enrolled author key (pre-ship 3x7; #1464 invariant)"
+                );
+            }
+        }
+        return Ok(false);
+    }
+
+    if let Some(cause) = outcome.downgraded() {
+        report.attestation_downgraded += 1;
+        match cause {
+            ImportClaimedCause::NoAttributedAuthor | ImportClaimedCause::Reattributed => {
+                tracing::warn!(
+                    target: IMPORT_TRACE_TARGET,
+                    memory_id = %staged.id,
+                    "bundle memory asserted attest_level=agent_attested but the destination \
+                     could not verify it — landed claimed (wire attestation is never trusted; \
+                     pre-ship 3x7)"
+                );
+            }
+            ImportClaimedCause::Unverifiable => {
+                let attributed = staged
+                    .metadata
+                    .get(crate::META_KEY_AGENT_ID)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
                 tracing::warn!(
                     target: IMPORT_TRACE_TARGET,
                     memory_id = %staged.id,
@@ -1973,26 +1921,10 @@ fn apply_import_attestation(
                      wire attestation is never trusted (pre-ship 3x7)"
                 );
             }
-            Ok(true)
-        }
-        Err(e) => {
-            report.forged_signature_skipped += 1;
-            report.warnings.push(format!(
-                "memory {} skipped: presented write_signature failed verification against \
-                 the destination-enrolled key for {attributed} (forged; never downgraded)",
-                staged.id
-            ));
-            tracing::warn!(
-                target: IMPORT_TRACE_TARGET,
-                memory_id = %staged.id,
-                author = %attributed,
-                error = %e,
-                "bundle memory skipped: presented write_signature is FORGED against the \
-                 destination-enrolled author key (pre-ship 3x7; #1464 invariant)"
-            );
-            Ok(false)
         }
     }
+
+    Ok(true)
 }
 
 /// #2209 — replay-verify the WHOLE staged `memory_revisions` chain from the

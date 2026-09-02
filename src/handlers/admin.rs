@@ -822,12 +822,19 @@ pub async fn import_memories(
     // backends BEFORE validate / governance / store so all downstream
     // consumers (governance enforce, store.store / db::insert) see
     // the admin caller as the row's principal.
-    let restamp_agent_id = |mem: &mut Memory| {
+    //
+    // #3421 — returns the row's ORIGINAL `metadata.agent_id` claim (pre-restamp)
+    // so the attestation reconcile below can apply the re-attribution rule: a
+    // row this import RE-OWNED can never verify the original author's
+    // `write_signature` against the new attribution, because the signed
+    // `SignableWrite` envelope commits to `agent_id`.
+    let restamp_agent_id = |mem: &mut Memory| -> Option<String> {
         if !mem.metadata.is_object() {
             mem.metadata = json!({});
         }
+        let mut original: Option<String> = None;
         if let Some(obj) = mem.metadata.as_object_mut() {
-            let original = obj
+            original = obj
                 .get("agent_id")
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string);
@@ -835,16 +842,39 @@ pub async fn import_memories(
                 "agent_id".to_string(),
                 serde_json::Value::String(caller.clone()),
             );
-            if let Some(orig) = original
-                && orig != caller
+            if let Some(orig) = original.as_ref()
+                && orig != &caller
             {
                 obj.insert(
                     field_names::IMPORTED_FROM_AGENT_ID.to_string(),
-                    serde_json::Value::String(orig),
+                    serde_json::Value::String(orig.clone()),
                 );
             }
         }
+        original
     };
+    // #3421 (security-high) — NEVER trust wire attestation on the import
+    // surface. Pre-fix this handler re-owned every row to the importing admin
+    // (`restamp_agent_id`) but carried the body's `metadata.attest_level` and
+    // `metadata.write_signature` through VERBATIM, so an unauthenticated body
+    // minted a durable `agent_attested` row whose retained signature was
+    // computed over a DIFFERENT agent_id / namespace / title — an attestation
+    // no principal ever signed, which every downstream trust surface
+    // (`row_is_agent_attested`, federation relay, the attestation census) then
+    // believed. The CLI L1 route (`cli::io`, #2264) and the portability v2
+    // route (`portability::import`) both already re-derive the attestation
+    // from what the DESTINATION can verify; HTTP was the one surface that did
+    // neither, so an attacker simply picked it.
+    //
+    // Resolve the destination-enrolled key for the importing admin ONCE, up
+    // front, BEFORE any row of this batch is written — an in-batch `_agents`
+    // row must never be able to self-enroll the key that verifies it. Every
+    // row is restamped to `caller`, so the caller's key is the only one that
+    // can ever be consulted. A key-lookup FAILURE is fatal for the batch (500)
+    // rather than silently read as "unenrolled": swallowing it would durably
+    // demote a genuinely signed re-import to `claimed` (#3145 discipline).
+    let mut enrolled_keys: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     // v0.7.0 Wave-3 Continuation 3 (Phase 18) — postgres-backed daemons
     // route through the SAL trait. We re-use `app.store.store(...)` per
     // memory (the upsert path that preserves agent_id immutability) and
@@ -872,12 +902,55 @@ pub async fn import_memories(
         };
         let ctx =
             crate::store::CallerContext::for_agent(caller.clone()).with_capability(capability);
+        // #3421 — pre-batch snapshot of the importing admin's
+        // destination-enrolled key (see the note at the restamp closure).
+        match app.store.agent_pubkey(&caller).await {
+            Ok(bound) => {
+                enrolled_keys.insert(caller.clone(), bound);
+            }
+            Err(e) => {
+                tracing::error!(
+                    "import_memories(postgres): resolving the destination-enrolled key for \
+                     the importing admin failed: {e}"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                )
+                    .into_response();
+            }
+        }
         let mut imported = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
         for mut mem in body.memories {
             // #956 — restamp before validate / governance / store.
-            restamp_agent_id(&mut mem);
+            let original_claim = restamp_agent_id(&mut mem);
+            // #3421 — re-derive the attestation from what THIS node can
+            // verify. A presented-but-forged signature skips the row (never
+            // downgraded, the #1464 invariant); a re-owned or unverifiable
+            // row lands `claimed` with the stale signature dropped.
+            let attest = crate::identity::attest::reconcile_imported_attestation(
+                &mut mem,
+                original_claim.as_deref(),
+                true,
+                &enrolled_keys,
+            );
+            if let Some(cause) = attest.skipped() {
+                tracing::warn!(
+                    memory_id = %mem.id,
+                    "import_memories(postgres): row skipped — {cause} (#3421)"
+                );
+                errors.push(format!("import refused: {cause}"));
+                continue;
+            }
+            if let Some(cause) = attest.downgraded() {
+                tracing::warn!(
+                    memory_id = %mem.id,
+                    "import_memories(postgres): row asserted attest_level=agent_attested but \
+                     landed claimed — {cause} (#3421)"
+                );
+            }
             if let Err(e) = validate::RequestValidator::validate_memory(&mem) {
                 // Issue #851: never echo the raw `e` to the wire paired
                 // with the user-supplied id (the combo reflects the
@@ -1002,11 +1075,52 @@ pub async fn import_memories(
     }
 
     let lock = app.db.lock().await;
+    // #3421 — pre-batch snapshot of the importing admin's destination-enrolled
+    // key (sqlite twin of the postgres branch above).
+    match db::agent_pubkey(&lock.0, &caller) {
+        Ok(bound) => {
+            enrolled_keys.insert(caller.clone(), bound);
+        }
+        Err(e) => {
+            tracing::error!(
+                "import_memories: resolving the destination-enrolled key for the importing \
+                 admin failed: {e}"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+            )
+                .into_response();
+        }
+    }
     let mut imported = 0usize;
     let mut errors = Vec::new();
     for mut mem in body.memories {
         // #956 — restamp before validate / insert.
-        restamp_agent_id(&mut mem);
+        let original_claim = restamp_agent_id(&mut mem);
+        // #3421 — sqlite twin of the postgres reconcile above (one shared
+        // funnel, `identity::attest::reconcile_imported_attestation`).
+        let attest = crate::identity::attest::reconcile_imported_attestation(
+            &mut mem,
+            original_claim.as_deref(),
+            true,
+            &enrolled_keys,
+        );
+        if let Some(cause) = attest.skipped() {
+            tracing::warn!(
+                memory_id = %mem.id,
+                "import_memories: row skipped — {cause} (#3421)"
+            );
+            errors.push(format!("import refused: {cause}"));
+            continue;
+        }
+        if let Some(cause) = attest.downgraded() {
+            tracing::warn!(
+                memory_id = %mem.id,
+                "import_memories: row asserted attest_level=agent_attested but landed \
+                 claimed — {cause} (#3421)"
+            );
+        }
         if let Err(e) = validate::RequestValidator::validate_memory(&mem) {
             // Issue #851: never echo `<id>: <validate error>` paired —
             // the combo reflects the caller's request and the inner

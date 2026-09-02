@@ -654,6 +654,284 @@ pub async fn stamp_attestation_async(
     let require = require_agent_attestation_for(surface);
     stamp_attestation(mem, agent_id, bound.as_deref(), signature, require)
 }
+// ---------------------------------------------------------------------------
+// #3421 — the ONE import-attestation reconciliation funnel
+// ---------------------------------------------------------------------------
+
+/// #3421 — why an imported row could NOT keep the attestation the wire
+/// asserted, and therefore landed `attest_level="claimed"` with any presented
+/// `write_signature` dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportClaimedCause {
+    /// The staged row carries no non-empty `metadata.agent_id`, so there is no
+    /// principal whose enrolled key could verify anything.
+    NoAttributedAuthor,
+    /// The row was RE-OWNED by the import (`original_claim != attributed`).
+    /// The [`SignableWrite`] envelope commits to `agent_id`, so the ORIGINAL
+    /// author's signature can never re-derive from the re-owned row — keeping
+    /// it would assert an attestation no principal ever minted.
+    Reattributed,
+    /// The attributed author has no destination-enrolled key, or the row
+    /// presented no signature at all.
+    Unverifiable,
+}
+
+impl std::fmt::Display for ImportClaimedCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::NoAttributedAuthor => "the row carries no attributed author",
+            Self::Reattributed => {
+                "the row was re-owned by the import, so the original author's signature \
+                 can never re-derive from it"
+            }
+            Self::Unverifiable => {
+                "the destination has no enrolled key for the attributed author, or no \
+                 signature was presented"
+            }
+        };
+        f.write_str(s)
+    }
+}
+
+/// #3421 — why an imported row must be SKIPPED entirely rather than landed at
+/// a lower attestation level.
+///
+/// A presented-but-bad signature is NEVER silently downgraded (the #1464
+/// invariant): a deliberately bad signature must not launder into a stored row
+/// as a merely-`claimed` write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportSkipCause {
+    /// `metadata.write_signature` is present but is not a JSON string.
+    NonStringSignature,
+    /// `metadata.write_signature` is a string but is not standard base64, or
+    /// does not decode to exactly [`crate::identity::verify::SIGNATURE_LEN`]
+    /// bytes.
+    MalformedSignature,
+    /// The presented signature was verified against the destination-enrolled
+    /// key for the attributed author and FAILED.
+    ForgedSignature,
+}
+
+impl std::fmt::Display for ImportSkipCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::NonStringSignature => "presented write_signature has a non-string shape",
+            Self::MalformedSignature => "presented write_signature is malformed",
+            Self::ForgedSignature => {
+                "presented write_signature failed verification against the \
+                 destination-enrolled author key (forged; never downgraded)"
+            }
+        };
+        f.write_str(s)
+    }
+}
+
+/// #3421 — what [`reconcile_imported_attestation`] decided for one staged row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportAttestDisposition {
+    /// The row asserted no `attest_level` and presented no `write_signature`,
+    /// so the attestation keys were left exactly as they arrived (absent reads
+    /// as `claimed` on every trust surface). Note the wire identity-key claim
+    /// may still have been stripped — see `strip_wire_identity_key`.
+    LeftAsIs,
+    /// The row landed `attest_level="claimed"` and any presented
+    /// `write_signature` was removed.
+    Claimed(ImportClaimedCause),
+    /// The presented signature verified against the destination-enrolled key
+    /// for the attributed author: `attest_level="agent_attested"` is genuine
+    /// and the signature was kept.
+    Attested,
+    /// The row must NOT be stored. The caller skips it (per-row disposition).
+    Skipped(ImportSkipCause),
+}
+
+/// #3421 — the decision [`reconcile_imported_attestation`] reached, plus the
+/// one fact every caller needs for its own reporting: whether the WIRE claimed
+/// `agent_attested` (so a `Claimed` disposition is a DOWNGRADE worth counting
+/// and warning about, not a routine absence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportAttestOutcome {
+    /// What was decided for the row.
+    pub disposition: ImportAttestDisposition,
+    /// `true` when the incoming (unauthenticated) metadata asserted
+    /// `attest_level = "agent_attested"`.
+    pub wire_asserted_attested: bool,
+}
+
+impl ImportAttestOutcome {
+    /// `true` when the row may be stored; `false` when the caller MUST skip it.
+    #[must_use]
+    pub fn keep_row(self) -> bool {
+        !matches!(self.disposition, ImportAttestDisposition::Skipped(_))
+    }
+
+    /// `Some(cause)` when the wire asserted `agent_attested` but the row landed
+    /// `claimed` — the countable, warn-worthy downgrade.
+    #[must_use]
+    pub fn downgraded(self) -> Option<ImportClaimedCause> {
+        match self.disposition {
+            ImportAttestDisposition::Claimed(cause) if self.wire_asserted_attested => Some(cause),
+            _ => None,
+        }
+    }
+
+    /// `Some(cause)` when the row must be skipped.
+    #[must_use]
+    pub fn skipped(self) -> Option<ImportSkipCause> {
+        match self.disposition {
+            ImportAttestDisposition::Skipped(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
+
+/// #3421 — re-derive a staged IMPORTED row's attestation from what the
+/// DESTINATION can verify, never from the wire.
+///
+/// This is the ONE funnel every import surface calls (the CLI/portability
+/// bundle route via `portability::import::apply_import_attestation`, the HTTP
+/// `POST /api/v1/import` admin route via `handlers::admin::import_memories`),
+/// so a new import surface cannot re-introduce the #3421 forge primitive: an
+/// unauthenticated body that carries `attest_level="agent_attested"` plus some
+/// other principal's `write_signature`, re-owned to the importing admin, is a
+/// durable attestation NO principal ever minted.
+///
+/// Behaviour, in order (the federation
+/// `federation_receive::apply_inbound_write_attestation` discipline, reused
+/// through the same [`stamp_attestation`] gate):
+///
+/// 1. When `strip_wire_identity_key`, the wire `metadata.agent_pubkey` claim is
+///    REMOVED — unauthenticated input must never seed the destination's
+///    enrolled-key lookup surface.
+/// 2. Fast path: a row that neither asserts an `attest_level` nor presents a
+///    `write_signature` is left byte-identical
+///    ([`ImportAttestDisposition::LeftAsIs`]).
+/// 3. A presented `write_signature` that is not a string, not base64, or not
+///    exactly [`crate::identity::verify::SIGNATURE_LEN`] bytes SKIPS the row —
+///    a bad signature is never read as an absent one.
+/// 4. The re-attribution rule: a row whose identity was restamped
+///    (`original_claim != attributed`) can never verify the ORIGINAL claimant's
+///    signature against the new attribution — it lands `claimed`.
+/// 5. Otherwise the presented signature is verified against `enrolled_keys`
+///    (the caller's PRE-resolved snapshot of destination-enrolled keys, taken
+///    before any row of this batch is written so an in-bundle `_agents` row
+///    cannot self-enroll the key that verifies it): valid → `agent_attested`
+///    with the signature kept; absent signature / unenrolled author →
+///    `claimed`; presented-but-FORGED → the row is SKIPPED, never downgraded.
+///
+/// `staged.metadata` is mutated in place for every disposition except
+/// [`ImportAttestDisposition::LeftAsIs`] (and the step-1 strip). A SKIPPED
+/// row's metadata may already have been touched — callers must discard the row,
+/// not store it.
+#[must_use]
+pub fn reconcile_imported_attestation(
+    staged: &mut Memory,
+    original_claim: Option<&str>,
+    strip_wire_identity_key: bool,
+    enrolled_keys: &std::collections::HashMap<String, Option<String>>,
+) -> ImportAttestOutcome {
+    use crate::models::field_names;
+
+    let wire_asserted_attested = staged
+        .metadata
+        .get(field_names::ATTEST_LEVEL)
+        .and_then(serde_json::Value::as_str)
+        == Some(AttestLevel::AgentAttested.as_str());
+    let wire_has_attest_level = staged.metadata.get(field_names::ATTEST_LEVEL).is_some();
+    let outcome = |disposition| ImportAttestOutcome {
+        disposition,
+        wire_asserted_attested,
+    };
+
+    // (1) Strip the wire identity-key claim under the restamp posture.
+    if strip_wire_identity_key
+        && let Some(obj) = staged.metadata.as_object_mut()
+        && obj.remove(field_names::AGENT_PUBKEY).is_some()
+    {
+        tracing::warn!(
+            target: "ai_memory::identity::attest",
+            memory_id = %staged.id,
+            "imported memory carried a wire agent_pubkey identity-key claim — stripped \
+             (unauthenticated input must not seed the enrolled-key surface; #3421)"
+        );
+    }
+
+    let presented_sig: Option<Vec<u8>> = match staged.metadata.get(field_names::WRITE_SIGNATURE) {
+        None => None,
+        Some(serde_json::Value::String(encoded)) => {
+            use base64::Engine as _;
+            match base64::engine::general_purpose::STANDARD.decode(encoded.trim()) {
+                Ok(signature) if signature.len() == crate::identity::verify::SIGNATURE_LEN => {
+                    Some(signature)
+                }
+                Ok(_) | Err(_) => {
+                    return outcome(ImportAttestDisposition::Skipped(
+                        ImportSkipCause::MalformedSignature,
+                    ));
+                }
+            }
+        }
+        Some(_) => {
+            return outcome(ImportAttestDisposition::Skipped(
+                ImportSkipCause::NonStringSignature,
+            ));
+        }
+    };
+
+    // (2) Byte-preserving fast path: nothing asserted, nothing presented.
+    if !wire_has_attest_level && presented_sig.is_none() {
+        return outcome(ImportAttestDisposition::LeftAsIs);
+    }
+
+    let land_claimed = |staged: &mut Memory| {
+        if let Some(obj) = staged.metadata.as_object_mut() {
+            obj.remove(field_names::WRITE_SIGNATURE);
+            obj.insert(
+                field_names::ATTEST_LEVEL.to_string(),
+                serde_json::Value::String(AttestLevel::Claimed.as_str().to_string()),
+            );
+        }
+    };
+
+    let attributed = staged
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let Some(attributed) = attributed.filter(|a| !a.is_empty()) else {
+        land_claimed(staged);
+        return outcome(ImportAttestDisposition::Claimed(
+            ImportClaimedCause::NoAttributedAuthor,
+        ));
+    };
+
+    // (4) The re-attribution rule.
+    if original_claim.is_some_and(|c| c != attributed) {
+        land_claimed(staged);
+        return outcome(ImportAttestDisposition::Claimed(
+            ImportClaimedCause::Reattributed,
+        ));
+    }
+
+    // (5) Verify against the PRE-resolved destination-enrolled key snapshot.
+    let bound: Option<&str> = enrolled_keys.get(&attributed).and_then(Option::as_deref);
+    match stamp_attestation(staged, &attributed, bound, presented_sig.as_deref(), false) {
+        Ok(AttestLevel::AgentAttested) => outcome(ImportAttestDisposition::Attested),
+        Ok(_) => {
+            // `stamp_attestation` already stamped `claimed`; drop the
+            // signature it could not stand behind.
+            if let Some(obj) = staged.metadata.as_object_mut() {
+                obj.remove(field_names::WRITE_SIGNATURE);
+            }
+            outcome(ImportAttestDisposition::Claimed(
+                ImportClaimedCause::Unverifiable,
+            ))
+        }
+        Err(_) => outcome(ImportAttestDisposition::Skipped(
+            ImportSkipCause::ForgedSignature,
+        )),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1211,5 +1489,201 @@ mod tests {
         redact_before_sign(&mut m);
         assert_eq!(m.content, mem.content, "clean content is left untouched");
         assert_eq!(m.title, mem.title);
+    }
+
+    // -- #3421: the shared import-attestation reconciliation funnel ---------
+
+    /// Build the destination's pre-resolved enrolled-key snapshot.
+    fn enrolled(
+        pairs: &[(&str, Option<&str>)],
+    ) -> std::collections::HashMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(a, k)| ((*a).to_string(), k.map(ToString::to_string)))
+            .collect()
+    }
+
+    fn sig_b64(kp: &keypair::AgentKeypair, mem: &Memory, agent_id: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(sign_for(kp, mem, agent_id))
+    }
+
+    /// ALLOWED (byte-preserving) — a row that asserts nothing and presents
+    /// nothing keeps its metadata exactly as it arrived.
+    #[test]
+    fn reconcile_imported_attestation_leaves_a_plain_row_as_is_3421() {
+        let mut mem = make_memory("plain body");
+        mem.metadata = serde_json::json!({ "agent_id": "ai:alice" });
+        let before = mem.metadata.clone();
+        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, &enrolled(&[]));
+        assert_eq!(out.disposition, ImportAttestDisposition::LeftAsIs);
+        assert!(out.keep_row());
+        assert_eq!(
+            mem.metadata, before,
+            "the fast path must not touch metadata"
+        );
+    }
+
+    /// DENIED — a RE-OWNED row can never keep the original author's
+    /// attestation: the signed envelope commits to `agent_id`, so the retained
+    /// signature could never re-derive. It lands `claimed` with the stale
+    /// signature dropped, and the wire identity-key claim is stripped.
+    #[test]
+    fn reconcile_imported_attestation_lands_claimed_on_reattribution_3421() {
+        let victim = keypair::generate("ai:victim").unwrap();
+        let mut mem = make_memory("re-owned body");
+        let signature = sig_b64(&victim, &mem, "ai:victim");
+        mem.metadata = serde_json::json!({
+            "agent_id": "ops:admin",
+            "attest_level": "agent_attested",
+            "write_signature": signature,
+            "agent_pubkey": victim.public_base64(),
+        });
+        // The row's ORIGINAL claim was the victim; the import already
+        // restamped `agent_id` to the importing admin.
+        let out = reconcile_imported_attestation(
+            &mut mem,
+            Some("ai:victim"),
+            true,
+            &enrolled(&[("ops:admin", None)]),
+        );
+        assert_eq!(
+            out.disposition,
+            ImportAttestDisposition::Claimed(ImportClaimedCause::Reattributed)
+        );
+        assert!(out.keep_row());
+        assert_eq!(out.downgraded(), Some(ImportClaimedCause::Reattributed));
+        assert_eq!(mem.metadata["attest_level"].as_str(), Some("claimed"));
+        assert!(mem.metadata.get("write_signature").is_none());
+        assert!(
+            mem.metadata.get("agent_pubkey").is_none(),
+            "an unauthenticated wire identity-key claim must never survive"
+        );
+    }
+
+    /// DENIED — a presented-but-FORGED signature SKIPS the row entirely; it is
+    /// never silently downgraded into storage (#1464 invariant).
+    #[test]
+    fn reconcile_imported_attestation_skips_a_forged_signature_3421() {
+        let enrolled_kp = keypair::generate("ai:alice").unwrap();
+        let attacker = keypair::generate("ai:alice").unwrap();
+        let mut mem = make_memory("forged body");
+        let forged = sig_b64(&attacker, &mem, "ai:alice");
+        mem.metadata = serde_json::json!({
+            "agent_id": "ai:alice",
+            "attest_level": "agent_attested",
+            "write_signature": forged,
+        });
+        let pk = enrolled_kp.public_base64();
+        let out = reconcile_imported_attestation(
+            &mut mem,
+            Some("ai:alice"),
+            true,
+            &enrolled(&[("ai:alice", Some(pk.as_str()))]),
+        );
+        assert_eq!(
+            out.disposition,
+            ImportAttestDisposition::Skipped(ImportSkipCause::ForgedSignature)
+        );
+        assert!(!out.keep_row());
+        assert_eq!(out.skipped(), Some(ImportSkipCause::ForgedSignature));
+    }
+
+    /// DENIED — a malformed `write_signature` is never read as an absent one.
+    #[test]
+    fn reconcile_imported_attestation_skips_a_malformed_signature_3421() {
+        let mut mem = make_memory("malformed body");
+        mem.metadata = serde_json::json!({
+            "agent_id": "ai:alice",
+            "write_signature": "not base64!!!",
+        });
+        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, &enrolled(&[]));
+        assert_eq!(
+            out.disposition,
+            ImportAttestDisposition::Skipped(ImportSkipCause::MalformedSignature)
+        );
+
+        let mut mem = make_memory("non-string body");
+        mem.metadata = serde_json::json!({
+            "agent_id": "ai:alice",
+            "write_signature": 42,
+        });
+        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, &enrolled(&[]));
+        assert_eq!(
+            out.disposition,
+            ImportAttestDisposition::Skipped(ImportSkipCause::NonStringSignature)
+        );
+    }
+
+    /// ALLOWED — a genuinely self-authored signature the DESTINATION can
+    /// verify keeps `agent_attested` and its signature verbatim.
+    #[test]
+    fn reconcile_imported_attestation_keeps_a_verified_self_signed_row_3421() {
+        let kp = keypair::generate("ai:alice").unwrap();
+        let mut mem = make_memory("self-signed body");
+        let signature = sig_b64(&kp, &mem, "ai:alice");
+        mem.metadata = serde_json::json!({
+            "agent_id": "ai:alice",
+            "attest_level": "agent_attested",
+            "write_signature": signature.clone(),
+        });
+        let pk = kp.public_base64();
+        let out = reconcile_imported_attestation(
+            &mut mem,
+            Some("ai:alice"),
+            true,
+            &enrolled(&[("ai:alice", Some(pk.as_str()))]),
+        );
+        assert_eq!(out.disposition, ImportAttestDisposition::Attested);
+        assert!(out.keep_row());
+        assert_eq!(out.downgraded(), None);
+        assert_eq!(
+            mem.metadata["attest_level"].as_str(),
+            Some("agent_attested")
+        );
+        assert_eq!(
+            mem.metadata["write_signature"].as_str(),
+            Some(signature.as_str())
+        );
+    }
+
+    /// DENIED (degraded, not skipped) — an author the destination has no
+    /// enrolled key for cannot be verified, so the asserted attestation is
+    /// dropped rather than believed.
+    #[test]
+    fn reconcile_imported_attestation_lands_claimed_for_an_unenrolled_author_3421() {
+        let kp = keypair::generate("ai:alice").unwrap();
+        let mut mem = make_memory("unenrolled body");
+        let signature = sig_b64(&kp, &mem, "ai:alice");
+        mem.metadata = serde_json::json!({
+            "agent_id": "ai:alice",
+            "attest_level": "agent_attested",
+            "write_signature": signature,
+        });
+        let out = reconcile_imported_attestation(
+            &mut mem,
+            Some("ai:alice"),
+            true,
+            &enrolled(&[("ai:alice", None)]),
+        );
+        assert_eq!(
+            out.disposition,
+            ImportAttestDisposition::Claimed(ImportClaimedCause::Unverifiable)
+        );
+        assert_eq!(mem.metadata["attest_level"].as_str(), Some("claimed"));
+        assert!(mem.metadata.get("write_signature").is_none());
+    }
+
+    /// DENIED — a row with no attributed author cannot carry an attestation.
+    #[test]
+    fn reconcile_imported_attestation_lands_claimed_without_an_author_3421() {
+        let mut mem = make_memory("authorless body");
+        mem.metadata = serde_json::json!({ "attest_level": "agent_attested" });
+        let out = reconcile_imported_attestation(&mut mem, None, true, &enrolled(&[]));
+        assert_eq!(
+            out.disposition,
+            ImportAttestDisposition::Claimed(ImportClaimedCause::NoAttributedAuthor)
+        );
+        assert_eq!(mem.metadata["attest_level"].as_str(), Some("claimed"));
     }
 }
