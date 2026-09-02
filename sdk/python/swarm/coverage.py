@@ -60,6 +60,9 @@ class CoverageTracker:
     documented_fail_closed: set[str] = field(default_factory=set)
     model_usage: dict[str, dict[str, float | int]] = field(default_factory=dict)
     model_latencies_ms: list[float] = field(default_factory=list)
+    #: Wall-clock seconds per named run phase (e.g. "assessments"), so a long
+    #: tail after the mission is visible in the artifacts, not just in a log.
+    phase_secs: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.tools:
@@ -92,6 +95,10 @@ class CoverageTracker:
         safe default.
         """
         self.documented_fail_closed.update(names)
+
+    def record_phase(self, name: str, seconds: float) -> None:
+        """Record (accumulate) the wall-clock a named run phase took."""
+        self.phase_secs[name] = round(self.phase_secs.get(name, 0.0) + float(seconds), 3)
 
     def record_model_usage(
         self, agent_id: str, raw_usage: Any, latency_ms: float | None = None

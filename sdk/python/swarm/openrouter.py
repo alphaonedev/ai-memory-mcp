@@ -144,18 +144,41 @@ class OpenRouterClient:
         This is intentionally separate from :meth:`decide`: an assessment
         must describe the evidence it was given, never take another action.
         Empty or non-text content is malformed and therefore fails closed.
+
+        Note: :attr:`last_usage` is per-CLIENT and therefore only meaningful
+        while completions are issued one at a time. Concurrent callers must use
+        :meth:`complete_with_usage`, which returns the usage of their own call.
         """
-        _body, message = await self._chat({
+        content, _usage = await self.complete_with_usage(
+            messages=messages, temperature=temperature)
+        return content
+
+    async def complete_with_usage(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        temperature: float = 0.1,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """:meth:`complete`, returning THIS call's usage block alongside it.
+
+        Attributing usage through the shared :attr:`last_usage` attribute is a
+        race as soon as several completions are in flight (#3346): whichever
+        response landed last would be billed to every agent. The usage travels
+        with the response instead, so per-agent accounting stays exact at any
+        concurrency.
+        """
+        body, message = await self._chat({
             "model": self._model,
             "messages": messages,
             "temperature": temperature,
             "usage": {"include": True},
         })
         content = message.get("content")
-        self.last_usage = _body.get("usage") if isinstance(_body, dict) else None
+        usage = body.get("usage") if isinstance(body, dict) else None
+        self.last_usage = usage
         if not isinstance(content, str) or not content.strip():
             raise OpenRouterError("malformed OpenRouter response: missing assessment content")
-        return content.strip()
+        return content.strip(), usage if isinstance(usage, dict) else None
 
     async def _chat(
         self, payload: dict[str, Any]

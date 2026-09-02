@@ -31,10 +31,14 @@ daemon response makes the scenario ``ok=False`` rather than passing silently.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import sys
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ai_memory.attestation import attestation_fields
@@ -42,6 +46,7 @@ from ai_memory.errors import AiMemoryError
 
 from swarm.openrouter import OpenRouterError
 from swarm.audit import AgentAssessment, parse_assessment
+from swarm.config import DEFAULT_ASSESS_CONCURRENCY
 from swarm.toolset import dispatch
 
 _RUN = uuid.uuid4().hex[:8]
@@ -372,7 +377,6 @@ async def nhi_assessment(
     if extra_path:
         try:
             # Intentionally verbatim: the auditor must see the original battery artifact.
-            from pathlib import Path
             evidence["extra_evidence_verbatim"] = Path(extra_path).read_text(encoding="utf-8")[:60000]
         except OSError as exc:
             evidence["extra_evidence_error"] = f"{type(exc).__name__}: {exc}"
@@ -460,31 +464,96 @@ _RUBRIC_PROMPT = """Return ONLY one JSON object with exactly these fields:
 Assess your just-completed mission from the supplied journal. Do not use tools."""
 
 
-async def collect_assessments(swarm: Swarm) -> list[AgentAssessment]:
-    """Run one strict no-tools rubric completion per agent and attest it."""
-    assessments: list[AgentAssessment] = []
-    for agent in swarm.agents:
-        messages = [{"role": "system", "content": _RUBRIC_PROMPT},
-                    {"role": "user", "content": _budget(json.dumps(
-                        {"agent_id": agent.identity.agent_id,
-                         "journal": [record.__dict__ for record in agent.journal]}, default=str), 200_000)}]
-        try:
-            raw = await agent.model.complete(messages=messages)
-            swarm.coverage.record_model_usage(agent.identity.agent_id, getattr(agent.model, "last_usage", None))
-            assessment = parse_assessment(agent.identity.agent_id, raw)
-        except OpenRouterError as exc:
-            assessment = parse_assessment(agent.identity.agent_id, "")
-            assessment = AgentAssessment(**{**assessment.__dict__,
-                                            "error": f"{type(exc).__name__}: {exc}"})
-        assessments.append(assessment)
-        stored = await dispatch(agent.client, agent.identity, "store", {
-            "title": f"nhi-audit-{agent.identity.agent_id}-{_RUN}",
-            "content": json.dumps(assessment.__dict__, sort_keys=True),
-            "namespace": swarm.shared_namespace, "scope": "collective",
-            "tags": ["nhi-audit"],
-        })
-        swarm.coverage.record(stored)
-    return assessments
+#: Streamed as each rubric lands, so a killed run keeps partial evidence.
+PARTIAL_ASSESSMENTS = "assessments.partial.jsonl"
+
+
+def _partial_path(journal_dir: str | Path | None) -> Path | None:
+    raw = journal_dir if journal_dir is not None else os.environ.get("SWARM_JOURNAL_DIR")
+    if not raw:
+        return None
+    destination = Path(raw)
+    destination.mkdir(parents=True, exist_ok=True)
+    return destination / PARTIAL_ASSESSMENTS
+
+
+def _append_partial(path: Path | None, assessment: AgentAssessment) -> None:
+    """Append one finished rubric. Fail-SOFT: streaming must never lose a run."""
+    if path is None:
+        return
+    try:
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(asdict(assessment), sort_keys=True, default=str) + "\n")
+    except OSError as exc:  # pragma: no cover - disk-full / permission
+        print(f"[assessments] partial stream unavailable: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+
+async def _assess_one(swarm: Swarm, agent: SwarmAgent) -> AgentAssessment:
+    """One agent's strict no-tools rubric completion, with ITS own usage."""
+    messages = [{"role": "system", "content": _RUBRIC_PROMPT},
+                {"role": "user", "content": _budget(json.dumps(
+                    {"agent_id": agent.identity.agent_id,
+                     "journal": [record.__dict__ for record in agent.journal]},
+                    default=str), 200_000)}]
+    try:
+        # Per-call usage, never the client-wide `last_usage`: several rubrics
+        # are in flight, so shared-attribute accounting would misbill agents.
+        raw, usage = await agent.model.complete_with_usage(messages=messages)
+        swarm.coverage.record_model_usage(agent.identity.agent_id, usage)
+        return parse_assessment(agent.identity.agent_id, raw)
+    except OpenRouterError as exc:
+        assessment = parse_assessment(agent.identity.agent_id, "")
+        return AgentAssessment(**{**assessment.__dict__,
+                                  "error": f"{type(exc).__name__}: {exc}"})
+
+
+async def collect_assessments(swarm: Swarm, *, concurrency: int | None = None,
+                              journal_dir: str | Path | None = None) -> list[AgentAssessment]:
+    """Run one strict no-tools rubric completion per agent and attest it.
+
+    Bounded-concurrent (#3346): at 256 agents and ~12 s per completion the
+    sequential loop left a ~50 minute tail after the mission had finished. A
+    semaphore of ``SWARM_ASSESS_CONCURRENCY`` (default
+    :data:`swarm.config.DEFAULT_ASSESS_CONCURRENCY`) keeps that paced — bounded,
+    never a synchronized 256-wide blast at the model or the daemon.
+
+    Everything else is unchanged: parsing stays strict, each agent's usage is
+    accounted to that agent, each rubric is attested by its own agent, and the
+    returned list is in agent order — identical to the sequential result. Each
+    rubric is also appended to ``assessments.partial.jsonl`` as it lands, so a
+    killed run keeps the evidence it had already paid for.
+    """
+    agents = list(swarm.agents)
+    if concurrency is None:
+        concurrency = getattr(swarm.config, "assess_concurrency", DEFAULT_ASSESS_CONCURRENCY)
+    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+    partial = _partial_path(journal_dir)
+    assessments: list[AgentAssessment | None] = [None] * len(agents)
+    started = time.perf_counter()
+
+    async def _one(index: int, agent: SwarmAgent) -> None:
+        async with semaphore:
+            try:
+                assessment = await _assess_one(swarm, agent)
+            except Exception as exc:  # noqa: BLE001 - one agent never aborts the fleet
+                assessment = AgentAssessment(
+                    agent.identity.agent_id, None, None, [], None, None, "",
+                    assessment_invalid=True, error=f"{type(exc).__name__}: {exc}")
+            assessments[index] = assessment
+            _append_partial(partial, assessment)
+            stored = await dispatch(agent.client, agent.identity, "store", {
+                "title": f"nhi-audit-{agent.identity.agent_id}-{_RUN}",
+                "content": json.dumps(asdict(assessment), sort_keys=True),
+                "namespace": swarm.shared_namespace, "scope": "collective",
+                "tags": ["nhi-audit"],
+            })
+            swarm.coverage.record(stored)
+
+    await asyncio.gather(*(_one(index, agent) for index, agent in enumerate(agents)))
+    swarm.coverage.record_phase("assessments", time.perf_counter() - started)
+    # Order is by agent, not by completion, so the artifact is reproducible.
+    return [item for item in assessments if item is not None]
 
 
 #: Set to ``1`` once node-to-node federation is configured between the modules.
@@ -574,6 +643,7 @@ async def run_all(swarm: Swarm) -> list[ScenarioResult]:
 
 __all__ = [
     "FEDERATED_ENV",
+    "PARTIAL_ASSESSMENTS",
     "ScenarioResult",
     "consensus_quorum",
     "cross_module_handoff",

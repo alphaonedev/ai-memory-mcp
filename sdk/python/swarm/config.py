@@ -30,6 +30,9 @@ OPENROUTER_MODEL_SLUG = "z-ai/glm-5.3-flash"
 
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_DAEMON_BASE_URL = "http://localhost:9077"
+#: Default bound on concurrent per-agent assessment completions (#3346).
+DEFAULT_ASSESS_CONCURRENCY = 8
+
 DEFAULT_MISSION = (
     "Gather three useful facts as memories; link them with derives_from and consolidate them; "
     "write exactly one mission-summary-<agent> memory in the shared namespace citing the "
@@ -94,6 +97,10 @@ class SwarmConfig:
     api_key: str | None = None
     admin_agent_id: str = "ai:hive-loadgen-f2"
     mission: str = DEFAULT_MISSION
+    #: How many per-agent rubric completions may be in flight at once. Bounded
+    #: on purpose: 1 leaves a ~50 min tail at 256 agents (#3346), unbounded
+    #: would be a 256-wide synchronized blast at the model endpoint.
+    assess_concurrency: int = DEFAULT_ASSESS_CONCURRENCY
 
     def __post_init__(self) -> None:
         if not self.base_urls:
@@ -102,6 +109,9 @@ class SwarmConfig:
             raise ConfigError(f"n_agents must be >= 1, got {self.n_agents}")
         if self.max_steps < 1:
             raise ConfigError(f"max_steps must be >= 1, got {self.max_steps}")
+        if self.assess_concurrency < 1:
+            raise ConfigError(
+                f"assess_concurrency must be >= 1, got {self.assess_concurrency}")
         if self.model_slug != OPENROUTER_MODEL_SLUG and not self.model_override_reason:
             raise ConfigError(
                 f"model {self.model_slug!r} is not the pinned acceptance model "
@@ -135,6 +145,7 @@ class SwarmConfig:
         ``SWARM_CA_CERT``            hive CA certificate path
         ``SWARM_API_KEY``            per-node HTTP request credential
         ``SWARM_MODEL_SLUG``         OpenRouter model override (audit-only use)
+        ``SWARM_ASSESS_CONCURRENCY`` bound on concurrent rubric completions
         ``SWARM_MODEL_OVERRIDE_REASON`` REQUIRED with an override; recorded
         ==========================  ===================================
         """
@@ -166,6 +177,8 @@ class SwarmConfig:
             api_key=env.get("SWARM_API_KEY") or None,
             admin_agent_id=env.get("SWARM_ADMIN_AGENT_ID", "ai:hive-loadgen-f2"),
             mission=env.get("SWARM_MISSION", DEFAULT_MISSION),
+            assess_concurrency=_int_env(
+                env, "SWARM_ASSESS_CONCURRENCY", DEFAULT_ASSESS_CONCURRENCY),
             model_slug=env.get("SWARM_MODEL_SLUG") or OPENROUTER_MODEL_SLUG,
             model_override_reason=env.get("SWARM_MODEL_OVERRIDE_REASON") or None,
         )
