@@ -12,6 +12,7 @@
 pub mod access_fold;
 pub mod atomise_worker;
 pub mod auto_tag_worker;
+pub mod embed_backfill_worker;
 pub mod fts_integrity;
 pub mod lease_sweep;
 pub mod memories_gauge;

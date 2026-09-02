@@ -475,6 +475,11 @@ pub struct Metrics {
     /// relational edge exists but will never reach the AGE graph until the
     /// row is repaired/re-enqueued.
     pub age_projection_quarantined_total: IntCounter,
+
+    /// #3342 — last observed unembedded-chunk length the live backfill
+    /// worker peeked. 0 means the drain is caught up; non-zero means
+    /// `embed_mode=async` (or a boot backlog) still has work.
+    pub embed_backfill_pending: IntGauge,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -1070,6 +1075,13 @@ impl Metrics {
         )?;
         registry.register(Box::new(age_projection_quarantined_total.clone()))?;
 
+        let embed_backfill_pending = IntGauge::new(
+            "ai_memory_embed_backfill_pending",
+            "Last peeked unembedded-chunk length for the live #3342 \
+             embed-backfill worker. 0 = caught up.",
+        )?;
+        registry.register(Box::new(embed_backfill_pending.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -1123,6 +1135,7 @@ impl Metrics {
             age_projection_pending_depth,
             age_projection_failed_total,
             age_projection_quarantined_total,
+            embed_backfill_pending,
         })
     }
 }

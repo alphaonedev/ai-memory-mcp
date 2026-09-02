@@ -6788,30 +6788,14 @@ pub async fn bootstrap_serve(
         let backfill_embedder = embedder_arc.clone();
         let backfill_batch = usize::try_from(app_config.resolve_embeddings().backfill_batch)
             .unwrap_or(crate::mcp::DEFAULT_EMBED_BACKFILL_BATCH_SIZE);
-        task_handles.push(tokio::spawn(async move {
-            let Some(emb) = backfill_embedder.as_ref() else {
-                return;
-            };
-            // Operator-level maintenance path: must see (and re-embed)
-            // every row regardless of metadata.scope — same posture as
-            // the federation catchup loop. Sentinel principal, not a
-            // literal, per the #1558 identity-sentinel SSOT.
-            let ctx = crate::store::CallerContext::for_admin(
-                crate::identity::sentinels::EMBEDDING_BACKFILL,
-            );
-            let written = crate::store::run_embedding_backfill_on_store(
-                backfill_store.as_ref(),
-                &ctx,
-                emb,
-                backfill_batch,
-            )
-            .await;
-            if written > 0 {
-                tracing::info!(
-                    "embedding backfill (serve boot, #1579 A4): {written} row(s) embedded"
-                );
-            }
-        }));
+        // #3342 — long-lived worker (periodic + wake from async create),
+        // not a one-shot boot sweep. Pending rows must become indexed
+        // without a daemon restart.
+        task_handles.push(crate::background::embed_backfill_worker::spawn(
+            backfill_store,
+            backfill_embedder,
+            backfill_batch,
+        ));
     }
 
     // FED-P3b — outbound credential renewal worker. When this node holds a

@@ -483,8 +483,9 @@ pub(crate) fn build_create_memory(
 ///   the tokio runtime is not pinned across a ~400 ms remote RTT
 ///   (CONCURRENCY-22). Semantic recall is available immediately.
 /// * `Async`: skip the embedder, return [`EmbedStatus::Pending`]. The
-///   durable insert still happens; the existing backfill sweep embeds
-///   the row. Fail-closed: the row is never dropped.
+///   durable insert still happens; the live embed-backfill worker
+///   (`crate::background::embed_backfill_worker`) drains Pending rows
+///   without a daemon restart. Fail-closed: the row is never dropped.
 async fn embed_for_create(
     app: &AppState,
     title: &str,
@@ -1540,6 +1541,10 @@ async fn create_memory_postgres(
         }
     }
 
+    if matches!(embed_status, EmbedStatus::Pending) {
+        crate::background::embed_backfill_worker::wake();
+    }
+
     // #2587 — enqueue the (possibly) deferred `auto_tag` job AFTER the
     // durable write above has already succeeded. Non-blocking; never
     // awaits the LLM. See `try_enqueue_auto_tag` for the eligibility
@@ -1929,6 +1934,10 @@ pub async fn create_memory(
     // Drop the DB lock before taking the vector index lock + running
     // federation fanout (async work).
     drop(lock);
+
+    if matches!(embed_status, EmbedStatus::Pending) {
+        crate::background::embed_backfill_worker::wake();
+    }
 
     // #2587 — enqueue the (possibly) deferred `auto_tag` job AFTER the
     // durable write above has already succeeded. Non-blocking; never

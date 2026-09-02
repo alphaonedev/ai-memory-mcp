@@ -797,14 +797,18 @@ impl EmbedMode {
     }
 
     fn from_env() -> Self {
-        match std::env::var("AI_MEMORY_EMBED_MODE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-        {
-            Some("async") => Self::Async,
-            _ => Self::Sync,
-        }
+        // Cached: the env is process-lifetime (Fable #3342 PERF note).
+        static CACHED: std::sync::OnceLock<EmbedMode> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            match std::env::var("AI_MEMORY_EMBED_MODE")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+            {
+                Some("async") => Self::Async,
+                _ => Self::Sync,
+            }
+        })
     }
 
     #[must_use]
