@@ -149,8 +149,15 @@ pub fn handle_skill_promote_from_reflection(
     // a reflection; emit the forensic-chain row BEFORE the storage write
     // so the audit trail captures the caller + source reflection_id
     // regardless of downstream outcome.
-    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    // #3363 — BIND the audited actor to the enforced caller: the promote mints
+    // a signed capability bundle, so the forensic row must name the principal
+    // that actually asked for it, not a wire-asserted one.
+    let caller = crate::identity::resolve_governance_subject(
+        params["agent_id"].as_str(),
+        None,
+        "promote skills",
+    )
+    .map_err(|e| e.to_string())?;
     crate::governance::audit::record_decision(
         &caller,
         "allow",

@@ -90,8 +90,15 @@ pub fn handle_skill_retire(
 
     let unretire = params["unretire"].as_bool().unwrap_or(false);
     let reason = params["reason"].as_str().filter(|s| !s.is_empty());
-    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    // #3363 — `caller` becomes the durable `retired_by` provenance column, the
+    // forensic audit actor and the signed-event agent. BIND it to the enforced
+    // caller so a wire `agent_id` cannot forge who retired a skill.
+    let caller = crate::identity::resolve_governance_subject(
+        params["agent_id"].as_str(),
+        None,
+        "retire skills",
+    )
+    .map_err(|e| e.to_string())?;
 
     // Resolve the target: a single version by `skill_id`, else the whole
     // (namespace, name) lineage.
@@ -276,8 +283,14 @@ pub fn handle_skill_delete(
     let _ = active_keypair;
 
     let force = params["force"].as_bool().unwrap_or(false);
-    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    // #3363 — `caller` becomes the durable `purged_by` provenance on the hard
+    // purge and its forensic audit actor. BIND it to the enforced caller.
+    let caller = crate::identity::resolve_governance_subject(
+        params["agent_id"].as_str(),
+        None,
+        "delete skills",
+    )
+    .map_err(|e| e.to_string())?;
 
     // Resolve the target lineage. A by-id request purges the WHOLE lineage
     // that id belongs to (never a partial-chain delete).

@@ -31,15 +31,18 @@ use serde_json::{Value, json};
 ///
 /// Returns the `{event_id, recorded_at}` envelope surfaced on the wire
 /// under [`field_names::INVOCATION_RECORD`].
+///
+/// `caller` is the ALREADY-RESOLVED actor: #3363 moved the resolution to the
+/// handler ingress so a wire-asserted `agent_id` that disagrees with the
+/// enforced caller refuses the whole activation BEFORE any read, instead of
+/// silently stamping a forged principal onto this append-only event row.
 fn record_skill_invocation(
     conn: &Connection,
     skill_id: &str,
     namespace: &str,
     name: &str,
-    params: &Value,
+    caller: String,
 ) -> Value {
-    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     let payload = json!({
         "skill_id": skill_id,
         "namespace": namespace,
@@ -80,6 +83,17 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_get requires 'skill_id'")?;
+
+    // #3363 — resolve (and BIND to the enforced caller) the invocation-record
+    // actor at ingress, before any read: a wire `agent_id` that disagrees with
+    // `AI_MEMORY_AGENT_ID` refuses rather than forging the `SKILL_INVOKED`
+    // signed-event principal.
+    let caller = crate::identity::resolve_governance_subject(
+        params["agent_id"].as_str(),
+        None,
+        "activate skills",
+    )
+    .map_err(|e| e.to_string())?;
 
     let row: Option<(
         String,
@@ -222,7 +236,7 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
     // v0.9.0 §11.5 B7-SKILL (#1865) — capture the invocation record.
     // Best-effort; never fails an otherwise-successful activation fetch.
     response[field_names::INVOCATION_RECORD] =
-        record_skill_invocation(conn, &id, &namespace, &name, params);
+        record_skill_invocation(conn, &id, &namespace, &name, caller);
 
     // Include resource list (paths only — content via memory_skill_resource).
     let mut res_stmt = conn

@@ -987,12 +987,19 @@ pub mod tools {
 // Internal use — functions called from handle_request below.
 // Not part of the external public surface.
 // ---------------------------------------------------------------------------
-use agent::{handle_agent_list, handle_agent_register};
+use agent::handle_agent_list;
+// #3363 — re-exported (not merely `use`d) so the caller-principal-binding
+// regression suite can drive the three coordination/meta create handlers whose
+// wire `agent_id` / `caller_agent_id` / `created_by` is now bound to the
+// enforced caller, from the integration-test crate.
+pub use action::handle_action_create;
+pub use agent::handle_agent_register;
 use archive::{
     handle_archive_list, handle_archive_purge, handle_archive_restore, handle_archive_stats,
     handle_gc,
 };
 use auto_tag::handle_auto_tag;
+pub use routine::handle_routine_create;
 // v0.7.0 ARCH-3 / FX-12 — `handle_check_duplicate` is `pub use`-exported
 // above; dispatch resolves via the crate path.
 use consolidate::handle_consolidate;
@@ -1076,9 +1083,9 @@ pub fn skill_compositional_context_for_tests(
 use store::handle_store;
 // v0.8.0 Pillar 1 (#1709) — coordination-action create/get handlers.
 use action::{
-    handle_action_add_edge, handle_action_create, handle_action_edges, handle_action_frontier,
-    handle_action_get, handle_action_list, handle_action_next, handle_action_transition,
-    handle_lease_acquire, handle_lease_get, handle_lease_release, handle_lease_renew,
+    handle_action_add_edge, handle_action_edges, handle_action_frontier, handle_action_get,
+    handle_action_list, handle_action_next, handle_action_transition, handle_lease_acquire,
+    handle_lease_get, handle_lease_release, handle_lease_renew,
 };
 // v0.8.0 Pillar 1 (#1709) — signed-signal coordination handlers.
 use signal::{
@@ -1092,8 +1099,7 @@ use checkpoint::{
 };
 // v0.8.0 Pillar 1 (#1709) — routine coordination handlers.
 use routine::{
-    handle_routine_create, handle_routine_freeze, handle_routine_list, handle_routine_run,
-    handle_routine_status,
+    handle_routine_freeze, handle_routine_list, handle_routine_run, handle_routine_status,
 };
 // v0.7.0 #1111 — `handle_subscription_replay` is `pub use`-exported above.
 // v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_subscribe` and

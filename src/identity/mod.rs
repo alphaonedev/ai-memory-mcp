@@ -365,6 +365,19 @@ pub fn resolve_read_visibility_caller() -> Option<String> {
 /// same rule inline (`resolve_namespace_standard_caller`), because its
 /// single-operator fallback must degrade to a sentinel rather than error.
 ///
+/// #3363 extended the SAME control to the eight tools the audit missed —
+/// `memory_agent_register` (`caller_agent_id`), `memory_skill_retire`,
+/// `memory_skill_delete`, `memory_skill_get`, `memory_skill_promote_from_reflection`,
+/// `memory_check_agent_action`, `memory_action_create` and `memory_routine_create`
+/// (the last three via [`crate::coordination_guard::resolve_actor`]). Those
+/// handlers stamped the wire value into the forensic audit chain / the
+/// `retired_by` + `purged_by` provenance columns / the `signed_events`
+/// `SKILL_INVOKED` actor / the coordination quota key, so `AI_MEMORY_AGENT_ID=`
+/// `ai:realcaller` plus `agent_id: "ai:forged"` on the wire wrote a FORGED
+/// principal into durable evidence. They now bind here and refuse, and the
+/// pre-#3363 `unwrap_or_else(|_| ANONYMOUS_INVALID)` swallow is gone: a
+/// resolution failure REFUSES the call instead of silently re-attributing it.
+///
 /// Semantics (the shipped `handle_inbox` #1557 / `handle_replay` #1571
 /// pattern, generalised):
 /// - **Multi-tenant posture** ([`resolve_read_visibility_caller`] is `Some`):
@@ -376,15 +389,30 @@ pub fn resolve_read_visibility_caller() -> Option<String> {
 ///
 /// `op` names the operation in the refusal (e.g. `"promote"`).
 ///
+/// #3363 — the wire value is ALWAYS run through the wire-strict
+/// [`validate::validate_agent_id`] first, whatever the posture. Pre-#3363 a
+/// present-but-malformed principal (`"../../etc"`, a `RESERVED_AGENT_IDS`
+/// sentinel that happened to equal the env caller) only met a validator on the
+/// single-operator fallback branch, so under the multi-tenant posture a
+/// shape-invalid value could reach the comparison unchecked. Validating at the
+/// top makes the "every WIRE entry point MUST call `validate_agent_id`"
+/// contract (see that function's docs) structural for every caller of this
+/// helper rather than a per-handler habit.
+///
 /// # Errors
-/// A mismatch refusal, or the [`resolve_agent_id`] resolution error.
+/// A wire-`agent_id` validation failure, a mismatch refusal, or the
+/// [`resolve_agent_id`] resolution error.
 pub fn resolve_governance_subject(
     explicit: Option<&str>,
     mcp_client: Option<&str>,
     op: &str,
 ) -> Result<String> {
+    let requested = explicit.filter(|s| !s.is_empty());
+    if let Some(requested) = requested {
+        validate::validate_agent_id(requested)?;
+    }
     if let Some(caller) = resolve_read_visibility_caller() {
-        if let Some(requested) = explicit.filter(|s| !s.is_empty())
+        if let Some(requested) = requested
             && requested != caller
         {
             anyhow::bail!(
@@ -1357,5 +1385,59 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_AGENT_ID);
         }
+    }
+
+    #[test]
+    fn governance_subject_always_validates_the_wire_principal_3363() {
+        // #3363 — pre-fix the wire value only met a validator on the
+        // single-operator FALLBACK branch (via `resolve_agent_id`), so under
+        // the multi-tenant posture a malformed / reserved principal reached the
+        // comparison unchecked and, on the sites that swallowed the error,
+        // degraded into a sentinel. Validation now runs FIRST, under every
+        // posture, per `validate_agent_id`'s "every WIRE entry point" contract.
+        //
+        // Both locks: the crate-wide guard (outermost — every cross-module
+        // mutator takes it) then this module's own, so neither a sibling here
+        // nor a sibling elsewhere can observe a half-applied env.
+        let _crate_g = agent_id_env_test_lock();
+        let _g = env_var_lock();
+
+        // MULTI-TENANT posture.
+        // SAFETY: env mutation serialised by both guards held above.
+        unsafe { std::env::set_var(ENV_AGENT_ID, "ai:realcaller") };
+
+        // DENIED — malformed principal (path traversal), refused BEFORE the
+        // mismatch comparison so the failure names the validation, not the
+        // binding.
+        let err = resolve_governance_subject(Some("../../etc"), None, "probe")
+            .expect_err("a path-traversal principal must refuse");
+        assert!(err.to_string().contains(".."), "got: {err}");
+
+        // DENIED — a well-formed principal that is not the caller.
+        let err = resolve_governance_subject(Some("ai:forged-2"), None, "probe")
+            .expect_err("a differing principal must refuse");
+        assert!(err.to_string().contains("agent_id mismatch"), "got: {err}");
+
+        // ALLOWED — the caller as itself, and the absent case.
+        assert_eq!(
+            resolve_governance_subject(Some("ai:realcaller"), None, "probe").expect("self"),
+            "ai:realcaller"
+        );
+        assert_eq!(
+            resolve_governance_subject(None, None, "probe").expect("absent"),
+            "ai:realcaller"
+        );
+
+        // SINGLE-OPERATOR default — unchanged ladder, still validated.
+        // SAFETY: env mutation serialised by both guards held above.
+        unsafe { std::env::remove_var(ENV_AGENT_ID) };
+        assert!(
+            resolve_governance_subject(Some("../../etc"), None, "probe").is_err(),
+            "the wire validator applies on the fallback branch too"
+        );
+        assert_eq!(
+            resolve_governance_subject(Some("ai:alice"), None, "probe").expect("valid wire id"),
+            "ai:alice"
+        );
     }
 }

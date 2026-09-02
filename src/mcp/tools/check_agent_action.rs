@@ -56,11 +56,28 @@ pub fn handle_check_agent_action(
         .and_then(Value::as_str)
         .ok_or_else(|| "kind is required".to_string())?;
     let action = build_action(kind, arguments)?;
-    let agent_id = arguments
+    // #3363 — `agent_id` is the SUBJECT the rules engine judges (and the
+    // identity the `governance_audit` decision row is written against), so it
+    // may not be self-asserted. Pre-#3363 the wire value was taken verbatim,
+    // never even reaching `validate_agent_id`: `{"agent_id": "../../etc"}` was
+    // accepted and `AI_MEMORY_AGENT_ID=ai:realcaller` could have its actions
+    // judged under any other principal's rules. A PRESENT value is now
+    // wire-validated and bound to the enforced caller (fail-closed on
+    // disagreement); an ABSENT one takes the enforced caller when the
+    // multi-tenant posture is engaged, else the documented
+    // [`DEFAULT_AGENT_ID`] fallback — so the single-operator default and the
+    // CLI-symmetric wire string are byte-identical to pre-#3363.
+    let requested = arguments
         .get(param_names::AGENT_ID)
         .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_AGENT_ID)
-        .to_string();
+        .filter(|s| !s.is_empty());
+    let agent_id = if requested.is_some() {
+        crate::identity::resolve_governance_subject(requested, None, "check agent actions")
+            .map_err(|e| e.to_string())?
+    } else {
+        crate::identity::resolve_read_visibility_caller()
+            .unwrap_or_else(|| DEFAULT_AGENT_ID.to_string())
+    };
     run_check(conn, &agent_id, kind, &action)
 }
 
@@ -655,6 +672,10 @@ mod tests {
     // Agent_id provided in arguments — echoed in response.
     #[test]
     fn agent_id_echoed_in_response() {
+        // #3363 — the supplied subject is now BOUND to `AI_MEMORY_AGENT_ID`
+        // when set, so this env-sensitive assertion must run with the var
+        // unset (single-operator posture), serialised crate-wide.
+        let _env = crate::identity::agent_id_env_unset_guard();
         let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(
@@ -672,6 +693,10 @@ mod tests {
     // Default agent_id ("anonymous:mcp") used when omitted.
     #[test]
     fn default_agent_id_when_omitted() {
+        // #3363 — the ABSENT-value fallback is the enforced caller when
+        // `AI_MEMORY_AGENT_ID` is set; pin the documented single-operator
+        // default by holding the var unset for the assertion.
+        let _env = crate::identity::agent_id_env_unset_guard();
         let _forensic = forensic_lock();
         let conn = fresh_conn();
         let resp = handle_check_agent_action(&conn, &json!({"kind": "bash", "command": "ls"}))
