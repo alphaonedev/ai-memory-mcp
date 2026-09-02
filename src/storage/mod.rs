@@ -17942,10 +17942,30 @@ pub fn get_unembedded_ids_batch_after(
     after_id: Option<&str>,
     limit: usize,
 ) -> Result<EmbeddableScan> {
+    // One-shot callers (CLI pages, tests): a fresh amort walks this call.
+    // The live MCP tick uses [`get_unembedded_ids_batch_after_amortised`].
+    let amort = crate::storage::embed_skip::EmbedSkipAmortisation::new();
+    get_unembedded_ids_batch_after_amortised(conn, after_id, limit, &amort)
+}
+
+/// #3344 — MCP-backfill twin of [`get_unembedded_ids_batch_after`].
+///
+/// Amortises the stale-marker walk on the **caller-owned** timer so two
+/// consecutive ticks are O(1) after the first walk. Keep the un-amortised
+/// free function for one-shot callers.
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn get_unembedded_ids_batch_after_amortised(
+    conn: &Connection,
+    after_id: Option<&str>,
+    limit: usize,
+    amort: &crate::storage::embed_skip::EmbedSkipAmortisation,
+) -> Result<EmbeddableScan> {
     // #1779 — pull encrypted_envelope + metadata so encrypted rows are
     // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
-    let amort = crate::storage::embed_skip::EmbedSkipAmortisation::new();
-    crate::storage::embed_skip::prepare_scan_sqlite(conn, &amort);
+    crate::storage::embed_skip::prepare_scan_sqlite(conn, amort);
     let not_skipped = crate::storage::embed_skip::SQL_AND_NOT_SKIPPED;
     let raw = if let Some(after) = after_id {
         let sql = format!(

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::config::{AppConfig, FeatureTier, ResolvedModels, TierConfig};
@@ -3776,6 +3776,20 @@ pub const DEFAULT_EMBED_BACKFILL_BATCH_SIZE: usize = 64;
 pub(crate) const BOOT_BACKFILL_BLOCKING_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(20);
 
+/// #3344 — rusqlite MCP backfill skip-walk timer.
+///
+/// The stdio MCP daemon is a single-DB process (one `embed_skip` table).
+/// SAL adapters own amortisation on the store instance; this lane has no
+/// store, so a module-private [`OnceLock`] is the ownership — documented
+/// as process-keyed to that one rusqlite DB, never shared across stores.
+/// CONCURRENCY-16: `OnceLock`, never `static mut` (IDIOMS-01).
+static MCP_EMBED_SKIP_AMORT: OnceLock<crate::storage::embed_skip::EmbedSkipAmortisation> =
+    OnceLock::new();
+
+fn mcp_embed_skip_amort() -> &'static crate::storage::embed_skip::EmbedSkipAmortisation {
+    MCP_EMBED_SKIP_AMORT.get_or_init(crate::storage::embed_skip::EmbedSkipAmortisation::new)
+}
+
 /// #3329 — spawn the detached background embedding-backfill drain used by the
 /// `background` boot posture (and by `blocking` for the post-budget remainder).
 ///
@@ -3954,6 +3968,25 @@ pub fn run_embedding_backfill_bounded(
     batch_size: usize,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<BackfillProgress> {
+    run_embedding_backfill_bounded_amortised(
+        conn,
+        emb,
+        batch_size,
+        deadline,
+        mcp_embed_skip_amort(),
+    )
+}
+
+/// #3344 — [`run_embedding_backfill_bounded`] with a caller-owned skip-walk
+/// timer. Production uses the module-private MCP OnceLock; tests pass a
+/// fresh instance so the walk-count pin cannot flake against a process-global.
+pub(crate) fn run_embedding_backfill_bounded_amortised(
+    conn: &mut rusqlite::Connection,
+    emb: &dyn Embed,
+    batch_size: usize,
+    deadline: Option<std::time::Instant>,
+    amort: &crate::storage::embed_skip::EmbedSkipAmortisation,
+) -> anyhow::Result<BackfillProgress> {
     // Defensive: a zero batch would make the bounded fetch below a
     // no-op-forever. The resolver clamps to 1..=10000 by construction
     // (`AppConfig::resolve_embeddings`), but if a future caller passes
@@ -3990,7 +4023,12 @@ pub fn run_embedding_backfill_bounded(
             deadline_hit = true;
             break;
         }
-        let scan = db::get_unembedded_ids_batch_after(conn, cursor.as_deref(), batch_size)?;
+        let scan = db::get_unembedded_ids_batch_after_amortised(
+            conn,
+            cursor.as_deref(),
+            batch_size,
+            amort,
+        )?;
         if scan.raw_last_id.is_none() {
             // Idempotence: the RAW fetch was empty ⇒ end of corpus. v1.0.0
             // #2336 (FBL-24): breaking on the RESOLVED chunk instead made a
@@ -16807,6 +16845,41 @@ mod backfill_resilience_1595_tests {
         assert!(
             db::get_unembedded_ids(&conn).unwrap().is_empty(),
             "backlog fully drained"
+        );
+    }
+
+    /// #3344 — two consecutive MCP backfill ticks share one amortisation:
+    /// the second tick must not re-walk `embed_skip` (O(1) after the first).
+    #[test]
+    fn consecutive_mcp_backfill_ticks_do_not_rewalk_embed_skip_3344() {
+        let mut conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        seed(&conn, "row-a", "healthy content long enough to embed");
+        let amort = crate::storage::embed_skip::EmbedSkipAmortisation::new();
+        super::run_embedding_backfill_bounded_amortised(
+            &mut conn,
+            &FixedFourDimEmbedder,
+            8,
+            None,
+            &amort,
+        )
+        .expect("first tick");
+        let walks = amort.table_walk_count();
+        assert!(
+            walks >= 1,
+            "first MCP tick must walk embed_skip, got {walks}"
+        );
+        super::run_embedding_backfill_bounded_amortised(
+            &mut conn,
+            &FixedFourDimEmbedder,
+            8,
+            None,
+            &amort,
+        )
+        .expect("second tick");
+        assert_eq!(
+            amort.table_walk_count(),
+            walks,
+            "second MCP tick within 60s must not re-walk embed_skip"
         );
     }
 
