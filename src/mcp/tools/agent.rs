@@ -7,10 +7,17 @@ use crate::mcp::param_names;
 use crate::models::field_names;
 use crate::{db, validate};
 use serde_json::{Value, json};
-pub(super) fn handle_agent_register(
-    conn: &rusqlite::Connection,
-    params: &Value,
-) -> Result<Value, String> {
+/// MCP `memory_agent_register` substrate handler.
+///
+/// #3363 — promoted from `pub(super)` to `pub` (re-exported by
+/// `crate::mcp`) so the caller-principal-binding regression suite can drive
+/// the `caller_agent_id` denied/allowed paths from the integration-test crate.
+///
+/// # Errors
+/// Returns a substrate error string when `agent_id` / `agent_type` are
+/// missing or fail validation, when the wire `caller_agent_id` disagrees with
+/// the enforced caller (#3363), or when the storage write fails.
+pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let agent_id = params["agent_id"].as_str().ok_or("agent_id is required")?;
     let agent_type = params[param_names::AGENT_TYPE]
         .as_str()
@@ -33,8 +40,18 @@ pub(super) fn handle_agent_register(
     // `_agents` namespace; emit the forensic-chain row BEFORE the
     // storage write so the audit trail captures intent regardless of
     // downstream storage outcome. Mirrors the #911 HTTP fix.
-    let caller = crate::identity::resolve_agent_id(params["caller_agent_id"].as_str(), None)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    //
+    // #3363 — the forensic actor is BOUND to the enforced caller. Pre-#3363
+    // `resolve_agent_id` gave the wire `caller_agent_id` precedence over the
+    // `AI_MEMORY_AGENT_ID` identity, so a caller could mint a principal and
+    // sign the audit row as somebody else; the failure branch also swallowed a
+    // shape-invalid value into `ANONYMOUS_INVALID` instead of refusing.
+    let caller = crate::identity::resolve_governance_subject(
+        params[param_names::CALLER_AGENT_ID].as_str(),
+        None,
+        "register agents",
+    )
+    .map_err(|e| e.to_string())?;
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -101,7 +118,9 @@ pub struct AgentRegisterRequest {
     /// #3171 — the id recorded as the ACTOR that registered this agent
     /// (governance audit subject). Honoured since #913, undeclared until the
     /// tool-contract audit. Distinct from `agent_id`, which is the principal
-    /// BEING registered.
+    /// BEING registered. #3363 — under the multi-tenant posture
+    /// (`AI_MEMORY_AGENT_ID` set) it is BOUND to the caller: a differing value
+    /// is refused rather than signed into the forensic chain.
     #[serde(default)]
     pub caller_agent_id: Option<String>,
 }

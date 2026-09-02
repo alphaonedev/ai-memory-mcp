@@ -102,9 +102,18 @@ pub(super) fn handle_delete(
     // caller's intent regardless of downstream outcome. Complementary
     // to `audit::emit(AuditAction::Delete)` further down which writes
     // the SIEM-shaped enterprise row AFTER the delete commits.
-    let caller_for_forensic =
-        crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    //
+    // #3363 — the forensic ACTOR is bound to the enforced caller too. #3171
+    // bound the two governance SUBJECT sites below, but this row is emitted
+    // FIRST, so a forged `agent_id` still wrote a forged actor into the
+    // tamper-evident chain for an operation the subject binding then refused.
+    // Same helper, same refusal, one op earlier.
+    let caller_for_forensic = crate::identity::resolve_governance_subject(
+        params[param_names::AGENT_ID].as_str(),
+        mcp_client,
+        "delete",
+    )
+    .map_err(|e| e.to_string())?;
     crate::governance::audit::record_decision(
         &caller_for_forensic,
         "allow",
@@ -784,6 +793,56 @@ mod tests {
             db::get(&conn, &id).unwrap().is_none(),
             "owner delete removes the row"
         );
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+        crate::config::clear_permissions_mode_override_for_test();
+    }
+
+    #[test]
+    fn forensic_actor_is_bound_to_the_caller_3363() {
+        // #3363 — #3171 bound the two governance SUBJECT sites in this handler,
+        // but the forensic-chain row emitted FIRST still took the wire
+        // `agent_id` verbatim, so a caller could stamp an arbitrary actor into
+        // the tamper-evident audit chain for a delete that was then refused.
+        // DENIED: the wire principal disagrees with the enforced caller.
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let _pm = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Off,
+        );
+        let conn = fresh_conn();
+        let mem = make_mem("alice-forensic", "forensic-3363"); // owner = ai:alice
+        let id = db::insert(&conn, &mem).expect("insert");
+        let db_path = db_path();
+
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+        let err = handle_delete(
+            &conn,
+            &db_path,
+            &json!({"id": id.clone(), "agent_id": "ai:mallory"}),
+            None,
+            None,
+        )
+        .expect_err("a forged forensic actor must refuse the delete");
+        assert!(
+            err.contains("agent_id mismatch") && err.contains("ai:mallory"),
+            "got: {err}"
+        );
+        assert!(
+            db::get(&conn, &id).unwrap().is_some(),
+            "the refusal must precede the destructive write"
+        );
+
+        // ALLOWED: the enforced caller acting as itself still deletes.
+        let ok = handle_delete(
+            &conn,
+            &db_path,
+            &json!({"id": id.clone(), "agent_id": "ai:alice"}),
+            None,
+            None,
+        );
+        assert!(ok.is_ok(), "owner delete must succeed: {ok:?}");
+        assert!(db::get(&conn, &id).unwrap().is_none());
 
         unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
         crate::config::clear_permissions_mode_override_for_test();

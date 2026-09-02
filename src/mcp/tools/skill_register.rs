@@ -487,8 +487,17 @@ pub fn handle_skill_register(
     // in the substrate; emit the forensic-chain row BEFORE the storage
     // write so the audit trail captures intent regardless of downstream
     // signing / storage outcome.
-    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    //
+    // #3363 — BIND the audited actor to the enforced caller, the same rule the
+    // sibling skill lifecycle tools (retire / delete / get / promote) now
+    // apply: registering an executable capability bundle may not be signed
+    // into the forensic chain under a wire-asserted principal.
+    let caller = crate::identity::resolve_governance_subject(
+        params["agent_id"].as_str(),
+        None,
+        "register skills",
+    )
+    .map_err(|e| e.to_string())?;
     crate::governance::audit::record_decision(
         &caller,
         "allow",

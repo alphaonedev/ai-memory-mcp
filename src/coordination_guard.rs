@@ -90,6 +90,11 @@ pub fn require_payload_size(field: &str, value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Names the operation in the #3363 caller-binding refusal raised by
+/// [`resolve_actor`]. One literal, shared by every coordination create surface
+/// that funnels through this helper (pm-v3.1 no-scattered-literal gate).
+const ACTOR_OP: &str = "create coordination objects";
+
 /// Resolve the ambient coordination actor for a create surface: validate a
 /// caller-supplied `agent_id` (rejecting shape violations + the reserved
 /// internal sentinels + whitespace / control chars) and, when none is
@@ -98,12 +103,34 @@ pub fn require_payload_size(field: &str, value: &Value) -> Result<(), String> {
 /// + unbounded" opt-in-by-attacker gap). Mirrors the `check_agent_action`
 /// ambient-caller precedent.
 ///
+/// #3363 — BOUND to the enforced caller. `identity::resolve_agent_id` gives the
+/// EXPLICIT wire value precedence over the `AI_MEMORY_AGENT_ID` env identity, so
+/// pre-#3363 a caller running as `ai:realcaller` could post
+/// `memory_action_create {agent_id: "ai:bob"}` and have the row attributed to —
+/// and bob's per-namespace storage quota charged for — a principal it is not.
+/// Routed through [`crate::identity::resolve_governance_subject`], a wire value
+/// that disagrees with the enforced caller is now REFUSED (fail-closed, same
+/// error class as the #3171 fixes on the other fourteen tools), and the
+/// single-operator default (env unset) stays byte-identical.
+///
 /// # Errors
 /// A stringified failure when a caller-supplied `agent_id` is shape-invalid or
-/// reserved, or when identity resolution fails outright.
+/// reserved, when it disagrees with the enforced caller, or when identity
+/// resolution fails outright.
 pub fn resolve_actor(caller_supplied: Option<&str>) -> Result<String, String> {
     let cleaned = caller_supplied.map(str::trim).filter(|s| !s.is_empty());
-    crate::identity::resolve_agent_id(cleaned, None).map_err(|e| format!("invalid agent_id: {e}"))
+    crate::identity::resolve_governance_subject(cleaned, None, ACTOR_OP).map_err(|e| {
+        let msg = e.to_string();
+        // The #3363 binding refusal is already self-describing
+        // ("agent_id mismatch: caller '…' may only …"); only the shape /
+        // reserved-sentinel failures keep the #2998 "invalid agent_id" prefix,
+        // so neither error contract changes and neither reads doubled.
+        if msg.starts_with("agent_id mismatch") {
+            msg
+        } else {
+            format!("invalid agent_id: {msg}")
+        }
+    })
 }
 
 #[cfg(test)]
@@ -143,7 +170,49 @@ mod tests {
     }
 
     #[test]
+    fn resolve_actor_binds_to_the_enforced_caller_3363() {
+        // #3363 — the coordination create funnel (`action_create`,
+        // `routine_create`, `checkpoint_create`) took the wire `agent_id` /
+        // `created_by` verbatim because `identity::resolve_agent_id` gives the
+        // EXPLICIT value precedence over `AI_MEMORY_AGENT_ID`. Under the
+        // multi-tenant posture a disagreeing wire principal must now refuse
+        // (fail-closed) rather than attribute — and charge the quota of — a
+        // principal the caller is not.
+        let _envg = crate::identity::agent_id_env_test_lock();
+        // SAFETY: process-global env mutation serialised on the crate-wide
+        // test lock held above; every mutator takes the same lock.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:realcaller") };
+
+        // DENIED — a differing wire principal.
+        let err = resolve_actor(Some("ai:bob")).expect_err("a forged actor must refuse");
+        assert!(
+            err.contains("agent_id mismatch") && err.contains("ai:bob"),
+            "got: {err}"
+        );
+        // The refusal message is not doubled with the #2998 shape prefix.
+        assert!(!err.contains("invalid agent_id"), "got: {err}");
+
+        // ALLOWED — the enforced caller acting as itself, and the omitted case
+        // (#2998 always-attributed) resolving to that same caller.
+        assert_eq!(
+            resolve_actor(Some("ai:realcaller")).expect("self is allowed"),
+            "ai:realcaller"
+        );
+        assert_eq!(
+            resolve_actor(None).expect("ambient resolves"),
+            "ai:realcaller"
+        );
+
+        // SAFETY: same serialisation as the set above.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+    }
+
+    #[test]
     fn resolve_actor_validates_caller_and_falls_back() {
+        // #3363 — this assertion depends on the single-operator posture
+        // (`AI_MEMORY_AGENT_ID` unset), where the legacy ladder still honours a
+        // valid wire value byte-identically.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         // A shape-invalid caller value is rejected (log-injection / spoof guard).
         assert!(resolve_actor(Some("has spaces;DROP")).is_err());
         // Omitted actor resolves to a durable non-empty ambient id.
