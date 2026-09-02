@@ -2370,7 +2370,11 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            match cli::audit::run(a, app_config, &mut out)? {
+            // #3429 — hand the audit verbs the ONE resolved store path (the
+            // same `db_path` every other subcommand gets), never an
+            // `AppConfig` they would re-resolve with `effective_db(DEFAULT_DB)`
+            // (which silently discards a non-default `--db`/`AI_MEMORY_DB`).
+            match cli::audit::run(&db_path, a, app_config, &mut out)? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }

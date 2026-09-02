@@ -150,6 +150,7 @@ fn base_mutations() -> Vec<(&'static str, Option<&'static str>)> {
 }
 
 fn run_bootstrap(
+    db_path: &Path,
     cfg: &AppConfig,
     key_dir: &Path,
     recovery: Option<String>,
@@ -158,7 +159,10 @@ fn run_bootstrap(
     let mut se = Vec::<u8>::new();
     let code = {
         let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
-        audit::run(bootstrap_args(key_dir, recovery), cfg, &mut out).expect("bootstrap-node run")
+        // #3429 — `audit::run` takes the ONE store path the top-level parser
+        // resolved; the verbs no longer re-resolve one from `AppConfig`.
+        audit::run(db_path, bootstrap_args(key_dir, recovery), cfg, &mut out)
+            .expect("bootstrap-node run")
     };
     (
         code,
@@ -188,7 +192,7 @@ fn bootstrap_node_certifies_under_full_asi_hard_modes_with_custody_keys() {
     muts.push((roles::RECORDER_KEY_DIR_ENV, rdir.path().to_str()));
     let _g = MultiEnvVarGuard::apply(&muts);
 
-    let (code, so, se) = run_bootstrap(&cfg, &key_dir, Some(recovery));
+    let (code, so, se) = run_bootstrap(&db_path, &cfg, &key_dir, Some(recovery));
     assert_eq!(
         code, 0,
         "certified under full asi-hard modes with witness+recorder keys. stderr: {se}"
@@ -210,7 +214,7 @@ fn bootstrap_node_certifies_under_full_asi_hard_modes_with_custody_keys() {
     }
 
     // Idempotent re-run WITHOUT a recovery pubkey stays certified (exit 0).
-    let (code2, so2, se2) = run_bootstrap(&cfg, &key_dir, None);
+    let (code2, so2, se2) = run_bootstrap(&db_path, &cfg, &key_dir, None);
     assert_eq!(
         code2, 0,
         "idempotent re-run must stay certified. stderr: {se2}"
@@ -236,7 +240,7 @@ fn bootstrap_node_refuses_under_asi_hard_modes_without_custody_keys() {
     muts.push((roles::RECORDER_KEY_DIR_ENV, empty_r.path().to_str()));
     let _g = MultiEnvVarGuard::apply(&muts);
 
-    let (code, _so, se) = run_bootstrap(&cfg, &key_dir, Some(recovery));
+    let (code, _so, se) = run_bootstrap(&db_path, &cfg, &key_dir, Some(recovery));
     assert_eq!(
         code, 1,
         "asi-hard modes armed but no custody keys must REFUSE (fail-closed). stderr: {se}"
@@ -272,7 +276,7 @@ fn bootstrap_node_refuses_when_certified_modes_not_armed() {
         ("AI_MEMORY_STORE_URL_FILE", None),
     ]);
 
-    let (code, _so, se) = run_bootstrap(&cfg, &key_dir, Some(recovery));
+    let (code, _so, se) = run_bootstrap(&db_path, &cfg, &key_dir, Some(recovery));
     assert_eq!(
         code, 1,
         "unarmed certified modes must REFUSE the certified claim (fail-closed). stderr: {se}"
