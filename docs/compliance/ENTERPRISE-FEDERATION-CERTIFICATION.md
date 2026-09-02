@@ -191,6 +191,30 @@ triggers re-cert** (see §7).
 > does NOT re-mint the certification** (bind remains `e22bc93c`; the
 > 2026-08-12 5-agent adversarial ratification stands).
 >
+> **Amendment (2026-09-02, #3422 @ `048ee7b9`, pushed in `e35ce473`).** The
+> §7-watched path `src/handlers/federation_receive.rs` changed by **85
+> inserted lines, all inside `#[cfg(test)] mod tests`** (one regression test,
+> `pg_authored_row_reverifies_after_the_timestamptz_round_trip_3422`): no
+> production line in any watched federation-wire path changed, no
+> wire/schema/`AI_MEMORY_FED_*` identifier was added, removed or renamed, and
+> no certified control (§7.1 PeerScope, signature verification, quarantine)
+> was removed. The behaviour the test pins lives in the attestation funnel
+> (`identity::attest::canonicalize_attested_created_at`, #3422): the
+> `created_at` a signed pre-image may carry is NARROWED to the one RFC3339
+> rendering both storage backends return, so a postgres-authored row whose
+> stamp was re-rendered by `TIMESTAMPTZ` now re-verifies on receive instead
+> of being skipped as unverifiable — a fail-closed narrowing of the accepted
+> pre-image set, not a new acceptance path (Fable 5.1 code + security review
+> on #3422). The §7 re-cert trigger fired because a watched path changed in
+> the batch push `d41050df..e35ce473` without this ledger entry
+> (`check-cert-expiry.sh`, run 33599061386). This amendment discharges it
+> against `e35ce473`. **This amendment does NOT re-mint the certification**
+> (bind remains `e22bc93c`; the 2026-08-12 5-agent adversarial ratification
+> stands). §5.4(2)–(5) will be re-attested at the post-fix-wave
+> rebuild-redeploy-retest pass on f1+f2, where the full federation battery
+> re-runs on the recompiled binary; until then the Certified Postgres + AGE +
+> pgvector (#2548) workflow is GREEN on `e35ce473` (run 33599061424).
+>
 ---
 
 ## 1. The trust boundary (what is certified)
