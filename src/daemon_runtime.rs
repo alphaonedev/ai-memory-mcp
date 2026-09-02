@@ -55,7 +55,6 @@ use clap_complete::{Shell, generate};
 use rusqlite::Connection;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
-use tracing_subscriber::EnvFilter;
 
 use crate::cli::agents::{AgentsArgs, PendingArgs};
 use crate::cli::archive::ArchiveArgs;
@@ -1544,6 +1543,27 @@ pub async fn run(
             .map(str::to_string),
     );
     let j = cli.json;
+
+    // v1.0.0 #3436 — the `--json` CONTRACT gate, BEFORE any work.
+    //
+    // `--json` is `global = true`, so clap accepts it on all 94
+    // subcommands while only some do anything with it. `install --json`,
+    // `wrap --json`, `man --json`, `config check --json` and
+    // `export-forensic-bundle --json` parsed fine, exited 0, and printed
+    // their ordinary human output — a flag accepted, reported successful,
+    // and silently dropped. Refuse instead, and refuse EARLY: nothing has
+    // touched the database at this point, so the message's "NOTHING WAS
+    // EXECUTED" is literally true.
+    //
+    // The classification is exhaustive over `Command` (see
+    // `cli::json_contract`), so a new subcommand cannot inherit the flag
+    // by accident — it will not compile until someone decides.
+    if j && cli::json_contract::json_support(&cli.command)
+        == cli::json_contract::JsonSupport::Unsupported
+    {
+        anyhow::bail!(cli::json_contract::refusal_message());
+    }
+
     let cli_agent_id: Option<String> = cli.agent_id.clone();
     // Track whether command writes to DB (for WAL checkpoint)
     let needs_checkpoint = is_write_command(&cli.command);
@@ -7392,13 +7412,13 @@ fn install_boot_console_subscriber(cmd: &Command) {
 /// `tracing-subscriber` level — repeated calls log a warning and no-op
 /// rather than panic. Split out from `serve()` so test code can opt out.
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse().unwrap())
-                .add_directive("tower_http=info".parse().unwrap()),
-        )
-        .try_init();
+    // v1.0.0 #3436 — through the shared console funnel, which pins the
+    // writer to STDERR. This builder previously omitted `.with_writer`,
+    // and the `tracing_subscriber` default is STDOUT, so `ai-memory serve`
+    // wrote ANSI-coloured log lines onto the stream a caller pipes into
+    // `jq` or a log shipper. The writer is not a parameter of the funnel,
+    // so this call site cannot reintroduce the bug.
+    crate::logging::init_console_tracing(&["tower_http=info"]);
 }
 
 /// Marker returned when daemon shutdown cannot prove that every writer has

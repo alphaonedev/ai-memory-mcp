@@ -48,6 +48,32 @@ impl<'a> CliOutput<'a> {
     pub fn from_std(stdout: &'a mut dyn Write, stderr: &'a mut dyn Write) -> Self {
         Self { stdout, stderr }
     }
+
+    /// v1.0.0 #3436 — write a HUMAN status line under the `--json` contract.
+    ///
+    /// Goes to **stdout** in human mode and to **stderr** when `--json` is in
+    /// effect, so a `--json` invocation's stdout stays a single machine-readable
+    /// document. This is the funnel for the "status line printed next to a JSON
+    /// envelope" pattern — the shape that made `rules keygen --json` emit
+    /// `Ed25519 operator key generated: …` immediately before its JSON, so no
+    /// caller could pipe it into `jq`.
+    ///
+    /// The line is never DROPPED, only rerouted: an operator watching a scripted
+    /// run still sees it, and the information it carries is already in the JSON
+    /// payload for the machine. Silence would trade one honesty problem for
+    /// another.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying writer's I/O error (e.g. a closed pipe), so a
+    /// handler can `?` it rather than panicking mid-output.
+    pub fn human_line(&mut self, json: bool, args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+        if json {
+            writeln!(self.stderr, "{args}")
+        } else {
+            writeln!(self.stdout, "{args}")
+        }
+    }
 }
 
 #[cfg(test)]

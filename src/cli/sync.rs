@@ -12,7 +12,6 @@ use anyhow::Result;
 use clap::Args;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Args)]
 pub struct SyncArgs {
@@ -451,13 +450,9 @@ pub async fn run_daemon(
     let batch_size = args.batch_size.max(1);
     let local_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
 
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse()?)
-                .add_directive("tower_http=info".parse()?),
-        )
-        .try_init();
+    // v1.0.0 #3436 — same shared console funnel `serve` uses; logs go to
+    // STDERR so `sync-daemon`'s stdout stays a data channel.
+    crate::logging::init_console_tracing(&["tower_http=info"]);
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = build_sync_client(&args).await?;

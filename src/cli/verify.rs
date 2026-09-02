@@ -619,8 +619,14 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
 // ─────────────────────────────────────────────────────────────────────
 
 /// Run the `verify-reflection-chain` subcommand against the SQLite DB at
-/// `db_path`. Returns an exit code: `0` if the chain is intact, `2`
-/// otherwise.
+/// `db_path`. Returns an exit code: `0` if the chain is intact, `1` if the
+/// root memory does not exist, `2` if the chain is broken.
+///
+/// v1.0.0 #3436 — the `1` (NOT FOUND) arm is new. Before it, an unknown
+/// root produced an empty walk whose `ok` predicate was vacuously true, so
+/// the verb answered `ok: true` / exit 0 about a memory it had never found.
+/// "I could not find it" and "I checked it and it is broken" are different
+/// answers and a CI gate must be able to tell them apart.
 ///
 /// v0.7.0 G-PHASE-E-4 (#709) — raised the failure exit code from `1`
 /// to `2`. The previous `1` was indistinguishable from CLI argument
@@ -635,6 +641,48 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
 pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     let json = args.format.to_ascii_lowercase() == "json";
     let conn = crate::db::open(db_path).context("open db")?;
+
+    // v1.0.0 #3436 — REFUSE an unknown root instead of certifying it.
+    //
+    // `build_chain_report` walks outward from `root_id`; a root that does
+    // not exist simply yields an empty walk, whose `ok` predicate
+    // (`edges_failed == 0 && bounded_status != "exceeded_cap"`) is
+    // vacuously TRUE. So `verify-reflection-chain <typo>` reported
+    // `ok: true` and exited 0 — a verifier that answers "verified" about
+    // a memory it never found is the worst failure mode a verifier has,
+    // and it is exactly what a CI gate would trust.
+    //
+    // The existence check lives HERE, at the CLI entry point, rather than
+    // inside `build_chain_report`: the forensic-bundle builder calls that
+    // same function for a root it has already resolved, and turning a
+    // missing row into a hard error there would change bundle semantics
+    // for no benefit.
+    //
+    // Exit 1 = NOT FOUND, deliberately distinct from exit 2 = verification
+    // FAILED (#709). "I could not find it" and "I checked it and it is
+    // broken" are different answers and a script must be able to tell them
+    // apart.
+    if crate::db::get(&conn, &args.memory_id)
+        .context("resolve verify-reflection-chain root")?
+        .is_none()
+    {
+        if json {
+            let payload = serde_json::json!({
+                "ok": false,
+                "root_id": args.memory_id,
+                "not_found": true,
+                "error": crate::errors::msg::not_found(&args.memory_id),
+            });
+            writeln!(out.stdout, "{}", serde_json::to_string_pretty(&payload)?)?;
+        } else {
+            writeln!(
+                out.stderr,
+                "{}",
+                crate::errors::msg::not_found(&args.memory_id)
+            )?;
+        }
+        return Ok(1);
+    }
 
     let report = build_chain_report(&conn, &args.memory_id, args.include_signed_events)?;
 
