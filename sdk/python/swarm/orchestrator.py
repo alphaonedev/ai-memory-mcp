@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 from ai_memory.attestation import AgentSigningKey
 
 from swarm.agent import SwarmAgent
-from swarm.audit import CallLog, set_call_log
+from swarm.audit import CallLog, mission_evidence, set_call_log
 from swarm.coverage import CoverageTracker
 from swarm.openrouter import OpenRouterClient
 
@@ -197,15 +197,34 @@ class Swarm:
                      and agent.mission_lineage_proved and agent.mission_summary_cites_sources)
                 for agent in self.agents}
 
-    def mission_progress(self) -> dict[str, dict[str, bool]]:
-        """Per-agent breakdown so a 0% strict rate is explainable, not opaque."""
+    def mission_progress(self) -> dict[str, dict[str, object]]:
+        """Per-agent breakdown so a 0% strict rate is explainable, not opaque.
+
+        Each agent carries BOTH views: the strict in-agent flags (which require
+        the summary to be titled AND written to the shared namespace) and the
+        call-log evidence (#3440), which reads back what was actually
+        dispatched. When the two disagree the evidence keys say why — e.g. 61
+        summaries stored but ``summary_in_shared_namespace`` false for all of
+        them is a mission the agents did most of, not a harness that saw none.
+        """
+        evidence = mission_evidence(self.call_log.entries,
+                                    shared_namespace=self.shared_namespace)
+        empty = {"summary_stored": False, "summary_count": 0,
+                 "summary_in_shared_namespace": False, "lineage_proved": False,
+                 "facts_stored": 0}
         return {agent.identity.agent_id: {
             "summary_stored": bool(agent.mission_summary_id),
             "single_summary": agent.mission_summary_count == 1,
             "lineage_proved": agent.mission_lineage_proved,
             "cites_all_sources": agent.mission_summary_cites_sources,
             "facts_stored": len(agent.mission_memory_ids),
-        } for agent in self.agents}
+            "summary_stored_evidence": found["summary_stored"],
+            "summary_count_evidence": found["summary_count"],
+            "summary_in_shared_namespace": found["summary_in_shared_namespace"],
+            "lineage_proved_evidence": found["lineage_proved"],
+            "facts_stored_evidence": found["facts_stored"],
+        } for agent in self.agents
+            for found in (evidence.get(agent.identity.agent_id, empty),)}
 
 
 async def run_swarm(config: SwarmConfig) -> CoverageTracker:
