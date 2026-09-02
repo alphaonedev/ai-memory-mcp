@@ -15566,11 +15566,29 @@ const GC_CHUNK_ROWS: usize = 500;
 /// identical snapshot because the transaction holds the write lock —
 /// target the exact same rows and the archive-before-delete invariant
 /// is preserved chunk by chunk.
-const SQL_GC_EXPIRED_CHUNK_IDS: &str = "SELECT id FROM memories \
-     WHERE expires_at IS NOT NULL AND expires_at < ?1 \
-     ORDER BY rowid LIMIT ?2";
+/// #3383 — shared expiry/owner predicate for GC preview, governance and writes.
+/// Ownership matches `purge_archive_for_caller`; NULL selects the admin sweep.
+pub(crate) const SQL_GC_EXPIRED_WHERE: &str = "expires_at IS NOT NULL AND expires_at < ?1 \
+     AND (?2 IS NULL OR json_extract(metadata, '$.agent_id') = ?2 \
+          OR json_extract(metadata, '$.target_agent_id') = ?2)";
 
 pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    gc_for_caller(conn, archive, None)
+}
+
+/// #3383 — caller-scoped MCP collection. `None` is the operator/admin sweep.
+/// Every archive, link snapshot, revision, erasure and delete uses the same
+/// owner-filtered chunk under the write transaction. Like archive purge, a
+/// caller can collect rows they authored or received, never unowned rows.
+///
+/// # Errors
+/// Propagates record-stop, SQLite, revision and erasure failures.
+pub(crate) fn gc_for_caller(
+    conn: &Connection,
+    archive: bool,
+    caller: Option<&str>,
+) -> Result<usize> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     // #2308 (FBL-04) — fold-before-gc at the eviction chokepoint. With
     // recall pure (#1869), a recalled row's TTL floor-extension lives
@@ -15592,46 +15610,50 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     if let Err(e) = fold_recall_accesses(conn, crate::SECS_PER_HOUR, crate::SECS_PER_DAY) {
         tracing::warn!("recall-access fold failed (pre-gc): {e}");
     }
-    // #2358 — prune the `recall_observations` ledger from THIS chokepoint
-    // too, not only the serve daemon's dedicated gc loop
-    // (`spawn_gc_loop_with_shadow_retention_tracked`). MCP-stdio and
-    // CLI-only topologies never run that background loop, so without this
-    // call the ledger grows unbounded off the serve daemon, making the
-    // documented `AI_MEMORY_OBSERVATIONS_TTL_DAYS` contract false on those
-    // topologies. Best-effort (WARN, never abort the sweep): a failed
-    // prune degrades to "ledger grows one more sweep", never corrupts —
-    // mirrors the fold-before-gc posture immediately above.
-    if let Err(e) = crate::observations::gc::prune(conn) {
-        tracing::warn!("recall_observations prune failed (in gc): {e}");
-    }
-    // #3011 — prune caller-declared-ephemeral (expired) coordination signals
-    // from this same chokepoint so every gc topology (serve / MCP stdio / CLI)
-    // honors `signals.expires_at`. Best-effort (WARN, never abort the sweep) —
-    // mirrors the observations prune posture immediately above.
-    if let Err(e) = crate::signals::prune_expired(conn, Utc::now().timestamp()) {
-        tracing::warn!("expired-signal prune failed (in gc): {e}");
-    }
-    // v1.0.0 #3464 — reap expired proof-of-possession bind challenges from the
-    // same chokepoint, so `agent_pubkey_challenges` is bounded by the challenge
-    // TTL rather than by history on every gc topology (serve / MCP stdio /
-    // CLI). Best-effort (WARN, never abort the sweep) — mirrors the
-    // observations / signals prune posture above. An unreaped expired row is
-    // inert, never admissible: the consuming UPDATE tests `expires_at` itself.
-    match reap_expired_pubkey_bind_challenges(conn) {
-        Ok(n) if n > 0 => {
-            tracing::debug!("reaped {n} expired agent pubkey bind challenge(s) (in gc)");
+    if caller.is_none() {
+        // #2358 — prune the `recall_observations` ledger from THIS chokepoint
+        // too, not only the serve daemon's dedicated gc loop
+        // (`spawn_gc_loop_with_shadow_retention_tracked`). MCP-stdio and
+        // CLI-only topologies never run that background loop, so without this
+        // call the ledger grows unbounded off the serve daemon, making the
+        // documented `AI_MEMORY_OBSERVATIONS_TTL_DAYS` contract false on those
+        // topologies. Best-effort (WARN, never abort the sweep): a failed
+        // prune degrades to "ledger grows one more sweep", never corrupts —
+        // mirrors the fold-before-gc posture immediately above.
+        if let Err(e) = crate::observations::gc::prune(conn) {
+            tracing::warn!("recall_observations prune failed (in gc): {e}");
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("expired bind-challenge reap failed (in gc): {e}"),
+        // #3011 — prune caller-declared-ephemeral (expired) coordination signals
+        // from this same chokepoint so every gc topology (serve / MCP stdio / CLI)
+        // honors `signals.expires_at`. Best-effort (WARN, never abort the sweep) —
+        // mirrors the observations prune posture immediately above.
+        if let Err(e) = crate::signals::prune_expired(conn, Utc::now().timestamp()) {
+            tracing::warn!("expired-signal prune failed (in gc): {e}");
+        }
+        // v1.0.0 #3464 — reap expired proof-of-possession bind challenges from the
+        // same chokepoint, so `agent_pubkey_challenges` is bounded by the challenge
+        // TTL rather than by history on every gc topology (serve / MCP stdio /
+        // CLI). Best-effort (WARN, never abort the sweep) — mirrors the
+        // observations / signals prune posture above. An unreaped expired row is
+        // inert, never admissible: the consuming UPDATE tests `expires_at` itself.
+        match reap_expired_pubkey_bind_challenges(conn) {
+            Ok(n) if n > 0 => {
+                tracing::debug!("reaped {n} expired agent pubkey bind challenge(s) (in gc)");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("expired bind-challenge reap failed (in gc): {e}"),
+        }
     }
     let now = Utc::now().to_rfc3339();
+    let expired_chunk_ids =
+        format!("SELECT id FROM memories WHERE {SQL_GC_EXPIRED_WHERE} ORDER BY rowid LIMIT ?3");
     // #1579 B6 (F5.7) — bounded-lock-hold chunked sweep. Each loop
     // iteration archives + deletes at most GC_CHUNK_ROWS expired rows
     // inside its own BEGIN IMMEDIATE transaction, so concurrent
     // writers interleave between chunks instead of stalling behind one
     // giant sweep transaction. Archive semantics are preserved: within
     // a chunk the archive INSERT and the DELETE address the same
-    // deterministic id set (see SQL_GC_EXPIRED_CHUNK_IDS), and a
+    // deterministic id set (see expired_chunk_ids), and a
     // failure rolls back only the in-flight chunk (already-committed
     // chunks remain reaped — same observable contract as repeated
     // smaller gc calls).
@@ -15665,9 +15687,9 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                             mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until,
                     cid, cid_genesis
                      FROM memories
-                     WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
+                     WHERE id IN ({expired_chunk_ids})"
                 ))?;
-                archive_stmt.execute(params![now, GC_CHUNK_ROWS])?;
+                archive_stmt.execute(params![now, caller, GC_CHUNK_ROWS])?;
                 // #3161 (v1.0.0) — DATA-LOSS CLOSE. The archive copy above
                 // moves only the memory ROW; `memory_links` carries an
                 // `ON DELETE CASCADE` FK on both endpoints, so the DELETE at
@@ -15680,8 +15702,8 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                 // kept its edges across archive→restore therefore depended on
                 // WHICH path archived it, an asymmetry no operator could see.
                 // Snapshot here, BEFORE the cascade, over the SAME
-                // deterministic chunk subquery (`SQL_GC_EXPIRED_CHUNK_IDS`,
-                // `ORDER BY rowid LIMIT ?2`) that the archive copy above and
+                // deterministic chunk subquery (`expired_chunk_ids`,
+                // `ORDER BY rowid LIMIT ?3`) that the archive copy above and
                 // the `DELETE` below both target — so the three statements
                 // provably pin to the identical row set inside this
                 // `BEGIN IMMEDIATE`, with no materialized id list to drift.
@@ -15708,23 +15730,23 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                             valid_until, observed_by, signature, attest_level, ?1,
                             source_cid, target_cid
                      FROM memory_links
-                     WHERE source_id IN ({SQL_GC_EXPIRED_CHUNK_IDS})
-                        OR target_id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
+                     WHERE source_id IN ({expired_chunk_ids})
+                        OR target_id IN ({expired_chunk_ids})"
                 ))?;
-                links_stmt.execute(params![now, GC_CHUNK_ROWS])?;
+                links_stmt.execute(params![now, caller, GC_CHUNK_ROWS])?;
             }
             // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
             // append ONE identity-only EXPIRE leaf per doomed row IN THIS
             // tx BEFORE the delete. The id set is the SAME deterministic
-            // chunk (SQL_GC_EXPIRED_CHUNK_IDS) the DELETE targets. Gated so
+            // chunk (expired_chunk_ids) the DELETE targets. Gated so
             // flag-OFF runs neither the select nor the append (byte-identical).
             if crate::config::append_only_enabled() {
                 let mut leaf_stmt = conn.prepare_cached(&format!(
                     "SELECT id, namespace, version FROM memories \
-                     WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
+                     WHERE id IN ({expired_chunk_ids})"
                 ))?;
                 let doomed: Vec<(String, String, i64)> = leaf_stmt
-                    .query_map(params![now, GC_CHUNK_ROWS], |r| {
+                    .query_map(params![now, caller, GC_CHUNK_ROWS], |r| {
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                     })?
                     .collect::<rusqlite::Result<_>>()?;
@@ -15749,10 +15771,10 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
             if !archive {
                 let mut evict_stmt = conn.prepare_cached(&format!(
                     "SELECT id, namespace, json_extract(metadata,'$.agent_id') \
-                     FROM memories WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
+                     FROM memories WHERE id IN ({expired_chunk_ids})"
                 ))?;
                 let evicted: Vec<(String, String, Option<String>)> = evict_stmt
-                    .query_map(params![now, GC_CHUNK_ROWS], |r| {
+                    .query_map(params![now, caller, GC_CHUNK_ROWS], |r| {
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                     })?
                     .collect::<rusqlite::Result<_>>()?;
@@ -15761,15 +15783,15 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                 }
             }
             let mut delete_stmt = conn.prepare_cached(&format!(
-                "DELETE FROM memories WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
+                "DELETE FROM memories WHERE id IN ({expired_chunk_ids})"
             ))?;
-            let deleted = delete_stmt.execute(params![now, GC_CHUNK_ROWS])?;
+            let deleted = delete_stmt.execute(params![now, caller, GC_CHUNK_ROWS])?;
             Ok(deleted)
         })();
         match result {
             Ok(n) => {
                 write_txn.commit()?;
-                total += n;
+                total = total.checked_add(n).context("gc count overflow")?;
                 if n < GC_CHUNK_ROWS {
                     break;
                 }
@@ -15804,10 +15826,12 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     // backends were already divergent here). It also makes the sweep MONOTONE:
     // each dangling row heals exactly once and leaves the matching set, so
     // there is no per-tick `updated_at` churn and no federation-fanout storm.
-    let _ = conn.execute(
-        SQL_HEAL_DANGLING_NAMESPACE_META,
-        params![Utc::now().to_rfc3339()],
-    );
+    if caller.is_none() {
+        let _ = conn.execute(
+            SQL_HEAL_DANGLING_NAMESPACE_META,
+            params![Utc::now().to_rfc3339()],
+        );
+    }
     Ok(total)
 }
 

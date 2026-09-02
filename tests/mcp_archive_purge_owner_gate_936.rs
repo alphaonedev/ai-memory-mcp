@@ -17,8 +17,8 @@
 //!    (with `agent_id: "alice"` in params) MUST NOT purge bob's
 //!    archived rows.
 //! 2. `mcp_as_admin_true_purges_cross_tenant_936` — the explicit
-//!    `as_admin: true` operator opt-in restores the owner-blind
-//!    wipe for legitimate admin sweeps.
+//!    `as_admin: true` opt-in plus operator-configured admin membership
+//!    permits the owner-blind wipe for legitimate admin sweeps.
 //! 3. `mcp_response_carries_owner_scope_936` — the response
 //!    envelope includes `owner_scope: "admin"|"caller"` so the
 //!    operator can audit which branch fired.
@@ -140,6 +140,8 @@ fn mcp_caller_only_purges_own_rows_936() {
 
 #[test]
 fn mcp_as_admin_true_purges_cross_tenant_936() {
+    // #3383: both admin fixtures seed the same immutable process allowlist.
+    ai_memory::identity::set_admin_agent_ids(vec!["ops:admin".to_string()]);
     let f = open_db_with_seed("alice", "ns-936-mcp/a");
     add_seed(&f, "bob", "ns-936-mcp/b");
     assert_eq!(archive_count(&f), 2);
@@ -165,6 +167,8 @@ fn mcp_as_admin_true_purges_cross_tenant_936() {
 
 #[test]
 fn mcp_response_carries_owner_scope_936() {
+    // #3383: both admin fixtures seed the same immutable process allowlist.
+    ai_memory::identity::set_admin_agent_ids(vec!["ops:admin".to_string()]);
     // Empty DB still returns the envelope with `owner_scope`.
     let f = NamedTempFile::new().expect("tempfile");
     let _ = ai_memory::db::open(f.path()).expect("db::open");
