@@ -433,6 +433,61 @@ fn load_keypair_best_effort(agent_id: &str) -> Option<Arc<crate::identity::keypa
     identity_keypair::load(agent_id, &dir).ok().map(Arc::new)
 }
 
+/// v1.0.0 #3402 — build the CLI surface's [`Atomiser`] through the SAME
+/// tier gate / curator resolver / keypair ladder the explicit
+/// `ai-memory atomise` verb uses, so the implicit `auto_atomise`
+/// namespace-policy pass on the store path can never drift from the
+/// explicit verb (different model, different signing posture, different
+/// egress decision).
+///
+/// Returns `None` — never an error — when this host has no curator:
+///
+/// * the daemon tier is `keyword` (no curator LLM exists at that tier);
+/// * the `[llm]` resolver produced no client, or the N7 inference-plane
+///   egress gate refused to construct one.
+///
+/// Both are legitimate production states, and both are DEGRADE, never
+/// corrupt: the caller hands `None` to
+/// [`crate::hooks::pre_store::run_auto_atomise`], whose `#2985`
+/// no-curator arm emits the loud, counted `skipped_no_curator` verdict.
+/// A heuristic splitter substitute is deliberately absent — `atomise_sync`
+/// ARCHIVES the parent, so a non-curator fallback would be the
+/// unintentional-data-loss class.
+pub(crate) fn build_cli_atomiser(
+    app_config: &AppConfig,
+    db_path: &Path,
+    calling_agent_id: &str,
+) -> Option<Arc<Atomiser>> {
+    let tier = app_config.effective_tier(None);
+    if tier == FeatureTier::Keyword {
+        tracing::warn!(
+            "auto_atomise requested on a `keyword`-tier host — no curator LLM exists at \
+             this tier, so the write is stored WITHOUT atomisation (the durable text is \
+             untouched; `ai-memory atomise <id>` recovers it after a tier change)"
+        );
+        return None;
+    }
+    match build_llm_curator(tier, db_path) {
+        Ok((curator, curator_model)) => Some(Arc::new(
+            Atomiser::new(
+                curator,
+                load_keypair_best_effort(calling_agent_id),
+                AtomiserConfig::default(),
+                tier,
+            )
+            .with_curator_model(curator_model),
+        )),
+        Err(e) => {
+            tracing::warn!(
+                "auto_atomise requested but no curator could be constructed on this host: \
+                 {e} — the write is stored WITHOUT atomisation (the durable text is \
+                 untouched; `ai-memory atomise <id>` recovers it)"
+            );
+            None
+        }
+    }
+}
+
 /// Emit a success result (human or JSON), return exit code 0.
 fn emit_success(
     result: &crate::atomisation::AtomiseResult,

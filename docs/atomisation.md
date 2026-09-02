@@ -108,9 +108,18 @@ bounded worker's queue depth is `AI_MEMORY_ATOMISE_QUEUE_CAPACITY`
 (default 256); a full queue drops the job with a counted WARN and an
 honest `skipped_queue_full` token — never a write failure.
 
-The CLI `ai-memory store` one-shot deliberately does NOT fire this hook
-(the operator-direct substrate path, matching the governance-hook and
-quota exemptions).
+`ai-memory store` fires the same hook (v1.0.0 #3402). Pre-#3402 the CLI
+one-shot was exempt, which meant the SAME namespace standard was
+half-applied depending on the surface: its ACL half was enforced on the
+CLI, its `auto_atomise` half was not. The CLI now resolves the curator
+through the same ladder `ai-memory atomise` uses and reports the same
+`atomise_mode` / `atomise_outcome` tokens (in `--json`, and as an
+`auto_atomise: mode=... outcome=...` stderr note otherwise). A one-shot
+process has no daemon to defer to, so a `deferred` namespace runs the
+same bounded single-consumer worker in-process and joins it before the
+command exits; a `keyword`-tier host, a missing `[llm]` backend or an
+egress refusal still degrade to `skipped_no_curator` with the durable
+text untouched.
 
 ### MCP tool (interactive)
 
