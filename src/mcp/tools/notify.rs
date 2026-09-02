@@ -364,6 +364,43 @@ mod d1_5_986_tests {
         assert_eq!(NotifyTool::family(), "other");
     }
 
+    /// #3362 — the generic caller-store reservation must not block the owning
+    /// notification funnel from delivering into `_messages/<target>`.
+    #[test]
+    fn notify_still_writes_its_owned_system_namespace_3362() {
+        let conn = crate::storage::open(std::path::Path::new(":memory:"))
+            .expect("open in-memory database");
+        let response = handle_notify(
+            &conn,
+            &json!({
+                "target_agent_id": "ai:victim",
+                "title": "legitimate message",
+                "payload": "delivered by the notify funnel",
+            }),
+            &crate::config::ResolvedTtl::default(),
+            Some("ai:sender"),
+        )
+        .expect("notify owns the messages namespace");
+
+        assert_eq!(response["namespace"], "_messages/ai:victim");
+        let rows = db::list(
+            &conn,
+            Some("_messages/ai:victim"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("list delivered message");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "notify");
+    }
+
     #[test]
     fn inbox_parity_986() {
         let derived = derived_props_for::<InboxRequest>();

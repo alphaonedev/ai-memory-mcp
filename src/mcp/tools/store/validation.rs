@@ -434,6 +434,32 @@ mod tests {
         assert!(err.contains("reserved"), "got: {err}");
     }
 
+    /// #3362 — the MCP store parser refuses every system-prefixed namespace,
+    /// including the two attacker-controlled identity/message targets from the
+    /// validation sweep.
+    #[test]
+    fn issue_3362_store_rejects_messages_and_agents_namespaces() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        for namespace in ["_messages/ai:victim", "_agents"] {
+            let params = json!({
+                "title": "forged system row",
+                "content": "attacker-controlled body",
+                "namespace": namespace,
+            });
+            let err = parse_and_build_memory(&params, Some("ai:mallory"), &ttl, &conn)
+                .expect_err("system namespace must be refused on the MCP store surface");
+            assert!(
+                err.contains("reserved for substrate-internal records"),
+                "unexpected refusal for {namespace}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn default_on_conflict_for_client_matrix() {
         assert_eq!(default_on_conflict_for_client(None), OnConflict::Merge);
