@@ -1346,7 +1346,7 @@ pub async fn session_start(
         }
         let limit = usize::try_from(body.limit.unwrap_or(10))
             .unwrap_or(usize::MAX)
-            .min(50);
+            .min(crate::boot_cluster::BOOT_PAYLOAD_LIST_CAP);
         let filter = crate::store::Filter {
             namespace: body.namespace.clone(),
             tier: None,
@@ -1355,7 +1355,7 @@ pub async fn session_start(
             since: None,
             until: None,
             valid_at: None,
-            limit,
+            limit: crate::boot_cluster::overfetch_limit(limit),
             // #1876 — subscription-mirror listing serves the first window.
             offset: 0,
             active_embedding_space: None,
@@ -1375,9 +1375,17 @@ pub async fn session_start(
                     .into_iter()
                     .filter(|m| crate::visibility::is_visible_to_caller(m, &caller))
                     .collect();
+                // #3352 — same display cluster as MCP session_start / CLI boot.
+                let clustered = crate::boot_cluster::cluster_payload(visible, limit, None);
+                let memories: Vec<serde_json::Value> = clustered
+                    .iter()
+                    .map(|c| {
+                        crate::boot_cluster::memory_json_with_similar(&c.memory, c.similar_count)
+                    })
+                    .collect();
                 let mut v = json!({
-                    "memories": &visible,
-                    "count": visible.len(),
+                    "memories": memories,
+                    "count": clustered.len(),
                     "mode": crate::mcp::SESSION_START_MODE,
                     "session_id": Uuid::new_v4().to_string(),
                 });

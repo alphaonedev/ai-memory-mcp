@@ -1336,7 +1336,7 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/memory_load_family` | HTTP parity for the always-on `memory_load_family` MCP loader. |
 | `POST` | `/api/v1/capture_turn` | #1416 — L4 layered-capture HTTP mirror of MCP `memory_capture_turn` (idempotent per-turn write via `MemoryStore::capture_turn_idempotent`). |
 | `POST` | `/api/v1/share` | #1095 — copy a memory into the recipient agent's `_shared/<from>→<to>/` namespace; body `{source_memory_id, target_agent_id}`. MCP: `memory_share`. |
-| `POST` | `/api/v1/session/start` | HTTP parity for `memory_session_start` (auto-recall session boot). |
+| `POST` | `/api/v1/session/start` | HTTP parity for `memory_session_start` (auto-recall session boot). Near-duplicates are clustered (same as `ai-memory boot`); a representative row may carry `similar_count`. |
 | `GET`  | `/api/v1/capabilities` | Capabilities envelope (schema_version `"3"`; `Accept-Capabilities` header negotiates v1/v2). MCP: `memory_capabilities`. |
 | `POST` | `/api/v1/notify` | Agent-to-agent inbox message. Sender resolved from `X-Agent-Id` only (#901); body `agent_id` must match or 403. MCP: `memory_notify`. |
 | `GET`  | `/api/v1/inbox` | Read the calling agent's inbox. MCP: `memory_inbox`; when `AI_MEMORY_AGENT_ID` is unset, access is bound to the same process-derived identity used by `memory_notify`, and an explicit `agent_id` must match it. MCP refuses startup when `AI_MEMORY_AGENT_ID` is configured empty or malformed. An isolated single-tenant process may explicitly set `[mcp] single_tenant_trust_all = true` to restore caller-unbound inbox selection; every use emits a WARN. |

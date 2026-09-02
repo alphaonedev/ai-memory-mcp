@@ -12,8 +12,9 @@
 //! Boot deliberately does **not** load the embedder. It returns the
 //! most-recently-accessed memories in the inferred namespace, falls back to
 //! the most-recently-accessed memories globally if the namespace is empty,
-//! and clamps output to a token budget so a misconfigured agent can't bloat
-//! its first turn.
+//! clusters near-duplicates (#3352) so a `--limit` budget prefers distinct
+//! facts, and clamps output to a token budget so a misconfigured agent
+//! can't bloat its first turn.
 //!
 //! Failure modes are graceful by default:
 //! - DB unavailable + `--quiet`: exit 0, empty stdout (a hook that fails
@@ -36,6 +37,10 @@
 //! - `latency`     — wall-clock from `run()` entry to header emit
 //! - `namespace`   — resolved namespace + how many memories matched
 
+use crate::boot_cluster::{
+    BOOT_PAYLOAD_LIST_CAP, ClusteredMemory, cluster_payload, memory_json_with_similar,
+    overfetch_limit,
+};
 use crate::cli::CliOutput;
 use crate::cli::helpers::{human_age, id_short};
 use crate::config::AppConfig;
@@ -243,27 +248,24 @@ fn fetch_boot_memories(
     Ok((fallback, String::new()))
 }
 
-/// Cumulative character → approximate-tokens budget clamp. Returns the
-/// prefix of `mems` that fits in the budget. Always keeps the first
-/// memory (R1 always-return-at-least-one parity with `memory_recall`).
-fn clamp_to_budget(mems: Vec<models::Memory>, budget_tokens: usize) -> Vec<models::Memory> {
+/// Cumulative character → approximate-tokens budget clamp over clustered
+/// boot rows. Always keeps the first memory (R1 always-return-at-least-one
+/// parity with `memory_recall`). Preserves #3352 `similar_count`.
+fn clamp_clustered(mems: Vec<ClusteredMemory>, budget_tokens: usize) -> Vec<ClusteredMemory> {
     if budget_tokens == 0 || mems.is_empty() {
         return mems;
     }
     let mut chars_so_far: usize = 0;
     let mut out = Vec::with_capacity(mems.len());
-    for (idx, mem) in mems.into_iter().enumerate() {
-        // Conservative per-row width: title + namespace + tier label +
-        // age + ~20 chars of decorations. Real toon/text rows are ~150
-        // chars; we round up to bound risk.
-        let row_chars = mem.title.len() + mem.namespace.len() + 80;
+    for (idx, item) in mems.into_iter().enumerate() {
+        let row_chars = item.memory.title.len() + item.memory.namespace.len() + 80;
         let projected_tokens =
             ((chars_so_far + row_chars) as f32 * TOKENS_PER_CHAR).ceil() as usize;
         if idx > 0 && projected_tokens > budget_tokens {
             break;
         }
         chars_so_far += row_chars;
-        out.push(mem);
+        out.push(item);
     }
     out
 }
@@ -553,7 +555,7 @@ pub fn run(
     let redact_titles = boot_cfg.effective_redact_titles();
 
     let format = BootFormat::parse(&args.format)?;
-    let limit = args.limit.clamp(1, 50);
+    let limit = args.limit.clamp(1, BOOT_PAYLOAD_LIST_CAP);
     let namespace = resolve_namespace(args);
 
     // Open the DB. On failure, honor `--quiet` (exit 0 with empty stdout
@@ -657,8 +659,8 @@ pub fn run(
         return Ok(());
     }
 
-    let (mems, used_namespace) = fetch_boot_memories(&conn, &namespace, limit)?;
-    let mems = clamp_to_budget(mems, args.budget_tokens);
+    let (mems, used_namespace) = fetch_boot_memories(&conn, &namespace, overfetch_limit(limit))?;
+    let mems = clamp_clustered(cluster_payload(mems, limit, None), args.budget_tokens);
     let fell_back = !mems.is_empty() && used_namespace.is_empty();
 
     if mems.is_empty() {
@@ -701,7 +703,7 @@ pub fn run(
                     out.stdout,
                     "{}",
                     serde_json::to_string(&serde_json::json!({
-                        "memories": render_memories_for_emit(&mems, redact_titles)
+                        "memories": render_clustered_for_emit(&mems, redact_titles)
                     }))?
                 )?;
             } else {
@@ -800,6 +802,21 @@ fn render_memories_for_emit(mems: &[models::Memory], redact_titles: bool) -> Vec
             redacted.metadata = serde_json::json!({});
             redacted
         })
+        .collect()
+}
+
+/// JSON/TOON emit of clustered boot rows. Applies the redact kill-switch
+/// then stamps `similar_count` on non-singleton clusters (#3352).
+fn render_clustered_for_emit(
+    mems: &[ClusteredMemory],
+    redact_titles: bool,
+) -> Vec<serde_json::Value> {
+    let owned: Vec<models::Memory> = mems.iter().map(|c| c.memory.clone()).collect();
+    let rendered = render_memories_for_emit(&owned, redact_titles);
+    rendered
+        .iter()
+        .zip(mems.iter())
+        .map(|(m, c)| memory_json_with_similar(m, c.similar_count))
         .collect()
 }
 
@@ -947,8 +964,9 @@ fn emit_status_header(
     Ok(())
 }
 
-fn emit_text(out: &mut CliOutput<'_>, mems: &[models::Memory], redact_titles: bool) -> Result<()> {
-    for mem in mems {
+fn emit_text(out: &mut CliOutput<'_>, mems: &[ClusteredMemory], redact_titles: bool) -> Result<()> {
+    for item in mems {
+        let mem = &item.memory;
         let age = human_age(&mem.updated_at);
         // PR-9h (#487 PR #497 req #73) — when `[boot] redact_titles =
         // true`, replace the title field with the redaction sentinel.
@@ -961,9 +979,16 @@ fn emit_text(out: &mut CliOutput<'_>, mems: &[models::Memory], redact_titles: bo
         } else {
             &mem.title
         };
+        // #3352 — note folded near-duplicates so the slot budget's
+        // compression is visible instead of silent.
+        let similar = if item.similar_count > 0 {
+            format!(", {} similar", item.similar_count)
+        } else {
+            String::new()
+        };
         writeln!(
             out.stdout,
-            "- [{}/{}] {} (ns={}, p={}, {})",
+            "- [{}/{}] {} (ns={}, p={}, {}{similar})",
             mem.tier,
             id_short(&mem.id),
             title,
@@ -978,7 +1003,7 @@ fn emit_text(out: &mut CliOutput<'_>, mems: &[models::Memory], redact_titles: bo
 fn emit_json_with_status(
     out: &mut CliOutput<'_>,
     manifest: &BootManifest,
-    mems: &[models::Memory],
+    mems: &[ClusteredMemory],
     fell_back: bool,
     redact_titles: bool,
 ) -> Result<()> {
@@ -986,7 +1011,7 @@ fn emit_json_with_status(
     // `fell_back_to_global`. Agents that ingest JSON get every manifest
     // field as a top-level key so they can reason about the runtime
     // without parsing a free-text header.
-    let rendered = render_memories_for_emit(mems, redact_titles);
+    let rendered = render_clustered_for_emit(mems, redact_titles);
     let body = serde_json::json!({
         "status": manifest.status.label(),
         "version": manifest.version,
@@ -1009,11 +1034,11 @@ fn emit_json_with_status(
     Ok(())
 }
 
-fn emit_toon(out: &mut CliOutput<'_>, mems: &[models::Memory], redact_titles: bool) -> Result<()> {
+fn emit_toon(out: &mut CliOutput<'_>, mems: &[ClusteredMemory], redact_titles: bool) -> Result<()> {
     // Reuse the canonical TOON serializer used by `memory_recall` so boot
     // output is byte-identical to a recall response on the wire format.
     // `memories_to_toon` takes the `{memories: [...], count: N}` shape.
-    let rendered = render_memories_for_emit(mems, redact_titles);
+    let rendered = render_clustered_for_emit(mems, redact_titles);
     let body = serde_json::json!({
         "memories": rendered,
         "count": rendered.len(),
@@ -1111,6 +1136,72 @@ mod tests {
         assert!(stdout.contains("first"));
         assert!(stdout.contains("second"));
         assert!(!stdout.contains("elsewhere"));
+    }
+
+    /// #3352 — 5 near-duplicates of one fact + 5 distinct facts under
+    /// `--limit 10` must occupy 6 body lines, not 10. The collapsed
+    /// cluster notes `N similar`.
+    #[test]
+    fn boot_clusters_near_duplicates_into_six_lines_3352() {
+        let _g = test_lock();
+        let mut env = TestEnv::fresh();
+        let body = "The Grok A2A channel wiring check requires the inbox \
+                    poller to sort messages by created_at rather than priority \
+                    so that P10 crowding cannot hide a P9 mail about the same \
+                    channel fact.";
+        for i in 1..=5 {
+            seed_memory(
+                &env.db_path,
+                "ns-dedupe",
+                &format!("Grok A2A channel wiring {i}"),
+                body,
+            );
+        }
+        let distinct = [
+            (
+                "Rust ownership aliasing",
+                "OWNERSHIP-10 many shared references xor one exclusive mutable borrow at a time.",
+            ),
+            (
+                "Postgres pool sizing",
+                "Read-path GET links p95 dropped after the handler stopped taking the writer lock.",
+            ),
+            (
+                "Schema ladder v96",
+                "embed_skip durable skip markers land as sqlite 0080 and postgres 0053 after v95.",
+            ),
+            (
+                "TLS listener 9077",
+                "Do not restart the live mTLS endpoint; tests must never point at production PG 5445.",
+            ),
+            (
+                "Cargo slot flock",
+                "Wrap every clippy and test invocation in cargo-slot.sh with CARGO_BUILD_JOBS set.",
+            ),
+        ];
+        for (title, content) in distinct {
+            seed_memory(&env.db_path, "ns-dedupe", title, content);
+        }
+        let db_path = env.db_path.clone();
+        let cfg = default_config();
+        let mut args = default_args();
+        args.namespace = Some("ns-dedupe".to_string());
+        args.limit = 10;
+        args.no_header = true;
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        let body_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with("- [")).collect();
+        assert_eq!(
+            body_lines.len(),
+            6,
+            "5 near-dupes + 5 distinct must yield 6 boot lines, got {}: {stdout}",
+            body_lines.len()
+        );
+        assert!(
+            stdout.contains("similar"),
+            "collapsed cluster must note N similar: {stdout}"
+        );
     }
 
     #[test]

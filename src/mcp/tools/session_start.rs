@@ -3,6 +3,7 @@
 
 //! MCP `memory_session_start` handler.
 
+use crate::boot_cluster::{BOOT_PAYLOAD_LIST_CAP, cluster_payload, overfetch_limit};
 use crate::db;
 use crate::llm::OllamaClient;
 use crate::validate;
@@ -65,13 +66,15 @@ pub(crate) fn handle_session_start(
             )
         })?;
     }
-    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(10)).unwrap_or(usize::MAX);
+    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(10))
+        .unwrap_or(usize::MAX)
+        .min(BOOT_PAYLOAD_LIST_CAP);
 
     let raw_results = db::list(
         conn,
         namespace,
         None,
-        limit.min(50),
+        overfetch_limit(limit),
         0,
         None,
         None,
@@ -89,7 +92,7 @@ pub(crate) fn handle_session_start(
     // (HTTP `list_memories`). When caller is None (single-tenant MCP
     // stdio with no handshake identity), the filter is skipped —
     // legacy behavior preserved for that narrow case.
-    let results = if let Some(caller_id) = caller {
+    let visible = if let Some(caller_id) = caller {
         raw_results
             .into_iter()
             .filter(|m| is_visible_to_caller(m, caller_id))
@@ -97,6 +100,13 @@ pub(crate) fn handle_session_start(
     } else {
         raw_results
     };
+
+    // #3352 — cluster near-duplicates AFTER the visibility filter so a
+    // private-other-agent row can never become the representative the
+    // caller sees. Over-fetch above fills the `limit` budget with
+    // distinct facts once the cluster collapses.
+    let clustered = cluster_payload(visible, limit, None);
+    let results: Vec<crate::models::Memory> = clustered.iter().map(|c| c.memory.clone()).collect();
 
     // v0.8.0 #1709 §2.5 T2 — route session_start rows through the shared
     // recall decorator so provenance_tier / confidence_tier / freshness_state
@@ -106,7 +116,17 @@ pub(crate) fn handle_session_start(
     // (O(1), not per-row); session_start has no recall score, so 0.0.
     let scored: Vec<(crate::models::Memory, f64)> =
         results.iter().map(|m| (m.clone(), 0.0)).collect();
-    let memories = crate::mcp::decorate_memory_many(&scored, true, conn);
+    let mut memories = crate::mcp::decorate_memory_many(&scored, true, conn);
+    for (decorated, member) in memories.iter_mut().zip(clustered.iter()) {
+        if member.similar_count > 0
+            && let Some(obj) = decorated.as_object_mut()
+        {
+            obj.insert(
+                crate::models::field_names::SIMILAR_COUNT.to_string(),
+                json!(member.similar_count),
+            );
+        }
+    }
 
     let mut response = json!({
         "memories": memories,
@@ -181,7 +201,7 @@ impl McpTool for SessionStartTool {
         "Auto-recall recent memories on session start."
     }
     fn docs() -> &'static str {
-        "Most-recently-accessed/updated. At smart/autonomous tier, includes LLM summary."
+        "Most-recently-accessed/updated. Near-duplicates are clustered (#3352) so the limit budget prefers distinct facts; clustered rows may carry similar_count. At smart/autonomous tier, includes LLM summary."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SessionStartRequest>()
@@ -289,6 +309,107 @@ mod tests {
         let err = handle_session_start(&conn, &json!({"namespace": "has spaces"}), None, None)
             .unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    fn seed_memory_with_content(
+        conn: &rusqlite::Connection,
+        ns: &str,
+        title: &str,
+        content: &str,
+    ) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": "ai:test"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        db::insert(conn, &mem).expect("insert")
+    }
+
+    /// #3352 — 5 near-duplicates + 5 distinct → session_start limit=10
+    /// returns 6 memories, with `similar_count` on the collapsed cluster.
+    #[test]
+    fn session_start_clusters_near_duplicates_3352() {
+        let (conn, _tmp) = fresh_db();
+        let body = "The Grok A2A channel wiring check requires the inbox \
+                    poller to sort messages by created_at rather than priority \
+                    so that P10 crowding cannot hide a P9 mail about the same \
+                    channel fact.";
+        for i in 1..=5 {
+            let _ = seed_memory_with_content(
+                &conn,
+                "ss-dedupe",
+                &format!("Grok A2A channel wiring {i}"),
+                body,
+            );
+        }
+        let distinct = [
+            (
+                "Rust ownership aliasing",
+                "OWNERSHIP-10 many shared references xor one exclusive mutable borrow at a time.",
+            ),
+            (
+                "Postgres pool sizing",
+                "Read-path GET links p95 dropped after the handler stopped taking the writer lock.",
+            ),
+            (
+                "Schema ladder v96",
+                "embed_skip durable skip markers land as sqlite 0080 and postgres 0053 after v95.",
+            ),
+            (
+                "TLS listener 9077",
+                "Do not restart the live mTLS endpoint; tests must never point at production PG 5445.",
+            ),
+            (
+                "Cargo slot flock",
+                "Wrap every clippy and test invocation in cargo-slot.sh with CARGO_BUILD_JOBS set.",
+            ),
+        ];
+        for (title, content) in distinct {
+            let _ = seed_memory_with_content(&conn, "ss-dedupe", title, content);
+        }
+        let resp = handle_session_start(
+            &conn,
+            &json!({"namespace": "ss-dedupe", "limit": 10}),
+            None,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(6));
+        let mems = resp["memories"].as_array().expect("memories array");
+        assert_eq!(mems.len(), 6);
+        let similar = mems
+            .iter()
+            .filter_map(|m| m.get("similar_count").and_then(Value::as_u64))
+            .collect::<Vec<_>>();
+        assert_eq!(similar, vec![4]);
     }
 
     // Limit clamped at 50 — pass 1000, ensure no overflow.
