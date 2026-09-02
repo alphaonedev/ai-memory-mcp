@@ -2434,7 +2434,7 @@ pub struct TierCount {
     pub count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NamespaceCount {
     pub namespace: String,
     pub count: usize,

@@ -116,6 +116,8 @@ pub mod governance;
 pub mod hook_subscribers;
 pub mod http;
 pub mod identity_binding;
+/// #3343 — bounded projections for GET /api/v1/stats and /namespaces.
+pub mod inventory;
 pub mod kg;
 pub mod links;
 pub mod memories;

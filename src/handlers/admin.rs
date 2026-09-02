@@ -14,7 +14,7 @@
 use crate::models::field_names;
 use axum::{
     Json,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -514,7 +514,8 @@ pub async fn quota_status_handler(
 
 pub async fn get_stats(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
+    Query(q): Query<crate::handlers::inventory::StatsQuery>,
 ) -> impl IntoResponse {
     // #946 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-only
     // gate. Pre-fix any caller could enumerate full per-tier counts +
@@ -522,6 +523,12 @@ pub async fn get_stats(
     if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "get_stats") {
         return resp;
     }
+    let summary = match crate::handlers::inventory::parse_summary_flag(q.summary.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return crate::handlers::inventory::invalid_summary_response(e),
+    };
+    let ns_limit = q.resolved_by_namespace_limit();
+
     // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
     // now route stats through `MemoryStore::stats`, which projects the
     // full `Stats` shape via SQL aggregates (total + per-tier + per-
@@ -529,19 +536,50 @@ pub async fn get_stats(
     // replaces the previous client-side fold over a 1M-limit
     // `list()` scan which was a Drift cleanup target and would not
     // scale to large deployments.
+    // #3343: cap `by_namespace` to top-N + `others`; `summary=1` omits
+    // the map entirely. Memory totals are unchanged.
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return match app.store.stats().await {
-            Ok(s) => Json(super::parity::postgres_stats_envelope(&s)).into_response(),
+            Ok(mut s) => {
+                let original_ns = std::mem::take(&mut s.by_namespace);
+                let (by_ns, others, ns_total) =
+                    crate::handlers::inventory::cap_namespace_counts(original_ns, ns_limit);
+                let mut envelope = super::parity::postgres_stats_envelope(&s);
+                crate::handlers::inventory::overlay_stats_inventory(
+                    &mut envelope,
+                    by_ns,
+                    others,
+                    ns_total,
+                    summary,
+                );
+                Json(envelope).into_response()
+            }
             Err(e) => store_err_to_response(e),
         };
     }
 
-    let lock = app.db.lock().await;
-    match db::stats(&lock.0, &lock.1) {
-        Ok(s) => Json(json!(s)).into_response(),
-        Err(e) => crate::handlers::errors::handler_error_500(&e),
-    }
+    // CONCURRENCY-03/20: drop the sqlite lock before capping/serializing.
+    let s = {
+        let lock = app.db.lock().await;
+        match db::stats(&lock.0, &lock.1) {
+            Ok(s) => s,
+            Err(e) => return crate::handlers::errors::handler_error_500(&e),
+        }
+    };
+    let mut s = s;
+    let original_ns = std::mem::take(&mut s.by_namespace);
+    let (by_ns, others, ns_total) =
+        crate::handlers::inventory::cap_namespace_counts(original_ns, ns_limit);
+    let mut envelope = json!(s);
+    crate::handlers::inventory::overlay_stats_inventory(
+        &mut envelope,
+        by_ns,
+        others,
+        ns_total,
+        summary,
+    );
+    Json(envelope).into_response()
 }
 
 pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

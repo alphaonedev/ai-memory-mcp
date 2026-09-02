@@ -483,11 +483,22 @@ Structured database stats (counts by tier/namespace, links, size,
 last GC). **Admin-gated** (#946 cluster). SQLite and PostgreSQL both emit
 `by_tier` and `by_namespace` as the documented lists below.
 
+Query:
+
+- `summary=1` (`true`/`yes` also accepted) — totals + `by_tier` only;
+  omits `by_namespace`. Unknown values are **400**.
+- `by_namespace_limit` — top-N namespaces by count (default **20**, max
+  **100**). Remainder folds into `others: {count, namespaces}`. Memory
+  totals (`total` / `total_memories`, `live`, `expired_pending_gc`) are
+  unchanged.
+
 ```json
 {
   "total_memories": 150,
   "by_tier": [{"tier":"short","count":20},{"tier":"mid","count":100},{"tier":"long","count":30}],
   "by_namespace": [{"namespace":"global","count":90}],
+  "by_namespace_total": 1,
+  "truncated": false,
   "expiring_soon": 5,
   "links_count": 23,
   "db_size_bytes": 524288,
@@ -1043,8 +1054,20 @@ Lists namespaces with live-memory counts (**admin-gated**, #945). With
 `?namespace=<ns>` the same route instead fetches that namespace's
 standard (query-string twin of the `{ns}/standard` path form below).
 
+Query (list form only): `limit` (default **50**, max **1000**), `offset`
+(default **0**), `prefix` (hierarchical: exact match or `prefix/…`
+descendants; invalid namespace → **400**). Both backends emit
+`{namespace, count}` objects (not a string list). `total` is the
+pre-page matching cardinality.
+
 ```json
-{ "namespaces": [{"namespace":"global","count":50},{"namespace":"project-x","count":30}] }
+{
+  "namespaces": [{"namespace":"global","count":50},{"namespace":"project-x","count":30}],
+  "total": 2,
+  "limit": 50,
+  "offset": 0,
+  "truncated": false
+}
 ```
 
 ### `GET /api/v1/namespaces/{ns}/standard` — get namespace standard
