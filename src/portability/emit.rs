@@ -266,7 +266,24 @@ pub fn build_full_envelope_audited(
     ledger.quarantined = quarantined;
     ledger.tombstoned = tombstoned;
     ledger.expired = expired;
-    let links = crate::storage::export_links(conn)?;
+    // v1.0.0 #3405 — the v2 envelope composes `memories[]` and `links[]` from
+    // two independent reads exactly like the v1 convenience view, so it
+    // inherited the same self-inconsistency: an edge whose endpoint the
+    // lifecycle allow-list or the confidentiality screen withheld rode the
+    // envelope pointing at a memory the envelope does not carry, and
+    // `import_full_envelope` could only count it as
+    // `links_skipped_missing_endpoint`. The envelope carries tombstones AS
+    // tombstones (`forget_tombstones`), never as live rows, so the honest
+    // shape is: drop the unresolvable edge at the producer and report it.
+    // This is a VALUE change to an existing field (fewer `links[]` entries),
+    // NOT a new envelope field — `ExportEnvelope` is parsed with
+    // `deny_unknown_fields`, so adding one would make every already-shipped
+    // binary refuse the new bundle (#2490 objection O2).
+    let (links, dangling_edges) = crate::export_scope::retain_resolvable_links(
+        &memories,
+        crate::storage::export_links(conn)?,
+    );
+    ledger.dangling_link_edges = dangling_edges;
 
     // v1.0.0 #2571 — archived rows (spec §6.4) get the SAME confidentiality
     // screen `memories[]` gets. Unlike `list_archive`/`restore_archived`

@@ -511,10 +511,23 @@ fn import_refuses_loudly_when_a_link_endpoint_is_missing_2490() {
         serde_json::from_slice(&assert.get_output().stdout).expect("report JSON");
 
     assert_eq!(report["links_imported"].as_u64(), Some(0));
+    // 2026-09-02 (#3405) — RE-ATTRIBUTED, not relaxed. #2490's requirement is
+    // "counted, not silently dropped", and the exit code asserted above is
+    // unchanged (EXIT_INCOMPLETE). #3405 splits the single `links_refused`
+    // bucket in two so an operator can act on the report: an endpoint the
+    // BUNDLE never carried is a PRODUCER defect (this case — re-export, or
+    // acknowledge with `--allow-dangling`), while an endpoint the bundle DID
+    // carry but that did not land is a destination-side reconstruction
+    // failure. Both still count toward the non-zero exit by default.
     assert_eq!(
-        report["links_refused"].as_u64(),
+        report["links_skipped_dangling"].as_u64(),
         Some(1),
         "a dangling edge must be counted, not silently dropped; report was {report}"
+    );
+    assert_eq!(
+        report["links_refused"].as_u64(),
+        Some(0),
+        "the bundle never carried the endpoint, so this is not a destination refusal"
     );
 }
 

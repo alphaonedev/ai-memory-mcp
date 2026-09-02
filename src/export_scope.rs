@@ -106,6 +106,63 @@ pub fn export_scope_warn() -> String {
     )
 }
 
+/// v1.0.0 #3405 — the export bundle's REFERENTIAL-INTEGRITY funnel: keep only
+/// the edges whose BOTH endpoints are carried by this artifact, and hand back
+/// the rendered `"<source>-><target>"` label of every edge dropped.
+///
+/// # Why this exists (the round-trip the exporter could not survive)
+///
+/// `memories[]` and `links[]` are computed from two INDEPENDENT reads.
+/// [`crate::storage::export_all`] applies the fail-closed
+/// [`crate::models::lifecycle_visible_clause`] allow-list (so a `tombstoned`
+/// or `quarantined` row never leaves) and
+/// [`crate::export_taxonomy::screen_memories_for_export_audited`] then DROPS
+/// forbidden-class rows; `crate::storage::export_links` filters only on
+/// EXPIRY. An edge whose endpoint was withheld by either gate therefore rode
+/// the artifact pointing at a memory the artifact does not contain.
+///
+/// That is not a cosmetic inconsistency: `memory_links` carries
+/// `REFERENCES memories(id)` foreign keys, so the destination CANNOT
+/// materialise such an edge. `ai-memory export | ai-memory import` — the
+/// documented backup/restore pipe — therefore exited 0 on the producing side
+/// and [`EXIT_EXPORT_INCOMPLETE`] on the consuming side, on the first run and
+/// on every subsequent one, with no disposition an operator could take. A
+/// self-inconsistent artifact is the #2444/#2490 false-success class relocated
+/// into the graph lane, so the fix is at the PRODUCER: an artifact never
+/// claims an edge it cannot carry.
+///
+/// # Disposition (report, never counted as a NEW loss)
+///
+/// A dropped edge is always the DOWNSTREAM consequence of an endpoint
+/// omission the ledger already accounts for — a forbidden-class drop or a
+/// quarantined row (both already make the export partial), or a tombstone /
+/// expiry (both are the substrate honouring an erasure receipt or a retention
+/// policy, reported and deliberately NOT partial). Counting the edge again
+/// would double-count the same withholding and would pin any corpus holding
+/// one forgotten-but-linked memory permanently at
+/// [`EXIT_EXPORT_INCOMPLETE`] — a forever-red backup job that ends as
+/// `|| true` and silences the NEXT withholding too (#2490 objection O9). So
+/// the count is REPORTED — in-band under
+/// [`crate::models::field_names::DANGLING_LINKS_WITHHELD`] and on the
+/// operator stderr channel with the edges — and never silently swallowed.
+#[must_use]
+pub fn retain_resolvable_links(
+    memories: &[crate::models::Memory],
+    links: Vec<crate::models::MemoryLink>,
+) -> (Vec<crate::models::MemoryLink>, Vec<String>) {
+    let present: std::collections::HashSet<&str> = memories.iter().map(|m| m.id.as_str()).collect();
+    let mut kept = Vec::with_capacity(links.len());
+    let mut dangling = Vec::new();
+    for link in links {
+        if present.contains(link.source_id.as_str()) && present.contains(link.target_id.as_str()) {
+            kept.push(link);
+        } else {
+            dangling.push(format!("{}->{}", link.source_id, link.target_id));
+        }
+    }
+    (kept, dangling)
+}
+
 /// v1.0.0 #2490 — the machine-readable accounting of everything an export
 /// did NOT faithfully carry.
 ///
@@ -158,6 +215,13 @@ pub struct ExportWithholdLedger {
     /// Live rows excluded because `expires_at` has passed. Reported, not
     /// counted as partial — expiry is intended.
     pub expired: usize,
+    /// v1.0.0 #3405 — edges DROPPED by [`retain_resolvable_links`] because an
+    /// endpoint memory is not carried by THIS artifact. Rendered
+    /// `"<source>-><target>"`; OPERATOR CHANNEL ONLY (an endpoint id here is
+    /// by construction an id the confidentiality boundary or a lifecycle
+    /// exclusion withheld, so publishing it in-band would leak exactly the
+    /// index objection O3 forbids — the artifact carries the COUNT).
+    pub dangling_link_edges: Vec<String>,
 }
 
 impl ExportWithholdLedger {
@@ -171,6 +235,13 @@ impl ExportWithholdLedger {
     #[must_use]
     pub fn redacted_total(&self) -> usize {
         self.redacted_ids.len()
+    }
+
+    /// v1.0.0 #3405 — edges withheld because an endpoint is not in the
+    /// artifact. Safe in-band (a count, never an id).
+    #[must_use]
+    pub fn dangling_links_total(&self) -> usize {
+        self.dangling_link_edges.len()
     }
 
     /// `true` when the artifact is NOT a faithful copy of the live corpus:
@@ -201,6 +272,10 @@ impl ExportWithholdLedger {
             (f::REDACTED): self.redacted_total(),
             (f::TOMBSTONED): self.tombstoned,
             (f::EXPIRED): self.expired,
+            // v1.0.0 #3405 — the edges this artifact could NOT carry. A
+            // pipe-to-file consumer never sees the stderr report, so the
+            // graph's incompleteness has to be legible from the bundle.
+            (f::DANGLING_LINKS_WITHHELD): self.dangling_links_total(),
         })
     }
 
@@ -222,6 +297,8 @@ impl ExportWithholdLedger {
             (f::REDACTED_IDS): self.redacted_ids,
             (f::TOMBSTONED): self.tombstoned,
             (f::EXPIRED): self.expired,
+            (f::DANGLING_LINKS_WITHHELD): self.dangling_links_total(),
+            (f::DANGLING_LINK_EDGES): self.dangling_link_edges,
             "partial": self.is_partial(),
         })
         .to_string()
@@ -284,6 +361,98 @@ mod tests {
             "JSON export is never portability-complete"
         );
         assert_eq!(SCOPE_MEMORIES_LINKS, "memories+links");
+    }
+
+    /// Build a minimal live memory carrying `id` (only the id is load-bearing
+    /// for the referential-integrity funnel).
+    fn mem(id: &str) -> crate::models::Memory {
+        crate::models::Memory {
+            id: id.to_string(),
+            ..crate::models::Memory::default()
+        }
+    }
+
+    /// Build a minimal edge (only the endpoints are load-bearing here).
+    fn edge(source_id: &str, target_id: &str) -> crate::models::MemoryLink {
+        crate::models::MemoryLink {
+            source_id: source_id.to_string(),
+            target_id: target_id.to_string(),
+            relation: crate::models::MemoryLinkRelation::default(),
+            created_at: "2026-07-14T00:00:00Z".to_string(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        }
+    }
+
+    #[test]
+    fn resolvable_links_drops_every_edge_naming_an_uncarried_endpoint_3405() {
+        // The funnel is backend-agnostic (it runs on the already-materialised
+        // memories + links of EVERY producer: CLI `export`, `export --full`,
+        // and the HTTP admin export on sqlite AND postgres), so this pins the
+        // control for both backends in one place.
+        let memories = vec![mem("a"), mem("b")];
+        let links = vec![
+            edge("a", "b"), // both carried  -> kept
+            edge("a", "z"), // target withheld -> dropped
+            edge("z", "b"), // source withheld -> dropped
+            edge("y", "z"), // neither carried -> dropped
+        ];
+        let (kept, dangling) = retain_resolvable_links(&memories, links);
+        assert_eq!(kept.len(), 1, "only the fully-carried edge survives");
+        assert_eq!(kept[0].source_id, "a");
+        assert_eq!(kept[0].target_id, "b");
+        assert_eq!(
+            dangling,
+            vec!["a->z".to_string(), "z->b".to_string(), "y->z".to_string()],
+            "every dropped edge is rendered for the operator channel, never swallowed"
+        );
+    }
+
+    #[test]
+    fn resolvable_links_is_a_no_op_on_a_self_consistent_bundle_3405() {
+        // The overwhelmingly common case must be byte-identical to pre-#3405:
+        // a corpus with no withholding loses no edge and reports nothing.
+        let memories = vec![mem("a"), mem("b"), mem("c")];
+        let links = vec![edge("a", "b"), edge("b", "c"), edge("c", "a")];
+        let (kept, dangling) = retain_resolvable_links(&memories, links);
+        assert_eq!(kept.len(), 3);
+        assert!(dangling.is_empty());
+    }
+
+    #[test]
+    fn dangling_edges_are_counted_in_band_but_their_ids_never_are_3405() {
+        // #2490 objection O3: an endpoint named by a dropped edge is BY
+        // CONSTRUCTION an id the export withheld, so the rendered edge is
+        // operator-channel-only. The artifact carries the COUNT.
+        let ledger = ExportWithholdLedger {
+            dangling_link_edges: vec!["a->secret-id".to_string()],
+            ..ExportWithholdLedger::default()
+        };
+        let marker = ledger.in_band_marker();
+        assert_eq!(
+            marker[crate::models::field_names::DANGLING_LINKS_WITHHELD].as_u64(),
+            Some(1)
+        );
+        assert!(
+            !marker.to_string().contains("secret-id"),
+            "the in-band marker must never publish a withheld endpoint id"
+        );
+        let report = ledger.stderr_report_line("/tmp/x.db", 0);
+        assert!(
+            report.contains("a->secret-id"),
+            "the operator channel DOES carry the edges: {report}"
+        );
+        assert!(
+            !ledger.is_partial(),
+            "a dangling edge is the downstream consequence of an omission the \
+             ledger already accounts for; counting it again would double-count \
+             the same withholding and pin a tombstoned corpus forever-red"
+        );
     }
 
     #[test]
