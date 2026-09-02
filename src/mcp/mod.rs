@@ -2596,7 +2596,18 @@ fn dispatch_memory_expand_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 }
 
 fn dispatch_memory_auto_tag(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_auto_tag(ctx.conn, ctx.llm, ctx.arguments)
+    // v1.0.0 #3381 — resolve the read-visibility principal so the tool's
+    // caller-scoped read gate and the governed update funnel it delegates to
+    // both judge the SAME subject. Mirrors `dispatch_memory_get`; `None` (no
+    // `AI_MEMORY_AGENT_ID`) is the single-operator trust-all posture.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_auto_tag(
+        ctx.conn,
+        ctx.llm,
+        ctx.arguments,
+        caller.as_deref(),
+        ctx.mcp_client,
+    )
 }
 
 fn dispatch_memory_detect_contradiction(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
