@@ -37,6 +37,8 @@ class _Module:
         self.requests: list[httpx.Request] = []
         self.rows = 0
         self.written: dict[tuple[object, object, object], str] = {}
+        #: Ids this tier actually minted; anything else is "memory not found".
+        self.minted: set[str] = set()
         #: Only set by the leak test: simulates a boundary that is NOT airtight.
         self.leaks_to = leaks_to
 
@@ -65,10 +67,17 @@ class _Module:
                 return httpx.Response(200, json={"id": self.written[key], "version": 1})
             self.rows += 1
             memory_id = f"{self.base_url}-mem-{self.rows}"
+            self.minted.add(memory_id)
             if body.get("signature"):
                 self.written[key] = memory_id
             return httpx.Response(201, json={"id": memory_id, "version": 1})
         if path == "/api/v1/consolidate":
+            # A tier can only fold ids IT stored: a vote written to the other
+            # module is "memory not found" here, exactly as the daemon reports.
+            unknown = [i for i in json.loads(request.content).get("ids", [])
+                       if i not in self.minted]
+            if unknown:
+                return httpx.Response(404, json={"error": f"memory not found: {unknown[0]}"})
             return httpx.Response(201, json={"id": f"{self.base_url}-con"})
         if path.startswith("/api/v1/memories/") and method == "GET" \
                 and not path.endswith("/lineage"):
@@ -152,6 +161,18 @@ async def test_producer_consumer_across_modules_would_fail() -> None:
         await _aclose(swarm)
     assert not result.ok
     assert "b_saw=False" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_consensus_quorum_across_modules_cannot_read_its_own_votes() -> None:
+    """The observed failure: votes=256 consolidated=False ("memory not found")."""
+    swarm, _first, _second = _two_module_swarm()
+    try:
+        result = await consensus_quorum(swarm, swarm.agents)
+    finally:
+        await _aclose(swarm)
+    assert not result.ok
+    assert "consolidated=False" in result.detail
 
 
 @pytest.mark.asyncio
