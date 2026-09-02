@@ -24,6 +24,7 @@ from ai_memory._common import (
     prep_json,
     wrap_transport_error,
 )
+from ai_memory.attestation import sign_bind_challenge
 from ai_memory.models import (
     AgentRegistration,
     BulkCreateResponse,
@@ -412,12 +413,40 @@ class AsyncAiMemoryClient:
             },
         )
 
-    async def bind_agent_pubkey(self, agent_id: str, pubkey_b64: str) -> dict[str, Any]:
+    async def bind_agent_pubkey_challenge(
+        self, agent_id: str, pubkey_b64: str
+    ) -> dict[str, Any]:
+        """``POST /api/v1/agents/{id}/pubkey/challenge``. See
+        :meth:`AiMemoryClient.bind_agent_pubkey_challenge`."""
+        return await self._request(
+            "POST",
+            f"/api/v1/agents/{agent_id}/pubkey/challenge",
+            json_body={"pubkey_b64": pubkey_b64},
+        )
+
+    async def bind_agent_pubkey(
+        self, agent_id: str, signing_key: AgentSigningKey
+    ) -> dict[str, Any]:
         """``PUT /api/v1/agents/{id}/pubkey``. See
         :meth:`AiMemoryClient.bind_agent_pubkey` — admin-gated, and required
-        once before a signed :meth:`store` can attest."""
+        once before a signed :meth:`store` can attest.
+
+        v1.0.0 #3464 — takes the PRIVATE key and runs the challenge/response
+        the daemon requires; a bare public key can no longer bind."""
+        pubkey_b64 = signing_key.public_key_b64()
+        challenge = await self.bind_agent_pubkey_challenge(agent_id, pubkey_b64)
+        proof = sign_bind_challenge(
+            signing_key,
+            agent_id=agent_id,
+            nonce=challenge["nonce"],
+            expires_at=challenge["expires_at"],
+        )
         return await self._request(
             "PUT",
             f"/api/v1/agents/{agent_id}/pubkey",
-            json_body={"pubkey_b64": pubkey_b64},
+            json_body={
+                "pubkey_b64": pubkey_b64,
+                "nonce": challenge["nonce"],
+                "proof_b64": proof,
+            },
         )

@@ -50,7 +50,7 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sqlite-over-NFS is not.
 
 The two backends are at **schema parity at v91**
-(`CURRENT_SCHEMA_VERSION = 95` on both ladders — the postgres upgrade
+(`CURRENT_SCHEMA_VERSION = 97` on both ladders — the postgres upgrade
 ladder ends at `migrate_v95()`).
 
 **Schema parity is NOT feature parity.** Some postgres ladder arms are
@@ -674,7 +674,7 @@ The eight remaining sqlite-only surfaces land here.
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
 > **RETRACTED**. The measured, gate-pinned inventory is **65
-> pg-supported unique paths, 17 fully-501 paths, 82 unique paths
+> pg-supported unique paths, 17 fully-501 paths, 83 unique paths
 > total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 65` /
 > `EXPECTED_FULLY_501_PATHS = 17` / `EXPECTED_TOTAL_UNIQUE_PATHS = 82`,
 > `tests/pg_supported_route_inventory_gate_2799.rs`), and the

@@ -127,26 +127,91 @@ async fn register_target_agent(router: &axum::Router) {
     );
 }
 
-fn valid_pubkey_b64() -> String {
+fn valid_keypair() -> ai_memory::identity::keypair::AgentKeypair {
     let dir = fresh_dir();
     // SAFETY-free key-dir override via the documented env knob is not
     // needed — `generate` takes no paths; the keypair lives in memory.
     let _ = dir;
-    ai_memory::identity::keypair::generate("test-bind-1539")
-        .expect("generate keypair")
-        .public_base64()
+    ai_memory::identity::keypair::generate("test-bind-1539").expect("generate keypair")
+}
+
+fn valid_pubkey_b64() -> String {
+    valid_keypair().public_base64()
 }
 
 fn put_pubkey(agent: &str, caller: &str, pubkey_b64: &str) -> Request<Body> {
+    put_pubkey_body(
+        agent,
+        caller,
+        &serde_json::json!({ "pubkey_b64": pubkey_b64 }),
+    )
+}
+
+fn put_pubkey_body(agent: &str, caller: &str, body: &serde_json::Value) -> Request<Body> {
     Request::builder()
         .method("PUT")
         .uri(format!("/api/v1/agents/{agent}/pubkey"))
         .header("content-type", "application/json")
         .header("x-agent-id", caller)
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({ "pubkey_b64": pubkey_b64 })).unwrap(),
-        ))
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap()
+}
+
+/// #3464 — run the challenge/response the bind now requires against `router`
+/// and return the `PUT` body. The daemon issues a single-use nonce for this
+/// (agent, candidate key) pair; the holder of the private half signs the
+/// domain-separated transcript.
+async fn take_challenge(
+    router: &axum::Router,
+    agent: &str,
+    caller: &str,
+    pubkey: &str,
+) -> ai_memory::identity::pubkey_bind::BindChallenge {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/agents/{agent}/pubkey/challenge"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", caller)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "pubkey_b64": pubkey })).unwrap(),
+        ))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the bind challenge must be issued to an admin caller"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    ai_memory::identity::pubkey_bind::BindChallenge {
+        nonce_b64: v["nonce"].as_str().expect("nonce").to_string(),
+        agent_id: agent.to_string(),
+        pubkey_b64: pubkey.to_string(),
+        expires_at: v["expires_at"].as_str().expect("expires_at").to_string(),
+    }
+}
+
+/// Answer a fresh challenge with `kp` and build the `PUT` body.
+async fn proved_bind_body(
+    router: &axum::Router,
+    agent: &str,
+    caller: &str,
+    kp: &ai_memory::identity::keypair::AgentKeypair,
+) -> serde_json::Value {
+    let pubkey = kp.public_base64();
+    let challenge = take_challenge(router, agent, caller, &pubkey).await;
+    let proof = ai_memory::identity::pubkey_bind::sign_bind_challenge(
+        kp.private.as_ref().expect("generated private key"),
+        &challenge,
+    );
+    serde_json::json!({
+        "pubkey_b64": pubkey,
+        "nonce": challenge.nonce_b64,
+        "proof_b64": proof,
+    })
 }
 
 /// Happy path: admin binds a valid Ed25519 pubkey to a registered
@@ -157,15 +222,17 @@ async fn bind_pubkey_route_happy_path_1539() {
     let (router, _f) = build_router_fixture();
     register_target_agent(&router).await;
 
+    let kp = valid_keypair();
+    let body = proved_bind_body(&router, TARGET_AGENT, ADMIN_CALLER, &kp).await;
     let resp = router
         .clone()
-        .oneshot(put_pubkey(TARGET_AGENT, ADMIN_CALLER, &valid_pubkey_b64()))
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &body))
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "admin bind of a valid pubkey must return 200"
+        "admin bind of a valid pubkey with a valid possession proof must return 200"
     );
     let body = axum::body::to_bytes(resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
         .await
@@ -225,18 +292,135 @@ async fn bind_pubkey_route_unregistered_agent_errors_1539() {
     let _dir = fresh_dir();
     let (router, _f) = build_router_fixture();
 
+    // #3464 — present a VALID possession proof so this test still exercises the
+    // registration pre-check rather than stopping at the proof gate.
+    let kp = valid_keypair();
+    let body = proved_bind_body(&router, "ai:never-registered", ADMIN_CALLER, &kp).await;
     let resp = router
         .clone()
-        .oneshot(put_pubkey(
-            "ai:never-registered",
-            ADMIN_CALLER,
-            &valid_pubkey_b64(),
-        ))
+        .oneshot(put_pubkey_body("ai:never-registered", ADMIN_CALLER, &body))
         .await
         .unwrap();
     assert!(
         !resp.status().is_success(),
         "binding to an unregistered agent must not succeed; got {}",
         resp.status()
+    );
+}
+
+/// v1.0.0 #3464 (security-high) — DENIED: an admin who does NOT hold the
+/// candidate key cannot bind it.
+///
+/// The attacker is a legitimate admin. They take the challenge for the
+/// victim's key and answer it with a key they DO hold. The signature is
+/// perfectly valid — under the wrong key — and must be refused, or the admin
+/// role alone would let them mint `agent_attested` writes as the victim.
+#[tokio::test]
+async fn bind_pubkey_route_refuses_a_proof_from_another_key_3464() {
+    let _dir = fresh_dir();
+    let (router, _f) = build_router_fixture();
+    register_target_agent(&router).await;
+
+    let victim = valid_keypair();
+    let attacker = ai_memory::identity::keypair::generate("attacker-3464").expect("keypair");
+    // A genuine challenge for the VICTIM's key — the exact transcript the
+    // server will verify against...
+    let challenge =
+        take_challenge(&router, TARGET_AGENT, ADMIN_CALLER, &victim.public_base64()).await;
+    // ...answered with the ATTACKER's key. The signature is well-formed and
+    // over the RIGHT bytes; only the key is wrong, which is the whole defect.
+    let forged = ai_memory::identity::pubkey_bind::sign_bind_challenge(
+        attacker.private.as_ref().expect("private"),
+        &challenge,
+    );
+    let body = serde_json::json!({
+        "pubkey_b64": victim.public_base64(),
+        "nonce": challenge.nonce_b64,
+        "proof_b64": forged,
+    });
+    let resp = router
+        .clone()
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "#3464 REGRESSED: a bind answered by a key OTHER than the candidate must be \
+         refused — admin authority says a caller may enroll a key, never WHICH key"
+    );
+}
+
+/// v1.0.0 #3464 — DENIED: a bind with no proof at all is refused, and the
+/// refusal comes from the proof gate (403), not a body-parse error, so the
+/// admin gate and validation still run first.
+#[tokio::test]
+async fn bind_pubkey_route_refuses_a_bind_with_no_proof_3464() {
+    let _dir = fresh_dir();
+    let (router, _f) = build_router_fixture();
+    register_target_agent(&router).await;
+
+    let resp = router
+        .clone()
+        .oneshot(put_pubkey(TARGET_AGENT, ADMIN_CALLER, &valid_pubkey_b64()))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a legacy pre-#3464 body carries no possession proof and must fail CLOSED"
+    );
+}
+
+/// v1.0.0 #3464 — DENIED: a challenge answers exactly once.
+#[tokio::test]
+async fn bind_pubkey_route_challenge_is_single_use_3464() {
+    let _dir = fresh_dir();
+    let (router, _f) = build_router_fixture();
+    register_target_agent(&router).await;
+
+    let kp = valid_keypair();
+    let body = proved_bind_body(&router, TARGET_AGENT, ADMIN_CALLER, &kp).await;
+    let first = router
+        .clone()
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &body))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK, "the honest bind succeeds");
+
+    let replay = router
+        .clone()
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.status(),
+        StatusCode::FORBIDDEN,
+        "a consumed nonce must never admit a second bind"
+    );
+}
+
+/// v1.0.0 #3464 — DENIED: the challenge endpoint is admin-gated too, so a
+/// non-admin cannot even obtain the nonce.
+#[tokio::test]
+async fn bind_pubkey_challenge_requires_admin_3464() {
+    let _dir = fresh_dir();
+    let (router, _f) = build_router_fixture();
+    register_target_agent(&router).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/agents/{TARGET_AGENT}/pubkey/challenge"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", "ai:not-an-admin")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "pubkey_b64": valid_pubkey_b64() })).unwrap(),
+        ))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "the bind challenge is admin-gated, exactly like the bind it precedes"
     );
 }

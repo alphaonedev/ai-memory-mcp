@@ -416,8 +416,24 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // TABLE + lowering the stamp (NoLoss — the ledger is derived
     // replay-protection state, regenerable by simply starting to record again,
     // never durable memory truth). Literal tail: MUST equal
-    // CURRENT_SCHEMA_VERSION. Postgres twin is `PostgresStore::migrate_v95`.
+    // CURRENT_SCHEMA_VERSION at the time it landed; v97 (#3464) is the tail now.
+    // Postgres twin is `PostgresStore::migrate_v95`.
     meta(95, "ATTESTED_WRITE_REPLAY_LEDGER", true, true, NoLoss, Sqlite),
+    // v97 (#3464, v1.0.0, security-high) — APPEND-ONLY AGENT PUBKEY HISTORY.
+    // Creates `agent_pubkey_history` (composite PK `(agent_id, version)`) + its
+    // ladder-owned lookup index, and BACKFILLS every live
+    // `metadata.agent_pubkey` as version 1 under the `legacy_unproven`
+    // authority. Reversibility DERIVED from the arm's SQL, not guessed: the arm
+    // only CREATEs a new relation and INSERTs into it, and it does not touch
+    // `memories` at all, so the revert is `DROP TABLE agent_pubkey_history` and
+    // the flat `metadata.agent_pubkey` binding an operator would roll back to is
+    // exactly where it already is — NoLoss. `CREATE TABLE IF NOT EXISTS` +
+    // `CREATE INDEX IF NOT EXISTS` + `INSERT OR IGNORE` on the composite PK make
+    // the whole batch re-runnable, so a crash mid-arm self-heals on the next
+    // open — idempotent. No full-table rebuild, no trigger drop (the v63/v65
+    // lesson does not arise). Literal tail: MUST equal CURRENT_SCHEMA_VERSION.
+    // Postgres twin is `PostgresStore::migrate_v97`.
+    meta(97, "AGENT_PUBKEY_HISTORY", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

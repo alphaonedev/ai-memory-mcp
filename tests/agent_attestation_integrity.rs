@@ -103,10 +103,16 @@ fn build_test_router() -> (axum::Router, NamedTempFile, std::path::PathBuf) {
 /// Register `agent_id` and bind `kp`'s public key through a fresh
 /// connection on the daemon's db file so the gate's `db::agent_pubkey`
 /// lookup resolves it.
-fn provision_agent(db_path: &std::path::Path, agent_id: &str, pubkey_b64: &str) {
+fn provision_agent(
+    db_path: &std::path::Path,
+    agent_id: &str,
+    kp: &ai_memory::identity::keypair::AgentKeypair,
+) {
     let conn = ai_memory::db::open(db_path).expect("reopen for provision");
     ai_memory::storage::register_agent(&conn, agent_id, "nhi", &[]).expect("register");
-    ai_memory::storage::bind_agent_pubkey(&conn, agent_id, pubkey_b64).expect("bind");
+    // #3464 — the bind funnel demands proof of possession; the helper holds the
+    // private half, so it runs the real challenge-response handshake.
+    ai_memory::storage::bind_agent_pubkey_with_keypair(&conn, agent_id, kp).expect("bind");
 }
 
 /// Standard-base64 Ed25519 signature over the canonical store envelope.
@@ -182,7 +188,7 @@ async fn put_update(
 async fn http_metadata_update_does_not_downgrade_agent_attested_3015() {
     let (router, _f, db_path) = build_test_router();
     let kp = ai_memory::identity::keypair::generate("ai:carol").expect("keypair");
-    provision_agent(&db_path, "ai:carol", &kp.public_base64());
+    provision_agent(&db_path, "ai:carol", &kp);
 
     let title = "downgrade-guard";
     let content = "Body prose for the attestation-downgrade regression, sufficiently long.";
@@ -247,7 +253,7 @@ async fn http_metadata_update_does_not_downgrade_agent_attested_3015() {
 async fn http_signed_store_stamps_agent_attested_and_adopts_created_at() {
     let (router, _f, db_path) = build_test_router();
     let kp = ai_memory::identity::keypair::generate("ai:alice").expect("keypair");
-    provision_agent(&db_path, "ai:alice", &kp.public_base64());
+    provision_agent(&db_path, "ai:alice", &kp);
 
     let title = "http-signed";
     let content = "This is the body of http-signed, long enough to be meaningful prose.";
@@ -296,7 +302,7 @@ async fn http_forged_signature_is_rejected_403() {
     let (router, _f, db_path) = build_test_router();
     let bound = ai_memory::identity::keypair::generate("ai:alice").expect("kp1");
     let attacker = ai_memory::identity::keypair::generate("ai:alice").expect("kp2");
-    provision_agent(&db_path, "ai:alice", &bound.public_base64());
+    provision_agent(&db_path, "ai:alice", &bound);
 
     let title = "http-forged";
     let content = "This is the body of http-forged, long enough to be meaningful prose.";
@@ -668,7 +674,7 @@ fn mcp_forged_signature_rejected_under_permissive_default_1985() {
 
     let bound = ai_memory::identity::keypair::generate("ai:alice").expect("kp1");
     let attacker = ai_memory::identity::keypair::generate("ai:alice").expect("kp2");
-    provision_agent(&db_path, "ai:alice", &bound.public_base64());
+    provision_agent(&db_path, "ai:alice", &bound);
 
     let title = "mcp-forged";
     let content = "Body of the forged MCP write, long enough to read as real prose.";
@@ -778,7 +784,7 @@ fn mcp_signed_store_upgrades_to_agent_attested() {
     let conn = ai_memory::db::open(&db_path).expect("db::open");
 
     let kp = ai_memory::identity::keypair::generate("ai:alice").expect("keypair");
-    provision_agent(&db_path, "ai:alice", &kp.public_base64());
+    provision_agent(&db_path, "ai:alice", &kp);
 
     let title = "mcp-signed";
     let content = "Body of the signed MCP write, long enough to read as real prose.";

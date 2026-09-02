@@ -100,9 +100,23 @@ Corpus-scale endpoints require an **admin** caller: `GET /stats`,
 `POST /forget`, `GET /namespaces` (list form), `GET /taxonomy`,
 `GET /archive`, `GET /archive/stats`, the seven `/skill/*` routes, and
 `PUT /agents/{id}/pubkey` (#1539 — bind an agent's Ed25519 attestation
-public key: body `{"pubkey_b64": "<base64 32-byte key>"}`, response
-`{"bound": true, "agent_id": "..."}`; the pubkey is validated as a real
-curve point and the agent must already be registered. Gives attesting
+public key: body `{"pubkey_b64": "<base64 32-byte key>", "nonce": "...",
+"proof_b64": "..."}`, response `{"bound": true, "agent_id": "..."}`; the
+pubkey is validated as a real curve point and the agent must already be
+registered. **v1.0.0 [#3464](https://github.com/alphaonedev/ai-memory-mcp/issues/3464)
+— proof of possession is REQUIRED**: take a single-use nonce from
+`POST /agents/{id}/pubkey/challenge` (same admin gate, body
+`{"pubkey_b64": "..."}`, response `{nonce, expires_at, transcript_b64}`),
+sign the domain-separated transcript with the CANDIDATE key's private half,
+and present it. Admin authority says a caller may enroll a key; it never
+said WHICH key, and before #3464 anyone holding the admin role could bind a
+key they controlled to another agent's id and then mint `agent_attested`
+writes as that agent. Every failure mode — unknown, expired or
+already-consumed nonce, wrong agent, wrong key, bad signature — returns the
+same opaque `403`, so the endpoint is not an oracle. Rebinding no longer
+destroys the previous key: every binding is kept in the append-only
+`agent_pubkey_history` ledger (schema v95) so writes an older key already
+attested stay verifiable against it. Gives attesting
 clients a first-party enrollment surface instead of an out-of-band DB
 write — store-path attestation is required by default on the HTTP direct-write surface only since v1.0.0 (#1985, correcting #1751; MCP/CLI stay permissive)
 (#1751; opt out with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`)).
@@ -1346,7 +1360,7 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/admin/quarantine/{id}/release` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — release one quarantined memory back to `lifecycle_state=open` (`handlers::release_quarantined`), the operator half of the [#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948) route-OUT contract that shipped with no caller. **Admin-gated**; the audit actor is the principal `require_admin` RETURNS — an id it admits only when it is on the admin allowlist AND the deployment has request authentication configured (#1570), and, under the `enforce` identity-binding posture, only when it is key-attested to a per-agent api key (#2044). The handler never reads `X-Agent-Id` itself. Appends a `memory.dequarantined` signed audit row in the SAME transaction as the state change on both backends. Idempotent: an id that is not currently quarantined answers `200 {"released": false}` and writes nothing (deliberately not `404` — that would leak the existence of rows this surface does not return). |
 | `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (104 at `full`, 7 at `core`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
 
-> **Total HTTP surface at v1.0.0: 82 unique URL paths across 96
+> **Total HTTP surface at v1.0.0: 83 unique URL paths across 96
 > production route registrations** (several paths carry more than one
 > method), on the sqlite-backed daemon and on the postgres-backed daemon
 > under `--features sal-postgres`. Both numbers are pinned in
@@ -1394,7 +1408,8 @@ value, not a transcription.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `PUT` | `/api/v1/agents/{id}/pubkey` | Bind an Ed25519 attestation public key to a registered agent (`handlers::bind_agent_pubkey`, [#1539](https://github.com/alphaonedev/ai-memory-mcp/issues/1539)). **Admin-gated.** The bound key is what the write-attestation and federation author-verification paths check a presented signature against — see §"Admin-gated endpoints". CLI twin: `ai-memory agents bind-key`. |
+| `PUT` | `/api/v1/agents/{id}/pubkey` | Bind an Ed25519 attestation public key to a registered agent (`handlers::bind_agent_pubkey`, [#1539](https://github.com/alphaonedev/ai-memory-mcp/issues/1539)). **Admin-gated, and since v1.0.0 [#3464](https://github.com/alphaonedev/ai-memory-mcp/issues/3464) it requires a proof of possession** answering a challenge from the route below. The bound key is what the write-attestation and federation author-verification paths check a presented signature against — see §"Admin-gated endpoints". CLI twin: `ai-memory agents bind-key`. |
+| `POST` | `/api/v1/agents/{id}/pubkey/challenge` | Issue the single-use, domain-separated bind challenge the candidate key must sign (`handlers::bind_agent_pubkey_challenge`, [#3464](https://github.com/alphaonedev/ai-memory-mcp/issues/3464)). **Admin-gated.** Returns `{nonce, expires_at, transcript_b64}`; both the agent id and the candidate key are inside the signed transcript, so a challenge minted for one pair can never admit the bind of another. CLI twin: `ai-memory agents bind-challenge` (+ `bind-key --proof-file`). |
 | `GET` | `/api/v1/memories/{id}/lineage` | Walk a memory's derivation lineage-DAG — ancestors/descendants over the provenance relation subset `derived_from` / `reflects_on` / `derives_from` (`handlers::get_lineage`, v0.9.0 G13-mem [#1859](https://github.com/alphaonedev/ai-memory-mcp/issues/1859)). Three-surface parity with the `memory_lineage` MCP tool and `ai-memory lineage`. Requires the lineage DAG to be enabled (`AI_MEMORY_LINEAGE_DAG`, default on). |
 | `POST` | `/api/v1/checkpoints/{id}/resolve` | Resolve a commit-checkpoint (`handlers::resolve_checkpoint`, [#2391](https://github.com/alphaonedev/ai-memory-mcp/issues/2391)) — local resolve plus W-of-N federation fanout via `federation::broadcast_checkpoint_resolution_quorum`. This is the SEND leg of the FED-RQ-01 ([#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936)) checkpoint-federation transport; the receive leg is gated by `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` (fail-closed by default). MCP: `memory_checkpoint_resolve`. |
 | `POST` | `/api/v1/skill/{id}/retire` | Retire or unretire a skill lineage (`handlers::skill_retire_route`, [#2024](https://github.com/alphaonedev/ai-memory-mcp/issues/2024)). **Admin-gated and reversible** — it sets the schema-v82 `retired_at` / `retired_by` / `retire_reason` columns and deletes nothing. Pass `unretire=true` to reverse. The irreversible sibling `memory_skill_delete` is deliberately MCP-only with no HTTP route; see [`agent-skills.md`](agent-skills.html). |

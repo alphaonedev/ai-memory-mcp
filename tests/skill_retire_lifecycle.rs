@@ -330,7 +330,7 @@ fn migration_v82_applies_and_is_idempotent() {
 
     // Fresh open reaches the current tip with the v82 retire columns present.
     let conn = db::open(&path).unwrap();
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 95);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 97);
     assert!(
         conn.prepare("SELECT retired_at, retired_by, retire_reason FROM skills LIMIT 0")
             .is_ok(),
@@ -359,10 +359,13 @@ fn migration_v82_applies_and_is_idempotent() {
         )
         .unwrap();
     assert_eq!(
-        version, 95,
+        version,
+        db::migrations::current_schema_version_for_tests(),
         "upgrade-from-v81 runs the full ladder to the current tip (v82 re-adds the \
          retire columns; v83 adds agent_api_keys; v91 adds archive-link cids; \
-         v93 adds token_cost_counters)"
+         v93 adds token_cost_counters; v97 adds agent_pubkey_history). Compared \
+         against the canonical accessor, not a literal, so a ladder bump does not \
+         need a hand-edit here (#3464)."
     );
     assert!(
         conn2
@@ -381,7 +384,12 @@ fn migration_v82_applies_and_is_idempotent() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v3, 95, "re-open stays at the current tip idempotently");
+    assert_eq!(
+        v3,
+        db::migrations::current_schema_version_for_tests(),
+        "re-open stays at the current tip idempotently (canonical accessor, not a \
+         literal, so a ladder bump needs no hand-edit here — #3464)"
+    );
     // A retire round-trips end-to-end on the migrated DB.
     let _: Value = handle_skill_register(
         &conn3,

@@ -1321,10 +1321,45 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         agent_id: &str,
         pubkey_b64: &str,
+        // v1.0.0 #3464 — the possession witness. Threaded straight through to
+        // the storage funnel, which is where the append-only history is kept.
+        proof: &crate::identity::pubkey_bind::PossessionProof,
     ) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::bind_agent_pubkey(&conn, agent_id, pubkey_b64).map_err(box_err)
+        db::bind_agent_pubkey(&conn, agent_id, pubkey_b64, proof).map_err(box_err)
+    }
+
+    async fn issue_pubkey_bind_challenge(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        pubkey_b64: &str,
+        issuer_daemon_id: &str,
+    ) -> StoreResult<crate::identity::pubkey_bind::BindChallenge> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::issue_pubkey_bind_challenge(&conn, agent_id, pubkey_b64, issuer_daemon_id)
+            .map_err(box_err)
+    }
+
+    async fn consume_pubkey_bind_challenge(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        nonce_b64: &str,
+    ) -> StoreResult<Option<crate::identity::pubkey_bind::BindChallenge>> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::consume_pubkey_bind_challenge(&conn, agent_id, nonce_b64).map_err(box_err)
+    }
+
+    async fn agent_pubkey_versions(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Vec<crate::storage::AgentPubkeyVersion>> {
+        let conn = self.state.lock().await;
+        db::agent_pubkey_versions(&conn, agent_id).map_err(box_err)
     }
 
     async fn agent_pubkey(&self, agent_id: &str) -> StoreResult<Option<String>> {

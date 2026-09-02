@@ -306,6 +306,61 @@ export class AgentSigningKey {
 }
 
 // ---------------------------------------------------------------------------
+// #3464 — proof of possession for agent public-key binding
+// ---------------------------------------------------------------------------
+
+/**
+ * Domain tag for the bind-challenge transcript. Distinct from every other
+ * signing domain in the substrate, so a signature minted for a write, a link,
+ * a lineage record or a sub-key cert can never be replayed as a possession
+ * proof.
+ */
+export const BIND_CHALLENGE_V1_DOMAIN = "ai-memory/bind-pubkey/v1";
+
+/**
+ * The exact bytes a candidate key must sign to prove possession.
+ *
+ * Domain-separated and LENGTH-PREFIXED, so no field boundary can be shifted to
+ * make one transcript read as another (`agentId="a", pubkey="bc"` and
+ * `agentId="ab", pubkey="c"` produce different bytes). Mirrors
+ * `crate::identity::pubkey_bind::bind_challenge_transcript` byte for byte.
+ */
+export function bindChallengeTranscript(input: {
+  agentId: string;
+  pubkeyB64: string;
+  nonce: string;
+  expiresAt: string;
+}): Buffer {
+  const parts: Buffer[] = [Buffer.from(BIND_CHALLENGE_V1_DOMAIN, "utf8")];
+  for (const field of [input.agentId, input.pubkeyB64, input.nonce, input.expiresAt]) {
+    const raw = Buffer.from(field, "utf8");
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(raw.length, 0);
+    parts.push(len, raw);
+  }
+  return Buffer.concat(parts);
+}
+
+/**
+ * Answer a bind challenge; returns the URL-safe-unpadded base64 proof.
+ *
+ * The public key is derived from `key`, so this can only ever produce a proof
+ * for a key the caller actually holds.
+ */
+export function signBindChallenge(
+  key: AgentSigningKey,
+  input: { agentId: string; nonce: string; expiresAt: string },
+): string {
+  const transcript = bindChallengeTranscript({
+    agentId: input.agentId,
+    pubkeyB64: key.publicKeyBase64(),
+    nonce: input.nonce,
+    expiresAt: input.expiresAt,
+  });
+  return key.sign(transcript).toString("base64url");
+}
+
+// ---------------------------------------------------------------------------
 // Signing
 // ---------------------------------------------------------------------------
 

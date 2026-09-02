@@ -1225,9 +1225,48 @@ pub fn agent_registration_title(agent_id: &str) -> String {
 }
 
 /// #1539 — body for `PUT /api/v1/agents/{id}/pubkey`.
+///
+/// v1.0.0 #3464 — `nonce` + `proof_b64` are REQUIRED. Pre-#3464 the body was
+/// the bare `pubkey_b64`, a SELF-ASSERTED key: admin-gated and curve-validated,
+/// but with nothing proving the caller held the matching private key, so anyone
+/// with the admin role could bind a key they controlled to another agent's id
+/// and then mint `agent_attested` writes as that agent. The two fields carry
+/// the answer to a challenge minted by
+/// `POST /api/v1/agents/{id}/pubkey/challenge`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BindAgentPubkeyBody {
     /// Base64 (URL-safe, no-pad accepted) 32-byte Ed25519 public key.
+    pub pubkey_b64: String,
+    /// v1.0.0 #3464 — the `nonce` returned by the challenge endpoint for THIS
+    /// `(agent_id, pubkey_b64)` pair. Single use.
+    ///
+    /// `#[serde(default)]` on purpose: a body that OMITS the proof must still
+    /// deserialize, so the request reaches the handler and is refused by the
+    /// admin gate / validation / the proof gate in that order. Without it,
+    /// axum's `Json` extractor would reject a legacy pre-#3464 body with a bare
+    /// 422 before the admin gate ran — turning an authorization refusal into a
+    /// parse error and losing the ordering the surface documents. An empty
+    /// nonce is never in the challenge store, so it fails closed at the proof
+    /// gate exactly like a wrong one.
+    #[serde(default)]
+    pub nonce: String,
+    /// v1.0.0 #3464 — base64 Ed25519 signature, by the candidate key, over the
+    /// domain-separated challenge transcript
+    /// (`crate::identity::pubkey_bind::bind_challenge_transcript`). See
+    /// [`BindAgentPubkeyBody::nonce`] for why this defaults rather than being
+    /// a hard parse requirement.
+    #[serde(default)]
+    pub proof_b64: String,
+}
+
+/// v1.0.0 #3464 — body for `POST /api/v1/agents/{id}/pubkey/challenge`.
+///
+/// The challenge is minted for one CANDIDATE key: the key is part of the
+/// signed transcript, so a challenge issued for one key can never admit a bind
+/// of another.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BindAgentPubkeyChallengeBody {
+    /// The candidate key the caller intends to bind.
     pub pubkey_b64: String,
 }
 

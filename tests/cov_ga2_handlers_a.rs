@@ -218,6 +218,44 @@ fn valid_pubkey_b64() -> String {
         .public_base64()
 }
 
+/// #3464 — run the challenge/response the bind now requires and return the
+/// `PUT /api/v1/agents/{id}/pubkey` body.
+///
+/// The daemon issues a single-use nonce for THIS (agent, candidate key) pair;
+/// the holder of the private half signs the domain-separated transcript. A
+/// caller who cannot do this cannot bind the key, which is the whole point of
+/// the gate.
+async fn proved_bind_body(
+    router: &axum::Router,
+    agent_id: &str,
+    kp: &ai_memory::identity::keypair::AgentKeypair,
+) -> serde_json::Value {
+    let pubkey = kp.public_base64();
+    let (status, v) = post_as(
+        router,
+        &format!("/api/v1/agents/{agent_id}/pubkey/challenge"),
+        "admin-caller",
+        json!({"pubkey_b64": pubkey}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "challenge: {v}");
+    let challenge = ai_memory::identity::pubkey_bind::BindChallenge {
+        nonce_b64: v["nonce"].as_str().expect("nonce").to_string(),
+        agent_id: agent_id.to_string(),
+        pubkey_b64: pubkey.clone(),
+        expires_at: v["expires_at"].as_str().expect("expires_at").to_string(),
+    };
+    let signature = ai_memory::identity::pubkey_bind::sign_bind_challenge(
+        kp.private.as_ref().expect("generated private key"),
+        &challenge,
+    );
+    json!({
+        "pubkey_b64": pubkey,
+        "nonce": challenge.nonce_b64,
+        "proof_b64": signature,
+    })
+}
+
 /// Build a wire-valid `Memory` JSON value carrying every required field
 /// (the `ImportBody.memories` vec deserializes into the full 26-field
 /// `Memory` struct; a partial object 422s before the handler runs). The
@@ -366,11 +404,13 @@ async fn bind_agent_pubkey_admin_sqlite_via_sal_returns_200() {
     let (r, _f, _db) = build_router(StorageBackend::Sqlite);
     // The bind path refuses an unregistered agent; register first.
     register_agent(&r, "cov-bind-agent").await;
+    let kp = ai_memory::identity::keypair::generate("cov-bind-agent").expect("keypair");
+    let body = proved_bind_body(&r, "cov-bind-agent", &kp).await;
     let (status, v) = put_as(
         &r,
         "/api/v1/agents/cov-bind-agent/pubkey",
         "admin-caller",
-        json!({"pubkey_b64": valid_pubkey_b64()}),
+        body,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{v}");
@@ -392,11 +432,13 @@ async fn bind_agent_pubkey_admin_postgres_via_sal_returns_200() {
         ai_memory::db::register_agent(&lock.0, "cov-bind-pg", "ai:test", &[])
             .expect("seed _agents row");
     }
+    let kp = ai_memory::identity::keypair::generate("cov-bind-pg").expect("keypair");
+    let body = proved_bind_body(&r, "cov-bind-pg", &kp).await;
     let (status, v) = put_as(
         &r,
         "/api/v1/agents/cov-bind-pg/pubkey",
         "admin-caller",
-        json!({"pubkey_b64": valid_pubkey_b64()}),
+        body,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{v}");

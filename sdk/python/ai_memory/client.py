@@ -28,6 +28,7 @@ from ai_memory._common import (
     prep_json,
     wrap_transport_error,
 )
+from ai_memory.attestation import sign_bind_challenge
 from ai_memory.models import (
     AgentRegistration,
     BulkCreateResponse,
@@ -169,7 +170,7 @@ class AiMemoryClient:
 
             key = AgentSigningKey.from_file("~/.config/ai-memory/keys/svc.priv")
             with AiMemoryClient() as c:
-                c.bind_agent_pubkey("svc", key.public_key_b64())  # once, admin
+                c.bind_agent_pubkey("svc", key)  # once, admin
                 c.store(title="t", content="c", agent_id="svc", signing_key=key)
 
         Omitting ``signing_key`` only works where the operator has explicitly
@@ -509,7 +510,25 @@ class AiMemoryClient:
             },
         )
 
-    def bind_agent_pubkey(self, agent_id: str, pubkey_b64: str) -> dict[str, Any]:
+    def bind_agent_pubkey_challenge(self, agent_id: str, pubkey_b64: str) -> dict[str, Any]:
+        """``POST /api/v1/agents/{id}/pubkey/challenge`` — take a bind nonce.
+
+        ADMIN-GATED. Returns ``{nonce, expires_at, transcript_b64, ...}``. The
+        challenge is single-use and minted for THIS ``(agent_id, pubkey_b64)``
+        pair, both of which ride inside the signed transcript, so it cannot
+        admit the bind of another agent or another key.
+        """
+        return self._request(
+            "POST",
+            f"/api/v1/agents/{agent_id}/pubkey/challenge",
+            json_body={"pubkey_b64": pubkey_b64},
+        )
+
+    def bind_agent_pubkey(
+        self,
+        agent_id: str,
+        signing_key: AgentSigningKey,
+    ) -> dict[str, Any]:
         """``PUT /api/v1/agents/{id}/pubkey`` — enroll an attestation key.
 
         ADMIN-GATED. Without a bound key the daemon cannot verify a signed
@@ -517,12 +536,32 @@ class AiMemoryClient:
         the required one-time step before :meth:`store` with ``signing_key``
         can succeed.
 
+        v1.0.0 #3464 — this now takes the **private** key, not a bare public
+        one, and runs the challenge/response the daemon requires: it takes a
+        single-use nonce, signs the domain-separated transcript with
+        ``signing_key``, and presents the proof. Passing only a public key can
+        no longer work by design — an admin who cannot demonstrate possession
+        of a key must not be able to bind it to an agent and then mint
+        ``agent_attested`` writes as that agent.
+
         Args:
-            pubkey_b64: Base64 32-byte Ed25519 public key; URL-safe unpadded
-                is accepted. :meth:`AgentSigningKey.public_key_b64` emits it.
+            signing_key: The Ed25519 key being enrolled, private half
+                included. See :mod:`ai_memory.attestation`.
         """
+        pubkey_b64 = signing_key.public_key_b64()
+        challenge = self.bind_agent_pubkey_challenge(agent_id, pubkey_b64)
+        proof = sign_bind_challenge(
+            signing_key,
+            agent_id=agent_id,
+            nonce=challenge["nonce"],
+            expires_at=challenge["expires_at"],
+        )
         return self._request(
             "PUT",
             f"/api/v1/agents/{agent_id}/pubkey",
-            json_body={"pubkey_b64": pubkey_b64},
+            json_body={
+                "pubkey_b64": pubkey_b64,
+                "nonce": challenge["nonce"],
+                "proof_b64": proof,
+            },
         )

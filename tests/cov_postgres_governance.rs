@@ -113,9 +113,18 @@ async fn agent_registry_full_lifecycle() {
     );
 
     // Bind a key, read it back, then revoke.
-    let pubkey_b64 = base64_pub();
+    let bind_kp = ai_memory::identity::keypair::generate(&agent_id).expect("keypair");
+    let pubkey_b64 = bind_kp.public_base64();
+    let proof = ai_memory::store::prove_possession_via_store(
+        &store,
+        &ctx,
+        &agent_id,
+        bind_kp.private.as_ref().expect("generated private key"),
+    )
+    .await
+    .expect("prove possession");
     store
-        .bind_agent_pubkey(&ctx, &agent_id, &pubkey_b64)
+        .bind_agent_pubkey(&ctx, &agent_id, &pubkey_b64, &proof)
         .await
         .expect("bind_agent_pubkey");
     let got = store
@@ -136,15 +145,6 @@ async fn agent_registry_full_lifecycle() {
             .is_none(),
         "key cleared after revoke"
     );
-}
-
-fn base64_pub() -> String {
-    use base64::Engine;
-    // 32-byte all-zero ed25519 pubkey is structurally a valid b64 blob;
-    // the bind path stores it verbatim, the verify path is exercised
-    // elsewhere. Use a deterministic 32-byte vector.
-    let bytes = [7u8; 32];
-    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 // ───────────────────────────────────────────────────────────────────

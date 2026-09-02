@@ -60,10 +60,10 @@ fn v74_columns_and_version_both_backends() {
         db::migrations::current_schema_version_for_tests(),
         "fresh open reaches the current schema tip"
     );
-    // Tip pin: the ladder head advanced to v91 (#3250 archived_memory_links
-    // source_cid/target_cid). The v74 cid columns asserted below still
-    // exist; only the tip moved (was v90 = #2385 archive genesis-cid).
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 95);
+    // Tip pin: the ladder head advanced to v97 (#3464 agent_pubkey_history —
+    // the append-only agent key ledger). The v74 cid columns asserted below
+    // still exist; only the tip moved (was v94 = #3324 lifecycle_state index).
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 97);
     // The additive columns exist and are queryable.
     assert!(
         conn.prepare("SELECT cid, cid_genesis FROM memories LIMIT 0")

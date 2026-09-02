@@ -126,7 +126,7 @@ fn no_lineage_falls_through_to_flat_key() {
     // resolver returns exactly the decoded flat key (legacy identity).
     db::register_agent(&conn, "flat-agent", "ai:test", &[]).expect("register");
     let k = kp("flat-agent");
-    db::bind_agent_pubkey(&conn, "flat-agent", &k.public_base64()).expect("bind");
+    db::bind_agent_pubkey_with_keypair(&conn, "flat-agent", &k).expect("bind");
     let resolved = db::current_authoritative_key(&conn, "flat-agent")
         .expect("resolve")
         .expect("flat key resolves");
@@ -413,7 +413,7 @@ fn genesis_substitution_and_wholesale_rewrite_rejected() {
         ],
     )
     .expect("attacker inserts forged genesis");
-    db::bind_agent_pubkey(&conn, "c1-agent", &k0_prime.public_base64())
+    db::bind_agent_pubkey_with_keypair(&conn, "c1-agent", &k0_prime)
         .expect("attacker syncs the flat key (defeating HeadKeyMismatch alone)");
 
     let verdict = db::verify_agent_lineage(&conn, "c1-agent").expect("read");
@@ -480,7 +480,7 @@ fn truncation_rollback_rejected() {
         [],
     )
     .expect("attacker rolls back the head");
-    db::bind_agent_pubkey(&conn, "c3-agent", &k1.public_base64())
+    db::bind_agent_pubkey_with_keypair(&conn, "c3-agent", &k1)
         .expect("attacker re-syncs the flat key to the burned key");
 
     let verdict = db::verify_agent_lineage(&conn, "c3-agent").expect("read");
@@ -577,7 +577,7 @@ fn head_key_mismatch_detected() {
     let (k0, _k1, _k2) = enroll_three_key_chain(&conn, "desync-agent");
     // Desync the flat binding back to K0 (e.g. an operator re-bind
     // outside the lineage path). The chain itself is intact.
-    db::bind_agent_pubkey(&conn, "desync-agent", &k0.public_base64()).expect("desync");
+    db::bind_agent_pubkey_with_keypair(&conn, "desync-agent", &k0).expect("desync");
     let verdict = db::verify_agent_lineage(&conn, "desync-agent").expect("read");
     assert!(
         matches!(verdict, Err(LineageError::HeadKeyMismatch)),
@@ -1218,8 +1218,18 @@ mod postgres_parity {
             .execute(&pool)
             .await
             .expect("roll back the head");
+        // #3464 — the SAL bind takes a possession witness; this test holds the
+        // private half, so it runs the real handshake.
+        let k1_proof = ai_memory::store::prove_possession_via_store(
+            &store,
+            &ctx,
+            &agent_id,
+            k1.private.as_ref().expect("generated private key"),
+        )
+        .await
+        .expect("prove possession");
         store
-            .bind_agent_pubkey(&ctx, &agent_id, &k1.public_base64())
+            .bind_agent_pubkey(&ctx, &agent_id, &k1.public_base64(), &k1_proof)
             .await
             .expect("re-sync to the burned key");
         assert_eq!(
@@ -1249,8 +1259,16 @@ mod postgres_parity {
             .await
             .expect("register flat agent");
         let kf = kp("pg-agent");
+        let kf_proof = ai_memory::store::prove_possession_via_store(
+            &store,
+            &flat_ctx,
+            &flat_id,
+            kf.private.as_ref().expect("generated private key"),
+        )
+        .await
+        .expect("prove possession");
         store
-            .bind_agent_pubkey(&flat_ctx, &flat_id, &kf.public_base64())
+            .bind_agent_pubkey(&flat_ctx, &flat_id, &kf.public_base64(), &kf_proof)
             .await
             .expect("bind flat");
         assert_eq!(

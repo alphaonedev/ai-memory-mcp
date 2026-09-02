@@ -169,7 +169,7 @@ async fn write_attestation_claimed_vs_agent_attested() {
     {
         let lock = db.lock().await;
         ai_memory::storage::register_agent(&lock.0, author, "nhi", &[]).expect("register");
-        ai_memory::storage::bind_agent_pubkey(&lock.0, author, &kp.public_base64()).expect("bind");
+        ai_memory::storage::bind_agent_pubkey_with_keypair(&lock.0, author, &kp).expect("bind");
     }
 
     let ns = "f53-write";

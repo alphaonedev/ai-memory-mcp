@@ -118,6 +118,13 @@ pub enum AttestV2Error {
     /// presented v2 envelope cannot be verified — fail-closed reject
     /// (a presented-but-unverifiable envelope is never downgraded).
     NoRootKey,
+    /// v1.0.0 #3464 — the certified instance sub-key has been REVOKED
+    /// (`agent_subkey_certs.revoked`). The cert may still verify under the
+    /// root and still be inside its validity window; revocation overrides
+    /// both. Pre-#3464 the column was written by nothing and read by nothing,
+    /// so a leaked sub-key kept minting `agent_attested` writes for the whole
+    /// life of its cert.
+    SubkeyRevoked,
     /// The bound principal-root key could not be decoded.
     BadRootKey,
     /// The cert certifies a different principal than the writing agent.
@@ -144,6 +151,9 @@ impl std::fmt::Display for AttestV2Error {
             }
             Self::Chain(e) => write!(f, "v2 subkey-certification chain failed: {e}"),
             Self::Suite(e) => write!(f, "v2 suite-binding cross-check failed: {e}"),
+            Self::SubkeyRevoked => f.write_str(
+                "the certified instance sub-key has been revoked                  (revoke with `ai-memory agents revoke-subkey-cert`)",
+            ),
         }
     }
 }
@@ -161,6 +171,7 @@ impl AttestV2Error {
             Self::PrincipalMismatch => "write_v2_principal_mismatch",
             Self::Chain(_) => "write_v2_chain_invalid",
             Self::Suite(_) => "write_v2_suite_mismatch",
+            Self::SubkeyRevoked => "write_v2_subkey_revoked",
         }
     }
 }
@@ -486,6 +497,16 @@ pub fn stamp_v2_sync(
         &now,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // v1.0.0 #3464 — REVOCATION gate. Runs AFTER the §2.3 chain (so the
+    // instance key we look up is one the root actually certified, never a
+    // caller-asserted id) and BEFORE the attestation stamp and the TOFU
+    // persist, so a revoked delegation neither attests a write nor re-seeds
+    // its own cert row. A read failure here PROPAGATES: flattening it to
+    // "not revoked" would re-admit a revoked sub-key on a transient fault,
+    // which is a forged-provenance window, not a degraded read.
+    if crate::db::subkey_is_revoked(conn, agent_id, &presented.cert.instance_key_id)? {
+        anyhow::bail!("{}", AttestV2Error::SubkeyRevoked);
+    }
     stamp_agent_attested(mem);
     if let Err(e) = crate::db::insert_subkey_cert(conn, &presented.to_record()) {
         tracing::warn!(error = %e, "v2 subkey-cert TOFU persist failed (write still attested)");
@@ -833,7 +854,7 @@ mod tests {
     fn registered_agent(conn: &rusqlite::Connection) -> keypair::AgentKeypair {
         crate::db::register_agent(conn, AGENT, "ai:generic", &[]).expect("register");
         let root_kp = keypair::generate(AGENT).expect("gen root");
-        crate::db::bind_agent_pubkey(conn, AGENT, &root_kp.public_base64()).expect("bind");
+        crate::db::bind_agent_pubkey_with_keypair(conn, AGENT, &root_kp).expect("bind");
         root_kp
     }
 

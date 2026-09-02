@@ -1658,11 +1658,35 @@ pg_test!(pg_register_then_bind_postgres_arm, url, {
     assert_eq!(rb["storage_backend"], "postgres");
 
     let kp = ai_memory::identity::keypair::generate(&agent_id).expect("keypair");
+    let pubkey_b64 = kp.public_base64();
+    // #3464 — proof of possession: take the single-use challenge, sign it.
+    let (cs, cb) = pg_post(
+        &router,
+        &format!("/api/v1/agents/{agent_id}/pubkey/challenge"),
+        ADMIN_AGENT,
+        &json!({"pubkey_b64": pubkey_b64}),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "challenge body={cb}");
+    let challenge = ai_memory::identity::pubkey_bind::BindChallenge {
+        nonce_b64: cb["nonce"].as_str().expect("nonce").to_string(),
+        agent_id: agent_id.clone(),
+        pubkey_b64: pubkey_b64.clone(),
+        expires_at: cb["expires_at"].as_str().expect("expires_at").to_string(),
+    };
+    let proof_b64 = ai_memory::identity::pubkey_bind::sign_bind_challenge(
+        kp.private.as_ref().expect("generated private key"),
+        &challenge,
+    );
     let (bs, bb) = put_as(
         &router,
         &format!("/api/v1/agents/{agent_id}/pubkey"),
         ADMIN_AGENT,
-        &json!({"pubkey_b64": kp.public_base64()}),
+        &json!({
+            "pubkey_b64": pubkey_b64,
+            "nonce": challenge.nonce_b64,
+            "proof_b64": proof_b64,
+        }),
     )
     .await;
     assert_eq!(bs, StatusCode::OK, "bind body={bb}");

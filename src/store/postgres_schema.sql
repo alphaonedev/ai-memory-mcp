@@ -949,6 +949,63 @@ CREATE INDEX IF NOT EXISTS idx_agent_subkey_certs_instance
     ON agent_subkey_certs(instance_key_id);
 
 -- ─────────────────────────────────────────────────────────────────────
+-- agent_pubkey_history — append-only agent key ledger
+-- (v1.0.0 #3464, schema v97; mirrors
+-- migrations/postgres/0054_v97_agent_pubkey_history.sql).
+--
+-- One row per (agent, dense 1-based key version). The composite PRIMARY KEY
+-- is the anti-equivocation constraint (a duplicate version is refused by the
+-- DATABASE — the `agent_lineage (agent_id, epoch)` precedent).
+-- `[bound_at, superseded_at)` is the key's half-open validity window; rows are
+-- never deleted and `pubkey_b64` is never rewritten, so rebinding a key can no
+-- longer destroy the anchor the `agent_attested` rows it already signed are
+-- verified against. `bind_authority` records which authority admitted the
+-- binding ('possession_proof' / 'lineage_succession' / 'legacy_unproven').
+--
+-- `idx_agent_pubkey_history_agent_bound` below is legal under THE RULE for the
+-- same reason as `idx_agent_subkey_certs_instance` above: both its columns
+-- belong to the `CREATE TABLE` immediately preceding and are NEVER
+-- `ALTER`-added by any ladder arm, so a pre-v97 database has no such relation
+-- at all and the `CREATE TABLE IF NOT EXISTS` creates it columns-and-all.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_pubkey_history (
+    agent_id       TEXT   NOT NULL,
+    version        BIGINT NOT NULL,
+    pubkey_b64     TEXT   NOT NULL,
+    bind_authority TEXT   NOT NULL,
+    proof_nonce    TEXT,
+    bound_at       TEXT   NOT NULL,
+    superseded_at  TEXT,
+    PRIMARY KEY (agent_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_pubkey_history_agent_bound
+    ON agent_pubkey_history(agent_id, bound_at);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- agent_pubkey_challenges — durable proof-of-possession bind challenges
+-- (v1.0.0 #3464, schema v97; mirrors
+-- migrations/postgres/0054_v97_agent_pubkey_history.sql).
+--
+-- Durable rather than in-process because THIS tier supports several daemons on
+-- one shared store, so challenge-on-replica-A / bind-on-replica-B is a
+-- supported shape. `pubkey_b64` is issuer-pinned (it rides inside the signed
+-- transcript). Single use is the `consumed_at IS NULL` predicate of the
+-- consuming `UPDATE ... RETURNING`. Expired rows are reaped by `gc`.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_pubkey_challenges (
+    challenge_id     TEXT NOT NULL PRIMARY KEY,
+    agent_id         TEXT NOT NULL,
+    pubkey_b64       TEXT NOT NULL,
+    nonce            TEXT NOT NULL UNIQUE,
+    issued_at        TEXT NOT NULL,
+    expires_at       TEXT NOT NULL,
+    consumed_at      TEXT,
+    issuer_daemon_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_pubkey_challenges_expires
+    ON agent_pubkey_challenges(expires_at);
+
+-- ─────────────────────────────────────────────────────────────────────
 -- signed_events_dlq — deferred-audit drainer dead-letter queue
 -- (v0.7.0 Cluster-C SEC-3, issue #767, schema v39 Postgres / v40 SQLite).
 --

@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 95).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 97).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -487,6 +487,48 @@ CREATE TABLE IF NOT EXISTS agent_subkey_certs (
     created_at         TEXT NOT NULL
 );
 
+-- v97 (#3464, v1.0.0, security-high) — APPEND-ONLY AGENT PUBKEY HISTORY. One
+-- row per (agent, dense 1-based key version); the composite PK is the
+-- anti-equivocation constraint (a duplicate version is refused by the
+-- DATABASE, the `agent_lineage` (agent_id, epoch) precedent). Rows are never
+-- deleted and `pubkey_b64` is never rewritten — the sole mutation is stamping
+-- `superseded_at` once on the row whose window is still open — so rebinding a
+-- key no longer orphans the `agent_attested` rows the previous key signed.
+-- Created by migration v97 for upgrading DBs; inline here so a fresh bootstrap
+-- carries it. The `idx_agent_pubkey_history_agent_bound` lookup index is
+-- LADDER-OWNED (the v97 arm), NOT inline — the #1861 / v75
+-- bootstrap-inline-index lesson.
+CREATE TABLE IF NOT EXISTS agent_pubkey_history (
+    agent_id       TEXT    NOT NULL,
+    version        INTEGER NOT NULL,
+    pubkey_b64     TEXT    NOT NULL,
+    bind_authority TEXT    NOT NULL,
+    proof_nonce    TEXT,
+    bound_at       TEXT    NOT NULL,
+    superseded_at  TEXT,
+    PRIMARY KEY (agent_id, version)
+);
+
+-- v97 (#3464) — DURABLE proof-of-possession bind challenges. The challenge a
+-- candidate key must sign before `bind_agent_pubkey` accepts it. Durable, not
+-- in-process: the certified postgres tier supports SEVERAL DAEMONS ON ONE
+-- SHARED STORE, so issue-on-A / bind-on-B is a supported shape, and the rows
+-- must also survive a restart. Single use is the `consumed_at IS NULL`
+-- predicate of the consuming UPDATE. Created by migration v97 for upgrading
+-- DBs; inline here so a fresh bootstrap carries it. The
+-- `idx_agent_pubkey_challenges_expires` reaping index is LADDER-OWNED (the v97
+-- arm), NOT inline — the #1861 / v75 bootstrap-inline-index lesson.
+CREATE TABLE IF NOT EXISTS agent_pubkey_challenges (
+    challenge_id     TEXT NOT NULL PRIMARY KEY,
+    agent_id         TEXT NOT NULL,
+    pubkey_b64       TEXT NOT NULL,
+    nonce            TEXT NOT NULL UNIQUE,
+    issued_at        TEXT NOT NULL,
+    expires_at       TEXT NOT NULL,
+    consumed_at      TEXT,
+    issuer_daemon_id TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     title,
     content,
@@ -915,7 +957,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 95;
+const CURRENT_SCHEMA_VERSION: i64 = 97;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -1703,6 +1745,15 @@ const MIGRATION_V94_SQLITE: &str =
 // is `PostgresStore::migrate_v95`.
 const MIGRATION_V95_SQLITE: &str =
     include_str!("../../migrations/sqlite/0079_v95_attested_write_ledger.sql");
+
+// v97 (#3464, v1.0.0, security-high) — APPEND-ONLY AGENT PUBKEY HISTORY. The
+// `agent_pubkey_history` ledger (composite PK `(agent_id, version)`) that
+// preserves every key an agent has ever bound, so rebinding no longer orphans
+// the `agent_attested` rows the previous key signed. Carries the version-1
+// backfill of every live `metadata.agent_pubkey`. Additive, idempotent,
+// reversible. The postgres twin is `PostgresStore::migrate_v97`.
+const MIGRATION_V97_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0081_v97_agent_pubkey_history.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -4237,7 +4288,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V94_SQLITE)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        // #3464 — settled arm: the v95 attested-write ledger is no longer the
+        // tip, so it gates on its LITERAL version. A bare
+        // CURRENT_SCHEMA_VERSION here would re-run v95's DDL for a database
+        // already at 95 and, worse, let a crash between the v95 and v97
+        // commits strand the schema claiming a tip it does not have (the
+        // #3323/#3324 settled-arm convention).
+        if version < 95 {
             // v95 (#3419, v1.0.0) — ATTESTED-WRITE REPLAY LEDGER. The direct
             // signed-write surfaces (`POST /api/v1/memories`, `/memories/bulk`,
             // MCP `memory_store`) validated a caller-presented Ed25519
@@ -4268,6 +4325,44 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 "v95 doc twin must ship the attested_write_ledger DDL"
             );
             conn.execute_batch(MIGRATION_V95_SQLITE)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v97 (#3464, v1.0.0, security-high) — APPEND-ONLY AGENT PUBKEY
+            // HISTORY. Pre-#3464 an agent's Ed25519 attestation key lived ONLY
+            // in the flat `metadata.agent_pubkey` field of its `_agents` row,
+            // and every rebind OVERWROTE it — silently destroying the anchor
+            // for every `agent_attested` row the previous key signed, so those
+            // rows could no longer be re-verified by anything (the federation
+            // `AI_MEMORY_FED_REQUIRE_WRITE_SIG` lane, an attestation audit,
+            // `row_is_agent_attested`). Destroying a durable provenance anchor
+            // in order to record a rotation is the data-loss class the
+            // substrate must never have.
+            //
+            // `agent_pubkey_history` is that anchor's append-only ledger: one
+            // row per (agent, dense 1-based key version), composite PK
+            // `(agent_id, version)` as the anti-equivocation constraint (the
+            // `agent_lineage` (agent_id, epoch) precedent — a duplicate version
+            // is refused by the DATABASE), `bound_at`/`superseded_at` as the
+            // key's validity window, and `bind_authority` recording WHY the
+            // binding was admitted. Rows are never deleted and `pubkey_b64` is
+            // never rewritten; the sole mutation is stamping `superseded_at`
+            // once on the open row. The backfill copies each live
+            // `metadata.agent_pubkey` in as version 1 under the honest
+            // `legacy_unproven` authority, so the upgrade itself loses no
+            // anchor and an operator can enumerate every binding that predates
+            // the proof-of-possession gate.
+            //
+            // Additive, `IF NOT EXISTS` + `INSERT OR IGNORE` idempotent,
+            // reversible (revert is DROP TABLE — the flat binding this arm does
+            // not touch stays the live key), NoLoss, no full-table rebuild. The
+            // postgres twin is `PostgresStore::migrate_v97`.
+            // Doc twin: migrations/sqlite/0081_v97_agent_pubkey_history.sql.
+            debug_assert!(
+                MIGRATION_V97_SQLITE.contains("CREATE TABLE IF NOT EXISTS agent_pubkey_history"),
+                "v97 doc twin must ship the agent_pubkey_history DDL"
+            );
+            conn.execute_batch(MIGRATION_V97_SQLITE)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on

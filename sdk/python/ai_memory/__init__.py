@@ -14,7 +14,7 @@ Example
 >>> from ai_memory.attestation import AgentSigningKey
 >>> key = AgentSigningKey.generate()  # doctest: +SKIP
 >>> with AiMemoryClient(base_url="http://localhost:9077") as c:  # doctest: +SKIP
-...     c.bind_agent_pubkey("svc", key.public_key_b64())  # once, admin-gated
+...     c.bind_agent_pubkey("svc", key)  # once, admin-gated
 ...     created = c.store(
 ...         title="hello", content="world", tier=Tier.MID,
 ...         agent_id="svc", signing_key=key,

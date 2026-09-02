@@ -169,8 +169,53 @@ ai-memory agents bind-key --agent-id my-agent \
 > with a usage error (exit 2) — a documented recipe that failed on ~3% of
 > generated keys.
 
-Now the daemon can verify signatures from `my-agent`. Re-binding
-overwrites in place (that's how you rotate — see below).
+Now the daemon can verify signatures from `my-agent`. Re-binding replaces
+the LIVE key (that's how you rotate — see below), but never destroys the
+previous one: since
+[#3464](https://github.com/alphaonedev/ai-memory-mcp/issues/3464) every
+binding is appended to the `agent_pubkey_history` ledger (schema v95) with a
+dense 1-based version and a `[bound_at, superseded_at)` window, so writes an
+older key already attested stay verifiable against the key that signed them.
+
+### Proof of possession (#3464)
+
+A bind now has to PROVE the caller holds the private half of the key being
+bound. Admin authority says a caller may enroll a key; it never said WHICH
+key, so before #3464 anyone with the admin role could bind a key they
+controlled to another agent's id and then mint `agent_attested` writes as
+that agent.
+
+The CLI does this for you when the private key is in the local key store —
+the command above is unchanged. For a key held by someone else (or on an
+air-gapped signer), use the offline flow:
+
+```bash
+# 1. On the daemon host: print the challenge (nonce + expiry + transcript)
+ai-memory agents bind-challenge --agent-id my-agent --pubkey <pub_b64> --json
+
+# 2. On the key holder's machine: sign `transcript_b64` with the PRIVATE key
+#    and write {"nonce", "expires_at", "signature_b64"} to proof.json
+
+# 3. Back on the daemon host:
+ai-memory agents bind-key --agent-id my-agent --pubkey <pub_b64> \
+  --proof-file proof.json
+```
+
+Over HTTP the same handshake is two admin-gated calls: `POST
+/api/v1/agents/{id}/pubkey/challenge` returns `{nonce, expires_at,
+transcript_b64}`, and `PUT /api/v1/agents/{id}/pubkey` takes
+`{pubkey_b64, nonce, proof_b64}`. The nonce is single use and short-lived;
+every failure mode returns the same opaque `403`, so the endpoint cannot be
+used as an oracle. The SDKs wrap both calls: `client.bind_agent_pubkey(id,
+signing_key)` (Python) and `client.bindAgentPubkey(id, signingKey)`
+(TypeScript) now take the SIGNING key, not a bare public one.
+
+The one exception is a lineage rotation (`ai-memory identity succeed`): the
+succession record is already signed by the agent's CURRENT key-holder, so
+that signature is the authority. It is recorded distinctly in the ledger as
+`bind_authority = lineage_succession`, and bindings that predate this gate
+are labelled `legacy_unproven`, so an operator can enumerate every binding
+that was never proved.
 
 ### Step 4 — Sign on each write surface
 
@@ -381,7 +426,8 @@ signature didn't verify — see [Troubleshooting](#troubleshooting).
 ## Rotate & revoke
 
 ```bash
-# Rotate the key (overwrite in place), then re-bind the new public key
+# Rotate the key (replaces the LIVE binding; #3464 keeps the old one on
+# record so already-attested writes stay verifiable), then re-bind
 ai-memory identity generate --agent-id my-agent --force
 ai-memory agents bind-key --agent-id my-agent --pubkey <new pub_b64>
 

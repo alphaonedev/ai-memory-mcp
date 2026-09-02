@@ -110,7 +110,7 @@ fn dest_with_enrolled_author() -> (Connection, ai_memory::identity::keypair::Age
     let conn = fresh_db("dest");
     ai_memory::db::register_agent(&conn, AUTHOR, "ai:generic", &[]).expect("register");
     let kp = ai_memory::identity::keypair::generate(AUTHOR).expect("keypair");
-    ai_memory::db::bind_agent_pubkey(&conn, AUTHOR, &kp.public_base64()).expect("bind");
+    ai_memory::db::bind_agent_pubkey_with_keypair(&conn, AUTHOR, &kp).expect("bind");
     (conn, kp)
 }
 

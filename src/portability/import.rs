@@ -2746,8 +2746,7 @@ mod tests {
         let dst = fresh_conn("attest-forged-dst-");
         crate::storage::register_agent(&dst, "ai:author-3x7", "ai:generic", &[]).expect("register");
         let kp = crate::identity::keypair::generate("ai:author-3x7").expect("keygen");
-        crate::storage::bind_agent_pubkey(&dst, "ai:author-3x7", &kp.public_base64())
-            .expect("bind");
+        crate::storage::bind_agent_pubkey_with_keypair(&dst, "ai:author-3x7", &kp).expect("bind");
 
         let src = fresh_conn("attest-forged-src-");
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
@@ -2854,7 +2853,7 @@ mod tests {
         let dst = fresh_conn("attest-restamp-dst-2264-");
         crate::storage::register_agent(&dst, original_agent, "ai:generic", &[])
             .expect("register original signer");
-        crate::storage::bind_agent_pubkey(&dst, original_agent, &kp.public_base64())
+        crate::storage::bind_agent_pubkey_with_keypair(&dst, original_agent, &kp)
             .expect("bind original key");
         let report = import_full_envelope(&dst, &env, &opts_default()).expect("import");
         assert_eq!(report.memories, 1);
@@ -2890,8 +2889,7 @@ mod tests {
         let dst = fresh_conn("attest-ok-dst-");
         crate::storage::register_agent(&dst, "ai:signer-3x7", "ai:generic", &[]).expect("register");
         let kp = crate::identity::keypair::generate("ai:signer-3x7").expect("keygen");
-        crate::storage::bind_agent_pubkey(&dst, "ai:signer-3x7", &kp.public_base64())
-            .expect("bind");
+        crate::storage::bind_agent_pubkey_with_keypair(&dst, "ai:signer-3x7", &kp).expect("bind");
 
         let mut mem = memory_fixture("mem-valid-sig-3x7", "signed row", "ai:signer-3x7");
         let sig =

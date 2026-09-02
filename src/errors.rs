@@ -194,6 +194,15 @@ pub mod msg {
     pub const AGENT_ID_QUERY_MISMATCH: &str =
         "agent_id query parameter does not match authenticated caller";
     pub const INVALID_OR_MISSING_SIGNATURE: &str = "invalid or missing X-AI-Memory-Signature";
+    /// v1.0.0 #3464 — the ONE refusal string every proof-of-possession bind
+    /// failure returns. Deliberately opaque and shared across every failure
+    /// mode (unknown / expired / already-consumed nonce, wrong agent, wrong
+    /// candidate key, malformed or invalid signature): the wire must not report
+    /// WHICH check failed, or the endpoint becomes an oracle for probing the
+    /// challenge store (the `SubkeyCertError` precedent).
+    pub const BIND_PROOF_REFUSED: &str = "pubkey bind refused: no valid proof of possession for the candidate key \
+         (request a challenge at POST /api/v1/agents/{id}/pubkey/challenge and sign it \
+         with the candidate key)";
     /// #1786 — MCP mutation owner-gate refusal (delete / update / promote /
     /// link). The single SSOT so the gate message is one named const across all
     /// four MCP mutation handlers (the HTTP twin lives in

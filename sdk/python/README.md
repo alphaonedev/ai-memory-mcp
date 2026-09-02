@@ -37,7 +37,7 @@ key = AgentSigningKey.generate()          # or .from_file("svc.priv")
 
 with AiMemoryClient(base_url="http://localhost:9077") as client:
     # One-time, admin-gated: enroll the public key for this agent.
-    client.bind_agent_pubkey("svc", key.public_key_b64())
+    client.bind_agent_pubkey("svc", key)  # #3464: proves possession
 
     created = client.store(
         title="BIND9 build notes",
@@ -141,7 +141,8 @@ AiMemoryClient(base_url="http://localhost:9077", agent_id="ai:claude-opus-4.7@ho
 | `subscribe(req)` / `unsubscribe(id)` / `subscriptions()` | `POST` / `DELETE ?id=<id>` / `GET /api/v1/subscriptions` | Webhook mgmt. The delete takes the id in the QUERY STRING — the daemon registers `delete` on the collection path only. |
 | `notify(req)` / `inbox(...)` | `/api/v1/notify`, `/api/v1/inbox` | Agent-to-agent messaging. |
 | `agents()` / `register_agent(...)` | `/api/v1/agents` | NHI registry. |
-| `bind_agent_pubkey(id, b64)` | `PUT /api/v1/agents/{id}/pubkey` | Enroll an attestation key (admin). |
+| `bind_agent_pubkey(id, key)` | `PUT /api/v1/agents/{id}/pubkey` | Enroll an attestation key (admin). Takes the PRIVATE key and runs the #3464 challenge/response. |
+| `bind_agent_pubkey_challenge(id, b64)` | `POST /api/v1/agents/{id}/pubkey/challenge` | Take the single-use bind nonce (admin). |
 
 `update(...)` takes an optional `expected_version=` for optimistic
 concurrency; it rides the `If-Match` header (the daemon's only version gate

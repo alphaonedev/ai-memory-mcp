@@ -115,10 +115,15 @@ fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, std::p
 
 /// Register `agent_id` and bind `pubkey_b64` through a fresh connection on the
 /// daemon's db file so the gate's bound-key lookup resolves it.
-fn provision_agent(db_path: &std::path::Path, agent_id: &str, pubkey_b64: &str) {
+fn provision_agent(
+    db_path: &std::path::Path,
+    agent_id: &str,
+    kp: &ai_memory::identity::keypair::AgentKeypair,
+) {
     let conn = ai_memory::db::open(db_path).expect("reopen for provision");
     ai_memory::storage::register_agent(&conn, agent_id, "nhi", &[]).expect("register");
-    ai_memory::storage::bind_agent_pubkey(&conn, agent_id, pubkey_b64).expect("bind");
+    // #3464 — proof of possession; the helper holds the private half.
+    ai_memory::storage::bind_agent_pubkey_with_keypair(&conn, agent_id, kp).expect("bind");
 }
 
 /// Standard-base64 Ed25519 signature over the canonical store envelope.
@@ -169,7 +174,7 @@ async fn assert_signed_bulk_row_emits_write_signature(backend: StorageBackend, n
     let (router, _f, db_path) = build_router(backend);
     let agent = "ai:alice";
     let kp = ai_memory::identity::keypair::generate(agent).expect("keypair");
-    provision_agent(&db_path, agent, &kp.public_base64());
+    provision_agent(&db_path, agent, &kp);
 
     let title = "bulk-2000-signed";
     let content = "This is the body of bulk-2000-signed, long enough to be meaningful prose.";

@@ -271,13 +271,73 @@ pub async fn bind_agent_pubkey(
             "pubkey_b64": body.pubkey_b64,
         }),
     );
+    // v1.0.0 #3464 (security-high) — PROOF OF POSSESSION. Consume the
+    // single-use challenge this bind answers, then verify that the CANDIDATE
+    // key signed it. Admin authority says the caller may enroll a key; it has
+    // never said WHICH key, and pre-#3464 that gap let anyone holding the admin
+    // role bind a key they controlled to another agent's id and mint
+    // `agent_attested` writes as that agent.
+    //
+    // Consume-then-verify is deliberate: a wrong answer burns the nonce rather
+    // than granting unlimited attempts against it. The refusal is a single
+    // opaque 403 on every failure mode (unknown/expired/consumed nonce, wrong
+    // agent, wrong key, bad signature) — the `SubkeyCertError` precedent: the
+    // wire must not report WHICH check failed.
+    // v1.0.0 #3464 — consume the DURABLE challenge. A backend fault here is NOT
+    // "no such challenge": flattening it would turn a transient error into a
+    // silent enrolment refusal, so it surfaces as a store error instead.
+    let consumed = match consume_bind_challenge(&app, &agent_id, &body.nonce).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let Some(challenge) = consumed else {
+        // The wire stays opaque across every failure mode, but the OPERATOR
+        // gets the distinction in the log (the #2966 observable-black-hole
+        // discipline). No nonce is logged.
+        tracing::warn!(
+            target: "identity.bind.challenge_miss",
+            agent_id = %agent_id,
+            "pubkey bind refused: no live challenge for this agent — the nonce is \
+             unknown, already consumed, expired, or was issued for a different \
+             agent (#3464)."
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": crate::errors::msg::BIND_PROOF_REFUSED})),
+        )
+            .into_response();
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let Ok(proof) = crate::identity::pubkey_bind::PossessionProof::verify_challenge_response(
+        &challenge,
+        &agent_id,
+        body.pubkey_b64.trim(),
+        &body.proof_b64,
+        &now,
+    ) else {
+        // The challenge existed and was consumed, but the answer did not verify
+        // under the CANDIDATE key. That is the #3464 attack shape, so it is
+        // worth an audit-grade WARN even though the wire response is the same
+        // opaque refusal.
+        tracing::warn!(
+            target: "identity.bind.proof_invalid",
+            agent_id = %agent_id,
+            "pubkey bind refused: the presented proof did not verify under the \
+             candidate key (#3464)"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": crate::errors::msg::BIND_PROOF_REFUSED})),
+        )
+            .into_response();
+    };
     #[cfg(feature = "sal")]
     {
         let ctx =
             crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
         match app
             .store
-            .bind_agent_pubkey(&ctx, &agent_id, body.pubkey_b64.trim())
+            .bind_agent_pubkey(&ctx, &agent_id, body.pubkey_b64.trim(), &proof)
             .await
         {
             Ok(()) => (
@@ -294,7 +354,7 @@ pub async fn bind_agent_pubkey(
     #[cfg(not(feature = "sal"))]
     {
         let lock = app.db.lock().await;
-        match db::bind_agent_pubkey(&lock.0, &agent_id, body.pubkey_b64.trim()) {
+        match db::bind_agent_pubkey(&lock.0, &agent_id, body.pubkey_b64.trim(), &proof) {
             Ok(()) => (
                 StatusCode::OK,
                 Json(json!({
@@ -306,6 +366,128 @@ pub async fn bind_agent_pubkey(
             Err(e) => crate::handlers::errors::handler_error_500(&e),
         }
     }
+}
+
+/// v1.0.0 #3464 — issue a bind challenge through whichever backend this daemon
+/// serves, so the row lands in the SAME store the bind will consume it from.
+///
+/// The challenge is durable precisely because the postgres tier supports
+/// several daemons on one shared store: an in-process cache would make
+/// issue-on-replica-A / bind-on-replica-B fail closed with no in-product
+/// remedy, and would void every outstanding enrolment on a rolling deploy.
+async fn issue_bind_challenge(
+    app: &AppState,
+    agent_id: &str,
+    pubkey_b64: &str,
+) -> Result<crate::identity::pubkey_bind::BindChallenge, axum::response::Response> {
+    let issuer = crate::identity::sentinels::DAEMON_PRINCIPAL;
+    #[cfg(feature = "sal")]
+    {
+        let ctx = crate::store::CallerContext::for_admin(issuer);
+        app.store
+            .issue_pubkey_bind_challenge(&ctx, agent_id, pubkey_b64, issuer)
+            .await
+            .map_err(store_err_to_response)
+    }
+    #[cfg(not(feature = "sal"))]
+    {
+        let lock = app.db.lock().await;
+        db::issue_pubkey_bind_challenge(&lock.0, agent_id, pubkey_b64, issuer)
+            .map_err(|e| crate::handlers::errors::handler_error_500(&e))
+    }
+}
+
+/// v1.0.0 #3464 — atomically consume a bind challenge through this daemon's
+/// backend.
+///
+/// `Ok(None)` is the refusable case (unknown / already consumed / expired /
+/// issued for a different agent), and the caller must treat all four alike.
+/// An `Err` is a genuine backend fault and must NOT be collapsed into it — a
+/// transient error is not a failed proof.
+async fn consume_bind_challenge(
+    app: &AppState,
+    agent_id: &str,
+    nonce_b64: &str,
+) -> Result<Option<crate::identity::pubkey_bind::BindChallenge>, axum::response::Response> {
+    #[cfg(feature = "sal")]
+    {
+        let ctx =
+            crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
+        app.store
+            .consume_pubkey_bind_challenge(&ctx, agent_id, nonce_b64)
+            .await
+            .map_err(store_err_to_response)
+    }
+    #[cfg(not(feature = "sal"))]
+    {
+        let lock = app.db.lock().await;
+        db::consume_pubkey_bind_challenge(&lock.0, agent_id, nonce_b64)
+            .map_err(|e| crate::handlers::errors::handler_error_500(&e))
+    }
+}
+
+/// v1.0.0 #3464 (security-high) — issue a single-use bind challenge.
+///
+/// `POST /api/v1/agents/{id}/pubkey/challenge`. Admin-gated exactly like the
+/// bind it precedes: the challenge names the agent and the candidate key, both
+/// of which ride inside the transcript the key must sign, so a challenge minted
+/// for one `(agent, key)` pair can never admit the bind of another.
+///
+/// The response carries the `nonce`, its `expires_at`, and the exact
+/// base64-encoded `transcript` bytes — so an offline signer never has to
+/// re-derive the encoding, and a mismatch between what the client signs and
+/// what the server verifies is impossible.
+// Axum's `Handler` is implemented for async fns, so the signature must stay
+// `async` even though minting a nonce touches no I/O at all — which is exactly
+// the point: this route reads and writes NO storage, which is why it is safe to
+// serve on both backends.
+#[allow(clippy::unused_async)]
+pub async fn bind_agent_pubkey_challenge(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(body): Json<crate::models::BindAgentPubkeyChallengeBody>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&app, &headers, BIND_AGENT_PUBKEY_ACTION) {
+        return resp;
+    }
+    if let Err(e) = validate::validate_agent_id(&agent_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    if let Err(e) = validate::validate_agent_pubkey_b64(&body.pubkey_b64) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let pubkey = body.pubkey_b64.trim();
+    let challenge = match issue_bind_challenge(&app, &agent_id, pubkey).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let transcript = crate::identity::pubkey_bind::bind_challenge_transcript(
+        &agent_id,
+        pubkey,
+        &challenge.nonce_b64,
+        &challenge.expires_at,
+    );
+    use base64::Engine as _;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "agent_id": agent_id,
+            "pubkey_b64": pubkey,
+            "nonce": challenge.nonce_b64,
+            "expires_at": challenge.expires_at,
+            "transcript_b64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&transcript),
+        })),
+    )
+        .into_response()
 }
 
 pub async fn list_agents(
