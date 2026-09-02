@@ -933,6 +933,164 @@ pub fn reconcile_imported_attestation(
     }
 }
 
+// ---------------------------------------------------------------------------
+// #3419 — admit-once replay guard for attested direct writes
+// ---------------------------------------------------------------------------
+
+/// #3419 — stable error slug for a refused REPLAY of an attested write
+/// envelope. Handlers map it to `409 CONFLICT`; the MCP surface returns it as
+/// a plain error string.
+pub const ATTESTED_WRITE_REPLAY_CODE: &str = "ATTESTED_WRITE_REPLAY";
+
+/// #3419 — the wire refusal for a replayed attested write. Names the remedy
+/// (re-sign with a fresh `created_at`) so a legitimate client that lost its
+/// response can make progress instead of guessing.
+pub const ATTESTED_WRITE_REPLAY_REFUSAL: &str = "ATTESTED_WRITE_REPLAY: this signed write envelope has already been accepted by this \
+     node. An Ed25519 signature is re-verifiable forever, so a signed envelope is \
+     SINGLE-USE: re-sign the write with a fresh `created_at` to submit it again.";
+
+/// #3419 — the wire refusal when the durable replay ledger cannot be consulted.
+///
+/// Fail CLOSED: with no ledger there is no way to tell a first submission from
+/// a captured replay, and admitting the write would mint an `agent_attested`
+/// row this node cannot stand behind. Degrade (refuse the write), never corrupt
+/// (accept a possible replay).
+pub const ATTESTED_WRITE_LEDGER_UNAVAILABLE: &str = "ATTESTED_WRITE_LEDGER_UNAVAILABLE: the durable \
+     attested-write replay ledger could not be consulted, so this node cannot tell a first \
+     submission from a replay; refusing the signed write (fail-closed).";
+
+/// #3419 — outcome of consulting the durable attested-write replay ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestedWriteAdmission {
+    /// The first time this node has seen this envelope. It was recorded; the
+    /// write may proceed.
+    Fresh,
+    /// This exact envelope was already accepted. The caller MUST refuse the
+    /// write.
+    Replay,
+}
+
+/// #3419 — the 32-byte fingerprint of ONE attested write envelope.
+///
+/// `SHA-256` over the length-prefixed `(agent_id, created_at, signature)`
+/// triple, matching the [`crate::identity::replay::ReplayCache`] house style:
+/// every component is prefixed with its big-endian `u32` length so
+/// `("ab", "c")` and `("a", "bc")` can never collide.
+///
+/// The signature alone would already identify the envelope — Ed25519 signing is
+/// deterministic (RFC 8032), so re-submitting a captured body presents
+/// byte-identical signature bytes, and any HONEST second write differs in at
+/// least one signed field and therefore signs differently. `agent_id` and
+/// `created_at` are folded in anyway so the ledger row is self-describing for
+/// forensics and so a signature captured from one signer can never be charged
+/// to another.
+#[must_use]
+pub fn attested_write_fingerprint(agent_id: &str, created_at: &str, signature: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in [agent_id.as_bytes(), created_at.as_bytes(), signature] {
+        // A component longer than u32::MAX cannot occur: `agent_id` is capped
+        // by `validate_agent_id`, `created_at` is an RFC3339 stamp, and the
+        // signature is a fixed 64 bytes. Saturate rather than truncate so the
+        // length prefix can never wrap into a colliding value.
+        let len = u32::try_from(part.len()).unwrap_or(u32::MAX);
+        hasher.update(len.to_be_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+/// #3419 — SQLite / direct-connection admit-once gate for an attested write.
+///
+/// Consults (and, on a first sighting, extends) the durable
+/// `attested_write_ledger` so a captured signed body cannot be re-submitted
+/// inside the ±[`ATTEST_CREATED_AT_SKEW_SECS`] freshness window. This is the
+/// piece [`prepare_signed_store`] structurally cannot provide: that funnel is
+/// I/O-free and only bounds the envelope's AGE, and an Ed25519 signature stays
+/// verifiable forever — so before #3419 the same captured
+/// `POST /api/v1/memories` body verified an unbounded number of times inside
+/// the window, minting duplicate rows or RESURRECTING a deleted memory, each
+/// landing `attest_level="agent_attested"` with a genuine signature.
+///
+/// Call it AFTER the signature has verified ([`stamp_attestation_sync`]) and
+/// immediately BEFORE the row is stored, so a forged or malformed submission
+/// never reaches the ledger.
+///
+/// # Single-use envelopes
+///
+/// Admission is recorded before the store lands, which is the fail-CLOSED
+/// direction: a crash (or a downstream refusal) between admission and the write
+/// leaves the envelope spent, so a retry is REFUSED with
+/// [`ATTESTED_WRITE_REPLAY_REFUSAL`] naming the remedy — loudly losing an
+/// envelope, never silently admitting a replay. Clients re-sign with a fresh
+/// `created_at`; that is what a nonce is.
+///
+/// # Errors
+///
+/// Returns [`ATTESTED_WRITE_LEDGER_UNAVAILABLE`] when the ledger cannot be
+/// consulted. Callers MUST refuse the write on this error.
+pub fn admit_attested_write_sync(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    created_at: &str,
+    signature: &[u8],
+) -> std::result::Result<AttestedWriteAdmission, String> {
+    let fingerprint = attested_write_fingerprint(agent_id, created_at, signature);
+    match crate::storage::admit_attested_write(conn, &fingerprint, agent_id, created_at) {
+        Ok(true) => Ok(AttestedWriteAdmission::Fresh),
+        Ok(false) => Ok(AttestedWriteAdmission::Replay),
+        Err(e) => {
+            tracing::error!(
+                target: "ai_memory::identity::attest",
+                agent_id = %agent_id,
+                err = %e,
+                "#3419: attested-write replay ledger unavailable; refusing the signed write \
+                 (fail-closed)"
+            );
+            Err(ATTESTED_WRITE_LEDGER_UNAVAILABLE.to_string())
+        }
+    }
+}
+
+/// #3419 — SAL admit-once gate for an attested write, the async twin of
+/// [`admit_attested_write_sync`].
+///
+/// Routes through [`crate::store::MemoryStore::admit_attested_write`] so the
+/// ledger lives in the SAME backend as the memories it protects: a postgres
+/// deployment gets a postgres ledger, not a sqlite sidecar that would leave the
+/// SAL write surfaces unguarded.
+///
+/// # Errors
+///
+/// Returns [`ATTESTED_WRITE_LEDGER_UNAVAILABLE`] when the ledger cannot be
+/// consulted — including a backend whose adapter does not implement it, whose
+/// trait default REFUSES rather than permitting. Callers MUST refuse the write.
+#[cfg(feature = "sal")]
+pub async fn admit_attested_write_async(
+    store: &dyn crate::store::MemoryStore,
+    agent_id: &str,
+    created_at: &str,
+    signature: &[u8],
+) -> std::result::Result<AttestedWriteAdmission, String> {
+    let fingerprint = attested_write_fingerprint(agent_id, created_at, signature);
+    match store
+        .admit_attested_write(&fingerprint, agent_id, created_at)
+        .await
+    {
+        Ok(true) => Ok(AttestedWriteAdmission::Fresh),
+        Ok(false) => Ok(AttestedWriteAdmission::Replay),
+        Err(e) => {
+            tracing::error!(
+                target: "ai_memory::identity::attest",
+                agent_id = %agent_id,
+                err = %e,
+                "#3419: attested-write replay ledger unavailable; refusing the signed write \
+                 (fail-closed)"
+            );
+            Err(ATTESTED_WRITE_LEDGER_UNAVAILABLE.to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 94).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 95).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -383,6 +383,27 @@ CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory_id
     ON memory_revisions(memory_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_revisions_sequence
     ON memory_revisions(sequence);
+
+-- v1.0.0 #3419 (schema v95) — the attested-write replay ledger. One row per
+-- caller-presented Ed25519 write envelope this node has already accepted;
+-- `fingerprint` (SHA-256 over the length-prefixed
+-- `(agent_id, created_at, signature)` triple) is the PRIMARY KEY, so the
+-- admit-once decision IS the uniqueness constraint. `seen_at` is unix epoch
+-- SECONDS so the bounded-retention prune is a numeric comparison that no
+-- timestamp rendering can confuse. Created by migration v95 for upgrading
+-- DBs; inline here so a fresh bootstrap has it. The index IS inline (the
+-- `memory_revisions` precedent): the #1861 / v75 bootstrap-inline-index
+-- lesson is about indexing a column the LADDER adds — this index covers a
+-- column of a table the same bootstrap batch creates, so a legacy open
+-- cannot race it.
+CREATE TABLE IF NOT EXISTS attested_write_ledger (
+    fingerprint BLOB    NOT NULL PRIMARY KEY,
+    agent_id    TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL,
+    seen_at     INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_attested_write_ledger_seen_at
+    ON attested_write_ledger(seen_at);
 
 -- v0.9.0 G13 (#1828, schema v76) — identity-lineage succession chain.
 -- One row per (agent_id, epoch); the composite PK is the DB-enforced
@@ -894,7 +915,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 94;
+const CURRENT_SCHEMA_VERSION: i64 = 95;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -1669,6 +1690,19 @@ const MIGRATION_V92_SQLITE: &str =
 // `PostgresStore::migrate_v94`.
 const MIGRATION_V94_SQLITE: &str =
     include_str!("../../migrations/sqlite/0078_v94_lifecycle_state_index.sql");
+
+// v1.0.0 #3419 (schema v95) — the ATTESTED-WRITE REPLAY LEDGER. One row per
+// caller-presented Ed25519 write envelope this node has already accepted,
+// keyed on the SHA-256 `(agent_id, created_at, signature)` fingerprint as the
+// PRIMARY KEY, so the storage engine's own uniqueness constraint IS the
+// admit-once decision. Retention is exactly the ±`ATTEST_CREATED_AT_SKEW_SECS`
+// replay window the freshness gate already enforces (pruned on every
+// admission), so the table is bounded by the attested-write RATE and never by
+// history. Pure additive `CREATE TABLE IF NOT EXISTS`, no backfill, no
+// rebuild; also inline in the bootstrap SCHEMA const above. The postgres twin
+// is `PostgresStore::migrate_v95`.
+const MIGRATION_V95_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0079_v95_attested_write_ledger.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -4172,7 +4206,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(crate::cost::MIGRATION_V93_SQLITE)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 94 {
             // v94 (#3324, #3266 MVG, v1.0.0) — LIFECYCLE_STATE INDEX. Ships
             // alongside the new `contaminated` lifecycle vocabulary (the state
             // auto-propagated DOWNSTREAM over the provenance DAG when a root
@@ -4201,6 +4235,39 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 "v94 doc twin must ship the lifecycle_state index DDL"
             );
             conn.execute_batch(MIGRATION_V94_SQLITE)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v95 (#3419, v1.0.0) — ATTESTED-WRITE REPLAY LEDGER. The direct
+            // signed-write surfaces (`POST /api/v1/memories`, `/memories/bulk`,
+            // MCP `memory_store`) validated a caller-presented Ed25519
+            // signature by shape and by the ±300 s freshness window and nothing
+            // else, so within that window a captured signed body verified an
+            // UNBOUNDED number of times — minting duplicate rows, or
+            // RESURRECTING a deleted memory, each landing
+            // `attest_level="agent_attested"` with a genuine signature. The
+            // federated `/sync/push` surface has had an `X-Memory-Nonce` guard
+            // since v0.7.0 (#922); the direct path had none.
+            //
+            // The ledger records ONE row per accepted envelope, keyed on the
+            // SHA-256 `(agent_id, created_at, signature)` fingerprint as the
+            // PRIMARY KEY — so "already accepted?" is decided by the storage
+            // engine's uniqueness constraint, not by a check-then-act read, and
+            // two concurrent submissions of the same body can never BOTH be
+            // admitted. Retention is exactly the replay window the freshness
+            // gate already enforces (`seen_at < now - 2×skew` is pruned on every
+            // admission), so the table is bounded by the attested-write RATE,
+            // never by history.
+            //
+            // Additive `CREATE TABLE IF NOT EXISTS`, idempotent, reversible
+            // (revert is DROP TABLE + lowering the stamp), NoLoss, no
+            // full-table rebuild. Doc twin:
+            // migrations/sqlite/0079_v95_attested_write_ledger.sql.
+            debug_assert!(
+                MIGRATION_V95_SQLITE.contains("attested_write_ledger"),
+                "v95 doc twin must ship the attested_write_ledger DDL"
+            );
+            conn.execute_batch(MIGRATION_V95_SQLITE)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on

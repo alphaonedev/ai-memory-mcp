@@ -462,6 +462,24 @@ pub(crate) fn handle_store(
                 crate::identity::attest::WriteSurface::Mcp,
             )
             .map_err(|e| e.to_string())?;
+            // #3419 (security-high) — admit-once replay guard. The signature has
+            // now VERIFIED, so consult the durable ledger before the row is
+            // stored: an Ed25519 signature is re-verifiable forever, so without
+            // this a captured signed call re-submitted inside the ±300 s
+            // freshness window mints duplicate rows (or resurrects a deleted
+            // memory) as `agent_attested`. A ledger fault refuses the write
+            // (fail-closed) rather than admitting a possible replay.
+            match crate::identity::attest::admit_attested_write_sync(
+                conn,
+                &agent_id,
+                &mem.created_at,
+                &sig_bytes,
+            )? {
+                crate::identity::attest::AttestedWriteAdmission::Fresh => {}
+                crate::identity::attest::AttestedWriteAdmission::Replay => {
+                    return Err(crate::identity::attest::ATTESTED_WRITE_REPLAY_REFUSAL.to_string());
+                }
+            }
             // #1801→#1954 item 2 — sender EMIT: persist the author's presented
             // signature so it propagates verbatim across federation relay hops.
             crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);

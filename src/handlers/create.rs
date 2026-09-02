@@ -1244,6 +1244,23 @@ async fn create_memory_postgres(
                 )
                     .into_response();
             }
+            // #3419 (security-high) — admit-once replay guard. The signature has
+            // now VERIFIED; consult the durable ledger before the row is stored.
+            // An Ed25519 signature is re-verifiable forever, so without this a
+            // captured signed body re-POSTed inside the ±300 s freshness window
+            // mints duplicate rows (or resurrects a deleted memory) as
+            // `agent_attested`. A ledger fault refuses the write (fail-closed).
+            if let Some(resp) = crate::handlers::errors::attested_write_admission_response(
+                &crate::identity::attest::admit_attested_write_async(
+                    app.store.as_ref(),
+                    agent_id,
+                    &mem.created_at,
+                    &sig_bytes,
+                )
+                .await,
+            ) {
+                return resp;
+            }
             // #1801→#1954 item 2 — sender EMIT: persist the author's presented
             // signature so it propagates verbatim across federation relay hops.
             crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
@@ -1760,6 +1777,19 @@ pub async fn create_memory(
                     })),
                 )
                     .into_response();
+            }
+            // #3419 (security-high) — admit-once replay guard, sqlite twin of
+            // the postgres branch above. Same durable ledger contract, same
+            // fail-closed disposition, same wire refusal helper.
+            if let Some(resp) = crate::handlers::errors::attested_write_admission_response(
+                &crate::identity::attest::admit_attested_write_sync(
+                    &lock.0,
+                    &agent_id,
+                    &mem.created_at,
+                    &sig_bytes,
+                ),
+            ) {
+                return resp;
             }
             // #1801→#1954 item 2 — sender EMIT: persist the author's presented
             // signature so it propagates verbatim across federation relay hops.

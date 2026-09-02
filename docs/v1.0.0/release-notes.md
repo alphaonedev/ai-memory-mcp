@@ -110,7 +110,7 @@ CLI subcommands):
 | HTTP routes | **96 production `.route(...)` registrations** / 82 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v94** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), v90 is additive (archive genesis-cid), and **v91 is additive** (archive-link cid pins, #3250). Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v91" |
+| Schema | **v95** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), v90 is additive (archive genesis-cid), and **v91 is additive** (archive-link cid pins, #3250). Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v91" |
 
 ## Secure-default flips (breaking)
 
@@ -606,7 +606,7 @@ those two review lanes raised, and no tag has been cut.
 
 ## Schema ladder v78 → v91
 
-`CURRENT_SCHEMA_VERSION = 94` on both adapters
+`CURRENT_SCHEMA_VERSION = 95` on both adapters
 (`src/storage/migrations.rs`, `src/store/postgres.rs`); CLAUDE.md
 §Database is the SSOT. Both adapters mirror via
 `src/store/postgres.rs::{migrate_v79 … migrate_v91}`.
