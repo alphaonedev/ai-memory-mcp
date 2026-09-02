@@ -137,7 +137,9 @@ pub(crate) fn handle_inbox_with_policy(
     // agent-to-agent messages. Without this bind, `resolve_agent_id` returns
     // the caller-supplied value verbatim, letting any caller read any agent's
     // private inbox. #3356 makes that legacy trust-all branch an explicit,
-    // default-off single-tenant opt-in.
+    // default-off single-tenant opt-in. When the visibility caller is absent
+    // because AI_MEMORY_AGENT_ID is unset, bind to the same process-derived
+    // identity memory_notify stamps rather than disabling inbox access.
     let owner = match caller {
         Some(c) => {
             if let Some(requested) = explicit {
@@ -150,14 +152,21 @@ pub(crate) fn handle_inbox_with_policy(
             c.to_string()
         }
         None => {
-            if !single_tenant_trust_all {
-                return Err(
-                    "memory_inbox requires a valid AI_MEMORY_AGENT_ID; cross-agent inbox access \
-                     is disabled unless [mcp] single_tenant_trust_all = true"
-                        .to_string(),
-                );
+            if single_tenant_trust_all {
+                crate::identity::resolve_agent_id(explicit, mcp_client)
+                    .map_err(|e| e.to_string())?
+            } else {
+                let derived = crate::identity::resolve_agent_id(None, mcp_client)
+                    .map_err(|e| e.to_string())?;
+                if let Some(requested) = explicit
+                    && requested != derived
+                {
+                    return Err(format!(
+                        "agent_id mismatch: caller '{derived}' may only read its own inbox"
+                    ));
+                }
+                derived
             }
-            crate::identity::resolve_agent_id(explicit, mcp_client).map_err(|e| e.to_string())?
         }
     };
     // #3374 — both were read with a silent fallback. `unread_only: "yes"` (a
@@ -444,17 +453,53 @@ mod d1_5_986_tests {
     }
 
     #[test]
-    fn inbox_none_caller_is_refused_by_default_3356() {
-        let (owner, sender) = ("alice", "carol");
+    fn inbox_none_caller_cannot_select_foreign_inbox_by_default_3356() {
+        let _env = crate::identity::agent_id_env_unset_guard();
+        let client = "inbox-default-denied-3356";
+        let derived = crate::identity::resolve_agent_id(None, Some(client)).unwrap();
+        let foreign = "ai:foreign-inbox-owner";
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        seed_inbox_message(&conn, owner, sender);
-        let error = handle_inbox_with_policy(&conn, &json!({"agent_id": owner}), None, None, false)
-            .unwrap_err();
+        seed_inbox_message(&conn, foreign, "ai:sender");
+
+        let error = handle_inbox_with_policy(
+            &conn,
+            &json!({"agent_id": foreign}),
+            Some(client),
+            None,
+            false,
+        )
+        .unwrap_err();
+
         assert_eq!(
             error,
-            "memory_inbox requires a valid AI_MEMORY_AGENT_ID; cross-agent inbox access is \
-             disabled unless [mcp] single_tenant_trust_all = true"
+            format!("agent_id mismatch: caller '{derived}' may only read its own inbox")
         );
+    }
+
+    #[test]
+    fn inbox_none_caller_reads_derived_own_inbox_by_default_3356() {
+        let _env = crate::identity::agent_id_env_unset_guard();
+        let client = "inbox-default-allowed-3356";
+        let owner = crate::identity::resolve_agent_id(None, Some(client)).unwrap();
+        let sender = "ai:sender";
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        seed_inbox_message(&conn, &owner, sender);
+
+        let implied =
+            handle_inbox_with_policy(&conn, &json!({}), Some(client), None, false).unwrap();
+        assert_eq!(implied["agent_id"].as_str(), Some(owner.as_str()));
+        assert_eq!(implied["count"].as_u64(), Some(1));
+
+        let explicit = handle_inbox_with_policy(
+            &conn,
+            &json!({"agent_id": &owner}),
+            Some(client),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(explicit["agent_id"].as_str(), Some(owner.as_str()));
+        assert_eq!(explicit["count"].as_u64(), Some(1));
     }
 
     #[test]

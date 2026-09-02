@@ -11663,36 +11663,35 @@ mod tests {
     }
 
     #[test]
-    fn handle_inbox_without_identity_is_refused_by_default_3356() {
-        // Notify alice, then prove an unresolved caller cannot select her inbox.
+    fn handle_inbox_without_configured_identity_binds_process_owner_3356() {
+        let _env = crate::identity::agent_id_env_unset_guard();
+        let owner = crate::identity::resolve_agent_id(None, None).unwrap();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let notify = make_tools_call(
             "memory_notify",
             json!({
-                "target_agent_id": "alice-w12",
+                "target_agent_id": &owner,
                 "title": "ping",
                 "payload": "are you there?",
                 "tier": Tier::Short.as_str(),
             }),
         );
         let _ = invoke_handle_request(&conn, &notify);
-        let inbox = make_tools_call(
-            "memory_inbox",
-            json!({"agent_id": "alice-w12", "limit": 10}),
-        );
-        let resp = invoke_handle_request(&conn, &inbox);
-        assert!(
-            resp.error.is_none(),
-            "JSON-RPC dispatch should return a tool envelope"
-        );
-        let text = resp.result.unwrap()["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(
-            text.contains("single_tenant_trust_all = true"),
-            "unexpected tool error: {text}"
-        );
+        for params in [
+            json!({"limit": 10}),
+            json!({"agent_id": &owner, "limit": 10}),
+        ] {
+            let inbox = make_tools_call("memory_inbox", params);
+            let resp = invoke_handle_request(&conn, &inbox);
+            assert!(resp.error.is_none());
+            let text = resp.result.unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let value: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["agent_id"].as_str(), Some(owner.as_str()));
+            assert_eq!(value["count"].as_u64(), Some(1));
+        }
     }
 
     #[test]
