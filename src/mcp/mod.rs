@@ -2577,7 +2577,13 @@ fn dispatch_memory_auto_tag(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> 
 }
 
 fn dispatch_memory_detect_contradiction(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_detect_contradiction(ctx.conn, ctx.llm, ctx.arguments)
+    // v1.0.0 #3387 — scope=private visibility gate, parity with
+    // `dispatch_memory_get` / `dispatch_memory_get_links`. This tool reads TWO
+    // rows by id, returns both titles and ships both bodies to an external
+    // LLM, so it must resolve the same read-visibility principal those tools
+    // do and refuse before the model call.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_detect_contradiction(ctx.conn, ctx.llm, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_archive_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

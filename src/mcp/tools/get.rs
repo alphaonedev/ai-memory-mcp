@@ -54,6 +54,35 @@ impl McpTool for GetTool {
 /// (#1553 — matches the HTTP GET /memories/{id} 404-mask, `memories.rs`).
 pub(super) const NOT_FOUND_MSG: &str = crate::errors::msg::MEMORY_NOT_FOUND;
 
+/// v1.0.0 #3387 — the canonical caller-scoped visibility mask for a
+/// **single by-id read**.
+///
+/// Every by-id MCP read that hands a caller (or an external model) a row's
+/// CONTENT must funnel the fetched row through this before touching it, and
+/// must render its `None` as the module's existence-hiding not-found message.
+/// Collapsing "no such row" and "row exists but is not visible to this caller"
+/// into ONE `None` is what stops such a tool from becoming a cross-tenant
+/// presence oracle (#1553 mask; #3387 found `memory_detect_contradiction`
+/// reading BOTH rows with no gate at all — it returned both titles and shipped
+/// both bodies to the external LLM for a caller who gets a bare not-found on
+/// either id from `memory_get`).
+///
+/// The predicate is the single canonical
+/// [`crate::visibility::is_visible_to_caller`] — never re-implement it at a
+/// call site (#951). `caller == None` is the single-tenant trust-all posture
+/// and is preserved unchanged.
+///
+/// Deliberately takes the ALREADY-FETCHED row rather than the id: id → row
+/// resolution differs per tool (`memory_get` accepts a unique id prefix,
+/// `memory_detect_contradiction` accepts an exact id only), while the
+/// visibility decision must not.
+pub(super) fn mask_invisible(
+    row: Option<crate::models::Memory>,
+    caller: Option<&str>,
+) -> Option<crate::models::Memory> {
+    row.filter(|mem| caller.is_none_or(|c| crate::visibility::is_visible_to_caller(mem, c)))
+}
+
 pub(super) fn handle_get(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -79,18 +108,13 @@ pub(super) fn handle_get(
                 )
             })?;
     }
-    match db::resolve_id(conn, id).map_err(|e| e.to_string())? {
+    // #1553 — scope=private visibility gate, parity with the sibling read
+    // tools (recall/list/search) and the HTTP GET-by-id path. A
+    // resolved-but-not-visible row is masked as not-found rather than 403'd so
+    // existence is not disclosed. #3387 lifted the gate into `mask_invisible`
+    // so every by-id content read shares one implementation.
+    match mask_invisible(db::resolve_id(conn, id).map_err(|e| e.to_string())?, caller) {
         Some(mem) => {
-            // #1553 — scope=private visibility gate, parity with the sibling
-            // read tools (recall/list/search) and the HTTP GET-by-id path. A
-            // resolved-but-not-visible row is masked as not-found rather than
-            // 403'd so existence is not disclosed. `caller == None` is the
-            // single-tenant trust-all posture and is preserved unchanged.
-            if let Some(c) = caller {
-                if !crate::visibility::is_visible_to_caller(&mem, c) {
-                    return Err(NOT_FOUND_MSG.into());
-                }
-            }
             let links = db::get_links(conn, &mem.id).unwrap_or_default();
             // Flatten: merge memory fields with links at top level (#96)
             let mut val = serde_json::to_value(&mem).map_err(|e| e.to_string())?;
