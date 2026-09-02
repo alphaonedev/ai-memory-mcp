@@ -96,14 +96,20 @@ pub async fn get_inbox(
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(100)
             .clamp(1, 1000);
+        let unread_only = q.unread_only.unwrap_or(false);
         let filter = crate::store::Filter {
             namespace: Some(ns),
             limit: cap,
+            // v1.0.0 #3463 — push the unread narrowing into the SQL (`AND
+            // access_count = 0` before `LIMIT`) instead of dropping read rows in
+            // Rust AFTER the limit had already been spent. Pre-fix, an agent
+            // whose newest `cap` inbox rows were all read got `unread_count: 0`
+            // while older unread messages sat in the namespace.
+            unread_only,
             ..Default::default()
         };
         return match app.store.list(&ctx, &filter).await {
             Ok(rows) => {
-                let unread_only = q.unread_only.unwrap_or(false);
                 let messages: Vec<serde_json::Value> = rows
                     .into_iter()
                     .filter(|m| {
@@ -119,6 +125,10 @@ pub async fn get_inbox(
                         // BOTH backends (`memories.access_count`, populated by
                         // the postgres row mapper), so the two arms now derive the
                         // SAME fact from the SAME durable field.
+                        //
+                        // #3463 — this is now a belt-and-suspenders re-check of a
+                        // predicate the QUERY already applied (see `unread_only`
+                        // on the `Filter` above); it can only narrow, never widen.
                         !unread_only || m.access_count == 0
                     })
                     .map(|m| {
@@ -154,6 +164,7 @@ pub async fn get_inbox(
                         })
                     })
                     .collect();
+                let message_count = messages.len();
                 // #3027 — count from the SAME derived marker the filter uses.
                 let unread_count = messages
                     .iter()
@@ -164,7 +175,13 @@ pub async fn get_inbox(
                     Json(json!({
                         "agent_id": owner,
                         "messages": messages,
+                        // #3463 — `count` and `unread_only` echoed here too, so
+                        // the postgres inbox envelope carries the same three
+                        // fields the sqlite/MCP twin returns and a client cannot
+                        // read a different shape per backend.
+                        "count": message_count,
                         "unread_count": unread_count,
+                        (field_names::UNREAD_ONLY): unread_only,
                         (field_names::STORAGE_BACKEND): "postgres",
                     })),
                 )

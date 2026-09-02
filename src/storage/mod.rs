@@ -124,6 +124,12 @@ const SQL_LIST_BASE: &str = "SELECT * FROM memories WHERE (expires_at IS NULL OR
 // OF ORDER BY" — a bounded per-tie-block sort, NOT a full "FOR ORDER BY" sort).
 const SQL_LIST_ORDER_LIMIT: &str =
     " ORDER BY priority DESC, updated_at DESC, id ASC LIMIT ? OFFSET ?";
+// v1.0.0 #3463 — the unread narrowing fragment. A bare, parameter-free
+// equality so the planner can serve it directly; appended by
+// `build_list_query` ONLY when the caller asks for unread-only, and always
+// BEFORE `SQL_LIST_ORDER_LIMIT` so it narrows the set the `LIMIT` then pages
+// (the pre-fix inbox filtered AFTER the limit, in Rust).
+const SQL_FRAGMENT_AND_UNREAD: &str = " AND access_count = 0";
 
 /// v0.7.0 H6 (round-2) — truncate a `DateTime<Utc>` to microsecond
 /// precision. Companion of the same-named helper in
@@ -7146,6 +7152,15 @@ pub fn build_list_query(
     // pushdown. `None` = no narrowing (byte-identical legacy SQL). See
     // `crate::store::MetadataEq`.
     metadata_eq: Option<(&str, &str)>,
+    // v1.0.0 #3463 — restrict to UNREAD rows (`access_count = 0`, the #3027
+    // unread marker) INSIDE the query, i.e. BEFORE `LIMIT`. The inbox surfaces
+    // used to prefetch the newest `limit` rows and drop the read ones in Rust
+    // afterwards, so an agent whose newest `limit` messages were all read was
+    // told it had NOTHING unread while older unread rows sat in the namespace —
+    // a silent false negative that any wake-then-read-once design inherits.
+    // `false` = no narrowing (byte-identical legacy SQL, hence the same cached
+    // plan for every pre-#3463 list shape).
+    unread_only: bool,
     limit: usize,
     offset: usize,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
@@ -7220,6 +7235,16 @@ pub fn build_list_query(
         params_vec.push(Box::new(k.to_string()));
         params_vec.push(Box::new(v.to_string()));
     }
+    // v1.0.0 #3463 — the unread axis, pushed down like every other filter:
+    // appended ONLY when requested, so the unfiltered shape keeps its exact
+    // legacy SQL. `access_count` is a real NOT NULL column on BOTH backends,
+    // and `= 0` is the SAME unread marker `#3027` pinned for the projection
+    // (`read: access_count > 0`), so the filter and the wire field can never
+    // disagree. Placed BEFORE `SQL_LIST_ORDER_LIMIT` — that is the whole point
+    // of the fix: the narrowing must precede `LIMIT`, never follow it.
+    if unread_only {
+        sql.push_str(SQL_FRAGMENT_AND_UNREAD);
+    }
     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list hides
     // Tombstoned/Quarantined (and any unknown state) from list. No alias in
     // SQL_LIST_BASE, so the unqualified column is used.
@@ -7262,6 +7287,9 @@ pub fn list(
         agent_id,
         valid_at,
         None,
+        // v1.0.0 #3463 — the historical `list` shape never narrowed on read
+        // state; `false` keeps every one of its ~30 call sites byte-identical.
+        false,
     )
 }
 
@@ -7291,6 +7319,9 @@ pub fn list_filtered(
     agent_id: Option<&str>,
     valid_at: Option<&str>,
     metadata_eq: Option<(&str, &str)>,
+    // v1.0.0 #3463 — narrow to UNREAD rows (`access_count = 0`) IN SQL, before
+    // the `LIMIT`. See [`build_list_query`]; `false` = no narrowing.
+    unread_only: bool,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let (sql, params_vec) = build_list_query(
@@ -7304,6 +7335,7 @@ pub fn list_filtered(
         agent_id,
         valid_at,
         metadata_eq,
+        unread_only,
         limit,
         offset,
     );

@@ -22556,6 +22556,21 @@ impl MemoryStore for PostgresStore {
         } else {
             ""
         };
+        // v1.0.0 #3463 — the unread narrowing, pushed into SQL so it applies
+        // BEFORE `LIMIT`, byte-for-byte the same point in the pipeline as the
+        // sqlite twin's `SQL_FRAGMENT_AND_UNREAD`. The inbox surfaces used to
+        // fetch the newest `limit` rows and drop the read ones in Rust
+        // afterwards, so an agent whose newest page was all read was told it had
+        // nothing unread while older unread rows remained. `access_count` is
+        // `BIGINT NOT NULL DEFAULT 0` here and `= 0` is the identical #3027
+        // unread marker the projection reports as `read`. A parameter-free
+        // constant, so it adds NO bind and cannot shift the `$10`/`$11`
+        // metadata-equality placeholder numbers.
+        let unread_predicate = if filter.unread_only {
+            "AND access_count = 0"
+        } else {
+            ""
+        };
         // #1876 — thread the `Filter` OFFSET so the postgres adapter pages
         // identically to sqlite (SAL parity — both clamp LIMIT to
         // LIST_MAX_LIMIT and page PAST the first window via OFFSET). The
@@ -22598,6 +22613,7 @@ impl MemoryStore for PostgresStore {
                        AND (valid_until IS NULL OR valid_until > $8))
                )
                {metadata_eq_predicate}
+               {unread_predicate}
                {lifecycle_vis}
              ORDER BY priority DESC, updated_at DESC, id COLLATE \"C\" ASC
              LIMIT $5 OFFSET $9",
@@ -22652,6 +22668,15 @@ impl MemoryStore for PostgresStore {
             .into_iter()
             .flatten()
             .collect();
+        // #3463 belt-and-suspenders, the twin of the sqlite adapter's re-check:
+        // re-apply the unread marker in-process so a drift between the SQL
+        // fragment and the canonical Rust predicate can only NARROW the result,
+        // never widen it. O(returned-rows).
+        let mems: Vec<Memory> = if filter.unread_only {
+            mems.into_iter().filter(|m| m.access_count == 0).collect()
+        } else {
+            mems
+        };
         if ctx.bypass_visibility {
             return Ok(mems);
         }
