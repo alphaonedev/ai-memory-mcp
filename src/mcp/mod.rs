@@ -11671,10 +11671,9 @@ mod tests {
         for params in [json!({}), json!({"agent_id": &owner})] {
             let resp = invoke_handle_request(&conn, &make_tools_call("memory_inbox", params));
             assert!(resp.error.is_none());
-            let value: Value = serde_json::from_str(
-                resp.result.unwrap()["content"][0]["text"].as_str().unwrap(),
-            )
-            .unwrap();
+            let value: Value =
+                serde_json::from_str(resp.result.unwrap()["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
             assert_eq!(value["agent_id"].as_str(), Some(owner.as_str()));
             assert_eq!(value["count"].as_u64(), Some(1));
         }
