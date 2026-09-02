@@ -1714,6 +1714,19 @@ impl MemoryStore for SqliteStore {
         db::fold_recall_accesses(&conn, crate::SECS_PER_HOUR, crate::SECS_PER_DAY).map_err(box_err)
     }
 
+    /// v1.0.0 #3345 — SAL port of `db::stamp_operational_backlog`.
+    async fn stamp_operational_backlog(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+    ) -> StoreResult<usize> {
+        let fallback = crate::validate::render_canonical_utc(
+            chrono::Utc::now() + chrono::Duration::seconds(crate::autonomy::SELF_REPORT_TTL_SECS),
+        );
+        let conn = self.state.lock().await;
+        db::stamp_operational_backlog(&conn, namespace, &fallback).map_err(box_err)
+    }
+
     async fn pending_decide(
         &self,
         _ctx: &CallerContext,

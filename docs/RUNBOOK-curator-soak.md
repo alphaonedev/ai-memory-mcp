@@ -67,8 +67,19 @@ ai-memory list --namespace _curator/rollback --limit 1 --json > baseline-rollbac
 ## The soak
 
 Let the curator run for **168 hours (7 × 24)**. One cycle per hour
-× 7 days = 168 cycles. Each cycle writes a self-report memory in
-`_curator/reports/<ts>`; accumulate ≥168 of these over the window.
+× 7 days = 168 cycles. Each cycle writes a self-report to the substrate
+self-report ledger; accumulate ≥168 of these over the window.
+
+> **v1.0.0 #3345 — read them with `ai-memory curator --reports`, not
+> `ai-memory list`.** Self-reports are substrate telemetry the daemon writes
+> about itself, so they are now stored `lifecycle_state = operational` and are
+> deliberately absent from `list` / recall / stats and from the embedding
+> backfill. Before this change they were ordinary embedded memories: on one
+> node they had grown to 24,930 rows — 97% of the store — with 24,801 paid
+> embedding calls, and the same namespace had already leaked once (#1466).
+> They now carry a 24-hour TTL and are reaped by the curator daemon's own GC
+> sweep, so **run the audit command below at most 24 h after the window you
+> care about**, or snapshot per-day during a long soak.
 
 During the soak:
 
@@ -90,7 +101,10 @@ At T+168 h, produce the audit trail:
 # is in _curator/reports.
 ai-memory list --namespace _curator/rollback --limit 10000 --json \
     > audit-actions.json
-ai-memory list --namespace _curator/reports --limit 10000 --json \
+# #3345 — self-reports are `lifecycle_state = operational`, so `list` does
+# not return them by design; `curator --reports` is their read path. Same
+# `{"count": N, "reports": [...]}` shape, `report` holding the per-cycle body.
+ai-memory curator --reports --reports-limit 10000 --json \
     > audit-cycles.json
 
 # Aggregate cycle reports for the headline numbers.

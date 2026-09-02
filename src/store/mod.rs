@@ -2666,6 +2666,31 @@ pub trait MemoryStore: Send + Sync {
         Ok(0)
     }
 
+    /// v1.0.0 #3345 — stamp a legacy substrate-telemetry backlog
+    /// [`crate::models::LifecycleState::Operational`], chunked and idempotent.
+    ///
+    /// The SAL port of `db::stamp_operational_backlog`. Called once from the
+    /// serve-boot maintenance path so BOTH backends converge: without the pg
+    /// twin a heterogeneous fleet would hide and stop embedding the reports on
+    /// its SQLite nodes while its PostgreSQL nodes kept recalling and paying to
+    /// embed them — mixed state across the fleet, the failure class the SAL
+    /// parity rule exists to prevent.
+    ///
+    /// Stamps only; never deletes. Returns the number of rows stamped by THIS
+    /// call, `0` once the backlog is drained (the impls short-circuit on a
+    /// bounded existence probe, so a clean store pays one indexed read).
+    ///
+    /// Default is a no-op returning `Ok(0)` — a third-party adapter that does
+    /// not implement it simply never migrates a legacy backlog it probably
+    /// never had (documented degrade, mirroring `fold_recall_accesses`).
+    async fn stamp_operational_backlog(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+    ) -> StoreResult<usize> {
+        Ok(0)
+    }
+
     // ==================================================================
     // v0.7.0 Wave-3 Continuation 2 — governance write paths
     // (Phase 11).

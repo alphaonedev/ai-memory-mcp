@@ -3563,6 +3563,44 @@ pub fn set_lifecycle_state(
 /// # Errors
 ///
 /// Propagates the rusqlite query error.
+/// v1.0.0 #3345 — operator read path for the substrate self-report ledger.
+///
+/// The curator's per-sweep self-reports are written
+/// [`crate::models::LifecycleState::Operational`], so they are structurally
+/// absent from `db::list` / recall / stats — deliberately: they are telemetry
+/// the daemon writes about itself, not memories an agent asked for. This is
+/// the replacement read path for the one procedure that legitimately wants
+/// them (`docs/RUNBOOK-curator-soak.md`, which counts one row per completed
+/// cycle over a 168-hour soak), reached from `ai-memory curator --reports`.
+///
+/// Returns `(id, created_at, content)` newest-first. `content` is the report
+/// JSON body verbatim, so the runbook's per-cycle counters stay readable.
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn list_operational_reports(
+    conn: &Connection,
+    namespace: &str,
+    limit: i64,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, created_at, content FROM memories \
+          WHERE namespace = ?1 AND lifecycle_state = ?2 \
+          ORDER BY created_at DESC LIMIT ?3",
+    )?;
+    let operational = crate::models::LifecycleState::Operational.as_str();
+    let rows = stmt.query_map(params![namespace, operational, limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 pub fn list_quarantined(
     conn: &Connection,
     namespace: Option<&str>,
@@ -15115,7 +15153,7 @@ pub fn auto_purge_archive(conn: &Connection, max_days: Option<i64>) -> Result<us
 /// 500 keeps each archive-copy + delete transaction in the
 /// single-digit-millisecond band on the P1 audit corpus while still
 /// amortising the per-transaction fsync across a useful batch.
-const GC_CHUNK_ROWS: usize = 500;
+pub(crate) const GC_CHUNK_ROWS: usize = 500;
 
 /// Subquery selecting one bounded chunk of expired row ids. Shared by
 /// the archive `INSERT … SELECT` and the `DELETE` inside the same
@@ -15127,6 +15165,91 @@ const GC_CHUNK_ROWS: usize = 500;
 const SQL_GC_EXPIRED_CHUNK_IDS: &str = "SELECT id FROM memories \
      WHERE expires_at IS NOT NULL AND expires_at < ?1 \
      ORDER BY rowid LIMIT ?2";
+
+/// v1.0.0 #3345 — one bounded chunk of rows still to be stamped
+/// [`crate::models::LifecycleState::Operational`]. Mirrors
+/// [`SQL_GC_EXPIRED_CHUNK_IDS`]: `ORDER BY rowid` makes the selection
+/// deterministic, and the `IN (subquery)` form avoids relying on
+/// `UPDATE … LIMIT`.
+const SQL_OPERATIONAL_STAMP_CHUNK_IDS: &str = "SELECT id FROM memories \
+     WHERE namespace = ?1 AND lifecycle_state <> 'operational' \
+     ORDER BY rowid LIMIT ?2";
+
+/// v1.0.0 #3345 — stamp a legacy substrate-telemetry backlog
+/// [`crate::models::LifecycleState::Operational`], chunked and idempotent.
+///
+/// The curator has written one `_curator/reports` self-report per sweep since
+/// v0.7 as an ordinary, recall-visible memory; on one fleet node that is 24,930
+/// rows (97% of the store) and 24,801 paid embeddings. New reports are written
+/// `Operational` by [`crate::autonomy::persist_self_report`], but the existing
+/// rows need migrating.
+///
+/// **Stamp, never delete.** The durable memory TEXT is the source of truth and
+/// is not this function's to destroy — it only marks the rows so the read/
+/// egress lanes and the embedding backfill stop returning them, and leaves the
+/// ordinary TTL + [`gc`] sweep to reap them on its own paced schedule. A NULL
+/// expiry is backfilled (such a row would otherwise never be reaped); an
+/// existing expiry is left ALONE, so this never silently shortens a retention
+/// an operator can see.
+///
+/// **Bounded and resumable.** Work is done in [`GC_CHUNK_ROWS`]-sized
+/// autocommitted chunks, so the sqlite write lock is never held across the
+/// whole backlog and an interrupted run resumes exactly where it stopped (the
+/// predicate is the progress marker). Idempotent: a second run stamps nothing.
+///
+/// **Self-terminating.** Once the backlog is drained, the leading existence
+/// probe short-circuits and NO sweep runs — a boot on a clean store pays one
+/// bounded, indexed `EXISTS` and nothing else.
+///
+/// Returns the number of rows stamped by THIS call (0 on a clean store).
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn stamp_operational_backlog(
+    conn: &Connection,
+    namespace: &str,
+    fallback_expires_at: &str,
+) -> Result<usize> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    // Self-terminating probe: on a store with nothing left to stamp this is
+    // the ONLY statement the boot path runs.
+    let pending: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories \
+          WHERE namespace = ?1 AND lifecycle_state <> 'operational')",
+        params![namespace],
+        |r| r.get(0),
+    )?;
+    if pending == 0 {
+        return Ok(0);
+    }
+    let sql = format!(
+        "UPDATE memories \
+            SET lifecycle_state = 'operational', \
+                expires_at = COALESCE(expires_at, ?3) \
+          WHERE id IN ({SQL_OPERATIONAL_STAMP_CHUNK_IDS})"
+    );
+    let mut total = 0usize;
+    loop {
+        let changed = conn.execute(&sql, params![namespace, GC_CHUNK_ROWS, fallback_expires_at])?;
+        if changed == 0 {
+            break;
+        }
+        total += changed;
+    }
+    if total > 0 {
+        tracing::info!(
+            target: "ai_memory::maintenance",
+            namespace,
+            stamped = total,
+            chunk_rows = GC_CHUNK_ROWS,
+            "#3345: stamped substrate self-report backlog `operational` \
+             (hidden from recall/list/stats and from the embedding backfill; \
+              reaped by the ordinary TTL sweep, never deleted here)"
+        );
+    }
+    Ok(total)
+}
 
 pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
@@ -17858,9 +17981,54 @@ pub fn get_embeddings_many(
 /// whole corpus in memory. Hot loops (the embed-backfill sweep) should
 /// use [`get_unembedded_ids_batch`] and drain in bounded passes; this
 /// variant remains for callers that need the full snapshot semantics.
+/// v1.0.0 #3345 — the ONE embedding-backfill row predicate.
+///
+/// `embedding IS NULL` AND the fail-CLOSED
+/// [`crate::models::lifecycle_visible_clause`] allow-list, so the backfill
+/// never spends an embedding on a row no read path can return.
+///
+/// **Why the visibility clause and not a namespace rule.** The rows that
+/// motivated this (#3345 — 24,801 paid embeddings on one host, 97% of the
+/// store, for curator self-reports nobody recalls) are hidden by the
+/// `Operational` lifecycle state, and the same predicate also stops paying for
+/// tombstoned / quarantined / contaminated rows, which were being embedded too.
+/// A namespace blocklist would have been a seventh copy of the ad-hoc
+/// `starts_with('_')` convention AND wrong — `_inbox/<agent>` rows are
+/// deliberately recallable by their recipient.
+///
+/// `extra` is appended verbatim (cursor predicate, ORDER BY, LIMIT). The
+/// clause is placeholder-free, so it never renumbers a call site's `?N`.
+/// v1.0.0 #3345 — the ONE embedding-backfill scan statement.
+///
+/// The envelope-bearing projection (#1779: `encrypted_envelope` + `metadata`
+/// so at-rest-encrypted rows are decrypted, or skipped, before embedding) was
+/// repeated verbatim at all three bounded call sites; this is the single site
+/// that spells it, so the projection and the [`unembedded_predicate`] gate can
+/// never drift apart between the LIMIT, keyset-cursor and keyset-start shapes.
+///
+/// `extra` is the per-shape tail (cursor predicate / ORDER BY / LIMIT), passed
+/// through to [`unembedded_predicate`]; the clause it appends is
+/// placeholder-free, so it never renumbers a call site's `?N`.
+fn unembedded_scan_sql(extra: &str) -> String {
+    format!(
+        "SELECT id, title, content, encrypted_envelope, metadata FROM memories {}",
+        unembedded_predicate(extra)
+    )
+}
+
+fn unembedded_predicate(extra: &str) -> String {
+    format!(
+        "WHERE embedding IS NULL {} {extra}",
+        crate::models::lifecycle_visible_clause("")
+    )
+}
+
 pub fn get_unembedded_ids(conn: &Connection) -> Result<Vec<(String, String, String)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, title, content FROM memories WHERE embedding IS NULL")?;
+    // #3345 — lifecycle-filtered; see `unembedded_predicate`.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, title, content FROM memories {}",
+        unembedded_predicate("")
+    ))?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -17888,10 +18056,7 @@ pub fn get_unembedded_ids_batch(
 ) -> Result<Vec<(String, String, String)>> {
     // #1779 — pull encrypted_envelope + metadata so encrypted rows are
     // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-         WHERE embedding IS NULL LIMIT ?1",
-    )?;
+    let mut stmt = conn.prepare_cached(&unembedded_scan_sql("LIMIT ?1"))?;
     let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
     let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(resolve_embeddable_rows(raw))
@@ -17924,17 +18089,12 @@ pub fn get_unembedded_ids_batch_after(
     // #1779 — pull encrypted_envelope + metadata so encrypted rows are
     // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
     let raw = if let Some(after) = after_id {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-             WHERE embedding IS NULL AND id > ?1 ORDER BY id LIMIT ?2",
-        )?;
+        let mut stmt =
+            conn.prepare_cached(&unembedded_scan_sql("AND id > ?1 ORDER BY id LIMIT ?2"))?;
         let rows = stmt.query_map(params![after, limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-             WHERE embedding IS NULL ORDER BY id LIMIT ?1",
-        )?;
+        let mut stmt = conn.prepare_cached(&unembedded_scan_sql("ORDER BY id LIMIT ?1"))?;
         let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };

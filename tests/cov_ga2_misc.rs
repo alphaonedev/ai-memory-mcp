@@ -689,6 +689,9 @@ async fn curator_store_url_postgres_once_builds_store_handle() {
         include_namespaces: Vec::new(),
         exclude_namespaces: Vec::new(),
         json: true,
+        // #3345 — self-report ledger read path; not this test's mode.
+        reports: false,
+        reports_limit: 200,
         rollback: None,
         rollback_last: None,
         reflect: false,

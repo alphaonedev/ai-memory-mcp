@@ -21927,6 +21927,12 @@ impl MemoryStore for PostgresStore {
             // "nothing to embed". See SqliteStore::list_unembedded.
             return Ok(Vec::new());
         }
+        // v1.0.0 #3345 — the scan is additionally gated on the fail-CLOSED
+        // `lifecycle_visible_clause` allow-list, the SQLite twin of
+        // `storage::unembedded_predicate`: never spend an embedding on a row
+        // no read path can return. Closes the 24,801 paid embeddings for
+        // curator self-reports (now `LifecycleState::Operational`) and stops
+        // paying for tombstoned / quarantined / contaminated rows too.
         let cap: i64 = i64::try_from(limit).unwrap_or(LIST_FALLBACK_LIMIT_I64);
         // v1.0.0 #2167 (#2183) — the always-on predicate re-embeds
         // NULL-embedding and NULL-space rows (the [G1]/[G2]-blocked legacy
@@ -21962,13 +21968,15 @@ impl MemoryStore for PostgresStore {
                 "SELECT id, title, content, encrypted_envelope, \
                         metadata::text AS metadata_json \
                    FROM memories \
-                  WHERE embedding IS NULL \
+                  WHERE (embedding IS NULL \
                      OR (embedding IS NOT NULL AND {unattributed}) \
                      OR (embedding IS NOT NULL AND embedding_space IS NOT NULL \
-                         AND embedding_space <> $2) \
+                         AND embedding_space <> $2)) \
+                        {lifecycle_vis} \
                   ORDER BY created_at ASC \
                   LIMIT $1",
-                unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
+                unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED,
+                lifecycle_vis = crate::models::lifecycle_visible_clause("")
             ))
             .bind(cap)
             .bind(active_fp)
@@ -21980,11 +21988,13 @@ impl MemoryStore for PostgresStore {
                 "SELECT id, title, content, encrypted_envelope, \
                         metadata::text AS metadata_json \
                    FROM memories \
-                  WHERE embedding IS NULL \
-                     OR (embedding IS NOT NULL AND {unattributed}) \
+                  WHERE (embedding IS NULL \
+                     OR (embedding IS NOT NULL AND {unattributed})) \
+                        {lifecycle_vis} \
                   ORDER BY created_at ASC \
                   LIMIT $1",
-                unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
+                unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED,
+                lifecycle_vis = crate::models::lifecycle_visible_clause("")
             ))
             .bind(cap)
             .fetch_all(&self.pool)
@@ -24640,6 +24650,69 @@ impl MemoryStore for PostgresStore {
     /// the fail-closed one: if the audit row cannot be written the decision
     /// rolls back and the action stays `pending`, which is refusable and
     /// retryable, rather than committing a state change nothing can attest to.
+    /// v1.0.0 #3345 — postgres twin of `db::stamp_operational_backlog`:
+    /// chunked, idempotent, stamp-never-delete, self-terminating.
+    async fn stamp_operational_backlog(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+    ) -> StoreResult<usize> {
+        self.gate_record_stop().await?;
+        // Self-terminating probe: on a store with nothing left to stamp this
+        // is the ONLY statement the boot path runs.
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM memories \
+              WHERE namespace = $1 AND lifecycle_state <> 'operational')",
+        )
+        .bind(namespace)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("probe operational backlog", e))?;
+        if !pending {
+            return Ok(0);
+        }
+        let fallback =
+            chrono::Utc::now() + chrono::Duration::seconds(crate::autonomy::SELF_REPORT_TTL_SECS);
+        let chunk = i64::try_from(crate::storage::GC_CHUNK_ROWS).unwrap_or(500);
+        let mut total = 0usize;
+        loop {
+            // `IN (subquery … ORDER BY id LIMIT)` bounds the lock-hold per
+            // statement exactly as the sqlite twin's chunk does; an
+            // interrupted run resumes on the same predicate.
+            let changed = sqlx::query(
+                "UPDATE memories \
+                    SET lifecycle_state = 'operational', \
+                        expires_at = COALESCE(expires_at, $3) \
+                  WHERE id IN (SELECT id FROM memories \
+                                WHERE namespace = $1 \
+                                  AND lifecycle_state <> 'operational' \
+                                ORDER BY id LIMIT $2)",
+            )
+            .bind(namespace)
+            .bind(chunk)
+            .bind(fallback)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("stamp operational backlog", e))?
+            .rows_affected();
+            if changed == 0 {
+                break;
+            }
+            total += usize::try_from(changed).unwrap_or(usize::MAX);
+        }
+        if total > 0 {
+            tracing::info!(
+                target: TRACE_TARGET,
+                namespace,
+                stamped = total,
+                "#3345: stamped substrate self-report backlog `operational` \
+                 (hidden from recall/list/stats and from the embedding \
+                  backfill; reaped by the ordinary TTL sweep, never deleted)"
+            );
+        }
+        Ok(total)
+    }
+
     async fn pending_decide(
         &self,
         _ctx: &CallerContext,

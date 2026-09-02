@@ -86,6 +86,25 @@ pub const CONSOLIDATE_MAX_CLUSTER_SIZE: usize = 8;
 /// / report memories).
 pub const CURATOR_NAMESPACE: &str = "_curator";
 
+/// v1.0.0 #3345 — the namespace the curator's per-sweep self-report lands in.
+/// Previously spelled inline at the writer and in five docs/tests.
+pub const CURATOR_REPORTS_NAMESPACE: &str = "_curator/reports";
+
+/// v1.0.0 #3345 — retention window for a curator self-report.
+///
+/// Self-reports are operational telemetry, not memories: an operator wants the
+/// last day of cycles for a soak/health read, nobody wants them forever. Pre-fix
+/// they were `Tier::Mid` with no explicit expiry, so `effective_expires_at`
+/// stamped `created_at + 7d` — GC-eligible in principle, but a
+/// `curator --daemon`-only host runs no GC loop at all, so on one fleet node
+/// they had accumulated to 24,930 rows (97% of the store). #1466 was the SAME
+/// leak in the SAME namespace (2,905 of 2,921 leaked rows); this is its
+/// recurrence. The fix is three-part and this const is one leg: a SHORT TTL
+/// here, the [`crate::models::LifecycleState::Operational`] hide so the rows
+/// are never recalled or embedded, and a GC loop in the curator daemon so the
+/// TTL is actually enforced on a curator-only host.
+pub const SELF_REPORT_TTL_SECS: i64 = 24 * crate::SECS_PER_HOUR;
+
 /// LLM surface the autonomy passes use. Implemented for `OllamaClient`
 /// in prod and stubbed in tests. The `auto_tag` and `detect_contradiction`
 /// methods are here for completeness — the autonomy passes themselves
@@ -976,8 +995,10 @@ pub fn persist_self_report(
         valid_from: None,
         valid_until: None,
         id: uuid::Uuid::new_v4().to_string(),
-        tier: Tier::Mid,
-        namespace: format!("{CURATOR_NAMESPACE}/reports"),
+        // #3345 — SHORT tier + an explicit 24h expiry: operational telemetry
+        // with a bounded horizon, not a durable memory.
+        tier: Tier::Short,
+        namespace: CURATOR_REPORTS_NAMESPACE.to_string(),
         title: format!("curator cycle @ {ts}"),
         content: serde_json::to_string_pretty(&body)?,
         tags: vec!["_curator".to_string(), "_report".to_string()],
@@ -988,7 +1009,11 @@ pub fn persist_self_report(
         created_at: ts.clone(),
         updated_at: ts,
         last_accessed_at: None,
-        expires_at: None,
+        // #3345 — explicit short expiry, rendered in the ONE canonical
+        // fixed-UTC form every write funnel stamps (#2418).
+        expires_at: Some(crate::validate::render_canonical_utc(
+            now + chrono::Duration::seconds(SELF_REPORT_TTL_SECS),
+        )),
         // #2110 — curator self-report rows are substrate-authored (direct
         // `db::insert`); record the substrate why_trace.
         metadata: serde_json::json!({
@@ -1006,7 +1031,13 @@ pub fn persist_self_report(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
-        lifecycle_state: crate::models::LifecycleState::Open,
+        // #3345 — system-only OPERATIONAL: structurally hidden from every
+        // ordinary read/egress lane by the fail-CLOSED
+        // `lifecycle_visible_clause` allow-list, and therefore never selected
+        // by the embedding backfill either (the selectors now carry the same
+        // clause). The row is still STORED so `ai-memory list --lifecycle
+        // operational` can audit the cycle history.
+        lifecycle_state: crate::models::LifecycleState::Operational,
     };
     db::insert(conn, &mem)?;
     Ok(())
@@ -1948,6 +1979,17 @@ mod tests {
         assert!(!log.is_empty(), "rollback log should be populated");
     }
 
+    /// v1.0.0 #3345 — the self-report is STORED but is no longer a
+    /// recall-visible memory.
+    ///
+    /// Pre-#3345 this test asserted `db::list(Some("_curator/reports"))` returned
+    /// the row — i.e. it pinned the defect: every sweep added an ordinary,
+    /// recall-visible, backfill-embeddable memory, which on one node reached
+    /// 24,930 rows (97% of the store) and 24,801 paid embedding calls. The
+    /// report is now written `LifecycleState::Operational`, so the fail-CLOSED
+    /// `lifecycle_visible_clause` allow-list that `db::list` carries hides it,
+    /// and the operator reads it through `db::list_operational_reports`
+    /// (`ai-memory curator --reports`) instead.
     #[test]
     fn self_report_written_to_reports_namespace() {
         let (_tmp, conn) = setup_conn();
@@ -1961,9 +2003,11 @@ mod tests {
             ..AutonomyPassReport::default()
         };
         persist_self_report(&conn, 1234, &pass, 3, 0, 0, 0).unwrap();
-        let reports = db::list(
+
+        // The ordinary read lane must NOT see it.
+        let recall_visible = db::list(
             &conn,
-            Some("_curator/reports"),
+            Some(CURATOR_REPORTS_NAMESPACE),
             None,
             10,
             0,
@@ -1975,8 +2019,24 @@ mod tests {
             None, // #1834 valid_at (no as-of)
         )
         .unwrap();
+        assert!(
+            recall_visible.is_empty(),
+            "a self-report must not be a recall-visible memory, got {} row(s)",
+            recall_visible.len()
+        );
+
+        // …but it IS stored, reachable through the operator read path, with
+        // its body intact and a bounded TTL.
+        let reports = db::list_operational_reports(&conn, CURATOR_REPORTS_NAMESPACE, 10).unwrap();
         assert_eq!(reports.len(), 1);
-        assert!(reports[0].content.contains("memories_consolidated"));
+        assert!(reports[0].2.contains("memories_consolidated"));
+        let row = db::get_any(&conn, &reports[0].0).unwrap().unwrap();
+        assert_eq!(row.tier, Tier::Short);
+        assert_eq!(
+            row.lifecycle_state,
+            crate::models::LifecycleState::Operational
+        );
+        assert!(row.expires_at.is_some(), "self-reports must carry a TTL");
     }
 
     #[test]

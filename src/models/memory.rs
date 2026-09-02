@@ -386,6 +386,30 @@ pub enum LifecycleState {
     /// `lifecycle_state` in `metadata.contamination.prior_lifecycle_state` so a
     /// future `swarm_rewind` can restore the exact prior state.
     Contaminated,
+    /// v1.0.0 #3345 — system-only OPERATIONAL record: substrate telemetry the
+    /// daemon writes about ITSELF (the curator's per-sweep self-report), not a
+    /// memory any agent asked for. The row is STORED (an operator can still
+    /// audit the cycle history) but is structurally hidden from every ordinary
+    /// read/egress lane by the fail-CLOSED [`lifecycle_visible_clause`]
+    /// allow-list, and — because that same clause now gates the embedding
+    /// backfill selectors — it is never spent an embedding on.
+    ///
+    /// **Why a lifecycle state rather than a namespace rule.** The `_`-prefix
+    /// convention is not a visibility boundary: `_inbox/<agent>` rows are
+    /// deliberately recallable by their recipient (the `target_agent_id`
+    /// carve-out in `crate::visibility`), so excluding `_`-prefixed namespaces
+    /// from recall would break inbox delivery. Marking the ROW, through the one
+    /// already-audited visibility SSOT, hides exactly the rows that should be
+    /// hidden — on both backends, at zero new SQL sites and with no new column.
+    ///
+    /// Set ONLY by the substrate self-report writer
+    /// ([`crate::autonomy::persist_self_report`]) and the #3345 backlog stamp;
+    /// ABSENT from [`Self::can_transition_to`] and REJECTED by
+    /// [`crate::validate::validate_lifecycle_state`] as caller input. Rows
+    /// carry a short TTL and are reaped by the ordinary GC sweep, so this state
+    /// bounds growth rather than accumulating it (see #1466, the prior leak of
+    /// this exact namespace).
+    Operational,
 }
 
 impl LifecycleState {
@@ -401,6 +425,7 @@ impl LifecycleState {
             Self::Tombstoned => "tombstoned",
             Self::Quarantined => "quarantined",
             Self::Contaminated => "contaminated",
+            Self::Operational => "operational",
         }
     }
 
@@ -418,6 +443,7 @@ impl LifecycleState {
             "tombstoned" => Some(Self::Tombstoned),
             "quarantined" => Some(Self::Quarantined),
             "contaminated" => Some(Self::Contaminated),
+            "operational" => Some(Self::Operational),
             _ => None,
         }
     }
@@ -435,6 +461,7 @@ impl LifecycleState {
             Self::Tombstoned,
             Self::Quarantined,
             Self::Contaminated,
+            Self::Operational,
         ]
     }
 
@@ -452,6 +479,7 @@ impl LifecycleState {
                 | Self::Tombstoned
                 | Self::Quarantined
                 | Self::Contaminated
+                | Self::Operational
         )
     }
 
@@ -465,7 +493,7 @@ impl LifecycleState {
     pub fn is_system_only(self) -> bool {
         matches!(
             self,
-            Self::Tombstoned | Self::Quarantined | Self::Contaminated
+            Self::Tombstoned | Self::Quarantined | Self::Contaminated | Self::Operational
         )
     }
 
@@ -3007,6 +3035,7 @@ mod tests {
                 LifecycleState::Tombstoned,
                 LifecycleState::Quarantined,
                 LifecycleState::Contaminated,
+                LifecycleState::Operational,
             ]
         );
     }
@@ -3058,6 +3087,8 @@ mod tests {
         assert!(!LifecycleState::Quarantined.is_recall_visible());
         // v1.0.0 #3324 — the contamination taint is hidden (fail-closed).
         assert!(!LifecycleState::Contaminated.is_recall_visible());
+        // v1.0.0 #3345 — substrate self-report telemetry is hidden.
+        assert!(!LifecycleState::Operational.is_recall_visible());
         // Every allow-list member is non-system-only, and vice-versa.
         for st in LifecycleState::all() {
             assert_eq!(st.is_recall_visible(), !st.is_system_only());

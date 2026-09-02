@@ -1212,11 +1212,14 @@ pub fn validate_kind(kind: Option<&str>) -> Result<()> {
 pub fn validate_lifecycle_state(state: Option<&str>) -> Result<()> {
     let Some(s) = state else { return Ok(()) };
     match crate::models::LifecycleState::from_str(s) {
-        // v1.0.0 R19/A3 (#1948) — `Tombstoned` / `Quarantined` are
-        // SYSTEM-ONLY: they parse (so a newer DB round-trips them on an
-        // older read) but a CALLER may never set them via a write. Rejecting
-        // them here blocks self-tombstone / self-quarantine at the write
-        // boundary (they are also absent from `can_transition_to`).
+        // v1.0.0 R19/A3 (#1948) — the SYSTEM-ONLY states (`Tombstoned`,
+        // `Quarantined`, `Contaminated` #3324, `Operational` #3345) parse (so a
+        // newer DB round-trips them on an older read) but a CALLER may never
+        // set them via a write. Rejecting them here blocks self-tombstone /
+        // self-quarantine / self-hiding at the write boundary (they are also
+        // absent from `can_transition_to`). The predicate is
+        // `LifecycleState::is_system_only`, so a new system-only state is
+        // refused here the moment it joins that set — never re-enumerated.
         Some(st) if st.is_system_only() => {
             let allowed = crate::models::LifecycleState::all()
                 .iter()

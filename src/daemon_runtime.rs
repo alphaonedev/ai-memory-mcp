@@ -8630,6 +8630,12 @@ pub async fn run_curator_daemon_with_primitives(
     // #1749 — Pillar-2.5 consolidation gate, resolved by the caller (which has
     // the `AppConfig` this daemon body lacks). Default-false at every caller.
     compaction_enabled: bool,
+    // v1.0.0 #3345 — archive-before-delete disposition for the TTL sweep the
+    // curator daemon loop now runs, resolved by the caller for the same reason
+    // `compaction_enabled` is (this body has no `AppConfig`). Threaded rather
+    // than defaulted so an operator who set `[storage].archive_on_gc = false`
+    // still gets hard-delete here instead of a silent retain.
+    archive_on_gc: bool,
     llm: Option<Arc<crate::llm::OllamaClient>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
@@ -8643,6 +8649,7 @@ pub async fn run_curator_daemon_with_primitives(
             enabled: compaction_enabled,
             ..Default::default()
         },
+        archive_on_gc,
     };
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));

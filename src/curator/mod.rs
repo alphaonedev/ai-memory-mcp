@@ -180,6 +180,26 @@ pub struct CuratorConfig {
     /// `enabled = false` per ROADMAP §7.5 (opt-in due to Ollama dep).
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// v1.0.0 #3345 — archive-before-delete disposition for the TTL sweep the
+    /// daemon loop now runs (`[storage].archive_on_gc`, default `true`).
+    ///
+    /// NOT a curator config key: `#[serde(skip)]` keeps it out of the config
+    /// file and the serialised report, because the operator already sets it
+    /// once under `[storage]`. It is in-process plumbing only, resolved by the
+    /// caller that HAS the `AppConfig` — the same shape #1749 used for
+    /// `compaction_enabled`. Threading it (rather than defaulting to `true`
+    /// here) matters: an operator who set `archive_on_gc = false` wants
+    /// hard-delete, and silently archiving instead would retain rows they
+    /// asked to be erased.
+    #[serde(skip, default = "default_archive_on_gc")]
+    pub archive_on_gc: bool,
+}
+
+/// v1.0.0 #3345 — `[storage].archive_on_gc`'s own default (`true`), so a
+/// `CuratorConfig` built without the resolver still takes the REVERSIBLE
+/// option. Mirrors `AppConfig::effective_archive_on_gc`.
+fn default_archive_on_gc() -> bool {
+    true
 }
 
 impl Default for CuratorConfig {
@@ -191,6 +211,7 @@ impl Default for CuratorConfig {
             include_namespaces: Vec::new(),
             exclude_namespaces: Vec::new(),
             compaction: CompactionConfig::default(),
+            archive_on_gc: default_archive_on_gc(),
         }
     }
 }
@@ -1043,6 +1064,30 @@ pub fn run_daemon(
         active_keypair.is_some()
     );
 
+    // v1.0.0 #3345 — one-shot, chunked, idempotent stamp of the legacy
+    // `_curator/reports` backlog. Self-terminating: once drained it costs a
+    // single indexed EXISTS probe, and this runs ONCE per daemon start, not
+    // per cycle. Best-effort — a failure here must never stop the curator.
+    match Connection::open(&db_path) {
+        Ok(conn) => {
+            let fallback = crate::validate::render_canonical_utc(
+                chrono::Utc::now()
+                    + chrono::Duration::seconds(crate::autonomy::SELF_REPORT_TTL_SECS),
+            );
+            if let Err(e) = crate::storage::stamp_operational_backlog(
+                &conn,
+                crate::autonomy::CURATOR_REPORTS_NAMESPACE,
+                &fallback,
+            ) {
+                tracing::warn!("#3345: self-report backlog stamp skipped: {e}");
+            }
+        }
+        Err(e) => tracing::warn!(
+            "#3345: self-report backlog stamp skipped (open {}): {e}",
+            db_path.display()
+        ),
+    }
+
     while !shutdown.load(Ordering::Relaxed) {
         match Connection::open(&db_path) {
             Ok(conn) => {
@@ -1084,6 +1129,28 @@ pub fn run_daemon(
                             report.dry_run
                         ),
                         Err(e) => tracing::error!("curator cycle errored: {e}"),
+                    }
+                    // v1.0.0 #3345 — reap expired rows on THIS host.
+                    //
+                    // `spawn_gc_loop_*` is pushed only from `bootstrap_serve`,
+                    // so a `curator --daemon`-only deployment ran no GC at all:
+                    // its own per-sweep self-reports were TTL-stamped and
+                    // GC-eligible but nothing ever reaped them, which is how one
+                    // node reached 24,930 rows. #1466 was this same leak in this
+                    // same namespace (2,905 of 2,921 rows) — this is its
+                    // recurrence, so the reaper now runs where the writer runs.
+                    //
+                    // `gc_if_needed` (not `gc`) keeps it a bounded indexed
+                    // EXISTS probe when nothing is expired, and `gc` itself is
+                    // chunked, so this adds no unpaced work to the cycle.
+                    // Best-effort: a GC failure degrades the cycle, never ends
+                    // the daemon.
+                    match crate::storage::gc_if_needed(&conn, cfg.archive_on_gc) {
+                        Ok(0) => {}
+                        Ok(reaped) => tracing::info!(
+                            "curator cycle: gc reaped {reaped} expired row(s) (#3345)"
+                        ),
+                        Err(e) => tracing::warn!("curator cycle: gc failed: {e}"),
                     }
                 }
             }
@@ -2197,9 +2264,13 @@ mod tests {
         };
         let _ = run_once(&conn, Some(&llm), &cfg, None).unwrap();
 
-        let reports = db::list(
+        // v1.0.0 #3345 — a sweep must leave NO recall-visible row. Pre-#3345
+        // this asserted `db::list` returned the report, i.e. it pinned the
+        // defect: one ordinary, embeddable memory per sweep, which reached
+        // 24,930 rows / 24,801 paid embeddings on one node (#1466 recurrence).
+        let recall_visible = db::list(
             &conn,
-            Some("_curator/reports"),
+            Some(crate::autonomy::CURATOR_REPORTS_NAMESPACE),
             None,
             10,
             0,
@@ -2211,8 +2282,18 @@ mod tests {
             None, // #1834 valid_at (no as-of)
         )
         .unwrap();
+        assert!(
+            recall_visible.is_empty(),
+            "a sweep must leave no recall-visible row, got {} row(s)",
+            recall_visible.len()
+        );
+
+        // The report IS written — just to the operator-only ledger view.
+        let reports =
+            db::list_operational_reports(&conn, crate::autonomy::CURATOR_REPORTS_NAMESPACE, 10)
+                .unwrap();
         assert_eq!(reports.len(), 1);
-        assert!(reports[0].content.contains("memories_consolidated"));
+        assert!(reports[0].2.contains("memories_consolidated"));
     }
 
     /// `run_once` skips already-tagged rows on a re-run — covering the

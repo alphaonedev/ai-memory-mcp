@@ -610,6 +610,8 @@ ai-memory restore --from /var/backups/ai-memory --yes
 | `--json` | bool | — | Machine-parseable report. |
 | `--rollback <id>` | string | — | Reverse one rollback-log entry. |
 | `--rollback-last <N>` | usize | — | Reverse the N most recent. |
+| `--reports` | bool | — | v1.0.0 [#3345](https://github.com/alphaonedev/ai-memory-mcp/issues/3345) — print the substrate self-report ledger (one entry per completed cycle, newest first) instead of running a sweep. |
+| `--reports-limit <N>` | i64 | `200` | With `--reports`, how many entries to print. |
 
 ```bash
 # Once with JSON report
@@ -620,7 +622,21 @@ ai-memory curator --daemon --interval-secs 1800
 
 # Reverse the last 5 autonomous actions
 ai-memory curator --rollback-last 5
+
+# Read the per-cycle self-report ledger (#3345)
+ai-memory curator --reports --reports-limit 10000 --json
 ```
+
+**Self-reports are not memories (#3345).** Each cycle records what the curator
+did, but that is substrate telemetry the daemon writes about ITSELF — so since
+v1.0.0 those rows carry `lifecycle_state = operational` and are deliberately
+absent from `list`, recall, stats and the embedding backfill. Before the change
+they were ordinary embedded memories and had reached 24,930 rows on one node
+(97% of the store, 24,801 paid embedding calls); the same namespace had already
+leaked once in [#1466](https://github.com/alphaonedev/ai-memory-mcp/issues/1466).
+They now carry a 24-hour TTL and the `--daemon` loop runs the TTL sweep it
+previously lacked, so use `--reports` (not `list --namespace _curator/reports`)
+to read them, and read within the retention window.
 
 See `docs/RUNBOOK-curator-soak.md` for the week-long soak procedure.
 

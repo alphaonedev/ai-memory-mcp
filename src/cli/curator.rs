@@ -49,6 +49,23 @@ pub struct CuratorArgs {
     /// Print the report as JSON rather than a human-readable summary.
     #[arg(long)]
     pub json: bool,
+    /// v1.0.0 #3345 — print the substrate self-report ledger instead of
+    /// running a sweep: the last N per-cycle reports, newest first.
+    ///
+    /// Self-reports are written `lifecycle_state = operational`, so they are
+    /// structurally absent from `ai-memory list` / recall / stats (they are
+    /// telemetry the daemon writes about ITSELF, and were 97% of one node's
+    /// store — #3345, a recurrence of #1466). This is the operator read path
+    /// that replaces `ai-memory list --namespace _curator/reports` for the
+    /// 168-hour soak procedure in `docs/RUNBOOK-curator-soak.md`.
+    ///
+    /// Local-operator only, like every other `ai-memory` verb: it reads the
+    /// operator's own database file directly, never a served surface.
+    #[arg(long, conflicts_with_all = ["once", "daemon", "rollback", "rollback_last"])]
+    pub reports: bool,
+    /// With `--reports`, how many reports to print (newest first).
+    #[arg(long, default_value_t = 200)]
+    pub reports_limit: i64,
     /// Reverse rollback-log entries instead of running a sweep. Accepts
     /// a specific rollback-memory id, or `--last N` for the most recent.
     /// Mutually exclusive with `--once` and `--daemon`.
@@ -237,6 +254,57 @@ async fn await_shutdown_signal() {
     }
 }
 
+/// v1.0.0 #3345 — `curator --reports`: print the substrate self-report ledger.
+///
+/// Self-reports are `lifecycle_state = operational` and therefore structurally
+/// invisible to `ai-memory list` / recall / stats. This is their operator read
+/// path — the replacement `docs/RUNBOOK-curator-soak.md` uses for its
+/// one-row-per-completed-cycle count over a 168-hour soak.
+///
+/// `--json` emits `{"reports": [{"id", "created_at", "report"}, …], "count": N}`
+/// so the runbook's `jq` step keeps working; the human form prints one line per
+/// cycle. `report` is re-parsed from the stored JSON body when it parses, and
+/// carried as a string when it does not (never silently dropped).
+///
+/// # Errors
+///
+/// Propagates database-open / query failures.
+fn run_reports(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> Result<()> {
+    let conn = db::open(db_path)?;
+    let rows = db::list_operational_reports(
+        &conn,
+        crate::autonomy::CURATOR_REPORTS_NAMESPACE,
+        args.reports_limit,
+    )?;
+    if args.json {
+        let reports: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(id, created_at, content)| {
+                let parsed = serde_json::from_str::<serde_json::Value>(content)
+                    .unwrap_or_else(|_| serde_json::Value::String(content.clone()));
+                serde_json::json!({
+                    "id": id,
+                    // #3345 — the canonical column-name const, never a bare
+                    // literal (pm-v3.1 hardcoded-literal gate).
+                    (crate::models::field_names::CREATED_AT): created_at,
+                    "report": parsed,
+                })
+            })
+            .collect();
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({ "count": reports.len(), "reports": reports })
+        )?;
+    } else {
+        for (id, created_at, content) in &rows {
+            writeln!(out.stdout, "{created_at}  {id}  {content}")?;
+        }
+        writeln!(out.stdout, "{} report(s)", rows.len())?;
+    }
+    Ok(())
+}
+
 /// `curator` handler. Daemon-mode delegates to `daemon_runtime`.
 pub async fn run(
     db_path: &Path,
@@ -256,13 +324,18 @@ pub async fn run(
         return run_rollback(db_path, args, out);
     }
 
+    if args.reports {
+        return run_reports(db_path, args, out);
+    }
+
     if args.reflect {
         return run_reflect(db_path, args, app_config, out).await;
     }
 
     if !args.once && !args.daemon {
         anyhow::bail!(
-            "curator requires --once, --daemon, --reflect, --rollback <id>, or --rollback-last N"
+            "curator requires --once, --daemon, --reflect, --reports, --rollback <id>, \
+             or --rollback-last N"
         );
     }
 
@@ -284,6 +357,9 @@ pub async fn run(
         include_namespaces: args.include_namespaces.clone(),
         exclude_namespaces: args.exclude_namespaces.clone(),
         compaction: curator_compaction_config(app_config),
+        // #3345 — resolved HERE (this is the arm that has the `AppConfig`),
+        // mirroring #1749's `compaction_enabled`.
+        archive_on_gc: app_config.effective_archive_on_gc(),
     };
 
     let feature_tier = app_config.effective_tier(None);
@@ -350,6 +426,9 @@ pub async fn run(
         // #1749 — resolve compaction.enabled here (the daemon body has no
         // AppConfig in scope) and thread it as a primitive.
         app_config.resolve_compaction_enabled(),
+        // #3345 — same shape: the daemon body has no AppConfig, so the TTL
+        // sweep's archive-before-delete disposition is resolved here.
+        app_config.effective_archive_on_gc(),
         llm.map(std::sync::Arc::new),
         shutdown,
     )
@@ -458,6 +537,8 @@ async fn run_store_backed_sweep(
         include_namespaces: args.include_namespaces.clone(),
         exclude_namespaces: args.exclude_namespaces.clone(),
         compaction: curator_compaction_config(app_config),
+        // #3345 — see the sqlite arm above.
+        archive_on_gc: app_config.effective_archive_on_gc(),
     };
     if args.once {
         // Consolidation BEFORE reflection (dedup, then reflect over survivors).
@@ -1349,6 +1430,8 @@ mod tests {
             include_namespaces: Vec::new(),
             exclude_namespaces: Vec::new(),
             json: false,
+            reports: false,
+            reports_limit: 200,
             rollback: None,
             rollback_last: None,
             reflect: false,
