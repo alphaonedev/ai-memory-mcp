@@ -267,14 +267,18 @@ async fn postgres_recall_purity_sal_and_http_entry_paths() {
             )),
             runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
             max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-            enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+            enrolled_agent_keys: std::sync::Arc::new(
+                ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+            ),
             http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
         };
         let router = ai_memory::build_router(
             ai_memory::handlers::ApiKeyState {
                 key: None,
                 mtls_enforced: false,
-                enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+                enrolled_agent_keys: std::sync::Arc::new(
+                    ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+                ),
                 identity_mode: ai_memory::config::HttpIdentityMode::default(),
             },
             app_state,

@@ -1898,8 +1898,21 @@ pub async fn run(
                 ) {
                     // #1927 non-argv store-url channel (env/file); resolved
                     // inside `build_store_handle` (None cli-arg).
+                    // #3418 — honour the verb's own `--store-url` as well as
+                    // the #1927 non-argv channel. The env/file channel remains
+                    // the hygienic path (a URL on argv is world-readable via
+                    // `/proc/<pid>/cmdline`), but a flag that does not exist is
+                    // one an operator cannot discover from `--help`, which is
+                    // why the certified postgres tier looked unenrollable.
+                    let store_url_arg = match &a.action {
+                        Some(
+                            AgentsAction::BindApiKey { store_url, .. }
+                            | AgentsAction::RevokeApiKey { store_url, .. },
+                        ) => store_url.as_deref(),
+                        _ => unreachable!("guarded by the matches! above"),
+                    };
                     let (_backend, store) = build_store_handle(
-                        None,
+                        store_url_arg,
                         &db_path,
                         None,
                         None,
@@ -1912,10 +1925,10 @@ pub async fn run(
                     )
                     .await?;
                     return match &a.action {
-                        Some(AgentsAction::BindApiKey { agent_id, token }) => {
-                            cli::agents::run_bind_api_key(&store, agent_id, token, j).await
-                        }
-                        Some(AgentsAction::RevokeApiKey { agent_id }) => {
+                        Some(AgentsAction::BindApiKey {
+                            agent_id, token, ..
+                        }) => cli::agents::run_bind_api_key(&store, agent_id, token, j).await,
+                        Some(AgentsAction::RevokeApiKey { agent_id, .. }) => {
                             cli::agents::run_revoke_api_key(&store, agent_id, j).await
                         }
                         _ => unreachable!("guarded by the matches! above"),
@@ -6854,18 +6867,25 @@ pub async fn bootstrap_serve(
     // same enrolled set. Pure in-memory afterwards — no per-request DB hit on
     // the hot path (respects the #2032 M3/L2 expensive-verify DoS layering).
     let http_identity_mode = crate::config::http_attested_identity_mode();
-    let enrolled_agent_keys: std::sync::Arc<std::collections::HashMap<String, String>> = {
+    let enrolled_agent_keys: std::sync::Arc<crate::handlers::identity_binding::EnrolledAgentKeys> = {
         #[cfg(feature = "sal")]
         {
             match store_handle.list_agent_api_keys().await {
-                Ok(rows) => std::sync::Arc::new(rows.into_iter().collect()),
+                Ok(rows) => std::sync::Arc::new(
+                    crate::handlers::identity_binding::EnrolledAgentKeys::from_map(
+                        rows.into_iter().collect(),
+                    ),
+                ),
                 Err(e) => {
                     tracing::warn!(
                         target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
                         "#2044: failed to load agent_api_keys ({e}); per-agent-key \
-                         binding is inert this boot"
+                         binding starts inert — the #3418 refresh loop retries, so \
+                         this is a transient degrade rather than a boot-long outage"
                     );
-                    std::sync::Arc::new(std::collections::HashMap::new())
+                    std::sync::Arc::new(
+                        crate::handlers::identity_binding::EnrolledAgentKeys::empty(),
+                    )
                 }
             }
         }
@@ -6873,14 +6893,21 @@ pub async fn bootstrap_serve(
         {
             let guard = db_state.lock().await;
             match crate::db::list_agent_api_keys(&guard.0) {
-                Ok(rows) => std::sync::Arc::new(rows.into_iter().collect()),
+                Ok(rows) => std::sync::Arc::new(
+                    crate::handlers::identity_binding::EnrolledAgentKeys::from_map(
+                        rows.into_iter().collect(),
+                    ),
+                ),
                 Err(e) => {
                     tracing::warn!(
                         target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
                         "#2044: failed to load agent_api_keys ({e}); per-agent-key \
-                         binding is inert this boot"
+                         binding starts inert — the #3418 refresh loop retries, so \
+                         this is a transient degrade rather than a boot-long outage"
                     );
-                    std::sync::Arc::new(std::collections::HashMap::new())
+                    std::sync::Arc::new(
+                        crate::handlers::identity_binding::EnrolledAgentKeys::empty(),
+                    )
                 }
             }
         }
@@ -6902,6 +6929,62 @@ pub async fn bootstrap_serve(
         args.mtls_allowlist.as_deref(),
     )
     .await?;
+
+    // v1.0.0 #3418 — LIVE refresh of the per-agent api-key registry.
+    //
+    // The enrolled set above is a boot snapshot; without this loop an
+    // enrollment needs a daemon restart to be honoured and — the security
+    // half — a REVOKED key keeps authenticating until that restart. The loop
+    // re-reads the CONFIGURED backend (so it works on the certified postgres
+    // tier, not just sqlite) and installs a whole new snapshot; readers see
+    // either the old map or the new one, never a partial one.
+    //
+    // Degrade, never corrupt: a failed read KEEPS the last known good
+    // snapshot and WARNs. Dropping to empty on a transient store blip would
+    // silently disarm the identity gate (`enforce_for_request` is inert on an
+    // empty map), which is the one outcome worse than staleness.
+    //
+    // Detached + interval-paced, so a slow store can never add latency to the
+    // request auth path (the #2032 M3/L2 expensive-verify layering).
+    let agent_key_refresh = crate::handlers::identity_binding::resolve_agent_key_refresh_interval();
+    tracing::info!(
+        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+        "{}",
+        crate::handlers::identity_binding::refresh_posture_note(agent_key_refresh)
+    );
+    if let Some(interval) = agent_key_refresh {
+        let registry = enrolled_agent_keys.clone();
+        #[cfg(feature = "sal")]
+        let refresh_store = store_handle.clone();
+        #[cfg(not(feature = "sal"))]
+        let refresh_db = db_state.clone();
+        task_handles.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // A missed tick must not burst-replay: one refresh per window.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick fires immediately; skip it (we just loaded at boot).
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                // Each backend reads with its own error type; both normalise to
+                // a display string so ONE funnel
+                // (`identity_binding::apply_agent_key_refresh`) owns the
+                // install-or-keep decision for every backend, and the
+                // degrade rule is stated once instead of per adapter.
+                #[cfg(feature = "sal")]
+                let loaded = refresh_store
+                    .list_agent_api_keys()
+                    .await
+                    .map_err(|e| e.to_string());
+                #[cfg(not(feature = "sal"))]
+                let loaded = {
+                    let guard = refresh_db.lock().await;
+                    crate::db::list_agent_api_keys(&guard.0).map_err(|e| e.to_string())
+                };
+                crate::handlers::identity_binding::apply_agent_key_refresh(&registry, loaded);
+            }
+        }));
+    }
 
     // #3155 — an operator who deliberately set
     // `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` with ZERO enrolled
@@ -9588,7 +9671,9 @@ mod tests {
             )),
             runtime: crate::runtime_context::RuntimeContext::global_arc(),
             max_page_size: crate::handlers::MAX_BULK_SIZE,
-            enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+            enrolled_agent_keys: std::sync::Arc::new(
+                crate::handlers::identity_binding::EnrolledAgentKeys::empty(),
+            ),
             http_identity_mode: crate::config::HttpIdentityMode::default(),
         }
     }

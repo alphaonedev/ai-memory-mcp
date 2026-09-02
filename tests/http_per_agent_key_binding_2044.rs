@@ -112,13 +112,16 @@ async fn echo(headers: HeaderMap) -> impl IntoResponse {
     Json(serde_json::json!({ "agent_id": agent }))
 }
 
-fn enrolled(pairs: &[(&str, &str)]) -> Arc<HashMap<String, String>> {
-    Arc::new(
-        pairs
-            .iter()
-            .map(|(tok, agent)| (api_key_sha256_hex(tok), (*agent).to_string()))
-            .collect(),
-    )
+fn enrolled(
+    pairs: &[(&str, &str)],
+) -> Arc<ai_memory::handlers::identity_binding::EnrolledAgentKeys> {
+    // v1.0.0 #3418 — the enrolled set is a LIVE registry, not a bare map; this
+    // helper seeds it the way boot does.
+    let map: HashMap<String, String> = pairs
+        .iter()
+        .map(|(tok, agent)| (api_key_sha256_hex(tok), (*agent).to_string()))
+        .collect();
+    Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::from_map(map))
 }
 
 fn router(auth: ApiKeyState) -> Router {
@@ -261,7 +264,9 @@ fn enforce_for_request_is_inert_when_no_keys_enrolled() {
     // the gate is inert in EVERY mode — advisory stays zero-WARN and enforce
     // does NOT brick a named caller (the #1985 unsatisfiable-default trap).
     use ai_memory::handlers::identity_binding::enforce_for_request;
-    let empty = HashMap::new();
+    // #3418 — the gate now reads the LIVE registry; an empty one is the same
+    // inert posture the boot photograph used to be.
+    let empty = ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty();
     let mut headers = HeaderMap::new();
     headers.insert("x-api-key", "shared-transport".parse().unwrap());
     for mode in [
@@ -281,8 +286,9 @@ fn h1_m1_enforce_refuses_shared_key_named_principal_at_gate() {
     // The gate the memories handlers + require_admin invoke. A shared-key caller
     // (empty/absent per-agent attestation → Claimed) acting as a NAMED principal
     // is refused under enforce; a key-authenticated caller passes.
-    let mut map = HashMap::new();
-    map.insert(api_key_sha256_hex("alice-key"), "alice".to_string());
+    let mut seed = HashMap::new();
+    seed.insert(api_key_sha256_hex("alice-key"), "alice".to_string());
+    let map = ai_memory::handlers::identity_binding::EnrolledAgentKeys::from_map(seed);
 
     let mut headers = HeaderMap::new();
     headers.insert("x-api-key", "shared-transport".parse().unwrap());

@@ -621,7 +621,9 @@ mod cov897_tests {
             )),
             runtime: crate::runtime_context::RuntimeContext::global_arc(),
             max_page_size: crate::handlers::MAX_BULK_SIZE,
-            enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+            enrolled_agent_keys: std::sync::Arc::new(
+                crate::handlers::identity_binding::EnrolledAgentKeys::empty(),
+            ),
             http_identity_mode: crate::config::HttpIdentityMode::default(),
         };
         (app, tmp)

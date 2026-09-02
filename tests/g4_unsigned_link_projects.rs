@@ -332,7 +332,9 @@ async fn g4_unsigned_http_link_projects_into_age() {
         )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
 
@@ -341,7 +343,9 @@ async fn g4_unsigned_http_link_projects_into_age() {
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let shutdown = Arc::new(Notify::new());

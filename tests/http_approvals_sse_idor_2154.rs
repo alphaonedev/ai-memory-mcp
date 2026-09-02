@@ -82,7 +82,9 @@ fn build_router(
     if enroll_alice {
         enrolled.insert(api_key_sha256_hex(ALICE_KEY), "alice".to_string());
     }
-    let enrolled = Arc::new(enrolled);
+    // v1.0.0 #3418 — the enrolled set is a LIVE registry, not a bare map.
+    let enrolled =
+        Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::from_map(enrolled));
 
     let app_state = AppState {
         db,
