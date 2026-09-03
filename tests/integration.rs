@@ -11695,7 +11695,7 @@ async fn http_smoke_matrix_phases_1_3() {
                 "agent_type": "ai:claude-opus-4.7",
                 "capabilities": ["test"]
             }),
-            None,
+            Some("ai:smoke-agent-2"),
         )
         .await;
         assert_eq!(code, "201", "register_agent: {body}");

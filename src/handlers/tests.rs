@@ -9061,6 +9061,7 @@ async fn http_register_agent_happy_path_returns_created() {
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
+                .header(crate::HEADER_AGENT_ID, "alice")
                 .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -9158,6 +9159,7 @@ async fn http_register_agent_duplicate_register_idempotent_preserves_registered_
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
+                .header(crate::HEADER_AGENT_ID, "twice")
                 .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -9170,6 +9172,7 @@ async fn http_register_agent_duplicate_register_idempotent_preserves_registered_
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
+                .header(crate::HEADER_AGENT_ID, "twice")
                 .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -9206,6 +9209,7 @@ async fn http_register_agent_capabilities_array_preserved() {
             axum::http::Request::builder()
                 .uri("/api/v1/agents")
                 .method("POST")
+                .header(crate::HEADER_AGENT_ID, "capper")
                 .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -9228,6 +9232,180 @@ async fn http_register_agent_capabilities_array_preserved() {
     assert!(me.capabilities.contains(&"store".to_string()));
     assert!(me.capabilities.contains(&"recall".to_string()));
     assert!(me.capabilities.contains(&"consolidate".to_string()));
+}
+
+#[tokio::test]
+async fn http_register_agent_cross_registration_refused_3398() {
+    let state = test_state();
+    let mut app_state = test_app_state(state.clone());
+    app_state.admin_agent_ids = Arc::new(Vec::new());
+    let app = Router::new()
+        .route("/api/v1/agents", axum_post(register_agent))
+        .with_state(app_state);
+    let body = serde_json::json!({
+        "agent_id": "ai:victim",
+        "agent_type": "human",
+        "capabilities": ["tampered"]
+    });
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/agents")
+                .method("POST")
+                .header(crate::HEADER_AGENT_ID, "ai:mallory")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let lock = state.lock().await;
+    assert!(db::list_agents(&lock.0).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_register_agent_self_cannot_mutate_profile_3398() {
+    let state = test_state();
+    let mut app_state = test_app_state(state.clone());
+    app_state.admin_agent_ids = Arc::new(Vec::new());
+    let app = Router::new()
+        .route("/api/v1/agents", axum_post(register_agent))
+        .with_state(app_state);
+    let initial = serde_json::json!({
+        "agent_id": "ai:alice",
+        "agent_type": "ai:worker",
+        "capabilities": ["read"]
+    });
+    let mutating = serde_json::json!({
+        "agent_id": "ai:alice",
+        "agent_type": "human",
+        "capabilities": ["admin"]
+    });
+    for (body, expected) in [
+        (initial, StatusCode::CREATED),
+        (mutating, StatusCode::FORBIDDEN),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header(crate::HEADER_AGENT_ID, "ai:alice")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    let lock = state.lock().await;
+    let agents = db::list_agents(&lock.0).unwrap();
+    assert_eq!(agents[0].agent_type, "ai:worker");
+    assert_eq!(agents[0].capabilities, vec!["read".to_string()]);
+}
+
+#[tokio::test]
+async fn http_register_agent_admin_may_manage_another_agent_3398() {
+    let state = test_state();
+    let app = Router::new()
+        .route("/api/v1/agents", axum_post(register_agent))
+        .with_state(test_app_state_with_admin(state.clone(), "ops:admin"));
+    let body = serde_json::json!({
+        "agent_id": "ai:managed",
+        "agent_type": "ai:worker",
+        "capabilities": ["read"]
+    });
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/agents")
+                .method("POST")
+                .header(crate::HEADER_AGENT_ID, "ops:admin")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let lock = state.lock().await;
+    assert_eq!(db::list_agents(&lock.0).unwrap()[0].agent_id, "ai:managed");
+}
+
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn http_register_agent_postgres_branch_enforces_self_or_admin_3398() {
+    let state = test_state();
+    let mut app_state = test_app_state(state);
+    app_state.storage_backend = StorageBackend::Postgres;
+    app_state.admin_agent_ids = Arc::new(vec!["ops:admin".to_string()]);
+    let store = app_state.store.clone();
+    let app = Router::new()
+        .route("/api/v1/agents", axum_post(register_agent))
+        .with_state(app_state);
+
+    for (caller, target, agent_type, capabilities, expected) in [
+        (
+            "ai:self",
+            "ai:self",
+            "ai:worker",
+            vec!["read"],
+            StatusCode::CREATED,
+        ),
+        (
+            "ai:self",
+            "ai:self",
+            "human",
+            vec!["admin"],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "ai:mallory",
+            "ai:victim",
+            "ai:worker",
+            vec!["read"],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "ops:admin",
+            "ai:managed",
+            "ai:worker",
+            vec!["read"],
+            StatusCode::CREATED,
+        ),
+    ] {
+        let body = serde_json::json!({
+            "agent_id": target,
+            "agent_type": agent_type,
+            "capabilities": capabilities,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/agents")
+                    .method("POST")
+                    .header(crate::HEADER_AGENT_ID, caller)
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            expected,
+            "caller={caller} target={target}"
+        );
+    }
+
+    let agents = store.list_agents().await.unwrap();
+    assert!(agents.iter().any(|agent| agent.agent_id == "ai:self"));
+    assert!(agents.iter().any(|agent| agent.agent_id == "ai:managed"));
+    assert!(!agents.iter().any(|agent| agent.agent_id == "ai:victim"));
 }
 
 // ---- list_pending (GET /api/v1/pending) --------------------------------

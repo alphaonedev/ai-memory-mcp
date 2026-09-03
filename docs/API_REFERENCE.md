@@ -1124,6 +1124,12 @@ Equivalent MCP tool: `memory_archive_stats` (`src/mcp/tools/archive.rs`).
 `agent_type` accepts `human`, `system`, or any `ai:<name>` form
 (`ai:claude-opus-4.7`, `ai:gpt-5`, etc.).
 
+The authenticated `X-Agent-Id` caller may register or refresh only its own
+entry. A self-refresh cannot change an existing `agent_type` or
+`capabilities`; those profile changes and registration of another agent
+require a trusted administrator. Refused attempts are audited and do not
+write either storage backend.
+
 ### `GET /api/v1/agents`
 
 **Admin-gated** (#946). Returns `{"agents":[…],"count":N}`.

@@ -190,9 +190,9 @@ async fn agents_round_trip_via_sal() {
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
-    let client = pg_test_client("ai:ext-test");
-
     let agent_id = format!("ext-agent-{}", uuid::Uuid::new_v4());
+    // #3398 — non-admin roster registration is self-service only.
+    let client = pg_test_client(&agent_id);
     let reg = client
         .post(format!("{base}/api/v1/agents"))
         .json(&json!({

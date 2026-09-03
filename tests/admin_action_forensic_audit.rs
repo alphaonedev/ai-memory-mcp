@@ -3,7 +3,7 @@
 
 //! Issue #911 — admin-class action forensic-audit emission regression pin.
 //!
-//! Pre-#911 the two admin-class state-changing handlers
+//! Pre-#911 the two state-changing handlers
 //! `POST /api/v1/agents` (`register_agent`) and `DELETE /api/v1/archive`
 //! (`purge_archive`) landed their state changes WITHOUT emitting a row
 //! to the signed forensic chain. That left SOC2-regulated deployments
@@ -23,7 +23,9 @@
 //!    `/api/v1/agents` lands a `kind=register_agent` row in the chain
 //!    with `actor` matching the authenticated caller, `decision=allow`,
 //!    and `payload.new_agent_id` matching the request body.
-//! 2. `purge_archive_emits_forensic_audit_entry` — DELETE to
+//! 2. `cross_registration_refusal_emits_deny_without_writing` — a non-admin
+//!    attempt to register another agent is denied and audited.
+//! 3. `purge_archive_emits_forensic_audit_entry` — DELETE to
 //!    `/api/v1/archive?older_than_days=0` lands a `kind=archive_purge`
 //!    row with `payload.older_than_days = 0`, even when the query
 //!    yields zero rows.
@@ -182,7 +184,10 @@ async fn register_agent_emits_forensic_audit_entry() {
 
     let (router, _f) = build_router_fixture();
     let new_agent_id = "ai:new-tenant-001";
-    let caller = "operator-alice";
+    // #3398 — non-admin registration is self-service only. Use the same
+    // authenticated principal as the roster id while preserving this test's
+    // original allow-audit assertion.
+    let caller = new_agent_id;
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/agents")
@@ -240,6 +245,49 @@ async fn register_agent_emits_forensic_audit_entry() {
         Some(new_agent_id),
         "payload.new_agent_id must match request body; got row={row}"
     );
+}
+
+#[tokio::test]
+async fn cross_registration_refusal_emits_deny_without_writing() {
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = fresh_dir();
+    forensic::shutdown();
+    forensic::init(dir.path(), None).expect("init forensic sink");
+
+    let (router, _f) = build_router_fixture();
+    let caller = "ai:mallory";
+    let target = "ai:victim";
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/agents")
+        .header("content-type", "application/json")
+        .header("x-agent-id", caller)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "agent_id": target,
+                "agent_type": "human",
+                "capabilities": ["tampered"],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    forensic::shutdown();
+    let rows = collect_kind_rows(dir.path(), "register_agent");
+    assert_eq!(
+        rows.len(),
+        1,
+        "one refusal must emit one decision: {rows:?}"
+    );
+    let row = &rows[0];
+    assert_eq!(row["actor"], caller);
+    assert_eq!(row["decision"], "deny");
+    assert_eq!(row["payload"]["new_agent_id"], target);
+    assert_eq!(row["payload"]["outcome"], "cross_registration_refused");
 }
 
 #[tokio::test]

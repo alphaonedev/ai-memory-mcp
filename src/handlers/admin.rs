@@ -16,7 +16,7 @@ use axum::{
     Json,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use chrono::Utc;
 use serde::Deserialize;
@@ -37,6 +37,58 @@ use super::StorageBackend;
 use super::admin_role::require_admin;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
+
+const REGISTER_AGENT_ENDPOINT: &str = "POST /api/v1/agents";
+
+fn registration_fields_match(
+    existing: &crate::models::AgentRegistration,
+    agent_type: &str,
+    capabilities: &[String],
+) -> bool {
+    existing.agent_type == agent_type
+        && existing.capabilities.len() == capabilities.len()
+        && existing
+            .capabilities
+            .iter()
+            .all(|capability| capabilities.contains(capability))
+}
+
+fn registration_refused(caller: &str, target: &str, outcome: &'static str) -> Response {
+    crate::governance::audit::record_decision(
+        caller,
+        "deny",
+        "register_agent",
+        "",
+        json!({
+            "new_agent_id": target,
+            "outcome": outcome,
+        }),
+    );
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": "agent registration not permitted"})),
+    )
+        .into_response()
+}
+
+fn audit_registration_allowed(
+    caller: &str,
+    target: &str,
+    agent_type: &str,
+    capabilities: &[String],
+) {
+    crate::governance::audit::record_decision(
+        caller,
+        "allow",
+        "register_agent",
+        "",
+        json!({
+            "new_agent_id": target,
+            (field_names::AGENT_TYPE): agent_type,
+            (field_names::CAPABILITIES): capabilities,
+        }),
+    );
+}
 
 pub async fn register_agent(
     State(app): State<AppState>,
@@ -70,31 +122,72 @@ pub async fn register_agent(
             .into_response();
     }
 
-    // #911 (security-medium / SOC2, 2026-05-19) — admin action audit.
-    // `register_agent` and `archive_purge` are admin-class state-changing
-    // surfaces whose forensic-chain entry was previously silent. The
-    // caller agent_id is resolved via the X-Agent-Id header (the same
-    // primitive `resolve_http_agent_id` other handlers use); when no
-    // header is provided we record the synthesized `anonymous:req-…`
-    // actor so the chain entry pins the unattested call. Emitted
-    // BEFORE any storage write to preserve the audit trail even if
-    // the storage layer fails downstream.
+    // #3398 — resolve the authenticated caller once. A non-admin may only
+    // register itself; a trusted admin may manage another roster entry.
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
-    crate::governance::audit::record_decision(
+    let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(caller) => caller,
+        Err(error) => {
+            crate::governance::audit::record_decision(
+                crate::identity::sentinels::ANONYMOUS_INVALID,
+                "deny",
+                "register_agent",
+                "",
+                json!({
+                    "new_agent_id": body.agent_id,
+                    "outcome": "agent_id_resolve_failed",
+                    "reason": error.to_string(),
+                }),
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", error)})),
+            )
+                .into_response();
+        }
+    };
+    if let Some(response) = crate::handlers::identity_binding::enforce_for_request(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
         &caller,
-        "allow",
-        "register_agent",
-        "",
-        json!({
-            "new_agent_id": body.agent_id,
-            (field_names::AGENT_TYPE): body.agent_type,
-            (field_names::CAPABILITIES): capabilities,
-        }),
-    );
+        REGISTER_AGENT_ENDPOINT,
+    ) {
+        crate::governance::audit::record_decision(
+            &caller,
+            "deny",
+            "register_agent",
+            "",
+            json!({
+                "new_agent_id": body.agent_id,
+                "outcome": "identity_binding_refused",
+            }),
+        );
+        return response;
+    }
+    let is_admin = crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
+    if caller != body.agent_id && !is_admin {
+        return registration_refused(&caller, &body.agent_id, "cross_registration_refused");
+    }
+
+    // A self-service re-registration is a liveness refresh, not a profile
+    // mutation. Only a trusted admin may change agent_type/capabilities.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) && !is_admin {
+        let agents = match app.store.list_agents().await {
+            Ok(agents) => agents,
+            Err(error) => return store_err_to_response(error),
+        };
+        if agents
+            .iter()
+            .find(|agent| agent.agent_id == body.agent_id)
+            .is_some_and(|agent| !registration_fields_match(agent, &body.agent_type, &capabilities))
+        {
+            return registration_refused(&caller, &body.agent_id, "self_profile_mutation_refused");
+        }
+    }
 
     // v0.7.0 Wave-3 Continuation 3 — postgres-backed daemons route the
     // agent-registration write through `app.store` so the row lands in
@@ -108,6 +201,9 @@ pub async fn register_agent(
     // fed-tracker state).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
+        // #911 / #3398 — only an authorised operation reaches this allow
+        // record, and it is emitted before the storage write.
+        audit_registration_allowed(&caller, &body.agent_id, &body.agent_type, &capabilities);
         // #910 — admin surface (registration / list_agents / stats);
         // bypass the SAL visibility filter so admin endpoints see the
         // full row set regardless of metadata.scope.
@@ -173,6 +269,22 @@ pub async fn register_agent(
     }
 
     let lock = app.db.lock().await;
+    if !is_admin {
+        let agents = match db::list_agents(&lock.0) {
+            Ok(agents) => agents,
+            Err(error) => return crate::handlers::errors::handler_error_500(&error),
+        };
+        if agents
+            .iter()
+            .find(|agent| agent.agent_id == body.agent_id)
+            .is_some_and(|agent| !registration_fields_match(agent, &body.agent_type, &capabilities))
+        {
+            return registration_refused(&caller, &body.agent_id, "self_profile_mutation_refused");
+        }
+    }
+    // #911 / #3398 — only an authorised operation reaches this allow
+    // record, and it is emitted before the storage write.
+    audit_registration_allowed(&caller, &body.agent_id, &body.agent_type, &capabilities);
     let register_result =
         db::register_agent(&lock.0, &body.agent_id, &body.agent_type, &capabilities);
     // Read the persisted `_agents` row back so we can fan it out to peers.
