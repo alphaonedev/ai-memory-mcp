@@ -1097,6 +1097,14 @@ pub fn handle_recall_dto(
     if let Some(v) = valid_at {
         validate::validate_valid_at(v).map_err(|e| e.to_string())?;
     }
+    // v1.0.0 #3366 — since/until are bound as TEXT against created_at; a
+    // non-RFC3339 string silently mis-filters. Refuse, matching valid_at.
+    if let Some(v) = since {
+        validate::validate_rfc3339_timestamp("since", v).map_err(|e| e.to_string())?;
+    }
+    if let Some(v) = until {
+        validate::validate_rfc3339_timestamp("until", v).map_err(|e| e.to_string())?;
+    }
     // #151 visibility
     let as_agent = req.as_agent.as_deref();
     if let Some(a) = as_agent {
@@ -1976,6 +1984,48 @@ mod tests {
         )
         .expect("ok");
         assert!(resp["memories"].is_array());
+    }
+
+    #[test]
+    fn since_garbage_is_refused_3366() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let err = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test", "since": "garbage"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect_err("malformed since must refuse");
+        assert!(err.contains("RFC3339"), "got: {err}");
+    }
+
+    #[test]
+    fn until_not_a_date_is_refused_3366() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let err = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test", "until": "not-a-date"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect_err("malformed until must refuse");
+        assert!(err.contains("RFC3339"), "got: {err}");
     }
 
     // limit huge → saturate
