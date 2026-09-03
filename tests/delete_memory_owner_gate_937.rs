@@ -166,11 +166,22 @@ async fn bob_cannot_delete_alice_memory_937() {
     let tmp = NamedTempFile::new().expect("tempfile");
     let alice_id = seed_memory(tmp.path(), "ai:alice", "delete-gate/test", &json!({}));
     let router = build_router_fixture(tmp.path());
-    let (status, _body) = delete_as(&router, "ai:bob", &alice_id).await;
+    let (status, body) = delete_as(&router, "ai:bob", &alice_id).await;
+    // #3426 / #3339 (2026-09-03) — was FORBIDDEN. Alice's row carries no
+    // `metadata.scope` key, so it is PRIVATE and bob cannot read it; a 403
+    // here confirmed the id EXISTS while `GET` answered 404, making the
+    // write path an existence oracle. The refusal is now the read path's
+    // own answer, which is what the postgres branch already returned (its
+    // handlers read through a visibility-scoped `store.get`). The DENIAL
+    // itself is unchanged — see the row-still-exists assertion below.
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "bob must NOT be able to delete alice's memory"
+        StatusCode::NOT_FOUND,
+        "bob must NOT be able to delete alice's memory, and must not learn it exists; body={body}"
+    );
+    assert!(
+        !body.to_string().contains("ai:alice"),
+        "#3426: the refusal must not name the owning agent; body={body}"
     );
 
     // Confirm row still exists after the rejected delete.

@@ -610,10 +610,22 @@ mod require_caller_owns_memory_tests {
 ///   (update / promote) where the inbox target should NOT be able
 ///   to mutate someone else's row.
 ///
-/// **Wire shape on rejection.** `403 Forbidden` with body
-/// `{"error": "caller does not own this memory", "owner": "<owner>",
-/// "caller": "<caller>"}` — matches the inline-site shape so test
-/// expectations + audit grep patterns remain valid.
+/// **Wire shape on rejection (#3426).** Two leak-resistant refusals,
+/// chosen by whether the caller may READ the row at all:
+/// - not visible to the caller (e.g. another agent's `private` row) →
+///   [`hidden_row_refusal`]: `404` with `{"error": "not found"}`,
+///   byte-identical to the read path's answer, so the write path is no
+///   longer an existence oracle. This matches what the postgres branch
+///   already returned (its handlers read through a visibility-scoped
+///   `store.get`).
+/// - visible but not owned (e.g. a `collective` row) →
+///   [`owner_gate_refusal`]: `403` with
+///   `{"error": "caller does not own this memory", "caller": "<caller>", "id": "<id>"}`.
+///
+/// Neither body names the owning agent id. Pre-#3426 the refusal carried
+/// an `"owner"` field, disclosing WHO holds a row to a caller that is not
+/// entitled to it; the owner is now emitted only to the server-side
+/// `AUTHZ_TRACE_TARGET` log.
 #[must_use]
 pub fn require_caller_owns_memory(
     mem: &Memory,
@@ -639,20 +651,104 @@ pub fn require_caller_owns_memory(
             return None;
         }
     }
+    // #3426 — the owner id stays SERVER-SIDE. Operators keep the full
+    // `caller != owner` attribution in this structured AUTHZ trace line;
+    // the refused caller gets a body that names neither.
     tracing::warn!(
         target: super::AUTHZ_TRACE_TARGET,
-        "ownership-gate 403: caller {caller} != owner {owner} (id={})",
+        "ownership-gate refusal: caller {caller} != owner {owner} (id={})",
         mem.id
     );
-    Some(
-        (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "caller does not own this memory",
-                "owner": owner,
-                "caller": caller,
-            })),
-        )
-            .into_response(),
-    )
+    // #3426 / #3339 — hide-on-write for a row the caller cannot READ.
+    // Pre-fix the sqlite branch answered `403 + owner` for a private row
+    // owned by someone else while `GET` answered `404`, so the write path
+    // was an existence AND identity oracle for rows the caller may not
+    // see. The postgres branch already masked these (its handlers fetch
+    // through a visibility-scoped `store.get`, which yields `NotFound` →
+    // 404), so this converges sqlite ONTO the standing postgres contract
+    // rather than inventing a third behaviour. Denial-preserving: a row
+    // refused before is still refused, only less informatively.
+    if !crate::visibility::is_visible_to_caller(mem, caller) {
+        return Some(hidden_row_refusal());
+    }
+    Some(owner_gate_refusal(
+        crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+        Some(caller),
+        RefusedResource::Memory,
+        &mem.id,
+    ))
+}
+
+/// #3426 — the single leak-resistant wire shape for EVERY cross-owner
+/// authorization refusal on the HTTP surface.
+///
+/// The owning agent id is deliberately **not a parameter**: a refusal
+/// built through this constructor is structurally incapable of naming
+/// the owner, so a future gate cannot reintroduce the disclosure by
+/// copying a neighbouring `json!` literal. The owner belongs in the
+/// server-side `AUTHZ_TRACE_TARGET` warn line at the call site, never
+/// on the wire.
+///
+/// `caller` and `id` are both values the refused caller SUPPLIED, so
+/// echoing them discloses nothing it did not already know. `caller` is
+/// `Option` because the postgres branch reaches this refusal through
+/// `postgres_gate::store_err_to_response`, which maps a bare
+/// [`crate::store::StoreError`] and has no caller principal in scope;
+/// omitting the field is strictly less disclosure, never more.
+///
+/// **Wire shape.** `403 Forbidden` with body
+/// `{"error": "<error>", "caller": "<caller>", "<key>": "<id>"}`, where
+/// `<key>` is [`RefusedResource::wire_key`] and `"caller"` is present
+/// only when known. The `error` string is byte-identical on both
+/// backends: it is the same SSOT const the SAL adapters put in
+/// `StoreError::PermissionDenied.reason`.
+#[must_use]
+pub fn owner_gate_refusal(
+    error: &str,
+    caller: Option<&str>,
+    resource: RefusedResource,
+    id: &str,
+) -> axum::response::Response {
+    let mut body = serde_json::Map::new();
+    body.insert("error".to_string(), json!(error));
+    if let Some(caller) = caller {
+        body.insert("caller".to_string(), json!(caller));
+    }
+    body.insert(resource.wire_key().to_string(), json!(id));
+    (StatusCode::FORBIDDEN, Json(serde_json::Value::Object(body))).into_response()
+}
+
+/// #3426 — which id an [`owner_gate_refusal`] echoes back, as a closed set
+/// rather than a caller-supplied key string (rust-1.98 API-09).
+///
+/// The gate sites differ only in what the refused row is CALLED on the
+/// wire — `id` for a memory the caller addressed directly, `source_id`
+/// for the source row of a graph edge — and a closed enum keeps a future
+/// site from inventing a key (`"owner"` included) by passing a literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefusedResource {
+    /// The memory the caller addressed directly, echoed as `id`.
+    Memory,
+    /// The source row of a link / graph traversal, echoed as `source_id`.
+    SourceMemory,
+}
+
+impl RefusedResource {
+    /// The JSON key this resource's id appears under in a refusal body.
+    #[must_use]
+    pub const fn wire_key(self) -> &'static str {
+        match self {
+            Self::Memory => "id",
+            Self::SourceMemory => "source_id",
+        }
+    }
+}
+
+/// #3426 / #3339 — the hide-on-write refusal for a row the caller is not
+/// entitled to READ, byte-identical to the `404` body the read path and
+/// the postgres branch already return, so a non-owner cannot tell
+/// "exists but not yours" from "does not exist".
+#[must_use]
+pub fn hidden_row_refusal() -> axum::response::Response {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
 }

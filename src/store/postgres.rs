@@ -7553,10 +7553,18 @@ impl PostgresStore {
         if existing_owner == caller || (allow_inbox && inbox_target == caller) {
             return Ok(());
         }
+        // #3426 — the refusal reason is the bare SSOT message; see the
+        // sqlite twin. The owning agent id goes only to the structured
+        // AUTHZ trace, never into the `PermissionDenied` reason that
+        // `store_err_to_response` renders into the 403 body.
+        tracing::warn!(
+            target: crate::handlers::AUTHZ_TRACE_TARGET,
+            "sal owner-gate refusal on {action}: caller {caller} != owner {existing_owner} (id={id})"
+        );
         Err(StoreError::PermissionDenied {
             action: action.to_string(),
             target: id.to_string(),
-            reason: format!("caller {caller:?} does not own memory (owner: {existing_owner:?})"),
+            reason: crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.to_string(),
         })
     }
 

@@ -645,16 +645,16 @@ pub async fn create_link(
             target: super::AUTHZ_TRACE_TARGET,
             "POST /api/v1/links 403: caller {caller} != source owner {source_owner} (source_id={source_id})"
         );
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
-                "owner": source_owner,
-                "caller": caller,
-                "source_id": source_id,
-            })),
-        )
-            .into_response();
+        // #3426 — leak-resistant refusal: the source row's owning agent id
+        // stays in the AUTHZ trace line above and never reaches the refused
+        // caller. Converges the sqlite branch onto the postgres SAL link
+        // gate, which already refused with the bare SSOT message.
+        return crate::handlers::parity::owner_gate_refusal(
+            crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
+            Some(caller.as_str()),
+            crate::handlers::parity::RefusedResource::SourceMemory,
+            &source_id,
+        );
     }
 
     // #1621 — K8 link-quota parity with the MCP path

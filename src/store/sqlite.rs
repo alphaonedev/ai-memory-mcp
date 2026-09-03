@@ -258,15 +258,26 @@ fn assert_caller_owns_for_mutation(
     if crate::visibility::caller_owns_for_mutation(&target, caller, allow_inbox) {
         return Ok(());
     }
-    let owner = target
+    // #3426 — the refusal reason is the bare SSOT message. Pre-fix it
+    // interpolated the ROW OWNER's agent id, which `store_err_to_response`
+    // renders straight into the 403 body (the sanitizer only redacts URLs
+    // and filesystem paths, not principals), so a refused cross-tenant
+    // caller learned WHO holds the row. The owner is emitted only to the
+    // structured AUTHZ trace below. Matches the postgres link gate, which
+    // already refused with the bare const.
+    let recorded_owner = target
         .metadata
         .get(crate::META_KEY_AGENT_ID)
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
+    tracing::warn!(
+        target: crate::handlers::AUTHZ_TRACE_TARGET,
+        "sal owner-gate refusal on {action}: caller {caller} != owner {recorded_owner} (id={id})"
+    );
     Err(StoreError::PermissionDenied {
         action: action.to_string(),
         target: id.to_string(),
-        reason: format!("caller {caller:?} does not own memory (owner: {owner:?})"),
+        reason: crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.to_string(),
     })
 }
 

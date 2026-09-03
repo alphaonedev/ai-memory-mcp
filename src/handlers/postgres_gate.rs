@@ -762,6 +762,30 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         )
             .into_response();
     }
+    // #3426 — the cross-owner memory owner-gate refusal, rendered in the
+    // SAME leak-resistant envelope the sqlite handler branch returns via
+    // `parity::owner_gate_refusal`, so the `error` string a client matches
+    // on is byte-identical whichever backend served the request. Pre-fix
+    // the generic arm below rendered `PermissionDenied`'s `Display`
+    // (`"caller lacks permission for {action} on {target}: {reason}"`)
+    // whose reason NAMED THE ROW OWNER — `sanitize_store_err_message`
+    // redacts URLs and filesystem paths, never principals.
+    //
+    // Anchored on the SSOT const, which is the ONE reason string both SAL
+    // adapters emit for this gate (`assert_caller_owns_for_mutation`), not
+    // on a substring sniff. Any other `PermissionDenied` falls through to
+    // the generic arm, which is leak-free as well now that no refusal
+    // reason interpolates an owner.
+    if let StoreError::PermissionDenied { target, reason, .. } = &e
+        && reason == crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY
+    {
+        return crate::handlers::parity::owner_gate_refusal(
+            crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+            None,
+            crate::handlers::parity::RefusedResource::Memory,
+            target,
+        );
+    }
     let (status, msg) = match &e {
         StoreError::NotFound { .. } => (StatusCode::NOT_FOUND, "not found".to_string()),
         StoreError::Conflict { .. } => (

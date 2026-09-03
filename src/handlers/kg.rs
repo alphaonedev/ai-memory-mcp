@@ -705,16 +705,14 @@ pub async fn kg_timeline(
             "GET /api/v1/kg/timeline 403: caller {caller} != owner {owner} (source_id={})",
             p.source_id
         );
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
-                "owner": owner,
-                "caller": caller,
-                "source_id": p.source_id,
-            })),
-        )
-            .into_response();
+        // #3426 — leak-resistant refusal: the owning agent id stays in the
+        // AUTHZ trace line above and never reaches the refused caller.
+        return crate::handlers::parity::owner_gate_refusal(
+            crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
+            Some(caller.as_str()),
+            crate::handlers::parity::RefusedResource::SourceMemory,
+            &p.source_id,
+        );
     }
 
     // v0.7.0 ARCH-2 FX-C2-batch5 (2026-05-27): postgres dispatches via
@@ -995,16 +993,14 @@ pub async fn kg_invalidate(
             "POST /api/v1/kg/invalidate 403: caller {caller} != owner {owner} (source_id={})",
             body.source_id
         );
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
-                "owner": owner,
-                "caller": caller,
-                "source_id": body.source_id,
-            })),
-        )
-            .into_response();
+        // #3426 — leak-resistant refusal: the owning agent id stays in the
+        // AUTHZ trace line above and never reaches the refused caller.
+        return crate::handlers::parity::owner_gate_refusal(
+            crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
+            Some(caller.as_str()),
+            crate::handlers::parity::RefusedResource::SourceMemory,
+            &body.source_id,
+        );
     }
 
     // v0.7.0 SAL-routing batch-4 (FX-C2) — postgres dispatches via the
