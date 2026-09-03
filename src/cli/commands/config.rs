@@ -152,10 +152,19 @@ fn check_toml(file: Option<&Path>, out: &mut CliOutput) -> Result<i32> {
             let _ = writeln!(out.stderr, "OK: {} is valid TOML", path.display());
             Ok(0)
         }
-        Err(_) => {
-            // Do not interpolate the toml error: it can echo the
-            // offending line, which may carry `api_key`.
-            let _ = writeln!(out.stderr, "ERROR: {} is not valid TOML", path.display());
+        Err(e) => {
+            // #3197 refused to interpolate the toml error at all, because
+            // its `Display` echoes the offending line (which may carry
+            // `api_key`). #3432 keeps that guarantee and restores the
+            // position: the shared funnel drops the echoed source block and
+            // screens what is left, so the operator gets "line 3, column 11"
+            // instead of an unlocatable "not valid TOML".
+            let _ = writeln!(
+                out.stderr,
+                "ERROR: {} is not valid TOML: {}",
+                path.display(),
+                crate::config_redact::redact_parse_error(&e)
+            );
             Ok(3)
         }
     }
@@ -197,11 +206,17 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
     let original_value: toml::Value = match toml::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
+            // #3432 — the `toml` Display renders the OFFENDING SOURCE LINE
+            // under a gutter, so interpolating it raw echoes whatever the
+            // operator wrote on that line (typically an `api_key`). This is
+            // the same leak `config check` (#3197) declined to take; route
+            // it through the shared funnel, which keeps the position and
+            // drops the echoed source.
             let _ = writeln!(
                 out.stderr,
                 "ERROR: {} is not valid TOML: {}",
                 path.display(),
-                e
+                crate::config_redact::redact_parse_error(&e)
             );
             return Ok(3);
         }
@@ -239,16 +254,34 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
     }
 
     let migrated_table = build_migrated_table(&original_table);
+    // #3432 — the display copy the redaction funnel renders. Kept separate
+    // from `migrated_value`/`migrated_text` so the bytes written to disk
+    // can never be the masked ones.
+    let migrated_table_for_display = migrated_table.clone();
     let migrated_value = toml::Value::Table(migrated_table);
     let migrated_text = toml::to_string_pretty(&migrated_value).unwrap_or_else(|_| String::new());
 
     if dry_run {
+        // #3432 — print the REDACTED rendering, never `migrated_text`.
+        // `migrated_text` is the byte-exact thing a real `migrate` writes
+        // to disk and it carries every inline credential in the source
+        // config verbatim (`[reranker] api_key`, the legacy top-level
+        // `api_key`, `[hooks.subscription] hmac_secret`, …). Printing it
+        // was the exact leak `config check` (#3197) was added to prevent —
+        // one verb hardened while its sibling echoed the same file.
+        //
+        // The redaction is DISPLAY-ONLY: `migrated_text` above is
+        // untouched, so the write path below still persists the real
+        // secrets. A masked value written back would be silent credential
+        // destruction.
+        let redacted_text = crate::config_redact::render_redacted_toml(&migrated_table_for_display);
         let _ = writeln!(
             out.stderr,
-            "--- DRY RUN — {} would be rewritten as: ---",
-            path.display()
+            "--- DRY RUN — {} would be rewritten as (secret values masked as `{}`): ---",
+            path.display(),
+            crate::config_redact::CONFIG_REDACTION_MASK,
         );
-        let _ = writeln!(out.stderr, "{migrated_text}");
+        let _ = writeln!(out.stderr, "{redacted_text}");
         let _ = writeln!(out.stderr, "--- end dry run ---");
         if also_clean_claude_json {
             let _ = writeln!(
@@ -281,7 +314,8 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
                  This usually means a legacy field in {} holds a value of the wrong \
                  type; fix it and re-run.",
                 path.display(),
-                e,
+                // #3432 — same source-echo hazard as the parse arm above.
+                crate::config_redact::redact_parse_error(&e),
                 path.display()
             );
             return Ok(3);
@@ -629,6 +663,285 @@ mod tests {
             }
         }
         (code, String::from_utf8(stderr).unwrap())
+    }
+
+    // -----------------------------------------------------------------
+    // #3432 — no config-printing verb may echo a secret value
+    //
+    // `config check` (#3197) was hardened so a secret-bearing config could
+    // not reach container logs; `config migrate --dry-run` then printed the
+    // whole resolved table, and both migrate parse arms interpolated the
+    // `toml` Display, which renders the offending SOURCE LINE. These tests
+    // pin BOTH directions: no secret VALUE on either stream, and the
+    // output still useful (non-secret values, key names and the `_env` /
+    // `_file` pointers survive) — plus the data-integrity half, that the
+    // redaction is display-only and the durable file keeps the real secret.
+    // -----------------------------------------------------------------
+
+    const S_LEGACY_TOP: &str = "legacy-top-level-secret-must-not-leak-3432";
+    const S_RERANKER: &str = "reranker-secret-must-not-leak-3432";
+    const S_LLM: &str = "llm-secret-must-not-leak-3432";
+    const S_EMBEDDINGS: &str = "embeddings-secret-must-not-leak-3432";
+    const S_HMAC: &str = "hmac-secret-must-not-leak-3432";
+    /// #3432 amendment 2 — a NUMERIC secret. Deliberately not
+    /// credential-shaped, so only the message-body masking can stop it.
+    const S_WRONG_TYPED: &str = "987654321321";
+
+    /// Legacy (v1 flat-field) layout carrying every inline-secret shape,
+    /// including the two (`[llm]` / `[embeddings]` `api_key`) the daemon's
+    /// secret-handling validator refuses. Used for the dry-run and the
+    /// REFUSED arms.
+    fn legacy_body_maximal() -> String {
+        format!(
+            "tier = \"smart\"\n\
+             llm_model = \"gemma\"\n\
+             ollama_url = \"http://localhost:11434\"\n\
+             api_key = \"{S_LEGACY_TOP}\"\n\
+             \n[reranker]\nenabled = true\napi_key = \"{S_RERANKER}\"\n\
+             \n[llm]\nbackend = \"xai\"\napi_key = \"{S_LLM}\"\n\
+             \n[embeddings]\nbackend = \"xai\"\napi_key = \"{S_EMBEDDINGS}\"\n\
+             \n[hooks.subscription]\nhmac_secret = \"{S_HMAC}\"\n"
+        )
+    }
+
+    /// Legacy layout whose inline secrets all live in sections the
+    /// validator does not refuse, so a real (non-dry-run) migrate succeeds
+    /// and writes.
+    fn legacy_body_migratable() -> String {
+        format!(
+            "tier = \"smart\"\n\
+             llm_model = \"gemma\"\n\
+             ollama_url = \"http://localhost:11434\"\n\
+             api_key = \"{S_LEGACY_TOP}\"\n\
+             \n[reranker]\nenabled = true\napi_key = \"{S_RERANKER}\"\n\
+             \n[hooks.subscription]\nhmac_secret = \"{S_HMAC}\"\n"
+        )
+    }
+
+    /// A numeric secret in a string-typed field. The migrated text parses as
+    /// TOML but FAILS `toml::from_str::<AppConfig>`, and serde's
+    /// `invalid type: integer \`…\`, expected a string` embeds the VALUE in
+    /// the message BODY — outside any gutter, and not vendor-shaped, so
+    /// neither the gutter filter nor the value-shape screen catches it.
+    /// #3432 amendment 2.
+    fn legacy_body_wrong_typed_secret() -> String {
+        format!(
+            "tier = \"smart\"\n\
+             llm_model = \"gemma\"\n\
+             \n[hooks.subscription]\nhmac_secret = {S_WRONG_TYPED}\n"
+        )
+    }
+
+    /// v2 sectioned layout that still carries ONE legacy field (a partially
+    /// migrated file — the realistic shape an operator runs `migrate`
+    /// against). A pure v2 file is a no-op that prints nothing, so it has
+    /// no print path to test.
+    fn v2_body_partial() -> String {
+        format!(
+            "schema_version = 2\n\
+             tier = \"smart\"\n\
+             default_namespace = \"proj\"\n\
+             api_key = \"{S_LEGACY_TOP}\"\n\
+             \n[llm]\nbackend = \"xai\"\napi_key_env = \"XAI_API_KEY\"\n\
+             \n[reranker]\nenabled = true\napi_key = \"{S_RERANKER}\"\n\
+             \n[hooks.subscription]\nhmac_secret = \"{S_HMAC}\"\n"
+        )
+    }
+
+    /// #3432 — like [`run_migrate_with_home`] but also returns stdout and
+    /// the on-disk config AFTER the run, so a test can assert both that no
+    /// secret reached a stream and that the durable file still holds the
+    /// real secret (the redaction is display-only).
+    fn run_migrate_capture(config_body: &str, dry_run: bool) -> (i32, String, String, String) {
+        let _g = env_lock();
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join(".config/ai-memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        std::fs::write(&cfg_path, config_body).unwrap();
+        let prev_home = std::env::var("HOME").ok();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        // SAFETY: serialised via `env_lock()`; restored before the guard
+        // drops, exactly as `run_migrate_with_home` does.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
+        }
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Migrate {
+                    dry_run,
+                    also_clean_claude_json: false,
+                },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        let on_disk = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        (
+            code,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+            on_disk,
+        )
+    }
+
+    /// DENIED path, table-driven: across both layouts and both modes (and
+    /// the validator-refused arm), no secret VALUE may appear on stdout or
+    /// stderr.
+    #[test]
+    fn migrate_never_prints_a_secret_value_3432() {
+        let secrets = [
+            S_LEGACY_TOP,
+            S_RERANKER,
+            S_LLM,
+            S_EMBEDDINGS,
+            S_HMAC,
+            S_WRONG_TYPED,
+        ];
+        let cases: [(&str, String, bool, i32); 7] = [
+            ("legacy/maximal", legacy_body_maximal(), true, 1),
+            // The migrated file carries an inline `[llm].api_key`, so the
+            // daemon's secret-handling validator refuses the write. The
+            // refusal message must not carry the secret either.
+            ("legacy/maximal", legacy_body_maximal(), false, 3),
+            ("legacy/migratable", legacy_body_migratable(), true, 1),
+            ("legacy/migratable", legacy_body_migratable(), false, 0),
+            ("v2/partial", v2_body_partial(), true, 1),
+            ("v2/partial", v2_body_partial(), false, 0),
+            // #3432 amendment 2 — the round-trip arm. The migrated text is
+            // valid TOML but does not deserialize into `AppConfig`, so
+            // `migrate` refuses (exit 3) and reports serde's error, which
+            // embeds the offending VALUE in the message BODY.
+            (
+                "legacy/wrong-typed-secret",
+                legacy_body_wrong_typed_secret(),
+                false,
+                3,
+            ),
+        ];
+        for (layout, body, dry_run, expected_code) in cases {
+            let (code, stdout, stderr, on_disk) = run_migrate_capture(&body, dry_run);
+            assert_eq!(
+                code, expected_code,
+                "{layout} dry_run={dry_run}: unexpected exit\nstderr: {stderr}"
+            );
+            for secret in secrets {
+                if !body.contains(secret) {
+                    continue;
+                }
+                assert!(
+                    !stdout.contains(secret),
+                    "{layout} dry_run={dry_run}: {secret} leaked on STDOUT:\n{stdout}"
+                );
+                assert!(
+                    !stderr.contains(secret),
+                    "{layout} dry_run={dry_run}: {secret} leaked on STDERR:\n{stderr}"
+                );
+            }
+            // Data integrity: the redaction is DISPLAY-ONLY. Whatever ends
+            // up on disk must still hold the real credentials — a masked
+            // value written back would be silent credential destruction.
+            if code == 0 {
+                for secret in secrets {
+                    if body.contains(secret) {
+                        assert!(
+                            on_disk.contains(secret),
+                            "{layout}: migrate MASKED {secret} in the written file — \
+                             redaction must never touch the durable artifact\n{on_disk}"
+                        );
+                    }
+                }
+            } else {
+                assert_eq!(
+                    on_disk, body,
+                    "{layout} dry_run={dry_run}: a non-success run must leave the \
+                     original config byte-identical"
+                );
+            }
+        }
+    }
+
+    /// ALLOWED path: the dry-run is still worth running — the structure,
+    /// the non-secret values, the secret field NAMES and the `_env`
+    /// pointer all survive, with the mask standing in for the values.
+    #[test]
+    fn migrate_dry_run_stays_useful_after_redaction_3432() {
+        let (code, _stdout, stderr, _on_disk) = run_migrate_capture(&v2_body_partial(), true);
+        assert_eq!(code, 1);
+        for expected in [
+            "tier = \"smart\"",
+            "[reranker]",
+            "enabled = true",
+            // The pointer an operator migrates TO must stay readable.
+            "api_key_env = \"XAI_API_KEY\"",
+            // The legacy flat field really did move into [storage].
+            "default_namespace",
+            // The masked fields are still named, so the mapping is visible.
+            "api_key",
+            "hmac_secret",
+            crate::config_redact::CONFIG_REDACTION_MASK,
+        ] {
+            assert!(
+                stderr.contains(expected),
+                "dry-run lost {expected}; a redactor nobody can use gets bypassed:\n{stderr}"
+            );
+        }
+    }
+
+    /// DENIED path, parse arm: the `toml` Display renders the offending
+    /// SOURCE LINE, so a malformed secret line must not be echoed back —
+    /// the same guarantee `config check` (#3197) makes.
+    #[test]
+    fn migrate_parse_error_does_not_echo_the_offending_line_3432() {
+        let body = format!("api_key = \"{S_LEGACY_TOP}\"unclosed\n");
+        let (code, stdout, stderr, on_disk) = run_migrate_capture(&body, true);
+        assert_eq!(code, 3, "stderr: {stderr}");
+        assert!(!stdout.contains(S_LEGACY_TOP), "leaked on stdout: {stdout}");
+        assert!(!stderr.contains(S_LEGACY_TOP), "leaked on stderr: {stderr}");
+        assert!(stderr.contains("not valid TOML"), "{stderr}");
+        assert_eq!(on_disk, body, "a parse failure must write nothing");
+    }
+
+    /// `config check`'s #3197 guarantee is preserved AND its diagnostics
+    /// improved: the position survives, the value does not.
+    #[test]
+    fn check_reports_the_position_without_the_value_3432() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-3432.toml");
+        std::fs::write(&path, format!("api_key = \"{S_LEGACY_TOP}\"unclosed\n")).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Check {
+                    file: Some(path.clone()),
+                },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        assert_eq!(code, 3);
+        let err = String::from_utf8(stderr).unwrap();
+        assert!(!err.contains(S_LEGACY_TOP), "leaked: {err}");
+        assert!(err.contains("not valid TOML"), "{err}");
+        assert!(
+            err.contains("line"),
+            "the position must survive so the operator can fix it: {err}"
+        );
+        assert!(String::from_utf8(stdout).unwrap().is_empty());
     }
 
     #[test]
