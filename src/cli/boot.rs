@@ -226,6 +226,13 @@ fn fetch_boot_memories(
         None,
         None, // #1834 valid_at (no as-of)
     )?;
+    // v1.0.0 #3348 — `ai-memory boot` had NO visibility filter at all: on a
+    // shared store it listed other agents' `_messages/*` inbox mail and the
+    // `_agents` registry as boot context. Routed through the visibility SSOT,
+    // which withholds substrate namespaces unless the request names one and
+    // applies the canonical owner/inbox predicate when an identity resolves.
+    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    let primary = filter_boot_visible(primary, vis_caller.as_deref(), Some(namespace));
     if !primary.is_empty() {
         return Ok((primary, namespace.to_string()));
     }
@@ -245,7 +252,22 @@ fn fetch_boot_memories(
         None,
         None, // #1834 valid_at (no as-of)
     )?;
+    // Stage 2 is UNSCOPED by construction (the global fallback), so no
+    // substrate row is eligible here at all.
+    let fallback = filter_boot_visible(fallback, vis_caller.as_deref(), None);
     Ok((fallback, String::new()))
+}
+
+/// v1.0.0 #3348 — the one place `boot` applies the visibility SSOT, so the two
+/// stages cannot drift apart.
+fn filter_boot_visible(
+    mems: Vec<models::Memory>,
+    caller: Option<&str>,
+    requested_namespace: Option<&str>,
+) -> Vec<models::Memory> {
+    mems.into_iter()
+        .filter(|m| crate::visibility::is_readable_on_query(m, caller, requested_namespace))
+        .collect()
 }
 
 /// Cumulative character → approximate-tokens budget clamp over clustered
@@ -1052,6 +1074,62 @@ fn emit_toon(out: &mut CliOutput<'_>, mems: &[ClusteredMemory], redact_titles: b
 mod tests {
     use super::*;
     use crate::cli::test_utils::{TestEnv, seed_memory};
+
+    // ---- #3348 — substrate namespaces on the `ai-memory boot` funnel -----
+    //
+    // `boot` had NO visibility filter at all: on a shared store it listed
+    // other agents' `_messages/*` inbox mail and the `_agents` registry as
+    // boot context. Both assertions below fail against the pre-#3348 code.
+
+    #[test]
+    fn boot_fetch_withholds_substrate_rows_3348() {
+        let env = TestEnv::fresh();
+        seed_memory(&env.db_path, "proj", "own", "ordinary context");
+        seed_memory(&env.db_path, "_messages/ai:carol", "mail", "a2a traffic");
+        seed_memory(&env.db_path, "_agents", "registry", "registry row");
+
+        let conn = crate::db::open(&env.db_path).expect("open");
+        // Stage 1 names an ordinary namespace; stage 2 (the global fallback)
+        // is unscoped by construction. Neither may serve substrate rows.
+        let (primary, _) = fetch_boot_memories(&conn, "proj", 50).expect("fetch");
+        let namespaces: Vec<&str> = primary.iter().map(|m| m.namespace.as_str()).collect();
+        assert!(
+            namespaces.contains(&"proj"),
+            "#3348 must not hide ordinary boot context; got {namespaces:?}"
+        );
+
+        // Force the stage-2 global fallback by asking for an empty namespace.
+        let (fallback, used) = fetch_boot_memories(&conn, "no-such-ns-3348", 50).expect("fetch");
+        assert!(used.is_empty(), "precondition: the global fallback ran");
+        let fallback_ns: Vec<&str> = fallback.iter().map(|m| m.namespace.as_str()).collect();
+        for ns in &fallback_ns {
+            assert!(
+                !ns.starts_with("_messages/") && *ns != "_agents",
+                "#3348: the UNSCOPED boot fallback must not serve substrate \
+                 bookkeeping as context; got {fallback_ns:?}"
+            );
+        }
+    }
+
+    /// Naming the namespace is the opt-in — stage 1 with an explicit inbox
+    /// namespace still reaches it (subject to the owner/inbox predicate).
+    #[test]
+    fn boot_fetch_honours_an_explicit_inbox_namespace_3348() {
+        let env = TestEnv::fresh();
+        seed_memory(&env.db_path, "_messages/ai:carol", "mail", "a2a traffic");
+        let conn = crate::db::open(&env.db_path).expect("open");
+        let (rows, used) = fetch_boot_memories(&conn, "_messages/ai:carol", 50).expect("fetch");
+        assert_eq!(
+            used, "_messages/ai:carol",
+            "precondition: stage 1 matched the named namespace"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "#3348: the fix withholds substrate rows from UNSCOPED reads; it does \
+             not make them unreachable by name"
+        );
+    }
 
     fn default_args() -> BootArgs {
         BootArgs {

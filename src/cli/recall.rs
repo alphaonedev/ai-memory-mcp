@@ -576,13 +576,24 @@ pub(crate) fn run_with_embedder(
     // pass). `None` (no stable `AI_MEMORY_AGENT_ID`) keeps the single-tenant
     // trust-all read posture. Fail-closed: this can only HIDE rows, never
     // widen the returned set.
-    let results: Vec<(crate::models::Memory, f64)> = match vis_caller.as_deref() {
-        None => results,
-        Some(c) => results
-            .into_iter()
-            .filter(|(m, _)| crate::visibility::is_visible_to_caller(m, c))
-            .collect(),
-    };
+    //
+    // v1.0.0 #3348 — routed through `crate::visibility::is_readable_on_query`.
+    // The `None => results` arm above was the reported disclosure: on a shared
+    // store an unscoped `ai-memory recall` returned `_messages/<other-agent>`
+    // inbox mail and `_agents` registry rows as ordinary memories, ranked above
+    // the operator's own. Substrate namespaces now require the request to NAME
+    // them (`--namespace _messages/ai:me`, which is what `ai-memory inbox`
+    // does); every ordinary namespace keeps the historical posture exactly.
+    let results: Vec<(crate::models::Memory, f64)> = results
+        .into_iter()
+        .filter(|(m, _)| {
+            crate::visibility::is_readable_on_query(
+                m,
+                vis_caller.as_deref(),
+                args.namespace.as_deref(),
+            )
+        })
+        .collect();
 
     // v0.9.0 P0-1 (#1869, T8) — CLI ledger append: with recall pure by
     // default, a recall that writes no `recall_observations` row

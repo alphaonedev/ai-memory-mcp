@@ -150,13 +150,14 @@ fn handle_list_capped(
         valid_at,
     )
     .map_err(|e| e.to_string())?;
-    let results = match caller {
-        Some(c) => results
-            .into_iter()
-            .filter(|m| crate::visibility::is_visible_to_caller(m, c))
-            .collect::<Vec<_>>(),
-        None => results,
-    };
+    // v1.0.0 #3348 — the visibility SSOT, not a caller-conditional filter. See
+    // `crate::visibility::is_readable_on_query`: `caller == None` used to mean
+    // "return every row", which surfaced other agents' `_messages/*` inbox mail
+    // and the `_agents` registry on an unscoped list over a shared store.
+    let results = results
+        .into_iter()
+        .filter(|m| crate::visibility::is_readable_on_query(m, caller, namespace))
+        .collect::<Vec<_>>();
     Ok(json!({"memories": results, "count": results.len()}))
 }
 
@@ -211,6 +212,85 @@ mod tests {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
         }
+    }
+
+    // ---- #3348 — substrate namespaces on the `memory_list` funnel ---------
+    //
+    // Reported: an unscoped read on a shared store returned other agents'
+    // `_messages/*` inbox mail and `_agents` registry rows as ordinary
+    // memories. Pre-#3348 `caller == None` skipped the filter entirely.
+
+    #[test]
+    fn unscoped_list_withholds_substrate_rows_3348() {
+        let conn = fresh_conn();
+        db::insert(&conn, &make_mem("own", "ns", MTier::Mid, "ai:alice")).expect("ins");
+        db::insert(
+            &conn,
+            &make_mem("mail", "_messages/ai:carol", MTier::Mid, "ai:bob"),
+        )
+        .expect("ins mail");
+        let mut registry = make_mem("registry", "_agents", MTier::Mid, "ai:bob");
+        registry.metadata[crate::META_KEY_SCOPE] =
+            json!(crate::models::namespace::MemoryScope::Collective.as_str());
+        db::insert(&conn, &registry).expect("ins registry");
+
+        for caller in [None, Some("ai:alice")] {
+            let out = handle_list(&conn, &json!({"limit": 50}), caller).expect("ok");
+            let namespaces: Vec<&str> = out["memories"]
+                .as_array()
+                .expect("memories array")
+                .iter()
+                .filter_map(|m| m["namespace"].as_str())
+                .collect();
+            assert!(
+                namespaces.contains(&"ns"),
+                "#3348 must not hide ordinary rows (caller={caller:?}); got {namespaces:?}"
+            );
+            assert!(
+                !namespaces.iter().any(|n| n.starts_with("_messages/")),
+                "#3348: an unscoped list must not return another agent's inbox \
+                 mail (caller={caller:?}); got {namespaces:?}"
+            );
+            assert!(
+                !namespaces.contains(&"_agents"),
+                "#3348: a BROAD scope must not make the agent registry an ambient \
+                 list result (caller={caller:?}); got {namespaces:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn naming_the_inbox_namespace_still_lists_your_own_mail_3348() {
+        let conn = fresh_conn();
+        let mut mail = make_mem("mail", "_messages/ai:carol", MTier::Mid, "ai:bob");
+        mail.metadata[crate::META_KEY_TARGET_AGENT_ID] = json!("ai:carol");
+        db::insert(&conn, &mail).expect("ins mail");
+
+        let mine = handle_list(
+            &conn,
+            &json!({"namespace": "_messages/ai:carol", "limit": 50}),
+            Some("ai:carol"),
+        )
+        .expect("ok");
+        assert_eq!(
+            mine["count"].as_u64(),
+            Some(1),
+            "#3348: naming the namespace is the opt-in — the recipient must still \
+             reach their OWN inbox"
+        );
+
+        let theirs = handle_list(
+            &conn,
+            &json!({"namespace": "_messages/ai:carol", "limit": 50}),
+            Some("ai:dave"),
+        )
+        .expect("ok");
+        assert_eq!(
+            theirs["count"].as_u64(),
+            Some(0),
+            "#3348: the opt-in lifts the AMBIENT exclusion only — the owner/inbox \
+             predicate still confines the row to its addressee"
+        );
     }
 
     // A. happy path — empty db

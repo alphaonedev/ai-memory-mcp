@@ -7,7 +7,6 @@ use crate::boot_cluster::{BOOT_PAYLOAD_LIST_CAP, cluster_payload, overfetch_limi
 use crate::db;
 use crate::llm::OllamaClient;
 use crate::validate;
-use crate::visibility::is_visible_to_caller;
 use serde_json::{Value, json};
 
 /// The `mode` / read-surface tag for `memory_session_start` — SSOT for the
@@ -22,10 +21,18 @@ pub(crate) const SESSION_START_MODE: &str = "session_start";
 /// `resolve_http_agent_id(body.agent_id, header_agent_id)`; MCP: via
 /// `ctx.mcp_client` captured from `initialize.clientInfo.name`). When
 /// `Some`, the post-list result set is filtered through
-/// [`is_visible_to_caller`] so `scope=private` rows owned by OTHER
-/// agents are dropped before the caller sees them — closing the
+/// [`crate::visibility::is_visible_to_caller`] so `scope=private` rows owned by
+/// OTHER agents are dropped before the caller sees them — closing the
 /// v0.7.0 #1420 cross-agent visibility leak (6-agent review
-/// reviewer 3 finding F3.3, memory `cd28329a`). When `None`, the
+/// reviewer 3 finding F3.3, memory `cd28329a`).
+///
+/// v1.0.0 #3348 — the whole post-filter now runs through
+/// [`crate::visibility::is_readable_on_query`] whether or not a caller
+/// resolved. `None` USED TO SKIP the filter entirely — the sentence below
+/// describes that superseded posture. Substrate namespaces (`_messages/*`,
+/// `_agents`, …) are withheld from an unscoped start regardless of caller;
+/// ordinary namespaces keep the historical `None` = trust-all contract.
+/// Superseded: when `None`, the
 /// post-filter is skipped — this preserves the single-tenant MCP
 /// stdio posture where no caller identity was captured at handshake;
 /// HTTP always synthesizes a caller (`anonymous:req-…`) so the HTTP
@@ -92,14 +99,17 @@ pub(crate) fn handle_session_start(
     // (HTTP `list_memories`). When caller is None (single-tenant MCP
     // stdio with no handshake identity), the filter is skipped —
     // legacy behavior preserved for that narrow case.
-    let visible = if let Some(caller_id) = caller {
-        raw_results
-            .into_iter()
-            .filter(|m| is_visible_to_caller(m, caller_id))
-            .collect::<Vec<_>>()
-    } else {
-        raw_results
-    };
+    //
+    // v1.0.0 #3348 — the skipped-when-`None` arm was the reported disclosure:
+    // an MCP `session_start` with no handshake identity returned other agents'
+    // `_messages/*` inbox mail and `_agents` registry rows as boot memories on a
+    // shared store. Routed through the visibility SSOT, which withholds
+    // substrate namespaces from an unscoped start regardless of caller, and
+    // leaves every ordinary namespace on the historical posture.
+    let visible = raw_results
+        .into_iter()
+        .filter(|m| crate::visibility::is_readable_on_query(m, caller, namespace))
+        .collect::<Vec<_>>();
 
     // #3352 — cluster near-duplicates AFTER the visibility filter so a
     // private-other-agent row can never become the representative the
@@ -286,6 +296,115 @@ mod tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).expect("insert")
+    }
+
+    // ---- #3348 — substrate namespaces on the `memory_session_start` funnel --
+    //
+    // Reported: `boot` listed inbox-derived rows. Pre-#3348 a `None` caller
+    // (single-tenant MCP stdio, no handshake identity) skipped the visibility
+    // post-filter entirely, so every other agent's `_messages/*` mail was
+    // eligible boot context on a shared store.
+
+    fn seed_in(conn: &rusqlite::Connection, ns: &str, title: &str, metadata: serde_json::Value) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("body for {title}"),
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata,
+            memory_kind: crate::models::MemoryKind::Observation,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            version: 1,
+            ..Memory::default()
+        };
+        db::insert(conn, &mem).expect("insert");
+    }
+
+    fn boot_namespaces(resp: &serde_json::Value) -> Vec<String> {
+        resp["memories"]
+            .as_array()
+            .expect("memories array")
+            .iter()
+            .filter_map(|m| m["namespace"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn unscoped_session_start_withholds_substrate_rows_3348() {
+        let (conn, _tmp) = fresh_db();
+        seed_in(&conn, "proj", "own", json!({"agent_id": "ai:alice"}));
+        seed_in(
+            &conn,
+            "_messages/ai:carol",
+            "mail",
+            json!({"agent_id": "ai:bob", "target_agent_id": "ai:carol"}),
+        );
+        seed_in(
+            &conn,
+            "_agents",
+            "registry",
+            json!({"agent_id": "ai:bob", "scope": "collective"}),
+        );
+
+        for caller in [None, Some("ai:alice")] {
+            let resp =
+                handle_session_start(&conn, &json!({"limit": 50}), None, caller).expect("ok");
+            let namespaces = boot_namespaces(&resp);
+            assert!(
+                !namespaces.iter().any(|n| n.starts_with("_messages/")),
+                "#3348: an unscoped session_start must not serve another agent's \
+                 inbox mail as boot context (caller={caller:?}); got {namespaces:?}"
+            );
+            assert!(
+                !namespaces.iter().any(|n| n == "_agents"),
+                "#3348: a BROAD scope must not make the agent registry ambient boot \
+                 context (caller={caller:?}); got {namespaces:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn naming_the_inbox_namespace_still_boots_your_own_mail_3348() {
+        let (conn, _tmp) = fresh_db();
+        seed_in(
+            &conn,
+            "_messages/ai:carol",
+            "mail",
+            json!({"agent_id": "ai:bob", "target_agent_id": "ai:carol"}),
+        );
+        let mine = handle_session_start(
+            &conn,
+            &json!({"namespace": "_messages/ai:carol", "limit": 50}),
+            None,
+            Some("ai:carol"),
+        )
+        .expect("ok");
+        assert_eq!(
+            boot_namespaces(&mine).len(),
+            1,
+            "#3348: naming the namespace is the opt-in — the recipient must still \
+             reach their OWN inbox"
+        );
+
+        let theirs = handle_session_start(
+            &conn,
+            &json!({"namespace": "_messages/ai:carol", "limit": 50}),
+            None,
+            Some("ai:dave"),
+        )
+        .expect("ok");
+        assert!(
+            boot_namespaces(&theirs).is_empty(),
+            "#3348: the opt-in lifts the AMBIENT exclusion only — the owner/inbox \
+             predicate still confines the row to its addressee"
+        );
     }
 
     // Happy path without LLM — returns memories + count, mode tag.
