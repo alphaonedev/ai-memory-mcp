@@ -5820,6 +5820,16 @@ pub struct WakeHubConfig {
     /// and raises its `lagged` marker instead.
     #[serde(default)]
     pub pending_max_ids: Option<usize>,
+    /// v1.0.0 #3468 — path to the DERIVED allowlist cache: the agents
+    /// permitted to join, with their ENROLLED public keys. Public material
+    /// only, 0600 enforced at load, refreshed out of band from ai-memory.
+    ///
+    /// Unset means the hub admits NOBODY. That is the fail-closed default: a
+    /// wake plane with no identity source must refuse, not fall back to
+    /// trusting whoever can reach the socket. `ai-memory wake-hub --posture`
+    /// reports which of the two verifiers a given configuration installs.
+    #[serde(default)]
+    pub allowlist: Option<std::path::PathBuf>,
 }
 
 impl AppConfig {

@@ -49,6 +49,11 @@ pub mod governance_install_defaults;
 pub mod governance_migrate;
 pub mod helpers;
 pub mod identity;
+/// v1.0.0 #3468 — `ai-memory identity delegate --scope a2a-hub`: mints the
+/// scoped, short-lived `a2a-hub/join/v1` delegation a wake-listener presents.
+/// Split from `cli::identity` so the mint path (which handles a private key
+/// and writes a 0600 bundle) is its own auditable file.
+pub mod identity_delegate;
 pub mod install;
 pub mod io;
 pub mod io_writer;

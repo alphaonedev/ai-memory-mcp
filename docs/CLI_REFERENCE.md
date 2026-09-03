@@ -1472,6 +1472,7 @@ ai-memory wake-hub                          # bind and serve until SIGINT/SIGTER
 ai-memory wake-hub --socket /run/x.sock     # explicit socket path
 ai-memory wake-hub --hub-id my-hub          # transcript-bound hub identifier
 ai-memory wake-hub --max-connections 128    # ceiling (clamped by RLIMIT_NOFILE)
+ai-memory wake-hub --allowlist /run/allow.json  # enrolled-key allowlist (#3468)
 ai-memory wake-hub --posture                # print the resolved posture, bind nothing
 ai-memory wake-hub --posture --json         # machine-readable posture
 ```
@@ -1489,15 +1490,39 @@ ai-memory inbox row stays the durable record and the `<=60 s` backstop poll
 stays the guarantee — losing the hub degrades wake **latency** and nothing else.
 It opens no database, on either backend.
 
-**Identity is not wired yet.** The shipped verifier REFUSES every hello until
-the scoped `a2a-hub/join/v1` delegation lands in
-[#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468), and there is
-deliberately **no flag** that substitutes a permissive one — a flag that
-disables identity verification is a flag that eventually gets set in production.
-Running it today therefore binds the socket, asserts its start-up invariants,
-serves counters, and admits nobody; `--posture` reports exactly that. Every
-identity refusal is a single `401 unauthorized` on the wire, so a peer cannot
-distinguish "unknown agent" from "bad signature" by probing.
+**Identity** ([#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468)).
+A hello is admitted only when it presents a scoped `a2a-hub/join/v1`
+delegation — a short-lived certificate minted by the agent's ENROLLED key
+(`ai-memory identity delegate --scope a2a-hub`), naming this hub and the exact
+hello key being presented. Without `--allowlist` the hub admits **nobody**;
+there is deliberately **no flag** that substitutes a permissive verifier, since
+a flag that disables identity verification is a flag that eventually gets set in
+production. Every identity refusal is a single `401 unauthorized` on the wire,
+so a peer cannot distinguish "unknown agent" from "bad signature" from
+"unproven root" by probing; the specific reason goes to the log. `--posture`
+reports which verifier a configuration installs (`deny-all` or
+`delegation/v1`).
+
+### `identity delegate` — mint a scoped hub delegation (v1.0.0, #3468)
+
+```bash
+ai-memory identity delegate --scope a2a-hub                 # 1 h, default hub
+ai-memory identity delegate --scope a2a-hub --ttl-secs 900  # shorter window
+ai-memory identity delegate --scope a2a-hub --hub-id my-hub --out /run/d.json
+```
+
+Generates a **fresh** delegated keypair and signs a short-lived certificate for
+it with the agent's enrolled key, writing a 0600 bundle. The bundle carries the
+DELEGATED private key and **never** the enrolled `.priv` — so a wake-listener
+holding it can be woken as the agent and can do nothing else; if it is
+compromised, the blast radius is "someone can be woken as me until this
+expires", not "someone can write my history".
+
+A public-only key handle cannot delegate. An unrecognised `--scope` is refused
+rather than minted with a name nothing checks. `--ttl-secs` is refused (not
+clamped) outside its bound, because the hub performs no live revocation lookup:
+a delegation's expiry IS its revocation, so an over-long window would be an
+un-revocable credential.
 
 Operator knobs live in the `[wake_hub]` config block (see
 [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md)); a CLI flag beats the config block,

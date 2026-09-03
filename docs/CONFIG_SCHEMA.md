@@ -768,7 +768,25 @@ rate_per_sec = 500             # authenticated frames/s, per connection
 rate_burst = 2000              # fan-out is charged to the SENDER
 pending_max_agents = 1024      # coalesced offline state, bounded
 pending_max_ids = 64           # ids retained per offline agent, then `lagged`
+allowlist = "/run/user/1000/ai-memory/wake-hub-allow.json"   # #3468
 ```
+
+**`allowlist`** (#3468) is the DERIVED cache of enrolled agent keys the hub
+verifies delegations against — agent id, enrolled public key, and #3464's
+`bind_authority`. Public material only; ai-memory remains the source of truth
+and the file is refreshed out of band. It is loaded 0600 (it names every agent
+permitted to join, so it is not public), a duplicate agent id is refused rather
+than resolved by iteration order, and an entry with no stated `bind_authority`
+is treated as `legacy_unproven` — an unstated provenance is not a proven one, so
+it cannot mint a delegation.
+
+**Unset means the hub admits NOBODY.** That is the fail-closed default, not a
+degraded mode: a wake plane with no identity source must refuse rather than
+trust whoever can reach the socket. If the key IS set and the file cannot be
+loaded, the hub REFUSES TO START rather than falling back — reporting
+`delegation/v1` in `--posture` while actually admitting nobody would be worse
+than either posture stated honestly. `ai-memory wake-hub --posture` prints which
+of the two verifiers a given configuration installs.
 
 Precedence per field: **CLI flag > `[wake_hub]` > compiled bound**
 (`src/wake_hub/limits.rs`). Every field is optional, and an unset field falls

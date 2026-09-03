@@ -82,6 +82,37 @@ pub enum IdentityAction {
         #[arg(long = "priv", value_name = "PATH")]
         private: Option<PathBuf>,
     },
+    /// v1.0.0 #3468 — mint a SCOPED `a2a-hub/join/v1` delegation: a
+    /// short-lived certificate, signed by this agent's ENROLLED key,
+    /// authorising ONE freshly-generated key to present a hello at ONE
+    /// named `ai-memory wake-hub` as this agent — and nothing else.
+    ///
+    /// The bundle it writes carries the DELEGATED private key, never the
+    /// enrolled `.priv`, so a compromised wake-listener can be woken as
+    /// this agent but can never write its history. The window is bounded
+    /// because the hub does no live revocation lookup: expiry IS the
+    /// revocation mechanism.
+    Delegate {
+        /// Agent identifier. Defaults to the NHI-hardened id.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Delegation scope. Only `a2a-hub` is minted by this build; an
+        /// unrecognised scope is refused rather than minted with a name
+        /// nothing checks.
+        #[arg(long, default_value = crate::identity::hub_delegation::A2A_HUB_SCOPE)]
+        scope: String,
+        /// The hub this delegation is valid at. A delegation is not
+        /// portable across hubs.
+        #[arg(long, default_value = crate::wake_hub::DEFAULT_HUB_ID)]
+        hub_id: String,
+        /// Lifetime in seconds. Bounded by the delegation maximum.
+        #[arg(long, default_value_t = crate::cli::identity_delegate::DEFAULT_DELEGATION_TTL_SECS)]
+        ttl_secs: i64,
+        /// Where to write the bundle. Defaults to
+        /// `<key-dir>/<agent-id>.a2a-hub.json`. Always written 0600.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
     /// List every keypair stored under the key storage directory.
     /// Private keys are never loaded — `list` is safe to wire into
     /// dashboards and shell autocompletion.
@@ -251,6 +282,25 @@ pub fn run(
             public,
             private,
         } => import(&dir, &agent_id, &public, private.as_deref(), json_out, out),
+        IdentityAction::Delegate {
+            agent_id,
+            scope,
+            hub_id,
+            ttl_secs,
+            out: bundle_path,
+        } => {
+            let id = resolve_id(agent_id.as_deref())?;
+            crate::cli::identity_delegate::run(
+                &dir,
+                &id,
+                &scope,
+                &hub_id,
+                ttl_secs,
+                bundle_path.as_deref(),
+                json_out,
+                out,
+            )
+        }
         IdentityAction::List => list(&dir, json_out, out),
         IdentityAction::ExportPub { agent_id } => export_pub(&dir, &agent_id, json_out, out),
         IdentityAction::EnrollLineage {

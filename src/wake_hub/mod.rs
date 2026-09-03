@@ -77,6 +77,11 @@ use routing::Router;
 
 pub mod codec;
 mod conn;
+/// v1.0.0 #3468 — the scoped `a2a-hub/join/v1` delegation verifier that
+/// replaces [`identity::DenyAllVerifier`] in production. Holds only public
+/// material and performs no live revocation lookup: a short expiry plus an
+/// audit-spine event IS the revocation mechanism.
+pub mod delegation_verifier;
 pub mod frame;
 pub mod identity;
 pub mod limits;
@@ -131,6 +136,10 @@ pub struct HubConfig {
     /// wait `base + rand(0, jitter)` so a hub restart does not produce a
     /// synchronised 256-way handshake blast.
     pub reconnect_jitter_ms: u32,
+    /// Derived allowlist cache of enrolled agent keys (#3468). `None` means no
+    /// allowlist is configured, so the hub admits nobody — the fail-closed
+    /// default, not a degraded mode to be worked around.
+    pub allowlist_path: Option<PathBuf>,
 }
 
 impl HubConfig {
@@ -175,6 +184,7 @@ impl HubConfig {
             pending_max_ids: DEFAULT_PENDING_MAX_IDS,
             reconnect_base_ms: DEFAULT_RECONNECT_BASE_MS,
             reconnect_jitter_ms: DEFAULT_RECONNECT_JITTER_MS,
+            allowlist_path: None,
         }
     }
 }
@@ -304,6 +314,7 @@ mod tests {
             claimed_agent_id: "a",
             pubkey: &[0u8; 32],
             signature: &[0u8; 64],
+            delegation: &[],
             topics: &topics,
             peer: PeerCred {
                 uid: 0,

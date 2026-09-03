@@ -227,6 +227,7 @@ impl Conn {
             claimed_agent_id: &frame.from,
             pubkey: &payload.pubkey,
             signature: &payload.signature,
+            delegation: &payload.delegation,
             topics: &payload.topics,
             peer: self.peer,
         };
@@ -470,6 +471,7 @@ impl Conn {
             hub_id: &self.state.cfg.hub_id,
             nonce: &self.nonce,
             agent_id: &agent.agent_id,
+            pubkey: &agent.pubkey,
             signature: &frame.payload,
             peer: self.peer,
         };

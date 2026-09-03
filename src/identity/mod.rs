@@ -137,6 +137,12 @@ pub mod lineage;
 // and no schema migration this stage. The v1 map-based `sign` path is
 // untouched and never cross-verifies with v2 (distinct domain tag).
 pub mod cbor_array;
+/// v1.0.0 #3468 (EPIC #3466) — the scoped `a2a-hub/join/v1` delegation: a
+/// short-lived certificate, minted by an agent's ENROLLED key, authorising ONE
+/// delegated key to present a hello at ONE named wake-hub as that agent, and
+/// nothing else. A separate domain from the sub-key cert on purpose: that tag
+/// already confers `agent_attested` write authority and has no scope element.
+pub mod hub_delegation;
 // v1.0.0 crypto-core stage 2 (#1942/#1941, epic #1940) — the SubkeyCert
 // instance-certification layer (spec §2.3) and the algorithm-suite
 // binding + anti-downgrade verifier rule (spec §2.4). Pure functions +

@@ -202,6 +202,9 @@ pub struct Client {
     hub_id: String,
     pub nonce: [u8; 32],
     pub agent_id: String,
+    /// The scoped delegation this client presents in its `hello` (#3468).
+    /// Empty by default, which every production verifier refuses.
+    pub delegation: Bytes,
 }
 
 impl Client {
@@ -217,6 +220,7 @@ impl Client {
             hub_id: hub_id.to_string(),
             nonce: [0u8; 32],
             agent_id: String::new(),
+            delegation: Bytes::new(),
         };
         let challenge = c
             .read_frame()
@@ -263,6 +267,7 @@ impl Client {
         HelloPayload {
             pubkey: key.verifying_key().to_bytes(),
             signature: sig.to_bytes(),
+            delegation: self.delegation.clone(),
             topics: topics.to_vec(),
         }
         .encode()

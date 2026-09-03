@@ -204,15 +204,14 @@ async fn accept_loop(
         };
         state.metrics.accepted();
 
-        let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
-            state.metrics.denied_ceiling();
-            tracing::warn!("wake-hub: at the connection ceiling; refusing a peer");
-            reject(stream, ErrorCode::Overflow, "hub at its connection ceiling").await;
-            continue;
-        };
-
-        // The SAME reader the start-up probe validated, so what was asserted at
-        // boot is what gates every connection.
+        // ORDER IS THE CONTROL (#3468 carry-over from the #3467 review):
+        // credentials -> authorize -> permit. An unauthorized peer must be
+        // dropped before it can consume a connection permit AND before the hub
+        // writes it a single byte. The previous order acquired the permit
+        // first, so at the ceiling a wrong-uid peer received a `507` — a reply
+        // that tells an unauthorized caller the hub exists and is saturated.
+        // The 0600 socket already prevents this peer from connecting at all;
+        // this is the defense-in-depth layer behind it.
         let cred = match read_peer_cred(stream.as_raw_fd()) {
             Ok(cred) => cred,
             Err(e) => {
@@ -222,7 +221,8 @@ async fn accept_loop(
             }
         };
         if let Err(deny) = state.deps.peer_authorizer.authorize(cred) {
-            // Refused before a single byte is read from the peer.
+            // Dropped in silence: no permit taken, no frame written, nothing
+            // read. The peer learns only that the connection closed.
             state.metrics.denied_peer_cred();
             tracing::warn!(
                 peer_uid = cred.uid,
@@ -230,9 +230,18 @@ async fn accept_loop(
                 reason = deny.label(),
                 "wake-hub: peer DENIED — {deny}"
             );
-            reject(stream, deny.wire_code(), deny.wire_reason()).await;
+            drop(stream);
             continue;
         }
+
+        // Only an AUTHORIZED peer is told the hub is at its ceiling, and only
+        // an authorized peer can occupy a permit.
+        let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
+            state.metrics.denied_ceiling();
+            tracing::warn!("wake-hub: at the connection ceiling; refusing a peer");
+            reject(stream, ErrorCode::Overflow, "hub at its connection ceiling").await;
+            continue;
+        };
 
         let task_state = Arc::clone(state);
         let rx = shutdown_tx.subscribe();

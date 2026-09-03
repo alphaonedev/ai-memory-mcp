@@ -58,6 +58,14 @@
 pub const WRITE_V2_DOMAIN: &str = "ai-memory/write/v2";
 /// Instance sub-key certificate discriminator (spec §2.3; stage-2 carrier).
 pub const SUBKEY_CERT_V1_DOMAIN: &str = "ai-memory/subkey-cert/v1";
+/// Scoped `a2a-hub` join-delegation discriminator (#3468, EPIC #3466).
+///
+/// DELIBERATELY NOT [`SUBKEY_CERT_V1_DOMAIN`]: that tag already means "may mint
+/// `agent_attested` writes" and its record carries no scope element, so a
+/// hub-join credential minted under it would be full write authority held by a
+/// long-running listener process. This tag's record adds an explicit `scope`
+/// element and a bounded lifetime, and cross-verifies with nothing else.
+pub const A2A_HUB_JOIN_V1_DOMAIN: &str = "ai-memory/a2a-hub-join/v1";
 /// Signed peer-head attestation discriminator (spec §5.2).
 pub const PEER_HEAD_ATTESTATION_V1_DOMAIN: &str = "ai-memory/peer-head-attestation-v1";
 /// Self-contained equivocation-proof discriminator (spec §5.2).
