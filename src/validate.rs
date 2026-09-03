@@ -968,6 +968,22 @@ pub fn validate_source_uri(s: &str) -> Result<()> {
     }
 }
 
+/// v1.0.0 #3366 — validate a caller-supplied RFC3339 timestamp used as a
+/// lexicographic TEXT bound (`since` / `until` / `valid_at` /
+/// `subscription_replay.since`). A non-RFC3339 string would silently
+/// mis-filter (`garbage` → 0 rows, `not-a-date` → all rows, unix-epoch
+/// digits → an arbitrary cutoff) rather than error. Refuse at the entry
+/// surfaces so a malformed bound is a clear `400`/typed error.
+///
+/// # Errors
+/// Returns an error when `value` is not a parseable RFC3339 timestamp.
+pub fn validate_rfc3339_timestamp(field: &str, value: &str) -> Result<()> {
+    if !is_valid_rfc3339(value) {
+        bail!("{field} must be an RFC3339 timestamp (e.g. 2026-01-01T00:00:00Z)");
+    }
+    Ok(())
+}
+
 /// v1.0.0 #1834 — validate a claim-bitemporal AS-OF (`valid_at`) recall/list
 /// query parameter. The value is canonicalized ([`canonicalize_valid_time`])
 /// and then compared LEXICOGRAPHICALLY against the (canonical) stored RFC3339
@@ -990,10 +1006,7 @@ pub fn validate_source_uri(s: &str) -> Result<()> {
 /// # Errors
 /// Returns an error when `valid_at` is not a parseable RFC3339 timestamp.
 pub fn validate_valid_at(valid_at: &str) -> Result<()> {
-    if !is_valid_rfc3339(valid_at) {
-        bail!("valid_at must be an RFC3339 timestamp (e.g. 2026-01-01T00:00:00Z)");
-    }
-    Ok(())
+    validate_rfc3339_timestamp("valid_at", valid_at)
 }
 
 /// v1.0.0 #1834 (pre-ship 3x7 fix) — canonicalize a claim-bitemporal
@@ -1703,6 +1716,21 @@ impl RequestValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc3339_timestamp_bound_refuses_garbage_3366() {
+        // #3366 — since/until/replay-since must not silently become TEXT compares.
+        assert!(validate_rfc3339_timestamp("since", "garbage").is_err());
+        assert!(validate_rfc3339_timestamp("until", "not-a-date").is_err());
+        assert!(validate_rfc3339_timestamp("since", "1725000000").is_err());
+        assert!(validate_rfc3339_timestamp("since", "2026-01-01T00:00:00Z").is_ok());
+        assert!(validate_rfc3339_timestamp("until", "2026-01-01T00:00:00+00:00").is_ok());
+        let err = validate_rfc3339_timestamp("since", "garbage").unwrap_err();
+        assert!(
+            err.to_string().contains("RFC3339"),
+            "error must name RFC3339, got {err}"
+        );
+    }
 
     #[test]
     fn test_valid_title() {

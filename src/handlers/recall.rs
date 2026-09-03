@@ -46,6 +46,29 @@ use super::store_err_to_response;
 /// returned a `(namespace, since, tier, limit)` tuple. Mutating
 /// the DTO in place keeps the (already-marshalled) request shape
 /// authoritative through the rest of the handler.
+/// v1.0.0 #3366 — refuse a non-RFC3339 `since`/`until` at both HTTP
+/// recall entries so a malformed bound is a 400, not a silent TEXT
+/// mis-filter. Shared by GET and POST.
+fn reject_malformed_created_at_bounds(req: &RecallRequest) -> Option<axum::response::Response> {
+    for (field, value) in [
+        ("since", req.since.as_deref()),
+        ("until", req.until.as_deref()),
+    ] {
+        if let Some(v) = value
+            && let Err(e) = validate::validate_rfc3339_timestamp(field, v)
+        {
+            return Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": crate::errors::msg::invalid(field, e)})),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
 fn splice_recall_scope_into(req: &mut RecallRequest, app: &AppState) -> Option<String> {
     let want_splice = req.session_default.unwrap_or(false);
     let scope_opt: Option<&crate::config::RecallScope> = if want_splice {
@@ -135,6 +158,10 @@ pub async fn recall_memories_get(
             Json(json!({"error": crate::errors::msg::invalid("valid_at", e)})),
         )
             .into_response();
+    }
+    // v1.0.0 #3366 — since/until TEXT bounds (same silent-mis-filter class).
+    if let Some(resp) = reject_malformed_created_at_bounds(&req) {
+        return resp;
     }
     // #1579 B4 — negotiate the response format BEFORE doing any work.
     // `json` (default) keeps the legacy envelope; `toon` /
@@ -231,6 +258,10 @@ pub async fn recall_memories_post(
             Json(json!({"error": crate::errors::msg::invalid("valid_at", e)})),
         )
             .into_response();
+    }
+    // v1.0.0 #3366 — since/until TEXT bounds (same silent-mis-filter class).
+    if let Some(resp) = reject_malformed_created_at_bounds(&req) {
+        return resp;
     }
     // #1579 B4 — same format negotiation as the GET path.
     let format = match crate::toon::WireFormat::parse_http(req.format.as_deref()) {

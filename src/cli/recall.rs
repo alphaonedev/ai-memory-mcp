@@ -196,6 +196,13 @@ pub fn run(
     if let Some(ref v) = args.valid_at {
         validate::validate_valid_at(v)?;
     }
+    // v1.0.0 #3366 — --since/--until are TEXT bounds on created_at.
+    if let Some(ref v) = args.since {
+        validate::validate_rfc3339_timestamp("since", v)?;
+    }
+    if let Some(ref v) = args.until {
+        validate::validate_rfc3339_timestamp("until", v)?;
+    }
     let mut conn = db::open(db_path)?;
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
 
