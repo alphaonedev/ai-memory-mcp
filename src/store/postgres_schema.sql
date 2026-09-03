@@ -1508,3 +1508,37 @@ CREATE TABLE IF NOT EXISTS attested_write_ledger (
 );
 CREATE INDEX IF NOT EXISTS idx_attested_write_ledger_seen_at
     ON attested_write_ledger(seen_at);
+
+-- v96 (#3344, v1.0.0) — DURABLE EMBED SKIP LIST. Derived cache of rows that
+-- cannot be embedded under the current key material (undecryptable envelope)
+-- or that exceed the embed byte cap. Boot/backfill skip them without a
+-- re-read / re-WARN; restoring the key changes the fingerprint and the
+-- next scan retries (healing path). Mirrors
+-- migrations/postgres/0053_v96_embed_skip.sql. A standalone table (not an
+-- index on a ladder-added memories column), so bootstrap is safe.
+CREATE TABLE IF NOT EXISTS embed_skip (
+    memory_id        TEXT        NOT NULL PRIMARY KEY,
+    agent_id         TEXT        NOT NULL DEFAULT '',
+    key_fingerprint  TEXT        NOT NULL,
+    reason           TEXT        NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT embed_skip_reason_ck CHECK (reason IN ('undecryptable', 'oversize'))
+);
+CREATE INDEX IF NOT EXISTS idx_embed_skip_fp
+    ON embed_skip(key_fingerprint);
+
+CREATE OR REPLACE FUNCTION trg_embed_skip_clear()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    DELETE FROM embed_skip WHERE memory_id = NEW.id;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS memories_embed_skip_clear ON memories;
+CREATE TRIGGER memories_embed_skip_clear
+AFTER UPDATE OF content, encrypted_envelope, embedding ON memories
+FOR EACH ROW
+EXECUTE FUNCTION trg_embed_skip_clear();

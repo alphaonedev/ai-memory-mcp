@@ -1912,7 +1912,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 95;
+const CURRENT_SCHEMA_VERSION: i32 = 96;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -2101,6 +2101,12 @@ pub struct PostgresStore {
     /// window where a stop engaged by ANOTHER daemon did not reach this
     /// pool's write gate until it reconnected.
     record_stop_refreshed_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// #3344 amendment 2 — per-store amortisation of the `embed_skip`
+    /// stale-marker walk. Behind `Arc` so [`Clone`] of this store shares
+    /// ONE timer (not process-global; not per-clone-fresh). A key
+    /// rotation is honoured within at most
+    /// [`crate::storage::embed_skip::INVALIDATE_MIN_INTERVAL`].
+    embed_skip_amort: std::sync::Arc<crate::storage::embed_skip::EmbedSkipAmortisation>,
 }
 
 /// #1628 — wire-pinned refusal text for legacy rows with no
@@ -2720,6 +2726,9 @@ impl PostgresStore {
                 // immediately re-read; the next re-check fires one TTL later.
                 record_stop_refreshed_ms: std::sync::Arc::new(
                     std::sync::atomic::AtomicU64::new(record_stop_refresh_now_ms()),
+                ),
+                embed_skip_amort: std::sync::Arc::new(
+                    crate::storage::embed_skip::EmbedSkipAmortisation::new(),
                 ),
             };
             // v1.0.0 #2445 — the ladder is skipped under the operator hatch for
@@ -3731,8 +3740,11 @@ impl PostgresStore {
         if current_version < 94 {
             self.migrate_v94().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 95 {
             self.migrate_v95().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v96().await?;
         }
 
         Ok(())
@@ -6744,7 +6756,10 @@ impl PostgresStore {
     /// states, and the fail-closed `lifecycle_visible_clause` allow-list is
     /// shared verbatim by both backends, so `contaminated` is hidden
     /// identically with no schema change). `CREATE INDEX IF NOT EXISTS` is
-    /// idempotent and additive. Tip arm — stamps [`CURRENT_SCHEMA_VERSION`].
+    /// idempotent and additive. Settled arm — stamps the LITERAL 94, NOT
+    /// [`CURRENT_SCHEMA_VERSION`] (now 95): a crash between the v94 and v95
+    /// commits must not strand the node stamped-past-v95 with the v95 arm
+    /// unrun (#3324 crash-consistency lesson).
     async fn migrate_v94(&self) -> StoreResult<()> {
         debug_assert!(
             MIGRATION_V94_LIFECYCLE_STATE_INDEX.contains("idx_memories_lifecycle_state"),
@@ -6762,7 +6777,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("apply v94 lifecycle-state-index ddl", e))?;
 
         // #3419 — settled arm: stamp the LITERAL 94, not CURRENT_SCHEMA_VERSION
-        // (now 95) — crash-consistency: a crash between the v94 and v95 commits
+        // (now 96) — crash-consistency: a crash between the v94 and v95 commits
         // must not strand the node stamped-past-v95 with the v95 arm unrun.
         // (Same lockstep the #3324 comment on `migrate_v93` records.)
         record_schema_version(&mut tx, 94).await?;
@@ -6792,8 +6807,8 @@ impl PostgresStore {
     /// table is bounded by the attested-write RATE and never by history.
     ///
     /// `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS` — additive,
-    /// idempotent, no backfill, no existing row read or rewritten. Tip arm —
-    /// stamps [`CURRENT_SCHEMA_VERSION`].
+    /// idempotent, no backfill, no existing row read or rewritten. Settled
+    /// arm — stamps the literal 95, not [`CURRENT_SCHEMA_VERSION`] (now 96).
     async fn migrate_v95(&self) -> StoreResult<()> {
         debug_assert!(
             MIGRATION_V95_ATTESTED_WRITE_LEDGER.contains("attested_write_ledger"),
@@ -6810,7 +6825,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v95 attested-write-ledger ddl", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        record_schema_version(&mut tx, 95).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v95 migration", e))?;
@@ -6820,6 +6835,42 @@ impl PostgresStore {
             "schema migration v95 applied (#3419: attested_write_ledger — the durable \
              admit-once replay guard for caller-presented Ed25519 write signatures on \
              the direct store surfaces)"
+        );
+        Ok(())
+    }
+
+    /// v1.0.0 #3344 — schema v96: durable `embed_skip` cache so boot and
+    /// the live embedding-backfill worker remember undecryptable / oversize
+    /// rows (keyed by id + encryption-key fingerprint) instead of
+    /// re-reading and re-WARNing them every pass. Additive
+    /// `CREATE TABLE IF NOT EXISTS` + clear trigger; a fresh cluster
+    /// inherits the table from `postgres_schema.sql`. Tip arm — stamps
+    /// [`CURRENT_SCHEMA_VERSION`]. Slots after #3419's settled v95.
+    async fn migrate_v96(&self) -> StoreResult<()> {
+        debug_assert!(
+            crate::storage::embed_skip::MIGRATION_V96_POSTGRES.contains("embed_skip"),
+            "#3344: the v96 DDL doc twin must ship with the binary"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v96 embed-skip ddl tx", e))?;
+
+        sqlx::raw_sql(crate::storage::embed_skip::MIGRATION_V96_POSTGRES)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v96 embed-skip ddl", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v96 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v96 applied (#3344: embed_skip — durable skip \
+             cache for unembeddable rows; restore the key to heal)"
         );
         Ok(())
     }
@@ -22118,6 +22169,9 @@ impl MemoryStore for PostgresStore {
             // "nothing to embed". See SqliteStore::list_unembedded.
             return Ok(Vec::new());
         }
+        crate::storage::embed_skip::postgres::prepare_scan(&self.pool, &self.embed_skip_amort)
+            .await;
+        let not_skipped = crate::storage::embed_skip::SQL_AND_NOT_SKIPPED;
         let cap: i64 = i64::try_from(limit).unwrap_or(LIST_FALLBACK_LIMIT_I64);
         // v1.0.0 #2167 (#2183) — the always-on predicate re-embeds
         // NULL-embedding and NULL-space rows (the [G1]/[G2]-blocked legacy
@@ -22153,10 +22207,10 @@ impl MemoryStore for PostgresStore {
                 "SELECT id, title, content, encrypted_envelope, \
                         metadata::text AS metadata_json \
                    FROM memories \
-                  WHERE embedding IS NULL \
+                  WHERE (embedding IS NULL \
                      OR (embedding IS NOT NULL AND {unattributed}) \
                      OR (embedding IS NOT NULL AND embedding_space IS NOT NULL \
-                         AND embedding_space <> $2) \
+                         AND embedding_space <> $2)){not_skipped} \
                   ORDER BY created_at ASC \
                   LIMIT $1",
                 unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
@@ -22171,8 +22225,8 @@ impl MemoryStore for PostgresStore {
                 "SELECT id, title, content, encrypted_envelope, \
                         metadata::text AS metadata_json \
                    FROM memories \
-                  WHERE embedding IS NULL \
-                     OR (embedding IS NOT NULL AND {unattributed}) \
+                  WHERE (embedding IS NULL \
+                     OR (embedding IS NOT NULL AND {unattributed})){not_skipped} \
                   ORDER BY created_at ASC \
                   LIMIT $1",
                 unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
@@ -22200,10 +22254,34 @@ impl MemoryStore for PostgresStore {
             let metadata_json = r
                 .try_get::<String, _>("metadata_json")
                 .map_err(|e| to_store_err("read unembedded metadata", e))?;
+            let agent_id = crate::storage::embed_skip::agent_id_from_metadata_json(&metadata_json);
             match crate::storage::resolve_embeddable_content(&id, content, envelope, &metadata_json)
             {
-                Some(plaintext) => out.push((id, title, plaintext)),
-                None => decrypt_skipped += 1,
+                Some(plaintext) => {
+                    let doc = crate::embeddings::embedding_document(&title, &plaintext);
+                    if crate::embeddings::oversize_embed_reason(doc.len()).is_some() {
+                        crate::storage::embed_skip::postgres::record_best_effort(
+                            &self.pool,
+                            &id,
+                            &agent_id,
+                            crate::storage::embed_skip::EmbedSkipReason::Oversize,
+                        )
+                        .await;
+                        decrypt_skipped += 1;
+                    } else {
+                        out.push((id, title, plaintext));
+                    }
+                }
+                None => {
+                    crate::storage::embed_skip::postgres::record_best_effort(
+                        &self.pool,
+                        &id,
+                        &agent_id,
+                        crate::storage::embed_skip::EmbedSkipReason::Undecryptable,
+                    )
+                    .await;
+                    decrypt_skipped += 1;
+                }
             }
         }
         // #2317 — the pg scan is LIMIT-from-top (no cursor), so undecryptable

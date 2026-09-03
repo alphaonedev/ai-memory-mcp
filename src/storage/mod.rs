@@ -842,6 +842,7 @@ mod doctor;
 /// #1964 [P1][D14] — recall-completeness index-coverage reconciliation:
 /// reconciles what the FTS5 + ANN recall indexes cover against the
 /// `memories` table so recall can report its coverage honestly.
+pub mod embed_skip;
 pub mod index_coverage;
 /// #1965 [P1] — corpus-lifecycle EXPIRE / EVICT / DISTILL contract: the
 /// spec + scoring layer that names the three bounded-growth transitions and
@@ -18008,15 +18009,35 @@ pub fn get_unembedded_ids_batch(
     conn: &Connection,
     limit: usize,
 ) -> Result<Vec<(String, String, String)>> {
+    // Free-function path has no store instance: a fresh amort walks
+    // this call (correct isolation; the SAL adapter uses
+    // [`get_unembedded_ids_batch_amortised`] for the O(1) tick).
+    let amort = crate::storage::embed_skip::EmbedSkipAmortisation::new();
+    get_unembedded_ids_batch_amortised(conn, limit, &amort)
+}
+
+/// #3344 — SAL-adapter twin of [`get_unembedded_ids_batch`] that
+/// amortises the stale-marker walk on the **store instance** so two
+/// stores in one process cannot share a timer.
+pub fn get_unembedded_ids_batch_amortised(
+    conn: &Connection,
+    limit: usize,
+    amort: &crate::storage::embed_skip::EmbedSkipAmortisation,
+) -> Result<Vec<(String, String, String)>> {
     // #1779 — pull encrypted_envelope + metadata so encrypted rows are
     // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
-    let mut stmt = conn.prepare_cached(
+    // #3344 — drop stale skip markers BEFORE the NOT IN filter so a restored
+    // key is retried this pass, then exclude remembered-unembeddable ids.
+    crate::storage::embed_skip::prepare_scan_sqlite(conn, amort);
+    let sql = format!(
         "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-         WHERE embedding IS NULL LIMIT ?1",
-    )?;
+         WHERE embedding IS NULL{} LIMIT ?1",
+        crate::storage::embed_skip::SQL_AND_NOT_SKIPPED
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
     let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(resolve_embeddable_rows(raw))
+    Ok(resolve_embeddable_rows(conn, raw))
 }
 
 /// #1595 — keyset-paginated variant of [`get_unembedded_ids_batch`].
@@ -18043,24 +18064,49 @@ pub fn get_unembedded_ids_batch_after(
     after_id: Option<&str>,
     limit: usize,
 ) -> Result<EmbeddableScan> {
+    // One-shot callers (CLI pages, tests): a fresh amort walks this call.
+    // The live MCP tick uses [`get_unembedded_ids_batch_after_amortised`].
+    let amort = crate::storage::embed_skip::EmbedSkipAmortisation::new();
+    get_unembedded_ids_batch_after_amortised(conn, after_id, limit, &amort)
+}
+
+/// #3344 — MCP-backfill twin of [`get_unembedded_ids_batch_after`].
+///
+/// Amortises the stale-marker walk on the **caller-owned** timer so two
+/// consecutive ticks are O(1) after the first walk. Keep the un-amortised
+/// free function for one-shot callers.
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn get_unembedded_ids_batch_after_amortised(
+    conn: &Connection,
+    after_id: Option<&str>,
+    limit: usize,
+    amort: &crate::storage::embed_skip::EmbedSkipAmortisation,
+) -> Result<EmbeddableScan> {
     // #1779 — pull encrypted_envelope + metadata so encrypted rows are
     // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
+    crate::storage::embed_skip::prepare_scan_sqlite(conn, amort);
+    let not_skipped = crate::storage::embed_skip::SQL_AND_NOT_SKIPPED;
     let raw = if let Some(after) = after_id {
-        let mut stmt = conn.prepare_cached(
+        let sql = format!(
             "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-             WHERE embedding IS NULL AND id > ?1 ORDER BY id LIMIT ?2",
-        )?;
+             WHERE embedding IS NULL AND id > ?1{not_skipped} ORDER BY id LIMIT ?2"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![after, limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
-        let mut stmt = conn.prepare_cached(
+        let sql = format!(
             "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-             WHERE embedding IS NULL ORDER BY id LIMIT ?1",
-        )?;
+             WHERE embedding IS NULL{not_skipped} ORDER BY id LIMIT ?1"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    Ok(resolve_embeddable_scan(raw))
+    Ok(resolve_embeddable_scan(conn, raw))
 }
 
 /// #1779 — `query_map` row mapper for the embedding-fetch SELECTs that now
@@ -18080,8 +18126,11 @@ fn embeddable_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<Embeddable
 /// #1779 — map raw embedding-fetch rows to `(id, title, content)`, decrypting
 /// encrypted-at-rest rows and SKIPPING (omitting) any whose envelope won't
 /// decrypt. See [`resolve_embeddable_content`].
-fn resolve_embeddable_rows(raw: Vec<EmbeddableRawRow>) -> Vec<(String, String, String)> {
-    resolve_embeddable_scan(raw).rows
+fn resolve_embeddable_rows(
+    conn: &Connection,
+    raw: Vec<EmbeddableRawRow>,
+) -> Vec<(String, String, String)> {
+    resolve_embeddable_scan(conn, raw).rows
 }
 
 /// v1.0.0 #2336 (FBL-24) — one page of an embedding scan, carrying the
@@ -18110,14 +18159,36 @@ pub struct EmbeddableScan {
 
 /// #2336 — resolve a raw fetch into an [`EmbeddableScan`] (rows +
 /// raw-cursor + decrypt-skip count).
-fn resolve_embeddable_scan(raw: Vec<EmbeddableRawRow>) -> EmbeddableScan {
+fn resolve_embeddable_scan(conn: &Connection, raw: Vec<EmbeddableRawRow>) -> EmbeddableScan {
     let raw_last_id = raw.last().map(|(id, ..)| id.clone());
     let mut rows: Vec<(String, String, String)> = Vec::with_capacity(raw.len());
     let mut decrypt_skipped = 0usize;
     for (id, title, content, envelope, metadata_json) in raw {
+        let agent_id = crate::storage::embed_skip::agent_id_from_metadata_json(&metadata_json);
         match resolve_embeddable_content(&id, content, envelope, &metadata_json) {
-            Some(resolved) => rows.push((id, title, resolved)),
-            None => decrypt_skipped += 1,
+            Some(resolved) => {
+                let doc = crate::embeddings::embedding_document(&title, &resolved);
+                if crate::embeddings::oversize_embed_reason(doc.len()).is_some() {
+                    crate::storage::embed_skip::record_sqlite_best_effort(
+                        conn,
+                        &id,
+                        &agent_id,
+                        crate::storage::embed_skip::EmbedSkipReason::Oversize,
+                    );
+                    decrypt_skipped += 1;
+                } else {
+                    rows.push((id, title, resolved));
+                }
+            }
+            None => {
+                crate::storage::embed_skip::record_sqlite_best_effort(
+                    conn,
+                    &id,
+                    &agent_id,
+                    crate::storage::embed_skip::EmbedSkipReason::Undecryptable,
+                );
+                decrypt_skipped += 1;
+            }
         }
     }
     EmbeddableScan {
@@ -18224,6 +18295,9 @@ pub fn get_memory_texts_batch(
         sql.push_str(" AND embedding_space IS NOT ?");
         binds.push(Box::new(space.to_string()));
     }
+    let amort = crate::storage::embed_skip::EmbedSkipAmortisation::new();
+    crate::storage::embed_skip::prepare_scan_sqlite(conn, &amort);
+    sql.push_str(crate::storage::embed_skip::SQL_AND_NOT_SKIPPED);
     sql.push_str(" ORDER BY id LIMIT ?");
     binds.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
     let mut stmt = conn.prepare(&sql)?;
@@ -18231,7 +18305,7 @@ pub fn get_memory_texts_batch(
         binds.iter().map(std::convert::AsRef::as_ref).collect();
     let rows = stmt.query_map(bind_refs.as_slice(), embeddable_row_mapper)?;
     let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(resolve_embeddable_scan(raw))
+    Ok(resolve_embeddable_scan(conn, raw))
 }
 
 /// v1.0.0 #2167 §5/§7 — outcome of `reembed --stamp-only`, the explicit

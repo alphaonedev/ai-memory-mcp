@@ -63,6 +63,12 @@ pub struct SqliteStore {
     /// the pre-#3196 shared-connection behaviour — correct, just not
     /// de-stalled — which is a fail-SAFE fallback, never a fail-open one.
     read_state: Arc<Mutex<rusqlite::Connection>>,
+    /// #3344 amendment 2 — per-store amortisation of the `embed_skip`
+    /// stale-marker walk. Must NOT be process-global: two SqliteStore
+    /// instances in one process (tests, dual-open) each own a timer.
+    /// A key rotation is honoured within at most
+    /// [`crate::storage::embed_skip::INVALIDATE_MIN_INTERVAL`].
+    embed_skip_amort: Arc<crate::storage::embed_skip::EmbedSkipAmortisation>,
 }
 
 impl SqliteStore {
@@ -93,6 +99,7 @@ impl SqliteStore {
             path,
             record_stop_key,
             read_state,
+            embed_skip_amort: Arc::new(crate::storage::embed_skip::EmbedSkipAmortisation::new()),
         })
     }
 
@@ -3396,7 +3403,8 @@ impl MemoryStore for SqliteStore {
             return Ok(Vec::new());
         }
         let conn = self.state.lock().await;
-        db::get_unembedded_ids_batch(&conn, limit).map_err(box_err)
+        db::get_unembedded_ids_batch_amortised(&conn, limit, &self.embed_skip_amort)
+            .map_err(box_err)
     }
 
     /// #3181 — REAL `set_embeddings_batch`. The trait default loops
@@ -3973,6 +3981,100 @@ mod tests {
         assert!(
             after_ids.contains(&b.id.as_str()),
             "the still-unembedded row must remain enumerable"
+        );
+    }
+
+    /// #3344 — an undecryptable sealed row is skipped, remembered in
+    /// `embed_skip`, omitted from a second scan, and retried after the
+    /// stored fingerprint goes stale (healing path).
+    #[tokio::test]
+    async fn list_unembedded_persists_skip_for_undecryptable_3344() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path().to_path_buf();
+        let store = SqliteStore::open(&path).expect("open");
+        let admin = CallerContext::for_admin("test-3344");
+        let unique = uuid::Uuid::new_v4();
+        let sealed_id = format!("unemb3344-sealed-{unique}");
+        let plain = test_memory("plain-3344", "plain unencrypted body");
+        let plain_id = store.store(&admin, &plain).await.expect("store plain");
+        {
+            let conn = store.state.lock().await;
+            conn.execute(
+                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
+                     confidence, source, created_at, updated_at, metadata, encrypted_envelope) \
+                 VALUES (?1, 'mid', 'sal-test', 'sealed', '', '[]', 5, 1.0, 'test', \
+                     datetime('now'), datetime('now'), '{\"agent_id\":\"ai:sal-test\"}', ?2)",
+                rusqlite::params![&sealed_id, vec![3u8, 0xde, 0xad, 0xbe, 0xef]],
+            )
+            .expect("insert sealed");
+        }
+        let first = store
+            .list_unembedded(&admin, 1_000)
+            .await
+            .expect("first scan");
+        assert!(
+            !first.iter().any(|(id, _, _)| id == &sealed_id),
+            "ALLOWED: undecryptable sealed row must be skipped"
+        );
+        assert!(
+            first
+                .iter()
+                .any(|(id, _, c)| id == &plain_id && c == "plain unencrypted body"),
+            "ALLOWED: plain row is returned verbatim, got {first:?}"
+        );
+        let skip_count: i64 = {
+            let conn = store.state.lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM embed_skip WHERE memory_id = ?1",
+                rusqlite::params![&sealed_id],
+                |r| r.get(0),
+            )
+            .expect("skip count")
+        };
+        assert_eq!(skip_count, 1, "first scan must persist a skip marker");
+
+        let tenant = CallerContext::for_agent("alice");
+        let denied = store
+            .list_unembedded(&tenant, 1_000)
+            .await
+            .expect("DENIED scan");
+        assert!(
+            denied.is_empty(),
+            "DENIED: non-admin list_unembedded must be empty"
+        );
+
+        {
+            let conn = store.state.lock().await;
+            conn.execute(
+                "UPDATE embed_skip SET key_fingerprint = 'stale-fp' WHERE memory_id = ?1",
+                rusqlite::params![&sealed_id],
+            )
+            .expect("stale the skip");
+        }
+        // Planting a stale stored fingerprint is not a live-key change.
+        // A fresh store instance is the amortisation reset (no process-global).
+        drop(store);
+        let store = SqliteStore::open(&path).expect("reopen");
+        let retried = store
+            .list_unembedded(&admin, 1_000)
+            .await
+            .expect("retry scan");
+        assert!(
+            !retried.iter().any(|(id, _, _)| id == &sealed_id),
+            "retry still cannot decrypt, so the row stays omitted"
+        );
+        let fp: String = {
+            let conn = store.state.lock().await;
+            conn.query_row(
+                "SELECT key_fingerprint FROM embed_skip WHERE memory_id = ?1",
+                rusqlite::params![&sealed_id],
+                |r| r.get(0),
+            )
+            .expect("fp after retry")
+        };
+        assert_ne!(
+            fp, "stale-fp",
+            "healing must re-record under the live key fingerprint, got {fp}"
         );
     }
 

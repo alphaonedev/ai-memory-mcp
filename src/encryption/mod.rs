@@ -72,7 +72,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -393,6 +393,45 @@ fn load_keypair_from_disk(agent_id: &str, dir: &Path) -> Result<Option<Keypair>>
         public,
         secret,
     }))
+}
+
+/// #3344 — fingerprint of the X25519 key [`open_content`] would use for
+/// `agent_id`. Skip markers are keyed by this value so restoring or
+/// rotating the key invalidates the skip (healing path).
+///
+/// Prefers the in-memory cache (the same key decrypt uses) and falls
+/// back to the on-disk `.priv`. Missing key material fingerprints as
+/// `absent:<agent_id>` rather than minting a key (peek, never create).
+#[must_use]
+pub fn agent_encryption_key_fingerprint(agent_id: &str) -> String {
+    match peek_public_key_bytes(agent_id) {
+        Some(bytes) => fingerprint_public_bytes(&bytes),
+        None => format!("absent:{agent_id}"),
+    }
+}
+
+fn fingerprint_public_bytes(bytes: &[u8; X25519_KEY_LEN]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(32);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in &digest[..16] {
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 0x0f)] as char);
+    }
+    out
+}
+
+fn peek_public_key_bytes(agent_id: &str) -> Option<[u8; X25519_KEY_LEN]> {
+    if let Ok(guard) = keypair_cache().lock() {
+        if let Some(kp) = guard.get(agent_id) {
+            return Some(*kp.public.as_bytes());
+        }
+    }
+    let dir = keypair_persist_dir().ok()?;
+    load_keypair_from_disk(agent_id, &dir)
+        .ok()
+        .flatten()
+        .map(|kp| *kp.public.as_bytes())
 }
 
 /// Look up the per-agent X25519 [`Keypair`], resolving it from (in order)
@@ -917,6 +956,25 @@ mod tests {
         let a = get_or_create_keypair("agent-a").expect("a");
         let b = get_or_create_keypair("agent-b").expect("b");
         assert_ne!(a.public.as_bytes(), b.public.as_bytes());
+    }
+
+    #[test]
+    fn agent_encryption_key_fingerprint_absent_then_stable_after_create() {
+        let agent = "fingerprint-3344-agent";
+        let absent = agent_encryption_key_fingerprint(agent);
+        assert!(
+            absent.starts_with("absent:"),
+            "missing key material fingerprints as absent, got {absent}"
+        );
+        let _kp = get_or_create_keypair(agent).expect("create");
+        let present = agent_encryption_key_fingerprint(agent);
+        assert_eq!(present.len(), 32, "sha256[..16] hex is 32 chars");
+        assert!(!present.starts_with("absent:"));
+        assert_eq!(
+            present,
+            agent_encryption_key_fingerprint(agent),
+            "fingerprint is stable for the same key"
+        );
     }
 
     #[test]
