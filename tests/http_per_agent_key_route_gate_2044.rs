@@ -59,7 +59,9 @@ fn build_enforce_router() -> (axum::Router, AppState, NamedTempFile) {
 
     let mut enrolled = HashMap::new();
     enrolled.insert(api_key_sha256_hex(ALICE_KEY), "alice".to_string());
-    let enrolled = Arc::new(enrolled);
+    // v1.0.0 #3418 — the enrolled set is a LIVE registry, not a bare map.
+    let enrolled =
+        Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::from_map(enrolled));
 
     let app_state = AppState {
         db,

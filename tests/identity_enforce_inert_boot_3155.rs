@@ -78,7 +78,7 @@ fn only_the_enforce_posture_produces_a_verdict_3155() {
 /// SIGNAL, it does not start refusing requests that were served before.
 #[test]
 fn an_empty_enrolled_map_stays_inert_on_the_request_path_3155() {
-    let enrolled: HashMap<String, String> = HashMap::new();
+    let enrolled = ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty();
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("x-agent-id", "boss".parse().expect("header value"));
     headers.insert(
@@ -105,10 +105,11 @@ fn an_empty_enrolled_map_stays_inert_on_the_request_path_3155() {
 /// works.
 #[test]
 fn enforce_refuses_a_claimed_caller_once_a_key_is_enrolled_3155() {
-    let mut enrolled: HashMap<String, String> = HashMap::new();
+    let mut seed: HashMap<String, String> = HashMap::new();
     // sha256 of some other agent's enrolled token -> that agent. The caller
     // below presents nothing that hashes to it, so it stays `Claimed`.
-    enrolled.insert("0".repeat(64), "someone-else".to_string());
+    seed.insert("0".repeat(64), "someone-else".to_string());
+    let enrolled = ai_memory::handlers::identity_binding::EnrolledAgentKeys::from_map(seed);
 
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("x-agent-id", "boss".parse().expect("header value"));

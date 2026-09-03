@@ -103,9 +103,17 @@ told which posture the coverage claim describes. **A multi-principal deployment
 that leaves the default in place is running the posture this project rates
 finding H1 (High, OWASP A01/A07).** Closing it is two steps:
 `ai-memory agents bind-api-key --agent-id <a> --token <t>` per principal, then
-`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` and restart `serve` (the
-key map is boot-loaded). Single-operator deployments that enrol no per-agent
-keys are unaffected either way.
+`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce`. As of v1.0.0 #3418 the
+enrolled key map is a LIVE registry, not a boot snapshot: a running `serve`
+re-reads it from the configured backend (sqlite or postgres) every
+`AI_MEMORY_AGENT_KEY_REFRESH_SECS` seconds (default 15; `0` restores the
+previous restart-required behaviour and says so at boot), so enrollment — and,
+materially for this section, **REVOCATION** — takes effect within that window
+with no restart. That window is therefore the upper bound on how long a leaked
+per-agent key stays live, and `ai-memory doctor` reports it. Enrolling against
+a postgres data tier uses
+`ai-memory agents bind-api-key --store-url <url> …`. Single-operator
+deployments that enrol no per-agent keys are unaffected either way.
 
 ### 3.2 Insecure context or data serialization (NSA concern b)
 

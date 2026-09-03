@@ -446,7 +446,9 @@ fn test_app_state(db: Db) -> AppState {
         )),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
         max_page_size: crate::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            crate::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         http_identity_mode: crate::config::HttpIdentityMode::default(),
     }
 }
@@ -1366,7 +1368,9 @@ async fn http_bulk_create_fans_out_with_federation() {
         )),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
         max_page_size: crate::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            crate::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         http_identity_mode: crate::config::HttpIdentityMode::default(),
     };
     let router = Router::new()
@@ -11036,7 +11040,9 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         )),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
         max_page_size: crate::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            crate::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         http_identity_mode: crate::config::HttpIdentityMode::default(),
     }
 }

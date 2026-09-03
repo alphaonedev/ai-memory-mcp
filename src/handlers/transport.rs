@@ -588,7 +588,10 @@ pub struct AppState {
     /// gate (no extension threading through the ~20 `require_admin` callers) and
     /// keyed to a server-held secret, never a header. Empty for a single-operator
     /// deployment → the gates are inert.
-    pub enrolled_agent_keys: Arc<std::collections::HashMap<String, String>>,
+    /// v1.0.0 #3418 — the LIVE registry, not a boot photograph. A refresh
+    /// installs a new snapshot in place, so enrollment AND revocation take
+    /// effect without a daemon restart.
+    pub enrolled_agent_keys: Arc<crate::handlers::identity_binding::EnrolledAgentKeys>,
 
     /// #2044 — the resolved [`crate::config::HttpIdentityMode`]
     /// (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY`, default `advisory`) consumed
@@ -914,7 +917,10 @@ pub struct ApiKeyState {
     /// the #2032 M3/L2 expensive-verify-DoS layering: this is a map get, not a
     /// signature verify). Empty for a single-operator deployment that enrolled
     /// no per-agent keys → the binding logic is inert (zero WARN).
-    pub enrolled_agent_keys: Arc<std::collections::HashMap<String, String>>,
+    /// v1.0.0 #3418 — the LIVE registry, not a boot photograph. A refresh
+    /// installs a new snapshot in place, so enrollment AND revocation take
+    /// effect without a daemon restart.
+    pub enrolled_agent_keys: Arc<crate::handlers::identity_binding::EnrolledAgentKeys>,
     /// #2044 — the resolved [`crate::config::HttpIdentityMode`]
     /// (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY`, default `advisory`).
     /// Governs whether a presented per-agent key BINDS `X-Agent-Id` and whether
@@ -1076,14 +1082,20 @@ pub async fn api_key_auth(
     };
 
     // Transport auth: accept the SHARED global key OR any ENROLLED per-agent
-    // key (schema v83 `agent_api_keys`, boot-seeded into `enrolled_agent_keys`).
-    // Both are server-held secrets; a per-agent key is additive + non-breaking.
+    // key (schema v83 `agent_api_keys`). #3418 — read the LIVE registry rather
+    // than a boot photograph, so a key REVOKED a moment ago stops authenticating
+    // now instead of at the next restart. That is the security half: an
+    // enrollment that lags is an inconvenience, a revocation that lags is a
+    // credential an operator believes is dead.
     let is_global = constant_time_eq(token.as_bytes(), expected.as_bytes());
     let token_hash = super::identity_binding::api_key_sha256_hex(&token);
     let per_agent: Option<String> = if is_global {
         None
     } else {
-        auth.enrolled_agent_keys.get(&token_hash).cloned()
+        auth.enrolled_agent_keys
+            .snapshot()
+            .get(&token_hash)
+            .cloned()
     };
     if !is_global && per_agent.is_none() {
         return (

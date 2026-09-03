@@ -1549,6 +1549,55 @@ fn section_identity_3147(conn: Option<&rusqlite::Connection>) -> ReportSection {
             .unwrap_or(0)
     });
     facts.push(("enrolled_api_keys".into(), enrolled.to_string()));
+
+    // v1.0.0 #3418 — say WHERE that count came from, and how long a revoked
+    // key stays live.
+    //
+    // The count above is read from the local sqlite `conn`. On a postgres data
+    // tier the enrolled keys live in postgres, so reporting a confident `0`
+    // here is not merely incomplete — it is WRONG, and it is wrong in the
+    // reassuring direction (an operator reads "no keys enrolled, gate inert"
+    // for a tier that may have hundreds). Doctor reports the provenance and
+    // WARNs rather than answering for a backend it did not read.
+    let configured_pg = crate::store_url::resolve_store_url(None)
+        .ok()
+        .flatten()
+        .is_some_and(|u| crate::store_url::is_postgres_url(&u));
+    if configured_pg {
+        facts.push((
+            "enrolled_api_keys_source".into(),
+            "local sqlite — NOT the configured postgres tier".into(),
+        ));
+        severity = severity_max(severity, Severity::Warning);
+        notes.push(
+            "a postgres store-url is configured, so `enrolled_api_keys` above counts the \
+             LOCAL sqlite file and not the tier the daemon actually serves; run \
+             `ai-memory agents bind-api-key --store-url <url>` to enroll there and read \
+             the daemon's own boot line for its enrolled count (#3418)"
+                .to_string(),
+        );
+    } else {
+        facts.push(("enrolled_api_keys_source".into(), "local sqlite".into()));
+    }
+
+    let refresh = crate::handlers::identity_binding::resolve_agent_key_refresh_interval();
+    facts.push((
+        "agent_key_refresh".into(),
+        match refresh {
+            Some(d) => format!("{}s", d.as_secs()),
+            None => "disabled (restart required)".into(),
+        },
+    ));
+    if refresh.is_none() && enrolled > 0 {
+        // Enrolled keys + no refresh = a revocation that never takes effect
+        // until someone restarts the daemon. That is a credential control the
+        // operator believes they have.
+        severity = severity_max(severity, Severity::Warning);
+        notes.push(crate::handlers::identity_binding::refresh_posture_note(
+            None,
+        ));
+    }
+
     if let Some(reason) =
         crate::handlers::identity_binding::inert_enforce_boot_reason(mode, enrolled)
     {

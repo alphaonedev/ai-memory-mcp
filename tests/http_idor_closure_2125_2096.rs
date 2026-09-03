@@ -83,7 +83,9 @@ fn build_router_with(
     let store: Arc<dyn ai_memory::store::MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
 
-    let enrolled = Arc::new(enrolled);
+    // v1.0.0 #3418 — the enrolled set is a LIVE registry, not a bare map.
+    let enrolled =
+        Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::from_map(enrolled));
 
     let app_state = AppState {
         db,

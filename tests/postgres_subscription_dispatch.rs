@@ -199,7 +199,9 @@ fn make_test_state() -> (AppState, std::path::PathBuf) {
         )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
 

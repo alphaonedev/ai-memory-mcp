@@ -2072,8 +2072,11 @@ pub trait MemoryStore: Send + Sync {
 
     /// #2095 (v1.0.0) — revoke EVERY enrolled per-agent api-key bound to
     /// `agent_id` (invalidate a leaked key). Returns the number of bindings
-    /// removed; revoking an unbound agent is `Ok(0)` (idempotent). Takes effect
-    /// on the daemon's next boot-seed (the in-memory map is boot-loaded).
+    /// removed; revoking an unbound agent is `Ok(0)` (idempotent). v1.0.0 #3418
+    /// — takes effect within the daemon's live-refresh window
+    /// (`AI_MEMORY_AGENT_KEY_REFRESH_SECS`, default 15s), NOT at the next
+    /// restart; that window is the upper bound on how long a leaked key stays
+    /// live.
     ///
     /// Default returns `UnsupportedCapability` so an adapter without key
     /// provisioning fails loudly rather than silently leaving a leaked key live.
@@ -2088,10 +2091,15 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// #2044 — enumerate every enrolled per-agent api-key as
-    /// `(token_sha256, agent_id)`. Used ONCE at daemon boot to seed the
-    /// in-memory principal-binding map ([`crate::handlers::ApiKeyState`]) so the
-    /// hot-path middleware resolves principals without a per-request DB hit
-    /// (respecting the #2032 M3/L2 expensive-verify-DoS layering).
+    /// `(token_sha256, agent_id)`. Seeds the in-memory principal-binding map
+    /// ([`crate::handlers::ApiKeyState`]) so the hot-path middleware resolves
+    /// principals without a per-request DB hit (respecting the #2032 M3/L2
+    /// expensive-verify-DoS layering). v1.0.0 #3418 — read at boot AND on a
+    /// bounded refresh cadence, so enrollment and REVOCATION reach a running
+    /// daemon; the result funnels through
+    /// [`crate::handlers::identity_binding::apply_agent_key_refresh`], which
+    /// keeps the last known snapshot when this read fails (degrade, never
+    /// disarm).
     ///
     /// Default returns an empty vec (no enrolled keys — inert).
     async fn list_agent_api_keys(&self) -> StoreResult<Vec<(String, String)>> {

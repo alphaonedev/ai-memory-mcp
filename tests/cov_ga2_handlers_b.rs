@@ -116,7 +116,9 @@ fn app_state_for(
         )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     }
 }
@@ -152,7 +154,9 @@ fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     (ai_memory::build_router(api_key_state, app_state), db_tmp)
@@ -182,7 +186,9 @@ fn fake_pg_router() -> (axum::Router, std::path::PathBuf) {
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     (
@@ -1024,7 +1030,9 @@ async fn approval_decide_live_postgres_missing_id_is_404() {
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let r = ai_memory::build_router(api_key_state, app_state);

@@ -431,9 +431,15 @@ footer a{color:var(--text-muted)}
       <p><strong>The shipped default is <code>advisory</code> with zero keys enrolled</strong>, and in that posture the project's own CHANGELOG records the consequence verbatim: <em>"Out of the box (<code>advisory</code> default + zero per-agent keys enrolled) H1/M1 behave EXACTLY as pre-#2044 — the gate is fully inert until an operator enrolls per-agent keys AND sets <code>enforce</code>."</em> That default was chosen deliberately — <code>enforce</code>-by-default with zero keys enrolled would refuse every existing shared-key deployment (the #1985 trap) — but a procurement reviewer must be told which posture the coverage claim describes. <strong>A multi-principal deployment that leaves the default in place is running the posture this project rates finding H1 (High, OWASP A01/A07)</strong> in its own <a href="v1.0.0-security-assessment.html">v1.0.0 adversarial security assessment</a>: cross-tenant IDOR/BOLA on read+mutate via a spoofable <code>X-Agent-Id</code>. Single-operator deployments that enrol no per-agent keys are unaffected either way.</p>
       <p><strong>Closing it is two steps:</strong></p>
 <pre class="codeblock"><span class="com"># 1. Enrol a per-agent API key for every named principal</span>
+<span class="com">#    (add --store-url &lt;url&gt; to enrol against a postgres data tier)</span>
 ai-memory agents bind-api-key --agent-id &lt;agent&gt; --token &lt;token&gt;
 
-<span class="com"># 2. Require the binding, then restart `serve` (the key map is boot-loaded)</span>
+<span class="com"># 2. Require the binding. Since v1.0.0 #3418 the enrolled key map is a LIVE</span>
+<span class="com">#    registry, not a boot snapshot: a running `serve` re-reads it from the</span>
+<span class="com">#    configured backend every AI_MEMORY_AGENT_KEY_REFRESH_SECS seconds</span>
+<span class="com">#    (default 15; 0 restores the old restart-required behaviour), so both</span>
+<span class="com">#    enrollment and REVOCATION take effect without a restart. That window is</span>
+<span class="com">#    the upper bound on how long a leaked per-agent key stays live.</span>
 export AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce
 ai-memory serve</pre>
       <div class="anchor-list">

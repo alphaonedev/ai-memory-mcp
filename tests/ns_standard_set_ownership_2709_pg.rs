@@ -114,13 +114,17 @@ async fn pg_router(url: &str) -> (axum::Router, Arc<dyn MemoryStore>) {
         )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: Arc::new(
+            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
-        enrolled_agent_keys: Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: Arc::new(
+            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     (ai_memory::build_router(api_key_state, app_state), store)

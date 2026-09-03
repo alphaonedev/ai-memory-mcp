@@ -300,7 +300,9 @@ async fn mtls_authenticated_request_bypasses_api_key_check() {
     let state = ai_memory::handlers::ApiKeyState {
         key: Some("operator-secret".to_string()),
         mtls_enforced: true,
-        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        enrolled_agent_keys: std::sync::Arc::new(
+            ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+        ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let app = Router::new()

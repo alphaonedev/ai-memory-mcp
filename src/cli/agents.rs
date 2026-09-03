@@ -68,8 +68,10 @@ pub enum AgentsAction {
     /// v1.0.0 #2044 (#2032-A / H1 IDOR + M1 admin spoof) — enroll a per-agent
     /// HTTP api-key so an `X-Agent-Id: <agent>` on the HTTP surface must prove
     /// possession of THIS token (the server stores only `sha256(token)`; the
-    /// raw token is never persisted). The daemon boot-loads the enrolled set,
-    /// so RESTART the `serve` daemon after enrolling for it to take effect.
+    /// raw token is never persisted). v1.0.0 #3418 — the daemon re-reads the
+    /// enrolled set on a bounded cadence, so this takes effect within that
+    /// refresh window with NO restart (`AI_MEMORY_AGENT_KEY_REFRESH_SECS`,
+    /// default 15s; `0` restores the pre-#3418 restart-required behaviour).
     /// Re-binding the same token rotates the mapping in place.
     BindApiKey {
         /// Agent identifier the presenting caller is bound to.
@@ -79,15 +81,57 @@ pub enum AgentsAction {
         /// header; only its SHA-256 digest is stored.
         #[arg(long)]
         token: String,
+        /// v1.0.0 #3418 — the data tier this enrollment is written to.
+        ///
+        /// Before #3418 the ONLY way to reach a postgres tier from this verb
+        /// was the non-argv `AI_MEMORY_STORE_URL` / `AI_MEMORY_STORE_URL_FILE`
+        /// channel, which is undiscoverable from `--help` — so the certified
+        /// enterprise configuration looked like it had no way to enroll a
+        /// per-agent key at all, and the `enforce` identity posture looked
+        /// unreachable there. The flag makes the supported path visible.
+        ///
+        /// It is declared on THIS verb rather than on `agents` as a whole so
+        /// clap itself refuses `--store-url` on every verb that would ignore
+        /// it — a structural control, not a runtime check. (A flag that
+        /// silently does nothing is how an operator ends up believing they
+        /// enrolled a key on a tier that never saw it.)
+        ///
+        /// The #1927 env/file channel still works and is still the hygienic
+        /// path: a URL on argv is world-readable via `/proc/<pid>/cmdline`.
+        /// Requires a build with `--features sal`; refused otherwise.
+        #[arg(long, value_name = "URL")]
+        store_url: Option<String>,
     },
     /// v1.0.0 #2095 — revoke (invalidate) EVERY enrolled per-agent HTTP api-key
     /// bound to `agent_id`. The PK is the token digest, so a leaked key can only
-    /// be invalidated by revoking the agent's binding(s). RESTART the `serve`
-    /// daemon after revoking (the enrolled map is boot-loaded).
+    /// be invalidated by revoking the agent's binding(s). v1.0.0 #3418 — the
+    /// revocation stops the key authenticating within the daemon's refresh
+    /// window with NO restart; that window is the upper bound on how long a
+    /// leaked key stays live, so keep it short on a fleet.
     RevokeApiKey {
         /// Agent identifier whose api-key binding(s) to remove.
         #[arg(long)]
         agent_id: String,
+        /// v1.0.0 #3418 — the data tier this enrollment is written to.
+        ///
+        /// Before #3418 the ONLY way to reach a postgres tier from this verb
+        /// was the non-argv `AI_MEMORY_STORE_URL` / `AI_MEMORY_STORE_URL_FILE`
+        /// channel, which is undiscoverable from `--help` — so the certified
+        /// enterprise configuration looked like it had no way to enroll a
+        /// per-agent key at all, and the `enforce` identity posture looked
+        /// unreachable there. The flag makes the supported path visible.
+        ///
+        /// It is declared on THIS verb rather than on `agents` as a whole so
+        /// clap itself refuses `--store-url` on every verb that would ignore
+        /// it — a structural control, not a runtime check. (A flag that
+        /// silently does nothing is how an operator ends up believing they
+        /// enrolled a key on a tier that never saw it.)
+        ///
+        /// The #1927 env/file channel still works and is still the hygienic
+        /// path: a URL on argv is world-readable via `/proc/<pid>/cmdline`.
+        /// Requires a build with `--features sal`; refused otherwise.
+        #[arg(long, value_name = "URL")]
+        store_url: Option<String>,
     },
     /// v1.0.0 crypto-core (#1942, spec §2.3) — pre-enroll a per-instance
     /// sub-key certificate from a JSON file. The cert is verified under the
@@ -151,6 +195,31 @@ pub enum PendingAction {
     },
     /// Reject a pending action by id.
     Reject { id: String },
+}
+
+/// v1.0.0 #3418 — refuse `--store-url` on the LOCAL-sqlite execution path.
+///
+/// The `sal` dispatch in [`crate::daemon_runtime`] intercepts `bind-api-key` /
+/// `revoke-api-key` and routes them through the configured backend, so a
+/// `--store-url` that reaches THIS function is one no store abstraction can
+/// honour: either the binary was built without `--features sal`, or the caller
+/// invoked `run_agents` directly.
+///
+/// Refuse rather than ignore. Silently writing an enrollment to the local
+/// sqlite file while reporting success is precisely the wrong-and-reassuring
+/// answer #3418 exists to remove — the operator would believe the certified
+/// tier had the key, and the `enforce` posture there would stay unreachable
+/// for a reason nothing in the output mentions.
+fn refuse_store_url_on_sqlite_path(store_url: Option<&str>, verb: &str) -> anyhow::Result<()> {
+    if store_url.is_some() {
+        anyhow::bail!(
+            "`agents {verb} --store-url` requires a build with `--features sal` (this \
+             binary has no store-abstraction layer, so the only reachable backend is the \
+             local sqlite database). NOTHING WAS EXECUTED — no api-key binding was \
+             written anywhere."
+        );
+    }
+    Ok(())
 }
 
 /// `agents` handler.
@@ -262,7 +331,12 @@ pub fn run_agents(
                 writeln!(out.stdout, "revoked pubkey for {agent_id}")?;
             }
         }
-        AgentsAction::BindApiKey { agent_id, token } => {
+        AgentsAction::BindApiKey {
+            agent_id,
+            token,
+            store_url,
+        } => {
+            refuse_store_url_on_sqlite_path(store_url.as_deref(), "bind-api-key")?;
             validate::validate_agent_id(&agent_id)?;
             let trimmed = token.trim();
             if trimmed.is_empty() {
@@ -284,11 +358,15 @@ pub fn run_agents(
                 writeln!(
                     out.stdout,
                     "bound api-key for {agent_id} (sha256={token_sha256}); \
-                     restart `ai-memory serve` for it to take effect"
+                     live within the daemon's refresh window (#3418)"
                 )?;
             }
         }
-        AgentsAction::RevokeApiKey { agent_id } => {
+        AgentsAction::RevokeApiKey {
+            agent_id,
+            store_url,
+        } => {
+            refuse_store_url_on_sqlite_path(store_url.as_deref(), "revoke-api-key")?;
             validate::validate_agent_id(&agent_id)?;
             let removed = db::revoke_agent_api_key(&conn, &agent_id)?;
             if json_out {
@@ -305,7 +383,7 @@ pub fn run_agents(
                 writeln!(
                     out.stdout,
                     "revoked {removed} api-key binding(s) for {agent_id}; \
-                     restart `ai-memory serve` for it to take effect"
+                     live within the daemon's refresh window (#3418)"
                 )?;
             }
         }
@@ -721,7 +799,7 @@ pub async fn run_bind_api_key(
     } else {
         println!(
             "bound api-key for {agent_id} (sha256={token_sha256}); \
-             restart `ai-memory serve` for it to take effect"
+             live within the daemon's refresh window (#3418)"
         );
     }
     Ok(())
@@ -755,7 +833,7 @@ pub async fn run_revoke_api_key(
     } else {
         println!(
             "revoked {removed} api-key binding(s) for {agent_id}; \
-             restart `ai-memory serve` for it to take effect"
+             live within the daemon's refresh window (#3418)"
         );
     }
     Ok(())
