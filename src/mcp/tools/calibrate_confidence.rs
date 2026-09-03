@@ -33,6 +33,8 @@ use crate::confidence::calibrate::{DEFAULT_WINDOW_DAYS, calibrate_from_shadow};
 ///
 /// Errors:
 /// * `days must be a positive integer` — caller passed `days <= 0`.
+/// * `days must not exceed 36500 days` — caller exceeded the bounded
+///   calibration window.
 /// * `memory_calibrate_confidence substrate error: ...` — SQL error.
 pub fn handle_calibrate_confidence(
     conn: &rusqlite::Connection,
@@ -44,6 +46,12 @@ pub fn handle_calibrate_confidence(
         .unwrap_or(DEFAULT_WINDOW_DAYS);
     if days <= 0 {
         return Err("days must be a positive integer".to_string());
+    }
+    if days > crate::validate::MAX_DURATION_DAYS {
+        return Err(format!(
+            "days must not exceed {} days (got {days})",
+            crate::validate::MAX_DURATION_DAYS
+        ));
     }
 
     let report = calibrate_from_shadow(conn, days, chrono::Utc::now())
@@ -62,7 +70,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct CalibrateConfidenceRequest {
-    /// Window days.
+    /// Window days (1..=36500).
     #[serde(default)]
     pub days: Option<i64>,
 
@@ -86,7 +94,7 @@ impl McpTool for CalibrateConfidenceTool {
         "Scan confidence_shadow_observations and emit per-source baselines (Form 5)."
     }
     fn docs() -> &'static str {
-        "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power — refuses on keyword tier."
+        "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Window is 1..=36500 days; default 30d. Family::Power — refuses on keyword tier."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<CalibrateConfidenceRequest>()
@@ -162,6 +170,24 @@ mod tests {
         assert_eq!(
             v["report"]["window_days"].as_i64().unwrap(),
             DEFAULT_WINDOW_DAYS
+        );
+    }
+
+    #[test]
+    fn bounded_days_refuse_huge_and_allow_maximum_3384() {
+        let (conn, _dir) = open_tmp();
+        let err = handle_calibrate_confidence(&conn, &json!({"days": i64::MAX}))
+            .expect_err("huge calibration window must be refused without panicking");
+        assert!(err.contains("must not exceed 36500"), "got: {err}");
+
+        let value = handle_calibrate_confidence(
+            &conn,
+            &json!({"days": crate::validate::MAX_DURATION_DAYS}),
+        )
+        .expect("maximum bounded window remains valid");
+        assert_eq!(
+            value["report"]["window_days"].as_i64(),
+            Some(crate::validate::MAX_DURATION_DAYS)
         );
     }
 }

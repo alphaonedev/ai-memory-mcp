@@ -65,7 +65,7 @@
 //! surface (as access 0) and the orphan-tolerant contract above holds.
 
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
@@ -161,14 +161,19 @@ pub struct CalibrationReport {
 ///
 /// # Errors
 ///
-/// Returns the underlying `rusqlite` error if the SELECT fails.
+/// Returns an error when `days` is outside `1..=36500`, checked timestamp
+/// subtraction fails, or an underlying SQLite operation fails.
 #[allow(clippy::cast_precision_loss)]
 pub fn calibrate_from_shadow(
     conn: &Connection,
     days: i64,
     now: chrono::DateTime<Utc>,
 ) -> Result<CalibrationReport> {
-    let since_dt = now - Duration::days(days);
+    // #3384 — caller-controlled windows must never reach chrono's panicking
+    // `Duration::days` / `DateTime - Duration` operators. Keep the bound and
+    // checked arithmetic in the substrate function so both CLI and MCP callers
+    // inherit the same fail-closed behavior.
+    let since_dt = crate::validate::checked_days_ago(now, "days", days, 1)?;
     let since = since_dt.to_rfc3339();
 
     // v0.9.0 §11.5 (#1706) — offline sweep step, ridden on this existing

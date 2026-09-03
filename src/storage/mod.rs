@@ -16297,23 +16297,21 @@ fn purge_archive_matching(
 /// # Errors
 ///
 /// Returns the #962 typed `InvalidArgument` envelope when `older_than_days`
-/// is negative (a negative cutoff would select rows archived in the FUTURE,
-/// i.e. effectively everything).
+/// is outside `0..=36500` or checked cutoff construction fails.
 fn archive_purge_predicate(
     namespace: Option<&str>,
     older_than_days: Option<i64>,
 ) -> Result<(String, Vec<String>)> {
-    if let Some(days) = older_than_days
-        && days < 0
-    {
-        return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: crate::errors::msg::older_than_days_negative(days),
-        }));
-    }
     let mut clauses: Vec<String> = Vec::with_capacity(2);
     let mut binds: Vec<String> = Vec::with_capacity(2);
     if let Some(days) = older_than_days {
-        binds.push((Utc::now() - chrono::Duration::days(days)).to_rfc3339());
+        let cutoff = crate::validate::checked_days_ago(Utc::now(), "older_than_days", days, 0)
+            .map_err(|error| {
+                anyhow::Error::new(StorageError::InvalidArgument {
+                    reason: error.to_string(),
+                })
+            })?;
+        binds.push(cutoff.to_rfc3339());
         clauses.push(format!("archived_at < ?{}", binds.len()));
     }
     if let Some(ns) = namespace {
@@ -16406,14 +16404,14 @@ pub fn purge_archive_for_caller(
 ) -> Result<usize> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     match older_than_days {
-        Some(days) if days < 0 => {
-            // #962 typed envelope.
-            return Err(anyhow::Error::new(StorageError::InvalidArgument {
-                reason: crate::errors::msg::older_than_days_negative(days),
-            }));
-        }
         Some(days) => {
-            let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+            let cutoff = crate::validate::checked_days_ago(Utc::now(), "older_than_days", days, 0)
+                .map_err(|error| {
+                    anyhow::Error::new(StorageError::InvalidArgument {
+                        reason: error.to_string(),
+                    })
+                })?
+                .to_rfc3339();
             purge_archive_matching(
                 conn,
                 "archived_at < ?1 \

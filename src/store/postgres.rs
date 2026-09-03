@@ -29209,13 +29209,14 @@ impl MemoryStore for PostgresStore {
         older_than_days: Option<i64>,
     ) -> StoreResult<usize> {
         self.gate_record_stop().await?;
-        if let Some(days) = older_than_days {
-            if days < 0 {
-                return Err(StoreError::InvalidInput {
-                    detail: crate::errors::msg::older_than_days_negative(days),
-                });
-            }
-        }
+        let cutoff = older_than_days
+            .map(|days| {
+                crate::validate::checked_days_ago(chrono::Utc::now(), "older_than_days", days, 0)
+                    .map_err(|error| StoreError::InvalidInput {
+                        detail: error.to_string(),
+                    })
+            })
+            .transpose()?;
 
         // #936 (security-critical, 2026-05-20) — owner-vs-caller gate.
         // Pre-#936 the postgres branch issued an unconstrained DELETE so
@@ -29233,11 +29234,10 @@ impl MemoryStore for PostgresStore {
         let caller = ctx.effective_principal();
         let bypass = ctx.bypass_visibility;
 
-        let res = match (older_than_days, bypass) {
+        let res = match (cutoff, bypass) {
             // Admin path — full owner-blind purge. The route's role
             // gate ensures only admin callers can reach this branch.
-            (Some(days), true) => {
-                let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+            (Some(cutoff), true) => {
                 sqlx::query("DELETE FROM archived_memories WHERE archived_at < $1")
                     .bind(cutoff)
                     .execute(&self.pool)
@@ -29251,22 +29251,19 @@ impl MemoryStore for PostgresStore {
             // Owner-scoped path — narrow to rows the caller owns
             // (`metadata.agent_id == caller` OR the inbox-target
             // carve-out `metadata.target_agent_id == caller`).
-            (Some(days), false) => {
-                let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
-                sqlx::query(
-                    "DELETE FROM archived_memories \
+            (Some(cutoff), false) => sqlx::query(
+                "DELETE FROM archived_memories \
                      WHERE archived_at < $1 \
                        AND ( \
                          (metadata->>'agent_id') = $2 OR \
                          (metadata->>'target_agent_id') = $2 \
                        )",
-                )
-                .bind(cutoff)
-                .bind(caller)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| to_store_err("archive_purge owner", e))?
-            }
+            )
+            .bind(cutoff)
+            .bind(caller)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("archive_purge owner", e))?,
             (None, false) => sqlx::query(
                 "DELETE FROM archived_memories \
                  WHERE \

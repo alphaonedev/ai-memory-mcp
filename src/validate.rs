@@ -26,6 +26,9 @@ const MAX_AGENT_ID_LEN: usize = 128;
 const MAX_AGENT_PUBKEY_B64_LEN: usize = 128;
 const MAX_METADATA_SIZE: usize = 65_536;
 const MAX_METADATA_DEPTH: usize = 32;
+/// Maximum caller-controlled relative time window (approximately 100 years).
+/// Keeps `chrono` duration construction and timestamp subtraction bounded.
+pub const MAX_DURATION_DAYS: i64 = 36_500;
 
 /// Canonical role-categorical source values accepted by the substrate.
 ///
@@ -726,6 +729,38 @@ pub fn validate_ttl_secs(ttl: Option<i64>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate a caller-controlled day count and subtract it from `now` using
+/// checked `chrono` operations.
+///
+/// `minimum` expresses the surface contract: calibration passes `1`, while
+/// archive purge passes `0`. The upper bound is always
+/// [`MAX_DURATION_DAYS`].
+///
+/// # Errors
+///
+/// Returns an error when `days` lies outside `minimum..=MAX_DURATION_DAYS`,
+/// cannot form a `chrono::TimeDelta`, or would underflow `now`.
+pub fn checked_days_ago(
+    now: chrono::DateTime<chrono::Utc>,
+    field: &str,
+    days: i64,
+    minimum: i64,
+) -> Result<chrono::DateTime<chrono::Utc>> {
+    if days < minimum {
+        if minimum == 0 {
+            bail!("{field} must be non-negative (got {days})");
+        }
+        bail!("{field} must be at least {minimum} days (got {days})");
+    }
+    if days > MAX_DURATION_DAYS {
+        bail!("{field} must not exceed {MAX_DURATION_DAYS} days (got {days})");
+    }
+    let delta = chrono::TimeDelta::try_days(days)
+        .ok_or_else(|| anyhow::anyhow!("{field} duration is outside the supported range"))?;
+    now.checked_sub_signed(delta)
+        .ok_or_else(|| anyhow::anyhow!("{field} produces a timestamp outside the supported range"))
 }
 
 pub fn validate_metadata(metadata: &serde_json::Value) -> Result<()> {

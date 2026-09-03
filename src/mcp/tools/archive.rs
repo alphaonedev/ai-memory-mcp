@@ -402,7 +402,7 @@ impl McpTool for ArchiveListTool {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct ArchivePurgeRequest {
-    /// Only purge entries older than N days.
+    /// Only purge entries older than N days (0..=36500).
     #[serde(default)]
     pub older_than_days: Option<i64>,
 
@@ -431,7 +431,7 @@ impl McpTool for ArchivePurgeTool {
         "Permanently delete archived memories."
     }
     fn docs() -> &'static str {
-        "Purge archive. Scope via older_than_days. Unrecoverable. #3171: the DEFAULT SCOPE IS \
+        "Purge archive. Scope via older_than_days (0..=36500). Unrecoverable. #3171: the DEFAULT SCOPE IS \
          CALLER-ONLY — only the resolved caller's archived rows are purged; `as_admin: true` \
          escalates to EVERY owner's. A governance Ask rule returns a SUCCESS-SHAPED \
          `{status:\"ask\"}` envelope with NOTHING purged — check `status`, not just the \
@@ -885,5 +885,26 @@ mod tests {
             purged.is_number(),
             "expected numeric `purged`, got: {purged}"
         );
+    }
+
+    #[test]
+    fn archive_purge_refuses_huge_days_and_allows_maximum_3384() {
+        let conn = open_conn();
+        let err = handle_archive_purge(
+            &conn,
+            &json!({"older_than_days": i64::MAX, "agent_id": "ai:archive-owner"}),
+        )
+        .expect_err("huge archive cutoff must be refused without panicking");
+        assert!(err.contains("must not exceed 36500"), "got: {err}");
+
+        let value = handle_archive_purge(
+            &conn,
+            &json!({
+                "older_than_days": crate::validate::MAX_DURATION_DAYS,
+                "agent_id": "ai:archive-owner",
+            }),
+        )
+        .expect("maximum bounded cutoff remains valid");
+        assert_eq!(value["purged"].as_u64(), Some(0));
     }
 }
