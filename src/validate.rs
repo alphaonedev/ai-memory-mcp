@@ -1098,27 +1098,25 @@ pub fn validate_source_span_for_body(span: &SourceSpan, body: &str) -> Result<()
     Ok(())
 }
 
-/// v1.0.0 R22 (#1947) — namespaces that are WRITE-RESERVED for a substrate
-/// internal lane and refused for a normal caller memory write.
+/// Namespaces that are WRITE-RESERVED for substrate-internal lanes and refused
+/// for a normal caller memory write.
 ///
-/// There is no general namespace-reservation mechanism (the `_`-prefix is
-/// only a curator/autonomy sweep skip, not a write refusal), so this is the
-/// minimal, documented validate-layer refusal for the ONE reserved name the
-/// equivocation-proof lane owns. It mirrors the system-only
-/// [`validate_lifecycle_state`] refusal: the value round-trips on reads but a
-/// caller may never author it. The entanglement records that live under this
-/// namespace are resolved-checkpoint rows the (deferred) federation runtime
-/// writes, never caller memories.
+/// #3362 extends the original R22 single-name reservation to the system-prefix
+/// contract: every trimmed namespace beginning with `_` belongs to its owning
+/// funnel (`memory_notify`, `memory_agent_register`, curator, federation, and
+/// similar substrate lanes). These values still round-trip on reads, but the
+/// generic memory create/update/promote surfaces may never author them.
 ///
 /// # Errors
 ///
-/// Returns an error when `namespace` (trimmed) equals a reserved name.
+/// Returns an error when `namespace` (trimmed) begins with the reserved `_`
+/// prefix.
 pub fn reject_reserved_write_namespace(namespace: &str) -> Result<()> {
-    if namespace.trim() == crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE {
+    let namespace = namespace.trim();
+    if namespace.starts_with('_') {
         bail!(
-            "namespace '{}' is reserved for substrate peer-head-entanglement records \
-             and cannot be written by a caller",
-            crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE
+            "namespace '{namespace}' is reserved for substrate-internal records and cannot be \
+             written by a caller; use the owning system tool"
         );
     }
     Ok(())
@@ -2643,6 +2641,22 @@ mod tests {
         );
     }
 
+    /// #3362 — caller memory writes cannot mint inbox or agent-registry rows;
+    /// those namespaces belong exclusively to their purpose-built funnels.
+    #[test]
+    fn validate_create_refuses_all_system_namespaces_3362() {
+        for namespace in ["_messages/ai:victim", "_agents", "_curator/reports"] {
+            let mut m = cm_valid();
+            m.namespace = namespace.to_string();
+            let err = validate_create(&m).expect_err("system namespace must be refused");
+            assert!(
+                err.to_string()
+                    .contains("reserved for substrate-internal records"),
+                "unexpected refusal for {namespace}: {err}"
+            );
+        }
+    }
+
     /// The refusal is exact — a namespace that merely CONTAINS the reserved
     /// name (as a sub-segment) is a distinct namespace and still writable.
     #[test]
@@ -2654,9 +2668,10 @@ mod tests {
 
     #[test]
     fn reject_reserved_write_namespace_trims_before_compare() {
-        // Leading/trailing whitespace around the reserved name is still refused.
-        assert!(reject_reserved_write_namespace("  _peer_head_entanglement  ").is_err());
+        // Leading/trailing whitespace around a system namespace is still refused.
+        assert!(reject_reserved_write_namespace("  _messages/ai:victim  ").is_err());
         assert!(reject_reserved_write_namespace("global").is_ok());
+        assert!(reject_reserved_write_namespace("team/_messages").is_ok());
     }
 
     // --- v0.7.0 #1467 — Form-6 `kind` strict validation ------------------

@@ -579,6 +579,9 @@ timestamp that was signed.
 
 This wire is identical across the three store surfaces (MCP
 `memory_store`, this HTTP endpoint, and the CLI `--sign` path).
+All three generic store surfaces reject namespaces whose trimmed value begins
+with `_`: that prefix is reserved for substrate-owned funnels such as
+`memory_notify` (`_messages/<target>`) and `memory_agent_register` (`_agents`).
 
 - **201 Created** with `{ "id": "...", "tier": "mid", "namespace": "...", "title": "...", "agent_id": "..." }`.
 - **202 Accepted** (governance pending) with `{ "status": "pending", "pending_id": "...", "action": "store" }`.
