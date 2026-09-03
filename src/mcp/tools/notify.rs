@@ -183,7 +183,15 @@ pub(crate) fn handle_inbox_with_policy(
         .map_or(50, |n| usize::try_from(n).unwrap_or(usize::MAX))
         .min(500);
     let namespace = super::agent::messages_namespace_for(&owner);
-    let items = db::list(
+    // v1.0.0 #3463 — the unread narrowing is PUSHED DOWN into the query
+    // (`list_filtered`'s `unread_only` axis -> `AND access_count = 0` before the
+    // SQL `LIMIT`). It used to run in Rust on the already-limited page, so an
+    // agent whose newest `limit` messages were all read got `count: 0` for
+    // `unread_only: true` while OLDER unread messages sat in its inbox — a
+    // silent false negative that a wake-then-read-once push design would
+    // inherit wholesale. The `limit` now bounds the UNREAD set, not the set the
+    // unread rows are looked for in.
+    let items = db::list_filtered(
         conn,
         Some(&namespace),
         None,
@@ -195,8 +203,14 @@ pub(crate) fn handle_inbox_with_policy(
         None,
         None,
         None, // #1834 valid_at (no as-of)
+        None, // #2580 metadata_eq (no narrowing)
+        unread_only,
     )
     .map_err(|e| e.to_string())?;
+    // #3463 belt-and-suspenders: the SAME marker re-checked in-process, so a
+    // drift between the SQL fragment and this predicate can only NARROW what
+    // the agent is shown, never widen it. With the pushdown in place this is a
+    // no-op on every correct path.
     let filtered: Vec<&Memory> = items
         .iter()
         .filter(|m| !unread_only || m.access_count == 0)
@@ -222,10 +236,18 @@ pub(crate) fn handle_inbox_with_policy(
             })
         })
         .collect();
+    // #3463 — `unread_count` derived from the SAME `access_count` marker the
+    // filter and the `read` wire field use, so the three can never disagree.
+    // Reported on this surface too (it was postgres-only), which is what lets a
+    // client compare inboxes across backends. Scope: the returned page. Under
+    // `unread_only: true` the page IS the unread window (the narrowing now runs
+    // before `LIMIT`), so this is the exact unread count up to `limit`.
+    let unread_count = filtered.iter().filter(|m| m.access_count == 0).count();
     Ok(json!({
         "agent_id": owner,
         "namespace": namespace,
         "count": messages.len(),
+        "unread_count": unread_count,
         (field_names::UNREAD_ONLY): unread_only,
         "messages": messages,
     }))

@@ -500,6 +500,138 @@ async fn bucket_b_inbox_unread_marker_is_access_count_3027() {
     let _ = handle.await;
 }
 
+/// v1.0.0 #3463 — `unread_only` must narrow INSIDE the query, before the SQL
+/// `LIMIT`, on the postgres arm too.
+///
+/// Pre-fix `get_inbox` fetched the newest `limit` rows through `store.list` and
+/// dropped the read ones in Rust afterwards. A full page of newer READ messages
+/// therefore HID older unread ones: the agent was answered `unread_count: 0`
+/// while unread messages sat in its namespace — a silent false negative, and an
+/// unsound foundation for any wake-then-read-once push design. The narrowing is
+/// now a SQL predicate (`AND access_count = 0`) applied before the `LIMIT`, the
+/// exact twin of the sqlite builder's `SQL_FRAGMENT_AND_UNREAD`.
+#[tokio::test(flavor = "multi_thread")]
+async fn bucket_b_inbox_unread_only_narrows_before_limit_3463() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping bucket_b_inbox_unread_only_narrows_before_limit_3463");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = pg_test_client("ai:parity-test");
+    let bob = format!("b3463-bob-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let alice = format!("b3463-alice-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // One LOW-priority message that stays unread, then three HIGH-priority ones
+    // that get marked read. `ORDER BY priority DESC, ...` puts the three read
+    // rows deterministically ahead of the unread one, so a `limit=3` window is
+    // entirely occupied by read rows — the corpus shape that produced the false
+    // negative.
+    let notify = |title: &str, priority: i64| {
+        let client = client.clone();
+        let base = base.clone();
+        let bob = bob.clone();
+        let alice = alice.clone();
+        let title = title.to_string();
+        async move {
+            let resp = client
+                .post(format!("{base}/api/v1/notify"))
+                .header("x-agent-id", &alice)
+                .json(&json!({
+                    "target_agent_id": bob,
+                    "title": title,
+                    "payload": format!("payload-{}", uuid::Uuid::new_v4()),
+                    "priority": priority,
+                }))
+                .send()
+                .await
+                .expect("notify POST");
+            assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+            let body: Value = resp.json().await.expect("notify body");
+            body["id"].as_str().expect("notify id").to_string()
+        }
+    };
+
+    let unread_id = notify("older unread", 1).await;
+    let mut read_ids = Vec::new();
+    for n in 0..3 {
+        read_ids.push(notify(&format!("newer read {n}"), 9).await);
+    }
+
+    // Mark the three high-priority rows read the way a real read does: bump
+    // `access_count`, the #3027 unread marker.
+    let probe = PostgresStore::connect(&url)
+        .await
+        .expect("connect probe pool");
+    for id in &read_ids {
+        let updated =
+            sqlx::query("UPDATE memories SET access_count = access_count + 1 WHERE id = $1")
+                .bind(id)
+                .execute(probe.pool())
+                .await
+                .expect("bump access_count")
+                .rows_affected();
+        assert_eq!(updated, 1, "fixture must touch exactly one row");
+    }
+
+    let inbox = |unread_only: bool, limit: u32| {
+        let client = client.clone();
+        let base = base.clone();
+        let bob = bob.clone();
+        async move {
+            let mut req = client
+                .get(format!("{base}/api/v1/inbox"))
+                .query(&[("limit", limit.to_string())]);
+            if unread_only {
+                req = req.query(&[("unread_only", "true")]);
+            }
+            let resp = req
+                .header("x-agent-id", &bob)
+                .send()
+                .await
+                .expect("inbox GET");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            resp.json::<Value>().await.expect("inbox body")
+        }
+    };
+
+    // DENIED path — the pre-fix false negative. A 3-row window fully occupied
+    // by newer READ rows must not hide the older unread one.
+    let unread = inbox(true, 3).await;
+    let msgs = unread["messages"].as_array().expect("messages array");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "#3463 REGRESSED: `unread_only` was applied AFTER the SQL LIMIT, so a full \
+         page of newer READ messages hid the older unread one and the agent was told \
+         it had nothing unread. got={unread}"
+    );
+    assert_eq!(msgs[0]["id"].as_str(), Some(unread_id.as_str()));
+    assert_eq!(msgs[0]["read"].as_bool(), Some(false));
+    assert_eq!(unread["unread_count"].as_u64(), Some(1));
+    assert_eq!(unread["count"].as_u64(), Some(1));
+    assert_eq!(unread["unread_only"].as_bool(), Some(true));
+
+    // ALLOWED path — without the axis the same window is the legacy page of
+    // three read rows, unchanged.
+    let all = inbox(false, 3).await;
+    let all_msgs = all["messages"].as_array().expect("messages array");
+    assert_eq!(
+        all_msgs.len(),
+        3,
+        "with `unread_only` absent the inbox must return the SAME first page it \
+         always did; got={all}"
+    );
+    assert!(
+        all_msgs.iter().all(|m| m["read"].as_bool() == Some(true)),
+        "the high-priority page is the three READ rows; got={all_msgs:?}"
+    );
+    assert_eq!(all["unread_count"].as_u64(), Some(0));
+    assert_eq!(all["count"].as_u64(), Some(3));
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
 /// S33: bob subscribes to a namespace; list_subscriptions surfaces it.
 #[tokio::test(flavor = "multi_thread")]
 async fn bucket_b_subscriptions_persist() {

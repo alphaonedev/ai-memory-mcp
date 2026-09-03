@@ -1053,6 +1053,28 @@ pub struct Filter {
     /// / `search`. Existing `..Default::default()` call sites are
     /// byte-identical.
     pub skip_access_ledger: bool,
+    /// v1.0.0 #3463 — narrow `list` to UNREAD rows only (`access_count == 0`,
+    /// the #3027 unread marker), pushed into SQL by BOTH adapters so the
+    /// narrowing happens BEFORE the `LIMIT`.
+    ///
+    /// The inbox surfaces previously fetched the newest `limit` rows and then
+    /// dropped the read ones in Rust. If those newest rows were all read, an
+    /// agent holding OLDER unread messages was told it had none — a silent
+    /// false negative, and an unsound foundation for any wake-then-read-once
+    /// push design. Applying the predicate in the query makes the returned
+    /// window the unread window on both backends.
+    ///
+    /// Default `false` (`#[derive(Default)]`): every existing
+    /// `..Default::default()` call site is byte-identical, and the emitted SQL
+    /// for `false` is unchanged (so cached plans are untouched). Honoured by
+    /// `list` on both adapters; ignored by `search` / `recall_hybrid`.
+    ///
+    /// Both adapters additionally re-apply the marker in-process on the rows
+    /// they return (the fail-closed re-check the [`MetadataEq`] axis
+    /// documents), so a hypothetical drift between the SQL fragment and the
+    /// canonical Rust predicate can only ever NARROW the result, never widen
+    /// it.
+    pub unread_only: bool,
 }
 
 impl Filter {
