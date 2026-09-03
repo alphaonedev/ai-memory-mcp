@@ -10478,6 +10478,129 @@ impl PostgresStore {
     /// `valid_until IS NULL OR valid_until > NOW()` filter so callers
     /// can read the full historical edge graph (S45's `as_of=past`
     /// semantics through `memory_kg_query`).
+    /// #3424 — fill the five DISPLAY fields on a traversal result set, in ONE
+    /// place, for BOTH postgres traversal paths.
+    ///
+    /// `POST /api/v1/kg/query` documents a nine-field row shape. The sqlite
+    /// lane projected all nine from `models::KgQueryNode`; the postgres lane
+    /// projected four, because [`KgQueryRow`] carried only four and the data
+    /// never reached the handler. Rather than teach the AGE Cypher projection
+    /// and the relational CTE each to carry the extra columns — two
+    /// hand-maintained projections is exactly what let the wire shapes drift in
+    /// the first place — both paths return the traversal skeleton and this one
+    /// step hydrates it. Whatever the traversal, the wire shape is identical by
+    /// construction.
+    ///
+    /// Two bounded lookups, both keyed by an `= ANY($1)` array over the rows
+    /// the traversal already capped:
+    ///
+    /// * `memories` → `title` / `target_namespace` for each target;
+    /// * `memory_links` → `valid_from` / `valid_until` / `observed_by` for the
+    ///   LAST hop of each row's path (`…->src->target`), which is the edge whose
+    ///   attribution the wire shape describes.
+    ///
+    /// A target whose row or edge cannot be resolved keeps the empty/`None`
+    /// default rather than inventing a value — degrade, never fabricate.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the lookup failure; a traversal that cannot be hydrated is
+    /// reported rather than returned with silently missing fields.
+    async fn hydrate_kg_query_rows(&self, rows: &mut [KgQueryRow]) -> StoreResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // -- targets: title + namespace ------------------------------------
+        let target_ids: Vec<String> = {
+            let mut v: Vec<String> = rows.iter().map(|r| r.target_id.clone()).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let target_rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, title, namespace FROM memories WHERE id = ANY($1)")
+                .bind(&target_ids)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| to_store_err("hydrate kg_query targets (#3424)", e))?;
+        let targets: std::collections::HashMap<String, (String, String)> = target_rows
+            .into_iter()
+            .map(|(id, title, ns)| (id, (title, ns)))
+            .collect();
+
+        // -- last hop: the edge whose attribution the row describes ---------
+        // `path` is the `a->b->c` chain the traversal built, so the last edge
+        // is (second-to-last, last). A depth-1 row's chain is `src->target`.
+        let last_hops: Vec<(String, String)> = rows
+            .iter()
+            .filter_map(|r| {
+                let mut it = r.path.rsplit("->");
+                let target = it.next()?;
+                let source = it.next()?;
+                Some((source.to_string(), target.to_string()))
+            })
+            .collect();
+        let hop_sources: Vec<String> = last_hops.iter().map(|(s, _)| s.clone()).collect();
+        let hop_targets: Vec<String> = last_hops.iter().map(|(_, t)| t.clone()).collect();
+        // `memory_links.valid_from` / `valid_until` are TIMESTAMPTZ, not TEXT:
+        // decode them as `DateTime<Utc>` and render with `to_rfc3339()`, the
+        // same projection `kg_timeline_cte` uses. Decoding straight into
+        // `Option<String>` fails the WHOLE query, which is how the first cut of
+        // this helper broke `age_cte_equivalence` — a reminder that a hydration
+        // step must not be able to take the traversal down with it.
+        let edge_recs = sqlx::query(
+            "SELECT source_id, target_id, valid_from, valid_until, observed_by \
+             FROM memory_links \
+             WHERE source_id = ANY($1) AND target_id = ANY($2)",
+        )
+        .bind(&hop_sources)
+        .bind(&hop_targets)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("hydrate kg_query edges (#3424)", e))?;
+        let mut edges: std::collections::HashMap<
+            (String, String),
+            (Option<String>, Option<String>, Option<String>),
+        > = std::collections::HashMap::new();
+        for r in &edge_recs {
+            let src: String = r
+                .try_get("source_id")
+                .map_err(|e| to_store_err("read edge source_id (#3424)", e))?;
+            let tgt: String = r
+                .try_get("target_id")
+                .map_err(|e| to_store_err("read edge target_id (#3424)", e))?;
+            let vf: Option<DateTime<Utc>> = r
+                .try_get(field_names::VALID_FROM)
+                .map_err(|e| to_store_err("read edge valid_from (#3424)", e))?;
+            let vu: Option<DateTime<Utc>> = r
+                .try_get(field_names::VALID_UNTIL)
+                .map_err(|e| to_store_err("read edge valid_until (#3424)", e))?;
+            let ob: Option<String> = r
+                .try_get(field_names::OBSERVED_BY)
+                .map_err(|e| to_store_err("read edge observed_by (#3424)", e))?;
+            edges.insert(
+                (src, tgt),
+                (vf.map(|t| t.to_rfc3339()), vu.map(|t| t.to_rfc3339()), ob),
+            );
+        }
+
+        for row in rows.iter_mut() {
+            if let Some((title, ns)) = targets.get(&row.target_id) {
+                row.title.clone_from(title);
+                row.target_namespace.clone_from(ns);
+            }
+            let mut it = row.path.rsplit("->");
+            if let (Some(target), Some(source)) = (it.next(), it.next())
+                && let Some((vf, vu, ob)) = edges.get(&(source.to_string(), target.to_string()))
+            {
+                row.valid_from.clone_from(vf);
+                row.valid_until.clone_from(vu);
+                row.observed_by.clone_from(ob);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn kg_query_with_history(
         &self,
         source_id: &str,
@@ -10513,23 +10636,30 @@ impl PostgresStore {
         // operators see a degraded but functional KG surface. Each
         // request retries AGE first; we don't latch the backend
         // permanently in case the operator restores AGE behind us.
-        match self.kg_backend {
+        // No `mut`: each traversal now hydrates its own rows before returning
+        // (#3424), so this dispatcher only forwards them.
+        let rows = match self.kg_backend {
             KgBackend::Age if !include_invalidated => {
                 match self.kg_query_cypher(source_id, max_depth).await {
-                    Ok(rows) => Ok(rows),
+                    Ok(rows) => rows,
                     Err(err) if is_age_runtime_failure(&err) => {
                         warn_age_fallback("kg_query", source_id, &err);
                         self.kg_query_cte_filtered(source_id, max_depth, include_invalidated)
-                            .await
+                            .await?
                     }
-                    Err(err) => Err(err),
+                    Err(err) => return Err(err),
                 }
             }
             _ => {
                 self.kg_query_cte_filtered(source_id, max_depth, include_invalidated)
-                    .await
+                    .await?
             }
-        }
+        };
+        // #3424 — hydration happens inside EACH traversal (see
+        // `hydrate_kg_query_rows`), not here, so a direct `kg_query_cte` /
+        // `kg_query_cypher` caller gets the same fully-populated row this
+        // dispatcher returns.
+        Ok(rows)
     }
 
     /// Cypher (Apache AGE) implementation of `kg_query`.
@@ -10715,6 +10845,14 @@ impl PostgresStore {
                 relation: age_last_edge_relation(&edges),
                 depth: edges.len(),
                 path: node_ids.join("->"),
+                // #3424 — left empty here and filled by the ONE shared
+                // hydration step in `kg_query_with_history`, so the AGE and
+                // CTE paths cannot project different wire shapes.
+                title: String::new(),
+                target_namespace: String::new(),
+                valid_from: None,
+                valid_until: None,
+                observed_by: None,
             });
         }
 
@@ -10760,6 +10898,13 @@ impl PostgresStore {
                 .then_with(|| a.target_id.cmp(&b.target_id))
         });
         decoded.truncate(kg_query_row_cap(None));
+        // #3424 — hydrate the five display fields on the FINAL, capped set.
+        // Placed inside the traversal rather than in the `kg_query_with_history`
+        // dispatcher so the invariant is "no partially-populated KgQueryRow ever
+        // leaves this adapter", for the public entry point AND for a direct
+        // `kg_query_cypher` / `kg_query_cte` caller — which is what
+        // `age_cte_equivalence` compares.
+        self.hydrate_kg_query_rows(&mut decoded).await?;
         Ok(decoded)
     }
 
@@ -10863,7 +11008,9 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("cte kg_query", e))?;
 
-        rows.iter()
+        // Shadow the raw sqlx rows with the decoded traversal set.
+        let mut rows = rows
+            .iter()
             .map(|r| {
                 let target_id: String = r
                     .try_get::<String, _>("target_id")
@@ -10882,9 +11029,23 @@ impl PostgresStore {
                     relation,
                     depth: usize::try_from(depth_i).unwrap_or(0),
                     path,
+                    // #3424 — see the AGE twin: filled by the shared hydration
+                    // step, never projected differently per traversal path.
+                    title: String::new(),
+                    target_namespace: String::new(),
+                    valid_from: None,
+                    valid_until: None,
+                    observed_by: None,
                 })
             })
-            .collect()
+            .collect::<StoreResult<Vec<KgQueryRow>>>()?;
+        // #3424 — hydrate inside the traversal, so a DIRECT `kg_query_cte`
+        // caller gets the same fully-populated row the public dispatcher
+        // returns. `age_cte_equivalence` compares exactly those two, and the
+        // invariant it pins is worth keeping: no partially-populated
+        // `KgQueryRow` leaves this adapter.
+        self.hydrate_kg_query_rows(&mut rows).await?;
+        Ok(rows)
     }
 
     /// Ordered fact timeline for an entity — v0.7 Track J dispatcher.

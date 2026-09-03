@@ -3637,6 +3637,14 @@ impl MemoryStore for SqliteStore {
                 relation: n.relation,
                 depth: n.depth,
                 path: n.path,
+                // #3424 — carry the five display fields the sqlite row ALREADY
+                // has. They were dropped here, which is half of why the two
+                // backends projected different wire shapes.
+                title: n.title,
+                target_namespace: n.target_namespace,
+                valid_from: n.valid_from,
+                valid_until: n.valid_until,
+                observed_by: n.observed_by,
             })
             .collect())
     }

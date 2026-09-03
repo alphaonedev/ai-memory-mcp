@@ -688,6 +688,52 @@ pub struct CheckDuplicateBody {
     pub threshold: Option<f32>,
 }
 
+/// #3424 — the ONE wire projection for a `POST /api/v1/check_duplicate`
+/// response.
+///
+/// `docs/API_REFERENCE.md` documents `nearest.similarity` (rounded for display)
+/// and `suggested_merge` as the nearest row's **id**, or null when the
+/// candidate is not a duplicate. The sqlite branch emitted exactly that; the
+/// postgres branch hand-built a different object that renamed `similarity` to
+/// `score`, skipped the display rounding, and put `check.is_duplicate` — a
+/// BOOLEAN — in `suggested_merge`, where a consumer expects an id to merge
+/// INTO. Two hand-maintained projections is the defect, not a symptom of it:
+/// both branches now call this function, so the shape can only change in one
+/// place.
+///
+/// `nearest` is `null` when the candidate pool was empty or the nearest row was
+/// masked from this caller by the #947 visibility filter.
+fn check_duplicate_response(check: &crate::models::DuplicateCheck) -> serde_json::Value {
+    let nearest_json = check.nearest.as_ref().map(|m| {
+        json!({
+            "id": m.id,
+            "title": m.title,
+            "namespace": m.namespace,
+            // Display rounding is part of the documented contract, not a
+            // cosmetic detail: two backends emitting different precision for
+            // the same pair is itself a wire-shape break.
+            (field_names::SIMILARITY): (f64::from(m.similarity)
+                * crate::SCORE_DISPLAY_ROUND_FACTOR)
+                .round()
+                / crate::SCORE_DISPLAY_ROUND_FACTOR,
+        })
+    });
+    // The merge TARGET, never a flag: `suggested_merge` is the id a caller
+    // would merge into, and is null unless the candidate really is a duplicate.
+    let suggested_merge = if check.is_duplicate {
+        check.nearest.as_ref().map(|m| m.id.clone())
+    } else {
+        None
+    };
+    json!({
+        (field_names::IS_DUPLICATE): check.is_duplicate,
+        "threshold": check.threshold,
+        "nearest": nearest_json,
+        (field_names::SUGGESTED_MERGE): suggested_merge,
+        (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
+    })
+}
+
 /// `POST /api/v1/check_duplicate` — REST mirror of the MCP
 /// `memory_check_duplicate` tool. Embeds `title + content`, scans
 /// embedded live memories, and returns the highest-cosine match plus
@@ -816,24 +862,20 @@ pub async fn check_duplicate(
                         check.is_duplicate = false;
                     }
                 }
-                let near_json = match check.nearest {
-                    Some(n) => json!({
-                        "id": n.id,
-                        "title": n.title,
-                        "namespace": n.namespace,
-                        "score": n.similarity,
-                    }),
-                    None => serde_json::Value::Null,
-                };
-                Json(json!({
-                    (field_names::IS_DUPLICATE): check.is_duplicate,
-                    "threshold": check.threshold,
-                    "nearest": near_json,
-                    (field_names::SUGGESTED_MERGE): check.is_duplicate,
-                    (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
-                    (field_names::STORAGE_BACKEND): "postgres",
-                }))
-                .into_response()
+                // #3424 — project through the SHARED response projection. The
+                // hand-built object this replaces renamed `similarity` ->
+                // `score`, dropped the display rounding, and put the
+                // `is_duplicate` BOOLEAN in `suggested_merge`, where the
+                // contract (and the sqlite lane) put the nearest row's id.
+                // `storage_backend` stays additive on this lane.
+                let mut body = check_duplicate_response(&check);
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        field_names::STORAGE_BACKEND.to_string(),
+                        serde_json::Value::String("postgres".to_string()),
+                    );
+                }
+                Json(body).into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -913,27 +955,127 @@ pub async fn check_duplicate(
         }
     }
 
-    let nearest_json = check.nearest.as_ref().map(|m| {
-        json!({
-            "id": m.id,
-            "title": m.title,
-            "namespace": m.namespace,
-            (field_names::SIMILARITY): (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
-                / crate::SCORE_DISPLAY_ROUND_FACTOR,
-        })
-    });
-    let suggested_merge = if check.is_duplicate {
-        check.nearest.as_ref().map(|m| m.id.clone())
-    } else {
-        None
-    };
+    // #3424 — the SAME shared projection the postgres branch uses.
+    Json(check_duplicate_response(&check)).into_response()
+}
 
-    Json(json!({
-        (field_names::IS_DUPLICATE): check.is_duplicate,
-        "threshold": check.threshold,
-        "nearest": nearest_json,
-        (field_names::SUGGESTED_MERGE): suggested_merge,
-        (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
-    }))
-    .into_response()
+#[cfg(test)]
+mod check_duplicate_wire_shape_tests_3424 {
+    //! #3424 — the `POST /api/v1/check_duplicate` wire shape, pinned on the ONE
+    //! projection BOTH backend branches call.
+    //!
+    //! The postgres branch used to hand-build a different object: it renamed
+    //! `nearest.similarity` to `score`, skipped the display rounding, and put
+    //! the `is_duplicate` BOOLEAN in `suggested_merge` where the contract puts
+    //! the nearest row's id. Testing the shared projection is what makes the
+    //! assertion binding on both lanes — the two branches differ only by the
+    //! additive `storage_backend` key, so a shape regression has to go through
+    //! this function.
+
+    use super::check_duplicate_response;
+    use crate::models::field_names;
+    use crate::models::{DuplicateCheck, DuplicateMatch};
+
+    fn check(is_duplicate: bool, nearest: Option<DuplicateMatch>) -> DuplicateCheck {
+        DuplicateCheck {
+            is_duplicate,
+            threshold: 0.85,
+            nearest,
+            candidates_scanned: 412,
+        }
+    }
+
+    fn a_match() -> DuplicateMatch {
+        DuplicateMatch {
+            id: "11111111-1111-4111-8111-111111111111".to_string(),
+            title: "Project uses PostgreSQL 15".to_string(),
+            namespace: "my-app".to_string(),
+            similarity: 0.923_456_7,
+        }
+    }
+
+    /// The documented key set, exactly — no `score`, no extra keys.
+    #[test]
+    fn projection_emits_the_documented_keys_3424() {
+        let body = check_duplicate_response(&check(true, Some(a_match())));
+        let obj = body.as_object().expect("object body");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                field_names::CANDIDATES_SCANNED,
+                field_names::IS_DUPLICATE,
+                "nearest",
+                field_names::SUGGESTED_MERGE,
+                "threshold",
+            ],
+            "envelope key set drifted: {body}"
+        );
+
+        let near = obj["nearest"].as_object().expect("nearest object");
+        let mut near_keys: Vec<&str> = near.keys().map(String::as_str).collect();
+        near_keys.sort_unstable();
+        assert_eq!(
+            near_keys,
+            vec!["id", "namespace", field_names::SIMILARITY, "title"],
+            "nearest key set drifted (the postgres lane used to emit `score`): {body}"
+        );
+        assert!(
+            near.get("score").is_none(),
+            "`score` is the postgres-only misnomer this fix removes: {body}"
+        );
+    }
+
+    /// `suggested_merge` is the merge TARGET id, never the `is_duplicate` flag.
+    #[test]
+    fn suggested_merge_is_the_nearest_id_not_a_bool_3424() {
+        let m = a_match();
+        let body = check_duplicate_response(&check(true, Some(m.clone())));
+        assert_eq!(
+            body[field_names::SUGGESTED_MERGE].as_str(),
+            Some(m.id.as_str()),
+            "suggested_merge must be the nearest row's id: {body}"
+        );
+        assert!(
+            !body[field_names::SUGGESTED_MERGE].is_boolean(),
+            "the postgres lane used to put the is_duplicate BOOLEAN here: {body}"
+        );
+    }
+
+    /// Not a duplicate → nothing to merge into.
+    #[test]
+    fn suggested_merge_is_null_when_not_a_duplicate_3424() {
+        let body = check_duplicate_response(&check(false, Some(a_match())));
+        assert!(
+            body[field_names::SUGGESTED_MERGE].is_null(),
+            "no merge target unless the candidate IS a duplicate: {body}"
+        );
+        // The nearest row is still reported — only the merge suggestion is
+        // withheld.
+        assert!(body["nearest"].is_object(), "{body}");
+    }
+
+    /// Display rounding is part of the contract: the postgres lane emitted the
+    /// raw f32, so the same pair produced different precision per backend.
+    #[test]
+    fn similarity_is_display_rounded_3424() {
+        let body = check_duplicate_response(&check(true, Some(a_match())));
+        let sim = body["nearest"][field_names::SIMILARITY]
+            .as_f64()
+            .expect("similarity is a number");
+        assert!(
+            (sim - 0.923).abs() < 1e-9,
+            "similarity must be rounded for display, got {sim}: {body}"
+        );
+    }
+
+    /// An empty candidate pool (or a visibility-masked nearest) reports null.
+    #[test]
+    fn nearest_is_null_when_absent_3424() {
+        let body = check_duplicate_response(&check(false, None));
+        assert!(body["nearest"].is_null(), "{body}");
+        assert!(body[field_names::SUGGESTED_MERGE].is_null(), "{body}");
+        assert_eq!(body[field_names::CANDIDATES_SCANNED], 412);
+    }
 }
