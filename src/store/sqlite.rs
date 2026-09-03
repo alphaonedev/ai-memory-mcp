@@ -3560,7 +3560,38 @@ impl MemoryStore for SqliteStore {
             valid_until: None,
         };
         let conn = self.state.lock().await;
-        db::insert(&conn, &mem).map_err(box_err)
+        // #3358 — trait-routed SQLite notify must enforce the same sender
+        // quota as MCP/HTTP SQLite and PostgreSQL. The recipient owns the
+        // inbox namespace, but the authenticated sender pays for the write.
+        let payload_bytes =
+            quotas::coordination_payload_bytes(&[&mem.title, &mem.content], &[&mem.metadata]);
+        let quota_op = quotas::QuotaOp::Memory {
+            bytes: payload_bytes,
+        };
+        match quotas::check_and_record(&conn, &ctx.agent_id, &mem.namespace, quota_op) {
+            Ok(()) => {}
+            Err(quotas::QuotaCheckError::Quota(q)) => {
+                return Err(StoreError::QuotaExceeded {
+                    agent_id: q.agent_id,
+                    namespace: q.namespace,
+                    limit: q.limit.as_str().to_string(),
+                    current: q.current,
+                    max: q.max,
+                });
+            }
+            Err(quotas::QuotaCheckError::Sql(e)) => return Err(box_err(e)),
+        }
+        match db::insert(&conn, &mem) {
+            Ok(id) => Ok(id),
+            Err(e) => {
+                if let Err(refund_err) =
+                    quotas::refund_op(&conn, &ctx.agent_id, &mem.namespace, quota_op)
+                {
+                    quotas::log_refund_op_failed(&ctx.agent_id, &refund_err);
+                }
+                Err(box_err(e))
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -5512,6 +5543,61 @@ mod tests {
         let mem = store.get(&ctx, &id).await.expect("get notify");
         assert_eq!(mem.namespace, "_inbox/ai:notify-target");
         assert!(mem.tags.iter().any(|t| t == "notify"));
+        let status = store
+            .quota_status_ns(&ctx.agent_id, &mem.namespace)
+            .await
+            .expect("sender quota status");
+        assert_eq!(status.current_memories_today, 1);
+        assert!(status.current_storage_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn notify_refuses_sender_over_quota_without_writing_3358() {
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let target = "ai:notify-quota-target";
+        let namespace = crate::inbox_namespace(target);
+        {
+            let conn = store.state.lock().await;
+            quotas::get_status(&conn, &ctx.agent_id, &namespace).expect("seed quota row");
+            conn.execute(
+                "UPDATE agent_quotas SET max_memories_per_day = 0
+                 WHERE agent_id = ?1 AND namespace = ?2",
+                rusqlite::params![ctx.agent_id, namespace],
+            )
+            .expect("tighten sender quota");
+        }
+
+        let err = store
+            .notify(
+                &ctx,
+                target,
+                "must be refused",
+                "must not reach the inbox",
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("notify over quota must fail closed");
+
+        assert!(matches!(
+            err,
+            StoreError::QuotaExceeded {
+                agent_id,
+                namespace: error_namespace,
+                ..
+            } if agent_id == ctx.agent_id && error_namespace == namespace
+        ));
+        let conn = store.state.lock().await;
+        let inbox_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = ?1",
+                [&namespace],
+                |row| row.get(0),
+            )
+            .expect("count inbox rows");
+        assert_eq!(inbox_rows, 0, "an over-quota notify must not materialise");
     }
 
     #[tokio::test]
