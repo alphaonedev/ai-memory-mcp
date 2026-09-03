@@ -161,7 +161,7 @@ pub struct CalibrationReport {
 ///
 /// # Errors
 ///
-/// Returns an error when `days` is outside `1..=36500`, checked timestamp
+/// Returns an error when `days` is outside `0..=36500`, checked timestamp
 /// subtraction fails, or an underlying SQLite operation fails.
 #[allow(clippy::cast_precision_loss)]
 pub fn calibrate_from_shadow(
@@ -173,7 +173,7 @@ pub fn calibrate_from_shadow(
     // `Duration::days` / `DateTime - Duration` operators. Keep the bound and
     // checked arithmetic in the substrate function so both CLI and MCP callers
     // inherit the same fail-closed behavior.
-    let since_dt = crate::validate::checked_days_ago(now, "days", days, 1)?;
+    let since_dt = crate::validate::checked_days_ago(now, "days", days, 0)?;
     let since = since_dt.to_rfc3339();
 
     // v0.9.0 §11.5 (#1706) — offline sweep step, ridden on this existing

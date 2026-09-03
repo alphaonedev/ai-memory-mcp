@@ -431,7 +431,7 @@ impl McpTool for ArchivePurgeTool {
         "Permanently delete archived memories."
     }
     fn docs() -> &'static str {
-        "Purge archive. Scope via older_than_days (0..=36500). Unrecoverable. #3171: the DEFAULT SCOPE IS \
+        "Purge archive. Scope via older_than_days. Unrecoverable. #3171: the DEFAULT SCOPE IS \
          CALLER-ONLY — only the resolved caller's archived rows are purged; `as_admin: true` \
          escalates to EVERY owner's. A governance Ask rule returns a SUCCESS-SHAPED \
          `{status:\"ask\"}` envelope with NOTHING purged — check `status`, not just the \

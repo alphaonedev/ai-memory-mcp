@@ -32,7 +32,7 @@ use crate::confidence::calibrate::{DEFAULT_WINDOW_DAYS, calibrate_from_shadow};
 /// ```
 ///
 /// Errors:
-/// * `days must be a positive integer` — caller passed `days <= 0`.
+/// * `days must be non-negative` — caller passed `days < 0`.
 /// * `days must not exceed 36500 days` — caller exceeded the bounded
 ///   calibration window.
 /// * `memory_calibrate_confidence substrate error: ...` — SQL error.
@@ -44,8 +44,8 @@ pub fn handle_calibrate_confidence(
         .get("days")
         .and_then(Value::as_i64)
         .unwrap_or(DEFAULT_WINDOW_DAYS);
-    if days <= 0 {
-        return Err("days must be a positive integer".to_string());
+    if days < 0 {
+        return Err("days must be non-negative".to_string());
     }
     if days > crate::validate::MAX_DURATION_DAYS {
         return Err(format!(
@@ -70,7 +70,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct CalibrateConfidenceRequest {
-    /// Window days (1..=36500).
+    /// Window days (0..=36500).
     #[serde(default)]
     pub days: Option<i64>,
 
@@ -94,7 +94,7 @@ impl McpTool for CalibrateConfidenceTool {
         "Scan confidence_shadow_observations and emit per-source baselines (Form 5)."
     }
     fn docs() -> &'static str {
-        "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Window is 1..=36500 days; default 30d. Family::Power — refuses on keyword tier."
+        "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power — refuses on keyword tier."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<CalibrateConfidenceRequest>()
@@ -154,13 +154,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_positive_days() {
+    fn rejects_negative_days() {
         let (conn, _dir) = open_tmp();
-        let err = handle_calibrate_confidence(&conn, &json!({"days": 0})).expect_err("must reject");
-        assert!(err.contains("positive integer"));
         let err =
             handle_calibrate_confidence(&conn, &json!({"days": -1})).expect_err("must reject");
-        assert!(err.contains("positive integer"));
+        assert!(err.contains("non-negative"));
     }
 
     #[test]
@@ -179,6 +177,11 @@ mod tests {
         let err = handle_calibrate_confidence(&conn, &json!({"days": i64::MAX}))
             .expect_err("huge calibration window must be refused without panicking");
         assert!(err.contains("must not exceed 36500"), "got: {err}");
+
+        let zero = handle_calibrate_confidence(&conn, &json!({"days": 0}))
+            .expect("zero is the documented empty-window calibration shape");
+        assert_eq!(zero["report"]["window_days"].as_i64(), Some(0));
+        assert_eq!(zero["report"]["total_observations"].as_u64(), Some(0));
 
         let value = handle_calibrate_confidence(
             &conn,
