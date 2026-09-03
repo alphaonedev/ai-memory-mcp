@@ -6973,21 +6973,9 @@ mod tests {
         )
     }
 
-    #[test]
-    fn mcp_server_refuses_shape_invalid_agent_identity_before_serving_3356() {
-        let _env = crate::identity::agent_id_env_set_guard("bad id with spaces");
-        let result = run_mcp_server(
-            std::path::Path::new(":memory:"),
-            FeatureTier::Keyword,
-            &crate::config::AppConfig::default(),
-            &crate::profile::Profile::core(),
-        );
-        let error = result.unwrap_err().to_string();
-        assert!(
-            error.starts_with("AI_MEMORY_AGENT_ID is invalid:"),
-            "unexpected startup error: {error}"
-        );
-    }
+    // #3475 moved `mcp_server_refuses_shape_invalid_agent_identity_before_serving_3356`
+    // (it installed a process-global identity) to its own binary, same
+    // assertions: `tests/mcp_agent_id_env_isolation_3475.rs`.
 
     /// Like [`invoke_handle_request`] but threads a live capture-nag
     /// watcher + session id through to the dispatch loop, exercising the
@@ -7298,6 +7286,7 @@ mod tests {
 
     #[test]
     fn handle_get_happy_returns_memory() {
+        let _env = crate::identity::agent_id_env_unset_guard(); // #3475
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         // Insert a memory directly to know the id.
         let mem = Memory {
@@ -9432,11 +9421,17 @@ mod tests {
         );
     }
 
+    /// #3356 configured this envelope-shape test's caller by INSTALLING
+    /// `AI_MEMORY_AGENT_ID=test-bot` process-wide, which #3475 showed makes
+    /// every concurrent lib test resolve a foreign identity. The envelope is
+    /// the subject here, so it now asserts against the DEFAULT fail-closed
+    /// posture's own derived owner instead — no env install.
     #[test]
     fn handle_inbox_returns_empty_for_unregistered_caller() {
-        let _env = crate::identity::agent_id_env_set_guard("test-bot");
+        let _env = crate::identity::agent_id_env_unset_guard(); // #3475
+        let owner = crate::identity::resolve_agent_id(None, None).unwrap();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let req = make_tools_call("memory_inbox", json!({"agent_id": "test-bot"}));
+        let req = make_tools_call("memory_inbox", json!({}));
         let resp = invoke_handle_request(&conn, &req);
         assert!(resp.error.is_none());
         let text = resp.result.unwrap()["content"][0]["text"]
@@ -9444,19 +9439,17 @@ mod tests {
             .unwrap()
             .to_string();
         let val: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(val["agent_id"], "test-bot");
+        assert_eq!(val["agent_id"], owner);
         assert!(val["namespace"].as_str().unwrap().starts_with("_messages/"));
         assert_eq!(val["count"], 0);
     }
 
+    /// Same #3475 treatment as its sibling above.
     #[test]
     fn handle_inbox_with_unread_only_filter() {
-        let _env = crate::identity::agent_id_env_set_guard("test-bot");
+        let _env = crate::identity::agent_id_env_unset_guard(); // #3475
+        let req = make_tools_call("memory_inbox", json!({"unread_only": true, "limit": 10}));
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let req = make_tools_call(
-            "memory_inbox",
-            json!({"agent_id": "test-bot", "unread_only": true, "limit": 10}),
-        );
         let resp = invoke_handle_request(&conn, &req);
         assert!(resp.error.is_none());
         let text = resp.result.unwrap()["content"][0]["text"]
@@ -10937,6 +10930,7 @@ mod tests {
 
     #[test]
     fn handle_get_resolves_by_prefix_and_includes_links() {
+        let _env = crate::identity::agent_id_env_unset_guard(); // #3475
         // db::resolve_id walks both exact and prefix lookup. Insert a
         // memory and request it by its 8-char prefix to drive the
         // prefix branch.
@@ -11048,6 +11042,7 @@ mod tests {
 
     #[test]
     fn handle_get_links_returns_outbound_and_inbound() {
+        let _env = crate::identity::agent_id_env_unset_guard(); // #3475
         // Seed source+target+link, query links from source.
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {

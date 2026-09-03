@@ -144,9 +144,23 @@
 # internal lock (which it structurally cannot reach -- `test_env_lock`
 # is `pub(crate)`, not exported across the test-binary boundary).
 #
+# ARM (d) -- issue #3475 (2026-09-02). Arms (a)-(c) above police HOW a
+# $HOME mutation is serialized. Arm (d) polices WHETHER a `src/**` test may
+# mutate the process environment AT ALL, because #3475 proved the
+# serialization answer does not generalize: a lock only helps when every
+# READER takes it too, and the readers here are several hundred lib tests
+# that resolve `AI_MEMORY_AGENT_ID` transitively. It is a per-file CENSUS
+# RATCHET against scripts/qc-allowlists/test-env-mutation-baseline.txt -- counts may fall
+# freely and never rise. Its full rationale sits with the code, below the
+# arms (a)-(c) main loop.
+#
 # Usage:
 #   scripts/check-test-env-lock.sh
-#     - exit 0 on clean, exit 1 on any violation
+#     - exit 0 on clean, exit 1 on any violation (arms (a)-(d))
+#   scripts/check-test-env-lock.sh --update-baseline
+#     - rewrite the arm (d) census baseline. Any number it RAISES is a
+#       deliberate widening of the #3475 control and must be justified in
+#       review; lowering one is always safe.
 #   scripts/check-test-env-lock.sh --self-test
 #     - injects: a violating fixture ($HOME mutation, zero test_env_lock
 #       reference anywhere in the file), a compliant fixture (same
@@ -164,7 +178,10 @@
 #       only), and a DELEGATE-WRAPPER compliant fixture (issue #2163
 #       over-widen guard -- a test acquiring its guard via a local
 #       delegate wrapper that transitively cites the token, which arm (c)
-#       must NOT false-positive); verifies the gate catches all five
+#       must NOT false-positive), and an ARM-(d) fixture (issue #3475 -- a
+#       wholly-new `src/**` file that INSTALLS a value into the
+#       process-global AI_MEMORY_AGENT_ID, invisible to arms (a)-(c)
+#       because it never touches $HOME); verifies the gate catches all six
 #       violators and spares BOTH compliant fixtures, then cleans up.
 #       Exit 0 on PASS.
 
@@ -357,8 +374,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
     probe_arm_b="${ROOT}/src/.check_home_lock_arm_b_probe.rs"
     probe_naked="${ROOT}/src/.check_home_lock_naked_probe.rs"
     probe_delegate="${ROOT}/src/.check_home_lock_delegate_probe.rs"
+    # Arm (d) (#3475) probe. Deliberately NOT dot-prefixed: arm (d) skips
+    # dot-prefixed basenames (they can never be a compiled Rust module), so a
+    # `.`-named fixture could not exercise it.
+    probe_arm_d="${ROOT}/src/check_test_env_arm_d_probe_3475.rs"
 
-    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate"; do
+    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run -- remove manually)" >&2
@@ -598,19 +619,39 @@ fn contrived_delegate_wrapper_test() {
 }
 EOF
 
+    # Case 8 (arm (d), issue #3475): a WHOLLY-NEW src/** file that installs a
+    # value into the process-global AI_MEMORY_AGENT_ID. It is not in the
+    # ratchet baseline, so arm (d) must flag it as a NEW OFFENDER -- even
+    # though it never touches $HOME and is therefore invisible to arms (a)-(c).
+    cat > "$probe_arm_d" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-env-lock.sh --self-test.
+// Installs a value into the process-global AI_MEMORY_AGENT_ID inside the
+// lib test binary -- the issue #3475 defect class. Must be caught by arm (d).
+#[test]
+fn contrived_agent_id_env_install() {
+    unsafe {
+        std::env::set_var("AI_MEMORY_AGENT_ID", "ai:contrived");
+    }
+    unsafe {
+        std::env::remove_var("AI_MEMORY_AGENT_ID");
+    }
+}
+EOF
+
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
 
-    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate"
+    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d"
     printf '%s\n' "$gate_output"
 
-    # PASS requires: non-zero exit, ALL FIVE violators reported (no-lock,
+    # PASS requires: non-zero exit, ALL SIX violators reported (no-lock,
     # hand-rolled-lock, comment-only-mention #2153a, the module-local-lock-
-    # adjacency #2153b shape, and the naked-mutation #2163 shape), and BOTH
-    # compliant fixtures (the plain compliant one AND the config.rs
-    # delegate-wrapper one) NOT reported.
+    # adjacency #2153b shape, the naked-mutation #2163 shape, and the arm-(d)
+    # AI_MEMORY_AGENT_ID install #3475), and BOTH compliant fixtures (the
+    # plain compliant one AND the config.rs delegate-wrapper one) NOT
+    # reported.
     ok=1
     (( gate_exit != 0 )) || ok=0
     printf '%s' "$gate_output" | grep -q '\.check_home_lock_violation_probe\.rs' || ok=0
@@ -618,6 +659,7 @@ EOF
     printf '%s' "$gate_output" | grep -q '\.check_home_lock_comment_only_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'contrived_handrolled_second_test\|\.check_home_lock_arm_b_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'contrived_naked_second_test\|\.check_home_lock_naked_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'check_test_env_arm_d_probe_3475\.rs' || ok=0
     if printf '%s' "$gate_output" | grep -q '\.check_home_lock_compliant_probe\.rs'; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: the compliant fixture was flagged)" >&2
@@ -640,7 +682,7 @@ EOF
     fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-env-lock gate self-test: PASS (caught all five contrived violations, spared both compliant fixtures; exit=${gate_exit})"
+        echo "Test-env-lock gate self-test: PASS (caught all six contrived violations -- five \$HOME shapes plus the #3475 arm (d) AI_MEMORY_AGENT_ID install -- and spared both compliant fixtures; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
@@ -653,6 +695,10 @@ fi
 cd "$ROOT"
 
 violations=""
+# Arms (a)-(c) record their verdict here rather than exiting immediately, so
+# arm (d) (issue #3475) always runs and a single invocation reports BOTH
+# defect classes instead of hiding the second behind the first.
+home_fail=0
 
 while IFS= read -r -d '' f; do
     rel="${f#"${ROOT}/"}"
@@ -779,9 +825,188 @@ if [[ -n "${violations//[[:space:]]/}" ]]; then
         echo "pattern (save+restore \$HOME under the guard, a SAFETY comment"
         echo "citing serialization by the lock)."
     } >&2
+    home_fail=1
+fi
+
+if (( home_fail == 0 )); then
+    echo "Test-env-lock gate: PASS (every \$HOME-mutating file references the shared test_env_lock guard)"
+fi
+
+# ---------------------------------------------------------------------
+# Arm (d) -- issue #3475: NO NEW process-global env mutation inside the
+# LIB TEST BINARY (src/**/*.rs).
+#
+# Arms (a)-(c) above police HOW a $HOME mutation is serialized. Arm (d)
+# polices WHETHER a src/** test may mutate the process environment at
+# all, because #3475 proved the serialization answer does not generalize.
+#
+# WHAT #3475 WAS. #3356 added two lib tests to src/mcp/mod.rs that
+# installed a shape-VALID identity into the process-global
+# AI_MEMORY_AGENT_ID (`agent_id_env_set_guard("test-bot")`) under the
+# crate-wide `identity::agent_id_env_test_lock()`. That lock serializes
+# the MUTATORS against each other -- but `visibility::is_visible_by_fields`
+# treats a row with no `metadata.scope` as `private` and therefore
+# OWNER-KEYED, and every MCP read dispatch feeds it
+# `identity::resolve_read_visibility_caller()`, which reads that same
+# variable. So for as long as the guard was held, EVERY CONCURRENT reader
+# in the process stopped seeing rows carrying no `metadata.agent_id`:
+# `memory_get` masked them as not-found and `memory_get_links` filtered
+# their neighbours away. `mcp::tests::handle_get_happy_returns_memory`,
+# `handle_get_resolves_by_prefix_and_includes_links` and
+# `handle_get_links_returns_outbound_and_inbound` began failing
+# nondeterministically on `Check (macos-fed,sqlite)` (run 33662095277).
+#
+# WHY A LOCK CANNOT BE THE ANSWER HERE. The victims are READERS. To make
+# the lock sufficient, every one of the several hundred lib tests that
+# transitively resolves identity would have to take it -- unreviewable,
+# and one test added tomorrow without it reopens the hole. The sound
+# control is PROCESS isolation: a `tests/*.rs` file compiles to its own
+# test binary and therefore its own process, so nothing it does to the
+# environment can be observed by the `src/**`-embedded `#[cfg(test)]`
+# cohort under any scheduling. See tests/mcp_agent_id_env_isolation_3475.rs
+# for the pattern (RAII set/unset guard + a binary-local mutex).
+#
+# HOW THE ARM WORKS (a RATCHET, not a flag day). This repository already
+# carried 849 `set_var`/`remove_var` sites across 79 `src/**` files when
+# #3475 was fixed; converting all of them is a migration, not a bug fix,
+# and a gate that demanded it in one step would simply be switched off.
+# So the arm pins a per-file CENSUS baseline
+# (scripts/qc-allowlists/test-env-mutation-baseline.txt) and refuses only what
+# things WORSE:
+#
+#   * any src/** file that mutates the environment and is NOT in the
+#     baseline (a wholly-new offender -- the common shape),
+#   * any baselined file whose total env-mutation count INCREASES,
+#   * any baselined file whose AI_MEMORY_AGENT_ID INSTALL count increases
+#     (the #3475 shape specifically: `set_var(ENV_AGENT_ID, ..)`,
+#     `set_var("AI_MEMORY_AGENT_ID", ..)`, or `agent_id_env_set_guard(..)`
+#     -- a `remove_var` / unset guard is NOT an install and is not counted,
+#     because clearing the variable can never make a concurrent reader
+#     resolve a foreign identity).
+#
+# Counts going DOWN always pass; the baseline is never auto-relaxed. A
+# genuine need to add a site (e.g. a production `set_var` outside any
+# test) is a deliberate, reviewed edit: `--update-baseline` rewrites the
+# census, and the diff has to be justified in review like any other.
+#
+# SCOPE / BOUNDS. src/** only -- `tests/**` is exactly the sanctioned
+# destination, so gating it would invert the control. Dot-prefixed
+# basenames are skipped: a `.foo.rs` can never be a Rust module, so it is
+# never compiled into the lib test binary (this is also what keeps the
+# arms (a)-(c) self-test fixtures, which are dot-prefixed scratch files,
+# from tripping this arm). Line-count based, like every other arm here: a
+# `//`-commented mutation counts, which is a deliberate over- rather than
+# under-approximation.
+# ---------------------------------------------------------------------
+
+# Lines that INSTALL a value into AI_MEMORY_AGENT_ID -- the #3475 shape.
+# `remove_var` / the unset guard is deliberately absent (see header).
+AGENT_ID_INSTALL_PATTERN='set_var\(([A-Za-z_][A-Za-z0-9_]*::)*ENV_AGENT_ID|set_var\("AI_MEMORY_AGENT_ID"|agent_id_env_set_guard\('
+
+# Any process-global environment mutation.
+ENV_MUTATION_PATTERN='(set_var|remove_var)\('
+
+BASELINE_FILE="${ROOT}/scripts/qc-allowlists/test-env-mutation-baseline.txt"
+
+# env_mutation_census
+# Emits `<agent_id_installs> <env_mutations> <path>` for every src/**/*.rs
+# file with at least one env mutation, sorted by path.
+env_mutation_census () {
+    while IFS= read -r -d '' f; do
+        local base="${f##*/}"
+        case "$base" in .*) continue ;; esac
+        local e a rel
+        e="$(grep -cE "$ENV_MUTATION_PATTERN" "$f" 2>/dev/null || true)"
+        a="$(grep -cE "$AGENT_ID_INSTALL_PATTERN" "$f" 2>/dev/null || true)"
+        # Skip only when BOTH counters are zero: an identity INSTALL routed
+        # through a helper (`agent_id_env_set_guard(..)`) is a #3475 offender
+        # even in a file that spells no `set_var`/`remove_var` of its own.
+        [[ "${e:-0}" -eq 0 && "${a:-0}" -eq 0 ]] && continue
+        rel="${f#"${ROOT}/"}"
+        printf '%s %s %s\n' "${a:-0}" "$e" "$rel"
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k3,3
+}
+
+if [[ "${1:-}" == "--update-baseline" ]]; then
+    {
+        echo "# scripts/qc-allowlists/test-env-mutation-baseline.txt -- issue #3475 ratchet baseline."
+        echo "#"
+        echo "# Format: <AI_MEMORY_AGENT_ID installs> <total env mutations> <path>"
+        echo "#"
+        echo "# Regenerate with: scripts/check-test-env-lock.sh --update-baseline"
+        echo "# A regenerated baseline that RAISES any number is a deliberate,"
+        echo "# reviewable widening of the #3475 control -- justify it in review."
+        echo "# See the arm (d) header in scripts/check-test-env-lock.sh."
+        env_mutation_census
+    } > "$BASELINE_FILE"
+    echo "Test-env-lock gate: baseline rewritten -> ${BASELINE_FILE#"${ROOT}/"}"
+    # Propagate an arms-(a)-(c) failure: rewriting the arm (d) baseline must
+    # never launder a $HOME-serialization violation into a green exit.
+    exit "$home_fail"
+fi
+
+if [[ ! -f "$BASELINE_FILE" ]]; then
+    echo "Test-env-lock gate arm (d): missing baseline ${BASELINE_FILE#"${ROOT}/"}" >&2
+    echo "(regenerate with: scripts/check-test-env-lock.sh --update-baseline)" >&2
+    exit 1
+fi
+
+arm_d_report="$(
+    env_mutation_census | awk -v baseline="$BASELINE_FILE" '
+    BEGIN {
+        while ((getline line < baseline) > 0) {
+            if (line ~ /^[[:space:]]*(#|$)/) continue
+            split(line, F, /[[:space:]]+/)
+            known[F[3]] = 1; base_agent[F[3]] = F[1] + 0; base_env[F[3]] = F[2] + 0
+        }
+        close(baseline)
+    }
+    {
+        agent = $1 + 0; env = $2 + 0; path = $3
+        if (!(path in known)) {
+            print "  NEW OFFENDER  " path " (env mutations=" env ", AI_MEMORY_AGENT_ID installs=" agent ")"
+            next
+        }
+        if (agent > base_agent[path])
+            print "  AI_MEMORY_AGENT_ID installs INCREASED  " path "  " base_agent[path] " -> " agent
+        if (env > base_env[path])
+            print "  env mutations INCREASED  " path "  " base_env[path] " -> " env
+    }
+    '
+)"
+
+if [[ -n "${arm_d_report//[[:space:]]/}" ]]; then
+    {
+        echo "New process-global env mutation in the LIB TEST BINARY (issue #3475):"
+        printf '%s\n' "$arm_d_report"
+        echo ""
+        echo "src/**/*.rs compiles into ONE test binary whose tests run in"
+        echo "PARALLEL THREADS, so std::env::set_var there is unsound AND"
+        echo "globally visible: a test that installs AI_MEMORY_AGENT_ID makes"
+        echo "every concurrently-running reader resolve a foreign identity, and"
+        echo "an unowned row then reads back as not-found (#3475). Serializing"
+        echo "the mutators does not fix it -- the victims are the READERS, and"
+        echo "they do not take the lock."
+        echo ""
+        echo "Put the test in its OWN test binary instead (own process):"
+        echo ""
+        echo "  tests/<name>.rs   -- see tests/mcp_agent_id_env_isolation_3475.rs"
+        echo ""
+        echo "If this really is a PRODUCTION mutation (not a test), the baseline"
+        echo "bump is a deliberate, reviewed widening:"
+        echo ""
+        echo "  scripts/check-test-env-lock.sh --update-baseline"
+        echo ""
+    } >&2
+    echo "Test-env-lock gate arm (d): FAIL" >&2
+    arm_d_fail=1
+else
+    arm_d_fail=0
+    echo "Test-env-lock gate arm (d): PASS (no src/** file gained env mutation over the #3475 baseline)"
+fi
+
+if (( home_fail != 0 || arm_d_fail != 0 )); then
     echo "" >&2
     echo "Test-env-lock gate: FAIL" >&2
     exit 1
 fi
-
-echo "Test-env-lock gate: PASS (every \$HOME-mutating file references the shared test_env_lock guard)"

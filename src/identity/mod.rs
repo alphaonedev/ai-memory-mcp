@@ -828,34 +828,28 @@ pub fn preserve_update_provenance_keys(
     merged
 }
 
-#[cfg(test)]
-pub(crate) struct AgentIdEnvSetGuard {
-    prev: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-#[must_use]
-pub(crate) fn agent_id_env_set_guard(value: &str) -> AgentIdEnvSetGuard {
-    let lock = agent_id_env_test_lock();
-    let prev = std::env::var_os(ENV_AGENT_ID);
-    // SAFETY: process-global env mutation is serialized on the crate-wide
-    // test lock, which remains held by the returned guard.
-    unsafe { std::env::set_var(ENV_AGENT_ID, value) };
-    AgentIdEnvSetGuard { prev, _lock: lock }
-}
-
-#[cfg(test)]
-impl Drop for AgentIdEnvSetGuard {
-    fn drop(&mut self) {
-        match self.prev.take() {
-            // SAFETY: `_lock` still serializes this process-global mutation.
-            Some(value) => unsafe { std::env::set_var(ENV_AGENT_ID, value) },
-            // SAFETY: `_lock` still serializes this process-global mutation.
-            None => unsafe { std::env::remove_var(ENV_AGENT_ID) },
-        }
-    }
-}
+// #3356's `AgentIdEnvSetGuard` / `agent_id_env_set_guard` are GONE (#3475).
+//
+// They were the crate's only sanctioned way for a LIB test to INSTALL a value
+// into the process-global `AI_MEMORY_AGENT_ID`, and the guard's crate-wide
+// lock made that look safe. It is not: the lock serializes the MUTATORS, while
+// the several hundred lib tests that merely RESOLVE identity never take it.
+// `visibility::is_visible_by_fields` treats a row with no `metadata.scope` as
+// `private` and therefore owner-keyed, so while such a guard was held EVERY
+// concurrent reader in the same process stopped seeing rows carrying no
+// `metadata.agent_id` — `mcp::tests::handle_get_*` failed nondeterministically
+// on `Check (macos-fed,sqlite)` (#3475, CI run 33662095277).
+//
+// A test that genuinely needs a configured identity belongs in its OWN test
+// binary (own process): `tests/mcp_agent_id_env_isolation_3475.rs`. Deleting
+// the fixture rather than documenting it away is deliberate — the absent
+// affordance is the control (ERRORS-09: make the illegal state
+// unrepresentable). `scripts/check-test-env-lock.sh` arm (d) covers the raw
+// `set_var("AI_MEMORY_AGENT_ID", ..)` spelling.
+//
+// [`agent_id_env_unset_guard`] STAYS: clearing the variable can never make a
+// concurrent reader resolve a foreign identity, so it is the sanctioned way
+// for an env-sensitive READER to pin the trust-all posture it asserts against.
 
 #[cfg(test)]
 mod tests {
