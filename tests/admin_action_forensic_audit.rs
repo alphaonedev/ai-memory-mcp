@@ -168,6 +168,56 @@ fn collect_kind_rows(dir: &std::path::Path, kind: &str) -> Vec<serde_json::Value
     hits
 }
 
+/// #3398 — the REFUSED cross-register is audited too. A denied admin-class
+/// state-change that leaves no forensic trace is indistinguishable from one
+/// that was never attempted, which is exactly what an operator needs to see
+/// after a roster-tampering probe.
+#[tokio::test]
+async fn register_agent_cross_register_refusal_emits_deny_row() {
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = fresh_dir();
+    forensic::shutdown();
+    forensic::init(dir.path(), None).expect("init forensic sink");
+
+    let (router, _f) = build_router_fixture();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/agents")
+        .header("content-type", "application/json")
+        // A non-admin caller (this fixture's `admin_agent_ids` is empty)
+        // targeting a DIFFERENT principal — the #3398 roster-overwrite vector.
+        .header("x-agent-id", "ai:mallory")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "agent_id": "ai:victim",
+                "agent_type": "human",
+                "capabilities": ["TAMPERED"],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a non-admin cross-register must be refused"
+    );
+
+    forensic::shutdown();
+    let rows = collect_kind_rows(dir.path(), "register_agent");
+    assert!(
+        rows.iter().any(|r| {
+            // `ForensicDecision` serialises the principal as `actor`
+            // (`src/governance/audit.rs`), not `agent_id`.
+            r.get("decision").and_then(|d| d.as_str()) == Some("deny")
+                && r.get("actor").and_then(|a| a.as_str()) == Some("ai:mallory")
+        }),
+        "the refusal must land a deny row naming the caller; rows: {rows:?}"
+    );
+}
+
 #[tokio::test]
 async fn register_agent_emits_forensic_audit_entry() {
     let _g = forensic_lock()
@@ -181,8 +231,17 @@ async fn register_agent_emits_forensic_audit_entry() {
     forensic::init(dir.path(), None).expect("init forensic sink");
 
     let (router, _f) = build_router_fixture();
+    // #3398 — `POST /api/v1/agents` now binds the registered principal to the
+    // authenticated caller: a non-admin may register only ITSELF. This fixture
+    // has an EMPTY `admin_agent_ids`, so the pre-#3398 shape here
+    // (`operator-alice` registering `ai:new-tenant-001`) is exactly the
+    // cross-register the fix refuses, and the handler never reached its #911
+    // audit emit. Registering as SELF keeps this test on its own subject — that
+    // the ALLOWED path emits a `kind=register_agent` forensic row — rather than
+    // silently re-purposing it into an authz test. The refused path's `deny`
+    // row is covered in `tests/agents_post_caller_binding_3398.rs`.
     let new_agent_id = "ai:new-tenant-001";
-    let caller = "operator-alice";
+    let caller = new_agent_id;
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/agents")

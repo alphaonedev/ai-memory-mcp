@@ -9062,6 +9062,12 @@ async fn http_register_agent_happy_path_returns_created() {
                 .uri("/api/v1/agents")
                 .method("POST")
                 .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                // #3398 — the route binds the registered principal to the
+                // authenticated caller, so the happy path is a SELF-register.
+                // Without the header the caller resolves to a synthesized
+                // `anonymous:req-…` id, which is a cross-register of `alice`
+                // and is now refused.
+                .header(crate::HEADER_AGENT_ID, "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
