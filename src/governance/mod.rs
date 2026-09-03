@@ -178,6 +178,13 @@ pub mod action_labels {
     /// with [`KG_INVALIDATE`] because the rewind's core primitive is
     /// invalidation/contamination of the root's lineage.
     pub const SWARM_REWIND: &str = "swarm_rewind";
+    /// #3398 — agent-roster registration (HTTP `POST /api/v1/agents`, MCP
+    /// `memory_agent_register`). Serves as BOTH the `record_decision` kind on
+    /// the #911 admin-action audit row and the `require_admin` endpoint label
+    /// on the #3398 cross-register refusal, so the allow row, the deny row and
+    /// the `admin_role` row an operator correlates after a roster-tampering
+    /// probe all carry one spelling.
+    pub const REGISTER_AGENT: &str = "register_agent";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

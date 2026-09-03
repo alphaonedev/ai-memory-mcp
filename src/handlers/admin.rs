@@ -145,11 +145,15 @@ pub async fn register_agent(
     // legitimate self-register does not emit a spurious `admin_role` deny row
     // into the forensic chain.
     if body.agent_id != caller {
-        if let Err(resp) = require_admin(&app, &headers, "register_agent") {
+        if let Err(resp) = require_admin(
+            &app,
+            &headers,
+            crate::governance::action_labels::REGISTER_AGENT,
+        ) {
             crate::governance::audit::record_decision(
                 &caller,
                 "deny",
-                "register_agent",
+                crate::governance::action_labels::REGISTER_AGENT,
                 "",
                 json!({
                     "target_agent_id": body.agent_id,
@@ -165,7 +169,7 @@ pub async fn register_agent(
     crate::governance::audit::record_decision(
         &caller,
         "allow",
-        "register_agent",
+        crate::governance::action_labels::REGISTER_AGENT,
         "",
         json!({
             "new_agent_id": body.agent_id,

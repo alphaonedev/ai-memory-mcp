@@ -41,11 +41,11 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc)]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
+use ai_memory::handlers::identity_binding::EnrolledAgentKeys;
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::store::MemoryStore;
 use axum::body::{Body, to_bytes};
@@ -116,16 +116,16 @@ fn app_state_for(db: Db, store: Arc<dyn MemoryStore>, storage_backend: StorageBa
         )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: Arc::new(HashMap::new()),
+        enrolled_agent_keys: enrolled,
         http_identity_mode: HttpIdentityMode::default(),
     }
 }
 
-fn router_from(app_state: AppState) -> axum::Router {
+fn router_from(app_state: AppState, enrolled: Arc<EnrolledAgentKeys>) -> axum::Router {
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
-        enrolled_agent_keys: Arc::new(HashMap::new()),
+        enrolled_agent_keys: enrolled,
         identity_mode: HttpIdentityMode::default(),
     };
     ai_memory::build_router(api_key_state, app_state)
@@ -146,8 +146,12 @@ fn sqlite_router() -> (axum::Router, NamedTempFile) {
     )));
     let store: Arc<dyn MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    let enrolled = Arc::new(EnrolledAgentKeys::empty());
     (
-        router_from(app_state_for(db, store, StorageBackend::Sqlite)),
+        router_from(
+            app_state_for(db, store, StorageBackend::Sqlite, Arc::clone(&enrolled)),
+            enrolled,
+        ),
         f,
     )
 }
@@ -341,7 +345,11 @@ async fn pg_router(url: &str) -> axum::Router {
         true,
     )));
     let store: Arc<dyn MemoryStore> = Arc::new(store_concrete);
-    router_from(app_state_for(db, store, StorageBackend::Postgres))
+    let enrolled = Arc::new(EnrolledAgentKeys::empty());
+    router_from(
+        app_state_for(db, store, StorageBackend::Postgres, Arc::clone(&enrolled)),
+        enrolled,
+    )
 }
 
 #[cfg(feature = "sal-postgres")]

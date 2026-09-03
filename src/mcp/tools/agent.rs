@@ -55,7 +55,7 @@ pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Res
     crate::governance::audit::record_decision(
         &caller,
         "allow",
-        "register_agent",
+        crate::governance::action_labels::REGISTER_AGENT,
         "",
         json!({
             "new_agent_id": agent_id,
