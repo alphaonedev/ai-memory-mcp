@@ -410,8 +410,17 @@ CREATE INDEX IF NOT EXISTS idx_attested_write_ledger_seen_at
 -- (undecryptable envelope) or that exceed the embed byte cap. Boot and
 -- the live backfill worker skip them without a re-read / re-WARN;
 -- restoring the key changes the fingerprint and the next scan retries.
--- Created by migration v96 for upgrading DBs; inline here so a fresh
--- bootstrap has it. The index IS inline (same bootstrap-batch table).
+-- Created by migration v96 for upgrading DBs; the TABLE + INDEX are
+-- inline here so a fresh bootstrap has them (same bootstrap-batch
+-- table). The memories-clearing TRIGGERS are deliberately NOT inline:
+-- `memories_embed_skip_clear_on_embed` references `NEW.embedding`, and
+-- `embedding` is a v3 ALTER (not a SCHEMA column). `open()` replays
+-- this bootstrap against LEGACY / mid-ladder databases BEFORE the
+-- ladder runs — installing that trigger here makes every later
+-- ALTER TABLE / shadow-table rebuild fail with `error in trigger
+-- memories_embed_skip_clear_on_embed: no such column: NEW.embedding`
+-- (the #1861 / v75 bootstrap-inline-index lesson). The v96 arm owns
+-- the triggers on both the fresh-install and the upgrade path.
 CREATE TABLE IF NOT EXISTS embed_skip (
     memory_id        TEXT NOT NULL PRIMARY KEY,
     agent_id         TEXT NOT NULL DEFAULT '',
@@ -422,17 +431,6 @@ CREATE TABLE IF NOT EXISTS embed_skip (
 );
 CREATE INDEX IF NOT EXISTS idx_embed_skip_fp
     ON embed_skip(key_fingerprint);
-CREATE TRIGGER IF NOT EXISTS memories_embed_skip_clear_on_content
-AFTER UPDATE OF content, encrypted_envelope ON memories
-BEGIN
-    DELETE FROM embed_skip WHERE memory_id = NEW.id;
-END;
-CREATE TRIGGER IF NOT EXISTS memories_embed_skip_clear_on_embed
-AFTER UPDATE OF embedding ON memories
-WHEN NEW.embedding IS NOT NULL
-BEGIN
-    DELETE FROM embed_skip WHERE memory_id = NEW.id;
-END;
 
 -- v0.9.0 G13 (#1828, schema v76) — identity-lineage succession chain.
 -- One row per (agent_id, epoch); the composite PK is the DB-enforced
@@ -1831,6 +1829,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 
     let write_txn = super::connection::WriteTxn::begin_exclusive(conn)?;
     let result = (|| -> Result<()> {
+        // #3344 — drop leftover bootstrap `embed_skip` memories triggers
+        // BEFORE any ladder ALTER / shadow-table rebuild. SQLite 3.25+
+        // revalidates every trigger body on RENAME / ALTER; a trigger
+        // whose WHEN clause names `NEW.embedding` blows up on a
+        // mid-ladder `memories` table that has not grown that column
+        // yet (v3). Idempotent. Recreated only by the v96 arm, and
+        // only when `embedding` exists.
+        crate::storage::embed_skip::drop_sqlite_clear_triggers(conn)?;
         if version < 2 {
             let mut has_confidence = false;
             let mut has_source = false;
@@ -3032,6 +3038,15 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                      deployment-without-quotas); skipping shadow-table swap"
                 );
             } else if !cols.contains("namespace") {
+                // #3344 — DROP the embed_skip memories triggers before
+                // the shadow-table swap. SQLite revalidates every
+                // trigger body on RENAME; a leftover
+                // `memories_embed_skip_clear_on_embed` (installed by a
+                // previous SCHEMA replay) fails this rebuild with
+                // `no such column: NEW.embedding`. Recreate is the v96
+                // arm's job (this arm runs only when starting
+                // version < 50, so version >= 96 is unreachable here).
+                crate::storage::embed_skip::drop_sqlite_clear_triggers(conn)?;
                 conn.execute_batch(MIGRATION_V50_SQLITE)?;
             }
         }
@@ -4313,7 +4328,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                     .contains("CREATE TABLE IF NOT EXISTS embed_skip"),
                 "v96 doc twin must ship the embed_skip DDL"
             );
-            conn.execute_batch(crate::storage::embed_skip::MIGRATION_V96_SQLITE)?;
+            debug_assert!(
+                crate::storage::embed_skip::MIGRATION_V96_SQLITE
+                    .contains(crate::storage::embed_skip::TRIGGER_CLEAR_ON_EMBED),
+                "v96 doc twin must ship the embedding-clear trigger"
+            );
+            crate::storage::embed_skip::apply_sqlite_v96(conn)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on
@@ -5875,6 +5895,26 @@ mod tests {
         // rebuilds predate.
         assert_memory_links_tip_shape(&conn, "historical replay from v1");
         assert!(index_exists(&conn, "idx_memory_links_target_cid"));
+
+        // v96 (#3344) — embed_skip table + memories-clearing triggers.
+        // The triggers are ladder-owned (not SCHEMA) because they
+        // reference `NEW.embedding`, a v3 ALTER. A v1 replay must still
+        // land them once embedding exists.
+        assert!(table_exists(&conn, "embed_skip"));
+        let mem_triggers = triggers_on(&conn, "memories");
+        assert!(
+            mem_triggers
+                .iter()
+                .any(|t| t == "memories_embed_skip_clear_on_embed"),
+            "v1 replay must install memories_embed_skip_clear_on_embed once embedding exists; \
+             present: {mem_triggers:?}"
+        );
+        assert!(
+            mem_triggers
+                .iter()
+                .any(|t| t == "memories_embed_skip_clear_on_content"),
+            "v1 replay must install memories_embed_skip_clear_on_content; present: {mem_triggers:?}"
+        );
     }
 
     /// v1.0.0 crypto-core stage 2 (#1942/#1941/#1945/#1834) — the
@@ -6177,8 +6217,101 @@ mod tests {
         );
         // And the index landed.
         assert!(index_exists(&conn, "idx_subscription_events_correlation"));
-        // Final state at CURRENT_SCHEMA_VERSION.
+    }
+
+    /// #3344 — bootstrap `SCHEMA` must NOT install the memories-clearing
+    /// embed_skip triggers. `open()` replays SCHEMA against mid-ladder
+    /// databases BEFORE the ladder; `embedding` is a v3 ALTER, not a
+    /// SCHEMA column, so a SCHEMA-installed `WHEN NEW.embedding IS NOT
+    /// NULL` trigger makes later ALTER / v50 rebuild fail with
+    /// `no such column: NEW.embedding`.
+    #[test]
+    fn schema_bootstrap_does_not_install_embed_skip_memories_triggers_3344() {
+        assert!(
+            !SCHEMA.contains("CREATE TRIGGER IF NOT EXISTS memories_embed_skip_clear_on_embed"),
+            "SCHEMA must not CREATE memories_embed_skip_clear_on_embed \
+             (ladder-owned by v96; embedding is a v3 ALTER)"
+        );
+        assert!(
+            !SCHEMA.contains("CREATE TRIGGER IF NOT EXISTS memories_embed_skip_clear_on_content"),
+            "SCHEMA must not CREATE memories_embed_skip_clear_on_content \
+             (ladder-owned by v96; keep both triggers in one arm)"
+        );
+        assert!(
+            SCHEMA.contains("CREATE TABLE IF NOT EXISTS embed_skip"),
+            "SCHEMA still carries the embed_skip TABLE (no memories-column refs)"
+        );
+    }
+
+    /// #3344 — a v26-stamped database whose `memories` table already has
+    /// `embedding` (v3 ALTER; not a SCHEMA column) must walk the rest of
+    /// the ladder, including v50's agent_quotas rebuild and v96's
+    /// trigger install, without `error in trigger
+    /// memories_embed_skip_clear_on_embed`. Mirrors the v27
+    /// subscription_events fixture: SCHEMA + stamp 26, plus the v3
+    /// embedding column the production v26 shape actually carries.
+    #[test]
+    fn historical_replay_v26_shaped_db_installs_v96_embed_skip_triggers_3344() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB", [])
+            .expect("v3 embedding column on v26-shaped memories");
+        conn.execute("DELETE FROM schema_version", [])
+            .expect("clear schema_version");
+        conn.execute("INSERT INTO schema_version (version) VALUES (26)", [])
+            .expect("stamp v26");
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at) \
+             VALUES ('m-v26', 'short', 'ns', 't', 'c', \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("seed v26 row");
+
+        super::migrate(&conn).expect("v26-shaped db must migrate to tip");
         assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+        assert!(
+            table_exists(&conn, "embed_skip"),
+            "v96 must create embed_skip on a v26-shaped upgrade"
+        );
+        assert!(
+            column_exists(&conn, "memories", "embedding"),
+            "v26-shaped memories already had embedding; tip must keep it"
+        );
+        let mem_triggers = triggers_on(&conn, "memories");
+        assert!(
+            mem_triggers
+                .iter()
+                .any(|t| t == "memories_embed_skip_clear_on_embed"),
+            "v96 must install memories_embed_skip_clear_on_embed after embedding exists; \
+             present: {mem_triggers:?}"
+        );
+        assert!(
+            mem_triggers
+                .iter()
+                .any(|t| t == "memories_embed_skip_clear_on_content"),
+            "v96 must install memories_embed_skip_clear_on_content; present: {mem_triggers:?}"
+        );
+
+        // Control: a successful embedding write drops the skip row.
+        conn.execute(
+            "INSERT INTO embed_skip (memory_id, agent_id, key_fingerprint, reason, created_at) \
+             VALUES ('m-v26', '', 'fp', 'oversize', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("plant skip");
+        conn.execute(
+            "UPDATE memories SET embedding = x'00000000' WHERE id = 'm-v26'",
+            [],
+        )
+        .expect("write embedding");
+        let leftover: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embed_skip", [], |r| r.get(0))
+            .expect("count skip");
+        assert_eq!(
+            leftover, 0,
+            "memories_embed_skip_clear_on_embed must DELETE the skip on a non-NULL embedding write"
+        );
     }
 
     #[test]

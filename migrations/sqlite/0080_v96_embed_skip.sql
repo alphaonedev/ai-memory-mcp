@@ -20,6 +20,16 @@
 -- `IF NOT EXISTS` triggers, no full-table rebuild (the v63/v65 hazard
 -- does not arise). Revert is DROP TABLE / DROP TRIGGER.
 --
+-- The memories-clearing triggers MUST be created only by this v96 arm
+-- (after `memories.embedding` exists). They must NOT be inlined in
+-- bootstrap `SCHEMA`: `open()` replays SCHEMA against mid-ladder
+-- databases before the ladder, and `embedding` is a v3 ALTER — a
+-- SCHEMA-installed `WHEN NEW.embedding IS NOT NULL` trigger makes
+-- later ALTER TABLE / the v50 agent_quotas rebuild fail with
+-- `error in trigger memories_embed_skip_clear_on_embed: no such
+-- column: NEW.embedding`. Rebuild arms DROP the pair first; this arm
+-- recreates them only when the column exists.
+--
 -- Slots after #3419's settled v95 `attested_write_ledger` arm.
 
 CREATE TABLE IF NOT EXISTS embed_skip (

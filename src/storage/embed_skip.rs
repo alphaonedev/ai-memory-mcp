@@ -19,7 +19,7 @@
 //! so a skip-cache fault can never block daemon readiness (North Star:
 //! degrade, never corrupt).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -43,6 +43,91 @@ pub const MIGRATION_V96_SQLITE: &str =
 /// Embedded Postgres DDL doc twin, applied by [`PostgresStore::migrate_v96`].
 pub const MIGRATION_V96_POSTGRES: &str =
     include_str!("../../migrations/postgres/0053_v96_embed_skip.sql");
+
+/// SQLite trigger: content / envelope rewrite drops the skip so the next
+/// scan retries. Ladder-owned (v96); not in bootstrap `SCHEMA`.
+pub const TRIGGER_CLEAR_ON_CONTENT: &str = "memories_embed_skip_clear_on_content";
+
+/// SQLite trigger: a successful embedding write drops the skip.
+/// References `NEW.embedding`, so it is illegal on a mid-ladder
+/// `memories` table that has not yet grown that column (v3 ALTER;
+/// bootstrap `SCHEMA` does not carry `embedding`).
+pub const TRIGGER_CLEAR_ON_EMBED: &str = "memories_embed_skip_clear_on_embed";
+
+const SQL_DROP_CLEAR_TRIGGERS: &str = "\
+DROP TRIGGER IF EXISTS memories_embed_skip_clear_on_content;\n\
+DROP TRIGGER IF EXISTS memories_embed_skip_clear_on_embed;";
+
+/// Table + index only (no memories triggers). Used when `memories` has
+/// not yet grown `embedding` so SQLite cannot validate `NEW.embedding`.
+const SQL_TABLE_AND_INDEX: &str = r"
+CREATE TABLE IF NOT EXISTS embed_skip (
+    memory_id        TEXT NOT NULL PRIMARY KEY,
+    agent_id         TEXT NOT NULL DEFAULT '',
+    key_fingerprint  TEXT NOT NULL,
+    reason           TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    CHECK (reason IN ('undecryptable', 'oversize'))
+);
+CREATE INDEX IF NOT EXISTS idx_embed_skip_fp
+    ON embed_skip(key_fingerprint);
+";
+
+/// Drop the memories-clearing skip triggers. Idempotent.
+///
+/// Call before any SQLite rebuild / `ALTER TABLE` that revalidates
+/// trigger bodies (v50 `agent_quotas` shadow swap, memories column
+/// ALTERs, …). A leftover bootstrap trigger whose `WHEN` clause names
+/// `NEW.embedding` fails those DDL steps on a mid-ladder table with
+/// `error in trigger memories_embed_skip_clear_on_embed: no such
+/// column: NEW.embedding` (#3344).
+///
+/// # Errors
+///
+/// Propagates a rusqlite failure. `DROP TRIGGER IF EXISTS` itself is
+/// a no-op when the trigger is absent.
+pub fn drop_sqlite_clear_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SQL_DROP_CLEAR_TRIGGERS)
+        .context("drop embed_skip memories clear triggers")?;
+    Ok(())
+}
+
+fn sqlite_memories_has_column(conn: &Connection, column: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(memories)")
+        .context("prepare PRAGMA table_info(memories)")?;
+    let cols = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("query PRAGMA table_info(memories)")?;
+    for col in cols {
+        if col.context("read memories column name")? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Apply the v96 SQLite DDL.
+///
+/// The `embed_skip` table is always created. The memories-clearing
+/// triggers are created ONLY when `memories.embedding` exists (v3
+/// adds it; bootstrap `SCHEMA` does not). ERRORS-09: do not install a
+/// trigger whose `WHEN` clause is illegal on the current table shape.
+///
+/// # Errors
+///
+/// Propagates a rusqlite failure applying the DDL.
+pub fn apply_sqlite_v96(conn: &Connection) -> Result<()> {
+    drop_sqlite_clear_triggers(conn)?;
+    if sqlite_memories_has_column(conn, "embedding")? {
+        conn.execute_batch(MIGRATION_V96_SQLITE)
+            .context("apply v96 embed_skip DDL")?;
+    } else {
+        conn.execute_batch(SQL_TABLE_AND_INDEX)
+            .context("apply v96 embed_skip table without memories triggers")?;
+    }
+    Ok(())
+}
 
 /// Why a row was remembered as unembeddable. A descriptive enum, not a
 /// bare bool (API-09).
@@ -524,5 +609,65 @@ mod tests {
             MIGRATION_V96_POSTGRES.contains("CREATE TABLE IF NOT EXISTS embed_skip"),
             "postgres DDL twin must ship the table"
         );
+        assert!(
+            MIGRATION_V96_SQLITE.contains(TRIGGER_CLEAR_ON_EMBED),
+            "sqlite DDL twin must ship the embedding-clear trigger"
+        );
+        assert!(
+            MIGRATION_V96_SQLITE.contains(TRIGGER_CLEAR_ON_CONTENT),
+            "sqlite DDL twin must ship the content-clear trigger"
+        );
+    }
+
+    #[test]
+    fn apply_sqlite_v96_skips_embed_trigger_when_embedding_column_absent_3344() {
+        let conn = Connection::open_in_memory().expect("mem db");
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                content TEXT,
+                encrypted_envelope BLOB
+            );",
+        )
+        .expect("stub memories without embedding");
+        apply_sqlite_v96(&conn).expect("v96 table-only apply");
+        let trigger_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = ?1",
+                params![TRIGGER_CLEAR_ON_EMBED],
+                |r| r.get(0),
+            )
+            .expect("probe trigger");
+        assert_eq!(
+            trigger_present, 0,
+            "must not CREATE memories_embed_skip_clear_on_embed without embedding"
+        );
+        let table_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = ?1",
+                params![TABLE],
+                |r| r.get(0),
+            )
+            .expect("probe table");
+        assert_eq!(table_present, 1, "embed_skip table is still created");
+    }
+
+    #[test]
+    fn drop_sqlite_clear_triggers_is_idempotent_3344() {
+        let conn = fresh_conn();
+        drop_sqlite_clear_triggers(&conn).expect("first drop");
+        drop_sqlite_clear_triggers(&conn).expect("second drop");
+        apply_sqlite_v96(&conn).expect("recreate");
+        let trigger_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = ?1",
+                params![TRIGGER_CLEAR_ON_EMBED],
+                |r| r.get(0),
+            )
+            .expect("probe trigger");
+        assert_eq!(trigger_present, 1, "recreate after drop must reinstall");
     }
 }
