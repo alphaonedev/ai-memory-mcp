@@ -931,8 +931,8 @@ pub(crate) fn resolve_key_dir(override_dir: Option<&std::path::Path>) -> Result<
     kp::default_key_dir()
 }
 
-/// Load the operator's signing key from `key_dir`. Auto-detects which
-/// of the two operator-key naming conventions is in use:
+/// Load the operator's signing key from `key_dir`. Auto-detects the supported
+/// operator-key naming conventions:
 ///
 /// 1. `operator.priv` (raw 32-byte seed) + `operator.pub` (raw 32-byte
 ///    verifying key) — the legacy dir-based layout the `add` / `enable`
@@ -941,6 +941,8 @@ pub(crate) fn resolve_key_dir(override_dir: Option<&std::path::Path>) -> Result<
 /// 2. `operator.key` (raw 32-byte seed) + `operator.key.pub` (base64url
 ///    no-pad encoded 32-byte verifying key) — the layout `rules keygen`
 ///    writes (`~/.config/ai-memory/operator.key`) per the L1-6 spec.
+/// 3. Exactly one custom `<path>` + `<path>.pub` pair written by an explicit
+///    `rules keygen --out <path>` inside `key_dir` (#3437).
 ///
 /// v0.7.0 G-PHASE-E-3 (#708) — before this fix, `rules keygen` wrote
 /// files under (2) but `rules enable --sign` only looked for (1), so
@@ -975,50 +977,57 @@ pub(crate) fn load_operator_signing_key_from_dir(
             )
         });
     }
-    // Layout 2 — `operator.key` (raw 32-byte seed) + `operator.key.pub`
-    // (base64url no-pad encoded 32-byte verifying key). This is what
-    // `rules keygen` writes; verify the public half decodes and matches
-    // the seed's derived verifying key before returning so a tampered
-    // .pub surfaces here, not on the next signature-verify call.
+    // Layout 2 — `operator.key` (raw 32-byte seed) + `operator.key.pub`.
     let priv_keygen = key_dir.join(OPERATOR_KEY_FILENAME);
     let pub_keygen = key_dir.join("operator.key.pub");
     if priv_keygen.exists() {
-        let signing = load_operator_signing_key(&priv_keygen).with_context(|| {
-            format!(
-                "governance.no_operator_key: failed loading {}",
-                priv_keygen.display()
-            )
-        })?;
-        if pub_keygen.exists() {
-            use base64::Engine;
-            let encoded = std::fs::read_to_string(&pub_keygen).with_context(|| {
-                format!("governance.no_operator_key: read {}", pub_keygen.display())
-            })?;
-            let trimmed = encoded.trim();
-            let pub_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(trimmed)
-                .with_context(|| {
-                    format!(
-                        "governance.no_operator_key: decode base64url public key at {}",
-                        pub_keygen.display()
-                    )
-                })?;
-            if pub_bytes.len() != ED25519_PUBLIC_LEN {
-                bail!(
-                    "governance.no_operator_key: public key {} decoded to {} bytes (expected {ED25519_PUBLIC_LEN})",
-                    pub_keygen.display(),
-                    pub_bytes.len(),
-                );
-            }
-            if signing.verifying_key().to_bytes().as_slice() != pub_bytes.as_slice() {
-                bail!(
-                    "governance.no_operator_key: private key {} does not match public key {}",
-                    priv_keygen.display(),
-                    pub_keygen.display(),
-                );
-            }
+        return load_keygen_pair(&priv_keygen, &pub_keygen);
+    }
+
+    // #3437 — an explicit `rules keygen --out <path>` is permitted to use an
+    // arbitrary filename, but the loader historically checked only the two
+    // hard-coded operator basenames above. Discover a generated seed by its
+    // matching `<path>.pub` sibling. Exactly one candidate is required: key
+    // selection must never depend on filesystem enumeration order.
+    let entries = std::fs::read_dir(key_dir).with_context(|| {
+        format!(
+            "governance.no_operator_key: read key dir {}",
+            key_dir.display()
+        )
+    })?;
+    let mut custom_pairs = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| {
+                format!(
+                    "governance.no_operator_key: enumerate key dir {}",
+                    key_dir.display()
+                )
+            })?
+            .path();
+        if path != priv_legacy
+            && path != priv_keygen
+            && !path.to_string_lossy().ends_with(".pub")
+            && pub_sibling_path(&path).is_file()
+        {
+            custom_pairs.push(path);
         }
-        return Ok(signing);
+    }
+    custom_pairs.sort();
+    match custom_pairs.as_slice() {
+        [private] => return load_keygen_pair(private, &pub_sibling_path(private)),
+        [] => {}
+        many => {
+            let names = many
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "governance.no_operator_key: ambiguous custom keygen outputs in {}: {names}",
+                key_dir.display()
+            );
+        }
     }
     // Layout 3 (#800 Gap #6 — keygen↔enable path-mismatch fallback) —
     // `ai-memory rules keygen` writes the operator key to
@@ -1037,47 +1046,12 @@ pub(crate) fn load_operator_signing_key_from_dir(
         let parent_priv = parent.join(OPERATOR_KEY_FILENAME);
         let parent_pub = parent.join("operator.key.pub");
         if parent_priv.exists() {
-            let signing = load_operator_signing_key(&parent_priv).with_context(|| {
-                format!(
-                    "governance.no_operator_key: failed loading {}",
-                    parent_priv.display()
-                )
-            })?;
-            if parent_pub.exists() {
-                use base64::Engine;
-                let encoded = std::fs::read_to_string(&parent_pub).with_context(|| {
-                    format!("governance.no_operator_key: read {}", parent_pub.display())
-                })?;
-                let trimmed = encoded.trim();
-                let pub_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(trimmed)
-                    .with_context(|| {
-                        format!(
-                            "governance.no_operator_key: decode base64url public key at {}",
-                            parent_pub.display()
-                        )
-                    })?;
-                if pub_bytes.len() != ED25519_PUBLIC_LEN {
-                    bail!(
-                        "governance.no_operator_key: public key {} decoded to {} bytes (expected {ED25519_PUBLIC_LEN})",
-                        parent_pub.display(),
-                        pub_bytes.len(),
-                    );
-                }
-                if signing.verifying_key().to_bytes().as_slice() != pub_bytes.as_slice() {
-                    bail!(
-                        "governance.no_operator_key: private key {} does not match public key {}",
-                        parent_priv.display(),
-                        parent_pub.display(),
-                    );
-                }
-            }
-            return Ok(signing);
+            return load_keygen_pair(&parent_priv, &parent_pub);
         }
     }
 
-    // Neither layout present — name all three so the operator picks
-    // the right one to materialise.
+    // No supported layout present — name the accepted forms so the operator
+    // can pick the right one to materialise.
     bail!(
         "governance.no_operator_key: no operator key found at {dir} \
          (also checked parent dir for the keygen layout). \
@@ -1085,9 +1059,50 @@ pub(crate) fn load_operator_signing_key_from_dir(
          as produced by per-agent `keypair` generation) OR \
          `operator.key` + `operator.key.pub` (raw 32-byte seed + base64url \
          verifier, as produced by `ai-memory rules keygen` — searched both \
-         `{dir}/` and `{dir}/../`)",
+         `{dir}/` and `{dir}/../`) OR exactly one custom `<path>` + \
+         `<path>.pub` keygen pair in `{dir}/`",
         dir = key_dir.display(),
     )
+}
+
+/// Load and cross-check the private/public pair emitted by `rules keygen`.
+fn load_keygen_pair(private: &Path, public: &Path) -> Result<SigningKey> {
+    use base64::Engine as _;
+
+    let signing = load_operator_signing_key(private).with_context(|| {
+        format!(
+            "governance.no_operator_key: failed loading {}",
+            private.display()
+        )
+    })?;
+    if !public.exists() {
+        return Ok(signing);
+    }
+    let encoded = std::fs::read_to_string(public)
+        .with_context(|| format!("governance.no_operator_key: read {}", public.display()))?;
+    let pub_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded.trim())
+        .with_context(|| {
+            format!(
+                "governance.no_operator_key: decode base64url public key at {}",
+                public.display()
+            )
+        })?;
+    if pub_bytes.len() != ED25519_PUBLIC_LEN {
+        bail!(
+            "governance.no_operator_key: public key {} decoded to {} bytes (expected {ED25519_PUBLIC_LEN})",
+            public.display(),
+            pub_bytes.len(),
+        );
+    }
+    if signing.verifying_key().to_bytes().as_slice() != pub_bytes.as_slice() {
+        bail!(
+            "governance.no_operator_key: private key {} does not match public key {}",
+            private.display(),
+            public.display(),
+        );
+    }
+    Ok(signing)
 }
 
 /// Resolve the caller's agent_id for `created_by` provenance. Uses
@@ -1488,6 +1503,41 @@ mod tests {
         // check: the random seed is unlikely to be valid utf8 anyway,
         // but we assert the success line is the only stdout content).
         assert!(s.starts_with("Ed25519 operator key generated:"));
+    }
+
+    #[test]
+    fn custom_keygen_out_is_discovered_and_loads_3437() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("team-operator.seed");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        keygen_operator(&custom, false, &mut out).expect("custom --out keygen");
+
+        let loaded = load_operator_signing_key_from_dir(dir.path())
+            .expect("loader must discover the one custom keygen pair");
+        let direct = load_operator_signing_key(&custom).expect("direct custom seed load");
+        assert_eq!(loaded.to_bytes(), direct.to_bytes());
+    }
+
+    #[test]
+    fn multiple_custom_keygen_outputs_fail_closed_as_ambiguous_3437() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        keygen_operator(&dir.path().join("first.seed"), false, &mut out).unwrap();
+        keygen_operator(&dir.path().join("second.seed"), false, &mut out).unwrap();
+
+        let err = load_operator_signing_key_from_dir(dir.path())
+            .expect_err("ambiguous key selection must fail closed");
+        assert!(err.to_string().contains("ambiguous custom keygen outputs"));
     }
 
     #[cfg(unix)]

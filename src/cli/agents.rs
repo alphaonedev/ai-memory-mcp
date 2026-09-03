@@ -75,10 +75,18 @@ pub enum AgentsAction {
         /// Agent identifier the presenting caller is bound to.
         #[arg(long)]
         agent_id: String,
-        /// The per-agent api-key token. Callers present it as the `X-API-Key`
-        /// header; only its SHA-256 digest is stored.
-        #[arg(long)]
-        token: String,
+        /// The per-agent api-key token. Prefer `--token-file`: argv is visible
+        /// to other local processes on common operating systems.
+        #[arg(
+            long,
+            conflicts_with = "token_file",
+            required_unless_present = "token_file"
+        )]
+        token: Option<String>,
+        /// Read the token from a mode-0600 file, keeping it off argv. Pass `-`
+        /// to read one token from stdin (for a secret-manager pipe).
+        #[arg(long, value_name = "PATH", conflicts_with = "token")]
+        token_file: Option<std::path::PathBuf>,
     },
     /// v1.0.0 #2095 — revoke (invalidate) EVERY enrolled per-agent HTTP api-key
     /// bound to `agent_id`. The PK is the token digest, so a leaked key can only
@@ -262,13 +270,16 @@ pub fn run_agents(
                 writeln!(out.stdout, "revoked pubkey for {agent_id}")?;
             }
         }
-        AgentsAction::BindApiKey { agent_id, token } => {
+        AgentsAction::BindApiKey {
+            agent_id,
+            token,
+            token_file,
+        } => {
             validate::validate_agent_id(&agent_id)?;
-            let trimmed = token.trim();
-            if trimmed.is_empty() {
-                anyhow::bail!("api-key token must not be empty");
-            }
-            let token_sha256 = crate::handlers::identity_binding::api_key_sha256_hex(trimmed);
+            let mut resolved = resolve_bind_api_key_token(token.as_deref(), token_file.as_deref())?;
+            let token_sha256 = crate::handlers::identity_binding::api_key_sha256_hex(&resolved);
+            use zeroize::Zeroize as _;
+            resolved.zeroize();
             db::bind_agent_api_key(&conn, &agent_id, &token_sha256)?;
             if json_out {
                 writeln!(
@@ -356,6 +367,73 @@ pub fn run_agents(
         }
     }
     Ok(())
+}
+
+/// Resolve `agents bind-api-key`'s secret source. Exactly one of argv or file
+/// must be supplied; clap enforces that for CLI callers and this helper repeats
+/// it for direct/programmatic callers. `--token-file -` reads stdin.
+///
+/// Files are opened once, permission-checked with `fstat`, and read through the
+/// same handle. On Unix, group/world permission bits fail closed.
+///
+/// # Errors
+///
+/// Returns an error for missing/ambiguous sources, unreadable or lax-permission
+/// files, stdin read failures, and empty tokens.
+pub(crate) fn resolve_bind_api_key_token(
+    token: Option<&str>,
+    token_file: Option<&Path>,
+) -> Result<String> {
+    match (token, token_file) {
+        (Some(_), Some(_)) => anyhow::bail!("use exactly one of --token or --token-file"),
+        (None, None) => anyhow::bail!("one of --token or --token-file is required"),
+        (Some(token), None) => normalize_api_key_token(token.to_string(), "--token"),
+        (None, Some(path)) if path == Path::new("-") => {
+            let stdin = std::io::stdin();
+            read_api_key_token(stdin.lock(), "stdin")
+        }
+        (None, Some(path)) => {
+            let file = std::fs::File::open(path)
+                .map_err(|e| anyhow::anyhow!("read --token-file {}: {e}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = file
+                    .metadata()
+                    .map_err(|e| anyhow::anyhow!("stat --token-file {}: {e}", path.display()))?
+                    .permissions()
+                    .mode();
+                if mode & 0o077 != 0 {
+                    anyhow::bail!(
+                        "--token-file {} has lax permissions (mode {:o}, group/world bits set); \
+                         tighten with `chmod 0600 {}`",
+                        path.display(),
+                        mode & 0o777,
+                        path.display()
+                    );
+                }
+            }
+            read_api_key_token(file, &format!("--token-file {}", path.display()))
+        }
+    }
+}
+
+fn read_api_key_token(mut reader: impl std::io::Read, source: &str) -> Result<String> {
+    let mut raw = String::new();
+    reader
+        .read_to_string(&mut raw)
+        .map_err(|e| anyhow::anyhow!("read {source}: {e}"))?;
+    normalize_api_key_token(raw, source)
+}
+
+fn normalize_api_key_token(mut raw: String, source: &str) -> Result<String> {
+    use zeroize::Zeroize as _;
+    let token = raw.trim().to_string();
+    raw.zeroize();
+    if token.is_empty() {
+        anyhow::bail!("api-key token from {source} must not be empty");
+    }
+    Ok(token)
 }
 
 /// Pre-enroll a sub-key certificate: parse the JSON envelope, verify it under
@@ -705,6 +783,57 @@ pub async fn run_bind_api_key(
         );
     }
     Ok(())
+}
+
+/// Resolve a bind-api-key secret source, invoke the configured SAL-store
+/// writer, then zeroize the resolved plaintext copy.
+///
+/// # Errors
+///
+/// Surfaces [`resolve_bind_api_key_token`] and [`run_bind_api_key`] failures.
+#[cfg(feature = "sal")]
+pub async fn run_bind_api_key_from_sources(
+    store: &std::sync::Arc<dyn crate::store::MemoryStore>,
+    agent_id: &str,
+    token: Option<&str>,
+    token_file: Option<&Path>,
+    json_out: bool,
+) -> Result<()> {
+    let mut resolved = resolve_bind_api_key_token(token, token_file)?;
+    let result = run_bind_api_key(store, agent_id, &resolved, json_out).await;
+    use zeroize::Zeroize as _;
+    resolved.zeroize();
+    result
+}
+
+/// Dispatch the bind variant without duplicating its secret-source
+/// destructuring in the top-level backend selector.
+///
+/// # Errors
+///
+/// Surfaces the bind helper's failures, or rejects a non-bind action.
+#[cfg(feature = "sal")]
+pub async fn run_bind_api_key_action(
+    store: &std::sync::Arc<dyn crate::store::MemoryStore>,
+    action: &AgentsAction,
+    json_out: bool,
+) -> Result<()> {
+    let AgentsAction::BindApiKey {
+        agent_id,
+        token,
+        token_file,
+    } = action
+    else {
+        anyhow::bail!("internal agents dispatch expected bind-api-key")
+    };
+    run_bind_api_key_from_sources(
+        store,
+        agent_id,
+        token.as_deref(),
+        token_file.as_deref(),
+        json_out,
+    )
+    .await
 }
 
 /// #2095 — per-agent HTTP api-key REVOCATION against the CONFIGURED SAL store.
@@ -2214,5 +2343,38 @@ mod tests {
             .block_on(run_revoke_api_key(&store, "bad id", false))
             .expect_err("invalid agent id must error");
         assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn bind_api_key_token_file_trims_and_requires_single_source_3437() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token");
+        std::fs::write(&path, "  file-secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        assert_eq!(
+            resolve_bind_api_key_token(None, Some(&path)).unwrap(),
+            "file-secret"
+        );
+        assert!(resolve_bind_api_key_token(None, None).is_err());
+        assert!(resolve_bind_api_key_token(Some("argv"), Some(&path)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_api_key_token_file_refuses_lax_permissions_3437() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lax-api-token");
+        std::fs::write(&path, "secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = resolve_bind_api_key_token(None, Some(&path))
+            .expect_err("group/world-readable secret must fail closed");
+        assert!(err.to_string().contains("lax permissions"));
     }
 }

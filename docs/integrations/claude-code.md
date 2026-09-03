@@ -372,7 +372,7 @@ Operators inspect / mutate rules via:
 
 ```text
 ai-memory rules list                          # read-only, no signature
-ai-memory rules enable R001 --sign            # activate; requires operator.priv
+ai-memory rules enable R001 --sign            # activate; requires an operator keypair
 ai-memory rules add ...   --sign              # author a new rule
 ```
 
@@ -383,9 +383,9 @@ must not be able to weaken its own constraints. See
 
 ### Operator workflow (end-to-end)
 
-1. **Keygen** — `ai-memory rules keygen --out operator` writes `operator.priv` +
-   `operator.pub` (the operator's signing keypair).
-2. **Sign-seed** — `ai-memory rules sign-seed --key operator.priv` signs
+1. **Keygen** — `ai-memory rules keygen --out operator.key` writes
+   `operator.key` + `operator.key.pub` (the operator's signing keypair).
+2. **Sign-seed** — `ai-memory rules sign-seed --key operator.key` signs
    the four seed rules (they ship unsigned + disabled by design).
 3. **Enable** — `ai-memory rules enable R001 --sign` (and R002/R003/R004
    as the audit clears each one).

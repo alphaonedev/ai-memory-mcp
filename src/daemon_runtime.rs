@@ -1912,8 +1912,8 @@ pub async fn run(
                     )
                     .await?;
                     return match &a.action {
-                        Some(AgentsAction::BindApiKey { agent_id, token }) => {
-                            cli::agents::run_bind_api_key(&store, agent_id, token, j).await
+                        Some(action @ AgentsAction::BindApiKey { .. }) => {
+                            cli::agents::run_bind_api_key_action(&store, action, j).await
                         }
                         Some(AgentsAction::RevokeApiKey { agent_id }) => {
                             cli::agents::run_revoke_api_key(&store, agent_id, j).await

@@ -594,6 +594,18 @@ ai-memory restore --from /var/backups/ai-memory --yes
 # Rollback: cp /var/lib/ai-memory/memories.pre-restore-2026-08-22T101500Z.db /var/lib/ai-memory/memories.db
 ```
 
+### `agents bind-api-key`
+
+Bind a per-agent HTTP API key without exposing the secret on argv:
+
+```bash
+ai-memory agents bind-api-key --agent-id ai:worker --token-file /run/secrets/worker-api-key
+secret-manager read worker-api-key | ai-memory agents bind-api-key --agent-id ai:worker --token-file -
+```
+
+Token files must be mode 0600 on Unix. `--token` remains available for
+compatibility but is mutually exclusive with `--token-file`.
+
 ## Autonomy (v0.6.1)
 
 ### `curator`
@@ -1206,13 +1218,14 @@ recursive-CTE fallback stays in place automatically. See
 CRUD over the `governance_rules` table consulted by
 `check_agent_action`. Mutation verbs (`add` / `enable` / `disable` /
 `remove`) require the operator's Ed25519 keypair on disk at
-`<key-dir>/operator.priv` (mode 0600); without it they refuse with
-`governance.no_operator_key`. Read verbs (`list` / `check`) are
-unprivileged. Global flag: `--key-dir <PATH>`.
+`<key-dir>/operator.priv`, `<key-dir>/operator.key`, or exactly one custom
+`<key-dir>/<name>` + `<key-dir>/<name>.pub` pair (private mode 0600); without
+one they refuse with `governance.no_operator_key`. Read verbs (`list` /
+`check`) are unprivileged. Global flag: `--key-dir <PATH>`.
 
 | Subcommand | Notes |
 |---|---|
-| `ai-memory rules keygen` | Generate the operator keypair used to sign rules. |
+| `ai-memory rules keygen [--out <path>]` | Generate the operator keypair used to sign rules. A custom output is discovered when it and its `.pub` sibling are the only custom keygen pair in the selected key directory. |
 | `ai-memory rules sign-seed --key <path>` | Sign the seed R001-R004 governance rules with the operator key (rules ship unsigned + disabled by design; sign-seed is the first-time operator-attestation step). |
 | `ai-memory rules add …` | Add a signed rule (flags include `--decision`, default `refuse`, and `--namespace`, default the global sentinel). |
 | `ai-memory rules list` | List the active rule corpus (CLI equivalent of `memory_rule_list`). |
