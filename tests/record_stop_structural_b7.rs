@@ -232,16 +232,19 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
             // (Const-reference tracking, so the fn that EXECUTES the const
             // is scanned instead, is #3485.)
             let fn_indent = lines[start].len() - lines[start].trim_start().len();
-            let const_between = lines[start + 1..=idx].iter().any(|l| {
+            let item_boundary_between = lines[start + 1..=idx].iter().any(|l| {
                 let indent = l.len() - l.trim_start().len();
                 let t = l.trim_start();
                 let t = t
                     .strip_prefix("pub(crate) ")
                     .or_else(|| t.strip_prefix("pub "))
                     .unwrap_or(t);
-                indent <= fn_indent && (t.starts_with("const ") || t.starts_with("static "))
+                indent <= fn_indent
+                    && (t.starts_with("const ")
+                        || t.starts_with("static ")
+                        || t.starts_with("mod "))
             });
-            if const_between {
+            if item_boundary_between {
                 continue;
             }
             let key = (rel.clone(), name.clone());
