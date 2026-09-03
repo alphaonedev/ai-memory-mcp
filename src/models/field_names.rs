@@ -129,6 +129,10 @@ pub const CERT: &str = "cert";
 /// `principal` — the certified principal (agent id) key.
 pub const PRINCIPAL: &str = "principal";
 /// `suite_tag` — committed advisory algorithm-suite tag key.
+/// `status` — wire field name. v1.0.0 #3350: `"ok"` when a check reached a
+/// verdict, `"degraded"` when it could not decide. On `"degraded"` the
+/// companion verdict field is `null`, never `false`.
+pub const STATUS: &str = "status";
 pub const SUITE_TAG: &str = "suite_tag";
 /// `session_id` — optional presence-encoded session id key.
 pub const SESSION_ID: &str = "session_id";
@@ -143,6 +147,13 @@ pub const BY_NAMESPACE: &str = "by_namespace";
 pub const BY_SOURCE_URI: &str = "by_source_uri";
 /// `candidates_scanned` — wire/row field name.
 pub const CANDIDATES_SCANNED: &str = "candidates_scanned";
+/// `candidates_available` — wire field name. v1.0.0 #3350: live rows that
+/// were IN SCOPE for a duplicate check, comparable or not. Paired with
+/// [`CANDIDATES_SCANNED`] (the rows actually compared) it is what makes a
+/// degraded check visible: `scanned == 0 && available > 0` means nothing
+/// could be compared, which used to be reported as a confident
+/// `is_duplicate: false`.
+pub const CANDIDATES_AVAILABLE: &str = "candidates_available";
 /// `canonical_name` — wire/row field name.
 pub const CANONICAL_NAME: &str = "canonical_name";
 /// `capabilities` — wire/row field name.
@@ -262,6 +273,12 @@ pub const WITHHELD_BY_CLASS: &str = "withheld_by_class";
 pub const WITHHELD_IDS: &str = "withheld_ids";
 /// `redacted` — count of exported rows whose stored bytes the secret screen
 /// ALTERED (#2490).
+/// `reason` — wire field name. v1.0.0 #3350: the closed-vocabulary token
+/// naming the EVIDENCE behind a duplicate verdict (`exact_content_hash`,
+/// `exact_title_in_namespace`, `embedding_cosine`, `empty_candidate_pool`)
+/// or, on a degraded check, why no verdict was reached
+/// (`query_embedding_unavailable`, `no_comparable_candidates`).
+pub const REASON: &str = "reason";
 pub const REDACTED: &str = "redacted";
 /// `redacted_ids` — operator-channel-only sibling of [`REDACTED`] (#2490).
 pub const REDACTED_IDS: &str = "redacted_ids";

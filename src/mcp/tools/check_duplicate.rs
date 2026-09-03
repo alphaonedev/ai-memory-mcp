@@ -50,33 +50,56 @@ pub fn handle_check_duplicate(
     // falling through to embedding cosine similarity. Catches byte-
     // identical duplicates that the embedding pipeline would otherwise
     // cap at ~0.92 due to nomic prefix normalisation.
-    let check = db::check_duplicate_with_text(conn, &query_embedding, &text, namespace, threshold)
-        .map_err(|e| e.to_string())?;
+    let check =
+        db::check_duplicate_with_text(conn, &query_embedding, title, &text, namespace, threshold)
+            .map_err(|e| e.to_string())?;
 
+    Ok(duplicate_check_envelope(&check))
+}
+
+/// v1.0.0 #3350 — the ONE duplicate-check wire envelope, shared by the MCP
+/// tool, the HTTP route (both backends) and the CLI verb so the three
+/// surfaces cannot drift.
+///
+/// `is_duplicate` is `null` — never `false` — when `status` is `"degraded"`:
+/// the check could not evaluate the candidate pool, and a caller must not be
+/// able to read that as a clean bill of health. `reason` always names the
+/// evidence (or the reason there is none), and `candidates_available` next to
+/// `candidates_scanned` shows how much of the pool was actually comparable.
+#[must_use]
+pub fn duplicate_check_envelope(check: &crate::models::DuplicateCheck) -> Value {
     // Round similarity to 3 decimals at the response edge — keeps the
     // JSON readable without leaking the f32's full quantisation noise.
+    // `None` (an embedding-free exact-title match) stays `null`.
     let nearest_json = check.nearest.as_ref().map(|m| {
         json!({
             "id": m.id,
             "title": m.title,
             "namespace": m.namespace,
-            (field_names::SIMILARITY): (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
-                / crate::SCORE_DISPLAY_ROUND_FACTOR,
+            (field_names::SIMILARITY): m.similarity.map(|sim| {
+                (f64::from(sim) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                    / crate::SCORE_DISPLAY_ROUND_FACTOR
+            }),
         })
     });
-    let suggested_merge = if check.is_duplicate {
+    let is_duplicate = check.verdict.as_bool();
+    let suggested_merge = if is_duplicate == Some(true) {
         check.nearest.as_ref().map(|m| m.id.clone())
     } else {
         None
     };
 
-    Ok(json!({
-        (field_names::IS_DUPLICATE): check.is_duplicate,
+    json!({
+        (field_names::STATUS): check.verdict.status(),
+        (field_names::IS_DUPLICATE): is_duplicate,
+        (field_names::REASON): check.verdict.reason(),
+        "detail": check.verdict.degraded_detail(),
         "threshold": check.threshold,
         "nearest": nearest_json,
         (field_names::SUGGESTED_MERGE): suggested_merge,
         (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
-    }))
+        (field_names::CANDIDATES_AVAILABLE): check.candidates_available,
+    })
 }
 
 // --- D1.5 (#986): per-tool McpTool impl for memory_check_duplicate ---

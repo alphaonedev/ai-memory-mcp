@@ -194,9 +194,10 @@ pub(crate) fn canonicalize_valid_until_stamp(valid_until: Option<&str>) -> Strin
 
 use crate::models::{
     AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, ConfidenceSource, DuplicateCheck,
-    DuplicateMatch, GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction,
-    MAX_NAMESPACE_DEPTH, Memory, MemoryKind, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD,
-    PendingAction, SourceSpan, Stats, Taxonomy, TaxonomyNode, Tier, TierCount, namespace_ancestors,
+    DuplicateEvidence, DuplicateMatch, DuplicateUndetermined, DuplicateVerdict, GovernanceDecision,
+    GovernanceLevel, GovernancePolicy, GovernedAction, MAX_NAMESPACE_DEPTH, Memory, MemoryKind,
+    MemoryLink, NamespaceCount, PROMOTION_THRESHOLD, PendingAction, SourceSpan, Stats, Taxonomy,
+    TaxonomyNode, Tier, TierCount, namespace_ancestors,
 };
 
 // #962 — typed substrate-layer error envelope. Substrate code emits
@@ -10775,6 +10776,11 @@ pub fn check_duplicate(
         mapped.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
+    // #3350 — the size of the pool the SQL gate admitted. `scanned` below
+    // counts only the rows we could actually COMPARE; the gap between the two
+    // is exactly the "I could not evaluate anything" signal that used to be
+    // reported as a confident `is_duplicate: false`.
+    let available: usize = rows.len();
     let mut best: Option<DuplicateMatch> = None;
     let mut scanned: usize = 0;
     for (id, title, ns, bytes) in rows {
@@ -10811,25 +10817,54 @@ pub fn check_duplicate(
         let similarity =
             crate::embeddings::Embedder::cosine_similarity(query_embedding, &candidate);
         scanned += 1;
-        let is_better = best.as_ref().is_none_or(|m| similarity > m.similarity);
+        // #3350 — every candidate in THIS loop was cosine-compared, so each
+        // carries a measured `Some(sim)`; `None` (an embedding-free
+        // exact-title match) never reaches here and would not be comparable
+        // if it did, so it must never displace a measured best.
+        let is_better = best
+            .as_ref()
+            .is_none_or(|m| m.similarity.is_none_or(|prev| similarity > prev));
         if is_better {
             best = Some(DuplicateMatch {
                 id,
                 title,
                 namespace: ns,
-                similarity,
+                similarity: Some(similarity),
             });
         }
     }
 
-    let is_duplicate = best
+    // v1.0.0 #3350 — FAIL CLOSED on "could not evaluate". Pre-fix every one of
+    // these arms produced `is_duplicate: false`, so a candidate that was never
+    // compared to anything read as a confident "not a duplicate" and the
+    // caller wrote over / beside an existing memory. The three cases are now
+    // distinct on the wire.
+    let verdict = if query_embedding.is_empty() {
+        DuplicateVerdict::Undetermined(DuplicateUndetermined::QueryEmbeddingUnavailable)
+    } else if scanned == 0 {
+        if available == 0 {
+            // Nothing was in scope: an honest, evaluated "not a duplicate".
+            DuplicateVerdict::NotDuplicate(DuplicateEvidence::EmptyCandidatePool)
+        } else {
+            // Rows WERE in scope and not one of them could be compared
+            // (dimension mismatch, malformed blob, foreign embedding space).
+            DuplicateVerdict::Undetermined(DuplicateUndetermined::NoComparableCandidates)
+        }
+    } else if best
         .as_ref()
-        .is_some_and(|m| m.similarity >= effective_threshold);
+        .and_then(|m| m.similarity)
+        .is_some_and(|sim| sim >= effective_threshold)
+    {
+        DuplicateVerdict::Duplicate(DuplicateEvidence::EmbeddingCosine)
+    } else {
+        DuplicateVerdict::NotDuplicate(DuplicateEvidence::EmbeddingCosine)
+    };
     Ok(DuplicateCheck {
-        is_duplicate,
+        verdict,
         threshold: effective_threshold,
         nearest: best,
         candidates_scanned: scanned,
+        candidates_available: available,
     })
 }
 
@@ -11350,6 +11385,7 @@ fn proactive_conflict_verdict(
 pub fn check_duplicate_with_text(
     conn: &Connection,
     query_embedding: &[f32],
+    query_title: &str,
     query_text: &str,
     namespace: Option<&str>,
     threshold: f32,
@@ -11404,25 +11440,73 @@ pub fn check_duplicate_with_text(
         let row_hash = canonical_content_hash(&row_text);
         if row_hash == query_hash {
             return Ok(DuplicateCheck {
-                is_duplicate: true,
+                verdict: DuplicateVerdict::Duplicate(DuplicateEvidence::ExactContentHash),
                 threshold: effective_threshold,
                 nearest: Some(DuplicateMatch {
                     id: id.clone(),
                     title: title.clone(),
                     namespace: ns.clone(),
-                    similarity: 1.0,
+                    similarity: Some(1.0),
                 }),
                 // We scanned every row through the hash compare to find
                 // the match — report that, not just the first one.
                 candidates_scanned: rows.len(),
+                candidates_available: rows.len(),
             });
         }
     }
 
-    // Phase 2 — no hash match; fall back to the embedding-based
+    // Phase 1b (v1.0.0 #3350) — EXACT `(title, namespace)` collision, decided
+    // WITHOUT any embedding. `memories` is UNIQUE on `(title, namespace)`, so
+    // a live row holding this candidate's slot means a store WOULD collide:
+    // that is a duplicate by construction, and reporting it needs no vector.
+    //
+    // This is the arm the #3350 repro fell through: an operator checked an
+    // EXISTING title with a short/paraphrased body, the content hash missed,
+    // the cosine pool turned out to be unevaluable, and the answer came back
+    // `is_duplicate: false` — a clean bill of health for a write that would
+    // have collided.
+    //
+    // Scoped to `namespace.is_some()` deliberately: without a target
+    // namespace there is no slot to collide with (the same title in a
+    // DIFFERENT namespace is a legitimately distinct memory), so the rule
+    // would be unsound.
+    if let Some(ns_filter) = namespace {
+        for (id, title, ns, _content) in &rows {
+            if title == query_title && ns == ns_filter {
+                return Ok(DuplicateCheck {
+                    verdict: DuplicateVerdict::Duplicate(DuplicateEvidence::ExactTitleInNamespace),
+                    threshold: effective_threshold,
+                    nearest: Some(DuplicateMatch {
+                        id: id.clone(),
+                        title: title.clone(),
+                        namespace: ns.clone(),
+                        // No cosine was measured — `null`, never `0.0`
+                        // (which would read as "measured, and far apart").
+                        similarity: None,
+                    }),
+                    candidates_scanned: rows.len(),
+                    candidates_available: rows.len(),
+                });
+            }
+        }
+    }
+
+    // Phase 2 — no exact match; fall back to the embedding-based
     // nearest-neighbor scan so callers still get the "closest existing
     // memory was X at similarity Y" signal on near-but-not-exact hits.
-    check_duplicate(conn, query_embedding, namespace, threshold)
+    let mut check = check_duplicate(conn, query_embedding, namespace, threshold)?;
+    // #3350 — `check_duplicate` only sees the EMBEDDED pool, so its own
+    // `candidates_available` under-reports what was really in scope. Restate
+    // it from this function's full live-row pool and re-derive the degraded
+    // verdict from the true numbers: rows in scope that could not be compared
+    // are the whole point of the signal.
+    check.candidates_available = rows.len();
+    if check.candidates_scanned == 0 && !rows.is_empty() && check.verdict.is_determined() {
+        check.verdict =
+            DuplicateVerdict::Undetermined(DuplicateUndetermined::NoComparableCandidates);
+    }
+    Ok(check)
 }
 
 /// Register an entity (canonical name + aliases) under a namespace
@@ -26171,9 +26255,12 @@ mod tests {
         let conn = test_db();
         let q = vec![1.0_f32, 0.0, 0.0];
         let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
-        assert!(!r.is_duplicate);
+        // #3350 — an EMPTY scope is an honest evaluated verdict, not degraded.
+        assert_eq!(r.verdict.as_bool(), Some(false));
+        assert_eq!(r.verdict.reason(), "empty_candidate_pool");
         assert!(r.nearest.is_none());
         assert_eq!(r.candidates_scanned, 0);
+        assert_eq!(r.candidates_available, 0);
     }
 
     #[test]
@@ -26191,9 +26278,11 @@ mod tests {
         let r = check_duplicate(&conn, &q, None, 0.85).unwrap();
         let nearest = r.nearest.expect("expected a nearest match");
         assert_eq!(nearest.id, id_a);
-        assert!(nearest.similarity > 0.99);
+        assert!(nearest.similarity.expect("cosine measured") > 0.99);
         assert_eq!(r.candidates_scanned, 3);
-        assert!(r.is_duplicate);
+        assert_eq!(r.candidates_available, 3);
+        assert_eq!(r.verdict.as_bool(), Some(true));
+        assert_eq!(r.verdict.reason(), "embedding_cosine");
         assert!((r.threshold - 0.85).abs() < 1e-6);
     }
 
@@ -26209,7 +26298,8 @@ mod tests {
             .nearest
             .expect("nearest must surface even when below threshold");
         assert_eq!(nearest.id, id_b);
-        assert!(!r.is_duplicate);
+        assert_eq!(r.verdict.as_bool(), Some(false));
+        assert_eq!(r.verdict.reason(), "embedding_cosine");
     }
 
     #[test]
@@ -26222,7 +26312,7 @@ mod tests {
         let q = vec![0.0_f32, 1.0, 0.0]; // orthogonal — cosine 0.0
         let r = check_duplicate(&conn, &q, None, 0.0).unwrap();
         assert!((r.threshold - DUPLICATE_THRESHOLD_MIN).abs() < 1e-6);
-        assert!(!r.is_duplicate);
+        assert_eq!(r.verdict.as_bool(), Some(false));
     }
 
     #[test]

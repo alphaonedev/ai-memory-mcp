@@ -4395,6 +4395,7 @@ pub trait MemoryStore: Send + Sync {
     async fn check_duplicate_with_text(
         &self,
         _query_embedding: &[f32],
+        _query_title: &str,
         _query_text: &str,
         _namespace: Option<&str>,
         _threshold: f32,
@@ -5948,7 +5949,7 @@ mod tests {
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(
-            s.check_duplicate_with_text(&[0.1_f32, 0.2], "title content", Some("ns"), 0.9)
+            s.check_duplicate_with_text(&[0.1_f32, 0.2], "title", "title content", Some("ns"), 0.9)
                 .await
                 .unwrap_err(),
             StoreError::UnsupportedCapability { .. }

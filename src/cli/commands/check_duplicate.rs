@@ -125,33 +125,58 @@ pub fn run_with_embedder(
         return Ok(());
     }
 
+    // v1.0.0 #3350 — three outcomes, not two. `is_duplicate` is `null` when
+    // the check could not evaluate the pool, and the human line must say so
+    // rather than print the old "ok  no duplicate", which read as a clean
+    // bill of health for a write nothing had been compared against.
     let is_dup = envelope
         .get(field_names::IS_DUPLICATE)
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .and_then(Value::as_bool);
     let scanned = envelope
         .get(field_names::CANDIDATES_SCANNED)
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if is_dup {
-        let merge = envelope
-            .get(field_names::SUGGESTED_MERGE)
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        let sim = envelope
-            .get("nearest")
-            .and_then(|n| n.get(field_names::SIMILARITY))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        writeln!(
-            out.stdout,
-            "check-duplicate: DUPLICATE  suggested_merge={merge}  similarity={sim:.3}  candidates_scanned={scanned}",
-        )?;
-    } else {
-        writeln!(
-            out.stdout,
-            "check-duplicate: ok  no duplicate  candidates_scanned={scanned}",
-        )?;
+    let available = envelope
+        .get(field_names::CANDIDATES_AVAILABLE)
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reason = envelope
+        .get(field_names::REASON)
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    match is_dup {
+        Some(true) => {
+            let merge = envelope
+                .get(field_names::SUGGESTED_MERGE)
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let sim = envelope
+                .get("nearest")
+                .and_then(|n| n.get(field_names::SIMILARITY))
+                .and_then(Value::as_f64);
+            let sim_text = sim.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}"));
+            writeln!(
+                out.stdout,
+                "check-duplicate: DUPLICATE  suggested_merge={merge}  similarity={sim_text}  reason={reason}  candidates_scanned={scanned}/{available}",
+            )?;
+        }
+        Some(false) => {
+            writeln!(
+                out.stdout,
+                "check-duplicate: ok  no duplicate  reason={reason}  candidates_scanned={scanned}/{available}",
+            )?;
+        }
+        None => {
+            let detail = envelope
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or("the candidate pool could not be evaluated");
+            writeln!(
+                out.stdout,
+                "check-duplicate: DEGRADED  no verdict  reason={reason}  candidates_scanned={scanned}/{available}",
+            )?;
+            writeln!(out.stderr, "check-duplicate: {detail}")?;
+        }
     }
     Ok(())
 }

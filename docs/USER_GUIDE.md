@@ -1095,7 +1095,10 @@ the nearest match with an `is_duplicate` flag.
 
 ```json
 {
+  "status": "ok",
   "is_duplicate": true,
+  "reason": "exact_content_hash",
+  "detail": null,
   "threshold": 0.85,
   "nearest": {
     "id": "a1b2c3d4-...",
@@ -1104,12 +1107,20 @@ the nearest match with an `is_duplicate` flag.
     "similarity": 0.92
   },
   "suggested_merge": "a1b2c3d4-...",
-  "candidates_scanned": 412
+  "candidates_scanned": 412,
+  "candidates_available": 412
 }
 ```
 
 `suggested_merge` is non-null when `is_duplicate == true`. Requires
 the `semantic` feature tier or higher (embeddings must be available).
+
+**v1.0.0 #3350.** When the check could not evaluate the pool at all, `status`
+is `"degraded"` and `is_duplicate` is `null` — never `false`. Treat that as
+"unknown, do not assume this write is unique", and read `reason` /
+`detail` for what to fix. An exact `(title, namespace)` match is reported as a
+duplicate even with no embedding available, because the store enforces that
+pair as unique. See the reason table in `docs/API_REFERENCE.md`.
 
 ---
 

@@ -32061,6 +32061,7 @@ impl MemoryStore for PostgresStore {
     async fn check_duplicate_with_text(
         &self,
         query_embedding: &[f32],
+        query_title: &str,
         query_text: &str,
         namespace: Option<&str>,
         threshold: f32,
@@ -32101,6 +32102,10 @@ impl MemoryStore for PostgresStore {
         let query_hash = query_hasher.finalize();
 
         let candidates_scanned = rows.len();
+        // v1.0.0 #3350 — decoded once so BOTH embedding-free rules (the
+        // content hash and the `(title, namespace)` collision) run over the
+        // same single scan, exactly as the sqlite twin does.
+        let mut exact_title: Option<crate::models::DuplicateMatch> = None;
         for r in &rows {
             let id: String = r.try_get("id").map_err(|e| to_store_err("read id", e))?;
             let title: String = r
@@ -32118,17 +32123,50 @@ impl MemoryStore for PostgresStore {
             let row_hash = row_hasher.finalize();
             if row_hash == query_hash {
                 return Ok(crate::models::DuplicateCheck {
-                    is_duplicate: true,
+                    verdict: crate::models::DuplicateVerdict::Duplicate(
+                        crate::models::DuplicateEvidence::ExactContentHash,
+                    ),
                     threshold: effective_threshold,
                     nearest: Some(crate::models::DuplicateMatch {
                         id,
                         title,
                         namespace: ns_v,
-                        similarity: 1.0,
+                        similarity: Some(1.0),
                     }),
                     candidates_scanned,
+                    candidates_available: candidates_scanned,
                 });
             }
+            // #3350 phase 1b — `memories` is UNIQUE on `(title, namespace)`,
+            // so a live row holding this candidate's slot is a guaranteed
+            // store collision: a duplicate established with NO embedding.
+            // Scoped to a named namespace (without one there is no slot to
+            // collide with). Recorded, not returned, so the content-hash rule
+            // above still wins on a later row.
+            if exact_title.is_none()
+                && let Some(ns_filter) = namespace
+                && title == query_title
+                && ns_v == ns_filter
+            {
+                exact_title = Some(crate::models::DuplicateMatch {
+                    id,
+                    title,
+                    namespace: ns_v,
+                    // No cosine was measured — `null`, never `0.0`.
+                    similarity: None,
+                });
+            }
+        }
+        if let Some(m) = exact_title {
+            return Ok(crate::models::DuplicateCheck {
+                verdict: crate::models::DuplicateVerdict::Duplicate(
+                    crate::models::DuplicateEvidence::ExactTitleInNamespace,
+                ),
+                threshold: effective_threshold,
+                nearest: Some(m),
+                candidates_scanned,
+                candidates_available: candidates_scanned,
+            });
         }
 
         // Phase 2 — fall through to the embedding-based nearest-
@@ -32137,11 +32175,26 @@ impl MemoryStore for PostgresStore {
         // Empty-embedding shortcut: if no vector was supplied (caller
         // is keyword-only), report "no duplicate found".
         if query_embedding.is_empty() {
+            // v1.0.0 #3350 — FAIL CLOSED. This arm used to answer
+            // `is_duplicate: false`: a caller with no embedder was told its
+            // write was unique when nothing had been compared at all. It is
+            // now an explicit no-verdict (unless nothing was in scope, which
+            // IS an honest "not a duplicate").
+            let verdict = if candidates_scanned == 0 {
+                crate::models::DuplicateVerdict::NotDuplicate(
+                    crate::models::DuplicateEvidence::EmptyCandidatePool,
+                )
+            } else {
+                crate::models::DuplicateVerdict::Undetermined(
+                    crate::models::DuplicateUndetermined::QueryEmbeddingUnavailable,
+                )
+            };
             return Ok(crate::models::DuplicateCheck {
-                is_duplicate: false,
+                verdict,
                 threshold: effective_threshold,
                 nearest: None,
-                candidates_scanned,
+                candidates_scanned: 0,
+                candidates_available: candidates_scanned,
             });
         }
 
@@ -32160,6 +32213,40 @@ impl MemoryStore for PostgresStore {
         // produced `query_embedding`). The nullable-safe `IS NULL OR =` form
         // preserves legacy dim-only behavior when no active space is seeded.
         let active_space = crate::embeddings::active_embedding_space();
+        // v1.0.0 #3350 — how many in-scope rows are actually COMPARABLE under
+        // the same gate the nearest-neighbour query uses. `LIMIT 1` alone
+        // cannot tell "the pool was empty of comparable vectors" from "the
+        // pool was compared and nothing was close"; without this count the
+        // postgres twin would keep reporting the fail-open verdict the sqlite
+        // side just closed, and the two backends would disagree on the wire.
+        let comparable: i64 = if let Some(ns) = namespace {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM memories
+                 WHERE embedding IS NOT NULL
+                   AND namespace = $1
+                   AND (expires_at IS NULL OR expires_at > $2)
+                   AND ($3::text IS NULL OR embedding_space = $3)",
+            )
+            .bind(ns)
+            .bind(now_dt)
+            .bind(active_space.as_ref())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text comparable count", e))?
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM memories
+                 WHERE embedding IS NOT NULL
+                   AND (expires_at IS NULL OR expires_at > $1)
+                   AND ($2::text IS NULL OR embedding_space = $2)",
+            )
+            .bind(now_dt)
+            .bind(active_space.as_ref())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("check_duplicate_with_text comparable count", e))?
+        };
+        let comparable = usize::try_from(comparable).unwrap_or(0);
         let nearest_row = if let Some(ns) = namespace {
             sqlx::query(
                 "SELECT id, title, namespace,
@@ -32214,21 +32301,44 @@ impl MemoryStore for PostgresStore {
                     id,
                     title,
                     namespace: ns_v,
-                    similarity: sim_f32,
+                    similarity: Some(sim_f32),
                 })
             }
             None => None,
         };
 
-        let is_duplicate = nearest
+        // v1.0.0 #3350 — the same three-way disposition the sqlite twin
+        // reaches, from the same two counts.
+        let verdict = if comparable == 0 {
+            if candidates_scanned == 0 {
+                crate::models::DuplicateVerdict::NotDuplicate(
+                    crate::models::DuplicateEvidence::EmptyCandidatePool,
+                )
+            } else {
+                crate::models::DuplicateVerdict::Undetermined(
+                    crate::models::DuplicateUndetermined::NoComparableCandidates,
+                )
+            }
+        } else if nearest
             .as_ref()
-            .is_some_and(|n| n.similarity >= effective_threshold);
+            .and_then(|n| n.similarity)
+            .is_some_and(|sim| sim >= effective_threshold)
+        {
+            crate::models::DuplicateVerdict::Duplicate(
+                crate::models::DuplicateEvidence::EmbeddingCosine,
+            )
+        } else {
+            crate::models::DuplicateVerdict::NotDuplicate(
+                crate::models::DuplicateEvidence::EmbeddingCosine,
+            )
+        };
 
         Ok(crate::models::DuplicateCheck {
-            is_duplicate,
+            verdict,
             threshold: effective_threshold,
             nearest,
-            candidates_scanned,
+            candidates_scanned: comparable,
+            candidates_available: candidates_scanned,
         })
     }
 
@@ -37781,15 +37891,17 @@ mod tests {
         // Empty embedding — phase 1 hash short-circuit doesn't need
         // pgvector and must surface similarity=1.0 byte-equal.
         let check = store
-            .check_duplicate_with_text(&[], &query_text, Some(&ns), 0.8)
+            .check_duplicate_with_text(&[], &mem.title, &query_text, Some(&ns), 0.8)
             .await
             .expect("check_duplicate_with_text");
-        assert!(
-            check.is_duplicate,
+        assert_eq!(
+            check.verdict.as_bool(),
+            Some(true),
             "byte-equal text must short-circuit as duplicate"
         );
+        assert_eq!(check.verdict.reason(), "exact_content_hash");
         let n = check.nearest.expect("nearest must be populated");
-        assert!((n.similarity - 1.0).abs() < f32::EPSILON);
+        assert!((n.similarity.expect("hash match is 1.0") - 1.0).abs() < f32::EPSILON);
     }
 
     #[tokio::test]

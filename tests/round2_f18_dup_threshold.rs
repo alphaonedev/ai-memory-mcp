@@ -102,22 +102,24 @@ fn check_duplicate_with_text_exact_match_returns_similarity_1_0() {
     // The MCP layer forms the query text as `format!("{title} {content}")`;
     // we mirror that exactly so the SHA-256 hash matches.
     let query_text = format!("{title} {content}");
-    let r = db::check_duplicate_with_text(&conn, &query_emb, &query_text, Some("ns"), 0.85)
+    let r = db::check_duplicate_with_text(&conn, &query_emb, title, &query_text, Some("ns"), 0.85)
         .expect("check_duplicate_with_text");
 
     let nearest = r
         .nearest
         .expect("byte-identical content must surface a nearest match");
     assert_eq!(nearest.id, stored_id);
+    let sim = nearest.similarity.expect("hash match reports a similarity");
     assert!(
-        (nearest.similarity - 1.0).abs() < 1e-6,
-        "byte-identical content must score similarity=1.0 (got {})",
-        nearest.similarity
+        (sim - 1.0).abs() < 1e-6,
+        "byte-identical content must score similarity=1.0 (got {sim})"
     );
-    assert!(
-        r.is_duplicate,
-        "byte-identical content must be flagged is_duplicate=true"
+    assert_eq!(
+        r.verdict.as_bool(),
+        Some(true),
+        "byte-identical content must be flagged as a duplicate"
     );
+    assert_eq!(r.verdict.reason(), "exact_content_hash");
 }
 
 #[test]
@@ -144,23 +146,33 @@ fn check_duplicate_with_text_near_miss_falls_through_to_embedding() {
         "shopping list buy bread, milk, eggs, and a thoughtfully-named cat toy".to_string();
     let query_emb = [1.0_f32, 0.0, 0.0];
 
-    let r = db::check_duplicate_with_text(&conn, &query_emb, &near_miss_text, Some("ns"), 0.85)
-        .expect("check_duplicate_with_text");
+    // #3350 — the title is deliberately DIFFERENT from the stored row's so the
+    // exact-`(title, namespace)` rule does not pre-empt the cosine fall-through
+    // this test is about.
+    let r = db::check_duplicate_with_text(
+        &conn,
+        &query_emb,
+        "shopping list (variant)",
+        &near_miss_text,
+        Some("ns"),
+        0.85,
+    )
+    .expect("check_duplicate_with_text");
 
     let nearest = r
         .nearest
         .expect("near-miss must still return a nearest neighbour");
     assert_eq!(nearest.id, stored_id);
+    let sim = nearest.similarity.expect("cosine fall-through measures");
     assert!(
-        nearest.similarity > 0.85,
-        "near-miss embedding cosine must clear the 0.85 floor (got {})",
-        nearest.similarity
+        sim > 0.85,
+        "near-miss embedding cosine must clear the 0.85 floor (got {sim})"
     );
     assert!(
-        nearest.similarity < 1.0,
-        "near-miss must NOT saturate at 1.0 — that path is reserved for hash matches (got {})",
-        nearest.similarity
+        sim < 1.0,
+        "near-miss must NOT saturate at 1.0 — that path is reserved for hash matches (got {sim})"
     );
+    assert_eq!(r.verdict.reason(), "embedding_cosine");
 }
 
 #[test]
@@ -169,9 +181,13 @@ fn check_duplicate_with_text_empty_db_returns_no_match() {
     // embedding fall-through should fabricate a match.
     let (conn, _tmp) = open_db();
     let query_emb = [1.0_f32, 0.0, 0.0];
-    let r = db::check_duplicate_with_text(&conn, &query_emb, "anything goes", None, 0.85)
-        .expect("check_duplicate_with_text");
-    assert!(!r.is_duplicate);
+    let r =
+        db::check_duplicate_with_text(&conn, &query_emb, "anything", "anything goes", None, 0.85)
+            .expect("check_duplicate_with_text");
+    // #3350 — nothing in scope IS an evaluated verdict, and it says so.
+    assert_eq!(r.verdict.as_bool(), Some(false));
+    assert_eq!(r.verdict.reason(), "empty_candidate_pool");
+    assert_eq!(r.candidates_available, 0);
     assert!(r.nearest.is_none());
 }
 
@@ -188,11 +204,15 @@ fn check_duplicate_with_text_namespace_filter_isolates_exact_match() {
 
     let query_emb = [1.0_f32, 0.0, 0.0];
     let query_text = format!("{title} {content}");
-    let r = db::check_duplicate_with_text(&conn, &query_emb, &query_text, Some("ns"), 0.85)
+    let r = db::check_duplicate_with_text(&conn, &query_emb, title, &query_text, Some("ns"), 0.85)
         .expect("check_duplicate_with_text");
-    assert!(
-        !r.is_duplicate,
+    assert_eq!(
+        r.verdict.as_bool(),
+        Some(false),
         "namespace filter must scope the exact-match short-circuit"
     );
+    // #3350 — and the exact-TITLE rule is namespace-scoped for the same
+    // reason: the identical title lives in `other`, not in `ns`.
+    assert_eq!(r.verdict.reason(), "empty_candidate_pool");
     assert!(r.nearest.is_none());
 }

@@ -602,27 +602,196 @@ pub struct KgQueryNode {
 /// One nearest-neighbor result from a `memory_check_duplicate` lookup
 /// (Pillar 2 / Stream D). `similarity` is the cosine similarity in
 /// `[-1.0, 1.0]`, rounded to three decimals at the response layer.
+///
+/// v1.0.0 #3350 — `similarity` is an `Option` because a match can be
+/// established WITHOUT a comparable embedding: an exact
+/// `(title, namespace)` collision is a hard, guaranteed duplicate whose
+/// cosine distance may be unknown (or meaningless). `None` on the wire is
+/// `null` — never `0.0`, which would read as "measured, and far apart".
 #[derive(Debug, Clone, Serialize)]
 pub struct DuplicateMatch {
     pub id: String,
     pub title: String,
     pub namespace: String,
-    pub similarity: f32,
+    pub similarity: Option<f32>,
+}
+
+/// v1.0.0 #3350 — how a DETERMINED duplicate verdict was reached.
+///
+/// A closed vocabulary: the wire `reason` is exactly [`Self::as_str`], so a
+/// caller can branch on the evidence rather than guess at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateEvidence {
+    /// The candidate's `embedding_document(title, content)` hashes
+    /// byte-equal to a live row's. Embedding-independent.
+    ExactContentHash,
+    /// A live row already occupies the candidate's `(title, namespace)`
+    /// slot. `memories` is UNIQUE on that pair, so a store WOULD collide —
+    /// a guaranteed duplicate, established without any embedding.
+    ExactTitleInNamespace,
+    /// Decided by cosine similarity over the comparable candidate pool.
+    EmbeddingCosine,
+    /// No live row was in scope at all, so there is nothing to duplicate.
+    /// This IS an evaluated verdict, not a degraded one.
+    EmptyCandidatePool,
+}
+
+impl DuplicateEvidence {
+    /// The wire spelling of this evidence.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactContentHash => "exact_content_hash",
+            Self::ExactTitleInNamespace => "exact_title_in_namespace",
+            Self::EmbeddingCosine => "embedding_cosine",
+            Self::EmptyCandidatePool => "empty_candidate_pool",
+        }
+    }
+}
+
+/// v1.0.0 #3350 — why a duplicate check could NOT reach a verdict.
+///
+/// These are the states that used to be reported as a confident
+/// `is_duplicate: false` — a fail-OPEN verdict that told a caller "safe to
+/// write" when nothing had actually been compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateUndetermined {
+    /// The candidate produced no query vector (the embedder is absent,
+    /// degraded, or returned an empty embedding), so no cosine comparison
+    /// was possible.
+    QueryEmbeddingUnavailable,
+    /// Live rows ARE in scope but none could be compared: each was missing an
+    /// embedding, carried a different dimension, or belonged to a foreign
+    /// embedding space (#2167 §9 cross-space gate).
+    NoComparableCandidates,
+}
+
+impl DuplicateUndetermined {
+    /// The wire spelling of this reason.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QueryEmbeddingUnavailable => "query_embedding_unavailable",
+            Self::NoComparableCandidates => "no_comparable_candidates",
+        }
+    }
+
+    /// Operator-facing sentence explaining what to do about it.
+    #[must_use]
+    pub const fn detail(self) -> &'static str {
+        match self {
+            Self::QueryEmbeddingUnavailable => {
+                "the candidate could not be embedded, so no similarity comparison ran; \
+                 enable semantic tier or above and retry before treating this write as unique"
+            }
+            Self::NoComparableCandidates => {
+                "live memories exist in this scope but none carried a comparable embedding \
+                 (missing, wrong dimension, or a different embedding space); backfill \
+                 embeddings and retry before treating this write as unique"
+            }
+        }
+    }
+}
+
+/// v1.0.0 #3350 — the outcome of a duplicate check.
+///
+/// [`Self::Undetermined`] is a FIRST-CLASS outcome, not an error and not a
+/// `false`. Before #3350 the check collapsed "I compared the pool and found
+/// nothing close" and "I could not compare anything at all" into the same
+/// `is_duplicate: false`, so a candidate whose embedding was unavailable —
+/// or whose namespace held only foreign-space rows — read as a clean
+/// "not a duplicate" and a caller would happily write a duplicate on top of
+/// it. Making the third state unrepresentable-as-`false` is the control:
+/// [`Self::as_bool`] returns `Option<bool>`, so every consumer has to decide
+/// what to do when there is no verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "verdict", content = "reason")]
+pub enum DuplicateVerdict {
+    /// Evaluated: this candidate duplicates [`DuplicateCheck::nearest`].
+    Duplicate(DuplicateEvidence),
+    /// Evaluated: this candidate is not a duplicate.
+    NotDuplicate(DuplicateEvidence),
+    /// NOT evaluated — the check could not decide. Never report this as
+    /// "not a duplicate".
+    Undetermined(DuplicateUndetermined),
+}
+
+impl DuplicateVerdict {
+    /// `Some(true)` / `Some(false)` for an evaluated verdict; `None` when the
+    /// check could not decide.
+    ///
+    /// Deliberately NOT a bare `bool`: a caller that wants one has to spell
+    /// out what "no verdict" means for it, which is the whole point of #3350.
+    #[must_use]
+    pub const fn as_bool(self) -> Option<bool> {
+        match self {
+            Self::Duplicate(_) => Some(true),
+            Self::NotDuplicate(_) => Some(false),
+            Self::Undetermined(_) => None,
+        }
+    }
+
+    /// `true` when the check reached a verdict.
+    #[must_use]
+    pub const fn is_determined(self) -> bool {
+        self.as_bool().is_some()
+    }
+
+    /// Wire `status`: `"ok"` for an evaluated verdict, `"degraded"` when the
+    /// check could not decide.
+    #[must_use]
+    pub const fn status(self) -> &'static str {
+        if self.is_determined() {
+            "ok"
+        } else {
+            "degraded"
+        }
+    }
+
+    /// Wire `reason` — the closed-vocabulary token naming the evidence
+    /// behind the verdict, or the reason no verdict was reached.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Duplicate(e) | Self::NotDuplicate(e) => e.as_str(),
+            Self::Undetermined(u) => u.as_str(),
+        }
+    }
+
+    /// Operator-facing detail for a degraded check; `None` when determined.
+    #[must_use]
+    pub const fn degraded_detail(self) -> Option<&'static str> {
+        match self {
+            Self::Undetermined(u) => Some(u.detail()),
+            _ => None,
+        }
+    }
 }
 
 /// Result envelope returned by `db::check_duplicate`.
 ///
-/// `is_duplicate` is `nearest.similarity >= threshold`. `nearest` is
-/// `None` only when the candidate pool is empty (no embedded, live
-/// memories matched the namespace filter). When `is_duplicate` is true,
-/// `nearest.id` doubles as the suggested merge target — we surface it
-/// under that name in the JSON response so the contract stays explicit.
+/// `nearest.id` doubles as the suggested merge target when the verdict is
+/// [`DuplicateVerdict::Duplicate`] — we surface it under that name in the
+/// JSON response so the contract stays explicit.
+///
+/// v1.0.0 #3350 — the boolean `is_duplicate` field became
+/// [`DuplicateCheck::verdict`], and `candidates_available` joined
+/// `candidates_scanned`. The pair is what makes a degraded check *visible*:
+/// `scanned == 0 && available == 0` means "nothing was in scope" (an honest
+/// not-a-duplicate), while `scanned == 0 && available > 0` means "rows were
+/// in scope and NONE of them could be compared" — which used to be reported
+/// as the same confident `false`.
 #[derive(Debug, Clone, Serialize)]
 pub struct DuplicateCheck {
-    pub is_duplicate: bool,
+    pub verdict: DuplicateVerdict,
     pub threshold: f32,
     pub nearest: Option<DuplicateMatch>,
+    /// Candidates actually COMPARED (hash-compared, or cosine-compared).
     pub candidates_scanned: usize,
+    /// Live rows in scope (after the namespace filter), comparable or not.
+    pub candidates_available: usize,
 }
 
 /// One node of the hierarchical namespace tree returned by

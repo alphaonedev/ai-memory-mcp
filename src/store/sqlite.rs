@@ -3467,13 +3467,21 @@ impl MemoryStore for SqliteStore {
     async fn check_duplicate_with_text(
         &self,
         query_embedding: &[f32],
+        query_title: &str,
         query_text: &str,
         namespace: Option<&str>,
         threshold: f32,
     ) -> StoreResult<crate::models::DuplicateCheck> {
         let conn = self.state.lock().await;
-        db::check_duplicate_with_text(&conn, query_embedding, query_text, namespace, threshold)
-            .map_err(box_err)
+        db::check_duplicate_with_text(
+            &conn,
+            query_embedding,
+            query_title,
+            query_text,
+            namespace,
+            threshold,
+        )
+        .map_err(box_err)
     }
 
     async fn notify(
@@ -5896,12 +5904,13 @@ mod tests {
         let query_text = format!("{} {}", mem.title, mem.content);
         // Empty embedding is fine — phase 1 (hash) doesn't need it.
         let check = store
-            .check_duplicate_with_text(&[], &query_text, Some("alphaone"), 0.8)
+            .check_duplicate_with_text(&[], &mem.title, &query_text, Some("alphaone"), 0.8)
             .await
             .expect("check_duplicate_with_text");
-        assert!(check.is_duplicate);
+        assert_eq!(check.verdict.as_bool(), Some(true));
+        assert_eq!(check.verdict.reason(), "exact_content_hash");
         let n = check.nearest.expect("nearest must be populated on dup");
-        assert!((n.similarity - 1.0).abs() < f32::EPSILON);
+        assert!((n.similarity.expect("hash match is 1.0") - 1.0).abs() < f32::EPSILON);
     }
 
     #[tokio::test]
@@ -5910,11 +5919,14 @@ mod tests {
         // candidates_scanned=0.
         let store = fresh_store();
         let check = store
-            .check_duplicate_with_text(&[], "no-match text", Some("alphaone"), 0.8)
+            .check_duplicate_with_text(&[], "no-match", "no-match text", Some("alphaone"), 0.8)
             .await
             .expect("check_duplicate_with_text empty");
-        assert!(!check.is_duplicate);
+        // #3350 — an empty scope is an honest evaluated verdict.
+        assert_eq!(check.verdict.as_bool(), Some(false));
+        assert_eq!(check.verdict.reason(), "empty_candidate_pool");
         assert_eq!(check.candidates_scanned, 0);
+        assert_eq!(check.candidates_available, 0);
     }
 
     // ------------------------------------------------------------------

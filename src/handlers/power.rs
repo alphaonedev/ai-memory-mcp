@@ -792,7 +792,13 @@ pub async fn check_duplicate(
             crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
         return match app
             .store
-            .check_duplicate_with_text(&query_embedding, &embedding_text, namespace, threshold)
+            .check_duplicate_with_text(
+                &query_embedding,
+                &body.title,
+                &embedding_text,
+                namespace,
+                threshold,
+            )
             .await
         {
             Ok(mut check) => {
@@ -812,28 +818,21 @@ pub async fn check_duplicate(
                         Err(_) => true,
                     };
                     if hide {
+                        // #947 — the caller may not learn that a private row
+                        // of another tenant matched. #3350: masking removes
+                        // the EVIDENCE, so the honest disposition is "no
+                        // verdict for you", not a fabricated "not a
+                        // duplicate" — the masked-away row still exists and a
+                        // write on top of it would still collide.
                         check.nearest = None;
-                        check.is_duplicate = false;
+                        check.verdict = crate::models::DuplicateVerdict::Undetermined(
+                            crate::models::DuplicateUndetermined::NoComparableCandidates,
+                        );
                     }
                 }
-                let near_json = match check.nearest {
-                    Some(n) => json!({
-                        "id": n.id,
-                        "title": n.title,
-                        "namespace": n.namespace,
-                        "score": n.similarity,
-                    }),
-                    None => serde_json::Value::Null,
-                };
-                Json(json!({
-                    (field_names::IS_DUPLICATE): check.is_duplicate,
-                    "threshold": check.threshold,
-                    "nearest": near_json,
-                    (field_names::SUGGESTED_MERGE): check.is_duplicate,
-                    (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
-                    (field_names::STORAGE_BACKEND): "postgres",
-                }))
-                .into_response()
+                let mut envelope = crate::mcp::duplicate_check_envelope(&check);
+                envelope[field_names::STORAGE_BACKEND] = json!("postgres");
+                Json(envelope).into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -889,6 +888,7 @@ pub async fn check_duplicate(
     let mut check = match db::check_duplicate_with_text(
         &lock.0,
         &query_embedding,
+        &body.title,
         &embedding_text,
         namespace,
         threshold,
@@ -908,32 +908,15 @@ pub async fn check_duplicate(
         if let Ok(Some(full_mem)) = db::get(&lock.0, &near.id)
             && !crate::visibility::is_visible_to_caller(&full_mem, &caller)
         {
+            // #947 + #3350 — see the postgres arm above: masking destroys the
+            // evidence, so the answer is "no verdict", never a fabricated
+            // clean one.
             check.nearest = None;
-            check.is_duplicate = false;
+            check.verdict = crate::models::DuplicateVerdict::Undetermined(
+                crate::models::DuplicateUndetermined::NoComparableCandidates,
+            );
         }
     }
 
-    let nearest_json = check.nearest.as_ref().map(|m| {
-        json!({
-            "id": m.id,
-            "title": m.title,
-            "namespace": m.namespace,
-            (field_names::SIMILARITY): (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
-                / crate::SCORE_DISPLAY_ROUND_FACTOR,
-        })
-    });
-    let suggested_merge = if check.is_duplicate {
-        check.nearest.as_ref().map(|m| m.id.clone())
-    } else {
-        None
-    };
-
-    Json(json!({
-        (field_names::IS_DUPLICATE): check.is_duplicate,
-        "threshold": check.threshold,
-        "nearest": nearest_json,
-        (field_names::SUGGESTED_MERGE): suggested_merge,
-        (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
-    }))
-    .into_response()
+    Json(crate::mcp::duplicate_check_envelope(&check)).into_response()
 }

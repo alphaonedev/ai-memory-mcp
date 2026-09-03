@@ -633,7 +633,7 @@ pub use lineage::{LINEAGE_DIRECTION_ANCESTORS, LINEAGE_DIRECTION_DESCENDANTS, ha
 // `src/cli/commands/kg_query.rs` / `src/cli/commands/check_duplicate.rs`
 // dispatch into the same substrate primitives the MCP tools consume,
 // guaranteeing wire envelope parity across the three surfaces.
-pub use check_duplicate::handle_check_duplicate;
+pub use check_duplicate::{duplicate_check_envelope, handle_check_duplicate};
 // v0.7.0 #1443 — CLI parity export for `ai-memory expand`. The
 // subcommand under `src/cli/commands/expand.rs` dispatches into this
 // same substrate primitive the MCP `memory_expand_query` tool consumes,

@@ -899,18 +899,40 @@ Response:
 
 ```json
 {
+  "status": "ok",
   "is_duplicate": true,
+  "reason": "exact_content_hash",
+  "detail": null,
   "threshold": 0.85,
   "nearest": { "id": "...", "title": "...", "namespace": "...", "similarity": 0.92 },
   "suggested_merge": "...",
-  "candidates_scanned": 412
+  "candidates_scanned": 412,
+  "candidates_available": 412
 }
 ```
 
 `threshold` is clamped to a 0.5 floor. Requires the `semantic` feature
 tier or higher — without an embedder the endpoint returns **503**
-(Service Unavailable); threshold mismatches return `200` with
-`is_duplicate: false`.
+(Service Unavailable).
+
+**v1.0.0 #3350 — "could not decide" is not "not a duplicate."** `status` is
+`"ok"` only when the check actually evaluated the candidate pool. When it
+could not, `status` is `"degraded"`, `is_duplicate` is **`null`** (never
+`false`), and `reason` names why:
+
+| `reason` | meaning |
+|---|---|
+| `exact_content_hash` | the candidate's `title + content` is byte-equal to `nearest` |
+| `exact_title_in_namespace` | a live row already holds this `(title, namespace)` slot, which the store enforces as unique — the write would collide. Reported with no embedding involved, so `nearest.similarity` is `null` |
+| `embedding_cosine` | decided by cosine similarity over the comparable pool |
+| `empty_candidate_pool` | nothing was in scope; an honest evaluated "not a duplicate" |
+| `query_embedding_unavailable` | **degraded** — the candidate could not be embedded, so nothing was compared |
+| `no_comparable_candidates` | **degraded** — rows are in scope but none carried a comparable embedding (missing, wrong dimension, or a different embedding space) |
+
+`candidates_available` counts the live rows in scope; `candidates_scanned`
+counts those actually compared. `scanned == 0 && available > 0` is the
+degraded signature. `nearest.similarity` is `null` when no cosine was
+measured — never `0.0`, which would read as "measured, and far apart".
 
 ### `POST /api/v1/entities`
 
