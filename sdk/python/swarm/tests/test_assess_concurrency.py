@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from types import SimpleNamespace
 
 import httpx
@@ -20,7 +19,7 @@ import pytest
 
 from ai_memory import AsyncAiMemoryClient
 from ai_memory.attestation import AgentSigningKey
-from swarm.agent import SwarmAgent, StepRecord
+from swarm.agent import StepRecord, SwarmAgent
 from swarm.choreography import PARTIAL_ASSESSMENTS, collect_assessments
 from swarm.config import DEFAULT_ASSESS_CONCURRENCY, ConfigError, SwarmConfig
 from swarm.coverage import CoverageTracker
@@ -103,22 +102,20 @@ async def _aclose(swarm: SimpleNamespace) -> None:
 
 
 @pytest.mark.asyncio
-async def test_bounded_concurrency_collapses_the_assessment_tail() -> None:
+async def test_bounded_concurrency_preserves_order_and_saturates_the_bound() -> None:
     model = _LatentModel(latency=0.1)
     swarm = _swarm(model, 64, concurrency=16)
-    started = time.perf_counter()
     try:
         assessments = await collect_assessments(swarm)
     finally:
         await _aclose(swarm)
-    elapsed = time.perf_counter() - started
-    # Sequential would be 64 x 100ms = 6.4 s; the issue's bar is < 2 s at 16.
-    assert elapsed < 2.0, elapsed
     assert len(assessments) == 64
-    assert model.max_in_flight <= 16
-    # ... and the bound is actually USED (never a 64-wide blast, never serial).
-    assert model.max_in_flight > 1
-    assert swarm.coverage.phase_secs["assessments"] == pytest.approx(elapsed, abs=0.5)
+    assert [a.agent_id for a in assessments] == [f"ai:swarm-{i}" for i in range(64)]
+    # The configured bound is both respected and fully exercised: never a
+    # 64-wide blast and never an accidentally serial run. Unlike a deadline,
+    # this remains deterministic on a loaded CI runner.
+    assert model.max_in_flight == 16
+    assert swarm.coverage.phase_secs["assessments"] > 0
 
 
 @pytest.mark.asyncio

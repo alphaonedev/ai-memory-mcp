@@ -76,7 +76,7 @@ include = ["ai_memory*"]
 ai_memory = ["py.typed"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "swarm/tests"]
 asyncio_mode = "auto"
 
 [tool.ruff]
