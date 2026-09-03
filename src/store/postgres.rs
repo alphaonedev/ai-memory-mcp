@@ -25541,6 +25541,14 @@ impl MemoryStore for PostgresStore {
         agent_id: &str,
         created_at: &str,
     ) -> StoreResult<bool> {
+        // #3481 — record-stop fence, the postgres twin of the sqlite gate in
+        // `storage::admit_attested_write`. An ungated admission under an active
+        // stop consumes the envelope's fingerprint while the write is refused
+        // downstream, so the caller's legitimate resubmission after the stop is
+        // then refused as a replay. Refusing here writes NO ledger row, leaving
+        // the envelope fresh. Runs BEFORE the shape check so a stop is reported
+        // as a stop regardless of the argument.
+        self.gate_record_stop().await?;
         if fingerprint.len() != 32 {
             return Err(StoreError::IntegrityFailed {
                 detail: format!(
