@@ -52,6 +52,10 @@ pub mod identity;
 pub mod install;
 pub mod io;
 pub mod io_writer;
+/// v1.0.0 #3436 — the `--json` contract gate: one exhaustive classification
+/// of every subcommand's `--json` support, so a verb can neither ignore the
+/// flag silently nor inherit it by accident.
+pub mod json_contract;
 pub mod link;
 pub mod logs;
 pub mod model_attest;

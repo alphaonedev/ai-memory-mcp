@@ -467,7 +467,7 @@ pub fn run(
             let key_dir_overridden = args.key_dir.is_some() || kp::key_dir_env_override().is_some();
             let resolved =
                 resolve_keygen_out_path(out_path.as_deref(), &key_dir, key_dir_overridden)?;
-            let fingerprint = keygen_operator(&resolved, force, out)?;
+            let fingerprint = keygen_operator(&resolved, force, json, out)?;
             // #1686 — generating an operator key flips the substrate to
             // attest-active (`resolve_operator_pubkey().is_some()`), which makes
             // `enforced_rule_passes` SKIP every enabled rule that is not
@@ -615,7 +615,12 @@ fn resolve_operator_key_path(override_path: Option<&Path>) -> Result<PathBuf> {
 /// The 32-byte seed is in scope only inside this function. It is
 /// never returned, never logged, never embedded in a `tracing!`
 /// macro. The caller receives only the fingerprint.
-fn keygen_operator(path: &Path, force: bool, out: &mut CliOutput<'_>) -> Result<String> {
+fn keygen_operator(
+    path: &Path,
+    force: bool,
+    json: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<String> {
     let pub_path = pub_sibling_path(path);
 
     if !force && (path.exists() || pub_path.exists()) {
@@ -663,10 +668,20 @@ fn keygen_operator(path: &Path, force: bool, out: &mut CliOutput<'_>) -> Result<
     let fingerprint = pub_fingerprint(&pub_bytes);
 
     // SECURITY: print the fingerprint, never the seed.
-    writeln!(
-        out.stdout,
-        "Ed25519 operator key generated: {fingerprint} -> {}",
-        path.display()
+    //
+    // v1.0.0 #3436 — through the `--json` contract funnel. This line used to
+    // go to stdout UNCONDITIONALLY and was immediately followed by
+    // `emit_ok`'s JSON envelope on the same stream, so `rules keygen --json`
+    // emitted `<human line>\n<json>` and no caller could pipe it into `jq`.
+    // Under `--json` it now goes to stderr; the fingerprint and both paths
+    // are already in the JSON payload, so nothing is lost to the machine and
+    // nothing is hidden from the human.
+    out.human_line(
+        json,
+        format_args!(
+            "Ed25519 operator key generated: {fingerprint} -> {}",
+            path.display()
+        ),
     )?;
 
     // `seed` is `[u8; 32]`, a `Copy` type, so an explicit `drop`
@@ -1454,7 +1469,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        let fp = keygen_operator(&key_path, false, &mut out).expect("keygen");
+        let fp = keygen_operator(&key_path, false, false, &mut out).expect("keygen");
         assert_eq!(fp.len(), 16);
 
         // Private file: mode 0600 + 32 bytes.
@@ -1501,11 +1516,11 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_path, false, &mut out).expect("first");
+        keygen_operator(&key_path, false, false, &mut out).expect("first");
         let bytes_before = std::fs::read(&key_path).unwrap();
 
         // Second call without --force must refuse.
-        let err = keygen_operator(&key_path, false, &mut out).unwrap_err();
+        let err = keygen_operator(&key_path, false, false, &mut out).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("refusing to overwrite"), "got: {msg}");
 
@@ -1525,8 +1540,8 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        let fp1 = keygen_operator(&key_path, false, &mut out).expect("first");
-        let fp2 = keygen_operator(&key_path, true, &mut out).expect("force");
+        let fp1 = keygen_operator(&key_path, false, false, &mut out).expect("first");
+        let fp2 = keygen_operator(&key_path, true, false, &mut out).expect("force");
         assert_ne!(fp1, fp2, "fresh keypair must have new fingerprint");
 
         let s = String::from_utf8(stderr).unwrap();
@@ -1549,7 +1564,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_path, false, &mut out).expect("keygen");
+        keygen_operator(&key_path, false, false, &mut out).expect("keygen");
         // Loosen perms.
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let err = load_operator_signing_key(&key_path).unwrap_err();
@@ -1622,7 +1637,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_path, false, &mut out).unwrap();
+        keygen_operator(&key_path, false, false, &mut out).unwrap();
 
         let conn = fresh_rules_conn();
         // Seed two unsigned rules to mirror the migration's R001..R004
@@ -2252,7 +2267,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_file, false, &mut out).unwrap();
+        keygen_operator(&key_file, false, false, &mut out).unwrap();
 
         let args = RulesArgs {
             key_dir: Some(key_dir),
@@ -2291,7 +2306,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_file, false, &mut out).unwrap();
+        keygen_operator(&key_file, false, false, &mut out).unwrap();
         let args = RulesArgs {
             key_dir: Some(key_dir),
             action: RulesAction::SignSeed {
@@ -2378,7 +2393,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_file, false, &mut out).unwrap();
+        keygen_operator(&key_file, false, false, &mut out).unwrap();
         assert!(key_file.exists(), "keygen must lay down operator.key");
         assert!(
             !key_dir.join("operator.priv").exists(),
@@ -2637,7 +2652,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_path, false, &mut out).unwrap();
+        keygen_operator(&key_path, false, false, &mut out).unwrap();
 
         let conn = fresh_rules_conn();
         rules_store::insert(
@@ -2690,7 +2705,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_path, false, &mut out).unwrap();
+        keygen_operator(&key_path, false, false, &mut out).unwrap();
 
         // Full migration ladder so governance_rules (v30) exists at
         // the path `run()` opens.
@@ -2742,7 +2757,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_path, false, &mut out).unwrap();
+        keygen_operator(&key_path, false, false, &mut out).unwrap();
         let db_path = tdir.path().join("rules.db");
         drop(crate::storage::open(&db_path).expect("init schema"));
 
@@ -2947,7 +2962,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        let err = keygen_operator(&key_path, false, &mut out).unwrap_err();
+        let err = keygen_operator(&key_path, false, false, &mut out).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("create parent dir"), "got: {msg}");
     }
@@ -2965,7 +2980,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_path, false, &mut out).expect("first keygen");
+        keygen_operator(&key_path, false, false, &mut out).expect("first keygen");
 
         let mut failing = FailingWriter;
         let mut stdout2: Vec<u8> = Vec::new();
@@ -2973,7 +2988,7 @@ mod tests {
             stdout: &mut stdout2,
             stderr: &mut failing,
         };
-        let res = keygen_operator(&key_path, true, &mut out2);
+        let res = keygen_operator(&key_path, true, false, &mut out2);
         assert!(res.is_err(), "stderr write failure must propagate");
     }
 
@@ -2990,7 +3005,7 @@ mod tests {
             stdout: &mut failing,
             stderr: &mut stderr,
         };
-        let res = keygen_operator(&key_path, false, &mut out);
+        let res = keygen_operator(&key_path, false, false, &mut out);
         assert!(res.is_err(), "stdout write failure must propagate");
         assert!(key_path.exists(), "key material still lands on disk");
     }
@@ -3008,7 +3023,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_path, false, &mut out).unwrap();
+        keygen_operator(&key_path, false, false, &mut out).unwrap();
 
         let conn = fresh_rules_conn();
         rules_store::insert(
@@ -3122,7 +3137,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_file, false, &mut out).expect("keygen");
+        keygen_operator(&key_file, false, false, &mut out).expect("keygen");
         (dir, db_path, key_dir)
     }
 
@@ -3198,7 +3213,7 @@ mod tests {
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        keygen_operator(&key_file, false, &mut out).expect("keygen");
+        keygen_operator(&key_file, false, false, &mut out).expect("keygen");
         let key_dir = dir.path().join("keys");
         std::fs::create_dir_all(&key_dir).expect("mkdir keys");
         (dir, db_path, key_dir)

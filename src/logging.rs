@@ -96,6 +96,69 @@ fn classify_unrecognized_sink(raw: Option<&str>) -> Option<String> {
     }
 }
 
+/// v1.0.0 #3436 — install the CONSOLE tracing subscriber, always on STDERR.
+///
+/// # The defect this closes
+///
+/// `ai-memory serve` and `ai-memory sync-daemon` each built their own
+/// `tracing_subscriber::fmt()` without `.with_writer(...)`, and the crate
+/// default is **stdout**. So both long-running verbs wrote ANSI-coloured
+/// log lines onto the same stream a caller pipes into `jq`, a log
+/// shipper, or a file it expects to be data. The MCP entrypoint had
+/// already worked this out and pinned stderr by hand — because stdio
+/// JSON-RPC owns stdout there and corrupting it is immediately fatal —
+/// but the fix lived at that one call site instead of in a funnel, so
+/// the two siblings kept the bug.
+///
+/// # The control
+///
+/// One initializer. Every console (non-file, non-syslog) subscriber in
+/// the product installs through here, and the writer is not a parameter:
+/// diagnostics go to stderr, and stdout stays the data channel. A verb
+/// cannot opt into logging on stdout by forgetting a builder call,
+/// because there is no builder call to forget.
+///
+/// The explicit operator-selected `[logging].sink = "stdout"`
+/// ([`crate::config::LogSink::Stdout`]) is untouched and still writes to
+/// stdout — that one is a deliberate choice for OS-tier capture
+/// (journald / launchd), not an accident of a default.
+///
+/// Idempotent: `try_init` no-ops when a subscriber is already installed
+/// (e.g. `init_file_logging` ran first), so the order of boot steps does
+/// not matter and a second call cannot panic.
+///
+/// `extra_directives` are appended to the env filter after
+/// [`DEFAULT_LOG_DIRECTIVE`]; an unparseable directive is skipped with a
+/// WARN rather than aborting the boot, because losing a log directive
+/// must never be fatal to the daemon it configures.
+pub fn init_console_tracing(extra_directives: &[&str]) {
+    let mut filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(
+        DEFAULT_LOG_DIRECTIVE
+            .parse()
+            .expect("DEFAULT_LOG_DIRECTIVE is a compile-time constant and always parses"),
+    );
+    // Collect rejects rather than warning inline: no subscriber is
+    // installed yet, so a `tracing::warn!` here would be swallowed — the
+    // silent-degradation shape this codebase treats as a defect.
+    let mut rejected: Vec<String> = Vec::new();
+    for directive in extra_directives {
+        match directive.parse() {
+            Ok(d) => filter = filter.add_directive(d),
+            Err(e) => rejected.push(format!("{directive:?} ({e})")),
+        }
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        // #3436 — the whole point of this funnel. NOT a parameter.
+        .with_writer(std::io::stderr)
+        .try_init();
+    // Now that a subscriber exists, the rejects are actually visible.
+    // Never fatal: a bad directive costs verbosity, not the boot.
+    for reject in rejected {
+        tracing::warn!(target: "logging", "ignoring unparseable log directive {reject}");
+    }
+}
+
 pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
     if !cfg.enabled.unwrap_or(false) {
         return Ok(None);

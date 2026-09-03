@@ -4278,14 +4278,12 @@ pub fn run_mcp_server(
     // emitting trace lines there would corrupt the protocol. `try_init`
     // is a no-op if a subscriber was already installed by another
     // command in the same process.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(crate::logging::DEFAULT_LOG_DIRECTIVE)
-            }),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
+    // v1.0.0 #3436 — this call site got the stderr pin right by hand
+    // (stdio JSON-RPC owns stdout, so a trace line here corrupts the
+    // protocol outright); it now shares the funnel with `serve` and
+    // `sync-daemon` so the guarantee is owned in ONE place instead of
+    // being rediscovered per verb.
+    crate::logging::init_console_tracing(&[]);
 
     // #3356: configured-but-invalid identity aborts boot rather than becoming unresolved.
     let _ = crate::identity::resolve_mcp_read_visibility_caller()?;
