@@ -108,6 +108,12 @@ pub mod update;
 pub mod verify;
 pub mod verify_audit_trail;
 pub mod verify_signed_events;
+/// v1.0.0 #3467 (EPIC #3466) — `ai-memory wake-hub` subcommand. CLI surface
+/// for the same-host, CONTENT-FREE agent wake plane
+/// ([`crate::wake_hub`]). Opt-in: never runs unless explicitly invoked, holds
+/// no durable truth, and exposes NO flag that could substitute a permissive
+/// identity verifier.
+pub mod wake_hub;
 /// v1.0.0 #1978 — `ai-memory watch` subcommand. CLI surface for the L3
 /// substrate poll-based filesystem-watcher capture daemon
 /// (`crate::recover::watcher`). Opt-in; mirrors the `curator`

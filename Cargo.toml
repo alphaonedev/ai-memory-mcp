@@ -98,6 +98,21 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 # pull transitively, so this adds NO new crate to `Cargo.lock` (the full
 # `tower` toolkit stays a dev-dependency, for the test `ServiceExt`).
 tower-service = "0.3"
+# v1.0.0 #3467 (EPIC #3466) — `ai-memory wake-hub` framing. `tokio-util`'s
+# `LengthDelimitedCodec` is the `max_frame_length`-bounded framer on the hub's
+# Unix-socket wire, and `bytes::Bytes` is what makes a topic fan-out refcount
+# ONE encoded buffer across N recipients instead of copying it N times.
+# Both crates are ALREADY in `Cargo.lock` (tokio-util via the tokio family,
+# bytes via tokio/axum/hyper) with exactly the dependency set the `codec`
+# feature needs — bytes, futures-core, futures-sink, pin-project-lite, tokio —
+# so promoting them to direct dependencies adds ZERO new entries to the lock
+# file. Same "promote a transitive to a direct dep so the import is explicit"
+# precedent as `tower-service`, `subtle` and `hex` above. The wake-hub
+# transport decision (rust-a2a `2026-09-02-wake-hub-implementation-decision.md`)
+# is explicitly ZERO NEW THIRD-PARTY CRATES; Google's cargo-vet covers
+# tokio/tokio-util/bytes/ed25519-dalek and none of the broker alternatives.
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
 # rustls 0.23 requires an explicit CryptoProvider — `ring` matches
 # reqwest's default for the sync-daemon, keeping a single provider
 # across the process. PEM parsing is handled by
