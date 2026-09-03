@@ -196,7 +196,14 @@ pub fn key_dir_env_override() -> Option<PathBuf> {
 /// re-derive the platform path (and drift from this one). Distinct from
 /// [`resolved_default_key_dir_path`], which answers "where will THIS process
 /// resolve keys" and therefore honours the override.
+///
+/// TEST-ONLY: gated behind `cfg(any(test, feature = "test-support"))`, so it
+/// is absent from a shipped build. It has no production consumer today, and a
+/// public accessor for "the operator's real key store, ignoring the override"
+/// is not a shape to leave lying around in the API for a future caller to
+/// reach for by accident.
 #[must_use]
+#[cfg(any(test, feature = "test-support"))]
 pub fn platform_default_key_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|base| base.join("ai-memory").join("keys"))
 }
@@ -252,6 +259,23 @@ pub fn platform_default_key_dir() -> Option<PathBuf> {
 /// Deliberately NOT `#[must_use]`: the POINT of this call is the side effect
 /// (pinning `AI_MEMORY_KEY_DIR`). The returned path is a convenience for the
 /// callers that want to assert against it; most correctly ignore it.
+///
+/// # Availability
+///
+/// Compiled ONLY under `cfg(any(test, feature = "test-support"))`. The
+/// `test` half serves this crate's own unit tests; the `test-support`
+/// feature — enabled for test targets by the self dev-dependency in
+/// `Cargo.toml` — serves integration tests, which link the rlib and for which
+/// `cfg(test)` is false. A production build has neither, so this function does
+/// not exist in the shipped API.
+///
+/// That gate is load-bearing, not tidiness: arming the sandbox PERMANENTLY
+/// pins [`KEY_DIR_ENV`] at a tempdir for the life of the process. Called from
+/// a daemon it would strand every key minted afterwards in a directory the OS
+/// reclaims at exit — silent, unrecoverable key loss. Making the call
+/// structurally unreachable outside tests is the only safe posture for a
+/// function whose whole job is to redirect the key store.
+#[cfg(any(test, feature = "test-support"))]
 pub fn install_test_key_dir_sandbox() -> PathBuf {
     static SANDBOX: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     let dir = SANDBOX.get_or_init(|| {

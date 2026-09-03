@@ -230,6 +230,59 @@ fn keypair_persist_dir_has_no_cfg_test_fork_3355() {
     }
 }
 
+/// The sandbox arming function must never re-enter the PRODUCTION API.
+///
+/// `install_test_key_dir_sandbox` permanently pins `AI_MEMORY_KEY_DIR` at a
+/// tempdir for the life of the process. Called from a daemon it would strand
+/// every key minted afterwards in a directory the OS reclaims at exit —
+/// silent, unrecoverable key loss. A `pub fn` with that behaviour sitting in
+/// the shipped API is a loaded footgun, so it is compiled only under
+/// `cfg(any(test, feature = "test-support"))`.
+///
+/// This pins the gate itself: dropping it would put the footgun back, and the
+/// diff that does so would otherwise look like harmless cleanup.
+#[test]
+fn test_only_key_dir_helpers_stay_out_of_the_production_api_3355() {
+    const GATE: &str = r#"cfg(any(test, feature = "test-support"))"#;
+
+    let src = std::fs::read_to_string("src/identity/keypair.rs").expect("read keypair.rs");
+    let lines: Vec<&str> = src.lines().collect();
+
+    for name in [
+        "pub fn install_test_key_dir_sandbox(",
+        "pub fn platform_default_key_dir(",
+    ] {
+        let idx = lines
+            .iter()
+            .position(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("#3355: `{name}` not found in src/identity/keypair.rs"));
+        // The gate sits in the attribute block immediately above the signature.
+        let window = lines[idx.saturating_sub(4)..idx].join(" ");
+        assert!(
+            window.contains(GATE),
+            "#3355: `{name}` is missing its `#[{GATE}]` gate — it would ship in \
+             the production API. Arming the sandbox permanently redirects the \
+             process key directory to a tempdir; a production caller would \
+             strand every key minted afterwards."
+        );
+    }
+
+    // And the feature must exist, or the gate above silently compiles to
+    // "test only", quietly removing it from integration tests.
+    let cargo = std::fs::read_to_string("Cargo.toml").expect("read Cargo.toml");
+    assert!(
+        cargo.contains("\ntest-support = []"),
+        "#3355: the `test-support` feature vanished from Cargo.toml [features]"
+    );
+    assert!(
+        cargo.contains(r#"ai-memory = { path = ".", features = ["test-support"] }"#),
+        "#3355: the self dev-dependency that enables `test-support` for test \
+         targets vanished from Cargo.toml [dev-dependencies]. Without it the \
+         sandbox is unreachable from `tests/` — the same crate-boundary \
+         blindness that caused this issue."
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The behavioural proof
 // ---------------------------------------------------------------------------

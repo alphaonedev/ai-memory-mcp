@@ -292,6 +292,29 @@ sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 # adapter. `sal-postgres` layers on the Postgres/pgvector backend.
 sal = ["dep:bitflags", "dep:thiserror"]
 sal-postgres = ["sal", "dep:sqlx", "dep:pgvector"]
+# v1.0.0 #3355 — TEST-ONLY support surface. OFF by default and never enabled
+# by a production build, so `identity::keypair::install_test_key_dir_sandbox`
+# and `platform_default_key_dir` do not exist in the shipped API at all.
+#
+# Why a feature and not `#[cfg(test)]`: `cfg(test)` is true only while
+# compiling THIS crate's own unit tests. An integration test in `tests/` links
+# the already-built rlib, compiled WITHOUT it — which is the exact defect
+# #3355 fixes (a `cfg(test)` key-dir sandbox that silently evaporated across
+# the crate boundary and let the suite mint 41 fixture keypairs in the
+# operator's real key store). A cargo feature is the mechanism that DOES
+# cross that boundary.
+#
+# Why it must stay off in production: arming the sandbox PERMANENTLY pins
+# `AI_MEMORY_KEY_DIR` at a tempdir for the life of the process. Called from a
+# daemon it would strand every key minted afterwards in a directory that
+# disappears on exit — silent, unrecoverable key loss. The feature gate makes
+# that call structurally unreachable in a shipped binary rather than merely
+# discouraged.
+#
+# Integration tests get it via the self dev-dependency in
+# `[dev-dependencies]` below; the crate's own unit tests get it from the
+# `cfg(test)` half of the `cfg(any(test, feature = "test-support"))` gate.
+test-support = []
 # W11/S11b — opt-in feature for tests that pull large model weights at runtime
 # (BERT cross-encoder, MiniLM, etc.). Off by default so CI doesn't download
 # 80MB+ on every run.
@@ -340,6 +363,14 @@ fs-notify = ["dep:notify"]
 vectorlite = ["rusqlite/load_extension"]
 
 [dev-dependencies]
+# v1.0.0 #3355 — self dev-dependency: the standard cargo pattern for turning a
+# feature on for TEST targets only. It makes `cargo test` build the library
+# with `test-support`, so integration tests can reach
+# `identity::keypair::install_test_key_dir_sandbox`, while `cargo build` /
+# `cargo install` compile it away entirely. Without this the sandbox would be
+# unreachable from `tests/` — the same crate-boundary blindness that caused
+# #3355 in the first place.
+ai-memory = { path = ".", features = ["test-support"] }
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 uuid = { version = "1", features = ["v4", "v7"] }
