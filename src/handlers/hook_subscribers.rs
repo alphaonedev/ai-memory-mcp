@@ -1041,37 +1041,49 @@ pub async fn get_namespace_standard_qs(
         }
         // Non-inherit form — single exact-match lookup.
         match app.store.get_namespace_standard(&bind_ctx, &ns).await {
-            Ok(Some((standard_id, parent))) => {
-                // #2543 — if the bound memory exists and is not visible,
-                // do not leak its id (MCP honesty shape).
+            Ok(Some((standard_id, _parent))) => {
                 match app.store.get(&bind_ctx, &standard_id).await {
-                    Ok(m) if !crate::visibility::is_visible_to_caller(&m, &visibility_caller) => {
+                    Ok(m) => {
+                        // #2543 — if the bound memory exists and is not visible,
+                        // do not leak its id (MCP honesty shape).
+                        if !crate::visibility::is_visible_to_caller(&m, &visibility_caller) {
+                            return (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "namespace": ns,
+                                    (field_names::STANDARD_ID): serde_json::Value::Null,
+                                    (field_names::STANDARDS_WITHHELD): 1,
+                                })),
+                            )
+                                .into_response();
+                        }
                         return (
                             StatusCode::OK,
                             Json(json!({
                                 "namespace": ns,
-                                (field_names::STANDARD_ID): serde_json::Value::Null,
-                                "id": serde_json::Value::Null,
-                                (field_names::STANDARDS_WITHHELD): 1,
-                                (field_names::STORAGE_BACKEND): "postgres",
+                                (field_names::STANDARD_ID): standard_id,
+                                "title": m.title,
+                                "content": m.content,
+                                "priority": m.priority,
+                                (field_names::GOVERNANCE):
+                                    crate::mcp::merge_governance_for_response(&m.metadata),
                             })),
                         )
                             .into_response();
                     }
-                    _ => {}
+                    Err(crate::store::StoreError::NotFound { .. }) => {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "namespace": ns,
+                                (field_names::STANDARD_ID): standard_id,
+                                "warning": "standard memory not found — may have been deleted",
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => return store_err_to_response(e),
                 }
-                return (
-                    StatusCode::OK,
-                    Json(json!({
-                        "namespace": ns,
-                        "resolved_namespace": ns,
-                        (field_names::STANDARD_ID): standard_id,
-                        "id": standard_id,
-                        (field_names::PARENT_NAMESPACE): parent,
-                        (field_names::STORAGE_BACKEND): "postgres",
-                    })),
-                )
-                    .into_response();
             }
             Ok(None) => {}
             Err(e) => return store_err_to_response(e),
@@ -1081,9 +1093,6 @@ pub async fn get_namespace_standard_qs(
             Json(json!({
                 "namespace": ns,
                 (field_names::STANDARD_ID): serde_json::Value::Null,
-                "id": serde_json::Value::Null,
-                (field_names::PARENT_NAMESPACE): serde_json::Value::Null,
-                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();

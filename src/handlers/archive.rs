@@ -415,9 +415,9 @@ pub async fn archive_stats(
     }
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons aggregate
     // counts directly from the `archived_memories` table.
-    #[cfg(feature = "sal-postgres")]
+    #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return match crate::store::postgres::archive_stats_via_store(&app.store).await {
+        return match app.store.archive_stats().await {
             Ok(v) => Json(v).into_response(),
             Err(e) => store_err_to_response(e),
         };

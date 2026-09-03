@@ -659,6 +659,8 @@ pub(crate) use namespace::authorize_namespace_standard_parent;
 // on the same rationale so the get-side governance pass-through
 // regression at `tests/issue_1326_*.rs` can pin the surface without
 // stdio JSON-RPC scaffolding.
+#[cfg(feature = "sal")]
+pub(crate) use namespace::merge_governance_for_response;
 pub use namespace::{
     handle_namespace_clear_standard, handle_namespace_clear_standard_trusted,
     handle_namespace_get_standard, handle_namespace_set_standard,

@@ -4623,6 +4623,14 @@ pub trait MemoryStore: Send + Sync {
             capability: "LIST_ARCHIVED".to_string(),
         })
     }
+
+    /// Return canonical archive counters: `archived_total` plus a list of
+    /// `{namespace, count}` objects ordered by descending count.
+    async fn archive_stats(&self) -> StoreResult<serde_json::Value> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVE_STATS".to_string(),
+        })
+    }
 }
 
 /// v0.7.0 Wave-3 Continuation 3 (Phase 20) — action class threaded

@@ -643,7 +643,7 @@ pub fn handle_namespace_get_standard(
 /// correctly — but operators inspecting the get-standard surface saw
 /// an incomplete policy blob and could not confirm their gate was
 /// stored.
-fn merge_governance_for_response(metadata: &Value) -> Value {
+pub(crate) fn merge_governance_for_response(metadata: &Value) -> Value {
     // Step 1: typed-struct base. Resolves to defaults when no
     // governance metadata is present (matches pre-#1326 behaviour
     // for the well-known-fields surface).

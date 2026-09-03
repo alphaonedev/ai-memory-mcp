@@ -1057,6 +1057,9 @@ of the single namespace's standard.
 { "namespace": "engineering/auth", "standards": [ … ], "chain": ["*","engineering","engineering/auth"], "count": 3 }
 ```
 
+With `inherit=false`, the response contains the bound standard's `title`,
+`content`, `priority`, and complete `governance` object on every backend.
+
 Returns 200 with `count: 0` and an empty `standards` array when no
 standard is set. Equivalent MCP tool: `memory_namespace_get_standard`
 (`src/mcp/tools/namespace.rs`).
@@ -1085,6 +1088,9 @@ clamped 1-1000; `limit=0` → 400), `offset`.
 ```json
 { "archived": [ … ], "count": 24 }
 ```
+
+Each archived row uses the live-memory field types; in particular, `tags` is a
+JSON array (never a JSON-encoded string).
 
 Equivalent MCP tool: `memory_archive_list` (`src/mcp/tools/archive.rs`).
 A `POST /api/v1/archive` form also exists (archive an explicit list of

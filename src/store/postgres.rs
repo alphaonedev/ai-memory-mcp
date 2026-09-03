@@ -32548,6 +32548,10 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<Vec<serde_json::Value>> {
         self.list_archived_pg(namespace, limit, offset).await
     }
+
+    async fn archive_stats(&self) -> StoreResult<serde_json::Value> {
+        self.archive_stats_pg().await
+    }
 }
 
 /// v0.7.0 Continuation 6 — adapter row-to-`QuotaStatus` projection.
@@ -32700,7 +32704,7 @@ pub async fn archive_stats_via_store(
     store: &std::sync::Arc<dyn MemoryStore>,
 ) -> StoreResult<serde_json::Value> {
     let pg = downcast_postgres(store)?;
-    pg.archive_stats().await
+    pg.archive_stats_pg().await
 }
 
 /// v0.7.0 Wave-3 Continuation 4 (Bucket E / S44) — postgres taxonomy walk.
@@ -33251,8 +33255,7 @@ impl PostgresStore {
 impl PostgresStore {
     /// Project the `archived_memories` table into the same wire shape
     /// `db::list_archived` produces for SQLite. Tags are stored as a
-    /// JSONB array; we serialize back to a string-formatted JSON to
-    /// match SQLite's `tags` text-encoded shape.
+    /// JSONB array and remain a structured JSON array on the wire.
     ///
     /// ARCH-2 FX-C2-batch5 (2026-05-27): renamed from `list_archived`
     /// to `list_archived_pg` so the SAL trait method
@@ -33342,10 +33345,6 @@ impl PostgresStore {
             let tags_jsonb: serde_json::Value = row
                 .try_get("tags")
                 .map_err(|e| to_store_err("list_archived tags decode", e))?;
-            let tags_string =
-                serde_json::to_string(&tags_jsonb).map_err(|e| StoreError::InvalidInput {
-                    detail: format!("list_archived tags serialise: {e}"),
-                })?;
             let metadata: serde_json::Value = row
                 .try_get("metadata")
                 .map_err(|e| to_store_err("list_archived metadata decode", e))?;
@@ -33446,7 +33445,7 @@ impl PostgresStore {
                 "namespace": namespace,
                 "title": title,
                 "content": content,
-                "tags": tags_string,
+                "tags": tags_jsonb,
                 "priority": priority,
                 (field_names::CONFIDENCE): confidence,
                 "source": source,
@@ -33617,44 +33616,32 @@ impl PostgresStore {
         Ok(out)
     }
 
-    async fn archive_stats(&self) -> StoreResult<serde_json::Value> {
+    async fn archive_stats_pg(&self) -> StoreResult<serde_json::Value> {
         use sqlx::Row;
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archived_memories")
             .fetch_one(&self.pool)
             .await
             .map_err(|e| to_store_err("archive stats total", e))?;
 
-        let by_reason_rows = sqlx::query(
-            "SELECT archive_reason, COUNT(*) AS cnt FROM archived_memories \
-             GROUP BY archive_reason ORDER BY cnt DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| to_store_err("archive stats by_reason", e))?;
-        let mut by_reason: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-        for r in by_reason_rows {
-            let reason: String = r.try_get(field_names::ARCHIVE_REASON).unwrap_or_default();
-            let cnt: i64 = r.try_get("cnt").unwrap_or(0);
-            by_reason.insert(reason, serde_json::json!(cnt));
-        }
-
         let by_namespace_rows = sqlx::query(
             "SELECT namespace, COUNT(*) AS cnt FROM archived_memories \
-             GROUP BY namespace ORDER BY cnt DESC LIMIT 100",
+             GROUP BY namespace ORDER BY cnt DESC, namespace ASC",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("archive stats by_namespace", e))?;
-        let mut by_namespace: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        let mut by_namespace = Vec::with_capacity(by_namespace_rows.len());
         for r in by_namespace_rows {
             let ns: String = r.try_get("namespace").unwrap_or_default();
             let cnt: i64 = r.try_get("cnt").unwrap_or(0);
-            by_namespace.insert(ns, serde_json::json!(cnt));
+            by_namespace.push(serde_json::json!({
+                "namespace": ns,
+                "count": cnt,
+            }));
         }
 
         Ok(serde_json::json!({
-            "total_archived": total,
-            "by_reason": by_reason,
+            "archived_total": total,
             (field_names::BY_NAMESPACE): by_namespace,
         }))
     }

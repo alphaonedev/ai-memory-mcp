@@ -418,10 +418,7 @@ pub async fn list_namespaces(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return match app.store.list_namespaces().await {
-            Ok(rows) => {
-                let v: Vec<String> = rows.into_iter().map(|r| r.namespace).collect();
-                Json(json!({(field_names::NAMESPACES): v})).into_response()
-            }
+            Ok(rows) => Json(json!({(field_names::NAMESPACES): rows})).into_response(),
             Err(e) => store_err_to_response(e),
         };
     }

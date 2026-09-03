@@ -3703,6 +3703,11 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         db::list_archived(&conn, namespace, limit, offset).map_err(box_err)
     }
+
+    async fn archive_stats(&self) -> StoreResult<serde_json::Value> {
+        let conn = self.state.lock().await;
+        db::archive_stats(&conn).map_err(box_err)
+    }
 }
 
 // #1643 — the `SqliteTransaction` placeholder (a `Transaction` impl

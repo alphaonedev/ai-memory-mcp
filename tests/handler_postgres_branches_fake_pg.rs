@@ -61,6 +61,15 @@ fn build_fake_pg_router() -> (axum::Router, NamedTempFile) {
 /// (e.g. `get_lineage`). Every other wiring detail is identical to
 /// [`build_fake_pg_router`].
 fn build_fake_pg_router_with_admins(admins: Vec<String>) -> (axum::Router, NamedTempFile) {
+    build_router_for_backend(StorageBackend::Postgres, admins)
+}
+
+/// #3400 — build either handler branch over the same isolated SQLite-backed
+/// SAL so golden tests can compare the complete HTTP envelopes byte-for-byte.
+fn build_router_for_backend(
+    backend: StorageBackend,
+    admins: Vec<String>,
+) -> (axum::Router, NamedTempFile) {
     permissive_attestation_for_tests();
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
@@ -85,8 +94,9 @@ fn build_fake_pg_router_with_admins(admins: Vec<String>) -> (axum::Router, Named
         mcp_config: Arc::new(None),
         active_keypair: Arc::new(None),
         family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
-        // The headline trick: claim to be Postgres while running on Sqlite.
-        storage_backend: StorageBackend::Postgres,
+        // `Postgres` drives the postgres handler branch while the isolated
+        // SqliteStore provides deterministic storage for parity tests.
+        storage_backend: backend,
         store,
         llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
@@ -119,6 +129,65 @@ fn build_fake_pg_router_with_admins(admins: Vec<String>) -> (axum::Router, Named
     };
     let router = ai_memory::build_router(api_key_state, app_state);
     (router, f)
+}
+
+fn seed_memory(file: &NamedTempFile, id: &str, namespace: &str, tags: &[&str], metadata: Value) {
+    let conn = ai_memory::db::open(file.path()).expect("open seed db");
+    let timestamp = "2026-09-02T00:00:00Z".to_string();
+    let memory = ai_memory::models::Memory {
+        id: id.to_string(),
+        tier: ai_memory::models::Tier::Long,
+        namespace: namespace.to_string(),
+        title: format!("title-{id}"),
+        content: format!("content-{id}"),
+        tags: tags.iter().map(ToString::to_string).collect(),
+        priority: 7,
+        confidence: 1.0,
+        source: "issue-3400".to_string(),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+        metadata,
+        ..Default::default()
+    };
+    ai_memory::db::insert(&conn, &memory).expect("insert seed memory");
+}
+
+fn seed_archived_memory(file: &NamedTempFile, id: &str, namespace: &str, tags: &[&str]) {
+    seed_memory(
+        file,
+        id,
+        namespace,
+        tags,
+        json!({"agent_id": "ops:admin", "scope": "collective"}),
+    );
+    let conn = ai_memory::db::open(file.path()).expect("open archive seed db");
+    ai_memory::db::archive_memory(&conn, id, Some("issue-3400")).expect("archive seed memory");
+}
+
+fn seed_namespace_standard(file: &NamedTempFile) {
+    let namespace = "policy-3400";
+    let id = "standard-3400";
+    seed_memory(
+        file,
+        id,
+        namespace,
+        &["standard"],
+        json!({
+            "agent_id": "alice",
+            "scope": "private",
+            "governance": {
+                "write": "owner",
+                "promote": "approve",
+                "delete": "owner",
+                "approver": "human",
+                "inherit": false,
+                "custom_gate": "preserved",
+            },
+        }),
+    );
+    let conn = ai_memory::db::open(file.path()).expect("open standard seed db");
+    ai_memory::db::set_namespace_standard(&conn, namespace, id, None)
+        .expect("bind namespace standard");
 }
 
 /// #901/#905/#907/#909 — handlers that accept a body-side `agent_id`
@@ -1016,6 +1085,96 @@ async fn pg_archive_stats_via_store_envelope() {
     );
 }
 
+/// #3400 — denied archive and namespace inventory routes are backend-blind.
+#[tokio::test]
+async fn protected_inventory_routes_deny_non_admin_on_both_backends_3400() {
+    for backend in [StorageBackend::Sqlite, StorageBackend::Postgres] {
+        for uri in [
+            "/api/v1/archive",
+            "/api/v1/archive/stats",
+            "/api/v1/namespaces",
+        ] {
+            let (router, _file) = build_router_for_backend(backend, Vec::new());
+            let (status, body) = get_uri_as(&router, uri, "not-an-admin").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{backend:?} {uri}: {body}");
+        }
+    }
+}
+
+/// #3400 — archived `tags` are a JSON array on both HTTP backend branches.
+#[tokio::test]
+async fn archive_list_wire_shape_matches_across_backends_3400() {
+    mark_request_authn_for_admin_tests();
+    let mut envelopes = Vec::new();
+    for backend in [StorageBackend::Sqlite, StorageBackend::Postgres] {
+        let (router, file) = build_router_for_backend(backend, vec!["ops:admin".to_string()]);
+        seed_archived_memory(&file, "archive-3400", "archive-ns", &["alpha", "beta"]);
+        let (status, mut body) = get_uri_as(&router, "/api/v1/archive", "ops:admin").await;
+        assert_eq!(status, StatusCode::OK, "{backend:?}: {body}");
+        assert_eq!(body["archived"][0]["tags"], json!(["alpha", "beta"]));
+        body["archived"][0]
+            .as_object_mut()
+            .expect("archive row object")
+            .remove("archived_at");
+        envelopes.push(body);
+    }
+    assert_eq!(envelopes[0], envelopes[1]);
+}
+
+/// #3400 — archive stats use the documented key and list projection on both
+/// backends; no backend-only map or alias is allowed onto the wire.
+#[tokio::test]
+async fn archive_stats_wire_shape_matches_across_backends_3400() {
+    mark_request_authn_for_admin_tests();
+    let mut envelopes = Vec::new();
+    for backend in [StorageBackend::Sqlite, StorageBackend::Postgres] {
+        let (router, file) = build_router_for_backend(backend, vec!["ops:admin".to_string()]);
+        seed_archived_memory(&file, "stats-a-1", "stats-a", &[]);
+        seed_archived_memory(&file, "stats-a-2", "stats-a", &[]);
+        seed_archived_memory(&file, "stats-b-1", "stats-b", &[]);
+        let (status, body) = get_uri_as(&router, "/api/v1/archive/stats", "ops:admin").await;
+        assert_eq!(status, StatusCode::OK, "{backend:?}: {body}");
+        assert_eq!(
+            body,
+            json!({
+                "archived_total": 3,
+                "by_namespace": [
+                    {"namespace": "stats-a", "count": 2},
+                    {"namespace": "stats-b", "count": 1},
+                ],
+            })
+        );
+        envelopes.push(body);
+    }
+    assert_eq!(envelopes[0], envelopes[1]);
+}
+
+/// #3400 — namespace counts must survive the postgres handler projection.
+#[tokio::test]
+async fn namespace_list_wire_shape_matches_across_backends_3400() {
+    mark_request_authn_for_admin_tests();
+    let mut envelopes = Vec::new();
+    for backend in [StorageBackend::Sqlite, StorageBackend::Postgres] {
+        let (router, file) = build_router_for_backend(backend, vec!["ops:admin".to_string()]);
+        seed_memory(&file, "ns-a-1", "ns-a", &[], json!({"scope": "collective"}));
+        seed_memory(&file, "ns-a-2", "ns-a", &[], json!({"scope": "collective"}));
+        seed_memory(&file, "ns-b-1", "ns-b", &[], json!({"scope": "collective"}));
+        let (status, body) = get_uri_as(&router, "/api/v1/namespaces", "ops:admin").await;
+        assert_eq!(status, StatusCode::OK, "{backend:?}: {body}");
+        assert_eq!(
+            body,
+            json!({
+                "namespaces": [
+                    {"namespace": "ns-a", "count": 2},
+                    {"namespace": "ns-b", "count": 1},
+                ],
+            })
+        );
+        envelopes.push(body);
+    }
+    assert_eq!(envelopes[0], envelopes[1]);
+}
+
 // ---------------------------------------------------------------------------
 // /api/v1/kg/* — PG branches via kg_*_via_store → 503
 // ---------------------------------------------------------------------------
@@ -1305,6 +1464,42 @@ async fn pg_get_namespace_standard_qs_no_namespace_returns_list() {
         StatusCode::FORBIDDEN,
         "#945: empty-allowlist /api/v1/namespaces MUST reject; body={v}"
     );
+}
+
+/// #3400 — the non-inherited namespace-standard response includes the same
+/// complete governance/body projection on both backends, while an unrelated
+/// caller receives the same body-free withheld envelope.
+#[tokio::test]
+async fn namespace_standard_wire_shape_matches_across_backends_3400() {
+    let mut allowed_envelopes = Vec::new();
+    let mut denied_envelopes = Vec::new();
+    for backend in [StorageBackend::Sqlite, StorageBackend::Postgres] {
+        let (router, file) = build_router_for_backend(backend, Vec::new());
+        seed_namespace_standard(&file);
+
+        let uri = "/api/v1/namespaces/policy-3400/standard";
+        let (allowed_status, allowed) = get_uri_as(&router, uri, "alice").await;
+        assert_eq!(allowed_status, StatusCode::OK, "{backend:?}: {allowed}");
+        assert_eq!(allowed["namespace"], "policy-3400");
+        assert_eq!(allowed["standard_id"], "standard-3400");
+        assert!(allowed["governance"].is_object(), "{backend:?}: {allowed}");
+        assert_eq!(allowed["governance"]["custom_gate"], "preserved");
+        allowed_envelopes.push(allowed);
+
+        let (denied_status, denied) = get_uri_as(&router, uri, "bob").await;
+        assert_eq!(denied_status, StatusCode::OK, "{backend:?}: {denied}");
+        assert_eq!(
+            denied,
+            json!({
+                "namespace": "policy-3400",
+                "standard_id": null,
+                "standards_withheld": 1,
+            })
+        );
+        denied_envelopes.push(denied);
+    }
+    assert_eq!(allowed_envelopes[0], allowed_envelopes[1]);
+    assert_eq!(denied_envelopes[0], denied_envelopes[1]);
 }
 
 // ---------------------------------------------------------------------------
