@@ -342,6 +342,10 @@ pub const MEMORIES_DROPPED: &str = "memories_dropped";
 pub const MEMORY_KIND: &str = "memory_kind";
 /// `namespaces` — wire/row field name.
 pub const NAMESPACES: &str = "namespaces";
+/// `namespace_count` — wire field on `GET /api/v1/stats` `others` (#3343).
+/// Count of namespaces folded out of `by_namespace` (not a list —
+/// [`NAMESPACES`] is the list key on `/namespaces`).
+pub const NAMESPACE_COUNT: &str = "namespace_count";
 /// `namespace_filter` — wire/row field name.
 pub const NAMESPACE_FILTER: &str = "namespace_filter";
 /// `next_since` — wire/row field name.

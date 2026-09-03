@@ -16,8 +16,8 @@ use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -398,8 +398,20 @@ pub async fn detect_contradictions(
 
 pub async fn list_namespaces(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
+    Query(q): Query<crate::handlers::inventory::ListNamespacesQuery>,
 ) -> impl IntoResponse {
+    list_namespaces_with_query(app, headers, q).await
+}
+
+/// #3343 — shared by the `/api/v1/namespaces` handler and the
+/// `get_namespace_standard_qs` dispatcher (which must forward
+/// `limit`/`offset`/`prefix` when `?namespace=` is absent).
+pub(crate) async fn list_namespaces_with_query(
+    app: AppState,
+    headers: HeaderMap,
+    q: crate::handlers::inventory::ListNamespacesQuery,
+) -> Response {
     // #945 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
     // only gate. Pre-fix any caller could enumerate every namespace
     // in the deployment via `for_admin("ai:http-internal")` bypass.
@@ -408,6 +420,15 @@ pub async fn list_namespaces(
     {
         return resp;
     }
+    if let Some(prefix) = q.prefix()
+        && let Err(e) = validate::validate_namespace(prefix)
+    {
+        return crate::handlers::inventory::invalid_prefix_response(e);
+    }
+    let limit = q.resolved_limit();
+    let offset = q.resolved_offset();
+    let prefix = q.prefix().map(str::to_string);
+
     // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
     // now route through the dedicated `MemoryStore::list_namespaces`
     // trait method (sqlx-native `GROUP BY namespace`) instead of
@@ -415,22 +436,44 @@ pub async fn list_namespaces(
     // shape mirrors the SQLite `db::list_namespaces` result: namespace
     // identifiers are structural metadata, not user data, so no #910
     // visibility filter applies — same posture as the SQLite branch.
+    // #3343: both backends now emit `{namespace,count}` objects (the
+    // documented list shape; postgres previously dropped counts to
+    // `Vec<String>`). Pagination is applied after the aggregate so
+    // curator/SAL callers of the trait stay complete.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return match app.store.list_namespaces().await {
             Ok(rows) => {
-                let v: Vec<String> = rows.into_iter().map(|r| r.namespace).collect();
-                Json(json!({(field_names::NAMESPACES): v})).into_response()
+                let (page, total) = crate::handlers::inventory::page_namespaces(
+                    rows,
+                    prefix.as_deref(),
+                    limit,
+                    offset,
+                );
+                Json(crate::handlers::inventory::namespaces_envelope(
+                    page, total, limit, offset,
+                ))
+                .into_response()
             }
             Err(e) => store_err_to_response(e),
         };
     }
 
-    let lock = app.db.lock().await;
-    match db::list_namespaces(&lock.0) {
-        Ok(ns) => Json(json!({(field_names::NAMESPACES): ns})).into_response(),
-        Err(e) => crate::handlers::errors::handler_error_500(&e),
-    }
+    // CONCURRENCY-03/20: copy the aggregate out and drop the sqlite
+    // lock before paging/serializing.
+    let rows = {
+        let lock = app.db.lock().await;
+        match db::list_namespaces(&lock.0) {
+            Ok(ns) => ns,
+            Err(e) => return crate::handlers::errors::handler_error_500(&e),
+        }
+    };
+    let (page, total) =
+        crate::handlers::inventory::page_namespaces(rows, prefix.as_deref(), limit, offset);
+    Json(crate::handlers::inventory::namespaces_envelope(
+        page, total, limit, offset,
+    ))
+    .into_response()
 }
 
 /// Query parameters for `GET /api/v1/taxonomy` (Pillar 1 / Stream A).

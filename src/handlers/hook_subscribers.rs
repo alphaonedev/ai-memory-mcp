@@ -24,7 +24,7 @@ use super::AppState;
 use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
-use super::{fanout_or_pending, list_namespaces, resolve_caller_agent_id};
+use super::{fanout_or_pending, resolve_caller_agent_id};
 
 /// Marker tag on namespace-standard rows (#1558 batch 6).
 const NAMESPACE_STANDARD_TAG: &str = "_namespace_standard";
@@ -866,6 +866,13 @@ pub struct NamespaceStandardQuery {
     pub namespace: Option<String>,
     #[serde(default)]
     pub inherit: Option<bool>,
+    /// #3343 — forwarded to `list_namespaces` when `namespace` is absent.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 pub async fn get_namespace_standard(
@@ -884,6 +891,9 @@ pub async fn get_namespace_standard(
     let merged = NamespaceStandardQuery {
         namespace: Some(ns),
         inherit: q.inherit,
+        limit: q.limit,
+        offset: q.offset,
+        prefix: q.prefix,
     };
     get_namespace_standard_qs(State(app), headers, Query(merged))
         .await
@@ -930,7 +940,18 @@ pub async fn get_namespace_standard_qs(
         // #945 SECURITY-medium (Track A QC sweep, 2026-05-20) —
         // list_namespaces now requires admin via require_admin;
         // thread headers through so the gate sees the X-Agent-Id.
-        return list_namespaces(State(app), headers).await.into_response();
+        // #3343 — forward limit/offset/prefix; dropping them here would
+        // make `GET /api/v1/namespaces?limit=` unbounded again.
+        return crate::handlers::power::list_namespaces_with_query(
+            app,
+            headers,
+            crate::handlers::inventory::ListNamespacesQuery {
+                limit: q.limit,
+                offset: q.offset,
+                prefix: q.prefix,
+            },
+        )
+        .await;
     };
 
     // v1.0.0 #2543 / #959 residual — explicit HTTP fetch of a namespace

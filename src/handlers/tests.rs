@@ -12075,6 +12075,59 @@ async fn http_list_namespaces_returns_seeded_namespaces() {
     assert!(!ns.is_empty());
 }
 
+#[tokio::test]
+async fn http_list_namespaces_paginates_limit_offset_and_prefix() {
+    let state = test_state();
+    let _ = insert_test_memory(&state, "proj", "t1").await;
+    let _ = insert_test_memory(&state, "proj/sub", "t2").await;
+    let _ = insert_test_memory(&state, "project-x", "t3").await;
+    let _ = insert_test_memory(&state, "other", "t4").await;
+    let app = Router::new()
+        .route("/api/v1/namespaces", axum_get(list_namespaces))
+        .with_state(test_app_state(state.clone()));
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/namespaces?prefix=proj&limit=1&offset=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["total"], 2, "hierarchical prefix, not string prefix: {v}");
+    assert_eq!(v["limit"], 1);
+    assert_eq!(v["offset"], 0);
+    assert_eq!(v["truncated"], true);
+    let arr = v["namespaces"].as_array().expect("namespaces array");
+    assert_eq!(arr.len(), 1);
+    assert!(arr[0].get("namespace").is_some());
+    assert!(arr[0].get("count").is_some());
+}
+
+#[tokio::test]
+async fn http_list_namespaces_invalid_prefix_is_400() {
+    let state = test_state();
+    let app = Router::new()
+        .route("/api/v1/namespaces", axum_get(list_namespaces))
+        .with_state(test_app_state(state));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/namespaces?prefix=bad%20ns")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // ---- get_taxonomy variants ----
 
 #[tokio::test]
@@ -12834,6 +12887,86 @@ async fn http_get_stats_with_data_returns_total() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["total"], 2);
+}
+
+#[tokio::test]
+async fn http_get_stats_summary_omits_by_namespace() {
+    let state = test_state();
+    let _ = insert_test_memory(&state, "ns-a", "t1").await;
+    let _ = insert_test_memory(&state, "ns-b", "t2").await;
+    let app = Router::new()
+        .route("/api/v1/stats", axum_get(get_stats))
+        .with_state(test_app_state(state.clone()));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/stats?summary=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["summary"], true);
+    assert!(
+        v.get("by_namespace").is_none(),
+        "summary must drop inventory: {v}"
+    );
+}
+
+#[tokio::test]
+async fn http_get_stats_caps_by_namespace_with_others() {
+    let state = test_state();
+    for i in 0..25 {
+        let _ = insert_test_memory(&state, &format!("cap-{i:02}"), "t").await;
+    }
+    let app = Router::new()
+        .route("/api/v1/stats", axum_get(get_stats))
+        .with_state(test_app_state(state.clone()));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["total"], 25, "memory totals unchanged: {v}");
+    let by_ns = v["by_namespace"].as_array().expect("by_namespace list");
+    assert_eq!(by_ns.len(), 20);
+    assert_eq!(v["by_namespace_total"], 25);
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["others"][crate::models::field_names::NAMESPACE_COUNT], 5);
+    assert_eq!(v["others"]["count"], 5);
+}
+
+#[tokio::test]
+async fn http_get_stats_invalid_summary_is_400() {
+    let state = test_state();
+    let app = Router::new()
+        .route("/api/v1/stats", axum_get(get_stats))
+        .with_state(test_app_state(state));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/stats?summary=maybe")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
