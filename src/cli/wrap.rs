@@ -124,15 +124,14 @@ pub struct WrapArgs {
 
     /// Override the system-message flag (e.g. `--system-prompt`). When
     /// set, wrap delivers the system message via this flag regardless
-    /// of what the lookup table says for `<agent>`.
+    /// of what the lookup table says for `<agent>`. Mutually exclusive
+    /// with `--system-env` and `--message-file-flag`.
     #[arg(long, value_name = "FLAG")]
     pub system_flag: Option<String>,
 
     /// Override the system-message env var (e.g. `OPENAI_CLI_SYSTEM`).
     /// Mutually exclusive with `--system-flag` and
-    /// `--message-file-flag`; if multiple are set, the last specified
-    /// on the command line wins (clap default), but the most common
-    /// case is supplying exactly one.
+    /// `--message-file-flag`.
     #[arg(long, value_name = "NAME", conflicts_with_all = ["system_flag", "message_file_flag"])]
     pub system_env: Option<String>,
 
@@ -140,6 +139,7 @@ pub struct WrapArgs {
     /// will write the system message to a tempfile and pass this flag
     /// + the tempfile path to the agent. The tempfile is cleaned up on
     /// wrap exit (cross-platform; uses `tempfile::NamedTempFile`).
+    /// Mutually exclusive with `--system-flag` and `--system-env`.
     #[arg(long, value_name = "FLAG", conflicts_with_all = ["system_flag", "system_env"])]
     pub message_file_flag: Option<String>,
 

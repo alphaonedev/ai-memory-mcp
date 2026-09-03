@@ -28,15 +28,25 @@ use crate::logging::resolve_log_dir_with_override;
 pub struct LogsArgs {
     #[command(subcommand)]
     pub action: LogsAction,
-    /// RFC3339 lower bound. Lines older than this are dropped from
-    /// `tail` / `cat` output.
-    #[arg(long, global = true, value_name = "TS")]
+    /// RFC3339 or YYYY-MM-DD lower bound. Lines older than this are
+    /// dropped from `tail` / `cat` output.
+    #[arg(
+        long,
+        global = true,
+        value_name = "TS",
+        value_parser = parse_timestamp_arg
+    )]
     pub since: Option<String>,
-    /// RFC3339 upper bound.
-    #[arg(long, global = true, value_name = "TS")]
+    /// RFC3339 or YYYY-MM-DD upper bound.
+    #[arg(
+        long,
+        global = true,
+        value_name = "TS",
+        value_parser = parse_timestamp_arg
+    )]
     pub until: Option<String>,
-    /// Filter to lines whose tracing `level` field equals this.
-    #[arg(long, global = true)]
+    /// Filter to a tracing level: trace, debug, info, warn, or error.
+    #[arg(long, global = true, value_parser = parse_level_arg)]
     pub level: Option<String>,
     /// Filter to lines that mention this namespace (case-insensitive
     /// substring match against the line body).
@@ -50,7 +60,12 @@ pub struct LogsArgs {
     pub action_filter: Option<String>,
     /// Output format: `text` (passthrough) or `json` (one filtered
     /// line per JSON object).
-    #[arg(long, global = true, default_value = "text")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "text",
+        value_parser = parse_format_arg
+    )]
     pub format: String,
     /// Override the operational log directory. Highest-priority layer
     /// in the resolution ladder (CLI > `AI_MEMORY_LOG_DIR` > `[logging]
@@ -84,8 +99,14 @@ pub struct TailArgs {
     /// Stream new lines as they arrive (poll-based, ~1s cadence).
     #[arg(long, default_value_t = false)]
     pub follow: bool,
-    /// Override the poll interval in milliseconds. Default 1000.
-    #[arg(long, default_value_t = 1000)]
+    /// Override the poll interval in milliseconds. Default 1000; valid only
+    /// with `--follow` and must be at least 1.
+    #[arg(
+        long,
+        default_value_t = 1000,
+        requires = "follow",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub follow_interval_ms: u64,
     /// Stop tailing after this many polls in `--follow` mode. Tests
     /// pass a small bound so the loop terminates deterministically.
@@ -116,7 +137,7 @@ pub fn run(args: LogsArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> R
         .with_context(|| "resolving operational log directory")?;
     let dir = resolved.path.clone();
     let _source: log_paths::PathSource = resolved.source;
-    let filters = args_filters(&args);
+    let filters = args_filters(&args)?;
     match args.action {
         LogsAction::Tail(t) => run_tail(&dir, &filters, &t, out),
         LogsAction::Cat => run_cat(&dir, &filters, out),
@@ -136,15 +157,85 @@ struct Filters {
     format_json: bool,
 }
 
-fn args_filters(a: &LogsArgs) -> Filters {
-    Filters {
-        since: a.since.as_deref().and_then(parse_ts),
-        until: a.until.as_deref().and_then(parse_ts),
-        level: a.level.clone(),
+fn args_filters(a: &LogsArgs) -> Result<Filters> {
+    let since = a
+        .since
+        .as_deref()
+        .map(parse_timestamp_arg)
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .and_then(|value| parse_ts(&value));
+    let until = a
+        .until
+        .as_deref()
+        .map(parse_timestamp_arg)
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .and_then(|value| parse_ts(&value));
+    if since
+        .as_ref()
+        .zip(until.as_ref())
+        .is_some_and(|(start, end)| start > end)
+    {
+        anyhow::bail!("--since must be earlier than or equal to --until");
+    }
+    let level = a
+        .level
+        .as_deref()
+        .map(parse_level_arg)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let format = parse_format_arg(&a.format).map_err(anyhow::Error::msg)?;
+    if matches!(&a.action, LogsAction::Archive | LogsAction::Purge(_))
+        && (since.is_some()
+            || until.is_some()
+            || level.is_some()
+            || a.namespace.is_some()
+            || a.actor.is_some()
+            || a.action_filter.is_some()
+            || format != "text")
+    {
+        anyhow::bail!("log filters and --format apply only to `logs tail` and `logs cat`");
+    }
+    Ok(Filters {
+        since,
+        until,
+        level,
         namespace: a.namespace.clone(),
         actor: a.actor.clone(),
         action: a.action_filter.clone(),
-        format_json: a.format == "json",
+        format_json: format == "json",
+    })
+}
+
+fn parse_timestamp_arg(value: &str) -> std::result::Result<String, String> {
+    parse_ts(value).map_or_else(
+        || {
+            Err(format!(
+                "invalid timestamp `{value}` (expected RFC3339 or YYYY-MM-DD)"
+            ))
+        },
+        |_| Ok(value.to_string()),
+    )
+}
+
+fn parse_level_arg(value: &str) -> std::result::Result<String, String> {
+    let normalized = value.to_ascii_lowercase();
+    match normalized.as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" => Ok(normalized),
+        _ => Err(format!(
+            "invalid log level `{value}` (expected trace, debug, info, warn, or error)"
+        )),
+    }
+}
+
+fn parse_format_arg(value: &str) -> std::result::Result<String, String> {
+    let normalized = value.to_ascii_lowercase();
+    match normalized.as_str() {
+        "text" | "json" => Ok(normalized),
+        _ => Err(format!(
+            "invalid log format `{value}` (expected text or json)"
+        )),
     }
 }
 
@@ -771,10 +862,10 @@ mod tests {
             format: "json".to_string(),
             log_dir: None,
         };
-        let f = args_filters(&args);
+        let f = args_filters(&args).unwrap();
         assert!(f.since.is_some());
         assert!(f.until.is_some());
-        assert_eq!(f.level.as_deref(), Some("WARN"));
+        assert_eq!(f.level.as_deref(), Some("warn"));
         assert_eq!(f.namespace.as_deref(), Some("ns"));
         assert_eq!(f.actor.as_deref(), Some("alice"));
         assert_eq!(f.action.as_deref(), Some("recall"));
@@ -782,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn args_filters_handles_garbage_since_as_none() {
+    fn args_filters_refuses_invalid_values_and_inverted_range_3438() {
         let args = LogsArgs {
             action: LogsAction::Cat,
             since: Some("garbage".to_string()),
@@ -794,9 +885,42 @@ mod tests {
             format: "text".to_string(),
             log_dir: None,
         };
-        let f = args_filters(&args);
-        assert!(f.since.is_none(), "garbage should fall back to None");
-        assert!(!f.format_json);
+        assert!(args_filters(&args).is_err());
+
+        let inverted = LogsArgs {
+            since: Some("2026-05-02".to_string()),
+            until: Some("2026-05-01".to_string()),
+            ..args
+        };
+        assert!(args_filters(&inverted).is_err());
+    }
+
+    #[test]
+    fn args_filters_refuses_unknown_level_format_and_mutation_filters_3438() {
+        let make_args = || LogsArgs {
+            action: LogsAction::Cat,
+            since: None,
+            until: None,
+            level: None,
+            namespace: None,
+            actor: None,
+            action_filter: None,
+            format: "text".to_string(),
+            log_dir: None,
+        };
+
+        let mut args = make_args();
+        args.level = Some("verbose".to_string());
+        assert!(args_filters(&args).is_err());
+
+        let mut args = make_args();
+        args.format = "yaml".to_string();
+        assert!(args_filters(&args).is_err());
+
+        let mut args = make_args();
+        args.action = LogsAction::Archive;
+        args.since = Some("2026-05-01".to_string());
+        assert!(args_filters(&args).is_err());
     }
 
     #[test]

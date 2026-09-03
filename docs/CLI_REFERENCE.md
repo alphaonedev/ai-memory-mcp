@@ -509,8 +509,8 @@ agent's Ed25519 public key for #626 Layer-3 store-path attestation
 ## Backup & restore (v0.6.0.0)
 
 ```bash
-ai-memory backup --to /var/backups/ai-memory --keep 48
-ai-memory restore --from /var/backups/ai-memory
+ai-memory --db /var/lib/ai-memory/memories.db backup --to /var/backups/ai-memory --keep 48
+ai-memory --db /var/lib/ai-memory/memories.db restore --from /var/backups/ai-memory --yes
 ```
 
 `backup` uses SQLite `VACUUM INTO` (hot-backup safe) and writes a
@@ -697,7 +697,7 @@ strategy.
 
 | Strategy | Behaviour | Default for |
 |----------|-----------|-------------|
-| `SystemFlag` | `--system <msg>` (or whatever the target accepts) | `codex` / `codex-cli`, `gemini` |
+| `SystemFlag` | A target-specific flag (`--system <msg>` by default) | `codex` / `codex-cli`, `gemini`; `claude` / `claude-cli` use `--append-system-prompt` |
 | `SystemEnv` | env-var injection | `ollama` |
 | `MessageFile` | tempfile + `--message-file <path>` | `aider` |
 | `Auto` | per-agent lookup table | (selector) |
@@ -727,14 +727,19 @@ via `[logging] enabled = true`). Subcommands:
 
 | Subcommand | Notes |
 |------------|-------|
-| `tail [--follow]` | Stream the active log file. `--follow-interval-ms` (default `1000`) sets the poll rate. `--lines <N>` (default `50`) sets the initial buffer. |
-| `cat` | Concatenate rotated log files in order. |
+| `tail [--follow]` | Stream the active log file. With `--follow`, `--follow-interval-ms` (default `1000`, minimum `1`) sets the poll rate. `--lines <N>` (default `50`) sets the initial buffer. |
+| `cat` | Concatenate all operational log files in chronological order. |
 | `archive` | zstd-compress files past their retention window. |
-| `purge --before <date>` | Delete log files older than `<date>` (RFC3339). Emits an audit-gap warning. |
+| `purge --before <date>` | Delete archived log files older than `<date>` (RFC3339 or `YYYY-MM-DD`). `--dry-run` lists candidates; `--no-warn` suppresses the audit-gap warning. |
 
 Global filters (apply to `tail` / `cat`): `--since`, `--until`,
 `--level`, `--namespace`, `--actor`, `--action-filter`,
 `--format text|json`, `--log-dir <PATH>`.
+
+Timestamp bounds accept RFC3339 or `YYYY-MM-DD`; malformed or inverted
+bounds are refused. Levels are `trace`, `debug`, `info`, `warn`, or `error`.
+Filters and `--format` are refused on `archive` / `purge`, where they would
+otherwise be ignored; `--log-dir` applies to every logs verb.
 
 Path resolution precedence: `--log-dir` flag > `AI_MEMORY_LOG_DIR` env >
 `config.toml` > platform default. See `docs/ADMIN_GUIDE.md` for the

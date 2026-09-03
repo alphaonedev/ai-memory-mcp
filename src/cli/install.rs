@@ -129,20 +129,20 @@ pub enum TargetCmd {
 
     // ---- v0.6.4-010 — cross-harness install profiles ----
     /// Claude Desktop MCP servers (writes the macOS/Windows config;
-    /// pass `--config <path>` on Linux). Args include
+    /// pass `--config <path>` on Linux). The generated entry pins
     /// `--profile core` (the v0.6.4 default).
     ClaudeDesktop(TargetArgs),
     /// OpenAI Codex CLI MCP servers. Pass `--config <path>` since the
-    /// canonical Codex config path varies by Codex version. Args
-    /// include `--profile core`.
+    /// canonical Codex config path varies by Codex version. The
+    /// generated entry pins `--profile core`.
     Codex(TargetArgs),
     /// xAI Grok CLI MCP servers. Pass `--config <path>` since the
-    /// Grok CLI config path varies by version. Args include
-    /// `--profile core`.
+    /// Grok CLI config path varies by version. The generated entry
+    /// pins `--profile core`.
     GrokCli(TargetArgs),
     /// Google Gemini CLI MCP servers. Pass `--config <path>` since the
-    /// Gemini CLI config path varies by version. Args include
-    /// `--profile core`.
+    /// Gemini CLI config path varies by version. The generated entry
+    /// pins `--profile core`.
     GeminiCli(TargetArgs),
 }
 

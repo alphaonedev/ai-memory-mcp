@@ -433,12 +433,11 @@ pub enum Command {
     /// Read-only, fast, never blocks. With `--quiet` (recommended for
     /// hooks) a missing DB exits 0 with empty stdout.
     Boot(BootArgs),
-    /// Issue #487 PR-2: wire `ai-memory boot` and the `ai-memory-mcp`
-    /// server into AI agents' config files (Claude Code SessionStart hook,
-    /// Cursor / Cline / Continue / Windsurf / OpenClaw MCP config). Default
-    /// is `--dry-run` (prints the diff, writes nothing). Pass `--apply` to
-    /// commit. Pass `--uninstall --apply` to remove a previously-installed
-    /// managed block.
+    /// Wire `ai-memory boot` and the `ai-memory-mcp` server into supported
+    /// harness config files (Claude Code, Claude Desktop, OpenClaw, Cursor,
+    /// Cline, Continue, Windsurf, Codex, Grok CLI, and Gemini CLI). Default is
+    /// dry-run (prints the diff, writes nothing). Pass `--apply` to commit or
+    /// `--uninstall --apply` to remove a previously installed managed block.
     Install(InstallArgs),
     /// Issue #487 PR-6: cross-platform Rust replacement for the bash /
     /// PowerShell wrappers PR-1 shipped in the integration recipes. Runs
