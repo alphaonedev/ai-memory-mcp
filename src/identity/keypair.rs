@@ -185,6 +185,115 @@ pub fn key_dir_env_override() -> Option<PathBuf> {
     }
 }
 
+/// The PLATFORM-default key directory, IGNORING `AI_MEMORY_KEY_DIR`.
+///
+/// i.e. "where the operator's real key store lives on this host", whatever
+/// the current process has been pointed at. `None` on a host that advertises
+/// no config directory.
+///
+/// v1.0.0 #3355 — exists so the key-dir sandbox guard can prove a test wrote
+/// NOTHING into the operator's key store, without the test tree having to
+/// re-derive the platform path (and drift from this one). Distinct from
+/// [`resolved_default_key_dir_path`], which answers "where will THIS process
+/// resolve keys" and therefore honours the override.
+#[must_use]
+pub fn platform_default_key_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|base| base.join("ai-memory").join("keys"))
+}
+
+/// v1.0.0 #3355 — arm the process-wide TEST key-directory sandbox.
+///
+/// # The defect this exists to make impossible
+///
+/// `encryption::keypair_persist_dir` used to fork on `#[cfg(test)]`: the
+/// `cfg(test)` arm returned an ephemeral tempdir, the other arm returned
+/// [`default_key_dir`]. **`cfg(test)` is true only while compiling THIS
+/// crate's own unit tests.** An integration test in `tests/` links the
+/// already-built rlib, compiled WITHOUT `cfg(test)` — so every integration
+/// test that reached the encryption keystore resolved the OPERATOR'S REAL
+/// `~/.config/ai-memory/keys` and minted fixture keypairs there. 43 of them
+/// accumulated on the maintainer's machine (`agent-bad-2383.x25519`,
+/// `pg-commit-b-wrong.x25519`, `test-agent-228-tamper.x25519` …) before
+/// anyone noticed, because the unit suite *looked* sandboxed.
+///
+/// The sandbox was worse than no sandbox: it produced a false assurance that
+/// held on one side of the crate boundary and silently evaporated on the
+/// other.
+///
+/// # Why this function is not `#[cfg(test)]`
+///
+/// For exactly the reason above. A sandbox that only exists under
+/// `cfg(test)` cannot be reached by the integration tests that need it most.
+/// This is compiled into the shipped rlib and is INERT unless called — it
+/// mutates nothing until a test arms it, and no production path calls it.
+/// That is the price of having ONE mechanism that works on both sides of the
+/// crate boundary instead of two that disagree.
+///
+/// # What it does
+///
+/// Creates a `0700` tempdir once per process and pins [`KEY_DIR_ENV`] at it,
+/// so every consumer of [`default_key_dir`] — the Ed25519 keystore, the
+/// X25519 encryption keystore, the CLI, and any `assert_cmd` child that
+/// inherits the environment — resolves the sandbox instead of the operator's
+/// key store. Idempotent: repeated calls return the same directory.
+///
+/// The tempdir handle is deliberately leaked into a `OnceLock` so the
+/// directory outlives every test in the binary; the OS reclaims it when the
+/// process exits.
+///
+/// # Panics
+///
+/// Panics — deliberately, and this is the fail-closed half — when the
+/// sandbox cannot be created, or when arming it does NOT move
+/// [`resolved_default_key_dir_path`] onto the sandbox. A test that believes
+/// it is sandboxed and is not would write real keys into a real key store;
+/// refusing loudly at arm time is the only safe outcome.
+///
+/// Deliberately NOT `#[must_use]`: the POINT of this call is the side effect
+/// (pinning `AI_MEMORY_KEY_DIR`). The returned path is a convenience for the
+/// callers that want to assert against it; most correctly ignore it.
+pub fn install_test_key_dir_sandbox() -> PathBuf {
+    static SANDBOX: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let dir = SANDBOX.get_or_init(|| {
+        let tmp = tempfile::tempdir().expect("#3355: create the test key-dir sandbox");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // #3198 refuses a group/world-writable key dir, and this fleet
+            // runs `umask 0002`, which would leave the tempdir at 0o775.
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("#3355: chmod 0700 the test key-dir sandbox");
+        }
+        // SAFETY: `OnceLock` initialisation runs exactly once per process and
+        // happens-before every reader that goes through this function. The
+        // same Once discipline the config/attestation test pins already use.
+        unsafe {
+            std::env::set_var(KEY_DIR_ENV, tmp.path());
+        }
+        tmp
+    });
+    let path = dir.path().to_path_buf();
+
+    // Fail closed: PROVE the arming took effect rather than trusting it. If
+    // some other code path cleared or overwrote `AI_MEMORY_KEY_DIR`, a test
+    // that called this function would otherwise proceed believing it was
+    // sandboxed while writing into the operator's real key store — the exact
+    // silent failure #3355 is about.
+    let resolved = resolved_default_key_dir_path()
+        .expect("#3355: the key dir must resolve once the sandbox is armed");
+    assert_eq!(
+        resolved,
+        path,
+        "#3355: arming the test key-dir sandbox did not take effect — \
+         {KEY_DIR_ENV} resolves to {} instead of the sandbox {}. Refusing to \
+         continue: a test that writes keys now would write them into a REAL \
+         key store.",
+        resolved.display(),
+        path.display()
+    );
+    path
+}
+
 /// Returns the default key storage directory:
 /// `dirs::config_dir().join("ai-memory/keys/")`.
 ///

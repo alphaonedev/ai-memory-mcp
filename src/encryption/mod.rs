@@ -267,22 +267,27 @@ const X25519_PRIV_SUFFIX: &str = ".x25519.priv";
 const X25519_KEY_LEN: usize = 32;
 
 /// Resolve the directory used to persist per-agent X25519 keypairs.
-/// Production resolves the platform key directory (honoring
-/// `AI_MEMORY_KEY_DIR`); test builds use a process-wide ephemeral
-/// tempdir so the unit suite never reads or writes the real key store.
-#[cfg(not(test))]
+///
+/// ONE implementation for every build. It resolves the platform key
+/// directory, honouring `AI_MEMORY_KEY_DIR`.
+///
+/// v1.0.0 #3355 — this used to fork on `#[cfg(test)]`, with the test arm
+/// returning a process-wide ephemeral tempdir. That fork was the leak.
+/// `cfg(test)` is true only while compiling THIS crate's own unit tests; an
+/// integration test in `tests/` links the already-built rlib, compiled
+/// WITHOUT `cfg(test)`, so it took the production arm and minted fixture
+/// keypairs in the OPERATOR'S REAL `~/.config/ai-memory/keys`. 43 of them
+/// accumulated there. The unit suite meanwhile looked perfectly sandboxed,
+/// which is why it went unnoticed — the fork did not merely fail to
+/// sandbox, it advertised a sandbox that did not exist where it mattered.
+///
+/// Tests now arm the sandbox EXPLICITLY, through the one cross-crate
+/// mechanism that works for unit and integration tests alike:
+/// [`crate::identity::keypair::install_test_key_dir_sandbox`]. Because that
+/// call is visible at each call site, a reader can tell whether a test is
+/// sandboxed by looking at it — the old fork made that invisible.
 fn keypair_persist_dir() -> Result<PathBuf> {
     crate::identity::keypair::default_key_dir()
-}
-
-#[cfg(test)]
-fn keypair_persist_dir() -> Result<PathBuf> {
-    use std::sync::OnceLock;
-    static TEST_KEY_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
-    Ok(TEST_KEY_DIR
-        .get_or_init(|| tempfile::tempdir().expect("create ephemeral x25519 test key dir"))
-        .path()
-        .to_path_buf())
 }
 
 /// `(pub_path, priv_path)` for `agent_id` under `dir`.
@@ -904,6 +909,12 @@ mod tests {
 
     #[test]
     fn keypair_round_trip_returns_same_secret() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         // Cache-hit path: second call returns the same secret material.
         let agent = "test-agent-roundtrip";
         let a = get_or_create_keypair(agent).expect("first generate");
@@ -914,6 +925,12 @@ mod tests {
 
     #[test]
     fn keypair_distinct_for_distinct_agents() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         let a = get_or_create_keypair("agent-a").expect("a");
         let b = get_or_create_keypair("agent-b").expect("b");
         assert_ne!(a.public.as_bytes(), b.public.as_bytes());
@@ -921,6 +938,12 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_round_trip_recovers_plaintext() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         let kp = get_or_create_keypair("roundtrip-agent").expect("keypair");
         let plaintext = "hello world — encryption substrate MVP";
         let env = encrypt(plaintext, &kp.public).expect("encrypt");
@@ -930,6 +953,12 @@ mod tests {
 
     #[test]
     fn envelope_wire_format_round_trips() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         let kp = get_or_create_keypair("envelope-bytes").expect("kp");
         let env = encrypt("payload bytes", &kp.public).expect("encrypt");
         let bytes = env.to_bytes();
@@ -957,6 +986,12 @@ mod tests {
 
     #[test]
     fn decrypt_with_wrong_secret_fails() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         let kp_alice = get_or_create_keypair("alice-wrong-key").expect("alice");
         let kp_eve = get_or_create_keypair("eve-wrong-key").expect("eve");
         let env = encrypt("secret-for-alice", &kp_alice.public).expect("encrypt");
@@ -966,6 +1001,12 @@ mod tests {
 
     #[test]
     fn decrypt_with_tampered_ciphertext_fails() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         let kp = get_or_create_keypair("tamper-detect").expect("kp");
         let mut env = encrypt("dont change this", &kp.public).expect("encrypt");
         // Flip a bit in the ciphertext — AEAD authentication catches it.
@@ -977,6 +1018,12 @@ mod tests {
 
     #[test]
     fn hkdf_derived_key_is_deterministic_and_differs_from_raw_shared_secret() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         // Same shared secret -> same derived key (decrypt must reproduce
         // the encrypt-side key), but the derived key must NOT equal the
         // raw X25519 output — proving HKDF actually conditions the secret
@@ -1010,6 +1057,12 @@ mod tests {
 
     #[test]
     fn decrypt_fails_when_ephemeral_pub_swapped() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         // Swapping the envelope's ephemeral pubkey for another valid one
         // must fail: it both changes the ECDH shared secret AND breaks the
         // AAD binding. No silent plaintext recovery.
@@ -1025,6 +1078,12 @@ mod tests {
 
     #[test]
     fn envelope_version_is_the_hkdf_aad_scheme() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         // Pin the scheme marker so an accidental revert to the raw-DH MVP
         // (0x01) is caught: the on-the-wire version byte must be 0x02.
         let kp = get_or_create_keypair("h3-version-pin").expect("kp");
@@ -1101,6 +1160,12 @@ mod tests {
 
     #[test]
     fn open_content_round_trips_via_process_test_key() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         // #228 Commit B — open_content recovers the plaintext from an
         // envelope sealed to the agent's per-process test keypair.
         // open_content resolves the agent key through
@@ -1122,6 +1187,12 @@ mod tests {
 
     #[test]
     fn per_record_envelope_round_trips_via_open_content() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         // #1956 — a 0x03 per-record envelope decrypts back to the plaintext
         // via the agent master KEK (open_content dispatches on the version byte).
         let agent = "r56-per-record-roundtrip";
@@ -1139,6 +1210,12 @@ mod tests {
 
     #[test]
     fn crypto_erase_makes_per_record_ciphertext_unrecoverable() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         // #1956 CORE PROPERTY — destroying the wrapped DEK (rewriting the
         // envelope to the 0x04 marker) makes the prior ciphertext permanently
         // unrecoverable, even with the correct agent master KEK in hand.
@@ -1161,6 +1238,12 @@ mod tests {
 
     #[test]
     fn legacy_v2_envelope_is_not_crypto_erasable_but_still_readable() {
+        // #3355 — arm the process-wide key-dir sandbox EXPLICITLY. This used
+        // to happen implicitly via a `cfg(test)` fork in `keypair_persist_dir`,
+        // which silently did nothing for the integration tests that link the
+        // rlib — and leaked 43 fixture keypairs into the operator's real key
+        // store. One mechanism now, visible at the call site.
+        crate::identity::keypair::install_test_key_dir_sandbox();
         // #1956 HONEST-LIMIT — a legacy 0x02 per-agent envelope has NO
         // per-record key to destroy, so it is NOT crypto-erasable; it stays
         // readable (open_content routes it through the legacy path).
