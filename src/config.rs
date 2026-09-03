@@ -8789,15 +8789,37 @@ impl AppConfig {
     /// `warn db unavailable` against the real DB that lives at the
     /// expanded path.
     pub fn effective_db(&self, cli_db: &Path) -> PathBuf {
-        // If CLI provided a non-default path, use it
-        let default_db = PathBuf::from("ai-memory.db");
-        if cli_db != default_db {
-            return cli_db.to_path_buf();
+        // A `cli_db` equal to the compiled default is indistinguishable from
+        // "no `--db` was passed" on this signature, which is exactly why
+        // #3431 introduced [`AppConfig::effective_db_explicit`]. Preserved
+        // verbatim for the callers that only hold a resolved path.
+        let explicit = (cli_db != Path::new(crate::daemon_runtime::DEFAULT_DB)).then_some(cli_db);
+        self.effective_db_explicit(explicit)
+    }
+
+    /// v1.0.0 #3431 — resolve the effective database path from the
+    /// EXPLICIT CLI/env value: `Some` when the operator passed `--db` (or set
+    /// `AI_MEMORY_DB`), `None` when nobody did.
+    ///
+    /// This is the honest form of [`AppConfig::effective_db`]. That one has to
+    /// infer explicitness by comparing against the `ai-memory.db` literal,
+    /// which both discards an operator who deliberately passed
+    /// `--db ai-memory.db` and — the #3431 defect — makes a path that came
+    /// from `config.toml` look like a typed flag to any caller that needs to
+    /// know which layer won.
+    ///
+    /// Precedence: explicit CLI/env > `[db]` in `config.toml` (with a leading
+    /// `~` expanded against `$HOME`, issue #507) > the compiled
+    /// [`crate::daemon_runtime::DEFAULT_DB`].
+    #[must_use]
+    pub fn effective_db_explicit(&self, cli_db: Option<&Path>) -> PathBuf {
+        if let Some(p) = cli_db {
+            return p.to_path_buf();
         }
-        // Otherwise check config — expanding leading `~` against $HOME.
-        self.db
-            .as_ref()
-            .map_or_else(|| cli_db.to_path_buf(), |s| expand_tilde(s))
+        self.db.as_ref().map_or_else(
+            || PathBuf::from(crate::daemon_runtime::DEFAULT_DB),
+            |s| expand_tilde(s),
+        )
     }
 
     /// Resolve Ollama URL for LLM generation (config or default).
