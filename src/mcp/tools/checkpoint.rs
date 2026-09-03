@@ -1018,7 +1018,7 @@ mod handler_tests {
             return;
         }
         let _g = crate::config::test_env_lock();
-        let key_dir = tempfile::tempdir().expect("key dir");
+        let key_dir = crate::test_support::secure_tempdir();
         // SAFETY: single-threaded isolated child; guarded by test_env_lock.
         unsafe {
             std::env::set_var(
@@ -1073,7 +1073,7 @@ mod handler_tests {
             return;
         }
         let _g = crate::config::test_env_lock();
-        let key_dir = tempfile::tempdir().expect("key dir");
+        let key_dir = crate::test_support::secure_tempdir();
         // SAFETY: single-threaded isolated child; guarded by test_env_lock.
         unsafe {
             std::env::set_var(

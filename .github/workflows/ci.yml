@@ -1629,6 +1629,19 @@ jobs:
           AI_MEMORY_NO_CONFIG: "1"
         run: cargo test --features sal --lib
 
+      # #3439 — keep identity key-directory fixtures honest under the
+      # collaborative umask used on self-hosted/operator machines. Production
+      # correctly refuses group-writable key dirs; tests must create 0700.
+      - name: Run key-directory fixture tests (sal feature, umask 002)
+        env:
+          AI_MEMORY_NO_CONFIG: "1"
+        run: |
+          umask 002
+          cargo test --features sal --lib identity::keypair::tests
+          cargo test --features sal --lib identity::verify::tests
+          cargo test --features sal --lib cli::identity::tests
+          cargo test --features sal --lib checkpoint::handler_tests
+
   # v1.0.0 #2257 — vectorlite OPT-IN feature gate. The `vectorlite` cargo
   # feature (#1860/#2219; `rusqlite/load_extension` + `src/vectorlite.rs`)
   # is OFF by default and was in NO CI job, so the no-native-lib fail-closed

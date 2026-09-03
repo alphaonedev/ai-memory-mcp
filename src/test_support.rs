@@ -25,6 +25,43 @@
 use std::ffi::OsString;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+/// Create a temporary directory whose mode is explicitly 0700 on Unix.
+///
+/// `tempfile` creates directories subject to the process umask. Tests that use
+/// a tempdir as an identity key directory must not accidentally inherit 0775
+/// under a collaborative `umask 002`, because the production key-directory
+/// guard correctly refuses group-writable paths (#3439).
+///
+/// # Panics
+///
+/// Panics if the temporary directory cannot be created or its Unix mode cannot
+/// be changed to 0700.
+pub(crate) fn secure_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().expect("secure tempdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod secure tempdir to 0700");
+    }
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn secure_tempdir_is_mode_0700_3439() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = secure_tempdir();
+    let mode = std::fs::metadata(dir.path())
+        .expect("secure tempdir metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
 /// Process-wide lock serialising every test that mutates an environment
 /// variable in-process, so `set_var`'s single-threaded contract holds and no
 /// test observes another's transient env state.

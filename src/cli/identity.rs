@@ -868,7 +868,7 @@ mod tests {
 
     fn fresh_env() -> (TestEnv, tempfile::TempDir) {
         let env = TestEnv::fresh();
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::test_support::secure_tempdir();
         (env, dir)
     }
 
@@ -1106,7 +1106,7 @@ mod tests {
         let kp = keypair::generate("alice").unwrap();
         let pub_bytes = kp.public.to_bytes();
         let priv_bytes = kp.private.as_ref().unwrap().to_bytes();
-        let staging = tempfile::TempDir::new().unwrap();
+        let staging = crate::test_support::secure_tempdir();
         let pub_file = staging.path().join("a.pub");
         let priv_file = staging.path().join("a.priv");
         std::fs::write(&pub_file, pub_bytes).unwrap();
@@ -1145,7 +1145,7 @@ mod tests {
         let dir_path = dir.path().to_path_buf();
         let alice = keypair::generate("alice").unwrap();
         let bob = keypair::generate("bob").unwrap();
-        let staging = tempfile::TempDir::new().unwrap();
+        let staging = crate::test_support::secure_tempdir();
         let pub_file = staging.path().join("alice.pub");
         let priv_file = staging.path().join("bob.priv");
         std::fs::write(&pub_file, alice.public.to_bytes()).unwrap();
@@ -1212,7 +1212,7 @@ mod tests {
         let (mut env, dir) = fresh_env();
         let dir_path = dir.path().to_path_buf();
         let kp = keypair::generate("dave").unwrap();
-        let staging = tempfile::TempDir::new().unwrap();
+        let staging = crate::test_support::secure_tempdir();
         let pub_file = staging.path().join("d.pub");
         std::fs::write(&pub_file, kp.public.to_bytes()).unwrap();
         {
@@ -1248,7 +1248,7 @@ mod tests {
         let (mut env, dir) = fresh_env();
         let dir_path = dir.path().to_path_buf();
         let kp = keypair::generate("eve").unwrap();
-        let staging = tempfile::TempDir::new().unwrap();
+        let staging = crate::test_support::secure_tempdir();
         let pub_file = staging.path().join("e.pub");
         std::fs::write(&pub_file, kp.public.to_bytes()).unwrap();
         {
@@ -1281,7 +1281,7 @@ mod tests {
         let (mut env, dir) = fresh_env();
         let dir_path = dir.path().to_path_buf();
         let kp = keypair::generate("frank").unwrap();
-        let staging = tempfile::TempDir::new().unwrap();
+        let staging = crate::test_support::secure_tempdir();
         let pub_file = staging.path().join("f.pub");
         let priv_file = staging.path().join("f.priv");
         std::fs::write(&pub_file, kp.public.to_bytes()).unwrap();

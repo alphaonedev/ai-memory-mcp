@@ -1572,7 +1572,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn tmp_dir() -> TempDir {
-        TempDir::new().expect("tempdir")
+        crate::test_support::secure_tempdir()
     }
 
     #[cfg(unix)]
@@ -2240,6 +2240,12 @@ mod tests {
         let dir = tmp_dir();
         let file = dir.path().join("not-a-dir");
         fs::write(&file, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let err = list(&file).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("reading key directory"), "got: {msg}");
