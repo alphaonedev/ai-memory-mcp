@@ -519,6 +519,7 @@ fn audit_dispatch_verify_missing_log_is_noop() {
 fn doctor_dispatch_json_emits_valid_json() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("doctor.db");
+    ai_memory(&db).args(["stats"]).assert().success();
     let assert_out = ai_memory(&db).args(["doctor", "--json"]).assert();
     let output = assert_out.get_output();
     // Doctor exit code: 0 on healthy, 2 on critical. assert_cmd's

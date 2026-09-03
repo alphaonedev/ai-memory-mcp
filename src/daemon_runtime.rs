@@ -2272,6 +2272,7 @@ pub async fn run(
                 remote: a.remote,
                 json: a.json,
                 fail_on_warn: a.fail_on_warn,
+                agent_id: cli_agent_id,
                 // #2815 — transport-auth knobs for the `--remote` fleet path.
                 // Inert (and byte-identical to the pre-#2815 client) when the
                 // operator passes none of them.

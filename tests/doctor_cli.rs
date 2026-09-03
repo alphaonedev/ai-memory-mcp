@@ -151,6 +151,69 @@ fn doctor_reports_clean_on_fresh_db() {
 }
 
 #[test]
+fn doctor_refuses_missing_db_without_creating_it_3434() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("missing.db");
+    assert!(!db.exists());
+
+    let output = ai_memory(&db)
+        .args(["doctor", "--json"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(!db.exists(), "doctor created the missing database");
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let storage = report["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["name"] == "Storage")
+        .expect("Storage section");
+    assert_eq!(storage["severity"], "critical");
+}
+
+#[test]
+fn doctor_reports_signing_key_for_resolved_caller_3434() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("ai-memory.db");
+    let agent_id = "ai:doctor-cli-3434";
+    init_db(&db);
+    ai_memory(&db)
+        .args(["identity", "generate", "--agent-id", agent_id])
+        .assert()
+        .success();
+
+    let output = ai_memory(&db)
+        .args(["--agent-id", agent_id, "doctor", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let identity = report["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["name"] == "Identity")
+        .expect("Identity section");
+    let facts = identity["facts"].as_array().unwrap();
+    assert!(
+        facts
+            .iter()
+            .any(|fact| fact == &serde_json::json!(["agent_id", agent_id]))
+    );
+    assert!(
+        facts
+            .iter()
+            .any(|fact| { fact == &serde_json::json!(["signing", format!("ready ({agent_id})")]) })
+    );
+}
+
+#[test]
 fn doctor_warns_on_dim_violations() {
     // Simulate the post-P2 schema by manually adding the `embedding_dim`
     // column. Pre-P2 the column doesn't exist and `db::doctor_dim_violations`

@@ -845,6 +845,14 @@ Reachability (#1598)**. Each section is severity-tagged.
 Exit codes: `0` healthy, `1` warning (only when `--fail-on-warn`), `2`
 critical.
 
+Local mode requires an existing database and opens it with SQLite's read-only
+flag; it never creates, bootstraps, or migrates `--db`. The Identity section
+resolves the global `--agent-id` and reports whether that caller's signing key
+can actually load. Because SQLite exposes the full FTS5 integrity command as a
+virtual-table write, local doctor reports that one probe as not run; use the
+daemon's cached `/api/v1/health.fts_integrity` result or run the check against a
+maintenance copy.
+
 ```bash
 ai-memory doctor
 ai-memory doctor --json | jq '.sections[] | select(.severity != "ok")'

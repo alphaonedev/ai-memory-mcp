@@ -242,6 +242,8 @@ pub struct DoctorArgs {
     pub remote: Option<String>,
     pub json: bool,
     pub fail_on_warn: bool,
+    /// Resolved CLI caller identity used to select the forensic signing key.
+    pub agent_id: Option<String>,
     /// #2815 — PEM CA to trust for the remote daemon's server certificate
     /// (private-CA / self-signed deployments). Precedent: `sync --ca-cert`,
     /// `serve --quorum-ca-cert`.
@@ -706,7 +708,7 @@ pub fn run(db_path: &Path, args: &DoctorArgs, out: &mut CliOutput<'_>) -> Result
         };
         run_remote(url, db_path, &auth)
     } else {
-        run_local(db_path)
+        run_local(db_path, args.agent_id.as_deref())
     };
     report.compute_overall();
 
@@ -954,7 +956,7 @@ fn snapshot_before_repair(
 // Local (--db) mode
 // ---------------------------------------------------------------------------
 
-fn run_local(db_path: &Path) -> Report {
+fn run_local(db_path: &Path, agent_id: Option<&str>) -> Report {
     let mut sections = Vec::with_capacity(7);
 
     // #3166 — FIRST, and BEFORE the database open, because the two faults are
@@ -978,7 +980,10 @@ fn run_local(db_path: &Path) -> Report {
     // Open the connection once; failures bubble into a single Critical
     // section and the rest of the report is N/A. Identity still renders
     // (the keystore is independent of the database).
-    let conn = match db::open(db_path) {
+    let conn = match db::open_read_only(db_path).and_then(|conn| {
+        db::assert_schema_not_ahead(&conn, &db_path.display().to_string())?;
+        Ok(conn)
+    }) {
         Ok(c) => c,
         Err(e) => {
             // v1.0.0 #2445 — name the schema-AHEAD refusal explicitly. `doctor`
@@ -1019,7 +1024,7 @@ fn run_local(db_path: &Path) -> Report {
                 facts.push((FACT_BINARY_SUPPORTS_SCHEMA.into(), p.supported.to_string()));
                 facts.push(("schema_stamp".into(), "poisoned".into()));
             }
-            sections.push(section_identity_3147(None));
+            sections.push(section_identity_3147(None, agent_id));
             sections.push(ReportSection {
                 name: "Storage".into(),
                 severity: Severity::Critical,
@@ -1069,7 +1074,7 @@ fn run_local(db_path: &Path) -> Report {
         }
     };
 
-    sections.push(section_identity_3147(Some(&conn)));
+    sections.push(section_identity_3147(Some(&conn), agent_id));
     sections.push(section_storage(&conn, db_path));
     sections.push(section_index(&conn));
     sections.push(section_embedding_space_census_2167(&conn));
@@ -1423,15 +1428,36 @@ type IdentityAcc = (Vec<(String, String)>, Severity, Vec<String>);
 
 /// Filesystem half of [`section_identity_3147`]: key-dir posture + daemon
 /// pub/priv presence. Never generates a key and never rewrites modes.
-fn identity_keystore_facts() -> IdentityAcc {
+fn identity_keystore_facts(explicit_agent_id: Option<&str>) -> IdentityAcc {
     let mut facts = Vec::new();
     let mut severity = Severity::Info;
     let mut notes = Vec::new();
+    let agent_id = match crate::identity::resolve_agent_id(explicit_agent_id, None) {
+        Ok(agent_id) => {
+            facts.push(("agent_id".into(), agent_id.clone()));
+            Some(agent_id)
+        }
+        Err(e) => {
+            severity = severity_max(severity, Severity::Warning);
+            facts.push(("agent_id".into(), format!("unresolved: {e:#}")));
+            facts.push((
+                "signing".into(),
+                "UNSIGNED — caller identity unresolved".into(),
+            ));
+            None
+        }
+    };
     match crate::identity::keypair::resolved_default_key_dir_path() {
         Ok(dir) => {
             facts.push(("key_dir".into(), dir.display().to_string()));
             identity_dir_mode_facts(&dir, &mut facts, &mut severity, &mut notes);
-            identity_signing_facts(&dir, &mut facts, &mut severity, &mut notes);
+            identity_signing_facts(
+                &dir,
+                agent_id.as_deref(),
+                &mut facts,
+                &mut severity,
+                &mut notes,
+            );
         }
         Err(e) => {
             severity = severity_max(severity, Severity::Warning);
@@ -1502,6 +1528,7 @@ fn identity_dir_mode_facts(
 
 fn identity_signing_facts(
     dir: &Path,
+    agent_id: Option<&str>,
     facts: &mut Vec<(String, String)>,
     severity: &mut Severity,
     notes: &mut Vec<String>,
@@ -1517,7 +1544,7 @@ fn identity_signing_facts(
         "daemon_priv".into(),
         if priv_exists { "present" } else { "absent" }.into(),
     ));
-    let signing = match (pub_exists, priv_exists) {
+    let daemon_signing = match (pub_exists, priv_exists) {
         (true, true) => "ready",
         (false, true) => "priv-only (public half re-derivable on next boot)",
         (true, false) => {
@@ -1532,15 +1559,55 @@ fn identity_signing_facts(
         }
         (false, false) => "none (first boot will generate)",
     };
-    facts.push(("signing".into(), signing.into()));
+    facts.push(("daemon_signing".into(), daemon_signing.into()));
+
+    let Some(agent_id) = agent_id else {
+        return;
+    };
+    match crate::identity::keypair::load(agent_id, dir) {
+        Ok(keypair) if keypair.can_sign() => {
+            facts.push(("signing".into(), format!("ready ({agent_id})")));
+        }
+        Ok(_) => {
+            *severity = severity_max(*severity, Severity::Warning);
+            facts.push((
+                "signing".into(),
+                format!("UNSIGNED — public-only key for {agent_id}"),
+            ));
+            notes.push(format!(
+                "no private signing key for {agent_id}; import or generate one before writing"
+            ));
+        }
+        Err(e) if crate::identity::keypair::is_key_absent_error(&e) => {
+            *severity = severity_max(*severity, Severity::Warning);
+            facts.push((
+                "signing".into(),
+                format!("UNSIGNED — no key for {agent_id}"),
+            ));
+            notes.push(format!(
+                "run `ai-memory identity generate --agent-id {agent_id}` before writing signed events"
+            ));
+        }
+        Err(e) => {
+            *severity = severity_max(*severity, Severity::Critical);
+            facts.push((
+                "signing".into(),
+                format!("UNSIGNED — key for {agent_id} could not be loaded"),
+            ));
+            notes.push(format!("signing key load failed for {agent_id}: {e:#}"));
+        }
+    }
 }
 
 /// #3147 / #3155 — Identity section. Read-only: never generates a key,
 /// never rewrites modes. Surfaces the daemon keypair half-state, the
 /// #3198 key-dir posture, and whether `HTTP_REQUIRE_ATTESTED_IDENTITY=enforce`
 /// is inert with zero enrolled keys.
-fn section_identity_3147(conn: Option<&rusqlite::Connection>) -> ReportSection {
-    let (mut facts, mut severity, mut notes) = identity_keystore_facts();
+fn section_identity_3147(
+    conn: Option<&rusqlite::Connection>,
+    agent_id: Option<&str>,
+) -> ReportSection {
+    let (mut facts, mut severity, mut notes) = identity_keystore_facts(agent_id);
     let mode = crate::config::http_attested_identity_mode();
     facts.push(("http_identity_mode".into(), mode.as_str().into()));
     let enrolled = conn.map_or(0, |c| {
@@ -1755,14 +1822,12 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
         ));
     }
 
-    // v1.0.0 #2579 — the FULL FTS5 integrity check, on the explicit
-    // operator-invoked surface. `/health` used to run this on every probe,
-    // which is O(corpus) and holds the WAL write lock; `doctor` is the verb
-    // an operator reaches for on demand, and this section is already
-    // corpus-proportional (the census aggregations below), so the cost is
-    // the point rather than a surprise. The daemon runs the same check on a
-    // paced background cadence and surfaces its cached verdict at
-    // `/api/v1/health.fts_integrity`.
+    // v1.0.0 #2579 — the FULL FTS5 integrity check on write-capable callers.
+    // SQLite exposes this check as a virtual-table INSERT command even though
+    // it only verifies derived state. #3434 makes local doctor genuinely
+    // read-only, so its connection must not attempt that command; the daemon
+    // still runs the full check on a paced background cadence and surfaces its
+    // cached verdict at `/api/v1/health.fts_integrity`.
     //
     // Before this landed, `doctor` did NOT check the FTS index at all — so
     // making `/health` cheap without adding it here would have deleted the
@@ -1778,36 +1843,56 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
     // value. Pushing the same fact in three arms would scatter the key across
     // three sites (the pm-v3.1 duplication the hardcoded-literal ratchet
     // blocks) for no gain.
-    let fts_verdict = match crate::db::fts_integrity_check(conn) {
-        Ok(()) => "verified (index agrees with the memories table)".to_string(),
-        Err(e) => match crate::background::fts_integrity::classify_error(&e) {
-            crate::background::fts_integrity::Outcome::Corrupt => {
-                severity = Severity::Critical;
-                append_note(
-                    &mut note,
-                    "the FTS5 index disagrees with the memories table — keyword recall will \
+    let fts_verdict = match conn.is_readonly(rusqlite::DatabaseName::Main) {
+        Ok(true) => {
+            append_note(
+                &mut note,
+                "the full FTS5 integrity command is not run by read-only doctor because SQLite \
+                 exposes it as a virtual-table write; inspect the daemon's cached \
+                 `/api/v1/health.fts_integrity` verdict or run the check on a maintenance copy",
+            );
+            "not run (doctor opened the database read-only)".to_string()
+        }
+        Ok(false) => match crate::db::fts_integrity_check(conn) {
+            Ok(()) => "verified (index agrees with the memories table)".to_string(),
+            Err(e) => match crate::background::fts_integrity::classify_error(&e) {
+                crate::background::fts_integrity::Outcome::Corrupt => {
+                    severity = Severity::Critical;
+                    append_note(
+                        &mut note,
+                        "the FTS5 index disagrees with the memories table — keyword recall will \
                      silently return FEWER rows than it should. The durable memory TEXT is \
                      intact; the index is derived and regenerable. Rebuild it with: \
                      sqlite3 <db> \"INSERT INTO memories_fts(memories_fts) VALUES('rebuild');\"",
-                );
-                format!("FAILED: {e}")
-            }
-            _ => {
-                // NOT a corruption verdict — do not escalate past Warning, and
-                // never downgrade a Critical some earlier probe already set.
-                if severity != Severity::Critical {
-                    severity = Severity::Warning;
+                    );
+                    format!("FAILED: {e}")
                 }
-                append_note(
-                    &mut note,
-                    "the FTS5 integrity check could not COMPLETE — this is NOT a corruption \
+                _ => {
+                    // NOT a corruption verdict — do not escalate past Warning, and
+                    // never downgrade a Critical some earlier probe already set.
+                    if severity != Severity::Critical {
+                        severity = Severity::Warning;
+                    }
+                    append_note(
+                        &mut note,
+                        "the FTS5 integrity check could not COMPLETE — this is NOT a corruption \
                      verdict and says nothing about whether the index agrees with the \
                      memories table. Re-run `ai-memory doctor` when the database is not \
                      under a concurrent write.",
-                );
-                format!("not verified (check could not complete): {e}")
-            }
+                    );
+                    format!("not verified (check could not complete): {e}")
+                }
+            },
         },
+        Err(e) => {
+            severity = Severity::Warning;
+            append_note(
+                &mut note,
+                "could not determine whether the database connection is read-only; the FTS5 \
+                 integrity command was withheld rather than risk a write",
+            );
+            format!("not verified (connection posture unknown): {e}")
+        }
     };
     facts.push(("fts_index_integrity".into(), fts_verdict));
 
@@ -3433,6 +3518,15 @@ mod tests {
     /// clearing the vars while we hold it) makes the SQLite report
     /// independent of test ordering.
     fn run_local_collect(db_path: &Path) -> Report {
+        if !db_path.exists() {
+            drop(crate::db::open(db_path).expect("initialize doctor test database"));
+        }
+        run_local_collect_without_setup(db_path)
+    }
+
+    /// Exercise the production read-only path without materializing the test
+    /// database first. Used by #3434's missing-path refusal regression.
+    fn run_local_collect_without_setup(db_path: &Path) -> Report {
         let _guard = crate::store_url::store_url_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3444,7 +3538,7 @@ mod tests {
             std::env::remove_var(crate::store_url::STORE_URL_ENV);
             std::env::remove_var(crate::store_url::STORE_URL_FILE_ENV);
         }
-        let mut report = run_local(db_path);
+        let mut report = run_local(db_path, None);
         report.compute_overall();
         report
     }
@@ -3528,6 +3622,106 @@ mod tests {
             "Identity section must report HTTP identity mode: {:?}",
             identity.facts
         );
+    }
+
+    #[test]
+    fn local_doctor_refuses_missing_db_without_creating_it_3434() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("doctor-must-not-create.sqlite");
+        assert!(!missing.exists());
+
+        let report = run_local_collect_without_setup(&missing);
+
+        assert!(
+            !missing.exists(),
+            "read-only doctor created the missing database"
+        );
+        let storage = find(&report, "Storage");
+        assert_eq!(storage.severity, Severity::Critical);
+        assert!(
+            fact(storage, "error").contains("read-only database connection"),
+            "got: {:?}",
+            storage.facts
+        );
+    }
+
+    #[test]
+    fn local_doctor_does_not_migrate_existing_schema_3434() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old-schema.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);\
+                 INSERT INTO schema_version (version) VALUES (1);",
+            )
+            .unwrap();
+        }
+
+        let _report = run_local_collect(&path);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "doctor migrated the existing database");
+        let memories_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memories'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memories_table, 0, "doctor bootstrapped the current schema");
+    }
+
+    #[test]
+    fn identity_signing_facts_report_resolved_caller_key_3434() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_id = "ai:doctor-3434";
+        let keypair = crate::identity::keypair::generate(agent_id).unwrap();
+        crate::identity::keypair::save(&keypair, dir.path()).unwrap();
+        let mut facts = Vec::new();
+        let mut severity = Severity::Info;
+        let mut notes = Vec::new();
+
+        identity_signing_facts(
+            dir.path(),
+            Some(agent_id),
+            &mut facts,
+            &mut severity,
+            &mut notes,
+        );
+
+        assert_eq!(
+            facts.iter().find(|(key, _)| key == "signing").unwrap().1,
+            format!("ready ({agent_id})")
+        );
+        assert_eq!(severity, Severity::Info);
+    }
+
+    #[test]
+    fn identity_signing_facts_warn_when_resolved_caller_key_is_missing_3434() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_id = "ai:missing-doctor-3434";
+        let mut facts = Vec::new();
+        let mut severity = Severity::Info;
+        let mut notes = Vec::new();
+
+        identity_signing_facts(
+            dir.path(),
+            Some(agent_id),
+            &mut facts,
+            &mut severity,
+            &mut notes,
+        );
+
+        assert_eq!(
+            facts.iter().find(|(key, _)| key == "signing").unwrap().1,
+            format!("UNSIGNED — no key for {agent_id}")
+        );
+        assert_eq!(severity, Severity::Warning);
+        assert!(notes.iter().any(|note| note.contains("identity generate")));
     }
 
     // -------------------------------------------------------------------
@@ -4350,6 +4544,7 @@ mod tests {
     fn run_emits_json_when_json_flag_set() {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
+        drop(crate::db::open(&db_path).expect("initialize doctor test database"));
         let mut out = env.output();
         let exit = run(
             &db_path,
@@ -4375,6 +4570,7 @@ mod tests {
     fn run_emits_text_by_default() {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
+        drop(crate::db::open(&db_path).expect("initialize doctor test database"));
         let mut out = env.output();
         let exit = run(
             &db_path,
