@@ -612,19 +612,20 @@ mod tests {
     }
 
     /// Run `migrate` against a `config.toml` materialised under a
-    /// tempdir `$HOME`. Returns (exit_code, stderr_text). Holds the
-    /// env lock for the duration.
+    /// tempdir `$HOME`. Returns (exit_code, stdout_text, stderr_text,
+    /// on_disk_config). Holds the env lock for the duration.
     fn run_migrate_with_home(
         config_body: Option<&str>,
         dry_run: bool,
         also_clean: bool,
-    ) -> (i32, String) {
+    ) -> (i32, String, String, String) {
         let _g = env_lock();
         let home = tempfile::tempdir().expect("tempdir");
+        let cfg_path = home.path().join(".config/ai-memory/config.toml");
         if let Some(body) = config_body {
-            let dir = home.path().join(".config/ai-memory");
+            let dir = cfg_path.parent().expect("config parent");
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("config.toml"), body).unwrap();
+            std::fs::write(&cfg_path, body).unwrap();
         }
         let prev_home = std::env::var("HOME").ok();
         let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
@@ -652,6 +653,7 @@ mod tests {
             };
             run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
         };
+        let on_disk = std::fs::read_to_string(&cfg_path).unwrap_or_default();
         unsafe {
             match prev_home {
                 Some(h) => std::env::set_var("HOME", h),
@@ -662,7 +664,12 @@ mod tests {
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
-        (code, String::from_utf8(stderr).unwrap())
+        (
+            code,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+            on_disk,
+        )
     }
 
     // -----------------------------------------------------------------
@@ -753,49 +760,7 @@ mod tests {
     /// secret reached a stream and that the durable file still holds the
     /// real secret (the redaction is display-only).
     fn run_migrate_capture(config_body: &str, dry_run: bool) -> (i32, String, String, String) {
-        let _g = env_lock();
-        let home = tempfile::tempdir().expect("tempdir");
-        let dir = home.path().join(".config/ai-memory");
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg_path = dir.join("config.toml");
-        std::fs::write(&cfg_path, config_body).unwrap();
-        let prev_home = std::env::var("HOME").ok();
-        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        // SAFETY: serialised via `env_lock()`; restored before the guard
-        // drops, exactly as `run_migrate_with_home` does.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
-        }
-        let mut stdout: Vec<u8> = Vec::new();
-        let mut stderr: Vec<u8> = Vec::new();
-        let code = {
-            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-            let args = ConfigCliArgs {
-                action: ConfigAction::Migrate {
-                    dry_run,
-                    also_clean_claude_json: false,
-                },
-            };
-            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
-        };
-        let on_disk = std::fs::read_to_string(&cfg_path).unwrap_or_default();
-        unsafe {
-            match prev_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-        (
-            code,
-            String::from_utf8(stdout).unwrap(),
-            String::from_utf8(stderr).unwrap(),
-            on_disk,
-        )
+        run_migrate_with_home(Some(config_body), dry_run, false)
     }
 
     /// DENIED path, table-driven: across both layouts and both modes (and
@@ -946,14 +911,15 @@ mod tests {
 
     #[test]
     fn run_migrate_missing_file_returns_two() {
-        let (code, stderr) = run_migrate_with_home(None, false, false);
+        let (code, _stdout, stderr, _on_disk) = run_migrate_with_home(None, false, false);
         assert_eq!(code, 2);
         assert!(stderr.contains("no config file"), "got: {stderr}");
     }
 
     #[test]
     fn run_migrate_invalid_toml_returns_three() {
-        let (code, stderr) = run_migrate_with_home(Some("this is { not valid toml"), false, false);
+        let (code, _stdout, stderr, _on_disk) =
+            run_migrate_with_home(Some("this is { not valid toml"), false, false);
         assert_eq!(code, 3);
         assert!(stderr.contains("not valid TOML"), "got: {stderr}");
     }
@@ -961,7 +927,7 @@ mod tests {
     #[test]
     fn run_migrate_already_v2_is_noop() {
         let body = "schema_version = 2\ntier = \"autonomous\"\n\n[llm]\nbackend = \"xai\"\n";
-        let (code, stderr) = run_migrate_with_home(Some(body), false, false);
+        let (code, _stdout, stderr, _on_disk) = run_migrate_with_home(Some(body), false, false);
         assert_eq!(code, 0);
         assert!(stderr.contains("no migration needed"), "got: {stderr}");
     }
@@ -969,7 +935,7 @@ mod tests {
     #[test]
     fn run_migrate_dry_run_returns_one() {
         let body = "llm_model = \"gemma\"\nollama_url = \"http://localhost:11434\"\n";
-        let (code, stderr) = run_migrate_with_home(Some(body), true, true);
+        let (code, _stdout, stderr, _on_disk) = run_migrate_with_home(Some(body), true, true);
         assert_eq!(code, 1);
         assert!(stderr.contains("DRY RUN"), "got: {stderr}");
         assert!(
@@ -981,7 +947,7 @@ mod tests {
     #[test]
     fn run_migrate_apply_writes_backup_and_succeeds() {
         let body = "llm_model = \"gemma\"\nollama_url = \"http://localhost:11434\"\n";
-        let (code, stderr) = run_migrate_with_home(Some(body), false, false);
+        let (code, _stdout, stderr, _on_disk) = run_migrate_with_home(Some(body), false, false);
         assert_eq!(code, 0);
         assert!(stderr.contains("OK: migrated"), "got: {stderr}");
         assert!(stderr.contains("backup:"), "got: {stderr}");
@@ -992,7 +958,7 @@ mod tests {
     #[test]
     fn run_migrate_apply_with_clean_no_claude_json() {
         let body = "embedding_model = \"nomic_embed_v15\"\n";
-        let (code, stderr) = run_migrate_with_home(Some(body), false, true);
+        let (code, _stdout, stderr, _on_disk) = run_migrate_with_home(Some(body), false, true);
         assert_eq!(code, 0);
         // No ~/.claude.json in the tempdir HOME → INFO no-change line.
         assert!(stderr.contains("no mcpServers env block"), "got: {stderr}");
