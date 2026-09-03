@@ -1143,7 +1143,7 @@ async fn pg_inbox_invalid_agent_id_400() {
 
 #[tokio::test]
 async fn pg_notify_happy_path() {
-    let (router, _f) = build_fake_pg_router();
+    let (router, f) = build_fake_pg_router();
     // #901: matching X-Agent-Id required for the body agent_id.
     let (status, v) = post_json_as(
         &router,
@@ -1152,15 +1152,24 @@ async fn pg_notify_happy_path() {
             "target_agent_id": "pg-recipient",
             "title": "pg-note",
             "payload": "hello from postgres branch",
-            "agent_id": "pg-sender",
+            "agent_id": "ai:pg-sender",
             "priority": 5,
         }),
-        "pg-sender",
+        "ai:pg-sender",
     )
     .await;
     assert!(
         status == StatusCode::CREATED || status == StatusCode::OK,
         "notify pg: {status} body={v}",
+    );
+    let id = v["id"].as_str().expect("notify id");
+    let conn = ai_memory::db::open(f.path()).expect("open fake-pg backing db");
+    let stored = ai_memory::db::get(&conn, id)
+        .expect("read notify")
+        .expect("notify row");
+    assert_eq!(
+        stored.metadata["agent_id"], "ai:pg-sender",
+        "postgres handler branch must preserve the authenticated sender exactly"
     );
 }
 

@@ -664,6 +664,7 @@ pub use namespace::{
     handle_namespace_get_standard, handle_namespace_set_standard,
     handle_namespace_set_standard_trusted,
 };
+pub(crate) use notify::handle_notify_for_caller;
 pub use notify::{handle_inbox, handle_notify};
 pub use pending::{handle_pending_approve, handle_pending_reject};
 // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.

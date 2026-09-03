@@ -243,11 +243,11 @@ pub async fn notify(
 
     let lock = app.db.lock().await;
     let resolved_ttl = lock.2.clone();
-    // Route via the MCP handler so the wire contract stays single-sourced.
-    // `mcp_client = Some(&sender)` makes `resolve_agent_id(None, _)` return
-    // the caller-resolved HTTP id — same effective provenance.
-    let mcp_client = sender.clone();
-    let result = crate::mcp::handle_notify(&lock.0, &params, &resolved_ttl, Some(&mcp_client));
+    // Route via the shared notify handler while preserving the identity already
+    // authenticated at the HTTP boundary. Treating this value as an MCP client
+    // name re-synthesizes it (`ai:alice` -> `ai:ai-alice@host`) and can collapse
+    // distinct HTTP callers onto the same durable sender (#3399).
+    let result = crate::mcp::handle_notify_for_caller(&lock.0, &params, &resolved_ttl, &sender);
 
     // v0.6.2 (S32): capture the just-inserted notify row and fan it out to
     // peers. Without this, alice's notify on node-1 lands in bob's inbox on

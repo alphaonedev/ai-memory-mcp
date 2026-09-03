@@ -8473,7 +8473,7 @@ async fn h8b_get_inbox_returns_pending_after_notify() {
                 .uri("/api/v1/notify")
                 .method("POST")
                 .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-                .header("x-agent-id", "alice")
+                .header("x-agent-id", "ai:alice")
                 .body(Body::from(serde_json::to_vec(&notify_body).unwrap()))
                 .unwrap(),
         )
@@ -8504,17 +8504,63 @@ async fn h8b_get_inbox_returns_pending_after_notify() {
     assert_eq!(v["count"], 1);
     let msg = &v["messages"][0];
     assert_eq!(msg["title"], "ping");
-    // `from` is the resolved sender — `handle_notify` calls
-    // `identity::resolve_agent_id(None, mcp_client)` which synthesizes the
-    // durable `ai:<client>@<host>` form when only `mcp_client` is set
-    // (#1720 B1 — pid-free for restart-stable ownership). We accept both the
-    // bare and synthesized forms.
-    let from = msg["from"].as_str().unwrap();
-    assert!(
-        from == "alice" || from.starts_with("ai:alice@"),
-        "unexpected sender: {from}",
-    );
+    // #3399: HTTP caller identity is already authoritative. It must be stored
+    // byte-for-byte, never reinterpreted as an MCP client name and synthesized.
+    assert_eq!(msg["from"], "ai:alice");
     assert_eq!(msg["read"], false);
+}
+
+/// #3399 — syntactically distinct HTTP identities must remain distinct senders.
+/// The old SQLite bridge treated each caller as an MCP client name, causing
+/// `ai:alice` and a synthesized client spelling to collide in durable metadata.
+#[tokio::test]
+async fn h8b_notify_preserves_distinct_http_sender_identities_3399() {
+    let state = test_state();
+    for sender in ["ai:alice", "ai-alice"] {
+        let app = Router::new()
+            .route("/api/v1/notify", axum_post(notify))
+            .with_state(test_app_state(state.clone()));
+        let body = serde_json::json!({
+            "target_agent_id": "bob",
+            "title": format!("from-{sender}"),
+            "payload": "identity regression",
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/notify")
+                    .method("POST")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .header("x-agent-id", sender)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let lock = state.lock().await;
+    let rows = db::list(
+        &lock.0,
+        Some("_messages/bob"),
+        None,
+        10,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let mut senders: Vec<&str> = rows
+        .iter()
+        .filter_map(|memory| memory.metadata["agent_id"].as_str())
+        .collect();
+    senders.sort_unstable();
+    assert_eq!(senders, ["ai-alice", "ai:alice"]);
 }
 
 /// `unread_only=true` filter omits already-read messages. We bump
