@@ -7786,6 +7786,45 @@ impl PostgresStore {
                 .as_deref()
                 .is_some_and(|c| c != cur_content.as_str());
 
+        // #3420 (security-high) — decide the attestation this row is ENTITLED
+        // to, BEFORE the governance builder consumes `cur_meta` / `cur_ns` /
+        // `cur_title`. `title` / `content` / `namespace` all sit INSIDE the
+        // signed `SignableWrite` envelope, while #3015 preserves
+        // `metadata.attest_level` / `metadata.write_signature` across the
+        // patch — so an unreconciled update persisted `agent_attested` beside a
+        // signature that can never again be re-derived from the row. The
+        // decision is the SAME shared funnel the sqlite twin uses.
+        let attest_entitled = crate::identity::attest::entitled_update_attestation(
+            &cur_meta,
+            crate::identity::attest::SignedEnvelopeFields {
+                agent_id: leaf_agent_id.as_deref().unwrap_or(""),
+                namespace: &cur_ns,
+                title: &cur_title,
+                kind: &cur_kind,
+                created_at: PG_CREATED_AT_NOT_PATCHABLE,
+                content: &cur_content,
+            },
+            crate::identity::attest::SignedEnvelopeFields {
+                agent_id: leaf_agent_id.as_deref().unwrap_or(""),
+                namespace: patch.namespace.as_deref().unwrap_or(cur_ns.as_str()),
+                title: patch.title.as_deref().unwrap_or(cur_title.as_str()),
+                kind: &cur_kind,
+                created_at: PG_CREATED_AT_NOT_PATCHABLE,
+                content: patch.content.as_deref().unwrap_or(cur_content.as_str()),
+            },
+        );
+        // The blob the SQL `metadata` CASE below will land is exactly
+        // `patch.metadata` when supplied (with only the reserved provenance
+        // keys overlaid — the attestation keys are NOT in that reserved set)
+        // and the stored blob otherwise; that is precisely `governed.metadata`.
+        let attest_post_merge = patch.metadata.clone().unwrap_or_else(|| cur_meta.clone());
+        let attest_needs_reconcile = crate::identity::attest::apply_entitled_attestation(
+            &attest_post_merge,
+            &attest_entitled,
+        )
+        .is_some();
+        let attest_downgrade = attest_entitled.is_downgrade_from(&cur_meta);
+
         // #1451 — consult GOVERNANCE_PRE_WRITE on the post-merge row.
         // Mirror the SQLite tier-downgrade protection so the gate sees
         // the tier that will actually be written (Long never downgrades;
@@ -8016,6 +8055,22 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("rollback update tx", e))?;
             return Ok(None);
         }
+        // #3420 — land the substrate-ENTITLED attestation in the SAME
+        // transaction as the update it belongs to. Skipped entirely when the
+        // blob the SET clause just wrote already carries exactly that pair
+        // (the overwhelmingly common path); a failure propagates so the tx
+        // rolls back rather than committing a row whose asserted attestation
+        // outlives the envelope it was minted over.
+        if attest_needs_reconcile {
+            tracing::warn!(
+                memory_id = %id,
+                downgrade = attest_downgrade,
+                "update reconciled the row's attestation: the persisted \
+                 attest_level/write_signature are the substrate-entitled pair for the \
+                 post-update signed envelope, not the caller-supplied or stale ones (#3420)"
+            );
+            pg_apply_entitled_attestation_in_tx(&mut tx, id, &attest_entitled).await?;
+        }
         // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the in-place
         // content UPDATE (same id) is the path-a supersede; prior content
         // lives in the in_place_edit archive snapshot above, never in the
@@ -8226,6 +8281,49 @@ impl PostgresStore {
         // tx ROLLBACK in the caller leaves the substrate clean.
         let now_dt = Utc::now();
         let now_rfc = now_dt.to_rfc3339();
+        // #3420 — the SUPERSEDING row is a FRESH row with a FRESH `created_at`,
+        // which is inside the signed `SignableWrite` envelope, so a carried
+        // `write_signature` can never re-derive from it. Run the SAME shared
+        // entitlement decision the sqlite twin runs (and the same one the
+        // in-place funnels use) so the two backends cannot drift: the stored
+        // attestation drops to `claimed` with the signature removed, and a
+        // caller-supplied one in `patch.metadata` can never be minted into the
+        // new row. Applied BEFORE `candidate` is composed so the governance /
+        // why_trace hooks and the INSERT all see the reconciled blob.
+        {
+            let existing_agent_id = metadata_agent_id_slot(&existing.metadata).unwrap_or("");
+            let entitled = crate::identity::attest::entitled_update_attestation(
+                &existing.metadata,
+                crate::identity::attest::SignedEnvelopeFields {
+                    agent_id: existing_agent_id,
+                    namespace: &existing.namespace,
+                    title: &existing.title,
+                    kind: existing.memory_kind.as_str(),
+                    created_at: &existing.created_at,
+                    content: &existing.content,
+                },
+                crate::identity::attest::SignedEnvelopeFields {
+                    agent_id: existing_agent_id,
+                    namespace: &new_namespace,
+                    title: &new_title,
+                    kind: existing.memory_kind.as_str(),
+                    created_at: &now_rfc,
+                    content: &new_content,
+                },
+            );
+            if let Some(reconciled) =
+                crate::identity::attest::apply_entitled_attestation(&new_metadata, &entitled)
+            {
+                tracing::warn!(
+                    memory_id = %existing.id,
+                    superseding_id = %new_id,
+                    downgrade = entitled.is_downgrade_from(&existing.metadata),
+                    "supersede reconciled the new row's attestation: a fresh created_at puts \
+                     it outside every signature the OLD row carried (#3420)"
+                );
+                new_metadata = reconciled;
+            }
+        }
         let candidate = Memory {
             id: new_id.clone(),
             tier: new_tier.clone(),
@@ -16619,6 +16717,52 @@ const ENVELOPE_OWNER_RECONCILED_MSG: &str = "upsert-merge landed on a row that r
      content was sealed to (concurrent first-creation race); re-sealing the \
      merged content to the retained identity so the row stays readable";
 
+/// #3420 — sentinel stood in for `created_at` on the two postgres IN-PLACE
+/// update funnels.
+///
+/// `created_at` is inside the signed `SignableWrite` envelope but is NOT
+/// patchable on an in-place update (only `title` / `content` / `namespace`
+/// are), so the before/after snapshots are equal by construction. Passing the
+/// SAME sentinel on both sides states that explicitly and avoids a needless
+/// `TIMESTAMPTZ`-to-TEXT column read on the update hot path. The SUPERSEDE
+/// funnel, which DOES mint a fresh `created_at`, passes the real values.
+const PG_CREATED_AT_NOT_PATCHABLE: &str = "<created_at not patchable on this funnel>";
+
+/// #3420 — force a row's attestation keys to the substrate-ENTITLED pair,
+/// inside the caller's transaction, after the update statement has landed.
+///
+/// The postgres update funnels merge `metadata` in SQL (a `jsonb` overlay whose
+/// `$N::JSONB IS NULL` arm deliberately keeps the stored blob for a
+/// metadata-less patch), so the entitled pair cannot be folded into the bind
+/// list without changing that COALESCE semantic. One extra PK-keyed statement
+/// in the SAME transaction is the exact equivalent of the sqlite twin's in-Rust
+/// correction: the row is updated WITH its entitled attestation, or the tx rolls
+/// back and nothing is.
+///
+/// # Errors
+///
+/// Propagates the statement failure so the enclosing tx rolls back — an update
+/// that cannot reconcile its attestation must not commit (fail closed).
+async fn pg_apply_entitled_attestation_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    entitled: &crate::identity::attest::EntitledAttestation,
+) -> StoreResult<()> {
+    sqlx::query(
+        "UPDATE memories \
+            SET metadata = ((metadata - $2::TEXT) - $3::TEXT) || $4::JSONB \
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(crate::models::field_names::ATTEST_LEVEL)
+    .bind(crate::models::field_names::WRITE_SIGNATURE)
+    .bind(entitled.as_overlay())
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("reconcile row attestation (#3420)", e))?;
+    Ok(())
+}
+
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
     StoreError::BackendUnavailable {
@@ -22219,6 +22363,42 @@ impl MemoryStore for PostgresStore {
         let content_changed = snap_title.as_deref().is_some_and(|t| t != cur_title)
             || snap_content.as_deref().is_some_and(|c| c != cur_content);
 
+        // #3420 (security-high) — decide the attestation this row is ENTITLED
+        // to BEFORE the governance builder consumes `cur_meta` / `cur_ns` /
+        // `cur_title`. Twin of the If-Match funnel
+        // (`update_with_expected_version_once`) and of the sqlite
+        // `storage::update_with_expected_version`, through the ONE shared
+        // decision so the three cannot drift.
+        let attest_pre_agent_id = metadata_agent_id_slot(&cur_meta)
+            .unwrap_or_default()
+            .to_string();
+        let attest_entitled = crate::identity::attest::entitled_update_attestation(
+            &cur_meta,
+            crate::identity::attest::SignedEnvelopeFields {
+                agent_id: &attest_pre_agent_id,
+                namespace: &cur_ns,
+                title: &cur_title,
+                kind: &cur_kind,
+                created_at: PG_CREATED_AT_NOT_PATCHABLE,
+                content: &cur_content,
+            },
+            crate::identity::attest::SignedEnvelopeFields {
+                agent_id: &attest_pre_agent_id,
+                namespace: patch.namespace.as_deref().unwrap_or(cur_ns.as_str()),
+                title: patch.title.as_deref().unwrap_or(cur_title.as_str()),
+                kind: &cur_kind,
+                created_at: PG_CREATED_AT_NOT_PATCHABLE,
+                content: patch.content.as_deref().unwrap_or(cur_content.as_str()),
+            },
+        );
+        let attest_post_merge = patch.metadata.clone().unwrap_or_else(|| cur_meta.clone());
+        let attest_needs_reconcile = crate::identity::attest::apply_entitled_attestation(
+            &attest_post_merge,
+            &attest_entitled,
+        )
+        .is_some();
+        let attest_downgrade = attest_entitled.is_downgrade_from(&cur_meta);
+
         // #2141 (SEC, HIGH — #1451 parity) — substrate governance pre-write
         // gate on the DEFAULT (non-If-Match) postgres update path. Pre-#2141
         // this funnel was the LAST un-gated postgres update surface: the
@@ -22466,6 +22646,22 @@ impl MemoryStore for PostgresStore {
         // early return drops `tx`, rolling back the snapshot above.
         if rows_affected == 0 {
             return Err(StoreError::NotFound { id: id.to_string() });
+        }
+
+        // #3420 — land the substrate-ENTITLED attestation in the SAME
+        // transaction as the update it belongs to (twin of the If-Match
+        // funnel). A failure propagates so the tx rolls back rather than
+        // committing a row whose asserted attestation outlives the envelope it
+        // was minted over.
+        if attest_needs_reconcile {
+            tracing::warn!(
+                memory_id = %id,
+                downgrade = attest_downgrade,
+                "update reconciled the row's attestation: the persisted \
+                 attest_level/write_signature are the substrate-entitled pair for the \
+                 post-update signed envelope, not the caller-supplied or stale ones (#3420)"
+            );
+            pg_apply_entitled_attestation_in_tx(&mut tx, id, &attest_entitled).await?;
         }
 
         // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the one-shot
