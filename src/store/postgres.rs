@@ -559,12 +559,7 @@ pub(crate) struct ListOrderIndexStatus {
 /// fourth query site and trips the #2167 §3.4 gate.)
 ///
 /// Drift is blocked mechanically by `tests/pg_projection_column_fidelity_2585.rs`.
-pub const MEMORY_READ_COLUMNS: &str = "id, tier, namespace, title, content, tags, \
-     priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, \
-     expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, \
-     citations, source_uri, source_span, confidence_source, confidence_signals, \
-     confidence_decayed_at, version, lifecycle_state, cid, valid_from, valid_until, \
-     encrypted_envelope";
+pub const MEMORY_READ_COLUMNS: &str = Memory::READ_COLUMNS;
 
 /// Full-row select of a single memory by id. Shared by `get`,
 /// `merge_inbound`, and the lifecycle-state reader so the projection

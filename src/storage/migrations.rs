@@ -4400,7 +4400,7 @@ pub fn backfill_memory_cids(conn: &Connection) -> Result<usize> {
         // (leave NULL) on ANY decrypt failure — a lost/rotated key must
         // never abort the migration (T5).
         let mem = {
-            let mut stmt = conn.prepare_cached(super::SQL_SELECT_MEMORY_ROW_BY_ID)?;
+            let mut stmt = conn.prepare_cached(super::SQL_SELECT_MEMORY_ROW_BY_ID_FOR_MIGRATION)?;
             match stmt.query_row(params![id], super::row_to_memory) {
                 Ok(m) => m,
                 Err(_) => continue,

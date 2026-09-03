@@ -1184,6 +1184,22 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// Canonical SQL projection for every live `memories` row materialised as
+    /// a [`Memory`], shared by the SQLite and PostgreSQL adapters. The extra
+    /// `encrypted_envelope` column is storage input used to decrypt `content`;
+    /// the remaining 30 names correspond one-for-one with [`Self::FIELD_COUNT`].
+    ///
+    /// Keep this list explicit and ordered. Row mappers intentionally tolerate
+    /// columns absent from pre-migration schemas, so a query-local projection
+    /// that accidentally omits a current field would otherwise fabricate its
+    /// fallback value instead of failing loudly (#3404).
+    pub(crate) const READ_COLUMNS: &'static str = "id, tier, namespace, title, content, tags, \
+         priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, \
+         expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, \
+         citations, source_uri, source_span, confidence_source, confidence_signals, \
+         confidence_decayed_at, version, lifecycle_state, cid, valid_from, valid_until, \
+         encrypted_envelope";
+
     /// Total number of declared `pub <name>: <type>` fields on the
     /// `Memory` struct. SSOT for the "27-field struct at v0.8.0
     /// (26 at v0.7.0, was 15 at v0.6.x)" narrative in CLAUDE.md /

@@ -65,7 +65,9 @@ const SQL_HEAL_DANGLING_NAMESPACE_META: &str = "UPDATE namespace_meta \
        AND NOT EXISTS (SELECT 1 FROM memories WHERE memories.id = namespace_meta.standard_id)";
 const SQL_MEMORY_EXISTS_COUNT: &str = "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1";
 const SQL_MEMORY_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)";
-const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = ?1";
+// Migration-only read: CID backfill runs before later columns exist, so it
+// cannot use the tip-schema canonical projection used by every runtime read.
+const SQL_SELECT_MEMORY_ROW_BY_ID_FOR_MIGRATION: &str = "SELECT * FROM memories WHERE id = ?1";
 /// #1823 G6 — prior-version (namespace, version) read for the COW leaf,
 /// shared across the append-only revision sites (single SQL SSOT).
 const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memories WHERE id = ?1";
@@ -110,7 +112,6 @@ pub(crate) const SQL_UPDATE_METADATA_AND_UPDATED_AT_BY_ID: &str =
 // it, so the planner sees bare `col = ?` / `col >= ?` predicates it can
 // drive through `idx_memories_list_order` / `idx_memories_ns_list_order`
 // instead of the formerly non-sargable `(?N IS NULL OR col = ?N)` arms.
-const SQL_LIST_BASE: &str = "SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?)";
 // v1.0.0 #2602 — `id ASC` is the FINAL total-order tiebreak. `(priority,
 // updated_at)` ties are common (priority is 1-10; bulk/federated rows share an
 // `updated_at` ms), so WITHOUT it the row at rank k among ties — which rows page
@@ -1023,6 +1024,27 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
 /// schema problem is never mistaken for a skippable poison row.
 pub(crate) fn row_to_memory_scan(row: &rusqlite::Row) -> rusqlite::Result<Option<Memory>> {
     row_to_memory_with_policy(row, DecryptFailurePolicy::SkipRow)
+}
+
+/// Table-qualified form of [`Memory::READ_COLUMNS`] for joined SQLite reads.
+///
+/// Generated once from the cross-backend SSOT rather than maintained as a
+/// second hand-written projection. Storage-only columns such as embeddings and
+/// generated indexes remain excluded.
+static MEMORY_READ_COLUMNS_M: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    Memory::READ_COLUMNS
+        .split(", ")
+        .map(|column| format!("m.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+});
+
+fn memory_read_columns(table_prefix: &str) -> &'static str {
+    match table_prefix {
+        "" => Memory::READ_COLUMNS,
+        "m." => MEMORY_READ_COLUMNS_M.as_str(),
+        _ => unreachable!("unsupported memories projection prefix: {table_prefix}"),
+    }
 }
 
 fn row_to_memory_with_policy(
@@ -2912,7 +2934,11 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
 }
 
 pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
-    let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+    let sql = format!(
+        "SELECT {} FROM memories WHERE id = ?1",
+        memory_read_columns("")
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     match rows.next() {
         // Ordinary read lane: hide system-only states (quarantined /
@@ -2945,7 +2971,11 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
 /// surface — never route caller-facing content reads through it, or hidden
 /// rows would leak back into the read lanes #3235 closed.
 pub fn get_any(conn: &Connection, id: &str) -> Result<Option<Memory>> {
-    let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+    let sql = format!(
+        "SELECT {} FROM memories WHERE id = ?1",
+        memory_read_columns("")
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     match rows.next() {
         Some(Ok(m)) => Ok(Some(m)),
@@ -2987,7 +3017,10 @@ pub fn get_many(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Mem
             .take(chunk.len())
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!("SELECT * FROM memories WHERE id IN ({placeholders})");
+        let sql = format!(
+            "SELECT {} FROM memories WHERE id IN ({placeholders})",
+            memory_read_columns("")
+        );
         let mut stmt = conn.prepare(&sql)?;
         // v1.0.0 #2383 (N1) — bulk fetch is a discovery scan: an
         // undecryptable row is omitted (WARN + metric) rather than failing
@@ -3008,7 +3041,11 @@ pub fn get_by_prefix(conn: &Connection, prefix: &str) -> Result<Option<Memory>> 
     // Escape SQL LIKE wildcards in the prefix to prevent % and _ from matching broadly
     let escaped = prefix.replace('%', "\\%").replace('_', "\\_");
     let pattern = format!("{escaped}%");
-    let mut stmt = conn.prepare("SELECT * FROM memories WHERE id LIKE ?1 ESCAPE '\\'")?;
+    let sql = format!(
+        "SELECT {} FROM memories WHERE id LIKE ?1 ESCAPE '\\'",
+        memory_read_columns("")
+    );
+    let mut stmt = conn.prepare(&sql)?;
     // #228 Commit B — collect with `?` (not `.filter_map(Result::ok)`) so a
     // row whose `encrypted_envelope` fails to decrypt surfaces the
     // fail-closed FromSqlConversionFailure from `row_to_memory` instead of
@@ -3784,7 +3821,11 @@ pub fn update_with_expected_version(
 ) -> Result<(bool, bool)> {
     // #1955 R45 — record-stop fence for the update funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+    let sql = format!(
+        "SELECT {} FROM memories WHERE id = ?1",
+        memory_read_columns("")
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
         return Ok((false, false));
@@ -4172,7 +4213,11 @@ pub fn update_with_archive_on_supersede(
     edit_source: crate::models::EditSource,
 ) -> Result<SupersedeResult> {
     // Read the existing row so we can compose the patched NEW row.
-    let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+    let sql = format!(
+        "SELECT {} FROM memories WHERE id = ?1",
+        memory_read_columns("")
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
         // #962 typed envelope — 404 NOT_FOUND through MemoryError mapping.
@@ -5157,7 +5202,11 @@ pub fn undo_in_place_edit(
     // (a) Load the live row (fail-closed NotFound when absent). Decrypts
     // content via row_to_memory's #228 branch when encryption is on.
     let live = {
-        let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+        let sql = format!(
+            "SELECT {} FROM memories WHERE id = ?1",
+            memory_read_columns("")
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
         let mut rows = stmt.query_map(params![id], row_to_memory)?;
         match rows.next() {
             Some(Ok(m)) => m,
@@ -7149,7 +7198,10 @@ pub fn build_list_query(
     limit: usize,
     offset: usize,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-    let mut sql = String::from(SQL_LIST_BASE);
+    let mut sql = format!(
+        "SELECT {} FROM memories WHERE (expires_at IS NULL OR expires_at > ?)",
+        memory_read_columns("")
+    );
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now.to_string())];
     if let Some(ns) = namespace {
         sql.push_str(SQL_FRAGMENT_AND_NAMESPACE_EQ);
@@ -7222,7 +7274,7 @@ pub fn build_list_query(
     }
     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list hides
     // Tombstoned/Quarantined (and any unknown state) from list. No alias in
-    // SQL_LIST_BASE, so the unqualified column is used.
+    // The canonical list base, so the unqualified column is used.
     sql.push(' ');
     sql.push_str(&crate::models::lifecycle_visible_clause(""));
     sql.push_str(SQL_LIST_ORDER_LIMIT);
@@ -7333,12 +7385,14 @@ pub(crate) fn memories_by_kind(
     kind: &crate::models::MemoryKind,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
-    let mut stmt = conn.prepare(
-        "SELECT * FROM memories
+    let sql = format!(
+        "SELECT {memory_columns} FROM memories
          WHERE memory_kind = ?1
            AND (expires_at IS NULL OR expires_at > ?2)
          ORDER BY priority DESC, updated_at DESC",
-    )?;
+        memory_columns = memory_read_columns(""),
+    );
+    let mut stmt = conn.prepare(&sql)?;
     // v1.0.0 #2383 (N1) — discovery scan: skip undecryptable rows.
     let rows = stmt.query_map(params![kind.as_str(), now], row_to_memory_scan)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -7432,13 +7486,7 @@ pub fn search_with_source_uri(
     };
 
     let sql = format!(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
-                m.encrypted_envelope
+        "SELECT {memory_columns}
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
@@ -7463,6 +7511,7 @@ pub fn search_with_source_uri(
                    THEN {soft_loser_factor} ELSE 1.0 END)
            DESC
          LIMIT ?9",
+        memory_columns = memory_read_columns("m."),
         vis = visibility_clause(11, 15, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
@@ -7561,13 +7610,7 @@ pub fn list_by_source_uri(
     // (visibility_clause owner-keyed private arm). The vis block + the
     // caller are the trailing placeholders, so no downstream renumber.
     let sql = format!(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
-                m.version, m.encrypted_envelope
+        "SELECT {memory_columns}
          FROM memories m
          WHERE m.source_uri = ?1
            AND (?2 IS NULL OR m.namespace = ?2)
@@ -7575,6 +7618,7 @@ pub fn list_by_source_uri(
            {lifecycle_vis}
          ORDER BY m.created_at ASC
          LIMIT ?3",
+        memory_columns = memory_read_columns("m."),
         vis = visibility_clause(4, 8, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
@@ -8050,17 +8094,7 @@ pub fn recall(
     };
 
     let sql = format!(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
-                -- #228 Commit B — encrypted_envelope so row_to_memory
-                -- decrypts at-rest content on this recall path; the trailing
-                -- `score` column is read by name (not positionally) so this
-                -- insertion is safe.
-                m.encrypted_envelope,
+        "SELECT {memory_columns},
                 ((fts.rank * -1)
                 + (m.priority * 0.5)
                 + (MIN(m.access_count, 50) * 0.1)
@@ -8095,6 +8129,7 @@ pub fn recall(
            {lifecycle_vis}
          ORDER BY score DESC
          LIMIT ?7",
+        memory_columns = memory_read_columns("m."),
         vis = visibility_clause(8, 12, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list: hides
         // Tombstoned/Quarantined (and any unknown state) from recall.
@@ -8530,20 +8565,16 @@ fn find_similar_title_candidates(
     limit: usize,
 ) -> Result<Vec<Memory>> {
     let fts_query = sanitize_fts_query(title, true);
-    let mut stmt = conn.prepare(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
-                m.encrypted_envelope
+    let sql = format!(
+        "SELECT {memory_columns}
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1 AND m.namespace = ?2
          ORDER BY fts.rank
          LIMIT ?3",
-    )?;
+        memory_columns = memory_read_columns("m."),
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         params![fts_query, namespace, i64::try_from(limit).unwrap_or(20)],
         // v1.0.0 #2383 (N1) — discovery scan: skip undecryptable rows.
@@ -16459,7 +16490,9 @@ pub fn export_all(conn: &Connection) -> Result<Vec<Memory>> {
     // parenthesised so the trailing AND binds to the whole predicate.
     let lifecycle_vis = crate::models::lifecycle_visible_clause("");
     let sql = format!(
-        "SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?1) {lifecycle_vis} ORDER BY created_at ASC"
+        "SELECT {memory_columns} FROM memories WHERE (expires_at IS NULL OR expires_at > ?1) \
+         {lifecycle_vis} ORDER BY created_at ASC",
+        memory_columns = memory_read_columns("")
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![now], row_to_memory)?;
@@ -18998,24 +19031,7 @@ fn fts_keyword_phase(
     // overflow (panic in overflow-checks builds, silent wrap in release).
     let fts_limit = limit.saturating_mul(3).max(30);
     let fts_sql = format!(
-        "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
-                m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
-                m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
-                m.memory_kind, m.entity_id, m.persona_version,
-                m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at, m.embedding,
-                -- #228 Commit B — encrypted_envelope rides this recall FTS
-                -- SELECT so row_to_memory decrypts at-rest content. It sits
-                -- AFTER m.embedding (positional index 25, read by row.get(25))
-                -- so the embedding index is unchanged; row_to_memory + the
-                -- fts_score read are by-name and unaffected.
-                m.encrypted_envelope,
-                -- v1.0.0 #2167 — the per-row embedding_space provenance
-                -- token (positional index 27, read by row.get(27)); the
-                -- fusion stage gates the inline cosine through
-                -- cosine_similarity_space_checked. Appended AFTER
-                -- encrypted_envelope so the embedding index 25 is unchanged.
-                m.embedding_space,
+        "SELECT {memory_columns}, m.embedding, m.embedding_space,
                 (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
                 + (m.confidence * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
@@ -19037,6 +19053,7 @@ fn fts_keyword_phase(
          ORDER BY fts_score DESC
          LIMIT ?7",
         fts_hierarchy_fragment = prep.fts_hierarchy_fragment,
+        memory_columns = memory_read_columns("m."),
         // #3279 — instant-based `created_at` since/until window (?5/?6).
         created_at_window = created_at_instant_window("m.", 5, 6),
         fts_archived_fragment = prep.fts_archived_fragment,
@@ -19069,13 +19086,8 @@ fn fts_keyword_phase(
             return Ok(None);
         };
         let fts_score: f64 = row.get("fts_score")?;
-        // Index 25 = `m.embedding` (the SELECT list above places it
-        // after `confidence_decayed_at`). Pull as `Option<Vec<u8>>`
-        // so legacy rows without embeddings surface as `None`.
-        let embedding_bytes: Option<Vec<u8>> = row.get(25)?;
-        // v1.0.0 #2167 — index 27 = `m.embedding_space` (after
-        // `m.encrypted_envelope` at 26). `None` = SQL NULL (unverified).
-        let embedding_space: Option<String> = row.get(27)?;
+        let embedding_bytes: Option<Vec<u8>> = row.get("embedding")?;
+        let embedding_space: Option<String> = row.get("embedding_space")?;
         Ok(Some((mem, fts_score, embedding_bytes, embedding_space)))
     };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
@@ -19442,16 +19454,7 @@ fn semantic_phase(
 
     // Fallback: linear scan over all embeddings.
     let sem_sql = format!(
-        // #228 Commit B — `encrypted_envelope` appended AFTER `embedding`
-        // so `row_to_memory` can decrypt at-rest content on this semantic
-        // linear-scan path while the positional `row.get(17)` for
-        // `embedding` (zero-based index 17) stays valid. row_to_memory
-        // reads encrypted_envelope by name, so its position is irrelevant
-        // to the decrypt; only the embedding's positional index is pinned.
-        "SELECT id, tier, namespace, title, content, tags, priority,
-                confidence, source, access_count, created_at, updated_at,
-                last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, embedding,
-                encrypted_envelope, embedding_space
+        "SELECT {memory_columns}, embedding, embedding_space
          FROM memories
          WHERE embedding IS NOT NULL
            AND (?1 IS NULL OR namespace = ?1)
@@ -19464,6 +19467,7 @@ fn semantic_phase(
            {sem_valid_at_fragment}
            {vis}
            {lifecycle_vis}",
+        memory_columns = memory_read_columns(""),
         sem_hierarchy_fragment = prep.sem_hierarchy_fragment,
         // #3279 — instant-based `created_at` since/until window (?4/?5).
         created_at_window = created_at_instant_window("", 4, 5),
@@ -19494,14 +19498,8 @@ fn semantic_phase(
         let Some(mem) = row_to_memory_scan(row)? else {
             return Ok(None);
         };
-        // v0.7.x Form 6 — `memory_kind` was inserted between
-        // `reflection_depth` and `embedding` in the SELECT list
-        // above; `embedding` sits at zero-based index 17.
-        let emb_bytes: Option<Vec<u8>> = row.get(17)?;
-        // v1.0.0 #2167 — `embedding_space` appended AFTER
-        // `encrypted_envelope` (index 18) so the pinned `row.get(17)`
-        // for `embedding` stays valid; read positionally at index 19.
-        let emb_space: Option<String> = row.get(19)?;
+        let emb_bytes: Option<Vec<u8>> = row.get("embedding")?;
+        let emb_space: Option<String> = row.get("embedding_space")?;
         Ok(Some((mem, emb_bytes, emb_space)))
     };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
@@ -20371,13 +20369,7 @@ pub fn memories_updated_since_counted(
     //     column cannot escape the decision;
     //   * a `Memory::FIELD_COUNT` pin — a new struct field forces the
     //     fixture to cover it.
-    const COLS: &str = "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
-                source, access_count, created_at, updated_at, last_accessed_at, expires_at, \
-                metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, \
-                source_uri, source_span, confidence_source, confidence_signals, \
-                confidence_decayed_at, encrypted_envelope, version, lifecycle_state, cid, \
-                valid_from, valid_until \
-         FROM memories ";
+    let columns = memory_read_columns("");
     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list. A
     // Tombstoned/Quarantined row must not relay onward on this federation
     // catch-up outbound path (honest caveat: quarantined rows black-hole
@@ -20386,14 +20378,16 @@ pub fn memories_updated_since_counted(
     let rows = match since {
         None => {
             let mut stmt = conn.prepare(&format!(
-                "{COLS} WHERE 1=1 {lifecycle_vis} ORDER BY updated_at ASC LIMIT ?1"
+                "SELECT {columns} FROM memories WHERE 1=1 {lifecycle_vis} \
+                 ORDER BY updated_at ASC LIMIT ?1"
             ))?;
             stmt.query_map(params![limit], row_to_memory_scan)?
                 .collect::<rusqlite::Result<Vec<_>>>()
         }
         Some(s) => {
             let mut stmt = conn.prepare(&format!(
-                "{COLS} WHERE updated_at > ?1 {lifecycle_vis} ORDER BY updated_at ASC LIMIT ?2"
+                "SELECT {columns} FROM memories WHERE updated_at > ?1 {lifecycle_vis} \
+                 ORDER BY updated_at ASC LIMIT ?2"
             ))?;
             stmt.query_map(params![s, limit], row_to_memory_scan)?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -23789,6 +23783,186 @@ mod tests {
         assert_eq!(got.title, "Test insert");
         assert_eq!(got.namespace, "test");
         assert_eq!(got.priority, 5);
+    }
+
+    /// #3404 — every SQLite read lane that returns a `Memory` must expose the
+    /// same durable row facts as `get`. Before the canonical projection,
+    /// keyword search/recall omitted `cid` and semantic recall also omitted
+    /// `version` plus `confidence_source`; the tolerant mapper silently
+    /// invented `None`, `1`, and `caller_provided` respectively.
+    #[test]
+    fn get_search_and_recall_preserve_canonical_row_fields_3404() {
+        const ALICE: &str = "ai:alice";
+        const BOB: &str = "ai:bob";
+        const NS: &str = "projection/3404";
+        const NEEDLE: &str = "projectionfidelityneedle";
+
+        let conn = test_db();
+        let mut mem = make_memory(NEEDLE, NS, Tier::Long, 5);
+        mem.content = format!("{NEEDLE} canonical row facts");
+        mem.confidence_source = ConfidenceSource::Default;
+        mem.metadata = serde_json::json!({"scope": "private", "agent_id": ALICE});
+        let id = insert(&conn, &mem).expect("insert projection fixture");
+        conn.execute("UPDATE memories SET version = 3 WHERE id = ?1", [&id])
+            .expect("stamp reproduced version");
+
+        let embedding_space = crate::embeddings::embedding_space_fingerprint("projection-3404");
+        set_embedding(&conn, &id, &[1.0, 0.0], &embedding_space).expect("stamp semantic fixture");
+
+        let truth = get(&conn, &id)
+            .expect("get projection fixture")
+            .expect("projection fixture exists");
+        assert_eq!(truth.version, 3);
+        assert!(
+            truth.cid.is_some(),
+            "insert funnel must stamp the durable CID"
+        );
+        assert_eq!(truth.confidence_source, ConfidenceSource::Default);
+
+        let assert_same_facts = |lane: &str, actual: &Memory| {
+            assert_eq!(actual.id, truth.id, "{lane}: wrong row");
+            assert_eq!(actual.version, truth.version, "{lane}: version drift");
+            assert_eq!(actual.cid, truth.cid, "{lane}: CID drift");
+            assert_eq!(
+                actual.confidence_source, truth.confidence_source,
+                "{lane}: confidence-source drift"
+            );
+        };
+
+        let search_hits = search(
+            &conn,
+            NEEDLE,
+            Some(NS),
+            None,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(NS),
+            false,
+            Some(ALICE),
+        )
+        .expect("allowed search");
+        assert_same_facts("search", &search_hits[0]);
+
+        let (keyword_hits, _) = recall(
+            &conn,
+            NEEDLE,
+            Some(NS),
+            10,
+            None,
+            None,
+            None,
+            SHORT_TTL_EXTEND_SECS,
+            MID_TTL_EXTEND_SECS,
+            Some(NS),
+            None,
+            false,
+            None,
+            Some(ALICE),
+            None,
+        )
+        .expect("allowed keyword recall");
+        assert_same_facts("keyword recall", &keyword_hits[0].0);
+
+        // No lexical overlap with the fixture: this reaches the semantic
+        // linear-scan projection rather than merely reusing the FTS result.
+        let (semantic_hits, _) = recall_hybrid(
+            &conn,
+            "quasarunrelated",
+            &[1.0, 0.0],
+            Some(NS),
+            10,
+            None,
+            None,
+            None,
+            None,
+            SHORT_TTL_EXTEND_SECS,
+            MID_TTL_EXTEND_SECS,
+            Some(NS),
+            None,
+            &crate::config::ResolvedScoring::default(),
+            false,
+            None,
+            Some(ALICE),
+            Some(&embedding_space),
+            None,
+        )
+        .expect("allowed semantic recall");
+        assert_same_facts("semantic recall", &semantic_hits[0].0);
+
+        assert!(
+            search(
+                &conn,
+                NEEDLE,
+                Some(NS),
+                None,
+                10,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(NS),
+                false,
+                Some(BOB),
+            )
+            .expect("denied search")
+            .is_empty(),
+            "non-owner search must remain denied"
+        );
+        assert!(
+            recall(
+                &conn,
+                NEEDLE,
+                Some(NS),
+                10,
+                None,
+                None,
+                None,
+                SHORT_TTL_EXTEND_SECS,
+                MID_TTL_EXTEND_SECS,
+                Some(NS),
+                None,
+                false,
+                None,
+                Some(BOB),
+                None,
+            )
+            .expect("denied keyword recall")
+            .0
+            .is_empty(),
+            "non-owner keyword recall must remain denied"
+        );
+        assert!(
+            recall_hybrid(
+                &conn,
+                "quasarunrelated",
+                &[1.0, 0.0],
+                Some(NS),
+                10,
+                None,
+                None,
+                None,
+                None,
+                SHORT_TTL_EXTEND_SECS,
+                MID_TTL_EXTEND_SECS,
+                Some(NS),
+                None,
+                &crate::config::ResolvedScoring::default(),
+                false,
+                None,
+                Some(BOB),
+                Some(&embedding_space),
+                None,
+            )
+            .expect("denied semantic recall")
+            .0
+            .is_empty(),
+            "non-owner semantic recall must remain denied"
+        );
     }
 
     #[test]
