@@ -6,7 +6,7 @@
 //! # The defect this closes
 //!
 //! `--json` is declared `global = true` on [`crate::daemon_runtime::Cli`],
-//! so **clap accepts it on all 94 subcommands**. Only some of them do
+//! so **clap accepts it on all 95 subcommands**. Only some of them do
 //! anything with it. `ai-memory install --json`, `wrap --json`,
 //! `man --json`, `config check --json` and `export-forensic-bundle --json`
 //! parsed fine, exited 0, and emitted their ordinary human output — a flag
@@ -118,6 +118,10 @@ pub fn json_support(command: &Command) -> JsonSupport {
         | Command::ExportReflections(..)
         | Command::RecoverPreviousSession(..)
         | Command::Watch(..)
+        // #3467 (EPIC #3466): `wake-hub --posture --json` emits its own
+        // envelope through `WakeHubArgs::json`; the serving mode has no
+        // JSON form and refuses nothing (no output channel to protect).
+        | Command::WakeHub(..)
         | Command::Atomise(..)
         | Command::Persona(..)
         | Command::Skill(..)

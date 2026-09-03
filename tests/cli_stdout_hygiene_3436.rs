@@ -15,7 +15,7 @@
 //!    pinned stderr by hand, but the fix lived at that one call site
 //!    instead of in a funnel, so its two siblings kept the bug.
 //! 2. **`--json` accepted and ignored.** The flag is `global = true`, so
-//!    clap takes it on all 94 subcommands while only some honour it.
+//!    clap takes it on all 95 subcommands while only some honour it.
 //! 3. **`verify-reflection-chain <unknown-id>` reported `ok: true`,
 //!    exit 0** — an empty walk satisfies the `ok` predicate vacuously, so
 //!    the verifier certified a memory it had never found.
