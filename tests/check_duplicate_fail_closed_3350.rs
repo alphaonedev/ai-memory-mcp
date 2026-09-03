@@ -240,6 +240,28 @@ fn missing_query_embedding_is_undetermined_3350() {
     assert_eq!(r.candidates_available, 1);
 }
 
+/// ORDERING PIN (#3350 gate finding). An EMPTY scope must resolve to the
+/// honest evaluated verdict even when there is also no query vector: with
+/// nothing in scope there was nothing to compare against, so "not a
+/// duplicate" is true rather than degraded. Testing the empty embedding first
+/// would report a degraded no-verdict for an empty store AND put sqlite out of
+/// parity with postgres, whose empty-embedding arm already resolves this way.
+#[test]
+fn empty_store_with_no_query_embedding_is_evaluated_not_degraded_3350() {
+    let (conn, _tmp) = open_db();
+    let text = ai_memory::embeddings::embedding_document("anything", "anything at all");
+    let r = db::check_duplicate_with_text(&conn, &[], "anything", &text, Some(NS), 0.85)
+        .expect("check_duplicate_with_text");
+    assert_eq!(
+        r.verdict.as_bool(),
+        Some(false),
+        "an empty scope is evaluated, not degraded"
+    );
+    assert_eq!(r.verdict.reason(), "empty_candidate_pool");
+    assert_eq!(r.candidates_available, 0);
+    assert_eq!(r.candidates_scanned, 0);
+}
+
 // ---------------------------------------------------------------------------
 // Wire envelope — MCP / HTTP / CLI share one builder
 // ---------------------------------------------------------------------------
@@ -406,6 +428,28 @@ mod postgres_parity {
             None,
             "unmeasured similarity stays null on postgres too"
         );
+    }
+
+    /// pg twin of the ORDERING PIN: an empty scope with no query vector is
+    /// the honest evaluated verdict on postgres too, so the two backends
+    /// answer identically.
+    #[tokio::test]
+    async fn pg_empty_store_with_no_query_embedding_is_evaluated_not_degraded_3350() {
+        let Some(url) = pg_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect pg");
+        let ns = format!("dup3350-{}", uuid::Uuid::new_v4());
+        let text = ai_memory::embeddings::embedding_document("anything", "anything at all");
+        let check = store
+            .check_duplicate_with_text(&[], "anything", &text, Some(&ns), 0.85)
+            .await
+            .expect("check_duplicate_with_text");
+        assert_eq!(check.verdict.as_bool(), Some(false));
+        assert_eq!(check.verdict.reason(), "empty_candidate_pool");
+        assert_eq!(check.candidates_available, 0);
+        assert_eq!(check.candidates_scanned, 0);
     }
 
     /// pg twin of the DENIED path: a scope whose rows carry no comparable

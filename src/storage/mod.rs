@@ -10839,17 +10839,21 @@ pub fn check_duplicate(
     // compared to anything read as a confident "not a duplicate" and the
     // caller wrote over / beside an existing memory. The three cases are now
     // distinct on the wire.
-    let verdict = if query_embedding.is_empty() {
+    // ORDER IS LOAD-BEARING (#3350 gate finding). "Nothing was in scope" is
+    // decided FIRST: an empty scope is an honest evaluated "not a duplicate"
+    // no matter why we could not compare — there was nothing to compare
+    // against. Testing `query_embedding.is_empty()` first would report a
+    // degraded no-verdict for an empty store, which is both wrong and out of
+    // parity with the postgres twin (whose empty-embedding arm already
+    // resolves an empty scope to `EmptyCandidatePool`).
+    let verdict = if available == 0 {
+        DuplicateVerdict::NotDuplicate(DuplicateEvidence::EmptyCandidatePool)
+    } else if query_embedding.is_empty() {
         DuplicateVerdict::Undetermined(DuplicateUndetermined::QueryEmbeddingUnavailable)
     } else if scanned == 0 {
-        if available == 0 {
-            // Nothing was in scope: an honest, evaluated "not a duplicate".
-            DuplicateVerdict::NotDuplicate(DuplicateEvidence::EmptyCandidatePool)
-        } else {
-            // Rows WERE in scope and not one of them could be compared
-            // (dimension mismatch, malformed blob, foreign embedding space).
-            DuplicateVerdict::Undetermined(DuplicateUndetermined::NoComparableCandidates)
-        }
+        // Rows WERE in scope and not one of them could be compared
+        // (dimension mismatch, malformed blob, foreign embedding space).
+        DuplicateVerdict::Undetermined(DuplicateUndetermined::NoComparableCandidates)
     } else if best
         .as_ref()
         .and_then(|m| m.similarity)

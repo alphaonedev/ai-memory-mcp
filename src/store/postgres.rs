@@ -32180,6 +32180,11 @@ impl MemoryStore for PostgresStore {
             // write was unique when nothing had been compared at all. It is
             // now an explicit no-verdict (unless nothing was in scope, which
             // IS an honest "not a duplicate").
+            //
+            // ORDER IS LOAD-BEARING and is the SAME order the sqlite twin
+            // uses: empty scope wins over a missing query vector, because
+            // there was nothing to compare against either way. Pinned on both
+            // backends by `empty_store_with_no_query_embedding_*_3350`.
             let verdict = if candidates_scanned == 0 {
                 crate::models::DuplicateVerdict::NotDuplicate(
                     crate::models::DuplicateEvidence::EmptyCandidatePool,
