@@ -58,6 +58,8 @@ use std::time::Duration;
 /// #3166 — the resolved `config.toml` path, reported by both the `--hooks`
 /// JSON payload and the `Configuration` report section. One name, one spelling.
 const FACT_CONFIG_PATH: &str = "config_path";
+/// #3385 — the retention posture the GC and forget paths actually consume.
+const FACT_ARCHIVE_ON_GC_EFFECTIVE: &str = "archive_on_gc_effective";
 /// #2555 — schema-refusal fact labels, shared by the schema-ahead / zeroed /
 /// poisoned Storage-Critical arms so the three refusals report one spelling.
 const FACT_DB_SCHEMA: &str = "db_schema";
@@ -1385,17 +1387,22 @@ fn section_config_health_3166() -> ReportSection {
                     "status".into(),
                     "skipped (AI_MEMORY_NO_CONFIG is truthy)".into(),
                 ),
+                (FACT_ARCHIVE_ON_GC_EFFECTIVE.into(), true.to_string()),
             ],
             note: None,
         };
     }
     match crate::config::AppConfig::load_for_boot() {
-        Ok(_) => ReportSection {
+        Ok(config) => ReportSection {
             name: NAME.into(),
             severity: Severity::Info,
             facts: vec![
                 (FACT_CONFIG_PATH.into(), config_path),
                 ("status".into(), "ok (or absent — compiled defaults)".into()),
+                (
+                    FACT_ARCHIVE_ON_GC_EFFECTIVE.into(),
+                    config.effective_archive_on_gc().to_string(),
+                ),
             ],
             note: None,
         },
@@ -1406,6 +1413,7 @@ fn section_config_health_3166() -> ReportSection {
                 (FACT_CONFIG_PATH.into(), config_path),
                 ("status".into(), "UNUSABLE".into()),
                 ("error".into(), format!("{e:#}")),
+                (FACT_ARCHIVE_ON_GC_EFFECTIVE.into(), true.to_string()),
             ],
             note: Some(
                 "config.toml exists but cannot be honoured — `ai-memory serve` REFUSES \
@@ -3412,6 +3420,23 @@ mod tests {
             assert!(v.get(k).is_some(), "expected key {k} in JSON");
         }
         assert_eq!(v["sections"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn configuration_report_names_effective_archive_on_gc_fact_3385() {
+        let cfg: crate::config::AppConfig =
+            toml::from_str("archive_on_gc = true\n\n[storage]\narchive_on_gc = false")
+                .expect("mixed config");
+        let section = ReportSection {
+            name: "Configuration".into(),
+            severity: Severity::Info,
+            facts: vec![(
+                FACT_ARCHIVE_ON_GC_EFFECTIVE.into(),
+                cfg.effective_archive_on_gc().to_string(),
+            )],
+            note: None,
+        };
+        assert_eq!(fact(&section, FACT_ARCHIVE_ON_GC_EFFECTIVE), "false");
     }
 
     // -------------------------------------------------------------------

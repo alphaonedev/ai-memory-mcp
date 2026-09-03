@@ -1259,8 +1259,12 @@ When garbage collection expires a memory, it can be **archived** instead of perm
 Enable archiving in `~/.config/ai-memory/config.toml`:
 
 ```toml
+[storage]
 archive_on_gc = true   # archive expired memories instead of deleting them (default: true)
 ```
+
+The deprecated top-level `archive_on_gc` key remains a compatibility fallback
+and emits a warning. When both forms are present, the `[storage]` value wins.
 
 ### CLI Commands
 

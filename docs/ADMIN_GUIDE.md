@@ -1021,7 +1021,7 @@ ai-memory gc
 curl -X POST http://127.0.0.1:9077/api/v1/gc
 ```
 
-By default, GC archives expired memories before deleting them. To disable archiving and permanently delete instead, set `archive_on_gc = false` in `config.toml`. Archived memories are moved to a separate archive table and can be listed, restored, or purged:
+By default, GC archives expired memories before deleting them. To disable archiving and permanently delete instead, set `[storage].archive_on_gc = false` in `config.toml`. The deprecated top-level key remains a warning-emitting compatibility fallback; `[storage]` wins when both are present. Archived memories are moved to a separate archive table and can be listed, restored, or purged:
 
 ```bash
 # List archived memories

@@ -151,6 +151,45 @@ fn doctor_reports_clean_on_fresh_db() {
 }
 
 #[test]
+fn doctor_reports_effective_archive_on_gc_for_v2_and_legacy_config_3385() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("ai-memory.db");
+    init_db(&db);
+
+    let config_dir = tmp.path().join(".config").join("ai-memory");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    std::fs::write(&config_path, "[storage]\narchive_on_gc = false\n").unwrap();
+
+    let mut v2 = ai_memory(&db);
+    v2.env_remove("AI_MEMORY_NO_CONFIG")
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", tmp.path())
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "archive_on_gc_effective          false",
+        ));
+
+    std::fs::write(&config_path, "archive_on_gc = false\n").unwrap();
+    let mut legacy = ai_memory(&db);
+    legacy
+        .env_remove("AI_MEMORY_NO_CONFIG")
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", tmp.path())
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "archive_on_gc_effective          false",
+        ))
+        .stderr(predicate::str::contains(
+            "legacy v1 flat-field configuration shape",
+        ));
+}
+
+#[test]
 fn doctor_warns_on_dim_violations() {
     // Simulate the post-P2 schema by manually adding the `embedding_dim`
     // column. Pre-P2 the column doesn't exist and `db::doctor_dim_violations`

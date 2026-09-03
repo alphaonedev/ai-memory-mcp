@@ -8824,10 +8824,16 @@ impl AppConfig {
 
     /// Whether to archive memories before GC deletion (default: true).
     ///
-    /// DOC-6: legacy resolver — kept for v0.7.x backward compat.
+    /// The canonical v2 `[storage].archive_on_gc` key wins over the
+    /// deprecated flat key. The flat key remains a lowest-precedence
+    /// compatibility fallback and emits the config-load deprecation WARN.
     #[allow(deprecated)]
     pub fn effective_archive_on_gc(&self) -> bool {
-        self.archive_on_gc.unwrap_or(true)
+        self.storage
+            .as_ref()
+            .and_then(|storage| storage.archive_on_gc)
+            .or(self.archive_on_gc)
+            .unwrap_or(true)
     }
 
     /// #1775 — one-shot boot WARN when the resolved `archive_on_gc` is
@@ -11147,6 +11153,33 @@ legacy_scoring = false
             ..AppConfig::default()
         };
         assert!(!cfg.effective_archive_on_gc());
+    }
+
+    #[test]
+    fn effective_archive_on_gc_honours_both_config_placements_3385() {
+        let legacy: AppConfig = toml::from_str("archive_on_gc = false").expect("legacy config");
+        assert!(
+            !legacy.effective_archive_on_gc(),
+            "deprecated flat archive_on_gc must remain a compatibility fallback"
+        );
+
+        let sectioned: AppConfig =
+            toml::from_str("[storage]\narchive_on_gc = false").expect("v2 config");
+        assert!(
+            !sectioned.effective_archive_on_gc(),
+            "canonical [storage].archive_on_gc must reach every GC consumer"
+        );
+    }
+
+    #[test]
+    fn effective_archive_on_gc_v2_wins_over_deprecated_flat_key_3385() {
+        let cfg: AppConfig =
+            toml::from_str("archive_on_gc = true\n\n[storage]\narchive_on_gc = false")
+                .expect("mixed legacy and v2 config");
+        assert!(
+            !cfg.effective_archive_on_gc(),
+            "the canonical v2 section must win when both placements are present"
+        );
     }
 
     // #1775 — the boot WARN helper is a pure side-effecting `eprintln`/
