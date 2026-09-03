@@ -68,6 +68,7 @@ pub fn cmd_notify(
     db_path: &std::path::Path,
     args: &NotifyArgs,
     app_config: &AppConfig,
+    caller: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
@@ -90,8 +91,9 @@ pub fn cmd_notify(
         params[db::META_KEY_WHY_TRACE] = json!(wt);
     }
 
-    let envelope = crate::mcp::handle_notify(&conn, &params, &resolved_ttl, None)
-        .map_err(|e| anyhow::anyhow!("notify: {e}"))?;
+    let envelope =
+        crate::mcp::handle_notify_for_caller(&conn, &params, &resolved_ttl, None, caller)
+            .map_err(|e| anyhow::anyhow!("notify: {e}"))?;
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string(&envelope)?)?;
@@ -124,7 +126,7 @@ mod tests {
             json: true,
         };
         let mut out = env.output();
-        let err = cmd_notify(&db, &args, &cfg, &mut out).expect_err("must fail");
+        let err = cmd_notify(&db, &args, &cfg, None, &mut out).expect_err("must fail");
         assert!(err.to_string().contains("notify"), "got: {err}");
     }
 
@@ -144,10 +146,16 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_notify(&db, &args, &cfg, &mut out).expect("notify ok");
+            cmd_notify(&db, &args, &cfg, Some("ai:cli-sender"), &mut out).expect("notify ok");
         }
         let stdout = env.stdout_str();
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
         assert_eq!(envelope["to"].as_str(), Some("ai:bob"));
+        assert_eq!(envelope["from"].as_str(), Some("ai:cli-sender"));
+        let conn = db::open(&db).unwrap();
+        let stored = db::get(&conn, envelope["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.metadata["agent_id"], "ai:cli-sender");
     }
 }

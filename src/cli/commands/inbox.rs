@@ -18,9 +18,9 @@ use crate::storage as db;
 /// CLI args for `ai-memory inbox`.
 #[derive(Args, Debug, Clone)]
 pub struct InboxArgs {
-    /// Inbox owner. Default = caller agent_id.
-    #[arg(long = "agent-id", value_name = "AGENT_ID")]
-    pub agent_id: Option<String>,
+    /// Requested inbox owner; must match the resolved caller.
+    #[arg(long = "inbox-agent-id", value_name = "AGENT_ID")]
+    pub inbox_agent_id: Option<String>,
 
     /// Only return messages with `access_count == 0`.
     #[arg(long = "unread-only")]
@@ -45,12 +45,14 @@ pub struct InboxArgs {
 pub fn cmd_inbox(
     db_path: &std::path::Path,
     args: &InboxArgs,
+    caller: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
+    let caller = crate::identity::resolve_agent_id(caller, None)?;
 
     let mut params = json!({});
-    if let Some(a) = &args.agent_id {
+    if let Some(a) = &args.inbox_agent_id {
         params["agent_id"] = json!(a);
     }
     if args.unread_only {
@@ -60,9 +62,7 @@ pub fn cmd_inbox(
         params["limit"] = json!(l);
     }
 
-    // CLI is single-tenant (the operator runs it locally) → trust-all caller
-    // (None), preserving the existing `--agent-id`-selects-inbox behavior. #1557.
-    let envelope = crate::mcp::handle_inbox(&conn, &params, None, None)
+    let envelope = crate::mcp::handle_inbox(&conn, &params, None, Some(&caller))
         .map_err(|e| anyhow::anyhow!("inbox: {e}"))?;
 
     if args.json {
@@ -98,14 +98,14 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = InboxArgs {
-            agent_id: Some("ai:alice".into()),
+            inbox_agent_id: Some("ai:alice".into()),
             unread_only: false,
             limit: None,
             json: true,
         };
         {
             let mut out = env.output();
-            cmd_inbox(&db, &args, &mut out).expect("ok");
+            cmd_inbox(&db, &args, Some("ai:alice"), &mut out).expect("ok");
         }
         let stdout = env.stdout_str();
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
@@ -124,14 +124,14 @@ mod tests {
             "message payload",
         );
         let args = InboxArgs {
-            agent_id: Some("ai:bob".into()),
+            inbox_agent_id: Some("ai:bob".into()),
             unread_only: false,
             limit: Some(10),
             json: false,
         };
         {
             let mut out = env.output();
-            cmd_inbox(&db, &args, &mut out).expect("ok");
+            cmd_inbox(&db, &args, Some("ai:bob"), &mut out).expect("ok");
         }
         let stdout = env.stdout_str();
         assert!(stdout.contains("1 message(s) for ai:bob"), "got: {stdout}");
@@ -146,17 +146,37 @@ mod tests {
         let db = env.db_path.clone();
         crate::cli::test_utils::seed_memory(&db, "_messages/ai:carol", "msg", "body");
         let args = InboxArgs {
-            agent_id: Some("ai:carol".into()),
+            inbox_agent_id: Some("ai:carol".into()),
             unread_only: true,
             limit: None,
             json: true,
         };
         {
             let mut out = env.output();
-            cmd_inbox(&db, &args, &mut out).expect("ok");
+            cmd_inbox(&db, &args, Some("ai:carol"), &mut out).expect("ok");
         }
         let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
         // Freshly seeded row has access_count==0 → unread → still listed.
         assert_eq!(envelope["count"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn inbox_cli_refuses_foreign_owner_3433() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        crate::cli::test_utils::seed_memory(&db, "_messages/ai:bob", "msg", "body");
+        let args = InboxArgs {
+            inbox_agent_id: Some("ai:bob".into()),
+            unread_only: false,
+            limit: None,
+            json: true,
+        };
+        let mut out = env.output();
+        let error = cmd_inbox(&db, &args, Some("ai:alice"), &mut out)
+            .expect_err("caller must not select another agent's inbox");
+        assert!(
+            error.to_string().contains("may only read its own inbox"),
+            "got: {error}"
+        );
     }
 }

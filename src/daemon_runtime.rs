@@ -2704,7 +2704,7 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::commands::subscribe::cmd_subscribe(&db_path, &a, &mut out)
+            cli::commands::subscribe::cmd_subscribe(&db_path, &a, cli_agent_id.as_deref(), &mut out)
         }
         Command::Unsubscribe(a) => {
             let stdout = std::io::stdout();
@@ -2744,7 +2744,13 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::commands::notify::cmd_notify(&db_path, &a, app_config, &mut out)
+            cli::commands::notify::cmd_notify(
+                &db_path,
+                &a,
+                app_config,
+                cli_agent_id.as_deref(),
+                &mut out,
+            )
         }
         Command::Inbox(a) => {
             let stdout = std::io::stdout();
@@ -2752,7 +2758,7 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::commands::inbox::cmd_inbox(&db_path, &a, &mut out)
+            cli::commands::inbox::cmd_inbox(&db_path, &a, cli_agent_id.as_deref(), &mut out)
         }
         Command::IngestMultistep(a) => {
             let stdout = std::io::stdout();
@@ -11928,6 +11934,100 @@ mod tests {
     // boilerplate itself. These three tests exercise the read-only
     // (mutation-free, hermetic) verb of each arm so coverage closes
     // without adding any production semantics.
+
+    #[tokio::test]
+    async fn fx_c3_cli_dispatch_binds_global_agent_id_3433() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let db_path = env.db_path.to_str().unwrap();
+        let caller = "ai:cli-caller-3433";
+        let target = "ai:cli-target-3433";
+        let cfg = AppConfig::default();
+
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            crate::db::register_agent(&conn, caller, "test", &[]).unwrap();
+        }
+
+        let notify = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            db_path,
+            "--agent-id",
+            caller,
+            "notify",
+            "--target-agent-id",
+            target,
+            "--title",
+            "caller identity",
+            "--payload",
+            "must not fall back to the host",
+        ])
+        .unwrap();
+        run(notify, &cfg, None).await.unwrap();
+
+        let subscribe = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            db_path,
+            "--agent-id",
+            caller,
+            "subscribe",
+            "--url",
+            "https://example.com/hook-3433",
+            "--secret",
+            "test-secret-3433",
+        ])
+        .unwrap();
+        run(subscribe, &cfg, None).await.unwrap();
+
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let notified = crate::db::list(
+                &conn,
+                Some(&format!("_messages/{target}")),
+                None,
+                10,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(notified.len(), 1);
+            assert_eq!(notified[0].metadata["agent_id"], caller);
+            let subscriptions = crate::subscriptions::list(&conn, Some(caller)).unwrap();
+            assert_eq!(subscriptions.len(), 1);
+            assert_eq!(subscriptions[0].created_by.as_deref(), Some(caller));
+        }
+
+        let foreign_inbox = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            db_path,
+            "--agent-id",
+            caller,
+            "inbox",
+            "--inbox-agent-id",
+            target,
+        ])
+        .unwrap();
+        let error = run(foreign_inbox, &cfg, None)
+            .await
+            .expect_err("CLI caller must not select another agent's inbox");
+        assert!(
+            error.to_string().contains("may only read its own inbox"),
+            "got: {error}"
+        );
+
+        let own_inbox =
+            Cli::try_parse_from(["ai-memory", "--db", db_path, "--agent-id", caller, "inbox"])
+                .unwrap();
+        run(own_inbox, &cfg, None).await.unwrap();
+    }
 
     #[tokio::test]
     async fn test_run_dispatch_identity_list_command() {

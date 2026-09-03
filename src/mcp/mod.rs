@@ -664,6 +664,7 @@ pub use namespace::{
     handle_namespace_get_standard, handle_namespace_set_standard,
     handle_namespace_set_standard_trusted,
 };
+pub(crate) use notify::handle_notify_for_caller;
 pub use notify::{handle_inbox, handle_notify};
 pub use pending::{handle_pending_approve, handle_pending_reject};
 // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.
@@ -729,6 +730,7 @@ pub use entity_register::handle_entity_register;
 pub use ingest_multistep::{IngestMultistepHandler, handle_ingest_multistep};
 pub use kg_invalidate::handle_kg_invalidate;
 pub use kg_timeline::handle_kg_timeline;
+pub(crate) use subscribe::handle_subscribe_for_caller;
 pub use subscribe::{handle_list_subscriptions, handle_subscribe};
 pub use swarm_rewind::handle_swarm_rewind;
 pub use verify::handle_verify;

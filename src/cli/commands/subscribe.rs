@@ -68,6 +68,7 @@ pub struct SubscribeArgs {
 pub fn cmd_subscribe(
     db_path: &std::path::Path,
     args: &SubscribeArgs,
+    caller: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
@@ -89,7 +90,7 @@ pub fn cmd_subscribe(
         params[field_names::EVENT_TYPES] = json!(args.event_types);
     }
 
-    let envelope = crate::mcp::handle_subscribe(&conn, &params, None)
+    let envelope = crate::mcp::handle_subscribe_for_caller(&conn, &params, None, caller)
         .map_err(|e| anyhow::anyhow!("subscribe: {e}"))?;
 
     if args.json {
@@ -124,9 +125,10 @@ mod tests {
         let mut out = env.output();
         // The CLI dispatcher caller is not registered in `_agents` →
         // substrate refuses with the registration-required error.
-        let err = cmd_subscribe(&db, &args, &mut out).expect_err("must fail");
+        let err =
+            cmd_subscribe(&db, &args, Some("ai:unregistered"), &mut out).expect_err("must fail");
         assert!(
-            err.to_string().contains("subscribe") || err.to_string().contains("register"),
+            err.to_string().contains("ai:unregistered") && err.to_string().contains("register"),
             "got: {err}"
         );
     }
@@ -141,8 +143,7 @@ mod tests {
         let db = env.db_path.clone();
         {
             let conn = db::open(&db).unwrap();
-            let agent_id = crate::identity::resolve_agent_id(None, None).unwrap();
-            db::register_agent(&conn, &agent_id, "test", &[]).expect("register");
+            db::register_agent(&conn, "ai:cli-subscriber", "test", &[]).expect("register");
         }
         let args = SubscribeArgs {
             url: "https://example.com/hook".into(),
@@ -155,11 +156,12 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_subscribe(&db, &args, &mut out).expect("subscribe ok");
+            cmd_subscribe(&db, &args, Some("ai:cli-subscriber"), &mut out).expect("subscribe ok");
         }
         let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
         assert!(envelope["id"].is_string());
         assert_eq!(envelope["url"], "https://example.com/hook");
+        assert_eq!(envelope[field_names::CREATED_BY], "ai:cli-subscriber");
     }
 
     #[test]
@@ -183,7 +185,7 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_subscribe(&db, &args, &mut out).expect("subscribe ok");
+            cmd_subscribe(&db, &args, None, &mut out).expect("subscribe ok");
         }
         let stdout = env.stdout_str();
         assert!(stdout.contains("subscribe: id="), "got: {stdout}");

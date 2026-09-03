@@ -15,6 +15,16 @@ pub fn handle_notify(
     resolved_ttl: &crate::config::ResolvedTtl,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
+    handle_notify_for_caller(conn, params, resolved_ttl, mcp_client, None)
+}
+
+pub(crate) fn handle_notify_for_caller(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    mcp_client: Option<&str>,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let target = params[param_names::TARGET_AGENT_ID]
         .as_str()
         .ok_or("target_agent_id is required")?;
@@ -41,7 +51,8 @@ pub fn handle_notify(
     validate::validate_title(title).map_err(|e| e.to_string())?;
     validate::validate_content(payload).map_err(|e| e.to_string())?;
 
-    let sender = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    let sender =
+        crate::identity::resolve_agent_id(caller, mcp_client).map_err(|e| e.to_string())?;
     let namespace = super::agent::messages_namespace_for(target);
 
     let now = chrono::Utc::now();

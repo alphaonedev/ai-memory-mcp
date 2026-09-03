@@ -97,13 +97,22 @@ pub fn handle_subscribe(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
+    handle_subscribe_for_caller(conn, params, mcp_client, None)
+}
+
+pub(crate) fn handle_subscribe_for_caller(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    mcp_client: Option<&str>,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let url = params["url"].as_str().ok_or("url is required")?;
     let events = params["events"].as_str().unwrap_or("*");
     let secret = params["secret"].as_str();
     let namespace_filter = params[param_names::NAMESPACE_FILTER].as_str();
     let agent_filter = params[param_names::AGENT_FILTER].as_str();
     let created_by =
-        crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+        crate::identity::resolve_agent_id(caller, mcp_client).map_err(|e| e.to_string())?;
 
     // R3-S1.HMAC (v0.7.0 fix campaign 2026-05-13): refuse subscription
     // registration when neither a per-subscription `secret` nor a
