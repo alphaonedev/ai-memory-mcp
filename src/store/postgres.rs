@@ -6862,7 +6862,11 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v96 embed-skip ddl", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // #3344 follow-up (Fable hotfix): a settled arm stamps its LITERAL
+        // version, never `CURRENT_SCHEMA_VERSION` — otherwise a node that
+        // crashes between the v96 and v97 commits restarts stamped 97 with
+        // `migrate_v97` never run (the same rule every arm above follows).
+        record_schema_version(&mut tx, 96).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v96 migration", e))?;
