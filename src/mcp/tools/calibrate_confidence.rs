@@ -32,7 +32,9 @@ use crate::confidence::calibrate::{DEFAULT_WINDOW_DAYS, calibrate_from_shadow};
 /// ```
 ///
 /// Errors:
-/// * `days must be a positive integer` — caller passed `days <= 0`.
+/// * `days must be non-negative` — caller passed `days < 0`.
+/// * `days must not exceed 36500 days` — caller exceeded the bounded
+///   calibration window.
 /// * `memory_calibrate_confidence substrate error: ...` — SQL error.
 pub fn handle_calibrate_confidence(
     conn: &rusqlite::Connection,
@@ -42,8 +44,14 @@ pub fn handle_calibrate_confidence(
         .get("days")
         .and_then(Value::as_i64)
         .unwrap_or(DEFAULT_WINDOW_DAYS);
-    if days <= 0 {
-        return Err("days must be a positive integer".to_string());
+    if days < 0 {
+        return Err("days must be non-negative".to_string());
+    }
+    if days > crate::validate::MAX_DURATION_DAYS {
+        return Err(format!(
+            "days must not exceed {} days (got {days})",
+            crate::validate::MAX_DURATION_DAYS
+        ));
     }
 
     let report = calibrate_from_shadow(conn, days, chrono::Utc::now())
@@ -62,7 +70,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct CalibrateConfidenceRequest {
-    /// Window days.
+    /// Window days (0..=36500).
     #[serde(default)]
     pub days: Option<i64>,
 
@@ -146,13 +154,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_positive_days() {
+    fn rejects_negative_days() {
         let (conn, _dir) = open_tmp();
-        let err = handle_calibrate_confidence(&conn, &json!({"days": 0})).expect_err("must reject");
-        assert!(err.contains("positive integer"));
         let err =
             handle_calibrate_confidence(&conn, &json!({"days": -1})).expect_err("must reject");
-        assert!(err.contains("positive integer"));
+        assert!(err.contains("non-negative"));
     }
 
     #[test]
@@ -162,6 +168,29 @@ mod tests {
         assert_eq!(
             v["report"]["window_days"].as_i64().unwrap(),
             DEFAULT_WINDOW_DAYS
+        );
+    }
+
+    #[test]
+    fn bounded_days_refuse_huge_and_allow_maximum_3384() {
+        let (conn, _dir) = open_tmp();
+        let err = handle_calibrate_confidence(&conn, &json!({"days": i64::MAX}))
+            .expect_err("huge calibration window must be refused without panicking");
+        assert!(err.contains("must not exceed 36500"), "got: {err}");
+
+        let zero = handle_calibrate_confidence(&conn, &json!({"days": 0}))
+            .expect("zero is the documented empty-window calibration shape");
+        assert_eq!(zero["report"]["window_days"].as_i64(), Some(0));
+        assert_eq!(zero["report"]["total_observations"].as_u64(), Some(0));
+
+        let value = handle_calibrate_confidence(
+            &conn,
+            &json!({"days": crate::validate::MAX_DURATION_DAYS}),
+        )
+        .expect("maximum bounded window remains valid");
+        assert_eq!(
+            value["report"]["window_days"].as_i64(),
+            Some(crate::validate::MAX_DURATION_DAYS)
         );
     }
 }

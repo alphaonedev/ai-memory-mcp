@@ -3271,6 +3271,26 @@ pub(crate) fn lookup_dispatch(tool_name: &str) -> Option<DispatchFn> {
     map.get(tool_name).copied()
 }
 
+/// Run one synchronous MCP tool behind an unwind boundary so a handler panic
+/// becomes a per-request error instead of terminating the shared stdio server.
+fn dispatch_with_panic_isolation<F>(tool_name: &str, dispatch: F) -> Result<Value, String>
+where
+    F: FnOnce() -> Result<Value, String>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(dispatch)) {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                tool = tool_name,
+                "MCP tool panic isolated at dispatch boundary"
+            );
+            Err(format!(
+                "tool '{tool_name}' panicked; the request was isolated"
+            ))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn handle_request(
@@ -3602,7 +3622,11 @@ fn handle_request(
                     format!("unknown tool: {tool_name}"),
                 );
             };
-            let result = dispatch(&ctx);
+            // #3384 — a panic in one synchronous handler must not unwind the
+            // task that owns the shared stdio session. Transactions and locks
+            // still unwind normally inside this boundary; the caller receives
+            // an ordinary tool error and subsequent requests remain live.
+            let result = dispatch_with_panic_isolation(tool_name, || dispatch(&ctx));
 
             // Outcome + elapsed reported under the `mcp_tool_call` span so
             // exporters can chart per-tool p95/p99 against PERFORMANCE.md
@@ -16621,6 +16645,21 @@ mod tests {
                  registered in registered_tools() — orphan dispatch wrapper (#1050)"
             );
         }
+    }
+
+    #[test]
+    fn dispatch_survives_a_simulated_tool_panic_3384() {
+        let isolated = super::dispatch_with_panic_isolation("memory_test_panic", || {
+            panic!("simulated tool panic")
+        })
+        .expect_err("panic must become a request error");
+        assert!(isolated.contains("request was isolated"));
+
+        let subsequent = super::dispatch_with_panic_isolation("memory_test_ok", || {
+            Ok(json!({"server_alive": true}))
+        })
+        .expect("a later dispatch must still run");
+        assert_eq!(subsequent["server_alive"], true);
     }
 
     // -----------------------------------------------------------------

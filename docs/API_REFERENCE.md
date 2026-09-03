@@ -1125,7 +1125,7 @@ Equivalent MCP tool: `memory_archive_restore` (`src/mcp/tools/archive.rs`).
 
 ### `DELETE /api/v1/archive?older_than_days=30` — purge archived memories
 
-Query: `older_than_days` (optional). Without the query param, all
+Query: `older_than_days` (optional, `0..=36500`). Without the query param, all
 archived rows are eligible. Returns `{"purged": N}`. Equivalent MCP
 tool: `memory_archive_purge` (`src/mcp/tools/archive.rs`).
 

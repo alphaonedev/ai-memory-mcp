@@ -402,7 +402,7 @@ impl McpTool for ArchiveListTool {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct ArchivePurgeRequest {
-    /// Only purge entries older than N days.
+    /// Only purge entries older than N days (0..=36500).
     #[serde(default)]
     pub older_than_days: Option<i64>,
 
@@ -885,5 +885,26 @@ mod tests {
             purged.is_number(),
             "expected numeric `purged`, got: {purged}"
         );
+    }
+
+    #[test]
+    fn archive_purge_refuses_huge_days_and_allows_maximum_3384() {
+        let conn = open_conn();
+        let err = handle_archive_purge(
+            &conn,
+            &json!({"older_than_days": i64::MAX, "agent_id": "ai:archive-owner"}),
+        )
+        .expect_err("huge archive cutoff must be refused without panicking");
+        assert!(err.contains("must not exceed 36500"), "got: {err}");
+
+        let value = handle_archive_purge(
+            &conn,
+            &json!({
+                "older_than_days": crate::validate::MAX_DURATION_DAYS,
+                "agent_id": "ai:archive-owner",
+            }),
+        )
+        .expect("maximum bounded cutoff remains valid");
+        assert_eq!(value["purged"].as_u64(), Some(0));
     }
 }
