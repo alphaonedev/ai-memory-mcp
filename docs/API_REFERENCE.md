@@ -1375,11 +1375,39 @@ router in `src/lib.rs`.
 | `GET`  | `/api/v1/capabilities` | Capabilities envelope (schema_version `"3"`; `Accept-Capabilities` header negotiates v1/v2). MCP: `memory_capabilities`. |
 | `POST` | `/api/v1/notify` | Agent-to-agent inbox message. Sender resolved from `X-Agent-Id` only (#901); body `agent_id` must match or 403. MCP: `memory_notify`. |
 | `GET`  | `/api/v1/inbox` | Read the calling agent's inbox. MCP: `memory_inbox`; when `AI_MEMORY_AGENT_ID` is unset, access is bound to the same process-derived identity used by `memory_notify`, and an explicit `agent_id` must match it. MCP refuses startup when `AI_MEMORY_AGENT_ID` is configured empty or malformed. An isolated single-tenant process may explicitly set `[mcp] single_tenant_trust_all = true` to restore caller-unbound inbox selection; every use emits a WARN. |
-| `GET` `POST` `DELETE` | `/api/v1/skill/list`, `/api/v1/skill/register`, `/api/v1/skill/{id}`, `/api/v1/skill/{id}/resource`, `/api/v1/skill/{id}/export`, `/api/v1/skill/{id}/promote`, `/api/v1/skill/{id}/compose` | Cluster E API-2 (#767) — Agent Skills HTTP parity for the seven `memory_skill_*` MCP tools. **Admin-gated.** |
+| `GET` `POST` `DELETE` | `/api/v1/skill/list`, `/api/v1/skill/register`, `/api/v1/skill/{id}`, `/api/v1/skill/{id}/resource`, `/api/v1/skill/{id}/export`, `/api/v1/skill/{id}/promote`, `/api/v1/skill/{id}/compose` | Cluster E API-2 (#767) — Agent Skills HTTP parity for the seven `memory_skill_*` MCP tools. **Admin-gated.** `…/export` writes on the daemon host and is **jailed** — see *Skills export root* below. |
 | `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. |
 | `GET`  | `/api/v1/admin/quarantine` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — list the memories currently held in federation quarantine (`handlers::list_quarantined`). **Admin-gated.** Identifying metadata ONLY (id, namespace, title, source, kind, timestamps) — never `content`: a quarantined row is untrusted input by construction and its content may be an at-rest seal sentinel. `?namespace=` narrows, `?limit=` pages (clamped to 1000). |
 | `POST` | `/api/v1/admin/quarantine/{id}/release` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — release one quarantined memory back to `lifecycle_state=open` (`handlers::release_quarantined`), the operator half of the [#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948) route-OUT contract that shipped with no caller. **Admin-gated**; the audit actor is the principal `require_admin` RETURNS — an id it admits only when it is on the admin allowlist AND the deployment has request authentication configured (#1570), and, under the `enforce` identity-binding posture, only when it is key-attested to a per-agent api key (#2044). The handler never reads `X-Agent-Id` itself. Appends a `memory.dequarantined` signed audit row in the SAME transaction as the state change on both backends. Idempotent: an id that is not currently quarantined answers `200 {"released": false}` and writes nothing (deliberately not `404` — that would leak the existence of rows this surface does not return). |
 | `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (104 at `full`, 7 at `core`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
+
+#### Skills export root (#3357)
+
+`POST /api/v1/skill/{id}/export` — and its MCP (`memory_skill_export`) and CLI
+(`ai-memory skill export`) twins — write `SKILL.md` plus a `resources/` subtree
+on the **daemon host**. The caller-supplied `target_folder` is therefore
+CONFINED to an export root, resolved fail-closed before any filesystem I/O:
+
+| Rung | Root | Created? |
+|---|---|---|
+| `AI_MEMORY_SKILLS_EXPORT_ROOT` is set | that directory | **No** — it must already exist, so an env typo REFUSES rather than silently minting a jail somewhere nobody meant |
+| unset (default) | `skills-export` **beside the resolved store** — the parent directory of the `--db` path this process opened, plus `/skills-export` | Yes, on first export, mode `0700` |
+
+If neither rung resolves to an existing directory (for example an in-memory
+store with no configured root), the export is REFUSED — it never falls back to
+an unconfined write.
+
+A `target_folder` is then refused unless it resolves INSIDE that root: a `..`
+component is rejected lexically before any I/O, a relative path is anchored at
+the root, and the deepest existing ancestor is canonicalized so a planted
+symlink out of the root (`<root>/link -> /etc`) collapses and is caught.
+Containment is re-asserted after the directory is created, before `SKILL.md` is
+written. The response still echoes the caller's `target_folder` spelling, so the
+documented register→export round-trip is unchanged.
+
+This is the write-side twin of the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail
+(#1923). The process working directory is deliberately NOT the fallback root: a
+daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 
 > **Total HTTP surface at v1.0.0: 82 unique URL paths across 96
 > production route registrations** (several paths carry more than one

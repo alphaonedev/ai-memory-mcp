@@ -1265,7 +1265,7 @@ is CLI-only; in-session recovery goes through `memory_recall` /
 |---|---|
 | `deref <ref_id>` | QW-3 — dereference a previously-offloaded blob; refuses tampered rows (SHA-256 mismatch). Pairs with `offload`. |
 | `share` | #1095 — copy a memory into `_shared/<from>→<to>/` (same primitive as `memory_share` / `POST /api/v1/share`). |
-| `skill <register\|list\|get\|resource\|export\|promote\|compose>` | Cluster E API-2 (#767) — CLI parity for the 7 `memory_skill_*` MCP tools. |
+| `skill <register\|list\|get\|resource\|export\|promote\|compose>` | Cluster E API-2 (#767) — CLI parity for the 7 `memory_skill_*` MCP tools. `export` is **jailed** (#3357): the destination folder must resolve inside the export root — `AI_MEMORY_SKILLS_EXPORT_ROOT` when set, otherwise a `skills-export` directory beside the resolved store (the parent directory of the `--db` path, created `0700` on first export). A `..` component, an absolute path outside the root, or a symlink leading out of it is REFUSED before anything is written; if neither root resolves to an existing directory the export is refused rather than falling back to an unconfined write. Same control as the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail (#1923). The process working directory is deliberately not the fallback. |
 | `namespace <set-standard\|get-standard\|clear-standard\|batman-policy>` | #800 — operator CRUD for the per-namespace standard policy pointer. |
 | `verify-reflection-chain <memory_id>` | L1-3 — walk `reflects_on` edges to depth 0, verify each Ed25519 signature, emit a chain-integrity report. Distinct from `verify-signed-events-chain` and `audit verify`. |
 
