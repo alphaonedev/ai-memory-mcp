@@ -340,7 +340,12 @@ async fn notify_fanout_postgres_reaches_w_of_n_peers() {
         "notify must succeed: {resp:?}"
     );
     let resp_body: Value = resp.json().await.expect("notify body");
-    assert_eq!(resp_body["storage_backend"], "postgres");
+    assert_eq!(
+        resp_body["namespace"],
+        ai_memory::inbox_namespace(&recipient)
+    );
+    assert_eq!(resp_body["to"], recipient);
+    assert_eq!(resp_body["tier"], "mid");
     assert!(resp_body["id"].is_string(), "notify must return id");
 
     // All three peers must observe at least one sync_push POST for

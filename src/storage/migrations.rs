@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 95).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 96).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -915,7 +915,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 95;
+const CURRENT_SCHEMA_VERSION: i64 = 96;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -1703,6 +1703,11 @@ const MIGRATION_V94_SQLITE: &str =
 // is `PostgresStore::migrate_v95`.
 const MIGRATION_V95_SQLITE: &str =
     include_str!("../../migrations/sqlite/0079_v95_attested_write_ledger.sql");
+
+// v96 (#3401, v1.0.0) — normalize legacy `_messages/<agent>` rows into the
+// backend-blind canonical `_inbox/<agent>` namespace, including archives.
+const MIGRATION_V96_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0080_v96_canonical_inbox_namespace.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3581,7 +3586,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 74 {
             // v74 = #1825 / v0.9.0 G8 (additive BLAKE3 content-id) — add
             // the `memories.cid` (TEXT) + `memories.cid_genesis` (BLOB)
             // columns + `idx_memories_cid`. SQLite lacks `ADD COLUMN IF
@@ -4237,7 +4242,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V94_SQLITE)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 95 {
             // v95 (#3419, v1.0.0) — ATTESTED-WRITE REPLAY LEDGER. The direct
             // signed-write surfaces (`POST /api/v1/memories`, `/memories/bulk`,
             // MCP `memory_store`) validated a caller-presented Ed25519
@@ -4268,6 +4273,15 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 "v95 doc twin must ship the attested_write_ledger DDL"
             );
             conn.execute_batch(MIGRATION_V95_SQLITE)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v96 (#3401, v1.0.0) — SQLite MCP historically wrote inbox rows
+            // under `_messages/<agent>` while both SAL adapters used
+            // `_inbox/<agent>`. Rewrite both live and archived legacy rows so
+            // upgrades, restore, and federation preserve a single namespace.
+            debug_assert!(MIGRATION_V96_SQLITE.contains("archived_memories"));
+            conn.execute_batch(MIGRATION_V96_SQLITE)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on
@@ -6824,5 +6838,58 @@ mod tests {
         // it is COMPLETE on both (two empty sets would satisfy equality).
         assert_memory_links_tip_shape(&upgraded, "v1 replay");
         assert_memory_links_tip_shape(&fresh, "fresh install");
+    }
+
+    #[test]
+    fn v96_moves_live_and_archived_legacy_messages_to_canonical_inbox_3401() {
+        let conn = fresh_db_via_migrate();
+        for (id, namespace) in [
+            ("legacy-live", "_messages/ai:bob"),
+            ("ordinary-live", "project/notes"),
+            ("legacy-archive", "_messages/ai:carol"),
+        ] {
+            conn.execute(
+                "INSERT INTO memories
+                 (id, tier, namespace, title, content, tags, priority, confidence,
+                  source, access_count, created_at, updated_at, metadata)
+                 VALUES (?1, 'short', ?2, ?1, 'payload', '[]', 5, 1.0,
+                         'test', 0, '2026-09-02T00:00:00Z',
+                         '2026-09-02T00:00:00Z', '{}')",
+                params![id, namespace],
+            )
+            .unwrap();
+        }
+        crate::storage::archive_memory(&conn, "legacy-archive", Some("test")).unwrap();
+
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (95)", [])
+            .unwrap();
+        migrate(&conn).unwrap();
+
+        let live_ns: String = conn
+            .query_row(
+                "SELECT namespace FROM memories WHERE id = 'legacy-live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ordinary_ns: String = conn
+            .query_row(
+                "SELECT namespace FROM memories WHERE id = 'ordinary-live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let archived_ns: String = conn
+            .query_row(
+                "SELECT namespace FROM archived_memories WHERE id = 'legacy-archive'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_ns, "_inbox/ai:bob");
+        assert_eq!(archived_ns, "_inbox/ai:carol");
+        assert_eq!(ordinary_ns, "project/notes");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
     }
 }

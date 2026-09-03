@@ -1132,7 +1132,7 @@ mod tests {
             valid_until: None,
             id: "m1".to_string(),
             tier: Tier::Mid,
-            namespace: "_messages/alice".to_string(),
+            namespace: "_inbox/alice".to_string(),
             title: "t".to_string(),
             content: "a".repeat(100),
             tags: vec![],

@@ -84,17 +84,6 @@ pub(super) fn handle_agent_list(conn: &rusqlite::Connection) -> Result<Value, St
     }))
 }
 
-// --- v0.6.0.0 agent notify / inbox -----------------------------------------
-
-/// Compose the canonical inbox namespace for a given `agent_id`.
-///
-/// Reuses the same sanitization regex that `validate_namespace` enforces
-/// on writes, so any `agent_id` that passes `validate::validate_agent_id`
-/// produces an acceptable namespace here.
-pub(super) fn messages_namespace_for(agent_id: &str) -> String {
-    format!("_messages/{agent_id}")
-}
-
 // --- D1.5 (#986): per-tool McpTool impls for the 2 meta-family agent tools ---
 
 use crate::mcp::registry::McpTool;
@@ -289,16 +278,5 @@ mod tests {
         let result = handle_agent_list(&conn).expect("list should succeed");
         assert_eq!(result["count"], 0);
         assert!(result["agents"].is_array());
-    }
-
-    #[test]
-    fn messages_namespace_for_prepends_messages_prefix() {
-        assert_eq!(messages_namespace_for("alice"), "_messages/alice");
-        assert_eq!(
-            messages_namespace_for("ai:claude@host:pid-1"),
-            "_messages/ai:claude@host:pid-1"
-        );
-        // Empty input is allowed by this helper (validator runs elsewhere).
-        assert_eq!(messages_namespace_for(""), "_messages/");
     }
 }

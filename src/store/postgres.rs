@@ -1522,6 +1522,11 @@ const MIGRATION_V94_LIFECYCLE_STATE_INDEX: &str =
 const MIGRATION_V95_ATTESTED_WRITE_LEDGER: &str =
     include_str!("../../migrations/postgres/0052_v95_attested_write_ledger.sql");
 
+/// v1.0.0 #3401 — normalize legacy `_messages/<agent>` rows into the
+/// backend-blind canonical `_inbox/<agent>` namespace, including archives.
+const MIGRATION_V96_CANONICAL_INBOX_NAMESPACE: &str =
+    include_str!("../../migrations/postgres/0053_v96_canonical_inbox_namespace.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -1912,7 +1917,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 95;
+const CURRENT_SCHEMA_VERSION: i32 = 96;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -3731,8 +3736,11 @@ impl PostgresStore {
         if current_version < 94 {
             self.migrate_v94().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 95 {
             self.migrate_v95().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v96().await?;
         }
 
         Ok(())
@@ -3817,7 +3825,7 @@ impl PostgresStore {
     /// SQLite v93 arm. Idempotent: a fresh cluster inherits the table inline
     /// from `postgres_schema.sql`, so the DDL is a no-op there; an existing
     /// cluster gains it here. NO rewrite, no reindex. Settled (non-tip)
-    /// arm — stamps the LITERAL 93, NOT [`CURRENT_SCHEMA_VERSION`] (now 94):
+    /// arm — stamps the LITERAL 93, NOT [`CURRENT_SCHEMA_VERSION`] (now 96):
     /// v93 is no longer the ladder tip, so stamping the constant here would
     /// record 94 and strand a crash-interrupted node past the v94 arm (see
     /// the stamp note below). This table holds NO durable memory truth
@@ -6744,7 +6752,7 @@ impl PostgresStore {
     /// states, and the fail-closed `lifecycle_visible_clause` allow-list is
     /// shared verbatim by both backends, so `contaminated` is hidden
     /// identically with no schema change). `CREATE INDEX IF NOT EXISTS` is
-    /// idempotent and additive. Tip arm — stamps [`CURRENT_SCHEMA_VERSION`].
+    /// idempotent and additive.
     async fn migrate_v94(&self) -> StoreResult<()> {
         debug_assert!(
             MIGRATION_V94_LIFECYCLE_STATE_INDEX.contains("idx_memories_lifecycle_state"),
@@ -6762,7 +6770,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("apply v94 lifecycle-state-index ddl", e))?;
 
         // #3419 — settled arm: stamp the LITERAL 94, not CURRENT_SCHEMA_VERSION
-        // (now 95) — crash-consistency: a crash between the v94 and v95 commits
+        // (now 96) — crash-consistency: a crash between the v94 and v95 commits
         // must not strand the node stamped-past-v95 with the v95 arm unrun.
         // (Same lockstep the #3324 comment on `migrate_v93` records.)
         record_schema_version(&mut tx, 94).await?;
@@ -6792,8 +6800,8 @@ impl PostgresStore {
     /// table is bounded by the attested-write RATE and never by history.
     ///
     /// `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS` — additive,
-    /// idempotent, no backfill, no existing row read or rewritten. Tip arm —
-    /// stamps [`CURRENT_SCHEMA_VERSION`].
+    /// idempotent, no backfill, no existing row read or rewritten. Settled arm
+    /// — stamps the literal schema version 95.
     async fn migrate_v95(&self) -> StoreResult<()> {
         debug_assert!(
             MIGRATION_V95_ATTESTED_WRITE_LEDGER.contains("attested_write_ledger"),
@@ -6810,7 +6818,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v95 attested-write-ledger ddl", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        record_schema_version(&mut tx, 95).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v95 migration", e))?;
@@ -6820,6 +6828,38 @@ impl PostgresStore {
             "schema migration v95 applied (#3419: attested_write_ledger — the durable \
              admit-once replay guard for caller-presented Ed25519 write signatures on \
              the direct store surfaces)"
+        );
+        Ok(())
+    }
+
+    /// v1.0.0 #3401 — schema v96: move legacy live and archived
+    /// `_messages/<agent>` rows to the canonical `_inbox/<agent>` namespace.
+    /// The prefix predicate makes the row rewrite idempotent.
+    async fn migrate_v96(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V96_CANONICAL_INBOX_NAMESPACE.contains("archived_memories"),
+            "#3401: the v96 DDL doc twin must migrate archived inbox rows"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v96 canonical-inbox migration tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V96_CANONICAL_INBOX_NAMESPACE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v96 canonical-inbox migration", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v96 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v96 applied (#3401: `_messages/<agent>` rows moved \
+             to canonical `_inbox/<agent>` in live and archived storage)"
         );
         Ok(())
     }
@@ -35832,6 +35872,72 @@ mod tests {
             Some(CURRENT_SCHEMA_VERSION),
             "schema_version must reach CURRENT_SCHEMA_VERSION"
         );
+    }
+
+    #[tokio::test]
+    async fn live_v96_moves_live_and_archived_legacy_messages_3401() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let live_id = format!("inbox-live-{}", uuid::Uuid::new_v4());
+        let archived_id = format!("inbox-archived-{}", uuid::Uuid::new_v4());
+        let canonical = crate::inbox_namespace("ai:sal-test");
+
+        for id in [&live_id, &archived_id] {
+            let memory = sample_memory(id, &canonical, id, "canonical inbox migration probe");
+            store.store(&ctx, &memory).await.expect("store probe row");
+        }
+        store
+            .archive_by_ids(&ctx, std::slice::from_ref(&archived_id), Some("test-3401"))
+            .await
+            .expect("archive probe row");
+
+        sqlx::query("UPDATE memories SET namespace = '_messages/ai:sal-test' WHERE id = $1")
+            .bind(&live_id)
+            .execute(&store.pool)
+            .await
+            .expect("seed legacy live namespace");
+        sqlx::query(
+            "UPDATE archived_memories SET namespace = '_messages/ai:sal-test' WHERE id = $1",
+        )
+        .bind(&archived_id)
+        .execute(&store.pool)
+        .await
+        .expect("seed legacy archived namespace");
+        sqlx::query("DELETE FROM schema_version")
+            .execute(&store.pool)
+            .await
+            .expect("clear schema stamp");
+        sqlx::query("INSERT INTO schema_version (version) VALUES (95)")
+            .execute(&store.pool)
+            .await
+            .expect("seed v95 schema stamp");
+
+        store.migrate().await.expect("apply v96 migration");
+
+        let live_namespace: String =
+            sqlx::query_scalar("SELECT namespace FROM memories WHERE id = $1")
+                .bind(&live_id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("read migrated live namespace");
+        let archived_namespace: String =
+            sqlx::query_scalar("SELECT namespace FROM archived_memories WHERE id = $1")
+                .bind(&archived_id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("read migrated archived namespace");
+        assert_eq!(live_namespace, canonical);
+        assert_eq!(archived_namespace, canonical);
+
+        let stamped: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&store.pool)
+            .await
+            .expect("read v96 schema stamp");
+        assert_eq!(stamped, CURRENT_SCHEMA_VERSION);
     }
 
     #[tokio::test]

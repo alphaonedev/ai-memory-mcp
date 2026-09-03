@@ -90,7 +90,7 @@ layout: doc
    honours semver discipline within a minor series; `0.8.0` (released
    2026-06-25) and `0.8.1` (released 2026-06-29) already shipped their
    schema bumps and new tools, and the current release is `0.9.0`
-   (schema v95, 104 MCP tools at `--profile full`). The supported pin
+   (schema v96, 104 MCP tools at `--profile full`). The supported pin
    syntax per channel:
 
    | Channel       | Pin syntax                                                          |

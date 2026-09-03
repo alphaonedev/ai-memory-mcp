@@ -121,52 +121,16 @@ pub async fn get_inbox(
                         // SAME fact from the SAME durable field.
                         !unread_only || m.access_count == 0
                     })
-                    .map(|m| {
-                        json!({
-                            "id": m.id,
-                            "title": m.title,
-                            "payload": m.content,
-                            "content": m.content,
-                            "priority": m.priority,
-                            "tier": m.tier.as_str(),
-                            "namespace": m.namespace,
-                            "metadata": m.metadata,
-                            (field_names::CREATED_AT): m.created_at,
-                            (field_names::UPDATED_AT): m.updated_at,
-                            // #3027 — surface the same read-state pair the
-                            // sqlite/MCP inbox projects, so a client cannot be
-                            // told a message is unread by one backend and read
-                            // by the other.
-                            "read": m.access_count > 0,
-                            (field_names::ACCESS_COUNT): m.access_count,
-                            "agent_id": m.metadata
-                                .get("agent_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(""),
-                            (field_names::FROM_AGENT_ID): m.metadata
-                                .get(field_names::FROM_AGENT_ID)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(""),
-                            (field_names::TARGET_AGENT_ID): m.metadata
-                                .get(field_names::TARGET_AGENT_ID)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(""),
-                        })
-                    })
+                    .map(|m| crate::mcp::inbox_message(&m))
                     .collect();
-                // #3027 — count from the SAME derived marker the filter uses.
-                let unread_count = messages
-                    .iter()
-                    .filter(|m| m.get("read").and_then(serde_json::Value::as_bool) != Some(true))
-                    .count();
                 (
                     StatusCode::OK,
-                    Json(json!({
-                        "agent_id": owner,
-                        "messages": messages,
-                        "unread_count": unread_count,
-                        (field_names::STORAGE_BACKEND): "postgres",
-                    })),
+                    Json(crate::mcp::inbox_envelope(
+                        &owner,
+                        &crate::inbox_namespace(&owner),
+                        unread_only,
+                        messages,
+                    )),
                 )
                     .into_response()
             }

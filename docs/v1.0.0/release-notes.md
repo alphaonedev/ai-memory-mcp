@@ -606,7 +606,7 @@ those two review lanes raised, and no tag has been cut.
 
 ## Schema ladder v78 → v91
 
-`CURRENT_SCHEMA_VERSION = 95` on both adapters
+`CURRENT_SCHEMA_VERSION = 96` on both adapters
 (`src/storage/migrations.rs`, `src/store/postgres.rs`); CLAUDE.md
 §Database is the SSOT. Both adapters mirror via
 `src/store/postgres.rs::{migrate_v79 … migrate_v91}`.

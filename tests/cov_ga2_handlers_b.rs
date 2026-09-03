@@ -396,13 +396,148 @@ async fn inbox_postgres_branch_empty_envelope() {
     let (status, body) = get(&r, "/api/v1/inbox").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["agent_id"], json!(AGENT));
-    // The postgres branch stamps storage_backend and an unread_count.
-    assert_eq!(
-        body[ai_memory::models::field_names::STORAGE_BACKEND],
-        json!("postgres")
-    );
+    assert_eq!(body["namespace"], json!(ai_memory::inbox_namespace(AGENT)));
+    assert_eq!(body["count"], json!(0));
+    assert_eq!(body["unread_only"], json!(false));
     assert_eq!(body["unread_count"], json!(0));
     assert_eq!(body["messages"], json!([]));
+}
+
+#[tokio::test]
+async fn notify_inbox_wire_contract_is_backend_blind_3401() {
+    let _g = GA2_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (sqlite, _sqlite_file) = sqlite_router();
+    let (postgres_path, _postgres_file) = fake_pg_router();
+    let request = json!({
+        "target_agent_id": AGENT,
+        "title": "backend-blind inbox",
+        "payload": "same request, same contract",
+    });
+
+    let (sqlite_status, sqlite_receipt) =
+        post_json(&sqlite, "/api/v1/notify", request.clone()).await;
+    let (postgres_status, postgres_receipt) =
+        post_json(&postgres_path, "/api/v1/notify", request).await;
+    assert_eq!(sqlite_status, StatusCode::CREATED);
+    assert_eq!(postgres_status, StatusCode::CREATED);
+    let sqlite_receipt_keys: std::collections::BTreeSet<_> = sqlite_receipt
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let postgres_receipt_keys: std::collections::BTreeSet<_> = postgres_receipt
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(sqlite_receipt_keys, postgres_receipt_keys);
+    for field in ["to", "namespace", "tier"] {
+        assert_eq!(sqlite_receipt[field], postgres_receipt[field], "{field}");
+    }
+    assert!(
+        sqlite_receipt["from"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert!(
+        postgres_receipt["from"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert_eq!(
+        sqlite_receipt["namespace"],
+        ai_memory::inbox_namespace(AGENT)
+    );
+    assert_eq!(sqlite_receipt["tier"], "short");
+
+    let (sqlite_status, sqlite_inbox) = get(&sqlite, "/api/v1/inbox").await;
+    let (postgres_status, postgres_inbox) = get(&postgres_path, "/api/v1/inbox").await;
+    assert_eq!(sqlite_status, StatusCode::OK);
+    assert_eq!(postgres_status, StatusCode::OK);
+    let sqlite_keys: std::collections::BTreeSet<_> = sqlite_inbox
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let postgres_keys: std::collections::BTreeSet<_> = postgres_inbox
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(sqlite_keys, postgres_keys);
+    for field in [
+        "agent_id",
+        "namespace",
+        "count",
+        "unread_count",
+        "unread_only",
+    ] {
+        assert_eq!(sqlite_inbox[field], postgres_inbox[field], "{field}");
+    }
+    let sqlite_message = &sqlite_inbox["messages"][0];
+    let postgres_message = &postgres_inbox["messages"][0];
+    let sqlite_message_keys: std::collections::BTreeSet<_> = sqlite_message
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let postgres_message_keys: std::collections::BTreeSet<_> = postgres_message
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(sqlite_message_keys, postgres_message_keys);
+    for field in [
+        "title",
+        "payload",
+        "content",
+        "priority",
+        "tier",
+        "namespace",
+        "read",
+        "access_count",
+        "target_agent_id",
+    ] {
+        assert_eq!(sqlite_message[field], postgres_message[field], "{field}");
+    }
+    assert!(
+        sqlite_message["from"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert!(
+        postgres_message["from"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+    for field in ["agent_id", "from_agent_id"] {
+        assert!(
+            sqlite_message[field]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(
+            postgres_message[field]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
+    }
+
+    for router in [&sqlite, &postgres_path] {
+        let (denied, _) = get(router, "/api/v1/inbox?agent_id=ai:someone-else").await;
+        assert_eq!(denied, StatusCode::FORBIDDEN);
+        let (allowed, body) = get(router, &format!("/api/v1/inbox?agent_id={AGENT}")).await;
+        assert_eq!(allowed, StatusCode::OK);
+        assert_eq!(body["namespace"], ai_memory::inbox_namespace(AGENT));
+    }
 }
 
 // ===========================================================================

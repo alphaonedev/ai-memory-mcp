@@ -907,7 +907,7 @@ fn fold_flips_inbox_unread_marker() {
         "notify: purity ping",
         "hello from alice",
         Tier::Short,
-        "_messages/ai:bob",
+        "_inbox/ai:bob",
     );
     let id = db::insert(&conn, &m).expect("insert inbox message");
     assert_eq!(access_count(&conn, &id), 0, "fresh message is unread");

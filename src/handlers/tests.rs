@@ -8226,7 +8226,7 @@ async fn h8b_list_subscriptions_agent_id_filter_excludes_others() {
 // ---- notify (POST /api/v1/notify) ----
 
 /// Happy path: alice notifies bob, the response carries the new id and
-/// `delivered_at` stamp; the row lands in bob's `_messages/bob` ns.
+/// `delivered_at` stamp; the row lands in bob's `_inbox/bob` ns.
 #[tokio::test]
 async fn h8b_notify_happy_path_creates_message() {
     let state = test_state();
@@ -8264,7 +8264,7 @@ async fn h8b_notify_happy_path_creates_message() {
     let lock = state.lock().await;
     let rows = db::list(
         &lock.0,
-        Some("_messages/bob"),
+        Some("_inbox/bob"),
         None,
         10,
         0,
@@ -8533,10 +8533,10 @@ async fn h8b_get_inbox_unread_only_filter_excludes_read() {
             valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Mid,
-            namespace: "_messages/alice".into(),
+            namespace: "_inbox/alice".into(),
             title: "unread".into(),
             content: "u".into(),
-            tags: vec!["_message".into()],
+            tags: vec!["notify".into()],
             priority: 5,
             confidence: 1.0,
             source: "notify".into(),
@@ -8565,10 +8565,10 @@ async fn h8b_get_inbox_unread_only_filter_excludes_read() {
             valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Mid,
-            namespace: "_messages/alice".into(),
+            namespace: "_inbox/alice".into(),
             title: "read".into(),
             content: "r".into(),
-            tags: vec!["_message".into()],
+            tags: vec!["notify".into()],
             priority: 5,
             confidence: 1.0,
             source: "notify".into(),
@@ -8633,10 +8633,10 @@ async fn h8b_get_inbox_limit_clamps_returned_count() {
                 valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Mid,
-                namespace: "_messages/alice".into(),
+                namespace: "_inbox/alice".into(),
                 title: format!("msg-{i}"),
                 content: "c".into(),
-                tags: vec!["_message".into()],
+                tags: vec!["notify".into()],
                 priority: 5,
                 confidence: 1.0,
                 source: "notify".into(),

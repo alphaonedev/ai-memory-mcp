@@ -3,7 +3,7 @@
 
 //! ARCH-8 (FX-C4-batch2, 2026-05-26) — per-migration metadata matrix.
 //!
-//! The substrate ships a 94-step migration ladder (v2 → v95) whose
+//! The substrate ships a 95-step migration ladder (v2 → v96) whose
 //! "reversible? data-loss-risk? idempotent?" contract an operator needs
 //! BEFORE they plan a rollback — restore-from-backup is the only
 //! fallback for an irreversible arm, and they must know which arms
@@ -415,9 +415,14 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // backfill and no pre-existing row is read or rewritten, so revert is DROP
     // TABLE + lowering the stamp (NoLoss — the ledger is derived
     // replay-protection state, regenerable by simply starting to record again,
-    // never durable memory truth). Literal tail: MUST equal
-    // CURRENT_SCHEMA_VERSION. Postgres twin is `PostgresStore::migrate_v95`.
+    // never durable memory truth). Settled arm. Postgres twin is
+    // `PostgresStore::migrate_v95`.
     meta(95, "ATTESTED_WRITE_REPLAY_LEDGER", true, true, NoLoss, Sqlite),
+    // v96 (#3401, v1.0.0) — rewrite pre-existing live and archived namespace
+    // values from `_messages/<agent>` to canonical `_inbox/<agent>`. The
+    // prefix-gated update is idempotent and meaning-preserving, but it writes
+    // pre-existing rows and is therefore conservatively irreversible.
+    meta(96, "CANONICAL_INBOX_NAMESPACE", true, false, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.
