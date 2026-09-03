@@ -201,7 +201,7 @@ impl McpTool for SessionStartTool {
         "Auto-recall recent memories on session start."
     }
     fn docs() -> &'static str {
-        "Most-recently-accessed/updated. Near-duplicates are clustered (#3352) so the limit budget prefers distinct facts; clustered rows may carry similar_count. At smart/autonomous tier, includes LLM summary."
+        "Most-recently-accessed/updated. At smart/autonomous tier, includes LLM summary."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SessionStartRequest>()
