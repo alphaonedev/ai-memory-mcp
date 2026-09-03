@@ -389,7 +389,7 @@ pub async fn approval_decide(
     // governance `approve_pending` postgres branch
     // (src/handlers/governance.rs): approve routes through
     // `governance_approve_with_consensus` + `execute_pending_action`;
-    // deny routes through `pending_decide(false)`.
+    // deny routes through `reject_with_approver_type` (#3448).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return approval_decide_postgres(&app, &id, &agent_id, &body).await;
@@ -490,8 +490,13 @@ pub async fn approval_decide(
             }
         }
         crate::approvals::Decision::Deny => {
-            match db::decide_pending_action(&lock.0, &id, false, &agent_id) {
-                Ok(true) => {
+            // v1.0.0 #3448 — approver gate on the deny arm, mirroring the
+            // approve arm's `db::approve_with_approver_type(.., Http)` above.
+            // Pre-fix this reached the raw structural transition, so an
+            // HMAC-valid caller could veto ANY tenant's pending action —
+            // including their own, which approve refuses.
+            match db::reject_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http) {
+                Ok(db::RejectOutcome::Rejected) => {
                     // #2634 — explicit deny chains "refuse".
                     audit_decide_verdict(&agent_id, &id, body.decision, "refuse");
                     json!({
@@ -501,10 +506,20 @@ pub async fn approval_decide(
                         "remember": format!("{:?}", body.remember).to_lowercase(),
                     })
                 }
-                Ok(false) => {
+                Ok(db::RejectOutcome::NotFound) => {
                     return (
                         StatusCode::NOT_FOUND,
                         Json(json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED})),
+                    )
+                        .into_response();
+                }
+                // #3448 — ineligible caller; the pending row is untouched.
+                // 403, mirroring the approve arm's `Rejected` response.
+                Ok(db::RejectOutcome::Refused(reason)) => {
+                    audit_decide_verdict(&agent_id, &id, body.decision, "refuse");
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error": crate::errors::msg::reject_refused(reason)})),
                     )
                         .into_response();
                 }
@@ -531,7 +546,9 @@ pub async fn approval_decide(
 /// store instead of the scratch sqlite. Mirrors the governance
 /// `approve_pending` postgres branch (src/handlers/governance.rs):
 /// approve = `governance_approve_with_consensus` +
-/// `execute_pending_action`; deny = `pending_decide(false)`.
+/// `execute_pending_action`; deny = `reject_with_approver_type`
+/// (#3448 — the deny arm is approver-gated exactly like approve; it was
+/// `pending_decide(false)`, which asks nothing about who is deciding).
 ///
 /// Response shapes are byte-identical to the sqlite K10 path (same
 /// fields, same status codes) — the storage backend is an
@@ -618,8 +635,17 @@ async fn approval_decide_postgres(
             }
         }
         crate::approvals::Decision::Deny => {
-            match app.store.pending_decide(&ctx, id, false, agent_id).await {
-                Ok(true) => {
+            // v1.0.0 #3448 — approver gate on the postgres deny arm, the twin
+            // of the sqlite branch and of the approve arm above. Pre-fix this
+            // reached the raw structural `pending_decide(.., false, ..)`, so
+            // any HMAC-valid `X-Agent-Id` principal could veto ANY tenant's
+            // pending action — including their own, which approve refuses.
+            match app
+                .store
+                .reject_with_approver_type(&ctx, id, agent_id)
+                .await
+            {
+                Ok(crate::store::RejectOutcome::Rejected) => {
                     // #2634 — explicit deny chains "refuse".
                     audit_decide_verdict(agent_id, id, body.decision, "refuse");
                     json!({
@@ -629,12 +655,21 @@ async fn approval_decide_postgres(
                         "remember": remember_label,
                     })
                 }
-                Ok(false) => {
+                Ok(crate::store::RejectOutcome::NotFound) => {
                     return (
                         StatusCode::NOT_FOUND,
                         Json(
                             json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED}),
                         ),
+                    )
+                        .into_response();
+                }
+                // #3448 — ineligible caller; the pending row is untouched.
+                Ok(crate::store::RejectOutcome::Refused(reason)) => {
+                    audit_decide_verdict(agent_id, id, body.decision, "refuse");
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error": crate::errors::msg::reject_refused(reason)})),
                     )
                         .into_response();
                 }

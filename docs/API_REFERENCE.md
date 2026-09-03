@@ -1173,6 +1173,18 @@ still collecting approvers. Equivalent MCP tool: `memory_pending_approve`
 Path param: `id`. Returns `{"rejected":true,"id":"…","decided_by":"alice"}`.
 Equivalent MCP tool: `memory_pending_reject` (`src/mcp/tools/pending.rs`).
 
+**Approver-gated (#3448).** Rejecting is a governance decision, so it requires
+the *same* approver eligibility as approving: on this multi-tenant surface the
+`X-Agent-Id` decider must be a **registered** agent and must **not** be the
+action's requester, and under an `approver = "agent:<id>"` namespace policy it
+must be that designated approver. An ineligible caller gets **403**
+`{"error":"reject refused: …"}` and the pending row is left untouched
+(`status` stays `pending`, no `decided_by`); an absent or already-decided id
+still returns **404**. The same gate applies to the `deny` decision of
+`POST /api/v1/approvals/{pending_id}` and to `ai-memory pending reject` (which
+keeps the single-operator `AI_MEMORY_AGENT_ID` opt-in posture, so a lone
+operator is never locked out of their own queue).
+
 ## Sync / federation
 
 ### `POST /api/v1/sync/push`

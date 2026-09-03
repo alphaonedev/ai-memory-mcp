@@ -565,8 +565,17 @@ pub async fn reject_pending(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
-        return match app.store.pending_decide(&ctx, &id, false, &agent_id).await {
-            Ok(true) => {
+        // v1.0.0 #3448 — approver gate, the twin of the `approve_pending`
+        // postgres branch above. Pre-fix this called the raw structural
+        // `pending_decide(.., false, ..)`, which asks nothing about WHO is
+        // deciding, so any `X-Agent-Id` principal — including the requester,
+        // whom approve refuses — could veto any other tenant's queued action.
+        return match app
+            .store
+            .reject_with_approver_type(&ctx, &id, &agent_id)
+            .await
+        {
+            Ok(crate::store::RejectOutcome::Rejected) => {
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Reject,
@@ -586,9 +595,16 @@ pub async fn reject_pending(
                 }))
                 .into_response()
             }
-            Ok(false) => (
+            Ok(crate::store::RejectOutcome::NotFound) => (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED})),
+            )
+                .into_response(),
+            // #3448 — the CALLER is not an eligible approver; the pending row
+            // is untouched. 403, mirroring the approve-side `Rejected` arm.
+            Ok(crate::store::RejectOutcome::Refused(reason)) => (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": crate::errors::msg::reject_refused(reason)})),
             )
                 .into_response(),
             Err(e) => store_err_to_response(e),
@@ -596,8 +612,13 @@ pub async fn reject_pending(
     }
 
     let lock = state.lock().await;
-    match db::decide_pending_action(&lock.0, &id, false, &agent_id) {
-        Ok(true) => {
+    // v1.0.0 #3448 — approver gate, matching the `approve_pending` sqlite
+    // branch above: `ApproveSurface::Http` enforces UNCONDITIONALLY because
+    // this surface is multi-tenant via per-request X-Agent-Id and sets no
+    // process AI_MEMORY_AGENT_ID, so the storage-layer env opt-in would never
+    // fire here.
+    match db::reject_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http) {
+        Ok(db::RejectOutcome::Rejected) => {
             drop(lock);
             // v0.6.2 (S34): fan out the reject so peers converge.
             if let Some(fed) = app.federation.as_ref() {
@@ -623,9 +644,16 @@ pub async fn reject_pending(
             Json(json!({"rejected": true, "id": id, (field_names::DECIDED_BY): agent_id}))
                 .into_response()
         }
-        Ok(false) => (
+        Ok(db::RejectOutcome::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED})),
+        )
+            .into_response(),
+        // #3448 — ineligible caller; the pending row is untouched. 403,
+        // mirroring the approve-side `Rejected` arm.
+        Ok(db::RejectOutcome::Refused(reason)) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": crate::errors::msg::reject_refused(reason)})),
         )
             .into_response(),
         Err(e) => crate::handlers::errors::handler_error_500(&e),

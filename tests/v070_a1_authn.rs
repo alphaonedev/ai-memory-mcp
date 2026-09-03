@@ -304,7 +304,16 @@ async fn s5c1_reject_with_valid_hmac_returns_200() {
     let _g = A1_HMAC_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_active_hooks_hmac_secret(Some("a1-positive-secret".to_string()));
     let (router, db) = build_router_with_db();
+    // v1.0.0 #3448 — the HTTP reject surface now enforces the SAME approver
+    // eligibility approve does (`ApproveSurface::Http`, unconditional), so the
+    // decider must be a REGISTERED agent distinct from the requester. This is
+    // an HMAC (S5-C1) positive control, so keep it decidable: queue as "alice"
+    // and decide as the registered, distinct "a1-rejecter".
     let pid = seed_pending_store(&db, "a1-reject-ns", "alice").await;
+    {
+        let lock = db.lock().await;
+        ai_memory::db::register_agent(&lock.0, "a1-rejecter", "ai:generic", &[]).ok();
+    }
 
     let body = String::new();
     let ts = chrono::Utc::now().timestamp().to_string();
@@ -313,7 +322,7 @@ async fn s5c1_reject_with_valid_hmac_returns_200() {
     let req = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/pending/{pid}/reject"))
-        .header("x-agent-id", "alice")
+        .header("x-agent-id", "a1-rejecter")
         .header("x-ai-memory-timestamp", &ts)
         .header("x-ai-memory-signature", &sig)
         .body(Body::from(body))

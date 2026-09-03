@@ -1506,10 +1506,17 @@ async fn approval_decide_deny_sqlite_path() {
     let (r, _t, db) = sqlite_router();
     let ns = uid("cov-ga2-r4-deny");
     let requester = uid("ai:cov-ga2-r4-dreq");
+    // v1.0.0 #3448 — the deny arm now enforces the SAME approver eligibility
+    // the approve arm does (`ApproveSurface::Http`, unconditional), so the
+    // decider must be a REGISTERED agent DISTINCT from the requester. Before
+    // #3448 this test vetoed as the requester itself, which is exactly the
+    // separation-of-duties violation approve has always refused.
+    let decider = uid("ai:cov-ga2-r4-ddec");
     let queued = mem(&uid("pa"), &ns, "needs approval", &requester);
     let payload = serde_json::to_value(&queued).expect("serialize payload");
     let pending_id = {
         let lock = db.lock().await;
+        ai_memory::db::register_agent(&lock.0, &decider, "ai:generic", &[]).ok();
         ai_memory::db::queue_pending_action(
             &lock.0,
             ai_memory::models::GovernedAction::Store,
@@ -1530,7 +1537,7 @@ async fn approval_decide_deny_sqlite_path() {
         .method("POST")
         .uri(format!("/api/v1/approvals/{pending_id}"))
         .header("content-type", "application/json")
-        .header("x-agent-id", &requester)
+        .header("x-agent-id", &decider)
         .header("x-ai-memory-signature", format!("sha256={sig}"))
         .header("x-ai-memory-timestamp", ts)
         .body(Body::from(body_bytes))

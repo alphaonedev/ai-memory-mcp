@@ -637,13 +637,33 @@ pub fn run_pending(
         PendingAction::Reject { id } => {
             validate::validate_id(&id)?;
             let agent = identity::resolve_agent_id(cli_agent_id, None)?;
-            let ok = db::decide_pending_action(&conn, &id, false, &agent)?;
-            if !ok {
-                writeln!(
-                    out.stderr,
-                    "pending action not found or already decided: {id}"
-                )?;
-                std::process::exit(1);
+            // v1.0.0 #3448 — approver gate, same posture as the CLI approve arm
+            // above (#1796): CLI is operator-as-actor (single operator), so the
+            // Human-arm gate stays on the AI_MEMORY_AGENT_ID opt-in and the lone
+            // operator is never self-locked out of vetoing their own queue.
+            // Pre-fix this reached the raw structural transition, so under the
+            // multi-agent opt-in the requester could veto their own action while
+            // `approve` refused them.
+            match db::reject_with_approver_type(
+                &conn,
+                &id,
+                &agent,
+                db::ApproveSurface::LocalOperator,
+            )? {
+                db::RejectOutcome::Rejected => {}
+                db::RejectOutcome::NotFound => {
+                    writeln!(
+                        out.stderr,
+                        "pending action not found or already decided: {id}"
+                    )?;
+                    std::process::exit(1);
+                }
+                // `bail!` (not `process::exit`) so the refusal is a clean
+                // nonzero exit via anyhow main AND unit-testable, matching the
+                // #1620 `ApproveOutcome::NotFound` arm's rationale above.
+                db::RejectOutcome::Refused(reason) => {
+                    anyhow::bail!(crate::errors::msg::reject_refused(&reason));
+                }
             }
             if json_out {
                 writeln!(
@@ -1268,6 +1288,12 @@ mod tests {
     #[test]
     fn test_pending_reject_happy_text() {
         // Happy `Reject` text path (lines 226-245).
+        // #3448 — this is ALSO the pin for "the single-operator trust-all
+        // default is unchanged": the approver gate is armed by
+        // `AI_MEMORY_AGENT_ID`, so the #1874 unset guard both asserts the
+        // unarmed posture and stops a sibling test's leaked value from arming
+        // it (the decider here IS the requester).
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_pending_action(&db, "pa-reject-1", "ns-r", "store", "test-agent");
@@ -1285,6 +1311,8 @@ mod tests {
 
     #[test]
     fn test_pending_reject_happy_json() {
+        // #3448 — see the sibling text test: unarmed single-operator posture.
+        let _envg = crate::identity::agent_id_env_unset_guard();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_pending_action(&db, "pa-reject-j", "ns-r", "store", "test-agent");
@@ -1301,6 +1329,151 @@ mod tests {
         assert_eq!(v["rejected"].as_bool().unwrap(), true);
         assert_eq!(v["id"].as_str().unwrap(), "pa-reject-j");
         assert_eq!(v["decided_by"].as_str().unwrap(), "test-agent");
+    }
+
+    // =================================================================
+    // v1.0.0 #3448 — CLI `pending reject` approver gate.
+    //
+    // Pre-#3448 this arm called the raw structural
+    // `db::decide_pending_action(.., false, ..)`, so under the multi-agent
+    // opt-in the requester could veto their own action while `pending
+    // approve` refused them, and any claimed id could veto anyone's.
+    // The two happy-path tests above cover the UNARMED single-operator
+    // default (no `AI_MEMORY_AGENT_ID`), which must stay unchanged — the
+    // lone operator is never self-locked out of their own queue.
+    // =================================================================
+
+    /// #3448 DENIED — the requester may not veto their own action under the
+    /// multi-agent opt-in, exactly as `pending approve` refuses them (#1796).
+    #[test]
+    fn test_pending_reject_refuses_self_veto_under_posture_3448() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_pending_action(
+            &db,
+            "pa-reject-self-3448",
+            "ns-r3448",
+            "store",
+            "ai:alice3448",
+        );
+        register_cli_agent(&db, "ai:alice3448");
+        // SAFETY: process-global env mutation serialized on the crate-wide
+        // test lock acquired above; restored before the assertions.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice3448") };
+        let args = PendingArgs {
+            action: PendingAction::Reject {
+                id: "pa-reject-self-3448".to_string(),
+            },
+        };
+        let res = {
+            let mut out = env.output();
+            run_pending(&db, args, false, Some("ai:alice3448"), &mut out)
+        };
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+
+        let err = res.expect_err("the requester must not be able to veto their own action");
+        let msg = err.to_string();
+        assert!(msg.contains("reject refused"), "got: {msg}");
+        assert!(
+            msg.contains(crate::errors::msg::SELF_APPROVAL_REFUSED),
+            "the refusal must carry the shared separation-of-duties reason, got: {msg}"
+        );
+        assert_pending_untouched(&db, "pa-reject-self-3448");
+    }
+
+    /// #3448 DENIED — an unregistered non-requester may not veto.
+    #[test]
+    fn test_pending_reject_refuses_unregistered_approver_3448() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_pending_action(
+            &db,
+            "pa-reject-unreg-3448",
+            "ns-r3448b",
+            "store",
+            "ai:alice3448",
+        );
+        // ai:mallory3448 is deliberately NOT registered.
+        // SAFETY: serialized on the crate-wide test lock acquired above.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:mallory3448") };
+        let args = PendingArgs {
+            action: PendingAction::Reject {
+                id: "pa-reject-unreg-3448".to_string(),
+            },
+        };
+        let res = {
+            let mut out = env.output();
+            run_pending(&db, args, false, Some("ai:mallory3448"), &mut out)
+        };
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+
+        let msg = res
+            .expect_err("an unregistered agent must not be able to veto")
+            .to_string();
+        assert!(msg.contains("reject refused"), "got: {msg}");
+        assert!(msg.contains("is not a registered agent"), "got: {msg}");
+        assert_pending_untouched(&db, "pa-reject-unreg-3448");
+    }
+
+    /// #3448 ALLOWED — a REGISTERED, non-requester approver still vetoes.
+    #[test]
+    fn test_pending_reject_allows_registered_approver_3448() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_pending_action(
+            &db,
+            "pa-reject-ok-3448",
+            "ns-r3448c",
+            "store",
+            "ai:alice3448",
+        );
+        register_cli_agent(&db, "ai:bob3448");
+        // SAFETY: serialized on the crate-wide test lock acquired above.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:bob3448") };
+        let args = PendingArgs {
+            action: PendingAction::Reject {
+                id: "pa-reject-ok-3448".to_string(),
+            },
+        };
+        let res = {
+            let mut out = env.output();
+            run_pending(&db, args, true, Some("ai:bob3448"), &mut out)
+        };
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+
+        res.expect("a registered non-requester approver must be allowed");
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["rejected"].as_bool().unwrap(), true);
+        assert_eq!(v["decided_by"].as_str().unwrap(), "ai:bob3448");
+        let conn = db::open(&db).expect("db::open");
+        let pa = db::get_pending_action(&conn, "pa-reject-ok-3448")
+            .expect("read")
+            .expect("row present");
+        assert_eq!(pa.status, "rejected");
+        assert_eq!(pa.decided_by.as_deref(), Some("ai:bob3448"));
+    }
+
+    /// #3448 — register an agent so the eligibility gate's registry arm passes.
+    fn register_cli_agent(db_path: &std::path::Path, agent_id: &str) {
+        let conn = db::open(db_path).expect("db::open");
+        db::register_agent(&conn, agent_id, "ai:generic", &[]).expect("register agent");
+    }
+
+    /// #3448 — a refused veto must be INERT: the row stays `pending` with no
+    /// decider recorded.
+    fn assert_pending_untouched(db_path: &std::path::Path, pending_id: &str) {
+        let conn = db::open(db_path).expect("db::open");
+        let pa = db::get_pending_action(&conn, pending_id)
+            .expect("read")
+            .expect("row present");
+        assert_eq!(pa.status, "pending", "a refused veto must not decide");
+        assert!(pa.decided_by.is_none(), "no decider may be recorded");
     }
 
     /// Install a Consensus(2) governance policy on `namespace`. The
