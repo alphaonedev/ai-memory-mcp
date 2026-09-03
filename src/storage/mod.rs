@@ -13943,6 +13943,22 @@ pub fn admit_attested_write(
     agent_id: &str,
     created_at: &str,
 ) -> Result<bool> {
+    // #3481 — record-stop fence. This funnel runs BEFORE the memory write, so
+    // an ungated admission under an active stop CONSUMES the envelope's
+    // fingerprint while the write itself is refused downstream: when the
+    // operator lifts the stop and the caller legitimately resubmits the same
+    // signed body, the ledger answers Replay and a genuine write is lost.
+    //
+    // The #3419 record-before-store ordering is the fail-closed direction
+    // against a CRASH (a spent envelope beats an admitted replay), but a record
+    // stop is a predictable, operator-initiated, indefinitely-long halt — the
+    // exact window in which a client retries, and the one case where burning
+    // the envelope is avoidable. Refuse the admission instead: no ledger row is
+    // written, so the envelope stays FRESH for after the stop.
+    //
+    // Deliberately NOT a B7 allowlist row: the allowlist is for writes that
+    // must proceed during a stop, and this one must not.
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().timestamp();
     conn.execute(
         "DELETE FROM attested_write_ledger WHERE seen_at < ?1",
