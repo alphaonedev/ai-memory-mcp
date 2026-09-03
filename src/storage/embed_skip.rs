@@ -260,6 +260,9 @@ pub fn record_sqlite(
     agent_id: &str,
     reason: EmbedSkipReason,
 ) -> Result<bool> {
+    // #3484 — derived cache or not, the store does not mutate under an
+    // engaged record stop (same funnel every write-SQL fn uses).
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let fp = match reason {
         EmbedSkipReason::Undecryptable => fingerprint_for(agent_id),
         EmbedSkipReason::Oversize => EmbedSkipReason::Oversize.as_str().to_string(),
@@ -277,6 +280,8 @@ pub fn record_sqlite(
 /// cleared by the content-update trigger). Returns the number of rows
 /// deleted.
 pub fn invalidate_stale_sqlite(conn: &Connection) -> Result<usize> {
+    // #3484 — DELETE FROM embed_skip is a write; gate it like every other.
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let mut stmt = conn.prepare(SQL_SELECT_ALL)?;
     let rows = stmt.query_map([], |row| {
         Ok((

@@ -19630,6 +19630,34 @@ impl PostgresStore {
     /// The clock is advanced by the elected writer regardless of read outcome
     /// so a persistent DB outage backs off to at most one probe per window
     /// (single-flight), never a retry storm.
+    /// #3484 — the embed-skip derived cache (#3344) is written from the
+    /// unembedded scan; under an engaged record stop the scan still reads
+    /// but records nothing (best-effort semantics: a refused record is a
+    /// skipped record, never an error surfaced to the scan).
+    async fn embed_skip_record_best_effort(
+        &self,
+        memory_id: &str,
+        agent_id: &str,
+        reason: crate::storage::embed_skip::EmbedSkipReason,
+    ) -> bool {
+        if self.gate_record_stop().await.is_err() {
+            return false;
+        }
+        crate::storage::embed_skip::postgres::record_best_effort(
+            &self.pool, memory_id, agent_id, reason,
+        )
+        .await
+    }
+
+    /// #3484 — same gate for the amortised stale-marker walk (DELETE).
+    async fn embed_skip_prepare_scan(&self) {
+        if self.gate_record_stop().await.is_err() {
+            return;
+        }
+        crate::storage::embed_skip::postgres::prepare_scan(&self.pool, &self.embed_skip_amort)
+            .await;
+    }
+
     async fn refresh_record_stop_if_stale(&self) {
         use std::sync::atomic::Ordering;
         let now_ms = record_stop_refresh_now_ms();
@@ -22173,8 +22201,7 @@ impl MemoryStore for PostgresStore {
             // "nothing to embed". See SqliteStore::list_unembedded.
             return Ok(Vec::new());
         }
-        crate::storage::embed_skip::postgres::prepare_scan(&self.pool, &self.embed_skip_amort)
-            .await;
+        self.embed_skip_prepare_scan().await;
         let not_skipped = crate::storage::embed_skip::SQL_AND_NOT_SKIPPED;
         let cap: i64 = i64::try_from(limit).unwrap_or(LIST_FALLBACK_LIMIT_I64);
         // v1.0.0 #2167 (#2183) — the always-on predicate re-embeds
@@ -22264,8 +22291,7 @@ impl MemoryStore for PostgresStore {
                 Some(plaintext) => {
                     let doc = crate::embeddings::embedding_document(&title, &plaintext);
                     if crate::embeddings::oversize_embed_reason(doc.len()).is_some() {
-                        crate::storage::embed_skip::postgres::record_best_effort(
-                            &self.pool,
+                        self.embed_skip_record_best_effort(
                             &id,
                             &agent_id,
                             crate::storage::embed_skip::EmbedSkipReason::Oversize,
@@ -22277,8 +22303,7 @@ impl MemoryStore for PostgresStore {
                     }
                 }
                 None => {
-                    crate::storage::embed_skip::postgres::record_best_effort(
-                        &self.pool,
+                    self.embed_skip_record_best_effort(
                         &id,
                         &agent_id,
                         crate::storage::embed_skip::EmbedSkipReason::Undecryptable,
