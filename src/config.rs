@@ -3232,6 +3232,11 @@ pub struct AppConfig {
     /// nonces are rejected with 409 Conflict. Default-OFF preserves
     /// the v0.6.x verify-anytime semantics for unmigrated clients.
     pub verify: Option<VerifyConfig>,
+    /// v1.0.0 #3467 (EPIC #3466) — `[wake_hub]` block. Operator knobs for the
+    /// `ai-memory wake-hub` same-host wake plane. Absent (the default) means
+    /// the compiled defaults from [`crate::wake_hub::limits`] apply; the
+    /// subcommand is opt-in and nothing here starts anything on its own.
+    pub wake_hub: Option<WakeHubConfig>,
     /// v0.7.0 M4 — connection-level `statement_timeout` (in seconds)
     /// applied via an `after_connect` hook to every postgres
     /// connection in the pool. Bounds runaway queries — a pathological
@@ -3469,6 +3474,7 @@ impl std::fmt::Debug for AppConfig {
             .field("hooks", &self.hooks)
             .field("subscriptions", &self.subscriptions)
             .field("verify", &self.verify)
+            .field("wake_hub", &self.wake_hub)
             .field(
                 "postgres_statement_timeout_secs",
                 &self.postgres_statement_timeout_secs,
@@ -5748,6 +5754,72 @@ pub struct SubscriptionsConfig {
     /// listener (CI, dev) set this to `true` explicitly.
     #[serde(default)]
     pub allow_loopback_webhooks: bool,
+}
+
+/// v1.0.0 #3467 (EPIC #3466) — `[wake_hub]` config block.
+///
+/// Operator knobs for `ai-memory wake-hub`, the same-host, CONTENT-FREE agent
+/// wake plane. Every field is optional and every unset field falls through to
+/// the compiled bound in [`crate::wake_hub::limits`], so a partial block can
+/// never widen a limit by omission.
+///
+/// Wire format:
+/// ```toml
+/// [wake_hub]
+/// socket = "/run/user/1000/ai-memory/wake-hub.sock"
+/// hub_id = "ai-memory-wake-hub"
+/// max_connections = 256
+/// queue_bytes = 65536          # per recipient
+/// global_egress_bytes = 33554432
+/// rate_per_sec = 500
+/// rate_burst = 2000
+/// pending_max_agents = 1024
+/// pending_max_ids = 64
+/// ```
+///
+/// Note what is NOT configurable: there is no key that disables identity
+/// verification, none that lets the hub carry a message body, and none that
+/// removes a bound. `deny_unknown_fields` makes a typo'd or invented key a
+/// hard config error rather than a silently-ignored line, so an operator who
+/// believes they tightened a limit cannot be wrong about it (#3166 fail-closed
+/// config posture).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeHubConfig {
+    /// Unix socket to listen on. Its parent directory must be owner-only
+    /// (0700) and the socket is forced to 0600 with the mode verified after
+    /// `chmod`. Unset resolves to the platform runtime directory, else
+    /// `~/.ai-memory/wake-hub.sock`.
+    #[serde(default)]
+    pub socket: Option<std::path::PathBuf>,
+    /// Hub identifier bound into every handshake transcript, so a signature
+    /// for one hub cannot be replayed at another.
+    #[serde(default)]
+    pub hub_id: Option<String>,
+    /// Hard connection ceiling, further clamped at start-up by `RLIMIT_NOFILE`.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// Per-recipient egress ceiling in BYTES — the bound that actually caps
+    /// memory (the frame count alone does not).
+    #[serde(default)]
+    pub queue_bytes: Option<usize>,
+    /// Hub-wide ceiling on queued egress bytes across every recipient.
+    #[serde(default)]
+    pub global_egress_bytes: Option<usize>,
+    /// Authenticated frames per second, per connection.
+    #[serde(default)]
+    pub rate_per_sec: Option<u32>,
+    /// Authenticated burst, per connection. Fan-out is charged to the sender,
+    /// so a topic wake costs `1 + recipients` against this budget.
+    #[serde(default)]
+    pub rate_burst: Option<u32>,
+    /// Agents for which coalesced offline state is retained.
+    #[serde(default)]
+    pub pending_max_agents: Option<usize>,
+    /// Inbox-row ids retained per offline agent before the set stops growing
+    /// and raises its `lagged` marker instead.
+    #[serde(default)]
+    pub pending_max_ids: Option<usize>,
 }
 
 impl AppConfig {
@@ -8395,6 +8467,7 @@ impl AppConfig {
             "request_timeout_secs",
             "llm_call_timeout_secs",
             "verify",
+            "wake_hub",
             "mcp_federation_forward_url",
             "agents",
             "governance",
@@ -11920,6 +11993,7 @@ legacy_scoring = false
         // every field. We only need the keys, not the values, so
         // default placeholder sub-structs are fine.
         let cfg = AppConfig {
+            wake_hub: Some(WakeHubConfig::default()),
             tier: Some("keyword".into()),
             db: Some(String::new()),
             ollama_url: Some(String::new()),
@@ -12013,6 +12087,7 @@ legacy_scoring = false
             "request_timeout_secs",
             "llm_call_timeout_secs",
             "verify",
+            "wake_hub",
             "mcp_federation_forward_url",
             "agents",
             "governance",

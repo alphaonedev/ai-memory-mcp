@@ -82,6 +82,7 @@ use crate::cli::sync::{SyncArgs, SyncDaemonArgs};
 use crate::cli::update::UpdateArgs;
 use crate::cli::verify::VerifyChainArgs;
 use crate::cli::verify_signed_events::VerifySignedEventsChainArgs;
+use crate::cli::wake_hub::WakeHubArgs;
 use crate::cli::watch::WatchArgs;
 use crate::cli::wrap::WrapArgs;
 use crate::config::{AppConfig, FeatureTier};
@@ -522,6 +523,23 @@ pub enum Command {
     /// never runs unless explicitly invoked. See
     /// `crate::recover::watcher` for the full design rationale.
     Watch(WatchArgs),
+    /// v1.0.0 #3467 (EPIC #3466) — `ai-memory wake-hub`: the same-host,
+    /// CONTENT-FREE agent wake plane over a 0600 Unix domain socket with
+    /// kernel-attested peer credentials (`SO_PEERCRED` on Linux,
+    /// `LOCAL_PEERPID` + `getpeereid` on macOS, both asserted at start-up).
+    ///
+    /// It routes a bounded wake HINT — `{inbox_row_id, namespace, sender,
+    /// digest, seq_high_watermark}`, at most 256 bytes — and NEVER a message
+    /// body: the v1 protocol has no `request` / `reply` / `notify` kinds at
+    /// all. The ai-memory inbox row stays the durable record and the `<=60 s`
+    /// backstop poll stays the guarantee, so losing the hub degrades wake
+    /// LATENCY and nothing else.
+    ///
+    /// Opt-in and store-free: it opens no database, on either backend. The
+    /// shipped identity verifier REFUSES every hello until the scoped
+    /// `a2a-hub/join/v1` delegation lands in #3468, and there is deliberately
+    /// no flag to substitute a permissive one. See [`crate::wake_hub`].
+    WakeHub(WakeHubArgs),
     /// v0.7.0 WT-1-F — operator-side wrapper over the atomisation
     /// engine ([`crate::atomisation::Atomiser`]). Decomposes one
     /// long-form memory into atomic propositions; surfaces every
@@ -2476,6 +2494,15 @@ pub async fn run(
             // coverage / #2088 precedent).
             init_tracing();
             cli::watch::dispatch(&db_path, &a, cli_agent_id.as_deref()).await
+        }
+        Command::WakeHub(a) => {
+            // Thin delegate. Deliberately does NOT touch `db_path`: the wake
+            // hub is content-free and store-free, so it opens no database on
+            // either backend.
+            if !a.posture {
+                init_tracing();
+            }
+            cli::wake_hub::dispatch(&a, app_config).await
         }
         Command::Atomise(a) => {
             let stdout = std::io::stdout();
@@ -7377,7 +7404,7 @@ pub async fn bootstrap_serve(
 fn command_installs_console_subscriber(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Serve(_) | Command::Curator(_) | Command::Watch(_)
+        Command::Serve(_) | Command::Curator(_) | Command::Watch(_) | Command::WakeHub(_)
     )
 }
 

@@ -1465,6 +1465,44 @@ backend), not merely `--version` success — a binary that built without
 `sal-postgres` will silently lack the Postgres surface. Always available
 (no feature gate).
 
+### `wake-hub` — same-host agent wake plane (v1.0.0, #3467 / EPIC #3466)
+
+```bash
+ai-memory wake-hub                          # bind and serve until SIGINT/SIGTERM
+ai-memory wake-hub --socket /run/x.sock     # explicit socket path
+ai-memory wake-hub --hub-id my-hub          # transcript-bound hub identifier
+ai-memory wake-hub --max-connections 128    # ceiling (clamped by RLIMIT_NOFILE)
+ai-memory wake-hub --posture                # print the resolved posture, bind nothing
+ai-memory wake-hub --posture --json         # machine-readable posture
+```
+
+A Unix-domain-socket switch (mode **0600**, inside an owner-only **0700**
+directory, peer credentials checked with `SO_PEERCRED` on Linux and
+`LOCAL_PEERPID` + `getpeereid` on macOS) that pushes a bounded, **content-free
+wake hint** to agents on this host, so a recipient learns "you have inbox row X"
+in about a millisecond instead of on its next poll.
+
+**It carries no message bodies.** The v1 protocol has no `request` / `reply` /
+`notify` kinds at all; the largest routed payload is a 256-byte
+`{inbox_row_id, namespace, sender, digest, seq_high_watermark}` hint. The
+ai-memory inbox row stays the durable record and the `<=60 s` backstop poll
+stays the guarantee — losing the hub degrades wake **latency** and nothing else.
+It opens no database, on either backend.
+
+**Identity is not wired yet.** The shipped verifier REFUSES every hello until
+the scoped `a2a-hub/join/v1` delegation lands in
+[#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468), and there is
+deliberately **no flag** that substitutes a permissive one — a flag that
+disables identity verification is a flag that eventually gets set in production.
+Running it today therefore binds the socket, asserts its start-up invariants,
+serves counters, and admits nobody; `--posture` reports exactly that. Every
+identity refusal is a single `401 unauthorized` on the wire, so a peer cannot
+distinguish "unknown agent" from "bad signature" by probing.
+
+Operator knobs live in the `[wake_hub]` config block (see
+[`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md)); a CLI flag beats the config block,
+which beats the compiled bound. Opt-in: nothing starts a hub implicitly.
+
 ## Shell, completions, man
 
 ```bash

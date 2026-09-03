@@ -499,8 +499,11 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 82;
 /// the `ai-memory quarantine list|release <id>` operator route-OUT of the
 /// #1948 federation quarantine, bumping 90 → 91; v1.0.0 #3322 (#3266 MVG)
 /// added `SwarmRewind` for the `ai-memory swarm-rewind` atomic cascade-rewind
-/// operator command, bumping 91 → 92.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 92;
+/// operator command, bumping 91 → 92; v1.0.0 #3467 (EPIC #3466) added
+/// `WakeHub` for the `ai-memory wake-hub` same-host CONTENT-FREE agent wake
+/// plane (a 0600 Unix-domain-socket wake switch that carries a bounded hint
+/// and never a message body), bumping 92 → 93.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 93;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -522,8 +525,10 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 92;
 /// self-report), bumping 91 → 92; v1.0.0 #2402 added `Quarantine` (operator
 /// route-OUT of the #1948 federation quarantine), bumping 92 → 93; v1.0.0
 /// #3322 (#3266 MVG) added `SwarmRewind` (atomic cascade-rewind operator
-/// command), bumping 93 → 94.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 94;
+/// command), bumping 93 → 94; v1.0.0 #3467 (EPIC #3466) added `WakeHub`
+/// (same-host CONTENT-FREE agent wake plane over a 0600 Unix domain socket),
+/// bumping 94 → 95.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 95;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
@@ -933,6 +938,18 @@ pub mod validate;
 /// flag profiles share the same predicate. See module docstring
 /// for the drift history that motivated the consolidation.
 pub mod visibility;
+/// v1.0.0 #3467 (EPIC #3466) — `ai-memory wake-hub`: a same-host,
+/// CONTENT-FREE agent wake plane over a 0600 Unix domain socket with
+/// kernel-attested peer credentials. Carries a bounded wake HINT
+/// (`{inbox_row_id, namespace, sender, digest, seq_high_watermark}`, <=256 B)
+/// and never a message body — the v1 protocol has no `request`/`reply`/
+/// `notify` kinds at all. Holds no durable truth and never touches the store:
+/// the ai-memory inbox row is the record, the wake is a hint, and the <=60 s
+/// backstop poll stays the guarantee, so losing the hub degrades wake LATENCY
+/// and nothing else. Identity verification is a trait boundary whose shipped
+/// default REFUSES every hello until the scoped `a2a-hub/join/v1` delegation
+/// lands in #3468.
+pub mod wake_hub;
 /// v1.0.0 #3403 — the shared memory-write EVENT funnel: one typed emitter
 /// per lifecycle event, binding the canonical event name to the canonical
 /// details type in ONE place, so every write surface (MCP, CLI) dispatches

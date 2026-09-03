@@ -750,6 +750,48 @@ dependency-free std-only poll loop when absent or on init failure.
 Source: `src/vectorlite.rs::{VECTORLITE_EXTENSION_ENV,from_env}` +
 `src/hnsw.rs`.
 
+## `[wake_hub]` — same-host agent wake plane (off unless invoked)
+
+Operator knobs for `ai-memory wake-hub`
+([#3467](https://github.com/alphaonedev/ai-memory-mcp/issues/3467), EPIC
+[#3466](https://github.com/alphaonedev/ai-memory-mcp/issues/3466)). The block is
+**inert on its own** — nothing here starts a hub; only the subcommand does.
+
+```toml
+[wake_hub]
+socket = "/run/user/1000/ai-memory/wake-hub.sock"
+hub_id = "ai-memory-wake-hub"
+max_connections = 256          # further clamped at start-up by RLIMIT_NOFILE
+queue_bytes = 65536            # per recipient — the bound that caps memory
+global_egress_bytes = 33554432 # hub-wide ceiling on queued egress
+rate_per_sec = 500             # authenticated frames/s, per connection
+rate_burst = 2000              # fan-out is charged to the SENDER
+pending_max_agents = 1024      # coalesced offline state, bounded
+pending_max_ids = 64           # ids retained per offline agent, then `lagged`
+```
+
+Precedence per field: **CLI flag > `[wake_hub]` > compiled bound**
+(`src/wake_hub/limits.rs`). Every field is optional, and an unset field falls
+through to the compiled bound — so a partial block can never widen a limit by
+omission.
+
+The block is `deny_unknown_fields`: an invented or misspelled key is a hard
+config error, not a silently-ignored line. That matters here more than
+elsewhere, because every key in this block is a *limit* — an operator who
+believes they tightened one must not be wrong about it (same #3166 fail-closed
+posture as the rest of the boot contract).
+
+**What is deliberately NOT configurable.** There is no key that disables
+identity verification, none that lets the hub carry a message body, and none
+that removes a bound. The socket mode (0600), its parent directory mode (0700),
+the wake-metadata ceiling (256 B), the wire frame ceiling and the pre-auth rate
+limit are all compiled invariants. The hub carries no durable truth — the
+ai-memory inbox row is the record and the `<=60 s` backstop poll is the
+guarantee — so every limit here degrades wake latency and never correctness.
+
+Source: `src/config.rs::WakeHubConfig` + `src/wake_hub/limits.rs`;
+`ai-memory wake-hub --posture --json` prints the resolved values.
+
 ## Boot contract — what happens to a config the daemon cannot honour
 
 **[#3166]** Boot FAILS CLOSED. The rule is one sentence: *a boot must never
