@@ -96,6 +96,21 @@ impl SqliteStore {
         })
     }
 
+    /// Open an existing SQLite store without creating or migrating it.
+    /// Intended for read-only operator sources such as `migrate --from`.
+    pub fn open_read_only(path: impl Into<PathBuf>) -> StoreResult<Self> {
+        let path = path.into();
+        let conn = db::open_read_only(&path).map_err(box_err)?;
+        let record_stop_key = crate::storage::record_stop::conn_key(&conn);
+        let state = Arc::new(Mutex::new(conn));
+        Ok(Self {
+            read_state: Arc::clone(&state),
+            state,
+            path,
+            record_stop_key,
+        })
+    }
+
     /// #3196 — try to open a dedicated read-only connection for
     /// [`Self::find_paths`]. Returns `None` (caller shares the writer) when
     /// the database is in-memory — a second open would attach a FRESH empty

@@ -8032,23 +8032,33 @@ fn cmd_bench_relevance(args: &BenchArgs) -> Result<()> {
     }
     Ok(())
 }
-
 #[cfg(feature = "sal")]
 async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
-    let src = migrate::open_store(&args.from)
+    let src = migrate::open_source_store(&args.from)
         .await
         .context("open source store")?;
-    let dst = migrate::open_store(&args.to)
+    let report = if args.dry_run {
+        migrate::migrate(
+            src.as_ref(),
+            src.as_ref(),
+            args.batch,
+            args.namespace.clone(),
+            true,
+        )
         .await
-        .context("open destination store")?;
-    let report = migrate::migrate(
-        src.as_ref(),
-        dst.as_ref(),
-        args.batch,
-        args.namespace.clone(),
-        args.dry_run,
-    )
-    .await;
+    } else {
+        let dst = migrate::open_store(&args.to)
+            .await
+            .context("open destination store")?;
+        migrate::migrate(
+            src.as_ref(),
+            dst.as_ref(),
+            args.batch,
+            args.namespace.clone(),
+            false,
+        )
+        .await
+    };
     // #1579 A3 (SECURITY) — the migrate report echoes both store URLs;
     // mask the userinfo password so credentials never land in stdout /
     // captured CI logs.

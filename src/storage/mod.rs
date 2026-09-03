@@ -882,6 +882,66 @@ pub use doctor::{
 pub use connection::open;
 // #1580 — read-only connection opener for the HTTP WAL read-pool.
 pub use connection::open_read_only;
+
+/// #3435 — validate the complete provenance graph that will exist after a
+/// bulk import. The ordinary link funnel's wall-clock heuristic is correct for
+/// single-node writes, but it cannot judge already-valid DAGs assembled on a
+/// different node: clock skew and historical imports can make a child appear
+/// older than its parent. Bulk migrate/sync callers therefore validate the
+/// union of existing and incoming lineage edges structurally, before writing
+/// any edge, and then use the import funnel that bypasses only that heuristic.
+///
+/// Duplicate triples are collapsed. Every relation in the canonical lineage
+/// set participates, matching Pass 0's scope. A self-loop or any longer cycle
+/// fails closed.
+pub(crate) fn validate_complete_lineage_dag<'a>(
+    links: impl IntoIterator<Item = &'a crate::models::MemoryLink>,
+) -> Result<()> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut indegree: HashMap<&str, usize> = HashMap::new();
+    let mut seen: HashSet<(&str, &str, crate::models::MemoryLinkRelation)> = HashSet::new();
+
+    for link in links {
+        if !link.relation.is_lineage()
+            || !seen.insert((&link.source_id, &link.target_id, link.relation))
+        {
+            continue;
+        }
+        adjacency
+            .entry(link.source_id.as_str())
+            .or_default()
+            .push(link.target_id.as_str());
+        indegree.entry(link.source_id.as_str()).or_insert(0);
+        *indegree.entry(link.target_id.as_str()).or_insert(0) += 1;
+    }
+
+    let mut ready: VecDeque<&str> = indegree
+        .iter()
+        .filter_map(|(&node, &degree)| (degree == 0).then_some(node))
+        .collect();
+    let mut visited = 0_usize;
+    while let Some(node) = ready.pop_front() {
+        visited += 1;
+        if let Some(targets) = adjacency.get(node) {
+            for &target in targets {
+                let degree = indegree
+                    .get_mut(target)
+                    .expect("every lineage target has an indegree entry");
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push_back(target);
+                }
+            }
+        }
+    }
+
+    if visited != indegree.len() {
+        anyhow::bail!("link refused: reflection cycle in final imported lineage graph");
+    }
+    Ok(())
+}
 // v1.0.0 #2445 — the EGRESS + guard surface (see `schema_guard` module docs).
 pub use connection::{assert_schema_not_ahead, open_unmigrated, probe_schema_stamp};
 // #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time

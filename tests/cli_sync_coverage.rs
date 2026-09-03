@@ -149,6 +149,10 @@ fn args_for(remote: PathBuf, dir: &str) -> SyncArgs {
     }
 }
 
+fn create_empty_db(path: &std::path::Path) {
+    drop(db::open(path).expect("create empty sync test database"));
+}
+
 // ---------------------------------------------------------------------------
 // run() — pull / push / merge — JSON-output branches
 // ---------------------------------------------------------------------------
@@ -185,6 +189,7 @@ fn push_json_output_branch() {
     let remote_env = Env::fresh();
     let remote = remote_env.db_path.clone();
     seed(&local, "ns", "to-remote", "data");
+    create_empty_db(&remote);
     let args = args_for(remote, "push");
     {
         let mut out = env.output();
@@ -284,6 +289,7 @@ fn push_skips_invalid_memory() {
     let remote = remote_env.db_path.clone();
     seed(&local, "ns", "valid", "x");
     let _ = seed_invalid_memory(&local, "ns");
+    create_empty_db(&remote);
     let args = args_for(remote, "push");
     {
         let mut out = env.output();
@@ -337,6 +343,7 @@ fn push_handles_valid_and_invalid_links() {
     let remote = remote_env.db_path.clone();
     seed_valid_link(&local, "ns");
     seed_invalid_link(&local);
+    create_empty_db(&remote);
     let args = args_for(remote, "push");
     {
         let mut out = env.output();
@@ -350,8 +357,11 @@ fn merge_handles_links_on_both_sides() {
     let local = env.db_path.clone();
     let remote_env = Env::fresh();
     let remote = remote_env.db_path.clone();
-    seed_valid_link(&local, "ns");
-    seed_valid_link(&remote, "ns");
+    // Distinct namespaces avoid the intentional `(title, namespace)` unique
+    // collision between the two otherwise-identical link fixtures, so this
+    // test exercises two genuinely importable edge sets.
+    seed_valid_link(&local, "local-ns");
+    seed_valid_link(&remote, "remote-ns");
     seed_invalid_link(&local);
     seed_invalid_link(&remote);
     let args = args_for(remote, "merge");
@@ -443,6 +453,7 @@ fn dry_run_text_output_pull_only() {
     let local = env.db_path.clone();
     let remote_env = Env::fresh();
     let remote = remote_env.db_path.clone();
+    create_empty_db(&local);
     seed(&remote, "ns", "R", "R");
     let mut args = args_for(remote, "pull");
     args.dry_run = true;
@@ -463,6 +474,7 @@ fn dry_run_text_output_push_only() {
     let remote_env = Env::fresh();
     let remote = remote_env.db_path.clone();
     seed(&local, "ns", "L", "L");
+    create_empty_db(&remote);
     let mut args = args_for(remote, "push");
     args.dry_run = true;
     {

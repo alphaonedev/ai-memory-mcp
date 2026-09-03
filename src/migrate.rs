@@ -156,6 +156,36 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
     )
 }
 
+/// Open a migration source without creating or migrating a SQLite database.
+/// PostgreSQL retains the adapter's existing connection semantics; connecting
+/// to a missing PostgreSQL database fails at the server without creating it.
+pub async fn open_source_store(url: &str) -> Result<Box<dyn MemoryStore>> {
+    if let Some(path) = url.strip_prefix(SQLITE_URL_SCHEME) {
+        let clean = path
+            .strip_prefix('/')
+            .map_or(path, |p| if p.starts_with('/') { p } else { path });
+        let clean = std::path::Path::new(clean);
+        if !clean.is_file() {
+            anyhow::bail!("source SQLite database does not exist: {}", clean.display());
+        }
+        let store = SqliteStore::open_read_only(clean).context("open read-only sqlite adapter")?;
+        return Ok(Box::new(store));
+    }
+
+    #[cfg(feature = "sal-postgres")]
+    if is_postgres_url(url) {
+        let store = crate::store::postgres::PostgresStore::connect(url)
+            .await
+            .context("connect postgres adapter")?;
+        return Ok(Box::new(store));
+    }
+
+    anyhow::bail!(
+        "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
+        crate::logging::redact_url_password(url)
+    )
+}
+
 /// Run the migration. Streams through the source in pages of
 /// `batch_size`, writing each page to the destination. Idempotent on
 /// re-run — both adapters' `store` implementations upsert on memory id.
@@ -438,14 +468,11 @@ pub async fn migrate(
     // This avoids a per-link RPC for the existence probe and keeps
     // the total cost at O(|links|).
     //
-    // The link write goes through the trait's `link()` rather than
-    // `link_signed()` because the source row already carries the
-    // (signature, observed_by, valid_from, valid_until) tuple — and
-    // `MemoryLink`'s round-trip from `list_links()` already preserves
-    // those fields. Re-signing on the destination would be wrong
-    // (we'd be claiming the link as the migration tool's own
-    // attestation rather than the original observer's), so we keep
-    // the rows opaque.
+    // After the complete destination+incoming lineage graph passes the
+    // structural DAG check, the link write goes through the trait's remote
+    // import funnel. That bypasses only the single-node wall-clock heuristic
+    // and preserves the source row's signature/observer/window without
+    // re-signing it as the migration tool.
     //
     // Dry-run mode skips every write but still tallies `links_read`
     // so operators can size the migration before committing.
@@ -469,17 +496,23 @@ pub async fn migrate(
     // skips deterministically. An empty destination is the common
     // case (fresh migrate) and every source link will land in the
     // `written` bucket.
-    let dst_pre: std::collections::BTreeSet<(String, String, String)> = if dry_run {
-        std::collections::BTreeSet::new()
+    let (dst_pre, dst_links): (std::collections::BTreeSet<_>, Vec<_>) = if dry_run {
+        (std::collections::BTreeSet::new(), Vec::new())
     } else {
         match to.list_links(link_filter).await {
-            Ok(rows) => rows
-                .into_iter()
-                // v0.7.0 fix campaign R1-M4 — relation is now an enum.
-                // Project to its canonical wire string so the BTreeSet
-                // key shape is unchanged from pre-typed-relation.
-                .map(|l| (l.source_id, l.target_id, l.relation.as_str().to_string()))
-                .collect(),
+            Ok(rows) => {
+                let keys = rows
+                    .iter()
+                    .map(|l| {
+                        (
+                            l.source_id.clone(),
+                            l.target_id.clone(),
+                            l.relation.as_str().to_string(),
+                        )
+                    })
+                    .collect();
+                (keys, rows)
+            }
             Err(e) => {
                 report
                     .errors
@@ -488,6 +521,18 @@ pub async fn migrate(
             }
         }
     };
+
+    let lineage_verdict = if dry_run {
+        crate::storage::validate_complete_lineage_dag(links.iter())
+    } else {
+        crate::storage::validate_complete_lineage_dag(dst_links.iter().chain(links.iter()))
+    };
+    if let Err(e) = lineage_verdict {
+        report
+            .errors
+            .push(format!("final lineage graph invalid: {e}"));
+        return report;
+    }
 
     for link in &links {
         report.links_read += 1;
@@ -502,7 +547,11 @@ pub async fn migrate(
             link.relation.as_str().to_string(),
         );
         let already_present = dst_pre.contains(&key);
-        match to.link(&ctx, link).await {
+        let attest_level = link
+            .attest_level
+            .as_deref()
+            .unwrap_or(crate::models::AttestLevel::Unsigned.as_str());
+        match to.apply_remote_link(&ctx, link, attest_level).await {
             Ok(()) => {
                 if already_present {
                     report.links_skipped += 1;
@@ -600,6 +649,19 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("unrecognised store URL")),
             Ok(_) => panic!("expected unrecognised-scheme error"),
         }
+    }
+
+    #[tokio::test]
+    async fn open_source_store_refuses_missing_sqlite_without_creating_it_3435() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-source.db");
+        let url = format!("sqlite://{}", missing.display());
+        let err = match open_source_store(&url).await {
+            Ok(_) => panic!("missing source must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("does not exist"));
+        assert!(!missing.exists(), "source probe must not create the file");
     }
 
     #[tokio::test]
@@ -861,6 +923,68 @@ mod tests {
             source_cid: None,
             target_cid: None,
         }
+    }
+
+    #[test]
+    fn complete_lineage_guard_accepts_dag_and_refuses_cycle_3435() {
+        let a_b = sample_link("a", "b", MemoryLinkRelation::DerivedFrom);
+        let b_c = sample_link("b", "c", MemoryLinkRelation::ReflectsOn);
+        let a_c = sample_link("a", "c", MemoryLinkRelation::DerivesFrom);
+        let dag = [&a_b, &b_c, &a_c];
+        crate::storage::validate_complete_lineage_dag(dag)
+            .expect("complete valid DAG must be accepted independent of edge order");
+
+        let c_a = sample_link("c", "a", MemoryLinkRelation::DerivedFrom);
+        let cyclic = [&a_b, &b_c, &c_a];
+        let err = crate::storage::validate_complete_lineage_dag(cyclic)
+            .expect_err("final lineage cycle must fail closed");
+        assert!(err.to_string().contains("reflection cycle"));
+    }
+
+    #[tokio::test]
+    async fn migrate_round_trips_10k_memories_and_clock_skewed_lineage_3435() {
+        const MEMORIES: usize = 10_000;
+        const LINKS: usize = 289;
+        let src_tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src = SqliteStore::open(src_tmp.path()).unwrap();
+        let dst = SqliteStore::open(dst_tmp.path()).unwrap();
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_MIGRATE);
+        let base = chrono::Utc::now() - chrono::Duration::days(2);
+
+        for i in 0..MEMORIES {
+            let memory = sample_memory_at(
+                &format!("bulk-{i:05}"),
+                "bulk-3435",
+                &format!("bulk row {i}"),
+                base + chrono::Duration::seconds(i.try_into().unwrap()),
+            );
+            src.store(&ctx, &memory).await.unwrap();
+        }
+        for i in 0..LINKS {
+            // Deliberately older -> newer. This is a structurally valid chain
+            // assembled on another clock, but the per-write Pass-0 timestamp
+            // heuristic rejects it when replayed as a local link.
+            let link = sample_link(
+                &format!("bulk-{i:05}"),
+                &format!("bulk-{:05}", i + 1),
+                MemoryLinkRelation::DerivedFrom,
+            );
+            src.apply_remote_link(&ctx, &link, crate::models::AttestLevel::Unsigned.as_str())
+                .await
+                .unwrap();
+        }
+
+        let report = migrate(&src, &dst, 1000, Some("bulk-3435".to_string()), false).await;
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert_eq!(report.memories_read, MEMORIES);
+        assert_eq!(report.memories_written, MEMORIES);
+        assert_eq!(report.links_read, LINKS);
+        assert_eq!(report.links_written, LINKS);
+        assert_eq!(
+            dst.list_links(Some("bulk-3435")).await.unwrap().len(),
+            LINKS
+        );
     }
 
     #[tokio::test]
