@@ -227,7 +227,10 @@ pub fn handle_subscription_replay(
         .ok_or("since is required (RFC3339)")?;
     // v1.0.0 #3366 — `delivered_at >= ?2` is a TEXT compare; a unix-epoch
     // digit string or other non-RFC3339 cutoff silently mis-filters.
+    // After refuse, bind the fixed-width UTC form so `+05:00` of the
+    // same instant matches `+00:00` / `Z`.
     crate::validate::validate_rfc3339_timestamp("since", since).map_err(|e| e.to_string())?;
+    let since = crate::validate::canonical_rfc3339(since);
     // v0.7.0 #1115 (SR-1 #5, HIGH) — caller-ownership gate. Pre-#1115
     // any MCP caller could pass an arbitrary `subscription_id` and
     // replay every event_payload that subscription received, including
@@ -252,7 +255,7 @@ pub fn handle_subscription_replay(
             "events": Vec::<Value>::new(),
         }));
     }
-    crate::subscriptions::memory_subscription_replay(conn, subscription_id, since)
+    crate::subscriptions::memory_subscription_replay(conn, subscription_id, &since)
         .map_err(|e| e.to_string())
 }
 
@@ -574,6 +577,48 @@ mod tests {
         let resp = handle_subscription_replay(
             &conn,
             &json!({"subscription_id": sid, "since": "2026-03-01T00:00:00Z"}),
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(1));
+        assert_eq!(resp["events"][0]["correlation_id"], "c-new");
+    }
+
+    #[test]
+    fn subscription_replay_offset_since_matches_utc_instant_3366() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let conn = fresh_conn();
+        let agent_id = register_agent(&conn);
+        let sid = crate::subscriptions::insert(
+            &conn,
+            &crate::subscriptions::NewSubscription {
+                url: "https://example.com/hook",
+                events: "memory_store",
+                secret: Some("sek"),
+                namespace_filter: None,
+                agent_filter: None,
+                created_by: Some(&agent_id),
+                event_types: None,
+            },
+        )
+        .expect("insert sub");
+        conn.execute(
+            "INSERT INTO subscription_events \
+             (subscription_id, correlation_id, event_type, payload, delivered_at, delivery_status) \
+             VALUES (?1, 'c-old', 'memory_store', '{}', '2026-01-01T00:00:00Z', 'ack')",
+            rusqlite::params![sid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO subscription_events \
+             (subscription_id, correlation_id, event_type, payload, delivered_at, delivery_status) \
+             VALUES (?1, 'c-new', 'memory_store', '{}', '2026-05-05T00:00:00Z', 'ack')",
+            rusqlite::params![sid],
+        )
+        .unwrap();
+        let resp = handle_subscription_replay(
+            &conn,
+            &json!({"subscription_id": sid, "since": "2026-03-01T05:00:00+05:00"}),
             None,
         )
         .expect("ok");

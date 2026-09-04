@@ -328,6 +328,9 @@ pub(crate) fn run_with_embedder(
             })
         })
     });
+    // v1.0.0 #3366 — bind micros+`Z` so an RFC3339 offset is an instant.
+    let effective_since = effective_since.map(|s| validate::canonical_rfc3339(&s));
+    let effective_until = args.until.as_deref().map(validate::canonical_rfc3339);
     let effective_limit_usize = if args.limit == 10
         && let Some(v) = scope.and_then(|s| s.limit)
     {
@@ -460,7 +463,7 @@ pub(crate) fn run_with_embedder(
                     effective_limit_usize.min(50),
                     args.tags.as_deref(),
                     effective_since.as_deref(),
-                    args.until.as_deref(),
+                    effective_until.as_deref(),
                     // v0.9 #1005 — coerce the concrete CLI-local index to
                     // the seam trait object at the pipeline boundary.
                     vector_index
@@ -505,7 +508,7 @@ pub(crate) fn run_with_embedder(
                     effective_limit_usize,
                     args.tags.as_deref(),
                     effective_since.as_deref(),
-                    args.until.as_deref(),
+                    effective_until.as_deref(),
                     resolved_ttl.short_extend_secs,
                     resolved_ttl.mid_extend_secs,
                     args.as_agent.as_deref(),
@@ -531,7 +534,7 @@ pub(crate) fn run_with_embedder(
             effective_limit_usize,
             args.tags.as_deref(),
             effective_since.as_deref(),
-            args.until.as_deref(),
+            effective_until.as_deref(),
             resolved_ttl.short_extend_secs,
             resolved_ttl.mid_extend_secs,
             args.as_agent.as_deref(),

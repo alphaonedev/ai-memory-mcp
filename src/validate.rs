@@ -975,6 +975,11 @@ pub fn validate_source_uri(s: &str) -> Result<()> {
 /// digits → an arbitrary cutoff) rather than error. Refuse at the entry
 /// surfaces so a malformed bound is a clear `400`/typed error.
 ///
+/// After this returns `Ok`, the caller MUST bind
+/// [`canonical_rfc3339`] / [`canonicalize_valid_time`] — not the raw
+/// input. RFC3339 offsets (`+05:00`) pass this check but still
+/// mis-order as TEXT against stored `Z` / `+00:00` bytes.
+///
 /// # Errors
 /// Returns an error when `value` is not a parseable RFC3339 timestamp.
 pub fn validate_rfc3339_timestamp(field: &str, value: &str) -> Result<()> {
@@ -1730,6 +1735,17 @@ mod tests {
             err.to_string().contains("RFC3339"),
             "error must name RFC3339, got {err}"
         );
+    }
+
+    #[test]
+    fn rfc3339_offset_canonicalizes_to_same_utc_bound_3366() {
+        // #3366 amendment — `+00:00` and `+05:00` of the SAME instant
+        // must bind as one fixed-width UTC string, or TEXT compare
+        // against stored `created_at` / `delivered_at` mis-filters.
+        let utc = canonicalize_valid_time("2026-03-01T00:00:00+00:00").expect("utc");
+        let offset = canonicalize_valid_time("2026-03-01T05:00:00+05:00").expect("offset");
+        assert_eq!(utc, offset);
+        assert_eq!(utc, "2026-03-01T00:00:00.000000Z");
     }
 
     #[test]
