@@ -30,7 +30,7 @@ const OTHER_INBOX: &str = "_messages/ai:other";
 
 struct Fixture {
     router: axum::Router,
-    _file: NamedTempFile,
+    file: NamedTempFile,
     ordinary: String,
     own_inbox: String,
     other_inbox: String,
@@ -149,7 +149,7 @@ fn fixture(storage_backend: StorageBackend) -> Fixture {
     };
     Fixture {
         router: ai_memory::build_router(api_keys, state),
-        _file: file,
+        file,
         ordinary,
         own_inbox,
         other_inbox,
@@ -305,4 +305,122 @@ async fn fake_pg_http_read_funnels_share_system_namespace_rule_3348() {
 async fn direct_sqlite_http_read_funnels_share_system_namespace_rule_3348() {
     let fixture = fixture(StorageBackend::Sqlite);
     assert_http_read_funnels_share_system_namespace_rule(&fixture).await;
+}
+
+// #3366 shares these HTTP read funnels with #3348; retain the same fixture so
+// timestamp filtering is exercised alongside the production visibility gates.
+#[tokio::test]
+async fn http_timestamp_bounds_refuse_malformed_3366() {
+    for backend in [StorageBackend::Sqlite, StorageBackend::Postgres] {
+        let fixture = fixture(backend);
+        for (field, value) in [
+            ("since", "garbage"),
+            ("until", "not-a-date"),
+            ("since", "1725000000"),
+        ] {
+            for surface in ["search", "recall", "recall-post"] {
+                let request = timestamp_request(surface, field, value, None);
+                let response = fixture.router.clone().oneshot(request).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{surface} {field}"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(body["error"].as_str().unwrap().contains("RFC3339"));
+            }
+        }
+    }
+}
+
+fn timestamp_request(
+    surface: &str,
+    field: &str,
+    value: &str,
+    until: Option<&str>,
+) -> Request<Body> {
+    let mut request = Request::builder().header(ai_memory::HEADER_AGENT_ID, CALLER);
+    if surface == "recall-post" {
+        let mut body = json!({"context": NEEDLE, "namespace": "operator-memory", (field): value});
+        if let Some(until) = until {
+            body["until"] = json!(until);
+        }
+        request = request
+            .method("POST")
+            .uri("/api/v1/recall")
+            .header("content-type", "application/json");
+        request
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    } else {
+        let query_key = if surface == "search" { "q" } else { "context" };
+        let value = value.replace('+', "%2B");
+        let until = until
+            .map(|until| format!("&until={}", until.replace('+', "%2B")))
+            .unwrap_or_default();
+        let uri = format!(
+            "/api/v1/{surface}?{query_key}={NEEDLE}&namespace=operator-memory&{field}={value}{until}"
+        );
+        request.uri(uri).body(Body::empty()).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn http_offset_windows_select_same_rows_3366() {
+    for backend in [StorageBackend::Sqlite, StorageBackend::Postgres] {
+        let fixture = fixture(backend);
+        let conn = ai_memory::db::open(fixture.file.path()).unwrap();
+        let old = insert(
+            &conn,
+            "operator-memory",
+            json!({"agent_id": CALLER, "scope": "private"}),
+        );
+        let future = insert(
+            &conn,
+            "operator-memory",
+            json!({"agent_id": CALLER, "scope": "private"}),
+        );
+        for (id, timestamp) in [
+            (&old, "2026-01-01T00:00:00.000000Z"),
+            (&fixture.ordinary, "2026-03-01T02:00:00.000000Z"),
+            (&future, "2026-06-01T02:00:00.000000Z"),
+        ] {
+            conn.execute(
+                "UPDATE memories SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![timestamp, id],
+            )
+            .unwrap();
+        }
+        for (since, until) in [
+            ("2026-03-01T00:00:00+00:00", "2026-06-01T00:00:00+00:00"),
+            ("2026-03-01T05:00:00+05:00", "2026-06-01T05:00:00+05:00"),
+        ] {
+            for surface in ["search", "recall", "recall-post"] {
+                let response = fixture
+                    .router
+                    .clone()
+                    .oneshot(timestamp_request(surface, "since", since, Some(until)))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{surface}");
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                let key = if surface == "search" {
+                    "results"
+                } else {
+                    "memories"
+                };
+                assert_eq!(
+                    ids(&body, key).as_slice(),
+                    std::slice::from_ref(&fixture.ordinary),
+                    "{surface} since={since}"
+                );
+            }
+        }
+    }
 }
