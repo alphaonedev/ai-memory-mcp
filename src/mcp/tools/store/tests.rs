@@ -88,6 +88,69 @@ fn base_params(title: &str) -> Value {
     })
 }
 
+fn valid_write_v2_for(
+    agent_id: &str,
+    namespace: &str,
+    title: &str,
+    content: &str,
+    kind: &str,
+    root: &crate::identity::keypair::AgentKeypair,
+) -> Value {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+
+    use crate::identity::cbor_array::{
+        HashCodec, Multihash, SUITE_ED25519_SHA256, SignableWriteV2, canonical_cbor_write_v2,
+    };
+    use crate::identity::subkey_cert::{SubkeyCert, sign_subkey_cert};
+
+    let sub = SigningKey::from_bytes(&[0x34; 32]);
+    let instance_key_id = sub.verifying_key().to_bytes().to_vec();
+    let model_version_ref = vec![0x56; 32];
+    let not_before = "2020-01-01T00:00:00Z";
+    let not_after = "2099-01-01T00:00:00Z";
+    let cert = SubkeyCert {
+        principal: agent_id,
+        instance_key_id: &instance_key_id,
+        model_version_ref: &model_version_ref,
+        not_before,
+        not_after,
+    };
+    let root_signing = root.private.as_ref().expect("generated root can sign");
+    let cert_signature = sign_subkey_cert(root_signing, &cert);
+    let digest: [u8; 32] = Sha256::digest(content.as_bytes()).into();
+    let created_at = crate::identity::attest::now_attestable_rfc3339();
+    let write = SignableWriteV2 {
+        agent_id,
+        namespace,
+        title,
+        kind,
+        created_at: &created_at,
+        content_digest: Multihash::new(HashCodec::Sha2_256, digest),
+        instance_key_id: &instance_key_id,
+        model_version_ref: &model_version_ref,
+        session_id: None,
+        suite_tag: SUITE_ED25519_SHA256,
+    };
+    let write_signature = sub.sign(&canonical_cbor_write_v2(&write)).to_bytes();
+    let b64 = base64::engine::general_purpose::STANDARD;
+    json!({
+        "cert": {
+            "principal": agent_id,
+            "instance_key_id": b64.encode(&instance_key_id),
+            "model_version_ref": b64.encode(&model_version_ref),
+            "not_before": not_before,
+            "not_after": not_after,
+        },
+        "cert_signature": b64.encode(cert_signature),
+        "write_signature": b64.encode(write_signature),
+        "suite_tag": SUITE_ED25519_SHA256,
+        "content_codec": "sha2-256",
+        "created_at": created_at,
+    })
+}
+
 // OnConflict::parse: all valid + invalid
 #[test]
 fn on_conflict_parse_variants() {
@@ -459,6 +522,24 @@ fn merge_dedup_reembeds_on_content_change() {
     )
     .expect("second");
     assert_eq!(r2["duplicate"].as_bool(), Some(true));
+
+    params["content"] =
+        json!("A third body proves re-embedding also works without an in-memory index.");
+    let r3 = handle_store(
+        &conn,
+        &db_path,
+        &params,
+        Some(&mock as &dyn Embed),
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("third merge without vector index");
+    assert_eq!(r3["duplicate"].as_bool(), Some(true));
 }
 
 // E. idempotency — same write twice produces same id under Merge default
@@ -2324,6 +2405,79 @@ fn mcp_store_signed_with_bound_key_stamps_agent_attested() {
         stored.created_at, created_at,
         "the server must adopt the caller-signed created_at verbatim"
     );
+
+    let replay_err = handle_store(
+        &conn,
+        &db_path(),
+        &params,
+        None,
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("the identical signed envelope must be admitted only once");
+    assert_eq!(
+        replay_err,
+        crate::identity::attest::ATTESTED_WRITE_REPLAY_REFUSAL,
+        "a replay must fail with the stable refusal instead of reaching an overwrite path"
+    );
+    assert!(
+        db::get(&conn, id).expect("get after replay").is_some(),
+        "replay refusal must preserve the first admitted row"
+    );
+}
+
+#[test]
+fn mcp_store_signed_ledger_fault_refuses_before_persist_3496() {
+    let conn = fresh_conn();
+    let kp = crate::identity::keypair::generate("ai:ledger-fault").expect("keypair");
+    db::register_agent(&conn, "ai:ledger-fault", "nhi", &[]).expect("register");
+    db::bind_agent_pubkey(&conn, "ai:ledger-fault", &kp.public_base64()).expect("bind");
+    conn.execute("DROP TABLE attested_write_ledger", [])
+        .expect("remove replay ledger to inject a storage fault");
+
+    let title = "signed-ledger-fault";
+    let content =
+        "A valid signed MCP write must fail closed when its replay ledger is unavailable.";
+    let created_at = crate::identity::attest::now_attestable_rfc3339();
+    let sig_b64 = sign_store_envelope(&kp, "ai:ledger-fault", title, content, &created_at);
+    let params = json!({
+        "title": title,
+        "content": content,
+        "namespace": "test-ns",
+        "agent_id": "ai:ledger-fault",
+        "signature": sig_b64,
+        "created_at": created_at,
+    });
+
+    let err = handle_store(
+        &conn,
+        &db_path(),
+        &params,
+        None,
+        None,
+        None,
+        &ResolvedTtl::default(),
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("a replay-ledger fault must refuse the signed write");
+    assert!(
+        err.contains("attested-write replay ledger"),
+        "the refusal should identify the failed security ledger: {err}"
+    );
+    assert!(
+        db::find_by_title_namespace(&conn, title, "test-ns")
+            .expect("lookup after ledger fault")
+            .is_none(),
+        "ledger failure must happen before memory persistence"
+    );
 }
 
 #[test]
@@ -2781,4 +2935,161 @@ fn issue_2878_mcp_store_merge_mode_still_upserts_unchanged() {
         "#1632: merge upsert bumps version (proves #2878 changed only error mode), got {}",
         row.version
     );
+}
+
+#[test]
+fn store_valid_write_v2_is_admitted_and_stamped_3496() {
+    const AGENT_ID: &str = "ai:alice";
+    const NAMESPACE: &str = "test-ns";
+    const TITLE: &str = "valid-v2-3496";
+    const KIND: &str = "instruction";
+
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let content = format!("This is the body of {TITLE}, long enough to be meaningful prose.");
+    let mut request = base_params(TITLE);
+    request["kind"] = json!(KIND);
+    crate::db::register_agent(&conn, AGENT_ID, "ai:generic", &[]).expect("register agent");
+    let root = crate::identity::keypair::generate(AGENT_ID).expect("generate root");
+    crate::db::bind_agent_pubkey(&conn, AGENT_ID, &root.public_base64()).expect("bind root");
+    request["write_v2"] = valid_write_v2_for(AGENT_ID, NAMESPACE, TITLE, &content, KIND, &root);
+
+    let response = handle_store(
+        &conn, &db_path, &request, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("a valid certified-subkey write must be admitted");
+    let stored = db::get(&conn, response["id"].as_str().unwrap())
+        .expect("read")
+        .expect("stored row");
+    assert_eq!(stored.metadata["attest_level"], "agent_attested");
+    assert_eq!(
+        crate::db::list_subkey_certs(&conn, Some("ai:alice"))
+            .expect("list certs")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn store_enforced_caller_withholds_and_refuses_cross_owner_duplicate_3496() {
+    let _lock = crate::identity::agent_id_env_test_lock();
+    let caller = crate::test_support::EnvGuard::capture("AI_MEMORY_AGENT_ID");
+    caller.unset();
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let mut seed = base_params("cross-owner-3496");
+    seed["agent_id"] = json!("ai:bob");
+    seed["on_conflict"] = json!("merge");
+    let seeded = handle_store(
+        &conn, &db_path, &seed, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("seed another agent's row");
+    let id = seeded["id"].as_str().unwrap().to_string();
+
+    caller.set("ai:alice");
+    let mut collision = base_params("cross-owner-3496");
+    collision["on_conflict"] = json!("merge");
+    collision["content"] = json!("An overwrite that the enforced caller must never apply.");
+    let err = handle_store(
+        &conn, &db_path, &collision, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect_err("a cross-owner exact duplicate must fail closed");
+    assert_eq!(err, crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY);
+    assert!(
+        db::get(&conn, &id)
+            .expect("read")
+            .expect("seed remains")
+            .content
+            .contains("This is the body of cross-owner-3496")
+    );
+}
+
+#[test]
+fn store_insert_and_refund_failures_remain_observable_without_persisting_3496() {
+    let conn = fresh_conn();
+    conn.execute_batch(
+        "CREATE TRIGGER fail_memory_insert_3496
+           BEFORE INSERT ON memories
+           BEGIN SELECT RAISE(ABORT, 'forced memory insert failure 3496'); END;
+         CREATE TRIGGER fail_quota_refund_3496
+           BEFORE UPDATE OF current_memories_today, current_storage_bytes ON agent_quotas
+           WHEN NEW.current_memories_today < OLD.current_memories_today
+           BEGIN SELECT RAISE(ABORT, 'forced quota refund failure 3496'); END;",
+    )
+    .expect("install test-local failure triggers");
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+
+    let err = handle_store(
+        &conn,
+        &db_path,
+        &base_params("insert-refund-fault-3496"),
+        None,
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("the forced insert fault must remain observable");
+    assert!(
+        err.contains("forced memory insert failure 3496"),
+        "got: {err}"
+    );
+    let charged: (i64, i64) = conn
+        .query_row(
+            "SELECT current_memories_today, current_storage_bytes
+               FROM agent_quotas WHERE agent_id = 'ai:alice' AND namespace = 'test-ns'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the initial quota charge was admitted");
+    assert_eq!(
+        charged.0, 1,
+        "the decrement-only refund trigger must have fired"
+    );
+    assert!(
+        charged.1 > 0,
+        "the failed refund must leave the admitted byte charge visible"
+    );
+    let memories: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        memories, 0,
+        "an insert fault must never leave a memory behind"
+    );
+}
+
+#[test]
+fn store_quarantined_duplicate_uses_request_echo_fallback_3496() {
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let mut params = base_params("quarantined-echo-3496");
+    params["on_conflict"] = json!("merge");
+    let seeded = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("seed write");
+    let id = seeded["id"].as_str().unwrap().to_string();
+    conn.execute(
+        "UPDATE memories SET lifecycle_state = ?1 WHERE id = ?2",
+        rusqlite::params![crate::models::LifecycleState::Quarantined.as_str(), id],
+    )
+    .expect("quarantine the dedup slot");
+    assert!(db::get(&conn, &id).expect("read").is_none());
+
+    params["content"] = json!("A second write into the slot hidden by quarantine.");
+    let response = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("an unreadable echo must not fail the already-committed write");
+    assert_eq!(response["tier"].as_str(), Some(Tier::Mid.as_str()));
+    assert_eq!(response["namespace"].as_str(), Some("test-ns"));
+    assert_eq!(response["title"].as_str(), Some("quarantined-echo-3496"));
 }

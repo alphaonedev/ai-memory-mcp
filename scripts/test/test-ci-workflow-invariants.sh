@@ -668,6 +668,129 @@ if [ "$d_total" -gt 0 ]; then
     fi
 fi
 
+# ===========================================================================
+# SECTION E — #3496: coverage profile aggregation stays executable and exact.
+#
+# cargo-llvm-cov 0.9.0 rejects `--no-clean --no-report`. The ordinary sweep
+# must therefore stop before reporting, while the one explicitly named,
+# ignored PostgreSQL proof retains those profiles and renders the combined
+# JSON. Keep the local wrapper token-for-token aligned with CI.
+# ===========================================================================
+echo "  --- Section E: #3496 coverage profile aggregation ---"
+
+COVERAGE_YML="$ROOT/.github/workflows/coverage.yml"
+COVERAGE_SH="$ROOT/scripts/coverage.sh"
+RUST_ACTION_PIN="f8be11a05b1d4f3fcebe6410cc16743212b999b0"
+
+coverage_toolchain_ok() {
+    local file="$1"
+    [ "$(grep -Fxc "        uses: dtolnay/rust-toolchain@$RUST_ACTION_PIN # 1.98.0" "$file" || true)" -eq 1 ] \
+        && [ "$(grep -Fxc '          toolchain: "1.98.0"' "$file" || true)" -eq 1 ]
+}
+
+if coverage_toolchain_ok "$COVERAGE_YML"; then
+    ok "E: coverage pins the action revision and Rust toolchain to exact 1.98.0"
+else
+    bad "E: coverage Rust toolchain is floating or mis-pinned" \
+        "pin dtolnay/rust-toolchain@$RUST_ACTION_PIN and toolchain 1.98.0"
+fi
+
+# R-203: prove both halves of the pin are load-bearing. A floating action ref
+# or a floating toolchain input must independently fail the structural gate.
+E_ACTION_MUT="$SCRATCH/coverage-3496-action-mutant.yml"
+awk '
+  !mutated && /uses: dtolnay\/rust-toolchain@/ {
+    sub(/dtolnay\/rust-toolchain@[^[:space:]]+/, "dtolnay/rust-toolchain@stable"); mutated = 1
+  }
+  { print }
+' "$COVERAGE_YML" > "$E_ACTION_MUT"
+if coverage_toolchain_ok "$E_ACTION_MUT"; then
+    bad "E regression: floating Rust action mutant passed" \
+        "the exact dtolnay/rust-toolchain action revision check is vacuous"
+else
+    ok "E regression: floating Rust action mutant is rejected"
+fi
+
+E_TOOLCHAIN_MUT="$SCRATCH/coverage-3496-toolchain-mutant.yml"
+awk '
+  !mutated && /toolchain: "1\.98\.0"/ {
+    sub(/toolchain: "1\.98\.0"/, "toolchain: \"stable\""); mutated = 1
+  }
+  { print }
+' "$COVERAGE_YML" > "$E_TOOLCHAIN_MUT"
+if coverage_toolchain_ok "$E_TOOLCHAIN_MUT"; then
+    bad "E regression: floating Rust toolchain mutant passed" \
+        "the exact 1.98.0 toolchain input check is vacuous"
+else
+    ok "E regression: floating Rust toolchain mutant is rejected"
+fi
+
+# Print each backslash-continued cargo-llvm-cov command on one normalized line.
+coverage_commands() {
+    awk '
+      /^[[:space:]]*cargo llvm-cov([[:space:]]|$)/ && !in_cmd {
+        in_cmd = 1; cmd = $0
+        if ($0 !~ /\\[[:space:]]*$/) { print cmd; in_cmd = 0 }
+        next
+      }
+      in_cmd {
+        cmd = cmd " " $0
+        if ($0 !~ /\\[[:space:]]*$/) { print cmd; in_cmd = 0 }
+      }
+    ' "$1" | sed 's/[[:space:]\\][[:space:]\\]*/ /g; s/^ //; s/ $//'
+}
+
+coverage_sequence_ok() {
+    local file="$1" commands ordinary named
+    commands="$(coverage_commands "$file")"
+    ordinary="$(printf '%s\n' "$commands" | grep -- '--lib --tests' || true)"
+    named="$(printf '%s\n' "$commands" \
+        | grep -- '-- schema_init_postgres_embedding_dim_conversion' || true)"
+    [ "$(printf '%s\n' "$ordinary" | grep -c . || true)" -eq 1 ] \
+        && [ "$(printf '%s\n' "$named" | grep -c . || true)" -eq 1 ] \
+        && [[ "$ordinary" == *"--no-report"* ]] \
+        && [[ "$ordinary" != *"--no-clean"* ]] \
+        && [[ "$named" == *"--no-clean"* ]] \
+        && [[ "$named" != *"--no-report"* ]] \
+        && [[ "$named" == *"--json"* ]] \
+        && [[ "$named" == *"--output-path coverage/current.json"* ]] \
+        && [[ "$named" == *"--ignored --test-threads=1"* ]]
+}
+
+if coverage_sequence_ok "$COVERAGE_YML" && coverage_sequence_ok "$COVERAGE_SH"; then
+    yml_commands="$(coverage_commands "$COVERAGE_YML")"
+    sh_commands="$(coverage_commands "$COVERAGE_SH")"
+    yml_ordinary="$(printf '%s\n' "$yml_commands" | grep -- '--lib --tests')"
+    sh_ordinary="$(printf '%s\n' "$sh_commands" | grep -- '--lib --tests')"
+    yml_named="$(printf '%s\n' "$yml_commands" | grep -- '-- schema_init_postgres_embedding_dim_conversion')"
+    sh_named="$(printf '%s\n' "$sh_commands" | grep -- '-- schema_init_postgres_embedding_dim_conversion')"
+    if [ "$yml_ordinary" = "$sh_ordinary" ] && [ "$yml_named" = "$sh_named" ]; then
+        ok "E: CI and local coverage use identical valid ordinary + PostgreSQL aggregation commands"
+    else
+        bad "E: CI and local coverage command tokens drifted" \
+            "scripts/coverage.sh must mirror coverage.yml for both aggregation phases"
+    fi
+else
+    bad "E: coverage aggregation command shape is invalid" \
+        "require ordinary --no-report, then named --no-clean + JSON report; never combine --no-clean with --no-report"
+fi
+
+# R-203: plant the exact cargo-llvm-cov 0.9.0-invalid option pair and require
+# this gate to reject it, proving the argument scan is not vacuous.
+E_MUT="$SCRATCH/coverage-3496-mutant.yml"
+awk '
+  !mutated && /--no-clean/ {
+    sub(/--no-clean/, "--no-clean --no-report"); mutated = 1
+  }
+  { print }
+' "$COVERAGE_YML" > "$E_MUT"
+if coverage_sequence_ok "$E_MUT"; then
+    bad "E regression: cargo-llvm-cov-invalid mutant passed" \
+        "the scan failed to detect --no-clean combined with --no-report"
+else
+    ok "E regression: --no-clean + --no-report mutant is rejected"
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"

@@ -397,3 +397,45 @@ fn rules_list_reports_real_enforcement_state_3430() {
         assert_eq!(row["enforcement_state"], "enforced");
     }
 }
+
+#[test]
+fn install_defaults_wrong_signer_reports_each_inert_rule_and_fails_3496() {
+    let _g = env_lock();
+    let (dir, db_path, key_dir) = fresh_env();
+    let _env = KeyDirGuard::set(&key_dir);
+    keygen(&db_path, &key_dir);
+    sign_seed(&db_path, &key_dir);
+
+    let wrong_key_dir = dir.path().join("wrong-signer");
+    keygen(&db_path, &wrong_key_dir);
+    let mut stdout = Vec::<u8>::new();
+    let mut stderr = Vec::<u8>::new();
+    let err = {
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        governance_install_defaults::run(
+            &db_path,
+            InstallDefaultsArgs {
+                yes: true,
+                json: false,
+                key_dir: Some(wrong_key_dir),
+            },
+            &mut out,
+        )
+        .expect_err("signing with a key other than the resolved verifier must fail")
+    };
+
+    let rendered = String::from_utf8(stdout).expect("utf8 stdout");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("refused to report success (#3430)"));
+    for id in ["R001", "R002", "R003", "R004"] {
+        assert!(
+            rendered.contains(&format!("NOT ENFORCED: {id} (skipped_signature_invalid)")),
+            "the non-zero ceremony must identify inert {id}: {rendered}"
+        );
+    }
+    assert!(rendered.contains("0 enforced, 4 inert"));
+    assert!(
+        !rendered.contains("4 enforced, 0 inert"),
+        "a wrong-key ceremony must never claim enforcement: {rendered}"
+    );
+}
