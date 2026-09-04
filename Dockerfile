@@ -21,6 +21,11 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY benches/ benches/
+# Cargo validates every manifest-declared target before it builds the selected
+# binary. Keep tests/ in the builder context because Cargo.toml contains
+# explicit [[test]] targets (including feature-gated ones); omitting the files
+# makes even `cargo build --release` fail during manifest validation (#3488).
+COPY tests/ tests/
 # v0.6.3 added include_str! references to migration SQL files
 # (Streams A-C schema v15: migrations/sqlite/0010_v063_hierarchy_kg.sql).
 # Without the migrations/ directory in the build context, cargo build
