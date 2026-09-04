@@ -69,6 +69,17 @@ fn reject_malformed_created_at_bounds(req: &RecallRequest) -> Option<axum::respo
     None
 }
 
+/// v1.0.0 #3366 — bind the fixed-width UTC form (micros + `Z`) so an
+/// RFC3339 offset is compared as an instant, not as TEXT bytes.
+fn canonicalize_created_at_bounds_in_place(req: &mut RecallRequest) {
+    if let Some(s) = req.since.take() {
+        req.since = Some(validate::canonical_rfc3339(&s));
+    }
+    if let Some(u) = req.until.take() {
+        req.until = Some(validate::canonical_rfc3339(&u));
+    }
+}
+
 fn splice_recall_scope_into(req: &mut RecallRequest, app: &AppState) -> Option<String> {
     let want_splice = req.session_default.unwrap_or(false);
     let scope_opt: Option<&crate::config::RecallScope> = if want_splice {
@@ -175,6 +186,7 @@ pub async fn recall_memories_get(
     // when `session_default=true` AND the caller omitted the
     // matching filter axis. Resolution: explicit args win.
     let scope_tier = splice_recall_scope_into(&mut req, &app);
+    canonicalize_created_at_bounds_in_place(&mut req);
     let kinds = p.resolved_kinds();
     // v0.7.0 ship-hardening (2026-05-19): resolve the caller principal
     // from the X-Agent-Id header (synthesizes anonymous on miss) so
@@ -270,6 +282,7 @@ pub async fn recall_memories_post(
     };
     // v0.7.0 (issue #518) — see GET handler for the resolution rule.
     let scope_tier = splice_recall_scope_into(&mut req, &app);
+    canonicalize_created_at_bounds_in_place(&mut req);
     let kinds = body.resolved_kinds();
     // See GET handler for the caller-resolution rationale.
     let caller_principal = match crate::handlers::parity::resolve_caller_agent_id(

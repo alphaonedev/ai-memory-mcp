@@ -1098,13 +1098,19 @@ pub fn handle_recall_dto(
         validate::validate_valid_at(v).map_err(|e| e.to_string())?;
     }
     // v1.0.0 #3366 — since/until are bound as TEXT against created_at; a
-    // non-RFC3339 string silently mis-filters. Refuse, matching valid_at.
+    // non-RFC3339 string silently mis-filters. Refuse, matching valid_at,
+    // then canonicalize to micros+`Z` so an offset (`+05:00`) compares
+    // as the same instant as `+00:00` / `Z`.
     if let Some(v) = since {
         validate::validate_rfc3339_timestamp("since", v).map_err(|e| e.to_string())?;
     }
     if let Some(v) = until {
         validate::validate_rfc3339_timestamp("until", v).map_err(|e| e.to_string())?;
     }
+    let since_canon = since.map(validate::canonical_rfc3339);
+    let until_canon = until.map(validate::canonical_rfc3339);
+    let since = since_canon.as_deref();
+    let until = until_canon.as_deref();
     // #151 visibility
     let as_agent = req.as_agent.as_deref();
     if let Some(a) = as_agent {
@@ -2026,6 +2032,53 @@ mod tests {
         )
         .expect_err("malformed until must refuse");
         assert!(err.contains("RFC3339"), "got: {err}");
+    }
+
+    #[test]
+    fn since_offset_equivalent_to_utc_returns_only_newer_3366() {
+        // #3366 amendment — ALLOWED path. Two rows 2026-01-01Z /
+        // 2026-05-05Z; `since=2026-03-01T00:00:00+00:00` AND the same
+        // instant spelled `+05:00` both return only the newer.
+        let conn = fresh_conn();
+        let mut older = make_mem("older ownership", "ownership rust", "test");
+        older.created_at = "2026-01-01T00:00:00Z".to_string();
+        older.updated_at = older.created_at.clone();
+        let mut newer = make_mem("newer ownership", "ownership rust", "test");
+        newer.created_at = "2026-05-05T00:00:00Z".to_string();
+        newer.updated_at = newer.created_at.clone();
+        db::insert(&conn, &older).unwrap();
+        db::insert(&conn, &newer).unwrap();
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        for since in ["2026-03-01T00:00:00+00:00", "2026-03-01T05:00:00+05:00"] {
+            let resp = handle_recall(
+                &conn,
+                &json!({
+                    "context": "ownership",
+                    "namespace": "test",
+                    "since": since,
+                }),
+                None,
+                None,
+                None,
+                false,
+                &ttl,
+                &scoring,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("since={since} must succeed: {e}"));
+            let titles: Vec<&str> = resp["memories"]
+                .as_array()
+                .expect("memories array")
+                .iter()
+                .filter_map(|m| m.get("title").and_then(Value::as_str))
+                .collect();
+            assert_eq!(
+                titles,
+                ["newer ownership"],
+                "since={since} must return only the May row, got {titles:?}"
+            );
+        }
     }
 
     // limit huge → saturate
