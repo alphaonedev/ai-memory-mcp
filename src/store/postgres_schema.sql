@@ -1527,18 +1527,9 @@ CREATE TABLE IF NOT EXISTS embed_skip (
 CREATE INDEX IF NOT EXISTS idx_embed_skip_fp
     ON embed_skip(key_fingerprint);
 
-CREATE OR REPLACE FUNCTION trg_embed_skip_clear()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    DELETE FROM embed_skip WHERE memory_id = NEW.id;
-    RETURN NEW;
-END;
-$$;
-
-DROP TRIGGER IF EXISTS memories_embed_skip_clear ON memories;
-CREATE TRIGGER memories_embed_skip_clear
-AFTER UPDATE OF content, encrypted_envelope, embedding ON memories
-FOR EACH ROW
-EXECUTE FUNCTION trg_embed_skip_clear();
+-- #3493 — the function + memories trigger are ladder-owned at v96. Bootstrap
+-- runs before the ladder on every connect, including against pre-v96 table
+-- shapes. Replaying the trigger here either takes an ACCESS EXCLUSIVE lock
+-- (`DROP TRIGGER`) before the bounded blocking-DDL arm can emit its canonical
+-- refusal, or names columns an older table does not have. Fresh databases still
+-- install the pair through migrations/postgres/0053_v96_embed_skip.sql.
