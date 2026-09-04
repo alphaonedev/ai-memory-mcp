@@ -318,7 +318,15 @@ async fn namespaces_round_trip_via_sal() {
         .await
         .expect("namespaces body");
     let arr = ns["namespaces"].as_array().expect("namespaces array");
-    assert!(arr.iter().any(|v| v.as_str() == Some(&unique_ns)));
+    let row = arr
+        .iter()
+        .find(|v| v["namespace"].as_str() == Some(&unique_ns))
+        .expect("seeded namespace appears in namespaces array");
+    assert_eq!(
+        row["count"].as_u64(),
+        Some(1),
+        "the unique namespace contains exactly the seeded memory"
+    );
 
     shutdown.notify_one();
     let _ = handle.await;
