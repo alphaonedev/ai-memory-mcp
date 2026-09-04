@@ -44,6 +44,23 @@ pub const MIGRATION_V96_SQLITE: &str =
 pub const MIGRATION_V96_POSTGRES: &str =
     include_str!("../../migrations/postgres/0053_v96_embed_skip.sql");
 
+/// Transactional teardown for the Postgres v96 embedding-dependent trigger.
+///
+/// `migrate_embedding_dim` runs this only after its embedding-NULL update has
+/// fired the trigger, then recreates the trigger before committing. PostgreSQL
+/// transactional DDL means any later failure rolls the drop back with the rest
+/// of the conversion.
+pub(crate) const POSTGRES_DROP_CLEAR_TRIGGER: &str =
+    "DROP TRIGGER IF EXISTS memories_embed_skip_clear ON memories";
+
+/// Canonical recreation of the v96 clear trigger after an embedding column
+/// type conversion.
+pub(crate) const POSTGRES_CREATE_CLEAR_TRIGGER: &str = "\
+CREATE TRIGGER memories_embed_skip_clear
+AFTER UPDATE OF content, encrypted_envelope, embedding ON memories
+FOR EACH ROW
+EXECUTE FUNCTION trg_embed_skip_clear()";
+
 /// SQLite trigger: content / envelope rewrite drops the skip so the next
 /// scan retries. Ladder-owned (v96); not in bootstrap `SCHEMA`.
 pub const TRIGGER_CLEAR_ON_CONTENT: &str = "memories_embed_skip_clear_on_content";
@@ -613,6 +630,14 @@ mod tests {
         assert!(
             MIGRATION_V96_POSTGRES.contains("CREATE TABLE IF NOT EXISTS embed_skip"),
             "postgres DDL twin must ship the table"
+        );
+        assert!(
+            MIGRATION_V96_POSTGRES.contains(POSTGRES_DROP_CLEAR_TRIGGER),
+            "postgres DDL twin must match the conversion-time trigger drop"
+        );
+        assert!(
+            MIGRATION_V96_POSTGRES.contains(POSTGRES_CREATE_CLEAR_TRIGGER),
+            "postgres DDL twin must match the conversion-time trigger recreation"
         );
         assert!(
             MIGRATION_V96_SQLITE.contains(TRIGGER_CLEAR_ON_EMBED),

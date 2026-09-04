@@ -1142,6 +1142,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires running postgres; see comment above for the recipe"]
     async fn schema_init_postgres_embedding_dim_conversion() {
+        use crate::store::{CallerContext, MemoryStore, StoreError};
+
         let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
             .expect("AI_MEMORY_TEST_POSTGRES_URL must be set");
         // Registered BEFORE any schema-init call so a panic on any
@@ -1163,6 +1165,43 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
         assert_eq!(v["embedding_dim"].as_i64(), Some(384), "initial dim: {v}");
 
+        let inspect = sqlx::PgPool::connect(&url)
+            .await
+            .expect("connect schema-init inspection pool");
+        let trigger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relname = 'memories' \
+             AND t.tgname = 'memories_embed_skip_clear' AND NOT t.tgisinternal",
+        )
+        .fetch_one(&inspect)
+        .await
+        .expect("inspect pre-conversion v96 trigger");
+        assert_eq!(trigger_count, 1, "current v96 trigger must be installed");
+
+        // Seed the derived cache behind a row with a live vector. The
+        // conversion's NULL update must fire v96 BEFORE the trigger is
+        // temporarily dropped, otherwise this marker would survive stale.
+        sqlx::query(
+            "INSERT INTO memories (id, tier, namespace, title, content, source, embedding) \
+             VALUES ('issue-3491-trigger', 'mid', 'issue-3491', 'trigger', 'before', 'test', \
+                     array_fill(0.25::real, ARRAY[384])::vector) \
+             ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, \
+                                            embedding = EXCLUDED.embedding",
+        )
+        .execute(&inspect)
+        .await
+        .expect("seed 384-dim memory");
+        sqlx::query(
+            "INSERT INTO embed_skip \
+             (memory_id, agent_id, key_fingerprint, reason) \
+             VALUES ('issue-3491-trigger', 'ai:3491', 'fp-before', 'oversize')",
+        )
+        .execute(&inspect)
+        .await
+        .expect("seed pre-conversion embed skip marker");
+
         // Step 2 — re-run at 768; expect conversion + WARN.
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -1171,7 +1210,7 @@ mod tests {
             store_url: url.clone(),
             json: true,
             embedding_dim: Some(768),
-            force_reembed: false,
+            force_reembed: true,
         };
         run(&args, None, &mut out).await.expect("schema-init 768");
         let raw = String::from_utf8(stdout).unwrap();
@@ -1185,13 +1224,62 @@ mod tests {
             v["embedding_dim_migrated"], true,
             "conversion should be flagged: {v}"
         );
+        let marker_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM embed_skip WHERE memory_id = 'issue-3491-trigger'",
+        )
+        .fetch_one(&inspect)
+        .await
+        .expect("inspect marker invalidated by conversion");
+        assert_eq!(
+            marker_count, 0,
+            "conversion NULL update must retain v96 cache invalidation semantics"
+        );
+
+        let trigger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relname = 'memories' \
+             AND t.tgname = 'memories_embed_skip_clear' AND NOT t.tgisinternal",
+        )
+        .fetch_one(&inspect)
+        .await
+        .expect("inspect post-conversion v96 trigger");
+        assert_eq!(
+            trigger_count, 1,
+            "v96 trigger must be recreated exactly once"
+        );
+
+        // Prove the recreated trigger remains live after the type change.
+        sqlx::query(
+            "INSERT INTO embed_skip \
+             (memory_id, agent_id, key_fingerprint, reason) \
+             VALUES ('issue-3491-trigger', 'ai:3491', 'fp-after', 'oversize')",
+        )
+        .execute(&inspect)
+        .await
+        .expect("seed post-conversion embed skip marker");
+        sqlx::query("UPDATE memories SET content = 'after' WHERE id = 'issue-3491-trigger'")
+            .execute(&inspect)
+            .await
+            .expect("fire recreated v96 trigger");
+        let marker_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM embed_skip WHERE memory_id = 'issue-3491-trigger'",
+        )
+        .fetch_one(&inspect)
+        .await
+        .expect("inspect post-conversion trigger effect");
+        assert_eq!(
+            marker_count, 0,
+            "recreated v96 trigger must clear the marker"
+        );
 
         // Step 3 — re-run at 768 again; expect idempotent no-op.
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
         let args = SchemaInitArgs {
-            store_url: url,
+            store_url: url.clone(),
             json: true,
             embedding_dim: Some(768),
             force_reembed: false,
@@ -1205,6 +1293,46 @@ mod tests {
         assert_eq!(
             v["embedding_dim_migrated"], false,
             "second run at same dim must be no-op: {v}"
+        );
+
+        // The trigger choreography must not bypass the existing record-stop
+        // funnel. Engage it, attempt a real reverse conversion, release it
+        // before asserting, then prove both column and trigger stayed intact.
+        let store = crate::store::postgres::PostgresStore::connect_with_dim(&url, 768)
+            .await
+            .expect("connect record-stop probe store");
+        let ctx = CallerContext::for_admin("ai:3491");
+        store
+            .record_stop(&ctx, true, "ai:3491", "record-plane")
+            .await
+            .expect("engage record stop");
+        let stopped_result = store.migrate_embedding_dim(384, true).await;
+        store
+            .record_stop(&ctx, false, "ai:3491", "record-plane")
+            .await
+            .expect("release record stop");
+        assert!(
+            matches!(stopped_result, Err(StoreError::Stopped { .. })),
+            "record stop must refuse dimension conversion: {stopped_result:?}"
+        );
+        assert_eq!(
+            store.current_embedding_dim().await.expect("current dim"),
+            Some(768),
+            "record-stop refusal must leave the column untouched"
+        );
+        let trigger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relname = 'memories' \
+             AND t.tgname = 'memories_embed_skip_clear' AND NOT t.tgisinternal",
+        )
+        .fetch_one(&inspect)
+        .await
+        .expect("inspect trigger after record-stop refusal");
+        assert_eq!(
+            trigger_count, 1,
+            "record-stop refusal must not touch v96 DDL"
         );
     }
 
