@@ -34210,6 +34210,23 @@ mod tests {
         }
     }
 
+    /// v1.0.0 #3493 — bootstrap is replayed before the migration ladder on
+    /// every connect. The v96 trigger both takes a conflicting table lock and
+    /// names columns absent from pre-v96 table shapes, so it must remain owned
+    /// by the v96 ladder migration. This also lets the bounded blocking-DDL arm
+    /// emit its canonical refusal instead of leaking a raw bootstrap timeout.
+    #[test]
+    fn bootstrap_replay_leaves_the_v96_trigger_to_the_ladder_3493() {
+        assert!(
+            !INIT_SCHEMA.contains("trg_embed_skip_clear"),
+            "bootstrap runs before the ladder and must not install the v96 trigger function"
+        );
+        assert!(
+            !INIT_SCHEMA.contains("memories_embed_skip_clear"),
+            "bootstrap runs before the ladder and must not install the v96 memories trigger"
+        );
+    }
+
     #[test]
     fn only_lock_contention_errors_are_retried_2614() {
         let contention = [
