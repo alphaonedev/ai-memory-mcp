@@ -533,6 +533,11 @@ mod tests {
     #[test]
     fn subscription_replay_unix_epoch_digits_refused_3366() {
         let conn = fresh_conn();
+        for malformed in ["garbage", "not-a-date", "1725000000"] {
+            let err = crate::subscriptions::replay_subscription_events(&conn, "sub-1", malformed)
+                .unwrap_err();
+            assert!(err.to_string().contains("RFC3339"));
+        }
         let err = handle_subscription_replay(
             &conn,
             &json!({"subscription_id": "sub-1", "since": "1725000000"}),

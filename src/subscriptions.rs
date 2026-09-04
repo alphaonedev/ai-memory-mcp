@@ -2401,6 +2401,7 @@ pub fn replay_subscription_events(
 ) -> Result<Vec<SubscriptionEvent>> {
     // v1.0.0 #3366 — `delivered_at >= ?2` is TEXT; bind the fixed-width
     // UTC form so an RFC3339 offset is compared as an instant.
+    crate::validate::validate_rfc3339_timestamp("since", since_rfc3339)?;
     let since = crate::validate::canonical_rfc3339(since_rfc3339);
     let mut stmt = conn.prepare(
         "SELECT id, subscription_id, correlation_id, event_type, payload, delivered_at, delivery_status \
@@ -2439,6 +2440,7 @@ pub fn memory_subscription_replay(
     subscription_id: &str,
     since_rfc3339: &str,
 ) -> Result<serde_json::Value> {
+    crate::validate::validate_rfc3339_timestamp("since", since_rfc3339)?;
     let since = crate::validate::canonical_rfc3339(since_rfc3339);
     let events = replay_subscription_events(conn, subscription_id, &since)?;
     Ok(serde_json::json!({

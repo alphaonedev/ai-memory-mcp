@@ -328,6 +328,14 @@ pub(crate) fn run_with_embedder(
             })
         })
     });
+    for (field, value) in [
+        ("since", effective_since.as_deref()),
+        ("until", args.until.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate::validate_rfc3339_timestamp(field, value)?;
+        }
+    }
     // v1.0.0 #3366 — bind micros+`Z` so an RFC3339 offset is an instant.
     let effective_since = effective_since.map(|s| validate::canonical_rfc3339(&s));
     let effective_until = args.until.as_deref().map(validate::canonical_rfc3339);

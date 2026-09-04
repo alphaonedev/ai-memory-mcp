@@ -30,22 +30,6 @@ use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 
-/// v0.7.0 (issue #518) — when `session_default == true` AND the
-/// caller omitted a given filter axis, splice in the configured
-/// `[agents.defaults.recall_scope]` value IN-PLACE on the canonical
-/// [`RecallRequest`] DTO. Returns the spliced `recall_scope_tier`
-/// (which has no field on the DTO — it's a postgres-SAL-only filter
-/// applied via `Filter.tier`) so the postgres branch in
-/// [`recall_response`] can consume it without re-reading the
-/// `app.recall_scope` state.
-///
-/// Resolution: explicit args > recall_scope defaults > compiled
-/// defaults.
-///
-/// #967 — replaces the legacy `apply_recall_scope_defaults` that
-/// returned a `(namespace, since, tier, limit)` tuple. Mutating
-/// the DTO in place keeps the (already-marshalled) request shape
-/// authoritative through the rest of the handler.
 /// v1.0.0 #3366 — refuse a non-RFC3339 `since`/`until` at both HTTP
 /// recall entries so a malformed bound is a 400, not a silent TEXT
 /// mis-filter. Shared by GET and POST.
@@ -80,6 +64,22 @@ fn canonicalize_created_at_bounds_in_place(req: &mut RecallRequest) {
     }
 }
 
+/// v0.7.0 (issue #518) — when `session_default == true` AND the
+/// caller omitted a given filter axis, splice in the configured
+/// `[agents.defaults.recall_scope]` value IN-PLACE on the canonical
+/// [`RecallRequest`] DTO. Returns the spliced `recall_scope_tier`
+/// (which has no field on the DTO — it's a postgres-SAL-only filter
+/// applied via `Filter.tier`) so the postgres branch in
+/// [`recall_response`] can consume it without re-reading the
+/// `app.recall_scope` state.
+///
+/// Resolution: explicit args > recall_scope defaults > compiled
+/// defaults.
+///
+/// #967 — replaces the legacy `apply_recall_scope_defaults` that
+/// returned a `(namespace, since, tier, limit)` tuple. Mutating
+/// the DTO in place keeps the (already-marshalled) request shape
+/// authoritative through the rest of the handler.
 fn splice_recall_scope_into(req: &mut RecallRequest, app: &AppState) -> Option<String> {
     let want_splice = req.session_default.unwrap_or(false);
     let scope_opt: Option<&crate::config::RecallScope> = if want_splice {
