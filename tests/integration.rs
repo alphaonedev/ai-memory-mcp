@@ -9428,14 +9428,14 @@ async fn http_notify_and_inbox_round_trip() {
         &d,
         "/api/v1/agents",
         &serde_json::json!({"agent_id": "ai:alice", "agent_type": "ai:generic"}),
-        None,
+        Some("ai:alice"),
     )
     .await;
     let _ = route_post(
         &d,
         "/api/v1/agents",
         &serde_json::json!({"agent_id": "ai:bob", "agent_type": "ai:generic"}),
-        None,
+        Some("ai:bob"),
     )
     .await;
 
@@ -9553,7 +9553,7 @@ async fn http_subscriptions_s33_shape_round_trip() {
         &d,
         "/api/v1/agents",
         &serde_json::json!({"agent_id": "ai:bob", "agent_type": "ai:generic"}),
-        None,
+        Some("ai:bob"),
     )
     .await;
     let ns = format!(
@@ -9615,7 +9615,7 @@ fn http_subscribe_rejects_missing_shape() {
         d.port,
         "/api/v1/agents",
         &serde_json::json!({"agent_id": "ai:bob", "agent_type": "ai:generic"}),
-        None,
+        Some("ai:bob"),
     );
     let (code, _body) = curl_post(
         d.port,
@@ -11117,7 +11117,7 @@ async fn test_quorum_partial_failure_with_timeout() {
         &leader,
         "/api/v1/agents",
         &serde_json::json!({"agent_id": "ai:fed-test", "agent_type": "ai:test"}),
-        None,
+        Some("ai:fed-test"),
     )
     .await;
     assert!(
@@ -11228,7 +11228,7 @@ async fn test_subscription_webhook_namespace_filter() {
         &d,
         "/api/v1/agents",
         &serde_json::json!({"agent_id": "webhook-receiver", "agent_type": "ai:generic"}),
-        None,
+        Some("webhook-receiver"),
     )
     .await;
 
@@ -11699,7 +11699,7 @@ async fn http_smoke_matrix_phases_1_3() {
                 "agent_type": "ai:claude-opus-4.7",
                 "capabilities": ["test"]
             }),
-            None,
+            Some("ai:smoke-agent-2"),
         )
         .await;
         assert_eq!(code, "201", "register_agent: {body}");

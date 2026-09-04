@@ -38,6 +38,45 @@ use super::admin_role::require_admin;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 
+/// #3398 — THE one response projection for `POST /api/v1/agents`, shared by the
+/// SQLite and PostgreSQL arms of [`register_agent`].
+///
+/// Pre-#3398 each arm hand-rolled its own object and they had DRIFTED: SQLite
+/// emitted `registered: true` and PostgreSQL did not, so a client that keyed off
+/// that field silently saw every postgres-backed registration as un-acknowledged.
+/// The two arms now derive from this single function rather than one being
+/// patched to resemble the other, so the next field lands on both by
+/// construction.
+///
+/// `postgres` carries the house `storage_backend` marker that the postgres arms
+/// of `run_gc` / `export` / `import` / `archive` also emit (it says which arm
+/// served the request); encoding it here keeps the one convention in one place
+/// instead of a literal per branch, sourced from the existing
+/// [`crate::storage::schema_guard::BACKEND_POSTGRES`] SSOT rather than a sixth
+/// bare `"postgres"` string.
+fn register_agent_response(
+    id: &str,
+    agent_id: &str,
+    agent_type: &str,
+    capabilities: &[String],
+    postgres: bool,
+) -> axum::response::Response {
+    let mut body = json!({
+        (field_names::REGISTERED): true,
+        "id": id,
+        "agent_id": agent_id,
+        (field_names::AGENT_TYPE): agent_type,
+        (field_names::CAPABILITIES): capabilities,
+    });
+    if postgres && let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            field_names::STORAGE_BACKEND.to_string(),
+            json!(crate::storage::schema_guard::BACKEND_POSTGRES),
+        );
+    }
+    (StatusCode::CREATED, Json(body)).into_response()
+}
+
 pub async fn register_agent(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -84,15 +123,76 @@ pub async fn register_agent(
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+
+    // #3398 (security, 2026-09-03) — BIND the registered principal to the
+    // authenticated caller. Pre-#3398 this route had NEITHER `require_admin`
+    // (unlike its own admin-gated `GET` twin, #946) NOR any caller-vs-`agent_id`
+    // check, and `db::register_agent` / the postgres `_agents` write are
+    // UPSERTS on the roster row. So any authenticated caller could POST
+    // `{agent_id: "<victim>", agent_type: "human", capabilities: ["TAMPERED"]}`
+    // and overwrite another agent's entry — including an admin's own
+    // `agent_type` / `capabilities` — after which the admin-gated `GET` served
+    // the forgery as authoritative roster truth. Same class as MCP #3372
+    // (re-register overwrite) and #3362 (`_agents` writable).
+    //
+    // The rule: a caller may register or refresh ONLY its own resolved
+    // identity; touching ANOTHER principal's entry (which is what mutates a
+    // foreign `agent_type` / `capabilities`) is an admin action and goes
+    // through the canonical `require_admin` gate rather than a second copy of
+    // its allowlist + #1570 authn-trust + #2044 key-attestation logic.
+    //
+    // `require_admin` is consulted ONLY on the cross-register path, so a
+    // legitimate self-register does not emit a spurious `admin_role` deny row
+    // into the forensic chain.
+    if body.agent_id != caller {
+        if let Err(resp) = require_admin(
+            &app,
+            &headers,
+            crate::governance::action_labels::REGISTER_AGENT,
+        ) {
+            crate::governance::audit::record_decision(
+                &caller,
+                "deny",
+                crate::governance::action_labels::REGISTER_AGENT,
+                "",
+                json!({
+                    "target_agent_id": body.agent_id,
+                    "outcome": "cross_register_requires_admin",
+                }),
+            );
+            return resp;
+        }
+    } else if let Some(resp) = super::identity_binding::enforce_for_request(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        &caller,
+        crate::governance::action_labels::REGISTER_AGENT,
+    ) {
+        // A shared transport key must not bypass the configured identity
+        // posture by claiming the target's name in both header and body.
+        crate::governance::audit::record_decision(
+            &caller,
+            "deny",
+            crate::governance::action_labels::REGISTER_AGENT,
+            "",
+            json!({"outcome": "self_register_requires_attested_identity"}),
+        );
+        return resp;
+    }
+
+    // #911 audit — emitted BEFORE any storage write so the chain records intent
+    // regardless of the downstream outcome.
     crate::governance::audit::record_decision(
         &caller,
         "allow",
-        "register_agent",
+        crate::governance::action_labels::REGISTER_AGENT,
         "",
         json!({
             "new_agent_id": body.agent_id,
             (field_names::AGENT_TYPE): body.agent_type,
             (field_names::CAPABILITIES): capabilities,
+            "self_register": body.agent_id == caller,
         }),
     );
 
@@ -157,17 +257,9 @@ pub async fn register_agent(
             valid_until: None,
         };
         return match app.store.store(&ctx, &agent_mem).await {
-            Ok(id) => (
-                StatusCode::CREATED,
-                Json(json!({
-                    "id": id,
-                    "agent_id": body.agent_id,
-                    (field_names::AGENT_TYPE): body.agent_type,
-                    (field_names::CAPABILITIES): capabilities,
-                    (field_names::STORAGE_BACKEND): "postgres",
-                })),
-            )
-                .into_response(),
+            Ok(id) => {
+                register_agent_response(&id, &body.agent_id, &body.agent_type, &capabilities, true)
+            }
             Err(e) => store_err_to_response(e),
         };
     }
@@ -201,17 +293,7 @@ pub async fn register_agent(
                     }
                 }
             }
-            (
-                StatusCode::CREATED,
-                Json(json!({
-                    (field_names::REGISTERED): true,
-                    "id": id,
-                    "agent_id": body.agent_id,
-                    (field_names::AGENT_TYPE): body.agent_type,
-                    (field_names::CAPABILITIES): capabilities,
-                })),
-            )
-                .into_response()
+            register_agent_response(&id, &body.agent_id, &body.agent_type, &capabilities, false)
         }
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
