@@ -9500,6 +9500,20 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("null archived_memories.embedding", e))?;
 
+        // #3491 — PostgreSQL refuses ALTER COLUMN TYPE while a trigger's
+        // column-scoped UPDATE list names that column. v96's
+        // `memories_embed_skip_clear` deliberately names `embedding`, so let
+        // the NULL update above fire first (preserving its cache-invalidation
+        // semantics), then remove it for the shortest possible DDL window.
+        // The drop, ALTERs, and recreation all live in THIS transaction: a
+        // failure at any later step rolls the trigger and column definitions
+        // back atomically. The record-stop gate ran before this transaction,
+        // exactly as it did before #3491.
+        sqlx::query(crate::storage::embed_skip::POSTGRES_DROP_CLEAR_TRIGGER)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("drop v96 embedding-dependent trigger", e))?;
+
         // Alter the column types. pgvector's type allows ALTER COLUMN
         // TYPE between two `vector(N)` declarations even when rows are
         // present (because we just NULLed them above). The `USING NULL`
@@ -9520,6 +9534,14 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("alter archived_memories.embedding type", e))?;
+
+        // Restore the exact v96 trigger before the transaction becomes
+        // visible. The trigger function itself is independent of the vector
+        // type and remains installed throughout the conversion.
+        sqlx::query(crate::storage::embed_skip::POSTGRES_CREATE_CLEAR_TRIGGER)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("recreate v96 embedding-dependent trigger", e))?;
 
         // Recreate the HNSW index on the live table. The archived
         // table is intentionally NOT given an HNSW index (matches the
