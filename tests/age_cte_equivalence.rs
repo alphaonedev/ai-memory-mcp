@@ -265,37 +265,68 @@ async fn project_fixture_into_age(
     // doesn't duplicate vertices.
     for id in ids {
         let cypher = "MERGE (n {id: $id}) RETURN n";
-        let sql = format!(
-            "SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1::agtype) AS (n agtype)"
-        );
+        let sql = format!("SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (n agtype)");
         let params = serde_json::json!({ "id": id }).to_string();
-        sqlx::query(&sql).bind(params).fetch_all(&mut *tx).await?;
+        sqlx::query(&sql)
+            .bind(Agtype(params))
+            .fetch_all(&mut *tx)
+            .await?;
     }
 
-    let base = chrono::Utc::now() - chrono::Duration::seconds(1000);
-    for (i, (src, dst, rel)) in fixture_edges().iter().enumerate() {
-        let valid_from =
-            (base + chrono::Duration::seconds(i64::try_from(i).unwrap_or(0))).to_rfc3339();
+    let store = PostgresStore::connect(url).await?;
+    let namespace = ids[0].rsplit_once("-mem-").expect("fixture id").0;
+    let links = store.list_links(Some(namespace)).await?;
+    assert!(!links.is_empty(), "AGE fixture must project real edges");
+    for link in links {
+        let valid_from = link.valid_from.expect("fixture claim timestamp");
         let cypher = "MATCH (a {id: $src}), (b {id: $dst}) \
              MERGE (a)-[r:related_to {relation: $rel}]->(b) \
              SET r.valid_from = $vf, r.observed_by = 'ai:j5-equivalence', \
                  r.created_at = $vf \
              RETURN r";
-        let sql = format!(
-            "SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1::agtype) AS (r agtype)"
-        );
+        let sql = format!("SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (r agtype)");
         let params = serde_json::json!({
-            "src": ids[*src],
-            "dst": ids[*dst],
-            "rel": rel,
+            "src": link.source_id,
+            "dst": link.target_id,
+            "rel": link.relation.as_str(),
             "vf": valid_from,
         })
         .to_string();
-        sqlx::query(&sql).bind(params).fetch_all(&mut *tx).await?;
+        sqlx::query(&sql)
+            .bind(Agtype(params))
+            .fetch_all(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;
     Ok(())
+}
+
+/// sqlx bind wrapper for AGE's `agtype`. Mirrors the production-side
+/// `Agtype` in `src/store/postgres.rs` (kept private there because it is an
+/// adapter-internal encoding detail), so this suite can issue direct Cypher
+/// with the same typed-Param shape the fix relies on.
+struct Agtype(String);
+
+impl sqlx::Type<sqlx::Postgres> for Agtype {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        sqlx::postgres::PgTypeInfo::with_name("agtype")
+    }
+    fn compatible(_ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        true
+    }
+}
+
+impl sqlx::Encode<'_, sqlx::Postgres> for Agtype {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        // agtype_recv: version byte (1) then the JSON text payload.
+        buf.push(1);
+        buf.extend_from_slice(self.0.as_bytes());
+        Ok(sqlx::encode::IsNull::No)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +486,12 @@ async fn issue_1689_age_excludes_invalidated_edges() {
         .kg_invalidate_cypher(&ids[0], &ids[1], "related_to", Some(&past), None)
         .await
         .expect("kg_invalidate_cypher 0->1");
+    // The fixture also has a parallel supersedes edge; retract both before
+    // asserting that no direct path survives.
+    store
+        .kg_invalidate_cypher(&ids[0], &ids[1], "supersedes", Some(&past), None)
+        .await
+        .expect("invalidate parallel 0->1 edge");
 
     // Current-view AGE traversal must now EXCLUDE the 0->1 edge, so node
     // 1 is no longer a direct (depth-1) target. (#1689 — pre-fix the

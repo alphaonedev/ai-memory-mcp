@@ -1313,6 +1313,59 @@ async fn kg_query_filter_visible(
     visible
 }
 
+/// #3424 — the ONE wire projection for a `POST /api/v1/kg/query` result row.
+///
+/// `docs/API_REFERENCE.md` documents a NINE-field row. The sqlite branch
+/// projected all nine from [`crate::models::KgQueryNode`]; the postgres branch
+/// hand-built a FOUR-field object, so the same route answered with two
+/// different shapes depending on the backend. Two hand-maintained projections
+/// is the defect, not a symptom of it — both branches now call this function,
+/// so a field can only be added or renamed in one place.
+///
+/// Field names come from the `field_names` SSOT wherever one exists, so a
+/// rename cannot silently diverge from the rest of the wire surface.
+fn kg_query_memories_json(nodes: &[crate::models::KgQueryNode]) -> Vec<serde_json::Value> {
+    nodes
+        .iter()
+        .map(|n| {
+            json!({
+                "target_id": n.target_id,
+                "relation": n.relation,
+                (field_names::VALID_FROM): n.valid_from,
+                (field_names::VALID_UNTIL): n.valid_until,
+                (field_names::OBSERVED_BY): n.observed_by,
+                "title": n.title,
+                (field_names::TARGET_NAMESPACE): n.target_namespace,
+                "depth": n.depth,
+                "path": n.path,
+            })
+        })
+        .collect()
+}
+
+/// #3424 — lift a SAL traversal row into the canonical
+/// [`crate::models::KgQueryNode`] so the postgres branch feeds the SAME
+/// projection the sqlite branch does. The five display fields are populated by
+/// `PostgresStore::hydrate_kg_query_rows`.
+///
+/// Gated on `sal-postgres`, matching its ONLY caller: the postgres branch of
+/// `kg_query` is `#[cfg(feature = "sal-postgres")]`, so a `sal`-only build has
+/// no use for this and `-D dead-code` rejects it.
+#[cfg(feature = "sal-postgres")]
+fn kg_row_to_node(r: &crate::store::KgQueryRow) -> crate::models::KgQueryNode {
+    crate::models::KgQueryNode {
+        target_id: r.target_id.clone(),
+        relation: r.relation.clone(),
+        valid_from: r.valid_from.clone(),
+        valid_until: r.valid_until.clone(),
+        observed_by: r.observed_by.clone(),
+        title: r.title.clone(),
+        target_namespace: r.target_namespace.clone(),
+        depth: r.depth,
+        path: r.path.clone(),
+    }
+}
+
 /// `POST /api/v1/kg/query` — REST mirror of the MCP `memory_kg_query`
 /// tool. Returns outbound multi-hop traversal from `source_id` (1..=5
 /// hops) filtered by the temporal/agent windows. 400 for invalid
@@ -1445,17 +1498,12 @@ pub async fn kg_query(
                 // single-path `paths` array of node-id chains so the
                 // find-paths style consumer can read the result back
                 // without a separate `find_paths` route.
-                let memories_json: Vec<serde_json::Value> = nodes
-                    .iter()
-                    .map(|n| {
-                        json!({
-                            "target_id": n.target_id,
-                            "relation": n.relation,
-                            "depth": n.depth,
-                            "path": n.path,
-                        })
-                    })
-                    .collect();
+                // #3424 — project through the SHARED wire projection instead
+                // of a second hand-built object that omitted five of the nine
+                // documented fields.
+                let projected: Vec<crate::models::KgQueryNode> =
+                    nodes.iter().map(kg_row_to_node).collect();
+                let memories_json = kg_query_memories_json(&projected);
                 let mut paths_json: Vec<serde_json::Value> = Vec::new();
                 if let Some(target) = body.to.as_deref() {
                     // Find the first traversal path that ends at `target`
@@ -1543,22 +1591,8 @@ pub async fn kg_query(
                 .into_iter()
                 .filter(|n| visible.contains(&n.target_id))
                 .collect();
-            let memories_json: Vec<serde_json::Value> = nodes
-                .iter()
-                .map(|n| {
-                    json!({
-                        "target_id": n.target_id,
-                        "relation": n.relation,
-                        (field_names::VALID_FROM): n.valid_from,
-                        (field_names::VALID_UNTIL): n.valid_until,
-                        (field_names::OBSERVED_BY): n.observed_by,
-                        "title": n.title,
-                        (field_names::TARGET_NAMESPACE): n.target_namespace,
-                        "depth": n.depth,
-                        "path": n.path,
-                    })
-                })
-                .collect();
+            // #3424 — the SAME shared projection the postgres branch uses.
+            let memories_json = kg_query_memories_json(&nodes);
             let paths_json: Vec<&str> = nodes.iter().map(|n| n.path.as_str()).collect();
             Json(json!({
                 "source_id": source_id,
