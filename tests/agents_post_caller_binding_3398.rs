@@ -66,23 +66,12 @@ fn fresh_dir() -> TempDir {
     tempfile::tempdir_in(&root).expect("tempdir under .local-runs")
 }
 
-/// Opt into the #1570 legacy header-trust posture so a bare `X-Agent-Id`
-/// naming the allowlisted admin resolves to the admin role on these keyless
-/// test daemons. It only LOOSENS admin gating, so it never weakens the DENIED
-/// assertions below — those use a non-allowlisted id.
-fn enable_admin_header_trust() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: set once, before any concurrent reader observes a
-        // half-written value; never cleared for the binary's lifetime.
-        unsafe {
-            std::env::set_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST, "1");
-        }
-    });
-}
-
-fn app_state_for(db: Db, store: Arc<dyn MemoryStore>, storage_backend: StorageBackend) -> AppState {
+fn app_state_for(
+    db: Db,
+    store: Arc<dyn MemoryStore>,
+    storage_backend: StorageBackend,
+    enrolled: Arc<EnrolledAgentKeys>,
+) -> AppState {
     AppState {
         db,
         embedder: Arc::new(None),
@@ -117,23 +106,26 @@ fn app_state_for(db: Db, store: Arc<dyn MemoryStore>, storage_backend: StorageBa
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: enrolled,
-        http_identity_mode: HttpIdentityMode::default(),
+        http_identity_mode: HttpIdentityMode::Enforce,
     }
 }
 
 fn router_from(app_state: AppState, enrolled: Arc<EnrolledAgentKeys>) -> axum::Router {
     let api_key_state = ApiKeyState {
-        key: None,
+        key: Some("roster-test-shared-key".to_string()),
         mtls_enforced: false,
         enrolled_agent_keys: enrolled,
-        identity_mode: HttpIdentityMode::default(),
+        identity_mode: HttpIdentityMode::Enforce,
     };
     ai_memory::build_router(api_key_state, app_state)
 }
 
 fn sqlite_router() -> (axum::Router, NamedTempFile) {
-    enable_admin_header_trust();
-    ai_memory::handlers::admin_role::mark_request_authn_configured(false);
+    sqlite_router_with_keys(Arc::new(EnrolledAgentKeys::empty()))
+}
+
+fn sqlite_router_with_keys(enrolled: Arc<EnrolledAgentKeys>) -> (axum::Router, NamedTempFile) {
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
@@ -146,7 +138,6 @@ fn sqlite_router() -> (axum::Router, NamedTempFile) {
     )));
     let store: Arc<dyn MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
-    let enrolled = Arc::new(EnrolledAgentKeys::empty());
     (
         router_from(
             app_state_for(db, store, StorageBackend::Sqlite, Arc::clone(&enrolled)),
@@ -157,7 +148,10 @@ fn sqlite_router() -> (axum::Router, NamedTempFile) {
 }
 
 fn req(method: &str, uri: &str, agent_id: Option<&str>, body: Option<&Value>) -> Request<Body> {
-    let mut b = Request::builder().method(method).uri(uri);
+    let mut b = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(ai_memory::HEADER_API_KEY, "roster-test-shared-key");
     if let Some(a) = agent_id {
         b = b.header("x-agent-id", a);
     }
@@ -176,7 +170,7 @@ async fn call(router: &axum::Router, r: Request<Body>) -> (StatusCode, Value) {
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
     (
         status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        serde_json::from_slice(&bytes).expect("JSON response"),
     )
 }
 
@@ -197,6 +191,71 @@ async fn roster_entry(router: &axum::Router, agent_id: &str) -> Option<Value> {
         .iter()
         .find(|a| a["agent_id"].as_str() == Some(agent_id))
         .cloned()
+}
+
+/// Both existing and absent targets receive the canonical, non-disclosing refusal.
+async fn assert_roster_control(router: &axum::Router, agent: &str) {
+    for (caller, kind) in [
+        (agent, "ai:generic"),
+        (agent, "human"),
+        (ADMIN, "ai:generic"),
+    ] {
+        let (status, body) = call(
+            router,
+            req(
+                "POST",
+                "/api/v1/agents",
+                Some(caller),
+                Some(&register_body(agent, kind, &["read"])),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "allowed registration: {body}");
+        assert_eq!(body["registered"], true);
+        let entry = roster_entry(router, agent).await.expect("registered entry");
+        assert_eq!(entry["agent_type"], kind);
+    }
+    let before = roster_entry(router, agent).await.expect("existing entry");
+    let absent = format!("ai:absent-{}", uuid::Uuid::new_v4().simple());
+    for target in [agent, absent.as_str()] {
+        for caller in [Some(MALLORY), None] {
+            let (status, body) = call(
+                router,
+                req(
+                    "POST",
+                    "/api/v1/agents",
+                    caller,
+                    Some(&register_body(target, "human", &["TAMPERED"])),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body, json!({"error": "admin role required"}));
+        }
+    }
+    assert_eq!(roster_entry(router, agent).await, Some(before));
+    assert_eq!(roster_entry(router, &absent).await, None);
+    let (status, body) = call(router, req("GET", "/api/v1/agents", Some(MALLORY), None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, json!({"error": "admin role required"}));
+}
+
+#[tokio::test]
+async fn sqlite_refresh_admin_write_and_refusal_body_preserve_roster() {
+    let (router, _file) = sqlite_router();
+    assert_roster_control(&router, ALICE).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_refresh_admin_write_and_refusal_body_preserve_roster() {
+    let Some(url) = common::postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL unset (no live postgres tier)");
+        return;
+    };
+    let router = pg_router(&url).await;
+    let agent = format!("ai:control-{}", uuid::Uuid::new_v4().simple());
+    assert_roster_control(&router, &agent).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -332,8 +391,12 @@ async fn sqlite_body_validation_still_precedes_the_binding() {
 
 #[cfg(feature = "sal-postgres")]
 async fn pg_router(url: &str) -> axum::Router {
-    enable_admin_header_trust();
-    ai_memory::handlers::admin_role::mark_request_authn_configured(false);
+    pg_router_with_keys(url, Arc::new(EnrolledAgentKeys::empty())).await
+}
+
+#[cfg(feature = "sal-postgres")]
+async fn pg_router_with_keys(url: &str, enrolled: Arc<EnrolledAgentKeys>) -> axum::Router {
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let store_concrete = ai_memory::store::postgres::PostgresStore::connect(url)
         .await
         .expect("connect postgres");
@@ -345,7 +408,6 @@ async fn pg_router(url: &str) -> axum::Router {
         true,
     )));
     let store: Arc<dyn MemoryStore> = Arc::new(store_concrete);
-    let enrolled = Arc::new(EnrolledAgentKeys::empty());
     router_from(
         app_state_for(db, store, StorageBackend::Postgres, Arc::clone(&enrolled)),
         enrolled,
@@ -416,4 +478,92 @@ async fn postgres_cross_register_by_a_non_admin_is_refused() {
         StatusCode::FORBIDDEN,
         "a non-admin may not register another principal on postgres either: {v}"
     );
+}
+
+fn test_keys() -> Arc<EnrolledAgentKeys> {
+    Arc::new(EnrolledAgentKeys::from_map(
+        [
+            ("alice-test-token", ALICE),
+            ("admin-test-token", ADMIN),
+            ("mallory-test-token", MALLORY),
+        ]
+        .into_iter()
+        .map(|(token, agent)| {
+            (
+                ai_memory::handlers::identity_binding::api_key_sha256_hex(token),
+                agent.to_string(),
+            )
+        })
+        .collect(),
+    ))
+}
+
+async fn assert_key_bound_registration(router: &axum::Router) {
+    for (token, header, target, expected) in [
+        ("alice-test-token", None, ALICE, StatusCode::CREATED),
+        (
+            "mallory-test-token",
+            Some(MALLORY),
+            ALICE,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "mallory-test-token",
+            Some(ALICE),
+            ALICE,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "roster-test-shared-key",
+            Some(ALICE),
+            ALICE,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "roster-test-shared-key",
+            Some(ADMIN),
+            ALICE,
+            StatusCode::FORBIDDEN,
+        ),
+        ("admin-test-token", Some(ADMIN), ALICE, StatusCode::CREATED),
+    ] {
+        let mut request = req(
+            "POST",
+            "/api/v1/agents",
+            header,
+            Some(&register_body(target, "ai:generic", &["read"])),
+        );
+        request.headers_mut().insert(
+            ai_memory::HEADER_API_KEY,
+            token.parse().expect("test token"),
+        );
+        let (status, body) = call(router, request).await;
+        assert_eq!(status, expected, "key-bound registration: {body}");
+        if status == StatusCode::FORBIDDEN {
+            let text = body.to_string();
+            for principal in [ALICE, ADMIN, MALLORY] {
+                assert!(
+                    !text.contains(principal),
+                    "refusal disclosed principal: {text}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn sqlite_key_bound_identity_cannot_be_forged() {
+    let (router, _file) = sqlite_router_with_keys(test_keys());
+    assert_key_bound_registration(&router).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_key_bound_identity_cannot_be_forged() {
+    let Some(url) = common::postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL unset (no live postgres tier)");
+        return;
+    };
+    let router = pg_router_with_keys(&url, test_keys()).await;
+    assert_key_bound_registration(&router).await;
 }

@@ -162,6 +162,23 @@ pub async fn register_agent(
             );
             return resp;
         }
+    } else if let Some(resp) = super::identity_binding::enforce_for_request(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        &caller,
+        crate::governance::action_labels::REGISTER_AGENT,
+    ) {
+        // A shared transport key must not bypass the configured identity
+        // posture by claiming the target's name in both header and body.
+        crate::governance::audit::record_decision(
+            &caller,
+            "deny",
+            crate::governance::action_labels::REGISTER_AGENT,
+            "",
+            json!({"outcome": "self_register_requires_attested_identity"}),
+        );
+        return resp;
     }
 
     // #911 audit — emitted BEFORE any storage write so the chain records intent
