@@ -157,7 +157,40 @@ async fn pg_recovery_mint_persists_and_resolves_authoritative_head() {
     let cold = keypair::generate(&agent_id).expect("cold recovery key");
     let genesis = enroll_genesis(&store, &ctx, &agent_id, &k0, &cold.public_base64()).await;
 
-    // K0 is LOST. Enroll 3 guardians (2-of-3) and mint a fresh head k_new.
+    // Prepare an otherwise-valid K0-signed rotation before revocation. The
+    // signature must become stale authority once the history head is closed.
+    let stale_successor = keypair::generate(&agent_id).expect("stale successor");
+    let stale_rotation = LineageRecord::rotation(
+        &genesis,
+        &stale_successor.public_base64(),
+        None,
+        "2026-07-10T12:00:00+00:00",
+    )
+    .expect("prepare stale rotation");
+    let stale_signature =
+        sign_succession(&k0, &stale_rotation.to_signable()).expect("sign before revoke");
+    store
+        .revoke_agent_pubkey(&ctx, &agent_id)
+        .await
+        .expect("close postgres history head");
+    let stale_error = store
+        .append_lineage_record(&ctx, &agent_id, &stale_rotation, &stale_signature)
+        .await
+        .expect_err("predecessor signature prepared before revoke must not reopen the head");
+    assert!(
+        matches!(
+            &stale_error,
+            ai_memory::store::StoreError::PermissionDenied { .. }
+        ),
+        "closed-head refusal stays typed: {stale_error}"
+    );
+    assert_eq!(store.agent_pubkey(&agent_id).await.expect("flat"), None);
+    assert_eq!(
+        store.read_lineage(&agent_id).await.expect("lineage").len(),
+        1
+    );
+
+    // K0 is LOST/revoked. Enroll 3 guardians (2-of-3) and mint a fresh head.
     let k_new = keypair::generate(&agent_id).expect("k_new");
     let guardians: Vec<keypair::AgentKeypair> = (0..3)
         .map(|_| keypair::generate("guardian").expect("guardian"))
@@ -187,6 +220,31 @@ async fn pg_recovery_mint_persists_and_resolves_authoritative_head() {
         .append_lineage_record(&ctx, &agent_id, &recovery, &quorum_blob)
         .await
         .expect("postgres recovery mint must persist the fresh head");
+
+    let history = store
+        .agent_pubkey_versions(&agent_id)
+        .await
+        .expect("postgres history");
+    assert_eq!(history.len(), 2);
+    assert_eq!(
+        history[1].bind_authority,
+        ai_memory::identity::pubkey_bind::BindAuthority::GuardianRecovery.as_str(),
+        "guardian recovery must be distinguishable in the durable audit history"
+    );
+
+    store
+        .append_lineage_record(&ctx, &agent_id, &recovery, &quorum_blob)
+        .await
+        .expect_err("a persisted guardian recovery cannot be replayed");
+    assert_eq!(
+        store
+            .agent_pubkey_versions(&agent_id)
+            .await
+            .expect("history after replay refusal")
+            .len(),
+        2,
+        "replay refusal leaves key history unchanged"
+    );
 
     // Recovery-aware resolution (verify_lineage_with_recovery) resolves the
     // fresh primary as the authoritative head.

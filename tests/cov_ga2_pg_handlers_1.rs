@@ -546,10 +546,34 @@ pg_test!(pg_bind_agent_pubkey_postgres_arm, url, {
     let kp = ai_memory::identity::keypair::generate(&agent_id).expect("keypair");
     let pubkey_b64 = kp.public_base64();
 
+    // #3464 — the bind now demands proof of possession: request the single-use
+    // challenge, then answer it with the candidate key's private half.
+    let (cs, cb) = post_json(
+        &router,
+        &format!("/api/v1/agents/{agent_id}/pubkey/challenge"),
+        &json!({"pubkey_b64": pubkey_b64}),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "challenge body={cb}");
+    let challenge = ai_memory::identity::pubkey_bind::BindChallenge {
+        nonce_b64: cb["nonce"].as_str().expect("nonce").to_string(),
+        agent_id: agent_id.clone(),
+        pubkey_b64: pubkey_b64.clone(),
+        expires_at: cb["expires_at"].as_str().expect("expires_at").to_string(),
+    };
+    let proof_b64 = ai_memory::identity::pubkey_bind::sign_bind_challenge(
+        kp.private.as_ref().expect("generated private key"),
+        &challenge,
+    );
+
     let (status, body) = put_json(
         &router,
         &format!("/api/v1/agents/{agent_id}/pubkey"),
-        &json!({"pubkey_b64": pubkey_b64}),
+        &json!({
+            "pubkey_b64": pubkey_b64,
+            "nonce": challenge.nonce_b64,
+            "proof_b64": proof_b64,
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind body={body}");
@@ -562,10 +586,32 @@ pg_test!(pg_bind_agent_pubkey_unregistered_is_error, url, {
     let (_store, router) = pg_store_and_router(&url).await;
     let agent_id = uid("ai:cov-ga2-bind-missing");
     let kp = ai_memory::identity::keypair::generate(&agent_id).expect("keypair");
+    let pubkey_b64 = kp.public_base64();
+    let (cs, cb) = post_json(
+        &router,
+        &format!("/api/v1/agents/{agent_id}/pubkey/challenge"),
+        &json!({"pubkey_b64": pubkey_b64}),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "challenge body={cb}");
+    let challenge = ai_memory::identity::pubkey_bind::BindChallenge {
+        nonce_b64: cb["nonce"].as_str().expect("nonce").to_string(),
+        agent_id: agent_id.clone(),
+        pubkey_b64: pubkey_b64.clone(),
+        expires_at: cb["expires_at"].as_str().expect("expires_at").to_string(),
+    };
+    let proof_b64 = ai_memory::identity::pubkey_bind::sign_bind_challenge(
+        kp.private.as_ref().expect("generated private key"),
+        &challenge,
+    );
     let (status, _body) = put_json(
         &router,
         &format!("/api/v1/agents/{agent_id}/pubkey"),
-        &json!({"pubkey_b64": kp.public_base64()}),
+        &json!({
+            "pubkey_b64": pubkey_b64,
+            "nonce": challenge.nonce_b64,
+            "proof_b64": proof_b64,
+        }),
     )
     .await;
     // Binding an unregistered agent surfaces the SAL InvalidInput →

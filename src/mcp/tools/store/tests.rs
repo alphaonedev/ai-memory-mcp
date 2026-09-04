@@ -2361,7 +2361,7 @@ fn mcp_store_signed_with_bound_key_stamps_agent_attested() {
     let conn = fresh_conn();
     let kp = crate::identity::keypair::generate("ai:alice").expect("keypair");
     db::register_agent(&conn, "ai:alice", "nhi", &[]).expect("register");
-    db::bind_agent_pubkey(&conn, "ai:alice", &kp.public_base64()).expect("bind");
+    db::bind_agent_pubkey_with_keypair(&conn, "ai:alice", &kp).expect("bind");
 
     let title = "signed-mem";
     let content = "This is the body of signed-mem, long enough to be meaningful prose.";
@@ -2436,7 +2436,7 @@ fn mcp_store_signed_ledger_fault_refuses_before_persist_3496() {
     let conn = fresh_conn();
     let kp = crate::identity::keypair::generate("ai:ledger-fault").expect("keypair");
     db::register_agent(&conn, "ai:ledger-fault", "nhi", &[]).expect("register");
-    db::bind_agent_pubkey(&conn, "ai:ledger-fault", &kp.public_base64()).expect("bind");
+    db::bind_agent_pubkey_with_keypair(&conn, "ai:ledger-fault", &kp).expect("bind");
     conn.execute("DROP TABLE attested_write_ledger", [])
         .expect("remove replay ledger to inject a storage fault");
 
@@ -2487,7 +2487,7 @@ fn mcp_store_forged_signature_is_rejected() {
     let attacker = crate::identity::keypair::generate("ai:alice").expect("kp2");
     db::register_agent(&conn, "ai:alice", "nhi", &[]).expect("register");
     // Bind the legitimate key; sign with a DIFFERENT key → forgery.
-    db::bind_agent_pubkey(&conn, "ai:alice", &bound.public_base64()).expect("bind");
+    db::bind_agent_pubkey_with_keypair(&conn, "ai:alice", &bound).expect("bind");
 
     let title = "forged-mem";
     let content = "This is the body of forged-mem, long enough to be meaningful prose.";
@@ -2952,7 +2952,7 @@ fn store_valid_write_v2_is_admitted_and_stamped_3496() {
     request["kind"] = json!(KIND);
     crate::db::register_agent(&conn, AGENT_ID, "ai:generic", &[]).expect("register agent");
     let root = crate::identity::keypair::generate(AGENT_ID).expect("generate root");
-    crate::db::bind_agent_pubkey(&conn, AGENT_ID, &root.public_base64()).expect("bind root");
+    crate::db::bind_agent_pubkey_with_keypair(&conn, AGENT_ID, &root).expect("bind root");
     request["write_v2"] = valid_write_v2_for(AGENT_ID, NAMESPACE, TITLE, &content, KIND, &root);
 
     let response = handle_store(

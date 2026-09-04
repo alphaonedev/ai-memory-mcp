@@ -47,6 +47,8 @@ pub const AGENT_PUBKEY: &str = "agent_pubkey";
 /// upsert (see `crate::RESERVED_UPSERT_METADATA_KEYS`) — a row carrying a
 /// pubkey with no bind stamp, or the reverse, is a torn state.
 pub const PUBKEY_BOUND_AT: &str = "pubkey_bound_at";
+/// `pubkey_bindings_stripped` — import/sync report field name.
+pub const PUBKEY_BINDINGS_STRIPPED: &str = "pubkey_bindings_stripped";
 /// `agent_type` — wire/row field name.
 pub const AGENT_TYPE: &str = "agent_type";
 /// `allowed_tools` — wire/row field name.
@@ -91,6 +93,8 @@ pub const ATOM_OF: &str = "atom_of";
 pub const MENTIONED_ENTITY_ID: &str = "mentioned_entity_id";
 /// `attest_level` — wire/row field name.
 pub const ATTEST_LEVEL: &str = "attest_level";
+/// `attestation_downgraded` — import/sync report field name.
+pub const ATTESTATION_DOWNGRADED: &str = "attestation_downgraded";
 /// `resolved_at` — wire/row field name for a checkpoint's resolution timestamp
 /// (#2391 checkpoint-resolve HTTP surface; also the `checkpoints` row column).
 pub const RESOLVED_AT: &str = "resolved_at";
@@ -286,6 +290,8 @@ pub const DANGLING_LINKS_WITHHELD: &str = "dangling_links_withheld";
 /// export withheld, so publishing it would leak the #2490 objection-O3
 /// index into the source corpus.
 pub const DANGLING_LINK_EDGES: &str = "dangling_link_edges";
+/// `forged_signature_skipped` — import/sync report field name.
+pub const FORGED_SIGNATURE_SKIPPED: &str = "forged_signature_skipped";
 /// `from_agent_id` — wire/row field name.
 pub const FROM_AGENT_ID: &str = "from_agent_id";
 /// `generated_at` — wire/row field name.

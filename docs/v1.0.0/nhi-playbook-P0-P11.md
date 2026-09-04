@@ -26,12 +26,12 @@ isolated namespace / DB so phases do not cross-contaminate. Every phase records
 its PASS/FAIL tally + evidence (row ids, SQL confirmations, error strings).
 
 **v1.0.0 SSOT values used below** (from `CLAUDE.md` / the canonical Rust consts):
-schema **v96**; MCP tools **103** at `--profile full` (102 callable + the
+schema **v97**; MCP tools **103** at `--profile full` (102 callable + the
 always-on `memory_capabilities` bootstrap), **7** at `--profile core`
 per `Profile::core().expected_tool_count()` — which `tools/list` renders as
 **8** entries, the same 7 callable tools plus that always-on bootstrap;
 capabilities envelope `schema_version` **"3"**; `Memory` **30 fields**;
-`MemoryLinkRelation::COUNT` **9**; HTTP **96** route registrations / **80**
+`MemoryLinkRelation::COUNT` **9**; HTTP **97** route registrations / **83**
 unique paths; CLI **90** default / **92** sal subcommands; `HookEvent`
 variants **22**. Because these are SSOT-derived, a phase asserts "matches the
 compiled SSOT" rather than a frozen literal — a mismatch is itself a finding.

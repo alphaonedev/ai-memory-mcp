@@ -340,6 +340,59 @@ class AgentSigningKey:
         return self._private.sign(payload)
 
 
+# ---------------------------------------------------------------------------
+# #3464 — proof of possession for agent public-key binding
+# ---------------------------------------------------------------------------
+
+#: Domain tag for the bind-challenge transcript. Distinct from every other
+#: signing domain in the substrate, so a signature minted for a write, a link, a
+#: lineage record or a sub-key cert can never be replayed as a possession proof.
+BIND_CHALLENGE_V1_DOMAIN = "ai-memory/bind-pubkey/v1"
+
+
+def bind_challenge_transcript(
+    *,
+    agent_id: str,
+    pubkey_b64: str,
+    nonce: str,
+    expires_at: str,
+) -> bytes:
+    """The exact bytes a candidate key must sign to prove possession.
+
+    Domain-separated and LENGTH-PREFIXED, so no field boundary can be shifted
+    to make one transcript read as another (``agent_id="a", pubkey="bc"`` and
+    ``agent_id="ab", pubkey="c"`` produce different bytes). Mirrors
+    ``crate::identity::pubkey_bind::bind_challenge_transcript`` byte for byte.
+    """
+    out = bytearray(BIND_CHALLENGE_V1_DOMAIN.encode("utf-8"))
+    for field in (agent_id, pubkey_b64, nonce, expires_at):
+        raw = field.encode("utf-8")
+        out += len(raw).to_bytes(4, "big")
+        out += raw
+    return bytes(out)
+
+
+def sign_bind_challenge(
+    key: AgentSigningKey,
+    *,
+    agent_id: str,
+    nonce: str,
+    expires_at: str,
+) -> str:
+    """Answer a bind challenge; returns the URL-safe-unpadded base64 proof.
+
+    The public key is derived from ``key``, so this can only ever produce a
+    proof for a key the caller actually holds.
+    """
+    transcript = bind_challenge_transcript(
+        agent_id=agent_id,
+        pubkey_b64=key.public_key_b64(),
+        nonce=nonce,
+        expires_at=expires_at,
+    )
+    return base64.urlsafe_b64encode(key.sign(transcript)).decode("ascii").rstrip("=")
+
+
 def _b64_decode_any(value: str) -> bytes:
     """Decode standard or URL-safe base64, with or without padding."""
     raw = value.strip()

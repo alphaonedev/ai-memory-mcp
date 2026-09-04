@@ -325,7 +325,10 @@ fn bind_and_revoke_pubkey_each_write_one_supersede_leaf() {
         "registering an agent is an insert, not a revision leaf"
     );
 
-    db::bind_agent_pubkey(&conn, agent, "dummy-base64-pubkey-AAAA").expect("bind pubkey");
+    // #3464 — the bind funnel now demands a possession proof, so the leaf
+    // assertion below rides a REAL key instead of a placeholder string.
+    let kp = ai_memory::identity::keypair::generate(agent).expect("keypair");
+    db::bind_agent_pubkey_with_keypair(&conn, agent, &kp).expect("bind pubkey");
     let after_bind = read_leaves(&conn);
     assert_eq!(after_bind.len(), 1, "bind writes one leaf");
     assert_eq!(after_bind[0].kind, "SUPERSEDE");
@@ -868,7 +871,8 @@ fn flag_off_writes_no_revision_leaves() {
 
     // bind / revoke.
     db::register_agent(&conn, "ai:off-agent", "llm", &[]).expect("register");
-    db::bind_agent_pubkey(&conn, "ai:off-agent", "off-pubkey-AAAA").expect("bind");
+    let off_kp = ai_memory::identity::keypair::generate("ai:off-agent").expect("keypair");
+    db::bind_agent_pubkey_with_keypair(&conn, "ai:off-agent", &off_kp).expect("bind");
     db::revoke_agent_pubkey(&conn, "ai:off-agent").expect("revoke");
 
     // tombstone (delete) + forget.

@@ -16,6 +16,11 @@ pub const SIGNALS: &str = "/api/v1/signals";
 pub const AGENTS: &str = "/api/v1/agents";
 /// #1539 — admin-gated attestation pubkey bind for a registered agent.
 pub const AGENTS_ID_PUBKEY: &str = "/api/v1/agents/{id}/pubkey";
+/// v1.0.0 #3464 — issue a single-use bind challenge for a candidate key. The
+/// candidate key must sign the challenge transcript and present the signature
+/// on [`AGENTS_ID_PUBKEY`]; without it the bind is refused, so an admin can no
+/// longer bind a key they merely assert.
+pub const AGENTS_ID_PUBKEY_CHALLENGE: &str = "/api/v1/agents/{id}/pubkey/challenge";
 pub const APPROVALS_STREAM: &str = "/api/v1/approvals/stream";
 pub const APPROVALS_PENDING_ID: &str = "/api/v1/approvals/{pending_id}";
 pub const ARCHIVE: &str = "/api/v1/archive";

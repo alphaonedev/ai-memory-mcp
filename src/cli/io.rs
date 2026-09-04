@@ -550,6 +550,9 @@ pub(crate) fn import_from_str(
     let conn = db::open(db_path)?;
     let mut imported = 0usize;
     let mut restamped = 0usize;
+    let mut pubkey_bindings_stripped = 0usize;
+    let mut attestation_downgraded = 0usize;
+    let mut forged_signature_skipped = 0usize;
     let mut errors = Vec::new();
     // v1.0.0 #2490 — split the per-row dispositions. `errors` used to hold
     // BOTH kinds and the command exited 0 regardless; the counters below are
@@ -576,6 +579,11 @@ pub(crate) fn import_from_str(
     // excluded from the exit-code sum so an idempotent restore exits 0.
     let mut idempotent_skipped = 0usize;
     for mut mem in memories {
+        let original_claim = mem
+            .metadata
+            .get(crate::META_KEY_AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         // #2208 re-audit N1 — the v1 wire-form must honour the SAME forget
         // covenant as the v2 route: stripping `spec_version` from a bundle
         // must not become a DOWNGRADE BYPASS that resurrects a
@@ -662,6 +670,22 @@ pub(crate) fn import_from_str(
             refused += 1;
             continue;
         }
+        // v1.0.0 #3464 — sanitize the complete `_agents` registration
+        // projection BEFORE the legacy v1 metadata-only ownership restamp.
+        // If that older block removes `metadata.agent_pubkey` first, the
+        // shared sanitizer can no longer tell that a parseable `content`
+        // mirror's signature/attestation became stale. Running the
+        // two-projection funnel first keeps metadata + content consistent and
+        // makes the attempted trust import operator-visible under both source
+        // trust postures.
+        if crate::storage::strip_unproven_agent_pubkey_binding(&mut mem) {
+            pubkey_bindings_stripped += 1;
+            errors.push(format!(
+                "{}: warning — imported agent_pubkey binding stripped; bind with a persisted \
+                 proof-of-possession challenge or verified lineage succession",
+                mem.id
+            ));
+        }
         if !args.trust_source {
             let original = mem
                 .metadata
@@ -703,6 +727,55 @@ pub(crate) fn import_from_str(
                     );
                 }
             }
+        }
+        // #3464 — this CLI import is a non-transactional per-row apply. Resolve
+        // the authoritative historical key only after stripping transported
+        // trust fields and immediately before verification; never freeze a key
+        // that a later rotation makes invalid for this signed timestamp.
+        let resolved_pubkeys = if let Some(author) =
+            crate::identity::attest::presented_attestation_author_needing_bound_key(
+                &mem,
+                original_claim.as_deref(),
+            ) {
+            match db::agent_pubkey_for_attestation_at(&conn, author, &mem.created_at) {
+                Ok(resolved) => Some(resolved),
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %mem.id,
+                        "import: signed row refused because destination key-history resolution failed: {e}"
+                    );
+                    errors.push(format!(
+                        "{}: refused — destination key history unavailable",
+                        mem.id
+                    ));
+                    refused += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let attest = crate::identity::attest::reconcile_imported_attestation(
+            &mut mem,
+            original_claim.as_deref(),
+            false,
+            resolved_pubkeys.as_ref(),
+        );
+        if let Some(cause) = attest.skipped() {
+            forged_signature_skipped += 1;
+            refused += 1;
+            errors.push(format!(
+                "{}: skipped — presented write_signature is malformed or forged: {cause}",
+                mem.id
+            ));
+            continue;
+        }
+        if let Some(cause) = attest.downgraded() {
+            attestation_downgraded += 1;
+            errors.push(format!(
+                "{}: warning — wire attestation downgraded to claimed: {cause}",
+                mem.id
+            ));
         }
         if let Err(e) = validate::validate_memory(&mem) {
             errors.push(format!("{}: {}", mem.id, e));
@@ -843,6 +916,9 @@ pub(crate) fn import_from_str(
                 // excluded from the exit-code sum so a restore of an unchanged
                 // corpus exits 0.
                 "idempotent_skipped": idempotent_skipped,
+                (models::field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
+                (models::field_names::ATTESTATION_DOWNGRADED): attestation_downgraded,
+                (models::field_names::FORGED_SIGNATURE_SKIPPED): forged_signature_skipped,
                 "errors": errors
             })
         )?;
@@ -856,6 +932,19 @@ pub(crate) fn import_from_str(
             writeln!(
                 out.stderr,
                 "warning: --trust-source: agent_id from imported JSON was preserved as-is"
+            )?;
+        }
+        if pubkey_bindings_stripped > 0 {
+            writeln!(
+                out.stderr,
+                "warning: stripped {pubkey_bindings_stripped} imported agent public-key \
+                 binding(s); use the persisted proof-of-possession or lineage bind flow"
+            )?;
+        }
+        if attestation_downgraded > 0 || forged_signature_skipped > 0 {
+            writeln!(
+                out.stderr,
+                "warning: import attestation re-verification downgraded {attestation_downgraded} row(s) and skipped {forged_signature_skipped} forged/malformed row(s)"
             )?;
         }
         if !errors.is_empty() {
@@ -1420,6 +1509,14 @@ mod tests {
             (crate::models::field_names::ATTEST_LEVEL): "agent_attested",
             (crate::models::field_names::WRITE_SIGNATURE): "forged-signature"
         });
+        planted.content = serde_json::json!({
+            "agent_id": planted_agent,
+            (crate::models::field_names::AGENT_PUBKEY): "attacker-controlled-key",
+            (crate::models::field_names::PUBKEY_BOUND_AT): "2099-01-01T00:00:00Z",
+            (crate::models::field_names::ATTEST_LEVEL): "agent_attested",
+            (crate::models::field_names::WRITE_SIGNATURE): "forged-signature"
+        })
+        .to_string();
         let payload = serde_json::json!({"memories": [planted], "links": []}).to_string();
 
         let mut dst = TestEnv::fresh();
@@ -1469,10 +1566,33 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(crate::identity::verify::AttestLevel::Claimed.as_str())
         );
+        let mirrored: serde_json::Value =
+            serde_json::from_str(&imported.content).expect("parse registration mirror");
+        assert!(
+            mirrored
+                .get(crate::models::field_names::AGENT_PUBKEY)
+                .is_none()
+        );
+        assert!(
+            mirrored
+                .get(crate::models::field_names::PUBKEY_BOUND_AT)
+                .is_none()
+        );
+        assert!(
+            mirrored
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .is_none()
+        );
+        assert_eq!(
+            mirrored
+                .get(crate::models::field_names::ATTEST_LEVEL)
+                .and_then(serde_json::Value::as_str),
+            Some(crate::identity::verify::AttestLevel::Claimed.as_str())
+        );
     }
 
     #[test]
-    fn v1_agent_claims_follow_explicit_trust_posture_2264() {
+    fn v1_trust_source_preserves_agent_id_but_never_bootstraps_key_3464() {
         let src = TestEnv::fresh();
         let src_db = src.db_path.clone();
         let id = seed_memory(&src_db, "seed", "seed-posture", "seed");
@@ -1480,15 +1600,12 @@ mod tests {
         let mut registration = db::get(&conn, &id).unwrap().unwrap();
         let agent = "ai:v1-posture-agent";
         let wire_key = "operator-trusted-wire-key";
-        let wire_signature = "operator-trusted-wire-signature";
         registration.namespace = crate::models::AGENTS_NAMESPACE.to_string();
         registration.title = crate::models::agent_registration_title(agent);
         registration.expires_at = Some("2099-01-01T00:00:00Z".into());
         registration.metadata = serde_json::json!({
             "agent_id": agent,
-            (crate::models::field_names::AGENT_PUBKEY): wire_key,
-            (crate::models::field_names::ATTEST_LEVEL): "agent_attested",
-            (crate::models::field_names::WRITE_SIGNATURE): wire_signature
+            (crate::models::field_names::AGENT_PUBKEY): wire_key
         });
         let payload = serde_json::json!({"memories": [registration], "links": []}).to_string();
 
@@ -1520,19 +1637,6 @@ mod tests {
                 .get(crate::models::field_names::AGENT_PUBKEY)
                 .is_none()
         );
-        assert!(
-            default_row
-                .metadata
-                .get(crate::models::field_names::WRITE_SIGNATURE)
-                .is_none()
-        );
-        assert_eq!(
-            default_row
-                .metadata
-                .get(crate::models::field_names::ATTEST_LEVEL)
-                .and_then(serde_json::Value::as_str),
-            Some(crate::identity::verify::AttestLevel::Claimed.as_str())
-        );
 
         let mut trusted_dst = TestEnv::fresh();
         let trusted_db = trusted_dst.db_path.clone();
@@ -1556,22 +1660,34 @@ mod tests {
         let conn = db::open(&trusted_db).unwrap();
         assert_eq!(
             db::agent_pubkey(&conn, agent).unwrap(),
-            Some(wire_key.into())
+            None,
+            "--trust-source is not proof of target-agent key possession"
         );
         let trusted_row = db::get(&conn, &id).unwrap().unwrap();
-        assert_eq!(
+        assert!(
             trusted_row
                 .metadata
-                .get(crate::models::field_names::WRITE_SIGNATURE)
-                .and_then(serde_json::Value::as_str),
-            Some(wire_signature)
+                .get(crate::models::field_names::AGENT_PUBKEY)
+                .is_none(),
+            "the flat key must not land even under explicit source trust"
+        );
+        let report: serde_json::Value =
+            serde_json::from_str(trusted_dst.stdout_str().trim()).expect("JSON import report");
+        assert_eq!(report["pubkey_bindings_stripped"], 1);
+        assert!(
+            report["errors"]
+                .as_array()
+                .is_some_and(|errors| errors.iter().any(|e| e
+                    .as_str()
+                    .is_some_and(|s| s.contains("agent_pubkey binding stripped"))))
         );
         assert_eq!(
             trusted_row
                 .metadata
-                .get(crate::models::field_names::ATTEST_LEVEL)
+                .get(crate::META_KEY_AGENT_ID)
                 .and_then(serde_json::Value::as_str),
-            Some("agent_attested")
+            Some(agent),
+            "--trust-source still preserves the ordinary authorship claim"
         );
     }
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel
@@ -40,6 +41,17 @@ DEFAULT_MEMORY_KIND = "observation"
 #: README all derive from (#2455 — they had drifted to three different
 #: answers: 1.0.0 / 0.8.0 / 0.6.0-alpha.0).
 SDK_VERSION = _SDK_VERSION
+
+
+def encode_path_segment(value: str) -> str:
+    """Percent-encode one caller-controlled HTTP path segment.
+
+    ``agent_id`` deliberately permits SPIFFE URIs and therefore slashes.
+    Interpolating it directly would turn one route parameter into several
+    path components. ``safe=''`` is load-bearing because ``quote`` otherwise
+    preserves ``/`` by default.
+    """
+    return quote(value, safe="")
 
 
 def build_httpx_kwargs(

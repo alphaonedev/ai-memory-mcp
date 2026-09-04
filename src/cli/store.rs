@@ -1204,7 +1204,7 @@ mod tests {
         {
             let conn = db::open(&db).unwrap();
             db::register_agent(&conn, "test-agent", "ai:claude-opus-4.7", &[]).unwrap();
-            db::bind_agent_pubkey(&conn, "test-agent", &kp.public_base64()).unwrap();
+            db::bind_agent_pubkey_with_keypair(&conn, "test-agent", &kp).unwrap();
         }
 
         let cfg = config::AppConfig::default();

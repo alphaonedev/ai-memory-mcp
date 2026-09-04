@@ -616,7 +616,7 @@ pub(super) fn resolve_inbound_attribution(
 pub(super) fn inbound_claim_is_write_attested(
     mem: &Memory,
     claimed_author: &str,
-    claimed_bound_key: Option<&str>,
+    resolved_pubkeys: Option<&crate::storage::AttestationPubkeyAt>,
 ) -> bool {
     let presented_sig = mem
         .metadata
@@ -629,10 +629,10 @@ pub(super) fn inbound_claim_is_write_attested(
                 .ok()
         });
     matches!(
-        crate::identity::attest::resolve_write_attest_level(
+        crate::identity::attest::resolve_historical_write_attest_level(
             mem,
             claimed_author,
-            claimed_bound_key,
+            resolved_pubkeys,
             presented_sig.as_deref(),
             false,
         ),
@@ -797,75 +797,78 @@ pub(super) fn signal_author_authorized(
     true
 }
 
-/// #2865 — resolve the attributed author's bound Ed25519 public key (base64)
-/// for the `/sync/push` per-write CONTENT-attestation lane
-/// ([`apply_inbound_write_attestation`]): the DB `agent_pubkey` registry FIRST,
-/// then the on-disk ENROLLED key store ([`crate::identity::verify::lookup_peer_public_key`],
-/// the key-dir) as a MISS-ONLY fallback.
+/// #3464 — adapt a timestamp-specific registry lookup to the federation
+/// verifier without weakening the existing #2865 key-directory fallback.
 ///
-/// **Why the fallback (the #2865 gap).** A daemon authors a federated
-/// consolidation as its FEDERATION identity (e.g. `ai:hive-memory-1`,
-/// #2860/#2862). A normally-enrolled mesh cross-enrolls a peer's federation
-/// public key into the key-dir — the SAME source the PULL author lane
-/// ([`attest_inbound_pull_memory`]), the signal-author lane
-/// ([`signal_author_authorized`]), and the transition-author lane already
-/// trust — but does NOT bind it into the per-node DB `agent_pubkey` registry.
-/// Pre-#2865 the push lane resolved the author key from the DB registry ONLY,
-/// so the propagated `metadata.write_signature` could not be verified and the
-/// row landed `attest_level=claimed` — quarantined at peers under
-/// `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (asi-hard). Consulting the key-dir
-/// as a fallback brings the push lane to parity with the pull lane and makes
-/// daemon-authored derived content converge at `agent_attested` OUT-OF-BOX,
-/// with no manual DB-bind step. 5-agent vote (`4d3ea1c5`), unanimous.
+/// Once any v97 history exists it is authoritative: a timestamp miss (for
+/// example, a revoked interval) returns no key, and neither the different
+/// current flat key nor an unversioned key-directory entry may replace it.
+/// Only a legacy identity with ZERO history rows may use its flat key and then
+/// the operator-enrolled key directory as the existing miss-only fallback.
 ///
-/// **Trust (why this is not a new grant).** The key-dir is
-/// operator/enrollment-controlled and is NOT writable over the wire — no
-/// `/sync/*` receive handler writes it — so reading it grants no new trust; it
-/// is the identical source three inbound author lanes already use. The fallback
-/// is MISS-ONLY (`registry_key.or_else(...)`): a key bound into the DB registry
-/// (e.g. the cert-round author via the admin `PUT /api/v1/agents/{id}/pubkey`
-/// route, or `ai-memory agents bind-key`) ALWAYS wins, so a stale/rotated
-/// key-dir entry can never shadow the authoritative registry key. And
-/// [`apply_inbound_write_attestation`] VERIFIES the presented signature against
-/// whichever key resolves — a wrong/absent key can only DEGRADE the row to
-/// `claimed`, never mis-attest it (a forged signature is rejected
-/// unconditionally). The key-dir [`ed25519_dalek::VerifyingKey`] is encoded
-/// URL-safe-no-pad exactly as the pull lane encodes it;
-/// [`crate::identity::keypair::decode_public_base64`] accepts both that and the
-/// STANDARD form the DB registry stores.
-/// #3145 (v1.0.0, data-integrity) — de-silence the DB-registry lookup on the
-/// federation receive lane.
-///
-/// [`crate::db::agent_pubkey`] now PROPAGATES a real backend fault instead of
-/// flattening it into `Ok(None)`. This lane still has to keep going (the
-/// enclosing `sync_push` loop returns `impl IntoResponse`, not a `Result`, and
-/// a fault here degrades the row to `claimed` / quarantines it rather than
-/// mis-attesting it — a wrong/absent key can only DEGRADE, never forge, because
-/// `apply_inbound_write_attestation` verifies the presented signature against
-/// whichever key resolves and rejects a forged one unconditionally). What it
-/// must NOT do is degrade SILENTLY: an operator seeing rows land `claimed`
-/// under a busy/locked database gets a named WARN naming the agent and the
-/// error, instead of an indistinguishable "author not enrolled".
-///
-/// Hardening this lane further (refusing the inbound batch outright on a
-/// registry fault, rather than degrading it) is deliberately NOT done here —
-/// it changes federation-receive semantics and belongs to its own change.
-fn registry_key_or_warn(
-    lookup: anyhow::Result<Option<String>>,
+/// Backend/corruption errors are noisy and yield no key. The federation data
+/// lane then truthfully downgrades or rejects under strict mode; it can never
+/// silently upgrade an unverifiable row.
+pub(crate) fn historical_author_key_or_warn<E: std::fmt::Display>(
+    lookup: Result<crate::storage::AttestationPubkeyAt, E>,
     attribute_agent: &str,
-) -> Option<String> {
-    lookup
-        .inspect_err(|e| {
+) -> Option<crate::storage::AttestationPubkeyAt> {
+    match lookup {
+        Ok(resolved) if resolved.history_exists => {
+            // History is authoritative even on a timestamp MISS. Falling back
+            // to the flat/current key (or key-dir) here would let a rotation
+            // rewrite the verifier for an older signed envelope.
+            Some(resolved)
+        }
+        Ok(mut resolved) => {
+            let registry_key = resolved.candidate_pubkeys_b64.pop();
+            resolved.candidate_pubkeys_b64 =
+                resolve_author_bound_key(registry_key, attribute_agent)
+                    .into_iter()
+                    .collect();
+            Some(resolved)
+        }
+        Err(e) => {
             tracing::warn!(
-                "sync_push: bound-key registry lookup FAILED for {attribute_agent}: {e:#} \
+                "federation: timestamp-specific bound-key lookup FAILED for \
+                 {attribute_agent}: {e} \
                  — treating as unenrolled for this row (it can only land `claimed` / be \
-                 quarantined, never mis-attested). Check database health (#3145)."
+                 quarantined, never mis-attested), with NO unversioned fallback. Check \
+                 database health and key-history integrity (#3145/#3464)."
             );
-        })
-        .ok()
-        .flatten()
+            // Preserve a fail-closed, no-fallback sentinel. Callers reach this
+            // helper only for a well-shaped presented signature, so an empty
+            // authoritative candidate set refuses that row rather than
+            // silently downgrading it or consulting the key directory.
+            Some(crate::storage::AttestationPubkeyAt {
+                candidate_pubkeys_b64: Vec::new(),
+                history_exists: true,
+            })
+        }
+    }
 }
 
+/// Strip and loudly report a peer-carried `_agents` public-key binding.
+///
+/// Federation can transport registration data, but it cannot manufacture the
+/// target agent's possession/lineage witness.  The v97 database trigger is the
+/// atomic enforcement backstop; doing this before persistence makes the
+/// refused trust claim visible to operators and keeps both JSON mirrors clean.
+pub(crate) fn strip_federated_pubkey_binding_or_warn(mem: &mut Memory) {
+    if crate::storage::strip_unproven_agent_pubkey_binding(mem) {
+        tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            memory_id = %mem.id,
+            "federated _agents public-key binding stripped: peer transport is not proof of possession or lineage (#3464)"
+        );
+    }
+}
+
+/// #2865 — resolve an unversioned/legacy federation author key: DB registry
+/// first, then the operator-enrolled key directory as a miss-only fallback.
+///
+/// v97 callers must reach this only through [`historical_author_key_or_warn`],
+/// which forbids this fallback once any timestamped history exists.
 #[must_use]
 pub fn resolve_author_bound_key(
     registry_key: Option<String>,
@@ -945,7 +948,7 @@ pub(super) fn apply_inbound_write_attestation(
     attribute_agent: &str,
     sender_agent_id: &str,
     original_claim: Option<&str>,
-    bound_pubkey_b64: Option<&str>,
+    resolved_pubkeys: Option<&crate::storage::AttestationPubkeyAt>,
     require_write_sig_env: bool,
 ) -> anyhow::Result<()> {
     // Skip re-attributed rows — the original claimant's signature would not
@@ -954,22 +957,27 @@ pub(super) fn apply_inbound_write_attestation(
     if original_claim.is_some_and(|c| c != attribute_agent) {
         return Ok(());
     }
-    let presented_sig: Option<Vec<u8>> = to_insert
+    let presented_sig: Option<Vec<u8>> = match to_insert
         .metadata
         .get(crate::models::field_names::WRITE_SIGNATURE)
-        .and_then(serde_json::Value::as_str)
-        .and_then(|s| {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .decode(s.trim())
-                .ok()
-        });
+    {
+        None => None,
+        Some(serde_json::Value::String(encoded)) => {
+            use base64::Engine as _;
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded.trim())
+                    .map_err(|_| anyhow::anyhow!("presented write_signature is not base64"))?,
+            )
+        }
+        Some(_) => anyhow::bail!("presented write_signature must be a base64 string"),
+    };
     // Strict requirement applies only to HONORED third-party relayed claims.
     let require = require_write_sig_env && attribute_agent != sender_agent_id;
-    crate::identity::attest::stamp_attestation(
+    crate::identity::attest::stamp_historical_attestation(
         to_insert,
         attribute_agent,
-        bound_pubkey_b64,
+        resolved_pubkeys,
         presented_sig.as_deref(),
         require,
     )
@@ -1003,13 +1011,12 @@ pub(super) fn apply_inbound_write_attestation(
 ///     (DEGRADE, never corrupt — the pull direction has no attested relayer to
 ///     hold accountable, so an unsigned row is accepted-and-flagged).
 ///
-/// The author key is resolved from the on-disk ENROLLED key store
-/// ([`crate::identity::verify::lookup_peer_public_key`]) — the SAME source the
-/// federation signal-author and transition-author lanes use — so the gate is
-/// backend-UNIFORM (sqlite + postgres pulls behave identically; the sqlite-only
-/// `db::agent_pubkey` registration source the push path uses is deliberately NOT
-/// used here). No `.is_ok()` / `if let Ok` is used as a security predicate — a
-/// forged signature is an explicit `Err` that returns `false`.
+/// The caller resolves `author_bound_key` from the destination's v97 history
+/// at `mem.created_at` through [`historical_author_key_or_warn`]. This keeps
+/// SQLite and PostgreSQL pulls backend-uniform and permits the older key-dir
+/// fallback only for a truly history-less legacy identity. No `.is_ok()` /
+/// `if let Ok` is used as a security predicate — a forged signature is an
+/// explicit `Err` that returns `false`.
 ///
 /// #2340 (FBL-32) — redacts to the TO-BE-PERSISTED form FIRST so the attestation
 /// verifies + stamps over exactly the bytes the storage funnel
@@ -1029,7 +1036,10 @@ pub(super) fn apply_inbound_write_attestation(
 /// Returns `true` when the (now-attested) row may be applied, `false` when it
 /// must be skipped.
 #[must_use]
-pub(crate) fn attest_inbound_pull_memory(mem: &mut Memory) -> bool {
+pub(crate) fn attest_inbound_pull_memory(
+    mem: &mut Memory,
+    resolved_pubkeys: Option<&crate::storage::AttestationPubkeyAt>,
+) -> bool {
     // Capture the claimed author BEFORE redaction so a credential-shaped
     // `agent_id` (pathological) still attests against the presented claim;
     // the screen may rewrite the stored leaf. Wave-2 B4: do NOT return
@@ -1066,18 +1076,12 @@ pub(crate) fn attest_inbound_pull_memory(mem: &mut Memory) -> bool {
         }
         return true;
     };
-    // #2865 — single-source the author-key resolution through the shared
-    // helper. The pull lane has no DB-registry source (it is backend-uniform by
-    // design), so it passes `None` and the helper resolves the enrolled key-dir
-    // key exactly as before (byte-identical) — the same resolver the push lane
-    // now falls back to.
-    let author_bound_key = resolve_author_bound_key(None, &author);
     match apply_inbound_write_attestation(
         mem,
         &author,
         &author,
         None,
-        author_bound_key.as_deref(),
+        resolved_pubkeys,
         crate::federation::receive_auth::require_write_sig_enabled(),
     ) {
         Ok(()) => true,
@@ -1094,6 +1098,34 @@ pub(crate) fn attest_inbound_pull_memory(mem: &mut Memory) -> bool {
             false
         }
     }
+}
+
+/// #3464 — storage-safe pull gate: remove transported identity-key claims
+/// before verifying/stamping the signed row.
+///
+/// Keeping the ordering inside one helper prevents catch-up callers from
+/// recreating the stamp-then-mutate defect where `agent_attested` described
+/// bytes different from those ultimately persisted.
+#[must_use]
+#[cfg(test)]
+pub(crate) fn sanitize_and_attest_inbound_pull_memory(
+    mem: &mut Memory,
+    resolved_pubkeys: Option<&crate::storage::AttestationPubkeyAt>,
+) -> bool {
+    sanitize_inbound_pull_memory(mem);
+    attest_inbound_pull_memory(mem, resolved_pubkeys)
+}
+
+/// Apply every signed-field mutation required at the federation pull boundary
+/// before a caller resolves timestamped key history.
+///
+/// The subsequent attestation helper repeats the redaction idempotently, but
+/// exposing this pre-lookup step prevents an unsigned/malformed or stripped
+/// row from parsing attacker-controlled `created_at` through the history
+/// resolver when no cryptographic verification can occur.
+pub(crate) fn sanitize_inbound_pull_memory(mem: &mut Memory) {
+    strip_federated_pubkey_binding_or_warn(mem);
+    crate::federation::receive_auth::redact_inbound_before_attestation(mem);
 }
 
 /// v1.0.0 R19/A3 (#1948, decision `560c8007`) — route-IN quarantine of a
@@ -2320,6 +2352,10 @@ pub async fn sync_push(
             &body.sender_agent_id,
             cap_for_namespace,
         );
+        // #3464 — remove peer-carried identity-key claims before ANY
+        // signature/honor decision. A post-verification strip would mutate
+        // the signed bytes while leaving `agent_attested` on the row.
+        strip_federated_pubkey_binding_or_warn(&mut to_insert);
         // #1464 — capture the originally-claimed author BEFORE attribution
         // may rewrite it, so the content-attestation step can skip rows that
         // get re-attributed to the sender (an unauthorized third-party claim).
@@ -2342,15 +2378,23 @@ pub async fn sync_push(
         // write_signature) is HONORED rather than re-attributed to the daemon
         // relay sender (the #2860 re-broadcast divergence). Reused below as the
         // attestation bound key when the claim is honored (attribute == claimed).
-        let claim_bound_key = original_claim.as_deref().and_then(|c| {
-            // #2865 — DB registry FIRST, enrolled key-dir as a MISS-ONLY
-            // fallback, so a third-party author whose FEDERATION identity key
-            // is cross-enrolled in the key-dir (not DB-bound) is HONORED
-            // rather than re-attributed to the relay sender.
-            resolve_author_bound_key(registry_key_or_warn(db::agent_pubkey(&lock.0, c), c), c)
-        });
+        let claim_bound_key =
+            crate::identity::attest::presented_attestation_author_needing_bound_key(
+                &to_insert,
+                original_claim.as_deref(),
+            )
+            .and_then(|c| {
+                // #2865 — DB registry FIRST, enrolled key-dir as a MISS-ONLY
+                // fallback, so a third-party author whose FEDERATION identity key
+                // is cross-enrolled in the key-dir (not DB-bound) is HONORED
+                // rather than re-attributed to the relay sender.
+                historical_author_key_or_warn(
+                    db::agent_pubkey_for_attestation_at(&lock.0, c, &to_insert.created_at),
+                    c,
+                )
+            });
         let claim_write_attested = original_claim.as_deref().is_some_and(|c| {
-            inbound_claim_is_write_attested(&to_insert, c, claim_bound_key.as_deref())
+            inbound_claim_is_write_attested(&to_insert, c, claim_bound_key.as_ref())
         });
         let attribute_agent = resolve_inbound_attribution(
             &mut to_insert,
@@ -2371,26 +2415,30 @@ pub async fn sync_push(
         // the key already looked up above (avoids a second lookup, #2863).
         let author_bound_key = if Some(attribute_agent.as_str()) == original_claim.as_deref() {
             claim_bound_key.clone()
-        } else {
+        } else if let Some(author) =
+            crate::identity::attest::presented_attestation_author_needing_bound_key(
+                &to_insert,
+                original_claim.as_deref(),
+            )
+        {
             // #2865 — same DB-first, enrolled-key-dir MISS-ONLY fallback as the
             // claim key above (the honored branch already carries it via
             // `claim_bound_key`). Lets a peer's cross-enrolled FEDERATION
             // identity key verify a propagated write_signature and reach
             // agent_attested out-of-box, with no manual DB-bind step.
-            resolve_author_bound_key(
-                registry_key_or_warn(
-                    db::agent_pubkey(&lock.0, &attribute_agent),
-                    &attribute_agent,
-                ),
-                &attribute_agent,
+            historical_author_key_or_warn(
+                db::agent_pubkey_for_attestation_at(&lock.0, author, &to_insert.created_at),
+                author,
             )
+        } else {
+            None
         };
         if let Err(e) = apply_inbound_write_attestation(
             &mut to_insert,
             &attribute_agent,
             &body.sender_agent_id,
             original_claim.as_deref(),
-            author_bound_key.as_deref(),
+            author_bound_key.as_ref(),
             crate::federation::receive_auth::require_write_sig_enabled(),
         ) {
             // #1801→#1954 item 7 — split the generic AttestationRequired WARN
@@ -2404,7 +2452,10 @@ pub async fn sync_push(
                 .get(crate::models::field_names::WRITE_SIGNATURE)
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|s| !s.trim().is_empty());
-            if author_bound_key.is_none() {
+            if author_bound_key
+                .as_ref()
+                .is_none_or(|keys| keys.candidate_pubkeys_b64.is_empty())
+            {
                 tracing::warn!(
                     target: ATTESTATION_TRACE_TARGET,
                     memory_id = %to_insert.id,
@@ -4168,11 +4219,130 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(kp.public.to_bytes())
     }
 
+    fn legacy_attestation_resolution(
+        pubkey_b64: Option<&str>,
+    ) -> Option<crate::storage::AttestationPubkeyAt> {
+        Some(crate::storage::AttestationPubkeyAt {
+            candidate_pubkeys_b64: pubkey_b64.into_iter().map(str::to_string).collect(),
+            history_exists: false,
+        })
+    }
+
     fn put_write_sig(mem: &mut Memory, sig: &[u8]) {
         let b64 = base64::engine::general_purpose::STANDARD.encode(sig);
         mem.metadata.as_object_mut().unwrap().insert(
             crate::models::field_names::WRITE_SIGNATURE.to_string(),
             serde_json::json!(b64),
+        );
+    }
+
+    fn signed_registration(
+        author: &str,
+        kp: &keypair::AgentKeypair,
+        carried_binding: bool,
+    ) -> Memory {
+        let mut mirror = serde_json::json!({ "agent_id": author });
+        if carried_binding {
+            let obj = mirror.as_object_mut().expect("registration object");
+            obj.insert(
+                crate::models::field_names::AGENT_PUBKEY.to_string(),
+                serde_json::Value::String(kp.public_base64()),
+            );
+            obj.insert(
+                crate::models::field_names::PUBKEY_BOUND_AT.to_string(),
+                serde_json::Value::String("2026-06-01T11:00:00+00:00".to_string()),
+            );
+        }
+        let mut mem = Memory {
+            id: format!(
+                "registration-{}",
+                if carried_binding { "key" } else { "clean" }
+            ),
+            namespace: crate::models::AGENTS_NAMESPACE.to_string(),
+            title: crate::models::agent_registration_title(author),
+            content: serde_json::to_string(&mirror).expect("registration mirror"),
+            created_at: "2026-06-01T12:00:00+00:00".to_string(),
+            metadata: mirror,
+            ..Memory::default()
+        };
+        let signature = attest::sign_memory_write(kp, &mem, author).expect("sign registration");
+        put_write_sig(&mut mem, &signature);
+        mem
+    }
+
+    #[test]
+    fn fast_old_key_signature_is_rechecked_across_rotation_skew_3464() {
+        let dir = tempfile::tempdir().expect("temp db dir");
+        let conn = crate::db::open(&dir.path().join("snapshot.db")).expect("migrate db");
+        let author = "ai:snapshot-author-3464";
+        crate::db::register_agent(&conn, author, "ai:test", &[]).expect("register author");
+        let old = keypair::generate("snapshot-old").expect("old key");
+        crate::db::bind_agent_pubkey_with_keypair(&conn, author, &old).expect("bind old key");
+        let old_bound = crate::db::agent_pubkey_versions(&conn, author)
+            .expect("old history")
+            .pop()
+            .expect("old version")
+            .bound_at;
+        let old_bound = chrono::DateTime::parse_from_rfc3339(&old_bound)
+            .expect("old bound")
+            .with_timezone(&chrono::Utc);
+        let rotation_at =
+            attest::canonical_created_at_stamp(old_bound + chrono::Duration::seconds(1));
+        let signed_at =
+            attest::canonical_created_at_stamp(old_bound + chrono::Duration::seconds(2));
+        let mut mem = Memory {
+            id: "snapshot-row-3464".to_string(),
+            namespace: "team/snapshot".to_string(),
+            title: "snapshot row".to_string(),
+            content: "signed payload".to_string(),
+            created_at: signed_at.clone(),
+            metadata: serde_json::json!({"agent_id": author}),
+            ..Memory::default()
+        };
+        let signature = attest::sign_memory_write(&old, &mem, author).expect("sign under K0");
+        put_write_sig(&mut mem, &signature);
+
+        let next = keypair::generate("snapshot-next").expect("next key");
+        conn.execute(
+            "UPDATE agent_pubkey_history SET superseded_at = ?2
+             WHERE agent_id = ?1 AND superseded_at IS NULL",
+            rusqlite::params![author, &rotation_at],
+        )
+        .expect("close old history");
+        conn.execute(
+            "INSERT INTO agent_pubkey_history
+                (agent_id, version, pubkey_b64, bind_authority, proof_nonce,
+                 bound_at, superseded_at)
+             VALUES (?1, 2, ?2, 'lineage_succession', NULL, ?3, NULL)",
+            rusqlite::params![author, next.public_base64(), &rotation_at],
+        )
+        .expect("model concurrent accepted rotation");
+        let authoritative = crate::db::agent_pubkey_for_attestation_at(&conn, author, &signed_at)
+            .expect("post-rotation lookup")
+            .candidate_pubkeys_b64;
+        assert_eq!(
+            authoritative,
+            [old.public_base64(), next.public_base64()],
+            "both skew-eligible keys are candidates; cryptography disambiguates"
+        );
+        assert!(
+            apply_inbound_write_attestation(
+                &mut mem,
+                author,
+                author,
+                Some(author),
+                Some(&crate::storage::AttestationPubkeyAt {
+                    candidate_pubkeys_b64: authoritative,
+                    history_exists: true,
+                }),
+                false,
+            )
+            .is_ok(),
+            "an old-key write accepted before rotation remains verifiable when its clock is fast"
+        );
+        assert_eq!(
+            mem.metadata[crate::models::field_names::ATTEST_LEVEL],
+            "agent_attested"
         );
     }
 
@@ -4193,7 +4363,7 @@ mod tests {
             author,
             "ai:relay",
             Some(author),
-            Some(&pk_b64(&kp)),
+            legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
             false,
         )
         .expect("valid sig must verify");
@@ -4253,7 +4423,7 @@ mod tests {
                 author,
                 "ai:relay",
                 Some(author),
-                Some(&pk_b64(&kp)),
+                legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
                 false,
             )
             .is_err(),
@@ -4278,7 +4448,7 @@ mod tests {
             author,
             "ai:relay",
             Some(author),
-            Some(&pk_b64(&kp)),
+            legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
             true,
         )
         .expect("#3422: a canonical pg-authored row must re-verify at the receiver");
@@ -4300,7 +4470,7 @@ mod tests {
             author,
             "ai:relay",
             Some(author),
-            Some(&pk_b64(&kp)),
+            legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
             false,
         );
         assert!(err.is_err(), "forged signature must be rejected");
@@ -4325,7 +4495,7 @@ mod tests {
             author,
             "ai:relay",
             Some(author),
-            Some(&pk_b64(&kp)),
+            legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
             false,
         )
         .expect("unsigned permissive must pass");
@@ -4366,6 +4536,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn historical_registry_miss_never_falls_back_to_current_keydir_3464() {
+        let dir = tempfile::tempdir().expect("key dir");
+        let author = "history-gap-author";
+        let kp = keypair::generate(author).expect("gen");
+        keypair::save(&kp, dir.path()).expect("enroll keydir key");
+        let _guard = KeyDirEnvGuard::set(dir.path());
+
+        let history_miss = historical_author_key_or_warn(
+            Ok::<_, &str>(crate::storage::AttestationPubkeyAt {
+                candidate_pubkeys_b64: Vec::new(),
+                history_exists: true,
+            }),
+            author,
+        );
+        assert!(
+            history_miss
+                .as_ref()
+                .is_some_and(|keys| keys.candidate_pubkeys_b64.is_empty()),
+            "a history gap remains authoritative and carries no fallback candidate"
+        );
+
+        let legacy = historical_author_key_or_warn(
+            Ok::<_, &str>(crate::storage::AttestationPubkeyAt {
+                candidate_pubkeys_b64: Vec::new(),
+                history_exists: false,
+            }),
+            author,
+        );
+        assert_eq!(
+            legacy
+                .as_ref()
+                .and_then(|keys| keys.candidate_pubkeys_b64.first())
+                .map(String::as_str),
+            Some(kp.public_base64().as_str()),
+            "the key-dir fallback remains available only to a zero-history identity"
+        );
+    }
+
     /// A VALID presented `write_signature`, verified against the author's
     /// locally-enrolled key, upgrades a pulled row to `agent_attested` and is
     /// applied. (The key source is the on-disk store, resolved by the gate
@@ -4381,15 +4590,139 @@ mod tests {
         let mut mem = wsig_mem(author);
         let sig = attest::sign_memory_write(&kp, &mem, author).expect("sign");
         put_write_sig(&mut mem, &sig);
+        let author_key = resolve_author_bound_key(None, author);
 
         assert!(
-            attest_inbound_pull_memory(&mut mem),
+            attest_inbound_pull_memory(
+                &mut mem,
+                legacy_attestation_resolution(author_key.as_deref()).as_ref(),
+            ),
             "a validly-signed pulled row must be applied"
         );
         assert_eq!(
             mem.metadata["attest_level"], "agent_attested",
             "a verified write_signature upgrades the pulled row to agent_attested"
         );
+    }
+
+    #[test]
+    fn pull_and_catchup_strip_registration_key_before_attestation_3464() {
+        let author = "ai:registration-author";
+        let kp = keypair::generate(author).expect("keypair");
+        let mut mem = signed_registration(author, &kp, true);
+        assert!(
+            sanitize_and_attest_inbound_pull_memory(
+                &mut mem,
+                legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
+            ),
+            "the stale signature is removed before verification, so pull safely downgrades"
+        );
+        assert!(
+            mem.metadata
+                .get(crate::models::field_names::AGENT_PUBKEY)
+                .is_none()
+        );
+        let content: serde_json::Value =
+            serde_json::from_str(&mem.content).expect("stripped registration mirror");
+        assert!(
+            content
+                .get(crate::models::field_names::AGENT_PUBKEY)
+                .is_none()
+        );
+        assert_eq!(content[crate::models::field_names::ATTEST_LEVEL], "claimed");
+        assert!(
+            mem.metadata
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .is_none(),
+            "sanitization must remove the now-stale signature"
+        );
+        assert_eq!(
+            mem.metadata[crate::models::field_names::ATTEST_LEVEL],
+            "claimed"
+        );
+    }
+
+    #[test]
+    fn pull_unsigned_and_malformed_rows_skip_history_resolution_3464() {
+        let author = "ai:history-dos-3464";
+        let mut unsigned = wsig_mem(author);
+        unsigned.created_at = "attacker-controlled-not-rfc3339".to_string();
+        sanitize_inbound_pull_memory(&mut unsigned);
+        assert!(
+            crate::identity::attest::presented_attestation_author_needing_bound_key(
+                &unsigned, None,
+            )
+            .is_none(),
+            "an unsigned row must not parse its timestamp through key history"
+        );
+        assert!(
+            attest_inbound_pull_memory(&mut unsigned, None),
+            "the unsigned federation row keeps its established claimed disposition"
+        );
+
+        let mut malformed = wsig_mem(author);
+        malformed.created_at = "attacker-controlled-not-rfc3339".to_string();
+        malformed
+            .metadata
+            .as_object_mut()
+            .expect("metadata")
+            .insert(
+                crate::models::field_names::WRITE_SIGNATURE.to_string(),
+                serde_json::Value::String("not base64!!!".to_string()),
+            );
+        sanitize_inbound_pull_memory(&mut malformed);
+        assert!(
+            crate::identity::attest::presented_attestation_author_needing_bound_key(
+                &malformed, None,
+            )
+            .is_none(),
+            "a malformed signature must be refused without a history/timestamp lookup"
+        );
+        assert!(
+            !attest_inbound_pull_memory(&mut malformed, None),
+            "a presented malformed signature is refused per row, never downgraded"
+        );
+    }
+
+    #[test]
+    fn http_push_strips_registration_key_before_attestation_3464() {
+        let author = "ai:registration-author-push";
+        let kp = keypair::generate(author).expect("keypair");
+        let mut mem = signed_registration(author, &kp, true);
+        strip_federated_pubkey_binding_or_warn(&mut mem);
+        let result = apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay",
+            Some(author),
+            legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "HTTP push may accept only after stripping and honest downgrade"
+        );
+        assert!(!row_is_agent_attested(&mem));
+        assert!(
+            mem.metadata
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .is_none()
+        );
+        let content: serde_json::Value =
+            serde_json::from_str(&mem.content).expect("stripped registration mirror");
+        assert_eq!(content[crate::models::field_names::ATTEST_LEVEL], "claimed");
+    }
+
+    #[test]
+    fn clean_signed_registration_still_attests_after_sanitization_3464() {
+        let author = "ai:registration-author-clean";
+        let kp = keypair::generate(author).expect("keypair");
+        let mut mem = signed_registration(author, &kp, false);
+        assert!(sanitize_and_attest_inbound_pull_memory(
+            &mut mem,
+            legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref()
+        ));
+        assert!(row_is_agent_attested(&mem));
     }
 
     /// THE SECURITY CORE: a FORGED presented signature (present but not
@@ -4409,9 +4742,13 @@ mod tests {
         let mut sig = attest::sign_memory_write(&kp, &mem, author).expect("sign");
         sig[0] ^= 0xFF; // forge
         put_write_sig(&mut mem, &sig);
+        let author_key = resolve_author_bound_key(None, author);
 
         assert!(
-            !attest_inbound_pull_memory(&mut mem),
+            !attest_inbound_pull_memory(
+                &mut mem,
+                legacy_attestation_resolution(author_key.as_deref()).as_ref(),
+            ),
             "a forged write_signature on the pull path must be REFUSED (skip the row)"
         );
     }
@@ -4434,9 +4771,13 @@ mod tests {
             "attest_level".to_string(),
             serde_json::json!("agent_attested"),
         );
+        let author_key = resolve_author_bound_key(None, author);
 
         assert!(
-            attest_inbound_pull_memory(&mut mem),
+            attest_inbound_pull_memory(
+                &mut mem,
+                legacy_attestation_resolution(author_key.as_deref()).as_ref(),
+            ),
             "an unsigned pulled row is accepted (flagged claimed), never dropped"
         );
         assert_eq!(
@@ -4460,7 +4801,7 @@ mod tests {
             ..Memory::default()
         };
         assert!(
-            attest_inbound_pull_memory(&mut mem),
+            attest_inbound_pull_memory(&mut mem, None),
             "an author-less pulled row carries no claim to verify; applied"
         );
     }
@@ -4480,7 +4821,7 @@ mod tests {
             ..Memory::default()
         };
         assert!(
-            attest_inbound_pull_memory(&mut mem),
+            attest_inbound_pull_memory(&mut mem, None),
             "author-less row is still applied"
         );
         assert_eq!(
@@ -4520,7 +4861,7 @@ mod tests {
             ..Memory::default()
         };
         assert!(
-            attest_inbound_pull_memory(&mut mem),
+            attest_inbound_pull_memory(&mut mem, None),
             "author-less credential row is still applied (redact, never refuse)"
         );
         assert_eq!(
@@ -4576,7 +4917,7 @@ mod tests {
             author,
             "ai:relay", // attribute(author) != sender → third-party
             Some(author),
-            Some(&pk_b64(&kp)),
+            legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
             true, // strict
         );
         assert!(err.is_err(), "strict third-party unsigned must be rejected");
@@ -4647,7 +4988,7 @@ mod tests {
             author,
             "ai:relay",
             Some(author),
-            Some(&pk_b64(&kp)),
+            legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
             true,
         )
         .expect("propagated origin signature must attest under the strict flip");
@@ -4702,7 +5043,7 @@ mod tests {
             author,
             "ai:beta",
             Some(author),
-            Some(&pk_b64(&kp)),
+            legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
             true,
         )
         .expect("origin signature must verify at hop-2 after relay through B");
@@ -4724,7 +5065,7 @@ mod tests {
             author,
             "ai:relay", // third-party (attribute author != sender)
             Some(author),
-            Some(&pk_b64(&kp)),
+            legacy_attestation_resolution(Some(&pk_b64(&kp))).as_ref(),
             false, // == AI_MEMORY_FED_REQUIRE_WRITE_SIG=0
         )
         .expect("permissive opt-out must accept an unsigned third-party relay");
@@ -4833,21 +5174,22 @@ mod tests {
             claimed_key: Option<&str>,
             require: bool,
         ) -> String {
+            let claimed_resolution = legacy_attestation_resolution(claimed_key);
             let original_claim = mem
                 .metadata
                 .get(crate::META_KEY_AGENT_ID)
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            let claim_write_attested = original_claim
-                .as_deref()
-                .is_some_and(|c| inbound_claim_is_write_attested(mem, c, claimed_key));
+            let claim_write_attested = original_claim.as_deref().is_some_and(|c| {
+                inbound_claim_is_write_attested(mem, c, claimed_resolution.as_ref())
+            });
             let attribute =
                 resolve_inbound_attribution(mem, sender, cfg, peer, claim_write_attested);
             // Caller key-reuse: when the claim was honored (attribute == claim),
             // the bound key is the claimed author's; otherwise the re-attributed
             // sender's key (unenrolled in this fixture → None).
             let bound = if Some(attribute.as_str()) == original_claim.as_deref() {
-                claimed_key
+                claimed_resolution.as_ref()
             } else {
                 None
             };

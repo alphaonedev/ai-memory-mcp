@@ -6,9 +6,10 @@
 
 use crate::cli::CliOutput;
 use crate::cli::helpers::id_short;
+use crate::identity::pubkey_bind;
 use crate::models::field_names;
 use crate::{db, identity, validate};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Args, Subcommand};
 use std::path::Path;
 
@@ -37,9 +38,18 @@ pub enum AgentsAction {
         #[arg(long, default_value = "")]
         capabilities: String,
     },
-    /// Bind (or rotate) the Ed25519 public key used to attest an
+    /// Bootstrap (or reassert) the Ed25519 public key used to attest an
     /// agent's signed writes (#626 Layer-3). The agent MUST already be
-    /// registered. Re-binding overwrites the previous key in place.
+    /// registered.
+    ///
+    /// v1.0.0 #3464 — the bind now requires PROOF OF POSSESSION of the
+    /// candidate key. By default the private half is loaded from the local key
+    /// store and the proof is produced in-process; `--proof-file` supplies it
+    /// for an offline signer (see `bind-challenge`). Every key is kept in the
+    /// append-only `agent_pubkey_history` ledger so writes it already attested
+    /// stay verifiable. A DISTINCT replacement must use `identity succeed`,
+    /// whose succession is signed by the current lineage key; admin authority
+    /// plus candidate possession alone cannot rotate another identity.
     BindKey {
         /// Agent identifier (must be registered)
         #[arg(long)]
@@ -56,10 +66,42 @@ pub enum AgentsAction {
         /// `docs/attestation.md` used exactly that failing space form.
         #[arg(long, allow_hyphen_values = true)]
         pubkey: String,
+        /// v1.0.0 #3464 — path to a JSON proof produced by an OFFLINE signer:
+        /// `{nonce, expires_at, signature_b64}`, answering a transcript from
+        /// `agents bind-challenge`. Omit it when the private key is in the
+        /// local key store and the CLI can prove possession itself.
+        #[arg(long)]
+        proof_file: Option<std::path::PathBuf>,
+    },
+    /// v1.0.0 #3464 — print the challenge an OFFLINE holder of the candidate
+    /// key must sign before `bind-key` will accept it. Emits the nonce, the
+    /// expiry, and the exact base64 transcript bytes, so the signer never has
+    /// to re-derive the encoding. Feed the answer back via
+    /// `bind-key --proof-file`.
+    BindChallenge {
+        /// Agent identifier the key will be bound to.
+        #[arg(long)]
+        agent_id: String,
+        /// Base64-encoded candidate Ed25519 public key.
+        #[arg(long, allow_hyphen_values = true)]
+        pubkey: String,
+    },
+    /// v1.0.0 #3464 — REVOKE a persisted per-instance sub-key certificate by
+    /// its row id (`agents subkey-certs` lists them). A revoked sub-key can no
+    /// longer attest a write: the v2 ingest gate refuses it even though the
+    /// cert still verifies under the root and is still inside its validity
+    /// window. One-way by design — a key believed compromised is replaced,
+    /// never re-trusted. Idempotent.
+    RevokeSubkeyCert {
+        /// The `b3:`-prefixed cert row id to revoke.
+        #[arg(long)]
+        cert_id: String,
     },
     /// Revoke the Ed25519 public key bound to an agent (#626 Layer-3).
-    /// The agent reverts to the permissive *claimed* posture until a
-    /// fresh key is bound. Idempotent.
+    /// The agent reverts to the configured unbound-key posture. The closed
+    /// history cannot be reopened by another direct candidate proof: a
+    /// replacement must use signed lineage succession / guardian recovery.
+    /// Idempotent.
     RevokeKey {
         /// Agent identifier (must be registered)
         #[arg(long)]
@@ -296,11 +338,140 @@ pub fn run_agents(
                 )?;
             }
         }
-        AgentsAction::BindKey { agent_id, pubkey } => {
+        AgentsAction::BindChallenge { agent_id, pubkey } => {
+            // #3464 — the offline half of the handshake. Persist the challenge
+            // in the SAME durable store `bind-key --proof-file` will consume:
+            // the storage engine's conditional consume is the single-use
+            // decision, including when two CLI invocations race.
             validate::validate_agent_id(&agent_id)?;
             validate::validate_agent_pubkey_b64(&pubkey)?;
-            let trimmed = pubkey.trim();
-            db::bind_agent_pubkey(&conn, &agent_id, trimmed)?;
+            let canonical = identity::keypair::canonical_public_base64(&pubkey)?;
+            let challenge = db::issue_pubkey_bind_challenge(
+                &conn,
+                &agent_id,
+                &canonical,
+                crate::identity::sentinels::DAEMON_PRINCIPAL,
+            )?;
+            let transcript = pubkey_bind::bind_challenge_transcript(
+                &agent_id,
+                &challenge.pubkey_b64,
+                &challenge.nonce_b64,
+                &challenge.expires_at,
+            );
+            use base64::Engine as _;
+            let transcript_b64 =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&transcript);
+            if json_out {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({
+                        "agent_id": agent_id,
+                        (field_names::AGENT_PUBKEY): challenge.pubkey_b64,
+                        "nonce": challenge.nonce_b64,
+                        (field_names::EXPIRES_AT): challenge.expires_at,
+                        "transcript_b64": transcript_b64,
+                    })
+                )?;
+            } else {
+                writeln!(out.stdout, "nonce:         {}", challenge.nonce_b64)?;
+                writeln!(out.stdout, "expires_at:    {}", challenge.expires_at)?;
+                writeln!(out.stdout, "transcript_b64: {transcript_b64}")?;
+                writeln!(
+                    out.stdout,
+                    "sign transcript_b64 with the candidate key, then \
+                     `agents bind-key --proof-file <json>`"
+                )?;
+            }
+        }
+        AgentsAction::RevokeSubkeyCert { cert_id } => {
+            let revoked = db::revoke_subkey_cert(&conn, &cert_id)?;
+            if json_out {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({"revoked": revoked, "cert_id": cert_id})
+                )?;
+            } else if revoked {
+                writeln!(out.stdout, "revoked subkey cert {cert_id}")?;
+            } else {
+                writeln!(
+                    out.stdout,
+                    "subkey cert {cert_id} was already revoked or is not enrolled"
+                )?;
+            }
+        }
+        AgentsAction::BindKey {
+            agent_id,
+            pubkey,
+            proof_file,
+        } => {
+            validate::validate_agent_id(&agent_id)?;
+            validate::validate_agent_pubkey_b64(&pubkey)?;
+            let canonical = identity::keypair::canonical_public_base64(&pubkey)?;
+            // #3464 — proof of possession, on this surface too. Either the
+            // operator hands us an offline signature over a `bind-challenge`
+            // transcript, or the private half is in the local key store and we
+            // run the whole handshake in process. With neither, REFUSE: a bind
+            // that cannot demonstrate the caller controls the key is exactly
+            // the defect this gate exists to close, and the CLI is not exempt
+            // from it just because it runs on the operator's machine. Storage
+            // further limits this external witness to first bootstrap or an
+            // idempotent same-key retry; distinct rotation uses
+            // `identity succeed` and the predecessor signature.
+            let proof = match &proof_file {
+                Some(path) => {
+                    let raw = std::fs::read_to_string(path)
+                        .with_context(|| format!("reading bind proof file {}", path.display()))?;
+                    let doc: serde_json::Value = serde_json::from_str(&raw)
+                        .with_context(|| format!("parsing bind proof file {}", path.display()))?;
+                    let field = |k: &str| -> Result<String> {
+                        doc.get(k)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("bind proof file is missing the `{k}` string field")
+                            })
+                    };
+                    let nonce = field("nonce")?;
+                    let stated_expiry = field(field_names::EXPIRES_AT)?;
+                    let signature = field(field_names::SIGNATURE_B64)?;
+                    let challenge = db::consume_pubkey_bind_challenge(&conn, &agent_id, &nonce)?
+                        .ok_or_else(|| anyhow::anyhow!(crate::errors::msg::BIND_PROOF_REFUSED))?;
+                    if challenge.challenge().expires_at != stated_expiry {
+                        return Err(anyhow::anyhow!(crate::errors::msg::BIND_PROOF_REFUSED));
+                    }
+                    pubkey_bind::PossessionProof::verify_challenge_response(
+                        challenge, &agent_id, &canonical, &signature,
+                    )
+                    .map_err(|e| anyhow::anyhow!(crate::errors::msg::pubkey_bind_refused(e)))?
+                }
+                None => {
+                    let dir = crate::identity::keypair::default_key_dir()?;
+                    let kp =
+                        crate::identity::keypair::load(&agent_id, &dir).with_context(|| {
+                            format!(
+                                "no bind proof supplied and no local private key for '{agent_id}': \
+                             pass --proof-file with a signature over an `agents bind-challenge` \
+                             transcript"
+                            )
+                        })?;
+                    let signing = kp.private.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "the local keypair for '{agent_id}' is PUBLIC-ONLY, so possession \
+                             cannot be proven; pass --proof-file instead"
+                        )
+                    })?;
+                    if kp.public_base64() != canonical {
+                        anyhow::bail!(
+                            "the local private key for '{agent_id}' does not match --pubkey; \
+                             pass --proof-file with a signature from the holder of that key"
+                        );
+                    }
+                    db::prove_possession_with_conn(&conn, &agent_id, signing)?
+                }
+            };
+            db::bind_agent_pubkey(&conn, &agent_id, &canonical, proof)?;
             if json_out {
                 writeln!(
                     out.stdout,
@@ -308,7 +479,7 @@ pub fn run_agents(
                     serde_json::json!({
                         "bound": true,
                         "agent_id": agent_id,
-                        (field_names::AGENT_PUBKEY): trimmed,
+                        (field_names::AGENT_PUBKEY): canonical,
                     })
                 )?;
             } else {
@@ -1604,15 +1775,107 @@ mod tests {
             .public_base64()
     }
 
+    /// #3464 — register `agent_id` and return a FULL keypair (private half
+    /// included), so the test can prove possession the way a real operator
+    /// does.
+    fn register_and_keypair(
+        env: &mut TestEnv,
+        db: &std::path::Path,
+        agent_id: &str,
+    ) -> crate::identity::keypair::AgentKeypair {
+        let reg = AgentsArgs {
+            action: Some(AgentsAction::Register {
+                agent_id: agent_id.to_string(),
+                agent_type: "ai:claude-opus-4.7".to_string(),
+                capabilities: String::new(),
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(db, reg, false, &mut out).expect("register");
+        }
+        env.stdout.clear();
+        env.stderr.clear();
+        crate::identity::keypair::generate(agent_id).expect("generate keypair")
+    }
+
+    /// #3464 — write the offline proof JSON `bind-key --proof-file` consumes.
+    /// The signature is produced with the candidate key's PRIVATE half, which
+    /// is the whole point: a test that could not do this is a test binding a
+    /// key nobody holds.
+    fn write_proof_file(
+        env: &TestEnv,
+        name: &str,
+        agent_id: &str,
+        kp: &crate::identity::keypair::AgentKeypair,
+    ) -> std::path::PathBuf {
+        let conn = db::open(&env.db_path).expect("open proof DB");
+        let challenge = db::issue_pubkey_bind_challenge(
+            &conn,
+            agent_id,
+            &kp.public_base64(),
+            crate::identity::sentinels::DAEMON_PRINCIPAL,
+        )
+        .expect("persist proof challenge");
+        let signature = pubkey_bind::sign_bind_challenge(
+            kp.private
+                .as_ref()
+                .expect("generated keypair has a private half"),
+            &challenge,
+        );
+        write_cert_file(
+            env,
+            name,
+            &serde_json::json!({
+                "nonce": challenge.nonce_b64,
+                (field_names::EXPIRES_AT): challenge.expires_at,
+                (field_names::SIGNATURE_B64): signature,
+            }),
+        )
+    }
+
+    #[test]
+    fn test_agents_bind_challenge_is_durable() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let key = kp.public_base64();
+        let args = AgentsArgs {
+            action: Some(AgentsAction::BindChallenge {
+                agent_id: "ai:curator".to_string(),
+                pubkey: key.clone(),
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, args, true, &mut out).expect("issue CLI challenge");
+        }
+        let response: serde_json::Value =
+            serde_json::from_str(env.stdout_str().trim()).expect("challenge JSON");
+        let nonce = response["nonce"].as_str().expect("nonce");
+        let conn = db::open(&db).expect("open challenge DB");
+        let stored: (String, String) = conn
+            .query_row(
+                "SELECT agent_id, pubkey_b64 FROM agent_pubkey_challenges WHERE nonce = ?1",
+                [nonce],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("durable challenge row");
+        assert_eq!(stored, ("ai:curator".to_string(), key));
+    }
+
     #[test]
     fn test_agents_bind_key_happy_text() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let pk = register_and_key(&mut env, &db, "ai:curator");
+        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let pk = kp.public_base64();
+        let proof = write_proof_file(&env, "bind-proof-text.json", "ai:curator", &kp);
         let args = AgentsArgs {
             action: Some(AgentsAction::BindKey {
                 agent_id: "ai:curator".to_string(),
                 pubkey: pk.clone(),
+                proof_file: Some(proof),
             }),
         };
         {
@@ -1629,11 +1892,14 @@ mod tests {
     fn test_agents_bind_key_happy_json() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let pk = register_and_key(&mut env, &db, "ai:curator");
+        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let pk = kp.public_base64();
+        let proof = write_proof_file(&env, "bind-proof-json.json", "ai:curator", &kp);
         let args = AgentsArgs {
             action: Some(AgentsAction::BindKey {
                 agent_id: "ai:curator".to_string(),
                 pubkey: pk.clone(),
+                proof_file: Some(proof),
             }),
         };
         {
@@ -1647,39 +1913,145 @@ mod tests {
     }
 
     #[test]
-    fn test_agents_bind_key_rotates_in_place() {
+    fn test_agents_bind_key_refuses_admin_owned_candidate_hijack() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let k1 = register_and_key(&mut env, &db, "ai:curator");
-        let k2 = crate::identity::keypair::generate("ai:curator")
-            .unwrap()
-            .public_base64();
-        assert_ne!(k1, k2);
-        for k in [&k1, &k2] {
+        let victim = register_and_keypair(&mut env, &db, "ai:victim");
+        let attacker = crate::identity::keypair::generate("ai:admin-attacker").unwrap();
+        let victim_key = victim.public_base64();
+        let attacker_key = attacker.public_base64();
+        assert_ne!(victim_key, attacker_key);
+
+        let victim_proof = write_proof_file(&env, "victim-bootstrap.json", "ai:victim", &victim);
+        {
             let args = AgentsArgs {
                 action: Some(AgentsAction::BindKey {
-                    agent_id: "ai:curator".to_string(),
-                    pubkey: k.clone(),
+                    agent_id: "ai:victim".to_string(),
+                    pubkey: victim_key.clone(),
+                    proof_file: Some(victim_proof),
                 }),
             };
             let mut out = env.output();
             run_agents(&db, args, false, &mut out).unwrap();
         }
+
+        let attacker_proof = write_proof_file(&env, "attacker-hijack.json", "ai:victim", &attacker);
+        let args = AgentsArgs {
+            action: Some(AgentsAction::BindKey {
+                agent_id: "ai:victim".to_string(),
+                pubkey: attacker_key,
+                proof_file: Some(attacker_proof),
+            }),
+        };
+        let mut out = env.output();
+        let error = run_agents(&db, args, false, &mut out)
+            .expect_err("candidate possession plus local admin access must not replace victim");
+        assert!(error.to_string().contains("current trust lineage"));
+
         let conn = db::open(&db).unwrap();
-        assert_eq!(db::agent_pubkey(&conn, "ai:curator").unwrap(), Some(k2));
+        assert_eq!(
+            db::agent_pubkey(&conn, "ai:victim").unwrap(),
+            Some(victim_key.clone())
+        );
+        let history = db::agent_pubkey_versions(&conn, "ai:victim").unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].pubkey_b64, victim_key);
+        assert!(history[0].superseded_at.is_none());
+    }
+
+    #[test]
+    fn test_agents_bind_key_same_key_needs_fresh_challenge_and_stays_idempotent() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let key = kp.public_base64();
+
+        let replayed = write_proof_file(&env, "single-use.json", "ai:curator", &kp);
+        for attempt in 0..2 {
+            let args = AgentsArgs {
+                action: Some(AgentsAction::BindKey {
+                    agent_id: "ai:curator".to_string(),
+                    pubkey: key.clone(),
+                    proof_file: Some(replayed.clone()),
+                }),
+            };
+            let mut out = env.output();
+            let result = run_agents(&db, args, false, &mut out);
+            if attempt == 0 {
+                result.expect("first challenge answer must bootstrap");
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("the same proof must be single-use")
+                        .to_string(),
+                    crate::errors::msg::BIND_PROOF_REFUSED
+                );
+            }
+        }
+
+        let fresh = write_proof_file(&env, "fresh-reassert.json", "ai:curator", &kp);
+        let args = AgentsArgs {
+            action: Some(AgentsAction::BindKey {
+                agent_id: "ai:curator".to_string(),
+                pubkey: key.clone(),
+                proof_file: Some(fresh),
+            }),
+        };
+        let mut out = env.output();
+        run_agents(&db, args, false, &mut out).expect("fresh same-key proof must reassert");
+
+        let conn = db::open(&db).unwrap();
+        let history = db::agent_pubkey_versions(&conn, "ai:curator").unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].pubkey_b64, key);
+    }
+
+    #[test]
+    fn test_agents_bind_key_refuses_expired_durable_challenge() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let proof = write_proof_file(&env, "expired.json", "ai:curator", &kp);
+        let raw = std::fs::read_to_string(&proof).expect("read proof");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("parse proof");
+        let nonce = doc["nonce"].as_str().expect("proof nonce");
+        let past = crate::validate::canonical_rfc3339(
+            &(chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+        );
+        let conn = db::open(&db).expect("open challenge DB");
+        conn.execute(
+            "UPDATE agent_pubkey_challenges SET expires_at = ?1 WHERE nonce = ?2",
+            rusqlite::params![past, nonce],
+        )
+        .expect("expire durable challenge");
+        drop(conn);
+
+        let args = AgentsArgs {
+            action: Some(AgentsAction::BindKey {
+                agent_id: "ai:curator".to_string(),
+                pubkey: kp.public_base64(),
+                proof_file: Some(proof),
+            }),
+        };
+        let mut out = env.output();
+        let error = run_agents(&db, args, false, &mut out)
+            .expect_err("expired durable challenge must refuse");
+        assert_eq!(error.to_string(), crate::errors::msg::BIND_PROOF_REFUSED);
+        let conn = db::open(&db).expect("reopen DB");
+        assert_eq!(db::agent_pubkey(&conn, "ai:curator").unwrap(), None);
     }
 
     #[test]
     fn test_agents_bind_key_unregistered_is_rejected() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let pk = crate::identity::keypair::generate("ai:ghost")
-            .unwrap()
-            .public_base64();
+        let kp = crate::identity::keypair::generate("ai:ghost").unwrap();
+        let proof = write_proof_file(&env, "ghost-proof.json", "ai:ghost", &kp);
         let args = AgentsArgs {
             action: Some(AgentsAction::BindKey {
                 agent_id: "ai:ghost".to_string(),
-                pubkey: pk,
+                pubkey: kp.public_base64(),
+                proof_file: Some(proof),
             }),
         };
         let mut out = env.output();
@@ -1697,6 +2069,7 @@ mod tests {
             action: Some(AgentsAction::BindKey {
                 agent_id: "ai:curator".to_string(),
                 pubkey: "not-a-valid-key".to_string(),
+                proof_file: None,
             }),
         };
         let mut out = env.output();
@@ -1708,11 +2081,11 @@ mod tests {
     fn test_agents_revoke_key_happy_text() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let pk = register_and_key(&mut env, &db, "ai:curator");
+        let kp = register_and_keypair(&mut env, &db, "ai:curator");
         // Bind then revoke.
         {
             let conn = db::open(&db).unwrap();
-            db::bind_agent_pubkey(&conn, "ai:curator", &pk).unwrap();
+            db::bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp).unwrap();
         }
         let args = AgentsArgs {
             action: Some(AgentsAction::RevokeKey {
@@ -1732,10 +2105,10 @@ mod tests {
     fn test_agents_revoke_key_happy_json() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let pk = register_and_key(&mut env, &db, "ai:curator");
+        let kp = register_and_keypair(&mut env, &db, "ai:curator");
         {
             let conn = db::open(&db).unwrap();
-            db::bind_agent_pubkey(&conn, "ai:curator", &pk).unwrap();
+            db::bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp).unwrap();
         }
         let args = AgentsArgs {
             action: Some(AgentsAction::RevokeKey {
@@ -1831,7 +2204,7 @@ mod tests {
         let root_kp = crate::identity::keypair::generate(principal).expect("gen root");
         {
             let conn = db::open(db).unwrap();
-            db::bind_agent_pubkey(&conn, principal, &root_kp.public_base64()).expect("bind");
+            db::bind_agent_pubkey_with_keypair(&conn, principal, &root_kp).expect("bind");
         }
         root_kp
             .private
@@ -1987,10 +2360,29 @@ mod tests {
         // CLI's bind-key validation so we can drive the decode-failure arm.
         let signer = register_and_bind_root(&mut env, &db, "ai:curator");
         {
+            // #3464 — a 10-byte "key" cannot sign anything, so no possession
+            // proof for it can exist and no bind funnel will take it. Corrupt
+            // the stored binding DIRECTLY instead: this test drives the
+            // decode-failure arm on a row that a legacy/hand-edited database
+            // could still hold.
             use base64::Engine as _;
             let b64 = base64::engine::general_purpose::STANDARD;
             let conn = db::open(&db).unwrap();
-            db::bind_agent_pubkey(&conn, "ai:curator", &b64.encode([0u8; 10])).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS agent_pubkey_history_authoritative_insert_v97;
+                 DROP TRIGGER IF EXISTS agent_pubkey_history_authoritative_update_v97;",
+            )
+            .expect("model a legacy/hand-edited database without v97 reconciliation");
+            conn.execute(
+                "UPDATE memories SET metadata = json_set(metadata, '$.agent_pubkey', ?2), \
+                 content = json_set(content, '$.agent_pubkey', ?2) \
+                 WHERE namespace = '_agents' AND title = ?1",
+                rusqlite::params![
+                    crate::models::agent_registration_title("ai:curator"),
+                    b64.encode([0u8; 10])
+                ],
+            )
+            .unwrap();
         }
         let json = build_cert_json(&signer, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
         let file = write_cert_file(&env, "cert-malformed-root.json", &json);

@@ -49,15 +49,15 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends are at **schema parity at v91**
-(`CURRENT_SCHEMA_VERSION = 96` on both ladders — the postgres upgrade
-ladder ends at `migrate_v96()`).
+The two backends are at **schema parity at v97**
+(`CURRENT_SCHEMA_VERSION = 97` on both ladders — the postgres upgrade
+ladder ends at `migrate_v97()`).
 
 **Schema parity is NOT feature parity.** Some postgres ladder arms are
 version-stamp no-ops rather than real DDL, so a matching version number
 does not mean a matching set of tables: postgres ships no `skills` table
 (`migrate_v82` is a no-op) and no `governance_rules` table. Concretely,
-**65 of the 82 unique production HTTP paths are served on postgres and
+**66 of the 83 unique production HTTP paths are served on postgres and
 17 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
 silent read/write against the wrong database), and the **stdio MCP path
 is SQLite-only**. See "The 17 fully-501 paths" below for the exact
@@ -336,7 +336,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v91 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
+   schema v97 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
    `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
@@ -674,7 +674,7 @@ The eight remaining sqlite-only surfaces land here.
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
 > **RETRACTED**. The measured, gate-pinned inventory is **65
-> pg-supported unique paths, 17 fully-501 paths, 82 unique paths
+> pg-supported unique paths, 17 fully-501 paths, 83 unique paths
 > total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 65` /
 > `EXPECTED_FULLY_501_PATHS = 17` / `EXPECTED_TOTAL_UNIQUE_PATHS = 82`,
 > `tests/pg_supported_route_inventory_gate_2799.rs`), and the
@@ -798,9 +798,9 @@ tool names is unaffected. On sqlite nothing changes.
 
 ### What still returns 501 on postgres
 
-Of the **82 unique production URL paths** (over **96 `.route(...)`
+Of the **83 unique production URL paths** (over **97 `.route(...)`
 registrations in `src/lib.rs`**, surfaced through
-`/api/v1/capabilities`), **65 are served on a postgres-backed daemon
+`/api/v1/capabilities`), **66 are served on a postgres-backed daemon
 and 17 are fully fail-closed** — every HTTP method on those 17 paths
 returns a uniform `501 NOT IMPLEMENTED`. The gate FAILS CLOSED by
 design: an un-migrated handler can never fall through to the empty

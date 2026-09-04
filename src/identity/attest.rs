@@ -379,6 +379,14 @@ pub fn prepare_signed_store<'a>(
     signature_b64: &str,
     created_at: Option<&'a str>,
 ) -> std::result::Result<(Vec<u8>, &'a str), String> {
+    prepare_signed_store_at(signature_b64, created_at, chrono::Utc::now())
+}
+
+fn prepare_signed_store_at<'a>(
+    signature_b64: &str,
+    created_at: Option<&'a str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::result::Result<(Vec<u8>, &'a str), String> {
     use base64::Engine as _;
     let sig_bytes = base64::engine::general_purpose::STANDARD
         .decode(signature_b64.trim())
@@ -391,13 +399,12 @@ pub fn prepare_signed_store<'a>(
         })?;
     let parsed = chrono::DateTime::parse_from_rfc3339(created_at)
         .map_err(|e| format!("invalid `created_at` (expected RFC3339): {e}"))?;
-    let skew = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc))
-        .num_seconds()
-        .abs();
-    if skew > ATTEST_CREATED_AT_SKEW_SECS {
+    let delta = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+    let limit = chrono::Duration::seconds(ATTEST_CREATED_AT_SKEW_SECS);
+    if delta > limit || delta < -limit {
         return Err(format!(
             "`created_at` is outside the ±{ATTEST_CREATED_AT_SKEW_SECS}s attestation freshness \
-             window (skew {skew}s); refusing to attest a stale or post-dated write"
+             window; refusing to attest a stale or post-dated write"
         ));
     }
     // #3422 — FAIL CLOSED on a `created_at` the storage layer cannot return
@@ -611,6 +618,71 @@ pub fn stamp_attestation(
     Ok(level)
 }
 
+/// Re-verify a persisted/imported signature against timestamp-eligible key
+/// history. Expanded eligibility can expose the predecessor and successor
+/// around a rotation boundary; the signature itself must select exactly one.
+/// Live admission must continue to use [`resolve_write_attest_level`] with the
+/// current binding instead.
+pub fn resolve_historical_write_attest_level(
+    mem: &Memory,
+    agent_id: &str,
+    resolved: Option<&crate::storage::AttestationPubkeyAt>,
+    signature: Option<&[u8]>,
+    require: bool,
+) -> Result<AttestLevel> {
+    let Some(signature) = signature else {
+        return resolve_write_attest_level(mem, agent_id, None, None, require);
+    };
+    let Some(resolved) = resolved else {
+        return resolve_write_attest_level(mem, agent_id, None, Some(signature), require);
+    };
+    if !resolved.history_exists {
+        if resolved.candidate_pubkeys_b64.len() > 1 {
+            anyhow::bail!("legacy attestation lookup returned multiple keys");
+        }
+        return resolve_write_attest_level(
+            mem,
+            agent_id,
+            resolved.candidate_pubkeys_b64.first().map(String::as_str),
+            Some(signature),
+            require,
+        );
+    }
+
+    let mut verified = 0_u8;
+    for candidate in &resolved.candidate_pubkeys_b64 {
+        crate::identity::keypair::decode_public_base64(candidate)
+            .map_err(|_| anyhow::anyhow!("corrupt pubkey history candidate"))?;
+        if resolve_write_attest_level(mem, agent_id, Some(candidate), Some(signature), true).is_ok()
+        {
+            verified = verified.saturating_add(1);
+        }
+    }
+    match verified {
+        1 => Ok(AttestLevel::AgentAttested),
+        0 => anyhow::bail!("no timestamp-eligible history key verifies the write signature"),
+        _ => anyhow::bail!("ambiguous pubkey history: multiple eligible keys verify the signature"),
+    }
+}
+
+/// [`stamp_attestation`] for persisted/imported historical re-verification.
+pub fn stamp_historical_attestation(
+    mem: &mut Memory,
+    agent_id: &str,
+    resolved: Option<&crate::storage::AttestationPubkeyAt>,
+    signature: Option<&[u8]>,
+    require: bool,
+) -> Result<AttestLevel> {
+    let level = resolve_historical_write_attest_level(mem, agent_id, resolved, signature, require)?;
+    if let Some(obj) = mem.metadata.as_object_mut() {
+        obj.insert(
+            crate::models::field_names::ATTEST_LEVEL.to_string(),
+            serde_json::Value::String(level.as_str().to_string()),
+        );
+    }
+    Ok(level)
+}
+
 /// CLI / direct-connection wrapper: resolve the bound key via
 /// [`crate::db::agent_pubkey`] and stamp the attestation on `mem`.
 ///
@@ -785,6 +857,50 @@ impl ImportAttestOutcome {
     }
 }
 
+/// Return the attributed author only when inbound-attestation reconciliation
+/// can reach cryptographic verification and therefore needs a destination
+/// history lookup.
+///
+/// Callers run this only after all signed-field sanitization. Unsigned rows,
+/// malformed/non-string signatures, author-less rows, and re-attributed rows
+/// have deterministic dispositions that do not consult a key. Avoiding that
+/// unnecessary lookup prevents attacker-controlled `created_at` or unrelated
+/// history corruption from turning those per-row dispositions into a
+/// batch-wide denial of service. Import, sync, and federation callers share
+/// this predicate after their surface-specific signed-field sanitization.
+#[must_use]
+pub fn presented_attestation_author_needing_bound_key<'a>(
+    staged: &'a Memory,
+    original_claim: Option<&str>,
+) -> Option<&'a str> {
+    use base64::Engine as _;
+
+    let attributed = staged
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .filter(|author| !author.is_empty());
+    let Some(attributed) = attributed else {
+        return None;
+    };
+    if original_claim.is_some_and(|claim| claim != attributed) {
+        return None;
+    }
+    staged
+        .metadata
+        .get(crate::models::field_names::WRITE_SIGNATURE)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|encoded| encoded.len() == 4 * crate::identity::verify::SIGNATURE_LEN.div_ceil(3))
+        .and_then(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .filter(|signature| signature.len() == crate::identity::verify::SIGNATURE_LEN)
+        .map(|_| attributed)
+}
+
 /// #3421 — re-derive a staged IMPORTED row's attestation from what the
 /// DESTINATION can verify, never from the wire.
 ///
@@ -812,10 +928,11 @@ impl ImportAttestOutcome {
 /// 4. The re-attribution rule: a row whose identity was restamped
 ///    (`original_claim != attributed`) can never verify the ORIGINAL claimant's
 ///    signature against the new attribution — it lands `claimed`.
-/// 5. Otherwise the presented signature is verified against `enrolled_keys`
-///    (the caller's PRE-resolved snapshot of destination-enrolled keys, taken
-///    before any row of this batch is written so an in-bundle `_agents` row
-///    cannot self-enroll the key that verifies it): valid → `agent_attested`
+/// 5. Otherwise the presented signature is verified against
+///    `resolved_pubkeys`, which the caller resolved from destination key
+///    history at this row's signed `created_at` immediately before invoking
+///    this funnel. Exactly one timestamp-eligible key must verify: valid →
+///    `agent_attested`
 ///    with the signature kept; absent signature / unenrolled author →
 ///    `claimed`; presented-but-FORGED → the row is SKIPPED, never downgraded.
 ///
@@ -828,7 +945,7 @@ pub fn reconcile_imported_attestation(
     staged: &mut Memory,
     original_claim: Option<&str>,
     strip_wire_identity_key: bool,
-    enrolled_keys: &std::collections::HashMap<String, Option<String>>,
+    resolved_pubkeys: Option<&crate::storage::AttestationPubkeyAt>,
 ) -> ImportAttestOutcome {
     use crate::models::field_names;
 
@@ -913,9 +1030,17 @@ pub fn reconcile_imported_attestation(
         ));
     }
 
-    // (5) Verify against the PRE-resolved destination-enrolled key snapshot.
-    let bound: Option<&str> = enrolled_keys.get(&attributed).and_then(Option::as_deref);
-    match stamp_attestation(staged, &attributed, bound, presented_sig.as_deref(), false) {
+    // (5) The caller resolves this row's authoritative history window
+    // immediately before verification. Once v97 history exists the resolver
+    // never substitutes a different current key for this instant; only a
+    // legacy identity with no history at all may contribute its flat key.
+    match stamp_historical_attestation(
+        staged,
+        &attributed,
+        resolved_pubkeys,
+        presented_sig.as_deref(),
+        false,
+    ) {
         Ok(AttestLevel::AgentAttested) => outcome(ImportAttestDisposition::Attested),
         Ok(_) => {
             // `stamp_attestation` already stamped `claimed`; drop the
@@ -1786,6 +1911,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prepare_signed_store_enforces_exact_inclusive_skew_boundary() {
+        use base64::Engine as _;
+        let sig = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-04T10:00:00.000000+00:00")
+            .expect("fixed now")
+            .with_timezone(&chrono::Utc);
+        for delta in [
+            chrono::Duration::seconds(ATTEST_CREATED_AT_SKEW_SECS),
+            -chrono::Duration::seconds(ATTEST_CREATED_AT_SKEW_SECS),
+        ] {
+            let timestamp = canonical_created_at_stamp(now + delta);
+            prepare_signed_store_at(&sig, Some(&timestamp), now)
+                .expect("the exact inclusive 300-second endpoint is admitted");
+        }
+        for delta in [
+            chrono::Duration::seconds(ATTEST_CREATED_AT_SKEW_SECS)
+                + chrono::Duration::microseconds(1),
+            -chrono::Duration::seconds(ATTEST_CREATED_AT_SKEW_SECS)
+                - chrono::Duration::microseconds(1),
+        ] {
+            let timestamp = canonical_created_at_stamp(now + delta);
+            let error = prepare_signed_store_at(&sig, Some(&timestamp), now)
+                .expect_err("300 seconds plus one microsecond is outside the window");
+            assert!(error.contains("freshness window"), "got: {error}");
+        }
+    }
+
     // ── #1801→#1954 sender-EMIT helper unit tests ────────────────────────────
 
     /// The store-time EMIT persists the detached signature under the canonical
@@ -1839,19 +1992,86 @@ mod tests {
 
     // -- #3421: the shared import-attestation reconciliation funnel ---------
 
-    /// Build the destination's pre-resolved enrolled-key snapshot.
-    fn enrolled(
-        pairs: &[(&str, Option<&str>)],
-    ) -> std::collections::HashMap<String, Option<String>> {
-        pairs
-            .iter()
-            .map(|(a, k)| ((*a).to_string(), k.map(ToString::to_string)))
-            .collect()
-    }
-
     fn sig_b64(kp: &keypair::AgentKeypair, mem: &Memory, agent_id: &str) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(sign_for(kp, mem, agent_id))
+    }
+
+    fn legacy_attestation_key(pubkey_b64: String) -> crate::storage::AttestationPubkeyAt {
+        crate::storage::AttestationPubkeyAt {
+            candidate_pubkeys_b64: vec![pubkey_b64],
+            history_exists: false,
+        }
+    }
+
+    #[test]
+    fn historical_candidate_verifier_requires_exactly_one_cryptographic_match_3464() {
+        let signer = keypair::generate("ai:alice").expect("signer");
+        let other = keypair::generate("ai:alice-other").expect("other");
+        let mem = make_memory("candidate selection");
+        let signature = sign_for(&signer, &mem, "ai:alice");
+        let candidates = crate::storage::AttestationPubkeyAt {
+            candidate_pubkeys_b64: vec![other.public_base64(), signer.public_base64()],
+            history_exists: true,
+        };
+        assert_eq!(
+            resolve_historical_write_attest_level(
+                &mem,
+                "ai:alice",
+                Some(&candidates),
+                Some(&signature),
+                false,
+            )
+            .expect("one candidate verifies"),
+            AttestLevel::AgentAttested
+        );
+
+        let no_match = crate::storage::AttestationPubkeyAt {
+            candidate_pubkeys_b64: vec![other.public_base64()],
+            history_exists: true,
+        };
+        assert!(
+            resolve_historical_write_attest_level(
+                &mem,
+                "ai:alice",
+                Some(&no_match),
+                Some(&signature),
+                false,
+            )
+            .is_err()
+        );
+        let ambiguous = crate::storage::AttestationPubkeyAt {
+            candidate_pubkeys_b64: vec![signer.public_base64(), signer.public_base64()],
+            history_exists: true,
+        };
+        assert!(
+            resolve_historical_write_attest_level(
+                &mem,
+                "ai:alice",
+                Some(&ambiguous),
+                Some(&signature),
+                false,
+            )
+            .expect_err("duplicate/reintroduced key corruption must fail closed")
+            .to_string()
+            .contains("ambiguous")
+        );
+        let corrupt = crate::storage::AttestationPubkeyAt {
+            candidate_pubkeys_b64: vec!["not-a-key".to_string(), signer.public_base64()],
+            history_exists: true,
+        };
+        assert!(
+            resolve_historical_write_attest_level(
+                &mem,
+                "ai:alice",
+                Some(&corrupt),
+                Some(&signature),
+                false,
+            )
+            .expect_err("one corrupt history candidate poisons the resolution")
+            .to_string()
+            .contains("corrupt")
+        );
     }
 
     /// ALLOWED (byte-preserving) — a row that asserts nothing and presents
@@ -1860,8 +2080,13 @@ mod tests {
     fn reconcile_imported_attestation_leaves_a_plain_row_as_is_3421() {
         let mut mem = make_memory("plain body");
         mem.metadata = serde_json::json!({ "agent_id": "ai:alice" });
+        mem.created_at = "attacker-controlled-not-rfc3339".to_string();
+        assert!(
+            presented_attestation_author_needing_bound_key(&mem, Some("ai:alice")).is_none(),
+            "an unsigned row must not parse created_at through key history"
+        );
         let before = mem.metadata.clone();
-        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, &enrolled(&[]));
+        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, None);
         assert_eq!(out.disposition, ImportAttestDisposition::LeftAsIs);
         assert!(out.keep_row());
         assert_eq!(
@@ -1887,12 +2112,7 @@ mod tests {
         });
         // The row's ORIGINAL claim was the victim; the import already
         // restamped `agent_id` to the importing admin.
-        let out = reconcile_imported_attestation(
-            &mut mem,
-            Some("ai:victim"),
-            true,
-            &enrolled(&[("ops:admin", None)]),
-        );
+        let out = reconcile_imported_attestation(&mut mem, Some("ai:victim"), true, None);
         assert_eq!(
             out.disposition,
             ImportAttestDisposition::Claimed(ImportClaimedCause::Reattributed)
@@ -1920,13 +2140,8 @@ mod tests {
             "attest_level": "agent_attested",
             "write_signature": forged,
         });
-        let pk = enrolled_kp.public_base64();
-        let out = reconcile_imported_attestation(
-            &mut mem,
-            Some("ai:alice"),
-            true,
-            &enrolled(&[("ai:alice", Some(pk.as_str()))]),
-        );
+        let key = legacy_attestation_key(enrolled_kp.public_base64());
+        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, Some(&key));
         assert_eq!(
             out.disposition,
             ImportAttestDisposition::Skipped(ImportSkipCause::ForgedSignature)
@@ -1939,11 +2154,16 @@ mod tests {
     #[test]
     fn reconcile_imported_attestation_skips_a_malformed_signature_3421() {
         let mut mem = make_memory("malformed body");
+        mem.created_at = "attacker-controlled-not-rfc3339".to_string();
         mem.metadata = serde_json::json!({
             "agent_id": "ai:alice",
             "write_signature": "not base64!!!",
         });
-        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, &enrolled(&[]));
+        assert!(
+            presented_attestation_author_needing_bound_key(&mem, Some("ai:alice")).is_none(),
+            "a malformed signature is refused before any history/timestamp lookup"
+        );
+        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, None);
         assert_eq!(
             out.disposition,
             ImportAttestDisposition::Skipped(ImportSkipCause::MalformedSignature)
@@ -1954,7 +2174,7 @@ mod tests {
             "agent_id": "ai:alice",
             "write_signature": 42,
         });
-        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, &enrolled(&[]));
+        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, None);
         assert_eq!(
             out.disposition,
             ImportAttestDisposition::Skipped(ImportSkipCause::NonStringSignature)
@@ -1973,13 +2193,8 @@ mod tests {
             "attest_level": "agent_attested",
             "write_signature": signature.clone(),
         });
-        let pk = kp.public_base64();
-        let out = reconcile_imported_attestation(
-            &mut mem,
-            Some("ai:alice"),
-            true,
-            &enrolled(&[("ai:alice", Some(pk.as_str()))]),
-        );
+        let key = legacy_attestation_key(kp.public_base64());
+        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, Some(&key));
         assert_eq!(out.disposition, ImportAttestDisposition::Attested);
         assert!(out.keep_row());
         assert_eq!(out.downgraded(), None);
@@ -2006,12 +2221,7 @@ mod tests {
             "attest_level": "agent_attested",
             "write_signature": signature,
         });
-        let out = reconcile_imported_attestation(
-            &mut mem,
-            Some("ai:alice"),
-            true,
-            &enrolled(&[("ai:alice", None)]),
-        );
+        let out = reconcile_imported_attestation(&mut mem, Some("ai:alice"), true, None);
         assert_eq!(
             out.disposition,
             ImportAttestDisposition::Claimed(ImportClaimedCause::Unverifiable)
@@ -2025,7 +2235,7 @@ mod tests {
     fn reconcile_imported_attestation_lands_claimed_without_an_author_3421() {
         let mut mem = make_memory("authorless body");
         mem.metadata = serde_json::json!({ "attest_level": "agent_attested" });
-        let out = reconcile_imported_attestation(&mut mem, None, true, &enrolled(&[]));
+        let out = reconcile_imported_attestation(&mut mem, None, true, None);
         assert_eq!(
             out.disposition,
             ImportAttestDisposition::Claimed(ImportClaimedCause::NoAttributedAuthor)

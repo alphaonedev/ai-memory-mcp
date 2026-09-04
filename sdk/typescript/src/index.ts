@@ -50,6 +50,10 @@ export {
   AgentSigningKey,
   DOMAIN_SEPARATION_TAG,
   attestationFields,
+  // #3464 — proof-of-possession bind challenge helpers.
+  bindChallengeTranscript,
+  signBindChallenge,
+  BIND_CHALLENGE_V1_DOMAIN,
   canonicalCborWrite,
   canonicalizeCreatedAt,
   contentSha256,
