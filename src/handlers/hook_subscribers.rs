@@ -1409,9 +1409,19 @@ pub async fn session_start(
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.list(&ctx, &filter).await {
             Ok(mems) => {
+                // v1.0.0 #3348 — the visibility SSOT, so `boot` cannot serve
+                // substrate bookkeeping (`_messages/*` inbox mail, the
+                // `_agents` registry) as ordinary memories on an unscoped
+                // start. The per-row owner/inbox gate is unchanged.
                 let visible: Vec<crate::models::Memory> = mems
                     .into_iter()
-                    .filter(|m| crate::visibility::is_visible_to_caller(m, &caller))
+                    .filter(|m| {
+                        crate::visibility::is_readable_on_query(
+                            m,
+                            Some(caller.as_str()),
+                            body.namespace.as_deref(),
+                        )
+                    })
                     .collect();
                 // #3352 — same display cluster as MCP session_start / CLI boot.
                 let clustered = crate::boot_cluster::cluster_payload(visible, limit, None);

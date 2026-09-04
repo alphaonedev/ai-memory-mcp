@@ -86,6 +86,21 @@ pub fn run(
         args.include_archived,
         vis_caller.as_deref(),
     )?;
+    // v1.0.0 #3348 — the visibility SSOT. `db::search`'s SQL `visibility_clause`
+    // short-circuits to "all visible" when `--as-agent` is absent (the common
+    // CLI case), so on a shared store an unscoped keyword search returned other
+    // agents' `_messages/*` inbox mail and `_agents` registry rows as ordinary
+    // results. Substrate namespaces now require the request to name them.
+    let results: Vec<crate::models::Memory> = results
+        .into_iter()
+        .filter(|m| {
+            crate::visibility::is_readable_on_query(
+                m,
+                vis_caller.as_deref(),
+                args.namespace.as_deref(),
+            )
+        })
+        .collect();
     if json_out {
         writeln!(
             out.stdout,

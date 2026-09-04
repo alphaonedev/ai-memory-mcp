@@ -518,6 +518,19 @@ async fn recall_response(
             .await
         {
             Ok(scored_pairs) => {
+                // #3348 — SAL adapters enforce tenant visibility, but the HTTP
+                // funnel owns the additional ambient-substrate rule because it
+                // depends on whether this exact request named a namespace.
+                let scored_pairs: Vec<_> = scored_pairs
+                    .into_iter()
+                    .filter(|(m, _)| {
+                        crate::visibility::is_readable_on_query(
+                            m,
+                            as_agent.or(caller_principal),
+                            namespace,
+                        )
+                    })
+                    .collect();
                 // v0.7.0 Form 4 (issue #757) — fact-provenance post-filter
                 // applies on the postgres SAL path too. Touch ops fire on
                 // the FILTERED set so a memory the caller filtered out by
@@ -936,6 +949,20 @@ async fn recall_response(
             return crate::handlers::errors::handler_error_500(&e);
         }
     };
+
+    // #3348 — apply the HTTP ambient-substrate rule before phase 2 records
+    // recall observations. A withheld row must neither reach the response nor
+    // leave a caller-visible access-ledger trace. Owner/inbox confinement stays
+    // delegated to the same canonical predicate.
+    let result = result.map(|(rows, outcome, telemetry)| {
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|(m, _)| {
+                crate::visibility::is_readable_on_query(m, as_agent.or(caller_principal), namespace)
+            })
+            .collect();
+        (rows, outcome, telemetry)
+    });
 
     // PHASE 2 (writer) — authoritative touch + recall_observations
     // ledger, batched under one brief writer lock. Mirrors the postgres

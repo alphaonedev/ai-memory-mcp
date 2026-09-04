@@ -30,15 +30,9 @@ use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 
-/// #951 (Track A QC sweep, 2026-05-20) — replaced the local
-/// duplicate of `is_visible_to_caller` with a re-export of the
-/// canonical helper at [`crate::visibility::is_visible_to_caller`].
-/// The local copy was missing the `metadata.target_agent_id` inbox
-/// carve-out that the canonical SAL version had — the drift would
-/// have silently blocked recipients from seeing their own private-
-/// scope inbox messages on list/kg-query paths. Single source now;
-/// both `sal` and non-sal builds share the same predicate.
-use crate::visibility::is_visible_to_caller;
+// #3348 — every tenant-facing HTTP list/search branch (SAL and direct SQLite)
+// applies the same ambient-substrate + owner/inbox visibility predicate.
+use crate::visibility::is_readable_on_query;
 
 pub async fn list_memories(
     State(app): State<AppState>,
@@ -92,6 +86,9 @@ pub async fn list_memories(
     ) {
         return resp;
     }
+
+    // Keep the request's namespace across the direct-SQLite closure move.
+    let requested_namespace = p.namespace.clone();
 
     // v1.0.0 #1834 — RFC3339-validate the claim-bitemporal AS-OF at the entry
     // surface. `valid_at` is compared lexicographically against stored bounds,
@@ -185,7 +182,9 @@ pub async fn list_memories(
                 // the result-set sizes that fit the trait's `limit`.
                 let visible: Vec<Memory> = mems
                     .into_iter()
-                    .filter(|m| is_visible_to_caller(m, &caller))
+                    .filter(|m| {
+                        is_readable_on_query(m, Some(&caller), requested_namespace.as_deref())
+                    })
                     .collect();
                 Json(json!({"memories": &visible, "count": visible.len()})).into_response()
             }
@@ -236,7 +235,7 @@ pub async fn list_memories(
             // the same `visibility_clause` helper as the search path.
             let visible: Vec<Memory> = mems
                 .into_iter()
-                .filter(|m| is_visible_to_caller(m, &caller))
+                .filter(|m| is_readable_on_query(m, Some(&caller), requested_namespace.as_deref()))
                 .collect();
             Json(json!({"memories": &visible, "count": visible.len()})).into_response()
         }
@@ -332,6 +331,10 @@ pub async fn search_memories(
         return resp;
     }
 
+    // #3348 — exact request namespace is the only opt-in to substrate rows.
+    // Retain it independently of the backend-specific filter ownership.
+    let requested_namespace = p.namespace.clone();
+
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
     // SAL trait. #3185/#3127: `PostgresStore::search` is a thin wrapper
     // over `search_with_source_uri`, so `Filter.since`/`until`/`source_uri`
@@ -426,11 +429,22 @@ pub async fn search_memories(
             capability: None,
         };
         return match app.store.search(&ctx, &p.q, &filter).await {
-            // #1579 B4 — serialize per the negotiated format.
-            Ok(r) => crate::handlers::wire_format::search_response(
-                format,
-                json!({"results": r, "count": r.len(), "query": p.q}),
-            ),
+            Ok(r) => {
+                let r: Vec<Memory> = r
+                    .into_iter()
+                    .filter(|m| {
+                        is_readable_on_query(
+                            m,
+                            Some(&resolved_caller),
+                            requested_namespace.as_deref(),
+                        )
+                    })
+                    .collect();
+                crate::handlers::wire_format::search_response(
+                    format,
+                    json!({"results": r, "count": r.len(), "query": p.q}),
+                )
+            }
             Err(e) => store_err_to_response(e),
         };
     }
@@ -513,11 +527,22 @@ pub async fn search_memories(
                 .await,
             );
             return match listed {
-                // #1579 B4 — serialize per the negotiated format.
-                Ok(r) => crate::handlers::wire_format::search_response(
-                    format,
-                    json!({"results": r, "count": r.len(), (field_names::SOURCE_URI): uri}),
-                ),
+                Ok(r) => {
+                    let r: Vec<Memory> = r
+                        .into_iter()
+                        .filter(|m| {
+                            is_readable_on_query(
+                                m,
+                                Some(&resolved_caller),
+                                requested_namespace.as_deref(),
+                            )
+                        })
+                        .collect();
+                    crate::handlers::wire_format::search_response(
+                        format,
+                        json!({"results": r, "count": r.len(), (field_names::SOURCE_URI): uri}),
+                    )
+                }
                 Err(e) => crate::handlers::errors::handler_error_500(&e),
             };
         }
@@ -555,11 +580,18 @@ pub async fn search_memories(
         .await,
     );
     match searched {
-        // #1579 B4 — serialize per the negotiated format.
-        Ok(r) => crate::handlers::wire_format::search_response(
-            format,
-            json!({"results": r, "count": r.len(), "query": p.q}),
-        ),
+        Ok(r) => {
+            let r: Vec<Memory> = r
+                .into_iter()
+                .filter(|m| {
+                    is_readable_on_query(m, Some(&resolved_caller), requested_namespace.as_deref())
+                })
+                .collect();
+            crate::handlers::wire_format::search_response(
+                format,
+                json!({"results": r, "count": r.len(), "query": p.q}),
+            )
+        }
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }

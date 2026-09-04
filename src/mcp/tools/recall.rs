@@ -1035,16 +1035,24 @@ pub fn handle_recall_dto(
 
     // v0.7.0 #1468 — per-row ownership visibility filter. Applied at every
     // retrieval branch immediately before serialization so a cross-agent
-    // `scope=private` row never reaches the wire. No-op when `caller` is
-    // `None` (single-tenant trust-all read posture).
+    // `scope=private` row never reaches the wire.
+    //
+    // v1.0.0 #3348 — routed through the visibility SSOT
+    // (`crate::visibility::is_readable_on_query`) instead of the old
+    // `match caller { None => results, .. }` shape. `None` used to mean "trust
+    // every row", so an UNSCOPED recall on a shared store returned every other
+    // agent's `_messages/<them>` inbox mail and the `_agents` registry, ranked
+    // ABOVE the operator's own memories. Substrate namespaces now require the
+    // request to name them; ordinary namespaces keep the historical contract
+    // byte-for-byte.
+    let requested_namespace = req.namespace.as_deref();
     let apply_visibility_filter = |results: Vec<(Memory, f64)>| -> Vec<(Memory, f64)> {
-        match caller {
-            None => results,
-            Some(c) => results
-                .into_iter()
-                .filter(|(m, _)| crate::visibility::is_visible_to_caller(m, c))
-                .collect(),
-        }
+        results
+            .into_iter()
+            .filter(|(m, _)| {
+                crate::visibility::is_readable_on_query(m, caller, requested_namespace)
+            })
+            .collect()
     };
 
     let _ = db::gc_if_needed(conn, archive_on_gc);

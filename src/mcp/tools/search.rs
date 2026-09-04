@@ -154,7 +154,7 @@ pub(super) fn handle_search(
                 caller,
             )
             .map_err(|e| e.to_string())?;
-            let results = filter_visible(results, caller);
+            let results = filter_visible(results, caller, namespace);
             return Ok(json!({"results": results, "count": results.len()}));
         }
         return Err(crate::errors::msg::QUERY_REQUIRED.into());
@@ -177,23 +177,27 @@ pub(super) fn handle_search(
         caller,
     )
     .map_err(|e| e.to_string())?;
-    let results = filter_visible(results, caller);
+    let results = filter_visible(results, caller, namespace);
     Ok(json!({"results": results, "count": results.len()}))
 }
 
-/// Drop rows the `caller` does not own (canonical #951 predicate). No-op
-/// when `caller` is `None` (single-tenant trust-all read posture).
+/// Drop rows the `caller` may not read, via the canonical #951 predicate.
+///
+/// v1.0.0 #3348 — routes through [`crate::visibility::is_readable_on_query`]
+/// rather than applying the predicate only when a `caller` happens to resolve.
+/// The old shape (`None` => return everything) meant an unscoped `search` on a
+/// shared store returned every other agent's `_messages/<them>` inbox mail and
+/// the `_agents` registry as ordinary results. Substrate rows now require the
+/// request to NAME their namespace; ordinary namespaces are unchanged.
 fn filter_visible(
     results: Vec<crate::models::Memory>,
     caller: Option<&str>,
+    requested_namespace: Option<&str>,
 ) -> Vec<crate::models::Memory> {
-    match caller {
-        Some(c) => results
-            .into_iter()
-            .filter(|m| crate::visibility::is_visible_to_caller(m, c))
-            .collect(),
-        None => results,
-    }
+    results
+        .into_iter()
+        .filter(|m| crate::visibility::is_readable_on_query(m, caller, requested_namespace))
+        .collect()
 }
 
 #[cfg(test)]
@@ -312,6 +316,89 @@ mod visibility_1468_tests {
         seed(&conn);
         let out = handle_search(&conn, &json!({"query": "needle"}), Some("ai:alice")).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(2));
+    }
+
+    // ---- #3348 — substrate namespaces on the `memory_search` funnel -------
+    //
+    // Reported: an unscoped `search` on a shared store returned other agents'
+    // `_messages/*` inbox mail and `_agents` registry rows as ordinary
+    // results. Pre-#3348 `caller == None` skipped the filter entirely, so the
+    // first assertion below returned 3 instead of 2.
+
+    fn mem_in(ns: &str, agent: &str, scope: Option<&str>) -> Memory {
+        let mut m = mem("row", agent, scope);
+        m.namespace = ns.to_string();
+        m
+    }
+
+    #[test]
+    fn unscoped_search_withholds_substrate_rows_3348() {
+        let conn = fresh_conn();
+        seed(&conn);
+        db::insert(&conn, &mem_in("_messages/ai:carol", "ai:bob", None)).expect("ins mail");
+        db::insert(
+            &conn,
+            &mem_in(
+                "_agents",
+                "ai:bob",
+                Some(crate::models::namespace::MemoryScope::Collective.as_str()),
+            ),
+        )
+        .expect("ins registry");
+
+        for caller in [None, Some("ai:alice")] {
+            let out = handle_search(&conn, &json!({"query": "needle"}), caller).expect("ok");
+            let namespaces: Vec<&str> = out["results"]
+                .as_array()
+                .expect("results array")
+                .iter()
+                .filter_map(|r| r["namespace"].as_str())
+                .collect();
+            assert!(
+                !namespaces.iter().any(|n| n.starts_with("_messages/")),
+                "#3348: an unscoped search must not return another agent's inbox \
+                 mail (caller={caller:?}); got {namespaces:?}"
+            );
+            assert!(
+                !namespaces.contains(&"_agents"),
+                "#3348: a BROAD scope must not make the agent registry an ambient \
+                 search result (caller={caller:?}); got {namespaces:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn naming_the_inbox_namespace_still_reaches_your_own_mail_3348() {
+        let conn = fresh_conn();
+        let mut mail = mem_in("_messages/ai:carol", "ai:bob", None);
+        mail.metadata[crate::META_KEY_TARGET_AGENT_ID] = json!("ai:carol");
+        db::insert(&conn, &mail).expect("ins mail");
+
+        let out = handle_search(
+            &conn,
+            &json!({"query": "needle", "namespace": "_messages/ai:carol"}),
+            Some("ai:carol"),
+        )
+        .expect("ok");
+        assert_eq!(
+            out["count"].as_u64(),
+            Some(1),
+            "#3348: naming the namespace is the opt-in — the recipient reading \
+             their OWN inbox must still work"
+        );
+
+        let denied = handle_search(
+            &conn,
+            &json!({"query": "needle", "namespace": "_messages/ai:carol"}),
+            Some("ai:dave"),
+        )
+        .expect("ok");
+        assert_eq!(
+            denied["count"].as_u64(),
+            Some(0),
+            "#3348: the opt-in lifts the AMBIENT exclusion only — the canonical \
+             owner/inbox predicate still confines the row to its addressee"
+        );
     }
 
     /// #1468 — the empty-query + `source_uri` early-return branch
