@@ -239,11 +239,11 @@ async fn cov897_http_create_short_content_skips_auto_tag() {
     assert_eq!(status, StatusCode::CREATED, "{payload}");
 }
 
-/// Internal-namespace gate at line 104-106 — namespaces starting with
-/// `_` must skip auto-tag (matches MCP `handle_store` skip at
-/// `src/mcp.rs:1818`).
+/// #3490/#3362 — generic HTTP writes to underscore-prefixed namespaces
+/// are refused before the auto-tag hook. System namespaces are writable only
+/// through their purpose-built substrate funnels.
 #[tokio::test]
-async fn cov897_http_create_internal_namespace_skips_auto_tag() {
+async fn cov897_http_create_internal_namespace_is_refused() {
     let (router, _f) = build_test_router(FeatureTier::Smart);
     let body = json!({
         "tier": "long",
@@ -257,5 +257,11 @@ async fn cov897_http_create_internal_namespace_skips_auto_tag() {
         "metadata": {}
     });
     let (status, payload) = post_create(&router, &body).await;
-    assert_eq!(status, StatusCode::CREATED, "{payload}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+    assert!(
+        payload
+            .to_string()
+            .contains("reserved for substrate-internal records"),
+        "reserved-namespace refusal must remain explicit, got {payload}"
+    );
 }

@@ -628,37 +628,6 @@ fn autonomy_hook_skipped_content_too_short() {
     );
 }
 
-// Hooks enabled, internal_namespace ("_*")
-#[test]
-fn autonomy_hook_skipped_internal_namespace() {
-    let conn = fresh_conn();
-    let db_path = db_path();
-    let ttl = ResolvedTtl::default();
-    let llm = Some(crate::llm::OllamaClient::new_for_testing("dummy-model"));
-    let resp = handle_store(
-        &conn,
-        &db_path,
-        &json!({
-            "title": "internal",
-            "content": "This content is long enough to exceed AUTONOMY_MIN_CONTENT_LEN clearly here.",
-            "namespace": "_internal",
-        }),
-        None,
-        llm.as_ref(),
-        None,
-        &ttl,
-        true,
-        None,
-        None,
-        None,
-    )
-    .expect("ok");
-    assert_eq!(
-        resp["autonomy_hook_skipped"].as_str(),
-        Some("internal_namespace")
-    );
-}
-
 // C. K9 Deny / Ask paths share the process-wide rules registry. The
 // shared mutex below serialises across ALL mcp::tools::* inline test
 // modules, not just this one — see `crate::mcp::SHARED_PERMISSION_RULES_GUARD`.

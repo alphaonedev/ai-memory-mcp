@@ -193,3 +193,26 @@ pub(super) fn merge_autonomy_outcome_into_response(
 /// The compiler removes the alias under `--release`.
 #[allow(dead_code)]
 pub(super) type Idx = dyn crate::hnsw::VectorSearchIndex;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #3490 — pin the internal-namespace autonomy exclusion at its pure
+    /// eligibility boundary. Generic MCP writes cannot reach this branch after
+    /// #3362 because every underscore-prefixed namespace is reserved; the
+    /// sanctioned `_curator/reports` writer is covered by
+    /// `autonomy::tests::self_report_written_to_reports_namespace`.
+    #[test]
+    fn autonomy_hook_skipped_internal_namespace() {
+        assert_eq!(
+            autonomy_skip_reason(true, true, AUTONOMY_MIN_CONTENT_LEN, "_curator/reports"),
+            Some("internal_namespace")
+        );
+        assert_eq!(
+            autonomy_skip_reason(true, true, AUTONOMY_MIN_CONTENT_LEN, "team/reports"),
+            None,
+            "ordinary caller namespaces remain autonomy-eligible"
+        );
+    }
+}

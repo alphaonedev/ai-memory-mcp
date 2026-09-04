@@ -1976,6 +1976,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].namespace, "_curator/reports");
+        assert_eq!(
+            reports[0].metadata["why_trace"].as_str(),
+            Some(crate::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
+            "the sanctioned internal write must retain substrate provenance"
+        );
         assert!(reports[0].content.contains("memories_consolidated"));
     }
 
