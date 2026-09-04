@@ -458,6 +458,18 @@ pub(crate) fn build_cli_atomiser(
     db_path: &Path,
     calling_agent_id: &str,
 ) -> Option<Arc<Atomiser>> {
+    build_cli_atomiser_with(app_config, db_path, calling_agent_id, build_llm_curator)
+}
+
+fn build_cli_atomiser_with<F>(
+    app_config: &AppConfig,
+    db_path: &Path,
+    calling_agent_id: &str,
+    build_curator: F,
+) -> Option<Arc<Atomiser>>
+where
+    F: FnOnce(FeatureTier, &Path) -> std::result::Result<(Box<dyn Curator>, String), String>,
+{
     let tier = app_config.effective_tier(None);
     if tier == FeatureTier::Keyword {
         tracing::warn!(
@@ -467,7 +479,7 @@ pub(crate) fn build_cli_atomiser(
         );
         return None;
     }
-    match build_llm_curator(tier, db_path) {
+    match build_curator(tier, db_path) {
         Ok((curator, curator_model)) => Some(Arc::new(
             Atomiser::new(
                 curator,
@@ -547,7 +559,6 @@ fn emit_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{EnvGuard, env_lock};
 
     #[test]
     fn exit_code_maps_every_variant() {
@@ -734,45 +745,51 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_atomiser_egress_refusal_degrades_without_network_client_3496() {
-        let _lock = env_lock();
-        let no_config = EnvGuard::capture("AI_MEMORY_NO_CONFIG");
-        no_config.set("1");
-        let inference_egress = EnvGuard::capture(crate::egress::ENV_INFERENCE_EGRESS);
-        inference_egress.set("deny");
+    fn build_cli_atomiser_builder_error_degrades_without_fallback_3497() {
         let mut cfg = AppConfig::default();
         cfg.tier = Some("smart".to_string());
         let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("atomise.db");
+        let calls = std::cell::Cell::new(0);
 
-        let atomiser = build_cli_atomiser(&cfg, &dir.path().join("atomise.db"), "ai:3496");
+        let atomiser = build_cli_atomiser_with(&cfg, &db_path, "ai:3497", |tier, path| {
+            calls.set(calls.get() + 1);
+            assert_eq!(tier, FeatureTier::Smart);
+            assert_eq!(path, db_path);
+            Err("injected offline curator refusal".to_string())
+        });
 
+        assert_eq!(calls.get(), 1, "the curator builder must run exactly once");
         assert!(
             atomiser.is_none(),
-            "an inference-egress refusal must not construct a curator or heuristic fallback"
+            "a curator-builder error must degrade without constructing a heuristic fallback"
         );
     }
 
     #[test]
     fn build_cli_atomiser_smart_tier_builds_offline_curator_3496() {
-        let _lock = env_lock();
-        let no_config = EnvGuard::capture("AI_MEMORY_NO_CONFIG");
-        no_config.set("1");
-        let inference_egress = EnvGuard::capture(crate::egress::ENV_INFERENCE_EGRESS);
-        inference_egress.set("allow");
-        let backend = EnvGuard::capture("AI_MEMORY_LLM_BACKEND");
-        backend.set(crate::llm::BACKEND_VLLM);
-        let model = EnvGuard::capture("AI_MEMORY_LLM_MODEL");
-        model.set(crate::llm::LOCAL_SERVER_MODEL_PLACEHOLDER);
-        let api_key = EnvGuard::capture(crate::config::ENV_LLM_API_KEY);
-        api_key.set("not-a-real-key");
-        let base_url = EnvGuard::capture("AI_MEMORY_LLM_BASE_URL");
-        base_url.unset();
         let mut cfg = AppConfig::default();
         cfg.tier = Some("smart".to_string());
         let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("atomise.db");
+        let calls = std::cell::Cell::new(0);
 
-        let atomiser = build_cli_atomiser(&cfg, &dir.path().join("atomise.db"), "ai:3496");
+        let atomiser = build_cli_atomiser_with(&cfg, &db_path, "ai:3497", |tier, path| {
+            calls.set(calls.get() + 1);
+            assert_eq!(tier, FeatureTier::Smart);
+            assert_eq!(path, db_path);
 
+            let client = OllamaClient::new_openai_compatible(
+                "http://127.0.0.1:1/v1",
+                crate::llm::LOCAL_SERVER_MODEL_PLACEHOLDER,
+                "not-a-real-key",
+            )
+            .expect("explicit offline OpenAI-compatible client must build");
+            let model = client.model_name().to_string();
+            Ok((Box::new(LlmCurator::new(client)), model))
+        });
+
+        assert_eq!(calls.get(), 1, "the curator builder must run exactly once");
         assert!(
             atomiser.is_some(),
             "smart tier with an offline-buildable vLLM client must construct the curator"
