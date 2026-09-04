@@ -547,6 +547,7 @@ fn emit_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvGuard, env_lock};
 
     #[test]
     fn exit_code_maps_every_variant() {
@@ -715,6 +716,66 @@ mod tests {
         assert!(
             s.contains("requires smart tier") || s.contains("tier"),
             "got stderr: {s}",
+        );
+    }
+
+    #[test]
+    fn build_cli_atomiser_keyword_tier_degrades_without_fallback_3496() {
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        let dir = tempfile::tempdir().unwrap();
+
+        let atomiser = build_cli_atomiser(&cfg, &dir.path().join("atomise.db"), "ai:3496");
+
+        assert!(
+            atomiser.is_none(),
+            "keyword tier has no curator, so auto-atomise must degrade without constructing a fallback"
+        );
+    }
+
+    #[test]
+    fn build_cli_atomiser_egress_refusal_degrades_without_network_client_3496() {
+        let _lock = env_lock();
+        let no_config = EnvGuard::capture("AI_MEMORY_NO_CONFIG");
+        no_config.set("1");
+        let inference_egress = EnvGuard::capture(crate::egress::ENV_INFERENCE_EGRESS);
+        inference_egress.set("deny");
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("smart".to_string());
+        let dir = tempfile::tempdir().unwrap();
+
+        let atomiser = build_cli_atomiser(&cfg, &dir.path().join("atomise.db"), "ai:3496");
+
+        assert!(
+            atomiser.is_none(),
+            "an inference-egress refusal must not construct a curator or heuristic fallback"
+        );
+    }
+
+    #[test]
+    fn build_cli_atomiser_smart_tier_builds_offline_curator_3496() {
+        let _lock = env_lock();
+        let no_config = EnvGuard::capture("AI_MEMORY_NO_CONFIG");
+        no_config.set("1");
+        let inference_egress = EnvGuard::capture(crate::egress::ENV_INFERENCE_EGRESS);
+        inference_egress.set("allow");
+        let backend = EnvGuard::capture("AI_MEMORY_LLM_BACKEND");
+        backend.set(crate::llm::BACKEND_VLLM);
+        let model = EnvGuard::capture("AI_MEMORY_LLM_MODEL");
+        model.set(crate::llm::LOCAL_SERVER_MODEL_PLACEHOLDER);
+        let api_key = EnvGuard::capture(crate::config::ENV_LLM_API_KEY);
+        api_key.set("not-a-real-key");
+        let base_url = EnvGuard::capture("AI_MEMORY_LLM_BASE_URL");
+        base_url.unset();
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("smart".to_string());
+        let dir = tempfile::tempdir().unwrap();
+
+        let atomiser = build_cli_atomiser(&cfg, &dir.path().join("atomise.db"), "ai:3496");
+
+        assert!(
+            atomiser.is_some(),
+            "smart tier with an offline-buildable vLLM client must construct the curator"
         );
     }
 

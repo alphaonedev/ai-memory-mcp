@@ -27,8 +27,11 @@
 #   scripts/coverage.sh
 #     - runs the full instrumented sweep + threshold check, exit 0 on PASS.
 #   AI_MEMORY_TEST_POSTGRES_URL=postgres://... scripts/coverage.sh
-#     - point at a live Postgres (PG16 + age + vector extensions) so the
-#       sal-postgres suite executes instead of skipping. Unset = those
+#     - point only at a disposable scratch Postgres (PG16 + age + vector
+#       extensions) so the sal-postgres suite executes instead of skipping.
+#       The explicitly aggregated v96 proof mutates the memories.embedding
+#       column's DDL and restores it during teardown; never target a live or
+#       shared database. Unset = postgres-gated
 #       tests self-skip via their `postgres_url()` guard (see
 #       tests/common::postgres_url), same as any other postgres-gated test.
 #   scripts/coverage.sh --no-threshold-check
@@ -62,20 +65,45 @@ echo "scripts/coverage.sh: running cargo llvm-cov --features sal,sal-postgres --
 if [[ -z "${AI_MEMORY_TEST_POSTGRES_URL:-}" ]]; then
     echo "scripts/coverage.sh: AI_MEMORY_TEST_POSTGRES_URL is unset — the sal-postgres" >&2
     echo "  suite will self-skip (postgres_url() guard) rather than exercise the" >&2
-    echo "  postgres backend. Set it to a live PG16 (+ age +vector extensions) instance" >&2
-    echo "  to match CI's coverage.yml service-container run." >&2
+    echo "  postgres backend. Set it only to a disposable scratch PG16 (+ age +" >&2
+    echo "  vector extensions) to match CI: the aggregated v96 proof mutates the" >&2
+    echo "  memories.embedding DDL before restoring it. Never use a live/shared DB." >&2
 fi
 
 # v0.8.0 #1709 SHIP-HARDEN — `-- --test-threads=1` is REQUIRED, not optional:
 # see the header comment above and the identical rationale in
 # .github/workflows/coverage.yml.
 cargo llvm-cov \
+    --no-report \
     --features sal,sal-postgres \
     --lib --tests \
-    --json \
-    --output-path coverage/current.json \
     --workspace \
     -- --test-threads=1
+
+# #3496 — the v96 conversion proof is intentionally ignored by ordinary test
+# sweeps because it mutates Postgres DDL. This coverage wrapper owns a serial,
+# explicitly configured database, so aggregate that behavior/security proof
+# before rendering the report. `--no-clean` preserves the first sweep's raw
+# profiles; this named filter does not broaden execution to unrelated ignored
+# tests. Without an explicitly supplied database, retain this wrapper's
+# documented self-skip behavior. Exact CI-equivalent floors require Postgres.
+if [[ -n "${AI_MEMORY_TEST_POSTGRES_URL:-}" ]]; then
+    cargo llvm-cov \
+        --no-clean \
+        --features sal,sal-postgres \
+        --lib --workspace \
+        --json \
+        --output-path coverage/current.json \
+        -- schema_init_postgres_embedding_dim_conversion \
+           --ignored --test-threads=1
+else
+    echo "scripts/coverage.sh: PostgreSQL v96 conversion coverage not aggregated;" >&2
+    echo "  exact CI-equivalent module floors require AI_MEMORY_TEST_POSTGRES_URL." >&2
+    cargo llvm-cov report \
+        --workspace \
+        --json \
+        --output-path coverage/current.json
+fi
 
 if [[ "$SKIP_THRESHOLDS" -eq 1 ]]; then
     echo "scripts/coverage.sh: --no-threshold-check set — skipping coverage/check-thresholds.sh"
