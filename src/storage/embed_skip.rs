@@ -50,11 +50,13 @@ pub const MIGRATION_V96_POSTGRES: &str =
 /// fired the trigger, then recreates the trigger before committing. PostgreSQL
 /// transactional DDL means any later failure rolls the drop back with the rest
 /// of the conversion.
+#[cfg(any(test, feature = "sal-postgres"))]
 pub(crate) const POSTGRES_DROP_CLEAR_TRIGGER: &str =
     "DROP TRIGGER IF EXISTS memories_embed_skip_clear ON memories";
 
 /// Canonical recreation of the v96 clear trigger after an embedding column
 /// type conversion.
+#[cfg(any(test, feature = "sal-postgres"))]
 pub(crate) const POSTGRES_CREATE_CLEAR_TRIGGER: &str = "\
 CREATE TRIGGER memories_embed_skip_clear
 AFTER UPDATE OF content, encrypted_envelope, embedding ON memories
