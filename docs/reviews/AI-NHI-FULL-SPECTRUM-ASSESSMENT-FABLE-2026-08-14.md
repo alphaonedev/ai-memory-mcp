@@ -6,6 +6,9 @@
 Intelligence (NHI) using ai-memory as its own working memory.
 **Date:** 2026-08-14 · **Substrate:** ai-memory v1.0.0 · **Status:** IN PROGRESS
 (2 of 10 novel lenses executed live; remainder designed, execution ongoing).
+**Re-audited at HEAD 2026-08-15 (Fable) — see §0.** The one PROVEN defect
+(F-L3b) is CLOSED; remaining items are latent/opt-in, observability, or
+cosmetic. GA is not blocked on content-integrity grounds.
 
 > **Framing (operator directive, 2026-08-14).** *"Assess ai-memory full
 > spectrum from an AI-NHI perspective — not just a playbook assessment.
@@ -20,6 +23,135 @@ they are produced (the assessment *is* the dogfood), then transcribed here.
 Every claim is labeled **PROVEN** (observed first-hand), **PLAUSIBLE**
 (reasoned, needs a deterministic re-probe before it becomes a filed defect),
 or **PENDING** (lens designed, not yet executed).
+
+---
+
+## 0. Re-audit at HEAD (Fable, 2026-08-15)
+
+This section re-audits every finding of the 2026-08-14 assessment against
+current `release/v1.0.0` HEAD, after the F-L3b fix (#2936) and the
+forensic-audit-trail hardening wave (#2945 / #2947 / #2949 / #2946 all
+merged) landed. Each line is a reconciled auditor + adversarial-verifier
+verdict (a 2×7 re-audit; both lenses agreed on every row). Labels:
+**established** = read in code at HEAD; **plausible** = reasoned gap, not
+measured; **unverified** = code path present + unit-tested but never
+exercised live. Cert scope: 500–1000 agents / ≤50 peers. Frame throughout:
+*can an AI-NHI trust this substrate as its own cognition?*
+
+### Per-finding closure status
+
+**D1 — F-L3b consolidation-laundering (the one PROVEN defect): CLOSED [established].**
+`memory_consolidate` no longer stamps derived output `Observation`/`confidence=1.0`.
+Both persisting builders bind `confidence=min(sources)` and `memory_kind=Claim`
+**unconditionally** into the real INSERT — sqlite `?17/?18` (`db::consolidate`)
+and postgres `$17/$18` (`PostgresStore::consolidate`); the pg `ON CONFLICT` arm
+carries `EXCLUDED.confidence/EXCLUDED.memory_kind`, so re-consolidation cannot
+re-launder. Verified by reading the actual bindings, not comments. Two **coverage**
+residuals remain (neither a live laundering path): the pg test `consolidate_merges_sources`
+(`tests/cov_postgres_governance.rs`) asserts only `title=="consolidated"` — no pin on
+`confidence`/`memory_kind` on pg; and no removal-proof control guards it. Cheap
+fix-now hardening (one assertion + one removal-proof row).
+
+**D2 — F-L1 contradiction weak-model hazard: OPEN [established, unshipped] → v1.1.0.**
+The detector prompt is verbatim-bare at `src/llm.rs:692` — no temporal-update or
+different-subject discriminator, and no lexical `shares_subject_token` pre-check
+exists anywhere. NOT reproduced at HEAD with the reference strong model (grok-4.5);
+the hazard is weak-local-model-only, opt-in (LLM + curator `--reflect`/autonomous),
+and produces reversible advisory `contradicts` edges, not content corruption. The
+proposed hardening (prompt clauses + deterministic pre-check + tests) is unshipped.
+Defer to v1.1.0; pull the deterministic pre-check forward only if a weak-local-model
+deployment is in a customer's target config.
+
+**D3 — F-L8a unverified-space recall: PARTIAL [established] → v1.1.0.**
+The load-bearing correctness danger is CLOSED in code: a foreign-space query vector
+is excluded from semantic scoring (not zip-truncated and blended), so the ordering
+the agent receives is space-clean; and the strict posture
+`AI_MEMORY_REQUIRE_EMBED_MODEL_MATCH=1` (#138) degrades to honest `mode:"keyword"`.
+Residual is **observability**: an NHI reading only the recall JSON still sees
+`mode:"hybrid"` with no in-band field reporting that N rows were served keyword-only;
+on MCP stdio (no `/metrics`) the daemon WARN is the sole channel, invisible to a
+JSON-only consumer. `mode:"hybrid"` is not strictly false. Additive `RecallMeta`
+field is a v1.1.0 metacognition enhancement, not a GA correction. (Today's Atlas-load
+re-hit was the write/boot-census axis, distinct from this recall-ranking finding.)
+
+**D4 — F-L7 nit 1, `memory_kinds` top-level = 2 of 16: OPEN [established, cosmetic] → v1.1.0 (+ fix-now doc-drift).**
+The capabilities envelope carries legacy `memory_kinds=["observation","reflection"]`
+alongside the authoritative `memory_kind_vocab.vocabulary` = 16 (`MemoryKind::all()`).
+Not a silent lie — the 16-kind block is co-present and the substrate accepts all 16
+regardless. The field is a v1/v2 back-compat wire element pinned to 2 by a live test,
+so changing it is a public-contract change (T1+T4) requiring a 5-agent vote → v1.1.0.
+Secondary **doc-drift** (fix-now): a pinning-test comment is stale/false (claims the
+enum carries only two variants) — a pure documentation correction, not a wire change.
+
+**D5 — F-L7 nit 2, `schema_version="v0.6.4-families-1"` in a `1.0.0` substrate: OPEN [established, cosmetic] → v1.1.0.**
+Premise holds verbatim at HEAD. The string is a stable wire-format shape discriminator
+for the families overview (unchanged since v0.6.4), not the release version. Bumping it
+is a wire-format contract change (T1+T4) that should follow a deliberate schema-version
+naming decision + vote — not a rushed pre-GA edit against a value nothing in-tree consumes.
+
+**D6 — pending cognition lenses L2/L4/L9: PARTIAL [code established / behavior unverified] → needs-live-probe.**
+Load-bearing controls are present, wired, and unit-tested; the floor is **unwalked, not
+holed**. L2 (durable boot-rehydration + SIGKILL-surviving stop-plane + power-loss harness),
+L4 (typed told/observed/inferred kinds + closed `kind_provenance` vocab + `confidence_source`
+ledger + #2936 closing the inference→observed-1.0 mask), L9 (crypto-erase + signed erasure
+attestation + federation resurrection tombstone) — none run end-to-end live. Documented
+boundaries (honest, not defects): `kind_provenance`/`confidence_source` are UNSIGNED metadata
+(a hostile writer can self-assert false provenance — claimed-not-attested); crypto-erase is a
+no-op for plaintext/legacy-`0x02` envelopes (true shred needs `AI_MEMORY_ENCRYPT_AT_REST` +
+`0x03`). Fix-now = run three cheap live probes (one SIGKILL→boot reconstruction, one
+told/observed/inferred reclassify, one forget-then-scan) to convert verified-in-code into
+verified-in-behaviour before GA.
+
+**D7 — pending multi-agent/scale lenses L5/L6/L10: PARTIAL [established].**
+Today's wave advanced this materially. **L5**: reserved-anchor-kind refusal at `/sync/push`
++ wire audit-signal poisoning gate landed (**PR #2946**, merged) — the injection-to-trusted-recall
+surface via checkpoint anchors is now closed. **L6** (shared-mind): write/signal attestation is
+default-ON (#2949 tri-state signature verdict + out-of-band `AI_MEMORY_AUDIT_PUBKEY` env pin);
+quarantine-of-unattributed remains opt-in (visible-accept default outside asi-hard) and LWW
+loudest-writer-wins self-relay truth-drift is not attested away — a documented posture choice,
+v1.1.0. **L10** (scale realism): latency machinery is SOUND (`--scale=1M` producer, access-count
+cap), but there is no attested **relevance**-at-10⁶ measurement — a **plausible**, unmeasured gap
+(v1.1.0 measurement apparatus). **#2948** residual: #2947 armed the append-only spine and advertises
+it as the tamper-evident revision ledger, yet the hottest re-store path (`db::insert` same
+title/namespace `ON CONFLICT DO UPDATE`, `storage/mod.rs`) can overwrite content with no leaf — so
+when the spine is enabled the feature under-delivers its claim. **Scope check (verified in code,
+2026-08-15):** `append_only` is armed ONLY by `AI_MEMORY_APPEND_ONLY` env / `[storage].append_only`
+config, compiled default **OFF**; it is **NOT** pinned by `asi-hard` (no `append_only` reference in
+`security_profile.rs::KNOBS`) and the enterprise-federation cert does **not** arm it. So #2948 is a
+completeness gap in the **opt-in** append-only feature, **not** a certified-posture or default-path
+defect — filed and tracked, near-term feature-completeness, not a GA gate.
+
+### Disposition table
+
+| Dim | Finding | Status at HEAD | Established? | Severity | Disposition |
+|-----|---------|----------------|--------------|----------|-------------|
+| D1 | F-L3b consolidation-laundering | **CLOSED** (#2936) | verified-in-code | low | done + cheap hardening ride-along |
+| D2 | F-L1 contradiction weak-model | OPEN | verified-in-code (unshipped) | low | v1.1.0 |
+| D3 | F-L8a unverified-space recall | PARTIAL | verified-in-code | low | v1.1.0 (correctness closed; add RecallMeta) |
+| D4 | F-L7 nit1 `memory_kinds`=2/16 | OPEN | verified-in-code | cosmetic | v1.1.0 (voted) + fix-now doc-drift |
+| D5 | F-L7 nit2 schema_version dissonance | OPEN | verified-in-code | cosmetic | v1.1.0 (voted) |
+| D6 | L2/L4/L9 cognition | PARTIAL | code est. / behavior unverified | medium | fix-now live-probe (×3) |
+| D7 | L5/L6/L10 multi-agent/scale | PARTIAL | verified-in-code | medium | L5 CLOSED (#2946); #2948 near-term feature-completeness; L6/L10 v1.1.0 |
+
+### Now-vs-v1.1.0 call
+
+**Fix-now (pre-GA):** run the three D6 live probes (L2/L4/L9 — convert verified-in-code
+into verified-in-behaviour); add the two cheap D1 hardening lines (one pg
+`confidence==min`/`memory_kind==Claim` assertion + one removal-proof control) so the pg
+closure is mechanically pinned; fix the stale D4 test comment (pure doc-drift). **#2948**
+is filed and tracked as near-term append-only-feature completeness — worth fixing so the
+feature delivers its tamper-evidence claim when armed, but it does **not** gate GA (opt-in,
+default-off, not cert-armed).
+
+**Defer to v1.1.0:** F-L1 contradiction hardening (prompt clauses + deterministic lexical
+pre-check + tests); F-L8a in-band `RecallMeta.unverified` field; the two wire-contract nits
+D4/D5 (each needs a 5-agent vote — the legacy `memory_kinds` field and the `schema_version`
+naming scheme); L10 relevance-at-10⁶ measurement apparatus; and the L6 quarantine-default flip.
+
+**Bottom line:** the one PROVEN defect is CLOSED on both backends at HEAD; no new load-bearing
+control is missing; the honest residual is one opt-in-feature completeness item (#2948), three
+never-run-live cognition lenses (present + unit-tested), one unmeasured scale question (L10), and
+test/observability/cosmetic hardening. **GA is not blocked on content-integrity grounds.**
 
 ---
 
