@@ -52,6 +52,27 @@ Each section carries a severity (`INFO`, `WARN`, `CRIT`, `N/A`) and a list
 of `(key, value)` facts. The overall report severity is the max across
 sections.
 
+### Configuration
+
+- `config_path` and `status` identify the configuration file and whether it can be loaded.
+- `archive_on_gc` (#3385) reports the **effective** GC archive policy — the value
+  the TTL sweep and `memory_forget` will actually use on this host. `true` (the
+  compiled default) archives an expired memory into `archived_memories` before
+  deleting it, so eviction stays reversible; `false` is a permanent hard delete
+  with no archive and no rollback.
+- `archive_on_gc_source` (#3385) reports WHICH layer supplied that value:
+  - `config` — `[storage].archive_on_gc`, the documented v2 key (highest precedence).
+  - `legacy` — the DEPRECATED flat top-level `archive_on_gc` key. Resolving it also
+    emits a one-shot stderr WARN; move it under `[storage]` or run
+    `ai-memory config migrate`.
+  - `compiled-default` — neither key is set, so archiving is on.
+
+  When both keys are set the `[storage]` one wins and the flat key is ignored;
+  if the two disagree, a one-shot stderr WARN names the winner.
+
+  An UNUSABLE configuration reports the load `error` instead: no config was
+  resolved, so there is no honest effective policy to print.
+
 ### Storage
 
 - `total_memories`, `expiring_within_1h`, `links`, `db_size_bytes`
