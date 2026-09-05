@@ -25,6 +25,11 @@
 //! simply unsigned (every Draft row, and any Frozen row frozen without a
 //! signing keypair).
 
+pub mod materialization;
+
+/// Shared refusal for attempts to execute a draft routine.
+pub(crate) const ROUTINE_NOT_FROZEN: &str = "routine must be frozen before it can be run";
+
 use crate::identity::keypair::AgentKeypair;
 use crate::identity::sign::{SignableRoutineFreeze, sign_routine_freeze};
 use crate::identity::verify::verify_routine_freeze;

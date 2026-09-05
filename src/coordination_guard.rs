@@ -133,6 +133,35 @@ pub fn resolve_actor(caller_supplied: Option<&str>) -> Result<String, String> {
     })
 }
 
+/// Validate and screen an action through the shared direct/routine create boundary.
+/// Returns the validated action and its #1807 storage-only charge.
+///
+/// # Errors
+/// Refuses invalid fields, credentials, metadata, or actor attribution.
+pub(crate) fn prepare_action(
+    mut action: crate::models::Action,
+) -> Result<(crate::models::Action, i64), String> {
+    require_namespace(&action.namespace)?;
+    require_text("title", &action.title, MAX_TEXT_FIELD_BYTES)?;
+    require_text("kind", &action.kind, MAX_KIND_BYTES)?;
+    require_payload_size("payload", &action.payload)?;
+    action.agent_id = Some(resolve_actor(action.agent_id.as_deref())?);
+    crate::secret_screen::screen_text_field_for_caller(&mut action.title)
+        .map_err(|e| e.to_string())?;
+    crate::secret_screen::screen_json_field_for_caller(&mut action.payload)
+        .map_err(|e| e.to_string())?;
+    if !action.metadata.is_null() {
+        crate::secret_screen::screen_json_field_for_caller(&mut action.metadata)
+            .map_err(|e| e.to_string())?;
+        crate::validate::validate_metadata(&action.metadata).map_err(|e| e.to_string())?;
+    }
+    let bytes = crate::quotas::coordination_payload_bytes(
+        &[&action.title, &action.kind],
+        &[&action.payload, &action.metadata],
+    );
+    Ok((action, bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

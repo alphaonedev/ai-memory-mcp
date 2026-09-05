@@ -110,6 +110,35 @@ pub fn create(conn: &Connection, action: &Action) -> rusqlite::Result<String> {
     Ok(action.id.clone())
 }
 
+/// Create an action with the shared coordination guards and atomic quota charge.
+///
+/// # Errors
+/// Refuses invalid input, exhausted quota, record-stop, or persistence failure.
+pub fn create_guarded(conn: &Connection, action: Action) -> Result<Action, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let action = create_guarded_in_transaction(&tx, action)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(action)
+}
+
+/// Shared insertion funnel for direct creates and a whole routine transaction.
+pub(crate) fn create_guarded_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    action: Action,
+) -> Result<Action, String> {
+    gate_record_stop_actions(tx).map_err(|e| e.to_string())?;
+    let (action, bytes) = crate::coordination_guard::prepare_action(action)?;
+    crate::quotas::check_and_record_storage_only_in_transaction(
+        tx,
+        action.agent_id.as_deref().unwrap_or_default(),
+        &action.namespace,
+        bytes,
+    )
+    .map_err(|e| e.to_string())?;
+    create(tx, &action).map_err(|e| e.to_string())?;
+    Ok(action)
+}
+
 /// Fetch an action by id. `None` when absent.
 ///
 /// # Errors

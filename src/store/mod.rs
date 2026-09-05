@@ -3708,6 +3708,19 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// Atomically materialise a frozen routine into guarded, quota-charged actions
+    /// and edges. Failure leaves no partial DAG or storage charge.
+    async fn routine_materialize(
+        &self,
+        _ctx: &CallerContext,
+        _routine_id: &str,
+        _arguments: &serde_json::Value,
+    ) -> StoreResult<Vec<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
     /// #1709 Pillar 1 — create a routine run (the v62 `routine_runs` table,
     /// one materialisation of a routine under a concrete argument binding).
     /// Returns the run id. Default `UnsupportedCapability`.
