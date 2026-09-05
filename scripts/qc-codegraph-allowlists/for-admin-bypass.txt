@@ -30,6 +30,15 @@ src/federation/receive.rs:FEDERATION_CATCHUP
 # never a tenant handler; mirrors the sqlite twin's unscoped scalar read.
 src/handlers/federation_signing_check.rs:probe_principal
 src/handlers/admin.rs:DAEMON_PRINCIPAL
+# #3464 (v1.0.0, security-high) — proof-of-possession bind challenge issuer
+# (`issue_bind_challenge`): the durable single-use challenge row is written with
+# the DAEMON_PRINCIPAL admin ctx (bound to the local `issuer` name) because the
+# challenge table is substrate enrolment state, not tenant data; the route
+# (`POST /api/v1/agents/{id}/pubkey/challenge`) is `require_admin`-gated ahead of
+# this call, the candidate key is issuer-pinned in the row, and the bind that
+# consumes it re-checks the (agent, key) tuple under the same admin gate. Adds no
+# read privilege. SECURITY APPROVAL 2026-09-05 (Fable, #3464 review): JUSTIFIED.
+src/handlers/admin.rs:issuer
 src/handlers/hook_subscribers.rs:AI_HTTP_INTERNAL
 src/handlers/http.rs:AI_HTTP_INTERNAL
 # #3064 batch C — POST /api/v1/memory_export_reflection postgres SAL
@@ -41,7 +50,6 @@ src/handlers/http.rs:AI_HTTP_INTERNAL
 src/handlers/route_1111.rs:http:export-reflection
 src/handlers/subscriptions.rs:SUBSCRIPTION_DISPATCH
 src/migrate.rs:AI_MIGRATE
-src/store/postgres.rs:GOVERNANCE_INTERNAL
 src/cli/stop.rs:AI_OPERATOR
 # #2121 — L2 transcript-recovery walker (recover_from_transcript_store): a
 # substrate re-store reading LOCAL host transcripts (CLI recover-previous-
