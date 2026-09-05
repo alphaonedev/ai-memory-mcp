@@ -689,6 +689,8 @@ async fn curator_store_url_postgres_once_builds_store_handle() {
         include_namespaces: Vec::new(),
         exclude_namespaces: Vec::new(),
         json: true,
+        prune_reports: false,
+        apply: false,
         rollback: None,
         rollback_last: None,
         reflect: false,

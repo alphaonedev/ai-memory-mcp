@@ -22533,10 +22533,11 @@ impl MemoryStore for PostgresStore {
                   WHERE (embedding IS NULL \
                      OR (embedding IS NOT NULL AND {unattributed}) \
                      OR (embedding IS NOT NULL AND embedding_space IS NOT NULL \
-                         AND embedding_space <> $2)){not_skipped} \
+                         AND embedding_space <> $2)){not_skipped}{not_substrate} \
                   ORDER BY created_at ASC \
                   LIMIT $1",
-                unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
+                unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED,
+                not_substrate = *crate::visibility::SQL_AND_NOT_SUBSTRATE
             ))
             .bind(cap)
             .bind(active_fp)
@@ -22549,10 +22550,11 @@ impl MemoryStore for PostgresStore {
                         metadata::text AS metadata_json \
                    FROM memories \
                   WHERE (embedding IS NULL \
-                     OR (embedding IS NOT NULL AND {unattributed})){not_skipped} \
+                     OR (embedding IS NOT NULL AND {unattributed})){not_skipped}{not_substrate} \
                   ORDER BY created_at ASC \
                   LIMIT $1",
-                unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED
+                unattributed = crate::storage::SQL_FRAGMENT_EMBEDDING_SPACE_UNATTRIBUTED,
+                not_substrate = *crate::visibility::SQL_AND_NOT_SUBSTRATE
             ))
             .bind(cap)
             .fetch_all(&self.pool)
@@ -22627,6 +22629,178 @@ impl MemoryStore for PostgresStore {
     /// per chunk instead of N autocommit round-trips; the postgres twin
     /// of sqlite's `db::set_embeddings_batch`. Returns rows actually
     /// updated (a row deleted between scan and write counts 0).
+    /// v1.0.0 #3345 — postgres arm of the curator-report backlog collapse.
+    ///
+    /// Same three steps as the sqlite twin (`curator::reports::prune_reports`),
+    /// and the DAY FOLD itself is the shared pure
+    /// [`crate::curator::reports::daily_rollup_memory`], so the two backends
+    /// cannot summarise the same day differently. What differs is only the
+    /// dialect: `created_at` is a real `TIMESTAMPTZ` here, so the day bucket is
+    /// `to_char(... AT TIME ZONE 'UTC')` and the retention stamp is a single
+    /// set-based `created_at + make_interval(...)` per chunk instead of a
+    /// per-row render (no text-format drift is possible on this backend).
+    ///
+    /// Never deletes; never shortens an expiry a row already carries.
+    async fn prune_curator_reports(
+        &self,
+        ctx: &CallerContext,
+        apply: bool,
+    ) -> StoreResult<crate::curator::reports::PruneReport> {
+        // Admin-only: the collapse rewrites substrate rows across every owner.
+        if !ctx.bypass_visibility {
+            return Err(StoreError::PermissionDenied {
+                action: "prune_curator_reports".to_string(),
+                target: crate::autonomy::CURATOR_REPORTS_NAMESPACE.to_string(),
+                reason: "admin context required".to_string(),
+            });
+        }
+        let ns = crate::autonomy::CURATOR_REPORTS_NAMESPACE;
+        // The backlog marker is the TIER, not a NULL expiry — see
+        // `curator::reports::backlog_marker_tier`: `db::insert` backfills the
+        // tier default (#1466), so legacy report rows carry `created_at + 7d`
+        // and a NULL-expiry predicate would find nothing on a real store.
+        let short = crate::models::Tier::Short.as_str();
+        let backlog: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM memories WHERE namespace = $1 AND tier <> $2",
+        )
+        .bind(ns)
+        .bind(short)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("prune_curator_reports backlog", e))?;
+        let mut report = crate::curator::reports::PruneReport {
+            backlog: usize::try_from(backlog).unwrap_or(0),
+            dry_run: !apply,
+            ..crate::curator::reports::PruneReport::default()
+        };
+        if !apply || backlog == 0 {
+            return Ok(report);
+        }
+        // B7' — parity with the gated sqlite twin
+        // (`curator::reports::stamp_backlog_chunk`): a store under a
+        // record-stop accepts NO writes, including this one. Gated HERE, past
+        // the dry-run return, so a frozen store can still be ASKED how big its
+        // backlog is — the read is not the write.
+        self.gate_record_stop().await?;
+
+        let now = Utc::now();
+        let days: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d \
+               FROM memories WHERE namespace = $1 AND tier <> $2 \
+              ORDER BY d ASC LIMIT $3",
+        )
+        .bind(ns)
+        .bind(short)
+        .bind(i64::try_from(crate::curator::reports::PRUNE_MAX_DAYS).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("prune_curator_reports days", e))?;
+
+        let mut chunk_budget = crate::curator::reports::PRUNE_MAX_CHUNKS;
+        for day in days {
+            let contents: Vec<String> = sqlx::query_scalar(
+                "SELECT content FROM memories \
+                  WHERE namespace = $1 \
+                    AND to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') = $2 \
+                  ORDER BY created_at ASC LIMIT $3",
+            )
+            .bind(ns)
+            .bind(&day)
+            .bind(
+                i64::try_from(crate::curator::reports::ROLLUP_MAX_ROWS_PER_DAY).unwrap_or(i64::MAX),
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("prune_curator_reports day rows", e))?;
+            // A body that will not parse is skipped, never fatal: one
+            // malformed report must not stop the day being summarised.
+            let bodies: Vec<serde_json::Value> = contents
+                .iter()
+                .filter_map(|c| serde_json::from_str(c).ok())
+                .collect();
+            if bodies.is_empty() {
+                continue;
+            }
+            let mem = crate::curator::reports::daily_rollup_memory(&day, &bodies, now);
+            let expires = mem
+                .expires_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            // Upsert on the SAME `(title, namespace)` key the sqlite insert
+            // upserts on (`memories_title_ns_uidx`), which is what makes a
+            // re-fold of a day replace its summary instead of appending one.
+            sqlx::query(
+                "INSERT INTO memories \
+                   (id, tier, namespace, title, content, source, priority, confidence, \
+                    created_at, updated_at, expires_at, metadata) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11::jsonb) \
+                 ON CONFLICT (title, namespace) DO UPDATE SET \
+                   content = EXCLUDED.content, \
+                   updated_at = EXCLUDED.updated_at, \
+                   expires_at = EXCLUDED.expires_at, \
+                   tier = EXCLUDED.tier",
+            )
+            .bind(&mem.id)
+            .bind(mem.tier.as_str())
+            .bind(&mem.namespace)
+            .bind(&mem.title)
+            .bind(&mem.content)
+            .bind(&mem.source)
+            .bind(mem.priority)
+            .bind(mem.confidence)
+            .bind(now)
+            .bind(expires)
+            .bind(mem.metadata.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("prune_curator_reports rollup upsert", e))?;
+            report.days_rolled_up += 1;
+
+            // Stamp ONLY the day just folded, chunked. Scoping the stamp to the
+            // folded day is the same structural guarantee the sqlite twin
+            // makes: `days` is capped at `PRUNE_MAX_DAYS`, so an unscoped stamp
+            // would set an expiry on rows whose day has no summary standing
+            // behind it — the one way this collapse could lose information.
+            // Idempotent and resumable: the predicate IS the remaining work.
+            while chunk_budget > 0 {
+                chunk_budget -= 1;
+                // Earliest-wins (`LEAST`): the collapse shortens over-long
+                // substrate retention — that is its purpose — but never
+                // lengthens the life of a row the store was already going to
+                // reap. Rewriting the tier in the same statement is what makes
+                // the pass idempotent: the marker moves with the retention.
+                let stamped = sqlx::query(
+                    "UPDATE memories \
+                        SET tier = $5, \
+                            expires_at = LEAST( \
+                                COALESCE(expires_at, \
+                                         created_at + make_interval(hours => $2)), \
+                                created_at + make_interval(hours => $2)) \
+                      WHERE id IN (SELECT id FROM memories \
+                                    WHERE namespace = $1 AND tier <> $5 \
+                                      AND to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') \
+                                          = $4 \
+                                    ORDER BY id LIMIT $3)",
+                )
+                .bind(ns)
+                .bind(i32::try_from(crate::autonomy::CURATOR_REPORT_TTL_HOURS).unwrap_or(i32::MAX))
+                .bind(i64::try_from(crate::curator::reports::PRUNE_CHUNK_ROWS).unwrap_or(i64::MAX))
+                .bind(&day)
+                .bind(short)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| to_store_err("prune_curator_reports stamp", e))?
+                .rows_affected();
+                if stamped == 0 {
+                    break;
+                }
+                report.stamped += usize::try_from(stamped).unwrap_or(0);
+            }
+        }
+        Ok(report)
+    }
+
     async fn set_embeddings_batch(
         &self,
         _ctx: &CallerContext,
@@ -32739,6 +32913,16 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("stats total", e))?;
         let total_usize = usize::try_from(total).unwrap_or(0);
 
+        // v1.0.0 #3345 — substrate-bookkeeping share of `total`, from the SAME
+        // visibility SSOT expression the sqlite twin counts with.
+        let substrate: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*)::BIGINT FROM memories WHERE {}",
+            *crate::visibility::SQL_IS_SUBSTRATE
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats substrate", e))?;
+
         let tier_rows = sqlx::query(
             "SELECT tier, COUNT(*)::BIGINT AS c FROM memories
              GROUP BY tier ORDER BY c DESC",
@@ -32837,6 +33021,7 @@ impl MemoryStore for PostgresStore {
             total: total_usize,
             live: usize::try_from(live).unwrap_or(0),
             expired_pending_gc: usize::try_from(expired_pending_gc).unwrap_or(0),
+            substrate: usize::try_from(substrate).unwrap_or(0),
             by_tier,
             by_namespace,
             expiring_soon: usize::try_from(expiring_soon).unwrap_or(0),

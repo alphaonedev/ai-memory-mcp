@@ -49,6 +49,16 @@ pub struct CuratorArgs {
     /// Print the report as JSON rather than a human-readable summary.
     #[arg(long)]
     pub json: bool,
+    /// v1.0.0 #3345 — collapse the historical `_curator/reports` backlog: fold
+    /// each affected UTC day into one daily summary, then stamp the retention
+    /// the per-sweep rows should have carried. DRY RUN unless `--apply` is
+    /// also given; never deletes (reaping stays with the audited GC path).
+    #[arg(long, conflicts_with_all = ["once", "daemon", "reflect", "rollback", "rollback_last"])]
+    pub prune_reports: bool,
+    /// Apply the `--prune-reports` collapse. Without it the command only
+    /// reports the counts a real run would act on.
+    #[arg(long, requires = "prune_reports")]
+    pub apply: bool,
     /// Reverse rollback-log entries instead of running a sweep. Accepts
     /// a specific rollback-memory id, or `--last N` for the most recent.
     /// Mutually exclusive with `--once` and `--daemon`.
@@ -260,9 +270,20 @@ pub async fn run(
         return run_reflect(db_path, args, app_config, out).await;
     }
 
+    if args.prune_reports {
+        // #3345 — the store-backed (postgres) arm goes through the SAL trait;
+        // the sqlite arm drives the same primitives directly.
+        #[cfg(feature = "sal")]
+        if curator_store_url(args).is_some() {
+            return run_store_backed_prune_reports(db_path, args, app_config, out).await;
+        }
+        return run_prune_reports(db_path, args, out);
+    }
+
     if !args.once && !args.daemon {
         anyhow::bail!(
-            "curator requires --once, --daemon, --reflect, --rollback <id>, or --rollback-last N"
+            "curator requires --once, --daemon, --reflect, --prune-reports, \
+             --rollback <id>, or --rollback-last N"
         );
     }
 
@@ -350,6 +371,9 @@ pub async fn run(
         // #1749 — resolve compaction.enabled here (the daemon body has no
         // AppConfig in scope) and thread it as a primitive.
         app_config.resolve_compaction_enabled(),
+        // #3345 — the curator daemon is the reaper on a curator-only host;
+        // hand it the operator's resolved erasure/archive posture.
+        app_config.effective_archive_on_gc(),
         llm.map(std::sync::Arc::new),
         shutdown,
     )
@@ -1255,6 +1279,79 @@ fn run_rollback(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> 
     anyhow::bail!("run_rollback entered without --rollback or --rollback-last");
 }
 
+/// v1.0.0 #3345 — render a [`curator::reports::PruneReport`] for an operator.
+///
+/// Both arms print through here so the sqlite and store-backed paths report
+/// the collapse in the same words and the same JSON shape.
+fn print_prune_report(
+    report: &curator::reports::PruneReport,
+    json: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    if json {
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(report)?)?;
+        return Ok(());
+    }
+    if report.dry_run {
+        writeln!(
+            out.stdout,
+            "curator report backlog (DRY RUN): {} per-sweep row(s) in {} carry no expiry.",
+            report.backlog,
+            autonomy::CURATOR_REPORTS_NAMESPACE
+        )?;
+        writeln!(
+            out.stdout,
+            "Re-run with --apply to fold each affected UTC day into {} and stamp the {}h \
+             retention on those rows. Nothing is deleted: expired rows are reaped (and \
+             archived, when archive_on_gc is on) by the ordinary GC.",
+            autonomy::CURATOR_REPORTS_DAILY_NAMESPACE,
+            autonomy::CURATOR_REPORT_TTL_HOURS
+        )?;
+        return Ok(());
+    }
+    writeln!(
+        out.stdout,
+        "curator report backlog collapsed: {} row(s) found, {} day(s) rolled up, {} row(s) \
+         stamped with the {}h retention. Reaping is the GC's — run `ai-memory gc` or let the \
+         daemon tick.",
+        report.backlog,
+        report.days_rolled_up,
+        report.stamped,
+        autonomy::CURATOR_REPORT_TTL_HOURS
+    )?;
+    Ok(())
+}
+
+/// v1.0.0 #3345 — `ai-memory curator --prune-reports [--apply]` against the
+/// local SQLite file. Dry run unless `--apply` is given.
+fn run_prune_reports(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> Result<()> {
+    let conn = db::open(db_path)?;
+    let report = curator::reports::prune_reports(&conn, args.apply)?;
+    print_prune_report(&report, args.json, out)
+}
+
+/// v1.0.0 #3345 — store-backed twin of [`run_prune_reports`], dispatched when
+/// `--store-url` selects a (postgres) SAL adapter. Routes through the
+/// [`crate::store::MemoryStore::prune_curator_reports`] trait method so the
+/// postgres arm collapses its own backlog rather than silently doing nothing.
+#[cfg(feature = "sal")]
+async fn run_store_backed_prune_reports(
+    db_path: &Path,
+    args: &CuratorArgs,
+    app_config: &config::AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let store =
+        crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config)
+            .await?;
+    let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
+    let report = store
+        .prune_curator_reports(&ctx, args.apply)
+        .await
+        .map_err(|e| anyhow::anyhow!("curator --prune-reports: {e}"))?;
+    print_prune_report(&report, args.json, out)
+}
+
 /// v0.8.0 Pillar-2.5 slice-3c2 (#1748) — store-backed twin of
 /// [`run_rollback`]. Dispatched from [`run`] when `--store-url` selects a
 /// (postgres) SAL store, so `curator --rollback[-last] --store-url
@@ -1349,6 +1446,8 @@ mod tests {
             include_namespaces: Vec::new(),
             exclude_namespaces: Vec::new(),
             json: false,
+            prune_reports: false,
+            apply: false,
             rollback: None,
             rollback_last: None,
             reflect: false,

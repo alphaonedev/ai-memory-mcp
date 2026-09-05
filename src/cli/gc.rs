@@ -78,7 +78,18 @@ pub fn run_stats(db_path: &Path, json_out: bool, out: &mut CliOutput<'_>) -> Res
         writeln!(out.stdout, "{}", serde_json::to_string(&stats)?)?;
         return Ok(());
     }
-    writeln!(out.stdout, "total memories: {}", stats.total)?;
+    // v1.0.0 #3345 — lead with the number the operator actually owns. `total`
+    // keeps its documented #2334 meaning (the RAW physical count) and is still
+    // printed; the substrate share is broken out beside it, because on the
+    // measured f1 tier "25,671 memories" was 24,930 curator self-reports and
+    // 741 real rows, and nothing on this surface said so.
+    let owned = stats.total.saturating_sub(stats.substrate);
+    writeln!(out.stdout, "memories: {owned}")?;
+    writeln!(
+        out.stdout,
+        "total rows: {} (substrate bookkeeping: {})",
+        stats.total, stats.substrate
+    )?;
     writeln!(out.stdout, "expiring within 1h: {}", stats.expiring_soon)?;
     writeln!(out.stdout, "links: {}", stats.links_count)?;
     writeln!(out.stdout, "database size: {} bytes", stats.db_size_bytes)?;
@@ -99,14 +110,31 @@ pub fn run_namespaces(db_path: &Path, json_out: bool, out: &mut CliOutput<'_>) -
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "namespaces", out)?;
     let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
-    let ns = db::list_namespaces(&conn)?;
+    let all = db::list_namespaces(&conn)?;
+    // v1.0.0 #3345 — substrate namespaces are bookkeeping, not inventory: the
+    // HTTP listing withholds them from an unscoped request and this listing
+    // has no prefix to opt in with. They are COUNTED rather than silently
+    // dropped, so the operator can still see that they exist (and reach them
+    // with `ai-memory list --namespace _curator/reports`).
+    let substrate_namespaces = all
+        .iter()
+        .filter(|n| crate::visibility::is_substrate_namespace(&n.namespace))
+        .count();
+    let ns: Vec<_> = all
+        .into_iter()
+        .filter(|n| !crate::visibility::is_substrate_namespace(&n.namespace))
+        .collect();
     if json_out {
         writeln!(
             out.stdout,
             "{}",
-            serde_json::to_string(
-                &serde_json::json!({(crate::models::field_names::NAMESPACES): ns})
-            )?
+            // #3345 — additive: the withheld substrate count travels with the
+            // machine-readable listing too, so a script cannot mistake the
+            // filtered list for the whole inventory.
+            serde_json::to_string(&serde_json::json!({
+                (crate::models::field_names::NAMESPACES): ns,
+                "substrate_namespaces_withheld": substrate_namespaces,
+            }))?
         )?;
         return Ok(());
     }
@@ -116,6 +144,13 @@ pub fn run_namespaces(db_path: &Path, json_out: bool, out: &mut CliOutput<'_>) -
         for n in &ns {
             writeln!(out.stdout, "  {}: {} memories", n.namespace, n.count)?;
         }
+    }
+    if substrate_namespaces > 0 {
+        writeln!(
+            out.stdout,
+            "  ({substrate_namespaces} substrate namespace(s) withheld — name one to read it, \
+             e.g. `ai-memory list --namespace _curator/reports`)"
+        )?;
     }
     Ok(())
 }
@@ -173,7 +208,10 @@ mod tests {
             run_stats(&db, false, &mut out).unwrap();
         }
         let s = env.stdout_str();
-        assert!(s.contains("total memories: 0"));
+        // #3345 — the headline is the corpus the operator owns; the physical
+        // row count and its substrate share are printed beside it.
+        assert!(s.contains("memories: 0"));
+        assert!(s.contains("total rows: 0 (substrate bookkeeping: 0)"));
         assert!(s.contains("links: 0"));
     }
 
@@ -188,7 +226,8 @@ mod tests {
             run_stats(&db, false, &mut out).unwrap();
         }
         let s = env.stdout_str();
-        assert!(s.contains("total memories: 2"));
+        assert!(s.contains("memories: 2"));
+        assert!(s.contains("total rows: 2 (substrate bookkeeping: 0)"));
         assert!(s.contains("by tier:"));
         assert!(s.contains("by namespace:"));
     }

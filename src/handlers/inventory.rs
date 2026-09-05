@@ -126,13 +126,20 @@ pub(crate) fn page_namespaces(
     limit: usize,
     offset: usize,
 ) -> (Vec<NamespaceCount>, usize) {
-    let filtered: Vec<NamespaceCount> = match prefix {
-        Some(prefix) => rows
-            .into_iter()
-            .filter(|r| matches_namespace_prefix(&r.namespace, prefix))
-            .collect(),
-        None => rows,
-    };
+    // v1.0.0 #3345 — substrate namespaces (`_curator/*`, `_messages/*`,
+    // `_agents`, …) are bookkeeping, not inventory. On the measured f1 tier
+    // `_curator/reports` was 24,930 of 25,671 rows, so the ONE namespace an
+    // operator does not own dominated the listing they use to see what they
+    // DO own. Withheld by default; NAMING the namespace is the opt-in, which
+    // is byte-for-byte the #3348 read posture (`substrate_namespace_requested`)
+    // rather than a second, differently-shaped visibility rule — and it needs
+    // no new query parameter, so no MCP schema / param-census / docs pin moves.
+    let include_substrate = crate::visibility::substrate_listing_requested(prefix);
+    let filtered: Vec<NamespaceCount> = rows
+        .into_iter()
+        .filter(|r| include_substrate || !crate::visibility::is_substrate_namespace(&r.namespace))
+        .filter(|r| prefix.is_none_or(|p| matches_namespace_prefix(&r.namespace, p)))
+        .collect();
     let total = filtered.len();
     let page_len = total.saturating_sub(offset).min(limit);
     let mut page = Vec::with_capacity(page_len);
@@ -252,6 +259,39 @@ mod tests {
             "project-x must not match hierarchical prefix proj"
         );
         assert_eq!(page, vec![ns("proj", 5), ns("proj/sub", 2)]);
+    }
+
+    /// v1.0.0 #3345 — an UNSCOPED namespace listing withholds substrate
+    /// bookkeeping. On the measured f1 tier `_curator/reports` alone was
+    /// 24,930 of 25,671 rows, so the listing an operator uses to see what they
+    /// own was dominated by the one namespace they do not.
+    #[test]
+    fn page_namespaces_withholds_substrate_from_an_unscoped_listing_3345() {
+        let rows = vec![
+            ns("proj", 5),
+            ns("_curator/reports", 24_930),
+            ns("_messages/ai:carol", 40),
+            ns("_agents", 3),
+        ];
+        let (page, total) = page_namespaces(rows, None, 50, 0);
+        assert_eq!(total, 1, "only the ordinary namespace is inventory");
+        assert_eq!(page, vec![ns("proj", 5)]);
+    }
+
+    /// Naming the namespace is the opt-in — byte-for-byte the #3348 read
+    /// posture, so there is no new query parameter and no second rule.
+    #[test]
+    fn page_namespaces_honours_a_named_substrate_prefix_3345() {
+        let rows = vec![ns("proj", 5), ns("_curator/reports", 24_930)];
+        let (page, total) = page_namespaces(rows.clone(), Some("_curator/reports"), 50, 0);
+        assert_eq!(total, 1);
+        assert_eq!(page, vec![ns("_curator/reports", 24_930)]);
+
+        // An ANCESTOR prefix opts in too: `?prefix=_curator` is a reasonable
+        // request and must not return a silently empty page.
+        let (page, total) = page_namespaces(rows, Some("_curator"), 50, 0);
+        assert_eq!(total, 1);
+        assert_eq!(page, vec![ns("_curator/reports", 24_930)]);
     }
 
     #[test]

@@ -3498,6 +3498,29 @@ impl MemoryStore for SqliteStore {
             .map_err(box_err)
     }
 
+    /// v1.0.0 #3345 — sqlite arm of the curator-report backlog collapse.
+    /// Delegates to the shared `curator::reports` primitives so the CLI's
+    /// direct-connection path and this SAL path cannot diverge.
+    async fn prune_curator_reports(
+        &self,
+        ctx: &CallerContext,
+        apply: bool,
+    ) -> StoreResult<crate::curator::reports::PruneReport> {
+        // Admin-only: the collapse rewrites substrate rows across every owner.
+        // Unlike `list_unembedded` (whose empty vec is the documented gate)
+        // this refuses LOUDLY — a silent zero-count "success" would tell an
+        // operator their 25k-row backlog was already clean.
+        if !ctx.bypass_visibility {
+            return Err(StoreError::PermissionDenied {
+                action: "prune_curator_reports".to_string(),
+                target: crate::autonomy::CURATOR_REPORTS_NAMESPACE.to_string(),
+                reason: "admin context required".to_string(),
+            });
+        }
+        let conn = self.state.lock().await;
+        crate::curator::reports::prune_reports(&conn, apply).map_err(box_err)
+    }
+
     /// #3181 — REAL `set_embeddings_batch`. The trait default loops
     /// `update_embedding` in autocommit and increments `written` UNCONDITIONALLY
     /// once per entry, so it reported a write for an id that no longer exists

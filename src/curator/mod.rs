@@ -37,6 +37,11 @@ pub(crate) mod cluster;
 pub(crate) mod compaction;
 pub(crate) mod persist;
 pub(crate) mod pipeline;
+/// v1.0.0 #3345 — curator self-report retention: the per-cycle daily rollup
+/// and the `--prune-reports` historical-backlog collapse. Public because the
+/// CLI (`ai-memory curator --prune-reports`) and the regression suites drive
+/// it directly.
+pub mod reports;
 // v0.7.0 L2-1 — `reflection_pass` exposes a small public surface
 // (`ReflectionPassConfig`, `ReflectionPassReport`, `DryRunProposal`,
 // `run_reflection_pass`) consumed by the integration test crate plus
@@ -532,6 +537,21 @@ pub fn run_once(
         )
     {
         tracing::warn!("self-report persist failed: {e}");
+    }
+
+    // v1.0.0 #3345 — fold TODAY's cycles into ONE daily summary row.
+    //
+    // The per-sweep report now expires after `CURATOR_REPORT_TTL_HOURS`, so
+    // without this the day's detail would simply be reaped. Recomputing the
+    // whole day on every cycle (rather than incrementing) keeps the fold
+    // idempotent and self-healing, and guarantees the last fold of a day runs
+    // while every one of that day's rows is still live — so the frozen summary
+    // is complete. Best-effort, exactly like the self-report above: a rollup
+    // failure degrades the summary, it never fails the cycle.
+    if !cfg.dry_run
+        && let Err(e) = crate::curator::reports::roll_up_today(conn)
+    {
+        tracing::warn!("curator daily rollup failed (#3345): {e}");
     }
 
     crate::metrics::curator_cycle_completed(
@@ -1033,6 +1053,13 @@ pub fn run_daemon(
     // `daemon_runtime::ensure_and_load_daemon_keypair` resolves this
     // from `DAEMON_KEYPAIR_LABEL` on disk, auto-generating when absent.
     active_keypair: Option<Arc<crate::identity::keypair::AgentKeypair>>,
+    // v1.0.0 #3345 — the operator's resolved `[storage].archive_on_gc`
+    // posture, threaded as a primitive (the daemon body has no `AppConfig`,
+    // exactly like `compaction_enabled`). It is NOT defaulted to `true` here:
+    // an explicit `archive_on_gc = false` is an ERASURE posture (#1775 /
+    // #3272), and archiving rows an operator asked to be destroyed would be a
+    // compliance violation in the opposite direction from data loss.
+    archive_on_gc: bool,
 ) {
     let interval = cfg.interval_secs.clamp(60, crate::SECS_PER_DAY as u64);
     tracing::info!(
@@ -1084,6 +1111,21 @@ pub fn run_daemon(
                             report.dry_run
                         ),
                         Err(e) => tracing::error!("curator cycle errored: {e}"),
+                    }
+                    // v1.0.0 #3345 — THE MISSING REAPER. Expiry stamps are
+                    // inert without a GC tick, and `spawn_gc_loop*` is pushed
+                    // only from `bootstrap_serve`: a host running nothing but
+                    // `ai-memory curator --daemon` (the measured f1 topology)
+                    // ran NO GC at all, so every TTL in the store — the new
+                    // report TTL included — was a promise nothing kept.
+                    // `gc_if_needed` short-circuits on a bounded EXISTS probe,
+                    // so a store with nothing expired pays one read per cycle.
+                    match crate::storage::gc_if_needed(&conn, archive_on_gc) {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(
+                            "curator gc: reaped {n} expired memories (archive={archive_on_gc})"
+                        ),
+                        Err(e) => tracing::warn!("curator gc failed: {e}"),
                     }
                 }
             }
@@ -1629,7 +1671,7 @@ mod tests {
         let daemon_thread = thread::spawn(move || {
             // Record that we're entering the daemon loop.
             *cycle_count_for_test.lock().unwrap() = 1;
-            run_daemon(db_path, None, cfg, shutdown_for_daemon, None);
+            run_daemon(db_path, None, cfg, shutdown_for_daemon, None, true);
             // Record that the daemon exited cleanly.
             *cycle_count_for_test.lock().unwrap() = 2;
         });
@@ -2213,6 +2255,33 @@ mod tests {
         .unwrap();
         assert_eq!(reports.len(), 1);
         assert!(reports[0].content.contains("memories_consolidated"));
+        // v1.0.0 #3345 — the same cycle folds the day into ONE summary row, so
+        // the day's aggregate outlives the 24 h per-sweep detail. This is the
+        // in-module pin that the rollup is actually wired into `run_once`.
+        let daily = db::list(
+            &conn,
+            Some(crate::autonomy::CURATOR_REPORTS_DAILY_NAMESPACE),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // #1834 valid_at (no as-of)
+        )
+        .unwrap();
+        assert_eq!(
+            daily.len(),
+            1,
+            "#3345: every cycle must leave exactly one summary row for today"
+        );
+        assert!(
+            daily[0].content.contains("\"cycles\""),
+            "the summary must carry the folded cycle count: {}",
+            daily[0].content
+        );
     }
 
     /// `run_once` skips already-tagged rows on a re-run — covering the
