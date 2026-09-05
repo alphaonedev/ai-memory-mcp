@@ -11,6 +11,8 @@ use std::path::Path;
 #[derive(Debug, Default, serde::Serialize)]
 pub struct Inventory {
     pub orphan_files: Vec<String>,
+    /// Public-only peer/guardian verification material; retained by default.
+    pub enrolled_public_keys: Vec<String>,
     pub protected_files: Vec<String>,
     pub skipped_symlinks: Vec<String>,
     pub deleted_files: Vec<String>,
@@ -40,14 +42,15 @@ pub(crate) fn inspect(
     dir: &Path,
     registered: &BTreeSet<String>,
     delete: bool,
+    include_public_only: bool,
 ) -> Result<Inventory> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        unix::inspect(dir, registered, delete)
+        unix::inspect(dir, registered, delete, include_public_only)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (dir, registered, delete);
+        let _ = (dir, registered, delete, include_public_only);
         bail!("key inventory requires descriptor-relative filesystem support on this platform")
     }
 }
@@ -173,21 +176,39 @@ mod unix {
         prefix: &Path,
         ids: &BTreeSet<String>,
         delete: bool,
+        include_public_only: bool,
         out: &mut Inventory,
     ) -> Result<()> {
-        for name in names(dir)? {
+        // Snapshot file kinds before unlinking: readdir order must not make a
+        // paired public key appear enrolled after its private sibling is pruned.
+        let entries = names(dir)?
+            .into_iter()
+            .map(|name| file_kind(dir, &name).map(|kind| (name, kind)))
+            .collect::<Result<Vec<_>>>()?;
+        let private_files: BTreeSet<_> = entries
+            .iter()
+            .filter(|(name, kind)| *kind == libc::S_IFREG && name.as_bytes().ends_with(b".priv"))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for (name, kind) in entries {
             let relative = prefix.join(&name);
             let label = relative
                 .to_str()
                 .context("non-UTF-8 key filename; refusing pruning")?;
-            let kind = file_kind(dir, &name)?;
             if kind == libc::S_IFLNK {
                 out.skipped_symlinks.push(label.to_owned());
                 continue;
             }
             if kind == libc::S_IFDIR {
                 if !name.as_bytes().starts_with(b".") {
-                    walk(&child(dir, &name)?, &relative, ids, delete, out)?;
+                    walk(
+                        &child(dir, &name)?,
+                        &relative,
+                        ids,
+                        delete,
+                        include_public_only,
+                        out,
+                    )?;
                 }
                 continue;
             }
@@ -217,7 +238,16 @@ mod unix {
                 out.protected_files.push(label.to_owned());
                 continue;
             }
-            out.orphan_files.push(label.to_owned());
+            let public_only = label.ends_with(".pub")
+                && !private_files.contains(Path::new(&name).with_extension("priv").as_os_str());
+            if public_only {
+                out.enrolled_public_keys.push(label.to_owned());
+                if !include_public_only {
+                    continue;
+                }
+            } else {
+                out.orphan_files.push(label.to_owned());
+            }
             if delete {
                 let name = CString::new(name.as_bytes())?;
                 // SAFETY: live pinned parent fd and valid CString; flags=0
@@ -231,7 +261,12 @@ mod unix {
         Ok(())
     }
 
-    pub(super) fn inspect(path: &Path, ids: &BTreeSet<String>, delete: bool) -> Result<Inventory> {
+    pub(super) fn inspect(
+        path: &Path,
+        ids: &BTreeSet<String>,
+        delete: bool,
+        include_public_only: bool,
+    ) -> Result<Inventory> {
         let dir = match root(path) {
             Ok(dir) => dir,
             Err(e)
@@ -243,11 +278,75 @@ mod unix {
             Err(e) => return Err(e).context("open key directory without following symlinks"),
         };
         let mut result = Inventory::default();
-        walk(&dir, Path::new(""), ids, delete, &mut result)?;
+        walk(
+            &dir,
+            Path::new(""),
+            ids,
+            delete,
+            include_public_only,
+            &mut result,
+        )?;
         result.orphan_files.sort();
+        result.enrolled_public_keys.sort();
         result.protected_files.sort();
         result.skipped_symlinks.sort();
         result.deleted_files.sort();
         Ok(result)
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paired_keys_prune_independent_of_creation_order() {
+        for private_first in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().canonicalize().unwrap();
+            std::fs::create_dir(dir.join("nested")).unwrap();
+            for stem in ["pair", "nested/pair.x25519"] {
+                let suffixes = if private_first {
+                    ["priv", "pub"]
+                } else {
+                    ["pub", "priv"]
+                };
+                for suffix in suffixes {
+                    std::fs::write(dir.join(format!("{stem}.{suffix}")), b"fixture").unwrap();
+                }
+            }
+            let result = inspect(&dir, &BTreeSet::new(), true, false).unwrap();
+            assert_eq!(result.orphan_files.len(), 4);
+            assert_eq!(result.deleted_files, result.orphan_files);
+            assert!(result.enrolled_public_keys.is_empty());
+            for name in result.deleted_files {
+                assert!(!dir.join(name).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn public_keys_require_regular_private_siblings_in_the_same_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("peer.priv"), b"fixture").unwrap();
+        std::fs::write(dir.join("nested/peer.pub"), b"fixture").unwrap();
+        std::fs::write(dir.join("guardian.x25519.pub"), b"fixture").unwrap();
+        std::os::unix::fs::symlink("peer.priv", dir.join("guardian.x25519.priv")).unwrap();
+        let result = inspect(&dir, &BTreeSet::new(), true, false).unwrap();
+        assert_eq!(
+            result.enrolled_public_keys,
+            ["guardian.x25519.pub", "nested/peer.pub"]
+        );
+        assert_eq!(result.deleted_files, ["peer.priv"]);
+        assert_eq!(result.skipped_symlinks, ["guardian.x25519.priv"]);
+        for name in &result.enrolled_public_keys {
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"fixture");
+        }
+        let preview = inspect(&dir, &BTreeSet::new(), false, true).unwrap();
+        assert!(preview.deleted_files.is_empty());
+        let removed = inspect(&dir, &BTreeSet::new(), true, true).unwrap();
+        assert_eq!(removed.deleted_files, result.enrolled_public_keys);
     }
 }

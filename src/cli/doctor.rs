@@ -1542,7 +1542,7 @@ fn identity_signing_facts(
 fn section_identity_3147(conn: Option<&rusqlite::Connection>, db_path: &Path) -> ReportSection {
     let (mut facts, mut severity, mut notes) = identity_keystore_facts();
     let inventory = crate::identity::keypair::resolved_default_key_dir_path()
-        .and_then(|dir| super::keys::inventory(db_path, None, &dir, false));
+        .and_then(|dir| super::keys::inventory(db_path, None, &dir, false, false));
     match inventory {
         Ok(inventory) => {
             facts.push((
@@ -1553,6 +1553,16 @@ fn section_identity_3147(conn: Option<&rusqlite::Connection>, db_path: &Path) ->
                 "key_symlinks_skipped".into(),
                 inventory.skipped_symlinks.len().to_string(),
             ));
+            facts.push((
+                "enrolled_public_keys".into(),
+                inventory.enrolled_public_keys.len().to_string(),
+            ));
+            if !inventory.enrolled_public_keys.is_empty() {
+                notes.push(format!(
+                    "enrolled public keys — peer/guardian verification material, not pruned: {}",
+                    inventory.enrolled_public_keys.join(", ")
+                ));
+            }
             if !inventory.orphan_files.is_empty() {
                 severity = severity_max(severity, Severity::Warning);
                 notes.push(format!("key files name no registered agent: {}; review with `ai-memory keys prune --dry-run` using the same --db or store URL and key directory", inventory.orphan_files.join(", ")));
@@ -1561,6 +1571,7 @@ fn section_identity_3147(conn: Option<&rusqlite::Connection>, db_path: &Path) ->
         Err(e) => {
             severity = severity_max(severity, Severity::Warning);
             facts.push(("orphan_key_files".into(), "unknown".into()));
+            facts.push(("enrolled_public_keys".into(), "unknown".into()));
             notes.push(crate::logging::redact_urls_in_message(&format!(
                 "key registry inspection failed: {e:#}"
             )));

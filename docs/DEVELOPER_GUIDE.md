@@ -1081,6 +1081,7 @@ cargo clippy -- -D warnings
 ```
 
 Integration tests run through the CLI binary, creating temporary databases for isolation.
+The shared test key-directory helper refuses a system temp root under HOME (for example, `TMPDIR=~/tmp`); use a temp root outside HOME to run the tests.
 
 ## Benchmarks
 

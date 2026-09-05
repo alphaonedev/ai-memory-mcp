@@ -2048,6 +2048,8 @@ The inventory reads the configured SQLite or PostgreSQL `_agents` registry,
 including expired registrations, and reports an unknown count if that registry
 cannot be read. It never treats an unavailable registry as empty.
 
+Public-only `.pub` / `.x25519.pub` files without a sibling private key are reported separately as `enrolled_public_keys` (peer/guardian verification material) and retained unless both `--include-public-only` and `--yes` are supplied.
+
 Preview using the same database and key directory as your deployment:
 
 ```bash

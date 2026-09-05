@@ -27,7 +27,9 @@ impl Fixture {
             "registered-3355.pub",
             "registered-3355.x25519.priv",
             "orphan-3355.pub",
-            "orphan-3355.x25519.priv",
+            "orphan-3355.priv",
+            "peer-3355.pub",
+            "guardian-3355.x25519.pub",
             "daemon.priv",
             "operator.key",
             "operator.key.pub",
@@ -86,6 +88,7 @@ fn preview_and_yes_protect_registered_and_reserved_keys() {
             2
         );
         assert!(f.keys.join("orphan-3355.pub").is_file());
+        assert_public_inventory(&value);
     }
     assert!(!f.prune(&["--dry-run", "--yes"]).status.success());
     let value = successful(&f.prune(&["--yes"]));
@@ -113,6 +116,25 @@ fn preview_and_yes_protect_registered_and_reserved_keys() {
         );
     }
     assert!(!f.keys.join("orphan-3355.pub").exists());
+    assert_public_inventory(&value);
+    assert_public_keys_present(&f);
+    for flags in [
+        &["--include-public-only"][..],
+        &["--include-public-only", "--dry-run"][..],
+    ] {
+        let preview = successful(&f.prune(flags));
+        assert!(
+            preview["inventory"]["deleted_files"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_public_keys_present(&f);
+    }
+    assert_public_keys_deleted(
+        &f,
+        &successful(&f.prune(&["--include-public-only", "--yes"])),
+    );
 }
 
 #[test]
@@ -191,6 +213,7 @@ fn doctor_names_orphans_and_the_preview_command() {
             .contains("orphan-3355.pub")
     );
     assert!(f.keys.join("orphan-3355.pub").exists());
+    assert_doctor_public_keys(identity);
 }
 
 #[test]
@@ -258,6 +281,7 @@ async fn postgres_registry_controls_doctor_preview_delete_and_refusal() {
         value["inventory"]["orphan_files"].as_array().unwrap().len(),
         2
     );
+    assert_public_inventory(&value);
     let doctor = f
         .command()
         .env("AI_MEMORY_STORE_URL", &url)
@@ -277,6 +301,7 @@ async fn postgres_registry_controls_doctor_preview_delete_and_refusal() {
             .unwrap()
             .contains("orphan-3355.pub")
     );
+    assert_doctor_public_keys(identity);
     let deletion = f
         .command()
         .env("AI_MEMORY_STORE_URL", &url)
@@ -291,6 +316,33 @@ async fn postgres_registry_controls_doctor_preview_delete_and_refusal() {
         2
     );
     assert!(f.keys.join("registered-3355.x25519.priv").exists());
+    assert_public_keys_present(&f);
+    for flags in [
+        &["--include-public-only"][..],
+        &["--include-public-only", "--dry-run"][..],
+    ] {
+        let preview = f
+            .command()
+            .env("AI_MEMORY_STORE_URL", &url)
+            .args(["--json", "keys", "prune"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(
+            successful(&preview)["inventory"]["deleted_files"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_public_keys_present(&f);
+    }
+    let public_deletion = f
+        .command()
+        .env("AI_MEMORY_STORE_URL", &url)
+        .args(["--json", "keys", "prune", "--include-public-only", "--yes"])
+        .output()
+        .unwrap();
+    assert_public_keys_deleted(&f, &successful(&public_deletion));
 
     // A malformed PG roster must refuse, even though the local SQLite roster
     // is readable. It must never fall back to that local registry.
@@ -312,4 +364,58 @@ async fn postgres_registry_controls_doctor_preview_delete_and_refusal() {
         b"sentinel"
     );
     pool.close().await;
+}
+
+fn assert_public_inventory(value: &serde_json::Value) {
+    assert_eq!(
+        value["inventory"]["enrolled_public_keys"],
+        serde_json::json!(["guardian-3355.x25519.pub", "peer-3355.pub"])
+    );
+    for name in ["peer-3355.pub", "guardian-3355.x25519.pub"] {
+        assert!(
+            !value["inventory"]["orphan_files"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(name))
+        );
+    }
+}
+
+fn assert_public_keys_present(f: &Fixture) {
+    for name in ["peer-3355.pub", "guardian-3355.x25519.pub"] {
+        assert_eq!(
+            std::fs::read(f.keys.join(name)).unwrap(),
+            b"fixture material"
+        );
+    }
+}
+
+fn assert_public_keys_deleted(f: &Fixture, value: &serde_json::Value) {
+    assert_public_inventory(value);
+    assert_eq!(
+        value["inventory"]["deleted_files"],
+        serde_json::json!(["guardian-3355.x25519.pub", "peer-3355.pub"])
+    );
+    for name in ["peer-3355.pub", "guardian-3355.x25519.pub"] {
+        assert!(!f.keys.join(name).exists());
+    }
+    assert!(f.keys.join("registered-3355.pub").is_file());
+    assert!(f.keys.join("owner.pub").is_file());
+}
+
+fn assert_doctor_public_keys(identity: &serde_json::Value) {
+    let facts = identity["facts"].as_array().unwrap();
+    assert!(facts.contains(&serde_json::json!(["enrolled_public_keys", "2"])));
+    assert!(facts.contains(&serde_json::json!(["orphan_key_files", "2"])));
+    let note = identity["note"].as_str().unwrap();
+    assert!(note.contains("enrolled public keys — peer/guardian verification material, not pruned: guardian-3355.x25519.pub, peer-3355.pub"));
+    let orphan_note = note
+        .split("key files name no registered agent:")
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    assert!(!orphan_note.contains("peer-3355.pub"));
+    assert!(!orphan_note.contains("guardian-3355.x25519.pub"));
 }
