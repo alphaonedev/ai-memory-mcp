@@ -33,6 +33,24 @@ pub struct InboxArgs {
     /// Emit the raw JSON envelope.
     #[arg(long)]
     pub json: bool,
+
+    /// v1.0.0 #3470 (EPIC #3466) — block until a wake arrives, then read.
+    ///
+    /// Waits on the wake plane: the `ai-memory wake-hub` socket when one is
+    /// configured, otherwise the bounded `<=60 s` backstop poll, which is the
+    /// documented degraded mode and not an error. The read and its rendering
+    /// are byte-identical to a plain `ai-memory inbox` — waiting changes WHEN
+    /// the read happens, never WHAT it returns.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Longest time `--wait` will block, in seconds. Unbounded when omitted.
+    ///
+    /// On expiry the command still performs the read and prints the result,
+    /// so a timeout is "nothing arrived in that window", never a failure and
+    /// never a reason to skip the durable truth.
+    #[arg(long, value_name = "SECS", requires = "wait")]
+    pub timeout: Option<u64>,
 }
 
 /// `ai-memory inbox` dispatch entry.
@@ -88,6 +106,69 @@ pub fn cmd_inbox(
     Ok(())
 }
 
+/// `ai-memory inbox --wait` — block on the wake plane, then render exactly
+/// what [`cmd_inbox`] renders.
+///
+/// Without `--wait` this is a straight delegate, so the non-waiting path is
+/// byte-identical to pre-#3470.
+///
+/// # Errors
+///
+/// Every refusal from the wake-listener resolution (a missing agent id, a
+/// bundle that does not verify, a poll interval over the normative bound),
+/// plus every failure [`cmd_inbox`] can produce.
+pub async fn cmd_inbox_waiting(
+    db_path: &std::path::Path,
+    args: &InboxArgs,
+    app_config: &crate::config::AppConfig,
+    cli_agent_id: Option<&str>,
+) -> Result<()> {
+    if args.wait {
+        let listen = crate::cli::wake_listen::WakeListenArgs {
+            agent_id: args.agent_id.clone(),
+            socket: None,
+            hub_id: None,
+            key_dir: None,
+            bundle: None,
+            poll_secs: None,
+            unread_only: args.unread_only,
+            limit: args.limit,
+            json: args.json,
+            exec: None,
+            once: true,
+            // No hub configured is NOT an error: the bounded backstop poll
+            // is then the delivery mechanism, which is exactly the contract
+            // this plane advertises.
+            no_hub: false,
+        };
+        let resolved = crate::cli::wake_listen::resolve(&listen, app_config, cli_agent_id)?;
+        let timeout = args.timeout.map(std::time::Duration::from_secs);
+        match crate::cli::wake_listen::wait_for_wake(&resolved, timeout).await {
+            Ok(Some(signal)) => {
+                tracing::debug!(reason = signal.reason.label(), "inbox --wait: woken");
+            }
+            Ok(None) => {
+                tracing::debug!("inbox --wait: timed out; reading anyway");
+            }
+            Err(e) => {
+                // Degrade, never refuse: the durable rows are readable
+                // whether or not the wake plane is reachable, and refusing
+                // here would make an inbox read depend on a latency
+                // optimisation.
+                tracing::warn!(
+                    "inbox --wait: the wake plane is unavailable ({e:#}); reading immediately"
+                );
+            }
+        }
+    }
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let mut so = stdout.lock();
+    let mut se = stderr.lock();
+    let mut out = CliOutput::from_std(&mut so, &mut se);
+    cmd_inbox(db_path, args, &mut out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +183,8 @@ mod tests {
             unread_only: false,
             limit: None,
             json: true,
+            wait: false,
+            timeout: None,
         };
         {
             let mut out = env.output();
@@ -123,6 +206,8 @@ mod tests {
             unread_only: false,
             limit: Some(10),
             json: false,
+            wait: false,
+            timeout: None,
         };
         {
             let mut out = env.output();
@@ -145,6 +230,8 @@ mod tests {
             unread_only: true,
             limit: None,
             json: true,
+            wait: false,
+            timeout: None,
         };
         {
             let mut out = env.output();
