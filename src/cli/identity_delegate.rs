@@ -120,7 +120,9 @@ pub fn run(
     // granularity the verifier reads at removes the race WITHOUT widening the
     // window: the start moves EARLIER by at most 999 ms, never later, and the
     // end moves with it so the TTL stays exactly `ttl_secs`. Same remedy, and
-    // for the same reason, as `wake_sink::producer_identity::mint` (#3469).
+    // for the same reason, as the #3469 wake-sink producer credential (which
+    // is not in this base; the symbol path is deliberately not named here so
+    // the comment cannot rot into an anchor for a module that is absent).
     let now = chrono::Utc::now();
     let not_before = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let not_after = (now + chrono::Duration::seconds(ttl_secs))
@@ -262,10 +264,10 @@ mod tests {
     /// sub-second precision therefore sits in that clock's FUTURE for up to a
     /// second, so a bundle minted and presented inside one wall-clock second
     /// was judged not-yet-valid and a fresh wake-listener delegation became a
-    /// refused hello. Mirrors
-    /// `wake_sink::producer_identity::tests::a_freshly_minted_delegation_is_valid_against_a_second_truncated_clock_3469`
-    /// for the CLI-minted bundle, and additionally pins that truncating the
-    /// stamp did not shorten the window the operator asked for.
+    /// refused hello. Mirrors the #3469 wake-sink producer pin (which is not
+    /// in this base, so its symbol path is deliberately not cited here) for
+    /// the CLI-minted bundle, and additionally pins that truncating the stamp
+    /// did not shorten the window the operator asked for.
     #[test]
     fn a_freshly_minted_bundle_is_valid_against_a_second_truncated_clock_3511() {
         use crate::identity::hub_delegation::{DelegationWire, check_validity};
