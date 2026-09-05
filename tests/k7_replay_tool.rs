@@ -107,7 +107,16 @@ fn k7_replay_returns_ordered_envelope_for_synthetic_event_series() {
 
     // Envelope: { subscription_id, since, count, events: [...] }
     assert_eq!(envelope["subscription_id"].as_str(), Some(sub_id.as_str()));
-    assert_eq!(envelope["since"].as_str(), Some("1970-01-01T00:00:00Z"));
+    // #3366 (commit 6863adb7, merged 76ccbea9) canonicalizes the `since`
+    // bound to the fixed-width UTC form (micros + `Z`) BEFORE the TEXT bind,
+    // and the envelope echoes the bound that was actually applied rather than
+    // the caller's spelling of it — so `+05:00` and `Z` of the same instant
+    // report the same cutoff. This expectation was not updated with that
+    // change (#3508); the canonical form is the contract.
+    assert_eq!(
+        envelope["since"].as_str(),
+        Some("1970-01-01T00:00:00.000000Z")
+    );
     assert_eq!(envelope["count"].as_u64(), Some(3));
 
     let events = envelope["events"].as_array().expect("events array");

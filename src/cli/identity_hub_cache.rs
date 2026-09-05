@@ -10,8 +10,17 @@ use std::path::{Path, PathBuf};
 /// Export a complete allowlist; omission revokes a previously exported agent.
 #[derive(Debug, clap::Args)]
 pub struct HubCacheArgs {
+    // v1.0.0 #3508 — deliberately NOT named `--agent-id`, and this rationale
+    // is a plain comment so it never reaches the operator's `--help`. The
+    // root `--agent-id` is `global = true` (env `AI_MEMORY_AGENT_ID`) and
+    // names the CALLER, while this flag names the principals to admit.
+    // Declaring the same long under a different argument id made clap refuse
+    // to BUILD the command ("'--agent-id' in use by both 'agents' and
+    // 'agent_id'"), which broke `ai-memory completions` and `ai-memory man`
+    // in debug builds. Same hazard, same remedy as `agents subkey-certs
+    // --principal` (#3017).
     /// Principals to retain. Repeat per agent; omit all to revoke everyone.
-    #[arg(long = "agent-id")]
+    #[arg(long = "include-agent", value_name = "AGENT_ID")]
     pub agents: Vec<String>,
     /// Public cache file consumed by wake-hub --allowlist. Atomically written 0600.
     #[arg(long, value_name = "PATH")]
