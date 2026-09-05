@@ -2847,6 +2847,56 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 #3075 / FED-RQ-01 (#1936) — apply a remote-origin resolved
+    /// commit-checkpoint RESOLUTION (`/sync/push` `checkpoints[]`).
+    ///
+    /// The receive-side CRDT apply under the substrate's
+    /// **first-resolution-wins** rule. `incoming` MUST already be authorized by
+    /// the caller: the funnel verifies the resolver's Ed25519 attestation
+    /// against the resolver's locally-ENROLLED key via
+    /// [`crate::federation::receive_auth::authorize_remote_checkpoint_resolution`]
+    /// (`AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`, #125) and runs the #2708
+    /// namespace confinement BEFORE calling this method.
+    ///
+    /// ## Why this is not [`checkpoint_resolve`](MemoryStore::checkpoint_resolve)
+    ///
+    /// `checkpoint_resolve` is the LOCAL resolve verb: it stamps a resolution
+    /// this node authored and, given a keypair, SIGNS it. A receiver must never
+    /// re-sign a peer's resolution (the v0.8.0 local-substrate rule) — the
+    /// sender's `signature` / `resolver_pubkey` are persisted VERBATIM, which is
+    /// what makes the #125 separation-of-duties freeze anchor verifiable
+    /// downstream. Routing the federated apply through `checkpoint_resolve`
+    /// would forge the receiver's own attestation onto another node's verdict.
+    ///
+    /// Adapters MUST, in this order:
+    /// 1. refuse a substrate-RESERVED anchor via the shared backend-blind
+    ///    [`crate::federation::receive_auth::inbound_checkpoint_kind_authorized`],
+    ///    checked on BOTH the CLAIMED wire kind and the STORED by-id kind, with
+    ///    the stored probe resolved UNCONDITIONALLY and failing CLOSED;
+    /// 2. CAS the locally-PENDING row (`AND state = 'pending'`) so a concurrent
+    ///    local resolve or second inbound resolution can never clobber a
+    ///    committed one;
+    /// 3. on a CAS miss, INSERT verbatim when no local row exists (treating a
+    ///    lost INSERT race as the same first-resolution-wins disposition), else
+    ///    classify against the local row via
+    ///    [`crate::checkpoints::classify_against_local`].
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a storage error; the caller counts an error as
+    /// `skipped` (an honest per-item non-ack), and the batch survives.
+    async fn apply_remote_checkpoint_resolution(
+        &self,
+        _ctx: &CallerContext,
+        _incoming: &crate::models::Checkpoint,
+    ) -> StoreResult<crate::checkpoints::InboundResolutionOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_CHECKPOINT_RESOLUTION".to_string(),
+        })
+    }
+
     /// #1718 — apply a remote-origin signal via the accept-and-flag-unsigned
     /// posture (a signal is a *message*, not an authority grant — same as
     /// [`apply_remote_memory`](MemoryStore::apply_remote_memory) /

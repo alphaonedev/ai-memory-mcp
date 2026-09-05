@@ -936,15 +936,20 @@ following should **not** treat v1.0.0 as sufficient:
   is likewise per-node: catch-up decrypts and the receiver re-seals under its
   own key.
 - **Postgres federation gaps (narrowing under #3075).** On the Postgres
-  backend, the pendings / pending_decisions / checkpoints federation lanes
-  report `unsupported_on_postgres` rather than fully replicating (honest
-  non-ack, never a silent drop). Four lanes **no longer** sit in this set:
-  since #3075 the governance-STANDARD lanes (namespace_meta /
-  namespace_meta_clears) and the archive / restore lanes APPLY on a Postgres
+  backend, the pendings / pending_decisions federation lanes report
+  `unsupported_on_postgres` rather than fully replicating (honest non-ack, never
+  a silent drop). Five lanes **no longer** sit in this set: since #3075 the
+  governance-STANDARD lanes (namespace_meta / namespace_meta_clears), the
+  archive / restore lanes, and the **checkpoints** lane APPLY on a Postgres
   receiver through the SAL trait, each gated by the SAME `receive_auth` verdict
   the sqlite receiver runs (#2479 Amendment E; the #2447 by-id STORED-namespace
-  confinement; the #1848 / G30 forget-tombstone refusal on restore), so the §7
-  separation-of-duties statement below is unchanged by those migrations. The
+  confinement; the #1848 / G30 forget-tombstone refusal on restore; and, for
+  checkpoints, the FED-RQ-01 #1936 / #125 resolver-key attestation, the #2708
+  claimed-AND-stored namespace confinement, the L5 reserved-anchor refusal and
+  first-resolution-wins, with the receiver NEVER re-signing). The §7
+  separation-of-duties statement below is therefore **strengthened**, not
+  weakened, by these migrations: the commit-checkpoint freeze anchor it rests on
+  now replicates to a Postgres peer instead of stopping at it. The
   sqlite/MCP-native path is complete on every lane.
 - **Scale envelope — ARCHITECTED, not MEASURED.** ~1000 agents, ≤ 50 peers
   per block — **not 1M**. PEER dimension MEASURED (#2921 bench,

@@ -491,19 +491,24 @@ and reported through `namespace_meta_applied` /
 `namespace_meta_cleared` / `namespace_meta_refused`, and the archive /
 restore siblings **`archives[]`** + **`restores[]`**, which carry the same
 #2447 by-id confinement on the row's STORED namespace and the same
-#1848 / G30 forget-tombstone refusal on restore. A fixed set of the
+#1848 / G30 forget-tombstone refusal on restore, and — since the same
+issue — **`checkpoints[]`**, the FED-RQ-01
+([#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936))
+commit-checkpoint RESOLUTION lane, so the
+`AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`
+([#125](https://github.com/alphaonedev/ai-memory-mcp/issues/125))
+separation-of-duties binding now holds on a PostgreSQL receiver: the
+resolver's attestation is verified against the resolver's locally-ENROLLED
+key (never the wire `resolver_pubkey`), the #2708 claimed-AND-stored
+namespace confinement and the L5 reserved-anchor refusal both run, and the
+receiver NEVER re-signs — the sender's attestation is persisted verbatim
+under first-resolution-wins. A fixed set of the
 remaining subcollections is **not yet** trait-covered for a verbatim
 inbound write against the postgres store, so on a postgres receiver
 those lanes are bucketed as **honest, sender-visible non-ack**
 (`unsupported_on_postgres` in the push response) rather than being
 applied. The still-affected subcollections are:
 
-- **`checkpoints`** — federated commit-checkpoint RESOLUTION, the
-  separation-of-duties freeze anchor
-  ([#125](https://github.com/alphaonedev/ai-memory-mcp/issues/125) /
-  FED-RQ-01
-  [#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936); see
-  the FED-RQ-01 gate above).
 - **`pendings`** + **`pending_decisions`** — the governance PENDING-action
   and pending-DECISION broadcast lanes
   ([#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478)).
@@ -516,8 +521,8 @@ heterogeneous federation never mistakes "not applied" for "applied"
 not reachable-around by an inbound peer: the funnel returns before the
 sqlite-inline apply loops for these lanes run, and nothing on the
 postgres path calls the corresponding trait write. Because these lanes
-refuse-to-apply rather than write, no unverified inbound checkpoint
-resolution or pending execution can land on a postgres receiver.
+refuse-to-apply rather than write, no unverified inbound pending execution
+can land on a postgres receiver.
 
 **Single-node deployments and sqlite-backed receivers are unaffected** —
 these lanes apply fully on a sqlite receiver and on the local MCP /

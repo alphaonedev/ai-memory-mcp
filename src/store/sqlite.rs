@@ -1587,6 +1587,23 @@ impl MemoryStore for SqliteStore {
         db::delete(&conn, id).map_err(box_err)
     }
 
+    /// #3075 / FED-RQ-01 — delegates VERBATIM to
+    /// [`crate::checkpoints::apply_inbound_resolution`], the free function the
+    /// sqlite `/sync/push` `checkpoints[]` loop has always called. The reserved-
+    /// anchor refusal, the pending->resolved CAS and the first-resolution-wins
+    /// classification therefore have exactly ONE sqlite implementation, and the
+    /// receiver never re-signs (the sender's attestation is persisted verbatim).
+    async fn apply_remote_checkpoint_resolution(
+        &self,
+        _ctx: &CallerContext,
+        incoming: &crate::models::Checkpoint,
+    ) -> StoreResult<crate::checkpoints::InboundResolutionOutcome> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        crate::checkpoints::apply_inbound_resolution(&conn, incoming)
+            .map_err(|e| box_err(anyhow::Error::from(e)))
+    }
+
     /// #3075 — the #2447 `restores[]` scope probe, read through the SAME
     /// unscoped scalar accessor the sqlite receive loop already calls, so the
     /// trait route and the inline route cannot disagree about what "provably no

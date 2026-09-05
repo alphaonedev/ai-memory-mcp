@@ -990,15 +990,15 @@ pub(super) async fn sync_push_via_store(
         }
     }
 
-    // ---- pendings / pending_decisions / checkpoints --------------------
+    // ---- pendings / pending_decisions -----------------------------------
     //
     // The subcollections still not trait-covered for a verbatim inbound write
     // on postgres. Surfaced as an honest, sender-visible non-ack so a
     // heterogeneous federation reports a true count — never a silent drop,
     // never a partial apply. #3075 migrates the remaining families one at a
     // time; `archives[]` / `restores[]` / `namespace_meta[]` /
-    // `namespace_meta_clears[]` have already left this bucket (see their loops
-    // below).
+    // `namespace_meta_clears[]` / `checkpoints[]` have already left this bucket
+    // (see their loops below).
     //
     // FED-RQ-01 (#1936) — commit-checkpoint RESOLUTIONS are counted here too:
     // the checkpoints table is not yet MemoryStore-trait-covered for a
@@ -1039,8 +1039,7 @@ pub(super) async fn sync_push_via_store(
     // shared `receive_auth` verdict it wraps) BEFORE approving — the #2488
     // lesson is that the two backends break in opposite directions when a lane
     // is confined on one funnel only.
-    unsupported_on_postgres +=
-        body.pendings.len() + body.pending_decisions.len() + body.checkpoints.len();
+    unsupported_on_postgres += body.pendings.len() + body.pending_decisions.len();
 
     // #1718 — signals round-trip via the SAL trait (`apply_remote_signal`:
     // accept-and-flag-unsigned, idempotent on the UUID, forged-sig refused) —
@@ -1274,6 +1273,162 @@ pub(super) async fn sync_push_via_store(
     // not just a declared scope, so Layer 2's disposition of an unscoped
     // enrolled peer is IDENTICAL on every lane and on both backends.
     let ns_gate_enrolled = attest_cfg.has_allowlist();
+    // ---- checkpoints (FED-RQ-01 #1936, #125, #2708, L5, #3075) ---------
+    //
+    // Federated commit-checkpoint RESOLUTIONS — the separation-of-duties freeze
+    // anchor. FAIL-CLOSED authorization, sqlite-twin parity, step for step:
+    //
+    //   * only RESOLVED checkpoints federate (a pending one carries no
+    //     attestation, so there is nothing to authorize or apply);
+    //   * #2708 (CB-3, CWE-284) namespace confinement on BOTH the CLAIMED wire
+    //     namespace and the STORED by-id namespace, because the CAS keys on
+    //     `(id, state)` only: a peer scoped to `public/*` must not resolve a
+    //     `secure/ops` freeze anchor by presenting a benign wire namespace. The
+    //     stored probe is ELIDED when Layer 1 is not armed for this peer, so a
+    //     zero-config deployment pays ZERO extra reads, and FAILS CLOSED when
+    //     it cannot resolve;
+    //   * #125 / FED-RQ-01: the resolution's Ed25519 attestation is verified
+    //     against the RESOLVER'S locally-ENROLLED key — never the wire
+    //     `resolver_pubkey` (the #1718/#87 authority-lane discipline) — through
+    //     the SHARED `receive_auth::authorize_remote_checkpoint_resolution`, so
+    //     `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` now binds on a pg receiver
+    //     exactly as it does on sqlite. A forged signature is refused
+    //     UNCONDITIONALLY, regardless of the knob;
+    //   * #3049 secret screen AFTER the attestation check, so the resolver-key
+    //     verification still runs over the bytes the resolver actually signed;
+    //   * the receiver NEVER re-signs (v0.8.0 local-substrate rule): the apply
+    //     goes through `apply_remote_checkpoint_resolution`, NOT
+    //     `checkpoint_resolve`, which would stamp this node's own attestation
+    //     onto another node's verdict.
+    //
+    // Per-item skip on unverifiable / conflict — the batch survives. No storage
+    // quota (a resolution is a state change, not net-new authorship, #1544).
+    let mut checkpoints_applied = 0usize;
+    let mut checkpoints_conflicted = 0usize;
+    let require_checkpoint_sig = crate::federation::receive_auth::require_checkpoint_sig_enabled();
+    for cp in &body.checkpoints {
+        if validate::validate_id(&cp.id).is_err()
+            || validate::validate_namespace(&cp.namespace).is_err()
+        {
+            skipped += 1;
+            continue;
+        }
+        if cp.state == crate::models::CheckpointState::Pending {
+            skipped += 1;
+            continue;
+        }
+        let existing_cp_ns = if ns_scope_needs_existing {
+            let probe_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+            match app.store.checkpoint_get(&probe_ctx, &cp.id).await {
+                Ok(row) => row.map(|c| c.namespace),
+                Err(e) => {
+                    // Fail CLOSED: an unresolvable existence probe cannot be
+                    // reported as "provably no local row" — that is exactly the
+                    // input the stored-vs-claimed relocate bypass needs.
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        checkpoint_id = %cp.id,
+                        cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                        "sync_push(store): checkpoint namespace-scope pre-resolve failed for {}: \
+                         {e}; refusing the resolution (#2708 fail-closed)",
+                        cp.id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            crate::federation::receive_auth::LANE_CHECKPOINTS,
+            &cp.id,
+            &cp.namespace,
+            existing_cp_ns.as_deref(),
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        ) {
+            skipped += 1;
+            continue;
+        }
+        let enrolled = cp
+            .resolved_by
+            .as_deref()
+            .and_then(crate::identity::verify::lookup_peer_public_key);
+        let signable = crate::checkpoints::resolution_signable(cp);
+        match crate::federation::receive_auth::authorize_remote_checkpoint_resolution(
+            &signable,
+            &cp.signature,
+            enrolled.as_ref(),
+            require_checkpoint_sig,
+        ) {
+            // #3164 — `Accept(key)` is the authenticated verdict;
+            // `AcceptUnverified` is the permissive rollout window. Both apply.
+            crate::federation::receive_auth::CheckpointResolutionAuthz::Accept(_)
+            | crate::federation::receive_auth::CheckpointResolutionAuthz::AcceptUnverified => {
+                if body.dry_run {
+                    noop += 1;
+                    continue;
+                }
+                let screened_cp = crate::secret_screen::redact_checkpoint_for_storage(cp);
+                let cp = screened_cp.as_ref().unwrap_or(cp);
+                let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+                match app
+                    .store
+                    .apply_remote_checkpoint_resolution(&apply_ctx, cp)
+                    .await
+                {
+                    Ok(crate::checkpoints::InboundResolutionOutcome::Applied) => {
+                        checkpoints_applied += 1;
+                    }
+                    Ok(crate::checkpoints::InboundResolutionOutcome::Noop) => noop += 1,
+                    Ok(crate::checkpoints::InboundResolutionOutcome::Conflict) => {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            checkpoint_id = %cp.id,
+                            "sync_push(store): inbound checkpoint resolution conflicts with a \
+                             different local resolution — first-resolution-wins, keeping local \
+                             (#1936)"
+                        );
+                        checkpoints_conflicted += 1;
+                        skipped += 1;
+                    }
+                    Ok(crate::checkpoints::InboundResolutionOutcome::RefusedReservedKind) => {
+                        // PR-1 / L5 (#2708-sibling, CWE-284): a wire-reachable
+                        // `/sync/push` MUST NOT steer the substrate's own
+                        // audit-signal spine. Per-item skip; batch survives.
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            checkpoint_id = %cp.id,
+                            condition_type = %cp.condition_type.as_str(),
+                            namespace = %cp.namespace,
+                            "sync_push(store): refusing inbound resolution of a \
+                             substrate-reserved checkpoint anchor (L5 audit-signal poisoning, \
+                             #2708-sibling); skipping this entry, batch survives"
+                        );
+                        skipped += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "sync_push(store): checkpoint resolution apply failed for {}: {e}",
+                            cp.id
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+            verdict => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    checkpoint_id = %cp.id,
+                    "sync_push(store): inbound checkpoint resolution refused ({verdict:?}) (#1936)"
+                );
+                skipped += 1;
+            }
+        }
+    }
+
     // ---- archives / restores (#2447, #3075) ----------------------------
     //
     // v0.6.2 (S29) sqlite-twin parity. `archives[]` is the SOFT move of a live
@@ -1546,6 +1701,9 @@ pub(super) async fn sync_push_via_store(
             "deleted": deleted,
             // #3075 — archive / restore lane counters, sqlite-twin names.
             "archived": archived,
+            // #3075 / FED-RQ-01 — checkpoint-resolution counters, sqlite-twin names.
+            "checkpoints_applied": checkpoints_applied,
+            "checkpoints_conflicted": checkpoints_conflicted,
             "restored": restored,
             "links_applied": links_applied,
             "signals_applied": signals_applied,
@@ -1564,10 +1722,10 @@ pub(super) async fn sync_push_via_store(
             "dry_run": body.dry_run,
             "receiver_agent_id": body.sender_agent_id,
             (field_names::STORAGE_BACKEND): "postgres",
-            "note": "pendings / pending_decisions / checkpoints are sqlite-only in this \
-                     funnel; memories / deletions / links / signals / action_transitions / \
-                     archives / restores / namespace_meta / namespace_meta_clears \
-                     round-trip via the SAL trait",
+            "note": "pendings / pending_decisions are sqlite-only in this funnel; \
+                     memories / deletions / links / signals / action_transitions / \
+                     archives / restores / namespace_meta / namespace_meta_clears / \
+                     checkpoints round-trip via the SAL trait",
         })),
     )
         .into_response()

@@ -506,7 +506,17 @@ fn resolutions_match(local: &Checkpoint, incoming: &Checkpoint) -> bool {
 /// race (or arrived after) a resolution already committed locally: a
 /// byte-identical tuple is an idempotent replay, anything else is a conflict
 /// with the LOCAL resolution kept. Never a write.
-fn classify_against_local(local: &Checkpoint, incoming: &Checkpoint) -> InboundResolutionOutcome {
+///
+/// `pub(crate)` since #3075 so the POSTGRES twin of [`apply_inbound_resolution`]
+/// (`store::postgres::federation_3075`) renders the identical disposition rather
+/// than re-deriving it. A second copy of "what counts as an idempotent replay"
+/// is exactly the cross-backend drift #2488 documents: one receiver would count
+/// a replay `Noop` while the other counted it `Conflict`, and the two would
+/// disagree about whether the freeze anchor had converged.
+pub(crate) fn classify_against_local(
+    local: &Checkpoint,
+    incoming: &Checkpoint,
+) -> InboundResolutionOutcome {
     if resolutions_match(local, incoming) {
         InboundResolutionOutcome::Noop
     } else {

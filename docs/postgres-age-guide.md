@@ -1063,11 +1063,11 @@ push response) — never a silent drop, never a partial apply.
 | `links` | Link replication | **applied** | — |
 | `signals` | Signed inter-agent signals | **applied** | [#1718](https://github.com/alphaonedev/ai-memory-mcp/issues/1718) |
 | `action_transitions` | Coordination-action CAS | **applied** | [#1718](https://github.com/alphaonedev/ai-memory-mcp/issues/1718) |
+| `checkpoints` | Federated commit-checkpoint RESOLUTION (the separation-of-duties freeze anchor) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#125](https://github.com/alphaonedev/ai-memory-mcp/issues/125) / FED-RQ-01 [#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936) |
 | `archives` | Archive fanout (soft move into `archived_memories`) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) |
 | `restores` | Restore fanout (archive -> live) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) / [#1848](https://github.com/alphaonedev/ai-memory-mcp/issues/1848) |
 | `namespace_meta` | Governance-STANDARD (namespace-standard rebind) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
 | `namespace_meta_clears` | Governance-STANDARD clear | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
-| `checkpoints` | Federated commit-checkpoint RESOLUTION (the separation-of-duties freeze anchor) | `unsupported_on_postgres` | [#125](https://github.com/alphaonedev/ai-memory-mcp/issues/125) / FED-RQ-01 [#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936) |
 | `pendings` | Governance PENDING-action broadcast | `unsupported_on_postgres` | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) |
 | `pending_decisions` | Governance pending-DECISION broadcast | `unsupported_on_postgres` | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) |
 
@@ -1087,7 +1087,15 @@ What this means for an operator:
   unresolvable probe) and, on `restores[]`, the #1848 / G30
   forget-tombstone gate — so a peer still cannot undo a local forget by
   pushing a restore, on either backend. Their counters are `archived` /
-  `restored`.
+  `restored`. The `checkpoints` lane carries the FULL FED-RQ-01 chain: the
+  resolved-only filter, the #2708 claimed-AND-stored namespace confinement, the
+  `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` (#125) verification of the resolver's
+  attestation against the resolver's locally-ENROLLED key (never the wire
+  `resolver_pubkey`), the L5 substrate-reserved-anchor refusal, and
+  first-resolution-wins. The receiver NEVER re-signs — the sender's
+  `signature` / `resolver_pubkey` are persisted verbatim, which is what keeps
+  the freeze anchor verifiable downstream. Counters: `checkpoints_applied` /
+  `checkpoints_conflicted`.
 - **A non-ack lane reports non-ack; it does NOT silently drop.** The
   disposition is **refuse-to-apply and honest** — the sender sees a
   non-zero `unsupported_on_postgres` count for the batch, so a
@@ -1102,10 +1110,9 @@ What this means for an operator:
   through its LOCAL surfaces (governed by local authz rather than peer
   scope).
 - **The receive-side signature/authority gates still hold on every
-  lane.** A still-unsupported lane refuses-to-apply rather than writes,
-  so no unverified inbound checkpoint resolution or pending execution can
-  land on a postgres receiver — a safe coverage gap, not a security
-  regression.
+  lane.** A still-unsupported lane refuses-to-apply rather than writes, so no
+  unverified inbound pending execution can land on a postgres receiver — a safe
+  coverage gap, not a security regression.
 
 Postgres-receiver replication of the remaining lanes (a trait-covered
 `apply_remote_*` write per lane, routed through the existing

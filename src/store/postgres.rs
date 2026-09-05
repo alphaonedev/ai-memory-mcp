@@ -24901,6 +24901,17 @@ impl MemoryStore for PostgresStore {
 
     /// `_ctx` is deliberately discarded — see the trait doc on
     /// [`MemoryStore::apply_remote_deletion`] (#2488).
+    /// #3075 / FED-RQ-01 — delegated to `postgres/federation_3075.rs`. The
+    /// receiver NEVER re-signs; the sender's attestation is persisted verbatim.
+    async fn apply_remote_checkpoint_resolution(
+        &self,
+        ctx: &CallerContext,
+        incoming: &crate::models::Checkpoint,
+    ) -> StoreResult<crate::checkpoints::InboundResolutionOutcome> {
+        self.apply_remote_checkpoint_resolution_pg(ctx, incoming)
+            .await
+    }
+
     /// #3075 — delegated to `postgres/federation_3075.rs` (this file is at its
     /// qual_10 budget). Fail-closed scalar probe; see the trait doc.
     async fn archived_namespace_by_id(

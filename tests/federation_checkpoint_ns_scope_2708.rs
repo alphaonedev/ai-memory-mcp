@@ -34,9 +34,14 @@
 //! guards pin the regressions a naive fix would cause (zero-config unaffected;
 //! in-scope resolution still applies; first-resolution-wins idempotency held).
 //!
-//! Postgres note: the pg funnel buckets `checkpoints[]` as
-//! `unsupported_on_postgres` (#1936) — it never applies a federated resolution
-//! — so this bypass is sqlite/MCP-native-only and so is the fix + this test.
+//! Postgres note (UPDATED at #3075): this file used to say the pg funnel
+//! bucketed `checkpoints[]` as `unsupported_on_postgres` and never applied a
+//! federated resolution, so the bypass — and the fix — were sqlite-only. #3075
+//! trait-covers the lane, so the pg receiver applies resolutions and the #2708
+//! confinement is live there too. It is the SAME verdict
+//! (`receive_auth::inbound_write_namespace_authorized` on the claimed AND
+//! stored namespace), called by both funnels; the postgres cell is
+//! `tests/fed_checkpoint_lane_3075_pg.rs::checkpoint_namespace_scope_gated_on_postgres_3075_2708`.
 //!
 //! Env-serialised under one async mutex: the funnel reads `AI_MEMORY_KEY_DIR`
 //! (resolver enrollment), `AI_MEMORY_FED_PEER_ATTESTATION` (the peer scope), and

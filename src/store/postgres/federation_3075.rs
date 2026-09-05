@@ -139,3 +139,186 @@ impl PostgresStore {
         self.archive_restore(&op_ctx, id).await
     }
 }
+
+/// The pending->resolved COMPARE-AND-SWAP behind
+/// [`PostgresStore::apply_remote_checkpoint_resolution_pg`] — the postgres twin
+/// of `checkpoints::APPLY_INBOUND_RESOLUTION_CAS_SQL`.
+///
+/// The `AND state = $9` guard is what makes first-resolution-wins hold under
+/// concurrency: without it the read that decided "local is pending" and the
+/// write that acts on that decision are a TOCTOU window in which a
+/// concurrently-committed local resolution is silently overwritten (#2396) —
+/// and the row being overwritten is a separation-of-duties freeze anchor.
+const SQL_APPLY_INBOUND_RESOLUTION_CAS: &str = "UPDATE checkpoints SET state = $1, resolved_by = $2, resolution = $3, \
+        resolution_note = $4, resolved_at = $5, signature = $6, resolver_pubkey = $7 \
+     WHERE id = $8 AND state = $9";
+
+/// The by-id STORED `(condition_type, namespace)` probe feeding the L5
+/// reserved-anchor gate. Scalar-ish (two columns, no JSON/attestation mapping)
+/// and FAIL-CLOSED at the call site.
+const SQL_CHECKPOINT_KIND_NS_BY_ID: &str =
+    "SELECT condition_type, namespace FROM checkpoints WHERE id = $1";
+
+impl PostgresStore {
+    /// #3075 / FED-RQ-01 (#1936) — see
+    /// [`crate::store::MemoryStore::apply_remote_checkpoint_resolution`].
+    ///
+    /// Step-for-step the sqlite `checkpoints::apply_inbound_resolution`:
+    ///
+    /// 0. L5 reserved-anchor refusal on the CLAIMED wire kind AND the STORED
+    ///    by-id kind, through the SHARED backend-blind
+    ///    `receive_auth::inbound_checkpoint_kind_authorized`. The stored probe
+    ///    runs UNCONDITIONALLY (not only when namespace-scope is armed) and
+    ///    PROPAGATES a read error, because a peer must not be able to present a
+    ///    benign wire kind to resolve a stored `_audit_witness` anchor by id.
+    /// 1. CAS the locally-PENDING row.
+    /// 2. On a CAS miss: INSERT verbatim when no local row exists, treating a
+    ///    lost INSERT race (PRIMARY KEY violation) as the same
+    ///    first-resolution-wins disposition; otherwise classify against the
+    ///    local row with the SHARED `checkpoints::classify_against_local`.
+    ///
+    /// The receiver NEVER re-signs: `signature` / `resolver_pubkey` travel on
+    /// `incoming` and are written verbatim by both the CAS and the INSERT.
+    pub(super) async fn apply_remote_checkpoint_resolution_pg(
+        &self,
+        ctx: &CallerContext,
+        incoming: &crate::models::Checkpoint,
+    ) -> StoreResult<crate::checkpoints::InboundResolutionOutcome> {
+        use crate::checkpoints::InboundResolutionOutcome;
+
+        self.gate_record_stop().await?;
+
+        // Step 0 — reserved-anchor gate on claimed AND stored kind.
+        let stored_kind_ns = self.checkpoint_kind_ns_by_id_pg(&incoming.id).await?;
+        let stored_ref = stored_kind_ns
+            .as_ref()
+            .map(|(kind, ns)| (*kind, ns.as_str()));
+        if !crate::federation::receive_auth::inbound_checkpoint_kind_authorized(
+            incoming.condition_type,
+            &incoming.namespace,
+            stored_ref,
+        ) {
+            return Ok(InboundResolutionOutcome::RefusedReservedKind);
+        }
+
+        // Step 1 — CAS the locally-PENDING row.
+        let updated = sqlx::query(SQL_APPLY_INBOUND_RESOLUTION_CAS)
+            .bind(incoming.state.as_str())
+            .bind(&incoming.resolved_by)
+            .bind(&incoming.resolution)
+            .bind(&incoming.resolution_note)
+            .bind(incoming.resolved_at)
+            .bind(&incoming.signature)
+            .bind(&incoming.resolver_pubkey)
+            .bind(&incoming.id)
+            .bind(crate::models::CheckpointState::Pending.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("apply_remote_checkpoint_resolution cas", e))?
+            .rows_affected();
+        if updated > 0 {
+            return Ok(InboundResolutionOutcome::Applied);
+        }
+
+        // Step 2 — no local row, or already resolved (possibly by a racer).
+        let Some(local) = self.checkpoint_row_by_id_pg(&incoming.id).await? else {
+            return match self.insert_checkpoint_verbatim_pg(ctx, incoming).await {
+                Ok(()) => Ok(InboundResolutionOutcome::Applied),
+                // Lost the INSERT race — the winner's row landed between our
+                // read and our write. Fall back to first-resolution-wins
+                // against whatever is now committed; never overwrite.
+                Err(e) if is_unique_violation(&e) => {
+                    match self.checkpoint_row_by_id_pg(&incoming.id).await? {
+                        Some(local) => {
+                            Ok(crate::checkpoints::classify_against_local(&local, incoming))
+                        }
+                        None => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+        };
+        Ok(crate::checkpoints::classify_against_local(&local, incoming))
+    }
+
+    /// The STORED `(condition_type, namespace)` probe. FAIL-CLOSED: an
+    /// unresolvable read PROPAGATES rather than being reported as "provably no
+    /// local row", which is the input the stored-vs-claimed bypass needs.
+    async fn checkpoint_kind_ns_by_id_pg(
+        &self,
+        id: &str,
+    ) -> StoreResult<Option<(crate::models::ConditionType, String)>> {
+        let row: Option<(String, String)> = sqlx::query_as(SQL_CHECKPOINT_KIND_NS_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("checkpoint_kind_ns_by_id", e))?;
+        let Some((kind, namespace)) = row else {
+            return Ok(None);
+        };
+        // An unparseable stored `condition_type` is a CORRUPT row, not an
+        // absent one: refuse rather than silently treating it as a benign kind
+        // the reserved-anchor gate would wave through.
+        let condition_type = crate::models::ConditionType::from_str(&kind).ok_or_else(|| {
+            super::StoreError::Backend(crate::store::BoxBackendError::new(format!(
+                "checkpoint {id} has an unrecognised stored condition_type {kind:?}"
+            )))
+        })?;
+        Ok(Some((condition_type, namespace)))
+    }
+
+    /// Full-row read used by the first-resolution-wins classification. A
+    /// checkpoint carries no at-rest envelope, so — unlike the memories lane
+    /// (#2488) — a full-row map here cannot fail for a decrypt reason.
+    async fn checkpoint_row_by_id_pg(
+        &self,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        sqlx::query(super::PG_CHECKPOINT_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("checkpoint_row_by_id", e))?
+            .as_ref()
+            .map(super::pg_row_to_checkpoint)
+            .transpose()
+    }
+
+    /// The FIRST-LANDING arm: the subject and its resolution arrive together,
+    /// so the whole wire row is inserted VERBATIM — attestation columns
+    /// included, never re-signed.
+    ///
+    /// Composes [`PostgresStore::checkpoint_create`], which already binds all
+    /// sixteen columns verbatim (including `state` / `resolved_*` /
+    /// `signature` / `resolver_pubkey`) and is already record-stop gated. A
+    /// second hand-written INSERT here would be a column list to keep in sync
+    /// with that one forever — the drift hazard #3075 is deliberately not
+    /// creating — and it would need its own gate, which is exactly the class
+    /// `tests/record_stop_structural_b7.rs` exists to catch.
+    async fn insert_checkpoint_verbatim_pg(
+        &self,
+        ctx: &CallerContext,
+        cp: &crate::models::Checkpoint,
+    ) -> StoreResult<()> {
+        self.checkpoint_create(ctx, cp).await.map(|_id| ())
+    }
+}
+
+/// Whether a `StoreError` carries a postgres UNIQUE / PRIMARY-KEY violation —
+/// the shape a losing concurrent INSERT of the same checkpoint id takes
+/// (`checkpoints.id` is the PRIMARY KEY). The sqlite twin asks the same
+/// question of `rusqlite::ErrorCode::ConstraintViolation`; both turn a lost
+/// insert race into the documented first-resolution-wins disposition instead of
+/// a hard error.
+fn is_unique_violation(err: &super::StoreError) -> bool {
+    let super::StoreError::Backend(source) = err else {
+        return false;
+    };
+    // sqlx surfaces the SQLSTATE in the rendered message; the class is
+    // `23505 unique_violation`. Matching the CODE (not prose) keeps this
+    // independent of the server's locale and of sqlx's wrapper wording.
+    source.to_string().contains(PG_UNIQUE_VIOLATION_SQLSTATE)
+}
+
+/// SQLSTATE `23505` — `unique_violation`.
+const PG_UNIQUE_VIOLATION_SQLSTATE: &str = "23505";
