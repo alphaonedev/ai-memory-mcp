@@ -221,6 +221,40 @@ that was never proved. Once a key is explicitly revoked, a stale predecessor
 signature cannot reopen it; only a verified M-of-N guardian recovery can
 advance the closed head, recorded as `bind_authority = guardian_recovery`.
 
+### Historical key eligibility on federation receive (#3502)
+
+Bind the author's key before creating and signing memories. Reverification
+uses the signed `created_at`, not receive time or `updated_at`. Once key history
+exists, only keys in its `[bound_at, superseded_at)` windows, expanded by the
+verifier's inclusive 300-second clock allowance, are candidates. A key bound
+later than that allowance cannot verify an older memory, even if it is the
+current key. Neither the current binding nor the key directory overrides a
+history miss. This prevents a later binding from granting authority over older
+signed envelopes. Both SQLite and PostgreSQL enforce this rule.
+
+A push batch can return HTTP 200 with refused items. `skipped` alone cannot
+tell you which items, so inspect `attestation_rejections`: an array of
+`{memory_id, cause}`, one entry per refused attestation, using the memory id
+the pusher itself submitted. The closed cause set is
+
+| `cause` | Meaning | Operator remedy |
+| --- | --- | --- |
+| `unenrolled_author_strict` | The attributed author has no key enrolled at this node at all. | Enroll the author's Ed25519 key here. |
+| `no_eligible_key_at_created_at` | The author **is** enrolled, but no key-history version is live at the signed `created_at` (skew-expanded), and history never falls back to the current key. | Nothing to re-enroll — the author must bind its key **before** it signs. Rows already signed before the binding are unverifiable here by construction. |
+| `missing_signature` | No `metadata.write_signature` under the strict write-sig flip. | The author must emit the signature at store time. |
+| `forged_or_malformed` | A signature was present and did not verify. | Investigate: this is a tampered or mis-derived envelope. |
+
+Each refusal also emits a receiver WARN carrying the memory id, the signed
+`created_at`, the attributed author, the sender, the `cause` and the `backend`
+(`sqlite`/`postgres`). The rejected memory is **not** stored; other eligible
+memories in the same batch still apply. The array is retained if a later quota
+refusal turns the same response into HTTP 429, so a partially applied batch is
+never reported as a clean success.
+
+These four tokens are observability-only. They are deliberately *not* part of
+the sender-side DLQ quarantine taxonomy (`unenrolled_peer`, `quota`, …), which
+classifies pushes that FAILED; a 200-with-refusals never enters that queue.
+
 ### Step 4 — Sign on each write surface
 
 **CLI** — add `--sign` (loads `<agent-id>.priv` locally, signs, stamps

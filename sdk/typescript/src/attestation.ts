@@ -44,9 +44,11 @@
  * ## Enrolling the key
  *
  * A signature only attests if the daemon has the matching public key bound to
- * the agent. Bind it once (admin-gated) via `PUT /api/v1/agents/{id}/pubkey`
- * with body `{"pubkey_b64": "..."}` — {@link AgentSigningKey.publicKeyBase64}
- * emits the accepted form and `client.bindAgentPubkey()` calls the route.
+ * the agent. Bind it before signing writes with
+ * `client.bindAgentPubkey(agentId, signingKey)`. This issues an admin-gated
+ * `POST /api/v1/agents/{id}/pubkey/challenge`, signs its transcript, and answers
+ * `PUT /api/v1/agents/{id}/pubkey` with `{pubkey_b64, nonce, proof_b64}`.
+ * A bare public key is insufficient.
  * Without a bound key the daemon cannot verify and still returns 403
  * (fail-closed, by design).
  *

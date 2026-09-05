@@ -447,6 +447,32 @@ pub const CAUSE_MISSING_SIGNATURE: &str = "missing_signature";
 /// [`CAUSE_MISSING_SIGNATURE`]).
 pub const CAUSE_FORGED_OR_MALFORMED: &str = "forged_or_malformed";
 
+/// v1.0.0 #3502 — closed-set attestation-refusal cause label: the attributed
+/// author DOES have an authoritative `agent_pubkey_history` at this node, but
+/// NO key version's `[bound_at, superseded_at)` window (expanded by the
+/// [`crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS`] allowance) covers
+/// the envelope's SIGNED `created_at`, so
+/// [`crate::storage::agent_pubkey_for_attestation_at`] resolved zero
+/// candidates and history must never fall back to the current/flat key.
+///
+/// Distinct from [`CAUSE_UNENROLLED_AUTHOR_STRICT`] because the operator
+/// remedy is the OPPOSITE: the author's key is already enrolled here, so
+/// enrolling it again changes nothing. The row is unverifiable at this node by
+/// construction — the author must bind its key BEFORE it signs (a key bound
+/// later can never vouch for an older signed envelope, which is exactly the
+/// retroactive-authority hole #3464 closed). This token also covers the
+/// fail-closed sentinel [`crate::handlers::federation_receive::historical_author_key_or_warn`]
+/// synthesizes when the history lookup itself ERRORS (authoritative-empty, no
+/// fallback); that path emits its own distinct WARN naming the lookup failure.
+///
+/// Observability-only, exactly like [`CAUSE_MISSING_SIGNATURE`] /
+/// [`CAUSE_FORGED_OR_MALFORMED`]: a `tracing` field plus the
+/// `attestation_rejections[]` entry on the `/sync/push` response, NOT a member
+/// of the [`crate::federation::push_dlq::classify_quarantine_cause`] DLQ
+/// taxonomy (a 200-with-refusals never enters the sender's DLQ), so the
+/// `metrics.rs` quarantine-cause enumeration is deliberately unchanged.
+pub const CAUSE_NO_ELIGIBLE_KEY_AT_CREATED_AT: &str = "no_eligible_key_at_created_at";
+
 /// Resolve a DATA-lane fed-sig requirement against its (flip-ready) default:
 ///
 /// - an explicit FALSY token (`0`/`false`/`no`/`off`, trimmed) is the

@@ -445,9 +445,10 @@ class AsyncAiMemoryClient:
             nonce=challenge["nonce"],
             expires_at=challenge["expires_at"],
         )
+        encoded_agent_id = encode_path_segment(agent_id)
         return await self._request(
             "PUT",
-            f"/api/v1/agents/{encode_path_segment(agent_id)}/pubkey",
+            f"/api/v1/agents/{encoded_agent_id}/pubkey",
             json_body={
                 "pubkey_b64": pubkey_b64,
                 "nonce": challenge["nonce"],
