@@ -86,6 +86,33 @@ pub const CONSOLIDATE_MAX_CLUSTER_SIZE: usize = 8;
 /// / report memories).
 pub const CURATOR_NAMESPACE: &str = "_curator";
 
+/// v1.0.0 #3345 — the namespace the per-sweep self-report lands in. One
+/// named const so the writer, the daily rollup, the `--prune-reports`
+/// backlog collapse and the tests all address the same rows.
+pub const CURATOR_REPORTS_NAMESPACE: &str = "_curator/reports";
+
+/// v1.0.0 #3345 — the namespace the DAILY rollup lands in (one row per UTC
+/// date). A child of [`CURATOR_REPORTS_NAMESPACE`], so it inherits the same
+/// substrate posture (`_curator/` prefix) without a second SSOT entry.
+pub const CURATOR_REPORTS_DAILY_NAMESPACE: &str = "_curator/reports/daily";
+
+/// v1.0.0 #3345 — how long a PER-SWEEP curator self-report stays live.
+///
+/// The measured defect: a 5-minute sweep interval wrote 287 reports/day and
+/// NOTHING ever reaped them, so `_curator/reports` reached 24,930 rows against
+/// 512 real memories. `Tier::Short`'s own 6 h default would have been enough to
+/// bound them, but the retention the issue asks for is a full day of per-sweep
+/// detail, so the writer stamps this explicitly rather than inheriting the tier
+/// default. The day's detail is not lost when a row expires: the rollup folds
+/// every cycle into the day's summary BEFORE any of the day's rows can reach
+/// this TTL, and GC archives what it reaps when `archive_on_gc` is on.
+pub const CURATOR_REPORT_TTL_HOURS: i64 = 24;
+
+/// v1.0.0 #3345 — how long a DAILY rollup row stays live. One row per day, so
+/// this is a ~90-row steady state — bounded, and long enough that an operator
+/// auditing a quarter of curator activity still has it.
+pub const CURATOR_REPORT_ROLLUP_TTL_DAYS: i64 = 90;
+
 /// LLM surface the autonomy passes use. Implemented for `OllamaClient`
 /// in prod and stubbed in tests. The `auto_tag` and `detect_contradiction`
 /// methods are here for completeness — the autonomy passes themselves
@@ -976,8 +1003,13 @@ pub fn persist_self_report(
         valid_from: None,
         valid_until: None,
         id: uuid::Uuid::new_v4().to_string(),
-        tier: Tier::Mid,
-        namespace: format!("{CURATOR_NAMESPACE}/reports"),
+        // v1.0.0 #3345 — SHORT tier with an EXPLICIT 24 h expiry. Pre-fix this
+        // row was `Tier::Mid` with `expires_at: None`, i.e. a permanent
+        // first-class memory minted once per sweep: 287/day on the certified
+        // f1 tier, 24,930 rows (97% of the store) against 512 real memories.
+        // A self-report is bookkeeping ABOUT the store, not knowledge IN it.
+        tier: Tier::Short,
+        namespace: CURATOR_REPORTS_NAMESPACE.to_string(),
         title: format!("curator cycle @ {ts}"),
         content: serde_json::to_string_pretty(&body)?,
         tags: vec!["_curator".to_string(), "_report".to_string()],
@@ -988,7 +1020,10 @@ pub fn persist_self_report(
         created_at: ts.clone(),
         updated_at: ts,
         last_accessed_at: None,
-        expires_at: None,
+        // v1.0.0 #3345 — bounded retention (see CURATOR_REPORT_TTL_HOURS).
+        // Stamped explicitly rather than left to the tier default so the
+        // retention this row promises is legible in the row itself.
+        expires_at: Some((now + chrono::Duration::hours(CURATOR_REPORT_TTL_HOURS)).to_rfc3339()),
         // #2110 — curator self-report rows are substrate-authored (direct
         // `db::insert`); record the substrate why_trace.
         metadata: serde_json::json!({
@@ -1983,6 +2018,23 @@ mod tests {
             "the sanctioned internal write must retain substrate provenance"
         );
         assert!(reports[0].content.contains("memories_consolidated"));
+        // v1.0.0 #3345 — bounded retention. Pre-fix this row was `Tier::Mid`
+        // with `expires_at: None`: a permanent first-class memory minted once
+        // per sweep, which reached 24,930 rows on the certified f1 tier.
+        assert_eq!(
+            reports[0].tier,
+            Tier::Short,
+            "#3345: a self-report is bookkeeping, not a mid-tier memory"
+        );
+        let expiry = reports[0]
+            .expires_at
+            .as_deref()
+            .expect("#3345: every self-report carries an explicit expiry");
+        let parsed = chrono::DateTime::parse_from_rfc3339(expiry).expect("RFC3339 expiry");
+        assert!(
+            parsed <= chrono::Utc::now() + chrono::Duration::hours(CURATOR_REPORT_TTL_HOURS),
+            "#3345: retention must be bounded at {CURATOR_REPORT_TTL_HOURS}h, got {expiry}"
+        );
     }
 
     #[test]

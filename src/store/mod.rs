@@ -1464,6 +1464,36 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 #3345 — collapse the historical `_curator/reports` backlog on
+    /// this backend: fold every affected UTC day into one daily summary row,
+    /// then stamp the retention the per-sweep rows should have carried.
+    ///
+    /// `apply == false` is a DRY RUN: nothing is written and the returned
+    /// counts describe what a real run would act on. Nothing is ever DELETED
+    /// on either path — a stamped row becomes an ordinary expired row that the
+    /// audited GC reaps (and archives, under `archive_on_gc`), so the collapse
+    /// stays reversible and an operator who lengthened retention by hand never
+    /// has it silently shortened.
+    ///
+    /// Admin-only, like [`Self::list_unembedded`]: it rewrites substrate rows
+    /// across every owner.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnsupportedCapability`] on an adapter that cannot express
+    /// the collapse — never `Ok` with zero counts, because "this backend
+    /// cannot do it" and "there was nothing to do" must not be the same value
+    /// (the #2639 rule).
+    async fn prune_curator_reports(
+        &self,
+        _ctx: &CallerContext,
+        _apply: bool,
+    ) -> StoreResult<crate::curator::reports::PruneReport> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "PRUNE_CURATOR_REPORTS".to_string(),
+        })
+    }
+
     /// #1579 A4 — write a batch of freshly-computed embeddings in as
     /// few round-trips as the backend allows. Mirrors the sqlite-side
     /// `db::set_embeddings_batch` bounded-batch shape (F5.6 semantics:

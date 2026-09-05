@@ -321,6 +321,132 @@ pub const SUBSTRATE_NAMESPACE_PREFIXES: &[&str] = &[
 /// v1.0.0 #3348 — substrate-owned namespaces with no trailing separator.
 pub const SUBSTRATE_NAMESPACES_EXACT: &[&str] = &["_agents", "_agent_sessions", "_standards"];
 
+/// v1.0.0 #3345 — every entry of the two substrate lists must be safe to
+/// splice into a SQL string literal, because [`SQL_AND_NOT_SUBSTRATE`] builds
+/// its predicate from them at process start. The lists are compile-time
+/// constants (no caller ever extends them at runtime), so this is checked
+/// STRUCTURALLY at compile time rather than defended against at query time:
+/// a future entry carrying a quote, a backslash, or a `%`/`_` LIKE
+/// metacharacter fails the build instead of emitting malformed — or silently
+/// over-matching — SQL on both backends (ERRORS-09: make the illegal state
+/// unrepresentable rather than validated).
+///
+/// The allowed alphabet is exactly what the current namespaces use: ASCII
+/// alphanumerics plus `_ / : - .`.
+const fn substrate_entries_are_sql_literal_safe(list: &[&str]) -> bool {
+    let mut i = 0;
+    while i < list.len() {
+        let bytes = list[i].as_bytes();
+        if bytes.is_empty() {
+            return false;
+        }
+        let mut j = 0;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if !(c.is_ascii_alphanumeric()
+                || c == b'_'
+                || c == b'/'
+                || c == b':'
+                || c == b'-'
+                || c == b'.')
+            {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    substrate_entries_are_sql_literal_safe(SUBSTRATE_NAMESPACE_PREFIXES),
+    "SUBSTRATE_NAMESPACE_PREFIXES entry is not safe to splice into SQL (#3345)"
+);
+const _: () = assert!(
+    substrate_entries_are_sql_literal_safe(SUBSTRATE_NAMESPACES_EXACT),
+    "SUBSTRATE_NAMESPACES_EXACT entry is not safe to splice into SQL (#3345)"
+);
+
+/// The unqualified column every [`SQL_AND_NOT_SUBSTRATE`] call site selects
+/// from (`memories.namespace`, never aliased at these sites).
+pub const SQL_NAMESPACE_COLUMN: &str = "namespace";
+
+/// v1.0.0 #3345 — the SQL form of [`is_substrate_namespace`], as a trailing
+/// ` AND NOT (...)` fragment over an unqualified `namespace` column.
+///
+/// ## Why a SQL twin of a Rust predicate exists at all
+///
+/// #3348 withheld substrate rows from every ambient READ. It could do that in
+/// Rust because every read funnel materialises its rows first. The embedding
+/// backfill cannot: it is a `SELECT ... WHERE embedding IS NULL LIMIT n` whose
+/// whole job is to choose which rows to spend money on, so a Rust-side filter
+/// applied after the scan would still hand the substrate rows to the embedder
+/// on the next page — the posture has to be IN the predicate, and therefore in
+/// SQL.
+///
+/// Derived from the SAME two const lists [`is_substrate_namespace`] reads, so
+/// a namespace added to the substrate SSOT inherits the no-embed posture with
+/// no second list to keep in sync. The compile-time
+/// [`substrate_entries_are_sql_literal_safe`] assertions above are what make
+/// the splice sound.
+///
+/// ## Portability
+///
+/// `substr(col, 1, n)` and `IN (...)` are the intersection of SQLite and
+/// PostgreSQL, so ONE fragment serves both backends. Deliberately NOT
+/// `LIKE '_curator/%'`: `_` is a single-character LIKE WILDCARD in both
+/// engines, so the obvious spelling would also match `Xcurator/…` — the exact
+/// class of silent over-match that would withhold an ordinary caller namespace
+/// from the embedder and quietly degrade that caller's recall.
+///
+/// ## Sargability
+///
+/// The fragment is a function-of-column predicate and therefore not index-
+/// seekable, by design: it is always ANDed onto an already-selective
+/// `embedding IS NULL` scan whose result set is exactly what it shrinks. The
+/// cost it adds is one `substr` per candidate row; the cost it removes is a
+/// paid embedding call per substrate row.
+pub static SQL_AND_NOT_SUBSTRATE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| substrate_exclusion_sql(SQL_NAMESPACE_COLUMN));
+
+/// v1.0.0 #3345 — the POSITIVE SQL twin of [`is_substrate_namespace`]: a bare
+/// boolean expression over an unqualified `namespace` column, true exactly for
+/// the rows that predicate accepts. [`SQL_AND_NOT_SUBSTRATE`] is its negation;
+/// the count surfaces (`stats.substrate`) use it directly, so "hidden from the
+/// embedder" and "counted as substrate" can never describe different row sets.
+pub static SQL_IS_SUBSTRATE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| substrate_match_sql(SQL_NAMESPACE_COLUMN));
+
+/// v1.0.0 #3345 — build the substrate-matching boolean expression for
+/// `column`. Public for the truth-table tests and for any future call site
+/// that qualifies the column differently; production reads the cached
+/// [`SQL_IS_SUBSTRATE`] / [`SQL_AND_NOT_SUBSTRATE`].
+#[must_use]
+pub fn substrate_match_sql(column: &str) -> String {
+    let exact = SUBSTRATE_NAMESPACES_EXACT
+        .iter()
+        .map(|ns| format!("'{ns}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut clauses = Vec::with_capacity(SUBSTRATE_NAMESPACE_PREFIXES.len() + 1);
+    clauses.push(format!("{column} IN ({exact})"));
+    for prefix in SUBSTRATE_NAMESPACE_PREFIXES {
+        clauses.push(format!(
+            "substr({column}, 1, {len}) = '{prefix}'",
+            len = prefix.len()
+        ));
+    }
+    clauses.join(" OR ")
+}
+
+/// v1.0.0 #3345 — build the ` AND NOT (...)` substrate-exclusion fragment for
+/// `column`, as the negation of [`substrate_match_sql`].
+#[must_use]
+pub fn substrate_exclusion_sql(column: &str) -> String {
+    format!(" AND NOT ({})", substrate_match_sql(column))
+}
+
 /// v1.0.0 #3348 — is `ns` a substrate-owned namespace?
 #[must_use]
 pub fn is_substrate_namespace(ns: &str) -> bool {
@@ -339,6 +465,31 @@ pub fn is_substrate_namespace(ns: &str) -> bool {
 #[must_use]
 pub fn substrate_namespace_requested(requested: Option<&str>) -> bool {
     requested.is_some_and(is_substrate_namespace)
+}
+
+/// v1.0.0 #3345 — the LISTING form of [`substrate_namespace_requested`].
+///
+/// A namespace listing (`GET /api/v1/namespaces?prefix=…`) is filtered by a
+/// HIERARCHICAL prefix rather than an exact namespace, so the opt-in has to
+/// recognise a prefix that leads INTO substrate space as well as one that
+/// names it: `?prefix=_curator` must reach `_curator/reports` exactly as
+/// `?prefix=_curator/reports` does, or the opt-in would be a trap that
+/// silently returns an empty page for a perfectly reasonable request.
+///
+/// An EMPTY prefix is not an opt-in — every namespace has it as an ancestor,
+/// so honouring it would re-open the ambient listing this closes.
+#[must_use]
+pub fn substrate_listing_requested(prefix: Option<&str>) -> bool {
+    prefix.is_some_and(|p| {
+        !p.is_empty()
+            && (is_substrate_namespace(p)
+                || SUBSTRATE_NAMESPACE_PREFIXES
+                    .iter()
+                    .any(|sp| sp.starts_with(p))
+                || SUBSTRATE_NAMESPACES_EXACT
+                    .iter()
+                    .any(|ns| ns.starts_with(p)))
+    })
 }
 
 /// v1.0.0 #3348 — the canonical read-surface predicate. Every ambient read
@@ -816,5 +967,137 @@ mod legacy_inbox_3401_tests {
         memory.namespace = "_messages/ai:recipient".into();
         memory.metadata[crate::META_KEY_TARGET_AGENT_ID] = json!("ai:other");
         assert!(!is_visible_to_caller(&memory, "ai:recipient"));
+    }
+}
+
+#[cfg(test)]
+mod substrate_sql_3345_tests {
+    //! v1.0.0 #3345 — the SQL twin of [`super::is_substrate_namespace`] must
+    //! accept EXACTLY the namespaces the Rust predicate accepts.
+    //!
+    //! The failure this pins is not hypothetical: the obvious spelling
+    //! (`namespace LIKE '_curator/%'`) silently over-matches, because `_` is a
+    //! single-character LIKE wildcard in both SQLite and PostgreSQL — it would
+    //! also match `Xcurator/…`, withholding an ordinary caller's namespace from
+    //! the embedder and quietly degrading their recall to keyword-only.
+
+    use super::{
+        SQL_AND_NOT_SUBSTRATE, SQL_IS_SUBSTRATE, is_substrate_namespace,
+        substrate_listing_requested,
+    };
+
+    /// A corpus that spans every substrate shape plus the near-misses that a
+    /// wildcard or a bare `starts_with` would wrongly capture.
+    const CORPUS: &[&str] = &[
+        "_curator/reports",
+        "_curator/reports/daily",
+        "_curator/rollback",
+        "_messages/ai:carol",
+        "_inbox/ai:carol",
+        "_subscriptions/ai:carol",
+        "_standard:proj",
+        "_agents",
+        "_agent_sessions",
+        "_standards",
+        // Near-misses — every one of these is an ORDINARY namespace.
+        "Xcurator/reports",
+        "acurator/reports",
+        "_curator",
+        "_agentsx",
+        "_shared/alice->bob",
+        "proj/notes",
+        "team/_messages",
+        "global",
+    ];
+
+    #[test]
+    fn the_sql_predicate_matches_the_rust_predicate_row_for_row() {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        conn.execute("CREATE TABLE memories (namespace TEXT NOT NULL)", [])
+            .expect("create");
+        for ns in CORPUS {
+            conn.execute("INSERT INTO memories (namespace) VALUES (?1)", [ns])
+                .expect("insert");
+        }
+
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT namespace FROM memories WHERE {} ORDER BY namespace",
+                *SQL_IS_SUBSTRATE
+            ))
+            .expect("prepare match");
+        let sql_matched: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect");
+
+        let mut rust_matched: Vec<String> = CORPUS
+            .iter()
+            .filter(|ns| is_substrate_namespace(ns))
+            .map(|ns| (*ns).to_string())
+            .collect();
+        rust_matched.sort();
+
+        assert_eq!(
+            sql_matched, rust_matched,
+            "#3345: the SQL and Rust forms of the substrate posture must not drift"
+        );
+        assert!(
+            !sql_matched.iter().any(|ns| ns == "Xcurator/reports"),
+            "#3345: `_` must not behave as a LIKE wildcard — an ordinary namespace \
+             one character away from a substrate one must stay embeddable"
+        );
+    }
+
+    #[test]
+    fn the_exclusion_fragment_is_the_exact_complement() {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        conn.execute("CREATE TABLE memories (namespace TEXT NOT NULL)", [])
+            .expect("create");
+        for ns in CORPUS {
+            conn.execute("INSERT INTO memories (namespace) VALUES (?1)", [ns])
+                .expect("insert");
+        }
+        // The fragment is written to be ANDed onto an existing WHERE clause.
+        let kept: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM memories WHERE 1 = 1{}",
+                    *SQL_AND_NOT_SUBSTRATE
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        let expected = i64::try_from(
+            CORPUS
+                .iter()
+                .filter(|ns| !is_substrate_namespace(ns))
+                .count(),
+        )
+        .expect("fits i64");
+        assert_eq!(
+            kept, expected,
+            "#3345: the exclusion fragment must keep exactly the non-substrate rows"
+        );
+    }
+
+    #[test]
+    fn a_listing_prefix_opts_in_by_naming_or_leading_into_substrate_space() {
+        assert!(substrate_listing_requested(Some("_curator/reports")));
+        assert!(
+            substrate_listing_requested(Some("_curator")),
+            "an ANCESTOR prefix must opt in, or `?prefix=_curator` is a trap \
+             that returns an empty page"
+        );
+        assert!(substrate_listing_requested(Some("_agents")));
+        assert!(!substrate_listing_requested(Some("proj")));
+        assert!(
+            !substrate_listing_requested(Some("")),
+            "an empty prefix is an ancestor of everything — honouring it would \
+             re-open the ambient listing this closes"
+        );
+        assert!(!substrate_listing_requested(None));
     }
 }

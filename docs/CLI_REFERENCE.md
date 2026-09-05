@@ -613,17 +613,39 @@ ai-memory restore --from /var/backups/ai-memory --yes
 | `--json` | bool | — | Machine-parseable report. |
 | `--rollback <id>` | string | — | Reverse one rollback-log entry. |
 | `--rollback-last <N>` | usize | — | Reverse the N most recent. |
+| `--prune-reports` | bool | — | #3345: collapse the historical `_curator/reports` backlog. **Dry run** unless `--apply`. |
+| `--apply` | bool | — | Apply `--prune-reports`. Requires `--prune-reports`. |
 
 ```bash
 # Once with JSON report
 ai-memory curator --once --max-ops 50 --json
 
-# Daemon mode
+# Daemon mode (also runs the GC tick — the curator daemon is the reaper on a
+# curator-only host, honouring [storage].archive_on_gc)
 ai-memory curator --daemon --interval-secs 1800
 
 # Reverse the last 5 autonomous actions
 ai-memory curator --rollback-last 5
+
+# How big is the pre-#3345 self-report backlog? (writes nothing)
+ai-memory curator --prune-reports --json
+
+# Collapse it: fold each UTC day into _curator/reports/daily, then stamp the
+# 24h retention the per-sweep rows should have carried. Deletes NOTHING —
+# reaping is the ordinary GC's, which archives when archive_on_gc is on.
+# Idempotent and resumable; safe to re-run.
+ai-memory curator --prune-reports --apply
+
+# Postgres-backed store: the same collapse through the SAL trait.
+ai-memory curator --prune-reports --apply --store-url postgres://…
 ```
+
+**Curator self-reports (#3345).** Each sweep writes one `Tier::Short` row to
+`_curator/reports` with a 24-hour expiry, and every cycle folds that day into a
+single summary row in `_curator/reports/daily` (90-day retention). Substrate
+namespaces are never embedded and are withheld from unscoped `namespaces`
+listings; naming the namespace is the opt-in. Pre-#3345 stores carry an
+unbounded, fully-embedded backlog — use `--prune-reports` to collapse it.
 
 See `docs/RUNBOOK-curator-soak.md` for the week-long soak procedure.
 

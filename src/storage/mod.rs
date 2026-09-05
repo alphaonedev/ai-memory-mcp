@@ -15243,6 +15243,19 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
         |r| r.get(0),
     )?;
 
+    // v1.0.0 #3345 — how much of `total` is substrate bookkeeping. Reported
+    // alongside the physical count (never subtracted from it — see the field
+    // doc) so an operator can read the real corpus size at a glance instead of
+    // mistaking 24,930 curator self-reports for their own memories.
+    let substrate: usize = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM memories WHERE {}",
+            *crate::visibility::SQL_IS_SUBSTRATE
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+
     let mut stmt =
         conn.prepare("SELECT tier, COUNT(*) FROM memories GROUP BY tier ORDER BY COUNT(*) DESC")?;
     let by_tier = stmt
@@ -15291,6 +15304,7 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
         total,
         live,
         expired_pending_gc,
+        substrate,
         by_tier,
         by_namespace,
         expiring_soon,
@@ -18121,8 +18135,10 @@ pub fn get_embeddings_many(
 /// use [`get_unembedded_ids_batch`] and drain in bounded passes; this
 /// variant remains for callers that need the full snapshot semantics.
 pub fn get_unembedded_ids(conn: &Connection) -> Result<Vec<(String, String, String)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, title, content FROM memories WHERE embedding IS NULL")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, title, content FROM memories WHERE embedding IS NULL{}",
+        *crate::visibility::SQL_AND_NOT_SUBSTRATE
+    ))?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -18155,6 +18171,28 @@ pub fn get_unembedded_ids_batch(
     get_unembedded_ids_batch_amortised(conn, limit, &amort)
 }
 
+/// v1.0.0 #3345 — the ONE embeddable-row projection + predicate the bounded
+/// backfill scans share.
+///
+/// Three call sites (the `LIMIT`-only batch and both keyset-cursor shapes)
+/// previously spelled the #1779 envelope-bearing projection and the
+/// `embedding IS NULL` + not-skipped predicate out longhand. Collapsing them
+/// means the projection and the two exclusion gates — #3344's remembered-
+/// unembeddable markers and #3345's substrate-namespace posture — cannot drift
+/// apart between the three shapes, which is precisely how a gate gets added to
+/// two of three scans and silently keeps paying on the third.
+///
+/// `extra` is spliced after the shared predicate and carries whatever cursor /
+/// ordering / `LIMIT` clause the caller needs.
+fn unembedded_scan_sql(extra: &str) -> String {
+    format!(
+        "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
+         WHERE embedding IS NULL{skipped}{substrate} {extra}",
+        skipped = crate::storage::embed_skip::SQL_AND_NOT_SKIPPED,
+        substrate = *crate::visibility::SQL_AND_NOT_SUBSTRATE,
+    )
+}
+
 /// #3344 — SAL-adapter twin of [`get_unembedded_ids_batch`] that
 /// amortises the stale-marker walk on the **store instance** so two
 /// stores in one process cannot share a timer.
@@ -18168,12 +18206,7 @@ pub fn get_unembedded_ids_batch_amortised(
     // #3344 — drop stale skip markers BEFORE the NOT IN filter so a restored
     // key is retried this pass, then exclude remembered-unembeddable ids.
     crate::storage::embed_skip::prepare_scan_sqlite(conn, amort);
-    let sql = format!(
-        "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-         WHERE embedding IS NULL{} LIMIT ?1",
-        crate::storage::embed_skip::SQL_AND_NOT_SKIPPED
-    );
-    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut stmt = conn.prepare_cached(&unembedded_scan_sql("LIMIT ?1"))?;
     let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
     let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(resolve_embeddable_rows(conn, raw))
@@ -18227,21 +18260,13 @@ pub fn get_unembedded_ids_batch_after_amortised(
     // #1779 — pull encrypted_envelope + metadata so encrypted rows are
     // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
     crate::storage::embed_skip::prepare_scan_sqlite(conn, amort);
-    let not_skipped = crate::storage::embed_skip::SQL_AND_NOT_SKIPPED;
     let raw = if let Some(after) = after_id {
-        let sql = format!(
-            "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-             WHERE embedding IS NULL AND id > ?1{not_skipped} ORDER BY id LIMIT ?2"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut stmt =
+            conn.prepare_cached(&unembedded_scan_sql("AND id > ?1 ORDER BY id LIMIT ?2"))?;
         let rows = stmt.query_map(params![after, limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
-        let sql = format!(
-            "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-             WHERE embedding IS NULL{not_skipped} ORDER BY id LIMIT ?1"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut stmt = conn.prepare_cached(&unembedded_scan_sql("ORDER BY id LIMIT ?1"))?;
         let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -18437,6 +18462,15 @@ pub fn get_memory_texts_batch(
     let amort = crate::storage::embed_skip::EmbedSkipAmortisation::new();
     crate::storage::embed_skip::prepare_scan_sqlite(conn, &amort);
     sql.push_str(crate::storage::embed_skip::SQL_AND_NOT_SKIPPED);
+    // v1.0.0 #3345 — a corpus-wide `ai-memory reembed` was 97% curator
+    // self-reports on the certified f1 tier: every one of them a paid
+    // embedding call for a row no ambient read path can return (#3348).
+    // Naming the namespace is the opt-in, exactly as it is for reads — so
+    // `reembed --namespace _curator/reports` still heals that namespace on
+    // purpose, while the unscoped sweep no longer pays for it by default.
+    if !crate::visibility::substrate_namespace_requested(namespace) {
+        sql.push_str(&crate::visibility::SQL_AND_NOT_SUBSTRATE);
+    }
     sql.push_str(" ORDER BY id LIMIT ?");
     binds.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
     let mut stmt = conn.prepare(&sql)?;

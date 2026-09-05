@@ -68,7 +68,18 @@ ai-memory list --namespace _curator/rollback --limit 1 --json > baseline-rollbac
 
 Let the curator run for **168 hours (7 × 24)**. One cycle per hour
 × 7 days = 168 cycles. Each cycle writes a self-report memory in
-`_curator/reports/<ts>`; accumulate ≥168 of these over the window.
+`_curator/reports`.
+
+> **#3345 — the reports are now BOUNDED.** A per-sweep report is `Tier::Short`
+> with a **24-hour** expiry and the curator daemon runs the GC tick, so
+> `_curator/reports` holds roughly one day of cycles at any moment — you will
+> NOT find 168 live rows at T+168 h. The day's aggregate is preserved: every
+> cycle folds its day into ONE summary row in `_curator/reports/daily`
+> (90-day retention). For a 7-day soak, either snapshot
+> `audit-cycles.json` **once per day** (below) or read the seven daily
+> summaries, which carry the same summed counters. This is deliberate: the
+> pre-#3345 writer produced 24,930 permanently-retained, fully-embedded rows
+> against 512 real memories on the certified f1 tier.
 
 During the soak:
 
@@ -92,6 +103,12 @@ ai-memory list --namespace _curator/rollback --limit 10000 --json \
     > audit-actions.json
 ai-memory list --namespace _curator/reports --limit 10000 --json \
     > audit-cycles.json
+
+# #3345 — the per-day summaries (one row per UTC date, 90-day retention).
+# On a soak longer than 24 h these are the complete record; the per-sweep
+# rows above are only the last day's detail.
+ai-memory list --namespace _curator/reports/daily --limit 1000 --json \
+    > audit-cycles-daily.json
 
 # Aggregate cycle reports for the headline numbers.
 # Field shapes map to src/curator.rs::CuratorReport + src/autonomy.rs::AutonomyPassReport:

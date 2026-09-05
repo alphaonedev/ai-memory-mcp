@@ -8850,7 +8850,20 @@ pub async fn run_curator_daemon_with_shutdown(
     let active_keypair = kp_opt.map(Arc::new);
     let db_owned = db_path;
     tokio::task::spawn_blocking(move || {
-        crate::curator::run_daemon(db_owned, llm_arc, cfg, shutdown_flag, active_keypair);
+        // #3345 — this typed-config entry point carries no `AppConfig`; it
+        // takes the DOCUMENTED DEFAULT of `[storage].archive_on_gc`
+        // (`AppConfig::effective_archive_on_gc` = true), i.e. archive before
+        // deletion. The operator-resolved value flows through the primitive
+        // entry point below, which is what the `ai-memory curator --daemon`
+        // CLI uses.
+        crate::curator::run_daemon(
+            db_owned,
+            llm_arc,
+            cfg,
+            shutdown_flag,
+            active_keypair,
+            crate::config::AppConfig::default().effective_archive_on_gc(),
+        );
     })
     .await
     .map_err(|e| anyhow::anyhow!("curator daemon join: {e}"))?;
@@ -8874,6 +8887,11 @@ pub async fn run_curator_daemon_with_primitives(
     // #1749 — Pillar-2.5 consolidation gate, resolved by the caller (which has
     // the `AppConfig` this daemon body lacks). Default-false at every caller.
     compaction_enabled: bool,
+    // v1.0.0 #3345 — the operator's resolved `[storage].archive_on_gc`, same
+    // primitive-threading pattern as `compaction_enabled`. The curator daemon
+    // is now the reaper on a curator-only host, and it must honour an explicit
+    // erasure posture rather than assume the safe-looking default.
+    archive_on_gc: bool,
     llm: Option<Arc<crate::llm::OllamaClient>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
@@ -8905,7 +8923,14 @@ pub async fn run_curator_daemon_with_primitives(
     let active_keypair = kp_opt.map(Arc::new);
 
     tokio::task::spawn_blocking(move || {
-        crate::curator::run_daemon(db_path, llm, cfg, shutdown_flag, active_keypair);
+        crate::curator::run_daemon(
+            db_path,
+            llm,
+            cfg,
+            shutdown_flag,
+            active_keypair,
+            archive_on_gc,
+        );
     })
     .await
     .map_err(|e| anyhow::anyhow!("curator daemon join: {e}"))?;

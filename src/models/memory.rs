@@ -2408,6 +2408,22 @@ pub struct Stats {
     /// diverge. Additive wire field.
     #[serde(default)]
     pub expired_pending_gc: usize,
+    /// v1.0.0 #3345 — how many of [`Stats::total`] are SUBSTRATE-namespace
+    /// rows (`_curator/*`, `_messages/*`, `_agents`, … — the closed
+    /// [`crate::visibility::SUBSTRATE_NAMESPACE_PREFIXES`] /
+    /// [`crate::visibility::SUBSTRATE_NAMESPACES_EXACT`] set): substrate
+    /// bookkeeping ABOUT the store rather than knowledge IN it.
+    ///
+    /// The reported defect was that an operator could not tell 512 real
+    /// memories from 25,671 rows, 24,930 of which were curator self-reports.
+    /// This field is ADDITIVE and `total` deliberately keeps its documented
+    /// #2334 meaning — the RAW physical count. Redefining `total` to exclude
+    /// these rows would re-open exactly the reconciliation defect #2334 closed
+    /// (two surfaces silently disagreeing about what "total" counts), so the
+    /// operator-legible number is `total - substrate`, which the CLI prints
+    /// and any dashboard can derive. Additive wire field.
+    #[serde(default)]
+    pub substrate: usize,
     pub by_tier: Vec<TierCount>,
     pub by_namespace: Vec<NamespaceCount>,
     pub expiring_soon: usize,

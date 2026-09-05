@@ -331,6 +331,12 @@ pub(super) fn postgres_stats_envelope(stats: &crate::models::Stats) -> serde_jso
         // expired_pending_gc = the awaiting-GC remainder).
         "live": stats.live,
         "expired_pending_gc": stats.expired_pending_gc,
+        // v1.0.0 #3345 — additive substrate-bookkeeping share of `total`, so
+        // the postgres envelope keeps SHAPE PARITY with the sqlite handler
+        // (which serializes `Stats` directly). A field present on one backend
+        // and absent on the other is exactly the drift this envelope exists
+        // to prevent.
+        "substrate": stats.substrate,
         "by_tier": stats.by_tier,
         (field_names::BY_NAMESPACE): stats.by_namespace,
         "expiring_soon": stats.expiring_soon,
@@ -351,6 +357,7 @@ mod stats_envelope_parity_tests {
             total: 7,
             live: 6,
             expired_pending_gc: 1,
+            substrate: 0,
             by_tier: vec![TierCount {
                 tier: "mid".to_string(),
                 count: 7,
