@@ -328,9 +328,10 @@ fn migration_v82_applies_and_is_idempotent() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("mig.db");
 
-    // Fresh open reaches the current tip with the v82 retire columns present.
+    // Fresh open reaches v98 (#3401 canonical inbox namespace) with the
+    // v82 retire columns present.
     let conn = db::open(&path).unwrap();
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 97);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 98);
     assert!(
         conn.prepare("SELECT retired_at, retired_by, retire_reason FROM skills LIMIT 0")
             .is_ok(),
