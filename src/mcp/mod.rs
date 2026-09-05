@@ -858,7 +858,12 @@ pub mod schema_handler_parity_test_exports {
 /// path. The production wire path remains the JSON-RPC dispatch in
 /// `handle_request`.
 pub mod tools {
-    pub use super::atomise::{AtomiseToolHandler, handle_atomise};
+    // #3064 lane L-PGP family F5 — `atomise_precheck` (+ its two result
+    // types) is the DB-FREE prologue the HTTP surface answers with; see
+    // `handlers::route_1111::atomise_http_via_store`.
+    pub use super::atomise::{
+        AtomiseArgs, AtomisePrecheck, AtomiseToolHandler, atomise_precheck, handle_atomise,
+    };
 
     /// v0.7.0 multi-agent literal-sweep (scanner B finding F-B3.x) —
     /// re-export the canonical on-conflict enum so external consumers

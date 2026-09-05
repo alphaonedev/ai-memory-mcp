@@ -14,7 +14,7 @@ layout: doc
 > the other **17 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
 > is SQLite-only** (`ai-memory mcp` always opens a local rusqlite
 > connection, so a postgres deployment serves MCP clients through the
-> HTTP daemon instead). Read "The 14 fully-501 paths" and
+> HTTP daemon instead). Read "The 13 fully-501 paths" and
 > "Tools unavailable on the PostgreSQL backend (v1.0.0)" below and
 > [Backend parity](../README.md#backend-parity) before committing to
 > postgres.
@@ -60,7 +60,7 @@ does not mean a matching set of tables: postgres ships no `skills` table
 **67 of the 84 unique production HTTP paths are served on postgres and
 17 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
 silent read/write against the wrong database), and the **stdio MCP path
-is SQLite-only**. See "The 14 fully-501 paths" below for the exact
+is SQLite-only**. See "The 13 fully-501 paths" below for the exact
 inventory, which is frozen against regression by
 `tests/pg_supported_route_inventory_gate_2799.rs`.
 
@@ -674,9 +674,9 @@ The eight remaining sqlite-only surfaces land here.
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
 > **RETRACTED**. The measured, gate-pinned inventory is **65
-> pg-supported unique paths, 14 fully-501 paths, 84 unique paths
-> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 70` /
-> `EXPECTED_FULLY_501_PATHS = 14` / `EXPECTED_TOTAL_UNIQUE_PATHS = 84`,
+> pg-supported unique paths, 13 fully-501 paths, 84 unique paths
+> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 71` /
+> `EXPECTED_FULLY_501_PATHS = 13` / `EXPECTED_TOTAL_UNIQUE_PATHS = 84`,
 > `tests/pg_supported_route_inventory_gate_2799.rs`), and the
 > same gate freezes the allow-list membership so a silent match-arm
 > add or remove fails until the SSOT is updated in a reviewed edit. The
@@ -809,7 +809,7 @@ in-memory scratch SQLite database that `bootstrap_serve` opens against
 read/write against the wrong database (data-integrity North Star:
 degrade, never corrupt). This inventory is pinned against regression by
 `tests/pg_supported_route_inventory_gate_2799.rs`, which freezes the
-exact 69-supported / 14-fully-501 partition and fails CI if the router
+exact 70-supported / 13-fully-501 partition and fails CI if the router
 and the `postgres_endpoint_supported()` allow-list ever drift.
 
 > **v1.0.0 update ([#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064)).**
@@ -831,9 +831,15 @@ and the `postgres_endpoint_supported()` allow-list ever drift.
 > `calibrate_confidence_report` method: the pg
 > `confidence_shadow_observations` table has shipped in the bootstrap
 > schema since v0.7.0, so the sweep needed a port, not a new relation.
-> The remaining 14 fully-501 paths below are the accepted v1.0.0 gaps.
+> `memory_atomise` followed last (69/14 -> 70/13) with NO port at all: its
+> HTTP surface never had storage access to port — the call site owns no
+> `AtomiseToolHandler`, so every HTTP call terminates in the tier-locked
+> advisory envelope before touching a database, identically on both
+> backends. A 501 there was the LESS truthful answer, since it implied the
+> route works on a sqlite daemon.
+> The remaining 13 fully-501 paths below are the accepted v1.0.0 gaps.
 
-**The 14 fully-501 paths (honest v1.0 gaps — do NOT expect these to
+**The 13 fully-501 paths (honest v1.0 gaps — do NOT expect these to
 work on Postgres; closing them is tracked under the v1.x Postgres
 surface-parity EPIC [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)
 and [#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064)):**
@@ -863,9 +869,8 @@ and [#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064)):**
 - **`/api/v1/share`** — the pg source-read `CallerContext` is a T3
   authorization posture choice deferred to a vote. *(v1.x.)*
 - **`memory_*` MCP-parity routes with no pg SAL method / app.db binding**
-  (5 paths): `memory_atomise`,
-  `memory_subscription_replay`, `memory_subscription_dlq_list`,
-  and `memory_rule_list` +
+  (4 paths): `memory_subscription_replay`,
+  `memory_subscription_dlq_list`, and `memory_rule_list` +
   `memory_check_agent_action` — the last two 501 only the governance
   **INSPECTION / read** API because postgres ships no `governance_rules`
   table (governance **enforcement** itself works on Postgres).
@@ -914,7 +919,6 @@ postgres skills storage specifically is
 | `memory_skill_compositional_context` | `POST /api/v1/skill/{id}/compose` | Skills plane. |
 | `memory_skill_retire` | `POST /api/v1/skill/{id}/retire` | Skills plane. |
 | `memory_share` | `POST /api/v1/share` | pg source-read `CallerContext` is a T3 authz posture choice deferred to a vote. |
-| `memory_atomise` | `POST /api/v1/memory_atomise` | No pg SAL method — `app.db`-bound. |
 | `memory_subscription_replay` | `POST /api/v1/memory_subscription_replay` | No pg SAL method — `app.db`-bound. |
 | `memory_subscription_dlq_list` | `POST /api/v1/memory_subscription_dlq_list` | No pg SAL method — `app.db`-bound. |
 | `memory_rule_list` | `POST /api/v1/memory_rule_list` | Governance **inspection/read** only (no `governance_rules` table); enforcement itself works on postgres. |
@@ -932,8 +936,10 @@ of [#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064) lane
 L-PGP it is allow-listed alongside its canonical twin
 `/api/v1/kg/find_paths` (both paths are wired to the same
 `handlers::kg_find_paths` handler, which dispatches through
-`MemoryStore::find_paths` on postgres), so the 14 fully-501 paths map
-one-to-one onto the 14 unavailable MCP tools listed above.
+`MemoryStore::find_paths` on postgres), and the arithmetic that
+reconciles **14 unavailable tools** with **13 fully-501 paths** is the
+skills mapping noted above: 9 `memory_skill_*` tools ride 8
+`/api/v1/skill/*` paths, so 9 + 5 tools correspond to 8 + 5 paths.
 
 ### SQLite-only substrate planes on a postgres daemon
 

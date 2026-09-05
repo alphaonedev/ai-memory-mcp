@@ -799,12 +799,57 @@ pub async fn handle_atomise_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #3064 lane L-PGP family F5 — postgres arm. This route is STORAGE-FREE
+    // on the HTTP surface (see `atomise_http_via_store`), so the postgres
+    // branch answers it without touching `app.db` at all.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return atomise_http_via_store(&app, &body);
+    }
     let lock = app.db.lock().await;
     let tier = app.tier_config.tier;
     let result = crate::mcp::tools::handle_atomise(&lock.0, &body, None, tier, None);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+/// #3064 lane L-PGP family F5 — the postgres arm of [`handle_atomise_http`].
+///
+/// This route needs no SAL port because the HTTP surface has NEVER been able
+/// to reach the atomisation engine: the engine lives on an
+/// `AtomiseToolHandler` the daemon only owns on the MCP dispatch path, and
+/// this handler's call site has always passed `handler: None`. Every HTTP
+/// `memory_atomise` call therefore terminates in the tier-locked advisory
+/// envelope, on EITHER backend, before any storage access — so the honest
+/// answer on postgres is that same envelope, not a `501` implying the route
+/// works on sqlite when it does not.
+///
+/// The safety is STRUCTURAL rather than a promise: `mcp::atomise_precheck` is
+/// driven with `handler_present = false`, which by construction can only
+/// return `TierLocked` or a validation `Err`. The `EngineRequired` arm is
+/// therefore unreachable today AND fails CLOSED with the documented 501
+/// envelope if a future change ever wires a real handler onto this surface —
+/// it can never silently fall through to `app.db`, the empty scratch sqlite.
+#[cfg(feature = "sal")]
+fn atomise_http_via_store(app: &AppState, body: &Value) -> axum::response::Response {
+    match crate::mcp::tools::atomise_precheck(body, app.tier_config.tier, false) {
+        Ok(crate::mcp::tools::AtomisePrecheck::TierLocked(envelope)) => {
+            (StatusCode::OK, Json(envelope)).into_response()
+        }
+        Ok(crate::mcp::tools::AtomisePrecheck::EngineRequired(_)) => {
+            // Unreachable while this call site passes `handler_present = false`.
+            // If it ever becomes reachable, the `rusqlite`-bound engine has NO
+            // postgres implementation, so refuse loudly with the substrate's
+            // own fail-closed envelope rather than running it against the
+            // wrong database.
+            tracing::error!(
+                "atomise_http_via_store reached EngineRequired on postgres — the                  rusqlite-bound atomisation engine has no postgres implementation;                  refusing rather than dispatching against the scratch database"
+            );
+            crate::handlers::postgres_not_implemented(crate::handlers::routes::MEMORY_ATOMISE)
+        }
         Err(e) => err_response(e),
     }
 }

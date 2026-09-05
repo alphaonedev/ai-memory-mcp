@@ -194,6 +194,11 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 /// 2026-08-29 (#3064 batch D): `memory_replay` LEFT this set —
 /// SAL `replay_transcript_union` + `fetch_transcript_content`
 /// (pg `memory_transcripts` / `memory_transcript_links` v22/v24).
+/// 2026-09-05 (#3064 lane L-PGP family F5): `memory_atomise` LEFT this set
+/// — its HTTP surface is STORAGE-FREE (the call site passes `handler: None`,
+/// so `atomise_precheck` short-circuits to the tier-locked envelope before
+/// any storage access), so the honest answer on postgres is that envelope
+/// rather than a 501 implying the route works on sqlite.
 /// 2026-09-05 (#3064 lane L-PGP family F3): `memory_calibrate_confidence`
 /// LEFT this set — SAL `calibrate_confidence_report` over the pg
 /// `confidence_shadow_observations` table (present since the bootstrap
@@ -212,7 +217,6 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 fn expected_fully_501_paths() -> BTreeSet<&'static str> {
     [
         routes::SHARE,
-        routes::MEMORY_ATOMISE,
         routes::MEMORY_CHECK_AGENT_ACTION,
         routes::MEMORY_RULE_LIST,
         routes::MEMORY_SUBSCRIPTION_DLQ_LIST,
@@ -307,8 +311,24 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // f3_calibrate_confidence_{sqlite,postgres}` — the postgres leg SEEDS the
 // postgres table and asserts the seeded baseline appears, so a scratch read
 // fails loudly.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 70;
-const EXPECTED_FULLY_501_PATHS: usize = 14;
+// 2026-09-05 (#3064 lane L-PGP family F5) — bumped 69 -> 70 pg-supported /
+// 14 -> 13 fully-501: `POST /api/v1/memory_atomise`. This entry is unlike its
+// siblings: NOTHING was ported, because the HTTP surface never had storage
+// access to port. `handle_atomise_http`'s call site has passed
+// `handler: None` since #1111, and `mcp::handle_atomise` short-circuits to
+// the tier-locked advisory envelope whenever the handler is absent — BEFORE
+// it touches `conn`. Every HTTP `memory_atomise` call therefore returns the
+// same envelope on both backends. The BINDING SAFETY INVARIANT is met by
+// construction and not by a promise: the postgres branch drives the shared
+// `mcp::atomise_precheck` with `handler_present = false`, whose type
+// signature makes the engine arm unreachable, and that arm fails CLOSED with
+// `postgres_not_implemented` if a future change ever wires a real handler
+// onto this surface. Refusing the route with a 501 was the LESS truthful
+// answer: it implied the route works on a sqlite daemon, which it does not.
+// Proof: `tests/pg_parity_3064.rs::f5_atomise_tier_locked_{sqlite,postgres}`
+// asserts the SAME envelope, byte for byte, on both backends.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 71;
+const EXPECTED_FULLY_501_PATHS: usize = 13;
 const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 84;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
@@ -353,6 +373,8 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "MEMORIES_BULK",
     // #3064 family F3 — SAL `calibrate_confidence_report` over the pg
     // `confidence_shadow_observations` table.
+    // #3064 family F5 — storage-free tier-locked envelope on both backends.
+    "MEMORY_ATOMISE",
     "MEMORY_CALIBRATE_CONFIDENCE",
     "MEMORY_DEPENDENTS_OF_INVALIDATED",
     "MEMORY_EXPORT_REFLECTION",

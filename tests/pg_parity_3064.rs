@@ -803,3 +803,120 @@ async fn f3_calibrate_confidence_postgres() {
     shutdown.notify_one();
     let _ = handle.await;
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// F5 — `POST /api/v1/memory_atomise`
+// ─────────────────────────────────────────────────────────────────────
+
+/// Drive atomise and return `(status, body, missing_id_status, bad_tokens_status)`.
+async fn f5_exercise(base: &str) -> (u16, Value, u16, u16) {
+    let client = pg_test_client(OWNER_AGENT);
+    let resp = client
+        .post(format!("{base}/api/v1/memory_atomise"))
+        .json(&json!({"memory_id": "any-id-at-all"}))
+        .send()
+        .await
+        .expect("atomise POST");
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.expect("atomise body");
+
+    // DENIED half — the argument validation the storage-free prologue owns.
+    // A missing `memory_id` and an out-of-range `max_atom_tokens` must be
+    // refused identically on both backends, BEFORE the tier gate.
+    let missing = client
+        .post(format!("{base}/api/v1/memory_atomise"))
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("missing id POST");
+    let missing_status = missing.status().as_u16();
+
+    let bad_tokens = client
+        .post(format!("{base}/api/v1/memory_atomise"))
+        .json(&json!({"memory_id": "x", "max_atom_tokens": 999_999}))
+        .send()
+        .await
+        .expect("bad tokens POST");
+    let bad_status = bad_tokens.status().as_u16();
+    let bad_body: Value = bad_tokens.json().await.expect("bad tokens body");
+    assert!(
+        bad_body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("out of range"),
+        "an out-of-range max_atom_tokens must be refused by message: {bad_body}"
+    );
+
+    (status, body, missing_status, bad_status)
+}
+
+fn f5_assert(status: u16, body: &Value, missing: u16, bad: u16, backend: &str) {
+    assert_eq!(status, 200, "{backend}: atomise body={body}");
+    // The tier-locked advisory envelope — 200 OK, not an error shape.
+    assert_eq!(
+        key_shape(body),
+        vec![
+            "current_tier".to_string(),
+            "required_tier".to_string(),
+            // The wire key is HYPHENATED (`field_names::TIER_LOCKED`); pinning
+            // the literal here is what catches a rename on either backend.
+            "tier-locked".to_string(),
+        ],
+        "{backend}: tier-locked envelope shape drifted: {body}"
+    );
+    assert_eq!(
+        body["tier-locked"].as_str(),
+        Some("memory_atomise requires smart tier or higher"),
+        "{backend}"
+    );
+    assert_eq!(body["required_tier"].as_str(), Some("smart"), "{backend}");
+    assert_eq!(
+        missing, 400,
+        "{backend}: a missing memory_id must be refused"
+    );
+    assert_eq!(
+        bad, 400,
+        "{backend}: an out-of-range max_atom_tokens must be refused"
+    );
+}
+
+/// The HTTP atomise surface is storage-free on BOTH backends: the call site
+/// owns no `AtomiseToolHandler`, so the tier-locked envelope is the complete
+/// answer. The sqlite leg pins the reference bytes.
+#[cfg(feature = "sal")]
+#[tokio::test(flavor = "multi_thread")]
+async fn f5_atomise_tier_locked_sqlite() {
+    let dir = fresh_dir("f5-sqlite");
+    let state = sqlite_app_state(&dir.path().join("f5.db"));
+    let (base, shutdown, handle) = spawn(state).await;
+
+    let (status, body, missing, bad) = f5_exercise(&base).await;
+    f5_assert(status, &body, missing, bad, "sqlite");
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+/// The postgres leg must return the SAME envelope, not a 501. A 501 would
+/// have implied the route works on a sqlite daemon — which the sqlite leg
+/// above proves it does not.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn f5_atomise_tier_locked_postgres() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping f5_atomise_tier_locked_postgres");
+        return;
+    };
+    let state = postgres_app_state(&url).await;
+    let (base, shutdown, handle) = spawn(state).await;
+
+    let (status, body, missing, bad) = f5_exercise(&base).await;
+    assert_ne!(
+        status, 501,
+        "memory_atomise must no longer be fail-closed on postgres: {body}"
+    );
+    f5_assert(status, &body, missing, bad, "postgres");
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}

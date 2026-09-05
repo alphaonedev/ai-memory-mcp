@@ -51,22 +51,22 @@ use super::{AppState, StorageBackend};
 #[cfg(feature = "sal")]
 #[must_use]
 pub fn postgres_not_implemented(endpoint: &'static str) -> Response {
-    // #934 (Track C, 2026-05-20; comment corrected #3070/#3073, v1.0.0) —
-    // for `/api/v1/find_paths` callers who hit this fallback, point at the
+    // #934 (Track C, 2026-05-20; comment corrected #3070/#3073, v1.0.0;
+    // corrected again #3064 lane L-PGP family F1, 2026-09-05) — for
+    // `/api/v1/find_paths` callers who hit this fallback, point at the
     // canonical `/api/v1/kg/find_paths` so the remediation hint is actually
-    // actionable. NOTE: on a POSTGRES-backed daemon the bare `/find_paths`
-    // path DOES still reach this gate and returns 501. The router alias in
-    // `src/lib.rs` registers the bare path (so it works on sqlite and is a
-    // known production route — see `path_is_registered_route`), but the
-    // postgres surface gate (`postgres_endpoint_supported`) allow-lists only
-    // `KG_FIND_PATHS`, NOT the bare `FIND_PATHS`, so `postgres_route_gate`
-    // shields the bare path with this 501 on postgres. The earlier claim that
-    // "/find_paths no longer reaches this gate on a current binary" was true
-    // only for the sqlite router path; it was never true on postgres. This
-    // branch is therefore load-bearing (not merely a courtesy for historic
-    // clients): it hands every bare-`/find_paths` caller on a postgres daemon
-    // the canonical `/api/v1/kg/find_paths` path instead of a bare
-    // "feature missing" message.
+    // actionable.
+    //
+    // NOTE (#3064 F1): the bare `/find_paths` path NO LONGER reaches this
+    // gate on a postgres-backed daemon — `postgres_endpoint_supported` now
+    // allow-lists it alongside `KG_FIND_PATHS`, because `src/lib.rs` wires
+    // BOTH paths to the same `handlers::kg_find_paths`. The prior revision of
+    // this comment said the opposite and was correct at the time; leaving it
+    // would now be the exact prose-rot class the repo's doc gates block. The
+    // branch is RETAINED rather than deleted: `postgres_not_implemented` is a
+    // general fallback that a future narrowing of the allow-list (or a caller
+    // reaching it by another route) can still hit, and when it does, handing
+    // back the canonical path beats a bare "feature missing" message.
     let remediation = if endpoint == super::routes::FIND_PATHS {
         "POST /api/v1/kg/find_paths instead (same handler; the bare /find_paths path is now an alias on v0.7.0+ binaries). Accepts both `source_id`/`target_id` and `from_id`/`to_id` body fields."
     } else {
@@ -287,6 +287,18 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // scratch sqlite ALSO carries that table, so an ungated handler would
         // have reported a plausible all-zero calibration rather than failing.
         ("POST", super::routes::MEMORY_CALIBRATE_CONFIDENCE) => true,
+        // #3064 lane L-PGP family F5 — `POST /api/v1/memory_atomise`. This
+        // route is STORAGE-FREE on the HTTP surface: the atomisation engine
+        // lives on an `AtomiseToolHandler` the daemon owns only on the MCP
+        // dispatch path, and this handler's call site has always passed
+        // `handler: None`, so every HTTP call terminates in the tier-locked
+        // advisory envelope BEFORE any storage access — identically on both
+        // backends. Refusing it on postgres implied the route works on sqlite,
+        // which it does not. The postgres branch drives the shared
+        // `mcp::atomise_precheck` with `handler_present = false`, which by
+        // construction cannot reach the engine, and fails CLOSED with this
+        // module's own 501 envelope if that ever changes.
+        ("POST", super::routes::MEMORY_ATOMISE) => true,
         // #3064 batch B — inbound `reflects_on` dependents + optional
         // `lineage_descendants` for `transitive`. Never `app.db.lock()`.
         ("POST", super::routes::MEMORY_DEPENDENTS_OF_INVALIDATED) => true,

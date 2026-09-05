@@ -101,32 +101,67 @@ impl AtomiseToolHandler {
 /// hint to pass on restart.
 const REQUIRED_TIER: &str = "smart";
 
-/// Handle a `memory_atomise` MCP tool call.
+/// #3064 lane L-PGP family F5 — the validated `memory_atomise` arguments the
+/// atomisation ENGINE needs once the tier gate has cleared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomiseArgs {
+    /// The memory to atomise. Non-empty; validated by [`atomise_precheck`].
+    pub memory_id: String,
+    /// Target atom size, defaulted and range-checked by [`atomise_precheck`].
+    pub max_atom_tokens: u32,
+    /// Re-atomise a source that already has atoms.
+    pub force_re_atomise: bool,
+}
+
+/// #3064 lane L-PGP family F5 — the outcome of the DB-FREE `memory_atomise`
+/// prologue.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AtomisePrecheck {
+    /// The call is fully answered WITHOUT any storage access — the tier-locked
+    /// advisory envelope.
+    TierLocked(Value),
+    /// The tier gate cleared AND a handler is present, so the
+    /// `rusqlite::Connection`-bound atomisation engine must run.
+    EngineRequired(AtomiseArgs),
+}
+
+/// The substrate-wide tier-locked advisory envelope for `memory_atomise`
+/// (200 OK, NOT a JSON-RPC error — the v0.7 tier-gated-surface convention).
+/// One construction site so every surface emits byte-identical bytes.
+fn tier_locked_envelope(tier: FeatureTier) -> Value {
+    json!({
+        (field_names::TIER_LOCKED): "memory_atomise requires smart tier or higher",
+        (field_names::CURRENT_TIER): tier.as_str(),
+        (field_names::REQUIRED_TIER): REQUIRED_TIER,
+    })
+}
+
+/// #3064 lane L-PGP family F5 — the DB-FREE prologue of [`handle_atomise`]:
+/// argument validation followed by the tier / handler short-circuit.
 ///
-/// The handler shape mirrors the other curator-pass tools
-/// (`memory_consolidate`, `memory_reflect`): synchronous + threaded
-/// `&rusqlite::Connection`, params bag is a `&Value`. Errors are
-/// returned as `Err(String)`; the dispatcher wraps them into the
-/// MCP `isError: true` envelope.
+/// Extracted so a surface that provably owns NO [`AtomiseToolHandler`] can
+/// answer the request without taking a storage connection at all. That is
+/// precisely what makes `POST /api/v1/memory_atomise` safe on a
+/// postgres-backed daemon: not a port of the engine (which is
+/// `rusqlite::Connection`-bound and lives on the MCP dispatch path), but the
+/// STRUCTURAL fact that the HTTP path never reaches it — its call site has
+/// always passed `handler: None`.
 ///
-/// # Arguments
+/// Reaching `EngineRequired` REQUIRES `handler_present`, so a caller passing
+/// `false` can rely on `TierLocked` (or an `Err`) being the only outcomes —
+/// and if that ever stops holding, such a caller is confronted with a variant
+/// it must handle rather than silently acquiring a connection to whichever
+/// database happens to be wired up.
 ///
-/// * `conn` — substrate connection (write path).
-/// * `params` — the JSON-RPC `arguments` object. Schema:
-///   `{ memory_id: string, max_atom_tokens?: int, force_re_atomise?: bool }`.
-/// * `handler` — pre-built handler (or `None` when the daemon has no
-///   LLM, which collapses to the tier-locked advisory).
-/// * `tier` — fallback tier when `handler` is `None` (so the
-///   tier-locked envelope still carries the correct `current_tier`).
-/// * `mcp_client` — captured `clientInfo.name` for the calling-agent
-///   resolution chain.
-pub fn handle_atomise(
-    conn: &rusqlite::Connection,
+/// # Errors
+///
+/// The same argument-validation refusals `handle_atomise` has always
+/// returned, in the same order, with the same messages.
+pub fn atomise_precheck(
     params: &Value,
-    handler: Option<&AtomiseToolHandler>,
     tier: FeatureTier,
-    mcp_client: Option<&str>,
-) -> Result<Value, String> {
+    handler_present: bool,
+) -> Result<AtomisePrecheck, String> {
     // ── Argument validation ─────────────────────────────────────────
     let memory_id = params
         .get(param_names::MEMORY_ID)
@@ -162,7 +197,17 @@ pub fn handle_atomise(
                     crate::atomisation::MAX_ATOM_TOKENS
                 ));
             }
-            u32::try_from(n).expect("range-checked above")
+            // The range check above proves this fits, but `expect` in a
+            // production path is a panic waiting for a future edit to the
+            // bounds (ERRORS-06); refuse with the SAME out-of-range message
+            // instead, so the conversion is total by construction.
+            u32::try_from(n).map_err(|_| {
+                format!(
+                    "max_atom_tokens out of range [{}, {}]: {n}",
+                    crate::atomisation::MIN_ATOM_TOKENS,
+                    crate::atomisation::MAX_ATOM_TOKENS
+                )
+            })?
         }
     } else {
         crate::atomisation::DEFAULT_ATOM_TOKENS
@@ -183,17 +228,59 @@ pub fn handle_atomise(
 
     // ── Tier gate (keyword short-circuit) ───────────────────────────
     // Resolved BEFORE the handler dispatch so the keyword tier never
-    // touches the DB. The advisory envelope is the substrate-wide
-    // tier-locked shape (200 OK, NOT JSON-RPC error — per the brief
-    // and the rest of the v0.7 tier-gated surface).
-    if tier == FeatureTier::Keyword || handler.is_none() {
-        return Ok(json!({
-            (field_names::TIER_LOCKED): "memory_atomise requires smart tier or higher",
-            (field_names::CURRENT_TIER): tier.as_str(),
-            (field_names::REQUIRED_TIER): REQUIRED_TIER,
-        }));
+    // touches the DB.
+    if tier == FeatureTier::Keyword || !handler_present {
+        return Ok(AtomisePrecheck::TierLocked(tier_locked_envelope(tier)));
     }
-    let handler = handler.expect("checked above");
+    Ok(AtomisePrecheck::EngineRequired(AtomiseArgs {
+        memory_id: memory_id.to_string(),
+        max_atom_tokens,
+        force_re_atomise,
+    }))
+}
+
+/// Handle a `memory_atomise` MCP tool call.
+///
+/// The handler shape mirrors the other curator-pass tools
+/// (`memory_consolidate`, `memory_reflect`): synchronous + threaded
+/// `&rusqlite::Connection`, params bag is a `&Value`. Errors are
+/// returned as `Err(String)`; the dispatcher wraps them into the
+/// MCP `isError: true` envelope.
+///
+/// # Arguments
+///
+/// * `conn` — substrate connection (write path).
+/// * `params` — the JSON-RPC `arguments` object. Schema:
+///   `{ memory_id: string, max_atom_tokens?: int, force_re_atomise?: bool }`.
+/// * `handler` — pre-built handler (or `None` when the daemon has no
+///   LLM, which collapses to the tier-locked advisory).
+/// * `tier` — fallback tier when `handler` is `None` (so the
+///   tier-locked envelope still carries the correct `current_tier`).
+/// * `mcp_client` — captured `clientInfo.name` for the calling-agent
+///   resolution chain.
+pub fn handle_atomise(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    handler: Option<&AtomiseToolHandler>,
+    tier: FeatureTier,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    let args = match atomise_precheck(params, tier, handler.is_some())? {
+        AtomisePrecheck::TierLocked(envelope) => return Ok(envelope),
+        AtomisePrecheck::EngineRequired(args) => args,
+    };
+    let Some(handler) = handler else {
+        // UNREACHABLE by construction: `atomise_precheck` returns
+        // `EngineRequired` only when `handler_present` is true. Fail CLOSED to
+        // the tier-locked envelope rather than `.expect()`-ing (ERRORS-06) — a
+        // panic here would take down the whole single-threaded MCP stdio loop.
+        return Ok(tier_locked_envelope(tier));
+    };
+    let (memory_id, max_atom_tokens, force_re_atomise) = (
+        args.memory_id.as_str(),
+        args.max_atom_tokens,
+        args.force_re_atomise,
+    );
 
     // ── Calling agent resolution (NHI) ──────────────────────────────
     let explicit_agent_id = params.get(param_names::AGENT_ID).and_then(Value::as_str);
