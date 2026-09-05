@@ -360,7 +360,18 @@ connections plus `FD_HEADROOM` descriptors — a smaller hub is honest, a hub
 that lies about its capacity is not. The systemd unit additionally restricts
 the address family to `AF_UNIX`: the wake plane is same-host by construction,
 so the kernel enforces that as well as the code. Its `ExecStartPost` runs
-`--health`, so a unit that reports "started" has actually been reached.
+`--health`, so a unit that reports "started" has actually been reached — a
+claim that holds **only because that probe retries**. `Type=simple` lets
+systemd run `ExecStartPost` as soon as it has forked the main process, before
+the hub has bound, and the hub sends no `sd_notify`; the unit therefore retries
+the probe for about five seconds across the bind race and fails the unit only
+if the hub is still unreachable after that. A single-shot probe would fail
+every start and, with `Restart=on-failure`, convert a healthy host into a
+restart loop. The unit also sets `RuntimeDirectoryPreserve=yes`, so the
+allowlist snapshot it tells you to publish at `/run/ai-memory/hub-allow.json`
+survives a stop or restart instead of being deleted with the runtime directory
+— which would leave the restarted hub admitting nobody. `/run` is a tmpfs, so
+that path still does not survive a **reboot**; republish it after boot.
 
 ### `ai-memory doctor`
 

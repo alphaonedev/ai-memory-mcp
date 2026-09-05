@@ -28,7 +28,18 @@ ExecStart=/bin/sh -c '/usr/bin/ai-memory wake-hub --socket "$SOCKET" --allowlist
 # ExecStartPost proves the hub is actually REACHABLE, not merely running.
 # `--health` connects as an ordinary client (same peer-credential gate, same
 # challenge, no privileged side channel) and exits non-zero when it is not.
-ExecStartPost=/bin/sh -c '/usr/bin/ai-memory wake-hub --socket "$SOCKET" --health'
+#
+# It RETRIES, and the retry is load-bearing rather than defensive padding.
+# With Type=simple systemd runs ExecStartPost as soon as it has FORKED the
+# main process -- before the hub has bound its socket. A single-shot probe
+# would find no socket, exit 2, mark the unit failed, and Restart=on-failure
+# would turn a healthy host into a RestartSec restart loop. The hub does not
+# call sd_notify (that would need a new crate, which this lane may not add),
+# so a bounded retry is how the unit spans the bind race: 20 attempts at
+# 0.25 s is about 5 s, comfortably inside TimeoutStartSec. The final probe is
+# deliberately NOT --json so a genuine failure leaves a diagnosable line in
+# the journal rather than a bare exit code.
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 20); do /usr/bin/ai-memory wake-hub --socket "$SOCKET" --health --json >/dev/null 2>&1 && exit 0; sleep 0.25; done; /usr/bin/ai-memory wake-hub --socket "$SOCKET" --health; exit 2'
 
 Restart=on-failure
 RestartSec=5s
@@ -68,6 +79,18 @@ ReadOnlyPaths=-/etc/ai-memory
 # with mkdir(2) itself and forces the socket to 0600, verifying both.
 RuntimeDirectory=ai-memory
 RuntimeDirectoryMode=0700
+# CHOSEN: keep the allowlist in /run and PRESERVE the directory across stops.
+# Without this, systemd removes /run/ai-memory when the unit stops, deleting
+# the very allowlist snapshot the comments above tell the operator to publish
+# at /run/ai-memory/hub-allow.json -- and a hub that starts with no allowlist
+# admits NOBODY. So the ONE allowlist path for this unit is
+#   /run/ai-memory/hub-allow.json
+# and that is the path #3504's refresher timer must write.
+# Honest bound: /run is a tmpfs, so `preserve` survives a stop/restart but NOT
+# a reboot. Publishing the snapshot after boot is exactly what the refresher
+# covers; until it exists, re-run `ai-memory identity hub-cache ... --out
+# /run/ai-memory/hub-allow.json` after a reboot.
+RuntimeDirectoryPreserve=yes
 ReadWritePaths=/run/ai-memory
 
 # MUST match wake_hub::limits::DESIRED_NOFILE. The hub raises its own soft
