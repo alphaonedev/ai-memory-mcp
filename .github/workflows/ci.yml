@@ -208,6 +208,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 2 }
+      - name: Test impact selector security fallbacks
+        run: python3 scripts/test/test_ci_test_impact.py
       - id: cls
         shell: bash
         env:
@@ -320,7 +322,9 @@ jobs:
             echo "::notice::cannot fetch impact base tree ($impact_base) — widening impact selection to the classification base"
             impact_base="$cls_base"
           fi
-          changed=$(git diff --name-only "$cls_base" HEAD)
+          # Include the old path of renames: moving code into docs is not
+          # a docs-only change (#3503).
+          changed=$(git diff --no-renames --name-only "$cls_base" HEAD)
           if [ -z "$changed" ]; then
             # FAIL CLOSED (#2494 §3 / #2496 fix 4). An empty diff vs the
             # PR base means "no NET changes", which is NOT "docs only" —
@@ -353,9 +357,9 @@ jobs:
           # the output based on docs_only. The script is self-contained
           # POSIX-compatible bash; full discipline + foundational list
           # documented inline in scripts/ci-test-impact.sh.
-          # NOTE the base: SELECTION uses $impact_base (may be the
-          # incremental previous head), never $cls_base's classification
-          # role. See the two-bases comment above.
+          # Token SELECTION uses $impact_base (may be the incremental
+          # previous head). The foundational safety check uses $cls_base
+          # so a follow-up commit cannot hide an earlier security change.
           chmod +x scripts/ci-test-impact.sh
           # SECOND-ORDER FAIL-OPEN, closed here (#2496). Splitting the two
           # bases is NECESSARY BUT NOT SUFFICIENT, and this was caught by
@@ -382,7 +386,7 @@ jobs:
           # wins.
           impact_out="${RUNNER_TEMP:-.}/ci-test-impact.out"
           : > "$impact_out"
-          GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$impact_base" "HEAD"
+          GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$impact_base" "HEAD" "$cls_base"
           if [ "$docs_only" != "true" ] && grep -q '^test_impact=__SKIP__$' "$impact_out"; then
             echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
             echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"

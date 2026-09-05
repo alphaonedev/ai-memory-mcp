@@ -24,7 +24,9 @@
 #   test_impact_reason=<string>  # human-readable explanation
 #
 # CLI:
-#   ci-test-impact.sh <base-sha> [head-sha]
+#   ci-test-impact.sh <base-sha> [head-sha] [foundational-base-sha]
+#   The optional third base spans the whole PR: foundational changes there
+#   force __ALL__ even when the incremental diff only changes a gate allowlist.
 #
 # Discipline (mandatory — do NOT relax without operator approval):
 #   1. PREFER false-positive (run too many tests) over false-negative
@@ -42,9 +44,10 @@
 #
 # Self-test:
 #   ci-test-impact.sh --self-test
-#     (exercises the foundational-list logic, the token-overlap matcher,
-#     and the SKIP/ALL/IMPACT triage tree end-to-end against synthetic
-#     diff inputs; no git state required)
+#     (exercises foundational predicates and token overlap)
+#   python3 scripts/test/test_ci_test_impact.py
+#     (exercises SKIP/ALL/IMPACT and the actual workflow classifier against
+#     committed fixture diffs, including incremental PR follow-ups)
 
 set -euo pipefail
 
@@ -90,14 +93,19 @@ is_foundational() {
         # never weakens the "storage changes force the full suite" invariant.
         src/storage/*) return 0 ;;
         migrations/*|migrations/**) return 0 ;;
-        # SAL trait surface (touches every store consumer)
-        src/store/mod.rs) return 0 ;;
+        # SAL trait AND all adapters/submodules touch store consumers. A
+        # basename heuristic cannot track cross-backend security contracts.
+        src/store/*) return 0 ;;
         # MCP dispatch surface (touches every MCP tool)
         src/mcp/mod.rs|src/mcp/registry.rs|src/mcp/profile.rs) return 0 ;;
         # Core data model (every test depends on Memory shape)
         src/models/memory.rs|src/models/link.rs|src/models/mod.rs) return 0 ;;
         # HTTP topology (every handler depends on transport)
         src/handlers/transport.rs|src/handlers/mod.rs|src/handlers/http.rs) return 0 ;;
+        # #3503: binding, authorization and visibility changes must run every
+        # acceptance/attestation/pubkey/federation suite, including explicitly
+        # named Cargo.toml targets under tests/acceptance/.
+        src/handlers/admin.rs|src/handlers/identity_binding.rs|src/visibility.rs) return 0 ;;
         # Federation RECEIVE authorization surface (#2488/#2491). These three
         # files are the two `/sync/push` funnels and the shared verdict they
         # both route through — a security gate whose regressions are silent
@@ -109,25 +117,15 @@ is_foundational() {
         # __ALL__ here keeps the #2447/#2488/#2491 pins load-bearing beyond
         # their own landing commits.
         src/handlers/federation_receive.rs|src/handlers/federation_signing_check.rs) return 0 ;;
-        src/federation/receive_auth.rs) return 0 ;;
-        # SAL ADAPTER implementations (#2488 rot fix). `src/store/mod.rs` (the
-        # trait surface) has been foundational since this list was written, but
-        # the two ADAPTERS were not — and the token heuristic does not select
-        # the cross-backend federation binaries from them: an edit to
-        # `src/store/postgres.rs` impact-selects 58/527 WITHOUT
-        # `federation_delete_ns_scope_2488_pg`, because the tokeniser matches
-        # the `postgres` token and the pin's basename ends in `_pg`. Same for
-        # `src/store/sqlite.rs` -> 21/527 without `..._2488`. So deleting the
-        # `namespace_by_id` override from either adapter would silently let the
-        # `get`-composing trait default take over — reinstating the
-        # erasure-denial trap (a row with an unopenable at-rest envelope becomes
-        # permanently un-deletable by federation) WITHOUT re-running the test
-        # that pins it. These files are the SAL implementations of a
-        # data-integrity contract; treat them like the substrate they are.
-        src/store/sqlite.rs|src/store/postgres.rs) return 0 ;;
+        # #3503 broadens the receive-auth pin to the entire federation tree.
+        src/federation/*) return 0 ;;
         # CI + gate scripts (changes to CI itself need full validation)
         .github/workflows/ci.yml|.github/workflows/c8-precheck.yml) return 0 ;;
         scripts/check-vendor-literals.sh|scripts/qc-codegraph-precheck.sh|scripts/ci-test-impact.sh) return 0 ;;
+        # The #3464 follow-up at 31faaa20 changed only these C8 allowlists;
+        # that push selected 7/747 tests. Authorization bypass approvals
+        # need the same full-suite validation as the gate that reads them.
+        scripts/qc-codegraph-allowlists/*) return 0 ;;
         # Recall + governance + signed events (cross-cutting subsystems)
         src/reranker.rs|src/hnsw.rs|src/embeddings.rs|src/signed_events.rs) return 0 ;;
         src/governance/mod.rs|src/governance/audit.rs|src/governance/rules.rs) return 0 ;;
@@ -269,7 +267,7 @@ run_self_test() {
     is_foundational "src/validate.rs" && check "src/validate.rs is foundational" "yes" "yes" || check "src/validate.rs is foundational" "yes" "no"
     is_foundational "src/storage/migrations.rs" && check "migrations.rs is foundational" "yes" "yes" || check "migrations.rs is foundational" "yes" "no"
     is_foundational "src/handlers/memories.rs" && check "handlers/memories.rs is NOT foundational" "no" "yes" || check "handlers/memories.rs is NOT foundational" "no" "no"
-    is_foundational "src/handlers/admin.rs" && check "handlers/admin.rs is NOT foundational" "no" "yes" || check "handlers/admin.rs is NOT foundational" "no" "no"
+    is_foundational "src/handlers/admin.rs" && check "handlers/admin.rs IS foundational" "yes" "yes" || check "handlers/admin.rs IS foundational" "yes" "no"
     is_foundational "tests/foo.rs" && check "tests/foo.rs is NOT foundational" "no" "yes" || check "tests/foo.rs is NOT foundational" "no" "no"
     is_foundational ".github/workflows/ci.yml" && check ".github/workflows/ci.yml IS foundational" "yes" "yes" || check ".github/workflows/ci.yml IS foundational" "yes" "no"
 
@@ -319,6 +317,7 @@ fi
 
 BASE="${1:-}"
 HEAD="${2:-HEAD}"
+FOUNDATIONAL_BASE="${3:-$BASE}"
 
 if [[ -z "$BASE" ]]; then
     note "no base SHA supplied — running FULL suite"
@@ -342,13 +341,32 @@ fi
 # separately: a git FAILURE (corrupt object, shallow-clone miss, bad
 # ref) must fall back to the FULL suite, not masquerade as an empty
 # diff and silently __SKIP__ the integration suite.
-if ! DIFF_OUT="$(git diff --name-only "$BASE" "$HEAD" 2>/dev/null)"; then
+# Show both paths of renames so moving a security file into docs cannot
+# hide its original path behind the docs-only short-circuit.
+if ! DIFF_OUT="$(git diff --no-renames --name-only "$BASE" "$HEAD" 2>/dev/null)"; then
     note "git diff $BASE..$HEAD FAILED — running FULL suite"
     emit "test_impact" "__ALL__"
     emit "test_impact_count" "ALL"
     emit "test_impact_total" "ALL"
     emit "test_impact_reason" "git-diff-failed"
     exit 0
+fi
+# #3503: selection may be incremental, but the full-suite safety decision
+# must cover the whole PR. A later allowlist-only push previously selected
+# just the parity binaries despite an earlier identity-binding change.
+FOUNDATIONAL_DIFF="$DIFF_OUT"
+if [[ "$FOUNDATIONAL_BASE" != "$BASE" ]]; then
+    if ! PR_DIFF="$(git diff --no-renames --name-only "$FOUNDATIONAL_BASE" "$HEAD" 2>/dev/null)"; then
+        note "foundational diff failed — running FULL suite"
+        emit "test_impact" "__ALL__"
+        emit "test_impact_count" "ALL"
+        emit "test_impact_total" "ALL"
+        emit "test_impact_reason" "foundational-diff-failed"
+        exit 0
+    fi
+    # Retain incremental paths too: reverting a security change still needs
+    # full validation even if that path disappears from the net PR diff.
+    FOUNDATIONAL_DIFF="${DIFF_OUT}"$'\n'"${PR_DIFF}"
 fi
 # (portable read-loop — bash 3 lacks mapfile)
 CHANGED=()
@@ -381,8 +399,8 @@ if [[ "$docs_only" == "true" ]]; then
     exit 0
 fi
 
-# Foundational check
-for f in "${CHANGED[@]}"; do
+# Foundational check spans the whole PR even when token selection does not.
+while IFS= read -r f; do
     if is_foundational "$f"; then
         note "foundational change detected ($f) — running FULL suite"
         emit "test_impact" "__ALL__"
@@ -391,7 +409,7 @@ for f in "${CHANGED[@]}"; do
         emit "test_impact_reason" "foundational:$f"
         exit 0
     fi
-done
+done <<< "$FOUNDATIONAL_DIFF"
 
 # Compute the impact set
 REPO_ROOT="$(git rev-parse --show-toplevel)"
