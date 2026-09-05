@@ -139,6 +139,16 @@ pub async fn handle_smart_load_http(
     // no private row.
     let caller =
         crate::handlers::parity::resolve_caller_agent_id(None, &headers, None).unwrap_or_default();
+    // #3064 lane L-PGP family F2 — postgres SAL dispatch. The family PICK is
+    // pure Rust (`mcp::tools::load_family::pick_family_for_intent`) and the
+    // family-tagged READ rides the SAME `app.store.list` path
+    // `POST /api/v1/memory_load_family` already uses on postgres, so the
+    // handler never reaches `app.db.lock()` (the empty scratch sqlite) on that
+    // backend. Pre-fix the route was fail-closed 501 for exactly that reason.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return smart_load_http_via_store(&app, &headers, &body).await;
+    }
     let lock = app.db.lock().await;
     let embedder = app
         .embedder
@@ -151,6 +161,89 @@ pub async fn handle_smart_load_http(
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => err_response(e),
     }
+}
+
+/// #3064 lane L-PGP family F2 — the postgres arm of
+/// [`handle_smart_load_http`].
+///
+/// Mirrors the sqlite path step for step so the wire envelope is identical:
+///
+/// 1. `intent` is required and is TRIMMED before routing (same validation
+///    order and same message as `mcp::handle_smart_load`, so a missing
+///    `intent` is a 400 on both backends).
+/// 2. `namespace`, when present, is validated with the SAME
+///    `validate::validate_namespace` the sqlite `handle_load_family` applies,
+///    so a malformed namespace refuses rather than silently listing the whole
+///    corpus.
+/// 3. `k` defaults to 20 and clamps to `1..=100` — the `handle_load_family`
+///    contract, restated here because the postgres read does not pass through
+///    that function.
+/// 4. the family pick and the envelope build are the SHARED pure helpers, so
+///    the routing decision and the JSON shape cannot drift between backends.
+///
+/// Never touches `app.db`: the read is `MemoryStore::list` through
+/// [`crate::handlers::power_consolidation::load_family_rows_via_store`].
+#[cfg(feature = "sal")]
+async fn smart_load_http_via_store(
+    app: &AppState,
+    headers: &HeaderMap,
+    body: &Value,
+) -> axum::response::Response {
+    let Some(intent_raw) = body["intent"].as_str() else {
+        return err_response("intent is required".to_string());
+    };
+    let intent = intent_raw.trim();
+    let namespace = body
+        .get(crate::mcp::param_names::NAMESPACE)
+        .and_then(Value::as_str);
+    if let Some(ns) = namespace
+        && let Err(e) = crate::validate::validate_namespace(ns)
+    {
+        return err_response(e.to_string());
+    }
+    let k_raw = body
+        .get(crate::mcp::param_names::K)
+        .and_then(Value::as_u64)
+        .unwrap_or(20);
+    let k = usize::try_from(k_raw).unwrap_or(usize::MAX).clamp(1, 100);
+
+    let embedder = app
+        .embedder
+        .as_ref()
+        .as_ref()
+        .map(|e| e as &dyn crate::embeddings::Embed);
+    let (family, score, source) = crate::mcp::pick_family_for_intent(intent, embedder);
+    let family_name = family.name();
+    tracing::info!(
+        target: crate::mcp::load_family::SMART_LOAD_LOG_TARGET,
+        chosen_family = family_name,
+        score = score,
+        source = source,
+        intent_len = intent.len(),
+        "smart_load routed intent to family (postgres)"
+    );
+
+    let rows = match crate::handlers::power_consolidation::load_family_rows_via_store(
+        app,
+        headers,
+        family_name,
+        namespace,
+        k,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(resp) => return resp,
+    };
+    let inner = json!({
+        "family": family_name,
+        "namespace": namespace,
+        "k": k,
+        "count": rows.len(),
+        "memories": rows,
+    });
+    let envelope = crate::mcp::smart_load_envelope(family_name, score, source, intent, &inner);
+    (StatusCode::OK, Json(envelope)).into_response()
 }
 
 /// `POST /api/v1/memory_reflect` — substrate reflection over a
@@ -706,12 +799,57 @@ pub async fn handle_atomise_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #3064 lane L-PGP family F5 — postgres arm. This route is STORAGE-FREE
+    // on the HTTP surface (see `atomise_http_via_store`), so the postgres
+    // branch answers it without touching `app.db` at all.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return atomise_http_via_store(&app, &body);
+    }
     let lock = app.db.lock().await;
     let tier = app.tier_config.tier;
     let result = crate::mcp::tools::handle_atomise(&lock.0, &body, None, tier, None);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+/// #3064 lane L-PGP family F5 — the postgres arm of [`handle_atomise_http`].
+///
+/// This route needs no SAL port because the HTTP surface has NEVER been able
+/// to reach the atomisation engine: the engine lives on an
+/// `AtomiseToolHandler` the daemon only owns on the MCP dispatch path, and
+/// this handler's call site has always passed `handler: None`. Every HTTP
+/// `memory_atomise` call therefore terminates in the tier-locked advisory
+/// envelope, on EITHER backend, before any storage access — so the honest
+/// answer on postgres is that same envelope, not a `501` implying the route
+/// works on sqlite when it does not.
+///
+/// The safety is STRUCTURAL rather than a promise: `mcp::atomise_precheck` is
+/// driven with `handler_present = false`, which by construction can only
+/// return `TierLocked` or a validation `Err`. The `EngineRequired` arm is
+/// therefore unreachable today AND fails CLOSED with the documented 501
+/// envelope if a future change ever wires a real handler onto this surface —
+/// it can never silently fall through to `app.db`, the empty scratch sqlite.
+#[cfg(feature = "sal")]
+fn atomise_http_via_store(app: &AppState, body: &Value) -> axum::response::Response {
+    match crate::mcp::tools::atomise_precheck(body, app.tier_config.tier, false) {
+        Ok(crate::mcp::tools::AtomisePrecheck::TierLocked(envelope)) => {
+            (StatusCode::OK, Json(envelope)).into_response()
+        }
+        Ok(crate::mcp::tools::AtomisePrecheck::EngineRequired(_)) => {
+            // Unreachable while this call site passes `handler_present = false`.
+            // If it ever becomes reachable, the `rusqlite`-bound engine has NO
+            // postgres implementation, so refuse loudly with the substrate's
+            // own fail-closed envelope rather than running it against the
+            // wrong database.
+            tracing::error!(
+                "atomise_http_via_store reached EngineRequired on postgres — the                  rusqlite-bound atomisation engine has no postgres implementation;                  refusing rather than dispatching against the scratch database"
+            );
+            crate::handlers::postgres_not_implemented(crate::handlers::routes::MEMORY_ATOMISE)
+        }
         Err(e) => err_response(e),
     }
 }
@@ -725,12 +863,63 @@ pub async fn handle_calibrate_confidence_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #3064 lane L-PGP family F3 — postgres SAL dispatch through
+    // `MemoryStore::calibrate_confidence_report`. Pre-fix this route took
+    // `app.db.lock()` unconditionally, so on a postgres daemon it would have
+    // swept the EMPTY scratch sqlite and reported an all-zero calibration as
+    // if it were the corpus's — which is why the gate refused it outright.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return calibrate_confidence_http_via_store(&app, &body).await;
+    }
     let lock = app.db.lock().await;
     let result = crate::mcp::handle_calibrate_confidence(&lock.0, &body);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => err_response(e),
+    }
+}
+
+/// #3064 lane L-PGP family F3 — the postgres arm of
+/// [`handle_calibrate_confidence_http`].
+///
+/// Restates the SAME argument contract `mcp::handle_calibrate_confidence`
+/// applies before it reaches the substrate, in the SAME order, so a refusal
+/// carries the identical message on both backends:
+///
+/// * `days` defaults to `DEFAULT_WINDOW_DAYS` and must be non-negative;
+/// * `days` must not exceed `validate::MAX_DURATION_DAYS` (the #3384
+///   bounded-window refusal — a caller-controlled window must never reach
+///   chrono's panicking duration arithmetic).
+///
+/// The substrate-error prefix is preserved verbatim so an operator's log
+/// greps match across backends.
+#[cfg(feature = "sal")]
+async fn calibrate_confidence_http_via_store(
+    app: &AppState,
+    body: &Value,
+) -> axum::response::Response {
+    let days = body
+        .get("days")
+        .and_then(Value::as_i64)
+        .unwrap_or(crate::confidence::calibrate::DEFAULT_WINDOW_DAYS);
+    if days < 0 {
+        return err_response("days must be non-negative".to_string());
+    }
+    if days > crate::validate::MAX_DURATION_DAYS {
+        return err_response(format!(
+            "days must not exceed {} days (got {days})",
+            crate::validate::MAX_DURATION_DAYS
+        ));
+    }
+    match app
+        .store
+        .calibrate_confidence_report(days, chrono::Utc::now())
+        .await
+    {
+        Ok(report) => (StatusCode::OK, Json(json!({ "report": report }))).into_response(),
+        Err(e) => err_response(format!("memory_calibrate_confidence substrate error: {e}")),
     }
 }
 

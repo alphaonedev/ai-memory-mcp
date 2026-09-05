@@ -170,6 +170,7 @@ pub const WEBHOOK_EVENT_TYPES: &[&str] = &[
     webhook_events::MEMORY_LINK_INVALIDATED,
     webhook_events::MEMORY_CONSOLIDATED,
     webhook_events::APPROVAL_REQUESTED,
+    webhook_events::AGENT_NOTIFIED,
 ];
 
 /// v0.7.0 multi-agent literal-sweep (scanner B finding F-B10.x) —
@@ -202,6 +203,20 @@ pub mod webhook_events {
     /// decision queues a pending action. Consumed directly by the
     /// K10 Approval HTTP+SSE handler.
     pub const APPROVAL_REQUESTED: &str = "approval_requested";
+
+    /// v1.0.0 #3465 — fired after a `memory_notify` inbox row commits,
+    /// on every notify funnel (MCP `handle_notify`, the CLI + HTTP
+    /// surfaces that route through it, and both SAL adapters). Emitted
+    /// by [`crate::write_events::agent_notified`], which fans the SAME
+    /// write to two independent lanes: this webhook lane (operator
+    /// egress) and the in-process wake bus
+    /// ([`crate::inbox_wake`]) that backs `GET /api/v1/inbox/stream`.
+    ///
+    /// The details block carries the recipient, a correlation id and a
+    /// `sha256:` digest of the body — NEVER the body itself. A webhook
+    /// subscriber that needs the text reads the row back by id through
+    /// the ordinary owner-gated read path.
+    pub const AGENT_NOTIFIED: &str = "agent_notified";
 }
 
 /// Insert a subscription, hashing any secret before persisting.
@@ -686,6 +701,31 @@ pub struct PromoteEventDetails {
 pub struct DeleteEventDetails {
     pub title: String,
     pub tier: String,
+}
+
+/// v1.0.0 #3465 — `agent_notified` event details.
+///
+/// The outer envelope already carries `memory_id` (the durable inbox
+/// row), `namespace` (`_messages/<recipient>` on the MCP lane,
+/// `_inbox/<recipient>` on the SAL lane) and `agent_id` (the
+/// authenticated SENDER, matching `owner_of` on every other write
+/// event). This block adds what the envelope cannot express.
+///
+/// `content_digest` is `sha256:<hex>` over the notification BODY. The
+/// body is NEVER placed on this wire: a webhook endpoint is operator
+/// egress, and a notify payload is verbatim tenant content. A
+/// subscriber that needs the text reads the row back by id through the
+/// owner-gated read path; the digest lets it verify it read the same
+/// bytes the event described.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentNotifiedEventDetails {
+    /// Inbox owner the notification was delivered to.
+    pub recipient_agent_id: String,
+    /// Correlates this webhook delivery with the in-process wake frame
+    /// published for the same notify (see [`crate::inbox_wake`]).
+    pub correlation_id: String,
+    /// `sha256:<hex>` over the notification body — never the body.
+    pub content_digest: String,
 }
 
 /// `memory_link_created` event — fires after `db::create_link`
@@ -4076,6 +4116,71 @@ mod tests {
             WEBHOOK_EVENT_TYPES.contains(&"approval_requested"),
             "K4: WEBHOOK_EVENT_TYPES must include approval_requested"
         );
+    }
+
+    /// v1.0.0 #3465 — the enforcement the `webhook_events` module doc
+    /// has always CLAIMED ("statically-asserted to contain every const
+    /// here via the unit test `webhook_event_consts_appear_in_array`")
+    /// but which did not exist anywhere in the tree: a const added to
+    /// `mod webhook_events` and forgotten in [`WEBHOOK_EVENT_TYPES`] is
+    /// silently unsubscribable — `insert` refuses it with "unknown
+    /// webhook event type" while the emitter fires it into the void,
+    /// and no test says a word.
+    ///
+    /// Rather than restate the list (which would drift the same way),
+    /// this parses `mod webhook_events` out of THIS file and asserts
+    /// every `pub const` string literal in it appears in the array.
+    /// Unit tests run with the crate root as CWD.
+    #[test]
+    fn webhook_event_consts_appear_in_array() {
+        let src = std::fs::read_to_string("src/subscriptions.rs")
+            .expect("read src/subscriptions.rs")
+            .replace("\r\n", "\n");
+        let start = src
+            .find("\npub mod webhook_events {")
+            .expect("locate `pub mod webhook_events`");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("locate end of webhook_events mod");
+        let body = &body[..end];
+
+        let mut found = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("pub const ") else {
+                continue;
+            };
+            let Some((_, literal)) = rest.split_once("= \"") else {
+                continue;
+            };
+            let Some((value, _)) = literal.split_once('"') else {
+                continue;
+            };
+            found.push(value.to_string());
+        }
+        assert!(
+            found.len() >= 5,
+            "parser found only {found:?} — the extraction broke, not the invariant"
+        );
+        for value in &found {
+            assert!(
+                WEBHOOK_EVENT_TYPES.contains(&value.as_str()),
+                "webhook_events::* const {value:?} is missing from WEBHOOK_EVENT_TYPES; \
+                 subscribers cannot opt in to an event the canonical list omits"
+            );
+        }
+        // And the array must not name an event no const backs (the
+        // MCP tool-name entries are the deliberate exception).
+        for event in WEBHOOK_EVENT_TYPES {
+            let backed = found.iter().any(|f| f == event)
+                || crate::mcp::registry::tool_names::ALL.contains(event);
+            assert!(
+                backed,
+                "WEBHOOK_EVENT_TYPES entry {event:?} is backed by neither a \
+                 webhook_events const nor an MCP tool name"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

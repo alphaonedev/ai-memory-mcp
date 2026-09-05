@@ -423,7 +423,11 @@ pub const META_KEY_FAMILY: &str = "family";
 // single-use nonce the candidate key must sign before
 // `PUT /api/v1/agents/{id}/pubkey` will bind it. A new PATH, so
 // EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 1 as well.
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 97;
+// 2026-09-05 (#3465) — bumped 97 → 98: the agent-facing inbox wake
+// stream `GET /api/v1/inbox/stream` (`handlers::inbox_sse`) — SSE over
+// the in-process `inbox_wake` broadcast bus. A new PATH, so
+// EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 1 as well.
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 98;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -458,7 +462,9 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // `/api/v1/admin/quarantine/{id}/release` (audited operator release).
 // 2026-09-02 (#3464) — bumped 82 → 83: the new unique path
 // `/api/v1/agents/{id}/pubkey/challenge` (proof-of-possession bind challenge).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 83;
+// 2026-09-05 (#3465) — bumped 83 → 84: the new unique path
+// `/api/v1/inbox/stream` (agent-facing inbox wake stream).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 84;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -815,6 +821,13 @@ pub mod export_taxonomy;
 pub mod export_scope;
 pub mod hooks;
 pub mod identity;
+// v1.0.0 #3465 — the in-process agent WAKE bus for `memory_notify`.
+// Feeds `GET /api/v1/inbox/stream` (SSE) and the fire-and-forget
+// `InboxWakeSink` seam the `ai-memory wake-hub` (#3467/#3469) attaches
+// to. Deliberately NOT the webhook lane (`subscriptions`), whose global
+// semaphore + subscription-scan cliff must never gate a recipient's
+// wake latency.
+pub mod inbox_wake;
 // v0.7.0 L1-2 — knowledge-graph substrate helpers (anti-cycle check).
 pub mod kg;
 // v0.7.0 (issue #651) — pluggable inference backend trait pulled
@@ -966,6 +979,16 @@ pub mod visibility;
 /// default REFUSES every hello until the scoped `a2a-hub/join/v1` delegation
 /// lands in #3468.
 pub mod wake_hub;
+/// v1.0.0 #3469 (EPIC #3466) — the bridge from the #3465 `agent_notified`
+/// wake bus to the #3467 wake-hub: an in-process sink when the hub is
+/// co-hosted with the daemon, and a Unix-domain-socket forwarder when it runs
+/// as a separate process. Fire-and-forget with bounded buffering, so a slow or
+/// absent hub costs a HINT and a counter, never a committed notify; wakes are
+/// addressed directly to the recipient (never a topic, never the webhook
+/// lane), carry `{inbox_row_id, namespace, sender, digest, seq_high_watermark}`
+/// and never a body, and a lost wake self-heals through the watermark plus the
+/// normative `<=60 s` backstop poll.
+pub mod wake_sink;
 /// v1.0.0 #3403 — the shared memory-write EVENT funnel: one typed emitter
 /// per lifecycle event, binding the canonical event name to the canonical
 /// details type in ONE place, so every write surface (MCP, CLI) dispatches
@@ -1380,6 +1403,10 @@ pub fn build_router_with_timeout(
         )
         .route(handlers::routes::NOTIFY, post(handlers::notify))
         .route(handlers::routes::INBOX, get(handlers::get_inbox))
+        // v1.0.0 #3465 — the agent-facing push side of `memory_notify`.
+        // SSE over the in-process wake bus; identity-bound to the
+        // caller's own inbox.
+        .route(handlers::routes::INBOX_STREAM, get(handlers::inbox_sse))
         .route(handlers::routes::SUBSCRIPTIONS, post(handlers::subscribe))
         .route(
             handlers::routes::SUBSCRIPTIONS,

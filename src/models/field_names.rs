@@ -81,6 +81,14 @@ pub const ARCHIVE_REASON_DEFAULT: &str = "archive";
 /// verb produced an archived row. Shared SSOT so the storage layer, the CLI
 /// and the regression tests agree on the marker.
 pub const ARCHIVE_REASON_DELETE: &str = "delete";
+/// v1.0.0 #3075 — the `archive_reason` VALUE stamped when the FEDERATION
+/// receive path archives a row on behalf of a peer's `archives[]`
+/// subcollection. Shared SSOT so the sqlite receive loop
+/// (`handlers::federation_receive::sync_push`) and BOTH SAL adapters'
+/// `apply_remote_archive` stamp the identical marker — a reason-filtered query
+/// or `archive_stats` report must not be able to tell the two backends apart,
+/// which is the exact drift `ARCHIVE_REASON_DEFAULT` above was minted to close.
+pub const ARCHIVE_REASON_SYNC_PUSH: &str = "sync_push";
 /// `atomisation_archived_at` — wire/row field name.
 pub const ATOMISATION_ARCHIVED_AT: &str = "atomisation_archived_at";
 /// `atom_count` — wire/row field name.

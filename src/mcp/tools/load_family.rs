@@ -35,6 +35,15 @@ pub struct LoadFamilyRequest {
 
 /// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_load_family`.
 #[allow(dead_code)]
+/// `tracing` target for the `memory_smart_load` routing decision, bound to the
+/// tool-name SSOT rather than repeating the string.
+///
+/// Both emit sites — the sqlite `forward_to_load_family` and the postgres
+/// `handlers::route_1111::smart_load_http_via_store` — reference this const, so
+/// the log target cannot drift from the wire tool name and the literal is not
+/// scattered across production sites (pm-v3.1 / the hardcoded-literal gate).
+pub(crate) const SMART_LOAD_LOG_TARGET: &str = crate::mcp::registry::tool_names::MEMORY_SMART_LOAD;
+
 pub struct LoadFamilyTool;
 
 impl McpTool for LoadFamilyTool {
@@ -434,21 +443,30 @@ pub fn handle_smart_load(
 ) -> Result<Value, String> {
     let intent_raw = params["intent"].as_str().ok_or("intent is required")?;
     let intent = intent_raw.trim();
+    let (family, score, source) = pick_family_for_intent(intent, embedder);
+    forward_to_load_family(conn, family, score, source, intent, params, caller)
+}
+
+/// #3064 lane L-PGP family F2 — the PURE family-routing half of
+/// [`handle_smart_load`], extracted verbatim so the postgres HTTP branch
+/// (`crate::handlers::route_1111::handle_smart_load_http`) routes an intent
+/// through the SAME keyword-veto + embedder-vote logic instead of a second
+/// copy that could silently drift. It touches no database and no `AppState`;
+/// the caller supplies the already-TRIMMED intent.
+///
+/// Returns `(family, score, chosen_family_source)` — exactly the triple the
+/// wire envelope reports.
+#[must_use]
+pub fn pick_family_for_intent(
+    intent: &str,
+    embedder: Option<&dyn Embed>,
+) -> (crate::profile::Family, f32, &'static str) {
     if intent.is_empty() {
         // Empty intent is the canonical "no signal" case — route to
         // Core and surface `chosen_family_source: "fallback"` so the
         // caller can detect it. `handle_load_family` then runs the same
         // DB query memory_load_family(family=core) would.
-        let resp = forward_to_load_family(
-            conn,
-            crate::profile::Family::Core,
-            0.0,
-            "fallback",
-            intent,
-            params,
-            caller,
-        )?;
-        return Ok(resp);
+        return (crate::profile::Family::Core, 0.0, "fallback");
     }
 
     // Round-4 — keyword-veto strategy. Always run the deterministic
@@ -465,7 +483,7 @@ pub fn handle_smart_load(
     // when it has a signal, fall back to the embedder only when it
     // returns `"fallback"` (no token overlap anywhere).
     let kw_pick = fallback_via_keywords(intent);
-    let (family, score, source) = match embedder {
+    match embedder {
         Some(emb) => match best_family_via_embedder(emb, intent) {
             Some((emb_family, emb_score)) => {
                 if kw_pick.2 == "keyword" && kw_pick.0 != emb_family {
@@ -479,9 +497,7 @@ pub fn handle_smart_load(
             None => kw_pick,
         },
         None => kw_pick,
-    };
-
-    forward_to_load_family(conn, family, score, source, intent, params, caller)
+    }
 }
 
 /// Build the `memory_smart_load` response by forwarding to
@@ -499,7 +515,7 @@ fn forward_to_load_family(
 ) -> Result<Value, String> {
     let family_name = family.name();
     tracing::info!(
-        target: "memory_smart_load",
+        target: SMART_LOAD_LOG_TARGET,
         chosen_family = family_name,
         score = score,
         source = source,
@@ -518,6 +534,27 @@ fn forward_to_load_family(
     }
 
     let inner = handle_load_family(conn, &forward, caller)?;
+    Ok(smart_load_envelope(
+        family_name,
+        score,
+        source,
+        intent,
+        &inner,
+    ))
+}
+
+/// #3064 lane L-PGP family F2 — flatten a `memory_load_family` response into
+/// the `memory_smart_load` wire envelope. Extracted from
+/// [`forward_to_load_family`] so the postgres HTTP branch emits the SAME
+/// bytes as the sqlite path rather than a hand-rebuilt twin.
+#[must_use]
+pub fn smart_load_envelope(
+    family_name: &str,
+    score: f32,
+    source: &str,
+    intent: &str,
+    inner: &Value,
+) -> Value {
     let memories = inner.get("memories").cloned().unwrap_or_else(|| json!([]));
     let count = inner.get("count").cloned().unwrap_or_else(|| json!(0));
     let k = inner
@@ -535,7 +572,7 @@ fn forward_to_load_family(
     let score_rounded = (f64::from(score) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
         / crate::SCORE_DISPLAY_ROUND_FACTOR;
 
-    Ok(json!({
+    json!({
         "chosen_family": family_name,
         "score": score_rounded,
         "chosen_family_source": source,
@@ -544,7 +581,7 @@ fn forward_to_load_family(
         "k": k,
         "count": count,
         "memories": memories,
-    }))
+    })
 }
 
 /// Embedder-driven family pick. Embeds the intent, scores it against

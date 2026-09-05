@@ -139,6 +139,15 @@ impl WakeHub {
         self.state.snapshot()
     }
 
+    /// The routing table, shared. Obtainable BEFORE [`Self::serve`] consumes
+    /// the hub — the same lifetime story as [`Self::metrics`] — so a co-hosted
+    /// daemon can install the #3469 in-process wake sink against a hub it is
+    /// about to move into a `serve` task.
+    #[must_use]
+    pub fn router(&self) -> Arc<super::routing::Router> {
+        self.state.router()
+    }
+
     /// The hub-wide egress budget. Obtainable BEFORE [`Self::serve`] consumes
     /// the hub, so an ops probe or a scale test can assert the byte cap is
     /// holding while the hub runs.

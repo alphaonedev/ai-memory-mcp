@@ -34,7 +34,7 @@ use super::AppState;
 use super::federation_receive::{
     ATTESTATION_TRACE_TARGET, SyncPushBody, apply_inbound_write_attestation,
     check_sender_clock_skew, extract_peer_id, next_utc_midnight, resolve_inbound_attribution,
-    signal_author_authorized,
+    resolve_inbound_decider, signal_author_authorized,
 };
 #[cfg(feature = "sal")]
 use crate::validate;
@@ -78,6 +78,148 @@ async fn resolve_stored_namespace(
 ) -> Result<Option<String>, crate::store::StoreError> {
     let ns_probe_ctx = crate::store::CallerContext::for_admin(probe_principal);
     app.store.namespace_by_id(&ns_probe_ctx, id).await
+}
+
+/// #3075 — the operator context the postgres federation-RECEIVE APPLY lanes use
+/// for their SAL writes.
+///
+/// ## Why `for_admin` (privacy bypass) and not `for_agent`
+///
+/// This is a PARITY requirement, not a convenience. The sqlite twin
+/// ([`super::federation_receive::sync_push`]) applies every one of these lanes
+/// through the RAW `db::*` free functions — `db::set_namespace_standard`,
+/// `db::clear_namespace_standard`, `db::archive_memory`, `db::restore_archived`,
+/// `db::upsert_pending_action` — none of which consult a caller identity at all.
+/// The federation authorization on those lanes is the PEER-SCOPE gate
+/// (`receive_auth::inbound_*_authorized`, #2447/#2478/#2479) plus the per-lane
+/// crypto attestation, NOT the local owner/tenant gate.
+///
+/// Several postgres trait methods DO carry a local caller-owns gate for their
+/// TENANT-facing surfaces (`clear_namespace_standard`'s #1777/#2545 owner gate,
+/// `archive_by_ids`' #3193 caller-owns gate, `archive_restore`'s #3271 twin).
+/// Routing a federated apply through a tenant-scoped context would make the pg
+/// receiver refuse rows the sqlite receiver applies — a SILENT cross-backend
+/// divergence in exactly the direction #2488 warns about (a lane confined on one
+/// funnel only), whose visible symptom is two peers answering `get_standard`
+/// with different governance. So the federated apply runs with the bypass and
+/// the peer-scope gate stays the sole authorization, byte-for-byte as on sqlite.
+///
+/// This adds NO reach a peer did not already have: every call site below runs
+/// AFTER the lane's `receive_auth` verdict, and `/sync/push` is a peer/operator
+/// surface (the #238 envelope gate + #29 signature + #30 nonce + #43 enrollment
+/// all precede this funnel), never a tenant-facing handler. The principal is the
+/// attested sender so the write is attributable in the audit trail.
+#[cfg(feature = "sal")]
+fn federation_apply_ctx(receive_principal: String) -> crate::store::CallerContext {
+    crate::store::CallerContext::for_admin(receive_principal)
+}
+
+/// #2478 / #3075 — postgres PROBE half of the pending effect-namespace gate.
+///
+/// The DECISION lives once in
+/// [`super::federation_receive::pending_namespaces_authorized_resolved`]; this
+/// function only resolves, through the SAL trait, the stored namespaces of the
+/// rows a pending action's EXECUTION would touch by id. The sqlite twin does
+/// the same through `db::namespace_by_id`, so the two backends differ only in
+/// HOW a namespace is read — never in what the answer means, which is the
+/// #2488 lesson (the delete lane broke in OPPOSITE directions on the two
+/// funnels because each carried its own copy of the gate).
+///
+/// The probe list is built here rather than inside the verdict so the #2488
+/// ELISION is preserved: when Layer 1 is unarmed for this peer no stored
+/// namespace can change the outcome, so a zero-config deployment pays ZERO
+/// extra round-trips. A probe that cannot be answered is recorded as
+/// [`ProbedNamespace::Unresolvable`], on which the shared verdict fails CLOSED.
+#[cfg(feature = "sal")]
+#[allow(clippy::too_many_arguments)]
+async fn pending_effect_namespaces_authorized(
+    app: &AppState,
+    sender_agent_id: &str,
+    base_lane: &str,
+    pa: &crate::models::PendingAction,
+    stored_pending_namespace: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    peer_id: Option<&str>,
+    require_push_ns_scope: bool,
+) -> bool {
+    use crate::handlers::federation_receive::{
+        ProbedNamespace, pending_namespaces_authorized_resolved, pending_scope_by_id_targets,
+        pending_scope_needs_by_id_probe,
+    };
+
+    let mut probes: Vec<(&str, ProbedNamespace)> = Vec::new();
+    if pending_scope_needs_by_id_probe(peer_id, attest_cfg) {
+        for memory_id in pending_scope_by_id_targets(pa) {
+            let probed =
+                match resolve_stored_namespace(app, sender_agent_id.to_string(), memory_id).await {
+                    Ok(Some(namespace)) => ProbedNamespace::Resolved(namespace),
+                    Ok(None) => ProbedNamespace::Absent,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            pending_id = %pa.id,
+                            memory_id = %memory_id,
+                            "sync_push(store): pending by-id namespace probe failed (#2478 \
+                             fail-closed): {e}"
+                        );
+                        ProbedNamespace::Unresolvable
+                    }
+                };
+            probes.push((memory_id, probed));
+        }
+    }
+    pending_namespaces_authorized_resolved(
+        base_lane,
+        pa,
+        stored_pending_namespace,
+        &probes,
+        attest_cfg,
+        peer_id,
+        require_push_ns_scope,
+    )
+}
+
+/// #2479 / #3075 — postgres READER for the severed-out-of-scope-parent WARN.
+///
+/// The DECISION (unchanged-link short circuit, `namespace_allowed` verdict, WARN
+/// text) lives once in
+/// [`super::federation_receive::warn_on_severed_out_of_scope_parent_resolved`];
+/// this function only supplies the stored `parent_namespace` the sqlite twin
+/// reads through `db::get_namespace_meta_entry`. Observability-only and
+/// deliberately fail-OPEN on a read error, exactly as the sqlite twin is: the
+/// scope verdict has ALREADY been rendered by the caller and nothing downstream
+/// consults this result, so a storage fault costs the log line and nothing else.
+/// (`get_namespace_standard` returns `(standard_id, parent_namespace)`; only the
+/// parent is used.)
+#[cfg(feature = "sal")]
+async fn warn_on_severed_out_of_scope_parent_via_store(
+    app: &AppState,
+    sender_agent_id: &str,
+    lane: &str,
+    namespace: &str,
+    declared_parent: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    peer_id: Option<&str>,
+) {
+    let read_ctx = federation_apply_ctx(sender_agent_id.to_string());
+    let stored_parent = match app.store.get_namespace_standard(&read_ctx, namespace).await {
+        Ok(Some((_standard_id, parent))) => parent,
+        Ok(None) => return,
+        Err(e) => {
+            crate::handlers::federation_receive::warn_severed_parent_unreadable(
+                lane, namespace, peer_id, &e,
+            );
+            return;
+        }
+    };
+    crate::handlers::federation_receive::warn_on_severed_out_of_scope_parent_resolved(
+        lane,
+        namespace,
+        stored_parent.as_deref(),
+        declared_parent,
+        attest_cfg,
+        peer_id,
+    );
 }
 
 #[cfg(feature = "sal")]
@@ -157,7 +299,15 @@ pub(super) async fn sync_push_via_store(
     let mut deleted = 0usize;
     let mut links_applied = 0usize;
     let mut latest_seen: Option<String> = None;
-    let mut unsupported_on_postgres = 0usize;
+    // #3075 — every `/sync/push` subcollection is now trait-covered on a
+    // postgres receiver, so this honest-non-ack tally is structurally ZERO. The
+    // FIELD stays on the wire: senders read it (and
+    // `success_report_non_ack_reason` keys off it), so dropping the entry would
+    // be a silent wire change on a fleet mid-upgrade. A future subcollection
+    // that lands without a pg apply MUST be added back to this tally rather
+    // than omitted — an unreported lane is the silent drop this counter exists
+    // to prevent.
+    let unsupported_on_postgres = 0usize;
     let mut quota_refused = 0usize;
     let mut first_quota_refusal: Option<crate::quotas::QuotaError> = None;
 
@@ -913,72 +1063,15 @@ pub(super) async fn sync_push_via_store(
         }
     }
 
-    // ---- archives / restores / pendings / pending_decisions /
-    //      namespace_meta / namespace_meta_clears -----------------------
+    // #3075 — the `unsupported_on_postgres` bucket that used to sit HERE is
+    // gone: `archives[]`, `restores[]`, `pendings[]`, `pending_decisions[]`,
+    // `namespace_meta[]`, `namespace_meta_clears[]` and `checkpoints[]` all
+    // apply through the SAL trait now, each behind the SAME `receive_auth`
+    // verdict the sqlite receiver runs (see their loops below). The counter
+    // itself is retained and reported as zero — see its declaration above for
+    // why the field must not be dropped from the wire, and what a future
+    // un-migrated subcollection must do instead of omitting itself.
     //
-    // These subcollections write into tables (archived_memories,
-    // pending_actions, namespace_meta) not yet trait-covered. Surface
-    // them with the same noop posture sqlite uses on missing rows so
-    // a heterogeneous federation reports an honest count.
-    //
-    // FED-RQ-01 (#1936) — commit-checkpoint RESOLUTIONS are counted here too:
-    // the checkpoints table is not yet MemoryStore-trait-covered for a
-    // federated verbatim-resolution write (the `checkpoint_resolve` trait method
-    // re-signs, which the receiver must NOT do), so the postgres funnel reports
-    // them as unsupported rather than silently dropping. The sqlite funnel (the
-    // MCP/epoch-apply-native checkpoint path) applies them fully. Full
-    // postgres-backed checkpoint-resolution federation is a tracked follow-up
-    // (a new `apply_remote_checkpoint_resolution` trait method).
-    // #2478 (CWE-284) — this bucketing is what makes the federated
-    // arbitrary-namespace pending-execution lane STRUCTURALLY UNREACHABLE on
-    // postgres: `sync_push` hands the whole request to this funnel before the
-    // sqlite `pendings[]` / `pending_decisions[]` loops run, and nothing here
-    // calls `decide_pending_action` / `approve_with_approver_type` /
-    // `execute_pending_action`. The disposition is fail-closed AND honest —
-    // `unsupported_on_postgres > 0` is a sender-side non-ack, never a silent
-    // drop. Pinned by `tests/federation_pending_ns_scope_2478_pg.rs`.
-    //
-    // The claim is about the FEDERATION lane only: `execute_pending_action` IS
-    // reachable on a postgres deployment through the LOCAL approve surfaces
-    // (`handlers::approvals` / `handlers::governance`), which are governed by
-    // local authz rather than peer scope.
-    //
-    // #2479 (CWE-284) — the same bucketing is what makes the federated
-    // GOVERNANCE-STANDARD lanes (`namespace_meta[]` + `namespace_meta_clears[]`)
-    // structurally unreachable on postgres. `sync_push` hands the whole request
-    // to this funnel and RETURNS before the sqlite `namespace_meta` loops run,
-    // and nothing in this funnel calls `MemoryStore::set_namespace_standard` /
-    // `clear_namespace_standard`. Pinned by an EXECUTABLE assertion (row state,
-    // not counters) in `tests/federation_ns_meta_scope_2479_pg.rs` rather than
-    // asserted in prose — the #2528 precedent.
-    //
-    // The claim is again about the FEDERATION lane ONLY. Those two trait methods
-    // ARE reachable on a postgres deployment through the LOCAL surfaces
-    // (`handlers::hook_subscribers::{set_namespace_standard,
-    // clear_namespace_standard}` and the MCP `memory_namespace_set_standard` /
-    // `_clear_standard` tools), which are governed by local authz rather than
-    // peer scope and are deliberately out of #2479's scope.
-    //
-    // Any future trait-covered federation of these subcollections MUST route
-    // through `receive_auth::inbound_namespace_meta_authorized` BEFORE the trait
-    // write. That verdict is backend-BLIND (it takes no connection and performs
-    // no probe, because `namespace_meta`'s PRIMARY KEY is the namespace itself),
-    // so the pg funnel can call it verbatim — there is no second implementation
-    // for the two backends to drift apart on.
-    //
-    // Any future trait-covered federation of these subcollections MUST route
-    // through `federation_receive::pending_namespaces_authorized` (or the shared
-    // `receive_auth` verdict it wraps) BEFORE approving — the #2488 lesson is
-    // that the two backends break in opposite directions when a lane is
-    // confined on one funnel only.
-    unsupported_on_postgres += body.archives.len()
-        + body.restores.len()
-        + body.pendings.len()
-        + body.pending_decisions.len()
-        + body.namespace_meta.len()
-        + body.namespace_meta_clears.len()
-        + body.checkpoints.len();
-
     // #1718 — signals round-trip via the SAL trait (`apply_remote_signal`:
     // accept-and-flag-unsigned, idempotent on the UUID, forged-sig refused) —
     // sqlite-twin parity. The #1544 storage-bytes quota lives on the SQLite
@@ -1206,6 +1299,731 @@ pub(super) async fn sync_push_via_store(
         }
     }
 
+    // #2447 (CWE-284) — the by-id sibling lanes (`archives[]` / `restores[]`)
+    // and the governance-STANDARD lanes probe under the whole ENROLLED posture,
+    // not just a declared scope, so Layer 2's disposition of an unscoped
+    // enrolled peer is IDENTICAL on every lane and on both backends.
+    let ns_gate_enrolled = attest_cfg.has_allowlist();
+    // ---- pendings / pending_decisions (#2478, #2529, #1920, #3075) -----
+    //
+    // The GOVERNANCE lanes. `pendings[]` injects UNDECIDED rows; decisions
+    // converge through `pending_decisions[]`. Both apply through the SAL trait
+    // with the sqlite receiver's gate chain, in the same order:
+    //
+    //   * #2529 — a wire row claiming a TERMINAL status is refused (a peer must
+    //     not inject a pre-approved row and skip the decision path), and a
+    //     locally-DECIDED row is never clobbered by a replay;
+    //   * #1920 (CWE-862) — `pending_author_authorized` gates WHO a pending may
+    //     be attributed to, so a hostile peer cannot file an action as an
+    //     arbitrary `requested_by` and approve it in the same request;
+    //   * #2478 (CWE-284) — the effect-namespace gate. The subject is the UNION
+    //     of every namespace the EXECUTION would touch (claimed payload
+    //     namespaces + the stored namespace of every by-id target), NOT the
+    //     pending row's declared `namespace`, because `execute_pending_action`
+    //     never reads that field. Unknown `action_type` is default-deny. The
+    //     VERDICT is the shared `pending_namespaces_authorized_resolved`; only
+    //     the by-id PROBE differs per backend, and the elision keeps a
+    //     zero-config deployment at ZERO extra reads;
+    //   * #3278 — the payload secret screen, AFTER the authorship + scope gates
+    //     so they read the bytes the peer signed, and BEFORE the upsert.
+    //
+    // The APPROVE arm routes through `approve_with_approver_type` (the hardened
+    // gate: self-approval refusal, registered-approver, approver-type policy),
+    // never the raw `pending_decide`, which would trust the wire `decider`. The
+    // REJECT arm grants no authority, so it keeps the idempotent
+    // `pending_decide(false)` transition — but under the #2532 scope gate and
+    // with the decider REBOUND to the attested peer (#2720), so a forged
+    // operator id never reaches the signed audit row.
+    let mut pendings_applied = 0usize;
+    let mut pending_decisions_applied = 0usize;
+    for pa in &body.pendings {
+        if validate::validate_id(&pa.id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        if pa.status != crate::handlers::federation_receive::PENDING_STATUS_PENDING {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                pending_id = %pa.id,
+                status = %pa.status,
+                "sync_push(store): refusing federated pendings entry with non-pending status \
+                 (#2529) — use pending_decisions[] to converge decisions"
+            );
+            skipped += 1;
+            continue;
+        }
+        if !crate::handlers::federation_receive::pending_author_authorized(
+            pa,
+            &body.sender_agent_id,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+        ) {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                pending_id = %pa.id,
+                requested_by = %pa.requested_by,
+                sender = %body.sender_agent_id,
+                peer_id = %peer_header_owned.as_deref().unwrap_or(""),
+                "sync_push(store): peer not authorized to inject a pending action attributed \
+                 to requested_by (#1920) — skipping"
+            );
+            skipped += 1;
+            continue;
+        }
+        // Probe the LOCAL row once, for the #2529 terminal-status refusal and
+        // the #2478 stored-namespace subject.
+        let probe_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        let local_pending = match app.store.get_pending(&probe_ctx, &pa.id).await {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    pending_id = %pa.id,
+                    cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                    "sync_push(store): refusing federated pendings entry — local governance \
+                     row unresolvable (#2478/#2529 fail-closed): {e}"
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        if let Some(existing) = local_pending.as_ref() {
+            if existing.status != crate::handlers::federation_receive::PENDING_STATUS_PENDING {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    pending_id = %pa.id,
+                    local_status = %existing.status,
+                    "sync_push(store): refusing federated pendings upsert — local row is \
+                     already decided (#2529); decisions converge via pending_decisions[]"
+                );
+                skipped += 1;
+                continue;
+            }
+        }
+        if ns_gate_enrolled {
+            let stored_pending_ns = local_pending.as_ref().map(|row| row.namespace.clone());
+            if !pending_effect_namespaces_authorized(
+                &app,
+                &body.sender_agent_id,
+                crate::federation::receive_auth::LANE_PENDINGS,
+                pa,
+                stored_pending_ns.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            )
+            .await
+            {
+                skipped += 1;
+                continue;
+            }
+        }
+        let screened_pa = crate::secret_screen::redact_pending_action_for_storage(pa);
+        let pa = screened_pa.as_ref().unwrap_or(pa);
+        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        match app.store.apply_remote_pending_action(&apply_ctx, pa).await {
+            Ok(()) => {
+                pendings_applied += 1;
+                // v0.7.0 K4 — peer-originated pending rows fire the
+                // `approval_requested` event here too, so local approval-API
+                // subscribers see a uniform queue regardless of which node
+                // minted the row. The subscription plane lives on the sqlite
+                // metadata DB on BOTH backends (the local pending-create
+                // handlers dispatch through `app.db` identically), so this is
+                // the same call the sqlite receive loop makes.
+                let lock = app.db.lock().await;
+                crate::subscriptions::dispatch_approval_requested(&lock.0, &pa.id, &lock.1);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "sync_push(store): apply_remote_pending_action failed for {}: {e}",
+                    pa.id
+                );
+                skipped += 1;
+            }
+        }
+    }
+    for dec in &body.pending_decisions {
+        if validate::validate_id(&dec.id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        // The pending row is resolved from LOCAL STORAGE, never from the
+        // `pendings[]` entry of this same request: that entry is
+        // attacker-controlled, so gating against it would be a TOCTOU on the
+        // gate's own input. It is also resolved BEFORE the approve, never
+        // between approve and execute — the consensus arm durably appends the
+        // vote and can flip `status` at threshold, so a refusal landing after
+        // it would leave an approved-but-unexecuted row.
+        let probe_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        let pa = match app.store.get_pending(&probe_ctx, &dec.id).await {
+            Ok(Some(pa)) => pa,
+            // Unknown pending — the converged no-op. Counting it `skipped`
+            // would make every converged replica non-ack forever (#2491).
+            Ok(None) => {
+                noop += 1;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    pending_id = %dec.id,
+                    cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                    "sync_push(store): refusing federated pending decision — the target \
+                     governance row is UNRESOLVABLE on this node (#2478/#2532 fail-closed): {e}"
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        // Both arms pass the SAME base lane: the destructive
+        // `pending_decisions (delete)` variant is selected INSIDE the shared
+        // verdict, from the pending action's own effect, not from the wire.
+        if ns_gate_enrolled
+            && !pending_effect_namespaces_authorized(
+                &app,
+                &body.sender_agent_id,
+                crate::federation::receive_auth::LANE_PENDING_DECISIONS,
+                &pa,
+                None,
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            )
+            .await
+        {
+            if !dec.approved {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    pending_id = %dec.id,
+                    namespace = %pa.namespace,
+                    "sync_push(store): refusing federated pending REJECT — peer not \
+                     authorized for the pending's effect namespaces (#2532); unauthorized \
+                     veto closed"
+                );
+            }
+            skipped += 1;
+            continue;
+        }
+        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        if dec.approved {
+            // #2478 — the `deleted` counter must report rows DESTROYED, not
+            // deletes attempted, or the 200 envelope lies in the other
+            // direction. The executor's delete arm discards the boolean, so
+            // probe first. An Err resolves to `false`, which UNDER-reports
+            // rather than claiming a destruction that may not have happened.
+            let delete_target_existed = pa.action_type
+                == crate::models::GovernedAction::Delete.as_str()
+                && match pa.memory_id.as_deref() {
+                    Some(mid) => matches!(
+                        resolve_stored_namespace(&app, body.sender_agent_id.clone(), mid).await,
+                        Ok(Some(_))
+                    ),
+                    None => false,
+                };
+            match app
+                .store
+                .approve_with_approver_type(&apply_ctx, &dec.id, &dec.decider)
+                .await
+            {
+                Ok(crate::store::ApproveOutcome::Approved) => {
+                    pending_decisions_applied += 1;
+                    match app.store.execute_pending_action(&apply_ctx, &dec.id).await {
+                        Ok(_) => {
+                            if delete_target_existed {
+                                deleted += 1;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "sync_push(store): execute_pending_action failed for {}: {e}",
+                                dec.id
+                            );
+                            // #2478 — without this the decision counted APPLIED
+                            // while its side effect never landed and `skipped`
+                            // stayed 0, so the sender ACKed a write that does
+                            // not exist here.
+                            skipped += 1;
+                        }
+                    }
+                }
+                // Consensus-gated: the relayed vote was recorded but quorum is
+                // not yet met on this peer — nothing to execute.
+                Ok(crate::store::ApproveOutcome::Pending { .. }) => pending_decisions_applied += 1,
+                Ok(crate::store::ApproveOutcome::Rejected(reason)) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        pending_id = %dec.id,
+                        decider = %dec.decider,
+                        "sync_push(store): refusing forged / unauthorized federated approval \
+                         (#1920): {reason}"
+                    );
+                    skipped += 1;
+                }
+                // The postgres adapter reports an unknown pending as a typed
+                // NotFound where the sqlite free function reports
+                // `ApproveOutcome::NotFound`; both are the converged no-op.
+                Err(crate::store::StoreError::NotFound { .. }) => noop += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        "sync_push(store): approve_with_approver_type failed for {}: {e}",
+                        dec.id
+                    );
+                    skipped += 1;
+                }
+            }
+        } else {
+            // #2720 F-12 (CWE-346) — bind the decider to the attested peer,
+            // never the self-asserted wire `dec.decider`, so the signed
+            // `pending_action.denied` audit row records the real actor.
+            let bound_decider = resolve_inbound_decider(
+                &dec.decider,
+                &body.sender_agent_id,
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+            );
+            match app
+                .store
+                .decide_pending_action(&apply_ctx, &dec.id, false, &bound_decider)
+                .await
+            {
+                Ok(true) => pending_decisions_applied += 1,
+                Ok(false) => noop += 1, // already decided — converged state
+                Err(e) => {
+                    tracing::warn!(
+                        "sync_push(store): decide_pending_action (reject) failed for {}: {e}",
+                        dec.id
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+    }
+
+    // ---- checkpoints (FED-RQ-01 #1936, #125, #2708, L5, #3075) ---------
+    //
+    // Federated commit-checkpoint RESOLUTIONS — the separation-of-duties freeze
+    // anchor. FAIL-CLOSED authorization, sqlite-twin parity, step for step:
+    //
+    //   * only RESOLVED checkpoints federate (a pending one carries no
+    //     attestation, so there is nothing to authorize or apply);
+    //   * #2708 (CB-3, CWE-284) namespace confinement on BOTH the CLAIMED wire
+    //     namespace and the STORED by-id namespace, because the CAS keys on
+    //     `(id, state)` only: a peer scoped to `public/*` must not resolve a
+    //     `secure/ops` freeze anchor by presenting a benign wire namespace. The
+    //     stored probe is ELIDED when Layer 1 is not armed for this peer, so a
+    //     zero-config deployment pays ZERO extra reads, and FAILS CLOSED when
+    //     it cannot resolve;
+    //   * #125 / FED-RQ-01: the resolution's Ed25519 attestation is verified
+    //     against the RESOLVER'S locally-ENROLLED key — never the wire
+    //     `resolver_pubkey` (the #1718/#87 authority-lane discipline) — through
+    //     the SHARED `receive_auth::authorize_remote_checkpoint_resolution`, so
+    //     `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` now binds on a pg receiver
+    //     exactly as it does on sqlite. A forged signature is refused
+    //     UNCONDITIONALLY, regardless of the knob;
+    //   * #3049 secret screen AFTER the attestation check, so the resolver-key
+    //     verification still runs over the bytes the resolver actually signed;
+    //   * the receiver NEVER re-signs (v0.8.0 local-substrate rule): the apply
+    //     goes through `apply_remote_checkpoint_resolution`, NOT
+    //     `checkpoint_resolve`, which would stamp this node's own attestation
+    //     onto another node's verdict.
+    //
+    // Per-item skip on unverifiable / conflict — the batch survives. No storage
+    // quota (a resolution is a state change, not net-new authorship, #1544).
+    let mut checkpoints_applied = 0usize;
+    let mut checkpoints_conflicted = 0usize;
+    let require_checkpoint_sig = crate::federation::receive_auth::require_checkpoint_sig_enabled();
+    for cp in &body.checkpoints {
+        if validate::validate_id(&cp.id).is_err()
+            || validate::validate_namespace(&cp.namespace).is_err()
+        {
+            skipped += 1;
+            continue;
+        }
+        if cp.state == crate::models::CheckpointState::Pending {
+            skipped += 1;
+            continue;
+        }
+        let existing_cp_ns = if ns_scope_needs_existing {
+            let probe_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+            match app.store.checkpoint_get(&probe_ctx, &cp.id).await {
+                Ok(row) => row.map(|c| c.namespace),
+                Err(e) => {
+                    // Fail CLOSED: an unresolvable existence probe cannot be
+                    // reported as "provably no local row" — that is exactly the
+                    // input the stored-vs-claimed relocate bypass needs.
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        checkpoint_id = %cp.id,
+                        cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                        "sync_push(store): checkpoint namespace-scope pre-resolve failed for {}: \
+                         {e}; refusing the resolution (#2708 fail-closed)",
+                        cp.id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            crate::federation::receive_auth::LANE_CHECKPOINTS,
+            &cp.id,
+            &cp.namespace,
+            existing_cp_ns.as_deref(),
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        ) {
+            skipped += 1;
+            continue;
+        }
+        let enrolled = cp
+            .resolved_by
+            .as_deref()
+            .and_then(crate::identity::verify::lookup_peer_public_key);
+        let signable = crate::checkpoints::resolution_signable(cp);
+        match crate::federation::receive_auth::authorize_remote_checkpoint_resolution(
+            &signable,
+            &cp.signature,
+            enrolled.as_ref(),
+            require_checkpoint_sig,
+        ) {
+            // #3164 — `Accept(key)` is the authenticated verdict;
+            // `AcceptUnverified` is the permissive rollout window. Both apply.
+            crate::federation::receive_auth::CheckpointResolutionAuthz::Accept(_)
+            | crate::federation::receive_auth::CheckpointResolutionAuthz::AcceptUnverified => {
+                if body.dry_run {
+                    noop += 1;
+                    continue;
+                }
+                let screened_cp = crate::secret_screen::redact_checkpoint_for_storage(cp);
+                let cp = screened_cp.as_ref().unwrap_or(cp);
+                let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+                match app
+                    .store
+                    .apply_remote_checkpoint_resolution(&apply_ctx, cp)
+                    .await
+                {
+                    Ok(crate::checkpoints::InboundResolutionOutcome::Applied) => {
+                        checkpoints_applied += 1;
+                    }
+                    Ok(crate::checkpoints::InboundResolutionOutcome::Noop) => noop += 1,
+                    Ok(crate::checkpoints::InboundResolutionOutcome::Conflict) => {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            checkpoint_id = %cp.id,
+                            "sync_push(store): inbound checkpoint resolution conflicts with a \
+                             different local resolution — first-resolution-wins, keeping local \
+                             (#1936)"
+                        );
+                        checkpoints_conflicted += 1;
+                        skipped += 1;
+                    }
+                    Ok(crate::checkpoints::InboundResolutionOutcome::RefusedReservedKind) => {
+                        // PR-1 / L5 (#2708-sibling, CWE-284): a wire-reachable
+                        // `/sync/push` MUST NOT steer the substrate's own
+                        // audit-signal spine. Per-item skip; batch survives.
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            checkpoint_id = %cp.id,
+                            condition_type = %cp.condition_type.as_str(),
+                            namespace = %cp.namespace,
+                            "sync_push(store): refusing inbound resolution of a \
+                             substrate-reserved checkpoint anchor (L5 audit-signal poisoning, \
+                             #2708-sibling); skipping this entry, batch survives"
+                        );
+                        skipped += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "sync_push(store): checkpoint resolution apply failed for {}: {e}",
+                            cp.id
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+            verdict => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    checkpoint_id = %cp.id,
+                    "sync_push(store): inbound checkpoint resolution refused ({verdict:?}) (#1936)"
+                );
+                skipped += 1;
+            }
+        }
+    }
+
+    // ---- archives / restores (#2447, #3075) ----------------------------
+    //
+    // v0.6.2 (S29) sqlite-twin parity. `archives[]` is the SOFT move of a live
+    // row into `archived_memories` (distinct from `deletions[]`, which hard
+    // deletes); `restores[]` is its inverse. Both apply through the SAL trait
+    // (`apply_remote_archive` / `apply_remote_restore`, both adapters) instead
+    // of reporting the lane `unsupported_on_postgres` (#3075).
+    //
+    // #2447 — both lanes are the same BY-ID reach into a foreign namespace the
+    // #1934 delete gate closed, one step softer: an archive still removes the
+    // row from every live read of a namespace the peer was denied, and an
+    // ARCHIVED row is the input `restores[]` resurrects. So both are confined
+    // with the shared `inbound_by_id_namespace_authorized` verdict on the
+    // row's STORED namespace, resolved through the SCALAR by-id projection —
+    // `namespace_by_id` for archives (the row is still live) and
+    // `archived_namespace_by_id` for restores (the row is in the archive
+    // table, which is the whole point of the lane). A missing row stays a
+    // no-op; an UNRESOLVABLE probe fails CLOSED, because reporting a read
+    // fault as "provably no local row" is exactly the input a
+    // stored-vs-claimed relocate bypass needs (#2497).
+    //
+    // The #1848 / G30 forget-tombstone gate on `restores[]` is NOT here: it
+    // lives inside `apply_remote_restore` on BOTH adapters, so it cannot be
+    // omitted by a future caller that reaches the trait method another way.
+    let mut archived = 0usize;
+    let mut restored = 0usize;
+    for arch_id in &body.archives {
+        if validate::validate_id(arch_id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        if ns_gate_enrolled {
+            match resolve_stored_namespace(&app, body.sender_agent_id.clone(), arch_id).await {
+                Ok(Some(namespace)) => {
+                    if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                        crate::federation::receive_auth::LANE_ARCHIVES,
+                        arch_id,
+                        Some(&namespace),
+                        &attest_cfg,
+                        peer_header_owned.as_deref(),
+                        require_push_ns_scope,
+                    ) {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %arch_id,
+                        cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                        "sync_push(store): archive pre-resolve failed for {arch_id}: {e}; \
+                         refusing the archive (#2447 fail-closed)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        match app.store.apply_remote_archive(&apply_ctx, arch_id).await {
+            Ok(true) => archived += 1,
+            Ok(false) => noop += 1,
+            Err(e) => {
+                tracing::warn!("sync_push(store): apply_remote_archive failed for {arch_id}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+    for res_id in &body.restores {
+        if validate::validate_id(res_id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        if ns_gate_enrolled {
+            let probe_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+            match app.store.archived_namespace_by_id(&probe_ctx, res_id).await {
+                Ok(Some(namespace)) => {
+                    if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                        crate::federation::receive_auth::LANE_RESTORES,
+                        res_id,
+                        Some(&namespace),
+                        &attest_cfg,
+                        peer_header_owned.as_deref(),
+                        require_push_ns_scope,
+                    ) {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %res_id,
+                        cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                        "sync_push(store): restore pre-resolve failed for {res_id}: {e}; \
+                         refusing the restore (#2447 fail-closed)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        match app.store.apply_remote_restore(&apply_ctx, res_id).await {
+            Ok(true) => restored += 1,
+            Ok(false) => noop += 1,
+            Err(e) => {
+                tracing::warn!("sync_push(store): apply_remote_restore failed for {res_id}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+
+    // ---- namespace_meta / namespace_meta_clears (#2479, #3075) ---------
+    //
+    // v0.6.2 (S35) sqlite-twin parity: apply the peer's governance-STANDARD
+    // rows through `MemoryStore::{set,clear}_namespace_standard` so a
+    // postgres-backed receiver converges on the originator's inheritance chain
+    // instead of reporting the whole lane `unsupported_on_postgres` (#3075).
+    //
+    // AUTHORIZATION IS THE SQLITE VERDICT, VERBATIM. Both loops call
+    // `receive_auth::inbound_namespace_meta_authorized`, which is backend-blind
+    // (no connection, no probe — `namespace_meta`'s PRIMARY KEY is the namespace
+    // itself, so there is no stored-vs-claimed split to resolve and the #2447
+    // relocate bypass has no subject here). That covers, in one shared
+    // function: the #2479 Amendment E UNCONDITIONAL refusal on the GLOBAL `*`
+    // standard for any peer that did not declare `**`, the row's own namespace,
+    // the declared `parent_namespace` it splices above that namespace, and the
+    // #2536 deep-descendant probe. A refusal increments the additive
+    // `namespace_meta_refused` counter AND `skipped` — identical to the sqlite
+    // twin, and deliberately not folded, because this funnel enqueues nothing to
+    // the push DLQ (#2498) so the sender is the only party that can retry.
+    let mut namespace_meta_applied = 0usize;
+    let mut namespace_meta_cleared = 0usize;
+    let mut namespace_meta_refused = 0usize;
+    for entry in &body.namespace_meta {
+        if validate::validate_namespace(&entry.namespace).is_err()
+            || validate::validate_id(&entry.standard_id).is_err()
+        {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        if ns_gate_enrolled {
+            if !crate::federation::receive_auth::inbound_namespace_meta_authorized(
+                crate::federation::receive_auth::LANE_NAMESPACE_META,
+                &entry.namespace,
+                entry.parent_namespace.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            ) {
+                namespace_meta_refused += 1;
+                skipped += 1;
+                continue;
+            }
+            // AFTER the verdict, never before: a refused entry severs nothing,
+            // so warning about it would be false (sqlite-twin ordering).
+            warn_on_severed_out_of_scope_parent_via_store(
+                &app,
+                &body.sender_agent_id,
+                crate::federation::receive_auth::LANE_NAMESPACE_META,
+                &entry.namespace,
+                entry.parent_namespace.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+            )
+            .await;
+        }
+        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        match app
+            .store
+            .set_namespace_standard(
+                &apply_ctx,
+                &entry.namespace,
+                &entry.standard_id,
+                entry.parent_namespace.as_deref(),
+            )
+            .await
+        {
+            Ok(()) => namespace_meta_applied += 1,
+            Err(e) => {
+                tracing::warn!(
+                    "sync_push(store): set_namespace_standard failed for {}: {e}",
+                    entry.namespace
+                );
+                skipped += 1;
+            }
+        }
+    }
+    for ns in &body.namespace_meta_clears {
+        if validate::validate_namespace(ns).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        // The DESTRUCTIVE twin: `clear_namespace_standard` removes the standard
+        // AND the parent link in one statement, and because governance is
+        // allow-on-silence an absent policy resolves PERMISSIVE — so this lane
+        // DISARMS a namespace (and, by inheritance, its descendants). No
+        // `standard_id` rides this lane, hence no parent to gate: the namespace
+        // is the whole subject (sqlite-twin reasoning, verbatim).
+        if ns_gate_enrolled {
+            if !crate::federation::receive_auth::inbound_namespace_meta_authorized(
+                crate::federation::receive_auth::LANE_NAMESPACE_META_CLEARS,
+                ns,
+                None,
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            ) {
+                namespace_meta_refused += 1;
+                skipped += 1;
+                continue;
+            }
+            warn_on_severed_out_of_scope_parent_via_store(
+                &app,
+                &body.sender_agent_id,
+                crate::federation::receive_auth::LANE_NAMESPACE_META_CLEARS,
+                ns,
+                None,
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+            )
+            .await;
+        }
+        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
+        match app.store.clear_namespace_standard(&apply_ctx, ns).await {
+            Ok(true) => namespace_meta_cleared += 1,
+            Ok(false) => noop += 1,
+            Err(e) => {
+                tracing::warn!("sync_push(store): clear_namespace_standard failed for {ns}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+
     // #1566 / #1579 B1 — ack-after-commit: the response (the sender's
     // quorum ack) returns now; rows still needing a locally-computed
     // vector are embedded by this detached task.
@@ -1216,9 +2034,24 @@ pub(super) async fn sync_push_via_store(
         Json(json!({
             "applied": applied,
             "deleted": deleted,
+            // #3075 — archive / restore lane counters, sqlite-twin names.
+            "archived": archived,
+            // #3075 / FED-RQ-01 — checkpoint-resolution counters, sqlite-twin names.
+            // #3075 — governance-queue lane counters, sqlite-twin names.
+            "pendings_applied": pendings_applied,
+            "pending_decisions_applied": pending_decisions_applied,
+            "checkpoints_applied": checkpoints_applied,
+            "checkpoints_conflicted": checkpoints_conflicted,
+            "restored": restored,
             "links_applied": links_applied,
             "signals_applied": signals_applied,
             "action_transitions_applied": action_transitions_applied,
+            // #3075 — governance-STANDARD lane counters, sqlite-twin names.
+            "namespace_meta_applied": namespace_meta_applied,
+            "namespace_meta_cleared": namespace_meta_cleared,
+            // #2479 — additive; see the sqlite twin's declaration for why this
+            // is not folded into `skipped`.
+            "namespace_meta_refused": namespace_meta_refused,
             "noop": noop,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
@@ -1227,9 +2060,11 @@ pub(super) async fn sync_push_via_store(
             "dry_run": body.dry_run,
             "receiver_agent_id": body.sender_agent_id,
             (field_names::STORAGE_BACKEND): "postgres",
-            "note": "pendings / archives / restores / namespace_meta / checkpoints are \
-                     sqlite-only in this funnel; memories / deletions / links / signals / \
-                     action_transitions round-trip via the SAL trait",
+            "note": "every /sync/push subcollection round-trips via the SAL trait on \
+                     this backend (#3075): memories / deletions / links / signals / \
+                     action_transitions / archives / restores / namespace_meta / \
+                     namespace_meta_clears / checkpoints / pendings / \
+                     pending_decisions",
         })),
     )
         .into_response()

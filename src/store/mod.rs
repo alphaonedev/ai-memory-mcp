@@ -2763,6 +2763,213 @@ pub trait MemoryStore: Send + Sync {
         }
     }
 
+    /// v1.0.0 #3075 — resolve an ARCHIVED row's namespace by id, for the
+    /// federation `restores[]` namespace-scope gate (#2447).
+    ///
+    /// The sibling of [`namespace_by_id`](MemoryStore::namespace_by_id), reading
+    /// the ARCHIVE table instead of the live one, because at the moment a
+    /// `restores[]` entry is authorized the row lives in `archived_memories` —
+    /// that is the whole point of the lane. Same fail-closed contract as its
+    /// live twin, and it matters for the same reason: `Ok(None)` MUST mean
+    /// "provably no archived row" (the caller may then treat the entry as a
+    /// no-op), and `Err(_)` means UNRESOLVABLE, on which every caller MUST fail
+    /// closed rather than treat the row as absent — an unresolvable probe is
+    /// exactly the input a stored-vs-claimed relocate bypass needs.
+    ///
+    /// A SCALAR projection, never a full-row read, for the #2488 reasons the
+    /// live twin documents: the full-row archive mapper is pinned to a
+    /// fail-closed at-rest decrypt, so a gate built on it would make a row with
+    /// an unopenable envelope permanently un-restorable by federation with no
+    /// operator escape hatch.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a storage error; adapters MUST NOT fold a read
+    /// fault into `Ok(None)`.
+    async fn archived_namespace_by_id(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVED_NAMESPACE_BY_ID".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3075 — apply a remote-origin ARCHIVE (`/sync/push` `archives[]`).
+    ///
+    /// The federated soft-move of a live row into `archived_memories`, stamped
+    /// with [`field_names::ARCHIVE_REASON_SYNC_PUSH`](crate::models::field_names::ARCHIVE_REASON_SYNC_PUSH).
+    /// Returns `true` when a live row was actually moved, `false` when there
+    /// was nothing to archive (the peer already archived it, or never sent the
+    /// original write) — the sqlite receive loop's long-standing no-op posture,
+    /// which the caller reports as `noop` rather than `skipped`.
+    ///
+    /// ## Why this is not [`archive_by_ids`](MemoryStore::archive_by_ids)
+    ///
+    /// `archive_by_ids` is the CALLER-OWNS verb (#3193): a tenant may not
+    /// archive another tenant's row. The federated lane has a different
+    /// authorization model entirely — the peer-scope gate
+    /// (`receive_auth::inbound_by_id_namespace_authorized` on the row's STORED
+    /// namespace, #2447) plus the enrolled-peer envelope — and the sqlite
+    /// receive loop has always applied it through the owner-BLIND
+    /// `db::archive_memory`. A separate method keeps the two contracts from
+    /// being conflated at a call site, and keeps the caller-owns contract of
+    /// `archive_by_ids` intact for the tenant surfaces that depend on it.
+    ///
+    /// Adapters MUST NOT apply an owner/tenant predicate here, and MUST NOT
+    /// relax any OTHER gate the local archive funnel enforces (link snapshot,
+    /// governance pre-write, record-stop).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a storage error; the caller counts an error as
+    /// `skipped` (an honest per-item non-ack), never as applied.
+    async fn apply_remote_archive(&self, _ctx: &CallerContext, _id: &str) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_ARCHIVE".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3075 — apply a remote-origin RESTORE (`/sync/push` `restores[]`).
+    ///
+    /// The inverse of [`apply_remote_archive`](MemoryStore::apply_remote_archive):
+    /// move the row from `archived_memories` back into `memories`. Returns
+    /// `true` when a row was restored, `false` for the no-op cases (no archived
+    /// row, or the id is FORGET-TOMBSTONED).
+    ///
+    /// ## The #1848 / G30 tombstone gate lives HERE, and only here
+    ///
+    /// `restores[]` is the AUTOMATIC, peer-triggered resurrection vector: a peer
+    /// must not be able to undo a local forget by pushing a restore of a
+    /// tombstoned id. So this method MUST check `forget_tombstones` before
+    /// restoring and report a tombstoned id as `Ok(false)` (a no-op, matching
+    /// the lane's posture for a missing row).
+    ///
+    /// It is deliberately NOT checked by
+    /// [`archive_restore`](MemoryStore::archive_restore): that is the OPERATOR
+    /// un-forget path, an authorized restore per the #1771 recoverable-delete
+    /// contract, and gating it would break a documented operator capability.
+    /// The postgres `archive_restore` carried a comment justifying its missing
+    /// tombstone gate by the premise that "federation `/sync/push` restores[]
+    /// are sqlite-only" — #3075 retires that premise, which is why the gate
+    /// lands on this method rather than on that one.
+    ///
+    /// Adapters MUST NOT apply an owner/tenant predicate here (see
+    /// `apply_remote_archive` for why), and MUST keep every other gate the
+    /// local restore funnel enforces (the already-live collision refusal,
+    /// governance pre-write, cid re-mint, link re-insertion, record-stop).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Conflict` when the id already exists in live `memories` (the
+    /// caller counts it `skipped`, matching the sqlite receive loop), or
+    /// `Backend` on a storage error.
+    async fn apply_remote_restore(&self, _ctx: &CallerContext, _id: &str) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_RESTORE".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3075 — apply a remote-origin PENDING-action row (`/sync/push`
+    /// `pendings[]`).
+    ///
+    /// The federated governance-queue injection lane: upsert the originator's
+    /// canonical row so replays and races converge on it. `pa.status` is
+    /// ALWAYS `"pending"` by the time an adapter sees it — the funnel refuses a
+    /// wire row claiming a terminal status (#2529), because decisions converge
+    /// through `pending_decisions[]` and a pre-decided injection would skip the
+    /// decision path entirely.
+    ///
+    /// ## Why this is not a generic "upsert pending" verb
+    ///
+    /// There is deliberately no caller-facing pending-upsert on this trait: a
+    /// pending row is an AUTHORITY REQUEST whose approval reaches
+    /// [`execute_pending_action`](MemoryStore::execute_pending_action) — an
+    /// arbitrary-namespace `insert` / `delete` / `promote` / `reflect`. The only
+    /// sanctioned producers are the governance gate
+    /// ([`enforce_governance_action`](MemoryStore::enforce_governance_action))
+    /// and THIS federated lane, which the funnel guards with the #1920
+    /// authorship gate, the #2529 status refusals and the #2478 effect-namespace
+    /// scope gate before calling it.
+    ///
+    /// Adapters MUST upsert on the primary key (idempotent on replay) and MUST
+    /// NOT apply an owner/tenant predicate — the peer-scope gate is the
+    /// authorization on this lane, exactly as on the sqlite receiver, whose
+    /// inline loop calls the owner-blind `db::upsert_pending_action`.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a storage error; the caller counts an error as
+    /// `skipped` (an honest per-item non-ack), and the batch survives.
+    async fn apply_remote_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        _pa: &crate::models::PendingAction,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_PENDING_ACTION".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3075 / FED-RQ-01 (#1936) — apply a remote-origin resolved
+    /// commit-checkpoint RESOLUTION (`/sync/push` `checkpoints[]`).
+    ///
+    /// The receive-side CRDT apply under the substrate's
+    /// **first-resolution-wins** rule. `incoming` MUST already be authorized by
+    /// the caller: the funnel verifies the resolver's Ed25519 attestation
+    /// against the resolver's locally-ENROLLED key via
+    /// [`crate::federation::receive_auth::authorize_remote_checkpoint_resolution`]
+    /// (`AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`, #125) and runs the #2708
+    /// namespace confinement BEFORE calling this method.
+    ///
+    /// ## Why this is not [`checkpoint_resolve`](MemoryStore::checkpoint_resolve)
+    ///
+    /// `checkpoint_resolve` is the LOCAL resolve verb: it stamps a resolution
+    /// this node authored and, given a keypair, SIGNS it. A receiver must never
+    /// re-sign a peer's resolution (the v0.8.0 local-substrate rule) — the
+    /// sender's `signature` / `resolver_pubkey` are persisted VERBATIM, which is
+    /// what makes the #125 separation-of-duties freeze anchor verifiable
+    /// downstream. Routing the federated apply through `checkpoint_resolve`
+    /// would forge the receiver's own attestation onto another node's verdict.
+    ///
+    /// Adapters MUST, in this order:
+    /// 1. refuse a substrate-RESERVED anchor via the shared backend-blind
+    ///    [`crate::federation::receive_auth::inbound_checkpoint_kind_authorized`],
+    ///    checked on BOTH the CLAIMED wire kind and the STORED by-id kind, with
+    ///    the stored probe resolved UNCONDITIONALLY and failing CLOSED;
+    /// 2. CAS the locally-PENDING row (`AND state = 'pending'`) so a concurrent
+    ///    local resolve or second inbound resolution can never clobber a
+    ///    committed one;
+    /// 3. on a CAS miss, INSERT verbatim when no local row exists (treating a
+    ///    lost INSERT race as the same first-resolution-wins disposition), else
+    ///    classify against the local row via
+    ///    [`crate::checkpoints::classify_against_local`].
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a storage error; the caller counts an error as
+    /// `skipped` (an honest per-item non-ack), and the batch survives.
+    async fn apply_remote_checkpoint_resolution(
+        &self,
+        _ctx: &CallerContext,
+        _incoming: &crate::models::Checkpoint,
+    ) -> StoreResult<crate::checkpoints::InboundResolutionOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPLY_REMOTE_CHECKPOINT_RESOLUTION".to_string(),
+        })
+    }
+
     /// #1718 — apply a remote-origin signal via the accept-and-flag-unsigned
     /// posture (a signal is a *message*, not an authority grant — same as
     /// [`apply_remote_memory`](MemoryStore::apply_remote_memory) /
@@ -4219,6 +4426,53 @@ pub trait MemoryStore: Send + Sync {
     async fn verify_link(&self, _filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {
         Err(StoreError::UnsupportedCapability {
             capability: "VERIFY_LINK".to_string(),
+        })
+    }
+
+    /// #3064 lane L-PGP family F3 — the Form-5 calibration sweep
+    /// (`memory_calibrate_confidence`).
+    ///
+    /// Reads `confidence_shadow_observations` over the trailing `days`
+    /// window and returns the per-(namespace, source) baselines. `now` is a
+    /// parameter, not a clock read, so the window boundary is deterministic
+    /// and both adapters compute the SAME `since` cutoff.
+    ///
+    /// The sweep is READ-ONLY over the report's inputs; the one write any
+    /// adapter may perform is the `recall_outcome` backfill from the
+    /// `recall_observations` ledger, which is a maintenance enrichment of
+    /// `consumption_utility` / `consume_access_divergence` and is skipped —
+    /// never forced — when it cannot run (absent ledger, or a stopped record
+    /// plane on the postgres adapter). The baselines themselves never depend
+    /// on it, so a skipped backfill DEGRADES the report's optional evidence
+    /// fields to `None` and never yields a wrong number.
+    ///
+    /// # Caller gate
+    ///
+    /// There is NONE, on either adapter, and that is deliberate for the
+    /// #3064 port: the sqlite sweep this method was lifted from applies no
+    /// caller filter, so the aggregation spans every namespace and the
+    /// returned baselines disclose per-namespace names plus aggregate
+    /// confidence statistics to any caller that reaches the route.
+    /// Reproducing that verbatim kept the two backends equal rather than
+    /// silently diverging; it did not WIDEN the exposure, since a sqlite
+    /// daemon already served the same report. The gap itself is tracked in
+    /// #3507 and must be closed on BOTH adapters together — an
+    /// implementor adding a caller filter to only one of them would
+    /// reintroduce exactly the cross-backend divergence this method exists
+    /// to prevent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidInput`] when `days` is outside `0..=36500` (the
+    /// bounded-window refusal), or a backend error. Default returns
+    /// `UnsupportedCapability`.
+    async fn calibrate_confidence_report(
+        &self,
+        _days: i64,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<crate::confidence::calibrate::CalibrationReport> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "CALIBRATE_CONFIDENCE".to_string(),
         })
     }
 

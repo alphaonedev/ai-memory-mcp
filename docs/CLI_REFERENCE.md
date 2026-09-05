@@ -1557,7 +1557,21 @@ secret is written. Use a new `--out` path when renewing a delegation.
 ```bash
 ai-memory identity hub-cache --include-agent ai:worker --out /run/allow.json
 ai-memory identity hub-cache --out /run/allow.json # revoke all cached principals
+ai-memory identity hub-cache --include-agent ai:worker --daemon-producer --out /run/allow.json
 ```
+
+`--daemon-producer` (#3469) additionally publishes the reserved
+`wake-hub-producer` row, bound to THIS host's enrolled `daemon` public key, so a
+daemon with `[wake_hub].sink_socket` set can join the hub and push wakes. It is
+off by default and reads only the public key. Its `bind_authority` is
+`daemon_key_dir`, which states the real provenance — an operator on this host
+asserted the binding — rather than claiming a possession proof the daemon key
+never performed; the hub accepts that authority for the reserved producer name
+and for no other principal. Like every other row it is audited before
+publication, and omitting the switch on the next refresh revokes it. A reserved
+principal passed to `--include-agent` is refused outright, because it has no key
+history and would otherwise be silently omitted from a snapshot that looked
+successful.
 
 Repeat `--include-agent` for each permitted principal. It is deliberately
 **not** named `--agent-id` ([#3508](https://github.com/alphaonedev/ai-memory-mcp/issues/3508)):

@@ -509,7 +509,7 @@ mod link;
 #[path = "tools/list.rs"]
 mod list;
 #[path = "tools/load_family.rs"]
-mod load_family;
+pub(crate) mod load_family;
 #[path = "tools/namespace.rs"]
 mod namespace;
 #[path = "tools/notify.rs"]
@@ -641,7 +641,12 @@ pub use check_duplicate::handle_check_duplicate;
 // surfaces.
 pub use expand_query::handle_expand_query;
 pub use kg_query::handle_kg_query;
-pub use load_family::{handle_load_family, handle_smart_load};
+// #3064 lane L-PGP family F2 — `pick_family_for_intent` + `smart_load_envelope`
+// are the pure routing/wire halves of `handle_smart_load`, re-exported so the
+// postgres HTTP branch shares them instead of carrying a drift-prone copy.
+pub use load_family::{
+    handle_load_family, handle_smart_load, pick_family_for_intent, smart_load_envelope,
+};
 pub(crate) use namespace::AUDIT_KIND_NAMESPACE_CLEAR_STANDARD;
 pub(crate) use namespace::authorize_namespace_standard_bind;
 // #2542 — consumed only by the SAL/postgres HTTP funnel (the sqlite HTTP path
@@ -853,7 +858,12 @@ pub mod schema_handler_parity_test_exports {
 /// path. The production wire path remains the JSON-RPC dispatch in
 /// `handle_request`.
 pub mod tools {
-    pub use super::atomise::{AtomiseToolHandler, handle_atomise};
+    // #3064 lane L-PGP family F5 — `atomise_precheck` (+ its two result
+    // types) is the DB-FREE prologue the HTTP surface answers with; see
+    // `handlers::route_1111::atomise_http_via_store`.
+    pub use super::atomise::{
+        AtomiseArgs, AtomisePrecheck, AtomiseToolHandler, atomise_precheck, handle_atomise,
+    };
 
     /// v0.7.0 multi-agent literal-sweep (scanner B finding F-B3.x) —
     /// re-export the canonical on-conflict enum so external consumers
@@ -2676,7 +2686,8 @@ fn dispatch_memory_agent_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String
 }
 
 fn dispatch_memory_notify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_notify(ctx.conn, ctx.arguments, ctx.resolved_ttl, ctx.mcp_client)
+    let ttl = ctx.resolved_ttl;
+    handle_notify(ctx.conn, ctx.db_path, ctx.arguments, ttl, ctx.mcp_client)
 }
 
 /// #1050 (2026-05-21) — `memory_share` was registered in

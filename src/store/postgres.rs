@@ -49,6 +49,15 @@ mod hub;
 
 use crate::models::ConfidenceSource;
 mod coordination_create;
+// #3064 lane L-PGP — postgres SAL for the tools whose HTTP mirrors were
+// fail-closed 501 on this backend. Its own module because postgres.rs is at
+// its qual_10 module-size budget (the lane brief mandates a submodule over a
+// private ceiling bump).
+mod parity_3064;
+// #3075 lane L-PGP — postgres SAL for the federation `/sync/push`
+// subcollections that were bucketed `unsupported_on_postgres`. Own module for
+// the same qual_10 budget reason as `parity_3064` above.
+mod federation_3075;
 mod pubkey_history;
 
 use crate::models::field_names;
@@ -24226,13 +24235,11 @@ impl MemoryStore for PostgresStore {
         // wholesale-preserved any string leaf under a `*_b64` key, so a
         // credential-shaped catchup-pull leaf egressed verbatim. Local
         // `store` / `store_batch` keep the TrustedByName storage screen.
-        let tombstoned: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
-        )
-        .bind(&memory.id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| to_store_err("apply_remote_memory tombstone check", e))?;
+        let tombstoned: bool = sqlx::query_scalar(federation_3075::SQL_FORGET_TOMBSTONE_EXISTS)
+            .bind(&memory.id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("apply_remote_memory tombstone check", e))?;
         if tombstoned {
             tracing::info!(
                 target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
@@ -24730,13 +24737,11 @@ impl MemoryStore for PostgresStore {
         // with the sqlite insert_if_newer gate). DROP an inbound write for a
         // tombstoned id (tombstone-wins) so a peer cannot revive a forgotten
         // row via LWW.
-        let tombstoned: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
-        )
-        .bind(&inbound.id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| to_store_err("merge_inbound tombstone check", e))?;
+        let tombstoned: bool = sqlx::query_scalar(federation_3075::SQL_FORGET_TOMBSTONE_EXISTS)
+            .bind(&inbound.id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("merge_inbound tombstone check", e))?;
         if tombstoned {
             tracing::info!(
                 target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
@@ -25070,6 +25075,66 @@ impl MemoryStore for PostgresStore {
 
     /// `_ctx` is deliberately discarded — see the trait doc on
     /// [`MemoryStore::apply_remote_deletion`] (#2488).
+    /// #3075 — delegated to `postgres/federation_3075.rs`. Owner-BLIND by trait
+    /// contract; the #1920 authorship + #2478 scope gates are the authorization.
+    async fn apply_remote_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        pa: &crate::models::PendingAction,
+    ) -> StoreResult<()> {
+        // #3175 parity — the gate is called HERE as well as inside the
+        // `postgres/federation_3075.rs` implementation (or the already-gated
+        // funnel it composes). `tests/qual_pg_record_stop_gate_parity_3175.rs`
+        // resolves the delegation TEXTUALLY within this file, so a callee in a
+        // submodule is invisible to it: without this line the parity check
+        // reports the arm ungated even though the write is gated. Keep BOTH —
+        // deleting the inner call would make the gate depend on this file's
+        // arm, and deleting this one re-breaks the parity scan.
+        // `gate_record_stop` is an idempotent read-probe, so the double call is
+        // behaviour-free and fails closed either way.
+        self.gate_record_stop().await?;
+        self.apply_remote_pending_action_pg(pa).await
+    }
+
+    /// #3075 / FED-RQ-01 — delegated to `postgres/federation_3075.rs`. The
+    /// receiver NEVER re-signs; the sender's attestation is persisted verbatim.
+    async fn apply_remote_checkpoint_resolution(
+        &self,
+        ctx: &CallerContext,
+        incoming: &crate::models::Checkpoint,
+    ) -> StoreResult<crate::checkpoints::InboundResolutionOutcome> {
+        // #3175 parity double-gate — see `apply_remote_pending_action` above.
+        self.gate_record_stop().await?;
+        self.apply_remote_checkpoint_resolution_pg(ctx, incoming)
+            .await
+    }
+
+    /// #3075 — delegated to `postgres/federation_3075.rs` (this file is at its
+    /// qual_10 budget). Fail-closed scalar probe; see the trait doc.
+    async fn archived_namespace_by_id(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<String>> {
+        self.archived_namespace_by_id_pg(id).await
+    }
+
+    /// #3075 — federated `archives[]` apply. Owner-BLIND by trait contract; the
+    /// peer-scope gate is the authorization on this lane.
+    async fn apply_remote_archive(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        // #3175 parity double-gate — see `apply_remote_pending_action` above.
+        self.gate_record_stop().await?;
+        self.apply_remote_archive_pg(ctx, id).await
+    }
+
+    /// #3075 — federated `restores[]` apply, with the #1848/G30 forget-tombstone
+    /// gate the OPERATOR un-forget path (`archive_restore`) deliberately omits.
+    async fn apply_remote_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        // #3175 parity double-gate — see `apply_remote_pending_action` above.
+        self.gate_record_stop().await?;
+        self.apply_remote_restore_pg(ctx, id).await
+    }
+
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop().await?;
         // #2493 / #2503 / #3192 — this override still does NOT compose
@@ -30118,9 +30183,18 @@ impl MemoryStore for PostgresStore {
         }
 
         // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): this is
-        // the OPERATOR un-forget path (federation /sync/push restores[] are
-        // sqlite-only per federation_signing_check.rs, never PostgresStore), so
-        // NO tombstone gate here — an authorized restore round-trips per #1771.
+        // the OPERATOR un-forget path, so NO tombstone gate here — an authorized
+        // restore round-trips per #1771.
+        //
+        // #3075 — the ORIGINAL justification for that omission was "federation
+        // /sync/push restores[] are sqlite-only per federation_signing_check.rs,
+        // never PostgresStore". That premise is RETIRED: the postgres receiver
+        // now applies `restores[]`. The omission stands anyway, on the #1771
+        // reasoning alone — but the G30 gate the federated lane needs is no
+        // longer absent, it MOVED: it lives on `apply_remote_restore`
+        // (`postgres/federation_3075.rs`), which runs it BEFORE composing this
+        // method. Do NOT "fix" the two by merging them: gating here would break
+        // the documented operator un-forget capability on both backends.
 
         // Reject if the id is already in active memories.
         let active: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
@@ -30823,7 +30897,26 @@ impl MemoryStore for PostgresStore {
             valid_from: None,
             valid_until: None,
         };
-        self.store(ctx, &mem).await
+        let new_id = self.store(ctx, &mem).await?;
+        // #3465 — the row is durable: wake the recipient on the
+        // in-process bus. Only the WAKE half fires here; the webhook
+        // half needs the `AppState`-scoped `_subscriptions/<agent>` SAL
+        // scan and therefore lives at the HTTP funnel
+        // (`write_events::agent_notified_webhook_postgres`), the same
+        // split `create_memory_postgres` and the bulk lane already
+        // have. Both halves derive the same correlation id from the row
+        // id, so the two lanes name the same wake. Publishing here (not
+        // only at the handler) means a direct `MemoryStore::notify`
+        // caller on postgres still wakes its recipient — parity with
+        // the sqlite adapter.
+        crate::write_events::agent_notified_wake(&crate::write_events::AgentNotified {
+            recipient_agent_id: target_agent,
+            sender_agent_id: &ctx.agent_id,
+            inbox_row_id: &new_id,
+            namespace: &mem.namespace,
+            content: payload,
+        });
+        Ok(new_id)
     }
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — full governance pipeline
@@ -31894,6 +31987,17 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("list (namespace) agent_quotas rows", e))?;
 
         rows.iter().map(row_to_quota_status).collect()
+    }
+
+    /// #3064 lane L-PGP family F3 — forwards to the `parity_3064` submodule
+    /// (postgres.rs is at its qual_10 module-size budget, so the SQL lives
+    /// beside its siblings there rather than behind a private ceiling bump).
+    async fn calibrate_confidence_report(
+        &self,
+        days: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<crate::confidence::calibrate::CalibrationReport> {
+        self.calibrate_confidence_report_pg(days, now).await
     }
 
     async fn verify_link(&self, filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {

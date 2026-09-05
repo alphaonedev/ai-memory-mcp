@@ -9,8 +9,23 @@ use crate::models::field_names;
 use crate::models::{Memory, Tier};
 use crate::{db, validate};
 use serde_json::{Value, json};
+/// `memory_notify` — write one message into `target_agent_id`'s inbox.
+///
+/// v1.0.0 #3465 — `db_path` was added so this funnel can emit the
+/// `agent_notified` write event (wake bus + webhook lane) through
+/// [`crate::write_events`] after the row commits. Pre-#3465 this
+/// handler wrote a durable row and dispatched NOTHING, so a recipient
+/// could only discover its mail by polling.
+///
+/// # Errors
+///
+/// Returns the caller-facing message when a required parameter is
+/// missing, a value fails validation (`target_agent_id`, `title`,
+/// `payload`), the `tier` does not parse, the sender's identity cannot
+/// be resolved, or the insert is refused.
 pub fn handle_notify(
     conn: &rusqlite::Connection,
+    db_path: &std::path::Path,
     params: &Value,
     resolved_ttl: &crate::config::ResolvedTtl,
     mcp_client: Option<&str>,
@@ -125,6 +140,24 @@ pub fn handle_notify(
             return Err(e.to_string());
         }
     };
+
+    // #3465 — the row is durable; wake the recipient and fan the event
+    // to opted-in webhook subscribers through the shared write-event
+    // funnel, so this surface and the SAL twins cannot drift on the
+    // event name or the envelope shape. Notify-class and infallible:
+    // a subscriber outage must never turn a committed notify into a
+    // reported failure.
+    crate::write_events::agent_notified(
+        conn,
+        db_path,
+        &crate::write_events::AgentNotified {
+            recipient_agent_id: target,
+            sender_agent_id: &sender,
+            inbox_row_id: &actual_id,
+            namespace: &namespace,
+            content: payload,
+        },
+    );
 
     Ok(notify_receipt(
         &actual_id,
@@ -467,6 +500,7 @@ mod d1_5_986_tests {
             .expect("open in-memory database");
         let response = handle_notify(
             &conn,
+            std::path::Path::new(":memory:"),
             &json!({
                 "target_agent_id": "ai:victim",
                 "title": "legitimate message",
@@ -511,7 +545,14 @@ mod d1_5_986_tests {
                 "title": format!("quota accounted notify {index}"),
                 "payload": "caller controlled payload",
             });
-            handle_notify(&conn, &params, &ttl, Some(client)).expect("notify under quota");
+            handle_notify(
+                &conn,
+                std::path::Path::new(":memory:"),
+                &params,
+                &ttl,
+                Some(client),
+            )
+            .expect("notify under quota");
         }
 
         let sender_status =
@@ -554,8 +595,14 @@ mod d1_5_986_tests {
             "payload": "must not reach the inbox",
         });
 
-        let err = handle_notify(&conn, &params, &ttl, Some(client))
-            .expect_err("notify over quota must fail closed");
+        let err = handle_notify(
+            &conn,
+            std::path::Path::new(":memory:"),
+            &params,
+            &ttl,
+            Some(client),
+        )
+        .expect_err("notify over quota must fail closed");
 
         assert!(err.contains("QUOTA_EXCEEDED"), "unexpected error: {err}");
         let inbox_rows: i64 = conn
@@ -590,6 +637,7 @@ mod d1_5_986_tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let result = handle_notify(
             &conn,
+            std::path::Path::new(":memory:"),
             &json!({
                 "target_agent_id": "ai:bob",
                 "title": "canonical notify",

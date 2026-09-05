@@ -5883,6 +5883,20 @@ pub struct WakeHubConfig {
     /// and raises its `lagged` marker instead.
     #[serde(default)]
     pub pending_max_ids: Option<usize>,
+    /// v1.0.0 #3469 — the hub socket THIS DAEMON forwards substrate wakes
+    /// to. Distinct from [`Self::socket`], which is where a hub LISTENS:
+    /// this key is the client end, read by `serve`, and it is the ONE
+    /// switch that makes `memory_notify` push a wake instead of leaving the
+    /// recipient to poll.
+    ///
+    /// Unset means NO forwarder is started. That is the fail-closed
+    /// default: opening a socket and joining an identity plane is an
+    /// operator decision, never something a daemon infers. Set it and the
+    /// daemon ALSO needs its enrolled signing key plus an allowlist row
+    /// binding `wake-hub-producer` to that key at the hub; without either
+    /// the forwarder refuses to start and says exactly what is missing.
+    #[serde(default)]
+    pub sink_socket: Option<std::path::PathBuf>,
     /// v1.0.0 #3468 — path to the DERIVED allowlist cache: the agents
     /// permitted to join, with their ENROLLED public keys. Public material
     /// only, 0600 enforced at load, refreshed out of band from ai-memory.

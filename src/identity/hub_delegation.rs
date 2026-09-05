@@ -66,6 +66,22 @@
 //! separate step ([`check_validity`]), so the cryptographic core stays
 //! deterministic and the caller supplies `now` — the same split
 //! `subkey_cert` uses.
+//!
+//! # Timestamp precision (v1.0.0 #3511)
+//!
+//! Both stamps are RFC3339 UTC at WHOLE-SECOND precision
+//! (`chrono::SecondsFormat::Secs`, i.e. truncated down), and every issuer in
+//! this build mints them that way. This is a property of the format, not a
+//! detail of one issuer: the hub verifier renders its own clock at the same
+//! granularity (`crate::wake_hub::delegation_verifier::ScopedDelegationVerifier`),
+//! so a `not_before` carrying a sub-second component sits in that clock's
+//! FUTURE for up to a second and a delegation minted and presented inside one
+//! wall-clock second is refused as not-yet-valid. Truncating the issued stamp
+//! cannot widen the window: the start moves earlier by at most 999 ms, never
+//! later, and `not_after` moves with it so the requested TTL is exact.
+//! [`check_validity`] parses any RFC3339 input, so a peer's finer-grained
+//! stamp still VERIFIES — it is simply judged against a second-granular
+//! clock.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 

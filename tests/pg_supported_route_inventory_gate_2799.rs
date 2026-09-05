@@ -106,6 +106,8 @@ fn all_registered_paths() -> Vec<&'static str> {
         routes::HEALTH,
         routes::IMPORT,
         routes::INBOX,
+        // v1.0.0 #3465 — agent-facing inbox wake SSE stream.
+        routes::INBOX_STREAM,
         routes::KG_FIND_PATHS,
         routes::KG_INVALIDATE,
         routes::KG_QUERY,
@@ -173,8 +175,13 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 /// SAL-less:
 ///   - 8 skill routes — no pg skills table (`migrate_v82` no-op).
 ///   - `/api/v1/find_paths` — bare alias; operators use `/api/v1/kg/find_paths`.
-///   - `/api/v1/share` — openable via SAL get+store, but the pg source-read
-///     CallerContext is a T3 authz posture choice (deferred to a vote).
+///   - `/api/v1/share` — blocked on #3379, NOT on a missing pg SAL method.
+///     `mcp::tools::share::handle_share` applies no caller-owns-source gate
+///     at all, so a pg port must pick a `CallerContext` for the source read:
+///     `for_admin` reproduces that hole as a cross-tenant read primitive, and
+///     the header-derived caller closes it but makes pg deliberately stricter
+///     than sqlite on a data-plane write. Fix #3379 first, then open the
+///     route on BOTH backends together.
 ///   - route_1111 family that is verified app.db-bound (calls `app.db.lock()`
 ///     with no pg branch) or has NO SAL trait method:
 ///       memory_atomise, memory_calibrate_confidence, memory_smart_load,
@@ -192,17 +199,38 @@ const METHODS: [Method; 4] = [Method::GET, Method::POST, Method::PUT, Method::DE
 /// 2026-08-29 (#3064 batch D): `memory_replay` LEFT this set —
 /// SAL `replay_transcript_union` + `fetch_transcript_content`
 /// (pg `memory_transcripts` / `memory_transcript_links` v22/v24).
+/// 2026-09-05 (#3064 lane L-PGP family F5): `memory_atomise` LEFT this set
+/// — its HTTP surface is STORAGE-FREE (the call site passes `handler: None`,
+/// so `atomise_precheck` short-circuits to the tier-locked envelope before
+/// any storage access), so the honest answer on postgres is that envelope
+/// rather than a 501 implying the route works on sqlite.
+/// 2026-09-05 (#3064 lane L-PGP family F3): `memory_calibrate_confidence`
+/// LEFT this set — SAL `calibrate_confidence_report` over the pg
+/// `confidence_shadow_observations` table (present since the bootstrap
+/// schema; no new relation, no schema rung). CAVEAT: the port
+/// reproduced sqlite's posture verbatim, and that posture has NO caller
+/// gate on either backend — the aggregation spans every namespace, so
+/// the report discloses per-namespace names + aggregate confidence
+/// statistics to any caller reaching the route. Opening it on postgres
+/// did not WIDEN the exposure (sqlite already served it) but does share
+/// it with pg deployments. Tracked in #3507; fix belongs on BOTH
+/// backends at once (cf. `/api/v1/share` + #3379 above).
+/// 2026-09-05 (#3064 lane L-PGP family F2): `memory_smart_load` LEFT this
+/// set — the family PICK is the pure `mcp::pick_family_for_intent` and the
+/// family-tagged READ is the SAME SAL `list` + `Filter::metadata_eq` path
+/// `memory_load_family` already uses on postgres. Never `app.db.lock()`.
+/// 2026-09-05 (#3064 lane L-PGP family F1): `/api/v1/find_paths` LEFT
+/// this set. It is a bare ALIAS: `src/lib.rs` routes it to the SAME
+/// handler as the already-pg-supported `/api/v1/kg/find_paths`
+/// (`handlers::kg_find_paths`, SAL `MemoryStore::find_paths`), so the
+/// 501 was an allow-list omission, not a missing SAL method.
 /// Opening ANY of these requires proving SAL dispatch first (see the
 /// module doc) and updating this list with justification.
 fn expected_fully_501_paths() -> BTreeSet<&'static str> {
     [
-        routes::FIND_PATHS,
         routes::SHARE,
-        routes::MEMORY_ATOMISE,
-        routes::MEMORY_CALIBRATE_CONFIDENCE,
         routes::MEMORY_CHECK_AGENT_ACTION,
         routes::MEMORY_RULE_LIST,
-        routes::MEMORY_SMART_LOAD,
         routes::MEMORY_SUBSCRIPTION_DLQ_LIST,
         routes::MEMORY_SUBSCRIPTION_REPLAY,
         routes::SKILL_ID,
@@ -251,9 +279,73 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // in-process challenge store), so there is no `app.db` scratch-read hazard;
 // refusing it on postgres would make key enrollment unreachable on that
 // backend.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 66;
-const EXPECTED_FULLY_501_PATHS: usize = 17;
-const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 83;
+// 2026-09-05 (#3465) — bumped 66 -> 67 / 83 -> 84 (501 count unchanged):
+// `GET /api/v1/inbox/stream` is a NEW route AND pg-supported. It is
+// backend-blind: it reads NOTHING from either store — it fans out the
+// in-process `inbox_wake` broadcast bus, which BOTH SAL adapters
+// publish to from their `notify` impl. Never `app.db.lock()`, never
+// `app.store` either.
+// 2026-09-05 (#3064 lane L-PGP family F1) — bumped 66 -> 67 pg-supported /
+// 17 -> 16 fully-501: `POST /api/v1/find_paths`. The BINDING SAFETY INVARIANT
+// is met by construction rather than by a new port — `src/lib.rs` wires this
+// path and `routes::KG_FIND_PATHS` to the SAME `handlers::kg_find_paths`
+// handler, which takes the `StorageBackend::Postgres` branch into
+// `MemoryStore::find_paths` and never `app.db.lock()`. The alias was refused
+// only because it was absent from `postgres_endpoint_supported`, which made a
+// postgres daemon 501 a route whose supported twin it already serves.
+// Proof-of-dispatch: `tests/pg_parity_3064.rs::
+// f1_find_paths_alias_matches_kg_find_paths_on_both_backends`.
+// 2026-09-05 (#3064 lane L-PGP family F2) — bumped 67 -> 68 pg-supported /
+// 16 -> 15 fully-501: `POST /api/v1/memory_smart_load`. The BINDING SAFETY
+// INVARIANT holds because the handler's postgres branch dispatches through
+// `crate::handlers::power_consolidation::load_family_rows_via_store` ->
+// `MemoryStore::list` (the SAME `Filter::metadata_eq` GIN pushdown +
+// `is_visible_to_caller` re-apply the already-supported
+// `MEMORY_LOAD_FAMILY` route uses) and never `app.db.lock()`. smart_load
+// wraps load_family, so opening it adds NO storage surface that was not
+// already pg-supported; the routing decision is a pure function of the
+// intent string and the optional embedder.
+// Proof-of-dispatch: `tests/pg_parity_3064.rs::
+// f2_smart_load_wraps_load_family_{sqlite,postgres}` (owner sees the
+// family-tagged row, a second principal does not).
+// 2026-09-05 (#3064 lane L-PGP family F3) — bumped 68 -> 69 pg-supported /
+// 15 -> 14 fully-501: `POST /api/v1/memory_calibrate_confidence`. The
+// BINDING SAFETY INVARIANT holds because the handler's postgres branch
+// dispatches to `MemoryStore::calibrate_confidence_report`
+// (`src/store/postgres/parity_3064.rs`) and never `app.db.lock()`. That
+// distinction is unusually load-bearing on this route: the empty scratch
+// sqlite ALSO ships a `confidence_shadow_observations` table, so the
+// pre-fix handler would have returned a plausible all-zero report instead
+// of erroring — the exact silent-wrong-answer class the gate exists to
+// prevent. The pg table has shipped in the bootstrap schema since v0.7.0;
+// no new relation and no schema rung.
+// Proof-of-dispatch: `tests/pg_parity_3064.rs::
+// f3_calibrate_confidence_{sqlite,postgres}` — the postgres leg SEEDS the
+// postgres table and asserts the seeded baseline appears, so a scratch read
+// fails loudly.
+// The tool's CALLER-GATE posture (absent on both backends; cross-namespace
+// aggregate disclosure) is a separate concern from this dispatch entry and
+// is tracked in #3507 — opening the route on pg reproduced sqlite's
+// behaviour rather than widening it.
+// 2026-09-05 (#3064 lane L-PGP family F5) — bumped 69 -> 70 pg-supported /
+// 14 -> 13 fully-501: `POST /api/v1/memory_atomise`. This entry is unlike its
+// siblings: NOTHING was ported, because the HTTP surface never had storage
+// access to port. `handle_atomise_http`'s call site has passed
+// `handler: None` since #1111, and `mcp::handle_atomise` short-circuits to
+// the tier-locked advisory envelope whenever the handler is absent — BEFORE
+// it touches `conn`. Every HTTP `memory_atomise` call therefore returns the
+// same envelope on both backends. The BINDING SAFETY INVARIANT is met by
+// construction and not by a promise: the postgres branch drives the shared
+// `mcp::atomise_precheck` with `handler_present = false`, whose type
+// signature makes the engine arm unreachable, and that arm fails CLOSED with
+// `postgres_not_implemented` if a future change ever wires a real handler
+// onto this surface. Refusing the route with a 501 was the LESS truthful
+// answer: it implied the route works on a sqlite daemon, which it does not.
+// Proof: `tests/pg_parity_3064.rs::f5_atomise_tier_locked_{sqlite,postgres}`
+// asserts the SAME envelope, byte for byte, on both backends.
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 71;
+const EXPECTED_FULLY_501_PATHS: usize = 13;
+const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 84;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
 /// names the allow-list body references. A silent match-arm add/remove
@@ -277,11 +369,16 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "ENTITIES_BY_ALIAS",
     "EXPAND_QUERY",
     "EXPORT",
+    // #3064 family F1 — the bare `/api/v1/find_paths` alias (same handler as
+    // the already-frozen `KG_FIND_PATHS`).
+    "FIND_PATHS",
     "FORGET",
     "GC",
     "HEALTH",
     "IMPORT",
     "INBOX",
+    // v1.0.0 #3465 — agent-facing inbox wake SSE stream.
+    "INBOX_STREAM",
     "KG_FIND_PATHS",
     "KG_INVALIDATE",
     "KG_QUERY",
@@ -290,6 +387,11 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "LINKS_VERIFY",
     "MEMORIES",
     "MEMORIES_BULK",
+    // #3064 family F3 — SAL `calibrate_confidence_report` over the pg
+    // `confidence_shadow_observations` table.
+    // #3064 family F5 — storage-free tier-locked envelope on both backends.
+    "MEMORY_ATOMISE",
+    "MEMORY_CALIBRATE_CONFIDENCE",
     "MEMORY_DEPENDENTS_OF_INVALIDATED",
     "MEMORY_EXPORT_REFLECTION",
     "MEMORY_LOAD_FAMILY",
@@ -297,6 +399,9 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     "MEMORY_REFLECT",
     "MEMORY_REFLECTION_ORIGIN",
     "MEMORY_REPLAY",
+    // #3064 family F2 — smart_load wraps the already-frozen
+    // `MEMORY_LOAD_FAMILY` read through the shared SAL helper.
+    "MEMORY_SMART_LOAD",
     "MEMORY_VERIFY",
     "METRICS",
     "METRICS_BARE",

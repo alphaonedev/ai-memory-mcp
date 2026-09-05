@@ -110,10 +110,21 @@ pub fn run(
         bail!("generated delegated keypair is unexpectedly public-only");
     };
 
+    // WHOLE SECONDS, deliberately (v1.0.0 #3511). The hub verifier compares
+    // against its own clock rendered at `SecondsFormat::Secs`
+    // (`ScopedDelegationVerifier::now`), i.e. TRUNCATED DOWN to the second. A
+    // `not_before` carrying sub-second precision is therefore in the FUTURE
+    // for that clock for up to a second, so a bundle minted and presented
+    // inside one wall-clock second was refused as not-yet-valid — a fresh
+    // wake-listener delegation turned into a refused hello. Stamping at the
+    // granularity the verifier reads at removes the race WITHOUT widening the
+    // window: the start moves EARLIER by at most 999 ms, never later, and the
+    // end moves with it so the TTL stays exactly `ttl_secs`. Same remedy, and
+    // for the same reason, as `wake_sink::producer_identity::mint` (#3469).
     let now = chrono::Utc::now();
-    let not_before = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let not_before = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let not_after = (now + chrono::Duration::seconds(ttl_secs))
-        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     // The local key file proves possession, not enrollment. Resolve the v97
     // ledger before signing; a legacy or retired root cannot delegate.
@@ -241,6 +252,91 @@ mod tests {
             not_before: "2026-09-04T12:00:00Z".to_owned(),
             not_after: "2026-09-04T13:00:00Z".to_owned(),
         }
+    }
+
+    /// REGRESSION (v1.0.0 #3511): a delegation this command mints must be
+    /// usable the INSTANT it is minted.
+    ///
+    /// `ScopedDelegationVerifier::now` renders `Utc::now()` at
+    /// `SecondsFormat::Secs`, i.e. truncated DOWN. A `not_before` carrying
+    /// sub-second precision therefore sits in that clock's FUTURE for up to a
+    /// second, so a bundle minted and presented inside one wall-clock second
+    /// was judged not-yet-valid and a fresh wake-listener delegation became a
+    /// refused hello. Mirrors
+    /// `wake_sink::producer_identity::tests::a_freshly_minted_delegation_is_valid_against_a_second_truncated_clock_3469`
+    /// for the CLI-minted bundle, and additionally pins that truncating the
+    /// stamp did not shorten the window the operator asked for.
+    #[test]
+    fn a_freshly_minted_bundle_is_valid_against_a_second_truncated_clock_3511() {
+        use crate::identity::hub_delegation::{DelegationWire, check_validity};
+
+        const TTL_SECS: i64 = 60;
+        const AGENT: &str = "ai:delegate-stamp-3511";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("identity.db");
+        let keys = dir.path().join("keys");
+        let conn = crate::db::open(&db).expect("open db");
+        crate::db::register_agent(&conn, AGENT, "nhi", &[]).expect("register");
+        let key = keypair::generate(AGENT).expect("generate");
+        keypair::save(&key, &keys).expect("save");
+        crate::db::bind_agent_pubkey_with_keypair(&conn, AGENT, &key).expect("bind");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let bundle_path = dir.path().join("bundle.json");
+        run(
+            &db,
+            None,
+            &keys,
+            AGENT,
+            A2A_HUB_SCOPE,
+            "hub",
+            TTL_SECS,
+            Some(&bundle_path),
+            true,
+            &mut out,
+        )
+        .expect("mint");
+
+        let bundle: DelegationBundle =
+            serde_json::from_slice(&std::fs::read(&bundle_path).expect("read bundle"))
+                .expect("parse bundle");
+        let encoded = URL_SAFE_NO_PAD
+            .decode(&bundle.delegation_b64)
+            .expect("decode delegation");
+        let wire = DelegationWire::decode(&encoded).expect("decode wire");
+
+        let truncated_now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        check_validity(&wire.as_delegation(), &truncated_now)
+            .expect("a delegation the hub cannot use the instant it is minted is useless");
+
+        // No sub-second component anywhere — on the wire and in the bundle the
+        // listener reads — so the property does not depend on where in the
+        // wall-clock second the mint happened to land.
+        for stamp in [
+            wire.not_before.as_str(),
+            wire.not_after.as_str(),
+            bundle.not_before.as_str(),
+            bundle.not_after.as_str(),
+        ] {
+            assert!(!stamp.contains('.'), "sub-second stamp: {stamp}");
+        }
+
+        // Truncation moves the START earlier by at most 999 ms, never later,
+        // and the end moves with it: the operator's TTL is exact.
+        let start = chrono::DateTime::parse_from_rfc3339(&wire.not_before).expect("parse start");
+        let end = chrono::DateTime::parse_from_rfc3339(&wire.not_after).expect("parse end");
+        assert_eq!(
+            (end - start).num_seconds(),
+            TTL_SECS,
+            "{} .. {}",
+            wire.not_before,
+            wire.not_after
+        );
+        assert_eq!(bundle.not_before, wire.not_before);
+        assert_eq!(bundle.not_after, wire.not_after);
     }
 
     #[test]

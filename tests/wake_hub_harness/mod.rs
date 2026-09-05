@@ -33,6 +33,7 @@ use ai_memory::wake_hub::identity::{
 };
 use ai_memory::wake_hub::limits::EgressBudget;
 use ai_memory::wake_hub::metrics::HubMetrics;
+use ai_memory::wake_hub::routing::Router;
 use ai_memory::wake_hub::{HubConfig, HubDeps, WakeHub};
 use bytes::Bytes;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
@@ -108,6 +109,8 @@ pub struct Harness {
     /// be lower than the configured `max_connections` (macOS defaults to a
     /// 256-fd soft limit, the exact case the adversarial vote flagged).
     pub connection_ceiling: usize,
+    /// The hub's routing table, taken BEFORE `serve` consumed the hub (#3469).
+    router: Arc<Router>,
     egress: Arc<EgressBudget>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -146,6 +149,7 @@ impl Harness {
         )
         .expect("wake-hub bind");
         let metrics = hub.metrics();
+        let router = hub.router();
         let egress = hub.egress_budget();
         let connection_ceiling = hub.fd_budget().connection_ceiling;
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -161,11 +165,19 @@ impl Harness {
             hub_id,
             metrics,
             connection_ceiling,
+            router,
             egress,
             shutdown: Some(tx),
             task: Some(task),
             _dir: dir,
         }
+    }
+
+    /// The hub's routing table, so a test can inject a substrate wake the way
+    /// a co-hosted daemon does (#3469).
+    #[must_use]
+    pub fn router(&self) -> Arc<Router> {
+        Arc::clone(&self.router)
     }
 
     /// Bytes currently reserved in the hub-wide egress budget.

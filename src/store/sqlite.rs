@@ -1587,6 +1587,83 @@ impl MemoryStore for SqliteStore {
         db::delete(&conn, id).map_err(box_err)
     }
 
+    /// #3075 — delegates VERBATIM to `db::upsert_pending_action`, the free
+    /// function the sqlite `/sync/push` `pendings[]` loop has always called.
+    /// Owner-BLIND by trait contract: the peer-scope gate (#2478) plus the
+    /// #1920 authorship gate are the authorization on this lane.
+    async fn apply_remote_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        pa: &crate::models::PendingAction,
+    ) -> StoreResult<()> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::upsert_pending_action(&conn, pa).map_err(box_err)
+    }
+
+    /// #3075 / FED-RQ-01 — delegates VERBATIM to
+    /// [`crate::checkpoints::apply_inbound_resolution`], the free function the
+    /// sqlite `/sync/push` `checkpoints[]` loop has always called. The reserved-
+    /// anchor refusal, the pending->resolved CAS and the first-resolution-wins
+    /// classification therefore have exactly ONE sqlite implementation, and the
+    /// receiver never re-signs (the sender's attestation is persisted verbatim).
+    async fn apply_remote_checkpoint_resolution(
+        &self,
+        _ctx: &CallerContext,
+        incoming: &crate::models::Checkpoint,
+    ) -> StoreResult<crate::checkpoints::InboundResolutionOutcome> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        crate::checkpoints::apply_inbound_resolution(&conn, incoming)
+            .map_err(|e| box_err(anyhow::Error::from(e)))
+    }
+
+    /// #3075 — the #2447 `restores[]` scope probe, read through the SAME
+    /// unscoped scalar accessor the sqlite receive loop already calls, so the
+    /// trait route and the inline route cannot disagree about what "provably no
+    /// archived row" means. `_ctx` is discarded for the reason the trait doc
+    /// gives on the live twin: this value renders a REFUSAL and is never
+    /// returned to the peer.
+    async fn archived_namespace_by_id(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        db::archived_namespace_by_id(&conn, id).map_err(box_err)
+    }
+
+    /// #3075 — federated archive, delegating VERBATIM to the free function the
+    /// sqlite `/sync/push` `archives[]` loop has always called, with the shared
+    /// `sync_push` reason marker. Owner-BLIND by contract (see the trait doc):
+    /// the peer-scope gate is the authorization on this lane, and adding a
+    /// tenant predicate here would make the trait route refuse rows the inline
+    /// receive loop applies.
+    async fn apply_remote_archive(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::archive_memory(
+            &conn,
+            id,
+            Some(crate::models::field_names::ARCHIVE_REASON_SYNC_PUSH),
+        )
+        .map_err(box_err)
+    }
+
+    /// #3075 — federated restore. The #1848 / G30 forget-tombstone gate runs
+    /// FIRST and reports a tombstoned id as the lane's no-op (`Ok(false)`), so a
+    /// peer cannot undo a local forget by pushing a restore; then the owner-BLIND
+    /// `db::restore_archived` (the operator un-forget funnel, #1771) does the
+    /// move. Byte-for-byte the order the inline receive loop uses.
+    async fn apply_remote_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        if db::memory_is_tombstoned(&conn, id).map_err(box_err)? {
+            return Ok(false);
+        }
+        db::restore_archived(&conn, id).map_err(box_err)
+    }
+
     async fn recall_hybrid(
         &self,
         ctx: &CallerContext,
@@ -2983,6 +3060,20 @@ impl MemoryStore for SqliteStore {
         quotas::list_status(&conn, Some(namespace)).map_err(box_err)
     }
 
+    /// #3064 lane L-PGP family F3 — delegates VERBATIM to the sqlite SSOT
+    /// `crate::confidence::calibrate::calibrate_from_shadow`, so the wire
+    /// bytes on this backend are byte-for-byte what `memory_calibrate_confidence`
+    /// has always emitted (bounded-window refusal, two-pass streaming
+    /// aggregation, `recall_outcome` backfill, and all).
+    async fn calibrate_confidence_report(
+        &self,
+        days: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<crate::confidence::calibrate::CalibrationReport> {
+        let conn = self.state.lock().await;
+        crate::confidence::calibrate::calibrate_from_shadow(&conn, days, now).map_err(box_err)
+    }
+
     async fn verify_link(&self, filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {
         // Filter shape: at least one of `(source_id, target_id)` OR
         // `link_id` must be set. `link_id` on the SQLite path is the
@@ -3696,7 +3787,27 @@ impl MemoryStore for SqliteStore {
             Err(quotas::QuotaCheckError::Sql(e)) => return Err(box_err(e)),
         }
         match db::insert(&conn, &mem) {
-            Ok(id) => Ok(id),
+            Ok(new_id) => {
+                // #3465 — the row is durable: wake the recipient on the
+                // in-process bus AND fan the `agent_notified` event to
+                // opted-in webhook subscribers, through the shared
+                // write-event funnel so this adapter cannot drift from the
+                // MCP twin on the event name or the envelope shape. Both
+                // are notify-class and infallible; the id is returned
+                // regardless.
+                crate::write_events::agent_notified(
+                    &conn,
+                    &self.path,
+                    &crate::write_events::AgentNotified {
+                        recipient_agent_id: target_agent,
+                        sender_agent_id: &ctx.agent_id,
+                        inbox_row_id: &new_id,
+                        namespace: &mem.namespace,
+                        content: payload,
+                    },
+                );
+                Ok(new_id)
+            }
             Err(e) => {
                 if let Err(refund_err) =
                     quotas::refund_op(&conn, &ctx.agent_id, &mem.namespace, quota_op)

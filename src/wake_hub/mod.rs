@@ -226,7 +226,11 @@ impl std::fmt::Debug for HubDeps {
 pub struct HubState {
     cfg: HubConfig,
     deps: HubDeps,
-    router: Router,
+    /// `Arc` because the substrate wake sink of
+    /// [#3469](https://github.com/alphaonedev/ai-memory-mcp/issues/3469) holds
+    /// the router for the life of the process, independently of the hub value
+    /// that [`server::WakeHub::serve`] consumes.
+    router: Arc<Router>,
     metrics: Arc<HubMetrics>,
 }
 
@@ -245,7 +249,7 @@ impl HubState {
         Self {
             cfg,
             deps,
-            router,
+            router: Arc::new(router),
             metrics,
         }
     }
@@ -268,6 +272,18 @@ impl HubState {
     #[must_use]
     pub const fn config(&self) -> &HubConfig {
         &self.cfg
+    }
+
+    /// The routing table, shared.
+    ///
+    /// Handed out so a CO-HOSTED hub can be fed from the in-process
+    /// `agent_notified` bus (#3469) through the SAME `Router::deliver`
+    /// injection point a peer-relayed wake uses — one set of queue, byte-cap,
+    /// egress-budget and offline-coalescing rules for both, rather than a
+    /// second privileged path into the hub.
+    #[must_use]
+    pub fn router(&self) -> Arc<Router> {
+        Arc::clone(&self.router)
     }
 }
 

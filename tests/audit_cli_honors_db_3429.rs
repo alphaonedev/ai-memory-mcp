@@ -236,6 +236,14 @@ fn audit_bootstrap_node_writes_the_resolved_db_not_the_config_store_3429() {
         "empty spine fixture"
     );
 
+    // `--recovery-pubkey=<value>`, never the two-token form: `recovery` is
+    // freshly generated URL-safe base64, so roughly one key in 64 starts with
+    // `-` and clap parsed it as a flag ("unexpected argument '-3' found") —
+    // a ~1/64 flake in this test. The `=` form binds the value to the option
+    // whatever its first byte is. (The CLI arg also carries
+    // `allow_hyphen_values` now, so the positional form works for operators;
+    // this keeps the test independent of that.)
+    let recovery_arg = format!("--recovery-pubkey={recovery}");
     let out = sb.run(&[
         "audit",
         "bootstrap-node",
@@ -243,8 +251,7 @@ fn audit_bootstrap_node_writes_the_resolved_db_not_the_config_store_3429() {
         AGENT,
         "--key-dir",
         sb.key_dir.to_str().expect("utf8 key dir"),
-        "--recovery-pubkey",
-        &recovery,
+        &recovery_arg,
         "--json",
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

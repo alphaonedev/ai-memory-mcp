@@ -29,6 +29,27 @@ src/federation/receive.rs:FEDERATION_CATCHUP
 # is fail-OPEN on exactly the rows the gate protects. Peer/operator surface,
 # never a tenant handler; mirrors the sqlite twin's unscoped scalar read.
 src/handlers/federation_signing_check.rs:probe_principal
+# #3075 (lane L-PGP) — the postgres federation-RECEIVE APPLY context
+# (`federation_apply_ctx`), used by the migrated `/sync/push` subcollections
+# (namespace_meta / namespace_meta_clears, and the further families as they
+# land). PARITY, not convenience: the sqlite twin applies these lanes through
+# raw `db::*` free functions that consult NO caller identity at all — the
+# federation authorization is the PEER-SCOPE gate (`receive_auth::inbound_*_
+# authorized`) plus the per-lane crypto attestation, never the local
+# owner/tenant gate. Several pg trait methods DO carry a local caller-owns gate
+# for their TENANT surfaces (`clear_namespace_standard` #1777/#2545,
+# `archive_by_ids` #3193, `archive_restore` #3271); routing a federated apply
+# through a tenant-scoped ctx would make the pg receiver refuse rows the sqlite
+# receiver applies — a silent cross-backend divergence of exactly the #2488
+# shape, whose symptom is two peers answering `get_standard` with different
+# governance. Every call site runs AFTER the lane's `receive_auth` verdict, on a
+# peer/operator surface (#238 envelope + #29 sig + #30 nonce + #43 enrollment
+# all precede it), never a tenant-facing handler; the principal is the attested
+# sender so the write stays attributable. Adds NO reach a peer did not have.
+# Security approval: Deputy Conductor Fable 5.1 (f1), 2026-09-05 — parity with the
+# owner-blind sqlite receive loop; every call site runs after the lane's receive_auth
+# verdict on a peer/operator surface.
+src/handlers/federation_signing_check.rs:receive_principal
 src/handlers/admin.rs:DAEMON_PRINCIPAL
 # #3464 (v1.0.0, security-high) — proof-of-possession bind challenge issuer
 # (`issue_bind_challenge`): the durable single-use challenge row is written with

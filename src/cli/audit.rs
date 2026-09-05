@@ -201,7 +201,7 @@ pub struct BootstrapNodeArgs {
     /// (#1949 — REQUIRED to enroll a NEW lineage so a stolen-and-lost key is
     /// recoverable). Not needed on an idempotent re-run of an
     /// already-enrolled node.
-    #[arg(long, value_name = "PUBKEY_B64")]
+    #[arg(long, value_name = "PUBKEY_B64", allow_hyphen_values = true)]
     pub recovery_pubkey: Option<String>,
     /// v1.0.0 #3061 F3 — the store this node runs on, mirroring `serve`'s
     /// `--store-url`. Bring-up MUST target the SAME store `serve` opens, so

@@ -10,11 +10,11 @@ layout: doc
 > is the supported deployment shape.
 >
 > **It is not a parity backend, and this guide does not claim it is.** At
-> v1.0.0 postgres serves **65 of the 82** unique production HTTP paths;
-> the other **17 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
+> v1.0.0 postgres serves **71 of the 84** unique production HTTP paths;
+> the other **13 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
 > is SQLite-only** (`ai-memory mcp` always opens a local rusqlite
 > connection, so a postgres deployment serves MCP clients through the
-> HTTP daemon instead). Read "The 17 fully-501 paths" and
+> HTTP daemon instead). Read "The 13 fully-501 paths" and
 > "Tools unavailable on the PostgreSQL backend (v1.0.0)" below and
 > [Backend parity](../README.md#backend-parity) before committing to
 > postgres.
@@ -57,10 +57,10 @@ ladder ends at `migrate_v98()`).
 version-stamp no-ops rather than real DDL, so a matching version number
 does not mean a matching set of tables: postgres ships no `skills` table
 (`migrate_v82` is a no-op) and no `governance_rules` table. Concretely,
-**66 of the 83 unique production HTTP paths are served on postgres and
-17 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
+**71 of the 84 unique production HTTP paths are served on postgres and
+13 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
 silent read/write against the wrong database), and the **stdio MCP path
-is SQLite-only**. See "The 17 fully-501 paths" below for the exact
+is SQLite-only**. See "The 13 fully-501 paths" below for the exact
 inventory, which is frozen against regression by
 `tests/pg_supported_route_inventory_gate_2799.rs`.
 
@@ -673,10 +673,10 @@ The eight remaining sqlite-only surfaces land here.
 > on a postgres-backed daemon, with "no residual 501 envelope on
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
-> **RETRACTED**. The measured, gate-pinned inventory is **65
-> pg-supported unique paths, 17 fully-501 paths, 83 unique paths
-> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 65` /
-> `EXPECTED_FULLY_501_PATHS = 17` / `EXPECTED_TOTAL_UNIQUE_PATHS = 82`,
+> **RETRACTED**. The measured, gate-pinned inventory is **71
+> pg-supported unique paths, 13 fully-501 paths, 84 unique paths
+> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 71` /
+> `EXPECTED_FULLY_501_PATHS = 13` / `EXPECTED_TOTAL_UNIQUE_PATHS = 84`,
 > `tests/pg_supported_route_inventory_gate_2799.rs`), and the
 > same gate freezes the allow-list membership so a silent match-arm
 > add or remove fails until the SSOT is updated in a reviewed edit. The
@@ -798,10 +798,10 @@ tool names is unaffected. On sqlite nothing changes.
 
 ### What still returns 501 on postgres
 
-Of the **83 unique production URL paths** (over **97 `.route(...)`
+Of the **84 unique production URL paths** (over **98 `.route(...)`
 registrations in `src/lib.rs`**, surfaced through
-`/api/v1/capabilities`), **66 are served on a postgres-backed daemon
-and 17 are fully fail-closed** — every HTTP method on those 17 paths
+`/api/v1/capabilities`), **70 are served on a postgres-backed daemon
+and 13 are fully fail-closed** — every HTTP method on those 13 paths
 returns a uniform `501 NOT IMPLEMENTED`. The gate FAILS CLOSED by
 design: an un-migrated handler can never fall through to the empty
 in-memory scratch SQLite database that `bootstrap_serve` opens against
@@ -809,7 +809,7 @@ in-memory scratch SQLite database that `bootstrap_serve` opens against
 read/write against the wrong database (data-integrity North Star:
 degrade, never corrupt). This inventory is pinned against regression by
 `tests/pg_supported_route_inventory_gate_2799.rs`, which freezes the
-exact 65-supported / 17-fully-501 partition and fails CI if the router
+exact 70-supported / 13-fully-501 partition and fails CI if the router
 and the `postgres_endpoint_supported()` allow-list ever drift.
 
 > **v1.0.0 update ([#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064)).**
@@ -819,9 +819,36 @@ and the `postgres_endpoint_supported()` allow-list ever drift.
 > (`/api/v1/memory_dependents_of_invalidated`), `memory_export_reflection`
 > (`/api/v1/memory_export_reflection`), and `memory_replay`
 > (`/api/v1/memory_replay`). This moved the partition from 61/21 to 65/17.
-> The remaining 17 fully-501 paths below are the accepted v1.0.0 gaps.
+> Lane L-PGP (2026-09-05) then opened the bare `/api/v1/find_paths` alias,
+> which `src/lib.rs` routes to the SAME already-supported
+> `handlers::kg_find_paths` handler — an allow-list omission, not a
+> missing SAL method. Partition 66/17 -> 67/16. `memory_smart_load`
+> followed (67/16 -> 68/15): its family PICK is a pure function of the
+> intent string and its family-tagged READ is the SAME SAL `list` +
+> `Filter::metadata_eq` path the already-supported `memory_load_family`
+> uses, shared through one helper rather than duplicated.
+> `memory_calibrate_confidence` followed (68/15 -> 69/14) on the SAL
+> `calibrate_confidence_report` method: the pg
+> `confidence_shadow_observations` table has shipped in the bootstrap
+> schema since v0.7.0, so the sweep needed a port, not a new relation.
+> **Caller-gate caveat.** That port deliberately reproduced the sqlite
+> sweep's existing posture, and that posture has NO caller gate on
+> either backend: the aggregation spans every namespace, so the report
+> discloses per-namespace names and aggregate confidence statistics to
+> any caller who can reach the route. Opening the route on postgres
+> did not widen that exposure — the same report was already reachable
+> on a sqlite daemon — but it does mean a postgres deployment now
+> shares it. Tracked in [#3507](https://github.com/alphaonedev/ai-memory-mcp/issues/3507); the fix belongs on BOTH backends
+> at once, exactly as with `/api/v1/share` and #3379.
+> `memory_atomise` followed last (69/14 -> 70/13) with NO port at all: its
+> HTTP surface never had storage access to port — the call site owns no
+> `AtomiseToolHandler`, so every HTTP call terminates in the tier-locked
+> advisory envelope before touching a database, identically on both
+> backends. A 501 there was the LESS truthful answer, since it implied the
+> route works on a sqlite daemon.
+> The remaining 13 fully-501 paths below are the accepted v1.0.0 gaps.
 
-**The 17 fully-501 paths (honest v1.0 gaps — do NOT expect these to
+**The 13 fully-501 paths (honest v1.0 gaps — do NOT expect these to
 work on Postgres; closing them is tracked under the v1.x Postgres
 surface-parity EPIC [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)
 and [#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064)):**
@@ -848,14 +875,19 @@ and [#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064)):**
   Operators running postgres MUST NOT plan on the skills plane in v1.0:
   it is a hard 501, not a degraded mode. Use a sqlite-backed daemon for
   skills, or wait for the v1.x postgres skills storage.
-- **`/api/v1/find_paths`** — the bare legacy alias. Use the supported
-  `/api/v1/kg/find_paths` instead.
-- **`/api/v1/share`** — the pg source-read `CallerContext` is a T3
-  authorization posture choice deferred to a vote. *(v1.x.)*
+- **`/api/v1/share`** — blocked on
+  [#3379](https://github.com/alphaonedev/ai-memory-mcp/issues/3379), not on a
+  missing pg SAL method. `mcp::tools::share::handle_share` applies **no
+  caller-owns-source gate at all**, so a postgres port must choose a
+  `CallerContext` for the source read: `for_admin` would faithfully
+  reproduce that hole as a cross-tenant read primitive, and the
+  header-derived caller would close it while making postgres deliberately
+  stricter than sqlite on a data-plane write. The sqlite gate is fixed
+  first (#3379); the route then opens on BOTH backends together, so they
+  converge on the safe semantics instead of diverging. *(v1.x.)*
 - **`memory_*` MCP-parity routes with no pg SAL method / app.db binding**
-  (7 paths): `memory_atomise`, `memory_smart_load`,
-  `memory_subscription_replay`, `memory_subscription_dlq_list`,
-  `memory_calibrate_confidence`, and `memory_rule_list` +
+  (4 paths): `memory_subscription_replay`,
+  `memory_subscription_dlq_list`, and `memory_rule_list` +
   `memory_check_agent_action` — the last two 501 only the governance
   **INSPECTION / read** API because postgres ships no `governance_rules`
   table (governance **enforcement** itself works on Postgres).
@@ -889,8 +921,8 @@ v1.x Postgres surface-parity EPIC is
 postgres skills storage specifically is
 [#2804](https://github.com/alphaonedev/ai-memory-mcp/issues/2804)).
 
-**17 MCP tools are unavailable on a postgres-backed daemon** — the 9
-`memory_skill_*` tools plus 8 others:
+**14 MCP tools are unavailable on a postgres-backed daemon** — the 9
+`memory_skill_*` tools plus 5 others:
 
 | MCP tool | REST mirror (501 on postgres) | Notes |
 |---|---|---|
@@ -903,10 +935,7 @@ postgres skills storage specifically is
 | `memory_skill_promote_from_reflection` | `POST /api/v1/skill/{id}/promote` | Skills plane. |
 | `memory_skill_compositional_context` | `POST /api/v1/skill/{id}/compose` | Skills plane. |
 | `memory_skill_retire` | `POST /api/v1/skill/{id}/retire` | Skills plane. |
-| `memory_share` | `POST /api/v1/share` | pg source-read `CallerContext` is a T3 authz posture choice deferred to a vote. |
-| `memory_atomise` | `POST /api/v1/memory_atomise` | No pg SAL method — `app.db`-bound. |
-| `memory_smart_load` | `POST /api/v1/memory_smart_load` | No pg SAL method — `app.db`-bound. |
-| `memory_calibrate_confidence` | `POST /api/v1/memory_calibrate_confidence` | No pg SAL method — `app.db`-bound. |
+| `memory_share` | `POST /api/v1/share` | Blocked on [#3379](https://github.com/alphaonedev/ai-memory-mcp/issues/3379) (sqlite has no caller-owns-source gate), not on a missing pg SAL method — see the path list above. |
 | `memory_subscription_replay` | `POST /api/v1/memory_subscription_replay` | No pg SAL method — `app.db`-bound. |
 | `memory_subscription_dlq_list` | `POST /api/v1/memory_subscription_dlq_list` | No pg SAL method — `app.db`-bound. |
 | `memory_rule_list` | `POST /api/v1/memory_rule_list` | Governance **inspection/read** only (no `governance_rules` table); enforcement itself works on postgres. |
@@ -919,10 +948,15 @@ the same fact at runtime: on postgres, `skills.implemented` is `false`
 with an additive `unsupported_on_postgres: true` /
 `unsupported_reason` (states the hard-501 failure mode).
 
-One additional REST path 501s on postgres but is **not** a distinct MCP
-tool: the bare legacy alias `/api/v1/find_paths` — use the supported
-`/api/v1/kg/find_paths` (the `memory_find_paths` tool already targets
-the supported path). That bare alias is the 17th fully-501 path.
+The bare legacy alias `/api/v1/find_paths` is **no longer** fully-501: as
+of [#3064](https://github.com/alphaonedev/ai-memory-mcp/issues/3064) lane
+L-PGP it is allow-listed alongside its canonical twin
+`/api/v1/kg/find_paths` (both paths are wired to the same
+`handlers::kg_find_paths` handler, which dispatches through
+`MemoryStore::find_paths` on postgres), and the arithmetic that
+reconciles **14 unavailable tools** with **13 fully-501 paths** is the
+skills mapping noted above: 9 `memory_skill_*` tools ride 8
+`/api/v1/skill/*` paths, so 9 + 5 tools correspond to 8 + 5 paths.
 
 ### SQLite-only substrate planes on a postgres daemon
 
@@ -984,8 +1018,11 @@ endpoint availability:
   approving caller re-issues the underlying write via the standard
   CRUD path. The full state machine runs identically on both
   backends — only the auto-replay step is gated.
-- Federation fanout subcollections that ride sqlite-only fed-tracker
-  state: archive / restore / purge / pending-decision broadcast.
+- Federation SEND-side fanout that rides sqlite-only fed-tracker
+  state: archive / restore / purge / pending-decision broadcast. (The
+  RECEIVE lane is a separate concern — archives / restores are
+  trait-covered on a pg receiver since #3075; see the coverage table
+  above.)
   Memories / deletions / links / sync_push core round-trip through
   the trait. Postgres operators relying on multi-node consistency
   for these subcollections should poll peers or pin sqlite for v0.7.0.
@@ -1010,52 +1047,80 @@ score = semantic_weight * cosine
 contract — same query, same top-K, same per-factor breakdown
 within FP tolerance.)
 
-### Federation lanes: sqlite-only on a PostgreSQL receiver (v1.0.0)
+### Federation subcollection coverage on a PostgreSQL receiver
 
 When a PostgreSQL-backed daemon is the **receiver** on a federated
-`/sync/push`, a fixed set of subcollections is not yet trait-covered for
-a verbatim inbound write against the postgres store. On that receiver
-they are bucketed as **honest, sender-visible non-ack**
-(`unsupported_on_postgres` in the push response) — never a silent drop.
-The affected subcollections are:
+`/sync/push`, **every** subcollection is now **APPLIED** — trait-covered,
+with the postgres funnel running the SAME `receive_auth` verdict the
+sqlite funnel runs before writing through the `MemoryStore` trait
+([#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)
+completed the migration). The `unsupported_on_postgres` field remains on
+the wire and reports **0**: it is the honest, sender-visible non-ack
+counter, and a future subcollection that lands without a postgres apply
+must report itself there rather than being silently dropped.
 
-| Subcollection | Federated lane | Tracked |
-|---|---|---|
-| `checkpoints` | Federated commit-checkpoint RESOLUTION (the separation-of-duties freeze anchor) | [#125](https://github.com/alphaonedev/ai-memory-mcp/issues/125) / FED-RQ-01 [#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936) |
-| `pendings` | Governance PENDING-action broadcast | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) |
-| `pending_decisions` | Governance pending-DECISION broadcast | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) |
-| `namespace_meta` | Governance-STANDARD (namespace-standard rebind) | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
-| `namespace_meta_clears` | Governance-STANDARD clear | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
-| `archives` | Archive fanout | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) |
-| `restores` | Restore fanout | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) |
+| Subcollection | Federated lane | Postgres receiver | Tracked |
+|---|---|---|---|
+| `memories` | Memory replication | **applied** | — |
+| `deletions` | Federated delete | **applied** | [#2488](https://github.com/alphaonedev/ai-memory-mcp/issues/2488) |
+| `links` | Link replication | **applied** | — |
+| `signals` | Signed inter-agent signals | **applied** | [#1718](https://github.com/alphaonedev/ai-memory-mcp/issues/1718) |
+| `action_transitions` | Coordination-action CAS | **applied** | [#1718](https://github.com/alphaonedev/ai-memory-mcp/issues/1718) |
+| `pendings` | Governance PENDING-action broadcast | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) / [#2529](https://github.com/alphaonedev/ai-memory-mcp/issues/2529) |
+| `pending_decisions` | Governance pending-DECISION broadcast | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2478](https://github.com/alphaonedev/ai-memory-mcp/issues/2478) / [#2532](https://github.com/alphaonedev/ai-memory-mcp/issues/2532) |
+| `checkpoints` | Federated commit-checkpoint RESOLUTION (the separation-of-duties freeze anchor) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#125](https://github.com/alphaonedev/ai-memory-mcp/issues/125) / FED-RQ-01 [#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936) |
+| `archives` | Archive fanout (soft move into `archived_memories`) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) |
+| `restores` | Restore fanout (archive -> live) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2447](https://github.com/alphaonedev/ai-memory-mcp/issues/2447) / [#1848](https://github.com/alphaonedev/ai-memory-mcp/issues/1848) |
+| `namespace_meta` | Governance-STANDARD (namespace-standard rebind) | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
+| `namespace_meta_clears` | Governance-STANDARD clear | **applied** (since [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)) | [#2479](https://github.com/alphaonedev/ai-memory-mcp/issues/2479) |
 
 What this means for an operator:
 
-- **A postgres receiver reports non-ack; it does NOT silently drop.**
-  The disposition is **refuse-to-apply and honest** — the sender sees a
-  non-zero `unsupported_on_postgres` count for the batch, so a
-  heterogeneous federation never mistakes "not applied" for "applied"
-  (data-integrity North Star: fail closed, disclose, never corrupt).
-  This is not bypassable by an inbound peer.
+- **An APPLIED lane carries the sqlite receiver's authorization,
+  unchanged.** The governance-STANDARD lanes route through the SAME
+  backend-blind `receive_auth::inbound_namespace_meta_authorized` verdict
+  the sqlite funnel calls — including the #2479 Amendment E
+  UNCONDITIONAL refusal on the global `*` standard for any peer that did
+  not declare `**`, the declared-parent check, and the #2536
+  deep-descendant probe. A refusal is reported to the sender in the
+  additive `namespace_meta_refused` counter, alongside
+  `namespace_meta_applied` / `namespace_meta_cleared`. The archive /
+  restore lanes carry the #2447 by-id confinement on the row's STORED
+  namespace (resolved through a scalar projection, fail-closed on an
+  unresolvable probe) and, on `restores[]`, the #1848 / G30
+  forget-tombstone gate — so a peer still cannot undo a local forget by
+  pushing a restore, on either backend. Their counters are `archived` /
+  `restored`. The `checkpoints` lane carries the FULL FED-RQ-01 chain: the
+  resolved-only filter, the #2708 claimed-AND-stored namespace confinement, the
+  `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` (#125) verification of the resolver's
+  attestation against the resolver's locally-ENROLLED key (never the wire
+  `resolver_pubkey`), the L5 substrate-reserved-anchor refusal, and
+  first-resolution-wins. The receiver NEVER re-signs — the sender's
+  `signature` / `resolver_pubkey` are persisted verbatim, which is what keeps
+  the freeze anchor verifiable downstream. Counters: `checkpoints_applied` /
+  `checkpoints_conflicted`.
+  The governance-QUEUE lanes carry the #2529 status refusals (a wire row
+  claiming a terminal status is refused; a replay cannot clobber a
+  locally-decided row), the #1920 authorship gate, the #2478
+  effect-namespace gate (whose subject is the UNION of every namespace the
+  EXECUTION would touch, not the row's declared namespace), the #3278
+  payload secret screen, the hardened `approve_with_approver_type` on the
+  APPROVE arm, and the #2720 decider rebinding on the REJECT arm.
+  Counters: `pendings_applied` / `pending_decisions_applied`.
+- **A refusal is reported, never silently dropped.** Every gate's refusal
+  increments a sender-visible counter (`skipped`, or the additive
+  `namespace_meta_refused`), so a heterogeneous federation never mistakes
+  "not applied" for "applied" (data-integrity North Star: fail closed,
+  disclose, never corrupt). This is not bypassable by an inbound peer.
 - **Single-node deployments and sqlite-receiver deployments are
-  unaffected.** These lanes apply fully on a sqlite-backed receiver and
-  on the MCP / epoch-apply-native local paths. The gap is the
-  postgres-*receiver* federation lane ONLY — the same governance and
-  checkpoint operations remain fully reachable on a postgres daemon
-  through its LOCAL surfaces (governed by local authz rather than peer
-  scope).
-- **The receive-side signature/authority gates still hold.** Because
-  these lanes refuse-to-apply rather than write, no unverified inbound
-  checkpoint resolution, pending execution, or namespace-standard rebind
-  can land on a postgres receiver — a safe coverage gap, not a security
-  regression.
-
-Full postgres-receiver replication of these lanes (a
-trait-covered `apply_remote_*` write for each) is tracked for **v1.1**
-under [#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075).
-Operators who need multi-node federated replication of these
-subcollections today should pin a sqlite-backed receiver for the
-affected namespaces until v1.1.
+  unaffected.** Every lane applies on both backends, and the same
+  governance and checkpoint operations also remain reachable on a
+  postgres daemon through its LOCAL surfaces (governed by local authz
+  rather than peer scope).
+- **The receive-side signature/authority gates hold on every lane, on
+  both backends.** They are the SAME shared `receive_auth` verdicts — a
+  postgres receiver does not carry a second implementation that could
+  drift from the sqlite one.
 
 ## Performance notes
 
@@ -1206,7 +1271,7 @@ parity test is the gate that prevents it.
 | HTTP full governance pipeline (multi-vote consensus + approver_type + inheritance walk on writes) | ✓ | ✓ (Wave-3 Continuation 3 — Phase 20) |
 | HTTP forget / consolidate / contradictions / notify / gc / import / export / archive write paths | ✓ | ✓ (Wave-3 Continuation 3 — Phase 13/14/15/16/17/18/19) |
 | `execute_pending_action` payload-replay on Approved | ✓ | sqlite-only — postgres returns `{approved: true, executed: false}`; caller re-issues underlying write |
-| Federation fanout subcollections (archive / restore / pending-decision broadcast) | ✓ | sqlite-only fed-tracker state |
+| Federation SEND-side fanout (archive / restore / pending-decision broadcast) | ✓ | sqlite-only fed-tracker state (the RECEIVE lane for archives / restores is trait-covered since #3075) |
 | Migration tool both directions | ✓ | ✓ |
 | `schema-init` CLI | n/a (auto-create) | ✓ (Wave 1 Stream B) |
 | `--store-url <URL>` flag on `serve` | ✓ (sqlite://) | ✓ (postgres://, postgresql://) |

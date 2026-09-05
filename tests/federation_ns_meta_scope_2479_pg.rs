@@ -1,47 +1,52 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! #2479 (CWE-284) — POSTGRES twin of `tests/federation_ns_meta_scope_2479.rs`.
+//! #2479 (CWE-284) + #3075 — POSTGRES twin of
+//! `tests/federation_ns_meta_scope_2479.rs`.
 //!
-//! ## What this file pins, and what it deliberately does NOT claim
+//! ## What changed at #3075
 //!
-//! On a postgres-backed receiver the federated GOVERNANCE-STANDARD lanes are
-//! STRUCTURALLY UNREACHABLE: `sync_push` hands the whole request to
-//! `federation_signing_check::sync_push_via_store` and RETURNS before the
-//! sqlite `namespace_meta[]` / `namespace_meta_clears[]` loops run, and that
-//! funnel buckets both subcollections into `unsupported_on_postgres` — it never
-//! calls `MemoryStore::set_namespace_standard` or `clear_namespace_standard`.
-//! So there is no pg hole to confine, and the honest claim is narrow:
+//! Through v1.0.0 the federated GOVERNANCE-STANDARD lanes were STRUCTURALLY
+//! UNREACHABLE on a postgres receiver: `sync_push_via_store` bucketed
+//! `namespace_meta[]` / `namespace_meta_clears[]` into
+//! `unsupported_on_postgres` and never called
+//! `MemoryStore::{set,clear}_namespace_standard`. Safe, but a real coverage gap
+//! — federated governance-standard rebinding simply did not replicate to a pg
+//! peer, so two nodes answered `get_standard` with divergent policy.
 //!
-//! > the FEDERATED `namespace_meta[]` / `namespace_meta_clears[]` subcollections
-//! > never reach a namespace-standard write on postgres
+//! #3075 lane L-PGP migrates the family: both lanes now APPLY on postgres
+//! through the SAL trait, gated by the SAME backend-BLIND verdict the sqlite
+//! funnel calls (`receive_auth::inbound_namespace_meta_authorized`). This file
+//! is therefore no longer a structural-unreachability control; it is the
+//! CROSS-BACKEND AUTHORIZATION proof, and each cell asserts BOTH halves:
 //!
-//! and NOT "namespace-standard writes are unreachable on postgres" — they ARE
-//! reachable there through the LOCAL surfaces (`handlers::hook_subscribers::
+//! - an OUT-OF-SCOPE target is REFUSED (row state unchanged, counted in the
+//!   additive `namespace_meta_refused`, never a silent drop), and
+//! - an IN-SCOPE target is APPLIED (row state written / cleared, counted in
+//!   `namespace_meta_applied` / `namespace_meta_cleared`).
+//!
+//! Asserting only the refusal would pass on the pre-#3075 funnel that applied
+//! nothing at all; asserting only the apply would pass on an ungated funnel.
+//! The pair is what pins the gate.
+//!
+//! The claim stays narrow in the other direction too: it is about the
+//! FEDERATED subcollections. The same two trait methods are ALSO reachable
+//! through the LOCAL surfaces (`handlers::hook_subscribers::
 //! {set_namespace_standard, clear_namespace_standard}` and the MCP
 //! `memory_namespace_set_standard` / `_clear_standard` tools), which are
-//! governed by local authz rather than peer scope and are out of scope for
-//! #2479.
+//! governed by local authz rather than peer scope and are out of scope here.
 //!
-//! ## Why the file exists anyway (the #2488 lesson)
+//! ## Why the file exists (the #2488 lesson)
 //!
 //! #2488/#2491 were the same two lines on the two funnels breaking in OPPOSITE
 //! directions, undetected, because only one backend was covered. These cells
-//! turn "postgres is structurally safe here" from a comment into an executable
-//! assertion, so a future change that trait-covers these subcollections cannot
-//! quietly open the lane on the backend nobody was watching. They are CONTROLS:
-//! green at the parent commit by design, exactly like the #2478 / #2497 pg
-//! controls.
+//! keep the migrated lane honest on the backend nobody was watching: a pg
+//! funnel that widened (applied an out-of-scope row) or narrowed (refused an
+//! in-scope one) relative to sqlite fails here.
 //!
-//! The structural claim is asserted in BOTH directions — an OUT-OF-SCOPE target
-//! and an IN-SCOPE one — because the assertion is that this funnel applies
-//! NOTHING on either lane, which is strictly stronger (and differently shaped)
-//! than the sqlite gate's claim. A cell that only checked the out-of-scope case
-//! would pass on a hypothetical future funnel that applied the in-scope entry.
-//!
-//! The disposition is also asserted to be HONEST, not merely safe:
-//! `unsupported_on_postgres > 0` is a sender-side non-ack, so the origin learns
-//! its governance rows did not replicate rather than being told they did.
+//! The disposition is also asserted to be HONEST: a refusal is visible to the
+//! sender as `namespace_meta_refused`, and the migrated lane no longer inflates
+//! `unsupported_on_postgres`.
 //!
 //! Gated on `feature = "sal-postgres"` + a runtime `AI_MEMORY_TEST_POSTGRES_URL`
 //! soft-skip. Deliberately NOT `#[ignore]`: the PR postgres job does not pass
@@ -154,8 +159,18 @@ async fn pg_router(url: &str) -> (axum::Router, Arc<dyn MemoryStore>) {
     (ai_memory::build_router(api_key_state, app_state), store)
 }
 
-/// Enrol `PEER_ID` scoped to `<root>/*` ONLY — arms Layer 1, the exact posture
-/// under which the sqlite twin's exploit cells land.
+/// Enrol `PEER_ID` scoped to `<root>/**` ONLY — arms Layer 1, mirroring the
+/// sqlite twin's `SCOPED_ALLOWLIST_ROOT_AND_PARENT` control posture.
+///
+/// The `**` (not `*`) is load-bearing for the APPLIED half:
+/// `inbound_namespace_meta_authorized` additionally probes a concrete DEEP
+/// DESCENDANT of the row's namespace (#2536), so a single-segment `<root>/*`
+/// scope legitimately refuses even an in-scope row — the sqlite twin's own
+/// in-scope control uses `alpha/**` for exactly this reason. It is still NOT
+/// allow-all: `peer_scope_is_allow_all` matches the LITERAL `**` only, so
+/// Amendment E's unconditional global-`*` refusal still fires under this
+/// posture (asserted below).
+///
 /// `AI_MEMORY_FED_SYNC_TRUST_PEER` is actively removed: setting it is what makes
 /// federation coverage vacuous.
 fn set_scoped_posture(root: &str) {
@@ -167,7 +182,7 @@ fn set_scoped_posture(root: &str) {
         std::env::set_var(
             ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
             format!(
-                r#"{{"{PEER_ID}":{{"allowed_namespaces":["{root}/*"],"allowed_sender_agent_ids":["{PEER_ID}"]}}}}"#
+                r#"{{"{PEER_ID}":{{"allowed_namespaces":["{root}/**"],"allowed_sender_agent_ids":["{PEER_ID}"]}}}}"#
             ),
         );
         std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
@@ -275,11 +290,11 @@ async fn push_namespace_meta(
     (status, report)
 }
 
-/// The federated `namespace_meta[]` lane never reaches a namespace-standard
-/// write on postgres — asserted on ROW STATE, for an OUT-OF-SCOPE target and an
-/// IN-SCOPE one alike, with the honest non-ack counter secondary.
+/// #3075 — the federated `namespace_meta[]` lane APPLIES on postgres for an
+/// IN-SCOPE namespace and REFUSES an OUT-OF-SCOPE one, asserted on ROW STATE in
+/// both directions with the sender-visible counters secondary.
 #[tokio::test]
-async fn federated_namespace_meta_lane_unreachable_on_postgres_2479() {
+async fn federated_namespace_meta_lane_scope_gated_on_postgres_2479_3075() {
     let Some(url) = pg_url() else {
         eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
@@ -310,8 +325,9 @@ async fn federated_namespace_meta_lane_unreachable_on_postgres_2479() {
         &router,
         vec![
             meta_entry(&victim_ns, &standard_id, None),
-            // IN SCOPE — the structural claim is that this funnel applies
-            // NOTHING on this lane, not merely that it refuses out-of-scope.
+            // IN SCOPE — #3075 requires this half to LAND; asserting only the
+            // refusal would also pass on the pre-#3075 funnel that applied
+            // nothing at all.
             meta_entry(&in_scope_ns, &standard_id, None),
         ],
         vec![],
@@ -324,26 +340,33 @@ async fn federated_namespace_meta_lane_unreachable_on_postgres_2479() {
         meta_row(&pool, &victim_ns).await.is_none(),
         "the pg funnel must not bind a foreign namespace's standard: {report}"
     );
-    assert!(
-        meta_row(&pool, &in_scope_ns).await.is_none(),
-        "the pg funnel applies NOTHING on this lane, in scope or not: {report}"
+    assert_eq!(
+        meta_row(&pool, &in_scope_ns).await.map(|r| r.0).as_deref(),
+        Some(standard_id.as_str()),
+        "#3075: the in-scope governance-standard bind must APPLY on pg: {report}"
     );
-    // Secondary — honest non-ack rather than a silent drop.
-    assert!(
-        unsupported(&report) >= 2,
-        "both entries must be reported unsupported, never silently dropped: {report}"
-    );
+    // Secondary — sender-visible counters, and the migrated lane no longer
+    // inflates the honest non-ack bucket.
     assert_eq!(
         report["namespace_meta_applied"].as_u64().unwrap_or(0),
-        0,
+        1,
         "{report}"
+    );
+    assert!(
+        report["namespace_meta_refused"].as_u64().unwrap_or(0) >= 1,
+        "the refusal must be sender-visible, never a silent drop: {report}"
+    );
+    assert_eq!(
+        unsupported(&report),
+        0,
+        "#3075: namespace_meta no longer buckets as unsupported_on_postgres: {report}"
     );
 }
 
-/// The DESTRUCTIVE twin: a federated clear cannot disarm a pg namespace's
-/// governance, including one the peer IS scoped for.
+/// The DESTRUCTIVE twin: a federated clear cannot disarm a namespace the peer
+/// is NOT scoped for, and DOES converge one it is (#3075).
 #[tokio::test]
-async fn federated_namespace_meta_clear_unreachable_on_postgres_2479() {
+async fn federated_namespace_meta_clear_scope_gated_on_postgres_2479_3075() {
     let Some(url) = pg_url() else {
         eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
@@ -383,28 +406,35 @@ async fn federated_namespace_meta_clear_unreachable_on_postgres_2479() {
         Some(victim_standard.as_str()),
         "a federated clear must not disarm a foreign namespace on pg: {report}"
     );
-    assert_eq!(
-        meta_row(&pool, &in_scope_ns).await.map(|r| r.0).as_deref(),
-        Some(in_scope_standard.as_str()),
-        "the pg funnel applies NOTHING on this lane, in scope or not: {report}"
-    );
     assert!(
-        unsupported(&report) >= 2,
-        "both clears must be reported unsupported: {report}"
+        meta_row(&pool, &in_scope_ns).await.is_none(),
+        "#3075: the in-scope clear must converge on pg: {report}"
     );
     assert_eq!(
         report["namespace_meta_cleared"].as_u64().unwrap_or(0),
-        0,
+        1,
         "{report}"
+    );
+    assert!(
+        report["namespace_meta_refused"].as_u64().unwrap_or(0) >= 1,
+        "the out-of-scope clear refusal must be sender-visible: {report}"
+    );
+    assert_eq!(
+        unsupported(&report),
+        0,
+        "#3075: namespace_meta_clears no longer buckets as unsupported: {report}"
     );
 }
 
-/// Amendment E's subject, on pg: the GLOBAL standard is likewise unreachable
-/// from the federated lane. Pinned separately because `*` is the one namespace
-/// whose reach is the whole substrate, so a future pg funnel that trait-covers
-/// this lane must not acquire it by accident.
+/// Amendment E's subject, on pg: the GLOBAL `*` standard stays UNREACHABLE from
+/// the federated lane even now that the lane applies (#3075). Pinned separately
+/// because `*` is the one namespace whose reach is the whole substrate —
+/// `build_namespace_chain` prepends it to EVERY namespace's inheritance chain —
+/// and the refusal is UNCONDITIONAL (not governed by
+/// `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE`) for any peer that did not
+/// declare `**`.
 #[tokio::test]
-async fn federated_global_standard_unreachable_on_postgres_2479() {
+async fn federated_global_standard_refused_on_postgres_2479_3075() {
     let Some(url) = pg_url() else {
         eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
@@ -447,5 +477,14 @@ async fn federated_global_standard_unreachable_on_postgres_2479() {
         before, after,
         "the substrate-wide default policy must be untouched by a federated push: {report}"
     );
-    assert!(unsupported(&report) >= 1, "{report}");
+    assert!(
+        report["namespace_meta_refused"].as_u64().unwrap_or(0) >= 1,
+        "the Amendment E refusal must be sender-visible: {report}"
+    );
+    assert_eq!(
+        report["namespace_meta_applied"].as_u64().unwrap_or(0),
+        0,
+        "{report}"
+    );
+    assert_eq!(unsupported(&report), 0, "{report}");
 }
