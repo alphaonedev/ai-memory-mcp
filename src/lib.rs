@@ -427,7 +427,17 @@ pub const META_KEY_FAMILY: &str = "family";
 // stream `GET /api/v1/inbox/stream` (`handlers::inbox_sse`) — SSE over
 // the in-process `inbox_wake` broadcast bus. A new PATH, so
 // EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 1 as well.
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 98;
+// 2026-09-06 (#3474) — bumped 98 → 100: the admin per-agent api-key enrolment
+// pair `POST /api/v1/agents/{id}/api-key` (`handlers::agent_api_key::
+// mint_agent_api_key` — mint-or-bind, the minted token returned exactly once)
+// and `POST /api/v1/agents/{id}/api-key/revoke`
+// (`handlers::agent_api_key::revoke_agent_api_key` — immediate for your own
+// key, approval-gated for another principal's or the last enrolled key). Both
+// are new PATHS, so EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 2 as well.
+// Re-derived from the ACTUAL count on the rebase base rather than carried
+// forward: the pre-rebase branch read 99/85 against a 97/83 base, and adding
+// its own delta to a moved base is exactly how a route-count SSOT drifts.
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 100;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -464,7 +474,10 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // `/api/v1/agents/{id}/pubkey/challenge` (proof-of-possession bind challenge).
 // 2026-09-05 (#3465) — bumped 83 → 84: the new unique path
 // `/api/v1/inbox/stream` (agent-facing inbox wake stream).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 84;
+// 2026-09-06 (#3474) — bumped 84 → 86: the two new unique paths
+// `/api/v1/agents/{id}/api-key` (admin mint/bind) and
+// `/api/v1/agents/{id}/api-key/revoke` (admin revoke, approval-gated).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 86;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -1387,6 +1400,18 @@ pub fn build_router_with_timeout(
         .route(
             handlers::routes::AGENTS_ID_PUBKEY_CHALLENGE,
             post(handlers::bind_agent_pubkey_challenge),
+        )
+        // v1.0.0 #3474 — admin-gated per-agent api-key enrolment. Both routes
+        // are POST: the mint returns a bearer secret exactly once (never
+        // cacheable, never a GET whose URL a proxy could log) and the revoke
+        // carries an optional approval body.
+        .route(
+            handlers::routes::AGENTS_ID_API_KEY,
+            post(handlers::agent_api_key::mint_agent_api_key),
+        )
+        .route(
+            handlers::routes::AGENTS_ID_API_KEY_REVOKE,
+            post(handlers::agent_api_key::revoke_agent_api_key),
         )
         .route(handlers::routes::PENDING, get(handlers::list_pending))
         .route(

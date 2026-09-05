@@ -104,6 +104,7 @@ pub(crate) fn fed_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
 pub mod accept_provenance;
 pub mod admin;
 pub mod admin_role;
+pub mod agent_api_key;
 pub mod approvals;
 pub mod archive;
 pub mod bulk;

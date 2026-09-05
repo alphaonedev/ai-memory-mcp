@@ -156,6 +156,19 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// v1.0.0 #3474 — SAL-layer `GovernedAction` back to its `models` twin, the
+/// inverse of the `From` impl in `store::mod`. The two enums exist so the
+/// trait surface need not import the models crate at every site; the sqlite
+/// adapter delegates to a `db::` free function that speaks the models form.
+fn models_governed_action(action: super::GovernedAction) -> crate::models::GovernedAction {
+    match action {
+        super::GovernedAction::Store => crate::models::GovernedAction::Store,
+        super::GovernedAction::Delete => crate::models::GovernedAction::Delete,
+        super::GovernedAction::Promote => crate::models::GovernedAction::Promote,
+        super::GovernedAction::Reflect => crate::models::GovernedAction::Reflect,
+    }
+}
+
 /// Preserve the #3464 authorization refusal across the sqlite SAL adapter so
 /// callers receive the same typed 403 as PostgreSQL, never a backend-shaped
 /// 500. Every other storage failure retains the established mapping.
@@ -1898,6 +1911,29 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<Option<crate::models::PendingAction>> {
         let conn = self.state.lock().await;
         db::get_pending_action(&conn, id).map_err(box_err)
+    }
+
+    /// v1.0.0 #3474 — thin delegate to the sqlite `pending_actions` INSERT.
+    async fn queue_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        action: super::GovernedAction,
+        namespace: &str,
+        memory_id: Option<&str>,
+        requested_by: &str,
+        payload: &serde_json::Value,
+    ) -> StoreResult<String> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::queue_pending_action(
+            &conn,
+            models_governed_action(action),
+            namespace,
+            memory_id,
+            requested_by,
+            payload,
+        )
+        .map_err(box_err)
     }
 
     async fn set_namespace_standard(

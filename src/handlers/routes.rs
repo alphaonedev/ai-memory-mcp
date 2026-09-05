@@ -21,6 +21,16 @@ pub const AGENTS_ID_PUBKEY: &str = "/api/v1/agents/{id}/pubkey";
 /// on [`AGENTS_ID_PUBKEY`]; without it the bind is refused, so an admin can no
 /// longer bind a key they merely assert.
 pub const AGENTS_ID_PUBKEY_CHALLENGE: &str = "/api/v1/agents/{id}/pubkey/challenge";
+/// v1.0.0 #3474 — admin-gated per-agent api-key MINT/BIND. The minted bearer
+/// token is returned exactly once in the response body and never persisted in
+/// raw form (only its `sha256`), so this path is `Cache-Control: no-store` and
+/// is refused unless the daemon's listener is loopback or TLS-terminated.
+pub const AGENTS_ID_API_KEY: &str = "/api/v1/agents/{id}/api-key";
+/// v1.0.0 #3474 — admin-gated per-agent api-key REVOCATION. Revoking your own
+/// key is immediate; revoking another principal's key — or the LAST enrolled
+/// key, which would disarm the identity gate fleet-wide (#1985) — queues a
+/// pending action a DIFFERENT registered approver must approve.
+pub const AGENTS_ID_API_KEY_REVOKE: &str = "/api/v1/agents/{id}/api-key/revoke";
 pub const APPROVALS_STREAM: &str = "/api/v1/approvals/stream";
 pub const APPROVALS_PENDING_ID: &str = "/api/v1/approvals/{pending_id}";
 pub const ARCHIVE: &str = "/api/v1/archive";
