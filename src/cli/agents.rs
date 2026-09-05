@@ -232,7 +232,13 @@ pub enum PendingAction {
         /// approver keys must be met before the CLI operator can approve it.
         /// Each `<signature_b64>` signs
         /// `approvals::signed::approval_signing_bytes(id, Approve)`.
-        #[arg(long = "approval", value_name = "PUBKEY_B64:SIG_B64")]
+        // #3511: URL-safe base64 can begin with `-`, which clap would parse as
+        // a flag. Plain `//` so the rationale stays out of the operator's help.
+        #[arg(
+            long = "approval",
+            value_name = "PUBKEY_B64:SIG_B64",
+            allow_hyphen_values = true
+        )]
         approvals: Vec<String>,
     },
     /// Reject a pending action by id.

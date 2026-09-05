@@ -205,7 +205,9 @@ pub enum IdentityAction {
         #[arg(long)]
         agent_id: Option<String>,
         /// base64 recovery challenge from `recover-prepare`.
-        #[arg(long, value_name = "CHALLENGE_B64")]
+        // #3511: URL-safe base64 can begin with `-`, which clap would parse as
+        // a flag. Plain `//` so the rationale stays out of the operator's help.
+        #[arg(long, value_name = "CHALLENGE_B64", allow_hyphen_values = true)]
         challenge: String,
     },
     /// v1.0.0 G17 (#1831) — phase 2 of the M-of-N recovery ceremony:
@@ -238,7 +240,13 @@ pub enum IdentityAction {
         /// A guardian attestation `guardian_pubkey_b64:signature_b64` (from
         /// `sign-recovery`). Repeat once per guardian; M distinct enrolled
         /// signers must be presented.
-        #[arg(long = "attestation", value_name = "PUBKEY_B64:SIG_B64")]
+        // #3511: URL-safe base64 can begin with `-`, which clap would parse as
+        // a flag. Plain `//` so the rationale stays out of the operator's help.
+        #[arg(
+            long = "attestation",
+            value_name = "PUBKEY_B64:SIG_B64",
+            allow_hyphen_values = true
+        )]
         attestations: Vec<String>,
     },
 }
