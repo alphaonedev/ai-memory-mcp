@@ -25,7 +25,7 @@ the binary, ai-memory boots a per-session process, and the AI now
 has 8 to 103 advertised memory tools at its disposal (depending on the
 `--profile` flag). For AIs that don't speak MCP, the HTTP API
 covers everything the MCP surface does, plus a few more endpoints
-(97 route registrations / 83 unique URL paths).
+(98 route registrations / 84 unique URL paths).
 
 Every recipe below assumes the binary is on your `PATH`. If
 `ai-memory --version` doesn't print `1.0.0`, go back to
@@ -310,7 +310,7 @@ Category-1 (hook-capable) vs. Category-2 (MCP-only) matrix.
 
 ## 7. HTTP API fallback — for clients that don't speak MCP
 
-ai-memory ships an HTTP/REST daemon with **97 route registrations / 83 unique URL paths**
+ai-memory ships an HTTP/REST daemon with **98 route registrations / 84 unique URL paths**
 covering everything the MCP surface does. Use it for AI clients
 with no MCP support (most browser-based assistants), custom
 scripts, multi-host setups, and browser extensions.

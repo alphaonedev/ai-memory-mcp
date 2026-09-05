@@ -46,6 +46,10 @@ pub const GC: &str = "/api/v1/gc";
 pub const HEALTH: &str = "/api/v1/health";
 pub const IMPORT: &str = "/api/v1/import";
 pub const INBOX: &str = "/api/v1/inbox";
+/// v1.0.0 #3465 — SSE wake stream for the caller's OWN inbox. Fed
+/// from the in-process `inbox_wake` broadcast bus, never the webhook
+/// lane; identity-bound at stream open.
+pub const INBOX_STREAM: &str = "/api/v1/inbox/stream";
 pub const KG_FIND_PATHS: &str = "/api/v1/kg/find_paths";
 pub const KG_INVALIDATE: &str = "/api/v1/kg/invalidate";
 pub const KG_QUERY: &str = "/api/v1/kg/query";

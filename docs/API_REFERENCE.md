@@ -1400,6 +1400,7 @@ router in `src/lib.rs`.
 | `GET`  | `/api/v1/capabilities` | Capabilities envelope (schema_version `"3"`; `Accept-Capabilities` header negotiates v1/v2). MCP: `memory_capabilities`. |
 | `POST` | `/api/v1/notify` | Agent-to-agent inbox message. Sender resolved from `X-Agent-Id` only (#901); body `agent_id` must match or 403. MCP: `memory_notify`. |
 | `GET`  | `/api/v1/inbox` | Read the calling agent's inbox. MCP: `memory_inbox`; when `AI_MEMORY_AGENT_ID` is unset, access is bound to the same process-derived identity used by `memory_notify`, and an explicit `agent_id` must match it. MCP refuses startup when `AI_MEMORY_AGENT_ID` is configured empty or malformed. An isolated single-tenant process may explicitly set `[mcp] single_tenant_trust_all = true` to restore caller-unbound inbox selection; every use emits a WARN. |
+| `GET`  | `/api/v1/inbox/stream` | v1.0.0 [#3465](https://github.com/alphaonedev/ai-memory-mcp/issues/3465) — SSE wake stream for the calling agent's OWN inbox (`handlers::inbox_sse`). One `agent_notified` frame per committed `memory_notify`, plus a synthetic `lagged` frame when a slow subscriber overruns the bounded broadcast buffer; keepalive every 15 s. Identity-bound at stream open — no delegation, no namespace widening, and an unresolved identity (absent/unreadable `X-Agent-Id`, or a self-asserted `host:` principal) gets a stream that never emits. Frames carry the inbox row id, namespace, sender, a correlation id and a `sha256:` content digest — **never the body**; the woken client reads its mail through `GET /api/v1/inbox`. Fed from the in-process wake bus, not the webhook lane. No MCP twin (SSE has no MCP transport). |
 | `GET` `POST` `DELETE` | `/api/v1/skill/list`, `/api/v1/skill/register`, `/api/v1/skill/{id}`, `/api/v1/skill/{id}/resource`, `/api/v1/skill/{id}/export`, `/api/v1/skill/{id}/promote`, `/api/v1/skill/{id}/compose` | Cluster E API-2 (#767) — Agent Skills HTTP parity for the seven `memory_skill_*` MCP tools. **Admin-gated.** `…/export` writes on the daemon host and is **jailed** — see *Skills export root* below. |
 | `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. |
 | `GET`  | `/api/v1/admin/quarantine` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — list the memories currently held in federation quarantine (`handlers::list_quarantined`). **Admin-gated.** Identifying metadata ONLY (id, namespace, title, source, kind, timestamps) — never `content`: a quarantined row is untrusted input by construction and its content may be an at-rest seal sentinel. `?namespace=` narrows, `?limit=` pages (clamped to 1000). |
@@ -1434,12 +1435,12 @@ This is the write-side twin of the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail
 (#1923). The process working directory is deliberately NOT the fallback root: a
 daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 
-> **Total HTTP surface at v1.0.0: 83 unique URL paths across 97
+> **Total HTTP surface at v1.0.0: 84 unique URL paths across 98
 > production route registrations** (several paths carry more than one
 > method), on the sqlite-backed daemon and on the postgres-backed daemon
 > under `--features sal-postgres`. Both numbers are pinned in
-> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 82` and
-> `EXPECTED_PRODUCTION_ROUTES_COUNT = 96`, asserted by
+> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 84` and
+> `EXPECTED_PRODUCTION_ROUTES_COUNT = 98`, asserted by
 > `tests/route_count_invariant.rs`. Three further routes are
 > `#[cfg(test)]`-gated and never registered in a production build
 > (`EXPECTED_TEST_ROUTES_COUNT = 3`).
