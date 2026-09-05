@@ -1,0 +1,448 @@
+{
+  "reviewer": "GPT 6 Astra enterprise juror C",
+  "captured_utc": "2026-09-05T21:32:06.926567+00:00",
+  "method": "Read-only ssh f2, direct known directory glob and SHA-256; no tests or remote mutation. Hash establishes captured bytes, not a historical signature or executing binary.",
+  "remote_files": [
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-ee7dba.json",
+      "name": "module-scaling-1mod-ee7dba.json",
+      "bytes": 528,
+      "sha256": "2a34f259329687e3752da0e3793d1ad69b472737788a080d46364643604e4f2b",
+      "mtime_utc": "2026-09-01T23:50:50.940091+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-1bf6b5.json",
+      "name": "module-scaling-1mod-1bf6b5.json",
+      "bytes": 524,
+      "sha256": "9c1e0caf83ac514c3e4c81a0e7dd5cba460b0c33e99d0d0b0cd2588b03162015",
+      "mtime_utc": "2026-09-01T21:54:08.428910+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-f85993.json",
+      "name": "module-scaling-2mod-f85993.json",
+      "bytes": 598,
+      "sha256": "21f02056e9ad129c2c490722274b03f30542a3b36cd8b57728c7b37dc115d489",
+      "mtime_utc": "2026-09-01T21:56:35.008311+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-31ba9a.json",
+      "name": "module-scaling-1mod-31ba9a.json",
+      "bytes": 527,
+      "sha256": "5d87a502361599cf78bb7581abae4cd9b69f9a967a3d7aec268387e16e5cd35c",
+      "mtime_utc": "2026-09-01T21:54:51.019026+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-00fd17.json",
+      "name": "module-scaling-2mod-00fd17.json",
+      "bytes": 3116,
+      "sha256": "4ea75504ed0f720b0997c1046014a64b8e792a61a2e60fe3c9cf1b26b81531e7",
+      "mtime_utc": "2026-09-01T21:53:01.093726+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-fa8c04.json",
+      "name": "module-scaling-2mod-fa8c04.json",
+      "bytes": 594,
+      "sha256": "f67ddfab5eeda4d0cf913702dbaaaa17cac7b59a95a2966a4ae49f410a324bdd",
+      "mtime_utc": "2026-09-01T21:55:52.448194+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-12a432.json",
+      "name": "module-scaling-1mod-12a432.json",
+      "bytes": 527,
+      "sha256": "d8d4d445794798585aabd6ba5eac87a5e637a8e2a35437da94caf70187c5d405",
+      "mtime_utc": "2026-09-01T21:54:50.976324+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-f2f4b6.json",
+      "name": "module-scaling-2mod-f2f4b6.json",
+      "bytes": 597,
+      "sha256": "25141e7502348719d90ee30bea47696e96bf62c21dab3f56623c94875f387635",
+      "mtime_utc": "2026-09-01T21:56:34.551445+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-68be5b.json",
+      "name": "module-scaling-1mod-68be5b.json",
+      "bytes": 524,
+      "sha256": "f3fbfd70846b95c46648ad59486bff5160c04661e4506f74cb36089f7b56f496",
+      "mtime_utc": "2026-09-01T21:54:08.344382+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-e08964.json",
+      "name": "module-scaling-1mod-e08964.json",
+      "bytes": 2753,
+      "sha256": "6e2e694c7b1d43e31a6b8ddc0adbb6e7d2b0c9777c75020d9720f93a306afde5",
+      "mtime_utc": "2026-09-01T21:49:54.479271+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-25c45b.json",
+      "name": "module-scaling-2mod-25c45b.json",
+      "bytes": 598,
+      "sha256": "018c16598dba808eb51ef9dbbb74eca3fb5d672ba354c6c07edd9552cbf69523",
+      "mtime_utc": "2026-09-01T21:56:35.245311+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-28ebe6.json",
+      "name": "module-scaling-1mod-28ebe6.json",
+      "bytes": 527,
+      "sha256": "de8a45a79cff12958335d085c97842886471bfa51abda545ea5aa4595e6f5b1a",
+      "mtime_utc": "2026-09-01T21:54:51.177027+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-832405.json",
+      "name": "module-scaling-2mod-832405.json",
+      "bytes": 598,
+      "sha256": "0f63a8cac72f3db5ff7e20e4fc5360582552e5cb53f38d8131e360e52bf0d1da",
+      "mtime_utc": "2026-09-01T21:56:35.473187+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-182010.json",
+      "name": "module-scaling-2mod-182010.json",
+      "bytes": 598,
+      "sha256": "ec53de66b5ee0d96c931f9b5892d08011340862806876a8963b42a6b72c586fa",
+      "mtime_utc": "2026-09-01T21:56:35.448340+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-180e12.json",
+      "name": "module-scaling-2mod-180e12.json",
+      "bytes": 594,
+      "sha256": "04f62d688cb5cdd3751b929a58b603ebdca34ac83484aa67c2955b74b0b07160",
+      "mtime_utc": "2026-09-01T21:55:52.588229+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-3ad68a.json",
+      "name": "module-scaling-1mod-3ad68a.json",
+      "bytes": 528,
+      "sha256": "731b7aebd5dd204a840c170b353d656af95f47972d8e79b50ceecb0fb6f3d041",
+      "mtime_utc": "2026-09-01T23:50:50.925073+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-e00698.json",
+      "name": "module-scaling-1mod-e00698.json",
+      "bytes": 528,
+      "sha256": "21e24b3df0e6dec88d77dbcb2eab610a2b2fe4085fd5d2c88d8af9ab8fb8ded1",
+      "mtime_utc": "2026-09-01T23:50:50.700286+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-cb7484.json",
+      "name": "module-scaling-1mod-cb7484.json",
+      "bytes": 528,
+      "sha256": "6731e624459c6cff67de4e4530d8b483fb5bef6ff0e8ca4d3ec764fd0c5dd120",
+      "mtime_utc": "2026-09-01T23:50:51.097962+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-3c7a10.json",
+      "name": "module-scaling-2mod-3c7a10.json",
+      "bytes": 598,
+      "sha256": "41b1d8f3654a35d86a2e6aecf6c6f54a7d9030ac98566fd004654cf6b73c9a1c",
+      "mtime_utc": "2026-09-01T21:56:34.976310+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-fd6705.json",
+      "name": "module-scaling-2mod-fd6705.json",
+      "bytes": 598,
+      "sha256": "81647420b40180dcd0ade8f826b1cf6ff42e4faa01c3a9557906a9bc06054d7f",
+      "mtime_utc": "2026-09-01T21:56:34.952240+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-7a34f4.json",
+      "name": "module-scaling-1mod-7a34f4.json",
+      "bytes": 527,
+      "sha256": "d63418f9fa511a63b2f94a2b16ee721ce34b2b1f63ed6eac69cf1683acc14c35",
+      "mtime_utc": "2026-09-01T21:54:50.979871+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-7d7500.json",
+      "name": "module-scaling-1mod-7d7500.json",
+      "bytes": 527,
+      "sha256": "97aea507b9543051311146677f6bd80b6a6b6a03d1abae168de9bc41a2369540",
+      "mtime_utc": "2026-09-01T21:54:51.678875+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-0ce185.json",
+      "name": "module-scaling-2mod-0ce185.json",
+      "bytes": 598,
+      "sha256": "832cc14f63681aadd51f0913720bc94c9bd436c1226ac8eff92e7fd212ff3c8f",
+      "mtime_utc": "2026-09-01T21:56:35.449126+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-360da1.json",
+      "name": "module-scaling-1mod-360da1.json",
+      "bytes": 527,
+      "sha256": "3e017fb3cf62a5548c63acbb4b0ee0c06bcc9499270655e2ab84feaa0999bd37",
+      "mtime_utc": "2026-09-01T21:54:50.986026+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-d956ae.json",
+      "name": "module-scaling-1mod-d956ae.json",
+      "bytes": 524,
+      "sha256": "02fdd2593b9eab66ec5b3d16ec104bbc358cd2aaf379986919e6b0ada9410dbc",
+      "mtime_utc": "2026-09-01T21:54:08.407907+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-0215da.json",
+      "name": "module-scaling-1mod-0215da.json",
+      "bytes": 527,
+      "sha256": "2457c119c81a1ee7a2e6d7bab5a3b1e7d1105aa7833bef2a79bfc463097e2f4a",
+      "mtime_utc": "2026-09-01T21:54:50.978458+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-ae1e45.json",
+      "name": "module-scaling-2mod-ae1e45.json",
+      "bytes": 594,
+      "sha256": "627f2103b55d199ea95a00bc5fdeafab43c5ea8359fc886c95b92cb04109a71e",
+      "mtime_utc": "2026-09-01T21:55:52.329192+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-af0cf2.json",
+      "name": "module-scaling-1mod-af0cf2.json",
+      "bytes": 527,
+      "sha256": "a91eed43bb7f26d074fbc95bf392c11f13960808d01b6836f4fb71a001f64ae6",
+      "mtime_utc": "2026-09-01T21:54:50.993151+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-1mod-fb15df.json",
+      "name": "module-scaling-1mod-fb15df.json",
+      "bytes": 524,
+      "sha256": "e94368e85a3347d5d94dedc27abc7480459d4d0606e95820035857d78cad1009",
+      "mtime_utc": "2026-09-01T21:54:08.336910+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling-2mod-540493.json",
+      "name": "module-scaling-2mod-540493.json",
+      "bytes": 594,
+      "sha256": "6dd318810d5005ddcced4e636fccd6109386c5093cb7131613d4805a0cdf5f81",
+      "mtime_utc": "2026-09-01T21:55:52.606194+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/continuity-815e36.json",
+      "name": "continuity-815e36.json",
+      "bytes": 623,
+      "sha256": "27857ef323115fc628d338b7559cb4f238e8a6ac15cc7be96296a0c9d9891b9a",
+      "mtime_utc": "2026-09-01T23:18:47.276598+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/continuity-ae919f.json",
+      "name": "continuity-ae919f.json",
+      "bytes": 623,
+      "sha256": "263a28a1e97da1bfebde648af5ad5d96c4d88db5d17c41189e72b770c4b519cf",
+      "mtime_utc": "2026-09-01T22:01:42.222792+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/continuity-13cd0d.json",
+      "name": "continuity-13cd0d.json",
+      "bytes": 623,
+      "sha256": "c2ec27947015a9865165dcb7ec2d8cc5d566b34d7ceb464645f1c8039313943f",
+      "mtime_utc": "2026-09-01T21:59:40.525419+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/continuity-a23546.json",
+      "name": "continuity-a23546.json",
+      "bytes": 1726,
+      "sha256": "407a39a425106a6bb09aa3e98ae864589003a359f36533dd4f61215438818508",
+      "mtime_utc": "2026-09-01T20:29:04.929415+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/continuity-a56d9a.json",
+      "name": "continuity-a56d9a.json",
+      "bytes": 1725,
+      "sha256": "dd99293d2bc56f6d6b3bf68b2b60eea611e8f74a8c63457f41ffbb59c1ab9552",
+      "mtime_utc": "2026-09-01T20:30:27.218635+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/big10-20260901T215834Z.json",
+      "name": "big10-20260901T215834Z.json",
+      "bytes": 1399,
+      "sha256": "c5e8a5a4e9e590f27e758cac8d9427f00041b520f6cda56033e2129af5c18e43",
+      "mtime_utc": "2026-09-01T21:59:41.124969+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/big10-20260901T231122Z.json",
+      "name": "big10-20260901T231122Z.json",
+      "bytes": 1173,
+      "sha256": "cf1b012bedcacd6df19681efd33014b03d442fcdd1b2daee5be037a8a703b8b1",
+      "mtime_utc": "2026-09-01T23:12:20.536868+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/big10-20260901T230530Z.json",
+      "name": "big10-20260901T230530Z.json",
+      "bytes": 1191,
+      "sha256": "3869ba19f95a4539c09950edae24ba130b7b3ea1b90a00808a9e0e96557a77ca",
+      "mtime_utc": "2026-09-01T23:06:23.563251+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/big10-20260901T220027Z.json",
+      "name": "big10-20260901T220027Z.json",
+      "bytes": 1171,
+      "sha256": "bed5c2d68a47b57dc776b042dfcc906a2bef437e2c9009243dc6ed8add50ea9b",
+      "mtime_utc": "2026-09-01T22:01:42.805171+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/module-scaling.py",
+      "name": "module-scaling.py",
+      "bytes": 4702,
+      "sha256": "c486e8cc417201a5ff003e8ddc16e6f11a128397942dcd1e3d39d22c2a743176",
+      "mtime_utc": "2026-09-01T23:18:29.512187+00:00",
+      "review_scope": "Full producer source"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/continuity-cycle.py",
+      "name": "continuity-cycle.py",
+      "bytes": 8763,
+      "sha256": "246cfd0b89462a2ae35cb4605107bd3505273264646b9e73d554e4904f8c8185",
+      "mtime_utc": "2026-09-01T23:18:29.504342+00:00",
+      "review_scope": "Full producer source"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/.local-runs/big10-regression.sh",
+      "name": "big10-regression.sh",
+      "bytes": 6005,
+      "sha256": "b54be0625d48bda49508ea3781b3d4a5825f81cd235971ebc0eaa5c3f2db6441",
+      "mtime_utc": "2026-09-01T23:03:09.027910+00:00",
+      "review_scope": "Full producer source"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/infra/cf-dashboard/public/federation-state.json",
+      "name": "federation-state.json",
+      "bytes": 2700,
+      "sha256": "56cba60f2fd0e410b966c1e74ea71fcb5f8b1f54e6093348b109c46e2954e3fb",
+      "mtime_utc": "2026-09-01T14:12:21.708761+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/infra/cf-dashboard/public/datatier-state.json",
+      "name": "datatier-state.json",
+      "bytes": 3884,
+      "sha256": "555df61dc1405e9629b5be79979cc4874e9d496438e957f914d9abb41789ebf8",
+      "mtime_utc": "2026-09-01T14:12:21.708472+00:00",
+      "review_scope": "Full parsed JSON contents"
+    },
+    {
+      "remote_path": "/home/fate_two/v07/v09-dev/infra/cf-dashboard/public/northstar-state.json",
+      "name": "northstar-state.json",
+      "bytes": 7123,
+      "sha256": "12e2bf2bfe9ae73117fa89611fd6019e866b41b9bccd55bc786e012906fc316b",
+      "mtime_utc": "2026-09-04T12:53:24.721781+00:00",
+      "review_scope": "Full parsed JSON contents"
+    }
+  ],
+  "local_files": [
+    {
+      "path": ".local-runs/astra-evidence/dashboard-enterprise-artifacts/scaling-continuity-all.json",
+      "sha256": "395cde996a4b0248de652f4a141e281303d2a1d3219eeab57a6d1003e4f61b1d",
+      "bytes": 42662,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/dashboard-enterprise-artifacts/continuity-cycle.py",
+      "sha256": "a26aa6fc22fa04cd67d1faf39888782b363c7126bb8e3b751a83983dbcbd5a5d",
+      "bytes": 8644,
+      "note": "Sanitized producer copy; remote hash is original"
+    },
+    {
+      "path": ".local-runs/astra-evidence/dashboard-enterprise-artifacts/module-scaling.py",
+      "sha256": "c486e8cc417201a5ff003e8ddc16e6f11a128397942dcd1e3d39d22c2a743176",
+      "bytes": 4702,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/f2-runs/big10-20260901T230530Z.json",
+      "sha256": "3869ba19f95a4539c09950edae24ba130b7b3ea1b90a00808a9e0e96557a77ca",
+      "bytes": 1191,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/f2-runs/big10-20260901T220027Z.json",
+      "sha256": "bed5c2d68a47b57dc776b042dfcc906a2bef437e2c9009243dc6ed8add50ea9b",
+      "bytes": 1171,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/f2-runs/big10-20260901T231122Z.json",
+      "sha256": "cf1b012bedcacd6df19681efd33014b03d442fcdd1b2daee5be037a8a703b8b1",
+      "bytes": 1173,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/f2-runs/big10-20260901T215834Z.json",
+      "sha256": "c5e8a5a4e9e590f27e758cac8d9427f00041b520f6cda56033e2129af5c18e43",
+      "bytes": 1399,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/f2-runs/big10-regression.sh",
+      "sha256": "b54be0625d48bda49508ea3781b3d4a5825f81cd235971ebc0eaa5c3f2db6441",
+      "bytes": 6005,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/f2-runs/continuity-ae919f.json",
+      "sha256": "263a28a1e97da1bfebde648af5ad5d96c4d88db5d17c41189e72b770c4b519cf",
+      "bytes": 623,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/f2-runs/continuity-13cd0d.json",
+      "sha256": "c2ec27947015a9865165dcb7ec2d8cc5d566b34d7ceb464645f1c8039313943f",
+      "bytes": 623,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/f2-runs/continuity-a23546.json",
+      "sha256": "407a39a425106a6bb09aa3e98ae864589003a359f36533dd4f61215438818508",
+      "bytes": 1726,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/f2-runs/continuity-a56d9a.json",
+      "sha256": "dd99293d2bc56f6d6b3bf68b2b60eea611e8f74a8c63457f41ffbb59c1ab9552",
+      "bytes": 1725,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    },
+    {
+      "path": ".local-runs/astra-evidence/f2-runs/continuity-815e36.json",
+      "sha256": "27857ef323115fc628d338b7559cb4f238e8a6ac15cc7be96296a0c9d9891b9a",
+      "bytes": 623,
+      "note": "Local review copy; combined JSON is a parsed serialization, not original remote bytes"
+    }
+  ],
+  "missing_names": []
+}

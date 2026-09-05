@@ -1,0 +1,56 @@
+[
+  {
+    "vendor": "openai",
+    "payload": {
+      "status": "pending",
+      "pending_id": "synthetic-pending"
+    },
+    "returned_success": true,
+    "stderr": ""
+  },
+  {
+    "vendor": "openai",
+    "payload": {
+      "status": "ask",
+      "reason": "synthetic gate"
+    },
+    "returned_success": true,
+    "stderr": ""
+  },
+  {
+    "vendor": "openai",
+    "payload": {
+      "memory_id": "synthetic-persisted",
+      "dedup_hit": false
+    },
+    "returned_success": true,
+    "stderr": ""
+  },
+  {
+    "vendor": "anthropic",
+    "payload": {
+      "status": "pending",
+      "pending_id": "synthetic-pending"
+    },
+    "returned_success": true,
+    "stderr": ""
+  },
+  {
+    "vendor": "anthropic",
+    "payload": {
+      "status": "ask",
+      "reason": "synthetic gate"
+    },
+    "returned_success": true,
+    "stderr": ""
+  },
+  {
+    "vendor": "anthropic",
+    "payload": {
+      "memory_id": "synthetic-persisted",
+      "dedup_hit": false
+    },
+    "returned_success": true,
+    "stderr": ""
+  }
+]

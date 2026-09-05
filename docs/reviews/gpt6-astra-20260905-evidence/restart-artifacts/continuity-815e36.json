@@ -1,0 +1,28 @@
+{
+ "run": "815e36",
+ "cycles": [
+  {
+   "cycle": 1,
+   "retained": true,
+   "resume_ms": 1191.8,
+   "health_ok_ms": 490.5,
+   "embedder_ready_ms": 490.5,
+   "killed_pid": 1896124,
+   "new_pid": 1959229,
+   "acked_writes_at_kill": 110,
+   "load_errors_during_outage": {
+    "TransportError": 48
+   },
+   "checks": {
+    "mission_memory_retained": true,
+    "inbox_retained": true,
+    "recall_finds_mission": true,
+    "acked_writes_present": "110/110",
+    "no_acked_write_lost": true,
+    "key_binding_retained_signed_write_ok": true,
+    "stats_total_pre_post": "23939->24050"
+   }
+  }
+ ],
+ "ts": "2026-09-01T23:18:47Z"
+}

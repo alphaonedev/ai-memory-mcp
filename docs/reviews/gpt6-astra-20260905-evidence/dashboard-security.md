@@ -1,0 +1,53 @@
+# GPT 6 Astra — dashboard security / North Star / NHI evidence review
+
+Evidence received: full local copies of dashboard-security-state.json (SHA-256 bf70a487ee569eee38ae4afb203219609d2d770ed7b02d82c46be23d59edba01) and dashboard-northstar-state.json (12e2bf2bfe9ae73117fa89611fd6019e866b41b9bccd55bc786e012906fc316b). Also read all issues and nhiAudit records, and relevant config, security, continuity, events, communications, coverage and usage portions of dashboard-state.json. These are dashboard records, not fresh reproduction of their underlying tests. Remote harness implementation/individual raw logs were not inspected by this juror in this pass. Root is examining that evidence separately.
+
+## Verdict and evidence quality
+
+The dashboard is substantially more informative than a wall of green checks: it preserves failures, harness defects, negative probes and historical remediation. It provides additional support for practical agent value and additional reasons to withhold a grand-slam verdict. It does not make every card a current, independently reproduced fact about source 87f86a0a or the installed MCP used in this conversation.
+
+The main state reports source origin87f86a0a, a different local tip and CI RED, updated2026-09-05T21:04:16Z. Both security and North Star surfaces have lastUpdated:null. Individual cards do not contain per-test run ids, command lines, commit/binary hash, backend/profile, fixture identity or raw artifact links. The North Star CI card cites7578c655, while other state sections cite87f86a0a. A dashboard's latest poll time does not renew every underlying test. Release branch v1.0.0 should not be conflated with a final GA tag; the timeline explicitly places final retest, security review, certification reissue and tag ahead.
+
+Security counts reconcile:20 cards=15 validated+2 failclosed+3 refining; functional17 and85% count both validated and failclosed as success. North Star rows reconcile22 validated+1 failclosed+2 refining=25 and92%=(22+1)/25, but functional21 does not match that convention. This is an evidence-accounting inconsistency, not a substrate vulnerability. Show denominators, expected outcomes and eligibility so agents cannot interpret an unavailable capability as a successfully completed positive workflow.
+
+## Security assertions that deserve credit, with scope
+
+- The security card asserts positive execution for signed writes, admin-gated provisioning, tool profiles, HMAC approvals, key-derived identity, namespace/owner isolation, Ed25519 keys, identity binding, mTLS, verify-full PostgreSQL transport, encrypted envelopes and replay rejection. These are meaningful intended controls. Deployment can enforce stronger identity than the advisory HTTP default in source; there is no contradiction if the test fleet enrolled keys and selected strict profiles.
+- A deterministic UUID is useful stable attribution; UUID generation by itself authenticates neither possession nor model identity. The signed principal binding is the relevant security control. A claim that each NHI signs under its own key needs key custody/binding evidence; labels alone cannot establish independent cognition or independent origins.
+- Capability-token and attenuation cards are classified failclosed. Those may be successful negative controls: a refusal for an out-of-caveat token is correct. They are not automatically broken features, and they also do not by themselves prove an authorized token can complete its permitted workflow. Require the permitted control paired with forbidden widening/replay probes.
+- The three refining security cards are LUKS, poison quarantine/no-cascade and tenant-scope leak resistance. They remain explicitly not validated here. LUKS is deployment at-rest protection, distinct from per-record envelopes and native node availability. No local disk-encryption deficiency is inferred from a cert-stack card.
+- state.comms explicitly distinguishes current agent-to-daemon mTLS and verify-full database connections from federation quorum peering that was not wired in that session. The prior cross-host9/9 result and present independent two-module workload can both be true. Do not use the workload as a fresh federation-convergence test.
+
+## Poisoning and isolation: unresolved semantics, not invented exploits
+
+state.security says3 injected,3 blocked,0 infections,0 cascades while both security/North Star poison cards remain refining. Possible causes include stale cards, a narrowly passing probe, or incompletely validated outcomes. Without common run ids, poisoned payloads, expected consumer behavior and logs, these facts cannot be collapsed into a global infection-resistance guarantee or a demonstrated live exploit. A blocked mutation is not the same assertion as a downstream agent recognizing believable but false stored evidence. The grand-slam test should include both, with real downstream task outcomes and repair acknowledgments after invalidation.
+
+Owner isolation cards describe unidentified reads returning NotFound; NHI audit separately alleges global inventory exposure through stats/namespaces and owner disclosure in Forbidden writes. These are different surfaces and could coexist. They warrant authorized cross-principal metadata tests in an isolated fixture. They do not establish that the present local configuration violated policy: intended roster visibility, principal enrollment, supplied capability and tenant policy must be recorded. Never equate aggregate counts with unauthorized disclosure without that boundary.
+
+The source review already found honest separation between signed relationship provenance, metadata content attestation and propagated lineage trust. Dashboard signing and poisoning badges do not remove the consumer interpretation issue, nor do they turn it into a cryptographic break.
+
+## NHI audit: what the failed run actually establishes
+
+The weighted Grok4.6 run is labeled8agents×6steps and final auditor verdictFAIL. Dashboard explicitly corrected a last-token parser that read the later phrase PASS would over-claim as PASS. Credit the correction; it demonstrates why verdict extraction should be structured and carry the source artifact.
+
+Its rubric records8valid, recall usefulness mean4.5, latency acceptable0, isolation respected6 and would rely6. Do not infer the usefulness rating's scale where none is given. Mission completion0.0,9facts stored,3lineage proofs,0summary stored are run observations filtered through a detector/harness whose own validity is challenged. This is not a clean estimate of product success probability or proof that no mission can finish. It does show that favorable subjective recall ratings did not translate into measured completion in that run.
+
+All eight quotes describe useful, on-namespace recall with variations; several report search worked despite older stored defect notes, several report empty search, and several report repetitive/circular tool use, ignored inbox handoffs, stale short-term facts or duplicate titles. These are operationally useful qualitative observations. They reinforce two principles: historical defect memories require revalidation, and correct primitives alone do not guarantee an agent completes a workflow.
+
+The summary top-failure claim search always empty is broader than the quotes, several of which explicitly say search worked. Preserve that disagreement rather than adopting the summary. Duplicate-title ConflictError may be correct idempotence enforcement against a dirty baseline; repeated agent retries and static summary names are harness/client-workflow defects unless a clean run shows more. Explicit negative probes need expected refusal accounting; the audit says matrix FAILURES listed negative controls while FC=0.
+
+Auditor findings distinguish harness problems (forget deleted0, reused notification ids, prior corpus/~23k rows, negative-test accounting) from alleged daemon problems (advertised atomisation unsupported on PostgreSQL, write Forbidden revealing owner). Treat the latter as reported findings requiring current source/fixture confirmation. Several have since had remediation work in the event stream; issue existence or a past filed label does not prove current failure.
+
+Recorded per-step7–28second latency includes model decision time, full schemas, embedding and tool operations. The usage record explicitly attributes roughly12–14seconds to agent pacing. Do not label all of it database/daemon latency. For agent value the end-to-end delay still matters, so publish both end-to-end time-to-task and layer timings.
+
+## Restart and release evidence
+
+The continuity cards record3retained cycles, resume1089/1014/997ms, with91/112/130acknowledged writes, and North Star says zero acknowledged writes lost. Per user clarification these are manually recorded prior-run results, not an automated current-run proof. They are useful historical evidence, but no current crash drill was performed here. Require exact prior artifacts or a new isolated run before certifying current restart behavior; do not kill shared services to obtain it.
+
+The event stream records many genuine negative gates and subsequent fixes, including silent inert governance repaired, attestation reconciliation/replay work, restored backup-integrity refusal, and current CI issues. It is a credible development chronology with candid failures. Its old open issues and local-merge statuses cannot replace current source inspection. Issue3501 explicitly says certification VOID until reissued; current evidence should carry that boundary instead of republishing a timeless certified badge.
+
+## Acceptance requirements suggested by these records
+
+Use per-run structured receipts: exact source and binary hash, backend/profile/identity/key enrollment, test fixture id, expected outcome, observed code/result, timing boundaries, artifact hash and current applicability. Pair every failclosed negative with its authorized positive where the capability is advertised. Fail the summarizer if counts disagree, if an old card lacks provenance, or if a free-text PASS parser contradicts a structured verdict. Use clean namespaces and unique subjects; record partial completion separately from harness-invalid runs. Independently test private content isolation, metadata discovery policy, owner existence disclosure, believable evidence poisoning, downstream correction and restart recovery.
+
+**Vote unchanged: conditional agent value YES; GRAND SLAM NO.** The new evidence supports real controls and useful recall, while demonstrating that workflow completion and evidence accounting still need stronger current proof.

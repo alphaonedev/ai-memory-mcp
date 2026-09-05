@@ -1,0 +1,57 @@
+{
+  "date": "2026-09-05",
+  "scope": "documentation publication checks only; no remote CI or release dispatch",
+  "checks": [
+    {
+      "name": "docs-vs-SSOT drift",
+      "result": "PASS"
+    },
+    {
+      "name": "doc symbol/path anchors",
+      "result": "PASS"
+    },
+    {
+      "name": "doc surface completeness",
+      "result": "PASS"
+    },
+    {
+      "name": "capacity claims",
+      "result": "PASS"
+    },
+    {
+      "name": "named CI job existence/enforcement truthfulness",
+      "result": "PASS"
+    },
+    {
+      "name": "benchmark claims",
+      "result": "PASS"
+    },
+    {
+      "name": "capture seam six-envelope reproduction",
+      "result": "PASS"
+    },
+    {
+      "name": "offload exact bytes and SHA-256",
+      "result": "PASS"
+    },
+    {
+      "name": "pinned source and relative links",
+      "result": "PASS"
+    },
+    {
+      "name": "JSON parse",
+      "result": "PASS"
+    },
+    {
+      "name": "credential-pattern screen",
+      "result": "PASS"
+    },
+    {
+      "name": "git diff --cached --check",
+      "result": "PASS after whitespace cleanup"
+    }
+  ],
+  "corrected_local_failure": "Capacity-claim gate initially interpreted a historical exclusion of aspirational fleet scale as a current numeric claim; reworded that evidence-note exclusion without changing its meaning. No allowlist or control changed.",
+  "limits": "Repository documentation gates do not establish semantic correctness of every claim; source and peer adjudication provide separate evidence.",
+  "corrected_local_whitespace": "Removed psql column-padding tails and extra EOF blanks; retained original hashes for normalized ballots; converted Markdown metadata hard breaks to paragraph breaks."
+}

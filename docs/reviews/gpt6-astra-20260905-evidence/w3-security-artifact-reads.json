@@ -1,0 +1,181 @@
+{
+  "note": "Artifact reading only; no new production source ranges. Hashes identify the inspected draft bytes, not producer authenticity.",
+  "files": [
+    {
+      "path": ".local-runs/astra-evidence/w2-fullpanel-architecture.md",
+      "sha256": "fcdc0ba96802255089519548a474f2a464ba240a8595a6421a067da0e1be3f08",
+      "lines": 55,
+      "read_ranges": [
+        [
+          1,
+          55
+        ]
+      ]
+    },
+    {
+      "path": ".local-runs/astra-evidence/w2-fullpanel-operations.md",
+      "sha256": "cdc2a48f7fa43159e34b973360afdf74db65f619bd4a8f147e44a7dc3c1b57bc",
+      "lines": 55,
+      "read_ranges": [
+        [
+          1,
+          55
+        ]
+      ]
+    },
+    {
+      "path": ".local-runs/astra-evidence/w2-fullpanel-cognition.md",
+      "sha256": "60730fe10d89446e4c1ddb1c4cfee36aef8de0e7b037af98003e6c216e80e143",
+      "lines": 51,
+      "read_ranges": [
+        [
+          1,
+          51
+        ]
+      ]
+    },
+    {
+      "path": ".local-runs/astra-evidence/w2-fullpanel-security.md",
+      "sha256": "e415f6424b5072622c7c9ed2127f8c70a5d7297a0e43bdd1b9049c9feddfd455",
+      "lines": 79,
+      "read_ranges": [
+        [
+          1,
+          79
+        ]
+      ]
+    },
+    {
+      "path": ".local-runs/astra-evidence/w2-fullpanel-continuity.md",
+      "sha256": "cf6583e45bb9ad37a433b48c0ae96e87a2942126c4a231d1f882af77963935dc",
+      "lines": 50,
+      "read_ranges": [
+        [
+          1,
+          50
+        ]
+      ]
+    },
+    {
+      "path": ".local-runs/astra-evidence/w2-fullpanel-enterprise.md",
+      "sha256": "79afc4a8cb012a90f87c07e16874e68b90a6e2c0f4ed13782bb980ce93c671e0",
+      "lines": 56,
+      "read_ranges": [
+        [
+          1,
+          56
+        ]
+      ]
+    },
+    {
+      "path": ".local-runs/astra-evidence/w2-fullpanel-retrieval.md",
+      "sha256": "9de9697efcbfa1c80ed9a9d66ad2ca24eecdc806ee811f10b4ee05080195e1b4",
+      "lines": 49,
+      "read_ranges": [
+        [
+          1,
+          49
+        ]
+      ]
+    },
+    {
+      "path": "docs/reviews/GPT-6-ASTRA-FULL-SPECTRUM-ASSESSMENT-2026-09-05.md",
+      "sha256": "906e7abf8b39e770c389b7779fc6d66acca449dd527de55353effa627c99582c",
+      "lines": 292,
+      "read_ranges": [
+        [
+          1,
+          292
+        ]
+      ]
+    },
+    {
+      "path": "docs/reviews/GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md",
+      "sha256": "5202003f5e603b5c9d5899680cfbb8726262d0f6813f54bbb3a2e116cc9e4284",
+      "lines": 373,
+      "read_ranges": [
+        [
+          1,
+          373
+        ]
+      ]
+    },
+    {
+      "path": "docs/reviews/gpt6-astra-20260905-evidence/README.md",
+      "sha256": "177449e6988e9541329b442414872718be0ffe055b1394be7658714d41768b7d",
+      "lines": 41,
+      "read_ranges": [
+        [
+          1,
+          41
+        ]
+      ]
+    },
+    {
+      "path": "docs/reviews/gpt6-astra-20260905-evidence/root-live-probes.json",
+      "sha256": "221ab5887b39cbffb59e850bc72687c6ca2cdfe450f63e5a02729db4aea855f5",
+      "lines": 496,
+      "read_ranges": [
+        [
+          1,
+          496
+        ]
+      ]
+    },
+    {
+      "path": "docs/reviews/gpt6-astra-20260905-evidence/root-cleanup-verification.json",
+      "sha256": "ede3399adc424cc1fa78c4c4f38f681bb11f6bbb9d163ab16e5497078b5b4dbb",
+      "lines": 32,
+      "read_ranges": [
+        [
+          1,
+          32
+        ]
+      ]
+    },
+    {
+      "path": "docs/reviews/gpt6-astra-20260905-evidence/capture-pending-probe.json",
+      "sha256": "cec952e758503afca832b96309636c57404b098843315e5770fefbd7debf6219",
+      "lines": 56,
+      "read_ranges": [
+        [
+          1,
+          56
+        ]
+      ]
+    },
+    {
+      "path": "docs/reviews/gpt6-astra-20260905-evidence/dashboard-security.md",
+      "sha256": "1409bb05634502d807473e809c1e54dc9ba717bd48a9dfb06780874b5bd7dcf2",
+      "lines": 53,
+      "read_ranges": [
+        [
+          1,
+          53
+        ]
+      ]
+    },
+    {
+      "path": "docs/reviews/gpt6-astra-20260905-evidence/issues-review-security.md",
+      "sha256": "d067016560d4fc8548dafd9ea73f8868f33fd0ec7b00018b28e4da88f7ab77c0",
+      "lines": 125,
+      "read_ranges": [
+        [
+          1,
+          55
+        ]
+      ]
+    },
+    {
+      "path": "docs/reviews/gpt6-astra-20260905-evidence/root-offload-dereference.json",
+      "sha256": "b04eebb06388855b2ade16c3475744c6b87b92aac4c1511606a7e4924717e937",
+      "lines": 16,
+      "read_ranges": [
+        [
+          1,
+          16
+        ]
+      ]
+    }
+  ]
+}

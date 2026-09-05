@@ -1,0 +1,44 @@
+[
+  {
+    "status": "fulfilled",
+    "value": {
+      "name": "get",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"access_count\": 0,\n  \"cid\": \"b3:0bd2957578ba0c3c5e4fbbdaa9e517ed77913a0fcebe3eb47a9811a784469773\",\n  \"citations\": [],\n  \"confidence\": 1.0,\n  \"confidence_source\": \"caller_provided\",\n  \"content\": \"Synthetic review fixture; no operational authority. A glacial otter carries the cobalt lantern. The experiment's lookup key is MOUNTAIN-ASTRA-7319. This fact exists only to measure exact and paraphrase retrieval.\",\n  \"created_at\": \"2026-09-05T21:00:05.290755+00:00\",\n  \"expires_at\": \"2026-09-12T21:00:05.290755Z\",\n  \"id\": \"ec3da1d1-3da5-4b30-bb78-92d90514afa3\",\n  \"lifecycle_state\": \"open\",\n  \"links\": [],\n  \"memory_kind\": \"observation\",\n  \"metadata\": {\n    \"agent_id\": \"ai:codex\",\n    \"assessment\": \"GPT 6 Astra 2026-09-05\",\n    \"attest_level\": \"claimed\",\n    \"auto_tags\": [\n      \"retrieval\",\n      \"synthetic fixture\",\n      \"benchmark\",\n      \"experiment\",\n      \"test data\"\n    ],\n    \"curated_at\": \"2026-09-05T21:02:42.879827+00:00\",\n    \"kind_provenance\": \"declared\",\n    \"scope\": \"private\",\n    \"synthetic\": true,\n    \"version_vector\": {\n      \"entries\": {\n        \"host:FROSTYi.local\": \"2026-09-05T21:00:05.290755+00:00\"\n      }\n    }\n  },\n  \"namespace\": \"review:astra:20260905:retrieval\",\n  \"priority\": 5,\n  \"reflection_depth\": 0,\n  \"source\": \"nhi\",\n  \"tags\": [\n    \"astra-review-synthetic\",\n    \"retrieval-probe\"\n  ],\n  \"tier\": \"mid\",\n  \"title\": \"astra-review-20260905-retrieval-A\",\n  \"updated_at\": \"2026-09-05T21:02:42.880096+00:00\",\n  \"version\": 3\n}"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "status": "fulfilled",
+    "value": {
+      "name": "search",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"count\": 1,\n  \"results\": [\n    {\n      \"access_count\": 0,\n      \"citations\": [],\n      \"confidence\": 1.0,\n      \"confidence_source\": \"caller_provided\",\n      \"content\": \"Synthetic review fixture; no operational authority. A glacial otter carries the cobalt lantern. The experiment's lookup key is MOUNTAIN-ASTRA-7319. This fact exists only to measure exact and paraphrase retrieval.\",\n      \"created_at\": \"2026-09-05T21:00:05.290755+00:00\",\n      \"expires_at\": \"2026-09-12T21:00:05.290755Z\",\n      \"id\": \"ec3da1d1-3da5-4b30-bb78-92d90514afa3\",\n      \"lifecycle_state\": \"open\",\n      \"memory_kind\": \"observation\",\n      \"metadata\": {\n        \"agent_id\": \"ai:codex\",\n        \"assessment\": \"GPT 6 Astra 2026-09-05\",\n        \"attest_level\": \"claimed\",\n        \"auto_tags\": [\n          \"retrieval\",\n          \"synthetic fixture\",\n          \"benchmark\",\n          \"experiment\",\n          \"test data\"\n        ],\n        \"curated_at\": \"2026-09-05T21:02:42.879827+00:00\",\n        \"kind_provenance\": \"declared\",\n        \"scope\": \"private\",\n        \"synthetic\": true,\n        \"version_vector\": {\n          \"entries\": {\n            \"host:FROSTYi.local\": \"2026-09-05T21:00:05.290755+00:00\"\n          }\n        }\n      },\n      \"namespace\": \"review:astra:20260905:retrieval\",\n      \"priority\": 5,\n      \"reflection_depth\": 0,\n      \"source\": \"nhi\",\n      \"tags\": [\n        \"astra-review-synthetic\",\n        \"retrieval-probe\"\n      ],\n      \"tier\": \"mid\",\n      \"title\": \"astra-review-20260905-retrieval-A\",\n      \"updated_at\": \"2026-09-05T21:02:42.880096+00:00\",\n      \"version\": 1\n    }\n  ]\n}"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "status": "fulfilled",
+    "value": {
+      "name": "recall",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"budget_tokens\": 1500,\n  \"count\": 1,\n  \"memories\": [\n    {\n      \"access_count\": 3,\n      \"citations\": [],\n      \"confidence\": 0.9998737867197236,\n      \"confidence_decayed_at\": \"2026-09-05T21:07:58.171718+00:00\",\n      \"confidence_source\": \"decayed\",\n      \"confidence_tier\": \"confirmed\",\n      \"content\": \"Synthetic review fixture; no operational authority. A glacial otter carries the cobalt lantern. The experiment's lookup key is MOUNTAIN-ASTRA-7319. This fact exists only to measure exact and paraphrase retrieval.\",\n      \"created_at\": \"2026-09-05T21:00:05.290755+00:00\",\n      \"expires_at\": \"2026-09-12T21:00:05.290755Z\",\n      \"freshness_state\": \"warm\",\n      \"id\": \"ec3da1d1-3da5-4b30-bb78-92d90514afa3\",\n      \"last_accessed_at\": \"2026-09-05T21:01:41.092+00:00\",\n      \"lifecycle_state\": \"open\",\n      \"memory_kind\": \"observation\",\n      \"metadata\": {\n        \"agent_id\": \"ai:codex\",\n        \"assessment\": \"GPT 6 Astra 2026-09-05\",\n        \"attest_level\": \"claimed\",\n        \"auto_tags\": [\n          \"retrieval\",\n          \"synthetic fixture\",\n          \"benchmark\",\n          \"experiment\",\n          \"test data\"\n        ],\n        \"curated_at\": \"2026-09-05T21:02:42.879827+00:00\",\n        \"kind_provenance\": \"declared\",\n        \"scope\": \"private\",\n        \"synthetic\": true,\n        \"version_vector\": {\n          \"entries\": {\n            \"host:FROSTYi.local\": \"2026-09-05T21:00:05.290755+00:00\"\n          }\n        }\n      },\n      \"namespace\": \"review:astra:20260905:retrieval\",\n      \"priority\": 5,\n      \"provenance_tier\": \"unsigned_caller\",\n      \"reflection_depth\": 0,\n      \"scheduled_validity\": \"valid\",\n      \"score\": 0.703,\n      \"source\": \"nhi\",\n      \"tags\": [\n        \"astra-review-synthetic\",\n        \"retrieval-probe\"\n      ],\n      \"tier\": \"mid\",\n      \"title\": \"astra-review-20260905-retrieval-A\",\n      \"updated_at\": \"2026-09-05T21:02:42.880096+00:00\",\n      \"version\": 1\n    }\n  ],\n  \"meta\": {\n    \"blend_weight\": 0.5,\n    \"budget_overflow\": false,\n    \"budget_tokens_remaining\": 1452,\n    \"budget_tokens_used\": 48,\n    \"candidate_counts\": {\n      \"fts\": 1,\n      \"hnsw\": 0\n    },\n    \"confidence_filtered_out\": 0,\n    \"had_filtered_candidates\": false,\n    \"memories_dropped\": 0,\n    \"recall_mode\": \"hybrid\",\n    \"reranker_used\": \"neural\",\n    \"semantic_withheld\": {\n      \"dim_mismatch\": 0,\n      \"measured\": true,\n      \"space_mismatch\": 0,\n      \"total\": 0,\n      \"unverified_space\": 0\n    }\n  },\n  \"mode\": \"hybrid+rerank\",\n  \"recall_id\": \"aec83dd3-bdb1-4749-b6d8-d49aa55db277\",\n  \"tokens_used\": 48\n}"
+          }
+        ]
+      }
+    }
+  }
+]

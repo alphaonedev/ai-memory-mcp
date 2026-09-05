@@ -1,0 +1,230 @@
+{
+  "method": "hashes of fetched review copies; no proof of historical producer identity or running binary; remote originals supplemented by enterprise manifest",
+  "files": [
+    {
+      "captured_path": "f2-dashboard/datatier-state.json",
+      "bytes": 3884,
+      "sha256": "555df61dc1405e9629b5be79979cc4874e9d496438e957f914d9abb41789ebf8"
+    },
+    {
+      "captured_path": "f2-dashboard/datatier.html",
+      "bytes": 9936,
+      "sha256": "835dfb1b1348754c31cda5e04139858593a7c87ea12a4bb0b81f2d991b755d95"
+    },
+    {
+      "captured_path": "f2-dashboard/federation-state.json",
+      "bytes": 2700,
+      "sha256": "56cba60f2fd0e410b966c1e74ea71fcb5f8b1f54e6093348b109c46e2954e3fb"
+    },
+    {
+      "captured_path": "f2-dashboard/federation.html",
+      "bytes": 9977,
+      "sha256": "b410b3d2c801e6f565828089b10b8c9e261d9587b71d9a5aa02460063ef959b9"
+    },
+    {
+      "captured_path": "f2-dashboard/index.html",
+      "bytes": 66125,
+      "sha256": "b4b70a9165c736a62da9cb81689e2f3727ed4173f54758d1f3713066fdfd15ae"
+    },
+    {
+      "captured_path": "f2-dashboard/mcp-tools-state.json",
+      "bytes": 34544,
+      "sha256": "f5e91b120ca8377e1dc1e4b679348a8722755958a87867e5f9170ba38e2caed6"
+    },
+    {
+      "captured_path": "f2-dashboard/mcp-tools.html",
+      "bytes": 10076,
+      "sha256": "5f55cee4235449f87bc1e2ce014834879ae55c6b69431b1e4856f0fdaf5e3edb"
+    },
+    {
+      "captured_path": "f2-dashboard/northstar-state.json",
+      "bytes": 7123,
+      "sha256": "12e2bf2bfe9ae73117fa89611fd6019e866b41b9bccd55bc786e012906fc316b"
+    },
+    {
+      "captured_path": "f2-dashboard/northstar.html",
+      "bytes": 10068,
+      "sha256": "19988dfd439f16d987c2086ae6db5dee945f5a751c112b6de2d6658b05f3c7eb"
+    },
+    {
+      "captured_path": "f2-dashboard/push-state.sh",
+      "bytes": 1301,
+      "sha256": "28a2aaa15c28605649dd0b1d1ecb77ff45be6c63933f1b9c77d2713e8020be9a"
+    },
+    {
+      "captured_path": "f2-dashboard/security-state.json",
+      "bytes": 5613,
+      "sha256": "bf70a487ee569eee38ae4afb203219609d2d770ed7b02d82c46be23d59edba01"
+    },
+    {
+      "captured_path": "f2-dashboard/security.html",
+      "bytes": 9978,
+      "sha256": "cc1ed97ccfe9c245876da9b2792e404f160aab0127071d4d4fef4aefd955ff74"
+    },
+    {
+      "captured_path": "f2-dashboard/state.json",
+      "bytes": 67619,
+      "sha256": "9d549013e3b8ae0da228fbab4759b76d7f87916035157df9f2521b7d333589e4"
+    },
+    {
+      "captured_path": "f2-dashboard/swarm-tools-state.json",
+      "bytes": 5329,
+      "sha256": "1a8c8a65a9311a9d894ee79ebe6b5efa5b3ff22e1daef3c808c6a9d56dc63e52"
+    },
+    {
+      "captured_path": "f2-dashboard/swarm-tools.html",
+      "bytes": 10081,
+      "sha256": "68138206f2488a4b1ffdbbf7cf59a9f6ead94f41ed813e086d04cd1e9e6273d5"
+    },
+    {
+      "captured_path": "f2-runs/big10-20260901T215834Z.json",
+      "bytes": 1399,
+      "sha256": "c5e8a5a4e9e590f27e758cac8d9427f00041b520f6cda56033e2129af5c18e43"
+    },
+    {
+      "captured_path": "f2-runs/big10-20260901T220027Z.json",
+      "bytes": 1171,
+      "sha256": "bed5c2d68a47b57dc776b042dfcc906a2bef437e2c9009243dc6ed8add50ea9b"
+    },
+    {
+      "captured_path": "f2-runs/big10-20260901T230530Z.json",
+      "bytes": 1191,
+      "sha256": "3869ba19f95a4539c09950edae24ba130b7b3ea1b90a00808a9e0e96557a77ca"
+    },
+    {
+      "captured_path": "f2-runs/big10-20260901T231122Z.json",
+      "bytes": 1173,
+      "sha256": "cf1b012bedcacd6df19681efd33014b03d442fcdd1b2daee5be037a8a703b8b1"
+    },
+    {
+      "captured_path": "f2-runs/big10-regression.sh",
+      "bytes": 6005,
+      "sha256": "b54be0625d48bda49508ea3781b3d4a5825f81cd235971ebc0eaa5c3f2db6441"
+    },
+    {
+      "captured_path": "f2-runs/continuity-13cd0d.json",
+      "bytes": 623,
+      "sha256": "c2ec27947015a9865165dcb7ec2d8cc5d566b34d7ceb464645f1c8039313943f"
+    },
+    {
+      "captured_path": "f2-runs/continuity-815e36.json",
+      "bytes": 623,
+      "sha256": "27857ef323115fc628d338b7559cb4f238e8a6ac15cc7be96296a0c9d9891b9a"
+    },
+    {
+      "captured_path": "f2-runs/continuity-a23546.json",
+      "bytes": 1726,
+      "sha256": "407a39a425106a6bb09aa3e98ae864589003a359f36533dd4f61215438818508"
+    },
+    {
+      "captured_path": "f2-runs/continuity-a56d9a.json",
+      "bytes": 1725,
+      "sha256": "dd99293d2bc56f6d6b3bf68b2b60eea611e8f74a8c63457f41ffbb59c1ab9552"
+    },
+    {
+      "captured_path": "f2-runs/continuity-ae919f.json",
+      "bytes": 623,
+      "sha256": "263a28a1e97da1bfebde648af5ad5d96c4d88db5d17c41189e72b770c4b519cf"
+    },
+    {
+      "captured_path": "f2-runs/continuity-cycle.py",
+      "bytes": 8763,
+      "sha256": "246cfd0b89462a2ae35cb4605107bd3505273264646b9e73d554e4904f8c8185"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-1f054492-b765-5c97-a331-026227bd4001.jsonl",
+      "bytes": 127712,
+      "sha256": "0e7e00647ac5b56e2e6d89ae02fd8afc03a4350793ff338744bfa823b2314cfc"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-363d9cac-3e4f-5c0b-a47d-f9ae53668852.jsonl",
+      "bytes": 171064,
+      "sha256": "4326490fbe7aa545461ac6ca8af0a99b489473f01b7b82cf6ee63c1391cb36dd"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-58c7e4f8-a711-5690-829e-2af6c9647a78.jsonl",
+      "bytes": 133835,
+      "sha256": "4d82bf35bdc7c0694c54321554c9cb4ab9403735eb1abfde8734f1465941d745"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-5a3705b9-5f1d-5623-8f3a-e1576866edf5.jsonl",
+      "bytes": 181177,
+      "sha256": "eeead2efd2d341ceb67d7d4b5257c75b539b837a335532de5ccc04ac2b8f05b9"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-5c925229-0363-5061-bfd7-469b1519c17d.jsonl",
+      "bytes": 85614,
+      "sha256": "e1fc0483c566e6fe1a63baa4e92432a5c95c8f306d64f64e4b3d670ef2624c3b"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-63cfe063-0bb1-5fc1-aaaf-ee32c487cc64.jsonl",
+      "bytes": 106764,
+      "sha256": "5c1e3226cdb501fe6829f006ae3b3cf241b30d566774356d206f983f8d461641"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-d30227fa-37d5-50a4-842f-2b4895275153.jsonl",
+      "bytes": 178154,
+      "sha256": "5fea2a9cea4959da1acaae5e3df928632573458c0f5304e8a12d2cc91e0e4afd"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-dace7d4e-4342-5a37-a298-dabfb200c3f2.jsonl",
+      "bytes": 101369,
+      "sha256": "856031abde5a3d2e12dd44c4ac6694e14c9e9bacbe15dc794b7c080dc72e856e"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/assessments.json",
+      "bytes": 6355,
+      "sha256": "42f60b4821e663bf303f975f54147a696f7d7497dfde8de7f332e3695ec07646"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/calls.jsonl",
+      "bytes": 3558943,
+      "sha256": "941953933165c62e93eecd7f03ba7822c0257fb1f898b1efffea81850cf65a57"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/fabric.log",
+      "bytes": 957,
+      "sha256": "d15e4b1b98b799c77b5b3c1b3584f82ef2dda1a6998b7e8448fdd45aaee5859f"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/nhi-assessment.md",
+      "bytes": 4794,
+      "sha256": "1cfffffbbe52eff465d1ee4e42fef033e80d5172c6fc46258a02feeb521b16aa"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/nhi-audit.json",
+      "bytes": 8035,
+      "sha256": "ce30cc44082986849f8e0e3fecee7ee19e7f3e812471091b578c26c93181e670"
+    },
+    {
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/usage.json",
+      "bytes": 2784,
+      "sha256": "7cf02b7e10f52515b91f5e6a91ae4a8df2d38866b40914d2522d86d901cd18e2"
+    },
+    {
+      "captured_path": "f2-runs/nhi-assessment-glm.md",
+      "bytes": 4547,
+      "sha256": "a28d8d8b64a501958907c826f0e204d6d6bcb82abfe562f9c6f59939503acddf"
+    },
+    {
+      "captured_path": "f2-runs/nhi-audit-run1.json",
+      "bytes": 6137,
+      "sha256": "f77978ddb54cceabe6c0fe3992c7974df274c5080769bbc810421fcb027538ab"
+    },
+    {
+      "captured_path": "dashboard-enterprise-artifacts/continuity-cycle.py",
+      "bytes": 8644,
+      "sha256": "a26aa6fc22fa04cd67d1faf39888782b363c7126bb8e3b751a83983dbcbd5a5d"
+    },
+    {
+      "captured_path": "dashboard-enterprise-artifacts/module-scaling.py",
+      "bytes": 4702,
+      "sha256": "c486e8cc417201a5ff003e8ddc16e6f11a128397942dcd1e3d39d22c2a743176"
+    },
+    {
+      "captured_path": "dashboard-enterprise-artifacts/scaling-continuity-all.json",
+      "bytes": 42662,
+      "sha256": "395cde996a4b0248de652f4a141e281303d2a1d3219eeab57a6d1003e4f61b1d"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "model": "x-ai/grok-4.6",
+  "n_agents": 8,
+  "generated_at": "2026-09-01T23:03:53.821Z",
+  "assessments_valid": 8,
+  "assessments_invalid": 0,
+  "auditor_verdict": "FAIL",
+  "call_log_reconcile": {
+    "coverage": 273,
+    "diff": {},
+    "logged": 273,
+    "ok": true
+  },
+  "mission_completed": 0,
+  "mission_completion_rate": 0.0,
+  "mission_partial": {
+    "facts_stored_total": 9,
+    "lineage_proved": 3,
+    "summary_stored": 0
+  },
+  "isolation_respected_count": 6,
+  "latency_acceptable_count": 0
+}

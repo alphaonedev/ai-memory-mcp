@@ -1,0 +1,76 @@
+{
+  "accepted_snapshot_sha256": {
+    "assessment": "906e7abf8b39e770c389b7779fc6d66acca449dd527de55353effa627c99582c",
+    "test_plan": "5202003f5e603b5c9d5899680cfbb8726262d0f6813f54bbb3a2e116cc9e4284"
+  },
+  "published_document_sha256": {
+    "GPT-6-ASTRA-FULL-SPECTRUM-ASSESSMENT-2026-09-05.md": "5c6d0ad56bc4129b7d76c92680090b8046c156be962dfc6a4f270dadf4b85952",
+    "GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md": "cf9e3740eea87f1f3fcebc375a26370816eae68fa2b0fa8e74b232cb56843fbe"
+  },
+  "mechanical_changes": [
+    "Filled actual final tally and linked 21-ballot registry.",
+    "Added conservative direct-source coverage count from existing ledgers.",
+    "Annotated historical W2 source-path typo already corrected by final reviewers.",
+    "Copied final evidence and ballots; normalized two direct-read windows to physical EOF without increasing coverage.",
+    "Recorded user-authorized documentation-only publication procedure, local checks, links and final hashes.",
+    "Normalized trailing whitespace/EOF blanks and converted metadata hard breaks to paragraph breaks; no wording/vote change."
+  ],
+  "substantive_changes_after_adjudication": false,
+  "evidence_whitespace_normalizations": [
+    {
+      "file": "w2-fullpanel-architecture.md",
+      "original_sha256": "fcdc0ba96802255089519548a474f2a464ba240a8595a6421a067da0e1be3f08",
+      "published_sha256": "841f36448bd71caf17f7039e0ed0ae903056af9b76da9624915b66f720daa02b"
+    },
+    {
+      "file": "w2-fullpanel-operations.md",
+      "original_sha256": "cdc2a48f7fa43159e34b973360afdf74db65f619bd4a8f147e44a7dc3c1b57bc",
+      "published_sha256": "ff50eaf5e8ea1dcaabfc272fd9632e10b6f377deffec46968aa0c9149c571cce"
+    },
+    {
+      "file": "w3-fullpanel-cognition.md",
+      "original_sha256": "1d4cc3face4406a2d29137e9fa9c804c5e31effc77058584baaf55a3727abb0d",
+      "published_sha256": "471b378ce7ccdedfaf4c8802c16f3f2e17a093806bb45a22c28fdabad9208cb5"
+    },
+    {
+      "file": "w2-fullpanel-cognition.md",
+      "original_sha256": "60730fe10d89446e4c1ddb1c4cfee36aef8de0e7b037af98003e6c216e80e143",
+      "published_sha256": "f5037d5b2a46ba6dd6cb1722adb9acf9a9b7396dcd9b452835f830a805849118"
+    },
+    {
+      "file": "w1-operations.md",
+      "original_sha256": "ac31a56bfa6ca9d00909e58862af77341645e03e6c2bf23d186acf66c1b3ea97",
+      "published_sha256": "4c52e868922da863f8da1e06d3f03c7dad2c48953b0b720c9b4a61658f420046"
+    },
+    {
+      "file": "issues-review-security.md",
+      "original_sha256": "d067016560d4fc8548dafd9ea73f8868f33fd0ec7b00018b28e4da88f7ab77c0",
+      "published_sha256": "414e8a21941c6b41140936580c38b807d192c95826395ebdfade33f61afe292e"
+    },
+    {
+      "file": "w1-cognition.md",
+      "original_sha256": "b842b52fafd74506f67e377d67fc618d31494f45c45c0811ba805b02a67d5f14",
+      "published_sha256": "ee2039ccaaab183467a2cb6badb4acb842fddb43c0719aa48be94d121bd969a7"
+    },
+    {
+      "file": "w3-fullpanel-operations.md",
+      "original_sha256": "0783507118f0e0ca7da680317c8efaad71c61d4f18689002589f346f97a5408b",
+      "published_sha256": "a3d089c1e08d19e8a3c3ea85d8410694c2e04ed586affeb8c91e4321c888491c"
+    },
+    {
+      "file": "w1-architecture.md",
+      "original_sha256": "4fc9c60d7268e892b2b166eeda2a1d853560f0faa6c2f4729b9f05bc80a1595a",
+      "published_sha256": "578c6c297bdf78c63736a12dd6cd36f59b8ce600a405e57c4d32ee7cf74091ef"
+    },
+    {
+      "file": "w3-fullpanel-architecture.md",
+      "original_sha256": "5b5f1ae82599b348a9c08288cbd9efe02304709b46035f92e316f58a405e87e2",
+      "published_sha256": "d3c4627464bb9b7f347d9aa8b1f9236482abecb256d96f2af6d0e5072bb0d186"
+    },
+    {
+      "file": "native-tier-proof.txt",
+      "original_sha256": "0fbd25889c45ccb118820258298884125abcafb1d1abf6b18575f0122faff3b5",
+      "published_sha256": "afeec6a55c3d61d70aac94195b9ae3d016effe92b155bb13a098e34fc2b6fa5d"
+    }
+  ]
+}

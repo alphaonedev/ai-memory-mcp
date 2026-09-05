@@ -1,0 +1,310 @@
+{
+  "source_commit": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+  "snapshot_date": "2026-09-05",
+  "required_protection": {
+    "enforce_admins": {
+      "enabled": true,
+      "url": "https://api.github.com/repos/alphaonedev/ai-memory-mcp/branches/release/v1.0.0/protection/enforce_admins"
+    },
+    "required_pull_request_reviews": null,
+    "required_signatures": {
+      "enabled": true,
+      "url": "https://api.github.com/repos/alphaonedev/ai-memory-mcp/branches/release/v1.0.0/protection/required_signatures"
+    },
+    "required_status_checks": {
+      "checks": [
+        {
+          "app_id": 15368,
+          "context": "Classify changes"
+        },
+        {
+          "app_id": 15368,
+          "context": "Lint (fmt + clippy)"
+        },
+        {
+          "app_id": 15368,
+          "context": "actionlint (workflow-injection guard)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Postgres feature gate"
+        },
+        {
+          "app_id": 15368,
+          "context": "SAL-only feature gate"
+        },
+        {
+          "app_id": 15368,
+          "context": "vectorlite feature gate"
+        },
+        {
+          "app_id": 15368,
+          "context": "Dockerfile build (no push)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Cross-compile (aarch64-apple-ios)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Cross-compile (aarch64-linux-android)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Build-script custom-build ledger gate (#2635)"
+        },
+        {
+          "app_id": 15368,
+          "context": "C8 caller-context allowlist check"
+        },
+        {
+          "app_id": 15368,
+          "context": "Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)"
+        },
+        {
+          "app_id": 15368,
+          "context": "L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Hardcoded-literal duplication ratchet (pm-v3.1)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Docs vs SSOT drift gate"
+        },
+        {
+          "app_id": 15368,
+          "context": "Cloud-init ASCII gate"
+        },
+        {
+          "app_id": 15368,
+          "context": "Test-reachable stdin-read gate (#1989)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Migration-ladder-uniqueness gate (guardrail-D)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Test-env $HOME-lock gate (#2146)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Installer checksum fail-closed gate (#2449)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Non-Rust conformance-reader proof gate (#2452)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Required-context + classify-base soundness gate (#2494/#2496/#2508)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Git-dependency-source supply-chain gate (#2050/#2512)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Coverage classify (docs-only short-circuit)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Per-Module Coverage Thresholds"
+        },
+        {
+          "app_id": 15368,
+          "context": "Doc symbol/path anchor gate (#2629)"
+        },
+        {
+          "app_id": 15368,
+          "context": "SDK-path vs routes.rs membership gate (#2629)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Named-CI-job existence + enforcement-truthfulness gate (#2629)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Doc surface completeness gate (#2839)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Check (linux-fed,enterprise-fed)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Check (macos-fed,sqlite)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Check (macos-fed,enterprise-fed)"
+        },
+        {
+          "app_id": 15368,
+          "context": "Check (ubuntu-latest,sqlite)"
+        },
+        {
+          "app_id": 15368,
+          "context": "External-PR operator-approval gate (author outside team => @alphaonedev review)"
+        },
+        {
+          "app_id": 15368,
+          "context": "MSRV (Rust 1.98)"
+        }
+      ],
+      "contexts": [
+        "Classify changes",
+        "Lint (fmt + clippy)",
+        "actionlint (workflow-injection guard)",
+        "Postgres feature gate",
+        "SAL-only feature gate",
+        "vectorlite feature gate",
+        "Dockerfile build (no push)",
+        "Cross-compile (aarch64-apple-ios)",
+        "Cross-compile (aarch64-linux-android)",
+        "Build-script custom-build ledger gate (#2635)",
+        "C8 caller-context allowlist check",
+        "Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)",
+        "L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)",
+        "Hardcoded-literal duplication ratchet (pm-v3.1)",
+        "Docs vs SSOT drift gate",
+        "Cloud-init ASCII gate",
+        "Test-reachable stdin-read gate (#1989)",
+        "Migration-ladder-uniqueness gate (guardrail-D)",
+        "Test-env $HOME-lock gate (#2146)",
+        "Installer checksum fail-closed gate (#2449)",
+        "Non-Rust conformance-reader proof gate (#2452)",
+        "Required-context + classify-base soundness gate (#2494/#2496/#2508)",
+        "Git-dependency-source supply-chain gate (#2050/#2512)",
+        "Coverage classify (docs-only short-circuit)",
+        "Per-Module Coverage Thresholds",
+        "Doc symbol/path anchor gate (#2629)",
+        "SDK-path vs routes.rs membership gate (#2629)",
+        "Named-CI-job existence + enforcement-truthfulness gate (#2629)",
+        "Doc surface completeness gate (#2839)",
+        "Check (linux-fed,enterprise-fed)",
+        "Check (macos-fed,sqlite)",
+        "Check (macos-fed,enterprise-fed)",
+        "Check (ubuntu-latest,sqlite)",
+        "External-PR operator-approval gate (author outside team => @alphaonedev review)",
+        "MSRV (Rust 1.98)"
+      ],
+      "contexts_url": "https://api.github.com/repos/alphaonedev/ai-memory-mcp/branches/release/v1.0.0/protection/required_status_checks/contexts",
+      "strict": true,
+      "url": "https://api.github.com/repos/alphaonedev/ai-memory-mcp/branches/release/v1.0.0/protection/required_status_checks"
+    }
+  },
+  "workflow_runs": [
+    {
+      "conclusion": "success",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738076",
+      "id": 33987738076,
+      "name": "clients-ci",
+      "run_attempt": 1,
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738051",
+      "id": 33987738051,
+      "name": "c8-precheck",
+      "run_attempt": 1,
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738085",
+      "id": 33987738085,
+      "name": "tool-count-drift",
+      "run_attempt": 1,
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738074",
+      "id": 33987738074,
+      "name": "Mobile runtime (iOS Simulator + Android emulator)",
+      "run_attempt": 1,
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738058",
+      "id": 33987738058,
+      "name": "token-budget",
+      "run_attempt": 1,
+      "status": "completed"
+    },
+    {
+      "conclusion": "failure",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738052",
+      "id": 33987738052,
+      "name": "Per-Module Coverage Thresholds",
+      "run_attempt": 1,
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738088",
+      "id": 33987738088,
+      "name": "Certified Postgres + AGE + pgvector tier (#2548)",
+      "run_attempt": 2,
+      "status": "completed"
+    },
+    {
+      "conclusion": "failure",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738077",
+      "id": 33987738077,
+      "name": "Batman Mode acceptance gate",
+      "run_attempt": 1,
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738084",
+      "id": 33987738084,
+      "name": "Postgres ignored tests (#3274)",
+      "run_attempt": 1,
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738040",
+      "id": 33987738040,
+      "name": "Bench",
+      "run_attempt": 1,
+      "status": "completed"
+    },
+    {
+      "conclusion": "failure",
+      "head_sha": "87f86a0a1399d8282a60690ce463cba2ba688ebe",
+      "html_url": "https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33987738090",
+      "id": 33987738090,
+      "name": "CI",
+      "run_attempt": 1,
+      "status": "completed"
+    }
+  ],
+  "rulesets": [
+    {
+      "enforcement": "active",
+      "id": 17752665,
+      "name": "signed-attested-branches",
+      "source": "alphaonedev/ai-memory-mcp",
+      "source_type": "Repository",
+      "target": "branch"
+    }
+  ]
+}
